@@ -824,3 +824,26 @@ test('account and detail copy describe current attribution and unavailable capab
   assert.equal((index.match(/<span class="auth-status-badge unauthed">暂未接入<\/span>/g) || []).length, 2);
   assert.ok(controller.includes('正在加载商品详情...'));
 });
+
+test('detail displays auth modal when promotion needs authorization and supports proceed without auth', async () => {
+  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(0, { status: 'success', user: user() });
+  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
+  const copyAction = h.page.handleCopyPromoteLink(); await flush();
+  await h.finish(2, {
+    status: 'success',
+    final_link: 'https://p.pinduoduo.com/station-A',
+    command_text: 'station-command-A',
+    is_fallback: true,
+    need_auth: true,
+    auth_msg: '尚未完成渠道授权备案',
+  });
+  await copyAction;
+  assert.equal(h.page.authModal.value.visible, true);
+  assert.equal(h.copied.length, 0);
+  h.page.handleProceedWithoutAuth();
+  assert.equal(h.page.authModal.value.visible, false);
+  assert.equal(h.copied.at(-1), 'station-command-A');
+});
+

@@ -210,6 +210,7 @@ def test_pdd_url_only_conversion_preserves_uid():
 
 def test_pdd_explicit_product_url_cannot_override_a_known_identity():
     with patch("adapters.pdd_adapter.generate_smart_promotion_url", return_value={"status": "error"}), \
+         patch("adapters.pdd_adapter.generate_goods_promotion_url", return_value={"status": "error"}), \
          patch("adapters.pdd_adapter.convert_pdd_url", return_value={
              "status": "success", "jump_url": "https://p.pinduoduo.com/verified", "raw_data": {}}) as convert:
         result = PddAdapter().convert_promotion_url("SIGN_A", goods_id="111", goods_sign="SIGN_A",
@@ -219,9 +220,13 @@ def test_pdd_explicit_product_url_cannot_override_a_known_identity():
 
 
 def test_unattributed_user_link_is_explicit_fallback():
+    def goods_mock(*args, uid=None, **kwargs):
+        if uid:
+            return {"status": "error", "error_msg": "PDD网关拒绝: [60001:AUTH] 未备案"}
+        return {"status": "success", "data": {"short_url": "https://p.pinduoduo.com/site"}}
+
     with patch("adapters.pdd_adapter.generate_smart_promotion_url", return_value={"status": "error"}), \
-         patch("adapters.pdd_adapter.generate_goods_promotion_url", return_value={
-             "status": "success", "data": {"short_url": "https://p.pinduoduo.com/site"}}):
+         patch("adapters.pdd_adapter.generate_goods_promotion_url", side_effect=goods_mock):
         result = PddAdapter().convert_promotion_url("SIGN_A", uid="u_12345678")
     assert result["is_fallback"] is True
 
@@ -293,3 +298,53 @@ def test_query_token_is_redacted_from_request_log():
     assert "private-token" not in path
     assert "[REDACTED]" in path
     assert "keyword=test" in path
+
+
+def test_unauthorized_user_fallback_flags_need_auth():
+    from adapters.pdd_adapter import PddAdapter
+    adapter = PddAdapter()
+
+    def smart_mock(client_id, client_secret, pid, goods_sign, uid=None, **kwargs):
+        if uid:
+            return {"status": "error", "error_msg": "PDD网关拒绝: [60001:AUTH] 未备案 - 请授权"}
+        return {"status": "success", "link_type": "官方专属红包", "data": {"short_url": "https://p.pinduoduo.com/station"}}
+
+    with patch("adapters.pdd_adapter.generate_smart_promotion_url", side_effect=smart_mock), \
+         patch("adapters.pdd_adapter.generate_goods_promotion_url", return_value={"status": "error", "error_msg": "[60001:AUTH] 未备案"}):
+        res = adapter.convert_promotion_url("SIGN_KIWI", uid="u_12345678")
+
+    assert res["status"] == "success"
+    assert res["need_auth"] is True
+    assert res["auth_platform"] == "pdd"
+    assert res["is_fallback"] is True
+    assert res["final_link"] == "https://p.pinduoduo.com/station"
+
+
+def test_pdd_attempt_promotions_strict_order():
+    """验证 _attempt_promotions 严格遵循：1. 超级红包(Channel 23) -> 2. 单品标准推广 -> 3. 招商洗链(zs.unit)"""
+    call_order = []
+
+    def mock_smart(*args, **kwargs):
+        call_order.append("1_smart_channel23")
+        return {"status": "error"}
+
+    def mock_goods(*args, **kwargs):
+        call_order.append("2_goods_standard")
+        return {"status": "error"}
+
+    def mock_zs(*args, **kwargs):
+        call_order.append("3_zs_unit")
+        return {"status": "success", "jump_url": "https://p.pinduoduo.com/zs", "raw_data": {}}
+
+    with patch("adapters.pdd_adapter.generate_smart_promotion_url", side_effect=mock_smart), \
+         patch("adapters.pdd_adapter.generate_goods_promotion_url", side_effect=mock_goods), \
+         patch("adapters.pdd_adapter.convert_pdd_url", side_effect=mock_zs):
+        link, raw, link_type, _ = PddAdapter()._attempt_promotions(
+            target="SIGN_TEST", source_url="https://mobile.pinduoduo.com/goods.html?goods_id=123", uid="u_123"
+        )
+
+    assert call_order == ["1_smart_channel23", "2_goods_standard", "3_zs_unit"]
+    assert link == "https://p.pinduoduo.com/zs"
+    assert link_type == "官方招商券推广"
+
+

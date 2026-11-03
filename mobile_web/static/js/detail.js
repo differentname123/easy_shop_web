@@ -116,7 +116,7 @@
           const { ok, data } = await api.post('/api/promote/convert', payload);
           if (generation !== conversionGeneration || !session.isCurrent(snapshot)) return null;
           if (ok && data.status === 'success') {
-            if (data.is_fallback) browser.showToast('专属优惠暂不可用，已提供商品原链接');
+            if (data.is_fallback && !data.need_auth) browser.showToast('专属优惠暂不可用，已提供商品原链接');
             return data;
           }
           browser.showToast('专属优惠暂不可用，已提供商品原链接');
@@ -137,21 +137,103 @@
       pendingConversion = { key, promise, session: snapshot };
       return promise;
     };
+    const authModal = ref({
+      visible: false,
+      platform: 'pdd',
+      platformName: '拼多多',
+      msg: '',
+      action: 'copy',
+      pendingInfo: null,
+      isFetchingAuth: false,
+    });
+    const executeJumpToBuy = info => {
+      const content = info.command_text || info.final_link;
+      if (content) browser.copyText(content, '已复制抢购口令，正在前往拼多多领券...');
+      browser.jumpToLink(info, goods.value?.product_url || '');
+    };
+    const executeCopyPromoteLink = (info, successTip) => {
+      const content = info.command_text || info.final_link;
+      if (content) browser.copyText(content, successTip || '抢购口令与领券链接已复制！打开拼多多APP即可自动识别，或通过链接直接下单~');
+      else browser.showToast('暂无有效口令');
+    };
     const handleJumpToBuy = async () => {
       const info = await handleGenerateLink('正在打通拼多多领券通道...');
       if (disposed) return;
       if (!info) return browser.showToast('获取购买链接失败，请重试');
-      const content = info.command_text || info.final_link;
-      if (content) browser.copyText(content, '已复制抢购口令，正在前往拼多多领券...');
-      browser.jumpToLink(info, goods.value?.product_url || '');
+      if (info.need_auth) {
+        authModal.value = {
+          visible: true,
+          platform: info.auth_platform || 'pdd',
+          platformName: '拼多多',
+          msg: info.auth_msg || '检测到您尚未在拼多多完成渠道授权备案，当前生成的链接为通用链接，本单无法计入您的推手返利佣金。',
+          action: 'buy',
+          pendingInfo: info,
+          isFetchingAuth: false,
+        };
+        return;
+      }
+      executeJumpToBuy(info);
     };
     const handleCopyPromoteLink = async () => {
       const info = await handleGenerateLink('正在生成拼多多抢购口令...');
       if (disposed) return;
       if (!info) return browser.showToast('生成口令失败，请稍后重试');
-      const content = info.command_text || info.final_link;
-      if (content) browser.copyText(content, '抢购口令与领券链接已复制！打开拼多多APP即可自动识别，或通过链接直接下单~');
-      else browser.showToast('暂无有效口令');
+      if (info.need_auth) {
+        authModal.value = {
+          visible: true,
+          platform: info.auth_platform || 'pdd',
+          platformName: '拼多多',
+          msg: info.auth_msg || '检测到您尚未在拼多多完成渠道授权备案，当前生成的链接为通用链接，本单无法计入您的推手返利佣金。',
+          action: 'copy',
+          pendingInfo: info,
+          isFetchingAuth: false,
+        };
+        return;
+      }
+      executeCopyPromoteLink(info);
+    };
+    const closeAuthModal = () => {
+      authModal.value.visible = false;
+      authModal.value.pendingInfo = null;
+    };
+    const handleProceedWithoutAuth = () => {
+      const info = authModal.value.pendingInfo;
+      const action = authModal.value.action;
+      closeAuthModal();
+      if (!info) return;
+      if (action === 'buy') {
+        executeJumpToBuy(info);
+      } else {
+        executeCopyPromoteLink(info, '抢购口令已复制（未授权本单不计佣金）');
+      }
+    };
+    const handleGoToAuth = async () => {
+      if (authModal.value.isFetchingAuth) return;
+      authModal.value.isFetchingAuth = true;
+      const snapshot = session.capture();
+      try {
+        const plat = authModal.value.platform || 'pdd';
+        const response = await api.get(`/api/user/auth?${new URLSearchParams({ platform: plat })}`, { token: snapshot.token });
+        if (response.ok && response.data && response.data.status === 'success') {
+          const authUrl = response.data.auth_url || response.data.short_url;
+          if (authUrl) {
+            browser.copyText(authUrl, '已复制授权链接，正在前往授权备案...');
+            if (global.window && global.window.open) {
+              global.window.open(authUrl, '_blank');
+            } else if (global.location) {
+              global.location.href = authUrl;
+            }
+            closeAuthModal();
+            return;
+          }
+        }
+        browser.showToast(response.data?.error_msg || '获取授权链接失败，请稍后重试');
+      } catch (err) {
+        global.console.warn('获取授权链接异常:', err);
+        browser.showToast('网络连接异常，请重试');
+      } finally {
+        authModal.value.isFetchingAuth = false;
+      }
     };
     const initialize = async () => {
       const params = new URLSearchParams(global.location.search);
@@ -184,6 +266,7 @@
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
       isDeepLoading, detailError, onCarouselScroll, goHome, goBack, goToRegister,
+      authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth,
       retryLoadDeepDetail: loadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,
     };
