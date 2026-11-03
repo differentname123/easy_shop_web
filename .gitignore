@@ -39,3 +39,7 @@ keys/
 *.p12
 *.pfx
 *.crt
+
+# Temporary files
+temp*.json
+*.tmp

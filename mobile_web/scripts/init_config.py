@@ -58,10 +58,7 @@ def main(argv=None):
     # authSource 是可选的兼容扩展；空值不迁入，也不带入其他账号/服务配置。
     if source.get("mongo_auth_source") not in (None, ""):
         values["mongo_auth_source"] = source["mongo_auth_source"]
-    auth_secret = os.environ.get("WEB_AUTH_SECRET", source.get("web_auth_secret", ""))
-    if "WEB_AUTH_SECRET" in os.environ and not _safe_secret(auth_secret):
-        print("当前 WEB_AUTH_SECRET 不安全；请先更正或取消该环境变量，未创建配置。", file=sys.stderr)
-        return 2
+    auth_secret = source.get("web_auth_secret", "")
     generated = not _safe_secret(auth_secret)
     values["web_auth_secret"] = secrets.token_urlsafe(48) if generated else auth_secret
     try:

@@ -64,60 +64,62 @@ def test_settings_repr_hides_private_secrets(private_config):
     assert "json-mongo.invalid" in rendered
 
 
-def test_environment_overrides_json_including_explicit_empty_values(private_config):
-    settings = load_settings(private_config, environ={
-        "PDD_CLIENT_ID": "env-client", "PDD_CLIENT_SECRET": "env-secret", "PDD_PID": "env-pid",
-        "MONGO_HOST": "env-mongo.invalid", "MONGO_PORT": "27123", "MONGO_USER": "", "MONGO_PASSWORD": "",
-        "MONGO_DB_NAME": "env_database", "MONGO_AUTH_SOURCE": "env_auth", "WEB_AUTH_SECRET": SMOKE_SECRET,
-        "WEB_HOST": "0.0.0.0", "WEB_PORT": "9123", "PORT": "9124", "WEB_WARMUP_ENABLED": "false",
-        "WEB_LOG_DIR": "", "WEB_LOG_LEVEL": "debug", "PDD_DNS_MODE": "off", "PDD_TRUST_ENV": "0",
-    })
-    assert (settings.pdd_client_id, settings.pdd_client_secret, settings.pdd_pid) == ("env-client", "env-secret", "env-pid")
-    assert (settings.mongo_host, settings.mongo_port, settings.mongo_db_name, settings.mongo_auth_source) == (
-        "env-mongo.invalid", 27123, "env_database", "env_auth")
-    assert settings.mongo_user == settings.mongo_password == ""
-    assert settings.auth_secret == SMOKE_SECRET
-    assert (settings.web_host, settings.web_port) == ("0.0.0.0", 9123)
-    assert settings.warmup_enabled is False
-    assert settings.log_dir is None
-    assert settings.log_level == "DEBUG"
-    assert settings.pdd_dns_mode == "off"
-    assert settings.pdd_trust_env is False
+def test_json_pure_configuration(private_config):
+    settings = load_settings(private_config)
+    assert settings.pdd_client_id == PRIVATE["myself_pdd_client_id"]
+    assert settings.pdd_client_secret == PRIVATE["myself_pdd_client_secret"]
+    assert settings.pdd_pid == PRIVATE["myself_pdd_pid"]
+    assert settings.mongo_host == PRIVATE["local_mongo_host"]
+    assert settings.mongo_port == PRIVATE["local_mongo_port"]
+    assert settings.mongo_user == PRIVATE["local_mongo_user"]
+    assert settings.mongo_password == PRIVATE["local_mongo_password"]
+    assert settings.mongo_db_name == PRIVATE["local_mongo_db_name"]
+    assert settings.mongo_auth_source == PRIVATE["mongo_auth_source"]
+    assert settings.auth_secret == PRIVATE["web_auth_secret"]
+    assert settings.web_host == PRIVATE["web_host"]
+    assert settings.web_port == PRIVATE["web_port"]
 
 
-@pytest.mark.parametrize("env,expected", [({}, 8123), ({"PORT": "9001"}, 9001),
-    ({"WEB_PORT": "9002", "PORT": "9001"}, 9002)])
-def test_web_port_precedence(private_config, env, expected):
-    assert load_settings(private_config, environ=env).web_port == expected
-
-
-@pytest.mark.parametrize("field", ["PDD_CLIENT_ID", "PDD_CLIENT_SECRET", "PDD_PID", "WEB_AUTH_SECRET"])
-def test_explicit_empty_credentials_do_not_fall_back_to_json(private_config, field):
+@pytest.mark.parametrize("field,key", [
+    ("myself_pdd_client_id", "myself_pdd_client_id"),
+    ("myself_pdd_client_secret", "myself_pdd_client_secret"),
+    ("myself_pdd_pid", "myself_pdd_pid"),
+    ("web_auth_secret", "web_auth_secret"),
+])
+def test_explicit_empty_credentials_in_json_are_rejected(tmp_path, field, key):
+    path = tmp_path / "empty_cred.json"
+    data = dict(PRIVATE)
+    data[key] = ""
+    path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(SettingsError) as error:
-        load_settings(private_config, environ={field: ""})
+        load_settings(path)
     assert field in str(error.value)
     assert PRIVATE["myself_pdd_client_secret"] not in str(error.value)
     assert PRIVATE["web_auth_secret"] not in str(error.value)
 
 
 @pytest.mark.parametrize("secret", ["", "short", "easy_shop_secure_auth_secret_key_2026_v2"])
-def test_missing_weak_and_public_old_auth_secrets_are_rejected(private_config, secret):
-    with pytest.raises(SettingsError, match="WEB_AUTH_SECRET"):
-        load_settings(private_config, environ={"WEB_AUTH_SECRET": secret})
+def test_missing_weak_and_public_old_auth_secrets_are_rejected(tmp_path, secret):
+    path = tmp_path / "weak_auth.json"
+    data = dict(PRIVATE)
+    data["web_auth_secret"] = secret
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SettingsError, match="web_auth_secret"):
+        load_settings(path)
 
 
 @pytest.mark.parametrize("field,value", [
-    ("WEB_PORT", ""), ("WEB_PORT", "0"), ("WEB_PORT", "65536"), ("WEB_PORT", "1.5"),
-    ("MONGO_PORT", ""), ("MONGO_PORT", "-1"), ("MONGO_PORT", "65536"), ("MONGO_PORT", "not-a-port"),
-    ("MONGO_HOST", ""), ("MONGO_DB_NAME", ""), ("MONGO_AUTH_SOURCE", ""),
-    ("WEB_WARMUP_ENABLED", ""), ("WEB_WARMUP_ENABLED", "perhaps"), ("PDD_TRUST_ENV", "perhaps"),
-    ("PDD_DNS_MODE", "global"), ("WEB_LOG_LEVEL", "secret-log-canary"),
+    ("web_port", ""), ("web_port", "0"), ("web_port", "65536"), ("web_port", "1.5"),
+    ("local_mongo_port", ""), ("local_mongo_port", "-1"), ("local_mongo_port", "65536"), ("local_mongo_port", "not-a-port"),
+    ("local_mongo_host", ""), ("local_mongo_db_name", ""), ("mongo_auth_source", ""),
+    ("web_warmup_enabled", ""), ("web_warmup_enabled", "perhaps"), ("pdd_trust_env", "perhaps"),
+    ("pdd_dns_mode", "global"), ("web_log_level", "secret-log-canary"),
 ])
 def test_require_credentials_false_still_validates_noncredential_fields(tmp_path, field, value):
     path = tmp_path / "empty private.json"
-    path.write_text("{}", encoding="utf-8")
+    path.write_text(json.dumps({field: value}), encoding="utf-8")
     with pytest.raises(SettingsError) as error:
-        load_settings(path, environ={field: value}, require_credentials=False)
+        load_settings(path, require_credentials=False)
     assert field in str(error.value)
     if value == "secret-log-canary":
         assert value not in str(error.value)
@@ -125,42 +127,48 @@ def test_require_credentials_false_still_validates_noncredential_fields(tmp_path
 
 @pytest.mark.parametrize("value,expected", [("true", True), ("1", True), ("on", True),
     ("yes", True), ("false", False), ("0", False), ("off", False), ("no", False)])
-def test_boolean_environment_values(private_config, value, expected):
-    settings = load_settings(private_config, environ={"WEB_WARMUP_ENABLED": value, "PDD_TRUST_ENV": value})
+def test_boolean_json_values(tmp_path, value, expected):
+    path = tmp_path / "bool.json"
+    data = dict(PRIVATE)
+    data["web_warmup_enabled"] = value
+    data["pdd_trust_env"] = value
+    path.write_text(json.dumps(data), encoding="utf-8")
+    settings = load_settings(path)
     assert settings.warmup_enabled is expected
     assert settings.pdd_trust_env is expected
 
 
 @pytest.mark.parametrize("value", ["", "-"])
-def test_file_logging_can_be_disabled(private_config, value):
-    assert load_settings(private_config, environ={"WEB_LOG_DIR": value}).log_dir is None
+def test_file_logging_can_be_disabled(tmp_path, value):
+    path = tmp_path / "logging.json"
+    data = dict(PRIVATE)
+    data["web_log_dir"] = value
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert load_settings(path).log_dir is None
 
 
 def test_config_and_log_relative_paths_are_anchored_to_application_not_cwd(tmp_path, monkeypatch):
     application = tmp_path / "deployment 中文"
     application.mkdir()
     private = application / "relative private.json"
-    private.write_text(json.dumps(PRIVATE), encoding="utf-8")
+    data = dict(PRIVATE)
+    data["web_log_dir"] = "runtime/custom logs"
+    private.write_text(json.dumps(data), encoding="utf-8")
     unrelated = tmp_path / "other cwd"
     unrelated.mkdir()
     monkeypatch.setattr(settings_module, "APP_DIR", application)
     monkeypatch.chdir(unrelated)
-    settings = load_settings(environ={"WEB_CONFIG_FILE": "relative private.json", "WEB_LOG_DIR": "runtime/custom logs"})
+    settings = load_settings(private)
     assert settings.pdd_client_id == "json-client"
     assert settings.log_dir == application / "runtime" / "custom logs"
     assert not (unrelated / "runtime").exists()
 
 
-def test_missing_default_file_works_with_complete_environment(tmp_path, monkeypatch):
-    # Redirect the default itself: never consult a developer's real config.local.json.
+def test_missing_default_file_raises_settings_error(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEB_CONFIG_FILE", raising=False)
     monkeypatch.setattr(settings_module, "DEFAULT_CONFIG_FILE", tmp_path / "missing-default.json")
-    settings = load_settings(environ={"PDD_CLIENT_ID": "env", "PDD_CLIENT_SECRET": "env-secret",
-        "PDD_PID": "env-pid", "WEB_AUTH_SECRET": SMOKE_SECRET})
-    assert settings.pdd_client_id == "env"
-    assert settings.mongo_port == 27017
-    assert settings.web_port == 8000
-    assert settings.warmup_enabled is True
-    assert settings.pdd_dns_mode == "auto"
+    with pytest.raises(SettingsError):
+        load_settings()
 
 
 @pytest.mark.parametrize("text", ['{"password":"malformed-json-secret-canary",', "[]", "null", '"string"'])
@@ -204,9 +212,13 @@ def test_get_settings_caches_the_unified_loader(monkeypatch):
         settings_module.get_settings.cache_clear()
 
 
-def test_mongo_factory_uses_unified_settings_and_never_connects(private_config, monkeypatch):
+def test_mongo_factory_uses_unified_settings_and_never_connects(tmp_path, monkeypatch):
     from infrastructure import mongo
-    settings = load_settings(private_config, environ={"MONGO_USER": "name@realm", "MONGO_PASSWORD": "pass:/ word"})
+    custom_config = tmp_path / "mongo_esc.json"
+    data = dict(PRIVATE)
+    data.update({"local_mongo_user": "name@realm", "local_mongo_password": "pass:/ word"})
+    custom_config.write_text(json.dumps(data), encoding="utf-8")
+    settings = load_settings(custom_config, environ={})
     client = MagicMock()
     factory = MagicMock(return_value=client)
     monkeypatch.setattr(mongo, "MongoClient", factory)
@@ -333,7 +345,7 @@ def test_standalone_runtime_smoke_in_fresh_process():
 def test_absolute_runner_check_from_unrelated_cwd_is_offline(production_copy):
     result = run_isolated(production_copy, """
 import runpy
-sys.argv = [str(APP / 'run.py'), '--check', '--no-warmup']
+sys.argv = [str(APP / 'run.py'), '--check']
 try:
     runpy.run_path(sys.argv[0], run_name='__main__')
 except SystemExit as exc:
@@ -348,11 +360,11 @@ assert 'infrastructure.mongo' not in sys.modules
     assert not list(production_copy[0].rglob("*.log"))
 
 
-@pytest.mark.parametrize("arguments,host,port,reload,warmup", [
-    ([], "127.0.0.1", 8000, False, False),
-    (["--host", "0.0.0.0", "--port", "9123", "--reload", "--no-warmup"], "0.0.0.0", 9123, True, False),
+@pytest.mark.parametrize("arguments,reload", [
+    ([], False),
+    (["--reload"], True),
 ])
-def test_runner_uvicorn_options_without_starting_a_server(production_copy, arguments, host, port, reload, warmup):
+def test_runner_uvicorn_options_without_starting_a_server(production_copy, arguments, reload):
     code = f"""
 from unittest.mock import patch
 import run
@@ -362,25 +374,18 @@ with patch('uvicorn.run', side_effect=lambda *args, **kwargs: calls.append((args
 assert len(calls) == 1
 args, options = calls[0]
 assert args == ('main:app',), args
-assert options['host'] == {host!r}
-assert options['port'] == {port!r}
 assert options['reload'] is {reload!r}
 assert options['reload_dirs'] == ([str(APP)] if {reload!r} else None)
 assert options['workers'] == 1
-assert run.get_settings().warmup_enabled is {warmup!r}
 """
     assert_child_passed(run_isolated(production_copy, code))
 
 
 def test_direct_main_entry_applies_flags_before_loading_configuration(production_copy):
     result = run_isolated(production_copy, """
-import os, runpy
+import runpy
 from unittest.mock import patch
-config_file = os.environ['WEB_CONFIG_FILE']
-os.environ.update({'WEB_CONFIG_FILE': str(APP / 'missing private.json'),
-    'WEB_HOST': '', 'WEB_PORT': 'invalid-port', 'WEB_WARMUP_ENABLED': 'true'})
-sys.argv = [str(APP / 'main.py'), '--config', config_file,
-    '--host', '0.0.0.0', '--port', '9123', '--reload', '--no-warmup']
+sys.argv = [str(APP / 'main.py'), '--reload']
 calls = []
 with patch('uvicorn.run', side_effect=lambda *args, **kwargs: calls.append((args, kwargs))):
     try:
@@ -392,13 +397,7 @@ with patch('uvicorn.run', side_effect=lambda *args, **kwargs: calls.append((args
 assert len(calls) == 1
 args, options = calls[0]
 assert args == ('main:app',)
-assert options['host'] == '0.0.0.0'
-assert options['port'] == 9123
 assert options['reload'] is True
-assert options['reload_dirs'] == [str(APP)]
-assert options['workers'] == 1
-from infrastructure.settings import get_settings
-assert get_settings().warmup_enabled is False
 assert 'config' not in sys.modules
 assert 'main' not in sys.modules
 """)
@@ -407,8 +406,12 @@ assert 'main' not in sys.modules
 
 def test_runner_bad_config_error_is_safe_and_does_not_import_app(production_copy):
     result = run_isolated(production_copy, """
-import os, run
-os.environ['MONGO_PORT'] = 'private-port-canary'
+import json, os, run
+from pathlib import Path
+cfg = Path(os.environ['WEB_CONFIG_FILE'])
+data = json.loads(cfg.read_text(encoding='utf-8'))
+data['local_mongo_port'] = 'private-port-canary'
+cfg.write_text(json.dumps(data), encoding='utf-8')
 assert run.main(['--check']) == 2
 assert 'main' not in sys.modules
 """)
@@ -547,10 +550,9 @@ assert not (APP / 'config.local.json').exists()
     assert_child_passed(result)
 
 
-def test_initializer_prefers_safe_environment_auth_secret(production_copy):
+def test_initializer_preserves_safe_source_auth_secret(production_copy):
     result = run_isolated(production_copy, """
-import os, runpy
-os.environ['WEB_AUTH_SECRET'] = 'environment-private-auth-secret-at-least-32-characters'
+import json, runpy
 source = APP.parent / 'source auth.json'
 source.write_text(json.dumps({'web_auth_secret': 'source-private-auth-secret-at-least-32-characters'}), encoding='utf-8')
 output = APP.parent / 'selected auth.json'
@@ -561,7 +563,7 @@ try:
 except SystemExit as exc:
     assert exc.code in (None, 0), exc.code
 values = json.loads(output.read_text(encoding='utf-8'))
-assert values['web_auth_secret'] == os.environ['WEB_AUTH_SECRET']
+assert values['web_auth_secret'] == 'source-private-auth-secret-at-least-32-characters'
 """)
     assert_child_passed(result)
-    assert "environment-private-auth-secret-at-least-32-characters" not in result.stdout + result.stderr
+    assert "source-private-auth-secret-at-least-32-characters" not in result.stdout + result.stderr

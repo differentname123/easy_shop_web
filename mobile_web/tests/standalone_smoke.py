@@ -70,6 +70,7 @@ def write_fake_config(path):
         "myself_pdd_pid": "standalone-pid", "local_mongo_host": "127.0.0.1",
         "local_mongo_port": 27017, "local_mongo_user": "", "local_mongo_password": "",
         "local_mongo_db_name": "standalone_never_connect", "web_auth_secret": SMOKE_SECRET,
+        "web_warmup_enabled": False, "web_log_dir": "-", "pdd_dns_mode": "off", "pdd_trust_env": False,
     }), encoding="utf-8")
 
 

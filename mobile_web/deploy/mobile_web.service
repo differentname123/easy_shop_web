@@ -12,14 +12,9 @@ Group=mobileweb
 WorkingDirectory=/opt/mobile_web
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
-Environment=WEB_CONFIG_FILE=/opt/mobile_web/config.local.json
-Environment=WEB_LOG_DIR=-
-Environment=WEB_LOG_LEVEL=INFO
-# Optional private env overrides (environment takes precedence over JSON).
-# Keep this file root-owned mode 0600; do not commit secrets into this unit.
-EnvironmentFile=-/etc/mobile_web.env
+# All service configuration is read directly from /opt/mobile_web/config.local.json.
 # Single worker, no reload. Do not use a shell or activate the virtualenv.
-ExecStart=/opt/mobile_web/.venv/bin/python /opt/mobile_web/run.py --host 127.0.0.1 --port 8000
+ExecStart=/opt/mobile_web/.venv/bin/python /opt/mobile_web/run.py
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
