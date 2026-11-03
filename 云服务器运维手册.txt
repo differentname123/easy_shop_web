@@ -1,0 +1,187 @@
+# 🚀 国内备案云服务器与惠选商城运维手册
+
+## 一、 基础设施信息 (Infrastructure)
+
+这里记录了本台新申请的国内 Debian 云服务器相关底层信息与网络访问入口。
+
+* ☁️ **服务器管理 (腾讯云轻量/CVM):**
+  * **公网 IPv4 地址:** `124.220.169.204`
+  * **操作系统:** Debian GNU/Linux (x86_64)
+  * **登录身份:** `root`（独享运维管理）
+  * **已放行安全组端口:** `22` (SSH), `80` (HTTP Web 访问)
+
+* 🌐 **访问阶段说明 (备案过渡期):**
+  * **当前阶段:** ICP 备案审核期间，**直接通过纯公网 IP 访问**，避开国内云厂商对未备案域名的 80 端口拦截。
+  * **当前访问地址:** `http://124.220.169.204/`
+  * **待备案完成后:** 解析正式域名并通过 Certbot 配置 443 SSL 证书（HTTPS）。
+
+---
+
+## 二、 Web 端与商城服务架构 (Nginx + FastAPI)
+
+当前服务器运行 **极简惠选商城 (`easy-shop`)** 的全栈服务与本地数据持久化层。
+
+### 1. 整体架构链路
+
+* **用户浏览器** ➔ **Nginx (服务器80端口)** ➔ **本地 Python 后端 (`127.0.0.1:8001`)** ➔ **本地 MongoDB (`127.0.0.1:27017`)**
+* **Nginx 路由与防白屏缓存规则:**
+  * **动态页面与接口 (`/`、`/detail`、`/api/`):** 转发至本地 `8001` 端口，强制 `no-cache, no-store`，确保发版后新 HTML 页面秒级直达客户端。
+  * **静态资源 (`/static/`):** 转发至本地 `8001` 端口，开启协商缓存（`public, no-cache`），彻底杜绝因 CDN/强缓存导致的“新 HTML 匹配旧 JS”引起的前端白屏崩溃。
+
+---
+
+### 2. 核心文件与配置路径
+
+| 模块 | 文件/目录路径 | 说明 |
+| :--- | :--- | :--- |
+| **代码主目录** | `/root/easy_shop_web/` | Git 项目根目录 |
+| **应用源码与静态页面** | `/root/easy_shop_web/mobile_web/` | 商城全栈源码目录（启动入口 `run.py`） |
+| **Python 虚拟环境** | `/root/easy_shop_web/mobile_web/.venv/` | 隔离的 Python 3 运行环境 |
+| **商城核心私有配置** | `/root/easy_shop_web/mobile_web/config.local.json` | **全局唯一真相源**：管理监听端口 (8001)、拼多多联盟凭据、Mongo 鉴权 |
+| **持久化运行日志** | `/root/easy_shop_web/mobile_web/runtime/logs/` | 业务请求与排查日志落盘目录 |
+| **系统守护服务** | `/etc/systemd/system/mobile_web.service` | Systemd 开机自启与进程常驻服务配置 |
+| **Nginx 站点配置** | `/etc/nginx/sites-available/default` | 80 端口反向代理规则配置 |
+
+---
+
+### 3. 标准日常运维与代码发布流程
+
+🟢 **代码更新与快速发布（常规标准流程）**
+由于国内服务器直连 GitHub 容易丢包超时，更新代码请通过国内加速通道：
+
+```bash
+cd /root/easy_shop_web
+# 1. 拉取最新代码
+git pull origin main
+
+# 2. 重启商城后台服务
+systemctl restart mobile_web.service
+
+# 3. 检查运行状态
+systemctl status mobile_web.service
+```
+
+* **修改业务配置（一站式管理）：**
+  ```bash
+  nano /root/easy_shop_web/mobile_web/config.local.json
+  # 修改后务必重启服务生效
+  systemctl restart mobile_web.service
+  ```
+
+* **查看实时日志与访问流水（免拼接，直接复制）：**
+  ```bash
+  # 方式 A：通过 systemd 查看实时控制台输出
+  journalctl -u mobile_web.service -n 50 -f
+
+  # 方式 B：通过文件查看应用持久化运行日志
+  tail -n 100 -f /root/easy_shop_web/mobile_web/runtime/logs/*.log
+  ```
+
+* **无损自检（测试配置及 Mongo 连通性，不发外部真实网络请求）:**
+  ```bash
+  /root/easy_shop_web/mobile_web/.venv/bin/python /root/easy_shop_web/mobile_web/run.py --check-mongo
+  ```
+
+🔵 **Nginx 配置修改与重载**
+```bash
+nginx -t && systemctl reload nginx
+```
+
+---
+
+## 三、 本地 MongoDB 数据库服务运维
+
+本服务器已安装 **MongoDB 8.0**，配置与开发环境完全一致，供商城后端直接本地免密/密码访问。
+
+### 1. 核心信息与配置路径
+
+| 配置项 | 路径或对应值 | 说明 |
+| :--- | :--- | :--- |
+| **系统服务名称** | `mongod.service` | 系统 Systemd 托管服务 |
+| **主配置文件** | `/etc/mongod.conf` | 绑定 `0.0.0.0`，已开启 `authorization: enabled` |
+| **数据持久化路径** | `/var/lib/mongodb` | 数据库实际文件存放目录 |
+| **日志文件路径** | `/var/log/mongodb/mongod.log` | 运行及报错排查日志 |
+| **监听端口** | `27017` | 默认数据库端口 |
+| **授权用户** | `localUser` | 所属鉴权库 `admin`，拥有读写权限 |
+| **用户密码** | `localPassword123` | 与 `config.local.json` 保持严格一致 |
+| **默认业务库** | `crawler_data` | 商城商品详情、推荐流与订单数据存放库 |
+
+### 2. 常用运维命令与连接方式
+
+* 🟢 **服务启停与状态检查:**
+  ```bash
+  systemctl restart mongod
+  systemctl stop mongod
+  systemctl status mongod
+  ```
+
+* 🔍 **查看 MongoDB 实时运行日志:**
+  ```bash
+  tail -n 100 -f /var/log/mongodb/mongod.log
+  ```
+
+* 🚀 **终端直连（Mongosh 交互式进入命令行）:**
+  ```bash
+  mongosh "mongodb://localUser:localPassword123@localhost:27017/crawler_data?authSource=admin"
+  ```
+
+* 💾 **数据备份与迁移（从旧服务器同步到本服务器）:**
+  ```bash
+  # 1. 在旧机器上导出数据：
+  mongodump --uri="mongodb://localUser:localPassword123@localhost:27017/crawler_data?authSource=admin" --out=./mongo_backup
+
+  # 2. 拷贝到新服务器后恢复导入：
+  mongorestore --uri="mongodb://localUser:localPassword123@localhost:27017/crawler_data?authSource=admin" ./mongo_backup
+  ```
+
+---
+
+## 四、 常见故障排查 (避坑经验汇总)
+
+### 🚨 故障 1：访问 IP 报 `502 Bad Gateway`
+* **根本原因：** Nginx 配置的反向代理端口与 Python 后端监听端口不匹配（常见于 Nginx 配了 8000，但应用在 `8001` 启动）。
+* **排查与解决：**
+  1. 执行 `systemctl status mobile_web`，查看日志中的 `Uvicorn running on http://0.0.0.0:XXXX`，确认真实端口。
+  2. 检查 `/etc/nginx/sites-available/default`，确认 `proxy_pass http://127.0.0.1:8001;` 中的端口与后端一致。
+  3. 执行 `nginx -t && systemctl reload nginx`。
+
+---
+
+### 🚨 故障 2：访问商品详情页出现全白屏（无内容渲染）
+* **根本原因：** 浏览器或 CDN 强缓存了旧版本的 `detail.js`，但加载了最新版的 `detail.html`。模板引用的变量在旧 JS 中未定义（如 `authModal.visible`），导致 Vue 渲染树崩溃白屏。
+* **排查与解决：**
+  1. 电脑端按 `F12` 打开控制台（Console），若看到 `TypeError: Cannot read properties of undefined`，即为此类错误。
+  2. Nginx 配置中必须为 `/static/` 增加 `add_header Cache-Control "public, no-cache";` 协商缓存配置。
+  3. 客户端按 `Ctrl + F5` 强制刷新，或在开发者工具中勾选 `Disable cache` 重试。
+
+---
+
+### 🚨 故障 3：国内服务器执行 `git clone` 或 `git pull` 失败 / 卡死
+* **根本原因：** 国内云服务器直连 GitHub 官方节点丢包严重；全新 Debian 缺失根证书库或校验失败。
+* **排查与解决：**
+  1. 一键关闭 SSL 严格校验：`git config --global http.sslVerify false`。
+  2. 安装系统根证书：`apt-get install -y ca-certificates`。
+  3. 使用国内加速镜像源拉取，例如：
+     ```bash
+     git clone https://ghfast.top/https://github.com/differentname123/easy_shop_web.git
+     ```
+
+---
+
+### 🚨 故障 4：`journalctl` 无法查看日志，提示 `system.journal is truncated`
+* **根本原因：** 查询时服务名写错（写成了 `easy-shop` 而非配置的 `mobile_web`）；或者全新机器启动时系统日志缓存文件损坏。
+* **排查与解决：**
+  1. 确认正确的服务名：`journalctl -u mobile_web.service -n 50 -f`。
+  2. 若仍提示 `truncated`，执行重置命令即可修复：
+     ```bash
+     systemctl restart systemd-journald
+     ```
+
+---
+
+### 🚨 故障 5：后端启动日志报 `localhost:27017: [Errno 111] Connection refused`
+* **根本原因：** MongoDB 服务未运行，或设置了密码后 `config.local.json` 仍为空密码。
+* **排查与解决：**
+  1. 检查 MongoDB 是否存活：`systemctl status mongod`。
+  2. 检查 `/root/easy_shop_web/mobile_web/config.local.json` 中的 `local_mongo_user` 和 `local_mongo_password` 是否填入正确账号密码。
+  3. 运行连通性自检命令确认：`/root/easy_shop_web/mobile_web/.venv/bin/python run.py --check-mongo`。

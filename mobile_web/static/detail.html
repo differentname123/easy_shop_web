@@ -291,6 +291,7 @@
       display: block;
       margin-bottom: 4px;
       border-radius: 6px;
+    }
   </style>
 </head>
 <body>
@@ -489,10 +490,10 @@
   </footer>
 
   <!-- ==================== 渠道授权引导弹窗 ==================== -->
-  <div class="modal-backdrop" v-if="authModal.visible" @click.self="closeAuthModal">
+  <div class="modal-backdrop" v-if="authModal?.visible" @click.self="closeAuthModal">
     <div class="sheet-dialog">
       <div class="sheet-header">
-        <span>{{ authModal.platformName || '拼多多' }}推手备案授权提示</span>
+        <span>{{ authModal?.platformName || '拼多多' }}推手备案授权提示</span>
         <button class="sheet-close" @click="closeAuthModal">×</button>
       </div>
 
