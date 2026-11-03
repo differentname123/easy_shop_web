@@ -1,0 +1,18 @@
+{
+  "myself_pdd_client_id": "",
+  "myself_pdd_client_secret": "",
+  "myself_pdd_pid": "",
+  "local_mongo_host": "localhost",
+  "local_mongo_port": 27017,
+  "local_mongo_user": "",
+  "local_mongo_password": "",
+  "local_mongo_db_name": "crawler_data",
+  "mongo_auth_source": "admin",
+  "web_auth_secret": "",
+  "web_host": "127.0.0.1",
+  "web_port": 8000,
+  "web_warmup_enabled": true,
+  "web_log_dir": "runtime/logs",
+  "web_log_level": "INFO",
+  "pdd_dns_mode": "auto"
+}

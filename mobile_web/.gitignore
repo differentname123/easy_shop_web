@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / coverage cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environment / IDE
+.venv/
+venv/
+.env
+.env.*
+config.local.json
+config.*.local.json
+runtime/
+*.log
+*.log.*
+
+# Private deployment material
+secrets/
+keys/
+*.key
+*.pem
+*.p12
+*.pfx

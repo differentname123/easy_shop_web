@@ -1,0 +1,11 @@
+# Deployment files must also work when checked out with Windows core.autocrlf.
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+.gitattributes text eol=lf
+requirements*.txt text eol=lf
+constraints.txt text eol=lf
+deploy/* text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.ini text eol=lf
+*.md text eol=lf

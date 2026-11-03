@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="format-detection" content="telephone=no">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <title>优选导购 - 极速省赚</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
+  <script src="/static/js/vue.global.prod.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- ==================== TAB 1: 首页 (拼多多进宝官方推荐) ==================== -->
+  <div v-show="currentTab === 'home'" class="tab-page tab-home" :class="{ 'is-searching': Boolean(activeHomeKeyword) }">
+    <header class="top-header" :class="{ 'header-hidden': isHeaderHidden }">
+      <div class="search-box">
+        <div class="search-input-wrap">
+          <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+          <input 
+            type="text" 
+            class="search-input" 
+            placeholder="搜索拼多多全网优惠爆品..." 
+            v-model="homeSearchKeyword"
+            @keyup.enter="onSearchHome"
+          />
+          <button v-if="homeSearchKeyword" class="search-clear-btn" @click="clearHomeSearch" title="清空搜索">✕</button>
+        </div>
+        <button class="search-btn" @click="onSearchHome">搜索</button>
+      </div>
+
+      <!-- 推荐频道滑动栏 -->
+      <nav class="channel-scroller" v-if="!activeHomeKeyword">
+        <div 
+          v-for="ch in homeChannels" 
+          :key="ch.channel_type"
+          class="channel-item"
+          :class="{ active: currentChannel === ch.channel_type }"
+          @click="switchChannel(ch.channel_type)"
+        >
+          {{ ch.name }}
+        </div>
+      </nav>
+    </header>
+
+    <!-- 首页商品双列网格 -->
+    <main class="goods-grid" v-if="homeGoodsList.length > 0">
+      <div 
+        v-for="item in homeGoodsList" 
+        :key="goodsKey(item)"
+        class="goods-card"
+        @click="openGoodsDetail(item)"
+      >
+        <div class="goods-thumb-wrap">
+          <img :src="item.image_url" :alt="item.name" class="goods-thumb" loading="lazy" />
+          <span class="plat-badge pdd">拼多多</span>
+        </div>
+        <div class="goods-body">
+          <h4 class="goods-title">{{ item.name }}</h4>
+          <div class="goods-tags">
+            <span v-if="item.has_coupon && item.coupon_amount > 0" class="coupon-tag">
+              <span class="tag-badge">券</span>
+              <span class="tag-val">减¥{{ formatMoney(item.coupon_amount) }}</span>
+            </span>
+            <span v-if="item.commission_amount > 0" class="rebate-tag">
+              <span class="tag-badge">预估推广佣金</span>
+              <span class="tag-val">¥{{ formatMoney(item.commission_amount) }}</span>
+            </span>
+          </div>
+          <div class="goods-footer">
+            <div class="goods-price-box">
+              <div class="price-row">
+                <span class="price-label">{{ item.has_coupon ? '券后' : '参考' }}</span>
+                <span class="price-unit">¥</span>
+                <span class="price-value">{{ formatMoney(item.price) }}</span>
+              </div>
+              <div class="meta-row">
+                <span v-if="item.original_price && item.original_price > item.price" class="price-original">¥{{ formatMoney(item.original_price) }}</span>
+                <span class="sales-tip">{{ formatSales(item.sales_tip) }}</span>
+              </div>
+            </div>
+            <div class="goods-action-btn">
+              <span>{{ item.has_coupon ? '去领券' : '马上抢' }}</span>
+              <svg class="action-arrow" viewBox="0 0 24 24"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/></svg>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 首页首屏与搜索骨架屏 -->
+    <div v-if="homeLoading && homeGoodsList.length === 0" class="goods-grid skeleton-grid">
+      <div v-for="n in 6" :key="n" class="goods-card skeleton-card">
+        <div class="skeleton-thumb"></div>
+        <div class="skeleton-body">
+          <div class="skeleton-line line-title"></div>
+          <div class="skeleton-line line-tags"></div>
+          <div class="skeleton-footer">
+            <div class="skeleton-line line-price"></div>
+            <div class="skeleton-line line-btn"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 加载中指示器 (底部分页加载) -->
+    <div v-if="homeLoading && homeGoodsList.length > 0" class="loading-wrap">
+      <span class="loading-spinner"></span>
+      <span>正在为您加载更多好物...</span>
+    </div>
+
+    <!-- 触底无更多数据提示 -->
+    <div v-if="!homeLoading && !homeHasMore && homeGoodsList.length > 0" class="loading-wrap end-wrap">
+      <span>已到底部，无更多商品</span>
+    </div>
+
+    <!-- 加载失败，点击重试 -->
+    <div v-if="!homeLoading && homeError && homeGoodsList.length > 0" class="loading-wrap retry-wrap" @click="retryLoadHomeGoods">
+      <span class="retry-btn">加载失败，点击重试 ↻</span>
+    </div>
+
+    <!-- 首屏或搜索加载中提示 -->
+    <div v-if="homeLoading && homeGoodsList.length === 0" class="loading-wrap" style="padding-top: 4px;">
+      <span class="loading-spinner"></span>
+      <span>{{ homeSearchKeyword ? '正在搜索商品与优惠信息...' : '正在为您获取商品推荐...' }}</span>
+    </div>
+
+    <div v-if="!homeLoading && homeGoodsList.length === 0" class="empty-wrap">暂无符合条件的商品</div>
+    <div id="homeBottomSentinel" style="height: 10px;"></div>
+  </div>
+
+  <!-- ==================== TAB 2: 爆单推广 (数据库爆品) ==================== -->
+  <div v-show="currentTab === 'boom'" class="tab-page tab-boom">
+    <header class="top-header" :class="{ 'header-hidden': isHeaderHidden }">
+      <!-- 爆单搜索栏 -->
+      <div class="search-box">
+        <div class="search-input-wrap">
+          <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+          <input 
+            type="text" 
+            class="search-input" 
+            placeholder="在爆单库中搜索商品..." 
+            v-model="boomSearchKeyword"
+            @keyup.enter="onSearchBoom"
+          />
+          <button v-if="boomSearchKeyword" class="search-clear-btn" @click="clearBoomSearch" title="清空搜索">✕</button>
+        </div>
+        <button class="search-btn" @click="onSearchBoom">搜索</button>
+      </div>
+
+      <!-- 平台筛选芯片 (第一行) -->
+      <div class="platform-bar">
+        <div 
+          v-for="p in boomPlatforms" 
+          :key="p.code"
+          class="plat-chip"
+          :class="{ active: boomPlatform === p.code }"
+          :aria-disabled="!p.active"
+          :title="p.active ? p.name : p.name + '暂未开放'"
+          @click="switchBoomPlatform(p.code)"
+        >
+          {{ p.name }}<span v-if="!p.active" class="plat-chip-badge">待开放</span>
+        </div>
+      </div>
+
+      <!-- 排序栏 -->
+      <div class="sort-bar">
+        <span class="sort-item" :class="{ active: boomSortBy === 'latest' }" @click="switchBoomSort('latest')">最新上架</span>
+        <span class="sort-item" :class="{ active: boomSortBy === 'save_desc' }" @click="switchBoomSort('save_desc')">立省最多</span>
+        <span class="sort-item" :class="{ active: boomSortBy === 'price_asc' }" @click="switchBoomSort('price_asc')">价格最低</span>
+      </div>
+    </header>
+
+    <!-- 爆单商品列表 (格式与首页保持100%完全一致) -->
+    <main class="goods-grid" v-if="boomGoodsList.length > 0">
+      <div 
+        v-for="item in boomGoodsList" 
+        :key="goodsKey(item)"
+        class="goods-card"
+        @click="openGoodsDetail(item)"
+      >
+        <div class="goods-thumb-wrap">
+          <img :src="item.image_url" :alt="item.name" class="goods-thumb" loading="lazy" />
+          <span class="plat-badge" :class="item.platform">{{ item.platform_name }}</span>
+        </div>
+        <div class="goods-body">
+          <h4 class="goods-title">{{ item.name }}</h4>
+          <div class="goods-tags">
+            <span v-if="item.has_coupon && item.coupon_amount > 0" class="coupon-tag">
+              <span class="tag-badge">券</span>
+              <span class="tag-val">减¥{{ formatMoney(item.coupon_amount) }}</span>
+            </span>
+            <span v-if="item.commission_amount > 0" class="rebate-tag">
+              <span class="tag-badge">预估推广佣金</span>
+              <span class="tag-val">¥{{ formatMoney(item.commission_amount) }}</span>
+            </span>
+          </div>
+          <div class="goods-footer">
+            <div class="goods-price-box">
+              <div class="price-row">
+                <span class="price-label">{{ item.has_coupon ? '券后' : '参考' }}</span>
+                <span class="price-unit">¥</span>
+                <span class="price-value">{{ formatMoney(item.price) }}</span>
+              </div>
+              <div class="meta-row">
+                <span v-if="item.original_price && item.original_price > item.price" class="price-original">¥{{ formatMoney(item.original_price) }}</span>
+                <span class="sales-tip">{{ formatSales(item.sales_tip) }}</span>
+              </div>
+            </div>
+            <div class="goods-action-btn">
+              <span>{{ item.has_coupon ? '去领券' : '马上抢' }}</span>
+              <svg class="action-arrow" viewBox="0 0 24 24"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/></svg>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 爆单首屏骨架屏 -->
+    <div v-if="boomLoading && boomGoodsList.length === 0" class="goods-grid skeleton-grid">
+      <div v-for="n in 6" :key="n" class="goods-card skeleton-card">
+        <div class="skeleton-thumb"></div>
+        <div class="skeleton-body">
+          <div class="skeleton-line line-title"></div>
+          <div class="skeleton-line line-tags"></div>
+          <div class="skeleton-footer">
+            <div class="skeleton-line line-price"></div>
+            <div class="skeleton-line line-btn"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 爆单加载状态提示 -->
+    <div v-if="boomLoading && boomGoodsList.length === 0" class="loading-wrap" style="padding-top: 4px;">
+      <span class="loading-spinner"></span>
+      <span>正在从精选库检索爆款好物...</span>
+    </div>
+
+    <div v-if="boomLoading && boomGoodsList.length > 0" class="loading-wrap">
+      <span class="loading-spinner"></span>
+      <span>正在加载更多爆款好物...</span>
+    </div>
+    <div v-if="!boomLoading && boomGoodsList.length === 0" class="empty-wrap">未检索到符合条件的爆款商品</div>
+    <div v-if="!boomLoading && !boomHasMore && boomGoodsList.length > 0" class="loading-wrap" style="color:var(--text-muted)">已到底部，无更多商品</div>
+    <div id="boomBottomSentinel" style="height: 10px;"></div>
+  </div>
+
+  <!-- ==================== TAB 3: 我的 (推手中心、订单收益与注册登录) ==================== -->
+  <div v-show="currentTab === 'user'" class="tab-page tab-user">
+    
+    <!-- 头部身份卡片 (已登录展示) -->
+    <div class="user-profile-header" v-if="isLoggedIn">
+      <div class="user-info-row">
+        <img :src="userProfile.avatar || defaultAvatar" @error="handleAvatarError" class="user-avatar" alt="用户头像" />
+        <div class="user-meta">
+          <h3>{{ userProfile.nickname }}</h3>
+          <div class="phone-text" v-if="userProfile.phone">手机号: {{ formatPhone(userProfile.phone) }}</div>
+          <div class="badges-wrap">
+            <div class="uid-badge" @click="copyText(userProfile.uid, '推手专属 UID 已复制')">
+              UID: {{ userProfile.uid }} <span>[复制]</span>
+            </div>
+            <div class="uid-badge" v-if="userProfile.invite_code" @click="copyText(userProfile.invite_code, '我的专属邀请码已复制')">
+              邀请码: {{ userProfile.invite_code }} <span>[复制]</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 未登录状态卡片 -->
+    <div class="user-profile-header" v-else>
+      <div class="user-info-row">
+        <div class="user-avatar" style="display:flex;align-items:center;justify-content:center;background:#fff;color:var(--primary-color);font-size:24px">👛</div>
+        <div class="user-meta">
+          <h3>我的账户 (未登录)</h3>
+          <p style="font-size:12px;opacity:0.9">无需登录也可领券；登录后可查看本人推广订单与佣金记录</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 手机号快速登记注册/登录卡片 (未登录时展示) -->
+    <div class="auth-reg-card" v-if="!isLoggedIn">
+      <div class="reg-title">{{ isRegisterMode ? '注册推广账户 (新用户注册)' : '已有账户登录' }}</div>
+      <div class="reg-subtitle">
+        {{ isRegisterMode ? '注册并登录后，可查看本人推广订单与佣金记录' : '输入已登记的手机号和密码，查看本人推广订单与佣金记录' }}
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">手机号</label>
+        <input 
+          type="tel" 
+          maxlength="11" 
+          class="form-input" 
+          placeholder="请输入11位中国大陆手机号" 
+          v-model="formPhone"
+        />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">登录密码</label>
+        <input 
+          type="password" 
+          class="form-input" 
+          placeholder="请输入密码 (至少6位)" 
+          v-model="formPassword"
+        />
+      </div>
+
+      <div class="form-group" v-if="isRegisterMode">
+        <label class="form-label">用户昵称 (选填)</label>
+        <input 
+          type="text" 
+          class="form-input" 
+          placeholder="例如: 省钱小能手 (若留空则自动生成)" 
+          v-model="formNickname"
+        />
+      </div>
+
+      <div class="form-group" v-if="isRegisterMode">
+        <label class="form-label">邀请码 (选填)</label>
+        <input 
+          type="text" 
+          class="form-input" 
+          placeholder="若有好友邀请码请填写，无则留空" 
+          v-model="formInviteCode"
+        />
+      </div>
+
+      <button class="form-btn-submit" @click="handleRegisterOrLogin" :disabled="isSubmittingAuth">
+        {{ isSubmittingAuth ? '提交中...' : (isRegisterMode ? '立即开通并登录' : '立即登录') }}
+      </button>
+
+      <div class="form-toggle-link" @click="isRegisterMode = !isRegisterMode">
+        {{ isRegisterMode ? '已有账号？切换密码登录' : '新用户？注册推广账户' }}
+      </div>
+    </div>
+
+    <!-- 收益统计面板 (已登录展示) -->
+    <div class="stats-card" v-if="isLoggedIn">
+      <div class="stats-grid">
+        <div class="stat-item">
+          <div class="num">¥{{ formatMoney(userOrdersData.total_commission ?? 0) }}</div>
+          <div class="label">订单佣金</div>
+        </div>
+        <div class="stat-item">
+          <div class="num">¥{{ formatMoney(userOrdersData.settled_commission ?? 0) }}</div>
+          <div class="label">平台已结算佣金</div>
+        </div>
+        <div class="stat-item">
+          <div class="num">¥{{ formatMoney(userOrdersData.refund_commission || 0) }}</div>
+          <div class="label">维权/退款({{ userOrdersData.refund_count || 0 }}笔)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 本人推广订单板块 (仅已登录推手展示) -->
+    <div class="order-section-card" v-if="isLoggedIn">
+      <div class="order-sec-header">
+        <div class="order-sec-title">
+          <svg style="width:16px;height:16px;fill:var(--primary-color)" viewBox="0 0 24 24"><path d="M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10H7v-2h10v2zm0-4H7V7h10v2zm0 8H7v-2h10v2z"/></svg>
+          我的推广订单
+        </div>
+        <button 
+          class="btn-sync-orders" 
+          @click="syncAndQueryOrders(true)"
+          :disabled="isSyncingOrders"
+        >
+          {{ isSyncingOrders ? '正在刷新订单...' : '同步并刷新订单' }}
+        </button>
+      </div>
+
+      <!-- 时间跨度筛选胶囊 -->
+      <div class="order-filter-tabs">
+        <span class="order-filter-chip" :class="{ active: orderDays === 1 }" @click="switchOrderDays(1)">近1天</span>
+        <span class="order-filter-chip" :class="{ active: orderDays === 7 }" @click="switchOrderDays(7)">近7天</span>
+        <span class="order-filter-chip" :class="{ active: orderDays === 30 }" @click="switchOrderDays(30)">近30天</span>
+        <span class="order-filter-chip" :class="{ active: orderDays === 0 }" @click="switchOrderDays(0)">全部历史</span>
+      </div>
+
+      <!-- 订单列表明细 -->
+      <div class="order-list-wrap" v-if="userOrdersData.order_list && userOrdersData.order_list.length > 0">
+        <div class="order-item-card" v-for="ord in userOrdersData.order_list" :key="ord.order_sn">
+          <img :src="ord.goods_thumbnail_url" class="order-item-thumb" alt="商品" />
+          <div class="order-item-info">
+            <h4 class="order-item-title">{{ ord.goods_name }}</h4>
+            <div class="order-item-bottom">
+              <div>
+                <span style="color:var(--text-muted)">实付: ¥{{ formatMoney(ord.order_amount_yuan) }}</span>
+                <span style="color:var(--primary-color);font-weight:700;margin-left:6px">订单佣金 ¥{{ formatMoney(ord.promotion_amount_yuan) }}</span>
+              </div>
+              <span 
+                class="order-status-tag"
+                :class="ord.is_refund ? 'refund' : (ord.is_settled ? 'settled' : 'paid')"
+              >
+                {{ ord.order_status_desc }}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty-wrap" style="padding:24px 0;font-size:12px">
+        {{ isSyncingOrders ? '正在同步订单数据...' : (orderDays === 0 ? '全部历史暂无出单记录，快去分享商品赚佣吧！' : '近 ' + orderDays + ' 天内暂无出单记录，快去分享商品赚佣吧！') }}
+      </div>
+    </div>
+
+    <!-- 渠道授权备案管理中心 -->
+    <div class="section-title">
+      <svg style="width:16px;height:16px;fill:var(--primary-color)" viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>
+      推广渠道授权
+    </div>
+
+    <!-- 拼多多官方推手备案卡片 -->
+    <div class="auth-card">
+      <div class="auth-header">
+        <div class="auth-plat-info">
+          <span style="display:inline-block;width:24px;height:24px;background:#e02e24;color:#fff;text-align:center;line-height:24px;border-radius:4px;font-size:12px;font-weight:700">拼</span>
+          <span>拼多多官方推手备案</span>
+        </div>
+        <span 
+          class="auth-status-badge"
+          :class="userProfile.auth_status?.pdd?.is_authorized ? 'authed' : 'unauthed'"
+        >
+          {{ userProfile.auth_status?.pdd?.is_authorized ? '已授权备案 ✅' : '未授权 ⚠️' }}
+        </span>
+      </div>
+      <p class="auth-desc">
+        {{ userProfile.auth_status?.pdd?.is_authorized 
+           ? '您已完成拼多多渠道备案。登录并验证身份后，购买或复制链接使用本人 UID；游客使用站长默认推广位，不按分享页 UID 归因。佣金以平台结算为准。'
+           : '推广账户可在登录后申请拼多多推广位备案。游客仍可领券，转链使用站长默认推广位；备案不代表已获得佣金或可提现余额。'
+        }}
+      </p>
+      <div class="auth-actions">
+        <button 
+          class="btn-auth" 
+          @click="handleCheckAndGetAuth('pdd')"
+          :disabled="isCheckingAuth"
+        >
+          {{ isCheckingAuth ? '检测中...' : (userProfile.auth_status?.pdd?.is_authorized ? '重新校验授权' : '一键开通拼多多授权') }}
+        </button>
+      </div>
+    </div>
+
+    <!-- 淘宝联盟预留卡片 -->
+    <div class="auth-card" style="opacity: 0.85;">
+      <div class="auth-header">
+        <div class="auth-plat-info">
+          <span style="display:inline-block;width:24px;height:24px;background:#ff5000;color:#fff;text-align:center;line-height:24px;border-radius:4px;font-size:12px;font-weight:700">淘</span>
+          <span>淘宝客渠道关系备案</span>
+        </div>
+        <span class="auth-status-badge unauthed">暂未接入</span>
+      </div>
+      <p class="auth-desc">
+        淘宝联盟暂未接入，当前不提供淘宝商品推广与渠道授权。
+      </p>
+      <div class="auth-actions">
+        <button class="btn-secondary" style="width:100%" @click="showToast('淘宝联盟暂未接入')">暂未接入</button>
+      </div>
+    </div>
+
+    <!-- 京东联盟预留卡片 -->
+    <div class="auth-card" style="opacity: 0.85;">
+      <div class="auth-header">
+        <div class="auth-plat-info">
+          <span style="display:inline-block;width:24px;height:24px;background:#e1251b;color:#fff;text-align:center;line-height:24px;border-radius:4px;font-size:12px;font-weight:700">京</span>
+          <span>京东推客渠道授权</span>
+        </div>
+        <span class="auth-status-badge unauthed">暂未接入</span>
+      </div>
+      <p class="auth-desc">
+        京东联盟暂未接入，当前不提供京东商品推广与渠道授权。
+      </p>
+      <div class="auth-actions">
+        <button class="btn-secondary" style="width:100%" @click="showToast('京东联盟暂未接入')">暂未接入</button>
+      </div>
+    </div>
+
+    <!-- 菜单说明列表 -->
+    <div class="menu-list">
+      <div class="menu-item" @click="showToast('商品佣金为预估，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。')">
+        <span>订单佣金与平台结算说明</span>
+        <span style="color:var(--text-muted)">›</span>
+      </div>
+      <div class="menu-item" v-if="userProfile.invite_code" @click="copyText(userProfile.invite_code, '我的专属邀请码已复制')">
+        <span>我的专属邀请码</span>
+        <span style="color:var(--text-sub);font-size:12px;font-weight:600">{{ userProfile.invite_code }} [复制]</span>
+      </div>
+      <div class="menu-item" v-if="isLoggedIn" @click="handleLogout" style="color:#f5222d;">
+        <span>切换账号 / 退出登录</span>
+        <span style="color:var(--text-muted)">›</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 底部固定导航栏 (TabBar) ==================== -->
+  <footer class="bottom-tab-bar">
+    <div class="tab-item" :class="{ active: currentTab === 'home' }" @click="currentTab = 'home'">
+      <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+      <span>首页</span>
+    </div>
+    <div class="tab-item" :class="{ active: currentTab === 'boom' }" @click="currentTab = 'boom'">
+      <svg viewBox="0 0 24 24"><path d="M13.5.67s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.61 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8C20 8.61 17.41 3.8 13.5.67zM11.71 19c-1.78 0-3.22-1.4-3.22-3.14 0-1.62 1.05-2.76 2.81-3.12 1.77-.36 3.6-1.21 4.62-2.58.39 1.29.59 2.65.59 4.04 0 2.65-2.15 4.8-4.8 4.8z"/></svg>
+      <span>爆单推广</span>
+    </div>
+    <div class="tab-item" :class="{ active: currentTab === 'user' }" @click="currentTab = 'user'">
+      <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+      <span>我的</span>
+    </div>
+  </footer>
+
+  <!-- ==================== 渠道授权引导弹窗 ==================== -->
+  <div class="modal-backdrop" v-if="isAuthModalOpen" @click.self="isAuthModalOpen = false">
+    <div class="sheet-dialog">
+      <div class="sheet-header">
+        <span>{{ currentAuthInfo?.platform_name || '官方' }}推手备案授权</span>
+        <button class="sheet-close" @click="isAuthModalOpen = false">×</button>
+      </div>
+
+      <div style="padding: 10px 0 20px;">
+        <div style="text-align:center;margin-bottom:16px;">
+          <div style="font-size:36px;margin-bottom:8px">
+            {{ currentAuthInfo?.is_authorized ? '🎉' : '🔐' }}
+          </div>
+          <h3 style="font-size:16px;color:var(--text-main)">
+            {{ currentAuthInfo?.is_authorized ? '您已成功备案！' : '开通推广授权权限' }}
+          </h3>
+          <p style="font-size:12px;color:var(--text-sub);margin-top:6px;line-height:1.5">
+            {{ currentAuthInfo?.msg }}
+          </p>
+        </div>
+
+        <div v-if="!currentAuthInfo?.is_authorized" class="pop-action-btns">
+          <a 
+            :href="currentAuthInfo?.auth_url || currentAuthInfo?.short_url" 
+            target="_blank" 
+            class="btn-primary-block"
+            @click="copyText(currentAuthInfo?.auth_url, '授权链接已复制')"
+          >
+            立即前往授权绑定
+          </a>
+          <button 
+            class="btn-outline-block"
+            @click="copyText(currentAuthInfo?.auth_url || currentAuthInfo?.short_url, '授权链接已复制，可粘贴至微信或浏览器中打开')"
+          >
+            复制授权链接
+          </button>
+        </div>
+
+        <div v-else class="pop-action-btns">
+          <button class="btn-primary-block" @click="isAuthModalOpen = false">我知道了</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- ==================== 全局高质感智能加载器与省钱话术轮播 ==================== -->
+  <div class="smart-loader-overlay" v-if="smartLoading.visible">
+    <div class="smart-loader-card">
+      <div class="smart-radar-wrapper">
+        <div class="smart-radar-ring"></div>
+        <div class="smart-radar-ring-inner"></div>
+        <div class="smart-radar-icon">🔍</div>
+      </div>
+      <div class="smart-loader-title">{{ smartLoading.title }}</div>
+      <div class="smart-loader-slogan-wrap">
+        <div class="smart-loader-slogan" :class="smartLoading.fadeClass">
+          {{ smartLoading.currentSlogan }}
+        </div>
+      </div>
+      <div class="smart-loader-bar">
+        <div class="smart-loader-bar-inner"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 轻量 Toast 提示 -->
+  <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>
+
+</div>
+
+<!-- 引入前端核心驱动脚本 -->
+<script src="/static/js/api.js"></script>
+<script src="/static/js/session.js"></script>
+<script src="/static/js/format.js"></script>
+<script src="/static/js/browser.js"></script>
+<script src="/static/js/feeds.js"></script>
+<script src="/static/js/account.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

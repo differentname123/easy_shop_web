@@ -1,0 +1,49 @@
+# Build context is this mobile_web directory, never the repository root.
+.git
+.git/**
+.claude
+.idea
+.vscode
+__pycache__
+**/__pycache__
+*.py[cod]
+**/*.py[cod]
+.venv
+venv
+env
+.tox
+.nox
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+runtime
+logs
+*.log
+**/*.log
+*.pid
+*.sock
+*.tar
+*.tar.gz
+*.zip
+# Private configuration is mounted at runtime. Exclude it at every depth.
+# Only the root-level public example is retained.
+**/config*.json
+!config.example.json
+**/.env
+**/.env.*
+**/*.env
+**/secrets
+**/keys
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.crt
+**/*.cer
+**/*.jks
+**/id_rsa*
+**/id_ed25519*
+# tests/ deliberately remains available for the Docker test target.

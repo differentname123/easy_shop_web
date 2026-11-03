@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="format-detection" content="telephone=no">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <title>商品详情 - 优选导购</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script src="/static/js/vue.global.prod.js"></script>
+  <style>
+    /* 专属商品详情大页样式 */
+    .detail-nav-bar {
+      position: fixed;
+      top: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 100%;
+      max-width: 540px;
+      height: calc(48px + var(--safe-top));
+      padding-top: var(--safe-top);
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(10px);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-left: 12px;
+      padding-right: 12px;
+      z-index: 1000;
+      border-bottom: 1px solid var(--border-light);
+      box-sizing: border-box;
+    }
+    .detail-nav-btn {
+      background: none;
+      border: none;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      padding: 6px 8px;
+    }
+    .detail-nav-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+    .detail-container {
+      padding-top: calc(48px + var(--safe-top));
+      padding-bottom: calc(72px + var(--safe-bottom));
+      min-height: 100vh;
+      background-color: var(--bg-page);
+    }
+    .hero-carousel {
+      position: relative;
+      width: 100%;
+      padding-top: 100%;
+      background: #f0f0f0;
+      overflow: hidden;
+    }
+    .hero-carousel-inner {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      overflow-x: auto;
+      scroll-snap-type: x mandatory;
+      scrollbar-width: none;
+    }
+    .hero-carousel-inner::-webkit-scrollbar {
+      display: none;
+    }
+    .hero-slide {
+      flex: 0 0 100%;
+      width: 100%;
+      height: 100%;
+      scroll-snap-align: start;
+      position: relative;
+    }
+    .hero-slide img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .hero-counter-badge {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      background: rgba(0, 0, 0, 0.6);
+      color: #fff;
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      backdrop-filter: blur(4px);
+    }
+    .detail-card-section {
+      background: #fff;
+      margin: 8px 10px;
+      padding: 14px 14px;
+      border-radius: 10px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+    }
+    .price-strip-main {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .price-strip-main > span {
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+    .privilege-header {
+      flex-direction: column;
+      gap: 4px;
+    }
+    .privilege-header > span:last-child {
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 1.5;
+    }
+    .price-strip-main .unit {
+      color: var(--primary-color);
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .price-strip-main .val {
+      color: var(--primary-color);
+      font-size: 28px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .price-strip-main .orig {
+      color: var(--text-muted);
+      font-size: 13px;
+      text-decoration: line-through;
+      margin-left: 4px;
+    }
+    .detail-h1-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-main);
+      line-height: 1.45;
+      margin-bottom: 8px;
+      overflow-wrap: break-word;
+      word-break: break-word;
+    }
+    .carousel-loading-badge {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.68);
+      color: #fff;
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      z-index: 2;
+    }
+    .loading-spinner-sm {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(255,255,255,0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spinner-rotate 0.75s linear infinite;
+    }
+    .deep-loading-card {
+      padding: 12px 14px;
+      background: #fafafa;
+      border: 1px dashed #d9d9d9;
+      border-radius: 8px;
+      margin: 8px 10px;
+    }
+    .deep-loading-content {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-sub);
+    }
+    .retry-card {
+      padding: 12px 14px;
+      background: #fffbe6;
+      border: 1px solid #ffe58f;
+      border-radius: 8px;
+      margin: 8px 10px;
+    }
+    .retry-card-content {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .retry-msg {
+      font-size: 12px;
+      color: #d46b08;
+    }
+    .retry-btn-inline {
+      background: #fa8c16;
+      color: #fff;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 14px;
+      font-size: 11px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .price-tag-badge {
+      background: #e02e24;
+      color: #fff;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      align-self: center;
+    }
+    .coupon-pill-detail {
+      background: #fff1f0;
+      color: #f5222d;
+      border: 1px solid #ffa39e;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      align-self: center;
+    }
+    .rebate-pill-detail {
+      background: #fffbe6;
+      color: #fa8c16;
+      border: 1px solid #ffe58f;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      align-self: center;
+    }
+    .trust-bar-section {
+      padding: 10px 14px;
+      background: #fafbfc;
+      margin: 8px 10px;
+      border-radius: 8px;
+    }
+    .trust-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .trust-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: #555;
+      font-weight: 500;
+    }
+    .detail-summary-desc {
+      font-size: 12px;
+      color: var(--text-sub);
+      background: #fbfbfb;
+      padding: 10px 12px;
+      border-radius: 6px;
+      line-height: 1.55;
+      margin-top: 8px;
+      border-left: 3px solid var(--primary-color);
+    }
+    .detail-gallery-flow {
+      margin-top: 12px;
+    }
+    .detail-gallery-header {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-main);
+      padding: 10px 4px 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .detail-img-full {
+      width: 100%;
+      display: block;
+      margin-bottom: 4px;
+      border-radius: 6px;
+  </style>
+</head>
+<body>
+<div id="app" class="detail-container">
+
+  <!-- ==================== 顶部极简导航栏 ==================== -->
+  <header class="detail-nav-bar">
+    <button class="detail-nav-btn" @click="goBack">
+      <svg style="width:20px;height:20px;fill:currentColor" viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+      <span>返回</span>
+    </button>
+    <span class="detail-nav-title">商品详情</span>
+    <button class="detail-nav-btn" @click="goHome">
+      <svg style="width:18px;height:18px;fill:currentColor" viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+      <span>首页</span>
+    </button>
+  </header>
+
+  <!-- ==================== 主图/高清多图横向轮播 ==================== -->
+  <div class="hero-carousel">
+    <div class="hero-carousel-inner" ref="carouselRef" @scroll="onCarouselScroll">
+      <div 
+        class="hero-slide" 
+        v-for="(img, idx) in carouselList" 
+        :key="idx"
+      >
+        <img :src="img" :alt="goods?.name || '商品实拍图'" />
+      </div>
+    </div>
+    <span class="hero-counter-badge" v-if="carouselList.length > 1">
+      {{ currentImgIndex + 1 }} / {{ carouselList.length }}
+    </span>
+    <!-- 高清实拍图加载提示 -->
+    <div class="carousel-loading-badge" v-if="carouselList.length <= 1 && isDeepLoading">
+      <span class="loading-spinner-sm"></span>
+      <span>商品图片加载中...</span>
+    </div>
+  </div>
+
+  <!-- ==================== 核心价格与基础信息卡片 ==================== -->
+  <div class="detail-card-section" v-if="goods">
+    <div class="price-strip-main">
+      <span class="price-tag-badge">{{ goods.has_coupon ? '券后参考价' : '参考价' }}</span>
+      <span class="unit">¥</span>
+      <span class="val">{{ formatMoney(goods.price) }}</span>
+      <span class="orig" v-if="goods.original_price && goods.original_price > goods.price">¥{{ formatMoney(goods.original_price) }}</span>
+      <span class="coupon-pill-detail" v-if="goods.coupon_amount > 0">立减 ¥{{ formatMoney(goods.coupon_amount) }}<template v-if="goods.coupon_info?.coupon_remain_quantity"> · 剩{{ goods.coupon_info.coupon_remain_quantity }}张</template></span>
+      <span class="rebate-pill-detail" v-if="goods.commission_amount > 0">预估推广佣金 ¥{{ formatMoney(goods.commission_amount) }}</span>
+      <span class="plat-badge" :class="goods.platform" style="position:static;margin-left:auto;font-size:10px">
+        {{ goods.platform_name || '拼多多' }}
+      </span>
+    </div>
+
+    <h1 class="detail-h1-title">{{ goods.name }}</h1>
+
+    <!-- 标签服务保障 (detail_tags) -->
+    <div class="service-guarantees-grid" v-if="goods.detail_tags && goods.detail_tags.length">
+      <span class="guarantee-chip" v-for="(tag, tIdx) in goods.detail_tags" :key="tIdx">✓ {{ tag }}</span>
+    </div>
+
+    <!-- 店铺评分 (shop_ratings) -->
+    <div class="shop-ratings-strip" v-if="goods.shop_ratings && (goods.shop_ratings.desc_score || goods.shop_ratings.serv_score || goods.shop_ratings.lgst_score)">
+      <span class="shop-rating-col" v-if="goods.shop_ratings.desc_score">描述相符 <b>{{ goods.shop_ratings.desc_score }}</b></span>
+      <span class="shop-rating-col" v-if="goods.shop_ratings.serv_score">服务态度 <b>{{ goods.shop_ratings.serv_score }}</b></span>
+      <span class="shop-rating-col" v-if="goods.shop_ratings.lgst_score">物流服务 <b>{{ goods.shop_ratings.lgst_score }}</b></span>
+    </div>
+
+    <div class="detail-meta-row" style="margin-bottom:4px;display:flex;justify-content:space-between;color:var(--text-muted);font-size:12px">
+      <span>{{ formatSales(goods.sales_tip) }}</span>
+      <span v-if="goods.mall_name">{{ goods.mall_name }}</span>
+    </div>
+
+    <div class="detail-summary-desc" v-if="goods.desc">
+      {{ goods.desc }}
+    </div>
+  </div>
+
+  <!-- ==================== 深度图文详情加载态与失败重试兜底 ==================== -->
+  <div class="detail-card-section deep-loading-card" v-if="isDeepLoading">
+    <div class="deep-loading-content">
+      <span class="loading-spinner"></span>
+      <span class="deep-loading-text">正在加载商品图片、规格与优惠信息...</span>
+    </div>
+  </div>
+
+  <div class="detail-card-section retry-card" v-if="detailError && (!goods?.carousel_images || goods.carousel_images.length <= 1)">
+    <div class="retry-card-content">
+      <span class="retry-msg">商品详情暂未完整获取，可重试加载</span>
+      <button class="retry-btn-inline" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
+    </div>
+  </div>
+
+  <!-- ==================== 商品价格、优惠券与预估推广佣金 ==================== -->
+  <div class="detail-card-section" v-if="goods">
+    <div class="privilege-box" style="margin-bottom:0">
+      <div class="privilege-header">
+        <span>价格与推广信息</span>
+        <span>佣金为预估，不抵扣付款；最终以平台结算为准</span>
+      </div>
+      <div class="price-calc-flow">
+        <div class="calc-step">
+          <div class="c-lbl">原标价</div>
+          <div class="c-num" style="text-decoration:line-through;color:var(--text-muted)">
+            ¥{{ formatMoney(goods.original_price ?? goods.price) }}
+          </div>
+        </div>
+        <span class="calc-sep">·</span>
+        <div class="calc-step" v-if="(goods.coupon_amount ?? goods.saved_price ?? 0) > 0">
+          <div class="c-lbl">优惠券金额</div>
+          <div class="c-num" style="color:#f5222d">
+            ¥{{ formatMoney(goods.coupon_amount ?? goods.saved_price) }}
+          </div>
+        </div>
+        <span class="calc-sep" v-if="(goods.coupon_amount ?? goods.saved_price ?? 0) > 0">·</span>
+        <div class="calc-step">
+          <div class="c-lbl">预估推广佣金</div>
+          <div class="c-num" style="color:#fa8c16">
+            ¥{{ formatMoney(goods.commission_amount) }}
+          </div>
+        </div>
+        <span class="calc-sep">·</span>
+        <div class="calc-step highlight">
+          <div class="c-lbl" style="color:var(--primary-color);font-weight:700">付款参考价</div>
+          <div class="c-num">
+            ¥{{ formatMoney(goods.price) }}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 游客推广归因与账户入口 -->
+  <div class="detail-card-section" style="padding:10px 14px;" v-if="!isLoggedIn" @click="goToRegister">
+    <div class="login-unlock-banner" style="margin-bottom:0">
+      <span>无需登录也可领券；游客转链使用站长默认推广位。登录后可查看本人推广订单与佣金记录。</span>
+      <span style="font-weight:700;color:var(--primary-color)">我的账户 ›</span>
+    </div>
+  </div>
+
+  <!-- ==================== 官方服务承诺 ==================== -->
+  <div class="detail-card-section trust-bar-section" v-if="goods?.service_guarantees?.length">
+    <div class="trust-bar">
+      <span class="trust-item" v-for="(guarantee, idx) in goods.service_guarantees" :key="idx">{{ guarantee }}</span>
+    </div>
+  </div>
+
+  <!-- ==================== 商品核心规格参数表 ==================== -->
+  <div class="detail-card-section" v-if="realSpecs && realSpecs.length">
+    <div class="specs-table" style="margin-bottom:0">
+      <div class="specs-table-title">
+        <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/></svg>
+        <span>商品核心参数</span>
+      </div>
+      <div class="spec-row" v-for="(spec, sIdx) in realSpecs" :key="sIdx">
+        <span class="spec-label">{{ spec.label }}</span>
+        <span class="spec-value">{{ spec.value }}</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 实拍大图展示流 ==================== -->
+  <div class="detail-card-section detail-gallery-flow" v-if="carouselList.length > 1">
+    <div class="detail-gallery-header">
+      <svg style="width:14px;height:14px;fill:var(--primary-color)" viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+      <span>商品高清实拍与图文详情</span>
+    </div>
+    <div v-for="(img, gIdx) in detailGalleryList" :key="'flow_' + gIdx">
+      <img :src="img" class="detail-img-full" loading="lazy" :alt="goods?.name + ' 图' + (gIdx+1)" />
+    </div>
+  </div>
+
+  <!-- ==================== 底部固定操作栏（无论登录与否均可领券与复制口令） ==================== -->
+  <footer class="detail-bottom-nav">
+    <div class="detail-nav-btn-icon" @click="goHome">
+      <span class="icon">🏠</span>
+      <span>首页</span>
+    </div>
+    <div class="detail-nav-btn-icon" @click="goToRegister">
+      <span class="icon">👛</span>
+      <span>账户</span>
+    </div>
+
+    <div class="detail-nav-actions">
+      <!-- 复制口令与链接 (口令+短链一体，直接打开拼多多APP或网页) -->
+      <button class="btn-copy-command" @click="handleCopyPromoteLink">
+        <span>📋</span>
+        <span>复制口令与链接</span>
+      </button>
+
+      <!-- 立即领券下单 (按需转链，优先唤起拼多多 APP) -->
+      <button class="btn-buy-now" @click="handleJumpToBuy">
+        <span>⚡</span>
+        <span>立即领券下单</span>
+      </button>
+    </div>
+  </footer>
+
+  <!-- ==================== 全局高质感智能加载器与省钱话术轮播 ==================== -->
+  <div class="smart-loader-overlay" v-if="smartLoading.visible">
+    <div class="smart-loader-card">
+      <div class="smart-radar-wrapper">
+        <div class="smart-radar-ring"></div>
+        <div class="smart-radar-ring-inner"></div>
+        <div class="smart-radar-icon">🎁</div>
+      </div>
+      <div class="smart-loader-title">{{ smartLoading.title }}</div>
+      <div class="smart-loader-slogan-wrap">
+        <div class="smart-loader-slogan" :class="smartLoading.fadeClass">
+          {{ smartLoading.currentSlogan }}
+        </div>
+      </div>
+      <div class="smart-loader-bar">
+        <div class="smart-loader-bar-inner"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 轻量 Toast 提示 -->
+  <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>
+
+
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/session.js"></script>
+<script src="/static/js/format.js"></script>
+<script src="/static/js/browser.js"></script>
+<script src="/static/js/detail.js"></script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+-r requirements.txt
+# Test tools only; Node's optional frontend tests need no npm packages.
+pytest==8.4.2
+httpx==0.28.1

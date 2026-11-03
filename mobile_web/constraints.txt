@@ -1,0 +1,32 @@
+# Exact runtime and test dependency resolution from the dedicated environment.
+# Constraints do not install optional/test packages; requirements select them.
+# Platform-specific dependencies (for example colorama) remain conditional.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.16.0
+cachetools==7.2.8
+certifi==2026.10.23
+charset-normalizer==3.5.2
+click==8.5.0
+colorama==0.4.6
+dnspython==2.9.1
+fastapi==0.142.2
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.1
+opentelemetry-api==1.45.2
+packaging==26.3
+pluggy==1.7.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pygments==2.21.0
+pymongo==4.18.2
+pytest==8.4.2
+requests==2.34.2
+starlette==1.10.0
+typing-inspection==0.4.4
+typing-extensions==4.16.0
+urllib3==2.8.0
+uvicorn==0.54.0

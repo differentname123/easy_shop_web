@@ -1,0 +1,39 @@
+[Unit]
+Description=Mobile web shopping guide
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Replace User, Group, WorkingDirectory, WEB_CONFIG_FILE and ExecStart together
+# if you use a different account or installation path.
+User=mobileweb
+Group=mobileweb
+WorkingDirectory=/opt/mobile_web
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=WEB_CONFIG_FILE=/opt/mobile_web/config.local.json
+Environment=WEB_LOG_DIR=-
+Environment=WEB_LOG_LEVEL=INFO
+# Optional private env overrides (environment takes precedence over JSON).
+# Keep this file root-owned mode 0600; do not commit secrets into this unit.
+EnvironmentFile=-/etc/mobile_web.env
+# Single worker, no reload. Do not use a shell or activate the virtualenv.
+ExecStart=/opt/mobile_web/.venv/bin/python /opt/mobile_web/run.py --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# File logging is disabled above. To enable it, create a writable runtime/logs
+# directory, set WEB_LOG_DIR, and allow ONLY that directory with ReadWritePaths.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mobile_web
+
+[Install]
+WantedBy=multi-user.target

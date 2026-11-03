@@ -1,0 +1,41 @@
+# IDE configuration
+.idea/
+.vscode/
+.claude/
+
+# Python compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Sensitive configuration & private environment files
+config.local.json
+config.*.local.json
+.env
+.env.*
+*.env
+
+# Runtime directories and logs
+runtime/
+logs/
+*.log
+*.log.*
+
+# Pytest / coverage cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Private keys and certificates
+secrets/
+keys/
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
