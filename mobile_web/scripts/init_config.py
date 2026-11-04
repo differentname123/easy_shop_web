@@ -16,6 +16,17 @@ FIELDS = {
     "myself_pdd_client_id": "",
     "myself_pdd_client_secret": "",
     "myself_pdd_pid": "",
+    "pdd_enabled": True,
+    "taobao_enabled": False,
+    "myself_taobao_app_key": "",
+    "myself_taobao_app_secret": "",
+    "myself_taobao_pid": "",
+    "taobao_adzone_id": "",
+    "taobao_session": "",
+    "taobao_inviter_code": "",
+    "haodanku_api_key": "",
+    "zhetaoke_appkey": "",
+    "zhetaoke_sid": "",
     "local_mongo_host": "localhost",
     "local_mongo_port": 27017,
     "local_mongo_user": "",
@@ -83,7 +94,7 @@ def main(argv=None):
         print("已生成并持久化新的认证密钥；旧令牌将失效，需要重新登录。")
     else:
         print("已保留现有私有认证密钥。")
-    print("请填写尚未配置的 PDD 字段，再运行 python run.py --check。")
+    print("请填写需要启用的平台及第三方字段，再运行 python run.py --check。")
     return 0
 
 

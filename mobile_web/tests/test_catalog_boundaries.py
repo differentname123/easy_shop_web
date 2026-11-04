@@ -25,6 +25,7 @@ def reset_caches():
 def catalog():
     repo = MagicMock()
     repo.get_product_detail.return_value = None
+    repo.upsert_product_detail.return_value = True
     adapter = MagicMock(spec=PddAdapter)
     adapter.active = True
     adapter.resolve_product_ref.side_effect = PddAdapter().resolve_product_ref

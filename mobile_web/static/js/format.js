@@ -56,6 +56,9 @@
       ? cached.goods_sign === target.goods_sign
       : target.goods_id && cached.goods_id === target.goods_id);
   };
+  shop.platformCapability = (platform, capability) => Boolean(platform?.active &&
+    (platform.capabilities?.[capability] ?? true));
+  shop.orderKey = order => `${order.platform || ''}:${order.order_sn}`;
   shop.promotionPayload = (goods, accountUid) => ({
     ...shop.goodsIdentity(goods),
     product_url: goods.product_url || '',

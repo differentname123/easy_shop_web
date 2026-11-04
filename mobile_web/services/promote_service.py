@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """推广生链编排：主标识隔离缓存，可信身份补全与当前请求文案各司其职。"""
 import math
+import hashlib
+import json
 import re
 import time
 from copy import deepcopy
@@ -17,8 +19,9 @@ _PROMOTION_CACHE = PROMOTION_CACHE
 
 
 class PromoteService:
-    def __init__(self, product_repo: Optional[ProductRepository] = None):
+    def __init__(self, product_repo: Optional[ProductRepository] = None, user_service=None):
         self.repo = product_repo if product_repo is not None else ProductRepository()
+        self.user_service = user_service
 
     # 保留旧调用入口，但共享层不包含具体平台名称。
     build_command_text = staticmethod(build_command_text)
@@ -47,7 +50,8 @@ class PromoteService:
     @classmethod
     def _cacheable(cls, result) -> bool:
         return (isinstance(result, dict) and result.get("status") == "success"
-                and not result.get("is_fallback") and bool(cls._final_link(result)))
+                and not result.get("is_fallback") and result.get("cacheable") is not False
+                and bool(cls._final_link(result)))
 
     @staticmethod
     def _valid_deadline(expires_at) -> bool:
@@ -73,6 +77,9 @@ class PromoteService:
             kwargs.get("title") or kwargs.get("name") or kwargs.get("goods_name") or "精选高性价比好物",
             result["final_link"], kwargs.get("price"), coupon,
         )
+        token = result.get("promotion_token")
+        if isinstance(token, str) and token.strip():
+            result["command_text"] += f"\n【平台口令】{token.strip()}"
         return result
 
     def convert_link(
@@ -98,9 +105,21 @@ class PromoteService:
         if not ref.key and not product_url:
             return {"status": "error", "error_msg": "缺少有效商品标识或链接"}
 
-        # 主标识本身即可隔离缓存；热命中不应先查 Mongo 补全辅助 ID。
+        identity = {}
+        if clean_uid and getattr(adapter, "requires_authorized_promotion", False):
+            if self.user_service is None:
+                from services.user_service import UserService
+                self.user_service = UserService()
+            context = self.user_service.get_promotion_context(clean_uid, plat)
+            if context.get("status") != "success":
+                return context
+            identity = context.get("identity") or {}
+        identity_key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest() if identity else ""
+        # 个人渠道变化使旧链接失效；非渠道型平台仍可先命中缓存再补商品身份。
         kind = "sign" if ref.goods_sign else "id"
         cache_key = ("promotion", plat, kind, ref.key, product_url, clean_uid)
+        if identity_key:
+            cache_key += (identity_key,)
         cached = PROMOTION_CACHE.get(cache_key)
         if (isinstance(cached, tuple) and len(cached) == 2
                 and self._valid_deadline(cached[0]) and self._cacheable(cached[1])):
@@ -120,7 +139,10 @@ class PromoteService:
                 PROMOTION_CACHE.set(cache_key, (expires_at, data))
                 return self._with_command(data, adapter, kwargs)
 
-        adapter_kwargs = {k: v for k, v in kwargs.items() if k not in ("goods_id", "goods_sign")}
+        adapter_kwargs = {k: v for k, v in kwargs.items()
+                          if k not in ("goods_id", "goods_sign", "identity", "relation_id", "special_id")}
+        if getattr(adapter, "requires_authorized_promotion", False):
+            adapter_kwargs["identity"] = identity
         result = adapter.convert_promotion_url(
             goods_id_or_sign=ref.key, uid=clean_uid or None,
             goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None,
@@ -128,7 +150,11 @@ class PromoteService:
         )
         if not isinstance(result, dict) or result.get("status") != "success":
             message = result.get("error_msg") if isinstance(result, dict) else None
-            return {"status": "error", "error_msg": message or "未能生成有效推广转链，商品可能已失效或缺少必要标识"}
+            error = {"status": "error", "error_msg": message or "未能生成有效推广转链，商品可能已失效或缺少必要标识"}
+            if isinstance(result, dict):
+                error.update({key: result[key] for key in ("error_code", "need_auth", "auth_platform", "auth_msg", "attribution_status")
+                              if key in result})
+            return error
 
         data = self._link_data(result)
         final_link = self._final_link(data)
@@ -136,7 +162,13 @@ class PromoteService:
             return {"status": "error", "error_msg": "平台未返回有效推广链接"}
         data["final_link"] = final_link
         expires_at = time.time() + PROMOTION_LINK_TTL
-        if not data.get("is_fallback"):
+        source_deadline = data.get("expires_at")
+        if source_deadline is not None:
+            if (isinstance(source_deadline, bool) or not isinstance(source_deadline, (int, float))
+                    or not math.isfinite(source_deadline) or source_deadline <= time.time()):
+                return {"status": "error", "error_msg": "平台返回的推广链接已过期或有效期无效"}
+            expires_at = min(expires_at, source_deadline)
+        if self._cacheable(data):
             PROMOTION_CACHE.set(cache_key, (expires_at, deepcopy(data)))
             if not clean_uid and ref.key:
                 self.repo.save_promotion_link_cache(

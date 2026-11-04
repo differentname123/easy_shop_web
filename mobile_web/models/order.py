@@ -9,17 +9,23 @@ from pydantic import BaseModel, Field
 class OrderItem(BaseModel):
     """订单单品信息"""
     order_sn: str
+    platform: str = "pdd"
     goods_id: str
     goods_name: str = "精选商品"
     goods_thumbnail_url: str = ""
     goods_quantity: int = 1
     order_amount_yuan: float = 0.0
+    # 平台当前报告口径；两种佣金均可能是预估，不表示钱包净到账。
     promotion_amount_yuan: float = 0.0
-    promotion_rate: int = 0
+    estimated_commission_yuan: Optional[float] = None
+    settled_commission_yuan: Optional[float] = None
+    commission_basis: Optional[str] = None
+    promotion_rate: float = 0
     order_status: Optional[int | str] = None
     order_status_desc: str = "未知状态"
     is_refund: bool = False
     is_settled: bool = False
+    is_invalid: bool = False
     order_pay_time: Optional[int] = None
     order_pay_time_str: str = ""
 

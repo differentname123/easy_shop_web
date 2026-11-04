@@ -18,8 +18,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        from infrastructure.settings import load_settings
-        settings = load_settings(args.config) if args.config else get_settings()
+        if args.config:
+            import os
+            from infrastructure.settings import app_path
+            os.environ["WEB_CONFIG_FILE"] = str(app_path(args.config))
+            get_settings.cache_clear()
+        settings = get_settings()
     except SettingsError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
@@ -41,7 +45,7 @@ def main(argv=None):
         return 0
 
     if args.check:
-        print("配置校验通过；未连接 MongoDB 或拼多多。")
+        print("配置校验通过；未连接 MongoDB 或外部平台。")
         return 0
 
     import uvicorn

@@ -56,8 +56,14 @@ def platform_name(platform: str) -> str:
 
 def get_all_platforms() -> List[Dict[str, Any]]:
     """平台名称与是否启用均来自同一装配表，前后端不再各自猜测。"""
-    descriptors = {**_ADAPTER_TYPES, **_ADAPTER_REGISTRY}
-    return [
-        {"code": code, "name": adapter.platform_name, "active": adapter.active}
-        for code, adapter in descriptors.items()
-    ]
+    capabilities = ("recommend", "search", "detail", "promotion", "authorization", "orders")
+    result = []
+    for code in {**_ADAPTER_TYPES, **_ADAPTER_REGISTRY}:
+        adapter = get_adapter(code)
+        configured = getattr(adapter, "capabilities", None)
+        result.append({
+            "code": code, "name": adapter.platform_name, "active": adapter.active,
+            "capabilities": {key: bool(adapter.active and (configured.get(key, False)
+                             if isinstance(configured, dict) else True)) for key in capabilities},
+        })
+    return result

@@ -5,6 +5,7 @@
 """
 import uuid
 import random
+import re
 import string
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
@@ -191,6 +192,33 @@ class UserRepository(BaseRepository):
                 return user
         return self.create_user(uid=uid)
 
+    @staticmethod
+    def clean_platform_identity(identity: dict) -> dict:
+        if not isinstance(identity, dict):
+            raise ValueError("平台渠道身份必须为对象")
+        result = {}
+        for key, value in identity.items():
+            if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", key):
+                raise ValueError("无效的平台渠道身份字段")
+            if not isinstance(value, str) or not value.strip() or len(value) > 128:
+                raise ValueError("平台渠道标识必须为非空字符串")
+            result[key] = value.strip()
+        return result
+
+    def get_uid_by_platform_identity(self, platform: str, identity: dict) -> Optional[str]:
+        """只反查已由服务端核实的身份；历史重复关系不能猜选其中一个用户。"""
+        clean_identity = self.clean_platform_identity(identity)
+        if not clean_identity:
+            return None
+        plat = normalize_platform(platform)
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", plat):
+            raise ValueError("无效的平台代码")
+        prefix = f"auth_status.{plat}"
+        query = {f"{prefix}.is_authorized": True}
+        query.update({f"{prefix}.identity.{key}": value for key, value in clean_identity.items()})
+        rows = list(self.col.find(query, {"uid": 1, "_id": 0}).limit(2))
+        return str(rows[0]["uid"]) if len(rows) == 1 and rows[0].get("uid") else None
+
     def update_auth_status(
         self,
         uid: str,
@@ -213,8 +241,17 @@ class UserRepository(BaseRepository):
             "last_active_at": now
         }
         if extra and isinstance(extra, dict):
-            for k, v in extra.items():
-                update_fields[f"{field_prefix}.{k}"] = v
+            for key, value in extra.items():
+                if not re.fullmatch(r"[a-z][a-z0-9_]*", key) or key in {"is_authorized", "bind", "updated_at"}:
+                    raise ValueError("无效的授权扩展字段")
+                if key == "identity":
+                    value = self.clean_platform_identity(value)
+                    for identity_key in value:
+                        path = f"{field_prefix}.identity.{identity_key}"
+                        # 唯一约束无法建立时拒绝保存，不能退回多用户共享同一渠道。
+                        self.col.create_index([(path, 1)], unique=True,
+                                              partialFilterExpression={path: {"$type": "string"}})
+                update_fields[f"{field_prefix}.{key}"] = value
 
         res = self.col.update_one(
             {"uid": str(uid).strip()},

@@ -4,6 +4,7 @@ if __name__ == "__main__":
     from run import main
     raise SystemExit(main())
 
+import asyncio
 import os
 import threading
 import time
@@ -17,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from infrastructure.logging_utils import configure_logging
 from infrastructure.pdd_client import configure_transport
+from services.detail_prefetch import DetailPrefetcher
 
 from config import logger, settings
 from adapters import get_adapter, get_all_platforms, PlatformUnavailableError
@@ -34,22 +36,76 @@ async def lifespan(app: FastAPI):
     configure_logging(settings)
     configure_transport(dns_mode=settings.pdd_dns_mode, trust_env=settings.pdd_trust_env)
 
+    from api.home import product_service
+    from api.goods import product_service as goods_service
+
+    services = tuple(dict.fromkeys((product_service, goods_service)))
+    for service in services:
+        start_writes = getattr(service, "start_background_writes", None)
+        if callable(start_writes):
+            start_writes()
+    prefetcher = None
+    warmup_thread = None
+    warmup_stop = threading.Event()
+    app.state.detail_prefetcher = None
+
     def warm_connections():
+        # 预取关闭时保留旧的首榜预热，但线程及其摘要写入必须随 lifespan 回收。
         for platform in get_all_platforms():
-            if platform["active"]:
+            if warmup_stop.is_set():
+                return
+            if not platform["active"]:
+                continue
+            adapter = None
+            try:
+                adapter = get_adapter(platform["code"])
+                adapter.warmup()
+            except Exception as exc:
+                logger.debug("[%s] 连接预热失败: %s", platform["code"], type(exc).__name__)
+            if adapter is None:
+                continue
+            if warmup_stop.is_set():
+                return
+            if platform.get("capabilities", {}).get("recommend", True):
                 try:
-                    get_adapter(platform["code"]).warmup()
+                    if adapter.channels:
+                        product_service.get_home_recommendations(
+                            platform=platform["code"], channel_type=adapter.channels[0]["channel_type"],
+                            offset=0, limit=20,
+                        )
                 except Exception as exc:
-                    logger.debug(f"[{platform['code']}] 连接预热失败: {exc}")
-        try:
-            from api.home import product_service
-            product_service.get_home_recommendations(channel_type=5, offset=0, limit=20)
-            logger.info("[lifespan] 首页默认推荐商品与缓存预热就绪")
-        except Exception as exc:
-            logger.warning(f"[lifespan] 首页推荐预热异常: {exc}")
-    if settings.warmup_enabled:
-        threading.Thread(target=warm_connections, name="platform-warmup", daemon=True).start()
-    yield
+                    logger.warning("[%s] 首页推荐预热异常: %s", platform["code"], type(exc).__name__)
+
+    try:
+        if settings.detail_prefetch_enabled:
+            prefetcher = DetailPrefetcher(
+                product_service, seed_enabled=settings.warmup_enabled,
+                interval_seconds=settings.detail_prefetch_interval_seconds,
+                platform_provider=get_all_platforms, adapter_provider=get_adapter,
+            )
+            for service in services:
+                service.prefetcher = prefetcher
+            app.state.detail_prefetcher = prefetcher
+            prefetcher.start()
+        elif settings.warmup_enabled:
+            warmup_thread = threading.Thread(target=warm_connections, name="platform-warmup", daemon=False)
+            warmup_thread.start()
+        yield
+    finally:
+        warmup_stop.set()
+        if prefetcher is not None:
+            # stop 先封 admission/set Event/丢排队项，再完整 join；同步 I/O 由自身超时返回。
+            await asyncio.to_thread(prefetcher.stop)
+        if warmup_thread is not None:
+            await asyncio.to_thread(warmup_thread.join)
+        for service in services:
+            await asyncio.to_thread(service.wait_for_background_writes)
+        # 在 worker 和兼容摘要线程真正退出之前，不得解除绑定导致请求回退到旧线程路径。
+        if prefetcher is not None:
+            for service in services:
+                if service.prefetcher is prefetcher:
+                    service.prefetcher = None
+        app.state.detail_prefetcher = None
 
 
 def _request_path(request) -> str:
@@ -63,7 +119,7 @@ def _request_path(request) -> str:
 def _html_page(filename: str, fallback: str):
     path = os.path.join(STATIC_DIR, filename)
     if os.path.isfile(path):
-        return FileResponse(path, media_type="text/html")
+        return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-cache"})
     return HTMLResponse(f"<h2>{fallback}</h2>")
 
 

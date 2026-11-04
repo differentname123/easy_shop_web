@@ -3,7 +3,8 @@
 首页接口路由：拼多多进宝官方推荐与关键词检索
 """
 from typing import Optional
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Depends
+from auth import get_optional_uid
 from services.product_service import ProductService
 from adapters import get_all_platforms, require_adapter
 
@@ -27,8 +28,10 @@ def get_recommend_goods(
     channel_type: int = Query(5, ge=1, description="平台频道代码，见 channels 接口"),
     offset: int = Query(0, ge=0, le=1000, description="偏移量"),
     limit: int = Query(20, ge=1, le=50, description="条数 (1-50)"),
+    cursor: Optional[str] = Query(None, max_length=2048, description="来源续页游标"),
     uid: Optional[str] = Query(None, max_length=64, description="推手用户UID"),
     platform: str = Query("pdd", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台标识"),
+    current_uid: Optional[str] = Depends(get_optional_uid),
 ):
     """
     获取首页官方推荐流商品
@@ -37,7 +40,8 @@ def get_recommend_goods(
         channel_type=channel_type,
         offset=offset,
         limit=limit,
-        uid=uid,
+        cursor=cursor,
+        uid=current_uid,
         platform=platform
     )
 
@@ -49,6 +53,7 @@ def search_goods(
     page_size: int = Query(20, ge=1, le=50, description="每页数量 (1-50)"),
     uid: Optional[str] = Query(None, max_length=64, description="推手用户UID"),
     platform: str = Query("pdd", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台标识"),
+    current_uid: Optional[str] = Depends(get_optional_uid),
 ):
     """
     首页关键词搜索联盟商品
@@ -57,7 +62,7 @@ def search_goods(
         keyword=keyword,
         page=page,
         page_size=page_size,
-        uid=uid,
+        uid=current_uid,
         platform=platform
     )
 
@@ -68,6 +73,7 @@ def get_goods_detail(
     goods_id: Optional[str] = Query(None, max_length=64, description="商品ID"),
     uid: Optional[str] = Query(None, max_length=64, description="推手用户UID"),
     platform: str = Query("pdd", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台标识"),
+    current_uid: Optional[str] = Depends(get_optional_uid),
 ):
     """
     获取官方商品完整规范化详情 (含多张高清实拍轮播图、满减优惠、店铺与服务保障)
@@ -78,5 +84,5 @@ def get_goods_detail(
         goods_id_or_sign=key,
         goods_id=goods_id,
         goods_sign=goods_sign,
-        uid=uid
+        uid=current_uid
     )

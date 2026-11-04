@@ -113,6 +113,10 @@ def test_missing_weak_and_public_old_auth_secrets_are_rejected(tmp_path, secret)
     ("local_mongo_port", ""), ("local_mongo_port", "-1"), ("local_mongo_port", "65536"), ("local_mongo_port", "not-a-port"),
     ("local_mongo_host", ""), ("local_mongo_db_name", ""), ("mongo_auth_source", ""),
     ("web_warmup_enabled", ""), ("web_warmup_enabled", "perhaps"), ("pdd_trust_env", "perhaps"),
+    ("web_detail_prefetch_enabled", "perhaps"),
+    ("web_detail_prefetch_interval_seconds", 59), ("web_detail_prefetch_interval_seconds", 301),
+    ("web_detail_prefetch_interval_seconds", True), ("web_detail_prefetch_interval_seconds", 60.5),
+    ("web_detail_prefetch_interval_seconds", "1.5"), ("web_detail_prefetch_interval_seconds", ""),
     ("pdd_dns_mode", "global"), ("web_log_level", "secret-log-canary"),
 ])
 def test_require_credentials_false_still_validates_noncredential_fields(tmp_path, field, value):
@@ -136,6 +140,40 @@ def test_boolean_json_values(tmp_path, value, expected):
     settings = load_settings(path)
     assert settings.warmup_enabled is expected
     assert settings.pdd_trust_env is expected
+
+
+@pytest.mark.parametrize("warmup,explicit,expected", [
+    (True, None, True), (False, None, False), (True, True, True),
+    (True, False, False), (False, True, True), (False, False, False),
+])
+def test_detail_prefetch_defaults_follow_warmup_and_json_explicit_value_wins(tmp_path, warmup, explicit, expected):
+    path = tmp_path / "prefetch.json"
+    data = dict(PRIVATE, web_warmup_enabled=warmup)
+    if explicit is not None:
+        data["web_detail_prefetch_enabled"] = explicit
+    path.write_text(json.dumps(data), encoding="utf-8")
+    settings = load_settings(path, environ={"WEB_DETAIL_PREFETCH_ENABLED": "opposite-value-ignored"})
+    assert settings.warmup_enabled is warmup
+    assert settings.detail_prefetch_enabled is expected
+    assert settings.detail_prefetch_interval_seconds == 300
+
+
+@pytest.mark.parametrize("value,expected", [(60, 60), (300, 300), ("120", 120)])
+def test_detail_prefetch_interval_is_a_bounded_integer(tmp_path, value, expected):
+    path = tmp_path / "interval.json"
+    path.write_text(json.dumps(dict(PRIVATE, web_detail_prefetch_interval_seconds=value)), encoding="utf-8")
+    assert load_settings(path).detail_prefetch_interval_seconds == expected
+
+
+def test_public_template_enables_prefetch_and_standalone_fake_explicitly_disables_it(tmp_path):
+    template = json.loads((APP_DIR / "config.example.json").read_text(encoding="utf-8"))
+    assert template["web_detail_prefetch_enabled"] is True
+    assert template["web_detail_prefetch_interval_seconds"] == 300
+    path = tmp_path / "standalone-fake.json"
+    write_fake_config(path)
+    fake = json.loads(path.read_text(encoding="utf-8"))
+    assert fake["web_detail_prefetch_enabled"] is False
+    assert load_settings(path).detail_prefetch_enabled is False
 
 
 @pytest.mark.parametrize("value", ["", "-"])
@@ -479,7 +517,10 @@ output = APP / 'config.local.json'
 values = json.loads(output.read_text(encoding='utf-8'))
 allowed = {'myself_pdd_client_id', 'myself_pdd_client_secret', 'myself_pdd_pid',
     'local_mongo_host', 'local_mongo_port', 'local_mongo_user', 'local_mongo_password',
-    'local_mongo_db_name', 'mongo_auth_source', 'web_auth_secret'}
+    'local_mongo_db_name', 'mongo_auth_source', 'web_auth_secret',
+    'pdd_enabled', 'taobao_enabled', 'myself_taobao_app_key', 'myself_taobao_app_secret',
+    'myself_taobao_pid', 'taobao_adzone_id', 'taobao_session', 'taobao_inviter_code',
+    'haodanku_api_key', 'zhetaoke_appkey', 'zhetaoke_sid'}
 assert set(values) <= allowed, set(values) - allowed
 assert values['mongo_auth_source'] == 'migrated_auth'
 assert values['myself_pdd_client_id'] == 'migrated-client'

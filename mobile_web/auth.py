@@ -92,6 +92,24 @@ async def get_current_uid(
     return uid
 
 
+async def get_optional_uid(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
+    token: Optional[str] = Query(None, description="登录鉴权令牌"),
+) -> Optional[str]:
+    """允许匿名，但提供失效凭据时不能静默退回匿名归因。"""
+    raw_token = next((value.strip() for value in (authorization, x_auth_token, token)
+                      if isinstance(value, str) and value.strip()), None)
+    if raw_token is None:
+        return None
+    uid = verify_access_token(raw_token)
+    if not uid:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="登录状态已过期或令牌不合法，请重新登录",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return uid
+
+
 def hash_password(password: str) -> str:
     """
     使用 PBKDF2-HMAC-SHA256 生成强密码哈希（含随机加盐）

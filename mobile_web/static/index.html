@@ -6,14 +6,14 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>优选导购 - 极速省赚</title>
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/style.css?v=tb-20261104">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js"></script>
+  <script src="/static/js/vue.global.prod.js?v=tb-20261104"></script>
 </head>
 <body>
 <div id="app">
 
-  <!-- ==================== TAB 1: 首页 (拼多多进宝官方推荐) ==================== -->
+  <!-- ==================== TAB 1: 平台推荐与搜索 ==================== -->
   <div v-show="currentTab === 'home'" class="tab-page tab-home" :class="{ 'is-searching': Boolean(activeHomeKeyword) }">
     <header class="top-header" :class="{ 'header-hidden': isHeaderHidden }">
       <div class="search-box">
@@ -22,7 +22,7 @@
           <input 
             type="text" 
             class="search-input" 
-            placeholder="搜索拼多多全网优惠爆品..." 
+            :placeholder="'搜索' + homePlatformName() + '优惠商品...'"
             v-model="homeSearchKeyword"
             @keyup.enter="onSearchHome"
           />
@@ -31,7 +31,14 @@
         <button class="search-btn" @click="onSearchHome">搜索</button>
       </div>
 
-      <!-- 推荐频道滑动栏 -->
+      <nav class="platform-bar home-platform-bar" aria-label="推荐平台">
+        <button v-for="p in platforms" :key="p.code" class="plat-chip"
+          :class="{ active: homePlatform === p.code }" :aria-disabled="!p.active"
+          @click="switchHomePlatform(p.code)">
+          {{ p.name }}<span v-if="!p.active" class="plat-chip-badge">未接入</span>
+        </button>
+      </nav>
+      <!-- 推荐频道滑动栏：名称与白名单由平台适配器提供 -->
       <nav class="channel-scroller" v-if="!activeHomeKeyword">
         <div 
           v-for="ch in homeChannels" 
@@ -55,7 +62,7 @@
       >
         <div class="goods-thumb-wrap">
           <img :src="item.image_url" :alt="item.name" class="goods-thumb" loading="lazy" />
-          <span class="plat-badge pdd">拼多多</span>
+          <span class="plat-badge" :class="item.platform">{{ item.platform_name || homePlatformName() }}</span>
         </div>
         <div class="goods-body">
           <h4 class="goods-title">{{ item.name }}</h4>
@@ -127,7 +134,11 @@
       <span>{{ homeSearchKeyword ? '正在搜索商品与优惠信息...' : '正在为您获取商品推荐...' }}</span>
     </div>
 
-    <div v-if="!homeLoading && homeGoodsList.length === 0" class="empty-wrap">暂无符合条件的商品</div>
+    <div v-if="!homeLoading && homeError" class="empty-wrap" @click="retryLoadHomeGoods">{{ platformsError ? '平台信息暂不可用，请刷新页面重试' : '加载失败，点击重试' }}</div>
+    <div v-if="!homeLoading && !homeError && !homeHasMore && homeGoodsList.length === 0" class="empty-wrap">暂无符合条件的商品</div>
+    <div v-if="!homeLoading && !homeError && homeHasMore" class="loading-wrap" @click="loadHomeGoods(false)">
+      <button class="retry-btn">继续加载下一页</button>
+    </div>
     <div id="homeBottomSentinel" style="height: 10px;"></div>
   </div>
 
@@ -343,11 +354,11 @@
       <div class="stats-grid">
         <div class="stat-item">
           <div class="num">¥{{ formatMoney(userOrdersData.total_commission ?? 0) }}</div>
-          <div class="label">订单佣金</div>
+          <div class="label">{{ orderPlatform === 'taobao' ? '联盟预估佣金' : '订单佣金' }}</div>
         </div>
         <div class="stat-item">
           <div class="num">¥{{ formatMoney(userOrdersData.settled_commission ?? 0) }}</div>
-          <div class="label">平台已结算佣金</div>
+          <div class="label">{{ orderPlatform === 'taobao' ? '联盟结算预估佣金' : '平台已结算佣金' }}</div>
         </div>
         <div class="stat-item">
           <div class="num">¥{{ formatMoney(userOrdersData.refund_commission || 0) }}</div>
@@ -372,6 +383,15 @@
         </button>
       </div>
 
+      <nav class="platform-bar order-platform-bar" aria-label="订单平台">
+        <button v-for="p in platforms" :key="p.code" class="plat-chip" :class="{ active: orderPlatform === p.code }"
+          :aria-disabled="!supportsPlatform(p.code, 'orders')" @click="switchOrderPlatform(p.code)">
+          {{ p.name }}<span v-if="!supportsPlatform(p.code, 'orders')" class="plat-chip-badge">不可用</span>
+        </button>
+      </nav>
+      <p class="order-notice" v-if="orderPlatform === 'taobao'">淘宝佣金为联盟预估 / 结算预估收入，不代表最终到账或可提现余额；失效订单不等同于退款。</p>
+      <p class="order-notice" v-if="orderMessage" role="status">{{ orderMessage }}</p>
+      <p class="order-notice" v-if="userOrdersData.sync_status">同步状态：{{ { running: '后台同步中', partial: '部分完成，后续继续同步', error: '后台同步失败，请稍后重试', success: '同步完成' }[userOrdersData.sync_status] || userOrdersData.sync_status }}</p>
       <!-- 时间跨度筛选胶囊 -->
       <div class="order-filter-tabs">
         <span class="order-filter-chip" :class="{ active: orderDays === 1 }" @click="switchOrderDays(1)">近1天</span>
@@ -382,18 +402,18 @@
 
       <!-- 订单列表明细 -->
       <div class="order-list-wrap" v-if="userOrdersData.order_list && userOrdersData.order_list.length > 0">
-        <div class="order-item-card" v-for="ord in userOrdersData.order_list" :key="ord.order_sn">
+        <div class="order-item-card" v-for="ord in userOrdersData.order_list" :key="orderKey(ord)">
           <img :src="ord.goods_thumbnail_url" class="order-item-thumb" alt="商品" />
           <div class="order-item-info">
             <h4 class="order-item-title">{{ ord.goods_name }}</h4>
             <div class="order-item-bottom">
               <div>
                 <span style="color:var(--text-muted)">实付: ¥{{ formatMoney(ord.order_amount_yuan) }}</span>
-                <span style="color:var(--primary-color);font-weight:700;margin-left:6px">订单佣金 ¥{{ formatMoney(ord.promotion_amount_yuan) }}</span>
+                <span style="color:var(--primary-color);font-weight:700;margin-left:6px">{{ orderPlatform === 'taobao' ? '联盟预估佣金' : '订单佣金' }} ¥{{ formatMoney(ord.promotion_amount_yuan) }}</span>
               </div>
               <span 
                 class="order-status-tag"
-                :class="ord.is_refund ? 'refund' : (ord.is_settled ? 'settled' : 'paid')"
+                :class="ord.is_refund ? 'refund' : (ord.is_invalid ? 'invalid' : (ord.is_settled ? 'settled' : 'paid'))"
               >
                 {{ ord.order_status_desc }}
               </span>
@@ -401,7 +421,7 @@
           </div>
         </div>
       </div>
-      <div v-else class="empty-wrap" style="padding:24px 0;font-size:12px">
+      <div v-else-if="!orderMessage" class="empty-wrap" style="padding:24px 0;font-size:12px">
         {{ isSyncingOrders ? '正在同步订单数据...' : (orderDays === 0 ? '全部历史暂无出单记录，快去分享商品赚佣吧！' : '近 ' + orderDays + ' 天内暂无出单记录，快去分享商品赚佣吧！') }}
       </div>
     </div>
@@ -412,68 +432,25 @@
       推广渠道授权
     </div>
 
-    <!-- 拼多多官方推手备案卡片 -->
-    <div class="auth-card">
+    <!-- 平台描述为唯一能力来源；未配置平台仍展示明确占位 -->
+    <div class="auth-card" v-for="p in platforms" :key="p.code">
       <div class="auth-header">
         <div class="auth-plat-info">
-          <span style="display:inline-block;width:24px;height:24px;background:#e02e24;color:#fff;text-align:center;line-height:24px;border-radius:4px;font-size:12px;font-weight:700">拼</span>
-          <span>拼多多官方推手备案</span>
+          <span class="auth-platform-icon" :class="p.code">{{ p.name.slice(0, 1) }}</span>
+          <span>{{ p.name }}渠道授权备案</span>
         </div>
-        <span 
-          class="auth-status-badge"
-          :class="userProfile.auth_status?.pdd?.is_authorized ? 'authed' : 'unauthed'"
-        >
-          {{ userProfile.auth_status?.pdd?.is_authorized ? '已授权备案 ✅' : '未授权 ⚠️' }}
+        <span class="auth-status-badge" :class="supportsPlatform(p.code, 'authorization') && userProfile.auth_status?.[p.code]?.is_authorized ? 'authed' : 'unauthed'">
+          {{ !supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置' : (userProfile.auth_status?.[p.code]?.is_authorized ? '已授权备案' : '未授权') }}
         </span>
       </div>
-      <p class="auth-desc">
-        {{ userProfile.auth_status?.pdd?.is_authorized 
-           ? '您已完成拼多多渠道备案。登录并验证身份后，购买或复制链接使用本人 UID；游客使用站长默认推广位，不按分享页 UID 归因。佣金以平台结算为准。'
-           : '推广账户可在登录后申请拼多多推广位备案。游客仍可领券，转链使用站长默认推广位；备案不代表已获得佣金或可提现余额。'
-        }}
+      <p class="auth-desc" v-if="supportsPlatform(p.code, 'authorization')">
+        登录并验证身份后可申请{{ p.name }}渠道备案。游客使用站长默认推广位，不按分享页 UID 归因；平台不支持通用链接时会明确提示。备案不代表已获得佣金或可提现余额。
       </p>
+      <p class="auth-desc" v-else>{{ p.name }}授权暂未接入或未配置，当前不提供该平台渠道授权。</p>
       <div class="auth-actions">
-        <button 
-          class="btn-auth" 
-          @click="handleCheckAndGetAuth('pdd')"
-          :disabled="isCheckingAuth"
-        >
-          {{ isCheckingAuth ? '检测中...' : (userProfile.auth_status?.pdd?.is_authorized ? '重新校验授权' : '一键开通拼多多授权') }}
+        <button class="btn-auth" @click="handleCheckAndGetAuth(p.code)" :disabled="isCheckingAuth || !supportsPlatform(p.code, 'authorization')">
+          {{ !supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置' : (isCheckingAuth ? '检测中...' : (userProfile.auth_status?.[p.code]?.is_authorized ? '重新校验授权' : '开通' + p.name + '授权')) }}
         </button>
-      </div>
-    </div>
-
-    <!-- 淘宝联盟预留卡片 -->
-    <div class="auth-card" style="opacity: 0.85;">
-      <div class="auth-header">
-        <div class="auth-plat-info">
-          <span style="display:inline-block;width:24px;height:24px;background:#ff5000;color:#fff;text-align:center;line-height:24px;border-radius:4px;font-size:12px;font-weight:700">淘</span>
-          <span>淘宝客渠道关系备案</span>
-        </div>
-        <span class="auth-status-badge unauthed">暂未接入</span>
-      </div>
-      <p class="auth-desc">
-        淘宝联盟暂未接入，当前不提供淘宝商品推广与渠道授权。
-      </p>
-      <div class="auth-actions">
-        <button class="btn-secondary" style="width:100%" @click="showToast('淘宝联盟暂未接入')">暂未接入</button>
-      </div>
-    </div>
-
-    <!-- 京东联盟预留卡片 -->
-    <div class="auth-card" style="opacity: 0.85;">
-      <div class="auth-header">
-        <div class="auth-plat-info">
-          <span style="display:inline-block;width:24px;height:24px;background:#e1251b;color:#fff;text-align:center;line-height:24px;border-radius:4px;font-size:12px;font-weight:700">京</span>
-          <span>京东推客渠道授权</span>
-        </div>
-        <span class="auth-status-badge unauthed">暂未接入</span>
-      </div>
-      <p class="auth-desc">
-        京东联盟暂未接入，当前不提供京东商品推广与渠道授权。
-      </p>
-      <div class="auth-actions">
-        <button class="btn-secondary" style="width:100%" @click="showToast('京东联盟暂未接入')">暂未接入</button>
       </div>
     </div>
 
@@ -511,11 +488,11 @@
   </footer>
 
   <!-- ==================== 渠道授权引导弹窗 ==================== -->
-  <div class="modal-backdrop" v-if="isAuthModalOpen" @click.self="isAuthModalOpen = false">
+  <div class="modal-backdrop" v-if="isAuthModalOpen" @click.self="closeAccountAuth">
     <div class="sheet-dialog">
       <div class="sheet-header">
         <span>{{ currentAuthInfo?.platform_name || '官方' }}推手备案授权</span>
-        <button class="sheet-close" @click="isAuthModalOpen = false">×</button>
+        <button class="sheet-close" @click="closeAccountAuth">×</button>
       </div>
 
       <div style="padding: 10px 0 20px;">
@@ -532,24 +509,13 @@
         </div>
 
         <div v-if="!currentAuthInfo?.is_authorized" class="pop-action-btns">
-          <a 
-            :href="currentAuthInfo?.auth_url || currentAuthInfo?.short_url" 
-            target="_blank" 
-            class="btn-primary-block"
-            @click="copyText(currentAuthInfo?.auth_url, '授权链接已复制')"
-          >
-            立即前往授权绑定
-          </a>
-          <button 
-            class="btn-outline-block"
-            @click="copyText(currentAuthInfo?.auth_url || currentAuthInfo?.short_url, '授权链接已复制，可粘贴至微信或浏览器中打开')"
-          >
-            复制授权链接
-          </button>
+          <button class="btn-primary-block" @click="openAccountAuth(false)">立即前往授权绑定</button>
+          <button class="btn-outline-block" @click="openAccountAuth(true)">复制授权链接</button>
+          <button class="btn-outline-block" @click="handleCheckAndGetAuth(currentAuthInfo.platform)">我已完成授权，重新校验</button>
         </div>
 
         <div v-else class="pop-action-btns">
-          <button class="btn-primary-block" @click="isAuthModalOpen = false">我知道了</button>
+          <button class="btn-primary-block" @click="closeAccountAuth">我知道了</button>
         </div>
       </div>
     </div>
@@ -580,12 +546,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js"></script>
-<script src="/static/js/session.js"></script>
-<script src="/static/js/format.js"></script>
-<script src="/static/js/browser.js"></script>
-<script src="/static/js/feeds.js"></script>
-<script src="/static/js/account.js"></script>
-<script src="/static/js/app.js"></script>
+<script src="/static/js/api.js?v=tb-20261104"></script>
+<script src="/static/js/session.js?v=tb-20261104"></script>
+<script src="/static/js/format.js?v=tb-20261104"></script>
+<script src="/static/js/browser.js?v=tb-20261104"></script>
+<script src="/static/js/feeds.js?v=tb-20261104"></script>
+<script src="/static/js/account.js?v=tb-20261104"></script>
+<script src="/static/js/app.js?v=tb-20261104"></script>
 </body>
 </html>

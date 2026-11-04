@@ -4,7 +4,7 @@ from typing import Dict, Any
 from urllib.parse import urlencode, urlsplit
 from adapters.base import BasePlatformAdapter, build_command_text
 from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id
-from config import PDD_CLIENT_ID, PDD_CLIENT_SECRET, PDD_PID, logger
+from config import PDD_CLIENT_ID, PDD_CLIENT_SECRET, PDD_PID, logger, settings
 from infrastructure.pdd_client import (
     call_pdd_api,
     clean_goods_item,
@@ -24,16 +24,13 @@ class PddAdapter(BasePlatformAdapter):
     platform_name = "拼多多"
     recommendation_limit = 400
     channels = (
-        {"channel_type": 5, "name": "实时热销", "icon": "fire"},
-        {"channel_type": 1, "name": "今日爆款", "icon": "crown"},
-        {"channel_type": 6, "name": "百亿补贴", "icon": "diamond"},
-        {"channel_type": 3, "name": "高佣优选", "icon": "tag"},
-        {"channel_type": 4, "name": "秒杀抢购", "icon": "clock"},
-        {"channel_type": 7, "name": "品牌大促", "icon": "star"},
+        {"channel_type": 5, "name": "实时热销榜", "icon": "fire"},
+        {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
     )
     legacy_order_statuses = {"refund": [4], "settled": [3, 5]}
 
-    def __init__(self, client_id=PDD_CLIENT_ID, client_secret=PDD_CLIENT_SECRET, pid=PDD_PID):
+    def __init__(self, client_id=PDD_CLIENT_ID, client_secret=PDD_CLIENT_SECRET, pid=PDD_PID, enabled=None):
+        self.active = settings.pdd_enabled if enabled is None else bool(enabled)
         self.client_id = client_id
         self.client_secret = client_secret
         self.pid = pid
@@ -46,6 +43,10 @@ class PddAdapter(BasePlatformAdapter):
             else:
                 goods_sign = raw
         return ProductRef(self.platform_code, goods_id or "", goods_sign or "")
+
+    def can_prefetch_detail(self, ref: ProductRef) -> bool:
+        """后台只使用 Sign 直查，不触发 ID-only 洗链或搜索兜底。"""
+        return bool(ref.goods_sign)
 
     def warmup(self) -> None:
         from infrastructure.pdd_client import warmup
@@ -122,8 +123,10 @@ class PddAdapter(BasePlatformAdapter):
         })
         return result
 
-    def get_recommend_goods(self, channel_type=5, offset=0, limit=20, uid=None, **kwargs) -> Dict[str, Any]:
-        """400 条推荐上限是拼多多规则，不下沉到通用商品服务。"""
+    def get_recommend_goods(self, channel_type=5, offset=0, limit=20, uid=None, detail_sink=None, **kwargs) -> Dict[str, Any]:
+        """400 条推荐上限是拼多多规则；内部 detail_sink 不转发到供应商。"""
+        if channel_type not in {channel["channel_type"] for channel in self.channels}:
+            return {"status": "error", "error_code": "invalid_channel", "error_msg": "不支持的榜单", "data": []}
         if offset >= self.recommendation_limit:
             return {"status": "success", "total_count": self.recommendation_limit, "offset": offset,
                     "limit": limit, "has_more": False, "data": []}
@@ -141,7 +144,8 @@ class PddAdapter(BasePlatformAdapter):
                      for item in raw_items if item]
             return {
                 "status": "success", "total_count": response.get("total", len(items)),
-                "offset": offset, "limit": limit, "list_id": response.get("list_id", ""),
+                "offset": offset, "limit": limit, "next_offset": offset + len(raw_items),
+                "list_id": response.get("list_id", ""),
                 "has_more": len(raw_items) >= request_limit and offset + request_limit < self.recommendation_limit,
                 "data": items,
             }

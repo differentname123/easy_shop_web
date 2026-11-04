@@ -3,7 +3,8 @@
 转链接口路由：根据用户 UID 动态生成带返利归因的推广链接
 """
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
+from auth import get_optional_uid
 from pydantic import BaseModel, Field
 from services.promote_service import PromoteService
 
@@ -23,10 +24,12 @@ class ConvertRequest(BaseModel):
 
 
 @router.post("/convert")
-def convert_link(req: ConvertRequest):
+def convert_link(req: ConvertRequest, current_uid: Optional[str] = Depends(get_optional_uid)):
     """
     点击商品时生成推手专属转链及平台口令（未登录使用官方推广位缓存）
     """
+    if req.uid and req.uid.strip() != current_uid:
+        raise HTTPException(status_code=403, detail="推广归因必须使用本人已验证身份")
     goods_key = req.goods_sign or req.goods_id or ""
     return promote_service.convert_link(
         platform=req.platform,
@@ -34,7 +37,7 @@ def convert_link(req: ConvertRequest):
         goods_id=req.goods_id,
         goods_sign=req.goods_sign,
         product_url=req.product_url,
-        uid=req.uid,
+        uid=current_uid,
         title=req.title,
         price=req.price,
         coupon_amount=req.coupon_amount,

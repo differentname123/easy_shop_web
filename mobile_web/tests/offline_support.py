@@ -19,6 +19,12 @@ _CONFIG = {
     "local_mongo_password": "",
     "local_mongo_db_name": "mobile_web_offline",
     "web_auth_secret": "mobile-web-offline-test-secret-not-for-deployment",
+    "web_host": "127.0.0.1",
+    "web_log_dir": "-",
+    "web_warmup_enabled": True,
+    "web_detail_prefetch_enabled": False,
+    "pdd_dns_mode": "off",
+    "pdd_trust_env": False,
 }
 
 

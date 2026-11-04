@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""单一配置入口：100% 纯粹基于私有 JSON (config.local.json)，完全不依赖任何环境变量。"""
+"""业务配置统一从私有 JSON 读取；WEB_CONFIG_FILE 仅选择文件路径。"""
 import json
 import sys
 from dataclasses import dataclass, field
@@ -35,6 +35,19 @@ class Settings:
     log_level: str
     pdd_dns_mode: str
     pdd_trust_env: bool
+    pdd_enabled: bool = True
+    taobao_enabled: bool = False
+    tb_app_key: str = ""
+    tb_app_secret: str = field(default="", repr=False)
+    tb_pid: str = ""
+    tb_adzone_id: str = ""
+    tb_session: str = field(default="", repr=False)
+    tb_inviter_code: str = field(default="", repr=False)
+    hdk_api_key: str = field(default="", repr=False)
+    ztk_appkey: str = field(default="", repr=False)
+    ztk_sid: str = field(default="", repr=False)
+    detail_prefetch_enabled: bool = True
+    detail_prefetch_interval_seconds: int = 300
 
 
 def app_path(value) -> Path:
@@ -104,6 +117,17 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
     pdd_client_id = text("myself_pdd_client_id").strip()
     pdd_client_secret = text("myself_pdd_client_secret")
     pdd_pid = text("myself_pdd_pid").strip()
+    tb_app_key = text("myself_taobao_app_key").strip()
+    tb_app_secret = text("myself_taobao_app_secret")
+    tb_pid = text("myself_taobao_pid").strip()
+    tb_adzone_id = text("taobao_adzone_id").strip()
+    if not tb_adzone_id and tb_pid.startswith("mm_"):
+        parts = tb_pid.split("_")
+        if len(parts) == 4 and all(part.isdigit() for part in parts[1:]):
+            tb_adzone_id = parts[-1]
+    pdd_enabled = _boolean(values.get("pdd_enabled", True), "pdd_enabled")
+    taobao_enabled = _boolean(values.get("taobao_enabled", bool(tb_app_key and tb_app_secret and tb_adzone_id)),
+                              "taobao_enabled")
     auth_secret = text("web_auth_secret")
     mongo_user = text("local_mongo_user")
     mongo_password = text("local_mongo_password")
@@ -121,10 +145,19 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
         raise SettingsError("local_mongo_user 与 local_mongo_password 必须同时配置或同时留空")
 
     if require_credentials:
-        missing = [key for key, value in (("myself_pdd_client_id", pdd_client_id),
-                   ("myself_pdd_client_secret", pdd_client_secret), ("myself_pdd_pid", pdd_pid)) if not value.strip()]
+        required = []
+        if pdd_enabled:
+            required.extend((("myself_pdd_client_id", pdd_client_id),
+                             ("myself_pdd_client_secret", pdd_client_secret), ("myself_pdd_pid", pdd_pid)))
+        if taobao_enabled:
+            required.extend((("myself_taobao_app_key", tb_app_key),
+                             ("myself_taobao_app_secret", tb_app_secret),
+                             ("taobao_adzone_id / myself_taobao_pid", tb_adzone_id)))
+        missing = [key for key, value in required if not value.strip()]
         if missing:
             raise SettingsError("缺少必需配置：" + ", ".join(missing))
+        if not pdd_enabled and not taobao_enabled:
+            raise SettingsError("至少需要启用一个联盟平台")
         if len(auth_secret.strip()) < 32 or auth_secret == LEGACY_AUTH_SECRET or auth_secret.lower().startswith("change-me"):
             raise SettingsError("web_auth_secret 必须是至少 32 字符的私有密钥；请在 config.local.json 中配置")
 
@@ -141,6 +174,17 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
     mongo_port = _port(values.get("local_mongo_port", 27017), "local_mongo_port")
     warmup_enabled = _boolean(values.get("web_warmup_enabled", True), "web_warmup_enabled")
     trust_env = _boolean(values.get("pdd_trust_env", sys.platform != "win32"), "pdd_trust_env")
+    detail_prefetch_enabled = _boolean(
+        values.get("web_detail_prefetch_enabled", warmup_enabled), "web_detail_prefetch_enabled")
+    interval = values.get("web_detail_prefetch_interval_seconds", 300)
+    if isinstance(interval, bool) or not isinstance(interval, (str, int)):
+        raise SettingsError("web_detail_prefetch_interval_seconds 必须是 60 到 300 的整数")
+    try:
+        detail_prefetch_interval_seconds = int(interval)
+    except (TypeError, ValueError):
+        raise SettingsError("web_detail_prefetch_interval_seconds 必须是 60 到 300 的整数") from None
+    if not 60 <= detail_prefetch_interval_seconds <= 300:
+        raise SettingsError("web_detail_prefetch_interval_seconds 必须是 60 到 300 的整数")
 
     return Settings(
         pdd_client_id=pdd_client_id, pdd_client_secret=pdd_client_secret, pdd_pid=pdd_pid,
@@ -150,9 +194,16 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
         web_port=web_port,
         auth_secret=auth_secret,
         warmup_enabled=warmup_enabled,
+        detail_prefetch_enabled=detail_prefetch_enabled,
+        detail_prefetch_interval_seconds=detail_prefetch_interval_seconds,
         log_dir=None if log_dir in {"", "-"} else app_path(log_dir), log_level=log_level,
         pdd_dns_mode=dns_mode,
         pdd_trust_env=trust_env,
+        pdd_enabled=pdd_enabled, taobao_enabled=taobao_enabled,
+        tb_app_key=tb_app_key, tb_app_secret=tb_app_secret, tb_pid=tb_pid, tb_adzone_id=tb_adzone_id,
+        tb_session=text("taobao_session").strip(), tb_inviter_code=text("taobao_inviter_code").strip(),
+        hdk_api_key=text("haodanku_api_key").strip(),
+        ztk_appkey=text("zhetaoke_appkey").strip(), ztk_sid=text("zhetaoke_sid").strip(),
     )
 
 

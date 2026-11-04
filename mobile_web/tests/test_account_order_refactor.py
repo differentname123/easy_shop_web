@@ -361,18 +361,22 @@ def orders(monkeypatch):
     repo.upsert_orders.side_effect = lambda orders, platform: len(orders)
     monkeypatch.setattr(order_module, "require_adapter", lambda platform: adapter)
     monkeypatch.setattr(order_module, "get_adapter", MagicMock(return_value=adapter))
-    return order_module.OrderService(repo), adapter, repo
+    sync_repo = MagicMock()
+    sync_repo.get_state.return_value = None
+    user_repo = MagicMock()
+    user_repo.get_uid_by_platform_identity.return_value = None
+    return order_module.OrderService(repo, sync_repo=sync_repo, user_repo=user_repo), adapter, repo
 
 
 def run_sync(service, end_time=200000):
-    assert order_module._SYNC_LOCK.acquire(blocking=False)
+    assert order_module._platform_lock("future_shop").acquire(blocking=False)
     service._sync_platform_orders_bg("future_shop", end_time)
-    assert not order_module._SYNC_LOCK.locked()
+    assert not order_module._platform_lock("future_shop").locked()
 
 
 def test_busy_lock_returns_local_data_without_start_or_sdk(orders):
     service, adapter, repo = orders
-    assert order_module._SYNC_LOCK.acquire(blocking=False)
+    assert order_module._platform_lock("future_shop").acquire(blocking=False)
     try:
         with patch.object(order_module.threading, "Thread") as thread:
             result = service.sync_and_query_orders("future_shop", "u_a", days=0, force_sync=True)
@@ -383,7 +387,7 @@ def test_busy_lock_returns_local_data_without_start_or_sdk(orders):
         assert repo.query_user_orders.call_args.kwargs["start_timestamp"] is None
         assert repo.query_user_orders.call_args.kwargs["legacy_order_statuses"] == adapter.legacy_order_statuses
     finally:
-        order_module._SYNC_LOCK.release()
+        order_module._platform_lock("future_shop").release()
 
 
 def test_thread_start_failure_releases_lock_and_preserves_success_watermark(orders):
@@ -392,7 +396,7 @@ def test_thread_start_failure_releases_lock_and_preserves_success_watermark(orde
     with patch.object(order_module.threading, "Thread") as thread:
         thread.return_value.start.side_effect = RuntimeError("thread unavailable")
         result = service.sync_and_query_orders("future_shop", "u_a")
-    assert not order_module._SYNC_LOCK.locked()
+    assert not order_module._platform_lock("future_shop").locked()
     assert result["data"]["last_sync_time"] == 123
     assert result["data"]["sync_status"] == "error"
     assert result["data"]["last_sync_attempt_time"] > 123
@@ -455,11 +459,11 @@ def test_complete_empty_window_advances_only_success_watermark(orders):
 def test_query_database_failure_returns_error_envelope(orders):
     service, _, repo = orders
     repo.query_user_orders.side_effect = RuntimeError("offline")
-    assert order_module._SYNC_LOCK.acquire(blocking=False)
+    assert order_module._platform_lock("future_shop").acquire(blocking=False)
     try:
         result = service.sync_and_query_orders("future_shop", "u_a")
     finally:
-        order_module._SYNC_LOCK.release()
+        order_module._platform_lock("future_shop").release()
     assert result["status"] == "error" and "data" not in result
 
 

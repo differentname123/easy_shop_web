@@ -1,6 +1,6 @@
 # mobile_web
 
-移动端导购与推广佣金查询应用。当前实际接入 **拼多多**；淘宝、京东仅保留明确禁用的兼容占位，不包含真实授权、查询、转链或订单实现。
+移动端导购与推广佣金查询应用。支持 **拼多多、淘宝联盟**，京东仍为禁用占位。两平台只保留实时和今日两个榜单；淘宝榜单由好单库提供ID，商品信息 / 推广链接由淘宝官方核准，订单由折淘客查询。启用方式与真实联调限制见 [多平台接入说明](PLATFORMS.md)。
 
 ## 功能全景与业务边界
 
@@ -32,14 +32,14 @@
 | 平台授权 | 本人是否已完成该平台推广所需授权 | `bind / we_app_info` 等既有兼容字段保留；不把某个平台备案细节扩散成通用业务分支。 |
 | 登录身份与推广归因 | 私有资料/订单以有效令牌 UID 为准；推广 UID 是另一作用域 | 当前页面登录后用本人 UID，游客用站长默认推广位。分享 URL 的 UID 不用于游客转链，也不能成为登录凭据。 |
 
-保留 `goods_id / product_id`、`brand / brand_name` 等既有字段别名，是为了兼容接口和历史数据；不为命名整齐而全局改名、迁移集合或新增一套通用模型框架。后端推广接口仍兼容匿名和显式推广 UID，不改变已有外部调用方式。
+保留 `goods_id / product_id`、`brand / brand_name` 等既有字段别名，是为了兼容接口和历史数据；不为命名整齐而全局改名或迁移业务集合。推广接口允许匿名；个人归因以有效令牌为准，旧 `uid` 参数只能与令牌本人一致，不能再单凭请求UID生成个人渠道链接。
 
 ## 模块边界
 
 ```text
 run.py                     单目录启动、本地校验、显式 Mongo ping
 main.py                    HTTP 装配、生命周期、静态页面、日志
-infrastructure/            本地 Mongo、PDD SDK/传输、日志基础设施
+infrastructure/            Mongo、PDD/TOP网关、好单库/折淘客HTTP、配置与日志
 scripts/init_config.py     一次性提取旧配置并初始化私有认证密钥
 api/                       请求校验、认证依赖、调用应用服务
 services/                  业务编排、缓存、授权有效期、后台同步节流
@@ -62,7 +62,7 @@ static/js/
 
 `create_app()` 负责 HTTP 装配，仓储首次使用时才连接 Mongo、初始化索引；索引失败不会永久标记为成功。启动预热复用已装配的首页商品服务，不再私自创建另一套真实仓储。
 
-## 以后如何接平台（本次不实现）
+## 以后如何接平台
 
 1. 在 `adapters/` 实现现有 `BasePlatformAdapter` 契约。
 2. 在 `adapters/__init__.py` 的显式装配表登记适配器。
@@ -70,7 +70,7 @@ static/js/
 
 通用商品、推广、授权和订单编排不需要另复制一套。API 平台参数验证代码格式，实际可用性由装配表判断。`GET /api/home/platforms` 的元信息已被前端平台筛选消费。
 
-这**不意味着整套前端已完全动态多平台化**：目前首页、授权与订单页面仍针对实际接入的拼多多，真正接入新平台时应按其实际能力补充页面。不得将历史本地库中的其他平台商品或占位类误当成已完成平台业务。
+首页、授权和订单页面消费同一平台元信息及能力字典，平台和会话隔离推荐 / 搜索缓存与迟到响应。新平台提供标准契约即可复用已有流程；特殊交互仍需按实际能力验收。历史本地库中的商品不代表对应平台在线能力已经启用。
 
 ## 商品身份、内容及缓存
 
@@ -92,13 +92,31 @@ static/js/
 - 上游故障可返回有效陈旧内容并标记 `source=database_fallback`，但不把降级内容写入正常 TTL 缓存，以便恢复后立即重试。
 - 真实零佣金、零券额保持零；未知保障、评分、库存保持空，不虚构补贴、最低价或服务承诺。
 
+### 后台准备热门详情
+
+- 后台复用同一套商品服务，不新增前端预取请求。启用后在启动及每5分钟准备各已启用平台前两个榜单首屏，各最多20件；不翻页、不扫描全库。
+- 淘宝榜单已取得官方完整联盟详情，通过内部`detail_sink`传递公开快照，立即预热匿名详情内存，再异步保存Mongo；不会为了预取重复查询一遍详情。列表HTTP及推荐缓存仍只有摘要，不夹带内部快照、原始响应或推广数据。
+- 拼多多仅对有Sign且缺失、过期或临近到期的商品补详情；后台不执行ID-only洗链。推荐、搜索和用户实际看到的本地列表也可提交前20件候选，冷门商品仍保留原有按需读取。
+- 单个生命周期托管worker、最多128项任务（含在途）、原子去重、队满非阻塞丢弃、最多两次尝试。新推荐的全部摘要仍按小批量保存，也由该worker管理，不按商品创建线程。
+- 临期阈值为周期加约30秒，后台提前刷新；前台继续使用尚有效快照。前后台同平台、同UID作用域、同类型主标识的在途请求单飞；匿名预取不混入个人推广上下文。
+- Mongo详情使用来源时间CAS，内存比较/发布在同一锁内完成，旧预取不能回滚较新完整详情。写库失败只重试已有快照，内存可用及旧库降级不等于“详情已入库”。
+- 关机拒收新任务、丢弃未执行项并等待在途调用结束；停止及退避可唤醒，但不能强杀同步HTTP，也不承诺固定秒数退出。import和服务构造不会自行启动worker。
+- 冷启动首个用户、队列满和上游故障仍可能走按需查询，不能把该功能描述成所有历史商品永久秒开。多ASGI进程也不会共享预取去重。
+
+| JSON字段 | 默认 / 行为 |
+| --- | --- |
+| `web_detail_prefetch_enabled` | 缺省跟随`web_warmup_enabled`，显式false关闭。 |
+| `web_detail_prefetch_interval_seconds` | 默认300，允许60～300秒；详情来源有效期仍为600秒，不因刷新周期改写。 |
+
+两开关均为true时执行主动首屏周期；显式prefetch=true但warmup=false时只处理用户列表触发，不主动拉榜。旧warmup=false配置缺省不新增后台请求。配置及后端代码修改后需重启/热重载对应进程；不会自动重启用户已运行的服务。离线测试配置显式关闭自动预取，专门测试注入完整替身后才开启。
+
 ### 推广只缓存生链结果，文案按当前请求生成
 
-- 推广内存键包含平台、主标识类型/值、URL、归因 UID；**先查缓存，miss 后才补全可信身份**，Sign 热命中不再查询 Mongo。
+- 推广内存键包含平台、主标识类型/值、URL、归因UID；渠道型平台先核验用户身份并加入身份指纹。商品Sign辅助身份仍在缓存miss后补全；PDD热命中不额外查商品Mongo。
 - 缓存有效链接、唤起协议等兼容字段，不缓存本次标题/价格生成的 `command_text`。每次返回都由适配器按当前请求重建文案，历史缓存中的旧文案也不直接复用。
-- 无有效链接的伪成功及 `is_fallback` 降级链接不进入正常缓存；返回值防御性复制，不能跨 UID 串链。
+- 无有效链接、`is_fallback`及`cacheable:false`均不进正常缓存；平台口令凭证参与本次文案重建，返回值防御性复制，不能跨UID串链。
 - 仅匿名、身份已知的正常推广结果持久化到 `products.default_promotion`；URL-only 只使用内存 URL 作用域缓存，不捏造商品身份。
-- 新 `default_promotion_expires_at` 明确按 UTC 保存三天来源截止时间。旧文档无可信截止时间、时间非法/过期时按 miss 按需重建；不猜历史本地时区，不迁移或删除商品。
+- `default_promotion_expires_at`按UTC保存，取公共上限三天与平台来源有效期中的较早值；淘宝口令来源未给有效期时不长效缓存。旧文档无可信截止时间或已过期则miss重建，不迁移或删除商品。
 - 数据库推广结果回填内存也保留原截止时间，不重新续期。现有内存容器最多保留30分钟；截止时间不出现在 HTTP 响应。
 - 详情页不长期保存成功转链结果，只合并同一完整 payload/会话的进行中请求。后续购买/复制再次请求后端，避免页面永久保留旧文案；卸载或会话变更后旧操作不能复制、导航或恢复账户。
 
@@ -117,7 +135,7 @@ static/js/
 
 **本轮没有连接真实数据库，不能断言生产缺索引或给出性能倍数。** 已验证的是代码查询形状、字段投影、索引声明，以及推广热命中不调用仓储。上线前应核对现有索引，评估首次索引创建负载，再在受控环境使用实际请求分布及 `explain(executionStats)` 检查默认排序、价格排序、类目和关键词查询；索引初始化仍沿用既有首次访问机制。
 
-本地爆单库 `total_count` 保留探测下界语义，翻页使用 `has_more`；订单 `total_count` 是完整筛选集计数。保留 `products/users/orders` 集合和主要字段，不删除历史数据或索引。
+本地爆单库 `total_count` 保留探测下界语义，翻页使用 `has_more`；订单 `total_count` 是完整筛选集计数。保留 `products/users/orders` 集合和主要字段，仅新增轻量 `order_sync_state` 检查点，不删除历史数据或索引。
 
 ## 账户、授权与订单的正确性边界
 
@@ -130,10 +148,10 @@ static/js/
 
 ### 明确保留、需要独立处理的限制
 
-1. **订单同步仍为 best-effort**：最近23小时、默认至多5页、180秒冷却、进程内互斥。达到预算会报 `partial`，但没有持久化游标、长期离线补单或多 worker 分布式互斥；已有库统计正确不等于所有平台历史订单已入库。
-2. **缓存是进程内缓存**：多 worker 不共享命中或失效；本轮不引入分布式缓存。推荐写入/预热仍使用既有 daemon 线程，不宣称具备完整任务回收体系。
+1. **订单同步是查询触发的有界增量同步**：首次最近23小时，每次至多5页、180秒冷却、按平台进程内锁。`order_sync_state` 持久化冻结窗口与页游标，预算用完报 `partial`，后续继续；完整窗口入库后才推进水位，后续重叠5分钟。没有常驻调度、全历史回补或多worker分布式互斥；无人访问账户不会自动同步。订单原子更新管线要求 MongoDB 4.2+。
+2. **缓存与预取去重是进程内状态**：多ASGI worker不共享命中、失效或队列。详情预取和推荐批量写已由lifespan托管，关闭时等待在途工作退出；不引入分布式缓存或可靠任务投递系统。
 3. **共享数据库的采集工作流**：在线写入仍保留 `format_retry_count=999` 等隔绝离线清洗的既有标记；父项目采集器使用的匿名 `promotion_url` 与本应用推广缓存不是可直接混用的个人归因链接。数据库数据契约仍需兼容，但部署和运行不依赖父项目采集器文件；本轮不更改其工作流。
-4. **PDD 网络兼容策略**：SDK/传输实现已迁入本地 `infrastructure/`；`PDD_DNS_MODE=auto` 保留 Windows 网络优化，Linux 默认走原生 DNS；代理环境的默认信任策略也区分 Windows/Linux。不是新增平台能力，也不代表已经验证所有网络环境。
+4. **PDD 网络兼容策略**：SDK/传输实现已迁入本地 `infrastructure/`；JSON `pdd_dns_mode=auto` 保留Windows网络优化，Linux 默认走原生 DNS；代理环境的默认信任策略也区分 Windows/Linux。不是新增平台能力，也不代表已经验证所有网络环境。
 5. **没有资金钱包**：预估商品佣金、订单佣金、平台已结算状态均不能证明本系统有可提现资产；不承诺固定到账或提现日期。
 
 ## 单目录运行：依赖与配置
@@ -146,23 +164,24 @@ Mongo 已在 Debian 云服务器部署，沿用 Windows 当前的 Mongo 主机�
 
 - 跟踪的 `config.example.json` 是结构模板，不包含真实凭据，也不能直接作为可用生产配置。
 - 默认私有配置是应用目录内的 `config.local.json`。`WEB_CONFIG_FILE` 可以指定其他文件；相对路径始终锚定 `mobile_web` 目录，不随启动命令的当前目录改变。
-- 优先级为 **环境变量 > JSON > 默认值**。JSON 字段名称参照模板；迁入工具会转换支持的旧字段，不要直接复制整个父项目配置。
-- 生产不会向上搜索父级配置。首次从旧环境迁入时，显式运行 `scripts/init_config.py --source <旧JSON绝对路径>`；它只提取 Mongo、PDD 和已有的安全认证密钥，**不覆盖已存在的目标文件**。
-- 安全的已有 `WEB_AUTH_SECRET`/JSON 认证密钥应继续沿用。缺少安全密钥时，迁入工具只在首次初始化生成并持久保存一个新密钥；原公开默认值不再接受，旧 token 需重新登录。不要在每次启动或部署时生成新密钥，也不要任意轮换有效密钥。
+- **业务配置只读取 JSON；不使用同名环境变量覆盖。** `WEB_CONFIG_FILE` 或 `run.py --config` 仅选择JSON文件，监听 / 预热 / 日志也在JSON中配置。字段名称参照模板，不要直接复制整个父项目配置。
+- 生产不会向上搜索父级配置。首次从旧环境迁入时，显式运行 `scripts/init_config.py --source <旧JSON绝对路径>`；它只提取Mongo、联盟及第三方凭据白名单和已有的安全认证密钥，**不覆盖已存在的目标文件**。
+- 安全的已有 JSON `web_auth_secret` 认证密钥应继续沿用。缺少安全密钥时，迁入工具只在首次初始化生成并持久保存一个新密钥；原公开默认值不再接受，旧 token 需重新登录。不要在每次启动或部署时生成新密钥，也不要任意轮换有效密钥。
 - 全新配置可按模板创建私有 JSON，填写实际凭据与至少32字符的随机认证密钥。不要把密钥、私有 JSON、`.env`、日志或证书提交到 Git 或打进镜像。
 
-| 环境变量 | 含义 / 默认值 |
+| JSON字段 | 含义 / 默认值 |
 | --- | --- |
-| `PDD_CLIENT_ID`、`PDD_CLIENT_SECRET`、`PDD_PID` | 当前拼多多联盟凭据和推广位；沿用原值。 |
-| `MONGO_HOST`、`MONGO_PORT`、`MONGO_USER`、`MONGO_PASSWORD` | 当前 Mongo 连接值；常规端口默认 `27017`。 |
-| `MONGO_DB_NAME`、`MONGO_AUTH_SOURCE` | 业务数据库及认证库；必须与现有 Mongo 用户实际配置一致。 |
-| `WEB_AUTH_SECRET` | 私有认证密钥，至少32字符，拒绝历史公开默认值；无安全配置时不能用旧默认密钥启动。 |
-| `WEB_HOST`、`WEB_PORT` | 默认 `127.0.0.1:8000`；未设置 `WEB_PORT` 时兼容 `PORT`。命令行 `--host/--port` 可显式覆盖监听值。 |
-| `WEB_WARMUP_ENABLED` | 默认 `1`；设为 `0` 或使用 `--no-warmup` 禁止启动预热。 |
-| `WEB_LOG_DIR` | 默认 `runtime/logs`，相对路径锚定应用目录；空字符串或 `-` 禁用文件日志，控制台仍有日志。 |
-| `WEB_LOG_LEVEL` | 日志级别，例如 `INFO`。 |
-| `PDD_DNS_MODE` | `auto / on / off`，默认 `auto`：Windows 保留优化、Linux 使用原生 DNS；特殊网络问题才显式调整。 |
-| `PDD_TRUST_ENV` | 是否信任 requests 代理等环境设置；默认 Windows `0`、Linux `1`。 |
+| `myself_pdd_client_id`、`myself_pdd_client_secret`、`myself_pdd_pid` | 拼多多联盟凭据和推广位；沿用原值。 |
+| `pdd_enabled`、`taobao_enabled` | 启用平台；PDD默认启用。旧JSON未写淘宝开关时，仅在官方凭据 / 推广位完整时自动启用。 |
+| 淘宝 / 好单库 / 折淘客字段 | 见 [PLATFORMS.md](PLATFORMS.md#配置淘宝)，密钥只放私有JSON。 |
+| `local_mongo_host`、`local_mongo_port`、`local_mongo_user`、`local_mongo_password` | 现有Mongo连接，端口默认27017，MongoDB要求4.2+。 |
+| `local_mongo_db_name`、`mongo_auth_source` | 业务数据库及认证库，与Mongo已有用户一致。 |
+| `web_auth_secret` | 至少32字符的私有认证密钥，拒绝历史公开默认值。 |
+| `web_host`、`web_port` | 模板设127.0.0.1:8000；解析器未配置host时默认0.0.0.0，公网部署须显式限制。 |
+| `web_warmup_enabled` | 默认true；设false禁止主动启动/周期热榜，但真实业务API仍可能读写Mongo / 请求平台。 |
+| `web_detail_prefetch_enabled`、`web_detail_prefetch_interval_seconds` | 后台公开详情准备开关及周期，详见上文；不生成个人推广或订单任务。 |
+| `web_log_dir`、`web_log_level` | 日志目录默认runtime/logs；空字符串或`-`只写控制台；默认级别INFO。 |
+| `pdd_dns_mode`、`pdd_trust_env` | DNS模式auto/on/off；是否信任代理环境默认Windows false、Linux true。 |
 
 `run.py` 默认单进程、单 worker、不开热重载。`--reload` 仅供开发；多 worker 不能共享当前进程内缓存或订单同步锁，不作为本方案生产默认值。默认入口为 **`python /绝对路径/mobile_web/run.py`**，无需仓库包名或 `--app-dir ../..`。
 
@@ -202,10 +221,10 @@ W:/project/python_project/easy_shop/app/mobile_web/.venv/Scripts/python.exe W:/p
 W:/project/python_project/easy_shop/app/mobile_web/.venv/Scripts/python.exe W:/project/python_project/easy_shop/app/mobile_web/run.py
 ```
 
-只检查真实入口的页面、静态资源和存活接口时，可改用下条命令（与上条二选一）。这**不是离线模式**：访问真实业务 API 仍可能连接 Mongo/PDD。
+只检查真实入口的页面、静态资源和存活接口时，先在所选JSON设 `web_warmup_enabled:false`，再运行下条命令（与上条二选一）。这**不是离线模式**：访问真实业务API仍可能请求平台或写Mongo。
 
 ```bash
-W:/project/python_project/easy_shop/app/mobile_web/.venv/Scripts/python.exe W:/project/python_project/easy_shop/app/mobile_web/run.py --no-warmup
+W:/project/python_project/easy_shop/app/mobile_web/.venv/Scripts/python.exe W:/project/python_project/easy_shop/app/mobile_web/run.py
 ```
 
 ## Debian：venv + systemd（推荐）
@@ -304,7 +323,7 @@ sudo systemctl status mobile_web --no-pager
 sudo journalctl -u mobile_web -n 100 --no-pager
 ```
 
-服务模板启用了只读系统保护。若改为文件日志，需要先创建服务用户可写的 `runtime/logs`，修改 `WEB_LOG_DIR` 并在 unit 中仅为该目录增加 `ReadWritePaths`；不要把整个应用目录改为运行时可写。
+服务模板启用了只读系统保护。若改为文件日志，需要先创建服务用户可写的 `runtime/logs`，修改JSON `web_log_dir` 并在unit中仅为该目录增加 `ReadWritePaths`；不要把整个应用目录改为运行时可写。
 
 后续发布只更新代码和必要的依赖，不覆盖配置、不重建密钥；确认 `--check` 成功后重启。
 
@@ -372,7 +391,7 @@ docker run --rm --network none mobile-web:test
 
 ### Debian Docker 网络与私有配置
 
-**容器中的 `localhost` 不是宿主机 Mongo。** 若现有 Mongo 配置指向 Debian 宿主机回环地址，推荐 Linux Docker 的 host 网络，沿用同一连接值，不改 Mongo、不另启数据库。下面用 `--host 127.0.0.1` 显式覆盖镜像的 `WEB_HOST=0.0.0.0`，保证 host 网络下仍只暴露给本机 nginx；host 网络不用 `-p`。不要同时运行占用同一8000端口的 systemd 应用与容器。
+**容器中的 `localhost` 不是宿主机Mongo。** 若配置指向Debian宿主机回环地址，可用Linux Docker host网络沿用连接值。挂载的私有JSON必须设 `web_host:"127.0.0.1"`、`web_log_dir:"-"`，只供本机nginx访问；host网络不用`-p`。镜像中的旧WEB_*环境值不覆盖JSON。不要同时运行占同一端口的systemd应用和容器。
 
 宿主服务用户的 `0600` 配置不一定能被容器 UID10001读取。以下命令为 Docker 准备独立的受限挂载副本；仅在首次切换 Docker 或有意更新配置时执行，不修改原配置、不生成新认证密钥。启用 userns-remap/rootless Docker 时，应按实际 UID 映射调整权限，而不是放宽为全员可读。
 
@@ -385,14 +404,14 @@ sudo install -o 10001 -g 10001 -m 0400 /opt/mobile_web/config.local.json /etc/mo
 ```
 
 ```bash
-sudo docker run -d --name mobile-web --restart unless-stopped --network host --mount type=bind,src=/etc/mobile_web/config.local.json,dst=/opt/mobile_web/config.local.json,readonly mobile-web:local python /opt/mobile_web/run.py --host 127.0.0.1
+sudo docker run -d --name mobile-web --restart unless-stopped --network host --mount type=bind,src=/etc/mobile_web/config.local.json,dst=/opt/mobile_web/config.local.json,readonly mobile-web:local python /opt/mobile_web/run.py
 ```
 
-若原值本来指向远程 Mongo，可以用 bridge 网络并将8000只映射至宿主 `127.0.0.1`；如改连宿主地址，应通过明确的 `MONGO_HOST` 环境覆盖，确认 Mongo 已有绑定、防火墙和权限后再用，不能假定容器能访问宿主回环 Mongo。
+若原值本来指向远程 Mongo，可以用 bridge 网络并将8000只映射至宿主 `127.0.0.1`；如改连宿主地址，应在私有JSON明确配置 `local_mongo_host`，确认 Mongo 已有绑定、防火墙和权限后再用，不能假定容器能访问宿主回环 Mongo。
 
 Windows Docker Desktop **不能照搬 Linux host 网络步骤**。访问 Windows 宿主服务通常使用 `host.docker.internal`，但 Mongo 必须已经允许来自该网络的连接；仅替换主机名不能解决只绑定回环地址或权限不通的问题。本项目 Windows 首选前述 venv 部署；Docker Desktop 网络按实际环境另行验证，不会自动变更 Mongo 配置。
 
-镜像默认日志到 stdout/stderr（`WEB_LOG_DIR=-`）；容器 `HEALTHCHECK` 仅请求本进程 `/health`，是 **liveness，不是 Mongo/PDD readiness**。默认端口为8000，若有意变更容器监听端口，须同步调整健康检查。`--no-warmup` 仅禁止预热，不会把真实应用变成离线替身。
+在JSON设 `web_log_dir:"-"` 才会只写stdout/stderr；容器HEALTHCHECK仅查`/health`，是liveness，不是Mongo或联盟readiness。变更JSON监听端口须同步健康检查。`web_warmup_enabled:false` 仅禁止预热，不会把真实应用变成离线替身。
 
 ## 测试与验收边界
 
@@ -428,7 +447,7 @@ python -B -m uvicorn tests.preview_app:app --host 127.0.0.1 --port 8000
 
 回归重点覆盖：源 TTL 临界、可信身份与缓存别名、推广热命中零仓储访问、当前价格文案、纯缓存记录不上榜/不作详情降级、真实零值、UTC 推广截止时间、完整启动生命周期、会话/卸载后的迟到响应。Node VM 回归不能替代真实 Vue 模板及窄屏浏览器验证；内存 Mongo 替身不能替代真库执行计划检查。
 
-验收时请分开记录：① `--check` 纯本地配置/结构校验；②显式 `--check-mongo` 只读连接验证；③真实入口 `--no-warmup` 的 `/health`、页面与静态资源；④测试替身下的离线业务回归；⑤经批准的真实平台联调。前四项不能证明真实联盟授权权限、商品时效、订单归因或最终佣金结算正确。默认预热和真实业务访问仍可能触发既有 Mongo 索引/写入及 PDD 请求，应在受控环境单独验证。
+验收时请分开记录：① `--check` 纯本地配置/结构校验；②显式 `--check-mongo` 只读连接验证；③JSON禁用预热的真实入口 `/health`、页面与静态资源；④测试替身下的离线业务回归；⑤经批准的真实平台联调。前四项不能证明真实联盟授权权限、商品时效、订单归因或最终佣金结算正确。默认预热和真实业务访问仍可能触发既有 Mongo 索引/写入及 PDD 请求，应在受控环境单独验证。
 
 ### 真实入口的独立性烟测
 

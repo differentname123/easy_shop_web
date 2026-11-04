@@ -1,57 +1,68 @@
 # -*- coding: utf-8 -*-
-"""仅供浏览器回归的离线装配：运行真实路由/服务/页面，不连接联盟和 Mongo。
+"""Browser-only assembly: real routes/services/Vue, in-memory platform/user/order boundaries.
 
-生产入口仍是 main:app，不能将此测试入口用于部署。
+Never deploy this entry point. No alliance credentials, Mongo, or external HTTP are used.
 """
-import os
+import json
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
-from fastapi.responses import Response
+from urllib.parse import urlencode
 
+from fastapi.responses import HTMLResponse, Response
 from tests.offline_support import BLOCKED_CALLS, install_offline_environment
 
 install_offline_environment()
 
-from main import create_app
-from adapters import get_adapter
-from api import home, goods, promote, user, order
+from adapters import register_adapter
+from adapters.base import BasePlatformAdapter
+from adapters.pdd_adapter import PddAdapter
+from adapters.tb_adapter import TaobaoAdapter
 
-adapter = get_adapter("pdd")
 PRODUCTS = []
-for index in range(1, 10):
-    raw = {
-        "goods_id": str(10000 + index), "goods_sign": f"SMOKE_SIGN_{index}",
-        "goods_name": f"回归测试商品 {index} · 家庭日用精选", "goods_desc": "离线回归数据，不是真实商品或返利承诺。",
-        "min_group_price_yuan": 30.0 + index, "coupon_discount_yuan": 5.0,
-        "has_coupon": True, "promotion_rate": 100, "estimated_commission_yuan": round(2.6 + index / 10, 2),
-        "goods_image_url": "/test-product.svg", "mall_name": "离线测试店铺", "sales_tip": "100+",
-        "brand_name": "回归测试", "category_name": "日用",
-        "_raw_data": {"goods_gallery_urls": ["/test-product.svg", "/test-product.svg?second=1"],
-                      "coupon_remain_quantity": 7, "coupon_total_quantity": 10},
-    }
-    PRODUCTS.append(adapter._normalize_goods(raw))
+for platform, adapter_type in (("pdd", PddAdapter), ("taobao", TaobaoAdapter)):
+    for index in range(1, 10):
+        PRODUCTS.append({
+            "platform": platform, "platform_name": adapter_type.platform_name,
+            "goods_id": str(10000 + index) if platform == "pdd" or index != 1 else "",
+            "product_id": str(10000 + index) if platform == "pdd" or index != 1 else "",
+            "goods_sign": f"{platform.upper()}_SMOKE_SIGN_{index}",
+            "name": f"{adapter_type.platform_name}回归测试商品 {index} · 家庭日用精选",
+            "desc": "离线回归数据，不是真实商品、真实淘口令或返利承诺。",
+            "price": 25.0 + index, "original_price": 30.0 + index, "coupon_amount": 5.0,
+            "saved_price": 5.0, "has_coupon": True, "commission_rate": 10.0,
+            "commission_amount": round(2.6 + index / 10, 2), "image_url": "/test-product.svg",
+            "mall_name": "离线测试店铺", "sales_tip": "100+", "category_name": "日用",
+            "carousel_images": ["/test-product.svg", "/test-product.svg?second=1"],
+            "specs": [{"label": "数据来源", "value": "离线内存替身"}],
+            "service_guarantees": [], "detail_tags": [],
+            "product_url": "/detail?" + urlencode({"platform": platform, "goods_sign": f"{platform.upper()}_SMOKE_SIGN_{index}"}),
+        })
 
 
 def catalog_result(items, page=1, page_size=20, offset=None):
     start = (page - 1) * page_size if offset is None else offset
-    return {"status": "success", "data": deepcopy(items[start:start + page_size]), "total_count": len(items),
-            "has_more": start + page_size < len(items), "page": page, "page_size": page_size}
+    end = min(start + page_size, len(items))
+    return {"status": "success", "data": deepcopy(items[start:end]), "total_count": len(items),
+            "has_more": end < len(items), "page": page, "page_size": page_size, "next_offset": end}
 
 
 class MemoryProducts:
     def get_product_detail(self, key, platform="pdd", key_type=None):
         return next((deepcopy(item) for item in PRODUCTS if item["platform"] == platform and
-                     key in (item["goods_id"], item["goods_sign"])), None)
+                     key and key in (item["goods_id"], item["goods_sign"])), None)
+
     def get_product_identity(self, goods_sign, platform="pdd"):
-        item = next((item for item in PRODUCTS if item["platform"] == platform
-                     and item["goods_sign"] == goods_sign), None)
+        item = self.get_product_detail(goods_sign, platform)
         return {"platform": platform, "product_id": item["goods_id"], "goods_sign": goods_sign} if item else None
+
     def upsert_home_products(self, items, **kwargs): return len(items)
     def upsert_product_detail(self, item): return True
     def query_boom_products(self, platform="all", keyword=None, page=1, page_size=20, **kwargs):
         items = [item for item in PRODUCTS if (platform == "all" or item["platform"] == platform)
                  and (not keyword or keyword in item["name"])]
         return catalog_result(items, page, page_size)
+
     def get_categories(self, **kwargs): return ["日用"]
     def get_promotion_link_cache(self, **kwargs): return None
     def save_promotion_link_cache(self, **kwargs): return True
@@ -59,56 +70,156 @@ class MemoryProducts:
 
 class MemoryUsers:
     def __init__(self):
-        self.profile = None
+        self.profiles = {}
+        self.authorized = set()
+
     def register_or_login(self, phone, password, nickname=None, invite_code=None):
-        self.profile = {"uid": "u_12345678", "phone": phone, "nickname": nickname or "离线测试用户",
-                        "avatar": "", "invite_code": "SMOKE01", "balance": 0, "total_rebate": 0, "pending_rebate": 0,
-                        "auth_status": {"pdd": {"is_authorized": False, "bind": 0}}}
-        return deepcopy(self.profile)
-    def get_user_by_uid(self, uid):
-        return deepcopy(self.profile) if self.profile and uid == self.profile["uid"] else None
-    def update_auth_status(self, uid, platform, is_authorized, bind):
-        self.profile["auth_status"][platform] = {"is_authorized": is_authorized, "bind": bind,
-                                                 "updated_at": datetime.now(timezone.utc)}
+        uid = "u_12345678" if phone.endswith("0000") else "u_87654321"
+        self.profiles.setdefault(uid, {
+            "uid": uid, "phone": phone, "nickname": nickname or "离线测试用户",
+            "avatar": "", "invite_code": "SMOKE01", "balance": 0, "total_rebate": 0, "pending_rebate": 0,
+            "auth_status": {"pdd": {"is_authorized": False, "bind": 0}, "taobao": {"is_authorized": False, "bind": 0}},
+        })
+        return deepcopy(self.profiles[uid])
+
+    def get_user_by_uid(self, uid): return deepcopy(self.profiles.get(uid))
+
+    def update_auth_status(self, uid, platform, is_authorized, bind, extra=None):
+        profile = self.profiles.get(uid)
+        if not profile: return False
+        profile["auth_status"][platform] = {
+            "is_authorized": is_authorized, "bind": bind, "updated_at": datetime.now(timezone.utc), **(extra or {}),
+        }
         return True
+
+    def get_uid_by_platform_identity(self, platform, identity):
+        for uid, profile in self.profiles.items():
+            saved = profile["auth_status"].get(platform, {})
+            if saved.get("is_authorized") and identity and all(saved.get("identity", {}).get(key) == value for key, value in identity.items()):
+                return uid
+        return None
 
 
 class MemoryOrders:
-    def upsert_orders(self, items, **kwargs): return len(items)
-    def query_user_orders(self, **kwargs):
-        return {"total_count": 1, "total_commission": 2.7, "settled_commission": 0.0,
-                "refund_commission": 0.0, "refund_count": 0, "order_list": [{
-                    "order_sn": "SMOKE_ORDER_1", "goods_id": "10001", "goods_name": PRODUCTS[0]["name"],
-                    "goods_thumbnail_url": "/test-product.svg", "goods_quantity": 1, "order_amount_yuan": 26.0,
-                    "promotion_amount_yuan": 2.7, "order_status_desc": "已支付（离线测试）",
-                    "order_pay_time_str": "2026-11-02 12:00", "is_refund": False, "is_settled": False,
-                }]}
+    def __init__(self):
+        self.orders = []
+        for platform in ("pdd", "taobao"):
+            for uid in ("u_12345678", "u_87654321"):
+                for index, state in enumerate(("paid", "settled", "invalid", "refund"), 1):
+                    item = next(item for item in PRODUCTS if item["platform"] == platform)
+                    self.orders.append({
+                        "platform": platform, "promoter_uid": uid, "order_sn": f"{uid}_SMOKE_ORDER_{index}",
+                        "goods_id": item["goods_id"], "goods_name": item["name"], "goods_thumbnail_url": "/test-product.svg",
+                        "goods_quantity": 1, "order_amount_yuan": 26.0, "promotion_amount_yuan": 2.7,
+                        "settled_promotion_amount_yuan": 2.5 if state == "settled" else None,
+                        "order_status_desc": {"paid": "已支付（预估）", "settled": "联盟结算预估" if platform == "taobao" else "平台已结算",
+                                              "invalid": "订单失效（非退款）", "refund": "已退款"}[state],
+                        "order_pay_time": int(time.time()) - index * 3600, "order_pay_time_str": "离线测试时间",
+                        "is_refund": state == "refund", "is_invalid": state in ("invalid", "refund"), "is_settled": state == "settled",
+                    })
+
+    def upsert_orders(self, items, **kwargs):
+        for item in items:
+            self.orders = [old for old in self.orders if (old["platform"], old["order_sn"]) != (item["platform"], item["order_sn"])]
+            self.orders.append(deepcopy(item))
+        return len(items)
+
+    def assign_unmatched_orders(self, platform, identity, uid): return 0
+
+    def query_user_orders(self, platform="pdd", promoter_uid="", start_timestamp=None, **kwargs):
+        items = [item for item in self.orders if item["platform"] == platform and item["promoter_uid"] == promoter_uid
+                 and (not start_timestamp or item["order_pay_time"] >= start_timestamp)]
+        valid = [item for item in items if not item["is_invalid"] and not item["is_refund"]]
+        refunds = [item for item in items if item["is_refund"]]
+        return {"total_count": len(items), "total_commission": round(sum(item["promotion_amount_yuan"] for item in valid), 2),
+                "settled_commission": round(sum(item["settled_promotion_amount_yuan"] or 0 for item in valid if item["is_settled"]), 2),
+                "refund_commission": round(sum(item["promotion_amount_yuan"] for item in refunds), 2), "refund_count": len(refunds),
+                "order_list": deepcopy(items)}
 
 
-products = MemoryProducts()
-for service in (home.product_service, goods.product_service, promote.promote_service):
-    service.repo = products
-user.user_service.repo = MemoryUsers()
-order.order_service.repo = MemoryOrders()
-adapter.warmup = lambda: None
-adapter.get_recommend_goods = lambda offset=0, limit=20, **kwargs: catalog_result(PRODUCTS, offset=offset, page_size=limit)
-adapter.search_goods = lambda keyword, page=1, page_size=20, **kwargs: catalog_result(
-    [item for item in PRODUCTS if keyword in item["name"]], page, page_size)
-adapter.get_goods_detail = lambda goods_id_or_sign="", goods_id=None, goods_sign=None, **kwargs: {
-    "status": "success", "data": products.get_product_detail(goods_sign or goods_id or goods_id_or_sign)}
-adapter.convert_promotion_url = lambda goods_id_or_sign="", **kwargs: adapter._promotion_result(
-    f"http://localhost:{os.environ.get('PORT', '8000')}/detail?goods_id=10001", {}, kwargs.get("title", "回归商品"),
-    kwargs.get("price"), kwargs.get("coupon_amount"), "离线测试链接")
-adapter.check_authority = lambda uid: {"status": "success", "is_authorized": False, "bind": 0}
-adapter.generate_authority_url = lambda uid, **kwargs: {"status": "success", "auth_url": "/", "short_url": "/"}
-adapter.fetch_increment_orders = lambda **kwargs: {"status": "success", "order_list": [], "total_count": 0, "has_more": False}
+class MemorySync:
+    def __init__(self): self.states = {}
+    def get_state(self, platform): return deepcopy(self.states.get(platform))
+    def save_state(self, platform, state): self.states[platform] = deepcopy(state); return True
 
+
+products, users, orders, sync = MemoryProducts(), MemoryUsers(), MemoryOrders(), MemorySync()
+
+
+class PreviewAdapter(BasePlatformAdapter):
+    active = True
+    capabilities = {name: True for name in ("recommend", "search", "detail", "promotion", "authorization", "orders")}
+
+    def __init__(self, platform, adapter_type):
+        self.platform_code, self.platform_name = platform, adapter_type.platform_name
+        self.channels = deepcopy(adapter_type.channels)  # Exactly the production adapter's two authoritative ranks.
+        self.required_identity_fields = ("relation_id",) if platform == "taobao" else ()
+        self.requires_authorized_promotion = platform == "taobao"
+
+    def get_recommend_goods(self, offset=0, limit=20, cursor=None, **kwargs):
+        if isinstance(cursor, str) and cursor: offset = int(json.loads(cursor).get("offset", offset))
+        elif isinstance(cursor, dict): offset = int(cursor.get("offset", offset))
+        return catalog_result([item for item in PRODUCTS if item["platform"] == self.platform_code], offset=offset, page_size=limit)
+
+    def search_goods(self, keyword, page=1, page_size=20, **kwargs):
+        return catalog_result([item for item in PRODUCTS if item["platform"] == self.platform_code and keyword in item["name"]], page, page_size)
+
+    def get_goods_detail(self, goods_id_or_sign="", goods_id=None, goods_sign=None, **kwargs):
+        return {"status": "success", "data": products.get_product_detail(goods_sign or goods_id or goods_id_or_sign, self.platform_code)}
+
+    def convert_promotion_url(self, goods_id_or_sign="", uid=None, identity=None, **kwargs):
+        authorized = (uid, self.platform_code) in users.authorized
+        if uid and self.requires_authorized_promotion and not (identity or {}).get("relation_id"):
+            return {"status": "error", "error_code": "AUTH_REQUIRED", "need_auth": True, "auth_platform": self.platform_code,
+                    "auth_msg": "离线淘宝渠道尚未授权，请完成模拟授权后重新生成链接。"}
+        item = products.get_product_detail(kwargs.get("goods_sign") or kwargs.get("goods_id") or goods_id_or_sign, self.platform_code)
+        return {"status": "success", "final_link": item["product_url"] if item else "/", "schema_url": "", "is_fallback": bool(uid and not authorized),
+                "need_auth": bool(uid and not authorized), "auth_platform": self.platform_code,
+                "auth_msg": "离线用户尚未完成该平台模拟渠道授权。", "cacheable": False,
+                "promotion_token": "￥OFFLINE_TEST_ONLY￥" if self.platform_code == "taobao" else ""}
+
+    def check_authority(self, uid):
+        authorized = (uid, self.platform_code) in users.authorized
+        identity = {"relation_id": f"OFFLINE_RELATION_{uid}", "external_id": uid} if authorized and self.platform_code == "taobao" else {}
+        return {"status": "success", "is_authorized": authorized, "bind": 1 if authorized else 0, "identity": identity}
+
+    def generate_authority_url(self, uid, **kwargs):
+        url = "/test/authorize?" + urlencode({"platform": self.platform_code, "uid": uid})
+        return {"status": "success", "auth_url": url, "short_url": url}
+
+    def fetch_increment_orders(self, **kwargs):
+        return {"status": "success", "order_list": [], "total_count": 0, "has_more": False}
+
+
+register_adapter("pdd", PreviewAdapter("pdd", PddAdapter))
+register_adapter("taobao", PreviewAdapter("taobao", TaobaoAdapter))
+
+from main import create_app
+from api import home, goods, promote, user, order
+
+for service in (home.product_service, goods.product_service, promote.promote_service): service.repo = products
+user.user_service.repo = users
+user.user_service.order_repo = orders
+promote.promote_service.user_service = user.user_service
+order.order_service.repo = orders
+order.order_service.sync_repo = sync
+order.order_service.user_repo = users
 app = create_app()
 
 
 @app.get("/test/offline-status")
 def offline_status():
     return {"status": "error" if BLOCKED_CALLS else "ok", "blocked_external_calls": list(BLOCKED_CALLS)}
+
+
+@app.get("/test/authorize")
+def authorize(platform: str, uid: str):
+    if platform not in ("pdd", "taobao") or uid not in users.profiles:
+        return HTMLResponse("离线授权参数无效", status_code=400)
+    users.authorized.add((uid, platform))
+    return HTMLResponse('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>离线模拟授权</title>'
+                        '<body><h2>离线模拟授权已完成</h2><p>请返回原页面重新校验授权；不会连接真实平台。</p>'
+                        '<a href="/?tab=user&platform=' + platform + '">返回账户</a></body></html>')
 
 
 @app.get("/test-product.svg")

@@ -8,7 +8,9 @@
       const api = shop.createApi();
       const session = shop.createSessionStore();
       const browser = shop.createBrowserTools({ ref });
-      const account = shop.createAccount({ ref, api, session, showToast: browser.showToast });
+      const account = shop.createAccount({ ref, api, session, getPlatforms: () => feeds.platforms.value,
+        copyText: browser.copyText, showToast: browser.showToast });
+      let initialized = false;
       const currentTab = ref('home');
       const isHeaderHidden = ref(false);
       let referralUid = '';
@@ -17,16 +19,20 @@
       let bottomObserver = null;
       let observerTimer = null;
       let walletRestore = null;
-      const feeds = shop.createFeeds({ ref, api, getUid: () => account.uid.value || referralUid, showToast: browser.showToast });
+      const feeds = shop.createFeeds({ ref, api, getUid: () => account.isLoggedIn.value ? account.uid.value : '',
+        getScope: session.scope, showToast: browser.showToast });
       const restoreAccount = () => {
         if (walletRestore) return walletRestore;
         walletRestore = account.fetchUserInfo().then(restored => {
-          if (restored && currentTab.value === 'user') return account.syncAndQueryOrders(false);
+          if (initialized && restored) {
+            account.resumePendingAuthorization();
+            if (currentTab.value === 'user') return account.syncAndQueryOrders(false);
+          }
         }).finally(() => { walletRestore = null; });
         return walletRestore;
       };
       const openGoodsDetail = item => {
-        try { global.sessionStorage.setItem('current_goods_summary', JSON.stringify(item)); } catch (_) {}
+        try { global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(item)}`, JSON.stringify(item)); } catch (_) {}
         feeds.saveSearchState();
         const params = new URLSearchParams({ ...shop.goodsIdentity(item), uid: account.uid.value || referralUid });
         global.location.href = `/detail?${params}`;
@@ -49,7 +55,7 @@
       };
       let lastFeedFetchTime = 0;
       const triggerLoadFeed = tab => {
-        if (tab !== currentTab.value) return;
+        if (!initialized || tab !== currentTab.value) return;
         if (tab === 'home') {
           if (feeds.homeLoading.value || !feeds.homeHasMore.value || feeds.homeError.value) return;
         } else if (tab === 'boom') {
@@ -97,22 +103,34 @@
           });
         }, 300);
       };
-      onMounted(() => {
+      const refreshAuthorization = () => {
+        if (!global.document.hidden) account.refreshAuthorization();
+      };
+      onMounted(async () => {
         const params = new URLSearchParams(global.location.search);
         referralUid = params.get('uid') || '';
         account.formInviteCode.value = params.get('invite_code') || '';
         if (['home', 'boom', 'user'].includes(params.get('tab'))) currentTab.value = params.get('tab');
-        feeds.initializeHome(params);
-        feeds.loadHomeChannels();
-        feeds.loadPlatforms();
-        restoreAccount();
+        const boot = (async () => {
+          await restoreAccount();
+          await feeds.initialize(params);
+          account.initializeOrderPlatform(params.get('platform'));
+          initialized = true;
+          account.resumePendingAuthorization();
+          if (currentTab.value === 'user' && account.isLoggedIn.value) account.syncAndQueryOrders(false);
+        })();
+        global.addEventListener('focus', refreshAuthorization);
+        global.document.addEventListener('visibilitychange', refreshAuthorization);
         global.addEventListener('scroll', handleGlobalScroll, { passive: true });
         global.document.addEventListener('scroll', handleGlobalScroll, { passive: true });
         global.addEventListener('touchstart', onTouchStart, { passive: true });
         global.addEventListener('touchmove', onTouchMove, { passive: true });
         setupBottomObserver();
+        await boot;
       });
       onUnmounted(() => {
+        global.removeEventListener('focus', refreshAuthorization);
+        global.document.removeEventListener('visibilitychange', refreshAuthorization);
         global.removeEventListener('scroll', handleGlobalScroll);
         global.document.removeEventListener('scroll', handleGlobalScroll);
         global.removeEventListener('touchstart', onTouchStart);
@@ -123,6 +141,10 @@
         account.dispose();
         browser.dispose();
       });
+      watch(account.uid, () => {
+        if (initialized) feeds.resetSession();
+      });
+      watch(feeds.homePlatform, () => { isHeaderHidden.value = false; lastScrollTop = 0; });
       watch(currentTab, newTab => {
         isHeaderHidden.value = false;
         if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0) feeds.loadBoomGoods(true);

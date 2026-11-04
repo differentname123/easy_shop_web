@@ -70,7 +70,8 @@ def write_fake_config(path):
         "myself_pdd_pid": "standalone-pid", "local_mongo_host": "127.0.0.1",
         "local_mongo_port": 27017, "local_mongo_user": "", "local_mongo_password": "",
         "local_mongo_db_name": "standalone_never_connect", "web_auth_secret": SMOKE_SECRET,
-        "web_warmup_enabled": False, "web_log_dir": "-", "pdd_dns_mode": "off", "pdd_trust_env": False,
+        "web_warmup_enabled": False, "web_detail_prefetch_enabled": False,
+        "web_log_dir": "-", "pdd_dns_mode": "off", "pdd_trust_env": False,
     }), encoding="utf-8")
 
 
@@ -154,6 +155,7 @@ def run_worker(app_dir, forbidden_root):
             self.assertEqual(self.config.MONGO_DB_NAME, "standalone_never_connect")
             self.assertEqual(self.config.AUTH_SECRET, SMOKE_SECRET)
             self.assertFalse(self.config.settings.warmup_enabled)
+            self.assertFalse(self.config.settings.detail_prefetch_enabled)
             self.assertIsNone(self.config.settings.log_dir)
             self.assertFalse(any(isinstance(handler, logging.FileHandler) for handler in self.config.logger.handlers))
             self.assertFalse(list(app_dir.rglob("*.log")), "imports must not initialize file logging")

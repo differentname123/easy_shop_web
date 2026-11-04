@@ -10,9 +10,10 @@ import time
 from copy import deepcopy
 from typing import Dict, Any, List, Optional, Tuple
 from pymongo import UpdateOne
+from pymongo.errors import DuplicateKeyError
 from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
-from models.product import clean_product_id, normalize_platform
+from models.product import clean_product_id, normalize_platform, utc_millis
 from config import PROMOTION_LINK_TTL, logger
 
 
@@ -335,9 +336,10 @@ class ProductRepository(BaseRepository):
         return result
 
     def get_product_detail(
-        self, goods_id_or_sign: str, platform: str = "pdd", key_type: Optional[str] = None, **kwargs
+        self, goods_id_or_sign: str, platform: str = "pdd", key_type: Optional[str] = None,
+        *, strict: bool = False, **kwargs
     ) -> Optional[Dict[str, Any]]:
-        """按平台隔离查询；key_type 可为 goods_id/product_id/id 或 goods_sign/sign。"""
+        """按平台隔离查询；strict=True 传播数据库故障，避免后台误判缺失后请求平台。"""
         key = str(goods_id_or_sign).strip() if goods_id_or_sign is not None else ""
         if not key:
             return None
@@ -362,6 +364,8 @@ class ProductRepository(BaseRepository):
                 return self._normalize_doc(doc)
         except Exception as e:
             logger.warning(f"从 Mongo 反查商品详情失败: {e}")
+            if strict:
+                raise
         return None
 
     def get_product_identity(self, goods_sign: str, platform: str = "pdd") -> Optional[Dict[str, Any]]:
@@ -423,17 +427,75 @@ class ProductRepository(BaseRepository):
             logger.warning(f"[ProductRepository.upsert_home_products] 批量入库异常: {e}")
             return 0
 
+    _DETAIL_CAS_ATTEMPTS = 4
+
+    @staticmethod
+    def _detail_source_time(value: Any) -> Optional[datetime.datetime]:
+        """BSON 毫秒精度的 naive UTC；naive 来源时间与 Mongo 默认解码一样表示 UTC。"""
+        try:
+            return utc_millis(value).replace(tzinfo=None)
+        except (ValueError, OverflowError, TypeError):
+            return None
+
     def upsert_product_detail(self, detail: Dict[str, Any]) -> bool:
-        """将深度商品详情写入或更新到数据库"""
+        """按来源时间有限 CAS；仅确认本快照入库返回 True，旧/同毫秒版本返回 False。"""
         if not detail or not isinstance(detail, dict):
             return False
-        mapped = self._build_product_update(detail, detail=True)
-        if mapped is None:
+        now = self._detail_source_time(datetime.datetime.now(datetime.timezone.utc))
+        # 兼容旧调用未给时间；明确给了非法/未来时间则拒绝，不能在落库时续期。
+        source_time = self._detail_source_time(detail.get("detail_updated_at", now))
+        if source_time is None or source_time > now:
             return False
-        filter_spec, update = mapped
         try:
-            self.col.update_one(filter_spec, update, upsert=True)
-            return True
+            mapped = self._build_product_update(detail, detail=True)
+            if mapped is None:
+                return False
+            filter_spec, update = mapped
+            update["$set"]["detail_updated_at"] = source_time
+            # 身份读取不走详情可展示条件，摘要/推广身份裸记录也必须参与 CAS。
+            collection = self.col
+            inserted_id = None
+            for _ in range(self._DETAIL_CAS_ATTEMPTS):
+                doc = collection.find_one(filter_spec, {"_id": 1, "detail_updated_at": 1})
+                if doc is None:
+                    # 只有身份条件参与 upsert；匹配并发创建的文档时绝不覆盖其字段。
+                    insert_doc = {**update["$setOnInsert"], **update["$set"]}
+                    try:
+                        result = collection.update_one(
+                            filter_spec, {"$setOnInsert": insert_doc}, upsert=True,
+                        )
+                    except DuplicateKeyError:
+                        # 另一线程可能已创建/补齐可信 ID；下轮按身份重读，预算有限。
+                        continue
+                    if getattr(result, "acknowledged", False) is not True:
+                        return False
+                    inserted_id = result.upserted_id
+                    # 即使已插入，也重读确认；matched-only 的 setOnInsert 不算本快照成功。
+                    continue
+
+                stored_time = self._detail_source_time(doc.get("detail_updated_at"))
+                # 不能用本次调用开始时的 now 判定未来：阻塞期间写入的新前台来源同样合法。
+                read_now = self._detail_source_time(datetime.datetime.now(datetime.timezone.utc))
+                if stored_time is not None and stored_time <= read_now and stored_time >= source_time:
+                    return bool(inserted_id is not None and doc["_id"] == inserted_id
+                                and stored_time == source_time)
+
+                # 用所读原值（而非归一化后的值）做条件；null 与缺字段也必须区分。
+                old_time = ({"$eq": doc["detail_updated_at"], "$exists": True}
+                            if "detail_updated_at" in doc else {"$exists": False})
+                try:
+                    result = collection.update_one(
+                        {"_id": doc["_id"], "detail_updated_at": old_time},
+                        {"$set": update["$set"]}, upsert=False,
+                    )
+                except DuplicateKeyError:
+                    continue
+                if getattr(result, "acknowledged", False) is not True:
+                    return False
+                if result.matched_count == 1:
+                    return result.modified_count == 1
+                # 条件失败说明读后有新详情写入，重新判断胜出来源时间，不无条件重试覆盖。
+            return False
         except Exception as e:
             logger.warning(f"[ProductRepository.upsert_product_detail] 详情入库异常: {e}")
             return False

@@ -7,9 +7,21 @@ const vm = require('node:vm');
 const root = path.resolve(__dirname, '..');
 const scripts = path.join(root, 'static', 'js');
 const flush = async () => { for (let index = 0; index < 20; index += 1) await Promise.resolve(); };
+const platformFixtures = [
+  { code: 'pdd', name: '拼多多', active: true, capabilities: { orders: true, authorization: true } },
+  { code: 'taobao', name: '淘宝', active: true, capabilities: { orders: true, authorization: true } },
+  { code: 'jd', name: '京东', active: false },
+];
+const channelFixtures = [{ channel_type: 5, name: '适配器实时榜' }, { channel_type: 1, name: '适配器今日榜' }];
 
-function harness({ url = 'https://shop.test/', saved = {}, clipboardFailure = false } = {}) {
-  const requests = [], mounted = [], unmounted = [], copied = [], toasts = [];
+function harness({ url = 'https://shop.test/', saved = {}, sessionSaved = {}, clipboardFailure = false } = {}) {
+  const requests = [], mounted = [], unmounted = [], copied = [], toasts = [], opened = [], scrolled = [];
+  const listeners = new Map();
+  const addListener = (name, callback) => {
+    if (!listeners.has(name)) listeners.set(name, new Set());
+    listeners.get(name).add(callback);
+  };
+  const removeListener = (name, callback) => listeners.get(name)?.delete(callback);
   const watchers = new Map(), timers = new Map();
   let timerId = 0, page;
   const storage = seed => {
@@ -32,16 +44,17 @@ function harness({ url = 'https://shop.test/', saved = {}, clipboardFailure = fa
   const document = {
     documentElement: { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 },
     body: { scrollTop: 0, scrollHeight: 2000, clientHeight: 800, appendChild() {}, removeChild() {} },
-    addEventListener() {}, removeEventListener() {}, getElementById: () => null,
+    addEventListener: addListener, removeEventListener: removeListener, getElementById: () => null,
     createElement: () => ({ value: '', select() {} }), execCommand: () => true,
   };
   const context = {
     URL, URLSearchParams, document,
     location: { href: url, search: new URL(url).search },
     history: { length: 1, replaceState() {}, back() {} },
-    localStorage: storage(saved), sessionStorage: storage(),
+    localStorage: storage(saved), sessionStorage: storage(sessionSaved),
     pageYOffset: 0, innerHeight: 800, innerWidth: 375,
-    addEventListener() {}, removeEventListener() {}, scrollTo() {},
+    addEventListener: addListener, removeEventListener: removeListener,
+    scrollTo: (x, y) => scrolled.push([x, y]), open: url => opened.push(url),
     console: { warn() {}, error() {}, log() {} },
     setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
     clearTimeout: id => timers.delete(id), setInterval: () => ++timerId, clearInterval() {},
@@ -60,14 +73,26 @@ function harness({ url = 'https://shop.test/', saved = {}, clipboardFailure = fa
   load('api', 'session', 'format', 'browser', 'feeds', 'account');
   const api = context.EasyShop.createApi();
   const session = context.EasyShop.createSessionStore();
-  const makeFeeds = () => context.EasyShop.createFeeds({ ref, api, getUid: () => '', showToast: message => toasts.push(message) });
-  const makeAccount = () => context.EasyShop.createAccount({ ref, api, session, showToast: message => toasts.push(message) });
+  const makeFeeds = () => {
+    const feed = context.EasyShop.createFeeds({ ref, api, getUid: () => '', getScope: session.scope, showToast: message => toasts.push(message) });
+    // Direct controller tests have already loaded these explicit API fixtures. Composition tests exercise loading itself.
+    feed.platforms.value = [...platformFixtures];
+    feed.homeChannels.value = [...channelFixtures];
+    feed.boomPlatforms.value = [{ code: 'all', name: '全部', active: true }, ...platformFixtures];
+    return feed;
+  };
+  const makeAccount = (platforms = platformFixtures) => context.EasyShop.createAccount({ ref, api, session,
+    getPlatforms: () => platforms, copyText: text => copied.push(text), showToast: message => toasts.push(message) });
+  const summaryKey = goods => `current_goods_summary:${session.scope()}:${context.EasyShop.goodsKey(goods)}`;
+  const feedKey = (kind, platform = 'pdd') => `easy_shop_${kind}:${session.scope()}:${platform}`;
   const finish = async (index, data, { status = 200 } = {}) => {
     assert.ok(requests[index], `Request ${index} exists`);
     requests[index].resolve({ ok: status >= 200 && status < 300, status, json: async () => data });
     await flush();
   };
-  return { context, api, session, requests, mounted, unmounted, copied, timers, toasts, load, makeFeeds, makeAccount, finish, get page() { return page; } };
+  return { context, api, session, requests, mounted, unmounted, copied, timers, toasts, opened, scrolled,
+    fire: name => [...(listeners.get(name) || [])].forEach(callback => callback()),
+    load, makeFeeds, makeAccount, finish, summaryKey, feedKey, get page() { return page; } };
 }
 const goodsResponse = (id, hasMore = true) => ({ status: 'success', data: [{ goods_id: id, platform: 'pdd' }], has_more: hasMore });
 const user = (uid = 'A', token = 'token-A') => ({ uid, phone: '13800000000', nickname: uid, auth_token: token });
@@ -151,7 +176,7 @@ test('search commits a separate query so draft edits cannot corrupt pagination o
   assert.equal(query.get('page'), '2');
   await h.finish(1, goodsResponse('A2'));
   feed.saveSearchState();
-  const saved = JSON.parse(h.context.sessionStorage.getItem('easy_shop_home_search_state'));
+  const saved = JSON.parse(h.context.sessionStorage.getItem(h.feedKey('home_search_state')));
   assert.equal(saved.keyword, 'A');
   assert.equal(saved.list.length, 2);
   feed.onSearchHome();
@@ -175,7 +200,7 @@ test('business-error pagination retry requests the failed offset instead of endi
 
 test('returning from detail restores the committed list, page and terminal state', () => {
   const h = harness(), feed = h.makeFeeds();
-  h.context.sessionStorage.setItem('easy_shop_home_search_state', JSON.stringify({ keyword: 'A', list: [{ goods_id: 'A' }], page: 3, offset: 40, hasMore: false, scrollTop: 100 }));
+  h.context.sessionStorage.setItem(h.feedKey('home_search_state'), JSON.stringify({ scope: h.session.scope(), platform: 'pdd', keyword: 'A', list: [{ goods_id: 'A' }], page: 3, offset: 40, hasMore: false, scrollTop: 100 }));
   feed.initializeHome(new URLSearchParams('keyword=A'));
   assert.equal(h.requests.length, 0);
   assert.equal(feed.homeSearchKeyword.value, 'A');
@@ -264,6 +289,9 @@ test('opening the account with a saved session queries orders after authenticati
   const infoIndex = h.requests.findIndex(request => request.url === '/api/user/info');
   assert.equal(h.requests.filter(request => request.url.startsWith('/api/order/')).length, 0);
   await h.finish(infoIndex, { status: 'success', user: user() });
+  await h.finish(h.requests.findIndex(request => request.url === '/api/home/platforms'), { status: 'success', data: platformFixtures });
+  await h.finish(h.requests.findIndex(request => request.url.startsWith('/api/home/channels')), { status: 'success', data: channelFixtures });
+  await h.finish(h.requests.findIndex(request => request.url.startsWith('/api/home/recommend')), goodsResponse('A'));
   const orderIndex = h.requests.findIndex(request => request.url.startsWith('/api/order/'));
   assert.ok(orderIndex >= 0);
   assert.equal(h.requests[orderIndex].options.headers.Authorization, 'Bearer token-A');
@@ -278,12 +306,12 @@ test('homepage card navigation preserves both product keys and the selected plat
   assert.equal(query.get('goods_id'), '123');
   assert.equal(query.get('goods_sign'), 'signed');
   assert.equal(query.get('platform'), 'pdd');
-  assert.equal(JSON.parse(h.context.sessionStorage.getItem('current_goods_summary')).name, 'A');
+  assert.equal(JSON.parse(h.context.sessionStorage.getItem(h.summaryKey({ goods_id: '123', platform: 'pdd' }))).name, 'A');
 });
 
 test('detail rejects another product cache and a saved phone alone is not a session', async () => {
   const h = harness({ url: 'https://shop.test/detail?goods_id=B&goods_sign=&platform=pdd&uid=untrusted', saved: { easy_shop_phone: '13800000000', easy_shop_uid: 'old' } });
-  h.context.sessionStorage.setItem('current_goods_summary', JSON.stringify({ goods_id: 'A', goods_sign: '', platform: 'pdd' }));
+  h.context.sessionStorage.setItem(h.summaryKey({ goods_id: 'B', platform: 'pdd' }), JSON.stringify({ goods_id: 'A', goods_sign: '', platform: 'pdd' }));
   h.load('detail'); const init = h.mounted[0](); await flush();
   assert.equal(h.page.goods.value, null);
   assert.equal(h.page.isLoggedIn.value, false);
@@ -334,7 +362,7 @@ test('detail fallback links are usable but not cached as a successful activation
 
 test('detail retries retain the summary and ignore superseded detail responses', async () => {
   const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
-  h.context.sessionStorage.setItem('current_goods_summary', JSON.stringify({ goods_id: 'A', platform: 'pdd', name: 'summary' }));
+  h.context.sessionStorage.setItem(h.summaryKey({ goods_id: 'A', platform: 'pdd' }), JSON.stringify({ goods_id: 'A', platform: 'pdd', name: 'summary' }));
   h.load('detail'); const init = h.mounted[0]();
   assert.equal(h.page.goods.value.name, 'summary');
   await h.finish(0, { status: 'error' }); await init;
@@ -398,7 +426,7 @@ test('a removed detail session cannot copy or reuse an old personalized conversi
 
 test('homepage shared script dependencies exist and toast is outside the authorization backdrop', () => {
   const source = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
-  const dependencies = [...source.matchAll(/<script src="\/static\/js\/([^"]+)"/g)].map(match => match[1]);
+  const dependencies = [...source.matchAll(/<script src="\/static\/js\/([^"]+)"/g)].map(match => match[1].split('?')[0]);
   for (const name of dependencies) assert.equal(fs.existsSync(path.join(scripts, name)), true, name);
   assert.ok(dependencies.indexOf('api.js') < dependencies.indexOf('app.js'));
   assert.ok(dependencies.indexOf('account.js') < dependencies.indexOf('app.js'));
@@ -412,13 +440,27 @@ test('homepage shared script dependencies exist and toast is outside the authori
 
 test('detail HTML loads shared dependencies and the external controller exactly once', () => {
   const source = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
-  const dependencies = [...source.matchAll(/<script src="\/static\/js\/([^"]+)"/g)].map(match => match[1]);
+  const dependencies = [...source.matchAll(/<script src="\/static\/js\/([^"]+)"/g)].map(match => match[1].split('?')[0]);
   for (const name of dependencies) assert.equal(fs.existsSync(path.join(scripts, name)), true, name);
   assert.equal(dependencies.filter(name => name === 'detail.js').length, 1);
   assert.ok(dependencies.indexOf('session.js') < dependencies.indexOf('detail.js'));
   assert.ok(dependencies.indexOf('browser.js') < dependencies.indexOf('detail.js'));
   assert.equal(source.includes('const { createApp, ref, computed, onMounted } = Vue;'), false);
   assert.ok(source.includes('v-for="(guarantee, idx) in goods.service_guarantees"'));
+});
+
+test('homepage and detail use one asset version to avoid mixing stale session and new controllers', () => {
+  const versions = new Set();
+  for (const page of ['index.html', 'detail.html']) {
+    const source = fs.readFileSync(path.join(root, 'static', page), 'utf8');
+    const urls = [...source.matchAll(/(?:src|href)="(\/static\/(?:js|css)\/[^\"]+)"/g)].map(match => new URL(match[1], 'https://offline.test'));
+    assert.ok(urls.length > 4);
+    for (const url of urls) {
+      assert.ok(url.searchParams.get('v'), url.pathname);
+      versions.add(url.searchParams.get('v'));
+    }
+  }
+  assert.equal(versions.size, 1);
 });
 
 test('a transient profile server failure does not erase a valid saved token', async () => {
@@ -536,7 +578,8 @@ test('visual fixes: avatar error fallback, receipt order icon, and orderDays 0 m
   assert.ok(indexHtml.includes('10H7v-2h10v2zm0-4H7V7h10v2zm0 8H7v-2h10v2z'), 'Order section title uses receipt SVG icon');
 
   // PDD badge is CSS badge matching Taobao and JD
-  assert.ok(indexHtml.includes('>拼</span>'), 'PDD authorization card uses CSS text badge');
+  assert.ok(indexHtml.includes('class="auth-platform-icon" :class="p.code"'), 'all authorization cards reuse the CSS text badge');
+  assert.ok(indexHtml.includes('p.name.slice(0, 1)'), 'the adapter descriptor supplies each platform badge');
 
   // orderDays === 0 empty state
   assert.ok(indexHtml.includes("orderDays === 0 ? '全部历史暂无出单记录"), 'Empty order message correctly addresses all-history (0 days)');
@@ -713,7 +756,8 @@ test('conversion business failures retain the original-link fallback and allow t
   const failed = h.page.handleCopyPromoteLink(); await flush();
   await h.finish(1, { status: 'error' }, { status: 503 }); await failed;
   assert.ok(h.copied[0].includes('https://goods.test/A'));
-  assert.ok(h.copied[0].includes('¥0'));
+  assert.equal(h.copied[0], 'https://goods.test/A', 'failure falls back to the plain original URL, never an invented command or token');
+  assert.equal(JSON.parse(h.requests[1].options.body).price, 0, 'known zero price is still sent unchanged');
   assert.equal(h.page.toastMessage.value.includes('复制'), true);
   assert.equal(h.page.smartLoading.value.visible, false);
   const retry = h.page.handleCopyPromoteLink(); await flush();
@@ -750,7 +794,7 @@ test('disposing detail invalidates a pending purchase before copy or navigation'
 
 test('disposing detail while identity restoration is pending prevents conversion, copy and navigation', async () => {
   const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
-  h.context.sessionStorage.setItem('current_goods_summary', JSON.stringify({ goods_id: 'A', platform: 'pdd', name: 'A' }));
+  h.context.sessionStorage.setItem(h.summaryKey({ goods_id: 'A', platform: 'pdd' }), JSON.stringify({ goods_id: 'A', platform: 'pdd', name: 'A' }));
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } });
   const buy = h.page.handleJumpToBuy(), copy = h.page.handleCopyPromoteLink(); await flush();
@@ -772,8 +816,8 @@ test('disposing detail while identity restoration is pending prevents conversion
 test('account order statistics preserve zero and never fall back to profile placeholder balances', () => {
   const source = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const formatMoney = harness().context.EasyShop.formatMoney;
-  assert.ok(source.includes('<div class="label">订单佣金</div>'));
-  assert.ok(source.includes('<div class="label">平台已结算佣金</div>'));
+  assert.ok(source.includes("orderPlatform === 'taobao' ? '联盟预估佣金' : '订单佣金'"));
+  assert.ok(source.includes("orderPlatform === 'taobao' ? '联盟结算预估佣金' : '平台已结算佣金'"));
   assert.equal(/userProfile\.(?:balance|total_rebate)/.test(source), false);
   for (const field of ['total_commission', 'settled_commission']) {
     const expression = source.match(new RegExp(`{{\\s*(formatMoney\\(userOrdersData\\.${field}[^}]+)\\s*}}`))?.[1];
@@ -819,9 +863,10 @@ test('account and detail copy describe current attribution and unavailable capab
   assert.ok(index.includes('平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本'));
   assert.ok(index.includes('游客使用站长默认推广位，不按分享页 UID 归因'));
   assert.ok(detail.includes('游客转链使用站长默认推广位'));
-  assert.ok(index.includes("showToast('淘宝联盟暂未接入')"));
-  assert.ok(index.includes("showToast('京东联盟暂未接入')"));
-  assert.equal((index.match(/<span class="auth-status-badge unauthed">暂未接入<\/span>/g) || []).length, 2);
+  assert.ok(index.includes('v-for="p in platforms"'), 'authorization placeholders use platform descriptors');
+  assert.ok(index.includes("!supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置'"));
+  assert.equal(index.includes("handleCheckAndGetAuth('pdd')"), false, 'authorization actions are not hardcoded to one platform');
+  assert.equal(controller.includes('拼多多'), false, 'detail effects and authorization copy are platform-neutral');
   assert.ok(controller.includes('正在加载商品详情...'));
 });
 
@@ -845,5 +890,405 @@ test('detail displays auth modal when promotion needs authorization and supports
   h.page.handleProceedWithoutAuth();
   assert.equal(h.page.authModal.value.visible, false);
   assert.equal(h.copied.at(-1), 'station-command-A');
+});
+
+test('home loads only adapter-declared ranks and unconfigured Taobao does not block PDD', async () => {
+  const h = harness();
+  const feed = h.context.EasyShop.createFeeds({ ref: h.context.Vue.ref, api: h.api, getUid: () => '', getScope: h.session.scope, showToast() {} });
+  assert.equal(feed.homeChannels.value.length, 0, 'there are no built-in fallback ranks');
+  assert.equal(feed.platforms.value.length, 0, 'there is no independent platform registry in the frontend');
+  const init = feed.initialize(new URLSearchParams('platform=taobao'));
+  await h.finish(0, { status: 'success', data: platformFixtures.map(item => ({ ...item, active: item.code === 'pdd' })) });
+  assert.equal(new URL(h.requests[1].url, 'https://shop.test').searchParams.get('platform'), 'pdd');
+  await h.finish(1, { status: 'success', data: channelFixtures });
+  assert.equal(feed.homeChannels.value.length, 2);
+  assert.equal(feed.homeChannels.value[0].name, '适配器实时榜');
+  assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('platform'), 'pdd');
+  await h.finish(2, goodsResponse('PDD')); await init;
+  await feed.switchHomePlatform('jd'); await feed.switchHomePlatform('taobao');
+  assert.equal(h.requests.length, 3, 'disabled platforms never generate catalog requests');
+  const source = fs.readFileSync(path.join(scripts, 'feeds.js'), 'utf8');
+  assert.equal(/百亿补贴|高佣优选|秒杀抢购/.test(source), false);
+});
+
+test('platform switching isolates channel caches, cursor state and late page appends', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  feed.loadHomeGoods(true);
+  await h.finish(0, { ...goodsResponse('PDD'), next_offset: 20, next_cursor: 'pdd-page-2' });
+  const old = feed.loadHomeGoods(false);
+  const taobao = feed.switchHomePlatform('taobao');
+  assert.equal(feed.homeGoodsList.value.length, 0);
+  assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+  await h.finish(2, { status: 'success', data: [{ channel_type: 5, name: '淘宝适配器实时榜' }, { channel_type: 1, name: '淘宝适配器今日榜' }] });
+  const query = new URL(h.requests[3].url, 'https://shop.test').searchParams;
+  assert.equal(query.get('platform'), 'taobao'); assert.equal(query.get('offset'), '0'); assert.equal(query.has('cursor'), false);
+  await h.finish(3, { status: 'success', data: [{ goods_sign: 'TB', platform: 'taobao' }], has_more: false, next_offset: 20 }); await taobao;
+  await h.finish(1, goodsResponse('late-PDD')); await old;
+  assert.equal(feed.homeGoodsList.value[0].goods_sign, 'TB');
+  const pdd = feed.switchHomePlatform('pdd');
+  await h.finish(4, { status: 'success', data: channelFixtures }); await pdd;
+  assert.equal(h.requests.length, 5, 'switching back uses only the matching platform cache');
+  assert.equal(feed.homeGoodsList.value[0].goods_id, 'PDD');
+  feed.loadHomeGoods(false);
+  const resumed = new URL(h.requests[5].url, 'https://shop.test').searchParams;
+  assert.equal(resumed.get('offset'), '20'); assert.equal(resumed.get('cursor'), 'pdd-page-2');
+  await h.finish(5, goodsResponse('PDD2', false));
+});
+
+test('recommendation pagination consumes source offsets and opaque cursors across empty approval pages', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  feed.homePlatform.value = 'taobao';
+  feed.loadHomeGoods(true);
+  await h.finish(0, { status: 'success', data: [{ goods_sign: 'approved', platform: 'taobao' }], has_more: true,
+    next_offset: 20, next_cursor: { page: 2, position: 'opaque+/?=' } });
+  feed.loadHomeGoods(false);
+  let params = new URL(h.requests[1].url, 'https://shop.test').searchParams;
+  assert.equal(params.get('offset'), '20');
+  assert.deepEqual(JSON.parse(params.get('cursor')), { page: 2, position: 'opaque+/?=' });
+  await h.finish(1, { status: 'success', data: [], has_more: true, next_offset: 40, next_cursor: 'opaque-next' });
+  assert.equal(feed.homeHasMore.value, true, 'an empty approved page is not the end of the source');
+  assert.equal(feed.homeGoodsList.value.length, 1);
+  feed.loadHomeGoods(false);
+  params = new URL(h.requests[2].url, 'https://shop.test').searchParams;
+  assert.equal(params.get('offset'), '40'); assert.equal(params.get('cursor'), 'opaque-next');
+  await h.finish(2, { status: 'success', data: [], has_more: false, next_offset: 60 });
+  assert.equal(feed.homeHasMore.value, false);
+});
+
+test('a completely empty first approval page still allows loading the next source page', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  feed.loadHomeGoods(true);
+  await h.finish(0, { status: 'success', data: [], has_more: true, next_offset: 20 });
+  assert.equal(feed.homeHasMore.value, true);
+  feed.loadHomeGoods(false);
+  assert.equal(new URL(h.requests[1].url, 'https://shop.test').searchParams.get('offset'), '20');
+  await h.finish(1, goodsResponse('approved-next', false));
+  assert.equal(feed.homeGoodsList.value.length, 1);
+  const html = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(html.includes('!homeLoading && !homeError && homeHasMore'), 'manual continuation remains available if the sentinel stays visible');
+});
+
+test('catalog and stored search snapshots cannot cross session or platform scopes', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  h.session.saveUser(user());
+  feed.homeSearchKeyword.value = 'A'; feed.onSearchHome();
+  await h.finish(0, goodsResponse('A-private', false)); feed.saveSearchState();
+  const oldKey = h.feedKey('home_search_state');
+  assert.ok(h.context.sessionStorage.getItem(oldKey));
+  h.session.saveUser(user('B', 'token-B'));
+  const restored = h.makeFeeds(); restored.initializeHome(new URLSearchParams('keyword=A'));
+  assert.equal(h.requests.length, 2, 'a different session does not restore A search results');
+  await h.finish(1, goodsResponse('B-result', false));
+  feed.switchChannel(5);
+  assert.equal(h.requests.length, 3, 'stale displayed state cannot be stamped into the new session cache');
+  await h.finish(2, goodsResponse('B-rank', false));
+  assert.equal(feed.homeGoodsList.value[0].goods_id, 'B-rank');
+  restored.homePlatform.value = 'taobao'; restored.initializeHome(new URLSearchParams('keyword=A'));
+  assert.equal(h.requests.length, 4, 'a different platform does not restore PDD search results');
+  assert.equal(new URL(h.requests[3].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+  await h.finish(3, { status: 'success', data: [], has_more: false });
+  assert.notEqual(h.feedKey('home_search_state'), oldKey);
+  assert.equal(h.context.sessionStorage.getItem(oldKey).includes('token-A'), false, 'cache payloads do not contain credentials');
+});
+
+test('late catalog results and delayed scroll restore are ignored after a session switch', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  const pending = feed.loadHomeGoods(true);
+  h.session.saveUser(user());
+  await h.finish(0, goodsResponse('old-guest')); await pending;
+  assert.equal(feed.homeGoodsList.value.length, 0);
+  h.context.sessionStorage.setItem(h.feedKey('home_search_state'), JSON.stringify({ scope: h.session.scope(), platform: 'pdd',
+    keyword: 'A', list: [{ goods_id: 'A', platform: 'pdd' }], page: 2, offset: 20, hasMore: false, scrollTop: 350 }));
+  const restored = h.makeFeeds(); restored.initializeHome(new URLSearchParams('keyword=A'));
+  const timer = [...h.timers.values()].find(item => item.delay === 60);
+  h.session.clear(); timer.callback();
+  assert.deepEqual(h.scrolled, [], 'old account return navigation cannot move the new session viewport');
+});
+
+test('channels sessionStorage and metadata loading reject a superseded platform response', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  const old = feed.loadHomeChannels();
+  const next = feed.switchHomePlatform('taobao');
+  await h.finish(1, { status: 'success', data: [{ channel_type: 5, name: 'TB实时' }, { channel_type: 1, name: 'TB今日' }] });
+  await h.finish(2, { status: 'success', data: [], has_more: false }); await next;
+  await h.finish(0, { status: 'success', data: channelFixtures }); await old;
+  assert.equal(feed.homeChannels.value[0].name, 'TB实时');
+  assert.equal(h.context.sessionStorage.getItem(h.feedKey('home_channels', 'pdd')), null);
+  assert.equal(JSON.parse(h.context.sessionStorage.getItem(h.feedKey('home_channels', 'taobao')))[0].name, 'TB实时');
+});
+
+test('a personalized promotion carries its verified bearer token and copies the server real-token text verbatim', async () => {
+  const h = harness({ url: 'https://shop.test/detail?platform=taobao&goods_sign=TB&uid=SHARER', saved: { easy_shop_token: 'token-A' } });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(0, { status: 'success', user: user() });
+  await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝联盟', name: 'TB' } }); await init;
+  const copy = h.page.handleCopyPromoteLink(); await flush();
+  assert.equal(h.requests[2].options.headers.Authorization, 'Bearer token-A');
+  assert.equal(JSON.parse(h.requests[2].options.body).uid, 'A');
+  const command = '平台提供完整文案\n￥REAL_PLATFORM_TOKEN￥\nhttps://buy.test/TB';
+  await h.finish(2, { status: 'success', final_link: 'https://buy.test/TB', promotion_token: '￥REAL_PLATFORM_TOKEN￥', command_text: command }); await copy;
+  assert.deepEqual(h.copied, [command]);
+  assert.equal(h.page.platformName.value, '淘宝联盟');
+  assert.equal(h.page.toastMessage.value.includes('淘宝联盟'), true);
+});
+
+test('promotion 401 clears the session and never copies an original-link fallback', async () => {
+  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(0, { status: 'success', user: user() });
+  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', product_url: 'https://goods.test/A' } }); await init;
+  const copy = h.page.handleCopyPromoteLink(); await flush();
+  assert.equal(h.requests[2].options.headers.Authorization, 'Bearer token-A');
+  await h.finish(2, { detail: 'expired' }, { status: 401 }); await copy;
+  assert.equal(h.session.token(), ''); assert.equal(h.page.isLoggedIn.value, false); assert.equal(h.copied.length, 0);
+});
+
+test('AUTH_REQUIRED business errors open Taobao authorization without inventing a station link', async () => {
+  const h = harness({ url: 'https://shop.test/detail?platform=taobao&goods_sign=TB', saved: { easy_shop_token: 'token-A' } });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(0, { status: 'success', user: user() });
+  await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝', product_url: 'https://goods.test/TB' } }); await init;
+  const buy = h.page.handleJumpToBuy(); await flush();
+  await h.finish(2, { status: 'error', error_code: 'AUTH_REQUIRED', need_auth: true, auth_platform: 'taobao', auth_msg: '请授权淘宝渠道' }); await buy;
+  assert.equal(h.page.authModal.value.visible, true); assert.equal(h.page.authModal.value.platformName, '淘宝');
+  assert.equal(h.page.authModal.value.pendingInfo.final_link, undefined); assert.equal(h.copied.length, 0);
+  const auth = h.page.handleGoToAuth();
+  assert.equal(new URL(h.requests[3].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+  assert.equal(h.requests[3].options.headers.Authorization, 'Bearer token-A');
+  await h.finish(3, { status: 'success', platform: 'taobao', platform_name: '淘宝', is_authorized: false, auth_url: 'https://auth.test/TB-A' }); await auth;
+  assert.deepEqual(h.opened, ['https://auth.test/TB-A']);
+  const marker = JSON.parse(h.context.sessionStorage.getItem('easy_shop_pending_authorization'));
+  assert.equal(marker.platform, 'taobao'); assert.equal(marker.scope, h.session.scope());
+  assert.equal(JSON.stringify(marker).includes('token-A'), false);
+  h.fire('focus'); await flush();
+  assert.equal(h.requests.length, 5, 'returning from authorization rechecks the user authorization endpoint');
+  await h.finish(4, { status: 'success', platform: 'taobao', platform_name: '淘宝', is_authorized: true });
+  assert.equal(h.page.authModal.value.visible, false);
+  assert.equal(h.requests.filter(request => request.url === '/api/promote/convert').length, 1, 'authorization confirmation requires a new explicit promotion action');
+});
+
+for (const invalidation of ['logout', 'switch-token', 'dispose']) {
+  test(`late detail authorization cannot open or copy an old URL after ${invalidation}`, async () => {
+    const h = harness({ url: 'https://shop.test/detail?platform=taobao&goods_sign=TB', saved: { easy_shop_token: 'token-A' } });
+    h.load('detail'); const init = h.mounted[0]();
+    await h.finish(0, { status: 'success', user: user() });
+    await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝' } }); await init;
+    const copy = h.page.handleCopyPromoteLink(); await flush();
+    await h.finish(2, { status: 'error', need_auth: true, auth_platform: 'taobao' }); await copy;
+    const auth = h.page.handleGoToAuth();
+    if (invalidation === 'logout') h.session.clear();
+    else if (invalidation === 'switch-token') h.context.localStorage.setItem('easy_shop_token', 'token-B');
+    else h.page.dispose();
+    await h.finish(3, { status: 'success', platform: 'taobao', is_authorized: false, auth_url: 'https://auth.test/OLD-A' }); await auth;
+    assert.equal(h.opened.length, 0); assert.equal(h.copied.length, 0);
+  });
+}
+
+test('account orders are isolated by platform and date, including unavailable capability and stable keys', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), account = h.makeAccount();
+  account.isLoggedIn.value = true; account.uid.value = 'A';
+  account.syncAndQueryOrders(); account.switchOrderPlatform('taobao'); account.switchOrderDays(30);
+  assert.equal(new URL(h.requests[1].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+  assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('days'), '30');
+  await h.finish(2, { status: 'success', data: { platform: 'taobao', query_days: 30, order_list: [{ platform: 'taobao', order_sn: 'same-sn' }] } });
+  await h.finish(1, { status: 'success', data: { platform: 'taobao', query_days: 7, order_list: [{ order_sn: 'old-date' }] } });
+  await h.finish(0, { status: 'success', data: { platform: 'pdd', order_list: [{ order_sn: 'old-platform' }] } });
+  assert.equal(account.userOrdersData.value.platform, 'taobao'); assert.equal(account.userOrdersData.value.query_days, 30);
+  assert.notEqual(account.orderKey({ platform: 'pdd', order_sn: 'same-sn' }), account.orderKey({ platform: 'taobao', order_sn: 'same-sn' }));
+  account.switchOrderPlatform('jd');
+  assert.equal(h.requests.length, 3); assert.ok(account.orderMessage.value.includes('订单能力未配置'));
+  assert.equal(account.userOrdersData.value.order_list.length, 0);
+  const noOrders = h.makeAccount([{ code: 'taobao', name: '淘宝', active: true, capabilities: { orders: false } }]);
+  noOrders.isLoggedIn.value = true; noOrders.uid.value = 'A'; noOrders.switchOrderPlatform('taobao');
+  assert.equal(h.requests.length, 3); assert.ok(noOrders.orderMessage.value.includes('淘宝订单能力未配置'));
+  const source = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(source.includes("ord.is_invalid ? 'invalid'"));
+  assert.ok(source.includes('失效订单不等同于退款'));
+  assert.ok(source.includes('联盟预估 / 结算预估收入，不代表最终到账或可提现余额'));
+});
+
+test('an unavailable order selection invalidates a pending prior-platform response', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), account = h.makeAccount();
+  account.isLoggedIn.value = true; account.uid.value = 'A';
+  account.syncAndQueryOrders(); account.switchOrderPlatform('jd');
+  await h.finish(0, { status: 'success', data: { order_list: [{ order_sn: 'late-PDD' }] } });
+  assert.equal(account.userOrdersData.value.order_list.length, 0); assert.ok(account.orderMessage.value.includes('京东'));
+});
+
+test('account authorization rejects logout, disposal and superseded platform responses', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), account = h.makeAccount();
+  account.isLoggedIn.value = true; account.uid.value = 'A';
+  account.handleCheckAndGetAuth('pdd'); account.handleCheckAndGetAuth('taobao');
+  await h.finish(1, { status: 'success', platform: 'taobao', platform_name: '淘宝', is_authorized: false, auth_url: 'https://auth.test/B' });
+  await h.finish(0, { status: 'success', platform: 'pdd', platform_name: '拼多多', is_authorized: false, auth_url: 'https://auth.test/old' });
+  assert.equal(account.currentAuthInfo.value.platform, 'taobao');
+  account.openAccountAuth(); assert.deepEqual(h.opened, ['https://auth.test/B']);
+  account.handleCheckAndGetAuth('taobao'); account.handleLogout(false);
+  await h.finish(2, { status: 'success', platform: 'taobao', is_authorized: true });
+  assert.equal(account.isAuthModalOpen.value, false); assert.equal(account.currentAuthInfo.value, null);
+  h.session.saveUser(user()); account.isLoggedIn.value = true; account.uid.value = 'A';
+  account.handleCheckAndGetAuth('taobao'); account.dispose();
+  await h.finish(3, { status: 'success', platform: 'taobao', is_authorized: false, auth_url: 'https://auth.test/disposed' });
+  account.openAccountAuth(); assert.equal(h.opened.length, 1);
+});
+
+test('authorization relation recheck is bounded, bearer-scoped and stops on success or session replacement', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), results = [];
+  const recheck = h.context.EasyShop.createAuthRecheck({ api: h.api, session: h.session,
+    onResult: data => results.push(data.is_authorized), onInvalid: () => h.session.clear() });
+  recheck.start('taobao', h.session.capture());
+  for (let index = 0; index < 3; index += 1) {
+    const check = recheck.refresh();
+    assert.equal(h.requests[index].options.headers.Authorization, 'Bearer token-A');
+    assert.equal(new URL(h.requests[index].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+    await h.finish(index, { status: 'success', platform: 'taobao', is_authorized: false }); await check;
+  }
+  await recheck.refresh(); assert.equal(h.requests.length, 3, 'active checks are limited to three');
+  assert.equal(h.timers.size, 0, 'no further active timer remains at the budget limit');
+  recheck.start('taobao', h.session.capture()); const success = recheck.refresh();
+  await h.finish(3, { status: 'success', platform: 'taobao', is_authorized: true }); await success;
+  await recheck.refresh(); assert.equal(h.requests.length, 4); assert.equal(h.timers.size, 0);
+  recheck.start('taobao', h.session.capture()); const old = recheck.refresh();
+  h.context.localStorage.setItem('easy_shop_token', 'token-B');
+  await h.finish(4, { status: 'success', platform: 'taobao', is_authorized: true }); await old;
+  assert.deepEqual(results, [false, false, false, true], 'old relation status cannot affect the new account');
+  recheck.start('taobao', h.session.capture()); const invalid = recheck.refresh();
+  await h.finish(5, { detail: 'expired' }, { status: 401 }); await invalid;
+  assert.equal(h.session.token(), ''); assert.equal(h.timers.size, 0);
+});
+
+test('scheduled purchase navigation checks its session again before app and web jumps', async () => {
+  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(0, { status: 'success', user: user() });
+  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd' } }); await init;
+  const buy = h.page.handleJumpToBuy(); await flush();
+  await h.finish(2, { status: 'success', final_link: 'https://buy.test/private-A', schema_url: 'app://private-A', command_text: 'command' }); await buy;
+  const navigation = [...h.timers.values()].find(item => item.delay === 400);
+  assert.ok(navigation); h.context.localStorage.setItem('easy_shop_token', 'token-B'); navigation.callback();
+  assert.equal(h.context.location.href, 'https://shop.test/detail?goods_id=A');
+  assert.equal([...h.timers.values()].some(item => item.delay === 800), false);
+});
+
+const pendingAuthKey = 'easy_shop_pending_authorization';
+function pendingAuthorizationFixture() {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } });
+  h.session.rememberAuthorization('taobao', h.session.capture());
+  return h.context.sessionStorage.getItem(pendingAuthKey);
+}
+
+test('full-page authorization return consumes only its same-session platform after verified identity and descriptors', async () => {
+  const first = harness({ saved: { easy_shop_token: 'token-A' } }), account = first.makeAccount();
+  account.isLoggedIn.value = true; account.uid.value = 'A';
+  const auth = account.handleCheckAndGetAuth('taobao');
+  await first.finish(0, { status: 'success', platform: 'taobao', platform_name: '淘宝', is_authorized: false, auth_url: 'https://auth.test/TB-A' }); await auth;
+  account.openAccountAuth();
+  const marker = first.context.sessionStorage.getItem(pendingAuthKey), parsed = JSON.parse(marker);
+  assert.equal(parsed.platform, 'taobao'); assert.equal(parsed.scope, first.session.scope());
+  assert.deepEqual(Object.keys(parsed).sort(), ['createdAt', 'platform', 'scope']);
+  assert.equal(marker.includes('token-A'), false); assert.equal(marker.includes('https://auth.test'), false);
+
+  const h = harness({ url: 'https://shop.test/?tab=user&platform=taobao', saved: { easy_shop_token: 'token-A' }, sessionSaved: { [pendingAuthKey]: marker } });
+  h.load('app'); const boot = h.mounted[0](); await flush();
+  assert.equal(h.requests.filter(request => request.url.startsWith('/api/user/auth?')).length, 0, 'a saved token alone does not authorize a recheck');
+  await h.finish(h.requests.findIndex(request => request.url === '/api/user/info'), { status: 'success', user: user() });
+  assert.equal(h.requests.filter(request => request.url.startsWith('/api/user/auth?')).length, 0, 'platform support is loaded before resuming');
+  await h.finish(h.requests.findIndex(request => request.url === '/api/home/platforms'), { status: 'success', data: platformFixtures });
+  await h.finish(h.requests.findIndex(request => request.url.startsWith('/api/home/channels')), { status: 'success', data: channelFixtures });
+  await h.finish(h.requests.findIndex(request => request.url.startsWith('/api/home/recommend')), { status: 'success', data: [], has_more: false }); await boot;
+  const authRequests = h.requests.filter(request => request.url.startsWith('/api/user/auth?'));
+  assert.equal(authRequests.length, 1, 'return does not enumerate all platform authorization endpoints');
+  assert.equal(new URL(authRequests[0].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+  assert.equal(authRequests[0].options.headers.Authorization, 'Bearer token-A');
+  assert.equal(h.context.sessionStorage.getItem(pendingAuthKey), null, 'the marker is consumed before the first recheck');
+  await h.finish(h.requests.indexOf(authRequests[0]), { status: 'success', platform: 'taobao', platform_name: '淘宝', is_authorized: true, bind: 1 });
+  assert.equal(h.page.userProfile.value.auth_status.taobao.is_authorized, true);
+  assert.equal(h.page.isAuthModalOpen.value, false, 'return updates status without reopening an old modal or URL');
+  await h.page.resumePendingAuthorization();
+  assert.equal(h.requests.filter(request => request.url.startsWith('/api/user/auth?')).length, 1, 'another restore cannot replay a consumed marker');
+  const orders = h.requests.findIndex(request => request.url.startsWith('/api/order/'));
+  if (orders >= 0) await h.finish(orders, { status: 'success', data: { order_list: [] } });
+});
+
+for (const [reason, token, mutate] of [
+  ['different account', 'token-B', value => value],
+  ['expired navigation marker', 'token-A', value => ({ ...value, createdAt: Date.now() - 11 * 60 * 1000 })],
+  ['future navigation marker', 'token-A', value => ({ ...value, createdAt: Date.now() + 60000 })],
+]) {
+  test(`pending authorization does not resume for ${reason}`, async () => {
+    const marker = JSON.stringify(mutate(JSON.parse(pendingAuthorizationFixture())));
+    const h = harness({ saved: { easy_shop_token: token }, sessionSaved: { [pendingAuthKey]: marker } }), account = h.makeAccount();
+    const restore = account.fetchUserInfo();
+    await h.finish(0, { status: 'success', user: user(token === 'token-A' ? 'A' : 'B', token) }); await restore;
+    await account.resumePendingAuthorization();
+    assert.equal(h.requests.length, 1); assert.equal(h.context.sessionStorage.getItem(pendingAuthKey), null);
+    assert.equal(account.currentAuthInfo.value, null);
+  });
+}
+
+test('logout, account replacement and invalid user-info token clear pending authorization without a recheck', async () => {
+  const marker = pendingAuthorizationFixture();
+  const h = harness({ saved: { easy_shop_token: 'token-A' }, sessionSaved: { [pendingAuthKey]: marker } });
+  h.session.clear(); assert.equal(h.context.sessionStorage.getItem(pendingAuthKey), null);
+  h.context.localStorage.setItem('easy_shop_token', 'token-A');
+  h.context.sessionStorage.setItem(pendingAuthKey, marker); h.session.saveUser(user('B', 'token-B'));
+  assert.equal(h.context.sessionStorage.getItem(pendingAuthKey), null, 'explicit account replacement drops the old navigation marker');
+  const invalid = harness({ saved: { easy_shop_token: 'token-A' }, sessionSaved: { [pendingAuthKey]: marker } }), account = invalid.makeAccount();
+  const restore = account.fetchUserInfo(); await invalid.finish(0, { detail: 'expired' }, { status: 401 }); await restore;
+  await account.resumePendingAuthorization();
+  assert.equal(invalid.requests.length, 1); assert.equal(invalid.session.token(), '');
+  assert.equal(invalid.context.sessionStorage.getItem(pendingAuthKey), null);
+  const guest = harness({ sessionSaved: { [pendingAuthKey]: marker } }), guestAccount = guest.makeAccount();
+  await guestAccount.fetchUserInfo(); await guestAccount.resumePendingAuthorization();
+  assert.equal(guest.requests.length, 0); assert.equal(guest.context.sessionStorage.getItem(pendingAuthKey), null);
+});
+
+test('resumed authorization has one bounded budget and a subsequent page cannot restart it', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' }, sessionSaved: { [pendingAuthKey]: pendingAuthorizationFixture() } }), account = h.makeAccount();
+  const restore = account.fetchUserInfo(); await h.finish(0, { status: 'success', user: user() }); await restore;
+  const first = account.resumePendingAuthorization();
+  await h.finish(1, { status: 'success', platform: 'taobao', is_authorized: false }); await first;
+  for (let index = 2; index <= 3; index += 1) {
+    const check = account.refreshAuthorization();
+    await h.finish(index, { status: 'success', platform: 'taobao', is_authorized: false }); await check;
+  }
+  await account.refreshAuthorization(); await account.resumePendingAuthorization();
+  assert.equal(h.requests.filter(request => request.url.startsWith('/api/user/auth?')).length, 3);
+  assert.equal(h.timers.size, 0); assert.equal(h.context.sessionStorage.getItem(pendingAuthKey), null);
+  const nextPage = h.makeAccount();
+  const restoredAgain = nextPage.fetchUserInfo(); await h.finish(4, { status: 'success', user: user() }); await restoredAgain;
+  await nextPage.resumePendingAuthorization();
+  assert.equal(h.requests.length, 5, 'another page cannot replenish an already consumed budget');
+});
+
+for (const invalidation of ['logout', 'switch-token', 'dispose']) {
+  test(`late resumed authorization remains isolated after ${invalidation}`, async () => {
+    const h = harness({ saved: { easy_shop_token: 'token-A' }, sessionSaved: { [pendingAuthKey]: pendingAuthorizationFixture() } }), account = h.makeAccount();
+    const restore = account.fetchUserInfo(); await h.finish(0, { status: 'success', user: user() }); await restore;
+    const check = account.resumePendingAuthorization();
+    if (invalidation === 'logout') account.handleLogout(false);
+    else if (invalidation === 'switch-token') h.context.localStorage.setItem('easy_shop_token', 'token-B');
+    else account.dispose();
+    await h.finish(1, { status: 'success', platform: 'taobao', platform_name: '淘宝', is_authorized: true }); await check;
+    assert.notEqual(account.userProfile.value.auth_status?.taobao?.is_authorized, true);
+    assert.equal(account.currentAuthInfo.value, null); assert.equal(h.opened.length, 0); assert.equal(h.copied.length, 0);
+  });
+}
+
+test('detail page restores one pending authorization only after verified identity, without automatic promotion or navigation', async () => {
+  const h = harness({ url: 'https://shop.test/detail?platform=taobao&goods_sign=TB', saved: { easy_shop_token: 'token-A' },
+    sessionSaved: { [pendingAuthKey]: pendingAuthorizationFixture() } });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝' } });
+  assert.equal(h.requests.length, 2, 'pending marker alone does not cause authorization calls');
+  await h.finish(0, { status: 'success', user: user() }); await init;
+  assert.equal(h.requests.length, 3); assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+  assert.equal(h.requests[2].options.headers.Authorization, 'Bearer token-A');
+  await h.finish(2, { status: 'success', platform: 'taobao', platform_name: '淘宝', is_authorized: true });
+  assert.equal(h.context.sessionStorage.getItem(pendingAuthKey), null);
+  assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 0);
+  assert.equal(h.opened.length, 0); assert.equal(h.copied.length, 0);
+  assert.equal(h.page.toastMessage.value.includes('授权已确认'), true);
+  await h.page.resumePendingAuthorization(); assert.equal(h.requests.length, 3);
 });
 

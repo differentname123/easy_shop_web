@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """商品领域数据契约及跨缓存、仓储使用的商品身份。"""
 from dataclasses import dataclass
+from copy import deepcopy
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 
@@ -38,6 +40,14 @@ class ProductRef:
         scope = ("detail", self.platform, uid or "")
         return [scope + (kind, value) for kind, value in
                 (("sign", self.goods_sign), ("id", self.goods_id)) if value]
+
+
+def utc_millis(value: datetime) -> datetime:
+    """来源时间统一为UTC及BSON毫秒精度，不在此生成新的来源时钟。"""
+    if not isinstance(value, datetime):
+        raise ValueError("详情来源时间必须为 datetime")
+    value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return value.replace(microsecond=(value.microsecond // 1000) * 1000)
 
 
 class ProductSummary(BaseModel):
@@ -81,3 +91,38 @@ class ProductDetail(ProductSummary):
     shop_ratings: Dict[str, str] = Field(default_factory=dict)
     specs: List[Dict[str, str]] = Field(default_factory=list)
     coupon_info: Dict[str, Any] = Field(default_factory=dict)
+
+
+_DETAIL_FIELDS = frozenset((getattr(ProductDetail, "model_fields", None) or ProductDetail.__fields__).keys()) | {
+    "brand_name", "category_name", "unified_tags", "search_id",
+}
+
+
+@dataclass(frozen=True)
+class DetailSnapshot:
+    """内部公共详情快照；与HTTP DTO分离，禁止夹带推广及用户上下文。"""
+    ref: ProductRef
+    data: Dict[str, Any]
+    fetched_at: datetime
+
+    def __post_init__(self):
+        if not isinstance(self.ref, ProductRef) or not self.ref.key or not isinstance(self.data, dict):
+            raise ValueError("详情快照缺少可信商品身份或内容")
+        data = {key: deepcopy(value) for key, value in self.data.items() if key in _DETAIL_FIELDS}
+        platform = normalize_platform(data.get("platform") or self.ref.platform)
+        actual = ProductRef(platform, data.get("goods_id"), data.get("goods_sign"))
+        if (platform != self.ref.platform or actual.goods_id != self.ref.goods_id
+                or actual.goods_sign != self.ref.goods_sign):
+            raise ValueError("详情快照与商品身份不一致")
+        data["platform"] = platform
+        object.__setattr__(self, "data", data)
+        object.__setattr__(self, "fetched_at", utc_millis(self.fetched_at))
+
+
+@dataclass(frozen=True)
+class DetailPrefetchResult:
+    """预取内部结果不冒用HTTP成功；只有ready代表已确认持久化。"""
+    status: str
+    snapshot: Optional[DetailSnapshot] = None
+    retryable: bool = False
+    next_check_at: float = 0.0

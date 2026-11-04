@@ -2,12 +2,16 @@
 """商品仓储确定性回归测试：无外部 API、无真实 MongoDB。"""
 import datetime
 import re
+import threading
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from bson import ObjectId
 from bson.decimal128 import Decimal128
+from pymongo.errors import DuplicateKeyError
+from pymongo.results import UpdateResult
 
 from config import PROMOTION_LINK_TTL
 from repositories.product_repo import ProductRepository
@@ -56,6 +60,8 @@ class MemoryCollection:
         self.queries = []
         self.projections = []
         self.cursor_calls = []
+        self.write_calls = []
+        self.lock = threading.RLock()
 
     def create_index(self, keys, **kwargs):
         self.indexes.append((keys, kwargs))
@@ -123,13 +129,28 @@ class MemoryCollection:
                         flags = re.I if value.get("$options") == "i" else 0
                         values = doc.get(key) if isinstance(doc.get(key), list) else [doc.get(key)]
                         matched = matched and any(isinstance(item, str) and re.search(operand, item, flags) for item in values)
+                    elif op == "$exists":
+                        matched = matched and ((key in doc) == operand)
+                    elif op == "$eq":
+                        matched = matched and MemoryCollection.equal(doc.get(key), operand)
                     elif op != "$options":
                         raise AssertionError(f"unsupported field operator: {op}")
             else:
-                matched = doc.get(key) == value
+                matched = MemoryCollection.equal(doc.get(key), value)
             if not matched:
                 return False
         return True
+
+    @staticmethod
+    def equal(left, right):
+        # Mongo 日期查询按 UTC 毫秒比较，不能依赖 Python aware/naive 相等。
+        if isinstance(left, datetime.datetime) and isinstance(right, datetime.datetime):
+            def bson_time(value):
+                value = (value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None
+                         else value.astimezone(datetime.timezone.utc))
+                return value.replace(microsecond=value.microsecond // 1000 * 1000)
+            return bson_time(left) == bson_time(right)
+        return left == right
 
     @staticmethod
     def project(doc, projection):
@@ -138,9 +159,15 @@ class MemoryCollection:
         return {key: deepcopy(value) for key, value in doc.items() if projection.get(key)}
 
     def find_one(self, query, projection=None):
-        self.queries.append(deepcopy(query))
-        self.projections.append(deepcopy(projection))
-        return next((self.project(doc, projection) for doc in self.docs if self.matches(doc, query)), None)
+        with self.lock:
+            self.queries.append(deepcopy(query))
+            self.projections.append(deepcopy(projection))
+            for doc in self.docs:
+                if self.matches(doc, query):
+                    # 直接注入的旧文档 fixture 也遵循 Mongo 文档总有 _id 的约定。
+                    doc.setdefault("_id", ObjectId())
+                    return self.project(doc, projection)
+            return None
 
     def find(self, query, projection=None):
         self.queries.append(deepcopy(query))
@@ -153,33 +180,43 @@ class MemoryCollection:
         return list(dict.fromkeys(doc.get(field) for doc in self.docs if self.matches(doc, query)))
 
     def update_one(self, query, update, upsert=False):
-        if set(update.get("$set", {})) & set(update.get("$setOnInsert", {})):
-            raise ValueError("MongoDB rejects conflicting update paths")
-        index = next((i for i, doc in enumerate(self.docs) if self.matches(doc, query)), None)
-        inserted = index is None
-        if inserted and not upsert:
-            return SimpleNamespace(upserted_count=0, modified_count=0)
-        if inserted:
-            doc = {key: value for key, value in query.items() if not key.startswith("$")}
-            doc.update(deepcopy(update.get("$setOnInsert", {})))
-        else:
-            doc = deepcopy(self.docs[index])
-        doc.update(deepcopy(update.get("$set", {})))
-        identity = (doc.get("platform"), doc.get("product_id"))
-        for i, other in enumerate(self.docs):
-            if i != index and (other.get("platform"), other.get("product_id")) == identity:
-                raise ValueError("duplicate unique(platform, product_id)")
-        if inserted:
-            self.docs.append(doc)
-        else:
-            self.docs[index] = doc
-        return SimpleNamespace(upserted_count=int(inserted), modified_count=int(not inserted))
+        with self.lock:
+            self.write_calls.append((deepcopy(query), deepcopy(update), upsert))
+            if set(update.get("$set", {})) & set(update.get("$setOnInsert", {})):
+                raise ValueError("MongoDB rejects conflicting update paths")
+            index = next((i for i, doc in enumerate(self.docs) if self.matches(doc, query)), None)
+            inserted = index is None
+            if inserted and not upsert:
+                return UpdateResult({"n": 0, "nModified": 0}, acknowledged=True)
+            if inserted:
+                doc = {key: deepcopy(value) for key, value in query.items()
+                       if not key.startswith("$") and not isinstance(value, dict)}
+                doc.update(deepcopy(update.get("$setOnInsert", {})))
+            else:
+                doc = deepcopy(self.docs[index])
+            doc.update(deepcopy(update.get("$set", {})))
+            doc.setdefault("_id", ObjectId())
+            identity = (doc.get("platform"), doc.get("product_id"))
+            for i, other in enumerate(self.docs):
+                if i != index and (other.get("platform"), other.get("product_id")) == identity:
+                    raise DuplicateKeyError("duplicate unique(platform, product_id)")
+                if i != index and other.get("_id") == doc["_id"]:
+                    raise DuplicateKeyError("duplicate unique(_id)")
+            modified = not inserted and doc != self.docs[index]
+            if inserted:
+                self.docs.append(doc)
+            else:
+                self.docs[index] = doc
+            raw_result = {"n": 1, "nModified": int(modified)}
+            if inserted:
+                raw_result["upserted"] = doc["_id"]
+            return UpdateResult(raw_result, acknowledged=True)
 
     def bulk_write(self, operations, ordered=False):
         inserted = modified = 0
         for operation in operations:
             result = self.update_one(operation._filter, operation._doc, upsert=operation._upsert)
-            inserted += result.upserted_count
+            inserted += int(result.upserted_id is not None)
             modified += result.modified_count
         return SimpleNamespace(upserted_count=inserted, modified_count=modified)
 

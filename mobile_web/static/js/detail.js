@@ -19,10 +19,18 @@
     let pendingConversion = null;
     let conversionGeneration = 0;
     let disposed = false;
+    let authGeneration = 0;
+    const promotionSessions = new WeakMap();
+    const platformName = computed(() => goods.value?.platform_name || goods.value?.platform || requested?.platform || '平台');
+    const canUse = info => !disposed && info && promotionSessions.has(info) && session.isCurrent(promotionSessions.get(info));
+    const invalidateSession = () => {
+      session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; isLoggedIn.value = false;
+      closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
+    };
     const carouselList = computed(() => {
       if (!goods.value) return [];
       if (Array.isArray(goods.value.carousel_images) && goods.value.carousel_images.length) return goods.value.carousel_images;
-      return [goods.value.image_url || 'https://img.pddpic.com/mms-avatar/default_avatar.png'];
+      return goods.value.image_url ? [goods.value.image_url] : [];
     });
     const detailGalleryList = computed(() => {
       if (!goods.value) return [];
@@ -42,14 +50,18 @@
     const goToRegister = () => { global.location.href = '/?tab=user'; };
     const goBack = () => {
       if (global.history.length > 1) return global.history.back();
+      const platform = requested?.platform || 'pdd';
       let keyword = '';
-      try { keyword = global.sessionStorage.getItem('easy_shop_home_search_keyword') || ''; } catch (_) {}
-      global.location.href = keyword ? `/?keyword=${encodeURIComponent(keyword)}` : '/';
+      try { keyword = JSON.parse(global.sessionStorage.getItem(`easy_shop_home_search_keyword:${session.scope()}:${platform}`) || 'null') || ''; } catch (_) {}
+      const params = new URLSearchParams({ platform });
+      if (keyword) params.set('keyword', keyword);
+      global.location.href = `/?${params}`;
     };
     const restoreIdentity = () => {
       if (identityRestore && identitySnapshot && session.isCurrent(identitySnapshot)) return identityRestore;
       identitySnapshot = session.capture();
       identityRestore = session.restore(api).then(result => {
+        if (disposed) return;
         if (result.user && session.isCurrent(result.session)) {
           verifiedSession = result.session;
           identitySnapshot = result.session;
@@ -66,7 +78,7 @@
       return identityRestore;
     };
     const loadDeepDetail = async () => {
-      if (!requested) return;
+      if (disposed || !requested) return;
       const generation = ++detailGeneration;
       isDeepLoading.value = true;
       detailError.value = false;
@@ -107,23 +119,27 @@
       if (pendingConversion && pendingConversion.key === key && session.isCurrent(pendingConversion.session)) return pendingConversion.promise;
       const generation = ++conversionGeneration;
       browser.startSmartLoading(title || '正在生成商品推广口令与链接...', [
-        '正在请求拼多多商品推广链接...',
+        `正在请求${platformName.value}商品推广链接...`,
         '正在等待口令与链接返回...',
-        '生成后可复制口令或打开商品链接...', '优惠与付款金额请以拼多多展示为准...',
+        '生成后可复制口令或打开商品链接...', `优惠与付款金额请以${platformName.value}展示为准...`,
       ]);
       const promise = (async () => {
         try {
-          const { ok, data } = await api.post('/api/promote/convert', payload);
-          if (generation !== conversionGeneration || !session.isCurrent(snapshot)) return null;
-          if (ok && data.status === 'success') {
+          const response = await api.post('/api/promote/convert', payload, { token: snapshot.token });
+          if (disposed || generation !== conversionGeneration || !session.isCurrent(snapshot)) return null;
+          const { ok, data } = response;
+          if (response.status === 401) { invalidateSession(); return null; }
+          if ((ok && data.status === 'success') || (response.status !== 403 && data.need_auth)) {
             if (data.is_fallback && !data.need_auth) browser.showToast('专属优惠暂不可用，已提供商品原链接');
+            // command_text (including a real promotion_token) belongs to the backend, not a client-side imitation.
+            promotionSessions.set(data, snapshot);
             return data;
           }
+          if (response.status === 403) { browser.showToast(data.detail || '推广身份不匹配，请重新登录'); return null; }
           browser.showToast('专属优惠暂不可用，已提供商品原链接');
-          return {
-            final_link: product.product_url || '', is_fallback: true,
-            command_text: `【好物精选】${product.name}\n【券后价】¥${product.price}\n${product.product_url || ''}`,
-          };
+          const fallback = { final_link: product.product_url || '', is_fallback: true };
+          promotionSessions.set(fallback, snapshot);
+          return fallback;
         } catch (error) {
           global.console.warn('转链异常:', error);
           return null;
@@ -137,62 +153,60 @@
       pendingConversion = { key, promise, session: snapshot };
       return promise;
     };
-    const authModal = ref({
-      visible: false,
-      platform: 'pdd',
-      platformName: '拼多多',
-      msg: '',
-      action: 'copy',
-      pendingInfo: null,
-      isFetchingAuth: false,
-    });
+    const authModal = ref({ visible: false, platform: '', platformName: '', msg: '', action: 'copy',
+      pendingInfo: null, isFetchingAuth: false, authOpened: false });
+    const recheck = shop.createAuthRecheck({ api, session, onInvalid: invalidateSession,
+      onResult: (data, snapshot) => {
+        if (disposed || !session.isCurrent(snapshot)) return;
+        if (data.is_authorized) {
+          closeAuthModal();
+          browser.showToast(`${data.platform_name || platformName.value}授权已确认，请重新生成专属链接`);
+        }
+      }, onError: () => { if (!disposed) browser.showToast('授权复查失败，请点击重新校验'); } });
+    const refreshAuthorization = () => { if (!disposed && !global.document.hidden) return recheck.refresh(); };
+    const showAuthorization = (info, action) => {
+      if (!canUse(info)) return;
+      authGeneration += 1; recheck.stop();
+      const platform = info.auth_platform || shop.goodsIdentity(goods.value).platform;
+      authModal.value = { visible: true, platform,
+        platformName: info.auth_platform_name || (platform === goods.value.platform ? platformName.value : platform),
+        msg: info.auth_msg || '尚未完成平台渠道授权备案；通用链接不保证计入本人推广佣金。',
+        action, pendingInfo: info, isFetchingAuth: false, authOpened: false };
+    };
     const executeJumpToBuy = info => {
+      if (!canUse(info)) return;
       const content = info.command_text || info.final_link;
-      if (content) browser.copyText(content, '已复制抢购口令，正在前往拼多多领券...');
-      browser.jumpToLink(info, goods.value?.product_url || '');
+      if (content) browser.copyText(content, `已复制推广信息，正在前往${platformName.value}领券...`);
+      browser.jumpToLink(info, goods.value?.product_url || '', () => canUse(info));
     };
     const executeCopyPromoteLink = (info, successTip) => {
+      if (!canUse(info)) return;
       const content = info.command_text || info.final_link;
-      if (content) browser.copyText(content, successTip || '抢购口令与领券链接已复制！打开拼多多APP即可自动识别，或通过链接直接下单~');
+      if (content) browser.copyText(content, successTip || `推广口令与链接已复制，可前往${platformName.value}使用`);
       else browser.showToast('暂无有效口令');
     };
     const handleJumpToBuy = async () => {
-      const info = await handleGenerateLink('正在打通拼多多领券通道...');
+      const info = await handleGenerateLink(`正在连接${platformName.value}领券通道...`);
       if (disposed) return;
       if (!info) return browser.showToast('获取购买链接失败，请重试');
       if (info.need_auth) {
-        authModal.value = {
-          visible: true,
-          platform: info.auth_platform || 'pdd',
-          platformName: '拼多多',
-          msg: info.auth_msg || '检测到您尚未在拼多多完成渠道授权备案，当前生成的链接为通用链接，本单无法计入您的推手返利佣金。',
-          action: 'buy',
-          pendingInfo: info,
-          isFetchingAuth: false,
-        };
+        showAuthorization(info, 'buy');
         return;
       }
       executeJumpToBuy(info);
     };
     const handleCopyPromoteLink = async () => {
-      const info = await handleGenerateLink('正在生成拼多多抢购口令...');
+      const info = await handleGenerateLink(`正在生成${platformName.value}推广口令与链接...`);
       if (disposed) return;
       if (!info) return browser.showToast('生成口令失败，请稍后重试');
       if (info.need_auth) {
-        authModal.value = {
-          visible: true,
-          platform: info.auth_platform || 'pdd',
-          platformName: '拼多多',
-          msg: info.auth_msg || '检测到您尚未在拼多多完成渠道授权备案，当前生成的链接为通用链接，本单无法计入您的推手返利佣金。',
-          action: 'copy',
-          pendingInfo: info,
-          isFetchingAuth: false,
-        };
+        showAuthorization(info, 'copy');
         return;
       }
       executeCopyPromoteLink(info);
     };
     const closeAuthModal = () => {
+      authGeneration += 1; recheck.stop();
       authModal.value.visible = false;
       authModal.value.pendingInfo = null;
     };
@@ -200,7 +214,7 @@
       const info = authModal.value.pendingInfo;
       const action = authModal.value.action;
       closeAuthModal();
-      if (!info) return;
+      if (!info?.final_link) return;
       if (action === 'buy') {
         executeJumpToBuy(info);
       } else {
@@ -208,32 +222,43 @@
       }
     };
     const handleGoToAuth = async () => {
-      if (authModal.value.isFetchingAuth) return;
-      authModal.value.isFetchingAuth = true;
+      if (disposed || authModal.value.isFetchingAuth || !canUse(authModal.value.pendingInfo)) return;
       const snapshot = session.capture();
+      if (!snapshot.token) { closeAuthModal(); goToRegister(); return; }
+      const generation = ++authGeneration;
+      authModal.value.isFetchingAuth = true;
       try {
-        const plat = authModal.value.platform || 'pdd';
-        const response = await api.get(`/api/user/auth?${new URLSearchParams({ platform: plat })}`, { token: snapshot.token });
-        if (response.ok && response.data && response.data.status === 'success') {
+        const platform = authModal.value.platform;
+        const response = await api.get(`/api/user/auth?${new URLSearchParams({ platform })}`, { token: snapshot.token });
+        if (disposed || generation !== authGeneration || !session.isCurrent(snapshot)) return;
+        if (response.status === 401) { invalidateSession(); return; }
+        if (response.ok && response.data?.status === 'success') {
+          if (response.data.is_authorized) {
+            session.forgetPendingAuthorization(platform);
+            closeAuthModal(); browser.showToast('授权已确认，请重新生成专属链接'); return;
+          }
           const authUrl = response.data.auth_url || response.data.short_url;
           if (authUrl) {
+            session.rememberAuthorization(platform, snapshot);
             browser.copyText(authUrl, '已复制授权链接，正在前往授权备案...');
-            if (global.window && global.window.open) {
-              global.window.open(authUrl, '_blank');
-            } else if (global.location) {
-              global.location.href = authUrl;
-            }
-            closeAuthModal();
+            if (global.window?.open) global.window.open(authUrl, '_blank', 'noopener');
+            else if (global.location) global.location.href = authUrl;
+            authModal.value.authOpened = true;
+            recheck.start(platform, snapshot);
             return;
           }
         }
         browser.showToast(response.data?.error_msg || '获取授权链接失败，请稍后重试');
       } catch (err) {
-        global.console.warn('获取授权链接异常:', err);
-        browser.showToast('网络连接异常，请重试');
-      } finally {
-        authModal.value.isFetchingAuth = false;
-      }
+        if (!disposed && generation === authGeneration && session.isCurrent(snapshot)) browser.showToast('网络连接异常，请重试');
+      } finally { if (generation === authGeneration) authModal.value.isFetchingAuth = false; }
+    };
+    const resumePendingAuthorization = () => {
+      if (disposed || !isLoggedIn.value || !verifiedSession || !session.isCurrent(verifiedSession)) return;
+      const platform = session.consumePendingAuthorization(verifiedSession);
+      if (!platform) return;
+      recheck.start(platform, verifiedSession);
+      return recheck.refresh();
     };
     const initialize = async () => {
       const params = new URLSearchParams(global.location.search);
@@ -241,7 +266,7 @@
       referralUid = params.get('uid') || '';
       let hasSummary = false;
       try {
-        const summary = JSON.parse(global.sessionStorage.getItem('current_goods_summary') || 'null');
+        const summary = JSON.parse(global.sessionStorage.getItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`) || 'null');
         if (shop.matchesGoodsSummary(summary, requested)) {
           goods.value = summary;
           hasSummary = true;
@@ -251,14 +276,20 @@
         '正在请求商品信息...', '正在加载商品图片与规格...',
         '正在获取价格与优惠券信息...', '商品信息以平台展示为准...',
       ]);
+      global.addEventListener('focus', refreshAuthorization);
+      global.document.addEventListener('visibilitychange', refreshAuthorization);
       const identity = restoreIdentity();
       await loadDeepDetail();
       browser.stopSmartLoading();
       await identity;
+      resumePendingAuthorization();
       // Promotion conversion is deliberately triggered only by a user action.
     };
     const dispose = () => {
       disposed = true;
+      closeAuthModal();
+      global.removeEventListener('focus', refreshAuthorization);
+      global.document.removeEventListener('visibilitychange', refreshAuthorization);
       detailGeneration += 1;
       conversionGeneration += 1;
       browser.dispose();
@@ -266,7 +297,7 @@
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
       isDeepLoading, detailError, onCarouselScroll, goHome, goBack, goToRegister,
-      authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth,
+      authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail: loadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,
     };

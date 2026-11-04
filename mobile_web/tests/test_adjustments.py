@@ -167,9 +167,9 @@ class TestOffsetAndDetailEnhancements(unittest.TestCase):
                 "total": 300,
                 "has_more": True
             }
-            res = self.client.get("/api/home/recommend?channel_type=3&offset=240&limit=20")
+            res = self.client.get("/api/home/recommend?channel_type=5&offset=240&limit=20")
             self.assertEqual(res.status_code, 200)
-            mock_get.assert_called_once_with(channel_type=3, offset=240, limit=20, uid=None, platform="pdd")
+            mock_get.assert_called_once_with(channel_type=5, offset=240, limit=20, cursor=None, uid=None, platform="pdd")
 
     def test_detail_dual_key_caching(self):
         """测试 get_goods_detail 双键缓存 (goods_id 与 goods_sign)"""

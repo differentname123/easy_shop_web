@@ -31,12 +31,20 @@ class BasePlatformAdapter(ABC):
     channels: tuple = ()
     recommendation_limit: Optional[int] = None
     legacy_order_statuses: dict = {}
+    required_identity_fields: tuple = ()
+    requires_authorized_promotion: bool = False
+    order_window_seconds: int = 23 * 3600
+    capabilities = None
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None) -> ProductRef:
         """公共层不猜测非数字标识的含义；各平台自行解析其兼容输入。"""
         if not goods_id and not goods_sign:
             goods_id = goods_id_or_sign
         return ProductRef(self.platform_code, goods_id or "", goods_sign or "")
+
+    def can_prefetch_detail(self, ref: ProductRef) -> bool:
+        """后台公开详情的资格判断；不改变前台按需查询能力。"""
+        return bool(ref.key)
 
     def warmup(self) -> None:
         """可选的启动预热，不要求通用入口了解任何平台 SDK。"""
@@ -55,6 +63,7 @@ class BasePlatformAdapter(ABC):
         offset: int = 0,
         limit: int = 20,
         uid: Optional[str] = None,
+        detail_sink=None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -63,6 +72,10 @@ class BasePlatformAdapter(ABC):
         :param offset: 分页偏移量
         :param limit: 每页数量
         :param uid: 推手/用户唯一UID
+        :param detail_sink: 可选内部纯内存回调 sink(DetailSnapshot)，仅发布整页校验通过、
+                            与卡片身份一致的白名单公开详情；fetched_at 是实际来源时间。
+                            不转发供应商，不把完整详情或内部字段放入列表返回值；
+                            不支持复用详情的平台可忽略，无回调不得增加详情工作。
         :return: {"status": "success", "total_count": int, "data": List[Dict]}
         """
         pass

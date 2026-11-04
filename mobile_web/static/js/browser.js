@@ -46,10 +46,10 @@
     const startSmartLoading = (title, slogans) => {
       stopSmartLoading();
       const list = slogans && slogans.length ? slogans : [
-        '正在向拼多多官方申请大额隐藏券...',
-        '正在全网比价，锁定最低到手折扣...',
-        '专属活动补贴匹配中，校验优惠有效性...',
-        '正在为您呈现实时优惠与高清实拍...',
+        '正在请求平台商品信息...',
+        '正在获取价格与优惠信息...',
+        '正在等待平台响应...',
+        '商品信息以平台展示为准...',
       ];
       let index = 0;
       smartLoading.value = {
@@ -65,12 +65,13 @@
         }, 220);
       }, 1300);
     };
-    const jumpToLink = (linkInfo, fallbackUrl = '') => {
+    const jumpToLink = (linkInfo, fallbackUrl = '', canNavigate = () => true) => {
       const target = linkInfo.final_link || fallbackUrl;
       global.setTimeout(() => {
+        if (!canNavigate()) return;
         if (linkInfo.schema_url && global.navigator.userAgent.toLowerCase().includes('mobile')) {
           global.location.href = linkInfo.schema_url;
-          global.setTimeout(() => { if (target) global.location.href = target; }, 800);
+          global.setTimeout(() => { if (target && canNavigate()) global.location.href = target; }, 800);
         } else if (target) {
           global.location.href = target;
         }
