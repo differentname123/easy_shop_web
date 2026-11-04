@@ -52,6 +52,16 @@
       </nav>
     </header>
 
+    <!-- 首页下拉刷新指示区 -->
+    <div class="pull-refresh-indicator" :class="{ transitioning: isTransitioning, visible: pullDistance > 0 || isRefreshing }" :style="{ height: pullDistance + 'px' }">
+      <div class="pull-refresh-content">
+        <span v-if="pullStatus === 'refreshing'" class="pull-refresh-spinner"></span>
+        <span v-else-if="pullStatus === 'success'" class="pull-refresh-success">✓</span>
+        <span v-else class="pull-refresh-arrow" :class="{ 'arrow-up': pullStatus === 'ready' }">↓</span>
+        <span class="pull-refresh-text">{{ pullText }}</span>
+      </div>
+    </div>
+
     <!-- 首页商品双列网格 -->
     <main class="goods-grid" v-if="homeGoodsList.length > 0">
       <div 
@@ -184,6 +194,16 @@
       </div>
     </header>
 
+    <!-- 爆单库下拉刷新指示区 -->
+    <div class="pull-refresh-indicator" :class="{ transitioning: isTransitioning, visible: pullDistance > 0 || isRefreshing }" :style="{ height: pullDistance + 'px' }">
+      <div class="pull-refresh-content">
+        <span v-if="pullStatus === 'refreshing'" class="pull-refresh-spinner"></span>
+        <span v-else-if="pullStatus === 'success'" class="pull-refresh-success">✓</span>
+        <span v-else class="pull-refresh-arrow" :class="{ 'arrow-up': pullStatus === 'ready' }">↓</span>
+        <span class="pull-refresh-text">{{ pullText }}</span>
+      </div>
+    </div>
+
     <!-- 爆单商品列表 (格式与首页保持100%完全一致) -->
     <main class="goods-grid" v-if="boomGoodsList.length > 0">
       <div 
@@ -261,6 +281,15 @@
 
   <!-- ==================== TAB 3: 我的 (推手中心、订单收益与注册登录) ==================== -->
   <div v-show="currentTab === 'user'" class="tab-page tab-user">
+    <!-- 用户页下拉刷新指示区 -->
+    <div class="pull-refresh-indicator" :class="{ transitioning: isTransitioning, visible: pullDistance > 0 || isRefreshing }" :style="{ height: pullDistance + 'px' }">
+      <div class="pull-refresh-content">
+        <span v-if="pullStatus === 'refreshing'" class="pull-refresh-spinner"></span>
+        <span v-else-if="pullStatus === 'success'" class="pull-refresh-success">✓</span>
+        <span v-else class="pull-refresh-arrow" :class="{ 'arrow-up': pullStatus === 'ready' }">↓</span>
+        <span class="pull-refresh-text">{{ pullText }}</span>
+      </div>
+    </div>
     
     <!-- 头部身份卡片 (已登录展示) -->
     <div class="user-profile-header" v-if="isLoggedIn">

@@ -24,7 +24,7 @@ class PddAdapter(BasePlatformAdapter):
     platform_name = "拼多多"
     recommendation_limit = 400
     channels = (
-        {"channel_type": 5, "name": "实时热销榜", "icon": "fire"},
+        {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
         {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
     )
     legacy_order_statuses = {"refund": [4], "settled": [3, 5]}

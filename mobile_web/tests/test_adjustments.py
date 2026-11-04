@@ -223,6 +223,20 @@ class TestOffsetAndDetailEnhancements(unittest.TestCase):
         self.assertIn("<!DOCTYPE html>", res.text)
         self.assertIn("商品详情", res.text)
 
+    def test_unified_channel_names_across_pdd_and_taobao(self):
+        """验证拼多多和淘宝两个适配器的榜单名称已统一为实时销量榜与今日销量榜"""
+        from adapters.pdd_adapter import PddAdapter
+        from adapters.tb_adapter import TaobaoAdapter
+
+        pdd_channels = {ch["channel_type"]: ch["name"] for ch in PddAdapter.channels}
+        tb_channels = {ch["channel_type"]: ch["name"] for ch in TaobaoAdapter.channels}
+
+        self.assertEqual(pdd_channels.get(5), "实时销量榜")
+        self.assertEqual(pdd_channels.get(1), "今日销量榜")
+        self.assertEqual(tb_channels.get(5), "实时销量榜")
+        self.assertEqual(tb_channels.get(1), "今日销量榜")
+        self.assertEqual(pdd_channels, tb_channels)
+
 
 if __name__ == "__main__":
     unittest.main()

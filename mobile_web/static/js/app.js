@@ -1,7 +1,7 @@
 // Homepage composition: controllers own business state; this file owns navigation and gestures.
 (function (global) {
   'use strict';
-  const { createApp, ref, onMounted, onUnmounted, watch } = global.Vue;
+  const { createApp, ref, computed, onMounted, onUnmounted, watch } = global.Vue;
   const shop = global.EasyShop;
   createApp({
     setup() {
@@ -15,7 +15,23 @@
       const isHeaderHidden = ref(false);
       let referralUid = '';
       let lastScrollTop = 0;
+      let touchStartX = 0;
       let touchStartY = 0;
+      let canPull = false;
+      let isPulling = false;
+      const pullDistance = ref(0);
+      const pullStatus = ref('idle');
+      const isRefreshing = ref(false);
+      const isTransitioning = ref(false);
+      const pullText = computed(() => {
+        if (pullStatus.value === 'ready') return '释放立即刷新';
+        if (pullStatus.value === 'refreshing') return '正在刷新第一页...';
+        if (pullStatus.value === 'success') return '刷新成功';
+        return '下拉即可刷新';
+      });
+      const getScrollTop = () => global.pageYOffset ||
+        (global.document && (global.document.documentElement.scrollTop || global.document.body.scrollTop ||
+        (global.document.scrollingElement ? global.document.scrollingElement.scrollTop : 0))) || 0;
       let bottomObserver = null;
       let observerTimer = null;
       let walletRestore = null;
@@ -37,20 +53,82 @@
         const params = new URLSearchParams({ ...shop.goodsIdentity(item), uid: account.uid.value || referralUid });
         global.location.href = `/detail?${params}`;
       };
+      const executeRefresh = async () => {
+        try {
+          if (currentTab.value === 'home') {
+            await feeds.refreshHomeGoods();
+          } else if (currentTab.value === 'boom') {
+            await feeds.refreshBoomGoods();
+          } else if (currentTab.value === 'user') {
+            await restoreAccount();
+            if (account.isLoggedIn.value) await account.syncAndQueryOrders(false);
+          }
+          pullStatus.value = 'success';
+        } catch (_) {
+          pullStatus.value = 'idle';
+        } finally {
+          global.setTimeout(() => {
+            pullDistance.value = 0;
+            pullStatus.value = 'idle';
+            isRefreshing.value = false;
+            global.setTimeout(() => { isTransitioning.value = false; }, 260);
+          }, 300);
+        }
+      };
       const onTouchStart = event => {
-        if (event.touches && event.touches[0]) touchStartY = event.touches[0].clientY;
+        if (!event.touches || !event.touches[0]) return;
+        touchStartY = event.touches[0].clientY;
+        touchStartX = event.touches[0].clientX;
+        const top = getScrollTop();
+        canPull = top <= 5 && !isRefreshing.value;
+        isPulling = false;
       };
       const onTouchMove = event => {
         if (!event.touches || !event.touches[0]) return;
         const y = event.touches[0].clientY;
-        const delta = y - touchStartY;
-        const top = global.pageYOffset || global.document.documentElement.scrollTop || global.document.body.scrollTop || 0;
-        if (delta < -10 && top > 30) {
+        const x = event.touches[0].clientX;
+        const deltaY = y - touchStartY;
+        const deltaX = x - touchStartX;
+        const top = getScrollTop();
+        if (canPull && !isRefreshing.value) {
+          if (!isPulling) {
+            if (deltaY > 8 && Math.abs(deltaY) > Math.abs(deltaX)) {
+              isPulling = true;
+              isTransitioning.value = false;
+            }
+          }
+          if (isPulling) {
+            isHeaderHidden.value = false;
+            if (event.cancelable) event.preventDefault();
+            const dist = Math.max(0, Math.min(72, deltaY * 0.45));
+            pullDistance.value = dist;
+            pullStatus.value = dist >= 48 ? 'ready' : 'pulling';
+            return;
+          }
+        }
+        if (deltaY < -10 && top > 30) {
           isHeaderHidden.value = true;
           touchStartY = y;
-        } else if (delta > 10) {
+        } else if (deltaY > 10) {
           isHeaderHidden.value = false;
           touchStartY = y;
+        }
+      };
+      const onTouchEnd = () => {
+        if (isPulling) {
+          isPulling = false;
+          canPull = false;
+          isTransitioning.value = true;
+          if (pullStatus.value === 'ready') {
+            pullStatus.value = 'refreshing';
+            isRefreshing.value = true;
+            pullDistance.value = 46;
+            executeRefresh();
+          } else {
+            pullDistance.value = 0;
+            pullStatus.value = 'idle';
+            global.setTimeout(() => { isTransitioning.value = false; }, 260);
+          }
         }
       };
       let lastFeedFetchTime = 0;
@@ -124,7 +202,9 @@
         global.addEventListener('scroll', handleGlobalScroll, { passive: true });
         global.document.addEventListener('scroll', handleGlobalScroll, { passive: true });
         global.addEventListener('touchstart', onTouchStart, { passive: true });
-        global.addEventListener('touchmove', onTouchMove, { passive: true });
+        global.addEventListener('touchmove', onTouchMove, { passive: false });
+        global.addEventListener('touchend', onTouchEnd, { passive: true });
+        global.addEventListener('touchcancel', onTouchEnd, { passive: true });
         setupBottomObserver();
         await boot;
       });
@@ -135,6 +215,8 @@
         global.document.removeEventListener('scroll', handleGlobalScroll);
         global.removeEventListener('touchstart', onTouchStart);
         global.removeEventListener('touchmove', onTouchMove);
+        global.removeEventListener('touchend', onTouchEnd);
+        global.removeEventListener('touchcancel', onTouchEnd);
         global.clearTimeout(observerTimer);
         if (bottomObserver) bottomObserver.disconnect();
         feeds.dispose();
@@ -144,14 +226,19 @@
       watch(account.uid, () => {
         if (initialized) feeds.resetSession();
       });
-      watch(feeds.homePlatform, () => { isHeaderHidden.value = false; lastScrollTop = 0; });
+      watch(feeds.homePlatform, () => {
+        isHeaderHidden.value = false; lastScrollTop = 0;
+        pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
+      });
       watch(currentTab, newTab => {
         isHeaderHidden.value = false;
+        pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
         if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0) feeds.loadBoomGoods(true);
         else if (newTab === 'user') restoreAccount();
       });
       return {
         ...browser, ...account, ...feeds, currentTab, isHeaderHidden,
+        pullDistance, pullStatus, isRefreshing, isTransitioning, pullText, executeRefresh,
         formatPhone: shop.formatPhone, formatMoney: shop.formatMoney, formatSales: shop.formatSales,
         goodsKey: shop.goodsKey, openGoodsDetail,
       };

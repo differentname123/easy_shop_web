@@ -1292,3 +1292,54 @@ test('detail page restores one pending authorization only after verified identit
   await h.page.resumePendingAuthorization(); assert.equal(h.requests.length, 3);
 });
 
+test('feeds pull-to-refresh invalidates channelCache and refreshes page 1 without wiping existing list', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  // 初始加载第一页
+  const init = feed.loadHomeGoods(true);
+  assert.equal(h.requests.length, 1);
+  await h.finish(0, goodsResponse('initial-item'));
+  await init;
+  assert.equal(feed.homeGoodsList.value.length, 1);
+  assert.equal(feed.homeGoodsList.value[0].goods_id, 'initial-item');
+
+  // 下拉刷新当前频道
+  const refreshPromise = feed.refreshHomeGoods();
+  assert.equal(h.requests.length, 2);
+  const reqUrl = new URL(h.requests[1].url, 'https://shop.test');
+  assert.equal(reqUrl.searchParams.get('offset'), '0');
+  // 刷新过程中原有商品不被提前清空成空白骨架
+  assert.equal(feed.homeGoodsList.value.length, 1);
+  assert.equal(feed.homeLoading.value, false, 'pull-to-refresh does not trigger bottom loading spinner');
+
+  // 返回新数据
+  await h.finish(1, goodsResponse('refreshed-item-1'));
+  const success = await refreshPromise;
+  assert.equal(success, true);
+  assert.equal(feed.homeGoodsList.value.length, 1);
+  assert.equal(feed.homeGoodsList.value[0].goods_id, 'refreshed-item-1');
+
+  // 验证爆单库下拉刷新第一页
+  const boomRefresh = feed.refreshBoomGoods();
+  assert.equal(h.requests.length, 3);
+  const boomUrl = new URL(h.requests[2].url, 'https://shop.test');
+  assert.equal(boomUrl.searchParams.get('page'), '1');
+  await h.finish(2, goodsResponse('boom-refreshed'));
+  await boomRefresh;
+  assert.equal(feed.boomGoodsList.value[0].goods_id, 'boom-refreshed');
+});
+
+test('app.js and DOM templates support pull-to-refresh indicator and gesture binding', () => {
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+  const appSource = fs.readFileSync(path.join(scripts, 'app.js'), 'utf8');
+
+  assert.ok(indexHtml.includes('pull-refresh-indicator'), 'index.html contains pull-refresh-indicator');
+  assert.ok(indexHtml.includes('pull-refresh-spinner'), 'index.html contains pull-refresh-spinner');
+  assert.ok(css.includes('overscroll-behavior-y: contain'), 'CSS prevents native overscroll interference');
+  assert.ok(css.includes('.pull-refresh-indicator'), 'CSS defines pull-refresh-indicator styles');
+  assert.ok(appSource.includes('pullDistance'), 'app.js tracks pullDistance');
+  assert.ok(appSource.includes('pullStatus'), 'app.js tracks pullStatus');
+  assert.ok(appSource.includes('executeRefresh'), 'app.js defines executeRefresh');
+});
+
+

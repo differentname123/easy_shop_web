@@ -97,31 +97,32 @@
       store('home_return_state', snapshot);
       if (activeHomeKeyword.value) store('home_search_state', snapshot);
     };
-    const loadHomeGoods = async (isReset = false) => {
-      if (!homePlatform.value || !homeChannels.value.some(item => item.channel_type === currentChannel.value)) return;
+    const loadHomeGoods = async (isReset = false, isPullRefresh = false) => {
+      if (!homePlatform.value || !homeChannels.value.some(item => item.channel_type === currentChannel.value)) return false;
       if (stateScope !== getScope()) isReset = true;
-      if (disposed || (!isReset && (homeLoading.value || !homeHasMore.value || homeError.value))) return;
+      if (disposed || (!isReset && (homeLoading.value || !homeHasMore.value || homeError.value))) return false;
       const generation = ++homeGeneration, scope = getScope();
       stateScope = scope;
       if (isReset) {
         homeOffset = 0; homeCursor = ''; homeSearchPage = 1;
-        homeGoodsList.value = []; homeHasMore.value = true; homeError.value = false;
+        if (!isPullRefresh) homeGoodsList.value = [];
+        homeHasMore.value = true; homeError.value = false;
       }
       const query = {
         platform: homePlatform.value, keyword: activeHomeKeyword.value, channel: currentChannel.value,
         page: homeSearchPage, offset: homeOffset, cursor: homeCursor, uid: getUid() || '',
       };
-      homeLoading.value = true;
+      if (!isPullRefresh) homeLoading.value = true;
       try {
         const params = new URLSearchParams(query.keyword ? {
           platform: query.platform, keyword: query.keyword, page: query.page, page_size: 20, uid: query.uid,
         } : { platform: query.platform, channel_type: query.channel, offset: query.offset, limit: 20, uid: query.uid });
         if (query.cursor) params.set('cursor', query.cursor);
         const response = await api.get(`/api/home/${query.keyword ? 'search' : 'recommend'}?${params}`);
-        if (!current(generation, scope)) return;
+        if (!current(generation, scope)) return false;
         const data = response.data;
         if (!response.ok || data.status !== 'success' || !Array.isArray(data.data)) {
-          homeError.value = true; showToast('商品加载中断，点击重试'); return;
+          homeError.value = true; showToast('商品加载中断，点击重试'); return false;
         }
         homeError.value = false;
         homeGoodsList.value = shop.mergeGoods(isReset ? [] : homeGoodsList.value, data.data);
@@ -133,9 +134,18 @@
         homeHasMore.value = data.has_more !== undefined ? Boolean(data.has_more) : data.data.length >= 20;
         if (query.keyword) { homeSearchPage = query.page + 1; saveSearchState(); }
         else channelCache.set(cacheKey(query.channel), snapshotList());
+        return true;
       } catch (_) {
         if (current(generation, scope)) { homeError.value = true; showToast('网络连接异常，请重试'); }
-      } finally { if (current(generation, scope)) homeLoading.value = false; }
+        return false;
+      } finally { if (current(generation, scope) && !isPullRefresh) homeLoading.value = false; }
+    };
+    const refreshHomeGoods = async () => {
+      if (disposed) return false;
+      if (!activeHomeKeyword.value) {
+        channelCache.delete(cacheKey(currentChannel.value));
+      }
+      return loadHomeGoods(true, true);
     };
     const retryLoadHomeGoods = () => {
       if (platformsError.value || !homeChannels.value.length) return initialize(new URLSearchParams(global.location.search));
@@ -218,21 +228,35 @@
       homeSearchKeyword.value = ''; activeHomeKeyword.value = '';
       return initialize(new URLSearchParams(global.location.search));
     };
-    const loadBoomGoods = async (isReset = false) => {
-      if (disposed || (!isReset && (boomLoading.value || !boomHasMore.value))) return;
+    const loadBoomGoods = async (isReset = false, isPullRefresh = false) => {
+      if (disposed || (!isReset && (boomLoading.value || !boomHasMore.value))) return false;
       const generation = ++boomGeneration, scope = getScope();
-      if (isReset) { boomPage = 1; boomGoodsList.value = []; boomHasMore.value = true; }
+      if (isReset) {
+        boomPage = 1;
+        if (!isPullRefresh) boomGoodsList.value = [];
+        boomHasMore.value = true;
+      }
       const query = { platform: boomPlatform.value, keyword: activeBoomKeyword, sort_by: boomSortBy.value, page: boomPage, page_size: 20 };
-      boomLoading.value = true;
+      if (!isPullRefresh) boomLoading.value = true;
       try {
         const { ok, data } = await api.get(`/api/goods/list?${new URLSearchParams(query)}`);
-        if (disposed || generation !== boomGeneration || scope !== getScope()) return;
+        if (disposed || generation !== boomGeneration || scope !== getScope()) return false;
         if (ok && data.status === 'success' && Array.isArray(data.data)) {
           boomGoodsList.value = shop.mergeGoods(isReset ? [] : boomGoodsList.value, data.data);
           boomHasMore.value = Boolean(data.has_more); boomPage = query.page + 1;
-        } else boomHasMore.value = false;
-      } catch (_) { if (!disposed && generation === boomGeneration && scope === getScope()) showToast('加载爆品失败'); }
-      finally { if (generation === boomGeneration && scope === getScope()) boomLoading.value = false; }
+          return true;
+        } else {
+          boomHasMore.value = false;
+          return false;
+        }
+      } catch (_) {
+        if (!disposed && generation === boomGeneration && scope === getScope()) showToast('加载爆品失败');
+        return false;
+      } finally { if (generation === boomGeneration && scope === getScope() && !isPullRefresh) boomLoading.value = false; }
+    };
+    const refreshBoomGoods = async () => {
+      if (disposed) return false;
+      return loadBoomGoods(true, true);
     };
     const onSearchBoom = () => { activeBoomKeyword = boomSearchKeyword.value.trim(); return loadBoomGoods(true); };
     const clearBoomSearch = () => { boomSearchKeyword.value = ''; return onSearchBoom(); };
@@ -244,10 +268,10 @@
     return {
       platforms, platformsError, homePlatform, homePlatformName, homeChannels, currentChannel, homeSearchKeyword,
       activeHomeKeyword, homeGoodsList, homeLoading, homeHasMore, homeError, loadHomeChannels, loadPlatforms,
-      loadHomeGoods, retryLoadHomeGoods, onSearchHome, clearHomeSearch, switchChannel, switchHomePlatform,
+      loadHomeGoods, refreshHomeGoods, retryLoadHomeGoods, onSearchHome, clearHomeSearch, switchChannel, switchHomePlatform,
       initializeHome, initialize, resetSession, saveSearchState,
       boomPlatforms, boomPlatform, boomSearchKeyword, boomSortBy, boomGoodsList, boomLoading, boomHasMore,
-      loadBoomGoods, onSearchBoom, clearBoomSearch, switchBoomPlatform, switchBoomSort,
+      loadBoomGoods, refreshBoomGoods, onSearchBoom, clearBoomSearch, switchBoomPlatform, switchBoomSort,
       dispose: () => { disposed = true; homeGeneration += 1; channelGeneration += 1; platformGeneration += 1; boomGeneration += 1; },
     };
   };

@@ -32,6 +32,7 @@ html {
   min-height: 100%;
   -webkit-text-size-adjust: 100%;
   overflow-anchor: none;
+  overscroll-behavior-y: contain;
 }
 
 body {
@@ -43,6 +44,7 @@ body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   overflow-anchor: none;
+  overscroll-behavior-y: contain;
 }
 
 #app {
@@ -65,6 +67,83 @@ body {
 #homeBottomSentinel,
 #boomBottomSentinel {
   overflow-anchor: none;
+}
+
+/* ================== 移动端顶部手势下拉刷新指示区 ================== */
+.pull-refresh-indicator {
+  width: 100%;
+  overflow: hidden;
+  height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  will-change: height;
+  pointer-events: none;
+}
+
+.pull-refresh-indicator.transitioning {
+  transition: height 0.25s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.pull-refresh-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 46px;
+  color: var(--text-sub);
+  font-size: 13px;
+  user-select: none;
+}
+
+.pull-refresh-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--primary-color);
+  transition: transform 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.pull-refresh-arrow.arrow-up {
+  transform: rotate(180deg);
+}
+
+.pull-refresh-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #e0e0e0;
+  border-top-color: var(--primary-color);
+  border-radius: 50%;
+  animation: pull-spin 0.8s linear infinite;
+}
+
+@keyframes pull-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.pull-refresh-success {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #52c41a;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.pull-refresh-text {
+  font-size: 13px;
+  color: var(--text-sub);
 }
 
 /* ================== 通用头部 & 智能手势隐现悬浮导航栏 ================== */

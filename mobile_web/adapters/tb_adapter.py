@@ -50,8 +50,8 @@ class TaobaoAdapter(BasePlatformAdapter):
     platform_code = "taobao"
     platform_name = "淘宝"
     channels = (
-        {"channel_type": 5, "name": "实时爆单榜", "icon": "fire"},
-        {"channel_type": 1, "name": "今日爆单榜", "icon": "crown"},
+        {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
+        {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
     )
     required_identity_fields = ("relation_id",)
     requires_authorized_promotion = True
