@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-京东联盟推手平台 API 自检与验证程序 (精简生产版)
+京东联盟推手平台 API 自检与验证程序 (极简精炼版)
 基于折淘客 (折京客) 及京东官方网关协议，剔除所有无关及未起作用的代码。
 
 【核心功能】：
 1. 榜单选品 (2小时实时榜 + 24小时今日热销榜)
 2. 全网关键词搜索
 3. 商品详情展示
-4. 双轨制推广转链 (方式1: 站长自营; 方式2: 带推手标识归因)
-5. 增量订单拉取与 70% 结算引擎
+4. 统一推广转链 (站长默认 promoter_id='owner'；推手传入专属标识，零授权直通归因)
+5. 增量订单拉取与关键字段打印 (纯净拉取，不擅自计算分成)
 """
 
 import os
@@ -28,16 +28,25 @@ if sys.platform == "win32":
 # 折淘客 (折京客) 凭据
 ZTK_APPKEY = os.environ.get("ZTK_APPKEY", "41ce110973f744118c1227d5f7f72b65")
 
-# 京东联盟账号与站长自营推广位
+# 京东联盟账号 (用于折淘客定位归属账号) 与 站长默认推广位
 JD_UNION_ID = os.environ.get("JD_UNION_ID", "2035679405")           # 联盟纯数字ID
-JD_POSITION_ID = os.environ.get("JD_POSITION_ID", "3110104129")     # 站长自营固定推广位ID
+DEFAULT_POSITION_ID = os.environ.get("JD_POSITION_ID", "3110104129") # 站长自营默认推广位ID
 
-# 京东开放平台应用凭据 (仅订单行查询使用)
+# 京东开放平台应用凭据 (仅在订单行接口计算签名时使用)
 JD_APP_KEY = os.environ.get("JD_APP_KEY", "45cb55a17ecbad6e91b004c0c34babe2")
 JD_APP_SECRET = os.environ.get("JD_APP_SECRET", "8d501939a5084e62aeed3377f9d6e7ac")
 
 # 折淘客 API 网关
 ZTK_API_BASE = "http://api.zhetaoke.com:20000/api"
+
+# 京东订单状态映射
+JD_ORDER_STATUS_MAP = {
+    15: "待付款",
+    16: "已付款",
+    17: "已完成",
+    18: "已结算",
+    19: "已失效"
+}
 
 
 # ==================== 2. 功能 1: 实时榜单选品 ====================
@@ -52,7 +61,7 @@ def get_rank_goods(sort_type: int = 1, page_size: int = 3) -> List[Dict[str, Any
         "appkey": ZTK_APPKEY,
         "unionId": str(JD_UNION_ID),
         "sortType": sort_type,
-        "rankId": 200000,  # 全部分类
+        "rankId": 200000,
         "pageIndex": 1,
         "pageSize": page_size
     }
@@ -161,48 +170,34 @@ def get_goods_detail(item_id: str) -> Dict[str, Any]:
         return {"error": f"详情查询异常: {e}"}
 
 
-# ==================== 5. 功能 4: 推广转链 (两种明确方式) ====================
-def convert_link_station_owner(material_url: str) -> Dict[str, Any]:
+# ==================== 5. 功能 4: 统一推广转链 (归因直通) ====================
+def convert_promotion_link(
+    material_url: str,
+    promoter_id: str = "owner",
+    position_id: Optional[str] = None
+) -> Dict[str, Any]:
     """
-    方式 1: 站长自营推广 (无推手归因)
-    使用站长在京东后台创建的官方媒体固定推广位
-    """
-    return _convert_promotion_core(
-        material_url=material_url,
-        sub_union_id=None,
-        position_id=JD_POSITION_ID
-    )
-
-
-def convert_link_for_promoter(material_url: str, promoter_id: str, custom_position_id: str = None) -> Dict[str, Any]:
-    """
-    方式 2: 带推手标识的专属推广 (100% 精准归因)
-    无需推手做任何授权，通过注入 subUnionId 和可选 positionId 实现归因
+    统一推广转链函数
+    京东推手无需授权，转链时直接注入 subUnionId 作为归因标识：
+    - 站长自己推广：promoter_id='owner'（默认使用站长固定推广位）
+    - 推手专属推广：promoter_id='推手用户ID' (如 'user_8899')，可选传入推手专属的数字 position_id
     :param material_url: 商品链接 / 物料链接
-    :param promoter_id: 推手用户唯一标识 (如 'user_8899', 系统 UID)
-    :param custom_position_id: 可选自定义纯数字推广位 (如 '998877')
+    :param promoter_id: 归属标识，站长默认 'owner'，推手传入其用户标识
+    :param position_id: 自定义数字推广位 ID
     """
     clean_promoter = str(promoter_id).strip()
-    return _convert_promotion_core(
-        material_url=material_url,
-        sub_union_id=clean_promoter,
-        position_id=custom_position_id or "998877"
-    )
+    # 推广位：若未指定，站长使用默认推广位，推手可传自定义数字推广位
+    final_pos_id = str(position_id) if position_id else DEFAULT_POSITION_ID
 
-
-def _convert_promotion_core(material_url: str, sub_union_id: Optional[str], position_id: str) -> Dict[str, Any]:
-    """底层真实转链引擎"""
     url = f"{ZTK_API_BASE}/open_jing_union_open_promotion_byunionid_get.ashx"
     params = {
         "appkey": ZTK_APPKEY,
         "unionId": str(JD_UNION_ID),
         "materialId": material_url,
-        "chainType": "3"  # 返回长链 + 短链
+        "chainType": "3",  # 返回长链 + 短链
+        "subUnionId": clean_promoter,
+        "positionId": final_pos_id
     }
-    if position_id:
-        params["positionId"] = str(position_id)
-    if sub_union_id:
-        params["subUnionId"] = str(sub_union_id)
 
     try:
         resp = requests.get(url, params=params, timeout=10).json()
@@ -216,24 +211,29 @@ def _convert_promotion_core(material_url: str, sub_union_id: Optional[str], posi
         pdata = result_data.get("data", {})
         return {
             "success": True,
-            "is_promoter_mode": bool(sub_union_id),
-            "sub_union_id": sub_union_id,
-            "position_id": position_id,
+            "promoter_id": clean_promoter,
+            "is_owner": clean_promoter == "owner",
+            "position_id": final_pos_id,
             "short_url": pdata.get("shortURL", ""),
             "click_url": pdata.get("clickURL", ""),
             "j_command": pdata.get("jCommand", ""),
-            "j_short_command": pdata.get("jShortCommand", ""),
-            "share_token": pdata.get("jShortCommand") or pdata.get("jCommand") or pdata.get("shortURL", "")
+            "j_short_command": pdata.get("jShortCommand", "")
         }
     except Exception as e:
         return {"error": f"转链异常: {e}"}
 
 
-# ==================== 6. 功能 5: 增量订单拉取与 70% 结算 ====================
-def fetch_orders(start_time: str, end_time: str, query_type: int = 1, page_index: int = 1, page_size: int = 50) -> Dict[str, Any]:
+# ==================== 6. 功能 5: 增量订单拉取与关键信息打印 ====================
+def fetch_orders(
+    start_time: str,
+    end_time: str,
+    query_type: int = 1,
+    page_index: int = 1,
+    page_size: int = 50
+) -> Dict[str, Any]:
     """
-    拉取京东真实订单行数据
-    :param start_time: 开始时间 yyyy-MM-dd HH:mm:ss (与结束时间跨度不超过1小时)
+    拉取京东真实订单行数据并提取核心业务字段（纯粹拉取，不擅自计算提成）
+    :param start_time: 开始时间 yyyy-MM-dd HH:mm:ss (跨度不超过1小时)
     :param end_time: 结束时间 yyyy-MM-dd HH:mm:ss
     :param query_type: 1=按订单下单时间, 3=按订单最后更新时间 (推荐)
     """
@@ -250,7 +250,7 @@ def fetch_orders(start_time: str, end_time: str, query_type: int = 1, page_index
         "fields": "goodsInfo,categoryInfo"
     }
     try:
-        # 折淘客中继计算签名，返回官方请求 URL
+        # 折淘客中继计算签名并返回官方 URL
         resp = requests.get(url, params=params, timeout=12).json()
         if resp.get("status") != 200:
             return {"success": False, "orders": [], "error": f"签名中继返回错误: {resp.get('content') or resp}"}
@@ -262,12 +262,11 @@ def fetch_orders(start_time: str, end_time: str, query_type: int = 1, page_index
         # 本地直接向京东官方网关发起请求
         jd_resp = requests.get(signed_gateway_url, timeout=10).json()
         
-        # 官方网关错误检测 (如签名无效等)
+        # 官方网关错误处理
         if "error_response" in jd_resp:
             err = jd_resp["error_response"]
-            return {"success": False, "orders": [], "error": f"京东网关返回错误: [code={err.get('code')}] {err.get('zh_desc') or err.get('en_desc')}"}
+            return {"success": False, "orders": [], "error": f"京东网关返回错误 [code={err.get('code')}]: {err.get('zh_desc') or err.get('en_desc')}"}
 
-        # 官方业务返回检测
         query_wrapper = jd_resp.get("jd_union_open_order_row_query_responce", {}).get("queryResult", {})
         query_res = json.loads(query_wrapper) if isinstance(query_wrapper, str) else query_wrapper
 
@@ -280,38 +279,33 @@ def fetch_orders(start_time: str, end_time: str, query_type: int = 1, page_index
 
         parsed_orders = []
         for o in raw_rows:
-            try:
-                estimate_fee = float(o.get("estimateFee") or 0.0)
-                actual_fee = float(o.get("actualFee") or 0.0)
-            except (TypeError, ValueError):
-                estimate_fee, actual_fee = 0.0, 0.0
-
+            v_code = int(o.get("validCode") or 0)
             parsed_orders.append({
-                "order_id": str(o.get("orderId", "")),
-                "row_id": str(o.get("id", "")),
-                "sku_id": str(o.get("skuId", "")),
-                "sku_name": o.get("skuName", ""),
-                "sub_union_id": str(o.get("subUnionId", "")),    # 订单透出的推手标识
-                "position_id": str(o.get("positionId", "")),    # 订单透出的推广位
-                "valid_code": int(o.get("validCode") or 0),
-                "order_time": o.get("orderTime", ""),
-                "finish_time": o.get("finishTime", ""),
-                "modify_time": o.get("modifyTime", ""),
-                "estimate_cos_price": str(o.get("estimateCosPrice") or "0.00"),
-                "estimate_fee": str(estimate_fee),
-                "actual_fee": str(actual_fee),
-                # 70% 推手分成结算
-                "settlement": {
-                    "promoter_share_profit": round(estimate_fee * 0.70, 2),
-                    "platform_share_profit": round(estimate_fee * 0.30, 2)
-                }
+                "order_id": str(o.get("orderId", "")),           # 订单号
+                "row_id": str(o.get("id", "")),                  # 行单号
+                "order_time": o.get("orderTime", ""),            # 下单时间
+                "modify_time": o.get("modifyTime", ""),          # 更新时间
+                "finish_time": o.get("finishTime", ""),          # 完成时间
+                "valid_code": v_code,                            # 订单状态码
+                "status_name": JD_ORDER_STATUS_MAP.get(v_code, f"状态{v_code}"),
+                "sku_id": str(o.get("skuId", "")),               # 商品SKU
+                "sku_name": o.get("skuName", ""),                # 商品名称
+                "sku_num": int(o.get("skuNum") or 1),            # 商品数量
+                "price": str(o.get("price") or "0.00"),          # 单价
+                "estimate_cos_price": str(o.get("estimateCosPrice") or "0.00"), # 计佣/实付金额
+                "commission_rate": str(o.get("commissionRate") or "0"),        # 佣金比例
+                "estimate_fee": str(o.get("estimateFee") or "0.00"),           # 预估佣金金额
+                "actual_fee": str(o.get("actualFee") or "0.00"),               # 实际佣金金额
+                "sub_union_id": str(o.get("subUnionId", "")),    # 订单归属的推手标识 (如 'owner', 'user_8899')
+                "position_id": str(o.get("positionId", ""))      # 订单归属的推广位ID
             })
 
         return {
             "success": True,
             "orders": parsed_orders,
             "count": len(parsed_orders),
-            "has_more": query_res.get("hasMore") in (True, "true")
+            "has_more": query_res.get("hasMore") in (True, "true"),
+            "raw_response": query_res
         }
     except Exception as e:
         return {"success": False, "orders": [], "error": f"订单查询请求异常: {e}"}
@@ -320,11 +314,11 @@ def fetch_orders(start_time: str, end_time: str, query_type: int = 1, page_index
 # ==================== 7. 主流程执行 ====================
 if __name__ == "__main__":
     print("=" * 80)
-    print("🚀 京东联盟 API 基础功能验证程序 (精简版)")
-    print(f"👉 当前联盟ID: {JD_UNION_ID} | 站长官方推广位: {JD_POSITION_ID}")
+    print("🚀 京东联盟 API 基础功能验证程序 (极简精炼版)")
+    print(f"👉 当前联盟ID: {JD_UNION_ID} | 站长默认推广位: {DEFAULT_POSITION_ID}")
     print("=" * 80)
 
-    # 1. 榜单测试 (2小时榜 & 24小时今日榜)
+    # 1. 榜单测试 (2小时榜 & 24小时今日热销榜)
     print("\n【1. 实时榜单拉取】")
     b2h = get_rank_goods(sort_type=1, page_size=2)
     print("  * 2小时实时热推榜 TOP 2:")
@@ -342,7 +336,6 @@ if __name__ == "__main__":
     for idx, it in enumerate(s_items, 1):
         print(f"  * ({idx}) {it.get('title')[:22]}... | 券后: ¥{it.get('final_price')} | 佣金率: {it.get('commission_rate')}% (¥{it.get('commission_amount')})")
 
-    # 选取一件真实物料
     sample_url = s_items[0]["item_url"] if s_items else "https://jingfen.jd.com/detail/6xXK8Ko5uwFbKWz.html"
     sample_sku = s_items[0]["item_id"] if s_items else "6xXY8Ko5uwFbKV5W"
 
@@ -355,39 +348,44 @@ if __name__ == "__main__":
     else:
         print(f"  * 详情获取失败: {det.get('error')}")
 
-    # 4. 推广转链 (两种核心方式)
-    print("\n【4. 推广转链对比 (极简双轨制)】")
+    # 4. 统一转链逻辑测试 (仅以 promoter_id 区分站长和推手)
+    print("\n【4. 统一推广转链对比】")
     
-    # 方式 1: 站长自营推广 (挂站长官方推广位)
-    link_owner = convert_link_station_owner(sample_url)
-    print("  👉 [方式 1: 站长自营推广]")
-    print(f"     推广位: {link_owner.get('position_id')}")
+    # 场景 A: 站长自己推广 (标识直接使用 'owner')
+    link_owner = convert_promotion_link(sample_url, promoter_id="owner")
+    print("  👉 [场景 A: 站长自营推广 (promoter_id='owner')]")
+    print(f"     归属标识: {link_owner.get('promoter_id')} | 推广位: {link_owner.get('position_id')}")
     print(f"     短链接: {link_owner.get('short_url')}")
-    print(f"     京口令: {link_owner.get('share_token')}")
+    print(f"     京口令: {link_owner.get('j_short_command') or link_owner.get('j_command')}")
 
-    # 方式 2: 带推手标识专属推广 (推手 user_8899)
-    link_promoter = convert_link_for_promoter(sample_url, promoter_id="user_8899", custom_position_id="998877")
-    print("\n  👉 [方式 2: 推手专属推广 (带标识归因)]")
-    print(f"     推手归因标识 (subUnionId): {link_promoter.get('sub_union_id')} | 自定义推广位: {link_promoter.get('position_id')}")
+    # 场景 B: 推手专属推广 (标识传入推手ID，如 'user_8899')
+    link_promoter = convert_promotion_link(sample_url, promoter_id="user_8899", position_id="998877")
+    print("\n  👉 [场景 B: 推手专属推广 (带标识归因)]")
+    print(f"     归属标识: {link_promoter.get('promoter_id')} | 自定义推广位: {link_promoter.get('position_id')}")
     print(f"     专属短链接: {link_promoter.get('short_url')}")
     print(f"     专属精简口令: {link_promoter.get('j_short_command')}")
     print(f"     专属完整口令: {link_promoter.get('j_command')}")
 
-    # 5. 增量订单拉取与 70% 结算
-    print("\n【5. 增量订单拉取与 70% 结算】")
-    # 针对 04:00 至 05:00 窗口查询
-    order_res = fetch_orders(start_time="2026-11-06 04:00:00", end_time="2026-11-06 05:00:00", query_type=1)
+    # 5. 增量订单拉取与核心字段打印 (无擅自分成计算)
+    print("\n【5. 增量订单拉取与核心字段打印】")
+    # 针对你刚才下的测试单对应时间段查询
+    test_start = "2026-11-06 04:30:00"
+    test_end = "2026-11-06 05:30:00"
+    print(f"  查询窗口: {test_start} 至 {test_end} (type=1: 按下单时间)")
+    order_res = fetch_orders(start_time=test_start, end_time=test_end, query_type=1)
+    
     if order_res.get("success"):
         orders = order_res.get("orders", [])
-        print(f"  * 接口调用成功，拉取到 {len(orders)} 笔订单数据:")
+        print(f"  * 订单接口调用成功，共拉取到 {len(orders)} 笔订单数据:")
         for o in orders:
-            st = o.get("settlement", {})
-            print(f"    - 订单号: {o.get('order_id')} | SKU: {o.get('sku_name')[:15]}...")
-            print(f"      付款金额: ¥{o.get('estimate_cos_price')} | 联盟佣金: ¥{o.get('estimate_fee')}")
-            print(f"      👉 归属推手: {o.get('sub_union_id')} | 推广位: {o.get('position_id')}")
-            print(f"      👉 推手70%提成: ¥{st.get('promoter_share_profit')} | 平台留存: ¥{st.get('platform_share_profit')}")
+            print(f"  -------------------------------------------------------------")
+            print(f"  订单号: {o.get('order_id')} (行单号: {o.get('row_id')})")
+            print(f"  下单时间: {o.get('order_time')} | 状态: {o.get('status_name')} (validCode={o.get('valid_code')})")
+            print(f"  商品: [{o.get('sku_id')}] {o.get('sku_name')}")
+            print(f"  付款金额: ¥{o.get('estimate_cos_price')} | 佣金比例: {o.get('commission_rate')}% | 联盟预估佣金: ¥{o.get('estimate_fee')}")
+            print(f"  👉 归属推手(subUnionId): {o.get('sub_union_id')} | 推广位ID: {o.get('position_id')}")
         if not orders:
-            print("    ℹ️ 当前时间窗口返回 0 笔订单 (说明: 京东官方订单行接口通常在下单后约 5~15 分钟完成批次同步)。")
+            print("  ℹ️ 当前窗口拉取到 0 笔订单。")
     else:
         print(f"  * 订单接口返回提示: {order_res.get('error')}")
 
