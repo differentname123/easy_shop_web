@@ -41,11 +41,22 @@ ZTK_API_BASE = "http://api.zhetaoke.com:20000/api"
 
 # 京东订单状态映射
 JD_ORDER_STATUS_MAP = {
+    -1: "未知",
+    2: "无效-拆单",
+    3: "成交未结算",
     15: "待付款",
     16: "已付款",
     17: "已完成",
     18: "已结算",
-    19: "已失效"
+    19: "已失效/锁定",
+    20: "平台拦截",
+    21: "数据异常",
+    22: "白条拒绝",
+    23: "拒收",
+    24: "支付后取消",
+    25: "未支付取消",
+    27: "售后中",
+    28: "售后退款"
 }
 
 
@@ -273,9 +284,15 @@ def fetch_orders(
         if query_res.get("code") != 200:
             return {"success": False, "orders": [], "error": f"京东业务响应: [code={query_res.get('code')}] {query_res.get('message')}"}
 
-        raw_rows = query_res.get("data", {}).get("orderRowResp", [])
-        if isinstance(raw_rows, dict):
-            raw_rows = [raw_rows]
+        data_block = query_res.get("data")
+        raw_rows = []
+        if isinstance(data_block, list):
+            raw_rows = data_block
+        elif isinstance(data_block, dict):
+            resp_data = data_block.get("orderRowResp", [])
+            raw_rows = resp_data if isinstance(resp_data, list) else [resp_data] if resp_data else []
+        elif not data_block:
+            raw_rows = []
 
         parsed_orders = []
         for o in raw_rows:
@@ -369,8 +386,8 @@ if __name__ == "__main__":
     # 5. 增量订单拉取与核心字段打印 (无擅自分成计算)
     print("\n【5. 增量订单拉取与核心字段打印】")
     # 针对你刚才下的测试单对应时间段查询
-    test_start = "2026-11-06 04:30:00"
-    test_end = "2026-11-06 05:30:00"
+    test_start = "2026-11-06 05:30:00"
+    test_end = "2026-11-06 06:30:00"
     print(f"  查询窗口: {test_start} 至 {test_end} (type=1: 按下单时间)")
     order_res = fetch_orders(start_time=test_start, end_time=test_end, query_type=1)
     
