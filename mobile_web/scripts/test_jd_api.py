@@ -7,7 +7,7 @@
 1. 榜单选品 (2小时实时榜 + 24小时今日热销榜)
 2. 全网关键词搜索
 3. 商品详情展示
-4. 统一推广转链 (站长默认 promoter_id='owner'；推手传入专属标识，零授权直通归因)
+4. 统一推广转链 (promoter_id 传入纯数字即可，免后台建位，纯数字原样透出直通归因)
 5. 增量订单拉取与关键字段打印 (纯净拉取，不擅自计算分成)
 """
 
@@ -15,7 +15,7 @@ import os
 import sys
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 import requests
 
 if sys.platform == "win32":
@@ -184,21 +184,23 @@ def get_goods_detail(item_id: str) -> Dict[str, Any]:
 # ==================== 5. 功能 4: 统一推广转链 (归因直通) ====================
 def convert_promotion_link(
     material_url: str,
-    promoter_id: str = "owner",
-    position_id: Optional[str] = None
+    promoter_id: Union[int, str] = DEFAULT_POSITION_ID
 ) -> Dict[str, Any]:
     """
     统一推广转链函数
-    京东推手无需授权，转链时直接注入 subUnionId 作为归因标识：
-    - 站长自己推广：promoter_id='owner'（默认使用站长固定推广位）
-    - 推手专属推广：promoter_id='推手用户ID' (如 'user_8899')，可选传入推手专属的数字 position_id
+    
+    【核心归因机制与参数说明】：
+    1. promoter_id 只要是纯数字即可（例如：推手在业务系统里的用户数字 ID 8899，或默认数字 3110104129）；
+    2. 京东联盟完全不需要在后台预先创建推广位，转链传入任意纯数字，订单成交后都会在 positionId 中原封不动透出；
+    3. 不再涉及任何 owner 特殊分支逻辑，所有推手与站长统一使用数字 ID 透传与归因。
+    
     :param material_url: 商品链接 / 物料链接
-    :param promoter_id: 归属标识，站长默认 'owner'，推手传入其用户标识
-    :param position_id: 自定义数字推广位 ID
+    :param promoter_id: 推广标识（必须为纯数字，如 8899 或 "8899"，未传入时默认使用 DEFAULT_POSITION_ID）
     """
-    clean_promoter = str(promoter_id).strip()
-    # 推广位：若未指定，站长使用默认推广位，推手可传自定义数字推广位
-    final_pos_id = str(position_id) if position_id else DEFAULT_POSITION_ID
+    clean_id = str(promoter_id).strip()
+    if not clean_id.isdigit():
+        # 若传入非纯数字，回退到默认推广位数字
+        clean_id = str(DEFAULT_POSITION_ID)
 
     url = f"{ZTK_API_BASE}/open_jing_union_open_promotion_byunionid_get.ashx"
     params = {
@@ -206,8 +208,7 @@ def convert_promotion_link(
         "unionId": str(JD_UNION_ID),
         "materialId": material_url,
         "chainType": "3",  # 返回长链 + 短链
-        "subUnionId": clean_promoter,
-        "positionId": final_pos_id
+        "positionId": clean_id
     }
 
     try:
@@ -222,9 +223,7 @@ def convert_promotion_link(
         pdata = result_data.get("data", {})
         return {
             "success": True,
-            "promoter_id": clean_promoter,
-            "is_owner": clean_promoter == "owner",
-            "position_id": final_pos_id,
+            "promoter_id": clean_id,
             "short_url": pdata.get("shortURL", ""),
             "click_url": pdata.get("clickURL", ""),
             "j_command": pdata.get("jCommand", ""),
@@ -365,20 +364,21 @@ if __name__ == "__main__":
     else:
         print(f"  * 详情获取失败: {det.get('error')}")
 
-    # 4. 统一转链逻辑测试 (仅以 promoter_id 区分站长和推手)
-    print("\n【4. 统一推广转链对比】")
+    # 4. 统一转链逻辑测试 (标识只要是纯数字即可，免去后台建位)
+    print("\n【4. 统一推广转链测试】")
+    # 说明：promoter_id 只要是纯数字即可（如推手用户ID或站长默认位），京东无需后台预先创建推广位，订单会原样透出该数字作为归因依据
     
-    # 场景 A: 站长自己推广 (标识直接使用 'owner')
-    link_owner = convert_promotion_link(sample_url, promoter_id="owner")
-    print("  👉 [场景 A: 站长自营推广 (promoter_id='owner')]")
-    print(f"     归属标识: {link_owner.get('promoter_id')} | 推广位: {link_owner.get('position_id')}")
-    print(f"     短链接: {link_owner.get('short_url')}")
-    print(f"     京口令: {link_owner.get('j_short_command') or link_owner.get('j_command')}")
+    # 示例 A: 默认/站长转链 (使用默认数字位)
+    link_default = convert_promotion_link(sample_url, promoter_id=DEFAULT_POSITION_ID)
+    print(f"  👉 [示例 A: 默认/站长转链 (promoter_id={DEFAULT_POSITION_ID})]")
+    print(f"     推广数字ID: {link_default.get('promoter_id')}")
+    print(f"     短链接: {link_default.get('short_url')}")
+    print(f"     京口令: {link_default.get('j_short_command') or link_default.get('j_command')}")
 
-    # 场景 B: 推手专属推广 (标识传入推手ID，如 'user_8899')
-    link_promoter = convert_promotion_link(sample_url, promoter_id="user_8899", position_id="998877")
-    print("\n  👉 [场景 B: 推手专属推广 (带标识归因)]")
-    print(f"     归属标识: {link_promoter.get('promoter_id')} | 自定义推广位: {link_promoter.get('position_id')}")
+    # 示例 B: 推手专属转链 (直接传入推手在系统中的纯数字ID，如 8899)
+    link_promoter = convert_promotion_link(sample_url, promoter_id=8899)
+    print(f"\n  👉 [示例 B: 推手专属转链 (直接传入推手纯数字ID，如 promoter_id=8899)]")
+    print(f"     推手数字ID: {link_promoter.get('promoter_id')}")
     print(f"     专属短链接: {link_promoter.get('short_url')}")
     print(f"     专属精简口令: {link_promoter.get('j_short_command')}")
     print(f"     专属完整口令: {link_promoter.get('j_command')}")
@@ -400,7 +400,7 @@ if __name__ == "__main__":
             print(f"  下单时间: {o.get('order_time')} | 状态: {o.get('status_name')} (validCode={o.get('valid_code')})")
             print(f"  商品: [{o.get('sku_id')}] {o.get('sku_name')}")
             print(f"  付款金额: ¥{o.get('estimate_cos_price')} | 佣金比例: {o.get('commission_rate')}% | 联盟预估佣金: ¥{o.get('estimate_fee')}")
-            print(f"  👉 归属推手(subUnionId): {o.get('sub_union_id')} | 推广位ID: {o.get('position_id')}")
+            print(f"  👉 归属推手/推广位数字ID(positionId): {o.get('position_id')}")
         if not orders:
             print("  ℹ️ 当前窗口拉取到 0 笔订单。")
     else:
