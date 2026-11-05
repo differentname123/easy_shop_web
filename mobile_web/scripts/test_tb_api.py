@@ -140,7 +140,7 @@ def convert_promotion_url(item_url: str, is_channel: bool = False, relation_id: 
         "relation_id": relation_id,
         "signurl": 5
     }, timeout=10).json()
-
+    # 如果是未授权的渠道id会返回下面的内容：{'content': '很抱歉！无效的relationId！', 'status': 301}
     if ztk_resp.get("status") != 200 or not ztk_resp.get("content"):
         return {"error": f"折淘客渠道转链失败: {ztk_resp}"}
 
