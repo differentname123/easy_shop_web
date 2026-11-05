@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
+import sys
 import hashlib
 from datetime import datetime, timedelta
 import requests
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ==================== 1. 核心固定配置 ====================
 TB_APP_KEY = "35288611"
