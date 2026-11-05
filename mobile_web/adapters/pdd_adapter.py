@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """拼多多边界：SDK 调用、原始字段转换、商品标识与推广降级策略。"""
+import re
 from typing import Dict, Any
 from urllib.parse import urlencode, urlsplit
 from adapters.base import BasePlatformAdapter, build_command_text
@@ -11,7 +12,6 @@ from infrastructure.pdd_client import (
     check_member_authority,
     generate_authority_url as pdd_gen_auth_url,
     generate_smart_promotion_url,
-    generate_goods_promotion_url,
     make_custom_parameters,
     convert_pdd_url,
     get_goods_detail as pdd_get_detail,
@@ -22,6 +22,7 @@ from infrastructure.pdd_client import (
 class PddAdapter(BasePlatformAdapter):
     platform_code = "pdd"
     platform_name = "拼多多"
+    requires_authorized_promotion = True
     recommendation_limit = 400
     channels = (
         {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
@@ -203,20 +204,30 @@ class PddAdapter(BasePlatformAdapter):
         """识别拼多多网关抛出的推手未备案/未授权错误。"""
         if not err:
             return False
-        msg = str(err.get("error_msg") or err.get("sub_msg") or err) if isinstance(err, dict) else str(err)
-        return any(k in msg for k in ("60001", "未备案", "请授权", "未传入已经授权备案过的相关参数", "未授权", "AUTH"))
+        if isinstance(err, dict):
+            if str(err.get("error_code")) in ("60001", "AUTH_REQUIRED") or str(err.get("sub_code")) == "60001":
+                return True
+            if any(self._is_unauthorized_error(item) for item in (err.get("strategy_errors") or [])):
+                return True
+            msg = " ".join(str(err.get(key) or "") for key in ("error_msg", "sub_msg")).strip()
+        else:
+            msg = str(err)
+        # 仅确认推手/渠道授权错误；AUTH、凭据或网络等通用失败不能撤销用户授权。
+        return bool(re.search(r"\[\s*60001\s*[:\]]|\(\s*60001\s*\)", msg)
+                    or "未传入已经授权备案过的相关参数" in msg
+                    or re.search(r"(?:用户|推手|渠道).{0,12}(?:未授权|未备案)", msg)
+                    or re.search(r"(?:^|[:：]\s*)(?:未授权|未备案|请授权)\s*$", msg))
 
     def _attempt_promotions(self, target, source_url, uid=None, **options) -> tuple:
         """
-        统一生链尝试策略（对称执行，无论带 UID 或站长兜底）：
-        1. 超级红包 (Channel 23 / 智能生链)
-        2. 单品标准推广 (goods.promotion.url.generate)
-        3. 招商洗链 (zs.unit.url.gen)
+        每个有效 UID 只尝试一套策略，由 service 决定是否另走通用路径：
+        1. 智能生链（内部已包含超级红包 → 单品标准推广）
+        2. 必要时官方 URL 洗链 (zs.unit.url.gen)
         返回: (link, raw, link_type, is_unauthorized)
         """
         is_unauthorized = False
 
-        # 1. 超级红包通道 (Channel 23 / 智能生链)
+        # 1. 智能生链内部已做红包 → 标准降级，外层不得重复标准请求。
         if target:
             try:
                 res = generate_smart_promotion_url(
@@ -235,26 +246,7 @@ class PddAdapter(BasePlatformAdapter):
                     is_unauthorized = True
                 logger.warning(f"[PddAdapter] 超级红包生链异常: {exc}")
 
-        # 2. 单品标准推广 (goods.promotion.url.generate)
-        if target:
-            try:
-                res = generate_goods_promotion_url(
-                    client_id=self.client_id, client_secret=self.client_secret,
-                    pid=self.pid, goods_sign=target, uid=uid, **options
-                )
-                if isinstance(res, dict) and res.get("status") == "success":
-                    raw = res.get("data") or {}
-                    link = raw.get("mobile_short_url") or raw.get("short_url") or raw.get("mobile_url") or raw.get("url")
-                    if link:
-                        return link, raw, "单品标准推广", False
-                elif self._is_unauthorized_error(res):
-                    is_unauthorized = True
-            except Exception as exc:
-                if self._is_unauthorized_error(exc):
-                    is_unauthorized = True
-                logger.warning(f"[PddAdapter] 单品标准生链异常: {exc}")
-
-        # 3. 官方招商券转链 / 洗链 (zs.unit.url.gen)
+        # 2. 官方招商券转链 / 洗链 (zs.unit.url.gen)
         if source_url:
             parsed = urlsplit(source_url)
             host = (parsed.hostname or "").lower()
@@ -286,6 +278,8 @@ class PddAdapter(BasePlatformAdapter):
             "command_text": self.build_command_text(title, link, price, coupon),
             "we_app_info": raw.get("we_app_info") or {}, "raw": raw,
         }
+        if is_fallback:
+            result["cacheable"] = False
         if need_auth:
             result["auth_platform"] = "pdd"
             result["auth_msg"] = "检测到您尚未在拼多多完成渠道授权备案，当前链接为官方通用链接，无法计入推手佣金返利"
@@ -298,45 +292,50 @@ class PddAdapter(BasePlatformAdapter):
         coupon = kwargs.get("coupon_amount") if kwargs.get("coupon_amount") is not None else kwargs.get("coupon")
         product_url = kwargs.get("product_url")
         options = {k: v for k, v in kwargs.items() if k not in
-                   ("goods_id", "goods_sign", "product_url", "title", "name", "goods_name", "price", "coupon", "coupon_amount")}
+                   ("goods_id", "goods_sign", "product_url", "title", "name", "goods_name", "price", "coupon", "coupon_amount", "identity")}
         target = goods_sign or goods_id
+        # 商品身份优先：客户端 URL 未经验证，不能把另一件商品洗链后写入当前商品缓存。
         source_url = product_url if not goods_id and not goods_sign else None
         if goods_id and str(goods_id).isdigit():
             source_url = "https://mobile.pinduoduo.com/goods.html?" + urlencode({"goods_id": goods_id})
 
         if not target and not source_url:
             return {"status": "error", "error_msg": "缺少商品 ID、Sign 或商品链接"}
+        if not target:
+            try:
+                parsed = urlsplit(source_url)
+                host = (parsed.hostname or "").lower()
+                valid_source = parsed.scheme in ("https", "http") and any(
+                    host == root or host.endswith("." + root) for root in ("pinduoduo.com", "yangkeduo.com"))
+            except (TypeError, ValueError, AttributeError):
+                valid_source = False
+            if not valid_source:
+                return {"status": "error", "error_code": "invalid_product_url", "need_auth": False,
+                        "error_msg": "仅支持拼多多官方 HTTP(S) 商品链接"}
 
         clean_uid = uid.strip() if isinstance(uid, str) and uid.strip() else None
 
-        need_auth = False
-        # 第一阶段：若有用户 UID，优先尝试推手专属转链
-        if clean_uid:
-            link, raw, link_type, is_unauthorized = self._attempt_promotions(
-                target, source_url, uid=clean_uid, **options
-            )
-            if link:
-                return self._promotion_result(link, raw, title, price, coupon, link_type, is_fallback=False, need_auth=False)
-            if is_unauthorized:
-                need_auth = True
-
-        # 第二阶段：推手专属转链失败（或未登录），脱掉 UID 使用站长/官方默认推广位进行对称尝试
-        link, raw, link_type, _ = self._attempt_promotions(
-            target, source_url, uid=None, **options
+        # 仅使用编排层给出的有效 UID；个人失败不在 adapter 内匿名重试，避免污染个人缓存。
+        link, raw, link_type, is_unauthorized = self._attempt_promotions(
+            target, source_url, uid=clean_uid, **options
         )
         if link:
-            return self._promotion_result(
-                link, raw, title, price, coupon,
-                link_type if not clean_uid else f"通用官方推广({link_type})",
-                is_fallback=bool(clean_uid),
-                need_auth=need_auth,
-            )
+            return self._promotion_result(link, raw, title, price, coupon, link_type)
+        if clean_uid:
+            result = {
+                "status": "error", "need_auth": is_unauthorized,
+                "error_code": "AUTH_REQUIRED" if is_unauthorized else "PERSONAL_PROMOTION_UNAVAILABLE",
+                "error_msg": "拼多多渠道授权未完成或已失效" if is_unauthorized else "暂未能生成拼多多个人推广链接",
+            }
+            if is_unauthorized:
+                result["auth_platform"] = "pdd"
+                result["auth_msg"] = "请到我的页重新校验拼多多渠道授权备案"
+            return result
 
-        # 第三阶段：所有生链接口均不可用，终极保底使用原始商品链接
+        # 匿名接口全部不可用才使用原始商品直链；此保底不可缓存。
         final_direct_url = source_url or ("https://mobile.yangkeduo.com/goods.html?" + urlencode({"goods_sign": goods_sign}))
         return self._promotion_result(
-            final_direct_url, {}, title, price, coupon, "商品直连保底",
-            is_fallback=True, need_auth=need_auth,
+            final_direct_url, {}, title, price, coupon, "商品直连保底", is_fallback=True,
         )
 
     def _handle_unauthorized_conversion(self, goods_sign, uid, **kwargs) -> Dict[str, Any]:
@@ -344,7 +343,7 @@ class PddAdapter(BasePlatformAdapter):
 
     def _handle_fallback_conversion(self, goods_id, goods_sign, uid, title="精选高性价比好物", price=None, coupon=None,
                                     product_url=None, **kwargs) -> Dict[str, Any]:
-        """兼容保留：内部直接委托对称转链机制。"""
+        """兼容保留：委托当前有效 UID 的单次转链策略。"""
         return self.convert_promotion_url(
             goods_sign or goods_id or "", uid=uid, goods_id=goods_id, goods_sign=goods_sign,
             title=title, price=price, coupon_amount=coupon, product_url=product_url, **kwargs

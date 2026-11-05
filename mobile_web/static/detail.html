@@ -6,8 +6,8 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>商品详情 - 优选导购</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=tb-20261104">
-  <script src="/static/js/vue.global.prod.js?v=tb-20261104"></script>
+  <link rel="stylesheet" href="/static/css/style.css?v=auth-20261105-2">
+  <script src="/static/js/vue.global.prod.js?v=auth-20261105-2"></script>
   <style>
     /* 专属商品详情大页样式 */
     .detail-nav-bar {
@@ -500,17 +500,14 @@
       <div style="padding: 10px 0 20px;">
         <div style="text-align:center;margin-bottom:16px;">
           <div style="font-size:36px;margin-bottom:8px">🔐</div>
-          <h3 style="font-size:16px;color:var(--text-main)">未完成推手授权备案</h3>
+          <h3 style="font-size:16px;color:var(--text-main)">{{ authModal.pendingInfo?.authorization_status === 'unknown' ? '渠道授权状态待确认' : '未完成推手授权备案' }}</h3>
           <p style="font-size:12px;color:var(--text-sub);margin-top:6px;line-height:1.5;padding:0 8px">
             {{ authModal.msg || '尚未完成平台渠道授权备案；请授权后重新生成专属链接。通用链接不保证计入本人推广佣金。' }}
           </p>
         </div>
 
         <div class="pop-action-btns">
-          <button class="btn-primary-block" @click="handleGoToAuth" :disabled="authModal.isFetchingAuth">
-            {{ authModal.isFetchingAuth ? '正在获取授权链接...' : '前往平台完成渠道授权' }}
-          </button>
-          <button v-if="authModal.authOpened" class="btn-outline-block" @click="handleGoToAuth">我已完成授权，重新校验</button>
+          <button class="btn-primary-block" @click="handleGoToAuth">去我的页完成渠道授权</button>
           <button v-if="authModal.pendingInfo?.final_link" class="btn-outline-block" @click="handleProceedWithoutAuth">
             {{ authModal.action === 'buy' ? '暂不授权，继续领券下单' : '暂不授权，继续复制通用口令' }}
           </button>
@@ -545,10 +542,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=tb-20261104"></script>
-<script src="/static/js/session.js?v=tb-20261104"></script>
-<script src="/static/js/format.js?v=tb-20261104"></script>
-<script src="/static/js/browser.js?v=tb-20261104"></script>
-<script src="/static/js/detail.js?v=tb-20261104"></script>
+<script src="/static/js/api.js?v=auth-20261105-2"></script>
+<script src="/static/js/session.js?v=auth-20261105-2"></script>
+<script src="/static/js/format.js?v=auth-20261105-2"></script>
+<script src="/static/js/browser.js?v=auth-20261105-2"></script>
+<script src="/static/js/detail.js?v=auth-20261105-2"></script>
 </body>
 </html>

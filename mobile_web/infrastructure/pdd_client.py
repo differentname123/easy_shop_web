@@ -402,6 +402,7 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
     [复合应用函数] 终极智能降级生链：礼金 > 官方超级红包(Channel 23) > 普通推广链接
     """
     custom_params = make_custom_parameters(uid=uid)
+    strategy_errors = []
 
     # 策略 1：如果传入了礼金活动 ID，尝试生成礼金秒杀单
     if cash_gift_id:
@@ -418,8 +419,8 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
             url_list = res.get("goods_promotion_url_generate_response", {}).get("goods_promotion_url_list", [])
             if url_list:
                 return {"status": "success", "link_type": "多多礼金秒杀", "data": url_list[0]}
-        except Exception:
-            pass  # 礼金降级，平滑进入下一级
+        except Exception as exc:
+            strategy_errors.append(str(exc))  # 继续降级，但失败时保留明确的授权错误证据
 
     # 策略 2：尝试获取官方超级红包卡券池链接
     try:
@@ -434,13 +435,15 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
         hb_url_list = hb_res.get("rp_promotion_url_generate_response", {}).get("url_list", [])
         if hb_url_list:
             return {"status": "success", "link_type": "官方超级红包", "data": hb_url_list[0]}
-    except Exception:
-        pass  # 降级进入常规普通生链
+    except Exception as exc:
+        strategy_errors.append(str(exc))
 
     # 策略 3：标准兜底推广
     fallback_res = generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=uid, **kwargs)
     if fallback_res.get("status") == "success":
         fallback_res["link_type"] = "常规推广"
+    elif strategy_errors:
+        fallback_res["strategy_errors"] = strategy_errors
     return fallback_res
 
 def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_id=None, uid=None, **kwargs):

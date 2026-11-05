@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-转链接口路由：根据用户 UID 动态生成带返利归因的推广链接
+转链接口路由：令牌校验本人身份，由服务按本平台授权选择个人或通用推广。
 """
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,7 +26,7 @@ class ConvertRequest(BaseModel):
 @router.post("/convert")
 def convert_link(req: ConvertRequest, current_uid: Optional[str] = Depends(get_optional_uid)):
     """
-    点击商品时生成推手专属转链及平台口令（未登录使用官方推广位缓存）
+    按本平台有效授权生成个人转链；游客及无有效授权用户复用站长通用缓存。
     """
     if req.uid and req.uid.strip() != current_uid:
         raise HTTPException(status_code=403, detail="推广归因必须使用本人已验证身份")

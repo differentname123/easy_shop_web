@@ -31,10 +31,16 @@
       if (notify && !disposed) showToast('已安全退出登录');
     };
     const invalidSession = () => { handleLogout(false); if (!disposed) showToast('登录凭证已过期，请重新登录'); };
-    const applyAuthorization = (data, snapshot) => {
+    const applyAuthorization = (data, snapshot, checkOnly = false) => {
       if (disposed || !session.isCurrent(snapshot)) return;
-      const platform = data.platform || currentAuthInfo.value?.platform;
-      currentAuthInfo.value = { ...data, platform, platform_name: data.platform_name || platformName(platform) };
+      const platform = data.platform;
+      if (!platform) return;
+      const previous = currentAuthInfo.value;
+      const keepUrl = checkOnly && !data.is_authorized && authSnapshot && session.isCurrent(authSnapshot) &&
+        authSnapshot.generation === snapshot.generation && authSnapshot.token === snapshot.token && previous?.platform === platform;
+      // A status-only negative response must not discard this session/platform's existing invitation.
+      const urls = keepUrl ? { auth_url: previous.auth_url, short_url: previous.short_url } : {};
+      currentAuthInfo.value = { ...data, ...urls, platform, platform_name: data.platform_name || platformName(platform) };
       authSnapshot = snapshot;
       userProfile.value = { ...userProfile.value, auth_status: { ...userProfile.value.auth_status,
         [platform]: { ...userProfile.value.auth_status?.[platform], is_authorized: data.is_authorized, bind: data.bind } } };
@@ -43,7 +49,7 @@
         showToast(`${currentAuthInfo.value.platform_name} 已成功备案`);
       }
     };
-    const recheck = shop.createAuthRecheck({ api, session, onResult: applyAuthorization, onInvalid: invalidSession,
+    const recheck = shop.createAuthRecheck({ api, session, onResult: (data, snapshot) => applyAuthorization(data, snapshot, true), onInvalid: invalidSession,
       onError: () => { if (!disposed) showToast('授权复查失败，可点击重新校验'); } });
     const fetchUserInfo = async () => {
       if (disposed) return false;
@@ -104,7 +110,7 @@
       } catch (_) { if (!disposed && session.isCurrent(snapshot)) showToast('网络连接异常'); }
       finally { isSubmittingAuth.value = false; }
     };
-    const handleCheckAndGetAuth = async platform => {
+    const handleCheckAndGetAuth = async (platform, checkOnly = false) => {
       if (disposed) return;
       if (!supportsPlatform(platform, 'authorization')) return showToast(`${platformName(platform)}授权暂未接入或未配置`);
       if (!isLoggedIn.value || !uid.value) return showToast('请先完成手机号登记注册');
@@ -112,15 +118,18 @@
       const snapshot = session.capture(), generation = ++authGeneration;
       recheck.stop(); isCheckingAuth.value = true;
       try {
-        const response = await api.get(`/api/user/auth?${new URLSearchParams({ platform })}`, { token: snapshot.token });
+        const params = new URLSearchParams({ platform });
+        if (checkOnly) { params.set('force', 'true'); params.set('check_only', 'true'); }
+        const response = await api.get(`/api/user/auth?${params}`, { token: snapshot.token });
         if (disposed || generation !== authGeneration || !session.isCurrent(snapshot)) return;
-        if (response.ok && response.data.status === 'success') {
-          applyAuthorization({ ...response.data, platform }, snapshot); isAuthModalOpen.value = true;
+        if (response.ok && response.data.status === 'success' && (!response.data.platform || response.data.platform === platform)) {
+          applyAuthorization({ ...response.data, platform }, snapshot, checkOnly); isAuthModalOpen.value = true;
         } else if (response.status === 401) invalidSession();
         else showToast(response.data.error_msg || response.data.detail || '获取授权状态失败');
       } catch (_) { if (!disposed && generation === authGeneration && session.isCurrent(snapshot)) showToast('网络请求异常'); }
       finally { if (generation === authGeneration) isCheckingAuth.value = false; }
     };
+    const handleRecheckAuth = platform => handleCheckAndGetAuth(platform, true);
     const openAccountAuth = (copyOnly = false) => {
       if (disposed || !authSnapshot || !session.isCurrent(authSnapshot)) { closeAccountAuth(); return; }
       const info = currentAuthInfo.value, url = info?.auth_url || info?.short_url;
@@ -154,7 +163,7 @@
     return {
       isLoggedIn, uid, userPhone, userProfile, isRegisterMode, formPhone, formPassword, formNickname, formInviteCode,
       isSubmittingAuth, handleRegisterOrLogin, handleLogout, fetchUserInfo,
-      isAuthModalOpen, currentAuthInfo, isCheckingAuth, handleCheckAndGetAuth, closeAccountAuth, openAccountAuth,
+      isAuthModalOpen, currentAuthInfo, isCheckingAuth, handleCheckAndGetAuth, handleRecheckAuth, closeAccountAuth, openAccountAuth,
       refreshAuthorization: recheck.refresh, resumePendingAuthorization, platformName, supportsPlatform,
       orderPlatform, orderDays, orderMessage, isSyncingOrders, userOrdersData, syncAndQueryOrders, switchOrderDays,
       switchOrderPlatform, initializeOrderPlatform,

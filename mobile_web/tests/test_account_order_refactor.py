@@ -161,7 +161,11 @@ def user(monkeypatch):
     return user_module.UserService(repo), adapter, repo
 
 
-@pytest.mark.parametrize("updated_at", [datetime.now(timezone.utc), datetime.now(timezone.utc).replace(tzinfo=None)])
+@pytest.mark.parametrize("updated_at", [
+    datetime.now(timezone.utc),
+    datetime.now(timezone.utc).replace(tzinfo=None),
+    1700000000,
+])
 def test_fresh_authorization_reuses_confirmation(user, updated_at):
     service, adapter, repo = user
     repo.get_user_by_uid.return_value["auth_status"] = {"future_shop": {"is_authorized": True, "updated_at": updated_at}}
@@ -172,7 +176,7 @@ def test_fresh_authorization_reuses_confirmation(user, updated_at):
 
 @pytest.mark.parametrize("status", [
     {"is_authorized": True, "authorized_at": 1700000000},
-    {"is_authorized": True, "updated_at": 1700000000},
+    {"is_authorized": True, "updated_at": None},
     {"is_authorized": True, "updated_at": "invalid"},
 ])
 def test_expired_or_legacy_authorization_is_rechecked(user, status):
@@ -203,7 +207,9 @@ def test_authorization_link_generation_failure_remains_error(user, response):
     adapter.check_authority.return_value = {"status": "success", "is_authorized": False, "bind": 0}
     adapter.generate_authority_url.return_value = response
     assert service.check_and_get_auth("u_1234abcd", "future_shop")["status"] == "error"
-    repo.update_auth_status.assert_called_once_with(uid="u_1234abcd", platform="future_shop", is_authorized=False, bind=0)
+    repo.update_auth_status.assert_called_once_with(
+        uid="u_1234abcd", platform="future_shop", is_authorized=False, bind=0, extra={"identity": {}},
+    )
 
 
 def test_confirmed_revocation_generates_real_authorization_url(user):

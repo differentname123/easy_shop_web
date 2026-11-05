@@ -58,10 +58,12 @@ def check_or_get_auth(
     current_uid: str = Depends(get_current_uid),
     uid: Optional[str] = Query(None, description="用户唯一UID (兼容参数)"),
     platform: str = Query("pdd", max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台代码"),
+    force: bool = Query(False, description="主动重新核验，绕过授权状态缓存"),
+    check_only: bool = Query(False, description="只核验状态，不生成授权邀请链接"),
 ):
     """
-    查询当前认证推手在指定平台的授权备案状态。若未授权，则自动返回专属备案授权链接。
+    查询当前认证推手授权状态；非 check_only 的未授权请求同时获取备案入口。
     """
     if uid and uid.strip() != current_uid:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权操作非本人名下的备案授权")
-    return user_service.check_and_get_auth(uid=current_uid, platform=platform)
+    return user_service.check_and_get_auth(uid=current_uid, platform=platform, force=force, check_only=check_only)

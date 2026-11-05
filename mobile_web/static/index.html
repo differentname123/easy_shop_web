@@ -6,9 +6,9 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>优选导购 - 极速省赚</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=tb-20261104">
+  <link rel="stylesheet" href="/static/css/style.css?v=auth-20261105-2">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=tb-20261104"></script>
+  <script src="/static/js/vue.global.prod.js?v=auth-20261105-2"></script>
 </head>
 <body>
 <div id="app">
@@ -477,7 +477,7 @@
       </p>
       <p class="auth-desc" v-else>{{ p.name }}授权暂未接入或未配置，当前不提供该平台渠道授权。</p>
       <div class="auth-actions">
-        <button class="btn-auth" @click="handleCheckAndGetAuth(p.code)" :disabled="isCheckingAuth || !supportsPlatform(p.code, 'authorization')">
+        <button class="btn-auth" @click="userProfile.auth_status?.[p.code]?.is_authorized ? handleRecheckAuth(p.code) : handleCheckAndGetAuth(p.code)" :disabled="isCheckingAuth || !supportsPlatform(p.code, 'authorization')">
           {{ !supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置' : (isCheckingAuth ? '检测中...' : (userProfile.auth_status?.[p.code]?.is_authorized ? '重新校验授权' : '开通' + p.name + '授权')) }}
         </button>
       </div>
@@ -485,6 +485,12 @@
 
     <!-- 菜单说明列表 -->
     <div class="menu-list">
+      <div class="menu-item" @click="copyText('easyeverything98', '官方客服微信号已复制：easyeverything98')">
+        <span style="display:flex;align-items:center;gap:6px;">
+          <span>💬 官方客服微信</span>
+        </span>
+        <span style="color:var(--primary);font-size:13px;font-weight:600">easyeverything98 <span style="font-size:11px;font-weight:normal;opacity:0.8">[点击复制]</span></span>
+      </div>
       <div class="menu-item" @click="showToast('商品佣金为预估，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。')">
         <span>订单佣金与平台结算说明</span>
         <span style="color:var(--text-muted)">›</span>
@@ -538,9 +544,12 @@
         </div>
 
         <div v-if="!currentAuthInfo?.is_authorized" class="pop-action-btns">
-          <button class="btn-primary-block" @click="openAccountAuth(false)">立即前往授权绑定</button>
-          <button class="btn-outline-block" @click="openAccountAuth(true)">复制授权链接</button>
-          <button class="btn-outline-block" @click="handleCheckAndGetAuth(currentAuthInfo.platform)">我已完成授权，重新校验</button>
+          <template v-if="currentAuthInfo?.auth_url || currentAuthInfo?.short_url">
+            <button class="btn-primary-block" @click="openAccountAuth(false)">立即前往授权绑定</button>
+            <button class="btn-outline-block" @click="openAccountAuth(true)">复制授权链接</button>
+          </template>
+          <button v-else class="btn-primary-block" @click="handleCheckAndGetAuth(currentAuthInfo.platform)">获取授权链接</button>
+          <button class="btn-outline-block" @click="handleRecheckAuth(currentAuthInfo.platform)" :disabled="isCheckingAuth">我已完成授权，重新校验</button>
         </div>
 
         <div v-else class="pop-action-btns">
@@ -575,12 +584,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=tb-20261104"></script>
-<script src="/static/js/session.js?v=tb-20261104"></script>
-<script src="/static/js/format.js?v=tb-20261104"></script>
-<script src="/static/js/browser.js?v=tb-20261104"></script>
-<script src="/static/js/feeds.js?v=tb-20261104"></script>
-<script src="/static/js/account.js?v=tb-20261104"></script>
-<script src="/static/js/app.js?v=tb-20261104"></script>
+<script src="/static/js/api.js?v=auth-20261105-2"></script>
+<script src="/static/js/session.js?v=auth-20261105-2"></script>
+<script src="/static/js/format.js?v=auth-20261105-2"></script>
+<script src="/static/js/browser.js?v=auth-20261105-2"></script>
+<script src="/static/js/feeds.js?v=auth-20261105-2"></script>
+<script src="/static/js/account.js?v=auth-20261105-2"></script>
+<script src="/static/js/app.js?v=auth-20261105-2"></script>
 </body>
 </html>

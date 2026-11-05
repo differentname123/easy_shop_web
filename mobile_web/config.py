@@ -25,6 +25,7 @@ AUTH_SECRET = settings.auth_secret
 ORDER_SYNC_INTERVAL = 180       # 增量订单拉取全局最小冷却间隔 (秒)
 ORDER_SYNC_MAX_PAGES = 5        # 单次增量拉单最大翻页数
 AUTH_STATUS_TTL = 86400         # 已确认平台授权状态的本地有效期
+AUTH_NEGATIVE_STATUS_TTL = 300  # 我的页普通查询复用明确未授权状态；主动核验可绕过
 PRODUCT_DETAIL_TTL = 600        # 官方详情有效期，摘要更新不能延长它
 PROMOTION_LINK_TTL = 3 * 86400   # 站长推广链接的来源有效期，不由内存回填续期
 CACHE_MAX_RECOMMEND = 256       # 首页推荐流缓存最大条目

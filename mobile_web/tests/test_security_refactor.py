@@ -191,18 +191,31 @@ class TestMultiPlatformAdapters(unittest.TestCase):
         self.assertEqual(jd_orders.get("order_list"), [])
 
     def test_pdd_adapter_fallback_marking(self):
-        """测试当拼多多上游生链失败时，兜底链接显式打上 is_fallback 标记且不重试"""
+        """个人失败交回 service 且不匿名重试；匿名直链保底显式标记且不可缓存。"""
         adapter = PddAdapter()
-        with patch("adapters.pdd_adapter.generate_smart_promotion_url", side_effect=Exception("API Limit")), \
-             patch("adapters.pdd_adapter.convert_pdd_url", return_value={"status": "error", "error_msg": "API Limit"}), \
-             patch("adapters.pdd_adapter.generate_goods_promotion_url", return_value={"status": "error"}):
-            res = adapter.convert_promotion_url(
-                goods_id_or_sign="111",
-                uid="uid_test"
-            )
+        with patch("adapters.pdd_adapter.generate_smart_promotion_url", side_effect=Exception("API Limit")) as smart, \
+             patch("adapters.pdd_adapter.convert_pdd_url", return_value={"status": "error", "error_msg": "API Limit"}) as wash:
+            personal = adapter.convert_promotion_url(goods_id_or_sign="111", uid="uid_test")
+            self.assertEqual(personal["status"], "error")
+            self.assertEqual(personal["error_code"], "PERSONAL_PROMOTION_UNAVAILABLE")
+            self.assertFalse(personal["need_auth"])
+            self.assertFalse(personal.get("final_link"))
+            smart.assert_called_once()
+            wash.assert_called_once()
+            self.assertEqual(smart.call_args.kwargs["uid"], "uid_test")
+            self.assertEqual(wash.call_args.kwargs["uid"], "uid_test")
+
+            smart.reset_mock()
+            wash.reset_mock()
+            res = adapter.convert_promotion_url(goods_id_or_sign="111")
             self.assertEqual(res["status"], "success")
             self.assertTrue(res.get("is_fallback"))
+            self.assertFalse(res["cacheable"])
             self.assertEqual(res["final_link"], "https://mobile.pinduoduo.com/goods.html?goods_id=111")
+            smart.assert_called_once()
+            wash.assert_called_once()
+            self.assertIsNone(smart.call_args.kwargs["uid"])
+            self.assertIsNone(wash.call_args.kwargs["uid"])
 
 
 # ==================== 4. 仓储层安全加固测试 ====================

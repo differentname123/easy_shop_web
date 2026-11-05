@@ -99,15 +99,18 @@
       if (!session.isCurrent(snapshot)) { stop(); return; }
       attempts += 1; checking = true;
       try {
-        const response = await api.get(`/api/user/auth?${new URLSearchParams({ platform })}`, { token: snapshot.token });
+        const response = await api.get(`/api/user/auth?${new URLSearchParams({ platform, force: 'true', check_only: 'true' })}`, { token: snapshot.token });
         if (current !== generation || !session.isCurrent(snapshot)) return;
         if (response.status === 401) { stop(); onInvalid(); return; }
-        if (!response.ok || response.data.status !== 'success') { stop(); onError(response.data); return; }
-        if (response.data.is_authorized) {
-          session.forgetPendingAuthorization(platform);
-          stop(); onResult(response.data, snapshot); return;
+        if (!response.ok || response.data.status !== 'success' || (response.data.platform && response.data.platform !== platform)) {
+          stop(); onError(response.data); return;
         }
-        onResult(response.data, snapshot);
+        const data = { ...response.data, platform };
+        if (data.is_authorized) {
+          session.forgetPendingAuthorization(platform);
+          stop(); onResult(data, snapshot); return;
+        }
+        onResult(data, snapshot);
       } catch (_) { if (current === generation && session.isCurrent(snapshot)) { stop(); onError(); } }
       finally {
         if (current === generation) {

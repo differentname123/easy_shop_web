@@ -17,9 +17,10 @@
     let identitySnapshot = null;
     let verifiedSession = null;
     let pendingConversion = null;
+    // Keep the original API object for WeakMap/session checks; Vue deeply proxies modal display state.
+    let pendingAuthorizationInfo = null;
     let conversionGeneration = 0;
     let disposed = false;
-    let authGeneration = 0;
     const promotionSessions = new WeakMap();
     const platformName = computed(() => goods.value?.platform_name || goods.value?.platform || requested?.platform || '平台');
     const canUse = info => !disposed && info && promotionSessions.has(info) && session.isCurrent(promotionSessions.get(info));
@@ -104,7 +105,7 @@
         if (generation === detailGeneration) isDeepLoading.value = false;
       }
     };
-    const handleGenerateLink = async title => {
+    const handleGenerateLink = async (title, failureTip = '生成口令失败，请稍后重试') => {
       if (disposed || !goods.value) return null;
       await restoreIdentity();
       if (disposed) return null;
@@ -129,19 +130,26 @@
           if (disposed || generation !== conversionGeneration || !session.isCurrent(snapshot)) return null;
           const { ok, data } = response;
           if (response.status === 401) { invalidateSession(); return null; }
-          if ((ok && data.status === 'success') || (response.status !== 403 && data.need_auth)) {
-            if (data.is_fallback && !data.need_auth) browser.showToast('专属优惠暂不可用，已提供商品原链接');
+          const hasLink = typeof data.final_link === 'string' && Boolean(data.final_link.trim());
+          if ((ok && data.status === 'success' && hasLink) || (response.status !== 403 && data.need_auth)) {
+            if (data.is_fallback && !data.need_auth) browser.showToast(data.attribution_status === 'anonymous'
+              ? '专属推广暂不可用，已提供通用信息（不计本人佣金）' : '专属优惠暂不可用，已提供商品原链接');
             // command_text (including a real promotion_token) belongs to the backend, not a client-side imitation.
             promotionSessions.set(data, snapshot);
             return data;
           }
           if (response.status === 403) { browser.showToast(data.detail || '推广身份不匹配，请重新登录'); return null; }
+          if (!product.product_url?.trim()) {
+            browser.showToast(data.error_msg || data.detail || '平台未返回有效推广链接，请稍后重试');
+            return null;
+          }
           browser.showToast('专属优惠暂不可用，已提供商品原链接');
-          const fallback = { final_link: product.product_url || '', is_fallback: true };
+          const fallback = { final_link: product.product_url, is_fallback: true };
           promotionSessions.set(fallback, snapshot);
           return fallback;
         } catch (error) {
           global.console.warn('转链异常:', error);
+          if (!disposed && generation === conversionGeneration && session.isCurrent(snapshot)) browser.showToast(failureTip);
           return null;
         } finally {
           if (generation === conversionGeneration) {
@@ -153,8 +161,7 @@
       pendingConversion = { key, promise, session: snapshot };
       return promise;
     };
-    const authModal = ref({ visible: false, platform: '', platformName: '', msg: '', action: 'copy',
-      pendingInfo: null, isFetchingAuth: false, authOpened: false });
+    const authModal = ref({ visible: false, platform: '', platformName: '', msg: '', action: 'copy', pendingInfo: null });
     const recheck = shop.createAuthRecheck({ api, session, onInvalid: invalidateSession,
       onResult: (data, snapshot) => {
         if (disposed || !session.isCurrent(snapshot)) return;
@@ -166,12 +173,13 @@
     const refreshAuthorization = () => { if (!disposed && !global.document.hidden) return recheck.refresh(); };
     const showAuthorization = (info, action) => {
       if (!canUse(info)) return;
-      authGeneration += 1; recheck.stop();
+      recheck.stop();
       const platform = info.auth_platform || shop.goodsIdentity(goods.value).platform;
+      pendingAuthorizationInfo = info;
       authModal.value = { visible: true, platform,
         platformName: info.auth_platform_name || (platform === goods.value.platform ? platformName.value : platform),
-        msg: info.auth_msg || '尚未完成平台渠道授权备案；通用链接不保证计入本人推广佣金。',
-        action, pendingInfo: info, isFetchingAuth: false, authOpened: false };
+        msg: info.auth_msg || info.error_msg || '尚未完成平台渠道授权备案；通用链接不保证计入本人推广佣金。',
+        action, pendingInfo: info };
     };
     const executeJumpToBuy = info => {
       if (!canUse(info)) return;
@@ -186,9 +194,8 @@
       else browser.showToast('暂无有效口令');
     };
     const handleJumpToBuy = async () => {
-      const info = await handleGenerateLink(`正在连接${platformName.value}领券通道...`);
-      if (disposed) return;
-      if (!info) return browser.showToast('获取购买链接失败，请重试');
+      const info = await handleGenerateLink(`正在连接${platformName.value}领券通道...`, '获取购买链接失败，请重试');
+      if (disposed || !info) return;
       if (info.need_auth) {
         showAuthorization(info, 'buy');
         return;
@@ -197,8 +204,7 @@
     };
     const handleCopyPromoteLink = async () => {
       const info = await handleGenerateLink(`正在生成${platformName.value}推广口令与链接...`);
-      if (disposed) return;
-      if (!info) return browser.showToast('生成口令失败，请稍后重试');
+      if (disposed || !info) return;
       if (info.need_auth) {
         showAuthorization(info, 'copy');
         return;
@@ -206,12 +212,13 @@
       executeCopyPromoteLink(info);
     };
     const closeAuthModal = () => {
-      authGeneration += 1; recheck.stop();
+      recheck.stop();
+      pendingAuthorizationInfo = null;
       authModal.value.visible = false;
       authModal.value.pendingInfo = null;
     };
     const handleProceedWithoutAuth = () => {
-      const info = authModal.value.pendingInfo;
+      const info = pendingAuthorizationInfo;
       const action = authModal.value.action;
       closeAuthModal();
       if (!info?.final_link) return;
@@ -221,37 +228,12 @@
         executeCopyPromoteLink(info, '抢购口令已复制（未授权本单不计佣金）');
       }
     };
-    const handleGoToAuth = async () => {
-      if (disposed || authModal.value.isFetchingAuth || !canUse(authModal.value.pendingInfo)) return;
-      const snapshot = session.capture();
-      if (!snapshot.token) { closeAuthModal(); goToRegister(); return; }
-      const generation = ++authGeneration;
-      authModal.value.isFetchingAuth = true;
-      try {
-        const platform = authModal.value.platform;
-        const response = await api.get(`/api/user/auth?${new URLSearchParams({ platform })}`, { token: snapshot.token });
-        if (disposed || generation !== authGeneration || !session.isCurrent(snapshot)) return;
-        if (response.status === 401) { invalidateSession(); return; }
-        if (response.ok && response.data?.status === 'success') {
-          if (response.data.is_authorized) {
-            session.forgetPendingAuthorization(platform);
-            closeAuthModal(); browser.showToast('授权已确认，请重新生成专属链接'); return;
-          }
-          const authUrl = response.data.auth_url || response.data.short_url;
-          if (authUrl) {
-            session.rememberAuthorization(platform, snapshot);
-            browser.copyText(authUrl, '已复制授权链接，正在前往授权备案...');
-            if (global.window?.open) global.window.open(authUrl, '_blank', 'noopener');
-            else if (global.location) global.location.href = authUrl;
-            authModal.value.authOpened = true;
-            recheck.start(platform, snapshot);
-            return;
-          }
-        }
-        browser.showToast(response.data?.error_msg || '获取授权链接失败，请稍后重试');
-      } catch (err) {
-        if (!disposed && generation === authGeneration && session.isCurrent(snapshot)) browser.showToast('网络连接异常，请重试');
-      } finally { if (generation === authGeneration) authModal.value.isFetchingAuth = false; }
+    const handleGoToAuth = () => {
+      if (!authModal.value.visible || !canUse(pendingAuthorizationInfo)) return;
+      const platform = authModal.value.platform;
+      closeAuthModal();
+      // Keep the user gesture synchronous; the account page owns URL generation and authorization return checks.
+      global.location.href = `/?${new URLSearchParams({ tab: 'user', platform })}`;
     };
     const resumePendingAuthorization = () => {
       if (disposed || !isLoggedIn.value || !verifiedSession || !session.isCurrent(verifiedSession)) return;

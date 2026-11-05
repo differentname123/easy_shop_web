@@ -48,6 +48,10 @@ def catalog_result(items, page=1, page_size=20, offset=None):
 
 
 class MemoryProducts:
+    def __init__(self):
+        self.promotion_links = {}
+        self.cache_calls = {"reads": 0, "hits": 0, "writes": 0}
+
     def get_product_detail(self, key, platform="pdd", key_type=None):
         return next((deepcopy(item) for item in PRODUCTS if item["platform"] == platform and
                      key and key in (item["goods_id"], item["goods_sign"])), None)
@@ -64,8 +68,29 @@ class MemoryProducts:
         return catalog_result(items, page, page_size)
 
     def get_categories(self, **kwargs): return ["日用"]
-    def get_promotion_link_cache(self, **kwargs): return None
-    def save_promotion_link_cache(self, **kwargs): return True
+
+    def _promotion_key(self, platform, goods_id=None, goods_sign=None, goods_key=None):
+        key = goods_sign or goods_id or goods_key
+        item = self.get_product_detail(key, platform)
+        return platform, item["goods_sign"] if item else key
+
+    def get_promotion_link_cache(self, platform, goods_id=None, goods_sign=None, goods_key=None):
+        self.cache_calls["reads"] += 1
+        key = self._promotion_key(platform, goods_id, goods_sign, goods_key)
+        saved = self.promotion_links.get(key)
+        if not saved or saved["_expires_at"] <= time.time():
+            self.promotion_links.pop(key, None)
+            return None
+        self.cache_calls["hits"] += 1
+        return {**deepcopy(saved), "from_cache": True}
+
+    def save_promotion_link_cache(self, platform, data, goods_id=None, goods_sign=None, goods_key=None, expires_at=None):
+        if not expires_at or expires_at <= time.time():
+            return False
+        self.cache_calls["writes"] += 1
+        key = self._promotion_key(platform, goods_id, goods_sign, goods_key)
+        self.promotion_links[key] = {**deepcopy(data), "_expires_at": expires_at}
+        return True
 
 
 class MemoryUsers:
@@ -154,7 +179,8 @@ class PreviewAdapter(BasePlatformAdapter):
         self.platform_code, self.platform_name = platform, adapter_type.platform_name
         self.channels = deepcopy(adapter_type.channels)  # Exactly the production adapter's two authoritative ranks.
         self.required_identity_fields = ("relation_id",) if platform == "taobao" else ()
-        self.requires_authorized_promotion = platform == "taobao"
+        self.requires_authorized_promotion = True
+        self.calls = {"anonymous_converts": 0, "personal_converts": 0, "authority_checks": 0, "authority_urls": 0}
 
     def get_recommend_goods(self, offset=0, limit=20, cursor=None, **kwargs):
         if isinstance(cursor, str) and cursor: offset = int(json.loads(cursor).get("offset", offset))
@@ -168,22 +194,27 @@ class PreviewAdapter(BasePlatformAdapter):
         return {"status": "success", "data": products.get_product_detail(goods_sign or goods_id or goods_id_or_sign, self.platform_code)}
 
     def convert_promotion_url(self, goods_id_or_sign="", uid=None, identity=None, **kwargs):
-        authorized = (uid, self.platform_code) in users.authorized
-        if uid and self.requires_authorized_promotion and not (identity or {}).get("relation_id"):
+        self.calls["personal_converts" if uid else "anonymous_converts"] += 1
+        if uid and any(not (identity or {}).get(field) for field in self.required_identity_fields):
             return {"status": "error", "error_code": "AUTH_REQUIRED", "need_auth": True, "auth_platform": self.platform_code,
-                    "auth_msg": "离线淘宝渠道尚未授权，请完成模拟授权后重新生成链接。"}
+                    "auth_msg": "离线平台渠道身份尚未确认，请完成模拟授权后重新生成链接。"}
         item = products.get_product_detail(kwargs.get("goods_sign") or kwargs.get("goods_id") or goods_id_or_sign, self.platform_code)
-        return {"status": "success", "final_link": item["product_url"] if item else "/", "schema_url": "", "is_fallback": bool(uid and not authorized),
-                "need_auth": bool(uid and not authorized), "auth_platform": self.platform_code,
-                "auth_msg": "离线用户尚未完成该平台模拟渠道授权。", "cacheable": False,
+        if not item:
+            return {"status": "error", "error_msg": "离线测试商品不存在"}
+        # Personal calls rely on the service's stored authorization decision, never a second remote check here.
+        link = item["product_url"] + "&" + urlencode({"promotion": "personal" if uid else "general"})
+        return {"status": "success", "final_link": link, "schema_url": "", "is_fallback": False,
+                "cacheable": True, "expires_at": time.time() + 3600,
                 "promotion_token": "￥OFFLINE_TEST_ONLY￥" if self.platform_code == "taobao" else ""}
 
     def check_authority(self, uid):
+        self.calls["authority_checks"] += 1
         authorized = (uid, self.platform_code) in users.authorized
         identity = {"relation_id": f"OFFLINE_RELATION_{uid}", "external_id": uid} if authorized and self.platform_code == "taobao" else {}
         return {"status": "success", "is_authorized": authorized, "bind": 1 if authorized else 0, "identity": identity}
 
     def generate_authority_url(self, uid, **kwargs):
+        self.calls["authority_urls"] += 1
         url = "/test/authorize?" + urlencode({"platform": self.platform_code, "uid": uid})
         return {"status": "success", "auth_url": url, "short_url": url}
 
@@ -191,8 +222,10 @@ class PreviewAdapter(BasePlatformAdapter):
         return {"status": "success", "order_list": [], "total_count": 0, "has_more": False}
 
 
-register_adapter("pdd", PreviewAdapter("pdd", PddAdapter))
-register_adapter("taobao", PreviewAdapter("taobao", TaobaoAdapter))
+preview_adapters = {platform: PreviewAdapter(platform, adapter_type)
+                    for platform, adapter_type in (("pdd", PddAdapter), ("taobao", TaobaoAdapter))}
+for platform, adapter in preview_adapters.items():
+    register_adapter(platform, adapter)
 
 from main import create_app
 from api import home, goods, promote, user, order
@@ -209,7 +242,9 @@ app = create_app()
 
 @app.get("/test/offline-status")
 def offline_status():
-    return {"status": "error" if BLOCKED_CALLS else "ok", "blocked_external_calls": list(BLOCKED_CALLS)}
+    return {"status": "error" if BLOCKED_CALLS else "ok", "blocked_external_calls": list(BLOCKED_CALLS),
+            "platform_calls": {platform: dict(adapter.calls) for platform, adapter in preview_adapters.items()},
+            "public_cache_calls": dict(products.cache_calls)}
 
 
 @app.get("/test/authorize")

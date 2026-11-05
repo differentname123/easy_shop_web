@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
-from config import AUTH_STATUS_TTL
+from config import AUTH_STATUS_TTL, AUTH_NEGATIVE_STATUS_TTL
 from models.product import normalize_platform
 from repositories.user_repo import UserRepository
 from adapters import get_adapter, PlatformUnavailableError
@@ -90,8 +90,11 @@ class UserService:
         return {"status": "success", "user": user_data}
 
     @staticmethod
-    def _auth_is_fresh(auth_status: dict) -> bool:
-        """Mongo 的 naive datetime 按 UTC 解读；无更新时间的旧记录必须复核。"""
+    def _auth_is_fresh(auth_status: dict, ttl: Optional[int] = None) -> bool:
+        """Mongo 的 naive datetime 按 UTC 解读；无更新时间的旧记录必须复核。
+        若 ttl 为 None，表示正向授权长期有效，不设人工定时过期，仅验证时间戳合法（非未来时间）。
+        若 ttl 有值，则在 [0, ttl) 窗口内有效（如未授权状态按短缓存 AUTH_NEGATIVE_STATUS_TTL 防刷）。
+        """
         updated_at = auth_status.get("updated_at")
         if isinstance(updated_at, datetime):
             if updated_at.tzinfo is None:
@@ -100,17 +103,21 @@ class UserService:
         if not isinstance(updated_at, (int, float)) or isinstance(updated_at, bool):
             return False
         age = time.time() - updated_at
-        return 0 <= age < AUTH_STATUS_TTL
+        if ttl is None:
+            return age >= -60
+        return 0 <= age < ttl
 
     @staticmethod
     def _identity_complete(adapter, identity) -> bool:
         required = getattr(adapter, "required_identity_fields", ())
         return isinstance(identity, dict) and all(
-            isinstance(identity.get(key), str) and identity[key].strip() for key in required
+            isinstance(identity.get(key), str) and identity[key].strip() not in ("", "0") for key in required
         )
 
-    def get_promotion_context(self, uid: str, platform: str = "pdd") -> Dict[str, Any]:
-        """内部可信归因上下文；查询授权不额外生成邀请链接。"""
+    def get_promotion_context(
+        self, uid: str, platform: str = "pdd", *, allow_remote: bool = True, force: bool = False,
+    ) -> Dict[str, Any]:
+        """转链只读本地资格；我的页可权威核验，均不额外生成邀请链接。"""
         plat = normalize_platform(platform)
         if not uid:
             return {"status": "error", "error_msg": "uid 不能为空"}
@@ -123,12 +130,32 @@ class UserService:
                 return {"status": "error", "error_msg": "推手用户不存在"}
             saved = (user.get("auth_status") or {}).get(plat) or {}
             identity = saved.get("identity") or {}
-            if (saved.get("is_authorized") is True and self._auth_is_fresh(saved)
-                    and self._identity_complete(adapter, identity) and identity.get("external_id", uid) == uid):
+            if not isinstance(identity, dict):
+                if not allow_remote:
+                    return {"status": "error", "platform": plat, "error_code": "invalid_platform_identity",
+                            "error_msg": "平台渠道身份格式无效，请重新验证授权"}
+                identity = {}
+            identity_matches = identity.get("external_id", uid) == uid
+            if not identity_matches and not allow_remote:
+                return {"status": "error", "platform": plat, "error_code": "IDENTITY_MISMATCH",
+                        "error_msg": "平台渠道身份与当前用户不符"}
+            if (not force and saved.get("is_authorized") is True and self._auth_is_fresh(saved)
+                    and identity_matches and self._identity_complete(adapter, identity)):
                 return dict(self._authorized_response(uid, plat, adapter.platform_name, saved.get("bind", 0)),
                             identity=UserRepository.clean_platform_identity(identity))
+            negative_fresh = (saved.get("is_authorized") is False
+                              and self._auth_is_fresh(saved, AUTH_NEGATIVE_STATUS_TTL))
+            if not allow_remote or (not force and negative_fresh):
+                return {"status": "success", "platform": plat, "platform_name": adapter.platform_name,
+                        "is_authorized": False, "bind": 0, "identity": {},
+                        "authorization_status": "unauthorized" if negative_fresh else "unknown"}
 
-            response = adapter.check_authority(uid=uid)
+            started = time.perf_counter()
+            try:
+                response = adapter.check_authority(uid=uid)
+            finally:
+                logger.info("[authorization] platform=%s stage=remote_check elapsed_ms=%.1f",
+                            plat, (time.perf_counter() - started) * 1000)
             if not isinstance(response, dict) or response.get("status") != "success":
                 return {"status": "error", "platform": plat,
                         "error_code": response.get("error_code", "authorization_failed") if isinstance(response, dict) else "authorization_failed",
@@ -143,19 +170,29 @@ class UserService:
             if identity.get("external_id", uid) != uid:
                 return {"status": "error", "platform": plat, "error_msg": "平台渠道身份与当前用户不符"}
             bind = response.get("bind", 0)
-            extra = {"identity": identity} if identity or getattr(adapter, "required_identity_fields", ()) else {}
             if not self.repo.update_auth_status(uid=uid, platform=plat, is_authorized=authorized, bind=bind,
-                                                **({"extra": extra} if extra else {})):
+                                                extra={"identity": identity}):
                 return {"status": "error", "platform": plat, "error_msg": "保存授权状态失败，请稍后重试"}
             if identity:
                 self._assign_unmatched_orders(plat, identity, uid)
             if authorized:
                 return dict(self._authorized_response(uid, plat, adapter.platform_name, bind), identity=identity)
             return {"status": "success", "platform": plat, "platform_name": adapter.platform_name,
-                    "is_authorized": False, "bind": bind, "identity": {}}
+                    "is_authorized": False, "bind": bind, "identity": {}, "authorization_status": "unauthorized"}
         except Exception as exc:
             logger.error(f"[{plat}] 查询用户授权失败: {type(exc).__name__}")
             return {"status": "error", "platform": plat, "error_msg": "查询或保存授权状态失败，请稍后重试"}
+
+    def invalidate_promotion_authorization(self, uid: str, platform: str) -> bool:
+        """只用于平台转链明确拒绝授权，普通供应商失败不能撤销本地资格。"""
+        try:
+            return bool(self.repo.update_auth_status(
+                uid=uid, platform=normalize_platform(platform), is_authorized=False, bind=0,
+                extra={"identity": {}},
+            ))
+        except Exception as exc:
+            logger.warning("[%s] 保存转链授权失效状态失败: %s", platform, type(exc).__name__)
+            return False
 
     def _assign_unmatched_orders(self, platform: str, identity: dict, uid: str) -> None:
         try:
@@ -170,10 +207,16 @@ class UserService:
         except Exception as exc:
             logger.warning(f"[{platform}] 未匹配订单归因回填待重试: {type(exc).__name__}")
 
-    def check_and_get_auth(self, uid: str, platform: str = "pdd") -> Dict[str, Any]:
-        """只缓存已确认且完整的授权；上游故障不等价于用户未授权。"""
-        result = self.get_promotion_context(uid, platform)
+    def check_and_get_auth(
+        self, uid: str, platform: str = "pdd", *, force: bool = False, check_only: bool = False,
+    ) -> Dict[str, Any]:
+        """获取授权入口或只核验状态；主动复查不反复生成邀请链接。"""
+        result = self.get_promotion_context(uid, platform, force=force)
         result.pop("identity", None)
+        if check_only:
+            if result.get("status") == "success" and result.get("is_authorized") is False:
+                result["msg"] = f"尚未在{result['platform_name']}完成渠道授权备案，请完成授权后重新校验"
+            return result
         if result.get("status") != "success" or result.get("is_authorized"):
             return result
         plat = normalize_platform(platform)

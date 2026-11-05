@@ -2,6 +2,7 @@
 """淘宝平台边界：官方商品、第三方ID榜单、核验身份与渠道订单映射。"""
 import math
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlsplit
 
@@ -73,6 +74,14 @@ class TaobaoAdapter(BasePlatformAdapter):
             key, secret, adzone, setting("tb_session"), setting("tb_inviter_code"))
         self.hdk = hdk_client if hdk_client is not None else HdkClient(setting("hdk_api_key"))
         self.ztk = ztk_client if ztk_client is not None else ZtkClient(setting("ztk_appkey"), setting("ztk_sid"))
+        pid_val = _text(setting("tb_pid"))
+        pid_prefix = _text(setting("tb_pid_prefix"))
+        if not pid_prefix and pid_val.startswith("mm_") and len(pid_val.split("_")) == 4:
+            pid_prefix = pid_val.rsplit("_", 1)[0]
+        if not pid_prefix:
+            pid_prefix = getattr(self.official, "pid_prefix", "") or "mm_328750149_3161250458"
+        channel_adzone = _text(setting("tb_channel_adzone_id")) or adzone or "116343300219"
+        self.channel_pid = _text(setting("tb_channel_pid")) or f"{pid_prefix}_{channel_adzone}"
         official_ok = bool(official_client is not None or key and secret)
         search_ok = bool(official_client is not None or official_ok and adzone)
         self.capabilities = {
@@ -279,6 +288,21 @@ class TaobaoAdapter(BasePlatformAdapter):
             return res
         return {"status": "success", "data": self._detail(res["data"])}
 
+    def _is_unauthorized_error(self, err) -> bool:
+        """识别淘宝/折淘客网关抛出的渠道未授权或 relationId 无效错误。"""
+        if not err:
+            return False
+        if isinstance(err, dict):
+            if err.get("need_auth") is True or err.get("error_code") == "AUTH_REQUIRED":
+                return True
+            if err.get("status") == 301:
+                return True
+            msg = " ".join(str(err.get(key) or "") for key in ("error_msg", "msg", "content")).strip()
+        else:
+            msg = str(err)
+        return bool("relationId" in msg or "relation_id" in msg or "无效的relation" in msg
+                    or re.search(r"(?:用户|推手|渠道).{0,12}(?:未授权|未备案|失效|无效)", msg))
+
     def convert_promotion_url(self, goods_id_or_sign, uid=None, **kwargs):
         identity = kwargs.get("identity") or {}
         relation_id = _text(identity.get("relation_id")) if isinstance(identity, dict) else ""
@@ -298,8 +322,38 @@ class TaobaoAdapter(BasePlatformAdapter):
         target = official_target
         if not target:
             target = "https://item.taobao.com/item.htm?" + urlencode({"id": ref.goods_id or item["goods_sign"]})
-        res = self.official.search_goods(target, page=1, page_size=20,
-                                         **({"relation_id": relation_id, "uid": _text(uid)} if uid else {}))
+        # 途径 B: 推手渠道推广 -> 调用折淘客高佣渠道转链
+        if uid and relation_id:
+            ztk_res = self.ztk.convert_channel_url(target, relation_id, self.channel_pid)
+            if not isinstance(ztk_res, dict) or ztk_res.get("status") != "success":
+                err = ztk_res.get("error_msg") if isinstance(ztk_res, dict) else "折淘客渠道转链失败"
+                is_unauth = self._is_unauthorized_error(ztk_res)
+                code = "AUTH_REQUIRED" if is_unauth else (ztk_res.get("error_code") if isinstance(ztk_res, dict) else "PROMOTION_FAILED")
+                return _error(code or "PROMOTION_FAILED", err, need_auth=is_unauth)
+            link = ztk_res.get("final_link") or ztk_res.get("url")
+            if not link or not str(link).startswith(("https://", "http://")):
+                return _error("PROMOTION_UNAVAILABLE", "折淘客未返回有效渠道推广链接")
+            password = ztk_res.get("tpwd") or ""
+            if not password:
+                token = self.official.create_tpwd(link, text=item.get("goods_name") or "精选好物")
+                password = token.get("password_simple") or token.get("model") or ""
+            if not password:
+                return _error("PROTOCOL_ERROR", "渠道转链未生成有效淘口令")
+            result = {
+                "status": "success", "url": link, "final_link": link, "mobile_url": link, "short_url": "",
+                "we_app_info": {}, "promotion_token": password, "token_type": "tpwd",
+                "attribution_status": "verified", "relation_id": relation_id, "need_auth": False,
+                "is_fallback": False, "goods_id": item.get("goods_id", ""),
+                "goods_sign": item.get("goods_sign", ""), "link_type": "折淘客渠道淘口令",
+            }
+            expires = _timestamp(ztk_res.get("expires_at"))
+            if expires:
+                result["expires_at"] = expires
+            result["cacheable"] = bool(expires)
+            return result
+
+        # 途径 A: 站长/自营/无渠道普通推广 -> 调用官方 TOP 物料升级接口
+        res = self.official.search_goods(target, page=1, page_size=20)
         if res.get("status") != "success":
             return res
         expected = ProductRef(self.platform_code, "", item["goods_sign"])
@@ -328,7 +382,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             return _error("PROTOCOL_ERROR", "官方未返回真实淘口令")
         result = {"status": "success", "url": link, "final_link": link, "mobile_url": link, "short_url": "",
                   "we_app_info": {}, "promotion_token": password, "token_type": "tpwd",
-                  "attribution_status": "verified" if uid else "anonymous", "need_auth": False,
+                  "attribution_status": "anonymous", "need_auth": False,
                   "is_fallback": False, "goods_id": item.get("goods_id", ""),
                   "goods_sign": item.get("goods_sign", ""), "link_type": "淘宝官方淘口令"}
         expires = _timestamp(token.get("expires_at") or (token.get("raw") or {}).get("expires_at"))
