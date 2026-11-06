@@ -7,6 +7,10 @@ import uuid
 import random
 import re
 import string
+import secrets
+import threading
+from pymongo.errors import DuplicateKeyError
+from models.user import normalize_promoter_id
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from repositories.base_repo import BaseRepository
@@ -20,8 +24,16 @@ DEFAULT_AVATAR = "https://img.pddpic.com/mms-avatar/default_avatar.png"
 class UserRepository(BaseRepository):
     COLLECTION_NAME = "users"
 
+    def __init__(self, db_instance=None):
+        self._promoter_index_ready = False
+        self._promoter_index_lock = threading.Lock()
+        super().__init__(db_instance)
+
     def _init_indexes(self):
         try:
+            self.col.create_index([("promoter_id", 1)], unique=True, name="promoter_id_unique",
+                                  partialFilterExpression={"promoter_id": {"$type": "string"}})
+            self._promoter_index_ready = True
             self.col.create_index([("uid", 1)], unique=True)
             self.col.create_index([("phone", 1)], unique=True, sparse=True)
             self.col.create_index([("invite_code", 1)], unique=True, sparse=True)
@@ -30,6 +42,59 @@ class UserRepository(BaseRepository):
         except Exception as e:
             logger.warning(f"用户集合索引创建提示: {e}")
             return False
+
+    def _ensure_promoter_index(self):
+        # 普通查询允许索引初始化重试；分配归因 ID 则必须确认唯一约束成立。
+        with self._promoter_index_lock:
+            if not self._promoter_index_ready:
+                self.col.create_index([("promoter_id", 1)], unique=True, name="promoter_id_unique",
+                                      partialFilterExpression={"promoter_id": {"$type": "string"}})
+                self._promoter_index_ready = True
+
+    @staticmethod
+    def _unassigned_promoter(uid):
+        return {"uid": uid, "$or": [{"promoter_id": {"$exists": False}},
+                                   {"promoter_id": None}, {"promoter_id": ""}]}
+
+    def ensure_promoter_id(self, uid: str, reserved_ids=()) -> str:
+        """首次数字生链时分配；唯一索引防碰撞，CAS 防同一账户被并发换号。"""
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            raise ValueError("推手用户不存在")
+        reserved = {normalize_promoter_id(value) for value in reserved_ids if value not in (None, "")}
+        self._ensure_promoter_index()
+        for _ in range(12):
+            user = self.col.find_one({"uid": clean_uid}, {"promoter_id": 1})
+            if not user:
+                raise ValueError("推手用户不存在")
+            existing = user.get("promoter_id")
+            if existing not in (None, ""):
+                canonical = normalize_promoter_id(existing)
+                if existing != canonical:
+                    raise ValueError("已保存的推广 ID 格式无效，不能自动换号")
+                return canonical
+            candidate = str(100_000_000 + secrets.randbelow(900_000_000))
+            if candidate in reserved:
+                continue
+            try:
+                result = self.col.update_one(self._unassigned_promoter(clean_uid),
+                                             {"$set": {"promoter_id": candidate}})
+            except DuplicateKeyError:
+                continue
+            if not result.acknowledged:
+                raise RuntimeError("推广 ID 写入未确认")
+            if result.matched_count:
+                return candidate
+        raise RuntimeError("暂时无法分配唯一推广 ID，请稍后重试")
+
+    def get_uid_by_promoter_id(self, promoter_id) -> Optional[str]:
+        """数字归因不依赖任何平台授权；历史歧义也不能猜选一个用户。"""
+        try:
+            promoter_id = normalize_promoter_id(promoter_id)
+        except ValueError:
+            return None
+        rows = list(self.col.find({"promoter_id": promoter_id}, {"uid": 1, "_id": 0}).limit(2))
+        return str(rows[0]["uid"]) if len(rows) == 1 and rows[0].get("uid") else None
 
     @staticmethod
     def generate_uid() -> str:

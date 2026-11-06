@@ -520,7 +520,8 @@ allowed = {'myself_pdd_client_id', 'myself_pdd_client_secret', 'myself_pdd_pid',
     'local_mongo_db_name', 'mongo_auth_source', 'web_auth_secret',
     'pdd_enabled', 'taobao_enabled', 'myself_taobao_app_key', 'myself_taobao_app_secret',
     'myself_taobao_pid', 'taobao_adzone_id', 'taobao_session', 'taobao_inviter_code',
-    'haodanku_api_key', 'zhetaoke_appkey', 'zhetaoke_sid'}
+    'haodanku_api_key', 'zhetaoke_appkey', 'zhetaoke_sid', 'jd_enabled',
+    'myself_jd_union_id', 'myself_jd_position_id', 'myself_jd_app_key', 'myself_jd_app_secret', 'jd_api_base'}
 assert set(values) <= allowed, set(values) - allowed
 assert values['mongo_auth_source'] == 'migrated_auth'
 assert values['myself_pdd_client_id'] == 'migrated-client'

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from config import AUTH_STATUS_TTL, AUTH_NEGATIVE_STATUS_TTL
 from models.product import normalize_platform
+from models.user import normalize_promoter_id
 from repositories.user_repo import UserRepository
 from adapters import get_adapter, PlatformUnavailableError
 from auth import create_access_token, mask_phone
@@ -89,6 +90,18 @@ class UserService:
         user_data["phone"] = mask_phone(user_data.get("phone"))
         return {"status": "success", "user": user_data}
 
+    def get_numeric_promotion_context(self, uid: str, platform: str, default_promoter_id) -> Dict[str, Any]:
+        """数字推广身份与渠道备案无关，已分配身份失败时不能变成站长身份。"""
+        plat = normalize_platform(platform)
+        try:
+            default_id = normalize_promoter_id(default_promoter_id)
+            promoter_id = self.repo.ensure_promoter_id(uid, reserved_ids=(default_id,))
+        except Exception as exc:
+            logger.warning("[%s] 读取数字推广身份失败: %s", plat, type(exc).__name__)
+            return {"status": "error", "error_code": "promoter_identity_unavailable",
+                    "error_msg": "无法确认本人推广身份，请稍后重试；未使用站长推广位代替"}
+        return {"status": "success", "uid": uid, "promoter_id": promoter_id}
+
     @staticmethod
     def _auth_is_fresh(auth_status: dict, ttl: Optional[int] = None) -> bool:
         """Mongo 的 naive datetime 按 UTC 解读；无更新时间的旧记录必须复核。
@@ -124,6 +137,10 @@ class UserService:
         adapter = get_adapter(plat)
         if not adapter.active:
             raise PlatformUnavailableError(f"{adapter.platform_name}暂未接入")
+        if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+            return {"status": "success", "platform": plat, "platform_name": adapter.platform_name,
+                    "authorization_required": False, "authorization_status": "not_required",
+                    "is_authorized": False, "bind": 0, "identity": {}, "msg": "该平台无需授权备案"}
         try:
             user = self.repo.get_user_by_uid(uid)
             if not user:
@@ -213,6 +230,8 @@ class UserService:
         """获取授权入口或只核验状态；主动复查不反复生成邀请链接。"""
         result = self.get_promotion_context(uid, platform, force=force)
         result.pop("identity", None)
+        if result.get("authorization_required") is False:
+            return result
         if check_only:
             if result.get("status") == "success" and result.get("is_authorized") is False:
                 result["msg"] = f"尚未在{result['platform_name']}完成渠道授权备案，请完成授权后重新校验"

@@ -5,44 +5,60 @@ from infrastructure.mongo import gen_db_object
 from config import logger
 
 
+class _CollectionIndexState:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.ready = False
+
+
 class BaseRepository:
     COLLECTION_NAME: str = ""
-    _initialized_collections = set()
+    # 只保护数据库上的状态字典装配；连接与索引 DDL 都不持有此锁。
     _initialization_lock = threading.RLock()
 
     def __init__(self, db_instance=None):
         # 路由/服务装配不触发网络 I/O；真实连接和索引在首次仓储操作时获取。
         self._db = db_instance
+        self._connection_lock = threading.RLock()
         self._index_state = threading.local()
+        self._collection_index_state = None
         if db_instance is not None and self.COLLECTION_NAME:
             self._ensure_indexes()
+
+    def _get_collection_index_state(self):
+        cached = self._collection_index_state
+        if cached is not None and cached[0] is self._db and cached[1] == self.COLLECTION_NAME:
+            return cached[2]
+        with self._initialization_lock:
+            cached = self._collection_index_state
+            if cached is not None and cached[0] is self._db and cached[1] == self.COLLECTION_NAME:
+                return cached[2]
+            # 状态跟随具体 db 生命周期，不能用永久全局 id() 集合记录短生命周期 mock。
+            states = getattr(self._db, "_repository_index_states", None)
+            if not isinstance(states, dict):
+                states = {}
+                try:
+                    self._db._repository_index_states = states
+                except Exception:
+                    # 不允许附加属性的注入对象使用仓储实例自己的状态；不强持有全局引用。
+                    pass
+            state = states.setdefault(self.COLLECTION_NAME, _CollectionIndexState())
+            self._collection_index_state = (self._db, self.COLLECTION_NAME, state)
+            return state
 
     def _ensure_indexes(self):
         if not self.COLLECTION_NAME or getattr(self._index_state, "building", False) or self._db is None:
             return
-        with self._initialization_lock:
-            # 优先挂载在具体 db 实例上，彻底避免短生命周期测试 mock 对象 GC 后 id() 地址重用冲突
-            initialized = getattr(self._db, "_initialized_collections", None)
-            if not isinstance(initialized, set):
-                initialized = set()
-                try:
-                    self._db._initialized_collections = initialized
-                except Exception:
-                    initialized = None
-            if initialized is not None:
-                if self.COLLECTION_NAME in initialized:
-                    return
-            else:
-                key = (id(self._db), self.COLLECTION_NAME)
-                if key in self._initialized_collections:
-                    return
+        state = self._get_collection_index_state()
+        if state.ready:
+            return
+        with state.lock:
+            if state.ready:
+                return
             self._index_state.building = True
             try:
                 if self._init_indexes() is not False:
-                    if initialized is not None:
-                        initialized.add(self.COLLECTION_NAME)
-                    else:
-                        self._initialized_collections.add((id(self._db), self.COLLECTION_NAME))
+                    state.ready = True
             except Exception as exc:
                 logger.warning(f"{self.COLLECTION_NAME} 索引初始化失败，后续访问将重试: {exc}")
             finally:
@@ -53,7 +69,7 @@ class BaseRepository:
         if not self.COLLECTION_NAME:
             raise NotImplementedError("子类仓储必须声明 COLLECTION_NAME")
         if self._db is None:
-            with self._initialization_lock:
+            with self._connection_lock:
                 if self._db is None:
                     self._db = gen_db_object()
         self._ensure_indexes()

@@ -11,7 +11,7 @@ from typing import Dict, Any, List, Optional
 from adapters import get_adapter, normalize_platform
 from models.product import ProductRef, DetailSnapshot, DetailPrefetchResult, utc_millis
 from repositories.product_repo import ProductRepository
-from cache import RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE
+from cache import RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, MATERIAL_CACHE
 from config import PRODUCT_DETAIL_TTL, logger
 
 _RECOMMEND_CACHE = RECOMMEND_CACHE
@@ -30,6 +30,9 @@ class _LoadedDetail:
 
 
 class ProductService:
+    # 摘要只是缓存性写入：无排队，满载时跳过，避免每个榜单请求各自启动线程。
+    _MAX_BACKGROUND_WRITES = 2
+
     def __init__(self, product_repo: Optional[ProductRepository] = None):
         self.repo = product_repo if product_repo is not None else ProductRepository()
         self.prefetcher = None
@@ -37,6 +40,7 @@ class ProductService:
         self._flights = {}
         self._write_lock = threading.RLock()
         self._background_writes = set()
+        self._summary_write_slots = threading.BoundedSemaphore(self._MAX_BACKGROUND_WRITES)
         self._writes_open = True
 
     @staticmethod
@@ -74,18 +78,33 @@ class ProductService:
             finally:
                 with self._write_lock:
                     self._background_writes.discard(thread)
-        thread = threading.Thread(target=save, name="bg-upsert-home-products", daemon=True)
+                    self._summary_write_slots.release()
         with self._write_lock:
             if not self._writes_open:
                 return
-            self._background_writes.add(thread)
+            if not self._summary_write_slots.acquire(blocking=False):
+                logger.warning("推荐摘要后台写入满载，跳过缓存性入库: limit=%s", self._MAX_BACKGROUND_WRITES)
+                return
+            thread = None
             try:
+                thread = threading.Thread(target=save, name="bg-upsert-home-products", daemon=True)
+                self._background_writes.add(thread)
                 thread.start()
             except Exception:
                 self._background_writes.discard(thread)
+                self._summary_write_slots.release()
                 logger.warning("推荐摘要后台任务未能启动")
 
     def _offer_products(self, items, channel_type=None, snapshots=()):
+        # 转链所需公开映射先发布，不能被可丢弃的后台摘要写入或预取开关阻断。
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ref = ProductRef(item.get("platform"), item.get("goods_id"), item.get("goods_sign"))
+            url = item.get("product_url")
+            if ref.key and isinstance(url, str) and url.strip():
+                kind = "sign" if ref.goods_sign else "id"
+                MATERIAL_CACHE.set((ref.platform, kind, ref.key), url.strip())
         if self.prefetcher is not None:
             try:
                 self.prefetcher.offer_products(items, channel_type=channel_type, snapshots=snapshots)
@@ -147,7 +166,13 @@ class ProductService:
         result = adapter.search_goods(keyword=keyword, page=page, page_size=page_size, uid=uid)
         if result.get("status") == "success":
             SEARCH_CACHE.set(cache_key, result)
-            self._offer_products(result.get("data") or [])
+            items = result.get("data") or []
+            # 搜索物料链接也保留到摘要库，不能依赖可关闭的详情预取来补映射。
+            if getattr(adapter, "requires_material_url", False) is True:
+                materials = [item for item in items if item.get("product_url")]
+                if materials:
+                    self._save_summary_in_background(materials, None)
+            self._offer_products(items)
         return result
 
     @staticmethod

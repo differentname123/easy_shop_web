@@ -16,6 +16,11 @@
     const descriptor = platform => getPlatforms().find(item => item.code === platform);
     const platformName = platform => descriptor(platform)?.name || platform;
     const supportsPlatform = (platform, capability) => shop.platformCapability(descriptor(platform), capability);
+    // An unavailable authorization endpoint is not evidence that a platform needs no authorization.
+    const requiresAuthorization = platform => !(descriptor(platform)?.active && descriptor(platform)?.authorization_required === false);
+    const orderAmountLabel = order => ({ paid: '实付', commissionable: '计佣金额' }[order.order_amount_basis] || '订单金额');
+    const orderTimeLabel = order => ({ paid: '付款时间', created: '下单时间' }[order.order_time_basis] || '订单时间');
+    const orderTimeText = order => order.order_time_str || (order.order_time_basis !== 'created' && order.order_pay_time_str) || '未提供';
     const applyUser = user => {
       userProfile.value = { ...emptyProfile(), ...user, avatar: user.avatar || DEFAULT_AVATAR };
       uid.value = user.uid; userPhone.value = user.phone; isLoggedIn.value = true;
@@ -112,6 +117,7 @@
     };
     const handleCheckAndGetAuth = async (platform, checkOnly = false) => {
       if (disposed) return;
+      if (!requiresAuthorization(platform)) return showToast(`${platformName(platform)}无需授权`);
       if (!supportsPlatform(platform, 'authorization')) return showToast(`${platformName(platform)}授权暂未接入或未配置`);
       if (!isLoggedIn.value || !uid.value) return showToast('请先完成手机号登记注册');
       if (!session.token()) return invalidSession();
@@ -145,7 +151,7 @@
       if (disposed || !isLoggedIn.value || !uid.value || !session.token()) return;
       const snapshot = session.capture();
       const platform = session.consumePendingAuthorization(snapshot);
-      if (!platform || !supportsPlatform(platform, 'authorization')) return;
+      if (!platform || !requiresAuthorization(platform) || !supportsPlatform(platform, 'authorization')) return;
       recheck.start(platform, snapshot);
       return recheck.refresh();
     };
@@ -164,7 +170,8 @@
       isLoggedIn, uid, userPhone, userProfile, isRegisterMode, formPhone, formPassword, formNickname, formInviteCode,
       isSubmittingAuth, handleRegisterOrLogin, handleLogout, fetchUserInfo,
       isAuthModalOpen, currentAuthInfo, isCheckingAuth, handleCheckAndGetAuth, handleRecheckAuth, closeAccountAuth, openAccountAuth,
-      refreshAuthorization: recheck.refresh, resumePendingAuthorization, platformName, supportsPlatform,
+      refreshAuthorization: recheck.refresh, resumePendingAuthorization, platformName, supportsPlatform, requiresAuthorization,
+      orderAmountLabel, orderTimeLabel, orderTimeText,
       orderPlatform, orderDays, orderMessage, isSyncingOrders, userOrdersData, syncAndQueryOrders, switchOrderDays,
       switchOrderPlatform, initializeOrderPlatform,
       orderKey: order => shop.orderKey({ ...order, platform: order.platform || orderPlatform.value }), defaultAvatar: DEFAULT_AVATAR, handleAvatarError,

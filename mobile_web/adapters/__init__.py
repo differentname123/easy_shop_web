@@ -63,6 +63,7 @@ def get_all_platforms() -> List[Dict[str, Any]]:
         configured = getattr(adapter, "capabilities", None)
         result.append({
             "code": code, "name": adapter.platform_name, "active": adapter.active,
+            "authorization_required": bool(getattr(adapter, "requires_authorized_promotion", False)),
             "capabilities": {key: bool(adapter.active and (configured.get(key, False)
                              if isinstance(configured, dict) else True)) for key in capabilities},
         })

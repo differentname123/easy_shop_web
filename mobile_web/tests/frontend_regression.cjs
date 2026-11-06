@@ -8,8 +8,8 @@ const root = path.resolve(__dirname, '..');
 const scripts = path.join(root, 'static', 'js');
 const flush = async () => { for (let index = 0; index < 20; index += 1) await Promise.resolve(); };
 const platformFixtures = [
-  { code: 'pdd', name: '拼多多', active: true, capabilities: { orders: true, authorization: true } },
-  { code: 'taobao', name: '淘宝', active: true, capabilities: { orders: true, authorization: true } },
+  { code: 'pdd', name: '拼多多', active: true, authorization_required: true, capabilities: { orders: true, authorization: true } },
+  { code: 'taobao', name: '淘宝', active: true, authorization_required: true, capabilities: { orders: true, authorization: true } },
   { code: 'jd', name: '京东', active: false },
 ];
 const channelFixtures = [{ channel_type: 5, name: '适配器实时榜' }, { channel_type: 1, name: '适配器今日榜' }];
@@ -840,8 +840,9 @@ test('disposing detail while identity restoration is pending prevents conversion
 test('account order statistics preserve zero and never fall back to profile placeholder balances', () => {
   const source = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const formatMoney = harness().context.EasyShop.formatMoney;
-  assert.ok(source.includes("orderPlatform === 'taobao' ? '联盟预估佣金' : '订单佣金'"));
-  assert.ok(source.includes("orderPlatform === 'taobao' ? '联盟结算预估佣金' : '平台已结算佣金'"));
+  assert.ok(source.includes('订单佣金参考'));
+  assert.ok(source.includes('结算口径佣金'));
+  assert.equal(source.includes("orderPlatform === 'taobao'"), false, 'shared order labels do not branch by platform');
   assert.equal(/userProfile\.(?:balance|total_rebate)/.test(source), false);
   for (const field of ['total_commission', 'settled_commission']) {
     const expression = source.match(new RegExp(`{{\\s*(formatMoney\\(userOrdersData\\.${field}[^}]+)\\s*}}`))?.[1];
@@ -1205,7 +1206,7 @@ test('account orders are isolated by platform and date, including unavailable ca
   const source = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   assert.ok(source.includes("ord.is_invalid ? 'invalid'"));
   assert.ok(source.includes('失效订单不等同于退款'));
-  assert.ok(source.includes('联盟预估 / 结算预估收入，不代表最终到账或可提现余额'));
+  assert.ok(source.includes('预估 / 结算口径展示，不代表最终到账或可提现余额'));
 });
 
 test('an unavailable order selection invalidates a pending prior-platform response', async () => {
@@ -1533,4 +1534,104 @@ test('app.js and DOM templates support pull-to-refresh indicator and gesture bin
   assert.ok(appSource.includes('executeRefresh'), 'app.js defines executeRefresh');
 });
 
+const activeJD = { code: 'jd', name: '京东', active: true, authorization_required: false,
+  capabilities: { recommend: true, search: true, detail: true, promotion: true, authorization: false, orders: true } };
+
+test('testJD no-auth account never opens or calls authorization and does not invent authorized status', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), account = h.makeAccount([activeJD]);
+  const restore = account.fetchUserInfo();
+  await h.finish(0, { status: 'success', user: user() }); await restore;
+  assert.equal(account.requiresAuthorization('jd'), false);
+  await account.handleCheckAndGetAuth('jd'); await account.handleRecheckAuth('jd');
+  assert.equal(h.requests.length, 1, 'JD never requests /api/user/auth');
+  assert.equal(h.toasts.at(-1), '京东无需授权');
+  assert.equal(account.isAuthModalOpen.value, false);
+  assert.equal(account.userProfile.value.auth_status.jd, undefined, 'no fake is_authorized record');
+  assert.equal(h.opened.length, 0);
+  const missingAuth = h.makeAccount([{ ...activeJD, code: 'fixture', authorization_required: true }]);
+  assert.equal(missingAuth.requiresAuthorization('fixture'), true, 'missing endpoint capability is not no-auth');
+  assert.equal(h.makeAccount([{ ...activeJD, active: false }]).requiresAuthorization('jd'), true,
+    'an inactive platform remains an unavailable placeholder');
+  const index = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(index.includes("!requiresAuthorization(p.code) ? '无需授权'"));
+  assert.ok(index.includes('class="auth-actions" v-if="requiresAuthorization(p.code)"'), 'no JD authorization button is rendered');
+});
+
+test('testJD catalog-only deployment loads shared ranks and search without PDD or TB', async () => {
+  const h = harness(), feed = h.context.EasyShop.createFeeds({ ref: h.context.Vue.ref, api: h.api,
+    getUid: () => '', getScope: h.session.scope, showToast: message => h.toasts.push(message) });
+  const init = feed.initialize(new URLSearchParams('platform=jd'));
+  await h.finish(0, { status: 'success', data: [activeJD] });
+  await h.finish(1, { status: 'success', data: channelFixtures });
+  assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('platform'), 'jd');
+  await h.finish(2, { status: 'success', data: [{ goods_id: 'JD_OPAQUE', platform: 'jd' }], has_more: false }); await init;
+  feed.homeSearchKeyword.value = '京东'; const search = feed.onSearchHome();
+  const params = new URL(h.requests[3].url, 'https://shop.test').searchParams;
+  assert.equal(params.get('platform'), 'jd'); assert.equal(params.get('keyword'), '京东');
+  await h.finish(3, { status: 'success', data: [], has_more: false }); await search;
+  assert.equal(feed.homePlatform.value, 'jd'); assert.equal(h.requests.length, 4);
+});
+
+for (const goodsId of ['10001', 'JD_OPAQUE_MATERIAL_2']) {
+  for (const action of ['copy', 'buy']) {
+    test(`testJD ${goodsId} ${action} uses shared detail, verified identity and real-token text without auth`, async () => {
+      const original = `https://shop.test/detail?platform=jd&goods_id=${goodsId}&uid=SHARER`;
+      const h = harness({ url: original, saved: { easy_shop_token: 'token-A' } });
+      h.load('detail'); const init = h.mounted[0]();
+      await h.finish(0, { status: 'success', user: user() });
+      await h.finish(1, { status: 'success', data: { goods_id: goodsId, platform: 'jd', platform_name: '京东', name: 'JD' } }); await init;
+      const pending = action === 'copy' ? h.page.handleCopyPromoteLink() : h.page.handleJumpToBuy(); await flush();
+      const request = h.requests[2], body = JSON.parse(request.options.body);
+      assert.equal(request.url, '/api/promote/convert'); assert.equal(request.options.headers.Authorization, 'Bearer token-A');
+      assert.equal(body.goods_id, goodsId); assert.equal(body.uid, 'A'); assert.equal(body.platform, 'jd');
+      assert.equal(body.promoter_id, undefined, 'only the server chooses numeric attribution');
+      const command = '京东测试文案\n￥JD_REAL_PLATFORM_TOKEN￥\nhttps://buy.test/JD';
+      await h.finish(2, { status: 'success', final_link: 'https://buy.test/JD', promotion_token: '￥JD_REAL_PLATFORM_TOKEN￥', command_text: command }); await pending;
+      assert.deepEqual(h.copied, [command]); assert.equal(h.page.authModal.value.visible, false);
+      assert.equal(h.requests.filter(item => item.url.startsWith('/api/user/auth')).length, 0);
+      if (action === 'buy') {
+        const navigation = [...h.timers.values()].find(item => item.delay === 400);
+        assert.ok(navigation); navigation.callback(); assert.equal(h.context.location.href, 'https://buy.test/JD');
+      }
+    });
+  }
+}
+
+test('testJD missing trusted material stays an explicit error with no fabricated link or authorization', async () => {
+  const h = harness({ url: 'https://shop.test/detail?platform=jd&goods_id=JD_OPAQUE_NO_LINK_3' });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(0, { status: 'success', data: { goods_id: 'JD_OPAQUE_NO_LINK_3', platform: 'jd', name: 'JD', product_url: '' } }); await init;
+  const pending = h.page.handleCopyPromoteLink(); await flush();
+  await h.finish(1, { status: 'error', error_msg: '缺少可信京东物料链接' }); await pending;
+  assert.equal(h.page.toastMessage.value, '缺少可信京东物料链接');
+  assert.equal(h.page.authModal.value.visible, false); assert.equal(h.copied.length, 0); assert.equal(h.opened.length, 0);
+  assert.equal(h.requests.length, 2);
+});
+
+test('testJD order amount and date labels follow canonical evidence, not platform or payment guesses', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), account = h.makeAccount([activeJD]);
+  account.isLoggedIn.value = true; account.uid.value = 'A';
+  const query = account.switchOrderPlatform('jd');
+  const item = { platform: 'jd', order_sn: 'line-1', order_time_basis: 'created', order_amount_basis: 'commissionable',
+    order_time_str: '2026-11-06 10:00:00', order_pay_time: null, order_pay_time_str: '', order_amount_yuan: 0 };
+  await h.finish(0, { status: 'success', data: { sync_status: 'partial', total_commission: 0, settled_commission: 0, order_list: [item] } }); await query;
+  assert.equal(account.orderAmountLabel(item), '计佣金额'); assert.equal(account.orderTimeLabel(item), '下单时间');
+  assert.equal(account.orderTimeText(item), '2026-11-06 10:00:00');
+  assert.equal(account.orderAmountLabel({ order_amount_basis: 'paid' }), '实付');
+  assert.equal(account.orderTimeLabel({ order_time_basis: 'paid' }), '付款时间');
+  assert.equal(account.orderAmountLabel({}), '订单金额'); assert.equal(account.orderTimeLabel({}), '订单时间');
+  assert.equal(account.orderTimeText({ order_time_basis: 'created', order_pay_time_str: 'not-known-paid' }), '未提供');
+  assert.equal(account.userOrdersData.value.sync_status, 'partial'); assert.equal(account.userOrdersData.value.settled_commission, 0);
+  const source = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(source.includes('orderAmountLabel(ord)')); assert.ok(source.includes('orderTimeLabel(ord)'));
+  assert.equal(source.includes("orderPlatform === 'taobao'"), false);
+});
+
+test('testJD missing order credentials do not issue a request or alter no-auth catalog availability', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } });
+  const account = h.makeAccount([{ ...activeJD, capabilities: { ...activeJD.capabilities, orders: false } }]);
+  account.isLoggedIn.value = true; account.uid.value = 'A'; await account.switchOrderPlatform('jd');
+  assert.equal(h.requests.length, 0); assert.ok(account.orderMessage.value.includes('订单能力未配置'));
+  assert.equal(account.requiresAuthorization('jd'), false); assert.equal(account.supportsPlatform('jd', 'detail'), true);
+});
 

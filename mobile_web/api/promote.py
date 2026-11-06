@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-转链接口路由：令牌校验本人身份，由服务按本平台授权选择个人或通用推广。
+转链接口路由：令牌校验本人身份，服务解析数字归因或平台渠道资格。
 """
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,7 +26,7 @@ class ConvertRequest(BaseModel):
 @router.post("/convert")
 def convert_link(req: ConvertRequest, current_uid: Optional[str] = Depends(get_optional_uid)):
     """
-    按本平台有效授权生成个人转链；游客及无有效授权用户复用站长通用缓存。
+    个人身份由服务端解析；仅要求授权的平台才做渠道分流，京东不走备案。
     """
     if req.uid and req.uid.strip() != current_uid:
         raise HTTPException(status_code=403, detail="推广归因必须使用本人已验证身份")

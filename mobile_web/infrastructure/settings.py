@@ -48,6 +48,12 @@ class Settings:
     ztk_sid: str = field(default="", repr=False)
     detail_prefetch_enabled: bool = True
     detail_prefetch_interval_seconds: int = 300
+    jd_enabled: bool = False
+    jd_union_id: str = ""
+    jd_position_id: str = ""
+    jd_app_key: str = ""
+    jd_app_secret: str = field(default="", repr=False)
+    jd_api_base: str = "http://api.zhetaoke.com:20000/api"
 
 
 def app_path(value) -> Path:
@@ -128,6 +134,17 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
     pdd_enabled = _boolean(values.get("pdd_enabled", True), "pdd_enabled")
     taobao_enabled = _boolean(values.get("taobao_enabled", bool(tb_app_key and tb_app_secret and tb_adzone_id)),
                               "taobao_enabled")
+    jd_enabled = _boolean(values.get("jd_enabled", False), "jd_enabled")
+    jd_union_id = text("myself_jd_union_id").strip()
+    jd_position_id = text("myself_jd_position_id").strip()
+    jd_app_key = text("myself_jd_app_key").strip()
+    jd_app_secret = text("myself_jd_app_secret")
+    jd_api_base = text("jd_api_base", "http://api.zhetaoke.com:20000/api").strip()
+    ztk_appkey = text("zhetaoke_appkey").strip()
+    # Identity values stay strings, including values larger than JavaScript's safe integers.
+    for name, value in (("myself_jd_union_id", jd_union_id), ("myself_jd_position_id", jd_position_id)):
+        if value and (not value.isascii() or not value.isdigit() or not value.lstrip("0")):
+            raise SettingsError(f"{name} 必须是正整数数字字符串")
     auth_secret = text("web_auth_secret")
     mongo_user = text("local_mongo_user")
     mongo_password = text("local_mongo_password")
@@ -153,10 +170,14 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
             required.extend((("myself_taobao_app_key", tb_app_key),
                              ("myself_taobao_app_secret", tb_app_secret),
                              ("taobao_adzone_id / myself_taobao_pid", tb_adzone_id)))
+        if jd_enabled:
+            # Catalog credentials do not imply promotion/order credentials are available.
+            required.extend((("zhetaoke_appkey", ztk_appkey), ("myself_jd_union_id", jd_union_id),
+                             ("jd_api_base", jd_api_base)))
         missing = [key for key, value in required if not value.strip()]
         if missing:
             raise SettingsError("缺少必需配置：" + ", ".join(missing))
-        if not pdd_enabled and not taobao_enabled:
+        if not pdd_enabled and not taobao_enabled and not jd_enabled:
             raise SettingsError("至少需要启用一个联盟平台")
         if len(auth_secret.strip()) < 32 or auth_secret == LEGACY_AUTH_SECRET or auth_secret.lower().startswith("change-me"):
             raise SettingsError("web_auth_secret 必须是至少 32 字符的私有密钥；请在 config.local.json 中配置")
@@ -203,7 +224,9 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
         tb_app_key=tb_app_key, tb_app_secret=tb_app_secret, tb_pid=tb_pid, tb_adzone_id=tb_adzone_id,
         tb_session=text("taobao_session").strip(), tb_inviter_code=text("taobao_inviter_code").strip(),
         hdk_api_key=text("haodanku_api_key").strip(),
-        ztk_appkey=text("zhetaoke_appkey").strip(), ztk_sid=text("zhetaoke_sid").strip(),
+        ztk_appkey=ztk_appkey, ztk_sid=text("zhetaoke_sid").strip(),
+        jd_enabled=jd_enabled, jd_union_id=jd_union_id, jd_position_id=jd_position_id,
+        jd_app_key=jd_app_key, jd_app_secret=jd_app_secret, jd_api_base=jd_api_base,
     )
 
 

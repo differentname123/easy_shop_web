@@ -6,9 +6,9 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>优选导购 - 极速省赚</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=auth-20261105-2">
+  <link rel="stylesheet" href="/static/css/style.css?v=jd-20261106-1">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=auth-20261105-2"></script>
+  <script src="/static/js/vue.global.prod.js?v=jd-20261106-1"></script>
 </head>
 <body>
 <div id="app">
@@ -383,11 +383,11 @@
       <div class="stats-grid">
         <div class="stat-item">
           <div class="num">¥{{ formatMoney(userOrdersData.total_commission ?? 0) }}</div>
-          <div class="label">{{ orderPlatform === 'taobao' ? '联盟预估佣金' : '订单佣金' }}</div>
+          <div class="label">订单佣金参考</div>
         </div>
         <div class="stat-item">
           <div class="num">¥{{ formatMoney(userOrdersData.settled_commission ?? 0) }}</div>
-          <div class="label">{{ orderPlatform === 'taobao' ? '联盟结算预估佣金' : '平台已结算佣金' }}</div>
+          <div class="label">结算口径佣金</div>
         </div>
         <div class="stat-item">
           <div class="num">¥{{ formatMoney(userOrdersData.refund_commission || 0) }}</div>
@@ -418,7 +418,7 @@
           {{ p.name }}<span v-if="!supportsPlatform(p.code, 'orders')" class="plat-chip-badge">不可用</span>
         </button>
       </nav>
-      <p class="order-notice" v-if="orderPlatform === 'taobao'">淘宝佣金为联盟预估 / 结算预估收入，不代表最终到账或可提现余额；失效订单不等同于退款。</p>
+      <p class="order-notice">佣金按平台报告的预估 / 结算口径展示，不代表最终到账或可提现余额；失效订单不等同于退款。日期按订单标明的付款或下单时间筛选，计佣金额不等于实付。</p>
       <p class="order-notice" v-if="orderMessage" role="status">{{ orderMessage }}</p>
       <p class="order-notice" v-if="userOrdersData.sync_status">同步状态：{{ { running: '后台同步中', partial: '部分完成，后续继续同步', error: '后台同步失败，请稍后重试', success: '同步完成' }[userOrdersData.sync_status] || userOrdersData.sync_status }}</p>
       <!-- 时间跨度筛选胶囊 -->
@@ -435,10 +435,11 @@
           <img :src="ord.goods_thumbnail_url" class="order-item-thumb" alt="商品" />
           <div class="order-item-info">
             <h4 class="order-item-title">{{ ord.goods_name }}</h4>
+            <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">{{ orderTimeLabel(ord) }}：{{ orderTimeText(ord) }}</div>
             <div class="order-item-bottom">
               <div>
-                <span style="color:var(--text-muted)">实付: ¥{{ formatMoney(ord.order_amount_yuan) }}</span>
-                <span style="color:var(--primary-color);font-weight:700;margin-left:6px">{{ orderPlatform === 'taobao' ? '联盟预估佣金' : '订单佣金' }} ¥{{ formatMoney(ord.promotion_amount_yuan) }}</span>
+                <span style="color:var(--text-muted)">{{ orderAmountLabel(ord) }}: ¥{{ formatMoney(ord.order_amount_yuan) }}</span>
+                <span style="color:var(--primary-color);font-weight:700;margin-left:6px">订单佣金参考 ¥{{ formatMoney(ord.promotion_amount_yuan) }}</span>
               </div>
               <span 
                 class="order-status-tag"
@@ -466,17 +467,20 @@
       <div class="auth-header">
         <div class="auth-plat-info">
           <span class="auth-platform-icon" :class="p.code">{{ p.name.slice(0, 1) }}</span>
-          <span>{{ p.name }}渠道授权备案</span>
+          <span>{{ p.name }}{{ requiresAuthorization(p.code) ? '渠道授权备案' : '推广渠道' }}</span>
         </div>
-        <span class="auth-status-badge" :class="supportsPlatform(p.code, 'authorization') && userProfile.auth_status?.[p.code]?.is_authorized ? 'authed' : 'unauthed'">
-          {{ !supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置' : (userProfile.auth_status?.[p.code]?.is_authorized ? '已授权备案' : '未授权') }}
+        <span class="auth-status-badge" :class="requiresAuthorization(p.code) && supportsPlatform(p.code, 'authorization') && userProfile.auth_status?.[p.code]?.is_authorized ? 'authed' : 'unauthed'">
+          {{ !requiresAuthorization(p.code) ? '无需授权' : (!supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置' : (userProfile.auth_status?.[p.code]?.is_authorized ? '已授权备案' : '未授权')) }}
         </span>
       </div>
-      <p class="auth-desc" v-if="supportsPlatform(p.code, 'authorization')">
+      <p class="auth-desc" v-if="!requiresAuthorization(p.code)">
+        {{ p.name }}推广无需平台授权或备案。登录后由服务端分配推广标识；游客使用站长默认推广位，不按分享页 UID 归因。推广标识不代表已获得佣金，缺少推广配置时会明确提示。
+      </p>
+      <p class="auth-desc" v-else-if="supportsPlatform(p.code, 'authorization')">
         登录并验证身份后可申请{{ p.name }}渠道备案。游客使用站长默认推广位，不按分享页 UID 归因；平台不支持通用链接时会明确提示。备案不代表已获得佣金或可提现余额。
       </p>
       <p class="auth-desc" v-else>{{ p.name }}授权暂未接入或未配置，当前不提供该平台渠道授权。</p>
-      <div class="auth-actions">
+      <div class="auth-actions" v-if="requiresAuthorization(p.code)">
         <button class="btn-auth" @click="userProfile.auth_status?.[p.code]?.is_authorized ? handleRecheckAuth(p.code) : handleCheckAndGetAuth(p.code)" :disabled="isCheckingAuth || !supportsPlatform(p.code, 'authorization')">
           {{ !supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置' : (isCheckingAuth ? '检测中...' : (userProfile.auth_status?.[p.code]?.is_authorized ? '重新校验授权' : '开通' + p.name + '授权')) }}
         </button>
@@ -584,12 +588,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=auth-20261105-2"></script>
-<script src="/static/js/session.js?v=auth-20261105-2"></script>
-<script src="/static/js/format.js?v=auth-20261105-2"></script>
-<script src="/static/js/browser.js?v=auth-20261105-2"></script>
-<script src="/static/js/feeds.js?v=auth-20261105-2"></script>
-<script src="/static/js/account.js?v=auth-20261105-2"></script>
-<script src="/static/js/app.js?v=auth-20261105-2"></script>
+<script src="/static/js/api.js?v=jd-20261106-1"></script>
+<script src="/static/js/session.js?v=jd-20261106-1"></script>
+<script src="/static/js/format.js?v=jd-20261106-1"></script>
+<script src="/static/js/browser.js?v=jd-20261106-1"></script>
+<script src="/static/js/feeds.js?v=jd-20261106-1"></script>
+<script src="/static/js/account.js?v=jd-20261106-1"></script>
+<script src="/static/js/app.js?v=jd-20261106-1"></script>
 </body>
 </html>

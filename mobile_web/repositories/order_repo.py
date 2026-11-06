@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """订单持久化及全量聚合；平台状态解释由服务提供，不在仓储猜测。"""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 from typing import Dict, Any, List, Optional
 from pymongo import UpdateOne
 from repositories.base_repo import BaseRepository
 from models.product import normalize_platform
+from models.order import normalize_order_fields
+from models.user import normalize_promoter_id
 from config import logger
+
+# 联盟业务展示统一北京时间；存储及来源时钟仍是UTC时间戳。
+_DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
 
 
 class OrderRepository(BaseRepository):
@@ -15,7 +20,9 @@ class OrderRepository(BaseRepository):
     def _init_indexes(self):
         try:
             self.col.create_index([("platform", 1), ("order_sn", 1)], unique=True)
+            # 保留历史付款时间索引，混合新旧数据的兼容分支仍会用到。
             self.col.create_index([("platform", 1), ("promoter_uid", 1), ("order_pay_time", -1)])
+            self.col.create_index([("platform", 1), ("promoter_uid", 1), ("order_time", -1), ("order_sn", -1)])
             self.col.create_index([("order_modify_at", -1)])
             return True
         except Exception as exc:
@@ -37,11 +44,18 @@ class OrderRepository(BaseRepository):
             order_sn = str(order.get("order_sn") or "").strip()
             if not order_sn:
                 raise ValueError("平台订单缺少 order_sn，不能确认该页已完整入库")
-            doc = dict(order)
+            doc = normalize_order_fields(order, platform)
             doc.pop("_id", None)
             doc.update(platform=platform, order_sn=order_sn)
             if "promoter_uid" in doc:
                 doc["promoter_uid"] = str(doc["promoter_uid"] or "").strip()
+            if doc.get("promoter_id") is not None and doc["promoter_id"] != "":
+                doc["promoter_id"] = normalize_promoter_id(doc["promoter_id"])
+            else:
+                doc.pop("promoter_id", None)
+            # 新页缺证据不清掉旧页保存的未知归因，后续绑定仍可安全回填。
+            if not doc.get("attribution_identity"):
+                doc.pop("attribution_identity", None)
             modified_at = doc.get("order_modify_at")
             if modified_at is None:
                 source_time = 0.0
@@ -63,7 +77,7 @@ class OrderRepository(BaseRepository):
                 if key in ("platform", "order_sn"):
                     continue
                 replacement = {"$cond": [fresh, {"$literal": value}, f"${key}"]}
-                if key in ("promoter_uid", "attribution_status", "attribution_identity"):
+                if key in ("promoter_uid", "attribution_status", "attribution_identity", "promoter_id"):
                     # 已知归属不可被新页的缺字段、未知身份或另一个UID改写。
                     previous = ({"$ifNull": ["$attribution_status", "matched"]}
                                 if key == "attribution_status" else f"${key}")
@@ -112,15 +126,19 @@ class OrderRepository(BaseRepository):
         ]}
 
     def _format_order(self, doc: dict, rules: dict) -> dict:
+        doc = normalize_order_fields(doc, doc.get("platform", ""))
         pay_time = doc.get("order_pay_time")
+        order_time = doc["order_time"]
         return {
             "platform": doc.get("platform", ""),
             "order_sn": doc.get("order_sn"),
+            "parent_order_sn": doc.get("parent_order_sn"),
             "goods_id": doc.get("goods_id") or "",
             "goods_name": doc.get("goods_name", "精选商品"),
             "goods_thumbnail_url": doc.get("goods_thumbnail_url", ""),
             "goods_quantity": doc.get("goods_quantity", 1),
             "order_amount_yuan": doc.get("order_amount_yuan", 0.0),
+            "order_amount_basis": doc["order_amount_basis"],
             # 当前报告口径由适配器选择；付款/结算预估均不表示净到账。
             "promotion_amount_yuan": float(doc.get("promotion_amount_yuan") or 0.0),
             "estimated_commission_yuan": doc.get("estimated_commission_yuan"),
@@ -132,8 +150,11 @@ class OrderRepository(BaseRepository):
             "is_refund": self._status_flag(doc, "is_refund", rules.get("refund", [])),
             "is_settled": self._status_flag(doc, "is_settled", rules.get("settled", [])),
             "is_invalid": doc.get("is_invalid") is True,
+            "order_time": order_time,
+            "order_time_basis": doc["order_time_basis"],
+            "order_time_str": datetime.fromtimestamp(order_time, _DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M") if order_time is not None else "",
             "order_pay_time": pay_time,
-            "order_pay_time_str": datetime.fromtimestamp(pay_time, timezone.utc).strftime("%Y-%m-%d %H:%M") if pay_time else "",
+            "order_pay_time_str": datetime.fromtimestamp(pay_time, _DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M") if pay_time else "",
         }
 
     def query_user_orders(
@@ -154,7 +175,12 @@ class OrderRepository(BaseRepository):
             return empty
         query: Dict[str, Any] = {"platform": normalize_platform(platform), "promoter_uid": uid}
         if start_timestamp is not None and start_timestamp > 0:
-            query["order_pay_time"] = {"$gte": int(start_timestamp)}
+            # 原生 OR 分支保留新/旧复合索引的可用性；缺失或 null 才回退付款时间。
+            # 已声明的创建时间（以及真实 0）不能被另一个付款时间绕过筛选。
+            query["$or"] = [
+                {"order_time": {"$gte": int(start_timestamp)}},
+                {"order_time": None, "order_pay_time": {"$gte": int(start_timestamp)}},
+            ]
         rules = legacy_order_statuses or {}
         refund = self._status_expression("is_refund", list(rules.get("refund", [])))
         settled = self._status_expression("is_settled", list(rules.get("settled", [])))
@@ -181,9 +207,11 @@ class OrderRepository(BaseRepository):
                     }},
                 ],
                 "order_list": [
-                    {"$sort": {"order_pay_time": -1, "order_sn": -1}},
+                    # 兼容未回填的旧文档，但不让明细排序/截断影响全量佣金统计。
+                    {"$set": {"_query_order_time": {"$ifNull": ["$order_time", "$order_pay_time"]}}},
+                    {"$sort": {"_query_order_time": -1, "order_sn": -1}},
                     {"$limit": max(1, min(int(limit), 100))},
-                    {"$project": {"_id": 0}},
+                    {"$project": {"_id": 0, "_query_order_time": 0}},
                 ],
             }},
         ]

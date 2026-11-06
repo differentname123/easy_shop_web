@@ -18,15 +18,24 @@ from adapters import register_adapter
 from adapters.base import BasePlatformAdapter
 from adapters.pdd_adapter import PddAdapter
 from adapters.tb_adapter import TaobaoAdapter
+from adapters.jd_adapter import JdAdapter
+from models.user import normalize_promoter_id
 
+PLATFORM_TYPES = (("pdd", PddAdapter), ("taobao", TaobaoAdapter), ("jd", JdAdapter))
 PRODUCTS = []
-for platform, adapter_type in (("pdd", PddAdapter), ("taobao", TaobaoAdapter)):
+for platform, adapter_type in PLATFORM_TYPES:
     for index in range(1, 10):
+        product_id = str(10000 + index) if platform != "taobao" or index != 1 else ""
+        goods_sign = f"{platform.upper()}_SMOKE_SIGN_{index}"
+        product_url = "/detail?" + urlencode({"platform": platform, "goods_sign": goods_sign})
+        if platform == "jd":
+            goods_sign = ""
+            product_id = {2: "JD_OPAQUE_MATERIAL_2", 3: "JD_OPAQUE_NO_LINK_3"}.get(index, product_id)
+            product_url = ("" if index == 3 else "https://union-click.jd.com/jdc?e=OFFLINE_MATERIAL_2" if index == 2
+                           else f"https://item.jd.com/{product_id}.html")
         PRODUCTS.append({
             "platform": platform, "platform_name": adapter_type.platform_name,
-            "goods_id": str(10000 + index) if platform == "pdd" or index != 1 else "",
-            "product_id": str(10000 + index) if platform == "pdd" or index != 1 else "",
-            "goods_sign": f"{platform.upper()}_SMOKE_SIGN_{index}",
+            "goods_id": product_id, "product_id": product_id, "goods_sign": goods_sign,
             "name": f"{adapter_type.platform_name}回归测试商品 {index} · 家庭日用精选",
             "desc": "离线回归数据，不是真实商品、真实淘口令或返利承诺。",
             "price": 25.0 + index, "original_price": 30.0 + index, "coupon_amount": 5.0,
@@ -36,7 +45,7 @@ for platform, adapter_type in (("pdd", PddAdapter), ("taobao", TaobaoAdapter)):
             "carousel_images": ["/test-product.svg", "/test-product.svg?second=1"],
             "specs": [{"label": "数据来源", "value": "离线内存替身"}],
             "service_guarantees": [], "detail_tags": [],
-            "product_url": "/detail?" + urlencode({"platform": platform, "goods_sign": f"{platform.upper()}_SMOKE_SIGN_{index}"}),
+            "product_url": product_url,
         })
 
 
@@ -58,7 +67,7 @@ class MemoryProducts:
 
     def get_product_identity(self, goods_sign, platform="pdd"):
         item = self.get_product_detail(goods_sign, platform)
-        return {"platform": platform, "product_id": item["goods_id"], "goods_sign": goods_sign} if item else None
+        return {key: item[key] for key in ("platform", "product_id", "goods_sign", "product_url")} if item else None
 
     def upsert_home_products(self, items, **kwargs): return len(items)
     def upsert_product_detail(self, item): return True
@@ -72,7 +81,7 @@ class MemoryProducts:
     def _promotion_key(self, platform, goods_id=None, goods_sign=None, goods_key=None):
         key = goods_sign or goods_id or goods_key
         item = self.get_product_detail(key, platform)
-        return platform, item["goods_sign"] if item else key
+        return platform, (item["goods_sign"] or item["goods_id"]) if item else key
 
     def get_promotion_link_cache(self, platform, goods_id=None, goods_sign=None, goods_key=None):
         self.cache_calls["reads"] += 1
@@ -109,6 +118,23 @@ class MemoryUsers:
 
     def get_user_by_uid(self, uid): return deepcopy(self.profiles.get(uid))
 
+    def ensure_promoter_id(self, uid, reserved_ids=()):
+        profile = self.profiles.get(uid)
+        if not profile:
+            raise ValueError("离线用户不存在")
+        if profile.get("promoter_id"):
+            return normalize_promoter_id(profile["promoter_id"])
+        occupied = {item.get("promoter_id") for item in self.profiles.values()} | set(reserved_ids)
+        candidate = 700000001
+        while str(candidate) in occupied:
+            candidate += 1
+        profile["promoter_id"] = normalize_promoter_id(str(candidate))
+        return profile["promoter_id"]
+
+    def get_uid_by_promoter_id(self, promoter_id):
+        candidate = normalize_promoter_id(promoter_id)
+        return next((uid for uid, profile in self.profiles.items() if profile.get("promoter_id") == candidate), None)
+
     def update_auth_status(self, uid, platform, is_authorized, bind, extra=None):
         profile = self.profiles.get(uid)
         if not profile: return False
@@ -128,7 +154,7 @@ class MemoryUsers:
 class MemoryOrders:
     def __init__(self):
         self.orders = []
-        for platform in ("pdd", "taobao"):
+        for platform in ("pdd", "taobao", "jd"):
             for uid in ("u_12345678", "u_87654321"):
                 for index, state in enumerate(("paid", "settled", "invalid", "refund"), 1):
                     item = next(item for item in PRODUCTS if item["platform"] == platform)
@@ -136,10 +162,18 @@ class MemoryOrders:
                         "platform": platform, "promoter_uid": uid, "order_sn": f"{uid}_SMOKE_ORDER_{index}",
                         "goods_id": item["goods_id"], "goods_name": item["name"], "goods_thumbnail_url": "/test-product.svg",
                         "goods_quantity": 1, "order_amount_yuan": 26.0, "promotion_amount_yuan": 2.7,
-                        "settled_promotion_amount_yuan": 2.5 if state == "settled" else None,
-                        "order_status_desc": {"paid": "已支付（预估）", "settled": "联盟结算预估" if platform == "taobao" else "平台已结算",
+                        "estimated_commission_yuan": 2.7,
+                        "settled_commission_yuan": 0.0 if platform == "jd" and state == "settled" else 2.5 if state == "settled" else None,
+                        "commission_basis": "settled" if state == "settled" else "estimated",
+                        "order_status_desc": {"paid": "已下单（预估）" if platform == "jd" else "已支付（预估）",
+                                              "settled": "联盟结算预估" if platform == "taobao" else "平台报告已结算",
                                               "invalid": "订单失效（非退款）", "refund": "已退款"}[state],
-                        "order_pay_time": int(time.time()) - index * 3600, "order_pay_time_str": "离线测试时间",
+                        "order_time": int(time.time()) - index * 3600,
+                        "order_time_str": "离线测试下单时间" if platform == "jd" else "离线测试付款时间",
+                        "order_time_basis": "created" if platform == "jd" else "paid",
+                        "order_amount_basis": "commissionable" if platform == "jd" else "paid",
+                        "order_pay_time": None if platform == "jd" else int(time.time()) - index * 3600,
+                        "order_pay_time_str": "" if platform == "jd" else "离线测试付款时间",
                         "is_refund": state == "refund", "is_invalid": state in ("invalid", "refund"), "is_settled": state == "settled",
                     })
 
@@ -153,11 +187,11 @@ class MemoryOrders:
 
     def query_user_orders(self, platform="pdd", promoter_uid="", start_timestamp=None, **kwargs):
         items = [item for item in self.orders if item["platform"] == platform and item["promoter_uid"] == promoter_uid
-                 and (not start_timestamp or item["order_pay_time"] >= start_timestamp)]
+                 and (not start_timestamp or item["order_time"] >= start_timestamp)]
         valid = [item for item in items if not item["is_invalid"] and not item["is_refund"]]
         refunds = [item for item in items if item["is_refund"]]
         return {"total_count": len(items), "total_commission": round(sum(item["promotion_amount_yuan"] for item in valid), 2),
-                "settled_commission": round(sum(item["settled_promotion_amount_yuan"] or 0 for item in valid if item["is_settled"]), 2),
+                "settled_commission": round(sum(item["settled_commission_yuan"] or 0 for item in valid if item["is_settled"]), 2),
                 "refund_commission": round(sum(item["promotion_amount_yuan"] for item in refunds), 2), "refund_count": len(refunds),
                 "order_list": deepcopy(items)}
 
@@ -179,8 +213,15 @@ class PreviewAdapter(BasePlatformAdapter):
         self.platform_code, self.platform_name = platform, adapter_type.platform_name
         self.channels = deepcopy(adapter_type.channels)  # Exactly the production adapter's two authoritative ranks.
         self.required_identity_fields = ("relation_id",) if platform == "taobao" else ()
-        self.requires_authorized_promotion = True
+        self.requires_authorized_promotion = platform != "jd"
+        self.requires_numeric_promoter_id = platform == "jd"
+        self.requires_material_url = platform == "jd"
+        self.default_promoter_id = "700000000" if platform == "jd" else ""
+        self.promotion_scope = "offline-union:700000000" if platform == "jd" else ""
+        self.order_window_seconds = 3600 if platform == "jd" else adapter_type.order_window_seconds
+        self.capabilities = {name: name != "authorization" or platform != "jd" for name in self.capabilities}
         self.calls = {"anonymous_converts": 0, "personal_converts": 0, "authority_checks": 0, "authority_urls": 0}
+        self.promotion_contexts = []
 
     def get_recommend_goods(self, offset=0, limit=20, cursor=None, **kwargs):
         if isinstance(cursor, str) and cursor: offset = int(json.loads(cursor).get("offset", offset))
@@ -193,7 +234,7 @@ class PreviewAdapter(BasePlatformAdapter):
     def get_goods_detail(self, goods_id_or_sign="", goods_id=None, goods_sign=None, **kwargs):
         return {"status": "success", "data": products.get_product_detail(goods_sign or goods_id or goods_id_or_sign, self.platform_code)}
 
-    def convert_promotion_url(self, goods_id_or_sign="", uid=None, identity=None, **kwargs):
+    def convert_promotion_url(self, goods_id_or_sign="", uid=None, identity=None, promoter_id=None, **kwargs):
         self.calls["personal_converts" if uid else "anonymous_converts"] += 1
         if uid and any(not (identity or {}).get(field) for field in self.required_identity_fields):
             return {"status": "error", "error_code": "AUTH_REQUIRED", "need_auth": True, "auth_platform": self.platform_code,
@@ -201,20 +242,37 @@ class PreviewAdapter(BasePlatformAdapter):
         item = products.get_product_detail(kwargs.get("goods_sign") or kwargs.get("goods_id") or goods_id_or_sign, self.platform_code)
         if not item:
             return {"status": "error", "error_msg": "离线测试商品不存在"}
-        # Personal calls rely on the service's stored authorization decision, never a second remote check here.
-        link = item["product_url"] + "&" + urlencode({"promotion": "personal" if uid else "general"})
+        if self.platform_code == "jd":
+            try:
+                trusted_id = normalize_promoter_id(promoter_id)
+            except ValueError:
+                return {"status": "error", "error_msg": "离线数字推广标识缺失"}
+            if not item["product_url"] or kwargs.get("trusted_product_url") != item["product_url"]:
+                return {"status": "error", "error_msg": "缺少可信京东物料链接，不能用不透明标识构造商品地址"}
+            self.promotion_contexts.append({"uid": uid, "promoter_id": trusted_id, "goods_id": item["goods_id"]})
+            link = "/detail?" + urlencode({"platform": "jd", "goods_id": item["goods_id"],
+                                           "promotion": "personal" if uid else "general", "offline_promoter": trusted_id})
+        else:
+            # Personal calls rely on stored authorization, never a second remote check here.
+            link = item["product_url"] + "&" + urlencode({"promotion": "personal" if uid else "general"})
         return {"status": "success", "final_link": link, "schema_url": "", "is_fallback": False,
-                "cacheable": True, "expires_at": time.time() + 3600,
-                "promotion_token": "￥OFFLINE_TEST_ONLY￥" if self.platform_code == "taobao" else ""}
+                **({"promoter_id": trusted_id} if self.platform_code == "jd" else {}),
+                "cacheable": self.platform_code != "jd", "expires_at": time.time() + 3600,
+                "promotion_token": "￥OFFLINE_JD_TEST_ONLY￥" if self.platform_code == "jd" else
+                                   "￥OFFLINE_TEST_ONLY￥" if self.platform_code == "taobao" else ""}
 
     def check_authority(self, uid):
         self.calls["authority_checks"] += 1
+        if not self.requires_authorized_promotion:
+            return {"status": "error", "error_msg": "该平台无需授权，不应发起授权查询"}
         authorized = (uid, self.platform_code) in users.authorized
         identity = {"relation_id": f"OFFLINE_RELATION_{uid}", "external_id": uid} if authorized and self.platform_code == "taobao" else {}
         return {"status": "success", "is_authorized": authorized, "bind": 1 if authorized else 0, "identity": identity}
 
     def generate_authority_url(self, uid, **kwargs):
         self.calls["authority_urls"] += 1
+        if not self.requires_authorized_promotion:
+            return {"status": "error", "error_msg": "该平台无需授权，不提供模拟授权链接"}
         url = "/test/authorize?" + urlencode({"platform": self.platform_code, "uid": uid})
         return {"status": "success", "auth_url": url, "short_url": url}
 
@@ -222,8 +280,7 @@ class PreviewAdapter(BasePlatformAdapter):
         return {"status": "success", "order_list": [], "total_count": 0, "has_more": False}
 
 
-preview_adapters = {platform: PreviewAdapter(platform, adapter_type)
-                    for platform, adapter_type in (("pdd", PddAdapter), ("taobao", TaobaoAdapter))}
+preview_adapters = {platform: PreviewAdapter(platform, adapter_type) for platform, adapter_type in PLATFORM_TYPES}
 for platform, adapter in preview_adapters.items():
     register_adapter(platform, adapter)
 
@@ -244,6 +301,7 @@ app = create_app()
 def offline_status():
     return {"status": "error" if BLOCKED_CALLS else "ok", "blocked_external_calls": list(BLOCKED_CALLS),
             "platform_calls": {platform: dict(adapter.calls) for platform, adapter in preview_adapters.items()},
+            "jd_promotion_contexts": deepcopy(preview_adapters["jd"].promotion_contexts),
             "public_cache_calls": dict(products.cache_calls)}
 
 

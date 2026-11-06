@@ -6,6 +6,8 @@ import threading
 from typing import Dict, Any, Optional
 from adapters import get_adapter, require_adapter
 from models.product import normalize_platform
+from models.order import normalize_order_fields
+from models.user import normalize_promoter_id
 from repositories.order_repo import OrderRepository
 from repositories.order_sync_repo import OrderSyncRepository
 from repositories.user_repo import UserRepository
@@ -37,21 +39,41 @@ class OrderService:
         self.sync_repo = sync_repo if sync_repo is not None else OrderSyncRepository()
         self.user_repo = user_repo if user_repo is not None else UserRepository()
 
-    def _attribute_order(self, order: dict, platform: str) -> dict:
-        """只信适配器归因证据或已验证的平台身份，绝不使用请求者 UID。"""
+    def _attribute_order(self, order: dict, platform: str, identity_cache: Optional[dict] = None) -> dict:
+        """只信适配器归因证据；数字推广身份与平台授权状态无关。
+
+        cache 仅由当前同步页持有，包含未匹配结果；下一页会重新反查新绑定。
+        """
         if not isinstance(order, dict):
             raise ValueError("平台订单规范化响应无效")
-        doc = dict(order)
+        doc = normalize_order_fields(order, platform)
+        cache = identity_cache if identity_cache is not None else {}
+        promoter_id = doc.get("promoter_id")
         identity = doc.get("attribution_identity")
-        if identity:
-            if not isinstance(identity, dict):
+        if promoter_id is not None and promoter_id != "":
+            promoter_id = normalize_promoter_id(promoter_id)
+            doc["promoter_id"] = promoter_id
+            key = ("promoter_id", promoter_id)
+            if key not in cache:
+                cache[key] = self.user_repo.get_uid_by_promoter_id(promoter_id)
+            uid = cache[key]
+            doc["promoter_uid"] = str(uid).strip() if uid else ""
+        elif identity:
+            if not isinstance(identity, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str) for key, value in identity.items()
+            ):
                 raise ValueError("平台订单归因身份无效")
-            uid = self.user_repo.get_uid_by_platform_identity(platform, identity)
+            key = ("platform_identity", platform, tuple(sorted(identity.items())))
+            if key not in cache:
+                cache[key] = self.user_repo.get_uid_by_platform_identity(platform, identity)
+            uid = cache[key]
             doc["promoter_uid"] = str(uid).strip() if uid else ""
         else:
-            # 兼容已有平台从官方 custom_parameters 提取的规范 UID。
+            # 兼容 PDD 从官方 custom_parameters 提取的规范 UID。
             doc.pop("attribution_identity", None)
             doc["promoter_uid"] = str(doc.get("promoter_uid") or "").strip()
+        if promoter_id is None or promoter_id == "":
+            doc.pop("promoter_id", None)
         doc["attribution_status"] = "matched" if doc["promoter_uid"] else "unmatched"
         return doc
 
@@ -105,7 +127,9 @@ class OrderService:
                 if not orders and has_more:
                     error = "平台返回空页但仍有后续订单"
                     break
-                normalized = [self._attribute_order(adapter.normalize_order(order), platform) for order in orders]
+                identity_cache = {}
+                normalized = [self._attribute_order(adapter.normalize_order(order), platform, identity_cache)
+                              for order in orders]
                 if normalized:
                     written = self.repo.upsert_orders(normalized, platform=platform)
                     if written != len(normalized):

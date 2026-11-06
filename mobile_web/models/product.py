@@ -58,6 +58,7 @@ class ProductSummary(BaseModel):
     goods_sign: str = ""
     name: str
     image_url: str
+    product_url: str = ""
     price: float
     original_price: float
     coupon_amount: float = 0.0
@@ -85,7 +86,6 @@ class ProductDetail(ProductSummary):
     """完整商品详情，商业承诺和券信息仅保存来源提供的真实值。"""
     desc: str = ""
     carousel_images: List[str] = Field(default_factory=list)
-    product_url: str = ""
     detail_tags: List[str] = Field(default_factory=list)
     service_guarantees: List[str] = Field(default_factory=list)
     shop_ratings: Dict[str, str] = Field(default_factory=dict)

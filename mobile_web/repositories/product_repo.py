@@ -26,6 +26,11 @@ class ProductRepository(BaseRepository):
             self.col.create_index("goods_sign", background=True)
             self.col.create_index([("updated_at", -1)], background=True)
             self.col.create_index([("platform", 1), ("updated_at", -1)], background=True)
+            # 价格正/反序共用同一索引；全站与单平台查询分别保留排序前缀。
+            self.col.create_index([("activity_price", 1)], background=True)
+            self.col.create_index([("platform", 1), ("activity_price", 1)], background=True)
+            self.col.create_index([("saved_price", -1), ("updated_at", -1)], background=True)
+            self.col.create_index([("platform", 1), ("saved_price", -1), ("updated_at", -1)], background=True)
             return True
         except Exception as e:
             logger.warning(f"商品集合索引创建提示: {e}")
@@ -40,7 +45,7 @@ class ProductRepository(BaseRepository):
             "platform", "product_id", "goods_id", "goods_sign", "name", "brand",
             "category", "activity_price", "price", "original_price", "saved_price",
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
-            "sales_tip", "image_url", "mall_name", "updated_at",
+            "sales_tip", "image_url", "mall_name", "updated_at", "product_url",
         ), 1),
     }
 
@@ -173,6 +178,11 @@ class ProductRepository(BaseRepository):
             if value is not None:
                 update_set[target] = str(value)
 
+        # 供应商摘要也可带可信物料链接，但不是完整详情，不推进详情来源时钟。
+        product_url = item.get("product_url")
+        if isinstance(product_url, str) and product_url.strip():
+            update_set["product_url"] = product_url.strip()
+
         update_set.update({
             "updated_at": now,
             "need_reformat": False,
@@ -195,7 +205,7 @@ class ProductRepository(BaseRepository):
                 detail_updated_at = detail_updated_at.replace(tzinfo=datetime.timezone.utc)
             update_set["detail_updated_at"] = detail_updated_at.astimezone(datetime.timezone.utc).replace(tzinfo=None)
             for key in (
-                "desc", "carousel_images", "product_url", "specs", "detail_tags",
+                "desc", "carousel_images", "specs", "detail_tags",
                 "unified_tags", "service_guarantees", "shop_ratings", "coupon_info", "search_id",
             ):
                 if key in item and item[key] is not None:
@@ -305,6 +315,7 @@ class ProductRepository(BaseRepository):
             "commission_amount": commission_amount,
             "sales_tip": str(self._first_present(doc, "sales_tip", default="0")),
             "image_url": doc.get("image_url") or "",
+            "product_url": doc.get("product_url") or "",
             "mall_name": doc.get("mall_name") or "",
             "updated_at": updated_at_str,
         }

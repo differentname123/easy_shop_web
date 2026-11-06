@@ -1,0 +1,117 @@
+{
+  "fetched_at": "2026-11-04 02:22:27",
+  "materials": [
+    {
+      "end_time": 1794585599,
+      "material_id": 130968,
+      "material_name": "品牌u享双11限时红包投放",
+      "material_type": 1,
+      "start_time": 1792425600,
+      "subject": 1
+    },
+    {
+      "end_time": 1953820799,
+      "material_id": 117935,
+      "material_name": "直播闪降货品正式",
+      "material_type": 1,
+      "start_time": 1762272000,
+      "subject": 1
+    },
+    {
+      "end_time": 1888156800,
+      "material_id": 98168,
+      "material_name": "双11波司登I精选到手固定",
+      "material_type": 1,
+      "start_time": 1729785600,
+      "subject": 1
+    },
+    {
+      "end_time": 1893340800,
+      "material_id": 92184,
+      "material_name": "20淘宝珠宝精选含到手价",
+      "material_type": 1,
+      "start_time": 1717084800,
+      "subject": 1
+    },
+    {
+      "end_time": 1890662400,
+      "material_id": 92183,
+      "material_name": "20淘宝服饰精选含到手价",
+      "material_type": 1,
+      "start_time": 1717084800,
+      "subject": 1
+    },
+    {
+      "end_time": 1893340800,
+      "material_id": 92182,
+      "material_name": "20天猫品牌团精选含到手价",
+      "material_type": 1,
+      "start_time": 1717084800,
+      "subject": 1
+    },
+    {
+      "end_time": 1893340800,
+      "material_id": 91356,
+      "material_name": "618快消API精选含到手固定",
+      "material_type": 1,
+      "start_time": 1715961600,
+      "subject": 1
+    },
+    {
+      "end_time": 1889884800,
+      "material_id": 88344,
+      "material_name": "618运动API精选含到价固定",
+      "material_type": 1,
+      "start_time": 1716220800,
+      "subject": 1
+    },
+    {
+      "end_time": 1889884800,
+      "material_id": 88116,
+      "material_name": "38母婴分会场PUBNEW",
+      "material_type": 1,
+      "start_time": 1709568000,
+      "subject": 1
+    },
+    {
+      "end_time": 1880208000,
+      "material_id": 88115,
+      "material_name": "38品牌团PUBNEW",
+      "material_type": 1,
+      "start_time": 1709568000,
+      "subject": 1
+    },
+    {
+      "end_time": 1864569600,
+      "material_id": 88057,
+      "material_name": "物料精选API样例副本副本",
+      "material_type": 1,
+      "start_time": 1709222400,
+      "subject": 1
+    },
+    {
+      "end_time": 1835452800,
+      "material_id": 87579,
+      "material_name": "母婴团精选API二合一含到手",
+      "material_type": 1,
+      "start_time": 1708963200,
+      "subject": 1
+    },
+    {
+      "end_time": 1835452800,
+      "material_id": 87578,
+      "material_name": "品牌团精选API二合一含到手",
+      "material_type": 1,
+      "start_time": 1708963200,
+      "subject": 1
+    },
+    {
+      "end_time": 1836057600,
+      "material_id": 87575,
+      "material_name": "美妆物料精选API二合一含到手",
+      "material_type": 1,
+      "start_time": 1708963200,
+      "subject": 1
+    }
+  ]
+}

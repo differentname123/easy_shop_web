@@ -10,8 +10,9 @@ from typing import Dict, Any, Optional
 from adapters import get_adapter, PlatformUnavailableError
 from adapters.base import build_command_text
 from models.product import ProductRef, clean_product_id, normalize_platform
+from models.user import normalize_promoter_id
 from repositories.product_repo import ProductRepository
-from cache import PROMOTION_CACHE
+from cache import PROMOTION_CACHE, MATERIAL_CACHE
 from config import PROMOTION_LINK_TTL, logger
 
 _UID_PATTERN = re.compile(r"^u_[0-9a-f]{8}$")
@@ -88,6 +89,28 @@ class PromoteService:
             result["command_text"] += f"\n【平台口令】{token.strip()}"
         return result
 
+    def _trusted_material_url(self, ref: ProductRef) -> str:
+        if not ref.key:
+            return ""
+        cache_key = (ref.platform, "sign" if ref.goods_sign else "id", ref.key)
+        cached = MATERIAL_CACHE.get(cache_key)
+        if isinstance(cached, str) and cached:
+            return cached
+        try:
+            item = self.repo.get_product_detail(ref.key, platform=ref.platform,
+                                                key_type="sign" if ref.goods_sign else "id")
+            if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
+                return ""
+            actual = ProductRef(ref.platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
+            if (ref.goods_sign and ref.goods_sign != actual.goods_sign
+                    or not ref.goods_sign and ref.goods_id != actual.goods_id):
+                return ""
+            value = item.get("product_url")
+            return value.strip() if isinstance(value, str) else ""
+        except Exception as exc:
+            logger.warning("读取推广物料映射失败: %s", type(exc).__name__)
+            return ""
+
     def _get_link_data(self, ref: ProductRef, product_url: str, uid: str, identity: dict, adapter, kwargs: dict) -> dict:
         started = time.perf_counter()
         scope = "personal" if uid else "public"
@@ -95,9 +118,20 @@ class PromoteService:
         cache_key = ("promotion", ref.platform, kind, ref.key, product_url, uid)
         if identity:
             cache_key += (hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),)
+        configured_scope = getattr(adapter, "promotion_scope", "")
+        configured_scope = configured_scope if isinstance(configured_scope, str) else ""
+        if configured_scope:
+            cache_key += (configured_scope,)
+
+        def matches_scope(data):
+            return (not configured_scope or data.get("promotion_scope") == configured_scope) and (
+                getattr(adapter, "requires_numeric_promoter_id", False) is not True
+                or data.get("promoter_id") == identity.get("promoter_id"))
+
         cached = PROMOTION_CACHE.get(cache_key)
         if (isinstance(cached, tuple) and len(cached) == 2 and self._valid_deadline(cached[0])
-                and self._cacheable(cached[1]) and (uid or self._public_attribution(cached[1]))):
+                and self._cacheable(cached[1]) and matches_scope(cached[1])
+                and (uid or self._public_attribution(cached[1]))):
             logger.info("[promotion] platform=%s scope=%s source=memory elapsed_ms=%.1f",
                         ref.platform, scope, (time.perf_counter() - started) * 1000)
             return self._link_data(cached[1])
@@ -110,7 +144,7 @@ class PromoteService:
                 platform=ref.platform, goods_id=ref.goods_id or None,
                 goods_sign=ref.goods_sign or None, goods_key=ref.key,
             )
-            if (self._cacheable(cached) and self._public_attribution(cached)
+            if (self._cacheable(cached) and self._public_attribution(cached) and matches_scope(cached)
                     and self._valid_deadline(cached.get("_expires_at"))):
                 expires_at = cached["_expires_at"]
                 data = self._link_data(cached)
@@ -120,9 +154,15 @@ class PromoteService:
                 return data
 
         adapter_kwargs = {k: v for k, v in kwargs.items()
-                          if k not in ("goods_id", "goods_sign", "identity", "relation_id", "special_id")}
+                          if k not in ("goods_id", "goods_sign", "identity", "relation_id", "special_id",
+                                       "promoter_id", "positionId", "position_id", "trusted_product_url",
+                                       "promotion_scope", "unionId", "union_id")}
         if getattr(adapter, "requires_authorized_promotion", False):
             adapter_kwargs["identity"] = identity
+        if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+            adapter_kwargs["promoter_id"] = identity["promoter_id"]
+        if getattr(adapter, "requires_material_url", False) is True:
+            adapter_kwargs["trusted_product_url"] = self._trusted_material_url(ref)
         provider_started = time.perf_counter()
         try:
             result = adapter.convert_promotion_url(
@@ -143,6 +183,11 @@ class PromoteService:
             return error
 
         data = self._link_data(result)
+        if getattr(adapter, "requires_numeric_promoter_id", False) is True and data.get("promoter_id") != identity.get("promoter_id"):
+            return {"status": "error", "error_code": "invalid_promotion_identity",
+                    "error_msg": "平台推广结果与当前推广身份不一致"}
+        if configured_scope:
+            data["promotion_scope"] = configured_scope
         final_link = self._final_link(data)
         if not final_link:
             return {"status": "error", "error_msg": "平台未返回有效推广链接"}
@@ -179,8 +224,14 @@ class PromoteService:
         adapter = get_adapter(plat)
         if not adapter.active:
             raise PlatformUnavailableError(f"{adapter.platform_name}暂未接入")
+        capabilities = getattr(adapter, "capabilities", None)
+        if isinstance(capabilities, dict) and capabilities.get("promotion") is False:
+            return {"status": "error", "error_code": "capability_unavailable",
+                    "error_msg": f"{adapter.platform_name}推广转链尚未配置"}
         clean_uid = uid.strip() if isinstance(uid, str) else ""
         if clean_uid and not _UID_PATTERN.fullmatch(clean_uid):
+            if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+                return {"status": "error", "error_code": "invalid_promoter_uid", "error_msg": "无效的登录推广身份"}
             clean_uid = ""
         resolved = adapter.resolve_product_ref(
             goods_id_or_sign, goods_id=kwargs.get("goods_id"), goods_sign=kwargs.get("goods_sign")
@@ -193,6 +244,23 @@ class PromoteService:
         identity, context = {}, {}
         effective_uid = clean_uid
         need_auth = False
+        if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+            if clean_uid:
+                if self.user_service is None:
+                    from services.user_service import UserService
+                    self.user_service = UserService()
+                context = self.user_service.get_numeric_promotion_context(
+                    clean_uid, plat, getattr(adapter, "default_promoter_id", ""))
+                if context.get("status") != "success":
+                    return context
+                numeric_id = context.get("promoter_id")
+            else:
+                numeric_id = getattr(adapter, "default_promoter_id", "")
+            try:
+                identity = {"promoter_id": normalize_promoter_id(numeric_id)}
+            except ValueError:
+                return {"status": "error", "error_code": "invalid_promoter_id",
+                        "error_msg": "平台推广身份尚未正确配置"}
         if clean_uid and getattr(adapter, "requires_authorized_promotion", False):
             if self.user_service is None:
                 from services.user_service import UserService

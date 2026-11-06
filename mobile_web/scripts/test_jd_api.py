@@ -348,7 +348,7 @@ if __name__ == "__main__":
 
     # 2. 关键词搜索测试
     print("\n【2. 全网关键词搜索】(搜索: '心相印抽纸')")
-    s_items = search_goods("心相印抽纸", page=1, page_size=2)
+    s_items = search_goods("心相印抽纸", page=1, page_size=20)
     for idx, it in enumerate(s_items, 1):
         print(f"  * ({idx}) {it.get('title')[:22]}... | 券后: ¥{it.get('final_price')} | 佣金率: {it.get('commission_rate')}% (¥{it.get('commission_amount')})")
 

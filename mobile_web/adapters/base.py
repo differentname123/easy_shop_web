@@ -33,6 +33,10 @@ class BasePlatformAdapter(ABC):
     legacy_order_statuses: dict = {}
     required_identity_fields: tuple = ()
     requires_authorized_promotion: bool = False
+    requires_numeric_promoter_id: bool = False
+    requires_material_url: bool = False
+    default_promoter_id: str = ""
+    promotion_scope: str = ""
     order_window_seconds: int = 23 * 3600
     capabilities = None
 

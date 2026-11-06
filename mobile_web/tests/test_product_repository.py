@@ -371,6 +371,49 @@ class TestProductRepository(unittest.TestCase):
         self.repo.upsert_product_detail({"goods_id": "100", "desc": "新来源"})
         self.assertGreater(self.col.docs[0]["detail_updated_at"], old)
 
+    def test_summary_material_url_is_persisted_without_creating_a_detail_clock(self):
+        url = "https://item.jd.com/123.html"
+        self.assertEqual(self.repo.upsert_home_products([{
+            "platform": "jd", "goods_id": "123", "name": "摘要商品", "price": 10,
+            "product_url": f"  {url}  ", "desc": "摘要不得冒充详情",
+            "detail_updated_at": datetime.datetime(2020, 1, 1),
+        }], channel_type=5), 1)
+        stored = self.col.docs[0]
+        self.assertEqual(stored["product_url"], url)
+        self.assertNotIn("detail_updated_at", stored)
+        self.assertNotIn("desc", stored)
+        self.assertEqual(self.repo.query_boom_products(platform="jd")["data"][0]["product_url"], url)
+        self.assertIsNone(self.repo.get_product_detail("123", platform="jd")["detail_updated_at"])
+
+        old_detail_time = datetime.datetime(2020, 1, 1)
+        self.assertTrue(self.repo.upsert_product_detail({
+            "platform": "jd", "goods_id": "123", "desc": "真实详情",
+            "detail_updated_at": old_detail_time,
+        }))
+        self.repo.upsert_home_products([{
+            "platform": "jd", "goods_id": "123", "product_url": url + "?source=summary",
+        }])
+        self.assertEqual(self.col.docs[0]["detail_updated_at"], old_detail_time)
+        self.assertEqual(self.col.docs[0]["desc"], "真实详情")
+        self.assertEqual(self.col.docs[0]["product_url"], url + "?source=summary")
+
+    def test_empty_detail_or_summary_material_url_does_not_erase_known_link(self):
+        url = "https://item.jd.com/123.html"
+        self.repo.upsert_home_products([{
+            "platform": "jd", "goods_id": "123", "name": "商品", "price": 10, "product_url": url,
+        }])
+        for index, empty_url in enumerate(("", None, " \t ")):
+            with self.subTest(product_url=empty_url):
+                self.assertTrue(self.repo.upsert_product_detail({
+                    "platform": "jd", "goods_id": "123", "product_url": empty_url,
+                    "desc": "真实详情", "detail_updated_at": datetime.datetime(2020, 1, 1 + index),
+                }))
+                self.assertEqual(self.col.docs[0]["product_url"], url)
+                self.repo.upsert_home_products([{
+                    "platform": "jd", "goods_id": "123", "product_url": empty_url,
+                }])
+                self.assertEqual(self.col.docs[0]["product_url"], url)
+
     def test_sign_only_products_do_not_collide_under_existing_unique_index(self):
         count = self.repo.upsert_home_products([
             {"goods_id": 0, "goods_sign": "SIGN_A", "name": "A", "price": 10},
@@ -425,12 +468,16 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(self.col.docs, [])
         self.assertEqual(self.col.queries, [])
 
-    def test_only_two_requested_sort_indexes_are_added_to_existing_indexes(self):
+    def test_price_and_savings_sort_indexes_are_added_to_existing_indexes(self):
         self.assertEqual(self.col.indexes, [
             ([("platform", 1), ("product_id", 1)], {"unique": True, "background": True}),
             ("goods_sign", {"background": True}),
             ([("updated_at", -1)], {"background": True}),
             ([("platform", 1), ("updated_at", -1)], {"background": True}),
+            ([("activity_price", 1)], {"background": True}),
+            ([("platform", 1), ("activity_price", 1)], {"background": True}),
+            ([("saved_price", -1), ("updated_at", -1)], {"background": True}),
+            ([("platform", 1), ("saved_price", -1), ("updated_at", -1)], {"background": True}),
         ])
 
     def test_displayable_content_requires_name_and_known_valid_price(self):
@@ -546,6 +593,7 @@ class TestProductRepository(unittest.TestCase):
                 "platform", "product_id", "goods_id", "goods_sign", "name", "brand", "category",
                 "activity_price", "price", "original_price", "saved_price", "coupon_amount", "has_coupon",
                 "commission_rate", "commission_amount", "sales_tip", "image_url", "mall_name", "updated_at",
+                "product_url",
             ), 1),
         })
         for field in ("_id", "desc", "carousel_images", "default_promotion", "default_promotion_expires_at"):

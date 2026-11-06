@@ -251,6 +251,8 @@ def evaluate(expr, doc):
     if operator == "$cond":
         test, yes, no = value
         return evaluate(yes if evaluate(test, doc) else no, doc)
+    if operator == "$ifNull":
+        return next((item for item in evaluate(value, doc) if item is not None), None)
     args = evaluate(value, doc)
     if operator == "$eq":
         return args[0] == args[1]
@@ -274,26 +276,35 @@ class MemoryOrderCollection:
     def aggregate(self, pipeline):
         self.pipeline = deepcopy(pipeline)
         match = pipeline[0]["$match"]
-        docs = [doc for doc in self.orders if all(
-            (doc.get(key, 0) >= value["$gte"]) if isinstance(value, dict) else doc.get(key) == value
-            for key, value in match.items()
-        )]
+        def matches(doc, query):
+            for key, value in query.items():
+                if key == "$or":
+                    if not any(matches(doc, branch) for branch in value): return False
+                elif isinstance(value, dict):
+                    assert set(value) == {"$gte"}
+                    if doc.get(key) is None or doc[key] < value["$gte"]: return False
+                elif doc.get(key) != value:
+                    return False
+            return True
+        docs = [doc for doc in self.orders if matches(doc, match)]
         output = {}
         for name, stages in pipeline[1]["$facet"].items():
             rows = deepcopy(docs)
             for stage in stages:
                 operator, value = next(iter(stage.items()))
                 if operator == "$project":
-                    if value == {"_id": 0}:
-                        rows = [{key: item for key, item in row.items() if key != "_id"} for row in rows]
+                    if all(item == 0 for item in value.values()):
+                        rows = [{key: item for key, item in row.items() if key not in value} for row in rows]
                     else:
                         rows = [{key: evaluate(expr, row) for key, expr in value.items()} for row in rows]
+                elif operator == "$set":
+                    rows = [dict(row, **{key: evaluate(expr, row) for key, expr in value.items()}) for row in rows]
                 elif operator == "$group":
                     rows = [{key: sum(evaluate(expr["$sum"], row) for row in rows)
                              for key, expr in value.items() if key != "_id"}] if rows else []
                 elif operator == "$sort":
                     for key, direction in reversed(list(value.items())):
-                        rows.sort(key=lambda row: row.get(key, 0), reverse=direction < 0)
+                        rows.sort(key=lambda row: (row.get(key) is not None, row.get(key) or 0), reverse=direction < 0)
                 elif operator == "$limit":
                     rows = rows[:value]
                 else:

@@ -18,6 +18,8 @@ DETAIL_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_T
 SEARCH_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_SEARCH, ttl=180)         # 关键词搜索 3 分钟
 CATEGORY_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_CATEGORY, ttl=600)     # 爆单库类目 10 分钟
 PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_PROMOTION, ttl=1800)  # 转链口令 30 分钟
+# 公开商品身份到上游物料URL；不是完整详情或个人推广链接。
+MATERIAL_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_TTL)
 
 
 def clear_all_caches():
@@ -27,3 +29,4 @@ def clear_all_caches():
     SEARCH_CACHE.clear()
     CATEGORY_CACHE.clear()
     PROMOTION_CACHE.clear()
+    MATERIAL_CACHE.clear()
