@@ -148,7 +148,7 @@ class ProductService:
             if isinstance(snapshot, DetailSnapshot) and len(snapshots) < 20 and snapshot.ref.platform == plat:
                 snapshots.append(snapshot)
         paging = {"cursor": cursor} if cursor else {}
-        if self.prefetcher is not None or getattr(adapter, "supports_search_detail_sink", False) is True:
+        if self.prefetcher is not None:
             paging["detail_sink"] = collect
         result = adapter.get_recommend_goods(channel_type=channel_type, offset=offset, limit=limit, uid=uid, **paging)
         if result.get("status") == "success":
@@ -182,25 +182,16 @@ class ProductService:
         if cached is not None:
             self._offer_products(cached.get("data") or [])
             return cached
-        snapshots = []
-        def collect(snapshot):
-            if isinstance(snapshot, DetailSnapshot) and len(snapshots) < 20 and snapshot.ref.platform == plat:
-                snapshots.append(snapshot)
-        search_kwargs = {"detail_sink": collect} if getattr(adapter, "supports_search_detail_sink", False) is True else {}
-        result = adapter.search_goods(keyword=keyword, page=page, page_size=page_size, uid=uid, **search_kwargs)
+        result = adapter.search_goods(keyword=keyword, page=page, page_size=page_size, uid=uid)
         if result.get("status") == "success":
             SEARCH_CACHE.set(cache_key, result)
             items = result.get("data") or []
-            for snapshot in snapshots:
-                deadline = self._snapshot_deadline(snapshot)
-                if deadline > time.time():
-                    self._cache_detail(plat, {"status": "success", "data": snapshot.data}, deadline)
             # 搜索物料链接也保留到摘要库，不能依赖可关闭的详情预取来补映射。
             if getattr(adapter, "requires_material_url", False) is True:
                 materials = [item for item in items if item.get("product_url")]
                 if materials:
                     self._save_summary_in_background(materials, None)
-            self._offer_products(items, snapshots=tuple(snapshots))
+            self._offer_products(items)
         else:
             logger.warning(
                 "❌ 【商品搜索失败】按关键词检索平台联盟商品失败 | 平台[%s] 关键词[%s] 页码[%s] 失败原因<%s> 排查方向<请检查上游搜索接口配额、关键词合法性或网关连通性>",

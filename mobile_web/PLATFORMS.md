@@ -13,27 +13,22 @@ API（参数、令牌）
 - `ProductService`、`PromoteService`、`UserService`、`OrderService` 不复制淘宝专用版本。
 - `tb_client.py` 访问淘宝官方TOP（自营推广、升级详情、渠道备案），`hdk_client.py` 只取第三方榜单ID，`ztk_client.py` 负责第三方订单协议以及推手渠道高佣转链。客户端和适配器不查用户数据库。
 - `adapters/__init__.py` 是唯一平台装配表；`/api/home/platforms` 返回实际启用状态及 `capabilities` 字典：`recommend/search/detail/promotion/authorization/orders`。前端首页、账户和订单据此展示。
-- 京东已实现多级高可用榜单、搜索、详情、数字推广转链和增量订单适配，默认关闭。由 `jd_client.py` 处理京东宙斯官方网关本地签名直连 (`https://api.jd.com/routerjson`)、折淘客官方协议通道 (`open_jing_union_open_goods_query.ashx` / `open_jd_union_open_goods_bigfield_query.ashx`) 及降级兜底；不复制京东专用 Service、页面或集合。
+- 京东已实现榜单、搜索、详情、数字推广转链和增量订单适配，默认关闭。由 `jd_client.py` 处理折京客协议与官方订单第二跳；不复制京东专用 Service、页面或集合。
 - `authorization_required` 由适配器声明生成；“需要备案”“授权接口已配置”“平台已启用”是不同事实。京东无需备案，不生成假授权状态。
 
 ## 京东接入与数字推广身份
 
-以 [test_jd_api.py](scripts/test_jd_api.py) 的基准实现为唯一协议依据，正式模块不导入示例，不使用其中的默认凭据。私有配置字段：
+以 [test_jd_api.py](scripts/test_jd_api.py) 的非 debug 示例为协议依据，正式模块不导入示例，不使用其中的默认凭据。私有配置字段：
 
 | JSON字段 | 作用 |
 | --- | --- |
 | `jd_enabled` | 默认false。可同时关闭PDD/TB，仅启用JD。 |
 | `zhetaoke_appkey` / `myself_jd_union_id` | 商品榜单、搜索、详情必需；不要求淘宝sid。 |
 | `myself_jd_position_id` | 默认数字推广ID；缺少时仅推广能力关闭。 |
-| `myself_jd_app_key` / `myself_jd_app_secret` | 京东开放平台应用凭据；用于榜单与订单行接口本地 MD5 签名直连 `https://api.jd.com/routerjson`（缺少时榜单走折淘客中继，订单能力关闭）。 |
+| `myself_jd_app_key` / `myself_jd_app_secret` | 订单中继凭据；缺少时仅订单能力关闭。 |
 | `jd_api_base` | 默认 `http://api.zhetaoke.com:20000/api`，集中配置供应商中继；不能拿淘宝10001端口替换。 |
 
-**多级高可用与防限流机制：**
-1. **实时榜单 (`get_rank_goods`)**：优先本地计算 MD5 签名直连 `https://api.jd.com/routerjson` (`jd.union.open.goods.rank.query`)，异常时自动回退至 `open_jd_union_open_goods_rank_query.ashx`。
-2. **关键词搜索 (`search_goods`)**：优先走京东联盟官方协议 `open_jing_union_open_goods_query.ashx` (`jd.union.open.goods.query`)，覆盖全网京东 CPS 商品且自带多张高清轮播图 (`imageInfo.imageList`) 与落地页 `materialUrl`；仅在异常或空结果时回退至 `api_quanwang.ashx`。
-3. **列表即详情快照 (`DetailSnapshot`) 与禁预取 (`can_prefetch_detail=False`)**：京东榜单 (`imgList`) 与官方搜索 (`imageInfo.imageList`) 已携带完整轮播图、价格、优惠券与佣金，列表拉取时通过 `detail_sink` 直接生成 `DetailSnapshot` 写入内存与数据库，用户点击详情实现 **0 外部详情请求**；同时禁用后台盲目单品详情轮询，彻底避免触发折淘客防采集封禁。
-4. **冷启动单品详情 (`get_goods_detail`)**：优先调用 `open_jing_union_open_goods_query.ashx` (`keyword=goods_id, pageIndex=1, pageSize=1`)，轮播图不足时联动 `open_jd_union_open_goods_bigfield_query.ashx` 补充图片与 `mainSkuId`，最后才以 `api_detail.ashx` 兜底。
-5. **增量订单 (`query_orders`)**：优先本地使用 `jd_app_key` 与 `jd_app_secret` 计算 MD5 签名直连 `https://api.jd.com/routerjson` (`jd.union.open.order.row.query`)，彻底避免将 `jd_app_secret` 通过 HTTP 明文发送给第三方中继；仅在直连失败时回退至 `open_jing_union_openz_order_row_query.ashx` 两跳签名 URL 模式（禁止重定向并严格校验 `https://api.jd.com/routerjson` 白名单）。
+**传输风险：** 折京客官方订单文档仍公布HTTP中继，订单请求携带应用凭据。代码禁止重定向、对第二跳限定 `https://api.jd.com/routerjson` 和订单查询method，但这不使HTTP第一跳变安全。真实带密钥联调/上线前须确认供应商可用的安全传输方案；本轮离线测试未发送真实凭据。示例中曾提交的密钥应由账号持有人轮换。
 
 - 保留站内 `uid` / JWT。首次本人JD转链时，服务端以部分唯一索引、条件写入及有界碰撞重试分配持久数字字符串 `users.promoter_id`；不由前端选择。
 - 生链只使用 `positionId=promoter_id`，订单按 `positionId → users.promoter_id → uid` 反查，不要求 `auth_status.jd`，不用 `subUnionId` 猜身份。
@@ -41,7 +36,7 @@ API（参数、令牌）
 - 默认ID保留不参与自动分配。游客链接直接使用配置默认ID；推手订单只按真实回传的数字ID匹配，不提供游客历史订单认领、默认位绑定或人工回填流程。
 - 推广链接中的数字ID、商品ID均是字符串，不能转JavaScript Number；分享URL或请求扩展字段不能覆盖服务端归因。
 - 上游未证明链接/口令有效期，因此JD返回 `cacheable:false`，不套三天长期缓存。真实京口令字段保留到 `promotion_token`。
-- 搜索/榜单的可信物料URL可保存为摘要 `product_url`。只有上游明确数字SKU或已核验物料链接可构造商品URL；不透明物料ID没有可信URL时明确失败，不能标题搜索猜商品。
+- 搜索/榜单的可信物料URL可保存为摘要 `product_url`，不刷新完整详情时钟。只有上游明确数字SKU可构造商品URL；不透明物料ID没有可信URL时明确失败，不能标题搜索猜商品。
 
 京东订单按更新时间 `type=3`、上海时区、至多一小时窗口查询；行 `id` 是 `order_sn`，父单 `orderId` 单独保存。首次23小时需要至少23个窗口，单次5页预算通常会返回partial，需要后续查询触发续传；不保证一次刷新同步全部历史。
 
