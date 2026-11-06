@@ -21,6 +21,14 @@ logger = logging.getLogger("mobile_web")
 
 _ORIG_GETADDRINFO = socket.getaddrinfo
 _PDD_FALLBACK_IPS = ("101.226.73.254", "58.217.134.20", "101.226.73.255", "58.217.134.19")
+_GATEWAY_FALLBACK_IPS = {
+    "gw-api.pinduoduo.com": _PDD_FALLBACK_IPS,
+    "eco.taobao.com": ("59.82.121.73",),
+    "gw.api.taobao.com": ("59.82.23.84",),
+    "api.zhetaoke.com": ("111.198.53.170",),
+    "api.jd.com": ("106.39.169.86",),
+    "v2.api.haodanku.com": ("139.200.130.76", "113.125.206.117", "139.200.130.199"),
+}
 _PDD_DNS_CACHE = {}
 _PDD_DNS_LOCK = threading.Lock()
 _PDD_TRANSPORT_LOCK = threading.Lock()
@@ -33,7 +41,7 @@ def _is_windows():
 
 
 def _pdd_cached_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    if _PDD_DNS_ENABLED and host == "gw-api.pinduoduo.com":
+    if _PDD_DNS_ENABLED and host in _GATEWAY_FALLBACK_IPS:
         now = time.time()
         entry = _PDD_DNS_CACHE.get(host)
         if entry and now < entry[0]:
@@ -48,14 +56,15 @@ def _pdd_cached_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
                 return res
             except Exception as exc:
                 logger.debug(
-                    "【DNS缓存兜底】解析拼多多网关域名[%s]失败，已切换至缓存或内置备用IPv4地址 | 异常<%s>",
+                    "【DNS缓存兜底】解析联盟网关域名[%s]失败，已切换至缓存或内置备用IPv4地址 | 异常<%s>",
                     host, exc.__class__.__name__,
                 )
                 if entry:
                     return [(f, t, p, c, (addr[0], port or addr[1])) for f, t, p, c, addr in entry[1]]
+                fallback_ips = _GATEWAY_FALLBACK_IPS.get(host, _PDD_FALLBACK_IPS)
                 fallback_res = [
                     (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))
-                    for ip in _PDD_FALLBACK_IPS
+                    for ip in fallback_ips
                 ]
                 _PDD_DNS_CACHE[host] = (now + 300, fallback_res)
                 return fallback_res
@@ -97,11 +106,13 @@ def configure_transport(dns_mode="auto", trust_env=None):
                 _ORIG_GETADDRINFO = socket.getaddrinfo
                 with _PDD_DNS_LOCK:
                     if not _PDD_DNS_CACHE:
-                        _PDD_DNS_CACHE["gw-api.pinduoduo.com"] = (
-                            time.time() + 600,
-                            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))
-                             for ip in _PDD_FALLBACK_IPS],
-                        )
+                        now_ts = time.time()
+                        for host_key, ips in _GATEWAY_FALLBACK_IPS.items():
+                            _PDD_DNS_CACHE[host_key] = (
+                                now_ts + 600,
+                                [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))
+                                 for ip in ips],
+                            )
                 _PDD_DNS_ENABLED = True
                 socket.getaddrinfo = _pdd_cached_getaddrinfo
                 _PDD_DNS_INSTALLED = True

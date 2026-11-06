@@ -101,9 +101,10 @@ def parse_order_response(body):
     if result["status"] != "success":
         return result
     data = result["data"]
-    if str(data.get("code")) != "200" or "data" not in data:
+    has_empty_success = str(data.get("message") or "").lower() == "success" and bool(data.get("requestId"))
+    if str(data.get("code")) != "200" or ("data" not in data and not has_empty_success):
         return _error("PROTOCOL_ERROR", "京东订单缺少成功代码或数据")
-    block = data["data"]
+    block = data.get("data")
     if isinstance(block, list):
         rows = block
     elif isinstance(block, dict) and "orderRowResp" in block:

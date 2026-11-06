@@ -454,3 +454,10 @@ def test_encrypted_id_rewrites_stale_item_jd_url_to_jingfen_and_falls_back_to_de
     assert http.get.call_args_list[2].kwargs["params"]["materialId"] == resigned_jingfen_url
 
 
+def test_live_empty_order_response_without_data_key_is_accepted_as_empty_page():
+    # 实测京东联盟 jd.union.open.order.row.query 在时间窗无订单时省略 data 字段，仅返回 code=200, message='success', requestId
+    body = wrapped(ORDER_ROOT, {"code": 200, "message": "success", "requestId": "o_064e3d2a_mw5i63kh_17803994"}, string=True)
+    res = parse_order_response(body)
+    assert res == {"status": "success", "order_list": [], "has_more": False, "total_count": 0}
+
+

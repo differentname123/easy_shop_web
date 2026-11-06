@@ -122,12 +122,19 @@ def call_tb_api(
         for credential in (app_key, app_secret, session_key):
             if credential:
                 error_detail = error_detail.replace(str(credential), "[REDACTED]")
-        logger.warning(
-            "❌ 【淘宝网关异常】淘宝开放平台返回业务错误 | 接口[%s] 错误码[%s] | 详情<%s> | 排查方向<请检查TOP应用权限、SessionKey有效期或请求参数>",
-            method,
-            sub_code or code or "UNKNOWN",
-            error_detail,
-        )
+        if str(sub_code) == "invalid-sessionkey" or str(code) == "27":
+            logger.info(
+                "【淘宝凭证切换】官方24h SessionKey已过期，将自动切换至折淘客90天长效SID通道 | 接口[%s] 状态[%s]",
+                method,
+                sub_code or code,
+            )
+        else:
+            logger.warning(
+                "❌ 【淘宝网关异常】淘宝开放平台返回业务错误 | 接口[%s] 错误码[%s] | 详情<%s> | 排查方向<请检查TOP应用权限、SessionKey有效期或请求参数>",
+                method,
+                sub_code or code or "UNKNOWN",
+                error_detail,
+            )
         return _error(str(sub_code or code), error_detail)
 
     return {"status": "success", "data": result, "raw": result}
@@ -446,7 +453,9 @@ def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_sess
     from pathlib import Path
 
     result = {"session_key": _text(current_session), "ztk_sid": ""}
-    config_path = Path(__file__).resolve().parents[2] / "config.local.json"
+    config_path = Path(__file__).resolve().parents[1] / "config.local.json"
+    if not config_path.is_file():
+        config_path = Path(__file__).resolve().parents[2] / "config.local.json"
     local_cfg = {}
     if config_path.is_file():
         try:
