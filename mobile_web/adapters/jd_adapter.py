@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-"""京东字段/分页适配；无授权、用户仓储或个人转站长兜底。"""
+"""京东字段/分页适配；与 scripts/test_jd_api.py 基准实现对齐，支持列表即详情快照沉淀与多级协议字段兼容。"""
 import hashlib
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 
 from adapters.base import BasePlatformAdapter
 from infrastructure.jd_client import (
     JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS, SHANGHAI,
     canonical_promoter_id, product_url,
 )
-from models.product import ProductDetail, ProductRef, ProductSummary, clean_product_id
+from models.product import (
+    DetailSnapshot, ProductDetail, ProductRef, ProductSummary,
+    clean_product_id, utc_millis,
+)
 
 
 JD_ORDER_STATUS = {
@@ -66,12 +69,63 @@ def _item_id(item):
 
 
 def _material_url(item):
-    source = product_url(item.get("item_url"))
+    source = product_url(_pick(item.get("item_url"), item.get("materialUrl")))
     if source:
         return source
     # Only an explicit supplier SKU is evidence for a canonical item URL.
-    sku = canonical_promoter_id(item.get("skuId"))
+    sku = canonical_promoter_id(_pick(item.get("skuId"), item.get("mainSkuId")))
     return f"https://item.jd.com/{sku}.html" if sku else ""
+
+
+def _extract_coupon_amount(item):
+    """兼容提取折淘客 `coupon_info_money` 与京东官方 `couponInfo.couponList` / `purchasePriceInfo.couponList`。"""
+    direct = _money(item.get("coupon_info_money"))
+    if direct is not None and direct > 0:
+        return direct
+    coupon_info = item.get("couponInfo") if isinstance(item.get("couponInfo"), dict) else {}
+    purchase_info = item.get("purchasePriceInfo") if isinstance(item.get("purchasePriceInfo"), dict) else {}
+    coupon_list = coupon_info.get("couponList")
+    if not isinstance(coupon_list, list):
+        coupon_list = purchase_info.get("couponList") if isinstance(purchase_info.get("couponList"), list) else []
+    best = 0.0
+    for c in coupon_list:
+        if isinstance(c, dict):
+            disc = _money(c.get("discount")) or 0.0
+            if c.get("isBest") == 1 and disc > 0:
+                return disc
+            if disc > best:
+                best = disc
+    return best
+
+
+def _extract_carousel_images(item):
+    """兼容提取折淘客 `small_images`、官方搜索/大字段 `imageInfo.imageList` 以及官方榜单 `imgList`。"""
+    raw_images = item.get("small_images")
+    if isinstance(raw_images, str):
+        candidates = raw_images.split("|")
+    elif isinstance(raw_images, list):
+        candidates = list(raw_images)
+    else:
+        candidates = []
+
+    image_info = item.get("imageInfo")
+    if isinstance(image_info, dict) and isinstance(image_info.get("imageList"), list):
+        for entry in image_info["imageList"]:
+            if isinstance(entry, dict) and isinstance(entry.get("url"), str):
+                candidates.append(entry["url"])
+            elif isinstance(entry, str):
+                candidates.append(entry)
+
+    if isinstance(item.get("imgList"), list):
+        for entry in item["imgList"]:
+            if isinstance(entry, str):
+                candidates.append(entry)
+
+    return list(dict.fromkeys(img.strip() for img in candidates if isinstance(img, str) and img.strip()))
+
+
+def _has_gallery_images(item):
+    return bool(_extract_carousel_images(item))
 
 
 class JdAdapter(BasePlatformAdapter):
@@ -84,6 +138,7 @@ class JdAdapter(BasePlatformAdapter):
     requires_authorized_promotion = False
     requires_numeric_promoter_id = True
     requires_material_url = True
+    supports_search_detail_sink = True
     order_window_seconds = ORDER_WINDOW_SECONDS
     legacy_order_statuses = {"settled": [18], "refund": [28]}
 
@@ -105,6 +160,15 @@ class JdAdapter(BasePlatformAdapter):
                              "orders": bool(client is not None or setting("ztk_appkey") and
                                             setting("jd_app_key") and setting("jd_app_secret"))}
 
+    def can_prefetch_detail(self, ref=None):
+        """
+        禁用京东后台逐单盲目详情预取：
+        1. 京东榜单 (`rank.query`) 与官方搜索 (`goods.query`) 接口返回的数据本身已携带完整轮播图 (`imgList` / `imageInfo.imageList`)、
+           券后价、优惠券与佣金，已在列表拉取阶段直接通过 `detail_sink` 生成 `DetailSnapshot` 沉淀至缓存与数据库；
+        2. 禁止 `DetailPrefetcher` 在后台对无快照商品发起批量单品详情轮询，彻底避免触发“只查详情不产生订单”的防采集限制。
+        """
+        return False
+
     def _available(self, capability):
         if not self.active:
             return _error("platform_unavailable", "京东暂未启用")
@@ -120,26 +184,62 @@ class JdAdapter(BasePlatformAdapter):
         raw_id = _item_id(item)
         if not raw_id:
             raise ValueError("missing goods identity")
-        purchase = item.get("purchasePriceInfo")
-        purchase = purchase if isinstance(purchase, dict) else {}
-        price = _pick(item.get("quanhou_jiage"), item.get("wlprice"), purchase.get("price"), item.get("size"))
-        original = _pick(item.get("size"), purchase.get("price"), price)
+        price_info = item.get("priceInfo") if isinstance(item.get("priceInfo"), dict) else {}
+        purchase = item.get("purchasePriceInfo") if isinstance(item.get("purchasePriceInfo"), dict) else {}
+        comm_info = item.get("commissionInfo") if isinstance(item.get("commissionInfo"), dict) else {}
+        image_info = item.get("imageInfo") if isinstance(item.get("imageInfo"), dict) else {}
+        shop_info = item.get("shopInfo") if isinstance(item.get("shopInfo"), dict) else {}
+
+        price = _pick(
+            item.get("quanhou_jiage"),
+            price_info.get("lowestCouponPrice"),
+            price_info.get("lowestPrice"),
+            item.get("wlprice"),
+            purchase.get("purchasePrice"),
+            price_info.get("price"),
+            purchase.get("price"),
+            item.get("size"),
+        )
+        original = _pick(
+            item.get("size"),
+            price_info.get("price"),
+            purchase.get("price"),
+            purchase.get("thresholdPrice"),
+            item.get("wlprice"),
+            price,
+        )
         price, original = _money(price), _money(original)
         name = _text(_pick(item.get("title"), item.get("tao_title"), item.get("skuName")))
         if price is None or price < 0 or not name:
             raise ValueError("missing or invalid public product content")
-        coupon = _money(item.get("coupon_info_money")) or 0.0
+        coupon = _extract_coupon_amount(item)
+        gallery = _extract_carousel_images(item)
+        image_url = _text(_pick(
+            item.get("pict_url"),
+            item.get("imageUrl"),
+            image_info.get("whiteImage"),
+            gallery[0] if gallery else "",
+        ))
         data = {
             "platform": self.platform_code, "platform_name": self.platform_name,
             "goods_id": raw_id, "goods_sign": raw_id,
             "name": name,
-            "image_url": _text(_pick(item.get("pict_url"), item.get("imageUrl"))),
+            "image_url": image_url,
             "price": price, "original_price": original if original is not None and original >= 0 else price,
             "coupon_amount": coupon, "has_coupon": coupon > 0,
-            "commission_rate": _money(_pick(item.get("tkrate3"), item.get("commissionShare"))) or 0.0,
-            "commission_amount": _money(_pick(item.get("tkfee3"), item.get("commission"))) or 0.0,
+            "commission_rate": _money(_pick(
+                item.get("tkrate3"),
+                comm_info.get("commissionShare"),
+                item.get("commissionShare"),
+            )) or 0.0,
+            "commission_amount": _money(_pick(
+                item.get("tkfee3"),
+                comm_info.get("couponCommission"),
+                comm_info.get("commission"),
+                item.get("commission"),
+            )) or 0.0,
             "sales_tip": _text(_pick(item.get("volume"), item.get("inOrderCount30Days"), "0")),
-            "mall_name": _text(item.get("shop_title")),
+            "mall_name": _text(_pick(item.get("shop_title"), shop_info.get("shopName"), item.get("shopName"))),
         }
         summary = ProductSummary(**data).to_dict(exclude_unset=True)
         material = _material_url(item)
@@ -149,13 +249,24 @@ class JdAdapter(BasePlatformAdapter):
 
     def _detail(self, item):
         data = self._summary(item)
-        images = item.get("small_images")
-        images = images.split("|") if isinstance(images, str) else images if isinstance(images, list) else []
-        images = list(dict.fromkeys(image.strip() for image in images if isinstance(image, str) and image.strip()))
+        images = _extract_carousel_images(item)
         data.update(desc=_text(item.get("description")), carousel_images=images,
                     product_url=_material_url(item), detail_tags=[], service_guarantees=[],
                     shop_ratings={}, specs=[], coupon_info={})
         return ProductDetail(**data).to_dict(exclude_unset=True)
+
+    def _emit_snapshots(self, raw_items, detail_sink):
+        if not callable(detail_sink):
+            return
+        fetched_at = None
+        for raw in raw_items:
+            if not _has_gallery_images(raw):
+                continue
+            if fetched_at is None:
+                fetched_at = utc_millis(datetime.now(timezone.utc))
+            detail = self._detail(raw)
+            ref = ProductRef(self.platform_code, detail["goods_id"], detail["goods_sign"])
+            detail_sink(DetailSnapshot(ref, detail, fetched_at))
 
     def get_recommend_goods(self, channel_type=5, offset=0, limit=20, uid=None, detail_sink=None, **kwargs):
         unavailable = self._available("recommend")
@@ -168,7 +279,7 @@ class JdAdapter(BasePlatformAdapter):
         except (TypeError, ValueError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东榜单频道或分页无效", data=[])
         page, skip = offset // limit + 1, offset % limit
-        items, total, more = [], None, False
+        items, raw_selected, total, more = [], [], None, False
         # Offset can straddle two upstream pages. Never publish a partial failed page.
         while len(items) < limit:
             result = self.client.get_rank_goods({5: 1, 1: 3}[channel], page=page, page_size=limit)
@@ -180,6 +291,7 @@ class JdAdapter(BasePlatformAdapter):
             selected = rows[skip:skip + limit - len(items)]
             try:
                 items.extend(self._summary(item) for item in selected)
+                raw_selected.extend(selected)
             except (ValueError, TypeError):
                 return _error("PROTOCOL_ERROR", "京东榜单商品身份或字段无效", data=[])
             total = result.get("total_count")
@@ -187,11 +299,12 @@ class JdAdapter(BasePlatformAdapter):
             if len(items) >= limit or not more or not rows:
                 break
             skip, page = 0, page + 1
-        # Rank summaries never claim full DetailSnapshots, even with a detail_sink.
+        # 当榜单返回自带完整轮播图 (如官方 rank.query 的 imgList) 时，直接沉淀详情快照，实现点击详情 0 外部调用。
+        self._emit_snapshots(raw_selected, detail_sink)
         return {"status": "success", "data": items, "total_count": total,
                 "offset": offset, "next_offset": offset + len(items), "has_more": more, "next_cursor": None}
 
-    def search_goods(self, keyword, page=1, page_size=20, uid=None, **kwargs):
+    def search_goods(self, keyword, page=1, page_size=20, uid=None, detail_sink=None, **kwargs):
         unavailable = self._available("search")
         if unavailable:
             return {**unavailable, "data": []}
@@ -199,7 +312,9 @@ class JdAdapter(BasePlatformAdapter):
         if result.get("status") != "success":
             return result
         try:
-            data = [self._summary(item) for item in result["data"]]
+            raw_rows = result["data"]
+            data = [self._summary(item) for item in raw_rows]
+            self._emit_snapshots(raw_rows, detail_sink)
         except (ValueError, TypeError, KeyError):
             return _error("PROTOCOL_ERROR", "京东搜索商品身份或字段无效", data=[])
         return {**result, "data": data}
@@ -219,7 +334,7 @@ class JdAdapter(BasePlatformAdapter):
             single = dict(rows[0])
             if _material_url(single):
                 single["tao_id"] = target_id
-                single["skuId"] = target_id
+                single.setdefault("skuId", target_id)
                 matches = [single]
         if len(matches) != 1:
             return _error("PRODUCT_IDENTITY_MISMATCH", "京东详情未证实请求商品身份")
