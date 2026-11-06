@@ -352,7 +352,7 @@ if __name__ == "__main__":
     for idx, it in enumerate(s_items, 1):
         print(f"  * ({idx}) {it.get('title')[:22]}... | 券后: ¥{it.get('final_price')} | 佣金率: {it.get('commission_rate')}% (¥{it.get('commission_amount')})")
 
-    sample_url = s_items[0]["item_url"] if s_items else "https://jingfen.jd.com/detail/6xXK8Ko5uwFbKWz.html"
+    sample_url = s_items[0]["item_url"] if s_items else "https://u.jd.com/egVs7wU"
     sample_sku = s_items[0]["item_id"] if s_items else "6xXY8Ko5uwFbKV5W"
 
     # 3. 商品详情展示测试
@@ -365,7 +365,7 @@ if __name__ == "__main__":
         print(f"  * 详情获取失败: {det.get('error')}")
 
     # 4. 统一转链逻辑测试 (标识只要是纯数字即可，免去后台建位)
-    print("\n【4. 统一推广转链测试】")
+    print(f"\n【4. 统一推广转链测试】 {sample_url}")
     # 说明：promoter_id 只要是纯数字即可（如推手用户ID或站长默认位），京东无需后台预先创建推广位，订单会原样透出该数字作为归因依据
     
     # 示例 A: 默认/站长转链 (使用默认数字位)
