@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from adapters import get_adapter, normalize_platform
+from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, DetailSnapshot, DetailPrefetchResult, utc_millis
 from repositories.product_repo import ProductRepository
 from cache import RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, MATERIAL_CACHE
@@ -74,7 +75,10 @@ class ProductService:
             try:
                 self.repo.upsert_home_products(items, channel_type=channel_type)
             except Exception as exc:
-                logger.warning("推荐摘要入库失败: %s", type(exc).__name__)
+                logger.warning(
+                    "❌ 【商品摘要入库异常】后台线程执行推荐摘要入库失败 | 频道[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或写入负载>",
+                    channel_type, format_exc_summary(exc),
+                )
             finally:
                 with self._write_lock:
                     self._background_writes.discard(thread)
@@ -83,7 +87,10 @@ class ProductService:
             if not self._writes_open:
                 return
             if not self._summary_write_slots.acquire(blocking=False):
-                logger.warning("推荐摘要后台写入满载，跳过缓存性入库: limit=%s", self._MAX_BACKGROUND_WRITES)
+                logger.warning(
+                    "【商品摘要背压】推荐摘要后台写入满载，跳过本次缓存性入库 | 频道[%s] 并发上限[%s] 排查方向<当前摘要写入并发已达上限，属正常背压保护>",
+                    channel_type, self._MAX_BACKGROUND_WRITES,
+                )
                 return
             thread = None
             try:
@@ -93,7 +100,10 @@ class ProductService:
             except Exception:
                 self._background_writes.discard(thread)
                 self._summary_write_slots.release()
-                logger.warning("推荐摘要后台任务未能启动")
+                logger.warning(
+                    "❌ 【商品摘要入库异常】推荐摘要后台任务未能启动 | 频道[%s] 排查方向<请检查系统线程资源或容器进程数限制>",
+                    channel_type,
+                )
 
     def _offer_products(self, items, channel_type=None, snapshots=()):
         # 转链所需公开映射先发布，不能被可丢弃的后台摘要写入或预取开关阻断。
@@ -109,7 +119,10 @@ class ProductService:
             try:
                 self.prefetcher.offer_products(items, channel_type=channel_type, snapshots=snapshots)
             except Exception as exc:
-                logger.warning("详情预取投递失败: %s", type(exc).__name__)
+                logger.warning(
+                    "❌ 【详情预取投递异常】向后台预取器投递商品列表时发生异常 | 频道[%s] 数量[%d] 异常<%s> 排查方向<请检查详情预取器队列状态>",
+                    channel_type, len(items) if isinstance(items, list) else 0, format_exc_summary(exc),
+                )
         elif channel_type is not None and items:
             self._save_summary_in_background(items, channel_type)
 
@@ -149,6 +162,12 @@ class ProductService:
                 if deadline > time.time():
                     self._cache_detail(plat, {"status": "success", "data": snapshot.data}, deadline)
             self._offer_products(items, channel_type=channel_type, snapshots=tuple(snapshots))
+        else:
+            logger.warning(
+                "❌ 【商品推荐失败】拉取平台首页推荐商品流失败 | 平台[%s] 频道[%s] 偏移[%s] 数量[%s] 失败原因<%s> 排查方向<请检查上游联盟接口配额、网络连接或应用密钥配置>",
+                plat, channel_type, offset, limit,
+                result.get("error_msg") or result.get("error_code") or "未知错误",
+            )
         return result
 
     def search_home_goods(self, keyword, page=1, page_size=20, uid=None, platform="pdd") -> Dict[str, Any]:
@@ -173,6 +192,12 @@ class ProductService:
                 if materials:
                     self._save_summary_in_background(materials, None)
             self._offer_products(items)
+        else:
+            logger.warning(
+                "❌ 【商品搜索失败】按关键词检索平台联盟商品失败 | 平台[%s] 关键词[%s] 页码[%s] 失败原因<%s> 排查方向<请检查上游搜索接口配额、关键词合法性或网关连通性>",
+                plat, keyword, page,
+                result.get("error_msg") or result.get("error_code") or "未知错误",
+            )
         return result
 
     @staticmethod
@@ -293,7 +318,10 @@ class ProductService:
             written = self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=snapshot.fetched_at)) is True
         except Exception as exc:
             written = False
-            logger.warning("商品详情入库失败: %s", type(exc).__name__)
+            logger.warning(
+                "❌ 【商品详情入库异常】提交商品详情快照到本地数据库失败 | 平台[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或索引约束>",
+                snapshot.ref.platform, format_exc_summary(exc),
+            )
         if stop_event is not None and stop_event.is_set():
             return _LoadedDetail(public, snapshot, persisted=written)
         if not written:
@@ -385,8 +413,19 @@ class ProductService:
             result = self._database_detail(item, "database")
             return self._cache_detail(plat, result, deadline, uid)
         loaded = self._load_official(ref, adapter, uid, kwargs)
-        if loaded.public.get("status") != "success" and item:
-            return self._database_detail(item, "database_fallback")
+        if loaded.public.get("status") != "success":
+            goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign)
+            reason = loaded.public.get("error_msg") or loaded.public.get("error_code") or "未知错误"
+            if item:
+                logger.warning(
+                    "❌ 【商品详情降级】实时拉取上游商品详情失败，已降级返回本地历史缓存 | 平台[%s] 商品[%s] 上游原因<%s> 排查方向<请检查上游详情接口状态或商品是否已下架>",
+                    plat, goods_tag, reason,
+                )
+                return self._database_detail(item, "database_fallback")
+            logger.warning(
+                "❌ 【商品详情失败】拉取商品详情失败且本地无可用缓存 | 平台[%s] 商品[%s] 失败原因<%s> 排查方向<请检查商品ID/Sign是否有效、商品是否已下架或上游接口状态>",
+                plat, goods_tag, reason,
+            )
         return loaded.public
 
     def prefetch_product_detail(self, ref, snapshot=None, refresh_ahead_seconds=330, stop_event=None):
@@ -418,7 +457,10 @@ class ProductService:
                     loaded = self._load_official(ref, adapter, stop_event=stop_event,
                                                  refresh_ahead_seconds=refresh_ahead_seconds)
         except Exception as exc:
-            logger.warning("公开详情预取失败: platform=%s type=%s", ref.platform, type(exc).__name__)
+            logger.warning(
+                "❌ 【详情预取异常】后台预取公开商品详情时发生异常 | 平台[%s] 异常<%s> 排查方向<请检查MongoDB连接或上游详情接口状态>",
+                ref.platform, format_exc_summary(exc),
+            )
             return DetailPrefetchResult("error", snapshot, retryable=True)
         if loaded.snapshot and self._snapshot_deadline(loaded.snapshot) <= time.time():
             return DetailPrefetchResult("skipped")

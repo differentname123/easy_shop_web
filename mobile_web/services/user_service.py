@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from config import AUTH_STATUS_TTL, AUTH_NEGATIVE_STATUS_TTL
+from infrastructure.logging_utils import format_exc_summary
 from models.product import normalize_platform
 from models.user import normalize_promoter_id
 from repositories.user_repo import UserRepository
@@ -68,13 +69,30 @@ class UserService:
             )
             auth_token = create_access_token(user["uid"])
             user_data = dict(user)
+            is_new_user = bool(user_data.pop("_is_new_user", False))
             user_data["auth_token"] = auth_token
             user_data["phone"] = mask_phone(user_data.get("phone"))
+            logger.info(
+                "【用户认证】操作[%s] 用户[%s] 手机[%s] 邀请码[%s] 结果[成功]",
+                "新用户注册" if is_new_user else "手机号登录",
+                user["uid"],
+                user_data["phone"],
+                user_data.get("invite_code") or "-",
+            )
             return {"status": "success", "user": user_data}
         except ValueError as e:
+            logger.warning(
+                "【用户认证拒绝】用户注册或登录校验未通过 | 手机[%s] 原因<%s>",
+                mask_phone(phone) if isinstance(phone, str) and phone.strip() else "-",
+                str(e),
+            )
             return {"status": "error", "error_msg": str(e)}
         except Exception as e:
-            logger.error(f"注册登录服务异常: {e}")
+            logger.error(
+                "❌ 【用户认证异常】处理用户手机号注册或登录时发生系统异常 | 手机[%s] 异常<%s> 排查方向<请检查MongoDB连接状态、users集合唯一索引或认证密钥配置>",
+                mask_phone(phone) if isinstance(phone, str) and phone.strip() else "-",
+                format_exc_summary(e),
+            )
             return {"status": "error", "error_msg": f"系统异常: {str(e)}"}
 
     def get_user_info(self, uid: str) -> Dict[str, Any]:
@@ -97,7 +115,10 @@ class UserService:
             default_id = normalize_promoter_id(default_promoter_id)
             promoter_id = self.repo.ensure_promoter_id(uid, reserved_ids=(default_id,))
         except Exception as exc:
-            logger.warning("[%s] 读取数字推广身份失败: %s", plat, type(exc).__name__)
+            logger.warning(
+                "❌ 【推广身份分配失败】为用户分配或读取数字推广位ID时发生异常 | 平台[%s] 用户[%s] 异常<%s> 排查方向<请检查MongoDB连接状态、promoter_id唯一索引或默认推广位配置>",
+                plat, uid, format_exc_summary(exc),
+            )
             return {"status": "error", "error_code": "promoter_identity_unavailable",
                     "error_msg": "无法确认本人推广身份，请稍后重试；未使用站长推广位代替"}
         return {"status": "success", "uid": uid, "promoter_id": promoter_id}
@@ -168,36 +189,61 @@ class UserService:
                         "authorization_status": "unauthorized" if negative_fresh else "unknown"}
 
             started = time.perf_counter()
-            try:
-                response = adapter.check_authority(uid=uid)
-            finally:
-                logger.info("[authorization] platform=%s stage=remote_check elapsed_ms=%.1f",
-                            plat, (time.perf_counter() - started) * 1000)
+            response = adapter.check_authority(uid=uid)
+            remote_ms = (time.perf_counter() - started) * 1000
             if not isinstance(response, dict) or response.get("status") != "success":
+                err_msg = response.get("error_msg", "平台授权状态查询失败，请稍后重试") if isinstance(response, dict) else "平台授权状态响应无效"
+                logger.warning(
+                    "❌ 【渠道授权核验失败】调用平台接口核验推手渠道备案状态失败 | 平台[%s] 用户[%s] 耗时[%.1fms] 失败原因<%s> 排查方向<请检查平台联盟授权接口连通性、PID配置或应用密钥>",
+                    plat, uid, remote_ms, err_msg,
+                )
                 return {"status": "error", "platform": plat,
                         "error_code": response.get("error_code", "authorization_failed") if isinstance(response, dict) else "authorization_failed",
-                        "error_msg": response.get("error_msg", "平台授权状态查询失败，请稍后重试") if isinstance(response, dict) else "平台授权状态响应无效"}
+                        "error_msg": err_msg}
             if not isinstance(response.get("is_authorized"), bool):
+                logger.warning(
+                    "❌ 【渠道授权核验失败】平台返回的授权状态字段不是布尔值 | 平台[%s] 用户[%s] 耗时[%.1fms] 排查方向<请检查上游联盟接口返回协议是否变更>",
+                    plat, uid, remote_ms,
+                )
                 return {"status": "error", "platform": plat, "error_msg": "平台授权状态响应无效"}
             authorized = response["is_authorized"]
             identity = UserRepository.clean_platform_identity(response.get("identity") or {}) if authorized else {}
             if authorized and not self._identity_complete(adapter, identity):
+                logger.warning(
+                    "❌ 【渠道授权核验失败】平台返回已授权但缺少必需的渠道身份字段 | 平台[%s] 用户[%s] 耗时[%.1fms] 排查方向<请检查平台返回的custom_parameters或relation_id字段>",
+                    plat, uid, remote_ms,
+                )
                 return {"status": "error", "error_code": "invalid_platform_identity", "platform": plat,
                         "error_msg": "平台未返回完整的用户渠道身份，请重新验证授权"}
             if identity.get("external_id", uid) != uid:
+                logger.warning(
+                    "❌ 【渠道授权核验失败】平台返回的渠道身份与当前登录用户不一致 | 平台[%s] 用户[%s] 耗时[%.1fms] 排查方向<请检查custom_parameters绑定关系>",
+                    plat, uid, remote_ms,
+                )
                 return {"status": "error", "platform": plat, "error_msg": "平台渠道身份与当前用户不符"}
             bind = response.get("bind", 0)
             if not self.repo.update_auth_status(uid=uid, platform=plat, is_authorized=authorized, bind=bind,
                                                 extra={"identity": identity}):
+                logger.error(
+                    "❌ 【渠道授权保存失败】将核验后的渠道授权状态写入数据库未命中用户记录 | 平台[%s] 用户[%s] 授权结果[%s] 排查方向<请检查users集合中该uid是否存在>",
+                    plat, uid, "已授权" if authorized else "未授权",
+                )
                 return {"status": "error", "platform": plat, "error_msg": "保存授权状态失败，请稍后重试"}
             if identity:
                 self._assign_unmatched_orders(plat, identity, uid)
+            logger.info(
+                "【渠道授权】平台[%s] 用户[%s] 动作[远程权威核验] 授权结果[%s] 耗时[%.1fms]",
+                plat, uid, "已授权" if authorized else "未授权", remote_ms,
+            )
             if authorized:
                 return dict(self._authorized_response(uid, plat, adapter.platform_name, bind), identity=identity)
             return {"status": "success", "platform": plat, "platform_name": adapter.platform_name,
                     "is_authorized": False, "bind": bind, "identity": {}, "authorization_status": "unauthorized"}
         except Exception as exc:
-            logger.error(f"[{plat}] 查询用户授权失败: {type(exc).__name__}")
+            logger.error(
+                "❌ 【渠道授权异常】查询或更新用户平台渠道授权状态时发生异常 | 平台[%s] 用户[%s] 异常<%s> 排查方向<请检查MongoDB连接状态、渠道身份唯一索引冲突或上游授权接口>",
+                plat, uid, format_exc_summary(exc),
+            )
             return {"status": "error", "platform": plat, "error_msg": "查询或保存授权状态失败，请稍后重试"}
 
     def invalidate_promotion_authorization(self, uid: str, platform: str) -> bool:
@@ -208,7 +254,10 @@ class UserService:
                 extra={"identity": {}},
             ))
         except Exception as exc:
-            logger.warning("[%s] 保存转链授权失效状态失败: %s", platform, type(exc).__name__)
+            logger.warning(
+                "❌ 【渠道授权更新异常】标记用户转链授权失效状态时写入数据库失败 | 平台[%s] 用户[%s] 异常<%s> 排查方向<请检查MongoDB连接状态>",
+                platform, uid, format_exc_summary(exc),
+            )
             return False
 
     def _assign_unmatched_orders(self, platform: str, identity: dict, uid: str) -> None:
@@ -222,7 +271,10 @@ class UserService:
             if attribution:
                 self.order_repo.assign_unmatched_orders(platform, attribution, uid)
         except Exception as exc:
-            logger.warning(f"[{platform}] 未匹配订单归因回填待重试: {type(exc).__name__}")
+            logger.warning(
+                "❌ 【订单归因回填告警】授权成功后回填历史未归属订单失败，后续同步将自动重试 | 平台[%s] 用户[%s] 异常<%s> 排查方向<请检查MongoDB orders集合连接状态>",
+                platform, uid, format_exc_summary(exc),
+            )
 
     def check_and_get_auth(
         self, uid: str, platform: str = "pdd", *, force: bool = False, check_only: bool = False,
@@ -244,16 +296,28 @@ class UserService:
             url_result = adapter.generate_authority_url(uid=uid)
             if not isinstance(url_result, dict) or url_result.get("status") != "success":
                 message = url_result.get("error_msg") if isinstance(url_result, dict) else None
+                logger.warning(
+                    "❌ 【渠道授权链接生成失败】调用平台接口生成备案授权引导链接失败 | 平台[%s] 用户[%s] 失败原因<%s> 排查方向<请检查平台联盟PID/AppKey配置或上游授权接口状态>",
+                    plat, uid, message or "上游返回失败",
+                )
                 return {"status": "error", "platform": plat, "error_msg": message or "生成授权链接失败，请稍后重试"}
             auth_url = url_result.get("auth_url") or url_result.get("short_url") or ""
             if not isinstance(auth_url, str) or not auth_url.strip():
+                logger.warning(
+                    "❌ 【渠道授权链接生成失败】平台未返回有效的备案授权链接 | 平台[%s] 用户[%s] 排查方向<请检查上游联盟接口返回字段>",
+                    plat, uid,
+                )
                 return {"status": "error", "platform": plat, "error_msg": "平台未返回有效授权链接"}
+            logger.info("【渠道授权】平台[%s] 用户[%s] 动作[生成备案引导链接] 结果[成功]", plat, uid)
             result.update(msg=f"您尚未在 {adapter.platform_name} 完成授权备案，请点击下方按钮前往授权",
                           auth_url=auth_url, short_url=url_result.get("short_url") or auth_url,
                           we_app_info=url_result.get("we_app_info", {}))
             return result
         except Exception as exc:
-            logger.error(f"[{plat}] 生成用户授权链接失败: {type(exc).__name__}")
+            logger.error(
+                "❌ 【渠道授权异常】生成用户平台渠道授权引导链接时发生未预期异常 | 平台[%s] 用户[%s] 异常<%s> 排查方向<请检查上游联盟接口连通性或配置>",
+                plat, uid, format_exc_summary(exc),
+            )
             return {"status": "error", "platform": plat, "error_msg": "生成授权链接失败，请稍后重试"}
 
     @staticmethod

@@ -12,6 +12,7 @@ from typing import Optional
 
 from adapters import get_adapter, get_all_platforms
 from config import logger
+from infrastructure.logging_utils import format_exc_summary
 from models.product import DetailSnapshot, ProductRef
 
 
@@ -97,6 +98,7 @@ class DetailPrefetcher:
         self._admitted = 0
         self._seed_cycles = 0
         self._completed = dict.fromkeys(_COMPLETION_STATUSES, 0)
+        self._batch_failures = {}
 
     def stats(self):
         """返回脱离内部状态的只读统计快照；不暴露任何商品或用户身份。"""
@@ -107,9 +109,20 @@ class DetailPrefetcher:
 
     def _log_stats(self, phase, *, admitted=None):
         stats = self.stats()
-        logger.info("[detail-prefetch] %s seed_cycles=%s admitted=%s queued=%s inflight=%s completed=%s",
-                    phase, stats["seed_cycles"], stats["admitted"] if admitted is None else admitted,
-                    stats["queued"], stats["inflight"], stats["completed"])
+        comp = stats["completed"]
+        logger.info(
+            "【详情预取】 %s 轮次[%s] 准入[%s] 排队[%s] 执行中[%s] 统计[就绪:%s/失败:%s/入库失败:%s/跳过:%s/摘要入库:%s]",
+            phase,
+            stats["seed_cycles"],
+            stats["admitted"] if admitted is None else admitted,
+            stats["queued"],
+            stats["inflight"],
+            comp.get("ready", 0),
+            comp.get("error", 0),
+            comp.get("persist_failed", 0),
+            comp.get("skipped", 0),
+            comp.get("summary_ready", 0),
+        )
 
     def _has_capacity(self):
         # 在途任务也计入总容量，整个协调器至多保有128个任务。
@@ -212,7 +225,10 @@ class DetailPrefetcher:
                 try:
                     self._adapter(platform["code"]).warmup()
                 except Exception as exc:
-                    logger.debug("[%s] 连接预热失败: %s", platform["code"], type(exc).__name__)
+                    logger.debug(
+                        "【详情预取】平台[%s] 连接池与索引预热未就绪 | 异常<%s>",
+                        platform["code"], format_exc_summary(exc),
+                    )
 
     def _seed(self):
         for platform in self._platforms():
@@ -224,7 +240,10 @@ class DetailPrefetcher:
             try:
                 channels = self._adapter(platform["code"]).channels[:2]
             except Exception as exc:
-                logger.warning("[%s] 商品预取平台不可用: %s", platform["code"], type(exc).__name__)
+                logger.warning(
+                    "❌ 【详情预取告警】获取平台预取频道配置失败，已跳过该平台本轮预取 | 平台[%s] 异常<%s> 排查方向<请检查平台适配器注册或配置状态>",
+                    platform["code"], format_exc_summary(exc),
+                )
                 continue
             for channel in channels:
                 if self._stop_event.is_set():
@@ -236,7 +255,10 @@ class DetailPrefetcher:
                         offset=0, limit=PAGE_LIMIT, uid=None, cursor=None,
                     )
                 except Exception as exc:
-                    logger.warning("[%s] 商品首屏预取失败: %s", platform["code"], type(exc).__name__)
+                    logger.warning(
+                        "❌ 【详情预取告警】执行平台首屏推荐预取时发生异常 | 平台[%s] 频道[%s] 异常<%s> 排查方向<请检查上游推荐接口或网络连接状态>",
+                        platform["code"], channel.get("channel_type"), format_exc_summary(exc),
+                    )
 
     def _execute_detail(self, task):
         snapshot = task.snapshot
@@ -252,7 +274,10 @@ class DetailPrefetcher:
                 )
             except Exception as exc:
                 # 只有共享入口明确标识的暂时错误才重试。
-                logger.warning("商品详情预取失败: %s", type(exc).__name__)
+                logger.warning(
+                    "❌ 【详情预取异常】执行商品详情预取任务时发生异常 | 平台[%s] 异常<%s> 排查方向<请检查上游详情接口或数据库状态>",
+                    task.ref.platform, format_exc_summary(exc),
+                )
                 break
             if result.snapshot is not None:
                 snapshot = result.snapshot  # persist_failed 的第二次尝试只落库，不重复 HTTP。
@@ -287,7 +312,10 @@ class DetailPrefetcher:
                 self.service.repo.upsert_home_products(task.items, channel_type=task.channel_type)
                 return "summary_ready"
             except Exception as exc:
-                logger.warning("推荐商品入库失败，不影响在线结果: %s", type(exc).__name__)
+                logger.warning(
+                    "❌ 【详情预取告警】预取队列批量写入推荐商品摘要失败，不影响在线结果 | 频道[%s] 异常<%s> 排查方向<请检查MongoDB写入连接状态>",
+                    task.channel_type, format_exc_summary(exc),
+                )
                 return "summary_error"
         return self._execute_detail(task)
 
@@ -321,17 +349,31 @@ class DetailPrefetcher:
                     if not self._stop_event.is_set():
                         status = self._execute(task)
                 finally:
+                    batch_failures = None
                     with self._condition:
                         self._completed[status] += 1
+                        if isinstance(task, _DetailTask) and status in ("error", "persist_failed"):
+                            plat = task.ref.platform or "unknown"
+                            self._batch_failures[plat] = self._batch_failures.get(plat, 0) + 1
                         self._inflight = None
                         batch_finished = not self._pending
+                        if batch_finished and self._batch_failures:
+                            batch_failures = dict(self._batch_failures)
+                            self._batch_failures.clear()
                         self._condition.notify_all()
                 if batch_finished:
+                    if batch_failures:
+                        dist = ", ".join(f"{plat}:{cnt}条" for plat, cnt in sorted(batch_failures.items()))
+                        logger.warning(
+                            "❌ 【详情预取告警】本批次后台预取存在失败任务 | 失败分布[%s] 排查方向<请检查对应平台上游详情接口配额(如折淘客/联盟网关限流)或数据库连接状态>",
+                            dist,
+                        )
                     self._log_stats("idle")
         finally:
             with self._condition:
                 self._accepting = False
                 self._pending.clear()
                 self._inflight = None
+                self._batch_failures.clear()
                 self._condition.notify_all()
             self._log_stats("stopped")

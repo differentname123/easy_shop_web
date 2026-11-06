@@ -14,6 +14,7 @@ from models.user import normalize_promoter_id
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from repositories.base_repo import BaseRepository
+from infrastructure.logging_utils import format_exc_summary
 from auth import hash_password, verify_password
 from config import logger
 from models.product import normalize_platform
@@ -40,7 +41,10 @@ class UserRepository(BaseRepository):
             self.col.create_index([("created_at", -1)])
             return True
         except Exception as e:
-            logger.warning(f"用户集合索引创建提示: {e}")
+            logger.warning(
+                "❌ 【数据库索引告警】创建用户集合索引时发生异常 | 集合[users] 异常<%s> 排查方向<请检查MongoDB连接状态或users集合唯一键(uid/phone/promoter_id)数据冲突>",
+                format_exc_summary(e),
+            )
             return False
 
     def _ensure_promoter_index(self):
@@ -206,7 +210,7 @@ class UserRepository(BaseRepository):
         self.col.insert_one(user_doc)
         user_doc.pop("_id", None)
         user_doc.pop("password_hash", None)
-        logger.info(f"新用户注册成功: phone={phone}, uid={new_uid}, invite_code={my_invite_code}")
+        user_doc["_is_new_user"] = True
         return user_doc
 
     def create_user(self, uid: Optional[str] = None, nickname: Optional[str] = None) -> Dict[str, Any]:
@@ -241,11 +245,15 @@ class UserRepository(BaseRepository):
             self.col.insert_one(user_doc)
             user_doc.pop("_id", None)
             return user_doc
-        except Exception:
+        except Exception as exc:
             existing = self.get_user_by_uid(final_uid)
             if existing:
                 existing.pop("password_hash", None)
                 return existing
+            logger.error(
+                "❌ 【数据库异常】初始化访客用户记录时写入失败 | 集合[users] 用户[%s] 异常<%s> 排查方向<请检查MongoDB连接状态、写入权限或唯一索引冲突>",
+                final_uid, format_exc_summary(exc),
+            )
             raise
 
     def get_or_create_user(self, uid: Optional[str] = None) -> Dict[str, Any]:

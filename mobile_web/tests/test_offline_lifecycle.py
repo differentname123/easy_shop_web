@@ -213,3 +213,66 @@ def test_shutdown_waits_for_io_without_blocking_event_loop_and_unbinds_only_afte
         assert all(ident != threading.get_ident() for ident in service.wait_threads + other.wait_threads)
 
     asyncio.run(exercise())
+
+
+def test_structured_logging_denoising_and_aggregation(monkeypatch):
+    from infrastructure.logging_utils import format_exc_summary
+    from services.promote_service import PromoteService
+
+    raw_exc = RuntimeError("GET https://api.example.com/v1?appkey=secret123&token=tok_abc failed")
+    summary = format_exc_summary(raw_exc)
+    assert "RuntimeError" in summary
+    assert "secret123" not in summary
+    assert "tok_abc" not in summary
+    assert "https://api.example.com" not in summary
+
+    service, other, _ = install_lifecycle_fakes(monkeypatch, warmup=False, prefetch=False)
+    app = create_app()
+    info_msgs, warn_msgs, debug_msgs = [], [], []
+    fake_logger = SimpleNamespace(
+        info=lambda msg, *a: info_msgs.append(msg % a if a else msg),
+        warning=lambda msg, *a: warn_msgs.append(msg % a if a else msg),
+        error=lambda msg, *a: warn_msgs.append(msg % a if a else msg),
+        debug=lambda msg, *a: debug_msgs.append(msg % a if a else msg),
+    )
+    monkeypatch.setattr(main_module, "logger", fake_logger)
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/static/css/home.css").status_code in (200, 404)
+        assert client.get("/").status_code == 200
+        assert client.get("/nonexistent-route").status_code == 404
+
+    assert not any("/health" in m for m in info_msgs), "健康检查正常请求不应刷屏 INFO"
+    assert any("/health" in m for m in debug_msgs)
+    assert any("【HTTP请求】" in m and "接口[GET /]" in m for m in info_msgs)
+    assert any("【HTTP请求告警】" in m and "状态[404]" in m and "排查方向<" in m for m in warn_msgs)
+
+    promo_info, promo_warn = [], []
+    monkeypatch.setattr(
+        "services.promote_service.logger",
+        SimpleNamespace(
+            info=lambda msg, *a: promo_info.append(msg % a if a else msg),
+            warning=lambda msg, *a: promo_warn.append(msg % a if a else msg),
+        ),
+    )
+    repo = SimpleNamespace(get_product_identity=lambda *a, **k: None, get_promotion_link_cache=lambda *a, **k: None)
+    user_svc = SimpleNamespace(
+        get_promotion_context=lambda uid, plat, **k: {"status": "success", "is_authorized": True, "identity": {"custom_parameters": uid}}
+    )
+    from models.product import ProductRef
+    adapter = SimpleNamespace(
+        active=True,
+        platform_name="拼多多",
+        requires_authorized_promotion=False,
+        resolve_product_ref=lambda gid, goods_id=None, goods_sign=None: ProductRef("pdd", str(gid), goods_sign or ""),
+        convert_promotion_url=lambda *a, **k: {"status": "error", "error_msg": "商品已下架或不支持推广"},
+    )
+    monkeypatch.setattr("services.promote_service.get_adapter", lambda plat: adapter)
+    res = PromoteService(product_repo=repo, user_service=user_svc).convert_link("pdd", "1001", uid="u_12345678")
+    assert res["status"] == "error"
+    assert promo_info == [], "转链失败时不应打印碎片化的前置 INFO 日志"
+    assert len(promo_warn) == 1
+    assert promo_warn[0].startswith("❌ 【推广转链失败】")
+    assert "平台[pdd]" in promo_warn[0] and "商品[1001]" in promo_warn[0] and "排查方向<" in promo_warn[0]
+

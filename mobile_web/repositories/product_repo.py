@@ -13,6 +13,7 @@ from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError
 from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
+from infrastructure.logging_utils import format_exc_summary
 from models.product import clean_product_id, normalize_platform, utc_millis
 from config import PROMOTION_LINK_TTL, logger
 
@@ -33,7 +34,10 @@ class ProductRepository(BaseRepository):
             self.col.create_index([("platform", 1), ("saved_price", -1), ("updated_at", -1)], background=True)
             return True
         except Exception as e:
-            logger.warning(f"商品集合索引创建提示: {e}")
+            logger.warning(
+                "❌ 【数据库索引告警】创建商品集合索引时发生异常 | 集合[products] 异常<%s> 排查方向<请检查MongoDB连接状态或products集合(platform+product_id)唯一索引冲突>",
+                format_exc_summary(e),
+            )
             return False
 
     _platform = staticmethod(normalize_platform)
@@ -281,7 +285,15 @@ class ProductRepository(BaseRepository):
                 "data": items,
             }
         except Exception as e:
-            logger.error(f"[ProductRepository.query_boom_products] 查询异常: {e}")
+            logger.error(
+                "❌ 【爆品库查询失败】分页查询本地爆单商品列表时发生数据库异常 | 平台[%s] 分类[%s] 关键词[%s] 排序[%s] 页码[%d] 异常<%s> 排查方向<请检查MongoDB连接状态、查询超时(2000ms)或正则表达式性能>",
+                self._platform(platform) if platform else "all",
+                category or "全部",
+                keyword or "-",
+                sort_by,
+                page,
+                format_exc_summary(e),
+            )
             return {
                 "status": "error",
                 "error_msg": str(e),
@@ -383,7 +395,10 @@ class ProductRepository(BaseRepository):
             if doc:
                 return self._normalize_doc(doc)
         except Exception as e:
-            logger.warning(f"从 Mongo 反查商品详情失败: {e}")
+            logger.warning(
+                "❌ 【商品缓存读取异常】从本地数据库反查商品详情时发生异常 | 平台[%s] 商品[%s] 键类型[%s] 严格模式[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或products集合索引>",
+                self._platform(platform), key, key_type or "auto", strict, format_exc_summary(e),
+            )
             if strict:
                 raise
         return None
@@ -399,7 +414,10 @@ class ProductRepository(BaseRepository):
                 {"_id": 0, "platform": 1, "product_id": 1, "goods_id": 1, "goods_sign": 1},
             )
         except Exception as e:
-            logger.warning(f"从 Mongo 反查商品身份失败: {e}")
+            logger.warning(
+                "❌ 【商品身份反查异常】从本地数据库按Sign反查商品ID时发生异常 | 平台[%s] Sign[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或goods_sign索引>",
+                self._platform(platform), sign, format_exc_summary(e),
+            )
             return None
 
     def get_categories(self, platform: str = "all") -> List[str]:
@@ -416,7 +434,10 @@ class ProductRepository(BaseRepository):
                     result.append(text)
             return result
         except Exception as e:
-            logger.warning(f"获取类目失败: {e}")
+            logger.warning(
+                "❌ 【商品类目读取降级】查询本地爆品库分类列表失败，已降级返回默认分类 | 平台[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或distinct聚合性能>",
+                self._platform(platform) if platform else "all", format_exc_summary(e),
+            )
             return ["全部", "食品", "美妆", "百货", "数码", "服饰"]
 
     def upsert_home_products(
@@ -446,10 +467,16 @@ class ProductRepository(BaseRepository):
         try:
             result = self.col.bulk_write(operations, ordered=False)
             upserted_count = result.upserted_count + result.modified_count
-            logger.info(f"[ProductRepository.upsert_home_products] 成功入库/更新 {upserted_count} 件首页推荐商品")
+            logger.debug(
+                "【商品摘要入库】批量写入首页推荐商品完成 | 频道[%s] 变更数量[%d条] 提交总数[%d条]",
+                channel_type if channel_type is not None else "-", upserted_count, len(operations),
+            )
             return upserted_count
         except Exception as e:
-            logger.warning(f"[ProductRepository.upsert_home_products] 批量入库异常: {e}")
+            logger.warning(
+                "❌ 【商品摘要入库异常】批量写入首页推荐流商品到本地数据库失败 | 频道[%s] 待写数量[%d条] 异常<%s> 排查方向<请检查MongoDB写入连接、磁盘空间或唯一索引冲突>",
+                channel_type if channel_type is not None else "-", len(operations), format_exc_summary(e),
+            )
             return 0
 
     _DETAIL_CAS_ATTEMPTS = 4
@@ -522,7 +549,12 @@ class ProductRepository(BaseRepository):
                 # 条件失败说明读后有新详情写入，重新判断胜出来源时间，不无条件重试覆盖。
             return False
         except Exception as e:
-            logger.warning(f"[ProductRepository.upsert_product_detail] 详情入库异常: {e}")
+            logger.warning(
+                "❌ 【商品详情入库异常】写入商品完整详情到本地数据库时发生异常 | 平台[%s] 商品[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或文档CAS并发冲突>",
+                detail.get("platform") or "-",
+                detail.get("goods_id") or detail.get("goods_sign") or "-",
+                format_exc_summary(e),
+            )
             return False
 
     @classmethod
@@ -583,7 +615,10 @@ class ProductRepository(BaseRepository):
             result["_expires_at"] = expires_at
             return result
         except Exception as e:
-            logger.warning(f"读取 products 表官方推广缓存异常: {e}")
+            logger.warning(
+                "❌ 【转链缓存读取异常】从products集合读取通用推广链接缓存失败，将回退实时转链 | 平台[%s] 商品[%s] 异常<%s> 排查方向<请检查MongoDB连接状态>",
+                platform, gid or gsign, format_exc_summary(e),
+            )
         return None
 
     def save_promotion_link_cache(
@@ -640,5 +675,8 @@ class ProductRepository(BaseRepository):
             )
             return True
         except Exception as e:
-            logger.warning(f"保存 products 表官方推广缓存异常: {e}")
+            logger.warning(
+                "❌ 【转链缓存写入异常】保存通用推广链接缓存到products集合失败 | 平台[%s] 商品[%s] 异常<%s> 排查方向<请检查MongoDB写入状态或唯一索引冲突>",
+                platform, gid or gsign, format_exc_summary(e),
+            )
             return False

@@ -46,7 +46,11 @@ def _pdd_cached_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
                 res = _ORIG_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
                 _PDD_DNS_CACHE[host] = (now + 600, res)
                 return res
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "【DNS缓存兜底】解析拼多多网关域名[%s]失败，已切换至缓存或内置备用IPv4地址 | 异常<%s>",
+                    host, exc.__class__.__name__,
+                )
                 if entry:
                     return [(f, t, p, c, (addr[0], port or addr[1])) for f, t, p, c, addr in entry[1]]
                 fallback_res = [
@@ -116,8 +120,8 @@ def warmup():
     """Best-effort connection-pool warmup, invoked explicitly at startup."""
     try:
         _PDD_SESSION.head("https://gw-api.pinduoduo.com", timeout=3.0)
-    except Exception:
-        logger.debug("拼多多连接池预热未完成，首次请求时重试")
+    except Exception as exc:
+        logger.debug("【连接池预热】拼多多网关连接池预热未完成，首次请求时将自动重连 | 异常<%s>", type(exc).__name__)
 
 
 def make_custom_parameters(uid=None, extra_custom=None):
@@ -322,7 +326,7 @@ def check_member_authority(client_id, client_secret, pid, uid):
             "request_id": resp_data.get("request_id")
         }
     except Exception as e:
-        logger.error(f"[备案查询异常] uid={uid}, 错误: {str(e)}")
+        logger.debug("【拼多多网关】查询推手备案状态返回异常，交由上层服务聚合处理 | 用户[%s] 异常<%s>", uid, str(e))
         return {"status": "error", "bind": 0, "is_authorized": False, "error_msg": str(e)}
 
 def generate_authority_url(client_id, client_secret, pid, uid=None, **kwargs):

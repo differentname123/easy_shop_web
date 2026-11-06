@@ -99,9 +99,13 @@ def call_tb_api(
             return _error("PROTOCOL_ERROR", "淘宝网关返回不受支持的重定向")
         resp.raise_for_status()
         result = resp.json()
-    except Exception:
+    except Exception as exc:
         # Exception messages may contain a URL or signed request; never echo credentials.
-        logger.warning("[TB_API] 通信失败: method=%s", method)
+        logger.warning(
+            "❌ 【淘宝网关异常】调用淘宝开放平台通信失败 | 接口[%s] | 异常类型<%s> | 排查方向<请检查淘宝TOP网关网络连通性或是否触发限流>",
+            method,
+            type(exc).__name__,
+        )
         return _error("NETWORK_ERROR", "淘宝开放平台通信失败")
 
     if not isinstance(result, dict):
@@ -118,7 +122,12 @@ def call_tb_api(
         for credential in (app_key, app_secret, session_key):
             if credential:
                 error_detail = error_detail.replace(str(credential), "[REDACTED]")
-        logger.warning("[TB_API] 平台返回错误: method=%s", method)
+        logger.warning(
+            "❌ 【淘宝网关异常】淘宝开放平台返回业务错误 | 接口[%s] 错误码[%s] | 详情<%s> | 排查方向<请检查TOP应用权限、SessionKey有效期或请求参数>",
+            method,
+            sub_code or code or "UNKNOWN",
+            error_detail,
+        )
         return _error(str(sub_code or code), error_detail)
 
     return {"status": "success", "data": result, "raw": result}

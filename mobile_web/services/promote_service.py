@@ -9,6 +9,7 @@ from copy import deepcopy
 from typing import Dict, Any, Optional
 from adapters import get_adapter, PlatformUnavailableError
 from adapters.base import build_command_text
+from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, clean_product_id, normalize_platform
 from models.user import normalize_promoter_id
 from repositories.product_repo import ProductRepository
@@ -40,7 +41,10 @@ class PromoteService:
                     goods_id = raw_gid or (ref.goods_sign if ref.platform in ("taobao", "jd") else "")
                     return ProductRef(ref.platform, goods_id, ref.goods_sign)
             except Exception as exc:
-                logger.warning(f"推广商品身份缓存读取失败: {exc}")
+                logger.warning(
+                    "❌ 【转链身份解析降级】读取商品身份缓存时发生异常，已降级使用原始参数继续转链 | 平台[%s] Sign[%s] 异常<%s> 排查方向<请检查MongoDB连接或products集合状态>",
+                    ref.platform, ref.goods_sign, format_exc_summary(exc),
+                )
             if ref.platform in ("taobao", "jd"):
                 val = ref.goods_sign or ref.goods_id
                 return ProductRef(ref.platform, val, val)
@@ -122,12 +126,16 @@ class PromoteService:
             value = item.get("product_url")
             return value.strip() if isinstance(value, str) else ""
         except Exception as exc:
-            logger.warning("读取推广物料映射失败: %s", type(exc).__name__)
+            logger.warning(
+                "❌ 【转链物料读取降级】从本地数据库读取商品可信物料链接失败，将尝试直接调用上游转链 | 平台[%s] 商品[%s] 异常<%s> 排查方向<请检查MongoDB连接状态>",
+                ref.platform, ref.key, format_exc_summary(exc),
+            )
             return ""
 
-    def _get_link_data(self, ref: ProductRef, product_url: str, uid: str, identity: dict, adapter, kwargs: dict) -> dict:
-        started = time.perf_counter()
-        scope = "personal" if uid else "public"
+    def _get_link_data(
+        self, ref: ProductRef, product_url: str, uid: str, identity: dict, adapter, kwargs: dict,
+        trace: Optional[dict] = None,
+    ) -> dict:
         kind = "sign" if ref.goods_sign else "id"
         cache_key = ("promotion", ref.platform, kind, ref.key, product_url, uid)
         if identity:
@@ -146,8 +154,8 @@ class PromoteService:
         if (isinstance(cached, tuple) and len(cached) == 2 and self._valid_deadline(cached[0])
                 and self._cacheable(cached[1]) and matches_scope(cached[1])
                 and (uid or self._public_attribution(cached[1]))):
-            logger.info("[promotion] platform=%s scope=%s source=memory elapsed_ms=%.1f",
-                        ref.platform, scope, (time.perf_counter() - started) * 1000)
+            if trace is not None:
+                trace.update(source="memory", provider_ms=0.0)
             return self._link_data(cached[1])
         if cached is not None:
             PROMOTION_CACHE.pop(cache_key)
@@ -163,8 +171,8 @@ class PromoteService:
                 expires_at = cached["_expires_at"]
                 data = self._link_data(cached)
                 PROMOTION_CACHE.set(cache_key, (expires_at, deepcopy(data)))
-                logger.info("[promotion] platform=%s scope=public source=database elapsed_ms=%.1f",
-                            ref.platform, (time.perf_counter() - started) * 1000)
+                if trace is not None:
+                    trace.update(source="database", provider_ms=0.0)
                 return data
 
         adapter_kwargs = {k: v for k, v in kwargs.items()
@@ -185,9 +193,8 @@ class PromoteService:
                 product_url=product_url or None, **adapter_kwargs
             )
         finally:
-            logger.info("[promotion] platform=%s scope=%s source=provider provider_ms=%.1f elapsed_ms=%.1f",
-                        ref.platform, scope, (time.perf_counter() - provider_started) * 1000,
-                        (time.perf_counter() - started) * 1000)
+            if trace is not None:
+                trace.update(source="provider", provider_ms=(time.perf_counter() - provider_started) * 1000)
         if not isinstance(result, dict) or result.get("status") != "success":
             message = result.get("error_msg") if isinstance(result, dict) else None
             error = {"status": "error", "error_msg": message or "未能生成有效推广转链，商品可能已失效或缺少必要标识"}
@@ -234,6 +241,7 @@ class PromoteService:
         uid: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
+        total_started = time.perf_counter()
         plat = normalize_platform(platform)
         adapter = get_adapter(plat)
         if not adapter.active:
@@ -255,17 +263,27 @@ class PromoteService:
         if not ref.key and not product_url:
             return {"status": "error", "error_msg": "缺少有效商品标识或链接"}
 
+        goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign) or "url"
+        user_tag = clean_uid or "匿名"
         identity, context = {}, {}
         effective_uid = clean_uid
         need_auth = False
+        auth_ms = 0.0
         if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+            auth_started = time.perf_counter()
             if clean_uid:
                 if self.user_service is None:
                     from services.user_service import UserService
                     self.user_service = UserService()
                 context = self.user_service.get_numeric_promotion_context(
                     clean_uid, plat, getattr(adapter, "default_promoter_id", ""))
+                auth_ms = (time.perf_counter() - auth_started) * 1000
                 if context.get("status") != "success":
+                    logger.warning(
+                        "❌ 【推广转链失败】获取推手数字推广位身份时失败 | 平台[%s] 商品[%s] 用户[%s] 耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户账号状态或默认推广位配置>",
+                        plat, goods_tag, user_tag, (time.perf_counter() - total_started) * 1000,
+                        context.get("error_msg") or context.get("error_code") or "推广身份异常",
+                    )
                     return context
                 numeric_id = context.get("promoter_id")
             else:
@@ -273,17 +291,25 @@ class PromoteService:
             try:
                 identity = {"promoter_id": normalize_promoter_id(numeric_id)}
             except ValueError:
+                logger.warning(
+                    "❌ 【推广转链失败】平台数字推广位ID格式无效 | 平台[%s] 商品[%s] 用户[%s] 排查方向<请检查环境变量中默认推广位ID(如JD_DEFAULT_POSITION_ID)是否为纯数字>",
+                    plat, goods_tag, user_tag,
+                )
                 return {"status": "error", "error_code": "invalid_promoter_id",
                         "error_msg": "平台推广身份尚未正确配置"}
         if clean_uid and getattr(adapter, "requires_authorized_promotion", False):
             if self.user_service is None:
                 from services.user_service import UserService
                 self.user_service = UserService()
-            started = time.perf_counter()
+            auth_started = time.perf_counter()
             context = self.user_service.get_promotion_context(clean_uid, plat, allow_remote=False)
-            logger.info("[promotion] platform=%s stage=local_authorization elapsed_ms=%.1f",
-                        plat, (time.perf_counter() - started) * 1000)
+            auth_ms = (time.perf_counter() - auth_started) * 1000
             if context.get("status") != "success":
+                logger.warning(
+                    "❌ 【推广转链失败】读取推手平台渠道授权状态时失败 | 平台[%s] 商品[%s] 用户[%s] 授权耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户中心数据库或授权状态配置>",
+                    plat, goods_tag, user_tag, auth_ms,
+                    context.get("error_msg") or context.get("error_code") or "授权上下文读取失败",
+                )
                 return context
             if context.get("is_authorized") is True:
                 identity = context.get("identity") or {}
@@ -291,7 +317,8 @@ class PromoteService:
                 effective_uid = ""
                 need_auth = True
 
-        data = self._get_link_data(ref, product_url, effective_uid, identity, adapter, kwargs)
+        trace: Dict[str, Any] = {}
+        data = self._get_link_data(ref, product_url, effective_uid, identity, adapter, kwargs, trace=trace)
         personal_fallback = False
         if (effective_uid and getattr(adapter, "requires_authorized_promotion", False)
                 and data.get("status") == "error"):
@@ -301,10 +328,30 @@ class PromoteService:
                 context = {"authorization_status": "unauthorized"}
                 need_auth = True
             elif code != "PERSONAL_PROMOTION_UNAVAILABLE":
+                total_ms = (time.perf_counter() - total_started) * 1000
+                logger.warning(
+                    "❌ 【推广转链失败】正在生成个人专属推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[personal] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、PID/RelationId配置或上游联盟转链接口状态>",
+                    plat, goods_tag, user_tag, trace.get("source", "provider"), auth_ms,
+                    trace.get("provider_ms", 0.0), total_ms,
+                    data.get("error_msg") or code or "未知错误",
+                )
                 return data
             personal_fallback = True
-            data = self._get_link_data(ref, product_url, "", {}, adapter, kwargs)
+            fallback_trace: Dict[str, Any] = {}
+            data = self._get_link_data(ref, product_url, "", {}, adapter, kwargs, trace=fallback_trace)
+            trace["source"] = fallback_trace.get("source", trace.get("source", "provider"))
+            trace["provider_ms"] = float(trace.get("provider_ms", 0.0)) + float(fallback_trace.get("provider_ms", 0.0))
+
+        total_ms = (time.perf_counter() - total_started) * 1000
+        source = trace.get("source", "provider")
+        provider_ms = float(trace.get("provider_ms", 0.0))
         if data.get("status") != "success":
+            logger.warning(
+                "❌ 【推广转链失败】正在生成商品推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、物料链接有效性或上游联盟转链网关状态>",
+                plat, goods_tag, user_tag, "personal" if effective_uid else "public",
+                source, auth_ms, provider_ms, total_ms,
+                data.get("error_msg") or data.get("error_code") or "未知错误",
+            )
             return data
 
         result = self._with_command(data, adapter, kwargs)
@@ -319,6 +366,20 @@ class PromoteService:
                           auth_platform=plat, auth_platform_name=adapter.platform_name,
                           authorization_status=authorization_status,
                           auth_msg=f"{message}；当前为通用链接，无法计入本人推广佣金。")
+            logger.info(
+                "【推广转链】平台[%s] 商品[%s] 用户[%s] 模式[fallback_public] 来源[%s] 结果[降级通用链] 授权状态[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms]",
+                plat, goods_tag, user_tag, source, authorization_status, auth_ms, provider_ms, total_ms,
+            )
         elif personal_fallback:
             result.update(is_fallback=True, attribution_status="anonymous")
+            logger.info(
+                "【推广转链】平台[%s] 商品[%s] 用户[%s] 模式[fallback_public] 来源[%s] 结果[降级通用链] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms]",
+                plat, goods_tag, user_tag, source, auth_ms, provider_ms, total_ms,
+            )
+        else:
+            logger.info(
+                "【推广转链】平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 结果[成功] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms]",
+                plat, goods_tag, user_tag, "personal" if effective_uid else "public",
+                source, auth_ms, provider_ms, total_ms,
+            )
         return result

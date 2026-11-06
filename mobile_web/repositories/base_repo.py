@@ -2,6 +2,7 @@
 """MongoDB 仓储基础设施：延迟连接、可注入数据库及可重试的索引初始化。"""
 import threading
 from infrastructure.mongo import gen_db_object
+from infrastructure.logging_utils import format_exc_summary
 from config import logger
 
 
@@ -60,7 +61,10 @@ class BaseRepository:
                 if self._init_indexes() is not False:
                     state.ready = True
             except Exception as exc:
-                logger.warning(f"{self.COLLECTION_NAME} 索引初始化失败，后续访问将重试: {exc}")
+                logger.warning(
+                    "❌ 【数据库索引告警】正在初始化集合索引时发生异常，后续访问将自动重试 | 集合[%s] 异常<%s> 排查方向<请检查MongoDB服务连接状态、账号权限或索引定义冲突>",
+                    self.COLLECTION_NAME, format_exc_summary(exc),
+                )
             finally:
                 self._index_state.building = False
 

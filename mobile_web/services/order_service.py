@@ -5,6 +5,7 @@ import time
 import threading
 from typing import Dict, Any, Optional
 from adapters import get_adapter, require_adapter
+from infrastructure.logging_utils import format_exc_summary
 from models.product import normalize_platform
 from models.order import normalize_order_fields
 from models.user import normalize_promoter_id
@@ -84,7 +85,9 @@ class OrderService:
 
     def _sync_platform_orders_bg(self, platform: str, end_time: int) -> None:
         """每次最多处理分页预算；同一窗口冻结时间、页码和不透明游标。"""
+        sync_started = time.perf_counter()
         processed = 0
+        pages_fetched = 0
         advanced = False
         complete = False
         error = ""
@@ -122,6 +125,7 @@ class OrderService:
                 if has_more is not None and not isinstance(has_more, bool):
                     error = "平台订单分页响应无效"
                     break
+                pages_fetched += 1
                 # 旧分页协议没有 has_more / cursor 时，仍按原始页长判断。
                 has_more = has_more if has_more is not None else len(orders) >= _PAGE_SIZE
                 if not orders and has_more:
@@ -156,19 +160,36 @@ class OrderService:
                 if state["pending"] is None:
                     complete = True
                     break
+            elapsed_ms = (time.perf_counter() - sync_started) * 1000
             if complete:
                 summary = {"status": "success", "error": "", "synced_count": processed}
-                logger.info(f"[{platform}] 当前目标窗口同步完成，处理 {processed} 笔订单")
+                logger.info(
+                    "【订单同步】平台[%s] 状态[success] 拉取页数[%d] 入库订单[%d笔] 耗时[%.1fms]",
+                    platform, pages_fetched, processed, elapsed_ms,
+                )
             else:
                 summary = {"status": "partial" if processed or advanced or not error else "error",
                            "error": error or "达到单次分页预算，窗口尚未完整同步",
                            "synced_count": processed}
-                logger.warning(f"[{platform}] 同步{summary['status']}: {summary['error']}，已处理 {processed} 笔")
+                if error:
+                    logger.warning(
+                        "❌ 【订单同步中断】拉取或写入增量订单时未完整完成 | 平台[%s] 状态[%s] 已处理页数[%d] 已入库[%d笔] 耗时[%.1fms] 中断原因<%s> 排查方向<请检查上游联盟订单接口状态、密钥配额或稍后自动续传>",
+                        platform, summary["status"], pages_fetched, processed, elapsed_ms, summary["error"],
+                    )
+                else:
+                    logger.info(
+                        "【订单同步】平台[%s] 状态[partial] 已处理页数[%d] 已入库[%d笔] 耗时[%.1fms] 说明<已达单次分页预算，剩余窗口将在下一周期继续同步>",
+                        platform, pages_fetched, processed, elapsed_ms,
+                    )
             _SYNC_STATE[platform] = summary
         except Exception as exc:
+            elapsed_ms = (time.perf_counter() - sync_started) * 1000
             _SYNC_STATE[platform] = {"status": "partial" if processed or advanced else "error",
                                      "error": "同步订单异常，请稍后重试", "synced_count": processed}
-            logger.error(f"[{platform}] 同步增量订单异常: {exc}")
+            logger.error(
+                "❌ 【订单同步异常】后台同步增量订单时发生系统异常 | 平台[%s] 已入库[%d笔] 耗时[%.1fms] 异常<%s> 排查方向<请检查MongoDB orders/order_sync_state集合连接状态、订单字段格式或上游接口>",
+                platform, processed, elapsed_ms, format_exc_summary(exc),
+            )
         finally:
             _platform_lock(platform).release()
 
@@ -191,7 +212,10 @@ class OrderService:
         except Exception as exc:
             _SYNC_STATE[platform] = {"status": "error", "error": "无法启动订单同步，请稍后重试", "synced_count": 0}
             lock.release()
-            logger.error(f"[{platform}] 启动同步线程失败: {exc}")
+            logger.error(
+                "❌ 【订单同步异常】启动后台订单增量同步线程失败 | 平台[%s] 异常<%s> 排查方向<请检查系统线程资源限制>",
+                platform, format_exc_summary(exc),
+            )
 
     def sync_and_query_orders(
         self,
@@ -221,7 +245,10 @@ class OrderService:
                 limit=100, legacy_order_statuses=adapter.legacy_order_statuses,
             )
         except Exception as exc:
-            logger.error(f"[{plat}] 查询订单仓储失败: {exc}")
+            logger.error(
+                "❌ 【订单查询失败】查询用户本地返利订单列表及统计汇总失败 | 平台[%s] 用户[%s] 时间跨度[%d天] 异常<%s> 排查方向<请检查MongoDB服务连接状态、orders集合索引或聚合管线兼容性>",
+                plat, clean_uid, days, format_exc_summary(exc),
+            )
             return {"status": "error", "error_msg": "查询订单与收益失败，请稍后重试"}
         state = _SYNC_STATE.get(plat, {})
         result.update({

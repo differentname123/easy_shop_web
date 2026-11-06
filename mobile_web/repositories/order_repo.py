@@ -5,6 +5,7 @@ import math
 from typing import Dict, Any, List, Optional
 from pymongo import UpdateOne
 from repositories.base_repo import BaseRepository
+from infrastructure.logging_utils import format_exc_summary
 from models.product import normalize_platform
 from models.order import normalize_order_fields
 from models.user import normalize_promoter_id
@@ -26,7 +27,10 @@ class OrderRepository(BaseRepository):
             self.col.create_index([("order_modify_at", -1)])
             return True
         except Exception as exc:
-            logger.warning(f"订单集合索引创建提示: {exc}")
+            logger.warning(
+                "❌ 【数据库索引告警】创建订单集合索引时发生异常 | 集合[orders] 异常<%s> 排查方向<请检查MongoDB连接状态或orders集合中是否存在重复(platform+order_sn)记录>",
+                format_exc_summary(exc),
+            )
             return False
 
     def upsert_orders(self, orders: List[Dict[str, Any]], platform: str = "pdd") -> int:
@@ -86,13 +90,9 @@ class OrderRepository(BaseRepository):
             operations.append(UpdateOne(
                 {"platform": platform, "order_sn": order_sn}, [{"$set": fields}], upsert=True
             ))
-        try:
-            result = self.col.bulk_write(operations, ordered=False)
-            if not result.acknowledged:
-                raise RuntimeError("订单批量写入未确认")
-        except Exception:
-            logger.exception("批量写入订单失败")
-            raise
+        result = self.col.bulk_write(operations, ordered=False)
+        if not result.acknowledged:
+            raise RuntimeError("订单批量写入未确认")
         return len(operations)
 
     def assign_unmatched_orders(self, platform: str, identity: dict, uid: str) -> int:
@@ -215,18 +215,14 @@ class OrderRepository(BaseRepository):
                 ],
             }},
         ]
-        try:
-            rows = list(self.col.aggregate(pipeline))
-            facet = rows[0] if rows else {}
-            stats = (facet.get("stats") or [{}])[0]
-            return {
-                "total_count": int(stats.get("total_count", 0)),
-                "total_commission": round(float(stats.get("total_commission", 0)), 2),
-                "settled_commission": round(float(stats.get("settled_commission", 0)), 2),
-                "refund_commission": round(float(stats.get("refund_commission", 0)), 2),
-                "refund_count": int(stats.get("refund_count", 0)),
-                "order_list": [self._format_order(doc, rules) for doc in facet.get("order_list", [])],
-            }
-        except Exception:
-            logger.exception("查询或聚合用户订单失败")
-            raise
+        rows = list(self.col.aggregate(pipeline))
+        facet = rows[0] if rows else {}
+        stats = (facet.get("stats") or [{}])[0]
+        return {
+            "total_count": int(stats.get("total_count", 0)),
+            "total_commission": round(float(stats.get("total_commission", 0)), 2),
+            "settled_commission": round(float(stats.get("settled_commission", 0)), 2),
+            "refund_commission": round(float(stats.get("refund_commission", 0)), 2),
+            "refund_count": int(stats.get("refund_count", 0)),
+            "order_list": [self._format_order(doc, rules) for doc in facet.get("order_list", [])],
+        }

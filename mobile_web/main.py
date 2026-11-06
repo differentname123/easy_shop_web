@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from infrastructure.logging_utils import configure_logging
+from infrastructure.logging_utils import configure_logging, format_exc_summary
 from infrastructure.pdd_client import configure_transport
 from services.detail_prefetch import DetailPrefetcher
 
@@ -61,7 +61,10 @@ async def lifespan(app: FastAPI):
                 adapter = get_adapter(platform["code"])
                 adapter.warmup()
             except Exception as exc:
-                logger.debug("[%s] 连接预热失败: %s", platform["code"], type(exc).__name__)
+                logger.debug(
+                    "【系统预热】平台[%s] 预热连接与索引未就绪 | 异常<%s> 排查方向<请检查MongoDB或上游网关连通性>",
+                    platform["code"], format_exc_summary(exc),
+                )
             if adapter is None:
                 continue
             if warmup_stop.is_set():
@@ -74,7 +77,10 @@ async def lifespan(app: FastAPI):
                             offset=0, limit=20,
                         )
                 except Exception as exc:
-                    logger.warning("[%s] 首页推荐预热异常: %s", platform["code"], type(exc).__name__)
+                    logger.warning(
+                        "❌ 【系统预热异常】正在预热平台首页推荐流时发生异常 | 平台[%s] 异常<%s> 排查方向<请检查平台配置、上游接口连通性或数据库状态>",
+                        platform["code"], format_exc_summary(exc),
+                    )
 
     try:
         if settings.detail_prefetch_enabled:
@@ -145,9 +151,45 @@ def create_app() -> FastAPI:
         started = time.perf_counter()
         forwarded = request.headers.get("x-forwarded-for")
         client = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "127.0.0.1")
-        response = await call_next(request)
+        req_path = _request_path(request)
+        path_only = request.url.path
+        is_noisy_asset = path_only.startswith("/static/") or path_only in ("/favicon.ico", "/health")
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            duration = (time.perf_counter() - started) * 1000
+            logger.error(
+                "❌ 【HTTP请求异常】处理客户端请求时发生未捕获异常 | 客户端[%s] 接口[%s %s] 耗时[%.1fms] 异常<%s> 排查方向<请结合上方业务日志排查对应接口或下游依赖>",
+                client, request.method, req_path, duration, format_exc_summary(exc),
+            )
+            raise
         duration = (time.perf_counter() - started) * 1000
-        logger.info(f"[{client}] {request.method} {_request_path(request)} -> {response.status_code} ({duration:.1f}ms)")
+        status_code = response.status_code
+        if status_code >= 500:
+            logger.error(
+                "❌ 【HTTP请求异常】接口返回服务端错误 | 客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms] 排查方向<请检查服务端异常日志或下游依赖状态>",
+                client, request.method, req_path, status_code, duration,
+            )
+        elif status_code >= 400:
+            logger.warning(
+                "【HTTP请求告警】接口返回客户端或鉴权错误 | 客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms] 排查方向<请检查请求参数、登录Token或访问路径>",
+                client, request.method, req_path, status_code, duration,
+            )
+        elif is_noisy_asset and duration < 1000:
+            logger.debug(
+                "【静态资源】客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms]",
+                client, request.method, req_path, status_code, duration,
+            )
+        elif duration >= 3000:
+            logger.warning(
+                "【HTTP慢请求】接口响应耗时过长 | 客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms] 排查方向<可能发生上游网关慢响应或重试，请结合业务日志排查>",
+                client, request.method, req_path, status_code, duration,
+            )
+        else:
+            logger.info(
+                "【HTTP请求】客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms]",
+                client, request.method, req_path, status_code, duration,
+            )
         return response
 
     for router in (home_router, goods_router, user_router, promote_router, order_router):

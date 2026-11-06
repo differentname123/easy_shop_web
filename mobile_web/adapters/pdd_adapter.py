@@ -4,6 +4,7 @@ import re
 from typing import Dict, Any
 from urllib.parse import urlencode, urlsplit
 from adapters.base import BasePlatformAdapter, build_command_text
+from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id
 from config import PDD_CLIENT_ID, PDD_CLIENT_SECRET, PDD_PID, logger, settings
 from infrastructure.pdd_client import (
@@ -160,7 +161,10 @@ class PddAdapter(BasePlatformAdapter):
                 "data": items,
             }
         except Exception as exc:
-            logger.error(f"[PddAdapter.get_recommend_goods] {exc}")
+            logger.debug(
+                "【拼多多接口异常】拉取推荐商品流异常，交由上层服务处理 | 频道[%s] 偏移[%s] 异常<%s>",
+                channel_type, offset, format_exc_summary(exc),
+            )
             return {"status": "error", "error_msg": str(exc), "data": []}
 
     def search_goods(self, keyword, page=1, page_size=20, uid=None, **kwargs) -> Dict[str, Any]:
@@ -181,7 +185,10 @@ class PddAdapter(BasePlatformAdapter):
                 "data": items,
             }
         except Exception as exc:
-            logger.error(f"[PddAdapter.search_goods] {exc}")
+            logger.debug(
+                "【拼多多接口异常】搜索联盟商品异常，交由上层服务处理 | 关键词[%s] 页码[%s] 异常<%s>",
+                keyword, page, format_exc_summary(exc),
+            )
             return {"status": "error", "error_msg": str(exc), "data": []}
 
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs) -> Dict[str, Any]:
@@ -198,7 +205,10 @@ class PddAdapter(BasePlatformAdapter):
                 return {"status": "error", "error_msg": "商品 ID 反查结果不匹配", "error_code": "product_identity_mismatch"}
             return {"status": "success", "data": item}
         except Exception as exc:
-            logger.error(f"[PddAdapter.get_goods_detail] {exc}")
+            logger.debug(
+                "【拼多多接口异常】查询商品详情异常，交由上层服务处理 | 商品[%s] 异常<%s>",
+                goods_id_or_sign or goods_id or goods_sign, format_exc_summary(exc),
+            )
             return {"status": "error", "error_msg": str(exc)}
 
     @staticmethod
@@ -253,7 +263,12 @@ class PddAdapter(BasePlatformAdapter):
             except Exception as exc:
                 if self._is_unauthorized_error(exc):
                     is_unauthorized = True
-                logger.warning(f"[PddAdapter] 超级红包生链异常: {exc}")
+                logger.warning(
+                    "【拼多多转链降级】超级红包智能生链异常，继续尝试招商券洗链或通用兜底 | 目标[%s] 用户[%s] 异常<%s> 排查方向<请检查推手是否完成渠道备案(60001)或商品是否支持推广>",
+                    target[:16] + "..." if isinstance(target, str) and len(target) > 16 else target,
+                    uid or "匿名",
+                    format_exc_summary(exc),
+                )
 
         # 2. 官方招商券转链 / 洗链 (zs.unit.url.gen)
         if source_url:
@@ -274,7 +289,10 @@ class PddAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     if self._is_unauthorized_error(exc):
                         is_unauthorized = True
-                    logger.warning(f"[PddAdapter] 招商券转链异常: {exc}")
+                    logger.warning(
+                        "【拼多多转链降级】招商券洗链异常，将回退保底策略 | 用户[%s] 异常<%s> 排查方向<请检查商品链接有效性或PID权限>",
+                        uid or "匿名", format_exc_summary(exc),
+                    )
 
         return None, None, None, is_unauthorized
 
@@ -362,7 +380,7 @@ class PddAdapter(BasePlatformAdapter):
         try:
             return check_member_authority(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid, uid=uid)
         except Exception as exc:
-            logger.error(f"[PddAdapter.check_authority] {exc}")
+            logger.debug("【拼多多接口异常】核验备案状态异常，交由上层服务处理 | 用户[%s] 异常<%s>", uid, format_exc_summary(exc))
             return {"status": "error", "is_authorized": False, "bind": 0, "error_msg": str(exc)}
 
     def generate_authority_url(self, uid, **kwargs) -> Dict[str, Any]:
@@ -374,7 +392,7 @@ class PddAdapter(BasePlatformAdapter):
                 return {"status": "success", "auth_url": link, "short_url": link, "we_app_info": info.get("we_app_info", {})}
             return {"status": "error", "error_msg": res.get("error_msg", "生成授权链接失败")}
         except Exception as exc:
-            logger.error(f"[PddAdapter.generate_authority_url] {exc}")
+            logger.debug("【拼多多接口异常】生成备案引导链接异常，交由上层服务处理 | 用户[%s] 异常<%s>", uid, format_exc_summary(exc))
             return {"status": "error", "error_msg": str(exc)}
 
     def fetch_increment_orders(self, start_time, end_time, page=1, page_size=50, **kwargs) -> Dict[str, Any]:
@@ -389,5 +407,5 @@ class PddAdapter(BasePlatformAdapter):
             return {"status": "success", "order_list": orders, "total_count": total,
                     "has_more": page * page_size < total}
         except Exception as exc:
-            logger.error(f"[PddAdapter.fetch_increment_orders] {exc}")
+            logger.debug("【拼多多接口异常】拉取增量订单异常，交由上层服务处理 | 页码[%s] 异常<%s>", page, format_exc_summary(exc))
             return {"status": "error", "error_msg": str(exc), "order_list": [], "total_count": 0}
