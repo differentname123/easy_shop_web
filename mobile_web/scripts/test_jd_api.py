@@ -107,8 +107,8 @@ def search_goods(keyword: str, page: int = 1, page_size: int = 3) -> List[Dict[s
     全网搜索京东推广商品
     """
     query = keyword.strip()
-    if len(query) < 4:
-        query = f"{query}热销商品"
+    while len(query) < 4:
+        query += query
 
     url = f"{ZTK_API_BASE}/api_quanwang.ashx"
     params = {
@@ -347,8 +347,8 @@ if __name__ == "__main__":
         print(f"    - [{g.get('rank')}] {g.get('title')[:22]}... | 现价: ¥{g.get('price')} | 预估佣金: ¥{g.get('commission_amount')}")
 
     # 2. 关键词搜索测试
-    print("\n【2. 全网关键词搜索】(搜索: '心相印抽纸')")
-    s_items = search_goods("心相印抽纸", page=1, page_size=20)
+    print("\n【2. 全网关键词搜索】(搜索: '可乐')")
+    s_items = search_goods("可乐", page=1, page_size=20)
     for idx, it in enumerate(s_items, 1):
         print(f"  * ({idx}) {it.get('title')[:22]}... | 券后: ¥{it.get('final_price')} | 佣金率: {it.get('commission_rate')}% (¥{it.get('commission_amount')})")
 

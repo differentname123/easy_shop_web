@@ -78,8 +78,8 @@ class JdAdapter(BasePlatformAdapter):
     platform_code = "jd"
     platform_name = "京东"
     channels = (
-        {"channel_type": 5, "name": "2小时实时榜", "icon": "fire"},
-        {"channel_type": 1, "name": "24小时热销榜", "icon": "crown"},
+        {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
+        {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
     )
     requires_authorized_promotion = False
     requires_numeric_promoter_id = True
@@ -214,6 +214,11 @@ class JdAdapter(BasePlatformAdapter):
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             return _error("PROTOCOL_ERROR", "京东详情商品列表无效")
         matches = [item for item in rows if _item_id(item) == ref.goods_id]
+        if not matches and len(rows) == 1:
+            single = dict(rows[0])
+            if _material_url(single):
+                single["tao_id"] = ref.goods_id
+                matches = [single]
         if len(matches) != 1:
             return _error("PRODUCT_IDENTITY_MISMATCH", "京东详情未证实请求商品身份")
         return {"status": "success", "data": matches[0]}

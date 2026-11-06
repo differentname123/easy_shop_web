@@ -119,7 +119,7 @@ def test_search_exact_script_parameters_public_url_and_missing_only_price_fallba
     assert "raw" not in str(first) and "jCommand" not in str(first)
     call = http.get.call_args
     assert call.args == (DEFAULT_API_BASE + "/api_quanwang.ashx",)
-    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "纸热销商品",
+    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "纸纸纸纸",
                                      "page": 2, "page_size": 3, "sort": "new", "youquan": 1, "type": 2}
     assert a.search_goods("足够长关键词")["data"][0]["price"] == 20.5
     assert http.get.call_args.kwargs["params"]["q"] == "足够长关键词"
@@ -140,10 +140,23 @@ def test_detail_identified_opaque_id_carousels_and_script_query(images, expected
     assert call.kwargs["params"]["tao_id"] == "opaque-material" and call.kwargs["params"]["type"] == 1
 
 
-@pytest.mark.parametrize("content", [[item("other")], [item(), item()], []])
+@pytest.mark.parametrize("content", [[item("other", item_url="")], [item(), item()], []])
 def test_detail_requires_unique_matching_supplier_identity(content):
     http = http_for({"status": 200, "content": content})
     assert adapter(client(http)).get_goods_detail("opaque-material")["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
+
+
+def test_detail_allows_rank_item_opaque_id_mapped_to_supplier_material_url():
+    # 模拟真实折淘客对于榜单商品的返回：请求参数为榜单混淆ID，返回单品详情的tao_id为物料长ID，但具备官方item_url
+    rank_item_id = "Wl4yEImIlQsfIguVL32ZfIguVL32Z4_3QWdizpmh42cklzdJw"
+    material_tao_id = "ejQ4e41VT9804VHJskns04VH3HCuxQ_3vbTPlrXEzwgtTJU5x"
+    supplier_item_url = f"https://jingfen.jd.com/detail/{material_tao_id}.html"
+    http = http_for({"status": 200, "content": [item(material_tao_id, item_url=supplier_item_url)]})
+    a = adapter(client(http))
+    result = a.get_goods_detail(rank_item_id)
+    assert result["status"] == "success"
+    assert result["data"]["goods_id"] == rank_item_id
+    assert result["data"]["product_url"] == supplier_item_url
 
 
 @pytest.mark.parametrize("string", [False, True])

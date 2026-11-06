@@ -221,8 +221,8 @@ class JdClient:
             query = keyword.strip()
             if not query:
                 raise ValueError
-            if len(query) < 4:
-                query += "热销商品"
+            while len(query) < 4:
+                query += query
         except (TypeError, ValueError, AttributeError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东搜索关键词或分页无效")
         body = self._request("api_quanwang.ashx", {"unionId": self.union_id, "q": query,
