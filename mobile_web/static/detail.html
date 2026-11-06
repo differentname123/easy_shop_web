@@ -379,8 +379,9 @@
 
   <div class="detail-card-section retry-card" v-if="detailError && (!goods?.carousel_images || goods.carousel_images.length <= 1)">
     <div class="retry-card-content">
-      <span class="retry-msg">商品详情暂未完整获取，可重试加载</span>
-      <button class="retry-btn-inline" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
+      <span class="retry-msg">{{ detailErrorMsg || '商品详情暂未完整获取，可重试加载' }}</span>
+      <button class="retry-btn-inline" v-if="!isOffPromotion" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
+      <button class="retry-btn-inline" v-else @click="goBack">返回挑选其他好物 ›</button>
     </div>
   </div>
 

@@ -461,3 +461,51 @@ def test_live_empty_order_response_without_data_key_is_accepted_as_empty_page():
     assert res == {"status": "success", "order_list": [], "has_more": False, "total_count": 0}
 
 
+def test_jd_detail_301_rate_limit_vs_off_promotion_arbitration_and_eviction():
+    from cache import clear_all_caches, is_product_off_promotion, RECOMMEND_CACHE
+    clear_all_caches()
+    off_promo_id = "oxXpYeb9FgS3eszB2h2f3eszB2h2fX_3TYrAutPKopeY0fpzO"
+    # 场景1：api_detail.ashx 返回 301 对应宝贝已下架，但转链探针返回 200 成功 -> 判定为 RATE_LIMIT（非真实下架）
+    http_rate_limited = http_for(
+        {"status": 301, "content": "对应宝贝已下架"},
+        wrapped(PROMOTION_ROOT, {"code": 200, "data": {
+            "shortURL": "https://u.jd.com/stillalive", "clickURL": "https://union-click.jd.com/alive",
+            "jCommand": "口令", "jShortCommand": "短口令"}}, field="result", string=True),
+    )
+    a_alive = adapter(client(http_rate_limited))
+    res_alive = a_alive.get_goods_detail(off_promo_id)
+    assert res_alive["status"] == "error"
+    assert res_alive["error_code"] == "RATE_LIMIT"
+
+    # 场景2：api_detail.ashx 返回 301 对应宝贝已下架，且转链探针返回 2001104 商品不在推广中 -> 确诊 PRODUCT_OFF_PROMOTION
+    http_off_promo = http_for(
+        {"status": 301, "content": "对应宝贝已下架"},
+        wrapped(PROMOTION_ROOT, {"code": 2001104, "message": "2001104_您的账号无权限访问，原因：商品不在推广中", "data": None}, field="result", string=True),
+    )
+    a_dead = adapter(client(http_off_promo))
+    res_dead = a_dead.get_goods_detail(off_promo_id)
+    assert res_dead["status"] == "error"
+    assert res_dead["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    # 场景3：ProductService 收到 PRODUCT_OFF_PROMOTION 时，不降级返回陈旧本地缓存，而是立即从全缓存与本地库物理驱逐并记入黑名单
+    repo = Mock()
+    repo.get_product_detail.return_value = {"platform": "jd", "goods_id": off_promo_id, "goods_sign": off_promo_id, "name": "旧缓存商品", "price": 99.0}
+    repo.delete_product.return_value = True
+    RECOMMEND_CACHE.set(("jd", "", 5, 0, 20, ""), {"status": "success", "data": [{"goods_id": off_promo_id, "goods_sign": off_promo_id}]})
+    svc = ProductService(product_repo=repo)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("services.product_service.get_adapter", lambda plat: a_dead)
+        http_off_promo2 = http_for(
+            {"status": 301, "content": "对应宝贝已下架"},
+            wrapped(PROMOTION_ROOT, {"code": 2001104, "message": "2001104_您的账号无权限访问，原因：商品不在推广中", "data": None}, field="result", string=True),
+        )
+        a_dead.client = client(http_off_promo2)
+        svc_res = svc.get_goods_detail(platform="jd", goods_id=off_promo_id, goods_sign=off_promo_id)
+    assert svc_res["status"] == "error"
+    assert svc_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+    repo.delete_product.assert_called_once_with("jd", goods_id=off_promo_id, goods_sign=off_promo_id)
+    assert is_product_off_promotion("jd", off_promo_id, off_promo_id) is True
+    assert RECOMMEND_CACHE.get(("jd", "", 5, 0, 20, ""))["data"] == []
+    clear_all_caches()
+
+

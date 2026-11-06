@@ -252,6 +252,23 @@ class JdAdapter(BasePlatformAdapter):
         ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
         result = self._fetch_item(ref)
         if result.get("status") != "success":
+            target_id = ref.goods_id or ref.goods_sign
+            if (result.get("ztk_ambiguous_301") is True
+                    and _is_encrypted_jd_item_id(target_id)
+                    and self.default_promoter_id):
+                # 【交叉探针裁决】：折淘客 api_detail.ashx 返回 {'status': 301, 'content': '对应宝贝已下架'} 存在二义性：
+                # 既可能是折淘客触发单品频控，也可能是商品真正取消了京东联盟推广。
+                # 通过官方转链接口探测 https://jingfen.jd.com/detail/{id}.html 即可精确裁决：
+                # - 若转链成功 (code=200)：说明商品仍在推广，301 纯属详情接口限流 -> 返回 RATE_LIMIT 以便上层启用本地缓存兜底；
+                # - 若京东联盟返回 2001104 (商品不在推广中)：确认已取消推广 -> 返回 PRODUCT_OFF_PROMOTION 触发全链路驱逐。
+                probe = self.client.convert_promotion_link(
+                    f"https://jingfen.jd.com/detail/{target_id}.html",
+                    self.default_promoter_id,
+                )
+                if probe.get("status") == "success":
+                    return _error("RATE_LIMIT", "京东详情接口触发临时频控，商品仍在正常推广中")
+                if probe.get("jd_off_promotion") is True:
+                    return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
             return result
         try:
             return {"status": "success", "data": self._detail(result["data"])}
@@ -303,7 +320,11 @@ class JdAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
                     result = self.client.convert_promotion_link(material, promoter)
+            elif result.get("jd_off_promotion") is True:
+                return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
         if result.get("status") != "success":
+            if result.get("jd_off_promotion") is True:
+                return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
             return result
         short, long = result.get("short_url") or "", result.get("click_url") or ""
         token = result.get("j_short_command") or result.get("j_command") or ""

@@ -10,6 +10,8 @@
     const uid = ref('');
     const isDeepLoading = ref(true);
     const detailError = ref(false);
+    const detailErrorMsg = ref('');
+    const isOffPromotion = ref(false);
     const generatedCommand = ref('');
     const commandModal = ref({ visible: false, text: '', token: '', link: '' });
     const closeCommandModal = () => {
@@ -101,6 +103,8 @@
       const generation = ++detailGeneration;
       isDeepLoading.value = true;
       detailError.value = false;
+      detailErrorMsg.value = '';
+      isOffPromotion.value = false;
       try {
         const params = new URLSearchParams({ ...requested, uid: uid.value || referralUid });
         const { ok, data } = await api.get(`/api/home/detail?${params}`);
@@ -113,7 +117,16 @@
             specs: detail.specs || goods.value?.specs,
             service_guarantees: detail.service_guarantees || goods.value?.service_guarantees,
           };
-        } else { detailError.value = true; }
+        } else {
+          if (data?.error_code === 'PRODUCT_OFF_PROMOTION') {
+            isOffPromotion.value = true;
+            detailErrorMsg.value = data.error_msg || '该商品已取消推广或已下架，请挑选其他好物';
+            goods.value = null;
+            try { global.sessionStorage.removeItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`); } catch (_) {}
+            browser.showToast(detailErrorMsg.value);
+          }
+          detailError.value = true;
+        }
       } catch (error) {
         if (generation === detailGeneration) {
           detailError.value = true;
@@ -157,7 +170,7 @@
             return data;
           }
           if (response.status === 403) { browser.showToast(data.detail || '推广身份不匹配，请重新登录'); return null; }
-          if (!product.product_url?.trim()) {
+          if (data?.error_code === 'PRODUCT_OFF_PROMOTION' || !product.product_url?.trim()) {
             browser.showToast(data.error_msg || data.detail || '平台未返回有效推广链接，请稍后重试');
             return null;
           }
@@ -310,7 +323,7 @@
     };
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
-      isDeepLoading, detailError, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
+      isDeepLoading, detailError, detailErrorMsg, isOffPromotion, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
       onCarouselScroll, goHome, goBack, goToRegister,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail: loadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,

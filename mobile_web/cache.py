@@ -20,6 +20,59 @@ CATEGORY_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_CATEGORY, ttl=600)     # �
 PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_PROMOTION, ttl=1800)  # 转链口令 30 分钟
 # 公开商品身份到上游物料URL；不是完整详情或个人推广链接。
 MATERIAL_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_TTL)
+# 已确认下架/取消推广的商品防复活黑名单（30分钟内拦截榜单滞后快照重新入库或展示）
+OFF_PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=2048, ttl=1800)
+
+
+def is_product_off_promotion(platform: str, goods_id: str = "", goods_sign: str = "") -> bool:
+    plat = str(platform or "").strip().lower()
+    gid = str(goods_id or "").strip()
+    gsign = str(goods_sign or "").strip()
+    if gid and (plat, gid) in OFF_PROMOTION_CACHE:
+        return True
+    if gsign and (plat, gsign) in OFF_PROMOTION_CACHE:
+        return True
+    return False
+
+
+def evict_product_from_caches(platform: str, goods_id: str = "", goods_sign: str = "") -> None:
+    """当上游明确裁决商品已取消推广或下架时，从全内存缓存域驱逐并登记防复活黑名单。"""
+    plat = str(platform or "").strip().lower()
+    targets = {str(x).strip() for x in (goods_id, goods_sign) if str(x or "").strip()}
+    if not plat or not targets:
+        return
+    for t in targets:
+        OFF_PROMOTION_CACHE.set((plat, t), True)
+        MATERIAL_CACHE.pop((plat, "id", t), None)
+        MATERIAL_CACHE.pop((plat, "sign", t), None)
+    for dkey in DETAIL_CACHE.keys():
+        if isinstance(dkey, tuple) and len(dkey) >= 4 and dkey[0] == plat and dkey[3] in targets:
+            DETAIL_CACHE.pop(dkey, None)
+    for pkey in PROMOTION_CACHE.keys():
+        if isinstance(pkey, tuple) and len(pkey) >= 4 and pkey[1] == plat and pkey[3] in targets:
+            PROMOTION_CACHE.pop(pkey, None)
+    for list_cache in (RECOMMEND_CACHE, SEARCH_CACHE):
+        for lkey in list_cache.keys():
+            if not (isinstance(lkey, tuple) and len(lkey) >= 1 and lkey[0] == plat):
+                continue
+            cached = list_cache.get(lkey)
+            if not isinstance(cached, dict) or not isinstance(cached.get("data"), list):
+                continue
+            old_items = cached["data"]
+            new_items = [
+                item for item in old_items
+                if not (
+                    isinstance(item, dict)
+                    and (
+                        str(item.get("goods_id") or "").strip() in targets
+                        or str(item.get("goods_sign") or "").strip() in targets
+                        or str(item.get("product_id") or "").strip() in targets
+                    )
+                )
+            ]
+            if len(new_items) != len(old_items):
+                updated = dict(cached, data=new_items)
+                list_cache.set(lkey, updated)
 
 
 def clear_all_caches():
@@ -30,3 +83,4 @@ def clear_all_caches():
     CATEGORY_CACHE.clear()
     PROMOTION_CACHE.clear()
     MATERIAL_CACHE.clear()
+    OFF_PROMOTION_CACHE.clear()

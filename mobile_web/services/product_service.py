@@ -12,7 +12,10 @@ from adapters import get_adapter, normalize_platform
 from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, DetailSnapshot, DetailPrefetchResult, utc_millis
 from repositories.product_repo import ProductRepository
-from cache import RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, MATERIAL_CACHE
+from cache import (
+    RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, MATERIAL_CACHE,
+    evict_product_from_caches, is_product_off_promotion,
+)
 from config import PRODUCT_DETAIL_TTL, logger
 
 _RECOMMEND_CACHE = RECOMMEND_CACHE
@@ -105,12 +108,31 @@ class ProductService:
                     channel_type,
                 )
 
+    def evict_off_promotion_product(self, ref: ProductRef) -> None:
+        """全链路驱逐已确认取消推广或下架的商品（内存各分域缓存 + 防复活黑名单 + MongoDB物理删除）。"""
+        if not isinstance(ref, ProductRef) or not ref.key:
+            return
+        evict_product_from_caches(ref.platform, ref.goods_id, ref.goods_sign)
+        delete_fn = getattr(self.repo, "delete_product", None)
+        if callable(delete_fn):
+            try:
+                delete_fn(ref.platform, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None)
+            except Exception as exc:
+                logger.warning(
+                    "❌ 【失效商品清理异常】物理删除下架商品记录时发生异常 | 平台[%s] 商品[%s] 异常<%s>",
+                    ref.platform, ref.key, format_exc_summary(exc),
+                )
+
     def _offer_products(self, items, channel_type=None, snapshots=()):
-        # 转链所需公开映射先发布，不能被可丢弃的后台摘要写入或预取开关阻断。
+        # 转链所需公开映射先发布，不能被可丢弃的后台摘要写入或预取开关阻断；同时过滤已在防复活黑名单中的下架商品。
+        valid_items = []
         for item in items:
             if not isinstance(item, dict):
                 continue
             ref = ProductRef(item.get("platform"), item.get("goods_id"), item.get("goods_sign"))
+            if is_product_off_promotion(ref.platform, ref.goods_id, ref.goods_sign):
+                continue
+            valid_items.append(item)
             url = item.get("product_url")
             if ref.key and isinstance(url, str) and url.strip():
                 clean_url = url.strip()
@@ -123,14 +145,14 @@ class ProductService:
                 MATERIAL_CACHE.set(cache_key, clean_url)
         if self.prefetcher is not None:
             try:
-                self.prefetcher.offer_products(items, channel_type=channel_type, snapshots=snapshots)
+                self.prefetcher.offer_products(valid_items, channel_type=channel_type, snapshots=snapshots)
             except Exception as exc:
                 logger.warning(
                     "❌ 【详情预取投递异常】向后台预取器投递商品列表时发生异常 | 频道[%s] 数量[%d] 异常<%s> 排查方向<请检查详情预取器队列状态>",
-                    channel_type, len(items) if isinstance(items, list) else 0, format_exc_summary(exc),
+                    channel_type, len(valid_items), format_exc_summary(exc),
                 )
-        elif channel_type is not None and items:
-            self._save_summary_in_background(items, channel_type)
+        elif channel_type is not None and valid_items:
+            self._save_summary_in_background(valid_items, channel_type)
 
     def get_home_recommendations(self, channel_type=5, offset=0, limit=20, uid=None,
                                  platform="pdd", force_refresh=False, cursor=None) -> Dict[str, Any]:
@@ -158,12 +180,19 @@ class ProductService:
             paging["detail_sink"] = collect
         result = adapter.get_recommend_goods(channel_type=channel_type, offset=offset, limit=limit, uid=uid, **paging)
         if result.get("status") == "success":
-            items = result.get("data") or []
-            result.setdefault("has_more", len(items) >= limit)
+            raw_items = result.get("data") or []
+            result.setdefault("has_more", len(raw_items) >= limit)
+            items = [
+                item for item in raw_items
+                if not (isinstance(item, dict) and is_product_off_promotion(plat, item.get("goods_id"), item.get("goods_sign")))
+            ]
+            result["data"] = items
             RECOMMEND_CACHE.set(cache_key, result)
             # Already-verified public snapshots can be read immediately; database
             # persistence is still a separate, tracked background outcome.
             for snapshot in snapshots:
+                if is_product_off_promotion(plat, snapshot.ref.goods_id, snapshot.ref.goods_sign):
+                    continue
                 deadline = self._snapshot_deadline(snapshot)
                 if deadline > time.time():
                     self._cache_detail(plat, {"status": "success", "data": snapshot.data}, deadline)
@@ -190,8 +219,13 @@ class ProductService:
             return cached
         result = adapter.search_goods(keyword=keyword, page=page, page_size=page_size, uid=uid)
         if result.get("status") == "success":
+            raw_items = result.get("data") or []
+            items = [
+                item for item in raw_items
+                if not (isinstance(item, dict) and is_product_off_promotion(plat, item.get("goods_id"), item.get("goods_sign")))
+            ]
+            result["data"] = items
             SEARCH_CACHE.set(cache_key, result)
-            items = result.get("data") or []
             # 搜索物料链接也保留到摘要库，不能依赖可关闭的详情预取来补映射。
             if getattr(adapter, "requires_material_url", False) is True:
                 materials = [item for item in items if item.get("product_url")]
@@ -422,6 +456,8 @@ class ProductService:
         ref = adapter.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
         if not ref.key:
             return {"status": "error", "error_msg": "请提供商品 ID 或 Sign", "error_code": "missing_product_identity"}
+        if is_product_off_promotion(plat, ref.goods_id, ref.goods_sign):
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}
         cached = self._cached_detail(ref, uid)
         if cached:
             return cached[1]
@@ -434,6 +470,13 @@ class ProductService:
         if loaded.public.get("status") != "success":
             goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign)
             reason = loaded.public.get("error_msg") or loaded.public.get("error_code") or "未知错误"
+            if str(loaded.public.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION":
+                self.evict_off_promotion_product(ref)
+                logger.warning(
+                    "❌ 【商品已下架/取消推广】上游确认商品已停止推广，已自动从缓存与本地库清理 | 平台[%s] 商品[%s] 原因<%s>",
+                    plat, goods_tag, reason,
+                )
+                return loaded.public
             if item:
                 logger.warning(
                     "❌ 【商品详情降级】实时拉取上游商品详情失败，已降级返回本地历史缓存 | 平台[%s] 商品[%s] 上游原因<%s> 排查方向<请检查上游详情接口状态或商品是否已下架>",

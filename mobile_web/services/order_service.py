@@ -83,8 +83,8 @@ class OrderService:
         return {"start_time": start_time, "end_time": min(start_time + window_seconds, target_end),
                 "target_end": target_end, "page": 1, "cursor": None}
 
-    def _sync_platform_orders_bg(self, platform: str, end_time: int) -> None:
-        """每次最多处理分页预算；同一窗口冻结时间、页码和不透明游标。"""
+    def _sync_platform_orders_bg(self, platform: str, end_time: int, auto_continue: bool = False) -> None:
+        """每次最多处理分页预算；后台线程触发时自动续传追平最近23h时间切片。"""
         sync_started = time.perf_counter()
         processed = 0
         pages_fetched = 0
@@ -100,66 +100,95 @@ class OrderService:
             success_end = int(state.get("last_success_end") or 0)
             if success_end:
                 _LAST_SYNC_TIMESTAMP[platform] = success_end
+            earliest_allowed = int(end_time) - _INITIAL_LOOKBACK_SECONDS
+            if auto_continue and isinstance(state.get("pending"), dict):
+                pending_start = int(state["pending"].get("start_time") or 0)
+                if pending_start < earliest_allowed:
+                    # 跨天重启后若遗留超过23h的陈旧未完成检查点，直接快进至最近23h窗口并对齐当前目标终点
+                    resume_start = max(
+                        (success_end - min(_SYNC_OVERLAP_SECONDS, window_seconds)) if success_end else earliest_allowed,
+                        earliest_allowed,
+                    )
+                    target_end = max(int(end_time), int(state["pending"].get("target_end") or 0), success_end)
+                    state["pending"] = self._new_pending(resume_start, target_end, window_seconds)
+                    self.sync_repo.save_state(platform, state)
             if not state.get("pending"):
                 # 首次仅最近23h；以后从成功水位重叠查询，未完成目标绝不被新请求替换。
                 start_time = (success_end - min(_SYNC_OVERLAP_SECONDS, window_seconds)
-                              if success_end else end_time - _INITIAL_LOOKBACK_SECONDS)
+                              if success_end else earliest_allowed)
+                if auto_continue and start_time < earliest_allowed:
+                    start_time = earliest_allowed
                 target_end = max(int(end_time), success_end)
                 state["pending"] = self._new_pending(start_time, target_end, window_seconds)
                 self.sync_repo.save_state(platform, state)
-            for _ in range(ORDER_SYNC_MAX_PAGES):
-                pending = state["pending"]
-                response = adapter.fetch_increment_orders(
-                    start_time=pending["start_time"], end_time=pending["end_time"],
-                    page=pending["page"], page_size=_PAGE_SIZE,
-                    cursor=deepcopy(pending.get("cursor")),
-                )
-                if not isinstance(response, dict) or response.get("status") != "success":
-                    error = response.get("error_msg", "平台订单查询失败") if isinstance(response, dict) else "平台订单响应无效"
-                    break
-                orders = response.get("order_list")
-                if not isinstance(orders, list):
-                    error = "平台订单列表响应无效"
-                    break
-                has_more = response.get("has_more")
-                if has_more is not None and not isinstance(has_more, bool):
-                    error = "平台订单分页响应无效"
-                    break
-                pages_fetched += 1
-                # 旧分页协议没有 has_more / cursor 时，仍按原始页长判断。
-                has_more = has_more if has_more is not None else len(orders) >= _PAGE_SIZE
-                if not orders and has_more:
-                    error = "平台返回空页但仍有后续订单"
-                    break
-                identity_cache = {}
-                normalized = [self._attribute_order(adapter.normalize_order(order), platform, identity_cache)
-                              for order in orders]
-                if normalized:
-                    written = self.repo.upsert_orders(normalized, platform=platform)
-                    if written != len(normalized):
-                        error = "订单未完整入库"
-                        break
-                    processed += len(normalized)
-                next_state = deepcopy(state)
-                if has_more:
-                    next_state["pending"].update(page=pending["page"] + 1,
-                                                 cursor=deepcopy(response.get("next_cursor")))
-                else:
-                    # 窗口全部写入后，成功水位与下一窗口一起原子保存。
-                    next_state["last_success_end"] = max(int(state.get("last_success_end") or 0), pending["end_time"])
-                    next_state["pending"] = (
-                        self._new_pending(pending["end_time"], pending["target_end"], window_seconds)
-                        if pending["end_time"] < pending["target_end"] else None
+            max_batches = 20 if auto_continue else 1
+            for batch_idx in range(max_batches):
+                for _ in range(ORDER_SYNC_MAX_PAGES):
+                    pending = state["pending"]
+                    response = adapter.fetch_increment_orders(
+                        start_time=pending["start_time"], end_time=pending["end_time"],
+                        page=pending["page"], page_size=_PAGE_SIZE,
+                        cursor=deepcopy(pending.get("cursor")),
                     )
-                # 即使这里失败也不移动内存游标/水位，下次读取旧检查点幂等重放。
-                self.sync_repo.save_state(platform, next_state)
-                state = next_state
-                advanced = advanced or not has_more
-                if state.get("last_success_end"):
-                    _LAST_SYNC_TIMESTAMP[platform] = state["last_success_end"]
-                if state["pending"] is None:
-                    complete = True
+                    if not isinstance(response, dict) or response.get("status") != "success":
+                        error = response.get("error_msg", "平台订单查询失败") if isinstance(response, dict) else "平台订单响应无效"
+                        break
+                    orders = response.get("order_list")
+                    if not isinstance(orders, list):
+                        error = "平台订单列表响应无效"
+                        break
+                    has_more = response.get("has_more")
+                    if has_more is not None and not isinstance(has_more, bool):
+                        error = "平台订单分页响应无效"
+                        break
+                    pages_fetched += 1
+                    # 旧分页协议没有 has_more / cursor 时，仍按原始页长判断。
+                    has_more = has_more if has_more is not None else len(orders) >= _PAGE_SIZE
+                    if not orders and has_more:
+                        error = "平台返回空页但仍有后续订单"
+                        break
+                    identity_cache = {}
+                    normalized = [self._attribute_order(adapter.normalize_order(order), platform, identity_cache)
+                                  for order in orders]
+                    if normalized:
+                        written = self.repo.upsert_orders(normalized, platform=platform)
+                        if written != len(normalized):
+                            error = "订单未完整入库"
+                            break
+                        processed += len(normalized)
+                    next_state = deepcopy(state)
+                    if has_more:
+                        next_state["pending"].update(page=pending["page"] + 1,
+                                                     cursor=deepcopy(response.get("next_cursor")))
+                    else:
+                        # 窗口全部写入后，成功水位与下一窗口一起原子保存。
+                        next_state["last_success_end"] = max(int(state.get("last_success_end") or 0), pending["end_time"])
+                        next_state["pending"] = (
+                            self._new_pending(pending["end_time"], pending["target_end"], window_seconds)
+                            if pending["end_time"] < pending["target_end"] else None
+                        )
+                    # 即使这里失败也不移动内存游标/水位，下次读取旧检查点幂等重放。
+                    self.sync_repo.save_state(platform, next_state)
+                    state = next_state
+                    advanced = advanced or not has_more
+                    if state.get("last_success_end"):
+                        _LAST_SYNC_TIMESTAMP[platform] = state["last_success_end"]
+                    if state["pending"] is None:
+                        if auto_continue and int(state.get("last_success_end") or 0) < int(end_time) - 60:
+                            # 旧检查点追平后，若距离当前时间仍有缺口，继续推进至当前 end_time
+                            next_start = max(
+                                int(state["last_success_end"]) - min(_SYNC_OVERLAP_SECONDS, window_seconds),
+                                earliest_allowed,
+                            )
+                            state["pending"] = self._new_pending(next_start, int(end_time), window_seconds)
+                            self.sync_repo.save_state(platform, state)
+                            continue
+                        complete = True
+                        break
+                if complete or error or not auto_continue or state.get("pending") is None:
                     break
+                if batch_idx + 1 < max_batches:
+                    time.sleep(0.05)
             elapsed_ms = (time.perf_counter() - sync_started) * 1000
             if complete:
                 summary = {"status": "success", "error": "", "synced_count": processed}
@@ -206,7 +235,7 @@ class OrderService:
             _LAST_SYNC_ATTEMPT[platform] = now
             _SYNC_STATE[platform] = {"status": "running", "error": "", "synced_count": 0}
             threading.Thread(
-                target=self._sync_platform_orders_bg, args=(platform, int(now)),
+                target=self._sync_platform_orders_bg, args=(platform, int(now), True),
                 name=f"bg-order-sync-{platform}", daemon=True,
             ).start()
         except Exception as exc:

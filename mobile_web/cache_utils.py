@@ -45,5 +45,9 @@ class ThreadSafeTTLCache:
         with self._lock:
             return len(self._cache)
 
+    def keys(self) -> list:
+        with self._lock:
+            return list(self._cache.keys())
+
     def __len__(self) -> int:
         return self.size()

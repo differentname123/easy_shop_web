@@ -13,7 +13,7 @@ from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, clean_product_id, normalize_platform
 from models.user import normalize_promoter_id
 from repositories.product_repo import ProductRepository
-from cache import PROMOTION_CACHE, MATERIAL_CACHE
+from cache import PROMOTION_CACHE, MATERIAL_CACHE, evict_product_from_caches
 from config import PROMOTION_LINK_TTL, logger
 
 _UID_PATTERN = re.compile(r"^u_[0-9a-f]{8}$")
@@ -372,6 +372,14 @@ class PromoteService:
         source = trace.get("source", "provider")
         provider_ms = float(trace.get("provider_ms", 0.0))
         if data.get("status") != "success":
+            if str(data.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION" and ref.key:
+                evict_product_from_caches(plat, ref.goods_id, ref.goods_sign)
+                delete_fn = getattr(self.repo, "delete_product", None)
+                if callable(delete_fn):
+                    try:
+                        delete_fn(plat, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None)
+                    except Exception:
+                        pass
             logger.warning(
                 "❌ 【推广转链失败】正在生成商品推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、物料链接有效性或上游联盟转链网关状态>",
                 plat, goods_tag, user_tag, "personal" if effective_uid else "public",

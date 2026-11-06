@@ -686,3 +686,32 @@ class ProductRepository(BaseRepository):
                 platform, gid or gsign, format_exc_summary(e),
             )
             return False
+
+    def delete_product(
+        self,
+        platform: str,
+        goods_id: Optional[str] = None,
+        goods_sign: Optional[str] = None,
+    ) -> bool:
+        """物理删除已确认取消推广或下架的商品记录，避免首页/爆单库或详情降级继续展示失效商品。"""
+        plat = self._platform(platform)
+        gid = self._real_goods_id(goods_id)
+        gsign = str(goods_sign or "").strip()
+        if not gid and not gsign:
+            return False
+        filter_spec = self._identity_filter(plat, gid, gsign)
+        try:
+            res = self.col.delete_many(filter_spec)
+            deleted = int(getattr(res, "deleted_count", 0) or 0)
+            if deleted > 0:
+                logger.info(
+                    "【失效商品清理】已从本地数据库物理移除取消推广/下架商品 | 平台[%s] 商品[%s] 移除条数[%d]",
+                    plat, gid or gsign, deleted,
+                )
+            return deleted > 0
+        except Exception as e:
+            logger.warning(
+                "❌ 【失效商品清理异常】从products集合删除下架商品失败 | 平台[%s] 商品[%s] 异常<%s>",
+                plat, gid or gsign, format_exc_summary(e),
+            )
+            return False

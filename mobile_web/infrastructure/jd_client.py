@@ -80,6 +80,14 @@ def _result(body, root, field="queryResult"):
     if "error_response" in value or "error" in value:
         return _error("UPSTREAM_ERROR", "京东返回业务错误")
     if "code" in value and str(value["code"]) != "200":
+        code_str = str(value["code"])
+        msg_str = str(value.get("message") or "")
+        if root == PROMOTION_ROOT and (
+            code_str in ("2001104", "2001920")
+            or "不在推广" in msg_str
+            or "无法转链" in msg_str
+        ):
+            return _error("UPSTREAM_ERROR", "京东商品已取消推广或不在推广中", jd_off_promotion=True)
         return _error("UPSTREAM_ERROR", "京东返回业务错误")
     return {"status": "success", "data": value}
 
@@ -297,6 +305,8 @@ class JdClient:
         if body.get("status") == "error":
             return body
         if str(body.get("status")) != "200":
+            if str(body.get("status")) == "301" and "下架" in str(body.get("content") or ""):
+                return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_301=True)
             return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误")
         if not _rows(body.get("content")):
             return _error("PROTOCOL_ERROR", "京东商品content列表无效")

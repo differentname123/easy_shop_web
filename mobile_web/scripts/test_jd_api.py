@@ -23,10 +23,20 @@
   - ❌ 不可用搜索词长度：搜索词 `q` 长度 `< 4` 个字符（如 `"可乐"`、`"纸巾"`）会被折淘客上游直接报错拒绝。
   - ✅ 必选补齐规则：当 `len(query) < 4` 时必须倍增补齐（`while len(query) < 4: query += query`，如 `"可乐"` -> `"可乐可乐"`）。
 
-三、【功能 3：单品详情查询 (`api_detail.ashx`)】
+三、【功能 3：单品详情查询 (`api_detail.ashx`) 与 `301: 对应宝贝已下架` 二义性裁决规范】
   - ✅ 可用入参：传入加密 `tao_id` / `itemId`（无论来自关键词搜索还是实时榜单），`type=1`，
     均可返回完整详情、轮播图 `small_images`（`|` 分隔）与权威 `https://jingfen.jd.com/detail/{id}.html` 链接。
   - ❌ 不可用入参：纯数字旧版 SKU ID（如 `"100012043978"`），接口直接报错 `{"status": 301, "content": "对应宝贝已下架"}`。
+  - ⚠️ 【核心二义性问题与完备裁决方案】：
+    当 `api_detail.ashx` 返回 `{"status": 301, "content": "对应宝贝已下架"}` 时存在二义性——
+    既可能是单 `ZTK_APPKEY` 触发折淘客频控伪装报错，也可能是商品真正取消了京东联盟推广（例如 `oxXpYeb9FgS3eszB2h2f3eszB2h2fX_3TYrAutPKopeY0fpzO`）。
+    必须执行以下两步交叉裁决（已在 `jd_client.py` + `jd_adapter.py` + `product_service.py` 闭环落地）：
+    1. **多 Key 轮询防误判**：先在 `ZTK_APPKEY_LIST` 所有 Key 间自动故障切换；若仅单 Key 限流，备用 Key 直接返回 `status=200`。
+    2. **官方转链探针终局裁决**：若全部 Key 均返回 `301: 对应宝贝已下架`，调用 `open_jing_union_open_promotion_byunionid_get.ashx`
+       探测 `https://jingfen.jd.com/detail/{id}.html`：
+       - 若转链返回 `code=200`（成功生成短链/口令）-> 证明商品仍在推广，详情 `301` 纯属频控（返回 `RATE_LIMIT`，保留并启用本地缓存兜底）；
+       - 若转链返回京东联盟官方内层码 `2001104`（`商品不在推广中`）或 `2001920` -> 100% 确诊商品已取消推广（返回 `PRODUCT_OFF_PROMOTION`，
+         立即从 `DETAIL_CACHE`/`MATERIAL_CACHE`/`RECOMMEND_CACHE`/`SEARCH_CACHE` 及 MongoDB `products` 集合物理驱逐，并加入 `OFF_PROMOTION_CACHE` 防复活黑名单）。
   - ❌ 严禁在转链时无条件预调 `api_detail.ashx`：`api_detail.ashx` 与 `api_quanwang.ashx` 共享单 `ZTK_APPKEY` 的 `1000` 频控池，
     而加密 ID 本身即可直接一步转链，无需浪费详情配额。
 
