@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """折淘客渠道订单与高佣转链协议（支持 ZTK_APPKEY_LIST 自动轮询切换，与 scripts/test_tb_api.py 对齐）。"""
 from datetime import datetime
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 import requests
 from infrastructure.http_utils import SHANGHAI, error_dict as _error, parse_appkey_list
 
 ZTK_ORDER_URL = "https://api.zhetaoke.com:10001/api/open_dingdanchaxun2.ashx"
 ZTK_CHANNEL_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl.ashx"
+ZTK_PUBLISHER_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_publisher_get.ashx"
+ZTK_INVITECODE_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_invitecode_get.ashx"
+ZTK_AUTH_INFO_URL = "https://api.zhetaoke.com:10001/api/open_taokeshouquaninfo.ashx"
 TRUSTED_TOP_HOSTS = frozenset(("eco.taobao.com", "gw.api.taobao.com"))
 ORDER_RESPONSE_ROOTS = ("tbk_sc_order_details_get_response", "tbk_order_details_get_response")
 TRUSTED_ORDER_METHODS = frozenset(("taobao.tbk.sc.order.details.get", "taobao.tbk.order.details.get"))
@@ -207,8 +210,7 @@ class ZtkClient:
                     err_msg = str(body.get("msg") or body.get("error_msg") or "").strip()
 
                 is_unauthorized = (
-                    status_code == 301
-                    or "relationId" in err_msg
+                    "relationId" in err_msg
                     or "relation_id" in err_msg
                     or "无效的relation" in err_msg
                     or any(keyword in err_msg for keyword in ("未授权", "未备案", "渠道关系无效", "渠道失效", "无效的渠道"))
@@ -247,3 +249,133 @@ class ZtkClient:
                 return _error("NETWORK_ERROR", "折淘客渠道转链通信失败")
 
         return self._run_with_key_failover(_convert_once)
+
+    def check_publisher_relation(self, uid: str):
+        """
+        通过折淘客 90 天长效 sid 调用 open_sc_publisher_get.ashx 核验推手淘宝渠道备案关系。
+        当本地自用型 TOP 应用的 24h taobao_session 过期时，提供无缝长效渠道核验能力。
+        """
+        if not self.appkey_list or not str(self.sid or "").strip():
+            return _error("CONFIG_ERROR", "折淘客渠道核验缺少 appkey 或 sid")
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return _error("INVALID_IDENTITY", "渠道核验需要站内 UID")
+
+        def _check_once(current_key):
+            params = {
+                "appkey": current_key,
+                "sid": str(self.sid).strip(),
+                "relation_app": "common",
+                "info_type": 1,
+                "external_id": clean_uid,
+                "page_no": 1,
+                "page_size": 100,
+            }
+            try:
+                body = self._get_response(ZTK_PUBLISHER_GET_URL, params=params)
+                if isinstance(body, dict) and body.get("status") == "error":
+                    return body
+                if not isinstance(body, dict):
+                    return _error("PROTOCOL_ERROR", "折淘客渠道核验响应不是对象")
+                if "error_response" in body or body.get("status") in (301, 1000):
+                    return _error("UPSTREAM_ERROR", "折淘客渠道核验接口返回业务错误")
+                resp_data = (body.get("tbk_sc_publisher_info_get_response") or {}).get("data")
+                if not isinstance(resp_data, dict):
+                    return _error("PROTOCOL_ERROR", "折淘客渠道核验缺少结果封套")
+                inviter_list = resp_data.get("inviter_list")
+                records = []
+                if isinstance(inviter_list, dict):
+                    raw_map = inviter_list.get("map_data", [])
+                    records = [raw_map] if isinstance(raw_map, dict) else (raw_map if isinstance(raw_map, list) else [])
+                elif isinstance(inviter_list, list):
+                    records = inviter_list
+
+                # 折淘客中继在未命中特定 external_id 时可能返回该 sid 下的全量渠道记录，需按站内 UID 精确过滤
+                matches = [
+                    r for r in records
+                    if isinstance(r, dict)
+                    and str(r.get("external_id") or "").strip() == clean_uid
+                    and str(r.get("relation_id") or "").strip() not in ("", "0")
+                ]
+                relations = {str(r["relation_id"]).strip() for r in matches}
+                if len(relations) > 1:
+                    return _error("AMBIGUOUS_IDENTITY", "官方返回多个渠道身份，需要人工核验")
+                if relations:
+                    matched = matches[0]
+                    identity = {"relation_id": next(iter(relations)), "external_id": clean_uid}
+                    if matched.get("account_name"):
+                        identity["account_name"] = str(matched["account_name"]).strip()
+                    if matched.get("create_date"):
+                        identity["create_date"] = str(matched["create_date"]).strip()
+                    return {
+                        "status": "success",
+                        "is_authorized": True,
+                        "bind": 1,
+                        "identity": identity,
+                        "records": matches,
+                    }
+                return {
+                    "status": "success",
+                    "is_authorized": False,
+                    "bind": 0,
+                    "identity": {},
+                    "records": [],
+                }
+            except Exception:
+                return _error("NETWORK_ERROR", "折淘客渠道核验通信失败")
+
+        return self._run_with_key_failover(_check_once)
+
+    def generate_authority_url(self, uid: str, inviter_code: str = ""):
+        """
+        通过折淘客 90 天长效 sid 调用 open_sc_invitecode_get.ashx 生成渠道备案邀请链接。
+        """
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return _error("INVALID_IDENTITY", "授权链接需要站内 UID")
+        code = str(inviter_code or "").strip()
+        if not code and self.appkey_list and str(self.sid or "").strip():
+            def _fetch_code(current_key):
+                params = {
+                    "appkey": current_key,
+                    "sid": str(self.sid).strip(),
+                    "relation_app": "common",
+                    "code_type": 1,
+                }
+                try:
+                    body = self._get_response(ZTK_INVITECODE_GET_URL, params=params)
+                    if not isinstance(body, dict) or "error_response" in body:
+                        return _error("UPSTREAM_ERROR", "折淘客邀请码获取失败")
+                    data = (body.get("tbk_sc_invitecode_get_response") or {}).get("data") or {}
+                    fetched = str(data.get("inviter_code") or "").strip()
+                    if not fetched:
+                        return _error("UPSTREAM_ERROR", "折淘客未返回有效邀请码")
+                    return {"status": "success", "inviter_code": fetched}
+                except Exception:
+                    return _error("NETWORK_ERROR", "折淘客邀请码通信失败")
+
+            res = self._run_with_key_failover(_fetch_code)
+            if isinstance(res, dict) and res.get("status") == "success":
+                code = res.get("inviter_code") or ""
+        if not code:
+            code = "VK6WGA"
+        url = "https://mos.m.taobao.com/inviter/register?" + urlencode({
+            "inviterCode": code, "src": "pub", "app": "common", "externalId": clean_uid,
+        })
+        return {"status": "success", "auth_url": url, "short_url": "", "we_app_info": {}}
+
+    def get_auth_info(self):
+        """查询折淘客 sid 授权详情及过期时间 (open_taokeshouquaninfo.ashx)。"""
+        if not self.appkey_list or not str(self.sid or "").strip():
+            return _error("CONFIG_ERROR", "缺少折淘客 appkey 或 sid")
+
+        def _info_once(current_key):
+            try:
+                body = self._get_response(ZTK_AUTH_INFO_URL, params={"appkey": current_key, "sid": str(self.sid).strip()})
+                if not isinstance(body, dict) or body.get("status") != 200 or not isinstance(body.get("data"), list) or not body["data"]:
+                    return _error("UPSTREAM_ERROR", "未查询到折淘客授权信息")
+                return {"status": "success", "data": body["data"][0]}
+            except Exception:
+                return _error("NETWORK_ERROR", "折淘客授权信息查询失败")
+
+        return self._run_with_key_failover(_info_once)

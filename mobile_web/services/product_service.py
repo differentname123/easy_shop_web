@@ -113,8 +113,14 @@ class ProductService:
             ref = ProductRef(item.get("platform"), item.get("goods_id"), item.get("goods_sign"))
             url = item.get("product_url")
             if ref.key and isinstance(url, str) and url.strip():
+                clean_url = url.strip()
                 kind = "sign" if ref.goods_sign else "id"
-                MATERIAL_CACHE.set((ref.platform, kind, ref.key), url.strip())
+                cache_key = (ref.platform, kind, ref.key)
+                existing_url = MATERIAL_CACHE.get(cache_key)
+                # 防止榜单合成的 item.jd.com/{encrypted_id}.html 覆盖详情页已解析出的权威 jingfen.jd.com 推广链接
+                if isinstance(existing_url, str) and "jingfen.jd.com" in existing_url and "jingfen.jd.com" not in clean_url:
+                    continue
+                MATERIAL_CACHE.set(cache_key, clean_url)
         if self.prefetcher is not None:
             try:
                 self.prefetcher.offer_products(items, channel_type=channel_type, snapshots=snapshots)
@@ -248,6 +254,18 @@ class ProductService:
     def _cache_detail(platform: str, result: dict, expires_at: float, uid=None, verified_ref=None):
         item = result.get("data") or {}
         ref = ProductRef(platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
+        url = item.get("product_url")
+        if isinstance(url, str) and url.strip():
+            clean_url = url.strip()
+            if ref.goods_sign:
+                MATERIAL_CACHE.set((ref.platform, "sign", ref.goods_sign), clean_url)
+            if ref.goods_id:
+                MATERIAL_CACHE.set((ref.platform, "id", ref.goods_id), clean_url)
+            if isinstance(verified_ref, ProductRef) and verified_ref.platform == ref.platform:
+                if verified_ref.goods_sign:
+                    MATERIAL_CACHE.set((verified_ref.platform, "sign", verified_ref.goods_sign), clean_url)
+                if verified_ref.goods_id:
+                    MATERIAL_CACHE.set((verified_ref.platform, "id", verified_ref.goods_id), clean_url)
         keys = ref.cache_keys(uid)
         if (isinstance(verified_ref, ProductRef) and verified_ref.platform == ref.platform
                 and ref.goods_id and ref.goods_id == verified_ref.goods_id):

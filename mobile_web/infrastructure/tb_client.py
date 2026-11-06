@@ -220,7 +220,7 @@ def clean_tb_goods_item(raw_item: dict, source_type: str = "") -> Optional[Dict[
         "price": round(max(0, final), 2), "original_price": round(max(original, final), 2),
         "coupon_amount": round(max(0, coupon), 2), "has_coupon": coupon > 0,
         "commission_amount": _number(income.get("commission_amount"), _number(pub.get("commission_amount"))),
-        "commission_rate": rate, "sales_tip": _text(base.get("tk_total_sales") or base.get("volume") or "0"),
+        "commission_rate": rate, "sales_tip": _text(base.get("tk_total_sales") or base.get("volume") or base.get("annual_vol") or "0"),
         "mall_name": base.get("shop_title") or "", "provcity": base.get("provcity") or "",
         "click_url": _url(pub.get("click_url")), "coupon_share_url": _url(pub.get("coupon_share_url")),
         "detail_tags": [t["tag_name"] for t in tags if isinstance(t, dict) and t.get("tag_name")],
@@ -436,6 +436,67 @@ def generate_tb_authority_url(app_key, app_secret, uid, session_key=None, invite
     return {"status": "success", "auth_url": url, "short_url": "", "we_app_info": {}}
 
 
+def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_session: str = "", _api_call=None) -> Dict[str, str]:
+    """
+    当检测到 taobao_session 缺失或触发 27:invalid-sessionkey 时：
+    1. 检查项目根目录下的 config.local.json 是否已更新了新的 taobao_session 或 zhetaoke_sid（支持热重载免重启）；
+    2. 若配置了 taobao_refresh_token，尝试调用淘宝开放平台 taobao.top.auth.token.refresh 自动刷新并持久化。
+    """
+    import os
+    from pathlib import Path
+
+    result = {"session_key": _text(current_session), "ztk_sid": ""}
+    config_path = Path(__file__).resolve().parents[2] / "config.local.json"
+    local_cfg = {}
+    if config_path.is_file():
+        try:
+            local_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            local_cfg = {}
+
+    file_session = _text(local_cfg.get("taobao_session") or local_cfg.get("TB_SESSION"))
+    file_sid = _text(local_cfg.get("zhetaoke_sid") or local_cfg.get("ZTK_SID"))
+    if file_sid:
+        result["ztk_sid"] = file_sid
+    if file_session and file_session != _text(current_session):
+        result["session_key"] = file_session
+        return result
+
+    refresh_token = _text(
+        os.environ.get("TB_REFRESH_TOKEN")
+        or local_cfg.get("taobao_refresh_token")
+        or local_cfg.get("TB_REFRESH_TOKEN")
+    )
+    if refresh_token and app_key and app_secret:
+        res = (_api_call or call_tb_api)(
+            app_key=app_key,
+            app_secret=app_secret,
+            method="taobao.top.auth.token.refresh",
+            biz_params={"refresh_token": refresh_token},
+        )
+        if res.get("status") == "success":
+            token_result = (res.get("data") or {}).get("top_auth_token_refresh_response", {}).get("token_result")
+            if isinstance(token_result, str):
+                try:
+                    token_result = json.loads(token_result)
+                except Exception:
+                    token_result = {}
+            if isinstance(token_result, dict):
+                new_session = _text(token_result.get("access_token") or token_result.get("taobao_user_nick"))
+                new_refresh = _text(token_result.get("refresh_token"))
+                if new_session:
+                    result["session_key"] = new_session
+                    if config_path.is_file() and isinstance(local_cfg, dict):
+                        try:
+                            local_cfg["taobao_session"] = new_session
+                            if new_refresh:
+                                local_cfg["taobao_refresh_token"] = new_refresh
+                            config_path.write_text(json.dumps(local_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                        except Exception:
+                            pass
+    return result
+
+
 class TaobaoClient:
     """实例边界用于默认配置装配与无网络协议测试；保留现有模块函数兼容。"""
     def __init__(self, app_key, app_secret, adzone_id="", session_key="", inviter_code="",
@@ -451,6 +512,17 @@ class TaobaoClient:
 
     def _call(self, **kwargs):
         return call_tb_api(**kwargs, http_session=self.http_session)
+
+    def try_refresh_session(self) -> str:
+        """尝试从 config.local.json 热重载或通过 refresh_token 刷新 session_key。"""
+        refreshed = reload_or_refresh_tb_credentials(
+            self.app_key, self.app_secret, self.session_key, _api_call=self._call
+        )
+        new_session = refreshed.get("session_key") or ""
+        if new_session and new_session != self.session_key:
+            self.session_key = new_session
+            return new_session
+        return ""
 
     def search_goods(self, keyword, page=1, page_size=20, **kwargs):
         if not self.adzone_id:

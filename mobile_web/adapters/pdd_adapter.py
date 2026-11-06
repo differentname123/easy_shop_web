@@ -172,7 +172,17 @@ class PddAdapter(BasePlatformAdapter):
             size = max(1, min(100, int(page_size or 20)))
             params = {"keyword": keyword, "pid": self.pid, "page": page, "page_size": size,
                       "custom_parameters": make_custom_parameters(uid=uid) if uid else None, **kwargs}
-            res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+            try:
+                res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+            except Exception as first_exc:
+                # 【对齐 test_pdd_api.py 实证基准】：
+                # 若当前登录用户尚未完成拼多多推手备案 (触发 60001 未传入已经授权备案过的相关参数)，
+                # 公共商品搜索自动回退为不传 custom_parameters（站长已备案 PID 级）重试，避免阻断用户搜索。
+                if uid and self._is_unauthorized_error(first_exc):
+                    params["custom_parameters"] = None
+                    res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+                else:
+                    raise
             response = res.get("goods_search_response", {})
             raw_items = response.get("goods_list", [])
             items = [self._normalize_goods_summary(clean_goods_item(item, source_type="pdd_search"))

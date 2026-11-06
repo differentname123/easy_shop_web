@@ -86,11 +86,12 @@ class TaobaoAdapter(BasePlatformAdapter):
         official_ok = bool(official_client is not None or key and secret)
         search_ok = bool(official_client is not None or official_ok and adzone)
         has_ztk_key = bool(getattr(self.ztk, "appkey_list", None) or setting("ztk_appkey") or ztk_keys)
+        has_ztk_channel = bool(has_ztk_key and setting("ztk_sid"))
         self.capabilities = {
             "recommend": bool(official_ok and (hdk_client is not None or setting("hdk_api_key"))),
             "search": search_ok, "detail": official_ok, "promotion": search_ok,
-            "authorization": bool(official_client is not None or official_ok and setting("tb_session")),
-            "orders": bool(ztk_client is not None or has_ztk_key and setting("ztk_sid")),
+            "authorization": bool(official_client is not None or official_ok and (setting("tb_session") or has_ztk_channel)),
+            "orders": bool(ztk_client is not None or has_ztk_channel),
         }
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
@@ -300,8 +301,6 @@ class TaobaoAdapter(BasePlatformAdapter):
         if isinstance(err, dict):
             if err.get("need_auth") is True or err.get("error_code") == "AUTH_REQUIRED":
                 return True
-            if err.get("status") == 301:
-                return True
             msg = " ".join(str(err.get(key) or "") for key in ("error_msg", "msg", "content")).strip()
         else:
             msg = str(err)
@@ -326,7 +325,11 @@ class TaobaoAdapter(BasePlatformAdapter):
         official_target = self._official_product_url((raw.get("item_basic_info") or {}).get("item_url"))
         target = official_target
         if not target:
-            target = "https://item.taobao.com/item.htm?" + urlencode({"id": ref.goods_id or item["goods_sign"]})
+            fallback_id = ref.goods_id or item["goods_sign"]
+            if str(fallback_id).isdigit():
+                target = "https://item.taobao.com/item.htm?" + urlencode({"id": fallback_id})
+            else:
+                target = "https://uland.taobao.com/item/edetail?" + urlencode({"id": fallback_id})
         # 途径 B: 推手渠道推广 -> 调用折淘客高佣渠道转链
         if uid and relation_id:
             ztk_res = self.ztk.convert_channel_url(target, relation_id, self.channel_pid)
@@ -396,11 +399,63 @@ class TaobaoAdapter(BasePlatformAdapter):
         result["cacheable"] = bool(expires)
         return result
 
+    def _ztk_channel_ready(self) -> bool:
+        appkeys = getattr(self.ztk, "appkey_list", None)
+        sid = getattr(self.ztk, "sid", None)
+        return bool(isinstance(appkeys, (tuple, list)) and appkeys and isinstance(sid, str) and sid.strip())
+
     def check_authority(self, uid):
-        return self.official.check_authority(uid)
+        current_sess = getattr(self.official, "session_key", None)
+        if getattr(self, "_last_invalid_session", None) and current_sess and current_sess == self._last_invalid_session:
+            if hasattr(self.official, "try_refresh_session") and callable(self.official.try_refresh_session):
+                try:
+                    self.official.try_refresh_session()
+                except Exception:
+                    pass
+            current_sess = getattr(self.official, "session_key", None)
+            if current_sess == self._last_invalid_session and self._ztk_channel_ready() and hasattr(self.ztk, "check_publisher_relation"):
+                ztk_res = self.ztk.check_publisher_relation(uid)
+                if isinstance(ztk_res, dict) and ztk_res.get("status") == "success":
+                    return ztk_res
+
+        res = self.official.check_authority(uid)
+        if isinstance(res, dict) and res.get("status") == "success":
+            self._last_invalid_session = None
+            return res
+        err_code = str((res or {}).get("error_code") or "")
+        if err_code in ("IDENTITY_MISMATCH", "AMBIGUOUS_IDENTITY", "INVALID_IDENTITY", "INCOMPLETE_IDENTITY"):
+            return res
+        is_invalid_sess = isinstance(res, dict) and ("invalid-sessionkey" in str(res.get("error_msg", "")).lower() or err_code == "27")
+        if hasattr(self.official, "try_refresh_session") and callable(self.official.try_refresh_session):
+            try:
+                if self.official.try_refresh_session():
+                    retry_res = self.official.check_authority(uid)
+                    if isinstance(retry_res, dict) and retry_res.get("status") == "success":
+                        self._last_invalid_session = None
+                        return retry_res
+            except Exception:
+                pass
+        if is_invalid_sess and isinstance(getattr(self.official, "session_key", None), str):
+            self._last_invalid_session = self.official.session_key
+        if self._ztk_channel_ready() and hasattr(self.ztk, "check_publisher_relation"):
+            ztk_res = self.ztk.check_publisher_relation(uid)
+            if isinstance(ztk_res, dict) and ztk_res.get("status") == "success":
+                return ztk_res
+        if is_invalid_sess:
+            return _error("SESSION_EXPIRED", "淘宝渠道授权服务正在刷新凭证，请稍后再试")
+        return res
 
     def generate_authority_url(self, uid, **kwargs):
-        return self.official.generate_authority_url(uid)
+        if self._ztk_channel_ready() and not getattr(self.official, "inviter_code", "") and hasattr(self.ztk, "generate_authority_url"):
+            ztk_res = self.ztk.generate_authority_url(uid)
+            if isinstance(ztk_res, dict) and ztk_res.get("status") == "success":
+                return ztk_res
+        res = self.official.generate_authority_url(uid)
+        if isinstance(res, dict) and res.get("status") == "success":
+            return res
+        if self._ztk_channel_ready() and hasattr(self.ztk, "generate_authority_url"):
+            return self.ztk.generate_authority_url(uid, inviter_code=getattr(self.official, "inviter_code", ""))
+        return res
 
     def fetch_increment_orders(self, start_time, end_time, page=1, page_size=50, **kwargs):
         result = self.ztk.query_orders(start_time, end_time, page=page, page_size=page_size, cursor=kwargs.get("cursor"))

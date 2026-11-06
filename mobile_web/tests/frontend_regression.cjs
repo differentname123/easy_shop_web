@@ -1702,14 +1702,45 @@ test('detail generatedCommand stores latest copied promotion command and clears 
   await h.finish(0, { status: 'success', user: user() });
   await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
   assert.equal(h.page.generatedCommand.value, '');
+  assert.equal(h.page.commandModal.value.visible, false);
 
   const copy = h.page.handleCopyPromoteLink(); await flush();
   await h.finish(2, { status: 'success', final_link: 'https://buy.test/A', command_text: '专属口令文案 https://buy.test/A' });
   await copy;
   assert.equal(h.page.generatedCommand.value, '专属口令文案 https://buy.test/A');
+  assert.equal(h.page.commandModal.value.visible, true);
+  assert.equal(h.page.commandModal.value.text, '专属口令文案 https://buy.test/A');
+
+  h.page.copyCommandFromModal();
+  assert.equal(h.copied.at(-1), '专属口令文案 https://buy.test/A');
+  h.page.closeCommandModal();
+  assert.equal(h.page.commandModal.value.visible, false);
 
   h.page.dispose();
   assert.equal(h.page.generatedCommand.value, '');
+  assert.equal(h.page.commandModal.value.visible, false);
 });
+
+test('switching platforms on Tab 1 while searching preserves activeHomeKeyword and searches the new platform', async () => {
+  const h = harness(), feeds = h.makeFeeds();
+  feeds.homeSearchKeyword.value = '维达纸巾';
+  const searchPdd = feeds.onSearchHome();
+  await h.finish(0, { status: 'success', data: [{ goods_id: 'P-SEARCH', platform: 'pdd', name: '拼多多纸巾' }], has_more: false });
+  await searchPdd;
+  assert.equal(feeds.activeHomeKeyword.value, '维达纸巾');
+
+  const switchTb = feeds.switchHomePlatform('taobao');
+  await h.finish(1, { status: 'success', data: [{ channel_type: 5, name: '实时热销榜' }] });
+  assert.ok(h.requests[2].url.startsWith('/api/home/search?'));
+  assert.ok(h.requests[2].url.includes('platform=taobao'));
+  assert.ok(h.requests[2].url.includes(encodeURIComponent('维达纸巾')));
+  await h.finish(2, { status: 'success', data: [{ goods_id: 'TB-SEARCH', platform: 'taobao', name: '淘宝纸巾' }], has_more: false });
+  await switchTb;
+  assert.equal(feeds.homePlatform.value, 'taobao');
+  assert.equal(feeds.activeHomeKeyword.value, '维达纸巾');
+  assert.equal(feeds.homeGoodsList.value[0].goods_id, 'TB-SEARCH');
+});
+
+
 
 

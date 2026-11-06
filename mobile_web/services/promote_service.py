@@ -106,13 +106,30 @@ class PromoteService:
     def _trusted_material_url(self, ref: ProductRef) -> str:
         if not ref.key:
             return ""
-        cache_key = (ref.platform, "sign" if ref.goods_sign else "id", ref.key)
+        kind = "sign" if ref.goods_sign else "id"
+        cache_key = (ref.platform, kind, ref.key)
         cached = MATERIAL_CACHE.get(cache_key)
+        if isinstance(cached, str) and cached:
+            if ref.platform != "jd" or "jingfen.jd.com" in cached:
+                return cached
+        # 若 DETAIL_CACHE 中已有详情页最新拉取的权威快照（如 jingfen.jd.com），优先采用并刷新 MATERIAL_CACHE
+        try:
+            from cache import DETAIL_CACHE
+            for dkey in ref.cache_keys():
+                entry = DETAIL_CACHE.get(dkey)
+                if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
+                    detail_url = (entry[1].get("data") or {}).get("product_url")
+                    if isinstance(detail_url, str) and detail_url.strip():
+                        clean_detail_url = detail_url.strip()
+                        MATERIAL_CACHE.set(cache_key, clean_detail_url)
+                        return clean_detail_url
+        except Exception:
+            pass
         if isinstance(cached, str) and cached:
             return cached
         try:
             item = self.repo.get_product_detail(ref.key, platform=ref.platform,
-                                                key_type="sign" if ref.goods_sign else "id")
+                                                key_type=kind)
             if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
                 return ""
             if ref.platform != "pdd":
@@ -124,7 +141,16 @@ class PromoteService:
                     or not ref.goods_sign and ref.goods_id != actual.goods_id):
                 return ""
             value = item.get("product_url")
-            return value.strip() if isinstance(value, str) else ""
+            if isinstance(value, str) and value.strip():
+                clean_val = value.strip()
+                if (ref.platform == "jd" and clean_val.startswith("https://item.jd.com/")
+                        and clean_val.endswith(".html")):
+                    cand_id = clean_val[len("https://item.jd.com/"):-len(".html")]
+                    if len(cand_id) >= 25 and "_" in cand_id:
+                        clean_val = f"https://jingfen.jd.com/detail/{cand_id}.html"
+                MATERIAL_CACHE.set(cache_key, clean_val)
+                return clean_val
+            return ""
         except Exception as exc:
             logger.warning(
                 "❌ 【转链物料读取降级】从本地数据库读取商品可信物料链接失败，将尝试直接调用上游转链 | 平台[%s] 商品[%s] 异常<%s> 排查方向<请检查MongoDB连接状态>",

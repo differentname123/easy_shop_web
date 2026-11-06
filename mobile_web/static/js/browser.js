@@ -16,8 +16,18 @@
     const fallbackCopy = (text, successTip) => {
       const input = global.document.createElement('textarea');
       input.value = text;
+      input.readOnly = true;
+      if (input.style) {
+        input.style.position = 'fixed';
+        input.style.top = '-9999px';
+        input.style.left = '-9999px';
+        input.style.opacity = '0';
+      }
       global.document.body.appendChild(input);
       input.select();
+      if (typeof input.setSelectionRange === 'function') {
+        try { input.setSelectionRange(0, String(text).length); } catch (_) {}
+      }
       try {
         if (global.document.execCommand('copy')) showToast(successTip);
         else showToast('复制失败，请长按手动复制');

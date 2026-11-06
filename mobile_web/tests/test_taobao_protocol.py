@@ -630,3 +630,38 @@ def test_ztk_client_multi_key_failover():
     assert len(res["order_list"]) == 1
     assert client.appkey == "key2"
     assert http.get.call_count == 2
+
+
+def test_taobao_adapter_falls_back_to_ztk_sid_channel_when_top_session_expired():
+    # 当官方 TOP taobao_session 过期报错 27:invalid-sessionkey 时，自动回退到折淘客 sid 授权核验与邀请码接口
+    http = SimpleNamespace(get=Mock(side_effect=[
+        reply({"tbk_sc_publisher_info_get_response": {"data": {
+            "total_count": 1,
+            "inviter_list": {"map_data": [{"external_id": "u_8bb0595a", "relation_id": "3400251845", "account_name": "测试推手"}]},
+        }}}),
+        reply({"tbk_sc_invitecode_get_response": {"data": {"inviter_code": "ZTKCODE88"}}}),
+    ]))
+    ztk = ZtkClient("ztk_key", "ztk_sid", http, appkey_list=("ztk_key",))
+    official = Mock()
+    official.inviter_code = ""
+    official.try_refresh_session.return_value = ""
+    official.check_authority.return_value = {
+        "status": "error", "error_code": "27",
+        "error_msg": "淘宝开放平台业务错误 [27:invalid-sessionkey]: SessionKey非法",
+    }
+    official.generate_authority_url.return_value = {
+        "status": "error", "error_code": "27",
+        "error_msg": "淘宝开放平台业务错误 [27:invalid-sessionkey]: SessionKey非法",
+    }
+    adapter = make_adapter(official, ztk=ztk)
+
+    auth_res = adapter.check_authority("u_8bb0595a")
+    assert auth_res["status"] == "success"
+    assert auth_res["is_authorized"] is True
+    assert auth_res["identity"]["relation_id"] == "3400251845"
+
+    invite_res = adapter.generate_authority_url("u_8bb0595a")
+    assert invite_res["status"] == "success"
+    assert "inviterCode=ZTKCODE88" in invite_res["auth_url"]
+    assert "externalId=u_8bb0595a" in invite_res["auth_url"]
+

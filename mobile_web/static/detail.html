@@ -6,8 +6,8 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>商品详情 - 优选导购</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261106-2">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261106-2"></script>
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261107-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261107-1"></script>
   <style>
     /* 专属商品详情大页样式 */
     .detail-nav-bar {
@@ -364,7 +364,7 @@
       <span v-if="goods.mall_name">{{ goods.mall_name }}</span>
     </div>
 
-    <div class="detail-summary-desc" v-if="goods.desc">
+    <div class="detail-summary-desc" v-if="goods.desc && goods.desc !== goods.name">
       {{ goods.desc }}
     </div>
   </div>
@@ -394,7 +394,7 @@
       <div class="price-calc-flow">
         <div class="calc-step">
           <div class="c-lbl">原标价</div>
-          <div class="c-num" style="text-decoration:line-through;color:var(--text-muted)">
+          <div class="c-num" :style="{ textDecoration: (goods.original_price ?? 0) > (goods.price ?? 0) ? 'line-through' : 'none', color: 'var(--text-muted)' }">
             ¥{{ formatMoney(goods.original_price ?? goods.price) }}
           </div>
         </div>
@@ -525,6 +525,26 @@
     </div>
   </div>
 
+  <!-- ==================== 口令与链接复制确认弹窗 ==================== -->
+  <div class="modal-backdrop" v-if="commandModal?.visible" @click.self="closeCommandModal">
+    <div class="sheet-dialog">
+      <div class="sheet-header">
+        <span>📋 {{ platformName }}推广口令与链接已生成</span>
+        <button class="sheet-close" @click="closeCommandModal">×</button>
+      </div>
+      <div style="padding: 10px 0 18px;">
+        <div class="command-preview-box">{{ commandModal.text }}</div>
+        <p style="font-size:12px;color:var(--text-sub);margin:10px 0 14px;line-height:1.5;">
+          已尝试自动写入剪贴板；若浏览器拦截自动复制，可点击下方按钮一键复制，或长按上方文本框复制后前往{{ platformName }}使用。
+        </p>
+        <div class="pop-action-btns">
+          <button class="btn-primary-block" @click="copyCommandFromModal">一键复制口令与链接</button>
+          <button class="btn-outline-block" @click="closeCommandModal">知道了</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== 全局高质感智能加载器与省钱话术轮播 ==================== -->
   <div class="smart-loader-overlay" v-if="smartLoading.visible">
     <div class="smart-loader-card">
@@ -551,10 +571,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261106-2"></script>
-<script src="/static/js/session.js?v=ux-20261106-2"></script>
-<script src="/static/js/format.js?v=ux-20261106-2"></script>
-<script src="/static/js/browser.js?v=ux-20261106-2"></script>
-<script src="/static/js/detail.js?v=ux-20261106-2"></script>
+<script src="/static/js/api.js?v=ux-20261107-1"></script>
+<script src="/static/js/session.js?v=ux-20261107-1"></script>
+<script src="/static/js/format.js?v=ux-20261107-1"></script>
+<script src="/static/js/browser.js?v=ux-20261107-1"></script>
+<script src="/static/js/detail.js?v=ux-20261107-1"></script>
 </body>
 </html>

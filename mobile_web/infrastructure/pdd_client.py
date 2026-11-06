@@ -470,7 +470,14 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
                 "custom_parameters": custom_params
             }
             params.update(kwargs)
-            res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params)
+            try:
+                res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params)
+            except Exception as first_err:
+                if custom_params is not None and ("60001" in str(first_err) or "授权备案" in str(first_err)):
+                    params.pop("custom_parameters", None)
+                    res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params)
+                else:
+                    raise
             goods_list = res.get("goods_detail_response", {}).get("goods_details", [])
             if goods_list:
                 cleaned = clean_goods_item(goods_list[0], source_type="detail_api")

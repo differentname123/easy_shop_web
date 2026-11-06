@@ -9,7 +9,7 @@
       invite_code: '', invited_by: null, balance: 0, total_rebate: 0, pending_rebate: 0, auth_status: {} });
     const emptyOrders = () => ({ total_count: 0, total_commission: 0, settled_commission: 0, refund_commission: 0, refund_count: 0, order_list: [] });
     const isLoggedIn = ref(false), uid = ref(''), userPhone = ref(''), userProfile = ref(emptyProfile());
-    const isRegisterMode = ref(true), formPhone = ref(''), formPassword = ref(''), formNickname = ref(''), formInviteCode = ref('');
+    const isRegisterMode = ref(false), formPhone = ref(''), formPassword = ref(''), formNickname = ref(''), formInviteCode = ref('');
     const isSubmittingAuth = ref(false), isAuthModalOpen = ref(false), currentAuthInfo = ref(null), isCheckingAuth = ref(false);
     const orderPlatform = ref('pdd'), orderDays = ref(7), isSyncingOrders = ref(false), userOrdersData = ref(emptyOrders());
     const orderMessage = ref('');

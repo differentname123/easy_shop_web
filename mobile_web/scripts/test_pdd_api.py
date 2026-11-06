@@ -9,6 +9,63 @@
 4. 三层智能兜底转链 (pdd.ddk.rp.prom.url.generate[23] -> pdd.ddk.goods.promotion.url.generate -> zs.unit.url.gen)
 5. 推手授权备案查询与生成 (pdd.ddk.member.authority.query + pdd.ddk.rp.prom.url.generate[10])
 6. 增量订单拉取与状态清洗 (pdd.ddk.order.list.increment.get)
+
+================================================================================
+【拼多多 DDK API 全链路实证基准规范：哪些可用 (✅) vs 哪些不可用 (❌)】
+================================================================================
+所有后续业务代码（pdd_client.py / pdd_adapter.py）必须严格以本文件实测结论为准，严禁发散猜测：
+
+一、【核心归因与备案机制：`custom_parameters` 与 `sub_code=60001` 铁律】
+  - 拼多多备案按 `(pid, custom_parameters)` 组合独立校验：
+    * ✅ 站长级（不传 `custom_parameters` 或传 `None`）：当前 `PDD_PID` 已完成站长备案（`bind=1`），
+      搜索、详情、三层转链全部 100% 正常可用。
+    * ✅ 已备案推手级（传入已完成 H5 备案的 `custom_parameters='{"uid":"xxx"}'`，`bind=1`）：
+      搜索与个人归因转链均 100% 可用，成交后订单通过 `custom_parameters` 原样透出 `{"uid":"xxx"}`。
+    * ❌ 未备案推手级（传入尚未在拼多多 H5 完成备案的 `custom_parameters='{"uid":"xxx"}'`，`bind=0`）：
+      1. ❌ 调用关键词搜索 (`pdd.ddk.goods.search`) 必报 `[50001:60001] 未传入已经授权备案过的相关参数(pid/custom_parameters)`！
+      2. ❌ 调用三层推广转链 (`rp.prom.url.generate[23]` / `goods.promotion.url.generate` / `zs.unit.url.gen`) 必报 `[50001:60001]`！
+      3. ❌ 严禁在 `uid=None` 时伪造默认 `"default_user"` 塞入 `custom_parameters`（会导致站长级调用也因 `"default_user"` 未备案而全部报 `60001`）。
+      4. ✅ 搜索自动降级铁律：商品搜索属于公共目录浏览能力，若传入登录用户的 `uid` 触发 `60001` 未备案错误，
+         必须自动移除 `custom_parameters`（回退站长级）重试，绝不能阻断未备案用户搜索商品。
+
+二、【功能 1：频道推荐/热销榜单 (`pdd.ddk.goods.recommend.get`)】
+  - ✅ 可用：`channel_type=5` (实时热销榜)、`channel_type=1` (今日爆款榜)，分页上限 `400` 条 (`offset < 400`)。
+  - ✅ 返回新版加密 `goods_sign` 与 `goods_id`，且该接口不校验 `custom_parameters` 是否已备案。
+
+三、【功能 2：全网关键词搜索 (`pdd.ddk.goods.search`)】
+  - ✅ 可用：支持关键词、商品标题或 `zs.unit.url.gen` 生成的拼多多短链搜索。
+  - ❌ 不可用（参数范围铁律）：`page_size < 10` 或 `page_size > 100` 必报 `参数校验失败：pageSize的取值范围是10-100！`
+    （哪怕在短链反查或小页预览场景，传给上游网关的 `page_size` 也必须 `>= 10`）。
+  - ❌ 不可用：传入未备案 `custom_parameters` 会直接报错 `60001`（需省略或自动降级为不传 `custom_parameters`）。
+
+四、【功能 3：商品详情 (`pdd.ddk.goods.detail`)】
+  - ✅ 可用唯一权威路径：必须传入加密 `goods_sign`（如 `"E932Ts1bVtZgMvVTwfvBVEJF7LgQI9Rz_JQwP5lJQN3"`），
+    一步获取完整详情、轮播图与标签。
+  - ❌ 不可用（严禁使用，必报 `sub_code=40009`）：
+    1. 仅传纯数字 `goods_id_list=[1016415496258]` 调 `pdd.ddk.goods.detail`，网关直接拒绝并报错：
+       `[50001:40009] 该查询不是来自终端用户的原始链接，请使用原始链接进行查询 (questionId=388)`！
+    2. 手工拼接 `https://mobile.yangkeduo.com/goods.html?goods_id={纯数字ID}` 调 `pdd.ddk.goods.zs.unit.url.gen`，
+       同样会被网关以 `sub_code=40009` 拦截！因此列表与详情卡片必须全程携带并透传 `goods_sign`。
+
+五、【功能 4：三层智能兜底转链 (`convert_pdd_promotion_url`)】
+  - ⚠️ 注意三个接口的推广位参数名各不相同（严禁混用）：
+    1. ✅ 策略 1（超级红包/百亿补贴，`pdd.ddk.rp.prom.url.generate`, `channel_type=23`）：
+       推广位参数名为 `p_id_list=[pid]`（数组），商品参数为 `diy_sp_red_packet_param={"goods_sign": goods_sign}`。
+    2. ✅ 策略 2（常规单品领券推广，`pdd.ddk.goods.promotion.url.generate`）：
+       推广位参数名为 `p_id=pid`（字符串），商品参数为 `goods_sign_list=[goods_sign]`（数组）。
+    3. ✅ 策略 3（招商短链清洗，`pdd.ddk.goods.zs.unit.url.gen`）：
+       推广位参数名为 `pid=pid`（字符串），`source_url` 仅支持真实生成的拼多多推广短链（如 `https://p.pinduoduo.com/xxx`），
+       ❌ 不支持手工拼接的 `goods.html?goods_id={纯数字ID}`（会报 `40009`）。
+
+六、【功能 5：推手授权备案查询与生成 (`member.authority.query` & `rp.prom.url.generate[10]`)】
+  - ✅ `pdd.ddk.member.authority.query`：不传 `custom_parameters` 时查询站长 `pid` 备案状态（`bind=1`）；
+    传入 `custom_parameters={"uid": uid}` 时查询该推手独立备案状态。
+  - ✅ `pdd.ddk.rp.prom.url.generate` (`channel_type=10`, `p_id_list=[pid]`, `custom_parameters={"uid": uid}`)：
+    生成该推手专属 H5/小程序授权备案链接。
+
+七、【功能 6：增量订单拉取 (`pdd.ddk.order.list.increment.get`)】
+  - ✅ 可用：入参为秒级时间戳 `start_update_time` 与 `end_update_time`（建议窗口 `<= 3600s`），金额单位均为“分”。
+================================================================================
 """
 
 import hashlib
@@ -116,9 +173,15 @@ def call_pdd_api(
         return {"error_response": {"error_msg": f"网络或解析异常: {e}", "error_code": "NETWORK_ERROR"}}
 
 
-def _build_custom_params(uid: Optional[str] = None) -> str:
-    """构建拼多多多级归因 custom_parameters JSON 字符串"""
-    safe_uid = str(uid or "").strip() or "default_user"
+def _build_custom_params(uid: Optional[str] = None) -> Optional[str]:
+    """
+    构建拼多多多级归因 custom_parameters JSON 字符串：
+    - 【实证铁律】当 uid 为 None 或空字符串时，必须返回 None（即不传 custom_parameters 字段，走已备案的站长 PID 级）；
+      严禁伪造未备案的 '{"uid":"default_user"}'，否则会导致搜索与转链全部触发 60001 未备案错误！
+    """
+    safe_uid = str(uid or "").strip()
+    if not safe_uid:
+        return None
     return json.dumps({"uid": safe_uid}, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -235,24 +298,41 @@ def search_pdd_goods(
     client_id: str = PDD_CLIENT_ID,
     client_secret: str = PDD_CLIENT_SECRET,
 ) -> Dict[str, Any]:
-    """拼多多全网关键词/短链/标题搜索 (pdd.ddk.goods.search)"""
+    """
+    拼多多全网关键词/短链/标题搜索 (pdd.ddk.goods.search)：
+    - 【实证保护 1】上游网关强制要求 page_size 取值范围为 [10, 100]，小于 10 必报 `pageSize的取值范围是10-100！`。
+    - 【实证保护 2】若传入了未备案推手 uid，拼多多网关会返回 sub_code=60001 (未传入已授权备案过的相关参数)；
+      此时自动移除 custom_parameters 回退为已备案的站长 PID 级检索，确保任何用户均可正常搜索商品。
+    """
+    req_page_size = max(10, min(100, int(page_size or 20)))
     biz_params: Dict[str, Any] = {
         "keyword": keyword,
         "page": page,
-        "page_size": page_size,
+        "page_size": req_page_size,
         "sort_type": sort_type,
         "with_coupon": with_coupon,
         "pid": pid or PDD_PID,
         "custom_parameters": _build_custom_params(uid),
     }
     res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", biz_params)
+    if res and "error_response" in res and biz_params.get("custom_parameters"):
+        err = res.get("error_response", {})
+        if str(err.get("sub_code")) == "60001" or "授权备案" in str(err.get("sub_msg", "")):
+            biz_params.pop("custom_parameters", None)
+            res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", biz_params)
+
     if not res or "error_response" in res:
         err = (res or {}).get("error_response", {})
-        return {"status": "error", "error_msg": err.get("error_msg", "拼多多商品搜索失败")}
+        return {
+            "status": "error",
+            "error_code": err.get("error_code"),
+            "sub_code": err.get("sub_code"),
+            "error_msg": err.get("sub_msg") or err.get("error_msg", "拼多多商品搜索失败"),
+        }
 
     body = res.get("goods_search_response", {})
     raw_list = body.get("goods_list") or []
-    cleaned_list = [clean_pdd_goods_item(item) for item in raw_list]
+    cleaned_list = [clean_pdd_goods_item(item) for item in raw_list][: int(page_size or 20)]
     return {
         "status": "success",
         "data": cleaned_list,
@@ -271,7 +351,7 @@ def _resolve_goods_sign_by_id(
     goods_id: str,
     pid: Optional[str] = None,
 ) -> Optional[str]:
-    """当仅持有纯数字 goods_id 时，借助 pdd.ddk.goods.zs.unit.url.gen 短链与搜索反查 goods_sign"""
+    """当仅持有纯数字 goods_id 时，借助 pdd.ddk.goods.zs.unit.url.gen 短链与搜索(page_size=10)反查 goods_sign"""
     use_pid = pid or PDD_PID
     if use_pid:
         raw_url = f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}"
@@ -284,12 +364,22 @@ def _resolve_goods_sign_by_id(
             or (zs_res or {}).get("goods_zs_unit_generate_response", {}).get("url")
         )
         if short_url:
-            s_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", {"keyword": short_url, "page_size": 5})
+            s_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", {
+                "keyword": short_url,
+                "pid": use_pid,
+                "page": 1,
+                "page_size": 10,
+            })
             for g in (s_res or {}).get("goods_search_response", {}).get("goods_list") or []:
                 if g.get("goods_sign"):
                     return str(g["goods_sign"])
 
-    s_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", {"keyword": str(goods_id), "page_size": 5})
+    s_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", {
+        "keyword": str(goods_id),
+        "pid": use_pid,
+        "page": 1,
+        "page_size": 10,
+    })
     for g in (s_res or {}).get("goods_search_response", {}).get("goods_list") or []:
         if str(g.get("goods_id")) == str(goods_id) and g.get("goods_sign"):
             return str(g["goods_sign"])
@@ -310,6 +400,11 @@ def get_pdd_goods_detail(
     """查询拼多多商品详情 (pdd.ddk.goods.detail)，并在仅有 goods_id 时自动触发短链探测降级"""
     if not goods_sign and not goods_id:
         return {"status": "error", "error_msg": "必须提供 goods_sign 或 goods_id 之一", "error_code": -1}
+
+    # 【对齐 PddAdapter.resolve_product_ref】：若调用方把非纯数字的加密串传在了 goods_id 参数上，自动归位为 goods_sign
+    if not goods_sign and goods_id is not None and not str(goods_id).strip().isdigit():
+        goods_sign = str(goods_id).strip()
+        goods_id = None
 
     biz_params: Dict[str, Any] = {"need_sku_info": need_sku_info}
     if goods_sign:
@@ -417,20 +512,31 @@ def convert_pdd_promotion_url(
     source_url: Optional[str] = None,
     uid: Optional[str] = None,
     pid: Optional[str] = None,
-    prefer_subsidy: bool = False,
+    prefer_subsidy: bool = True,
     client_id: str = PDD_CLIENT_ID,
     client_secret: str = PDD_CLIENT_SECRET,
 ) -> Dict[str, Any]:
     """
     三层智能降级转链：
-    1. 若 prefer_subsidy=True 且有 goods_sign，优先尝试百亿补贴营销频道 (pdd.ddk.rp.prom.url.generate, channel_type=23)
+    1. 优先尝试官方超级红包/百亿补贴营销频道 (pdd.ddk.rp.prom.url.generate, channel_type=23, diy_sp_red_packet_param)
     2. 常规单品推广转链 (pdd.ddk.goods.promotion.url.generate)
     3. 招商长短链兜底转链 (pdd.ddk.goods.zs.unit.url.gen)
+    - 若传入的 uid 尚未在拼多多完成备案 (sub_code=60001)，明确返回 need_auth=True 提示前端引导授权。
     """
     use_pid = pid or PDD_PID
     custom_params = _build_custom_params(uid)
+    hit_unauth = False
+    last_err_msg = ""
 
-    # 策略 1：百亿补贴/营销页转链
+    def _record_err(resp: Optional[Dict[str, Any]]) -> None:
+        nonlocal hit_unauth, last_err_msg
+        if resp and "error_response" in resp:
+            err = resp["error_response"]
+            if str(err.get("sub_code")) == "60001" or "授权备案" in str(err.get("sub_msg", "")):
+                hit_unauth = True
+            last_err_msg = err.get("sub_msg") or err.get("error_msg") or last_err_msg
+
+    # 策略 1：官方超级红包/百亿补贴频道转链 (channel_type=23)
     if prefer_subsidy and goods_sign:
         rp_params = {
             "channel_type": 23,
@@ -438,9 +544,10 @@ def convert_pdd_promotion_url(
             "custom_parameters": custom_params,
             "generate_short_url": True,
             "generate_we_app": True,
-            "diy_subsidy_param": {"goods_sign": goods_sign},
+            "diy_sp_red_packet_param": {"goods_sign": goods_sign},
         }
         rp_res = call_pdd_api(client_id, client_secret, "pdd.ddk.rp.prom.url.generate", rp_params)
+        _record_err(rp_res)
         url_list = (rp_res or {}).get("rp_promotion_url_generate_response", {}).get("url_list") or []
         if url_list:
             first = url_list[0]
@@ -448,7 +555,7 @@ def convert_pdd_promotion_url(
             if link:
                 return {
                     "status": "success",
-                    "link_type": "百亿补贴专属加补链",
+                    "link_type": "官方超级红包/百亿补贴链",
                     "final_link": link,
                     "short_url": first.get("short_url", link),
                     "url": first.get("url", link),
@@ -456,7 +563,7 @@ def convert_pdd_promotion_url(
                 }
 
     # 策略 2：常规单品推广转链
-    if goods_sign:
+    if goods_sign and not hit_unauth:
         gen_params: Dict[str, Any] = {
             "p_id": use_pid,
             "goods_sign_list": [goods_sign],
@@ -468,6 +575,7 @@ def convert_pdd_promotion_url(
         if search_id:
             gen_params["search_id"] = search_id
         gen_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.promotion.url.generate", gen_params)
+        _record_err(gen_res)
         url_list = (gen_res or {}).get("goods_promotion_url_generate_response", {}).get("goods_promotion_url_list") or []
         if url_list:
             first = url_list[0]
@@ -484,12 +592,13 @@ def convert_pdd_promotion_url(
 
     # 策略 3：招商短链兜底转链
     target_source_url = source_url or (f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}" if goods_id else "")
-    if target_source_url:
+    if target_source_url and not hit_unauth:
         zs_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.zs.unit.url.gen", {
             "source_url": target_source_url,
             "pid": use_pid,
             "custom_parameters": custom_params,
         })
+        _record_err(zs_res)
         zs_body = (zs_res or {}).get("goods_zs_unit_generate_response", {})
         link = zs_body.get("mobile_short_url") or zs_body.get("short_url") or zs_body.get("mobile_url") or zs_body.get("url")
         if link:
@@ -501,19 +610,30 @@ def convert_pdd_promotion_url(
                 "url": zs_body.get("url", link),
             }
 
-    return {"status": "error", "error_msg": "拼多多三层推广转链均未获取到有效链接"}
+    if hit_unauth:
+        return {
+            "status": "error",
+            "need_auth": True,
+            "error_code": "60001",
+            "error_msg": f"当前推手 uid={uid} 尚未完成拼多多备案授权 (60001): {last_err_msg}",
+        }
+    return {"status": "error", "error_msg": last_err_msg or "拼多多三层推广转链均未获取到有效链接"}
 
 
 # ==============================================================================
 # 核心功能 5：推手授权备案查询与生成 (member.authority.query & rp.prom[10])
 # ==============================================================================
 def check_pdd_member_authority(
-    uid: str = "default_user",
+    uid: Optional[str] = None,
     pid: Optional[str] = None,
     client_id: str = PDD_CLIENT_ID,
     client_secret: str = PDD_CLIENT_SECRET,
 ) -> Dict[str, Any]:
-    """查询推手是否已完成拼多多备案授权 (pdd.ddk.member.authority.query)"""
+    """
+    查询是否已完成拼多多备案授权 (pdd.ddk.member.authority.query)：
+    - uid=None 时查询站长 PID 本身的备案状态 (bind=1)；
+    - uid="xxx" 时查询该推手 custom_parameters={"uid":"xxx"} 的独立备案状态。
+    """
     res = call_pdd_api(client_id, client_secret, "pdd.ddk.member.authority.query", {
         "pid": pid or PDD_PID,
         "custom_parameters": _build_custom_params(uid),
@@ -527,7 +647,7 @@ def check_pdd_member_authority(
 
 
 def generate_pdd_authority_url(
-    uid: str = "default_user",
+    uid: str = "u_baseline_test",
     pid: Optional[str] = None,
     client_id: str = PDD_CLIENT_ID,
     client_secret: str = PDD_CLIENT_SECRET,
@@ -604,11 +724,11 @@ def main():
         print("未检测到拼多多配置 (myself_pdd_client_id / secret)，请先检查 config.local.json。")
         return
 
-    test_uid = "u_baseline_test"
+    unfiled_test_uid = "u_baseline_test"
 
     # 1. 验证热销榜单 (channel_type=5 实时热销榜 & channel_type=1 今日爆款榜)
     print("\n[1/6] 验证拼多多榜单拉取 (channel_type=5 实时热销榜)...")
-    rec_res = get_pdd_recommend_goods(channel_type=5, limit=3, uid=test_uid)
+    rec_res = get_pdd_recommend_goods(channel_type=5, limit=3, uid=None)
     sample_sign = None
     sample_id = None
     if rec_res["status"] == "success" and rec_res["data"]:
@@ -619,9 +739,9 @@ def main():
     else:
         print(f" -> 推荐拉取失败: {rec_res.get('error_msg')}")
 
-    # 2. 验证关键词搜索
-    print("\n[2/6] 验证拼多多关键词搜索 (pdd.ddk.goods.search)...")
-    search_res = search_pdd_goods("抽纸", page=1, page_size=3, uid=test_uid)
+    # 2. 验证关键词搜索 (同时验证传入未备案 uid 自动降级回退站长级检索)
+    print("\n[2/6] 验证拼多多关键词搜索 (pdd.ddk.goods.search, 含未备案 uid 自动降级保护)...")
+    search_res = search_pdd_goods("抽纸", page=1, page_size=3, uid=unfiled_test_uid)
     if search_res["status"] == "success" and search_res["data"]:
         first = search_res["data"][0]
         sample_sign = sample_sign or first.get("goods_sign")
@@ -630,29 +750,38 @@ def main():
     else:
         print(f" -> 搜索失败: {search_res.get('error_msg')}")
 
-    # 3. 验证商品详情
+    # 3. 验证商品详情 (✅ goods_sign 权威主路径 vs ❌ 纯数字 goods_id 触发 40009 拦截验证)
     print("\n[3/6] 验证拼多多商品详情 (pdd.ddk.goods.detail)...")
     if sample_sign or sample_id:
         detail_res = get_pdd_goods_detail(goods_sign=sample_sign, goods_id=sample_id, pid=PDD_PID)
         if detail_res["status"] == "success":
             d = detail_res["data"]
-            print(f" -> 详情获取成功: {d['name'][:25]} | 店铺: {d.get('mall_name')} | 轮播图: {len(d.get('carousel_images', []))}张")
+            print(f" -> [✅ goods_sign 主路径] 详情成功: {d['name'][:25]} | 轮播图: {len(d.get('carousel_images', []))}张")
         else:
-            print(f" -> 详情获取失败: {detail_res.get('error_msg')}")
+            print(f" -> [goods_sign 主路径] 详情失败: {detail_res.get('error_msg')}")
+    if sample_id:
+        id_only_res = get_pdd_goods_detail(goods_sign=None, goods_id=sample_id, pid=PDD_PID)
+        print(f" -> [❌ 仅传纯数字 goods_id 预期触发 40009 拦截]: status={id_only_res['status']}, sub_code={id_only_res.get('sub_code')} ({id_only_res.get('sub_msg', '')[:32]}...)")
 
-    # 4. 验证三层智能转链
+    # 4. 验证三层智能转链 (站长已备案级 uid=None vs 未备案推手 uid 触发 60001 拦截)
     print("\n[4/6] 验证拼多多三层智能兜底转链...")
     if sample_sign or sample_id:
-        conv_res = convert_pdd_promotion_url(goods_sign=sample_sign, goods_id=sample_id, uid=test_uid)
-        print(f" -> 转链结果: status={conv_res['status']}, type={conv_res.get('link_type')}, link={conv_res.get('final_link')}")
+        conv_owner = convert_pdd_promotion_url(goods_sign=sample_sign, goods_id=sample_id, uid=None, prefer_subsidy=True)
+        print(f" -> [A. 站长已备案级 (uid=None, 超级红包轨)] status={conv_owner['status']}, type={conv_owner.get('link_type')}, link={conv_owner.get('final_link')}")
+        conv_std = convert_pdd_promotion_url(goods_sign=sample_sign, goods_id=sample_id, uid=None, prefer_subsidy=False)
+        print(f" -> [B. 站长已备案级 (uid=None, 常规单品轨)] status={conv_std['status']}, type={conv_std.get('link_type')}, link={conv_std.get('final_link')}")
+        conv_unauth = convert_pdd_promotion_url(goods_sign=sample_sign, goods_id=sample_id, uid=unfiled_test_uid)
+        print(f" -> [C. 未备案推手级 (uid={unfiled_test_uid})] 预期触发 60001 授权拦截: need_auth={conv_unauth.get('need_auth')}, code={conv_unauth.get('error_code')}")
 
     # 5. 验证推手备案查询与授权链接生成
-    print("\n[5/6] 验证拼多多推手备案查询与授权链接生成...")
-    auth_res = check_pdd_member_authority(uid=test_uid)
-    print(f" -> 备案查询结果: {auth_res}")
-    if not auth_res.get("is_authorized"):
-        url_res = generate_pdd_authority_url(uid=test_uid)
-        print(f" -> 授权链接生成结果: status={url_res['status']}, auth_url={url_res.get('auth_url')}")
+    print("\n[5/6] 验证拼多多备案查询 (站长级 vs 未备案推手级) 与授权链接生成...")
+    owner_auth = check_pdd_member_authority(uid=None)
+    print(f" -> [站长 PID 级备案状态 (uid=None)]: {owner_auth}")
+    user_auth = check_pdd_member_authority(uid=unfiled_test_uid)
+    print(f" -> [测试推手备案状态 (uid={unfiled_test_uid})]: {user_auth}")
+    if not user_auth.get("is_authorized"):
+        url_res = generate_pdd_authority_url(uid=unfiled_test_uid)
+        print(f" -> [生成推手 H5 备案授权链接]: status={url_res['status']}, auth_url={url_res.get('auth_url')}")
 
     # 6. 验证增量订单查询
     print("\n[6/6] 验证拼多多增量订单拉取 (最近 1 小时)...")

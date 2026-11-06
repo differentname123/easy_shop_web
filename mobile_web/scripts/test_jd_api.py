@@ -3,50 +3,53 @@
 京东联盟推手平台 API 自检与验证程序 (极简精炼版 · 支持多 ZTK_APPKEY_LIST 自动轮询与故障切换)
 基于折淘客 (折京客) 及京东官方网关协议，作为全项目京东功能的唯一基准实现。
 
-【核心功能】：
-1. 榜单选品 (2小时实时榜 + 24小时今日热销榜)
-2. 全网关键词搜索
-3. 商品详情展示
-4. 统一推广转链 (promoter_id 传入纯数字即可，免后台建位，纯数字原样透出直通归因)
-5. 增量订单拉取与关键字段打印 (纯净拉取，不擅自计算分成)
-
 ================================================================================
-【重要：京东接口备选方案第一性原理实证结论与避坑指南（请勿重复踩坑）】
+【京东联盟 API 全链路实证基准规范：哪些可用 (✅) vs 哪些不可用 (❌)】
 ================================================================================
-为解决折淘客 `api_quanwang.ashx` (搜索) 与 `api_detail.ashx` (详情) 容易触发频控限制的问题，
-我们通过 `test_jd_api_debug.py` 对所有潜在备选方案进行了严格的临界点压测，实证结论如下：
+所有后续业务代码（jd_client.py / jd_adapter.py）必须严格以本文件实测结论为准，严禁发散猜测：
 
-1. ❌ 【已证伪方案 A】：使用个人 `jd_app_key` 直连京东宙斯官方网关 (`https://api.jd.com/routerjson`)
-   - 权限缺失：普通个人/推手联盟账号在京东开放平台没有关键词搜索 (`jd.union.open.goods.query`)、
-     单品详情 (`bigfield.query` / `promotiongoodsinfo.query`) 及官方转链 (`promotion.common.get` / `byunionid.get`)
-     的调用权限，直连均返回 `code=19 / code=43 无访问权限`。
-   - 加密 `itemId` 跨 app_key 冲突（隐蔽大坑）：虽然个人 `jd_app_key` 直连支持拉取实时榜单
-     (`jd.union.open.goods.rank.query`)，但京东生成的加密 `itemId` 与调用方的 `app_key` 强绑定！
-     用个人 `jd_app_key` 直连拿到的榜单 `itemId`，传给折淘客转链接口（底层使用折淘客工具商自己的 `app_key`）时，
-     实测有 30%~40% 的商品会直接报错 `2001104 商品不在推广中` 或 `2001917 优惠券不可购买该商品`。
-     因此，榜单与转链必须同源走折淘客接口，绝不能混用个人 `jd_app_key` 直连榜单。
+一、【功能 1：实时榜单选品 (`open_jd_union_open_goods_rank_query.ashx`)】
+  - ✅ 可用：`sortType=1` (2小时实时热推榜)、`sortType=3` (24小时今日热销榜)，`rankId=200000`，
+    返回京东联盟加密 `itemId`（如 `2JQkZkZ2nGOIkKHE8K75IkKfe6mXtQ_3SD7M7MGcugkXyuI4w`）。
+  - ✅ 可用商品链接拼接格式：`https://jingfen.jd.com/detail/{itemId}.html`
+    （实测既可在浏览器正常访问，也可直接传入转链接口完成转链）。
+  - ❌ 严禁拼接格式：`https://item.jd.com/{itemId}.html`
+    （加密 `itemId` 拼接到 `item.jd.com` 后浏览器无法打开 [404]，且传入转链接口必报 `2001104 商品不在推广中`）。
+  - ❌ 严禁使用个人 `jd_app_key` 直连京东官方榜单：京东生成的加密 `itemId` 与调用方 `app_key` 强绑定，
+    用个人 `jd_app_key` 拿到的榜单 `itemId` 传给折淘客转链接口会有 30%~40% 报 `2001104` 或 `2001917`。
 
-2. ❌ 【已证伪方案 B】：使用折淘客“京东官方协议透传接口” (`open_jing_union_open_goods_query.ashx`) 作为搜索/详情兜底
-   - 共享同一限流池（救活率 0%）：实测在折淘客服务端内部，老搜索 (`api_quanwang.ashx`)、老详情 (`api_detail.ashx`)
-     与官方透传接口 (`open_jing_union_open_goods_query.ashx`) 底层走的是同一个京东 `goods.query` 通道，
-     共享同一个限流计数器（错误码 `1000`）。
-   - 临界点实测现象：当单个 `ZTK_APPKEY` 连续请求触发折淘客 `1000` 限流的同一毫秒：
-     * `open_jing_union_open_goods_query.ashx` 返回 `{"status": 301, "content": "...接口调用异常...1000"}`；
-     * `api_detail.ashx` 因底层拿不到数据，将其包装为假报错 `{"status": 301, "content": "对应宝贝已下架"}`；
-     * `api_quanwang.ashx` 因底层拿不到数据，将其包装为假报错 `{"status": 301, "content": "无符合条件的数据"}`。
-   - 负面副作用：在同一个 `appkey` 下做“透传与老接口互相 fallback”不仅救活率为 0%，还会让每次失败请求
-     消耗双倍限流配额，加速并延长账号被锁定在 `1000` 状态的时间。
-   - 另外，`open_jd_union_open_goods_bigfield_query.ashx` 虽不受 `1000` 限制，但仅返回图片与基础属性，
-     不含商品价格、优惠券与佣金，无法独立支撑搜索或详情。
+二、【功能 2：全网关键词搜索 (`api_quanwang.ashx`)】
+  - ✅ 可用：`type=2`, `youquan=1`, `sort="new"`，返回加密 `tao_id` 及 `item_url` (`https://jingfen.jd.com/detail/{tao_id}.html`)。
+  - ❌ 不可用搜索词长度：搜索词 `q` 长度 `< 4` 个字符（如 `"可乐"`、`"纸巾"`）会被折淘客上游直接报错拒绝。
+  - ✅ 必选补齐规则：当 `len(query) < 4` 时必须倍增补齐（`while len(query) < 4: query += query`，如 `"可乐"` -> `"可乐可乐"`）。
 
-3. ✅ 【唯一实证有效方案】：多 `ZTK_APPKEY_LIST` 凭据池自动轮询与故障切换 (Failover)
-   - 核心发现：折淘客的频控限制绑定在单个 `ZTK_APPKEY` 上，既不限制服务器 IP，也不限制绑定的 `JD_UNION_ID`！
-   - 实证结果：注册多个折淘客账号并绑定完全相同的京东联盟授权 (`JD_UNION_ID = 2035679405`)，
-     当 `Key 1` 触发 `301/1000` 限流报错的同一毫秒，在同一 IP、同一 `JD_UNION_ID` 下切换至 `Key 2` 重试同一请求，
-     搜索与详情救活率均为 100%！
-   - 架构设计：输入改为 `ZTK_APPKEY_LIST` 列表，内部维护健康 Key 游标；当当前 Key 正常时持续复用，
-     一旦触发折淘客限流或业务失败（如 `status != 200`），立即顺延切换列表中的下一个 Key 重试并更新健康游标。
-     后续只需注册新折淘客账号并追加到 `ZTK_APPKEY_LIST`，即可线性扩展额度。
+三、【功能 3：单品详情查询 (`api_detail.ashx`)】
+  - ✅ 可用入参：传入加密 `tao_id` / `itemId`（无论来自关键词搜索还是实时榜单），`type=1`，
+    均可返回完整详情、轮播图 `small_images`（`|` 分隔）与权威 `https://jingfen.jd.com/detail/{id}.html` 链接。
+  - ❌ 不可用入参：纯数字旧版 SKU ID（如 `"100012043978"`），接口直接报错 `{"status": 301, "content": "对应宝贝已下架"}`。
+  - ❌ 严禁在转链时无条件预调 `api_detail.ashx`：`api_detail.ashx` 与 `api_quanwang.ashx` 共享单 `ZTK_APPKEY` 的 `1000` 频控池，
+    而加密 ID 本身即可直接一步转链，无需浪费详情配额。
+
+四、【功能 4：统一推广转链 (`open_jing_union_open_promotion_byunionid_get.ashx`)】
+  - ✅ 可用 `materialId` 格式（以下 3 种格式实测均 100% 一步转链成功）：
+    1. 直接传入裸加密 ID：`materialId = "2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w"`
+    2. 传入京粉详情页链接：`materialId = "https://jingfen.jd.com/detail/2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w.html"`
+    3. 传入联盟推广短链接：`materialId = "https://u.jd.com/xxx"`
+  - ❌ 不可用 `materialId` 格式（严禁使用）：
+    1. ❌ `https://item.jd.com/{encrypted_id}.html`：无法访问且无法转链，必报 `2001104 商品不在推广中`。
+    2. ❌ 纯数字 SKU ID（如 `100012043978` 或 `https://item.jd.com/100012043978.html` 或 `https://jingfen.jd.com/detail/100012043978.html`）：
+       接口直接报错 `{"status": 301, "content": "很抱歉！不支持数字id转链！"}`。
+  - ✅ 可用 `positionId` (`promoter_id`)：传入任意纯数字（如站长默认 `3110104129` 或推手数字 ID `8899`），
+    免去后台建位，成交后在订单 `positionId` 字段原封不动透出。
+
+五、【功能 5：增量订单拉取 (`open_jing_union_openz_order_row_query.ashx` 二跳官方网关)】
+  - ✅ 可用：折淘客使用 `jd_app_key` + `jd_app_secret` 签名并返回 `https://api.jd.com/routerjson?...`，
+    本地直接请求京东官方网关获取真实订单行。
+  - ⚠️ 协议约束：查询时间窗跨度不得超过 1 小时 (`<= 3600s`)，推荐 `type=3` (按更新时间查询)。
+
+六、【频控与高可用唯一有效方案 (`ZTK_APPKEY_LIST` 自动故障切换)】
+  - ❌ 已证伪：同一 `appkey` 下用 `open_jing_union_open_goods_query.ashx` 给 `api_quanwang.ashx` / `api_detail.ashx` 兜底（共享同一 `1000` 限流计数器，救活率 0% 且双倍消耗配额）。
+  - ✅ 唯一有效：折淘客频控绑定在单个 `ZTK_APPKEY` 上，不限制 IP 与 `JD_UNION_ID`。使用 `ZTK_APPKEY_LIST` 多 Key 轮询与自动故障切换，救活率 100%。
 ================================================================================
 """
 
@@ -224,7 +227,9 @@ def get_rank_goods(
                 "commission_rate": str(it.get("commissionShare") or "0"),
                 "commission_amount": str(it.get("commission") or "0.00"),
                 "image_url": it.get("imageUrl", ""),
-                "item_url": f"https://item.jd.com/{item_id}.html" if item_id else ""
+                # 【实证规范】加密 itemId 严禁拼接为 https://item.jd.com/{item_id}.html (无法访问且转链必报 2001104)；
+                # 必须使用 https://jingfen.jd.com/detail/{item_id}.html 格式（可正常访问且支持直接转链）。
+                "item_url": f"https://jingfen.jd.com/detail/{item_id}.html" if item_id else ""
             })
         return result
     except Exception as e:
@@ -242,6 +247,9 @@ def search_goods(
     全网搜索京东推广商品（当主 appkey 触发折淘客频控返回 status=301 时，自动切换备用 appkey 重试）
     """
     query = keyword.strip()
+    # 【重要协议约束】折淘客全网搜索接口 (api_quanwang.ashx) 强制要求搜索词 q 的长度至少为 4 个字符；
+    # 若少于 4 个字符（例如“纸巾”、“可乐”），折淘客上游会直接报错拒绝响应。
+    # 因此此处必须对不足 4 个字符的关键词进行倍增补齐（如“纸巾” -> “纸巾纸巾”），切勿删除！
     while len(query) < 4:
         query += query
 
@@ -312,6 +320,7 @@ def get_goods_detail(
         small_imgs = [img for img in (c.get("small_images") or "").split("|") if img]
         return {
             "item_id": str(c.get("tao_id", "")),
+            "item_url": c.get("item_url", ""),
             "title": c.get("title") or c.get("tao_title") or "",
             "shop_title": c.get("shop_title", ""),
             "is_self_operated": c.get("user_type") == "1",
@@ -334,14 +343,21 @@ def convert_promotion_link(
     appkey_list: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """
-    统一推广转链函数
+    统一推广转链函数 (open_jing_union_open_promotion_byunionid_get.ashx)
+
+    【实证 materialId 入参规范（请严格遵守）】：
+    - ✅ 可用格式 1 (裸加密 ID)：直接传入榜单 itemId 或搜索 tao_id，如 "2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w"
+    - ✅ 可用格式 2 (京粉详情页)："https://jingfen.jd.com/detail/2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w.html"
+    - ✅ 可用格式 3 (联盟短链接)："https://u.jd.com/xxx"
+    - ❌ 严禁格式 A："https://item.jd.com/{encrypted_id}.html" -> 无法访问且必报 2001104 商品不在推广中
+    - ❌ 严禁格式 B：纯数字 SKU ID (如 "100012043978") -> 必报 301 不支持数字id转链
 
     【核心归因机制与参数说明】：
     1. promoter_id 只要是纯数字即可（例如：推手在业务系统里的用户数字 ID 8899，或默认数字 3110104129）；
     2. 京东联盟完全不需要在后台预先创建推广位，转链传入任意纯数字，订单成交后都会在 positionId 中原封不动透出；
     3. 不再涉及任何 owner 特殊分支逻辑，所有推手与站长统一使用数字 ID 透传与归因。
 
-    :param material_url: 商品链接 / 物料链接
+    :param material_url: 加密商品 ID / 京粉商品链接 (https://jingfen.jd.com/detail/{id}.html) / 联盟短链
     :param promoter_id: 推广标识（必须为纯数字，如 8899 或 "8899"，未传入时默认使用 DEFAULT_POSITION_ID）
     :param appkey_list: 可选折淘客 appkey 列表，默认使用全局 ZTK_APPKEY_LIST
     """
@@ -527,20 +543,20 @@ if __name__ == "__main__":
     else:
         print(f"  * 详情获取失败: {det.get('error')}")
 
-    # 4. 统一转链逻辑测试 (标识只要是纯数字即可，免去后台建位)
-    print(f"\n【4. 统一推广转链测试】 {sample_url}")
+    # 4. 统一转链逻辑测试 (验证京粉链接转链 + 裸加密 ID 直接转链 + 推手纯数字 ID 归因)
+    print(f"\n【4. 统一推广转链测试】")
     link_default = convert_promotion_link(sample_url, promoter_id=DEFAULT_POSITION_ID)
-    print(f"  👉 [示例 A: 默认/站长转链 (promoter_id={DEFAULT_POSITION_ID})]")
+    print(f"  👉 [示例 A: 京粉详情链接转链 ({sample_url[:55]}... | promoter_id={DEFAULT_POSITION_ID})]")
     print(f"     推广数字ID: {link_default.get('promoter_id')}")
     print(f"     短链接: {link_default.get('short_url')}")
     print(f"     京口令: {link_default.get('j_short_command') or link_default.get('j_command')}")
 
-    link_promoter = convert_promotion_link(sample_url, promoter_id=8899)
-    print(f"\n  👉 [示例 B: 推手专属转链 (直接传入推手纯数字ID，如 promoter_id=8899)]")
-    print(f"     推手数字ID: {link_promoter.get('promoter_id')}")
-    print(f"     专属短链接: {link_promoter.get('short_url')}")
-    print(f"     专属精简口令: {link_promoter.get('j_short_command')}")
-    print(f"     专属完整口令: {link_promoter.get('j_command')}")
+    link_raw_id = convert_promotion_link(sample_sku, promoter_id=8899)
+    print(f"\n  👉 [示例 B: 裸加密ID直接转链 + 推手专属纯数字归因 (materialId={sample_sku[:28]}... | promoter_id=8899)]")
+    print(f"     推手数字ID: {link_raw_id.get('promoter_id')}")
+    print(f"     专属短链接: {link_raw_id.get('short_url')}")
+    print(f"     专属精简口令: {link_raw_id.get('j_short_command')}")
+    print(f"     专属完整口令: {link_raw_id.get('j_command')}")
 
     # 5. 增量订单拉取与核心字段打印 (无擅自分成计算)
     print("\n【5. 增量订单拉取与核心字段打印】")

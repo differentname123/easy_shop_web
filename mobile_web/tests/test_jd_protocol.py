@@ -413,7 +413,7 @@ def test_appkey_list_never_retries_on_unsafe_redirect_or_untrusted_gateway():
     assert http.get.call_count == 1
 
 
-def test_rank_encrypted_item_id_converts_directly_without_redundant_detail_call():
+def test_rank_encrypted_item_id_converts_directly_with_jingfen_url_without_detail_call():
     rank_item_id = "ph4N7kTDsgSNgYyttv5GNgYyttv5G4_373ZMX5zcfkxXRxU0H"
     http = http_for(wrapped(PROMOTION_ROOT, {"code": 200, "data": {
         "shortURL": "https://u.jd.com/rankshort", "clickURL": "https://union-click.jd.com/ranklong",
@@ -423,5 +423,34 @@ def test_rank_encrypted_item_id_converts_directly_without_redundant_detail_call(
     assert result["status"] == "success"
     assert result["short_url"] == "https://u.jd.com/rankshort"
     assert http.get.call_count == 1
-    assert http.get.call_args.kwargs["params"]["materialId"] == f"https://item.jd.com/{rank_item_id}.html"
+    assert http.get.call_args.kwargs["params"]["materialId"] == f"https://jingfen.jd.com/detail/{rank_item_id}.html"
+
+
+def test_encrypted_id_rewrites_stale_item_jd_url_to_jingfen_and_falls_back_to_detail_when_needed():
+    # 1. 若传入了旧缓存的 https://item.jd.com/{encrypted_id}.html，JdAdapter 直接纠正为 https://jingfen.jd.com/detail/{encrypted_id}.html；
+    # 2. 若京东对榜单混淆 ID 返回 2001104，JdClient 识别为京东业务错误不轮询其余 appkey，并由 JdAdapter 调 api_detail.ashx 换取重签名 tao_id 重试。
+    encrypted_id = "2JQgZkZ2nGOIkKfwpvzdIkKfwpvzdQ_3SD7M7MGcugkXyuI4w"
+    resigned_id = "2JQkZkZ2nGOIkKHE8K75IkKfe6mXtQ_3SD7M7MGcugkXyuI4w"
+    resigned_jingfen_url = f"https://jingfen.jd.com/detail/{resigned_id}.html"
+    http = http_for(
+        wrapped(PROMOTION_ROOT, {"code": 2001104, "message": "2001104_您的账号无权限访问，原因：商品不在推广中", "data": None}, field="result", string=True),
+        {"status": 200, "content": [item(resigned_id, item_url=resigned_jingfen_url)]},
+        wrapped(PROMOTION_ROOT, {"code": 200, "data": {
+            "shortURL": "https://u.jd.com/2riP3lL", "clickURL": "https://union-click.jd.com/jdc?e=test",
+            "jCommand": "长京口令", "jShortCommand": "https://u.jd.com/2riP3lL CA1507"}}, field="result", string=True),
+    )
+    c = JdClient(["key-1", "key-2", "key-3"], "10001", "test-jd-key", "test-jd-secret", http_session=http)
+    a = adapter(c)
+    result = a.convert_promotion_url(
+        encrypted_id, uid="u_8bb0595a", promoter_id="3110104129",
+        trusted_product_url=f"https://item.jd.com/{encrypted_id}.html",
+    )
+    assert result["status"] == "success"
+    assert result["short_url"] == "https://u.jd.com/2riP3lL"
+    assert result["promotion_token"] == "https://u.jd.com/2riP3lL CA1507"
+    assert http.get.call_count == 3
+    assert http.get.call_args_list[0].kwargs["params"]["materialId"] == f"https://jingfen.jd.com/detail/{encrypted_id}.html"
+    assert http.get.call_args_list[1].args == (DEFAULT_API_BASE + "/api_detail.ashx",)
+    assert http.get.call_args_list[2].kwargs["params"]["materialId"] == resigned_jingfen_url
+
 

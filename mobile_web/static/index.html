@@ -6,9 +6,9 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>优选导购 - 极速省赚</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261106-2">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261107-1">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261106-2"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261107-1"></script>
 </head>
 <body>
 <div id="app">
@@ -49,6 +49,10 @@
         >
           {{ ch.name }}
         </div>
+      </nav>
+      <nav class="search-status-bar" v-else>
+        <span class="search-status-text">当前在 <b>{{ homePlatformName() }}</b> 搜索「{{ activeHomeKeyword }}」，点上方平台可切换搜索</span>
+        <button type="button" class="search-back-btn" @click="clearHomeSearch">返回精选榜单</button>
       </nav>
     </header>
 
@@ -608,12 +612,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261106-2"></script>
-<script src="/static/js/session.js?v=ux-20261106-2"></script>
-<script src="/static/js/format.js?v=ux-20261106-2"></script>
-<script src="/static/js/browser.js?v=ux-20261106-2"></script>
-<script src="/static/js/feeds.js?v=ux-20261106-2"></script>
-<script src="/static/js/account.js?v=ux-20261106-2"></script>
-<script src="/static/js/app.js?v=ux-20261106-2"></script>
+<script src="/static/js/api.js?v=ux-20261107-1"></script>
+<script src="/static/js/session.js?v=ux-20261107-1"></script>
+<script src="/static/js/format.js?v=ux-20261107-1"></script>
+<script src="/static/js/browser.js?v=ux-20261107-1"></script>
+<script src="/static/js/feeds.js?v=ux-20261107-1"></script>
+<script src="/static/js/account.js?v=ux-20261107-1"></script>
+<script src="/static/js/app.js?v=ux-20261107-1"></script>
 </body>
 </html>

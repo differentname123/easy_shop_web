@@ -180,14 +180,16 @@
       const platform = platforms.value.find(item => item.code === code);
       if (!platform?.active) { showToast('该平台暂未接入或未配置'); return; }
       if (code === homePlatform.value) return;
+      const preservedKeyword = (activeHomeKeyword.value || homeSearchKeyword.value || '').trim();
       homeGeneration += 1; channelGeneration += 1;
       homePlatform.value = code; currentChannel.value = 5;
-      homeSearchKeyword.value = ''; activeHomeKeyword.value = ''; homeGoodsList.value = [];
+      homeSearchKeyword.value = preservedKeyword; activeHomeKeyword.value = preservedKeyword; homeGoodsList.value = [];
       homeLoading.value = true; homeError.value = false; homeHasMore.value = true;
       homeOffset = 0; homeCursor = ''; homeSearchPage = 1;
-      syncHomeSearchToUrl(''); global.scrollTo(0, 0);
+      syncHomeSearchToUrl(preservedKeyword); global.scrollTo(0, 0);
       const generation = homeGeneration, scope = getScope();
       if (await loadHomeChannels() && current(generation, scope)) {
+        if (preservedKeyword) return loadHomeGoods(true);
         const cached = channelCache.get(cacheKey());
         if (cached) applySnapshot(cached);
         else return loadHomeGoods(true);

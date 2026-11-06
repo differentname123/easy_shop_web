@@ -208,6 +208,10 @@ class JdClient:
             last_result = result
             if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR"):
                 return result
+            # 若折淘客网关已正常返回京东联盟内层业务封套（说明当前 appkey 配额正常，而是京东返回如 2001104 商品不在推广中等业务码），
+            # 换用其他折淘客 appkey 仍会得到相同的京东业务错误，立即返回交由上层走详情链接兜底，避免轮询拖慢响应。
+            if isinstance(body, dict) and (PROMOTION_ROOT in body or RANK_ROOT in body or ORDER_ROOT in body):
+                return result
 
         return last_result
 
@@ -265,6 +269,9 @@ class JdClient:
             query = keyword.strip()
             if not query:
                 raise ValueError
+            # 【重要协议约束】折淘客全网搜索接口 (api_quanwang.ashx) 强制要求搜索词 q 的长度至少为 4 个字符；
+            # 若少于 4 个字符（例如“纸巾”、“可乐”），折淘客上游会直接报错拒绝响应。
+            # 因此此处必须对不足 4 个字符的关键词进行倍增补齐（如“纸巾” -> “纸巾纸巾”），切勿删除！
             while len(query) < 4:
                 query += query
         except (TypeError, ValueError, AttributeError, OverflowError):

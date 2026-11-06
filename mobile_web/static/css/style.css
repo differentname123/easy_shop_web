@@ -173,7 +173,7 @@ body {
 }
 
 .tab-page.tab-home.is-searching {
-  padding-top: calc(96px + var(--safe-top));
+  padding-top: calc(132px + var(--safe-top));
 }
 
 .tab-page.tab-boom {
@@ -1817,13 +1817,14 @@ body {
   border-radius: 22px;
   font-size: 13px;
   font-weight: 600;
-  padding: 10px 0;
+  padding: 10px 8px;
   text-align: center;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
+  white-space: nowrap;
   transition: all 0.2s;
 }
 
@@ -1833,20 +1834,21 @@ body {
 }
 
 .btn-buy-now {
-  flex: 1.2;
+  flex: 1.15;
   background: linear-gradient(135deg, #ff4d4f 0%, #cf1322 100%);
   color: #ffffff;
   border: none;
   border-radius: 22px;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 700;
-  padding: 10px 0;
+  padding: 10px 8px;
   text-align: center;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
+  white-space: nowrap;
   box-shadow: 0 4px 12px rgba(207, 19, 34, 0.35);
   transition: all 0.2s;
 }
@@ -1923,5 +1925,57 @@ body {
   line-height: 1.45;
   user-select: text;
 }
+
+/* 首页跨平台搜索状态条 */
+.search-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 12px 8px;
+  gap: 8px;
+  background: #fff;
+}
+
+.search-status-text {
+  font-size: 12px;
+  color: var(--text-sub);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-status-text b {
+  color: var(--primary-color);
+}
+
+.search-back-btn {
+  background: #fff1f0;
+  color: var(--primary-color);
+  border: 1px solid #ffa39e;
+  border-radius: 12px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* 详情页口令弹窗展示框 */
+.command-preview-box {
+  background: #fffaf0;
+  border: 1px dashed #ffa940;
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 13px;
+  color: var(--text-main);
+  line-height: 1.55;
+  word-break: break-all;
+  white-space: pre-wrap;
+  user-select: text;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
 
 

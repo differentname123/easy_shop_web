@@ -192,9 +192,20 @@ class ProductRepository(BaseRepository):
                 update_set[target] = str(value)
 
         # 供应商摘要也可带可信物料链接，但不是完整详情，不推进详情来源时钟。
+        # 对于京东加密 ID，统一规范化为 https://jingfen.jd.com/detail/{encrypted_id}.html；榜单摘要仅在首次插入时写入，避免覆盖详情页已解析出的长物料链接。
         product_url = item.get("product_url")
         if isinstance(product_url, str) and product_url.strip():
-            update_set["product_url"] = product_url.strip()
+            clean_url = product_url.strip()
+            target_id = goods_id or goods_sign
+            if platform == "jd" and len(target_id) >= 25 and "_" in target_id:
+                if clean_url == f"https://item.jd.com/{target_id}.html":
+                    clean_url = f"https://jingfen.jd.com/detail/{target_id}.html"
+                if not detail and clean_url == f"https://jingfen.jd.com/detail/{target_id}.html":
+                    insert_set["product_url"] = clean_url
+                else:
+                    update_set["product_url"] = clean_url
+            else:
+                update_set["product_url"] = clean_url
 
         update_set["updated_at"] = now
         if item.get("source") is not None:

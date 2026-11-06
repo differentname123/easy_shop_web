@@ -11,6 +11,14 @@
     const isDeepLoading = ref(true);
     const detailError = ref(false);
     const generatedCommand = ref('');
+    const commandModal = ref({ visible: false, text: '', token: '', link: '' });
+    const closeCommandModal = () => {
+      commandModal.value = { visible: false, text: '', token: '', link: '' };
+    };
+    const copyCommandFromModal = () => {
+      if (!commandModal.value.text) return;
+      browser.copyText(commandModal.value.text, `推广口令与链接已复制，可前往${platformName.value}使用`);
+    };
     let requested = null;
     let referralUid = '';
     let detailGeneration = 0;
@@ -27,7 +35,7 @@
     const canUse = info => !disposed && info && promotionSessions.has(info) && session.isCurrent(promotionSessions.get(info));
     const invalidateSession = () => {
       session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; isLoggedIn.value = false;
-      generatedCommand.value = ''; closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
+      generatedCommand.value = ''; closeCommandModal(); closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
     };
     const carouselList = computed(() => {
       if (!goods.value) return [];
@@ -69,6 +77,7 @@
     const restoreIdentity = () => {
       if (identityRestore && identitySnapshot && session.isCurrent(identitySnapshot)) return identityRestore;
       generatedCommand.value = '';
+      closeCommandModal();
       identitySnapshot = session.capture();
       identityRestore = session.restore(api).then(result => {
         if (disposed) return;
@@ -204,6 +213,12 @@
       const content = info.command_text || info.final_link;
       if (content) {
         generatedCommand.value = content;
+        commandModal.value = {
+          visible: true,
+          text: content,
+          token: info.promotion_token || info.j_short_command || info.we_app_web_view_short_url || '',
+          link: info.short_url || info.final_link || '',
+        };
         browser.copyText(content, successTip || `推广口令与链接已复制，可前往${platformName.value}使用`);
       }
       else browser.showToast('暂无有效口令');
@@ -285,6 +300,7 @@
     const dispose = () => {
       disposed = true;
       generatedCommand.value = '';
+      closeCommandModal();
       closeAuthModal();
       global.removeEventListener('focus', refreshAuthorization);
       global.document.removeEventListener('visibilitychange', refreshAuthorization);
@@ -294,7 +310,8 @@
     };
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
-      isDeepLoading, detailError, generatedCommand, onCarouselScroll, goHome, goBack, goToRegister,
+      isDeepLoading, detailError, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
+      onCarouselScroll, goHome, goBack, goToRegister,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail: loadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,

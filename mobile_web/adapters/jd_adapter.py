@@ -74,14 +74,18 @@ def _is_encrypted_jd_item_id(value):
 def _material_url(item):
     source = product_url(item.get("item_url"))
     if source:
+        if source.startswith("https://item.jd.com/") and source.endswith(".html"):
+            candidate_id = source[len("https://item.jd.com/"):-len(".html")]
+            if _is_encrypted_jd_item_id(candidate_id):
+                return f"https://jingfen.jd.com/detail/{candidate_id}.html"
         return source
     # Only an explicit supplier SKU or official encrypted itemId is evidence for a canonical item URL.
     sku = canonical_promoter_id(item.get("skuId"))
     if sku:
         return f"https://item.jd.com/{sku}.html"
-    raw_item_id = clean_product_id(item.get("itemId"))
+    raw_item_id = clean_product_id(item.get("itemId") or item.get("tao_id"))
     if _is_encrypted_jd_item_id(raw_item_id):
-        return f"https://item.jd.com/{raw_item_id}.html"
+        return f"https://jingfen.jd.com/detail/{raw_item_id}.html"
     return ""
 
 
@@ -269,8 +273,12 @@ class JdAdapter(BasePlatformAdapter):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
         # The service strips request kwargs before supplying this private bridge.
         material = product_url(kwargs.get("trusted_product_url"))
-        if not material and _is_encrypted_jd_item_id(target_id):
-            material = f"https://item.jd.com/{target_id}.html"
+        # 【对齐 test_jd_api.py 实证基准】：
+        # 加密 itemId 拼接为 https://item.jd.com/{id}.html 无法访问且转链必报 2001104 (商品不在推广中)；
+        # 必须使用 https://jingfen.jd.com/detail/{id}.html 格式直接一步转链（若缓存中残留旧版 item.jd.com 拼接格式则自动纠正）。
+        jingfen_encrypted_url = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else ""
+        if jingfen_encrypted_url and (not material or material == f"https://item.jd.com/{target_id}.html"):
+            material = jingfen_encrypted_url
         if not material:
             detail = self._fetch_item(ref)
             if detail.get("status") != "success":
@@ -279,6 +287,22 @@ class JdAdapter(BasePlatformAdapter):
         if not material:
             return _error("MATERIAL_URL_REQUIRED", "京东物料ID缺少已核验的商品链接")
         result = self.client.convert_promotion_link(material, promoter)
+        if result.get("status") != "success" and jingfen_encrypted_url and material == jingfen_encrypted_url:
+            # 极端情况下若榜单混淆 itemId 需换取详情页重签名 tao_id，才回退调用一次 api_detail.ashx
+            detail = self._fetch_item(ref)
+            if detail.get("status") == "success":
+                detail_material = _material_url(detail["data"])
+                if detail_material and detail_material != material:
+                    material = detail_material
+                    try:
+                        from cache import MATERIAL_CACHE
+                        if ref.goods_sign:
+                            MATERIAL_CACHE.set(("jd", "sign", ref.goods_sign), detail_material)
+                        if ref.goods_id:
+                            MATERIAL_CACHE.set(("jd", "id", ref.goods_id), detail_material)
+                    except Exception:
+                        pass
+                    result = self.client.convert_promotion_link(material, promoter)
         if result.get("status") != "success":
             return result
         short, long = result.get("short_url") or "", result.get("click_url") or ""
