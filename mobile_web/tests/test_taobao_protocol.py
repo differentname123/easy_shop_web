@@ -619,5 +619,14 @@ def test_taobao_detail_extracts_verified_specs_from_official_item():
     ]
 
 
-
-
+def test_ztk_client_multi_key_failover():
+    http = SimpleNamespace(get=Mock(side_effect=[
+        reply({"code": 301, "msg": "appkey日调用次数超限"}),
+        reply(order_response([{"trade_id": "t1"}])),
+    ]))
+    client = ZtkClient("key1", "sid1", http, appkey_list=("key1", "key2"))
+    res = client.query_orders(0, 100)
+    assert res["status"] == "success"
+    assert len(res["order_list"]) == 1
+    assert client.appkey == "key2"
+    assert http.get.call_count == 2

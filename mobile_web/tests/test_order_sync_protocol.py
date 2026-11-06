@@ -59,7 +59,6 @@ class MemoryOrders:
 
 class Adapter:
     order_window_seconds = 23 * 3600
-    legacy_order_statuses = {}
     active = True
 
     def __init__(self, fetch=None):

@@ -28,7 +28,6 @@ from auth import (
     verify_password,
     mask_phone,
     get_current_uid,
-    LEGACY_SALT,
 )
 from cache_utils import ThreadSafeTTLCache
 from adapters import get_adapter
@@ -80,15 +79,8 @@ class TestAuthSecurity(unittest.TestCase):
         self.assertTrue(verify_password(raw_pwd, pwd_hash))
         # 错误密码校验失败
         self.assertFalse(verify_password("WrongPassword", pwd_hash))
-
-    def test_legacy_password_compatibility(self):
-        """测试向上平滑兼容历史 sha256 盐值哈希"""
-        pwd = "mypassword"
-        legacy_hash = hashlib.sha256(f"{LEGACY_SALT}_{pwd}_{LEGACY_SALT}".encode("utf-8")).hexdigest()
-
-        # 能够正确验证历史旧哈希
-        self.assertTrue(verify_password(pwd, legacy_hash))
-        self.assertFalse(verify_password("wrongpassword", legacy_hash))
+        # 非 PBKDF2 格式哈希直接拒绝
+        self.assertFalse(verify_password(raw_pwd, "legacy_plain_or_sha256_hash"))
 
     def test_mask_phone(self):
         """测试手机号脱敏"""
@@ -267,26 +259,8 @@ class TestProductRepoSecurity(unittest.TestCase):
         self.assertTrue(result["has_more"])
         self.assertEqual(len(result["data"]), 20)
 
-    def test_upsert_isolates_commercial_llm_cost(self):
-        """测试写入商品时设置 need_reformat: False 和 format_status: success，隔绝大模型调用费用"""
-        self.mock_col.bulk_write.return_value = MagicMock()
-        products = [{
-            "goods_id": "1001",
-            "name": "测试商品",
-            "price": 10.0,
-            "original_price": 20.0,
-        }]
-        self.repo.upsert_home_products(products, channel_type=1)
 
-        # 提取 bulk_write 的 UpdateOne 操作
-        operations = self.mock_col.bulk_write.call_args[0][0]
-        update_doc = operations[0]._doc["$set"]
-        self.assertFalse(update_doc["need_reformat"])
-        self.assertEqual(update_doc["format_status"], "success")
-        self.assertEqual(update_doc["format_retry_count"], 999)
-
-
-# ==================== 5. 用户服务与密码平滑升级测试 ====================
+# ==================== 5. 用户服务与授权备案测试 ====================
 class TestUserServiceSecurity(unittest.TestCase):
     def setUp(self):
         self.mock_db = MagicMock()
@@ -295,31 +269,6 @@ class TestUserServiceSecurity(unittest.TestCase):
         self.user_repo = UserRepository(db_instance=self.mock_db)
         self.user_repo._db = self.mock_db
         self.user_service = UserService(user_repo=self.user_repo)
-
-    def test_legacy_password_auto_upgrade_on_login(self):
-        """测试使用旧 sha256 密码登录成功后，数据库自动无感升级为 PBKDF2 哈希"""
-        pwd = "OldPassword123"
-        legacy_hash = hashlib.sha256(f"{LEGACY_SALT}_{pwd}_{LEGACY_SALT}".encode("utf-8")).hexdigest()
-
-        user_doc = {
-            "uid": "u_999",
-            "phone": "13800138000",
-            "password_hash": legacy_hash,
-            "balance": 0.0,
-            "auth_status": {}
-        }
-        self.mock_users_col.find_one.return_value = user_doc
-
-        # 用户登录
-        res = self.user_service.register_or_login("13800138000", pwd)
-        self.assertEqual(res["status"], "success")
-        self.assertIn("auth_token", res["user"])
-
-        # 验证 update_one 被调用，更新密码为 PBKDF2
-        self.mock_users_col.update_one.assert_called_once()
-        update_args = self.mock_users_col.update_one.call_args[0]
-        new_hash = update_args[1]["$set"]["password_hash"]
-        self.assertTrue(new_hash.startswith("pbkdf2_sha256$"))
 
     def test_check_and_get_auth_skips_external_api_if_authorized(self):
         """测试用户已备案时直接返回，绝不重复调用外部电商平台接口"""

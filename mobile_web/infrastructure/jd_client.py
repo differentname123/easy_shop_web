@@ -1,25 +1,21 @@
 # -*- coding: utf-8 -*-
 """京东/折京客薄协议边界；支持多 ZTK_APPKEY_LIST 自动轮询与故障切换，与 scripts/test_jd_api.py 严格对齐。"""
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
 import requests
+from infrastructure.http_utils import SHANGHAI, error_dict as _error, parse_appkey_list
 from models.user import normalize_promoter_id
 
 # Documented relay currently uses HTTP. Configure an approved secure alternative
 # before sending production secrets; never silently substitute the Taobao relay.
 DEFAULT_API_BASE = "http://api.zhetaoke.com:20000/api"
 ORDER_WINDOW_SECONDS = 3600
-SHANGHAI = timezone(timedelta(hours=8))
 ORDER_ROOT = "jd_union_open_order_row_query_responce"
 RANK_ROOT = "jd_union_open_goods_rank_query_responce"
 PROMOTION_ROOT = "jd_union_open_promotion_byunionid_get_response"
 ORDER_METHOD = "jd.union.open.order.row.query"
-
-
-def _error(code, message):
-    return {"status": "error", "error_code": code, "error_msg": message}
 
 
 def canonical_promoter_id(value):
@@ -28,35 +24,6 @@ def canonical_promoter_id(value):
         return normalize_promoter_id(value)
     except ValueError:
         return ""
-
-
-def parse_appkey_list(raw):
-    """
-    将单个折淘客 appkey、逗号分隔字符串或字符串列表/元组规范化为去重后的非空 appkey 元组。
-    拒绝布尔值、非字符串及包含控制字符的非法输入。
-    """
-    if raw is None or isinstance(raw, bool):
-        return ()
-    if isinstance(raw, str):
-        candidates = raw.split(",")
-    elif isinstance(raw, (list, tuple)):
-        candidates = []
-        for item in raw:
-            if not isinstance(item, str) or isinstance(item, bool):
-                return ()
-            candidates.extend(item.split(","))
-    else:
-        return ()
-    seen = []
-    for key in candidates:
-        clean = key.strip()
-        if not clean:
-            continue
-        if any(ord(c) < 33 for c in clean):
-            return ()
-        if clean not in seen:
-            seen.append(clean)
-    return tuple(seen)
 
 
 def product_url(value):

@@ -242,7 +242,7 @@ class OrderService:
         try:
             result = self.repo.query_user_orders(
                 platform=plat, promoter_uid=clean_uid, start_timestamp=start_ts,
-                limit=100, legacy_order_statuses=adapter.legacy_order_statuses,
+                limit=100,
             )
         except Exception as exc:
             logger.error(

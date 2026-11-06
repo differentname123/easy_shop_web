@@ -164,9 +164,6 @@ class UserRepository(BaseRepository):
                 raise ValueError("手机号已注册，输入的密码不正确")
 
             update_fields: Dict[str, Any] = {"last_login_at": now, "last_active_at": now}
-            if not str(stored_hash or "").startswith("pbkdf2_sha256$"):
-                update_fields["password_hash"] = hash_password(password)
-
             self.col.update_one({"phone": phone}, {"$set": update_fields})
             existing["last_login_at"] = now
             existing["last_active_at"] = now

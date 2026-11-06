@@ -30,7 +30,6 @@ class BasePlatformAdapter(ABC):
     active: bool = True
     channels: tuple = ()
     recommendation_limit: Optional[int] = None
-    legacy_order_statuses: dict = {}
     required_identity_fields: tuple = ()
     requires_authorized_promotion: bool = False
     requires_numeric_promoter_id: bool = False

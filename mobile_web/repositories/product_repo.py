@@ -196,12 +196,7 @@ class ProductRepository(BaseRepository):
         if isinstance(product_url, str) and product_url.strip():
             update_set["product_url"] = product_url.strip()
 
-        update_set.update({
-            "updated_at": now,
-            "need_reformat": False,
-            "format_status": "success",
-            "format_retry_count": 999,
-        })
+        update_set["updated_at"] = now
         if item.get("source") is not None:
             update_set["source"] = item["source"]
         elif not detail:

@@ -76,8 +76,7 @@ def test_jd_created_time_and_zero_amounts_are_not_relabelled_as_paid():
            "promotion_amount_yuan": 0, "commission_basis": "actual",
            "order_status": 27, "is_refund": False, "is_settled": False, "is_invalid": False}
     repo.upsert_orders([doc], "jd")
-    result = repo.query_user_orders("jd", "owner", start_timestamp=900,
-                                    legacy_order_statuses={"refund": [27], "settled": [27]})
+    result = repo.query_user_orders("jd", "owner", start_timestamp=900)
     assert result["total_count"] == 1
     assert result["total_commission"] == result["settled_commission"] == result["refund_commission"] == 0
     row = result["order_list"][0]

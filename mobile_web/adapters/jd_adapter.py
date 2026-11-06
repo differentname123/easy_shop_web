@@ -96,7 +96,6 @@ class JdAdapter(BasePlatformAdapter):
     requires_numeric_promoter_id = True
     requires_material_url = True
     order_window_seconds = ORDER_WINDOW_SECONDS
-    legacy_order_statuses = {"settled": [18], "refund": [28]}
 
     def __init__(self, settings=None, client=None, **overrides):
         if settings is None:

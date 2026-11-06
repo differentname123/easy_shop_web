@@ -4,10 +4,9 @@
 """
 from typing import Optional
 from fastapi import APIRouter, Query
-from services.product_service import ProductService
+from api.home import product_service
 
 router = APIRouter(prefix="/api/goods", tags=["爆单推广库"])
-product_service = ProductService()
 
 
 @router.get("/list")

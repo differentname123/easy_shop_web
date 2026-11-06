@@ -1,291 +1,664 @@
 # -*- coding: utf-8 -*-
 """
-拼多多 (多多客 DDK) 官方底层 API 详情与元数据自检程序
-用途：
-1. 测试 pdd.ddk.goods.detail 官方单品详情接口返回的完整真实原始数据
-2. 测试 pdd.ddk.goods.recommend.get (推荐榜单) 与 pdd.ddk.goods.search (关键词搜索)
-3. 深入检测店铺字段 (mall_name / mall_id)、品牌 (brand_name)、规格与服务保障
-4. 将 API 完整返回原始 JSON 格式化导出到文件，便于在编辑器中深入对比
-
-使用方法：
-  python test_pdd_api.py                        # 自动从推荐榜拉取热门商品测试详情
-  python test_pdd_api.py <goods_sign>           # 指定商品 goods_sign 测试
-  python test_pdd_api.py <goods_id>             # 指定纯数字商品 ID 测试
-  python test_pdd_api.py "抽纸"                 # 指定关键词先搜索再测试其详情
+拼多多 (多多进宝 DDK) 核心能力标准基线脚本 (生产级精简版)
+================================================================================
+本脚本作为全项目拼多多 API 的唯一权威基线，维护并验证项目用到的全部 6 项核心 API 操作：
+1. 获取热销榜单/频道推荐商品 (pdd.ddk.goods.recommend.get: channel_type=5 实时热销 / 1 今日爆款)
+2. 关键词搜索商品 (pdd.ddk.goods.search)
+3. 获取商品详情及短链探测降级 (pdd.ddk.goods.detail + pdd.ddk.goods.zs.unit.url.gen 探测)
+4. 三层智能兜底转链 (pdd.ddk.rp.prom.url.generate[23] -> pdd.ddk.goods.promotion.url.generate -> zs.unit.url.gen)
+5. 推手授权备案查询与生成 (pdd.ddk.member.authority.query + pdd.ddk.rp.prom.url.generate[10])
+6. 增量订单拉取与状态清洗 (pdd.ddk.order.list.increment.get)
 """
 
+import hashlib
+import json
 import os
 import sys
-import json
 import time
-import hashlib
-from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import requests
 
-# 自动处理 Windows 终端编码
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+# 确保 Windows 终端下能够正常输出中文与特殊符号
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
-# 确保脚本无论在哪个目录下运行，都能正确加载 mobile_web 模块和配置
-CURRENT_DIR = Path(__file__).resolve().parent
-MOBILE_WEB_DIR = CURRENT_DIR.parent if CURRENT_DIR.name == "scripts" else CURRENT_DIR
-if str(MOBILE_WEB_DIR) not in sys.path:
-    sys.path.insert(0, str(MOBILE_WEB_DIR))
+PDD_API_URL = "https://gw-api.pinduoduo.com/api/router"
 
-# 默认凭证兜底（来自项目 config.local.json）
-FALLBACK_CLIENT_ID = "f15639975cba4df6bc8afcde5151086a"
-FALLBACK_CLIENT_SECRET = "2b32a01a4d9ca5327595cf97eed3f798631c87f3"
-FALLBACK_PID = "41675195_317608303"
-PDD_GATEWAY_URL = "https://gw-api.pinduoduo.com/api/router"
+SERVICE_TAG_MAP = {
+    1: "全场包邮", 2: "七天退换", 3: "退货包运费", 4: "送货入户并安装",
+    5: "送货入户", 6: "电子发票", 7: "诚信发货", 8: "缺重包赔",
+    9: "坏果包赔", 10: "果重保证", 11: "闪电退款", 12: "24小时发货",
+    13: "48小时发货", 15: "假一罚十", 16: "贴心服务", 17: "顺丰包邮",
+    18: "只换不修", 19: "全国联保", 20: "分期付款", 21: "极速退款",
+    22: "上门换新", 23: "材质保障", 24: "精准物流", 29: "预约配送",
+    31: "电器城服务", 32: "顺丰冷链", 1000001: "正品发票",
+}
 
-
-def load_credentials():
-    """按优先级从 config.local.json 或环境变量加载拼多多凭证"""
-    client_id = os.environ.get("PDD_CLIENT_ID", "")
-    client_secret = os.environ.get("PDD_CLIENT_SECRET", "")
-    pid = os.environ.get("PDD_PID", "")
-
-    config_candidates = [
-        Path.cwd() / "config.local.json",
-        Path.cwd() / "mobile_web" / "config.local.json",
-        CURRENT_DIR / "config.local.json",
-        MOBILE_WEB_DIR / "config.local.json",
-        MOBILE_WEB_DIR.parent / "config.local.json",
-    ]
-
-    for p in config_candidates:
-        if p.is_file():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    client_id = client_id or cfg.get("myself_pdd_client_id") or cfg.get("pdd_client_id", "")
-                    client_secret = client_secret or cfg.get("myself_pdd_client_secret") or cfg.get("pdd_client_secret", "")
-                    pid = pid or cfg.get("myself_pdd_pid") or cfg.get("pdd_pid", "")
-                    if client_id and client_secret:
-                        break
-            except Exception:
-                pass
-
-    return (
-        client_id or FALLBACK_CLIENT_ID,
-        client_secret or FALLBACK_CLIENT_SECRET,
-        pid or FALLBACK_PID,
-    )
+UNIFIED_TAG_MAP = {
+    24: "百亿补贴", 7: "百亿补贴", 10412: "百亿补贴",
+    10564: "千万补贴", 6: "千万神券", 31: "品牌黑标",
+}
 
 
-def call_pdd_api(client_id: str, client_secret: str, api_type: str, business_params: dict = None) -> dict:
-    """
-    自包含的拼多多网关请求与 MD5 自动签名引擎
-    独立实现，零外部依赖，任何目录直接运行均可执行。
-    """
-    raw_params = {
+# ==============================================================================
+# 0. 配置加载与基础签名通信协议
+# ==============================================================================
+def load_local_config() -> dict:
+    """自动向上寻找并加载 config.local.json 配置文件"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(3):
+        candidate = os.path.join(current_dir, "config.local.json")
+        if os.path.exists(candidate):
+            with open(candidate, "r", encoding="utf-8") as f:
+                return json.load(f)
+        current_dir = os.path.dirname(current_dir)
+    return {}
+
+
+_cfg = load_local_config()
+PDD_CLIENT_ID = _cfg.get("myself_pdd_client_id", "")
+PDD_CLIENT_SECRET = _cfg.get("myself_pdd_client_secret", "")
+PDD_PID = _cfg.get("myself_pdd_pid", "")
+
+
+def generate_pdd_sign(params: Dict[str, Any], client_secret: str) -> str:
+    """生成拼多多开放平台 MD5 签名（首尾拼接 client_secret，按 key 字典序升序）"""
+    sorted_keys = sorted(params.keys())
+    sign_str = client_secret
+    for k in sorted_keys:
+        v = params[k]
+        if v is not None and k != "sign":
+            if isinstance(v, bool):
+                v = "true" if v else "false"
+            elif isinstance(v, (dict, list)):
+                v = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+            sign_str += f"{k}{v}"
+    sign_str += client_secret
+    return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
+
+
+def call_pdd_api(
+    client_id: str,
+    client_secret: str,
+    api_type: str,
+    biz_params: Optional[Dict[str, Any]] = None,
+    timeout: int = 12,
+) -> Optional[Dict[str, Any]]:
+    """通用拼多多网关请求封装"""
+    if not client_id or not client_secret:
+        return {"error_response": {"error_msg": "拼多多 API 密钥未配置", "error_code": "CONFIG_ERROR"}}
+
+    payload: Dict[str, Any] = {
         "type": api_type,
         "client_id": client_id,
         "timestamp": str(int(time.time())),
         "data_type": "JSON",
-        "version": "V1",
     }
-    if business_params:
-        raw_params.update({k: v for k, v in business_params.items() if v is not None})
+    if biz_params:
+        for k, v in biz_params.items():
+            if v is not None:
+                if isinstance(v, bool):
+                    payload[k] = "true" if v else "false"
+                elif isinstance(v, (dict, list)):
+                    payload[k] = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+                else:
+                    payload[k] = str(v)
 
-    params = {}
-    for key, val in raw_params.items():
-        if isinstance(val, bool):
-            params[key] = "true" if val else "false"
-        elif isinstance(val, (list, dict)):
-            params[key] = json.dumps(val, ensure_ascii=False, separators=(",", ":"))
-        else:
-            params[key] = str(val)
-
-    sign_str = client_secret
-    for key in sorted(params.keys()):
-        sign_str += f"{key}{params[key]}"
-    sign_str += client_secret
-    params["sign"] = hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
-
+    payload["sign"] = generate_pdd_sign(payload, client_secret)
     try:
-        resp = requests.post(
-            PDD_GATEWAY_URL,
-            json=params,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json",
-            },
-            timeout=10,
-        )
+        resp = requests.post(PDD_API_URL, data=payload, timeout=timeout)
+        resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        return {"error_response": {"error_msg": f"网络通信异常: {str(e)}"}}
+        return {"error_response": {"error_msg": f"网络或解析异常: {e}", "error_code": "NETWORK_ERROR"}}
 
 
-def print_section(title: str):
-    print("\n" + "=" * 68)
-    print(f"  {title}")
-    print("=" * 68)
+def _build_custom_params(uid: Optional[str] = None) -> str:
+    """构建拼多多多级归因 custom_parameters JSON 字符串"""
+    safe_uid = str(uid or "").strip() or "default_user"
+    return json.dumps({"uid": safe_uid}, ensure_ascii=False, separators=(",", ":"))
 
 
-def main():
-    client_id, client_secret, pid = load_credentials()
+def clean_pdd_goods_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """将拼多多原始商品字典（分）清洗为标准业务字段（元）"""
+    cleaned = dict(item)
+    min_group_price = item.get("min_group_price", 0) or 0
+    min_normal_price = item.get("min_normal_price", 0) or 0
+    coupon_discount = item.get("coupon_discount", 0) or 0
+    promotion_rate = item.get("promotion_rate", 0) or 0
+    subsidy_amount = item.get("subsidy_amount", 0) or 0
 
-    print_section("1. 拼多多 API 测试环境与凭据检查")
-    print(f"• Client ID     : {client_id[:6]}******{client_id[-4:] if len(client_id) > 10 else ''}")
-    print(f"• Client Secret : {'*' * 16}")
-    print(f"• 默认推手 PID  : {pid or '(未配置)'}")
-    print(f"• 当前测试时间  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    group_yuan = round(min_group_price / 100.0, 2)
+    normal_yuan = round(min_normal_price / 100.0, 2)
+    coupon_yuan = round(coupon_discount / 100.0, 2)
+    subsidy_yuan = round(subsidy_amount / 100.0, 2)
+    final_price_yuan = round(max(group_yuan - coupon_yuan, 0.0), 2)
+    comm_rate_pct = round(promotion_rate / 10.0, 2)
+    est_comm_yuan = round(final_price_yuan * (promotion_rate / 1000.0), 2)
 
-    # ==================== 确定待测试的商品 target ====================
-    target_arg = sys.argv[1].strip() if len(sys.argv) > 1 else ""
-    target_goods_sign = ""
-    target_goods_id = ""
+    raw_goods_id = str(item.get("goods_id") or "").strip()
+    if raw_goods_id in ("0", "None", "null"):
+        raw_goods_id = ""
+    raw_goods_sign = str(item.get("goods_sign") or "").strip()
+    if raw_goods_sign in ("0", "None", "null"):
+        raw_goods_sign = ""
 
-    if target_arg:
-        if target_arg.isdigit():
-            target_goods_id = target_arg
-            print(f"\n[入参识别] 用户传入了商品 ID: {target_goods_id}")
-        elif len(target_arg) > 20 and ("_" in target_arg or "-" in target_arg or target_arg.isalnum()):
-            target_goods_sign = target_arg
-            print(f"\n[入参识别] 用户传入了商品 Sign: {target_goods_sign}")
-        else:
-            print(f"\n[入参识别] 用户传入了关键词搜索: '{target_arg}'，先调用 pdd.ddk.goods.search...")
-            search_params = {"keyword": target_arg, "page_size": 10}
-            if pid:
-                search_params["pid"] = pid
-            s_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", search_params)
-            s_list = s_res.get("goods_search_response", {}).get("goods_list", [])
-            if s_list:
-                first = s_list[0]
-                target_goods_sign = first.get("goods_sign")
-                target_goods_id = str(first.get("goods_id", ""))
-                print(f"  * 搜索命中首位商品: {first.get('goods_name')}")
-                print(f"  * 提取 goods_sign: {target_goods_sign}")
-                print(f"  * 搜索接口返回的 mall_name: {repr(first.get('mall_name'))}")
-            else:
-                print(f"  * 关键词 '{target_arg}' 搜索无结果，将从推荐榜提取测试商品。")
+    cleaned.update({
+        "platform": "pdd",
+        "goods_id": raw_goods_id or raw_goods_sign,
+        "goods_sign": raw_goods_sign,
+        "name": item.get("goods_name", ""),
+        "image_url": item.get("goods_image_url") or item.get("goods_thumbnail_url", ""),
+        "min_group_price_yuan": group_yuan,
+        "min_normal_price_yuan": normal_yuan,
+        "coupon_discount_yuan": coupon_yuan,
+        "subsidy_amount_yuan": subsidy_yuan,
+        "final_price_yuan": final_price_yuan,
+        "price": final_price_yuan,
+        "original_price": group_yuan,
+        "coupon_amount": coupon_yuan,
+        "has_coupon": bool(item.get("has_coupon", False) or coupon_discount > 0),
+        "promotion_rate_percent": comm_rate_pct,
+        "estimated_commission_yuan": est_comm_yuan,
+        "commission_rate": comm_rate_pct,
+        "commission_amount": est_comm_yuan,
+        "sales_tip": str(item.get("sales_tip") or "0"),
+        "mall_name": item.get("mall_name", ""),
+        "brand_name": item.get("brand_name", ""),
+        "category_name": item.get("opt_name") or item.get("cat_name", ""),
+        "search_id": item.get("search_id", ""),
+    })
+    return cleaned
 
-    if not target_goods_sign and not target_goods_id:
-        print("\n[自动选品] 正在从实时热销榜 (channel_type=5) 拉取 1 件热门商品测试...")
-        rec_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.recommend.get", {"channel_type": 5, "limit": 5})
-        rec_list = rec_res.get("goods_basic_detail_response", {}).get("list", [])
-        if not rec_list:
-            print("[错误] 推荐榜未返回商品，无法继续测试。API 返回:", rec_res)
-            sys.exit(1)
-        first = rec_list[0]
-        target_goods_sign = first.get("goods_sign")
-        target_goods_id = str(first.get("goods_id", ""))
-        print(f"  * 推荐榜选中商品: {first.get('goods_name')}")
-        print(f"  * 选中 goods_sign: {target_goods_sign}")
-        print(f"  * 榜单接口返回的 mall_name: {repr(first.get('mall_name'))}")
 
-    # ==================== 调用 pdd.ddk.goods.detail 官方详情接口 ====================
-    print_section("2. 调用官方详情接口: pdd.ddk.goods.detail")
-    detail_params = {}
-    if target_goods_sign:
-        detail_params["goods_sign"] = target_goods_sign
-    elif target_goods_id:
-        detail_params["goods_id"] = target_goods_id
+# ==============================================================================
+# 核心功能 1：获取榜单/推荐商品 (pdd.ddk.goods.recommend.get)
+# ==============================================================================
+def get_pdd_recommend_goods(
+    channel_type: int = 5,
+    offset: int = 0,
+    limit: int = 20,
+    pid: Optional[str] = None,
+    uid: Optional[str] = None,
+    list_id: Optional[str] = None,
+    client_id: str = PDD_CLIENT_ID,
+    client_secret: str = PDD_CLIENT_SECRET,
+) -> Dict[str, Any]:
+    """
+    获取多多进宝官方频道推荐/热销榜单商品：
+    - channel_type=5: 实时热销榜
+    - channel_type=1: 今日爆款榜
+    """
+    biz_params: Dict[str, Any] = {
+        "channel_type": channel_type,
+        "offset": offset,
+        "limit": limit,
+        "pid": pid or PDD_PID,
+        "custom_parameters": _build_custom_params(uid),
+    }
+    if list_id:
+        biz_params["list_id"] = list_id
+
+    res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.recommend.get", biz_params)
+    if not res or "error_response" in res:
+        err = (res or {}).get("error_response", {})
+        return {"status": "error", "error_msg": err.get("error_msg", "获取拼多多推荐列表失败")}
+
+    body = res.get("goods_basic_detail_response", {})
+    raw_list = body.get("list") or []
+    cleaned_list = [clean_pdd_goods_item(item) for item in raw_list]
+    return {
+        "status": "success",
+        "data": cleaned_list,
+        "total_count": body.get("total", len(cleaned_list)),
+        "list_id": body.get("list_id", ""),
+        "search_id": body.get("search_id", ""),
+        "next_offset": offset + len(cleaned_list),
+        "has_more": len(cleaned_list) >= limit,
+    }
+
+
+# ==============================================================================
+# 核心功能 2：关键词搜索商品 (pdd.ddk.goods.search)
+# ==============================================================================
+def search_pdd_goods(
+    keyword: str,
+    page: int = 1,
+    page_size: int = 20,
+    sort_type: int = 0,
+    with_coupon: bool = False,
+    pid: Optional[str] = None,
+    uid: Optional[str] = None,
+    client_id: str = PDD_CLIENT_ID,
+    client_secret: str = PDD_CLIENT_SECRET,
+) -> Dict[str, Any]:
+    """拼多多全网关键词/短链/标题搜索 (pdd.ddk.goods.search)"""
+    biz_params: Dict[str, Any] = {
+        "keyword": keyword,
+        "page": page,
+        "page_size": page_size,
+        "sort_type": sort_type,
+        "with_coupon": with_coupon,
+        "pid": pid or PDD_PID,
+        "custom_parameters": _build_custom_params(uid),
+    }
+    res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", biz_params)
+    if not res or "error_response" in res:
+        err = (res or {}).get("error_response", {})
+        return {"status": "error", "error_msg": err.get("error_msg", "拼多多商品搜索失败")}
+
+    body = res.get("goods_search_response", {})
+    raw_list = body.get("goods_list") or []
+    cleaned_list = [clean_pdd_goods_item(item) for item in raw_list]
+    return {
+        "status": "success",
+        "data": cleaned_list,
+        "total_count": body.get("total_count", len(cleaned_list)),
+        "list_id": body.get("list_id", ""),
+        "search_id": body.get("search_id", ""),
+    }
+
+
+# ==============================================================================
+# 核心功能 3：获取商品详情及短链探测降级 (pdd.ddk.goods.detail)
+# ==============================================================================
+def _resolve_goods_sign_by_id(
+    client_id: str,
+    client_secret: str,
+    goods_id: str,
+    pid: Optional[str] = None,
+) -> Optional[str]:
+    """当仅持有纯数字 goods_id 时，借助 pdd.ddk.goods.zs.unit.url.gen 短链与搜索反查 goods_sign"""
+    use_pid = pid or PDD_PID
+    if use_pid:
+        raw_url = f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}"
+        zs_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.zs.unit.url.gen", {
+            "source_url": raw_url,
+            "pid": use_pid,
+        })
+        short_url = (
+            (zs_res or {}).get("goods_zs_unit_generate_response", {}).get("short_url")
+            or (zs_res or {}).get("goods_zs_unit_generate_response", {}).get("url")
+        )
+        if short_url:
+            s_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", {"keyword": short_url, "page_size": 5})
+            for g in (s_res or {}).get("goods_search_response", {}).get("goods_list") or []:
+                if g.get("goods_sign"):
+                    return str(g["goods_sign"])
+
+    s_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", {"keyword": str(goods_id), "page_size": 5})
+    for g in (s_res or {}).get("goods_search_response", {}).get("goods_list") or []:
+        if str(g.get("goods_id")) == str(goods_id) and g.get("goods_sign"):
+            return str(g["goods_sign"])
+    return None
+
+
+def get_pdd_goods_detail(
+    client_id: str = PDD_CLIENT_ID,
+    client_secret: str = PDD_CLIENT_SECRET,
+    goods_sign: Optional[str] = None,
+    goods_id: Optional[Any] = None,
+    pid: Optional[str] = None,
+    custom_parameters: Optional[Any] = None,
+    search_id: Optional[str] = None,
+    goods_img_type: Optional[int] = None,
+    need_sku_info: bool = True,
+) -> Dict[str, Any]:
+    """查询拼多多商品详情 (pdd.ddk.goods.detail)，并在仅有 goods_id 时自动触发短链探测降级"""
+    if not goods_sign and not goods_id:
+        return {"status": "error", "error_msg": "必须提供 goods_sign 或 goods_id 之一", "error_code": -1}
+
+    biz_params: Dict[str, Any] = {"need_sku_info": need_sku_info}
+    if goods_sign:
+        biz_params["goods_sign"] = str(goods_sign).strip()
+    elif goods_id is not None:
+        biz_params["goods_id_list"] = [int(goods_id)] if str(goods_id).isdigit() else [str(goods_id)]
+
     if pid:
-        detail_params["pid"] = pid
+        biz_params["pid"] = pid
+    if custom_parameters:
+        biz_params["custom_parameters"] = custom_parameters
+    if search_id:
+        biz_params["search_id"] = search_id
+    if goods_img_type is not None:
+        biz_params["goods_img_type"] = goods_img_type
 
-    print(f"• 发送请求参数: {detail_params}")
-    raw_response = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", detail_params)
+    raw_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", biz_params)
 
-    goods_details = raw_response.get("goods_detail_response", {}).get("goods_details", [])
-    if not goods_details:
-        print("[错误] pdd.ddk.goods.detail 未返回商品详情！原始响应:")
-        print(json.dumps(raw_response, indent=2, ensure_ascii=False))
-        sys.exit(1)
+    # 若仅传了 goods_id 且被网关拒绝，自动通过短链+搜索探测出 goods_sign 重试
+    if raw_res and "error_response" in raw_res and not goods_sign and goods_id:
+        resolved_sign = _resolve_goods_sign_by_id(client_id, client_secret, str(goods_id), pid=pid)
+        if resolved_sign:
+            biz_params.pop("goods_id_list", None)
+            biz_params["goods_sign"] = resolved_sign
+            raw_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", biz_params)
 
-    raw_detail = goods_details[0]
+    if not raw_res or "error_response" in raw_res:
+        err = (raw_res or {}).get("error_response", {})
+        return {
+            "status": "error",
+            "error_code": err.get("error_code", -1),
+            "sub_code": err.get("sub_code", ""),
+            "error_msg": err.get("error_msg", "获取商品详情失败"),
+            "sub_msg": err.get("sub_msg", ""),
+        }
 
-    # ==================== 重点字段详细分析 ====================
-    print_section("3. 官方详情字段分类诊断与店铺字段透视")
+    details = raw_res.get("goods_detail_response", {}).get("goods_details") or []
+    if not details:
+        return {"status": "error", "error_code": 404, "error_msg": "未找到对应的拼多多商品详情"}
 
-    print("\n【A. 店铺与商家核心字段】：")
-    mall_keys = [
-        "mall_name", "mall_id", "merchant_type", "mall_cps", "has_mall_coupon",
-        "mall_coupon_discount_pct", "mall_coupon_remain_quantity", "mall_img_url"
-    ]
-    for k in mall_keys:
-        val = raw_detail.get(k)
-        print(f"  - {k:<25}: {repr(val)} (类型: {type(val).__name__})")
+    cleaned = clean_pdd_goods_item(details[0])
+    gallery = cleaned.get("goods_gallery_urls") or []
+    if not gallery and cleaned.get("image_url"):
+        gallery = [cleaned["image_url"]]
 
-    mall_name_val = raw_detail.get("mall_name")
-    if mall_name_val == "" or mall_name_val is None:
-        print("  ⚠️ 【诊断结论】拼多多官方 detail 接口确实返回了 mall_name 字段，但其值为空字符串 '' 或 None！")
-        print("     这证明：拼多多多多进宝在 API 网关层面对普通分销账号隐去或未透出店铺名称。")
+    raw_utags = cleaned.get("unified_tags") or []
+    parsed_utags = []
+    for t in raw_utags:
+        label = UNIFIED_TAG_MAP.get(t)
+        if label and label not in parsed_utags:
+            parsed_utags.append(label)
+
+    raw_stags = cleaned.get("service_tags") or []
+    parsed_services = []
+    for s in raw_stags:
+        s_label = SERVICE_TAG_MAP.get(s)
+        if s_label and s_label not in parsed_services:
+            parsed_services.append(s_label)
+
+    detail_tags = list(parsed_utags)
+    if cleaned.get("brand_name") and f"品牌:{cleaned['brand_name']}" not in detail_tags:
+        detail_tags.append(f"品牌:{cleaned['brand_name']}")
+    if cleaned.get("is_pre_sale"):
+        detail_tags.append("预售商品")
+
+    c_start = cleaned.get("coupon_start_time", 0)
+    c_end = cleaned.get("coupon_end_time", 0)
+    valid_tip = ""
+    if c_start and c_end:
+        try:
+            s_str = datetime.fromtimestamp(c_start, tz=timezone.utc).strftime("%m.%d")
+            e_str = datetime.fromtimestamp(c_end, tz=timezone.utc).strftime("%m.%d")
+            valid_tip = f"{s_str} - {e_str} 有效"
+        except Exception:
+            pass
+
+    cleaned.update({
+        "desc": cleaned.get("goods_desc") or cleaned.get("goods_name", ""),
+        "carousel_images": gallery,
+        "detail_tags": detail_tags,
+        "unified_tags": parsed_utags,
+        "service_guarantees": parsed_services,
+        "shop_ratings": {
+            "desc_score": cleaned.get("desc_txt") or "",
+            "serv_score": cleaned.get("serv_txt") or "",
+            "lgst_score": cleaned.get("lgst_txt") or "",
+        },
+        "coupon_info": {
+            "coupon_total_quantity": cleaned.get("coupon_total_quantity", 0),
+            "coupon_remain_quantity": cleaned.get("coupon_remain_quantity", 0),
+            "coupon_min_order_amount_yuan": round((cleaned.get("coupon_min_order_amount") or 0) / 100.0, 2),
+            "valid_tip": valid_tip,
+        },
+    })
+    return {"status": "success", "data": cleaned}
+
+
+# ==============================================================================
+# 核心功能 4：三层智能兜底转链 (rp.prom[23] -> goods.promotion -> zs.unit)
+# ==============================================================================
+def convert_pdd_promotion_url(
+    goods_sign: Optional[str] = None,
+    goods_id: Optional[str] = None,
+    search_id: Optional[str] = None,
+    source_url: Optional[str] = None,
+    uid: Optional[str] = None,
+    pid: Optional[str] = None,
+    prefer_subsidy: bool = False,
+    client_id: str = PDD_CLIENT_ID,
+    client_secret: str = PDD_CLIENT_SECRET,
+) -> Dict[str, Any]:
+    """
+    三层智能降级转链：
+    1. 若 prefer_subsidy=True 且有 goods_sign，优先尝试百亿补贴营销频道 (pdd.ddk.rp.prom.url.generate, channel_type=23)
+    2. 常规单品推广转链 (pdd.ddk.goods.promotion.url.generate)
+    3. 招商长短链兜底转链 (pdd.ddk.goods.zs.unit.url.gen)
+    """
+    use_pid = pid or PDD_PID
+    custom_params = _build_custom_params(uid)
+
+    # 策略 1：百亿补贴/营销页转链
+    if prefer_subsidy and goods_sign:
+        rp_params = {
+            "channel_type": 23,
+            "p_id_list": [use_pid],
+            "custom_parameters": custom_params,
+            "generate_short_url": True,
+            "generate_we_app": True,
+            "diy_subsidy_param": {"goods_sign": goods_sign},
+        }
+        rp_res = call_pdd_api(client_id, client_secret, "pdd.ddk.rp.prom.url.generate", rp_params)
+        url_list = (rp_res or {}).get("rp_promotion_url_generate_response", {}).get("url_list") or []
+        if url_list:
+            first = url_list[0]
+            link = first.get("mobile_short_url") or first.get("short_url") or first.get("mobile_url") or first.get("url")
+            if link:
+                return {
+                    "status": "success",
+                    "link_type": "百亿补贴专属加补链",
+                    "final_link": link,
+                    "short_url": first.get("short_url", link),
+                    "url": first.get("url", link),
+                    "we_app_info": first.get("we_app_info", {}),
+                }
+
+    # 策略 2：常规单品推广转链
+    if goods_sign:
+        gen_params: Dict[str, Any] = {
+            "p_id": use_pid,
+            "goods_sign_list": [goods_sign],
+            "custom_parameters": custom_params,
+            "generate_short_url": True,
+            "generate_we_app": True,
+            "generate_authority_url": False,
+        }
+        if search_id:
+            gen_params["search_id"] = search_id
+        gen_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.promotion.url.generate", gen_params)
+        url_list = (gen_res or {}).get("goods_promotion_url_generate_response", {}).get("goods_promotion_url_list") or []
+        if url_list:
+            first = url_list[0]
+            link = first.get("mobile_short_url") or first.get("short_url") or first.get("mobile_url") or first.get("url")
+            if link:
+                return {
+                    "status": "success",
+                    "link_type": "常规单品领券推广链",
+                    "final_link": link,
+                    "short_url": first.get("short_url", link),
+                    "url": first.get("url", link),
+                    "we_app_info": first.get("we_app_info", {}),
+                }
+
+    # 策略 3：招商短链兜底转链
+    target_source_url = source_url or (f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}" if goods_id else "")
+    if target_source_url:
+        zs_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.zs.unit.url.gen", {
+            "source_url": target_source_url,
+            "pid": use_pid,
+            "custom_parameters": custom_params,
+        })
+        zs_body = (zs_res or {}).get("goods_zs_unit_generate_response", {})
+        link = zs_body.get("mobile_short_url") or zs_body.get("short_url") or zs_body.get("mobile_url") or zs_body.get("url")
+        if link:
+            return {
+                "status": "success",
+                "link_type": "招商长短链兜底推广",
+                "final_link": link,
+                "short_url": zs_body.get("short_url", link),
+                "url": zs_body.get("url", link),
+            }
+
+    return {"status": "error", "error_msg": "拼多多三层推广转链均未获取到有效链接"}
+
+
+# ==============================================================================
+# 核心功能 5：推手授权备案查询与生成 (member.authority.query & rp.prom[10])
+# ==============================================================================
+def check_pdd_member_authority(
+    uid: str = "default_user",
+    pid: Optional[str] = None,
+    client_id: str = PDD_CLIENT_ID,
+    client_secret: str = PDD_CLIENT_SECRET,
+) -> Dict[str, Any]:
+    """查询推手是否已完成拼多多备案授权 (pdd.ddk.member.authority.query)"""
+    res = call_pdd_api(client_id, client_secret, "pdd.ddk.member.authority.query", {
+        "pid": pid or PDD_PID,
+        "custom_parameters": _build_custom_params(uid),
+    })
+    if not res or "error_response" in res:
+        err = (res or {}).get("error_response", {})
+        return {"status": "error", "error_msg": err.get("error_msg", "查询拼多多备案状态失败")}
+
+    bind = (res.get("authority_query_response") or {}).get("bind", 0)
+    return {"status": "success", "bind": bind, "is_authorized": bind == 1}
+
+
+def generate_pdd_authority_url(
+    uid: str = "default_user",
+    pid: Optional[str] = None,
+    client_id: str = PDD_CLIENT_ID,
+    client_secret: str = PDD_CLIENT_SECRET,
+) -> Dict[str, Any]:
+    """生成拼多多推手专属备案授权链接 (pdd.ddk.rp.prom.url.generate, channel_type=10)"""
+    res = call_pdd_api(client_id, client_secret, "pdd.ddk.rp.prom.url.generate", {
+        "channel_type": 10,
+        "p_id_list": [pid or PDD_PID],
+        "custom_parameters": _build_custom_params(uid),
+        "generate_short_url": True,
+        "generate_mobile": True,
+    })
+    if not res or "error_response" in res:
+        err = (res or {}).get("error_response", {})
+        return {"status": "error", "error_msg": err.get("error_msg", "生成拼多多授权链接失败")}
+
+    url_list = (res.get("rp_promotion_url_generate_response") or {}).get("url_list") or []
+    if not url_list:
+        return {"status": "error", "error_msg": "拼多多返回授权链接列表为空"}
+
+    first = url_list[0]
+    auth_url = first.get("mobile_short_url") or first.get("mobile_url") or first.get("short_url") or first.get("url", "")
+    return {
+        "status": "success",
+        "auth_url": auth_url,
+        "url": first.get("url", ""),
+        "short_url": first.get("short_url", ""),
+        "mobile_url": first.get("mobile_url", ""),
+    }
+
+
+# ==============================================================================
+# 核心功能 6：增量订单拉取与清洗 (pdd.ddk.order.list.increment.get)
+# ==============================================================================
+def fetch_pdd_increment_orders(
+    start_update_time: int,
+    end_update_time: int,
+    page: int = 1,
+    page_size: int = 50,
+    client_id: str = PDD_CLIENT_ID,
+    client_secret: str = PDD_CLIENT_SECRET,
+) -> Dict[str, Any]:
+    """拉取拼多多更新时间段内的增量订单列表 (pdd.ddk.order.list.increment.get)"""
+    res = call_pdd_api(client_id, client_secret, "pdd.ddk.order.list.increment.get", {
+        "start_update_time": int(start_update_time),
+        "end_update_time": int(end_update_time),
+        "page": page,
+        "page_size": page_size,
+        "return_count": True,
+    })
+    if not res or "error_response" in res:
+        err = (res or {}).get("error_response", {})
+        return {"status": "error", "error_msg": err.get("error_msg", "拉取拼多多增量订单失败"), "order_list": []}
+
+    body = res.get("order_list_get_response", {})
+    raw_orders = body.get("order_list") or []
+    total_count = body.get("total_count", len(raw_orders))
+    return {
+        "status": "success",
+        "total_count": total_count,
+        "order_list": raw_orders,
+        "has_more": page * page_size < total_count if isinstance(total_count, int) else len(raw_orders) >= page_size,
+    }
+
+
+# ==============================================================================
+# 全链路自检验证主流程
+# ==============================================================================
+def main():
+    print("================================================================================")
+    print("拼多多 (多多进宝 DDK) 全链路标准基线验证脚本")
+    print("================================================================================")
+    if not PDD_CLIENT_ID or not PDD_CLIENT_SECRET:
+        print("未检测到拼多多配置 (myself_pdd_client_id / secret)，请先检查 config.local.json。")
+        return
+
+    test_uid = "u_baseline_test"
+
+    # 1. 验证热销榜单 (channel_type=5 实时热销榜 & channel_type=1 今日爆款榜)
+    print("\n[1/6] 验证拼多多榜单拉取 (channel_type=5 实时热销榜)...")
+    rec_res = get_pdd_recommend_goods(channel_type=5, limit=3, uid=test_uid)
+    sample_sign = None
+    sample_id = None
+    if rec_res["status"] == "success" and rec_res["data"]:
+        first = rec_res["data"][0]
+        sample_sign = first.get("goods_sign")
+        sample_id = first.get("goods_id")
+        print(f" -> 成功拉取 {len(rec_res['data'])} 条推荐商品，首条: {first['name'][:25]} (¥{first['price']})")
     else:
-        print(f"  ✓ 【诊断结论】该商品有返回店铺名称: '{mall_name_val}'")
+        print(f" -> 推荐拉取失败: {rec_res.get('error_msg')}")
 
-    print("\n【B. 品牌与分类字段】：")
-    brand_keys = ["brand_name", "category_name", "category_id", "cat_ids", "opt_name"]
-    for k in brand_keys:
-        print(f"  - {k:<25}: {repr(raw_detail.get(k))}")
+    # 2. 验证关键词搜索
+    print("\n[2/6] 验证拼多多关键词搜索 (pdd.ddk.goods.search)...")
+    search_res = search_pdd_goods("抽纸", page=1, page_size=3, uid=test_uid)
+    if search_res["status"] == "success" and search_res["data"]:
+        first = search_res["data"][0]
+        sample_sign = sample_sign or first.get("goods_sign")
+        sample_id = sample_id or first.get("goods_id")
+        print(f" -> 搜索成功，共命中 {search_res['total_count']} 条，首条: {first['name'][:25]} (¥{first['price']})")
+    else:
+        print(f" -> 搜索失败: {search_res.get('error_msg')}")
 
-    print("\n【C. 价格与佣金字段】：")
-    price_keys = [
-        "min_group_price", "min_normal_price", "promotion_rate", "predict_promotion_rate",
-        "has_coupon", "coupon_discount", "coupon_remain_quantity", "sales_tip"
-    ]
-    for k in price_keys:
-        print(f"  - {k:<25}: {repr(raw_detail.get(k))}")
+    # 3. 验证商品详情
+    print("\n[3/6] 验证拼多多商品详情 (pdd.ddk.goods.detail)...")
+    if sample_sign or sample_id:
+        detail_res = get_pdd_goods_detail(goods_sign=sample_sign, goods_id=sample_id, pid=PDD_PID)
+        if detail_res["status"] == "success":
+            d = detail_res["data"]
+            print(f" -> 详情获取成功: {d['name'][:25]} | 店铺: {d.get('mall_name')} | 轮播图: {len(d.get('carousel_images', []))}张")
+        else:
+            print(f" -> 详情获取失败: {detail_res.get('error_msg')}")
 
-    print("\n【D. 服务评分与标签】：")
-    rating_keys = ["desc_txt", "serv_txt", "lgst_txt", "unified_tags", "service_tags", "activity_tags"]
-    for k in rating_keys:
-        print(f"  - {k:<25}: {repr(raw_detail.get(k))}")
+    # 4. 验证三层智能转链
+    print("\n[4/6] 验证拼多多三层智能兜底转链...")
+    if sample_sign or sample_id:
+        conv_res = convert_pdd_promotion_url(goods_sign=sample_sign, goods_id=sample_id, uid=test_uid)
+        print(f" -> 转链结果: status={conv_res['status']}, type={conv_res.get('link_type')}, link={conv_res.get('final_link')}")
 
-    print("\n【E. 图片与轮播实拍】：")
-    print(f"  - goods_image_url        : {raw_detail.get('goods_image_url')}")
-    gallery = raw_detail.get("goods_gallery_urls", [])
-    print(f"  - goods_gallery_urls     : 共 {len(gallery)} 张实拍大图")
-    for i, img in enumerate(gallery[:3]):
-        print(f"      [{i+1}] {img}")
-    if len(gallery) > 3:
-        print(f"      ... 还有 {len(gallery) - 3} 张")
+    # 5. 验证推手备案查询与授权链接生成
+    print("\n[5/6] 验证拼多多推手备案查询与授权链接生成...")
+    auth_res = check_pdd_member_authority(uid=test_uid)
+    print(f" -> 备案查询结果: {auth_res}")
+    if not auth_res.get("is_authorized"):
+        url_res = generate_pdd_authority_url(uid=test_uid)
+        print(f" -> 授权链接生成结果: status={url_res['status']}, auth_url={url_res.get('auth_url')}")
 
-    # ==================== 对比清洗与适配器层输出 ====================
-    print_section("4. 对比系统清洗层与适配器层输出")
-    try:
-        from infrastructure.pdd_client import clean_goods_item
-        from adapters.pdd_adapter import PddAdapter
-
-        cleaned = clean_goods_item(raw_detail, source_type="test_detail")
-        print(f"• clean_goods_item 清洗后的 mall_name: {repr(cleaned.get('mall_name'))}")
-
-        adapter = PddAdapter()
-        normalized = adapter._normalize_goods(cleaned)
-        print(f"• PddAdapter._normalize_goods 后的 mall_name: {repr(normalized.get('mall_name'))}")
-        print(f"• 最终生成的 specs (规格列表):")
-        for spec in normalized.get("specs", []):
-            print(f"    - {spec.get('label')}: {spec.get('value')}")
-        if not any(s.get("label") == "店铺名称" for s in normalized.get("specs", [])):
-            print("    ℹ️ 注：因 mall_name 为空，规格参数中自动过滤了'店铺名称'行。")
-    except Exception as e:
-        print(f"• (适配器层可选对比跳过: {e})")
-
-    # ==================== 导出完整原始 JSON ====================
-    print_section("5. 导出完整原始 JSON 数据")
-    out_file = CURRENT_DIR / "pdd_detail_raw.json"
-    try:
-        with open(out_file, "w", encoding="utf-8") as f:
-            json.dump(raw_detail, f, ensure_ascii=False, indent=2)
-        print(f"✓ 官方完整原始数据 (共 {len(raw_detail)} 个字段) 已成功写入文件:")
-        print(f"  {out_file.resolve()}")
-    except Exception as e:
-        print(f"[警告] 写入文件失败: {e}")
-
-    print("\n【完整字段列表 (按字母排序)】：")
-    for idx, key in enumerate(sorted(raw_detail.keys()), 1):
-        print(f"  {idx:2d}. {key}")
-
-    print("\n" + "=" * 68)
-    print("  测试完成！你可以直接打开 pdd_detail_raw.json 查看所有完整字段与值。")
-    print("=" * 68 + "\n")
+    # 6. 验证增量订单查询
+    print("\n[6/6] 验证拼多多增量订单拉取 (最近 1 小时)...")
+    now_ts = int(time.time())
+    ord_res = fetch_pdd_increment_orders(now_ts - 3600, now_ts)
+    print(f" -> 订单查询结果: status={ord_res['status']}, 数量={len(ord_res.get('order_list', []))}")
 
 
 if __name__ == "__main__":

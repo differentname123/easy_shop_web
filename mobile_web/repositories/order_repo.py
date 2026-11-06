@@ -113,19 +113,10 @@ class OrderRepository(BaseRepository):
         return result.modified_count
 
     @staticmethod
-    def _status_flag(doc: dict, field: str, statuses: list) -> bool:
-        return doc[field] is True if field in doc else doc.get("order_status") in statuses
+    def _status_expression(field: str) -> dict:
+        return {"$eq": [f"${field}", True]}
 
-    @staticmethod
-    def _status_expression(field: str, statuses: list) -> dict:
-        # 显式 False 优先；只有旧文档缺失规范字段时才回退到适配器规则。
-        return {"$cond": [
-            {"$eq": [{"$type": f"${field}"}, "missing"]},
-            {"$in": ["$order_status", statuses]},
-            {"$eq": [f"${field}", True]},
-        ]}
-
-    def _format_order(self, doc: dict, rules: dict) -> dict:
+    def _format_order(self, doc: dict) -> dict:
         doc = normalize_order_fields(doc, doc.get("platform", ""))
         pay_time = doc.get("order_pay_time")
         order_time = doc["order_time"]
@@ -147,8 +138,8 @@ class OrderRepository(BaseRepository):
             "promotion_rate": doc.get("promotion_rate", 0),
             "order_status": doc.get("order_status"),
             "order_status_desc": doc.get("order_status_desc", "未知状态"),
-            "is_refund": self._status_flag(doc, "is_refund", rules.get("refund", [])),
-            "is_settled": self._status_flag(doc, "is_settled", rules.get("settled", [])),
+            "is_refund": doc.get("is_refund") is True,
+            "is_settled": doc.get("is_settled") is True,
             "is_invalid": doc.get("is_invalid") is True,
             "order_time": order_time,
             "order_time_basis": doc["order_time_basis"],
@@ -163,7 +154,6 @@ class OrderRepository(BaseRepository):
         promoter_uid: str = "",
         start_timestamp: Optional[int] = None,
         limit: int = 100,
-        legacy_order_statuses: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Mongo 单次 facet：统计全量匹配订单，明细单独排序/截取。失败交给服务返回 error。"""
         empty = {
@@ -181,10 +171,9 @@ class OrderRepository(BaseRepository):
                 {"order_time": {"$gte": int(start_timestamp)}},
                 {"order_time": None, "order_pay_time": {"$gte": int(start_timestamp)}},
             ]
-        rules = legacy_order_statuses or {}
-        refund = self._status_expression("is_refund", list(rules.get("refund", [])))
-        settled = self._status_expression("is_settled", list(rules.get("settled", [])))
-        invalid = self._status_expression("is_invalid", [])
+        refund = self._status_expression("is_refund")
+        settled = self._status_expression("is_settled")
+        invalid = self._status_expression("is_invalid")
         pipeline = [
             {"$match": query},
             {"$facet": {
@@ -224,5 +213,5 @@ class OrderRepository(BaseRepository):
             "settled_commission": round(float(stats.get("settled_commission", 0)), 2),
             "refund_commission": round(float(stats.get("refund_commission", 0)), 2),
             "refund_count": int(stats.get("refund_count", 0)),
-            "order_list": [self._format_order(doc, rules) for doc in facet.get("order_list", [])],
+            "order_list": [self._format_order(doc) for doc in facet.get("order_list", [])],
         }

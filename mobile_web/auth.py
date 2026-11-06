@@ -16,7 +16,6 @@ from config import AUTH_SECRET
 
 TOKEN_TTL_SECONDS = 30 * 86400  # 访问令牌默认有效期 30 天
 PBKDF2_ITERATIONS = 100_000
-LEGACY_SALT = "easy_shop_salt_2026"
 
 
 def create_access_token(uid: str, ttl: int = TOKEN_TTL_SECONDS) -> str:
@@ -124,26 +123,23 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, stored_hash: Optional[str]) -> bool:
     """
-    校验密码哈希，平滑兼容旧加盐 SHA256 格式
+    校验 PBKDF2-HMAC-SHA256 密码哈希
     """
     if not password or not stored_hash or not isinstance(stored_hash, str):
         return False
-    # 1. 尝试新标准 PBKDF2 校验
-    if stored_hash.startswith("pbkdf2_sha256$"):
-        try:
-            parts = stored_hash.split("$")
-            if len(parts) == 4:
-                _, iter_str, salt_hex, digest_hex = parts
-                salt = bytes.fromhex(salt_hex)
-                expected = bytes.fromhex(digest_hex)
-                actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iter_str))
-                return hmac.compare_digest(actual, expected)
-        except Exception:
-            return False
-
-    # 2. 向后兼容旧格式加盐单次 SHA-256
-    legacy_expected = hashlib.sha256(f"{LEGACY_SALT}_{password}_{LEGACY_SALT}".encode("utf-8")).hexdigest()
-    return hmac.compare_digest(stored_hash, legacy_expected)
+    if not stored_hash.startswith("pbkdf2_sha256$"):
+        return False
+    try:
+        parts = stored_hash.split("$")
+        if len(parts) == 4:
+            _, iter_str, salt_hex, digest_hex = parts
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(digest_hex)
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iter_str))
+            return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+    return False
 
 
 def mask_phone(phone: Optional[str]) -> str:

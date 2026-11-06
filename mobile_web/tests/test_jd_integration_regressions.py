@@ -70,6 +70,6 @@ def test_fractional_modify_clock_cannot_allow_old_state_to_roll_back(newer, olde
 def test_jd_display_time_roundtrips_shanghai_not_timezone_less_utc(source):
     adapter = JdAdapter(SimpleNamespace(jd_enabled=True), client=Mock())
     doc = adapter.normalize_order({"id": "row", "validCode": 16, "orderTime": source})
-    row = OrderRepository()._format_order(doc, {})
+    row = OrderRepository()._format_order(doc)
     assert row["order_time_str"] == source[:16]
     assert row["order_time_basis"] == "created" and row["order_pay_time_str"] == ""

@@ -341,9 +341,6 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(stored["name"], "新标题")
         self.assertEqual(stored["activity_price"], 9)
         self.assertEqual(stored["channel_type"], 5)
-        self.assertFalse(stored["need_reformat"])
-        self.assertEqual(stored["format_status"], "success")
-        self.assertEqual(stored["format_retry_count"], 999)
 
     def test_summary_can_update_explicit_brand_and_category(self):
         self.repo.upsert_home_products([{"goods_id": "100", "brand": "旧", "category": "旧类"}])

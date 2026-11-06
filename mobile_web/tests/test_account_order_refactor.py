@@ -23,7 +23,6 @@ class Adapter:
     active = True
     platform_code = "future_shop"
     platform_name = "测试平台"
-    legacy_order_statuses = {"refund": ["returned"], "settled": ["paid_out"]}
 
     def __init__(self):
         self.convert_promotion_url = MagicMock(return_value={"status": "success", "url": "https://example.com/promo"})
@@ -337,23 +336,23 @@ def test_aggregation_covers_all_matches_not_only_100_display_rows():
     assert not any("$limit" in stage for stage in col.pipeline[1]["$facet"]["stats"])
 
 
-def test_canonical_false_wins_and_legacy_rules_are_platform_supplied():
+def test_canonical_boolean_flags_drive_order_stats():
     docs = [
-        {"order_sn": "false", "order_status": "returned", "is_refund": False, "is_settled": True},
-        {"order_sn": "legacy-refund", "order_status": "returned"},
-        {"order_sn": "legacy-settled", "order_status": "paid_out"},
-        {"order_sn": "not-pdd", "order_status": 4},
-        {"order_sn": "settled-false", "order_status": "paid_out", "is_settled": False},
+        {"order_sn": "settled-1", "order_status": "returned", "is_refund": False, "is_settled": True},
+        {"order_sn": "refund-1", "order_status": "returned", "is_refund": True, "is_settled": False},
+        {"order_sn": "settled-2", "order_status": "paid_out", "is_refund": False, "is_settled": True},
+        {"order_sn": "unsettled", "order_status": 4, "is_refund": False, "is_settled": False},
+        {"order_sn": "settled-false", "order_status": "paid_out", "is_refund": False, "is_settled": False},
     ]
     for doc in docs:
         doc.update(platform="future_shop", promoter_uid="u_a", promotion_amount_yuan=2)
     repo = order_repo_for(MemoryOrderCollection(docs))
-    result = repo.query_user_orders("future_shop", "u_a", legacy_order_statuses=Adapter.legacy_order_statuses)
+    result = repo.query_user_orders("future_shop", "u_a")
     assert result["total_count"] == 5 and result["total_commission"] == 8
     assert result["refund_count"] == 1 and result["refund_commission"] == 2
     assert result["settled_commission"] == 4
     by_id = {order["order_sn"]: order for order in result["order_list"]}
-    assert not by_id["false"]["is_refund"] and not by_id["not-pdd"]["is_refund"]
+    assert not by_id["settled-1"]["is_refund"] and not by_id["unsettled"]["is_refund"]
     assert not by_id["settled-false"]["is_settled"]
 
 
@@ -402,7 +401,6 @@ def test_busy_lock_returns_local_data_without_start_or_sdk(orders):
         order_module.get_adapter.assert_not_called()
         adapter.fetch_increment_orders.assert_not_called()
         assert repo.query_user_orders.call_args.kwargs["start_timestamp"] is None
-        assert repo.query_user_orders.call_args.kwargs["legacy_order_statuses"] == adapter.legacy_order_statuses
     finally:
         order_module._platform_lock("future_shop").release()
 

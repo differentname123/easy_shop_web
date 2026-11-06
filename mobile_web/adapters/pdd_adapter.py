@@ -3,7 +3,7 @@
 import re
 from typing import Dict, Any
 from urllib.parse import urlencode, urlsplit
-from adapters.base import BasePlatformAdapter, build_command_text
+from adapters.base import BasePlatformAdapter
 from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id
 from config import PDD_CLIENT_ID, PDD_CLIENT_SECRET, PDD_PID, logger, settings
@@ -29,7 +29,6 @@ class PddAdapter(BasePlatformAdapter):
         {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
         {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
     )
-    legacy_order_statuses = {"refund": [4], "settled": [3, 5]}
 
     def __init__(self, client_id=PDD_CLIENT_ID, client_secret=PDD_CLIENT_SECRET, pid=PDD_PID, enabled=None):
         self.active = settings.pdd_enabled if enabled is None else bool(enabled)
@@ -57,8 +56,9 @@ class PddAdapter(BasePlatformAdapter):
     def normalize_order(self, order: dict) -> dict:
         result = dict(order)
         status = result.get("order_status")
-        for field, rule in (("is_refund", "refund"), ("is_settled", "settled")):
-            result[field] = bool(result[field]) if result.get(field) is not None else status in self.legacy_order_statuses[rule]
+        status_rules = {"is_refund": (4,), "is_settled": (3, 5)}
+        for field, codes in status_rules.items():
+            result[field] = bool(result[field]) if result.get(field) is not None else status in codes
         return result
 
     def _normalize_goods_summary(self, raw_cleaned: dict) -> dict:
@@ -211,10 +211,6 @@ class PddAdapter(BasePlatformAdapter):
             )
             return {"status": "error", "error_msg": str(exc)}
 
-    @staticmethod
-    def _build_command_text(title, final_link, price=None, coupon=None) -> str:
-        return build_command_text(title, final_link, price, coupon, "拼多多")
-
     def _resolve_goods_id(self, goods_id_or_sign: str, kwargs: dict) -> tuple:
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
         return ref.goods_id or None, ref.goods_sign or None
@@ -363,17 +359,6 @@ class PddAdapter(BasePlatformAdapter):
         final_direct_url = source_url or ("https://mobile.yangkeduo.com/goods.html?" + urlencode({"goods_sign": goods_sign}))
         return self._promotion_result(
             final_direct_url, {}, title, price, coupon, "商品直连保底", is_fallback=True,
-        )
-
-    def _handle_unauthorized_conversion(self, goods_sign, uid, **kwargs) -> Dict[str, Any]:
-        return self.convert_promotion_url(goods_sign, uid=uid, **kwargs)
-
-    def _handle_fallback_conversion(self, goods_id, goods_sign, uid, title="精选高性价比好物", price=None, coupon=None,
-                                    product_url=None, **kwargs) -> Dict[str, Any]:
-        """兼容保留：委托当前有效 UID 的单次转链策略。"""
-        return self.convert_promotion_url(
-            goods_sign or goods_id or "", uid=uid, goods_id=goods_id, goods_sign=goods_sign,
-            title=title, price=price, coupon_amount=coupon, product_url=product_url, **kwargs
         )
 
     def check_authority(self, uid) -> Dict[str, Any]:

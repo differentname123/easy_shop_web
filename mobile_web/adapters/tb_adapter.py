@@ -57,7 +57,6 @@ class TaobaoAdapter(BasePlatformAdapter):
     required_identity_fields = ("relation_id",)
     requires_authorized_promotion = True
     order_window_seconds = ORDER_WINDOW_SECONDS
-    legacy_order_statuses = {"settled": [3], "refund": []}
 
     def __init__(self, settings=None, official_client=None, hdk_client=None, ztk_client=None, **overrides):
         if settings is None:
@@ -73,7 +72,9 @@ class TaobaoAdapter(BasePlatformAdapter):
         self.official = official_client if official_client is not None else TaobaoClient(
             key, secret, adzone, setting("tb_session"), setting("tb_inviter_code"))
         self.hdk = hdk_client if hdk_client is not None else HdkClient(setting("hdk_api_key"))
-        self.ztk = ztk_client if ztk_client is not None else ZtkClient(setting("ztk_appkey"), setting("ztk_sid"))
+        ztk_keys = setting("ztk_appkey_list", ())
+        self.ztk = ztk_client if ztk_client is not None else ZtkClient(
+            setting("ztk_appkey"), setting("ztk_sid"), appkey_list=ztk_keys)
         pid_val = _text(setting("tb_pid"))
         pid_prefix = _text(setting("tb_pid_prefix"))
         if not pid_prefix and pid_val.startswith("mm_") and len(pid_val.split("_")) == 4:
@@ -84,11 +85,12 @@ class TaobaoAdapter(BasePlatformAdapter):
         self.channel_pid = _text(setting("tb_channel_pid")) or f"{pid_prefix}_{channel_adzone}"
         official_ok = bool(official_client is not None or key and secret)
         search_ok = bool(official_client is not None or official_ok and adzone)
+        has_ztk_key = bool(getattr(self.ztk, "appkey_list", None) or setting("ztk_appkey") or ztk_keys)
         self.capabilities = {
             "recommend": bool(official_ok and (hdk_client is not None or setting("hdk_api_key"))),
             "search": search_ok, "detail": official_ok, "promotion": search_ok,
             "authorization": bool(official_client is not None or official_ok and setting("tb_session")),
-            "orders": bool(ztk_client is not None or setting("ztk_appkey") and setting("ztk_sid")),
+            "orders": bool(ztk_client is not None or has_ztk_key and setting("ztk_sid")),
         }
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
