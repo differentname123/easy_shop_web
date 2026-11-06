@@ -45,6 +45,7 @@ class Settings:
     tb_inviter_code: str = field(default="", repr=False)
     hdk_api_key: str = field(default="", repr=False)
     ztk_appkey: str = field(default="", repr=False)
+    ztk_appkey_list: tuple = field(default=(), repr=False)
     ztk_sid: str = field(default="", repr=False)
     detail_prefetch_enabled: bool = True
     detail_prefetch_interval_seconds: int = 300
@@ -140,7 +141,32 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
     jd_app_key = text("myself_jd_app_key").strip()
     jd_app_secret = text("myself_jd_app_secret")
     jd_api_base = text("jd_api_base", "http://api.zhetaoke.com:20000/api").strip()
-    ztk_appkey = text("zhetaoke_appkey").strip()
+
+    def _parse_key_entries(raw_val, field_name):
+        if raw_val is None:
+            return []
+        if isinstance(raw_val, bool):
+            raise SettingsError(f"{field_name} 必须是字符串或字符串列表")
+        if isinstance(raw_val, (str, int)):
+            return [part.strip() for part in str(raw_val).split(",") if part.strip()]
+        if isinstance(raw_val, list):
+            items = []
+            for entry in raw_val:
+                if isinstance(entry, bool) or not isinstance(entry, (str, int)):
+                    raise SettingsError(f"{field_name} 列表元素必须是字符串")
+                items.extend(part.strip() for part in str(entry).split(",") if part.strip())
+            return items
+        raise SettingsError(f"{field_name} 必须是字符串或字符串列表")
+
+    primary_keys = _parse_key_entries(values.get("zhetaoke_appkey", ""), "zhetaoke_appkey")
+    extra_keys = _parse_key_entries(values.get("zhetaoke_appkey_list", None), "zhetaoke_appkey_list")
+    merged_keys = []
+    for k in primary_keys + extra_keys:
+        if k and k not in merged_keys:
+            merged_keys.append(k)
+    ztk_appkey_list = tuple(merged_keys)
+    ztk_appkey = ztk_appkey_list[0] if ztk_appkey_list else ""
+
     # Identity values stay strings, including values larger than JavaScript's safe integers.
     for name, value in (("myself_jd_union_id", jd_union_id), ("myself_jd_position_id", jd_position_id)):
         if value and (not value.isascii() or not value.isdigit() or not value.lstrip("0")):
@@ -224,7 +250,7 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
         tb_app_key=tb_app_key, tb_app_secret=tb_app_secret, tb_pid=tb_pid, tb_adzone_id=tb_adzone_id,
         tb_session=text("taobao_session").strip(), tb_inviter_code=text("taobao_inviter_code").strip(),
         hdk_api_key=text("haodanku_api_key").strip(),
-        ztk_appkey=ztk_appkey, ztk_sid=text("zhetaoke_sid").strip(),
+        ztk_appkey=ztk_appkey, ztk_appkey_list=ztk_appkey_list, ztk_sid=text("zhetaoke_sid").strip(),
         jd_enabled=jd_enabled, jd_union_id=jd_union_id, jd_position_id=jd_position_id,
         jd_app_key=jd_app_key, jd_app_secret=jd_app_secret, jd_api_base=jd_api_base,
     )

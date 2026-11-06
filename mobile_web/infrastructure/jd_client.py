@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""京东/折京客薄协议边界；不读取用户、仓储或示例中的凭据。"""
+"""京东/折京客薄协议边界；支持多 ZTK_APPKEY_LIST 自动轮询与故障切换，与 scripts/test_jd_api.py 严格对齐。"""
 import json
-from models.user import normalize_promoter_id
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import requests
+from models.user import normalize_promoter_id
 
 # Documented relay currently uses HTTP. Configure an approved secure alternative
 # before sending production secrets; never silently substitute the Taobao relay.
@@ -28,6 +28,35 @@ def canonical_promoter_id(value):
         return normalize_promoter_id(value)
     except ValueError:
         return ""
+
+
+def parse_appkey_list(raw):
+    """
+    将单个折淘客 appkey、逗号分隔字符串或字符串列表/元组规范化为去重后的非空 appkey 元组。
+    拒绝布尔值、非字符串及包含控制字符的非法输入。
+    """
+    if raw is None or isinstance(raw, bool):
+        return ()
+    if isinstance(raw, str):
+        candidates = raw.split(",")
+    elif isinstance(raw, (list, tuple)):
+        candidates = []
+        for item in raw:
+            if not isinstance(item, str) or isinstance(item, bool):
+                return ()
+            candidates.extend(item.split(","))
+    else:
+        return ()
+    seen = []
+    for key in candidates:
+        clean = key.strip()
+        if not clean:
+            continue
+        if any(ord(c) < 33 for c in clean):
+            return ()
+        if clean not in seen:
+            seen.append(clean)
+    return tuple(seen)
 
 
 def product_url(value):
@@ -66,7 +95,9 @@ def _trusted_signed_url(value):
 def _result(body, root, field="queryResult"):
     if not isinstance(body, dict):
         return _error("PROTOCOL_ERROR", "京东响应不是对象")
-    if "error_response" in body or "error" in body:
+    if "error_response" in body or "error" in body or (
+        "status" in body and str(body.get("status")) != "200" and root not in body
+    ):
         return _error("UPSTREAM_ERROR", "京东网关返回业务错误")
     wrapper = body.get(root)
     if not isinstance(wrapper, dict) or field not in wrapper:
@@ -129,9 +160,21 @@ def parse_order_response(body):
 
 
 class JdClient:
+    """
+    京东折淘客协议客户端（与 scripts/test_jd_api.py 严格对齐）：
+    支持传入单个 appkey、逗号分隔字符串或 `ZTK_APPKEY_LIST` 序列。
+    由于折淘客频控限制绑定在单个 `appkey` 而非 IP 或 `unionId` 上，
+    当当前 `appkey` 触发折淘客限流（返回 `UPSTREAM_ERROR` / `status=301`）或通信失败时，
+    自动顺延切换列表中的下一个 `appkey` 重试，并记忆健康 Key 游标。
+    """
+
     def __init__(self, appkey="", union_id="", app_key="", app_secret="",
-                 api_base=DEFAULT_API_BASE, http_session=None, timeout=(3.0, 12.0)):
-        self.appkey, self.union_id = appkey, str(union_id).strip()
+                 api_base=DEFAULT_API_BASE, http_session=None, timeout=(3.0, 12.0),
+                 appkey_list=None):
+        self.appkey_list = parse_appkey_list(appkey_list if appkey_list is not None else appkey)
+        self.appkey = self.appkey_list[0] if self.appkey_list else ""
+        self._active_key_index = 0
+        self.union_id = str(union_id).strip()
         self.app_key, self.app_secret = app_key, app_secret
         self.api_base = str(api_base).rstrip("/")
         self.http = http_session if http_session is not None else requests.Session()
@@ -155,8 +198,8 @@ class JdClient:
             # Request exceptions and supplier messages may contain keys/signed URLs.
             return _error("NETWORK_ERROR", "京东接口通信失败")
 
-    def _request(self, endpoint, params, orders=False):
-        if not self.appkey or (orders and not (self.app_key and self.app_secret)) or (not orders and not canonical_promoter_id(self.union_id)):
+    def _validate_config(self, orders=False):
+        if not self.appkey_list or (orders and not (self.app_key and self.app_secret)) or (not orders and not canonical_promoter_id(self.union_id)):
             return _error("CONFIG_ERROR", "京东接口缺少必要配置")
         try:
             base = urlsplit(self.api_base)
@@ -168,7 +211,38 @@ class JdClient:
             valid = False
         if not valid:
             return _error("CONFIG_ERROR", "京东中继网关配置无效")
-        return self._get(self.api_base + "/" + endpoint, params={"appkey": self.appkey, **params})
+        return None
+
+    def _execute_with_failover(self, endpoint, params, evaluator, *, orders=False):
+        """
+        使用 `self.appkey_list` 执行请求：
+        - 从当前健康游标 `self._active_key_index` 开始；
+        - 若成功，更新游标并返回；
+        - 若遇到 `UPSTREAM_ERROR`（如单 Key 触发折淘客 301/1000 限流）或 `NETWORK_ERROR`，自动切换下一个 Key 重试；
+        - 若遇到安全/协议/分页错误（如 `UNSAFE_REDIRECT`, `PROTOCOL_ERROR`, `PAGINATION_ERROR`, `UNTRUSTED_GATEWAY`），立即终止返回。
+        """
+        config_error = self._validate_config(orders=orders)
+        if config_error is not None:
+            return config_error
+
+        total = len(self.appkey_list)
+        start_idx = self._active_key_index % total
+        last_result = None
+
+        for offset in range(total):
+            idx = (start_idx + offset) % total
+            current_key = self.appkey_list[idx]
+            body = self._get(self.api_base + "/" + endpoint, params={"appkey": current_key, **params})
+            result = evaluator(body)
+            if result.get("status") == "success":
+                self._active_key_index = idx
+                self.appkey = current_key
+                return result
+            last_result = result
+            if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR"):
+                return result
+
+        return last_result
 
     @staticmethod
     def _page(page, size):
@@ -187,18 +261,21 @@ class JdClient:
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东榜单分页或类型无效")
-        body = self._request("open_jd_union_open_goods_rank_query.ashx", {
+
+        def _evaluate(body):
+            if body.get("status") == "error":
+                return body
+            result = _result(body, RANK_ROOT)
+            if result["status"] != "success":
+                return result
+            data = result["data"]
+            if not _rows(data.get("data")):
+                return _error("PROTOCOL_ERROR", "京东榜单列表无效")
+            return self._catalog_page(data["data"], page, size, data)
+
+        return self._execute_with_failover("open_jd_union_open_goods_rank_query.ashx", {
             "unionId": self.union_id, "sortType": sort_type, "rankId": 200000,
-            "pageIndex": page, "pageSize": size})
-        if body.get("status") == "error":
-            return body
-        result = _result(body, RANK_ROOT)
-        if result["status"] != "success":
-            return result
-        data = result["data"]
-        if not _rows(data.get("data")):
-            return _error("PROTOCOL_ERROR", "京东榜单列表无效")
-        return self._catalog_page(data["data"], page, size, data)
+            "pageIndex": page, "pageSize": size}, _evaluate)
 
     @staticmethod
     def _catalog_page(rows, page, size, envelope):
@@ -225,15 +302,21 @@ class JdClient:
                 query += query
         except (TypeError, ValueError, AttributeError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东搜索关键词或分页无效")
-        body = self._request("api_quanwang.ashx", {"unionId": self.union_id, "q": query,
-            "page": page, "page_size": size, "sort": "new", "youquan": 1, "type": 2})
-        return self._content(body, page, size)
+        return self._execute_with_failover(
+            "api_quanwang.ashx",
+            {"unionId": self.union_id, "q": query, "page": page, "page_size": size,
+             "sort": "new", "youquan": 1, "type": 2},
+            lambda body: self._content(body, page, size),
+        )
 
     def get_goods_detail(self, goods_id):
         if not isinstance(goods_id, str) or not goods_id.strip():
             return _error("INVALID_ARGUMENT", "京东详情缺少商品ID")
-        body = self._request("api_detail.ashx", {"unionId": self.union_id, "tao_id": goods_id, "type": 1})
-        return self._content(body)
+        return self._execute_with_failover(
+            "api_detail.ashx",
+            {"unionId": self.union_id, "tao_id": goods_id, "type": 1},
+            self._content,
+        )
 
     def _content(self, body, page=None, size=None):
         if body.get("status") == "error":
@@ -250,24 +333,30 @@ class JdClient:
         material = product_url(material_url)
         if not promoter or not material:
             return _error("INVALID_ARGUMENT", "京东转链缺少有效物料URL或数字推广ID")
-        body = self._request("open_jing_union_open_promotion_byunionid_get.ashx", {
-            "unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter})
-        if body.get("status") == "error":
-            return body
-        result = _result(body, PROMOTION_ROOT, "result")
-        if result["status"] != "success":
-            return result
-        result = result["data"]
-        if str(result.get("code")) != "200" or not isinstance(result.get("data"), dict):
-            return _error("PROTOCOL_ERROR", "京东转链结果无效")
-        source = result["data"]
-        data = {"short_url": product_url(source.get("shortURL")),
-                "click_url": product_url(source.get("clickURL")),
-                "j_command": source.get("jCommand") if isinstance(source.get("jCommand"), str) else "",
-                "j_short_command": source.get("jShortCommand") if isinstance(source.get("jShortCommand"), str) else ""}
-        if not (data["short_url"] or data["click_url"]):
-            return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
-        return {"status": "success", "promoter_id": promoter, **data}
+
+        def _evaluate(body):
+            if body.get("status") == "error":
+                return body
+            result = _result(body, PROMOTION_ROOT, "result")
+            if result["status"] != "success":
+                return result
+            result = result["data"]
+            if str(result.get("code")) != "200" or not isinstance(result.get("data"), dict):
+                return _error("PROTOCOL_ERROR", "京东转链结果无效")
+            source = result["data"]
+            data = {"short_url": product_url(source.get("shortURL")),
+                    "click_url": product_url(source.get("clickURL")),
+                    "j_command": source.get("jCommand") if isinstance(source.get("jCommand"), str) else "",
+                    "j_short_command": source.get("jShortCommand") if isinstance(source.get("jShortCommand"), str) else ""}
+            if not (data["short_url"] or data["click_url"]):
+                return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
+            return {"status": "success", "promoter_id": promoter, **data}
+
+        return self._execute_with_failover(
+            "open_jing_union_open_promotion_byunionid_get.ashx",
+            {"unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter},
+            _evaluate,
+        )
 
     def query_orders(self, start_time, end_time, page=1, page_size=50, cursor=None):
         try:
@@ -284,15 +373,23 @@ class JdClient:
                       "fields": "goodsInfo,categoryInfo"}
         except (TypeError, ValueError, OverflowError, OSError):
             return _error("INVALID_ARGUMENT", "京东订单时间窗、分页或游标无效（最大1小时）")
-        body = self._request("open_jing_union_openz_order_row_query.ashx", params, orders=True)
-        if body.get("status") == "error":
-            return body
-        if str(body.get("status")) != "200":
-            return _error("UPSTREAM_ERROR", "京东订单签名中继返回业务错误")
-        signed = body.get("content")
-        if not _trusted_signed_url(signed):
-            return _error("UNTRUSTED_GATEWAY", "拒绝非受信HTTPS京东订单签名地址")
-        body = self._get(signed)
+
+        def _evaluate_relay(body):
+            if body.get("status") == "error":
+                return body
+            if str(body.get("status")) != "200":
+                return _error("UPSTREAM_ERROR", "京东订单签名中继返回业务错误")
+            signed = body.get("content")
+            if not _trusted_signed_url(signed):
+                return _error("UNTRUSTED_GATEWAY", "拒绝非受信HTTPS京东订单签名地址")
+            return {"status": "success", "signed": signed}
+
+        relay = self._execute_with_failover(
+            "open_jing_union_openz_order_row_query.ashx", params, _evaluate_relay, orders=True
+        )
+        if relay.get("status") != "success":
+            return relay
+        body = self._get(relay["signed"])
         if body.get("status") == "error":
             return body
         result = parse_order_response(body)

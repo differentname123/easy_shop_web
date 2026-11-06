@@ -127,3 +127,15 @@ def test_public_authorization_required_comes_from_adapter_declaration(monkeypatc
     assert descriptors["taobao"]["authorization_required"] is True
     assert not descriptors["jd"]["capabilities"]["authorization"]
     assert not descriptors["taobao"]["capabilities"]["authorization"]
+
+
+def test_zhetaoke_appkey_list_merges_deduplicates_and_redacts_all_keys(tmp_path):
+    settings = load_settings(jd_config(
+        tmp_path,
+        zhetaoke_appkey="key-alpha, key-beta",
+        zhetaoke_appkey_list=["key-beta", "key-gamma"],
+    ))
+    assert settings.ztk_appkey == "key-alpha"
+    assert settings.ztk_appkey_list == ("key-alpha", "key-beta", "key-gamma")
+    assert "key-alpha" not in repr(settings) and "key-gamma" not in repr(settings)
+

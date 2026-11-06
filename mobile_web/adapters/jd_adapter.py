@@ -65,13 +65,24 @@ def _item_id(item):
                  if clean_product_id(item.get(key))), "")
 
 
+def _is_encrypted_jd_item_id(value):
+    """识别京东联盟官方加密 itemId (如榜单/搜索返回的字母数字下划线混合加密 ID)。"""
+    text = _text(value)
+    return len(text) >= 25 and "_" in text and all(c.isalnum() or c == "_" for c in text)
+
+
 def _material_url(item):
     source = product_url(item.get("item_url"))
     if source:
         return source
-    # Only an explicit supplier SKU is evidence for a canonical item URL.
+    # Only an explicit supplier SKU or official encrypted itemId is evidence for a canonical item URL.
     sku = canonical_promoter_id(item.get("skuId"))
-    return f"https://item.jd.com/{sku}.html" if sku else ""
+    if sku:
+        return f"https://item.jd.com/{sku}.html"
+    raw_item_id = clean_product_id(item.get("itemId"))
+    if _is_encrypted_jd_item_id(raw_item_id):
+        return f"https://item.jd.com/{raw_item_id}.html"
+    return ""
 
 
 class JdAdapter(BasePlatformAdapter):
@@ -96,14 +107,20 @@ class JdAdapter(BasePlatformAdapter):
         self.default_promoter_id = canonical_promoter_id(setting("jd_position_id"))
         union_id = _text(setting("jd_union_id"))
         self.promotion_scope = hashlib.sha256((union_id + ":" + self.default_promoter_id).encode()).hexdigest()[:24]
+        raw_appkeys = setting("ztk_appkey_list", ()) or setting("ztk_appkey", "")
         self.client = client if client is not None else JdClient(
-            setting("ztk_appkey"), union_id, setting("jd_app_key"), setting("jd_app_secret"),
+            raw_appkeys, union_id, setting("jd_app_key"), setting("jd_app_secret"),
             setting("jd_api_base", DEFAULT_API_BASE))
-        catalog = bool(client is not None or setting("ztk_appkey") and canonical_promoter_id(union_id))
+        has_appkey = bool(getattr(self.client, "appkey_list", None) or setting("ztk_appkey") or setting("ztk_appkey_list"))
+        catalog = bool(client is not None or has_appkey and canonical_promoter_id(union_id))
         self.capabilities = {"recommend": catalog, "search": catalog, "detail": catalog,
                              "promotion": bool(catalog and self.default_promoter_id), "authorization": False,
-                             "orders": bool(client is not None or setting("ztk_appkey") and
+                             "orders": bool(client is not None or has_appkey and
                                             setting("jd_app_key") and setting("jd_app_secret"))}
+
+    def can_prefetch_detail(self, ref=None):
+        """禁用后台盲目单品详情轮询，避免无故消耗 ZTK_APPKEY_LIST 配额。"""
+        return False
 
     def _available(self, capability):
         if not self.active:
@@ -253,6 +270,8 @@ class JdAdapter(BasePlatformAdapter):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
         # The service strips request kwargs before supplying this private bridge.
         material = product_url(kwargs.get("trusted_product_url"))
+        if not material and _is_encrypted_jd_item_id(target_id):
+            material = f"https://item.jd.com/{target_id}.html"
         if not material:
             detail = self._fetch_item(ref)
             if detail.get("status") != "success":

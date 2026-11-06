@@ -379,3 +379,49 @@ def test_numeric_scope_config_fingerprint_and_failure_has_no_owner_fallback():
     result = adapter(c).convert_promotion_url("opaque", uid="u_test", promoter_id="88", trusted_product_url="https://item.jd.com/123.html")
     assert result["status"] == "error" and c.convert_promotion_link.call_count == 1
     assert c.convert_promotion_link.call_args.args[1] == "88"
+
+
+def test_appkey_list_failover_rescues_rate_limited_key_and_updates_active_cursor():
+    # 当 Key 1 触发折淘客 301 频控限制时，自动切换到 Key 2 重试成功，并将健康游标切换到 Key 2
+    http = http_for(
+        {"status": 301, "content": "对应宝贝已下架"},
+        {"status": 200, "content": [item("opaque-material")]},
+        {"status": 200, "content": [item("second-item")]},
+    )
+    c = JdClient(["key-1", "key-2"], "10001", "test-jd-key", "test-jd-secret", http_session=http)
+    assert c.appkey_list == ("key-1", "key-2")
+
+    # 第一次请求：Key 1 返回 301 失败 -> 自动切换 Key 2 成功
+    res1 = c.get_goods_detail("opaque-material")
+    assert res1["status"] == "success"
+    assert http.get.call_count == 2
+    assert http.get.call_args_list[0].kwargs["params"]["appkey"] == "key-1"
+    assert http.get.call_args_list[1].kwargs["params"]["appkey"] == "key-2"
+    assert c.appkey == "key-2"
+
+    # 第二次请求：直接从已记忆的健康 Key 2 发起，1 次即成功，不再浪费在已限流的 Key 1 上
+    res2 = c.search_goods("蓝牙耳机")
+    assert res2["status"] == "success"
+    assert http.get.call_count == 3
+    assert http.get.call_args_list[2].kwargs["params"]["appkey"] == "key-2"
+
+
+def test_appkey_list_never_retries_on_unsafe_redirect_or_untrusted_gateway():
+    http = SimpleNamespace(get=Mock(side_effect=[reply({}, 302), reply({"status": 200, "content": [item()]})]))
+    c = JdClient(["key-1", "key-2"], "10001", "test-jd-key", "test-jd-secret", http_session=http)
+    assert c.search_goods("蓝牙耳机")["error_code"] == "UNSAFE_REDIRECT"
+    assert http.get.call_count == 1
+
+
+def test_rank_encrypted_item_id_converts_directly_without_redundant_detail_call():
+    rank_item_id = "ph4N7kTDsgSNgYyttv5GNgYyttv5G4_373ZMX5zcfkxXRxU0H"
+    http = http_for(wrapped(PROMOTION_ROOT, {"code": 200, "data": {
+        "shortURL": "https://u.jd.com/rankshort", "clickURL": "https://union-click.jd.com/ranklong",
+        "jCommand": "榜单京口令", "jShortCommand": "榜单短口令"}}, field="result", string=True))
+    a = adapter(client(http))
+    result = a.convert_promotion_url(rank_item_id, uid="u_8bb0595a", promoter_id="3110104129")
+    assert result["status"] == "success"
+    assert result["short_url"] == "https://u.jd.com/rankshort"
+    assert http.get.call_count == 1
+    assert http.get.call_args.kwargs["params"]["materialId"] == f"https://item.jd.com/{rank_item_id}.html"
+

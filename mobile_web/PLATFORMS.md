@@ -23,7 +23,7 @@ API（参数、令牌）
 | JSON字段 | 作用 |
 | --- | --- |
 | `jd_enabled` | 默认false。可同时关闭PDD/TB，仅启用JD。 |
-| `zhetaoke_appkey` / `myself_jd_union_id` | 商品榜单、搜索、详情必需；不要求淘宝sid。 |
+| `zhetaoke_appkey` / `zhetaoke_appkey_list` / `myself_jd_union_id` | 商品榜单、搜索、详情必需；支持配置单个 `zhetaoke_appkey`（也支持逗号分隔）或 `zhetaoke_appkey_list` 字符串数组。由于折淘客频控限制绑定在单个 `appkey` 而非 IP 或 `JD_UNION_ID`，配置多个绑定相同京东授权的 `appkey` 时，`JdClient` 会在单 Key 限流（`301`/`1000`）时自动顺延切换到下一个可用 Key 并记忆健康游标。 |
 | `myself_jd_position_id` | 默认数字推广ID；缺少时仅推广能力关闭。 |
 | `myself_jd_app_key` / `myself_jd_app_secret` | 订单中继凭据；缺少时仅订单能力关闭。 |
 | `jd_api_base` | 默认 `http://api.zhetaoke.com:20000/api`，集中配置供应商中继；不能拿淘宝10001端口替换。 |
