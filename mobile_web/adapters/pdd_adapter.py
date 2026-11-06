@@ -143,11 +143,20 @@ class PddAdapter(BasePlatformAdapter):
             raw_items = response.get("list", [])
             items = [self._normalize_goods_summary(clean_goods_item(item, source_type=f"pdd_recommend_{channel_type}"))
                      for item in raw_items if item]
+            total = response.get("total")
+            has_total = isinstance(total, int) and not isinstance(total, bool) and total > 0
+            effective_limit = min(self.recommendation_limit, total) if has_total else self.recommendation_limit
+            has_more = (
+                bool(raw_items) and offset + request_limit < effective_limit
+                if has_total
+                else len(raw_items) >= request_limit and offset + request_limit < self.recommendation_limit
+            )
+            next_offset = offset + request_limit if (has_total and raw_items) else offset + len(raw_items)
             return {
-                "status": "success", "total_count": response.get("total", len(items)),
-                "offset": offset, "limit": limit, "next_offset": offset + len(raw_items),
+                "status": "success", "total_count": total if total is not None else len(items),
+                "offset": offset, "limit": limit, "next_offset": next_offset,
                 "list_id": response.get("list_id", ""),
-                "has_more": len(raw_items) >= request_limit and offset + request_limit < self.recommendation_limit,
+                "has_more": has_more,
                 "data": items,
             }
         except Exception as exc:

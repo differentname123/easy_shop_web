@@ -6,8 +6,8 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>商品详情 - 优选导购</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=jd-20261106-1">
-  <script src="/static/js/vue.global.prod.js?v=jd-20261106-1"></script>
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261106-2">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261106-2"></script>
   <style>
     /* 专属商品详情大页样式 */
     .detail-nav-bar {
@@ -420,6 +420,15 @@
           </div>
         </div>
       </div>
+
+      <!-- 已生成口令可视化展示与二次复制兜底 -->
+      <div class="generated-command-card" v-if="generatedCommand">
+        <div class="generated-command-header">
+          <span>📋 已生成专属口令 / 推广链接</span>
+          <button class="btn-re-copy" @click="copyText(generatedCommand, '推广口令已复制')">再次复制</button>
+        </div>
+        <div class="generated-command-body">{{ generatedCommand }}</div>
+      </div>
     </div>
   </div>
 
@@ -542,10 +551,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=jd-20261106-1"></script>
-<script src="/static/js/session.js?v=jd-20261106-1"></script>
-<script src="/static/js/format.js?v=jd-20261106-1"></script>
-<script src="/static/js/browser.js?v=jd-20261106-1"></script>
-<script src="/static/js/detail.js?v=jd-20261106-1"></script>
+<script src="/static/js/api.js?v=ux-20261106-2"></script>
+<script src="/static/js/session.js?v=ux-20261106-2"></script>
+<script src="/static/js/format.js?v=ux-20261106-2"></script>
+<script src="/static/js/browser.js?v=ux-20261106-2"></script>
+<script src="/static/js/detail.js?v=ux-20261106-2"></script>
 </body>
 </html>

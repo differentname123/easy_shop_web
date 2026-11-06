@@ -589,4 +589,35 @@ def test_promote_service_caches_generic_promotion_in_db_for_unauthorized_users(m
     adapter.convert_promotion_url.assert_not_called()
 
 
+def test_taobao_detail_extracts_verified_specs_from_official_item():
+    official = Mock()
+    official.configured = True
+    official.get_goods_details.return_value = {
+        "status": "success",
+        "data": [{
+            "goods_id": "889900",
+            "goods_sign": "889900",
+            "goods_name": "维达抽纸整箱",
+            "brand_name": "Vinda/维达",
+            "category_name": "纸品/湿巾",
+            "mall_name": "维达官方旗舰店",
+            "provcity": "广东 江门",
+            "min_group_price_yuan": 29.9,
+            "original_price_yuan": 39.9,
+            "coupon_discount_yuan": 10.0,
+            "has_coupon": True,
+        }],
+    }
+    adapter = make_adapter(official)
+    res = adapter.get_goods_detail("889900", goods_id="889900")
+    assert res["status"] == "success"
+    assert res["data"]["specs"] == [
+        {"label": "商品品牌", "value": "Vinda/维达"},
+        {"label": "商品类目", "value": "纸品/湿巾"},
+        {"label": "店铺名称", "value": "维达官方旗舰店"},
+        {"label": "发货地", "value": "广东 江门"},
+    ]
+
+
+
 

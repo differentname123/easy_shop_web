@@ -1635,3 +1635,81 @@ test('testJD missing order credentials do not issue a request or alter no-auth c
   assert.equal(account.requiresAuthorization('jd'), false); assert.equal(account.supportsPlatform('jd', 'detail'), true);
 });
 
+test('boom feed error sets boomError without permanently locking boomHasMore, and retryLoadBoomGoods recovers', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  const first = feed.loadBoomGoods(true);
+  await h.finish(0, { status: 'error', error_msg: '加载失败' }, { status: 500 });
+  await first;
+  assert.equal(feed.boomError.value, true);
+  assert.equal(feed.boomHasMore.value, true, 'transient error does not mark feed as permanently exhausted');
+
+  const retry = feed.retryLoadBoomGoods();
+  await h.finish(1, { status: 'success', data: [{ goods_id: 'BOOM_1', platform: 'pdd' }], has_more: false });
+  await retry;
+  assert.equal(feed.boomError.value, false);
+  assert.equal(feed.boomGoodsList.value.length, 1);
+  assert.equal(feed.boomGoodsList.value[0].goods_id, 'BOOM_1');
+});
+
+test('boom state snapshot is scoped to session and restores platform, sort, keyword and list on return', async () => {
+  const h = harness(), feed = h.makeFeeds();
+  feed.boomPlatform.value = 'pdd';
+  feed.boomSortBy.value = 'price_desc';
+  feed.boomSearchKeyword.value = '纸巾';
+  const load = feed. onSearchBoom();
+  await h.finish(0, { status: 'success', data: [{ goods_id: 'B1', platform: 'pdd' }], has_more: true });
+  await load;
+  feed.saveBoomState();
+
+  const restored = h.makeFeeds();
+  assert.equal(restored.restoreBoomState(), true);
+  assert.equal(restored.boomPlatform.value, 'pdd');
+  assert.equal(restored.boomSortBy.value, 'price_desc');
+  assert.equal(restored.boomSearchKeyword.value, '纸巾');
+  assert.equal(restored.boomGoodsList.value.length, 1);
+  assert.equal(restored.boomGoodsList.value[0].goods_id, 'B1');
+});
+
+test('syncAndQueryOrders schedules bounded follow-up polling when sync_status is running and stops on completion or logout', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), account = h.makeAccount();
+  h.session.saveUser(user());
+  account.isLoggedIn.value = true;
+  account.uid.value = 'A';
+
+  const initial = account.syncAndQueryOrders(false);
+  await h.finish(0, { status: 'success', data: { sync_status: 'running', order_list: [] } });
+  await initial;
+
+  const pollTimer = [...h.timers.values()].find(t => t.delay === 2000);
+  assert.ok(pollTimer, 'schedules a 2000ms follow-up poll when sync_status is running');
+  pollTimer.callback();
+  assert.equal(h.requests.length, 2);
+  await h.finish(1, { status: 'success', data: { sync_status: 'ok', order_list: [{ order_sn: 'ORD-1' }] } });
+  await flush();
+  assert.equal(account.userOrdersData.value.order_list.length, 1);
+  assert.equal([...h.timers.values()].some(t => t.delay === 2000), false, 'stops polling once sync_status is no longer running');
+
+  // Verify defaultOrderThumb and handleOrderThumbError fallback
+  assert.ok(account.defaultOrderThumb.startsWith('data:image/svg+xml'));
+  const imgTarget = { src: 'https://broken.test/thumb.jpg' };
+  account.handleOrderThumbError({ target: imgTarget });
+  assert.equal(imgTarget.src, account.defaultOrderThumb);
+});
+
+test('detail generatedCommand stores latest copied promotion command and clears on session invalidation or disposal', async () => {
+  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  h.load('detail'); const init = h.mounted[0]();
+  await h.finish(0, { status: 'success', user: user() });
+  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
+  assert.equal(h.page.generatedCommand.value, '');
+
+  const copy = h.page.handleCopyPromoteLink(); await flush();
+  await h.finish(2, { status: 'success', final_link: 'https://buy.test/A', command_text: '专属口令文案 https://buy.test/A' });
+  await copy;
+  assert.equal(h.page.generatedCommand.value, '专属口令文案 https://buy.test/A');
+
+  h.page.dispose();
+  assert.equal(h.page.generatedCommand.value, '');
+});
+
+

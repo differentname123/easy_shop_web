@@ -6,9 +6,9 @@
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>优选导购 - 极速省赚</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=jd-20261106-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261106-2">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=jd-20261106-1"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261106-2"></script>
 </head>
 <body>
 <div id="app">
@@ -191,6 +191,7 @@
         <span class="sort-item" :class="{ active: boomSortBy === 'latest' }" @click="switchBoomSort('latest')">最新上架</span>
         <span class="sort-item" :class="{ active: boomSortBy === 'save_desc' }" @click="switchBoomSort('save_desc')">立省最多</span>
         <span class="sort-item" :class="{ active: boomSortBy === 'price_asc' }" @click="switchBoomSort('price_asc')">价格最低</span>
+        <span class="sort-item" :class="{ active: boomSortBy === 'price_desc' }" @click="switchBoomSort('price_desc')">价格最高</span>
       </div>
     </header>
 
@@ -274,8 +275,12 @@
       <span class="loading-spinner"></span>
       <span>正在加载更多爆款好物...</span>
     </div>
-    <div v-if="!boomLoading && boomGoodsList.length === 0" class="empty-wrap">未检索到符合条件的爆款商品</div>
-    <div v-if="!boomLoading && !boomHasMore && boomGoodsList.length > 0" class="loading-wrap" style="color:var(--text-muted)">已到底部，无更多商品</div>
+    <div v-if="!boomLoading && boomError && boomGoodsList.length > 0" class="loading-wrap retry-wrap" @click="retryLoadBoomGoods">
+      <span class="retry-btn">加载失败，点击重试 ↻</span>
+    </div>
+    <div v-if="!boomLoading && boomError && boomGoodsList.length === 0" class="empty-wrap" @click="retryLoadBoomGoods">加载爆品失败，点击重试 ↻</div>
+    <div v-if="!boomLoading && !boomError && boomGoodsList.length === 0" class="empty-wrap">未检索到符合条件的爆款商品</div>
+    <div v-if="!boomLoading && !boomError && !boomHasMore && boomGoodsList.length > 0" class="loading-wrap" style="color:var(--text-muted)">已到底部，无更多商品</div>
     <div id="boomBottomSentinel" style="height: 10px;"></div>
   </div>
 
@@ -336,6 +341,7 @@
           class="form-input" 
           placeholder="请输入11位中国大陆手机号" 
           v-model="formPhone"
+          @keyup.enter="handleRegisterOrLogin"
         />
       </div>
 
@@ -346,6 +352,7 @@
           class="form-input" 
           placeholder="请输入密码 (至少6位)" 
           v-model="formPassword"
+          @keyup.enter="handleRegisterOrLogin"
         />
       </div>
 
@@ -356,6 +363,7 @@
           class="form-input" 
           placeholder="例如: 省钱小能手 (若留空则自动生成)" 
           v-model="formNickname"
+          @keyup.enter="handleRegisterOrLogin"
         />
       </div>
 
@@ -366,6 +374,7 @@
           class="form-input" 
           placeholder="若有好友邀请码请填写，无则留空" 
           v-model="formInviteCode"
+          @keyup.enter="handleRegisterOrLogin"
         />
       </div>
 
@@ -432,7 +441,7 @@
       <!-- 订单列表明细 -->
       <div class="order-list-wrap" v-if="userOrdersData.order_list && userOrdersData.order_list.length > 0">
         <div class="order-item-card" v-for="ord in userOrdersData.order_list" :key="orderKey(ord)">
-          <img :src="ord.goods_thumbnail_url" class="order-item-thumb" alt="商品" />
+          <img :src="ord.goods_thumbnail_url || defaultOrderThumb" @error="handleOrderThumbError" class="order-item-thumb" alt="商品" />
           <div class="order-item-info">
             <h4 class="order-item-title">{{ ord.goods_name }}</h4>
             <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">{{ orderTimeLabel(ord) }}：{{ orderTimeText(ord) }}</div>
@@ -509,6 +518,17 @@
       </div>
     </div>
   </div>
+
+  <!-- 悬浮回到顶部按钮 -->
+  <button
+    v-if="showBackToTop && (currentTab === 'home' || currentTab === 'boom')"
+    class="back-to-top-btn"
+    @click="scrollToTop"
+    title="回到顶部"
+    aria-label="回到顶部"
+  >
+    <svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/></svg>
+  </button>
 
   <!-- ==================== 底部固定导航栏 (TabBar) ==================== -->
   <footer class="bottom-tab-bar">
@@ -588,12 +608,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=jd-20261106-1"></script>
-<script src="/static/js/session.js?v=jd-20261106-1"></script>
-<script src="/static/js/format.js?v=jd-20261106-1"></script>
-<script src="/static/js/browser.js?v=jd-20261106-1"></script>
-<script src="/static/js/feeds.js?v=jd-20261106-1"></script>
-<script src="/static/js/account.js?v=jd-20261106-1"></script>
-<script src="/static/js/app.js?v=jd-20261106-1"></script>
+<script src="/static/js/api.js?v=ux-20261106-2"></script>
+<script src="/static/js/session.js?v=ux-20261106-2"></script>
+<script src="/static/js/format.js?v=ux-20261106-2"></script>
+<script src="/static/js/browser.js?v=ux-20261106-2"></script>
+<script src="/static/js/feeds.js?v=ux-20261106-2"></script>
+<script src="/static/js/account.js?v=ux-20261106-2"></script>
+<script src="/static/js/app.js?v=ux-20261106-2"></script>
 </body>
 </html>

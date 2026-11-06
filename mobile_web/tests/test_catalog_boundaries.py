@@ -186,6 +186,19 @@ def test_pdd_recommendation_cap_lives_in_adapter():
     assert result["has_more"] is False
 
 
+def test_pdd_recommend_pagination_uses_total_when_page_filters_one_item():
+    raw_19 = [{"goods_id": i, "goods_sign": f"SIGN_{i}", "goods_name": f"商品{i}"} for i in range(1, 20)]
+    with patch("adapters.pdd_adapter.call_pdd_api", return_value={
+        "goods_basic_detail_response": {"list": raw_19, "total": 422}
+    }):
+        res = PddAdapter().get_recommend_goods(channel_type=1, offset=0, limit=20)
+    assert res["status"] == "success"
+    assert len(res["data"]) == 19
+    assert res["has_more"] is True
+    assert res["next_offset"] == 20
+
+
+
 def test_pdd_order_failure_stays_failure():
     with patch("adapters.pdd_adapter.query_increment_orders", return_value={"status": "error", "error_msg": "API失败"}):
         result = PddAdapter().fetch_increment_orders(1, 2)

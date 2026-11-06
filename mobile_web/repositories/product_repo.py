@@ -409,7 +409,12 @@ class ProductRepository(BaseRepository):
             filter_query["platform"] = self._platform(platform)
         try:
             cats = self.col.distinct("category", {"$and": [filter_query, self._displayable_content_filter()]})
-            return [c for c in cats if c and str(c).strip()]
+            result = []
+            for c in cats:
+                text = str(c).strip() if c is not None else ""
+                if text and len(text) <= 20 and not text.startswith("未知"):
+                    result.append(text)
+            return result
         except Exception as e:
             logger.warning(f"获取类目失败: {e}")
             return ["全部", "食品", "美妆", "百货", "数码", "服饰"]

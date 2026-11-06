@@ -143,9 +143,19 @@ class TaobaoAdapter(BasePlatformAdapter):
 
     def _detail(self, item):
         data = self._summary(item)
+        specs = [
+            {"label": label, "value": str(item[key])}
+            for key, label in (
+                ("brand_name", "商品品牌"),
+                ("category_name", "商品类目"),
+                ("mall_name", "店铺名称"),
+                ("provcity", "发货地"),
+            )
+            if item.get(key)
+        ]
         data.update({"desc": item.get("goods_desc") or "", "carousel_images": item.get("carousel_images") or [],
                      "detail_tags": item.get("detail_tags") or [], "service_guarantees": [],
-                     "shop_ratings": {}, "specs": [], "coupon_info": {},
+                     "shop_ratings": {}, "specs": specs, "coupon_info": {},
                      "product_url": self._official_product_url(((item.get("raw_item") or {}).get("item_basic_info") or {}).get("item_url"))})
         return ProductDetail(**data).to_dict(exclude_unset=True)
 

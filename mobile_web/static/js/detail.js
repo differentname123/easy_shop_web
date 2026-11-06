@@ -10,6 +10,7 @@
     const uid = ref('');
     const isDeepLoading = ref(true);
     const detailError = ref(false);
+    const generatedCommand = ref('');
     let requested = null;
     let referralUid = '';
     let detailGeneration = 0;
@@ -26,7 +27,7 @@
     const canUse = info => !disposed && info && promotionSessions.has(info) && session.isCurrent(promotionSessions.get(info));
     const invalidateSession = () => {
       session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; isLoggedIn.value = false;
-      closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
+      generatedCommand.value = ''; closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
     };
     const carouselList = computed(() => {
       if (!goods.value) return [];
@@ -51,6 +52,13 @@
     const goToRegister = () => { global.location.href = '/?tab=user'; };
     const goBack = () => {
       if (global.history.length > 1) return global.history.back();
+      try {
+        const savedTab = global.sessionStorage.getItem(`easy_shop_last_active_tab:${session.scope()}`);
+        if (savedTab === 'boom') {
+          global.location.href = '/?tab=boom';
+          return;
+        }
+      } catch (_) {}
       const platform = requested?.platform || 'pdd';
       let keyword = '';
       try { keyword = JSON.parse(global.sessionStorage.getItem(`easy_shop_home_search_keyword:${session.scope()}:${platform}`) || 'null') || ''; } catch (_) {}
@@ -60,6 +68,7 @@
     };
     const restoreIdentity = () => {
       if (identityRestore && identitySnapshot && session.isCurrent(identitySnapshot)) return identityRestore;
+      generatedCommand.value = '';
       identitySnapshot = session.capture();
       identityRestore = session.restore(api).then(result => {
         if (disposed) return;
@@ -184,13 +193,19 @@
     const executeJumpToBuy = info => {
       if (!canUse(info)) return;
       const content = info.command_text || info.final_link;
-      if (content) browser.copyText(content, `已复制推广信息，正在前往${platformName.value}领券...`);
+      if (content) {
+        generatedCommand.value = content;
+        browser.copyText(content, `已复制推广信息，正在前往${platformName.value}领券...`);
+      }
       browser.jumpToLink(info, goods.value?.product_url || '', () => canUse(info));
     };
     const executeCopyPromoteLink = (info, successTip) => {
       if (!canUse(info)) return;
       const content = info.command_text || info.final_link;
-      if (content) browser.copyText(content, successTip || `推广口令与链接已复制，可前往${platformName.value}使用`);
+      if (content) {
+        generatedCommand.value = content;
+        browser.copyText(content, successTip || `推广口令与链接已复制，可前往${platformName.value}使用`);
+      }
       else browser.showToast('暂无有效口令');
     };
     const handleJumpToBuy = async () => {
@@ -269,6 +284,7 @@
     };
     const dispose = () => {
       disposed = true;
+      generatedCommand.value = '';
       closeAuthModal();
       global.removeEventListener('focus', refreshAuthorization);
       global.document.removeEventListener('visibilitychange', refreshAuthorization);
@@ -278,7 +294,7 @@
     };
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
-      isDeepLoading, detailError, onCarouselScroll, goHome, goBack, goToRegister,
+      isDeepLoading, detailError, generatedCommand, onCarouselScroll, goHome, goBack, goToRegister,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail: loadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,

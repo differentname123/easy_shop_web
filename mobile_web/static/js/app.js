@@ -13,6 +13,7 @@
       let initialized = false;
       const currentTab = ref('home');
       const isHeaderHidden = ref(false);
+      const showBackToTop = ref(false);
       let referralUid = '';
       let lastScrollTop = 0;
       let touchStartX = 0;
@@ -32,6 +33,12 @@
       const getScrollTop = () => global.pageYOffset ||
         (global.document && (global.document.documentElement.scrollTop || global.document.body.scrollTop ||
         (global.document.scrollingElement ? global.document.scrollingElement.scrollTop : 0))) || 0;
+      const scrollToTop = () => {
+        isHeaderHidden.value = false;
+        showBackToTop.value = false;
+        lastScrollTop = 0;
+        global.scrollTo(0, 0);
+      };
       let bottomObserver = null;
       let observerTimer = null;
       let walletRestore = null;
@@ -48,8 +55,12 @@
         return walletRestore;
       };
       const openGoodsDetail = item => {
-        try { global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(item)}`, JSON.stringify(item)); } catch (_) {}
-        feeds.saveSearchState();
+        try {
+          global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(item)}`, JSON.stringify(item));
+          global.sessionStorage.setItem(`easy_shop_last_active_tab:${session.scope()}`, currentTab.value);
+        } catch (_) {}
+        if (currentTab.value === 'boom') feeds.saveBoomState();
+        else feeds.saveSearchState();
         const params = new URLSearchParams({ ...shop.goodsIdentity(item), uid: account.uid.value || referralUid });
         global.location.href = `/detail?${params}`;
       };
@@ -137,7 +148,7 @@
         if (tab === 'home') {
           if (feeds.homeLoading.value || !feeds.homeHasMore.value || feeds.homeError.value) return;
         } else if (tab === 'boom') {
-          if (feeds.boomLoading.value || !feeds.boomHasMore.value) return;
+          if (feeds.boomLoading.value || !feeds.boomHasMore.value || feeds.boomError.value) return;
         } else {
           return;
         }
@@ -153,6 +164,7 @@
         const height = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight, document.scrollingElement ? document.scrollingElement.scrollHeight : 0);
         const viewport = global.innerHeight || document.documentElement.clientHeight || document.body.clientHeight;
         const isScrollingDown = top > lastScrollTop;
+        showBackToTop.value = top > 500;
         if (top <= 15) isHeaderHidden.value = false;
         else if (top - lastScrollTop > 5 && top > 50) isHeaderHidden.value = true;
         else if (top - lastScrollTop < -5) isHeaderHidden.value = false;
@@ -188,14 +200,28 @@
         const params = new URLSearchParams(global.location.search);
         referralUid = params.get('uid') || '';
         account.formInviteCode.value = params.get('invite_code') || '';
-        if (['home', 'boom', 'user'].includes(params.get('tab'))) currentTab.value = params.get('tab');
+        if (['home', 'boom', 'user'].includes(params.get('tab'))) {
+          currentTab.value = params.get('tab');
+        } else {
+          try {
+            const savedTab = global.sessionStorage.getItem(`easy_shop_last_active_tab:${session.scope()}`);
+            if (savedTab === 'boom' && !params.get('keyword') && !params.get('q')) {
+              currentTab.value = 'boom';
+              global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`);
+            }
+          } catch (_) {}
+        }
         const boot = (async () => {
           await restoreAccount();
           await feeds.initialize(params);
           account.initializeOrderPlatform(params.get('platform'));
           initialized = true;
           account.resumePendingAuthorization();
-          if (currentTab.value === 'user' && account.isLoggedIn.value) account.syncAndQueryOrders(false);
+          if (currentTab.value === 'boom' && feeds.boomGoodsList.value.length === 0) {
+            if (!feeds.restoreBoomState()) feeds.loadBoomGoods(true);
+          } else if (currentTab.value === 'user' && account.isLoggedIn.value) {
+            account.syncAndQueryOrders(false);
+          }
         })();
         global.addEventListener('focus', refreshAuthorization);
         global.document.addEventListener('visibilitychange', refreshAuthorization);
@@ -227,17 +253,19 @@
         if (initialized) feeds.resetSession();
       });
       watch(feeds.homePlatform, () => {
-        isHeaderHidden.value = false; lastScrollTop = 0;
+        isHeaderHidden.value = false; showBackToTop.value = false; lastScrollTop = 0;
         pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
       });
       watch(currentTab, newTab => {
-        isHeaderHidden.value = false;
+        isHeaderHidden.value = false; showBackToTop.value = false;
         pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
-        if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0) feeds.loadBoomGoods(true);
-        else if (newTab === 'user') restoreAccount();
+        try { global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`); } catch (_) {}
+        if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0) {
+          if (!feeds.restoreBoomState()) feeds.loadBoomGoods(true);
+        } else if (newTab === 'user') restoreAccount();
       });
       return {
-        ...browser, ...account, ...feeds, currentTab, isHeaderHidden,
+        ...browser, ...account, ...feeds, currentTab, isHeaderHidden, showBackToTop, scrollToTop,
         pullDistance, pullStatus, isRefreshing, isTransitioning, pullText, executeRefresh,
         formatPhone: shop.formatPhone, formatMoney: shop.formatMoney, formatSales: shop.formatSales,
         goodsKey: shop.goodsKey, openGoodsDetail,

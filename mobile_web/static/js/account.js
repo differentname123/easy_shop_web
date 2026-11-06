@@ -3,6 +3,7 @@
   'use strict';
   const shop = global.EasyShop = global.EasyShop || {};
   const DEFAULT_AVATAR = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="32" fill="%23f0f2f5"/><circle cx="32" cy="24" r="12" fill="%23cbd5e1"/><path d="M14 54c0-10 8-18 18-18s18 8 18 18" fill="%23cbd5e1"/></svg>';
+  const DEFAULT_ORDER_THUMB = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="%23f1f5f9"/><path d="M20 22h24l-2 22H22L20 22zm7 0v-2a5 5 0 0 1 10 0v2" fill="none" stroke="%2394a3b8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   shop.createAccount = function ({ ref, api, session, getPlatforms = () => [], copyText = () => {}, showToast }) {
     const emptyProfile = () => ({ uid: '', phone: '', nickname: '未登录', avatar: DEFAULT_AVATAR,
       invite_code: '', invited_by: null, balance: 0, total_rebate: 0, pending_rebate: 0, auth_status: {} });
@@ -12,7 +13,13 @@
     const isSubmittingAuth = ref(false), isAuthModalOpen = ref(false), currentAuthInfo = ref(null), isCheckingAuth = ref(false);
     const orderPlatform = ref('pdd'), orderDays = ref(7), isSyncingOrders = ref(false), userOrdersData = ref(emptyOrders());
     const orderMessage = ref('');
-    let orderGeneration = 0, authGeneration = 0, disposed = false, authSnapshot = null;
+    let orderGeneration = 0, authGeneration = 0, disposed = false, authSnapshot = null, orderPollTimer = null;
+    const stopOrderPoll = () => {
+      if (orderPollTimer !== null) {
+        global.clearTimeout(orderPollTimer);
+        orderPollTimer = null;
+      }
+    };
     const descriptor = platform => getPlatforms().find(item => item.code === platform);
     const platformName = platform => descriptor(platform)?.name || platform;
     const supportsPlatform = (platform, capability) => shop.platformCapability(descriptor(platform), capability);
@@ -30,7 +37,7 @@
       isAuthModalOpen.value = false; currentAuthInfo.value = null; isCheckingAuth.value = false;
     };
     const handleLogout = (notify = true) => {
-      session.clear(); orderGeneration += 1; closeAccountAuth();
+      session.clear(); orderGeneration += 1; stopOrderPoll(); closeAccountAuth();
       isLoggedIn.value = false; uid.value = ''; userPhone.value = ''; userProfile.value = emptyProfile();
       userOrdersData.value = emptyOrders(); isSyncingOrders.value = false; orderMessage.value = '';
       if (notify && !disposed) showToast('已安全退出登录');
@@ -66,8 +73,9 @@
       } catch (error) { global.console.error('获取用户信息失败:', error); }
       return false;
     };
-    const syncAndQueryOrders = async (force = false) => {
+    const syncAndQueryOrders = async (force = false, pollCount = 0) => {
       if (disposed || !isLoggedIn.value || !uid.value || !session.token()) return;
+      stopOrderPoll();
       const snapshot = session.capture(), generation = ++orderGeneration;
       const platform = orderPlatform.value, days = orderDays.value;
       if (!supportsPlatform(platform, 'orders')) {
@@ -77,15 +85,26 @@
       }
       orderMessage.value = ''; isSyncingOrders.value = true;
       try {
-        const query = new URLSearchParams({ platform, days, force: force ? 'true' : 'false' });
+        const query = new URLSearchParams({ platform, days, force: (force && pollCount === 0) ? 'true' : 'false' });
         const response = await api.post(`/api/order/sync_and_query?${query}`, undefined, { token: snapshot.token });
         if (disposed || generation !== orderGeneration || !session.isCurrent(snapshot) || platform !== orderPlatform.value || days !== orderDays.value) return;
         if (response.ok && response.data.status === 'success' && response.data.data) {
           userOrdersData.value = response.data.data;
-          if (force) {
+          if (force && pollCount === 0) {
             const messages = { running: '已刷新本地订单，后台同步进行中', success: '订单已刷新',
               partial: '订单已刷新，后台同步尚未完成', error: '订单已刷新，后台同步失败，请稍后重试' };
             showToast(messages[response.data.data.sync_status] || '已刷新本地订单');
+          } else if (force && pollCount > 0 && response.data.data.sync_status === 'success') {
+            showToast('后台订单同步已完成');
+          }
+          if (response.data.data.sync_status === 'running' && pollCount < 2) {
+            orderPollTimer = global.setTimeout(() => {
+              if (!disposed && generation === orderGeneration && session.isCurrent(snapshot) && platform === orderPlatform.value && days === orderDays.value) {
+                syncAndQueryOrders(force, pollCount + 1);
+              } else {
+                stopOrderPoll();
+              }
+            }, 2000);
           }
         } else if (response.status === 401) invalidSession();
         else { orderMessage.value = response.data.detail || response.data.error_msg || '订单查询失败，请重试'; showToast(orderMessage.value); }
@@ -166,6 +185,7 @@
       orderPlatform.value = getPlatforms().find(item => item.code === preferred)?.code || getPlatforms().find(item => item.active)?.code || '';
     };
     const handleAvatarError = event => { if (event?.target) event.target.src = DEFAULT_AVATAR; };
+    const handleOrderThumbError = event => { if (event?.target && event.target.src !== DEFAULT_ORDER_THUMB) event.target.src = DEFAULT_ORDER_THUMB; };
     return {
       isLoggedIn, uid, userPhone, userProfile, isRegisterMode, formPhone, formPassword, formNickname, formInviteCode,
       isSubmittingAuth, handleRegisterOrLogin, handleLogout, fetchUserInfo,
@@ -174,8 +194,9 @@
       orderAmountLabel, orderTimeLabel, orderTimeText,
       orderPlatform, orderDays, orderMessage, isSyncingOrders, userOrdersData, syncAndQueryOrders, switchOrderDays,
       switchOrderPlatform, initializeOrderPlatform,
-      orderKey: order => shop.orderKey({ ...order, platform: order.platform || orderPlatform.value }), defaultAvatar: DEFAULT_AVATAR, handleAvatarError,
-      dispose: () => { disposed = true; orderGeneration += 1; closeAccountAuth(); },
+      orderKey: order => shop.orderKey({ ...order, platform: order.platform || orderPlatform.value }),
+      defaultAvatar: DEFAULT_AVATAR, handleAvatarError, defaultOrderThumb: DEFAULT_ORDER_THUMB, handleOrderThumbError,
+      dispose: () => { disposed = true; orderGeneration += 1; stopOrderPoll(); closeAccountAuth(); },
     };
   };
 })(globalThis);

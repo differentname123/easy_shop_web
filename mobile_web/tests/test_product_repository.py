@@ -565,6 +565,8 @@ class TestProductRepository(unittest.TestCase):
             {"platform": "pdd", "name": "缺价", "category": "推广裸类"},
             {"platform": "pdd", "price": 0, "category": "无名类"},
             {"platform": "pdd", "name": "无类", "price": 1, "category": " "},
+            {"platform": "pdd", "name": "占位类", "price": 1, "category": "未知标签_1"},
+            {"platform": "pdd", "name": "超长类", "price": 1, "category": "这是一个超过二十个字符长度的异常脏数据分类名"},
             {"platform": "taobao", "name": "另一平台", "price": "3", "category": "美妆"},
         ]
         self.assertEqual(set(self.repo.get_categories()), {"食品", "美妆"})
