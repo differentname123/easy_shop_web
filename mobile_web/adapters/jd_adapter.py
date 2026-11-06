@@ -113,12 +113,12 @@ class JdAdapter(BasePlatformAdapter):
         return None
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
-        # JD material IDs can be opaque. They are IDs, not PDD/TB encrypted signs.
-        return ProductRef(self.platform_code, goods_id or goods_id_or_sign or "", "")
+        val = _text(goods_sign or goods_id or goods_id_or_sign)
+        return ProductRef(self.platform_code, val, val)
 
     def _summary(self, item):
-        goods_id = _item_id(item)
-        if not goods_id:
+        raw_id = _item_id(item)
+        if not raw_id:
             raise ValueError("missing goods identity")
         purchase = item.get("purchasePriceInfo")
         purchase = purchase if isinstance(purchase, dict) else {}
@@ -131,7 +131,7 @@ class JdAdapter(BasePlatformAdapter):
         coupon = _money(item.get("coupon_info_money")) or 0.0
         data = {
             "platform": self.platform_code, "platform_name": self.platform_name,
-            "goods_id": goods_id, "goods_sign": "",
+            "goods_id": raw_id, "goods_sign": raw_id,
             "name": name,
             "image_url": _text(_pick(item.get("pict_url"), item.get("imageUrl"))),
             "price": price, "original_price": original if original is not None and original >= 0 else price,
@@ -205,19 +205,21 @@ class JdAdapter(BasePlatformAdapter):
         return {**result, "data": data}
 
     def _fetch_item(self, ref):
-        if not ref.goods_id or "://" in ref.goods_id or ref.goods_id.startswith("//"):
+        target_id = ref.goods_id or ref.goods_sign
+        if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东需要商品ID而非未经核验的请求URL")
-        result = self.client.get_goods_detail(ref.goods_id)
+        result = self.client.get_goods_detail(target_id)
         if result.get("status") != "success":
             return result
         rows = result.get("data")
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             return _error("PROTOCOL_ERROR", "京东详情商品列表无效")
-        matches = [item for item in rows if _item_id(item) == ref.goods_id]
+        matches = [item for item in rows if _item_id(item) == target_id]
         if not matches and len(rows) == 1:
             single = dict(rows[0])
             if _material_url(single):
-                single["tao_id"] = ref.goods_id
+                single["tao_id"] = target_id
+                single["skuId"] = target_id
                 matches = [single]
         if len(matches) != 1:
             return _error("PRODUCT_IDENTITY_MISMATCH", "京东详情未证实请求商品身份")
@@ -245,8 +247,9 @@ class JdAdapter(BasePlatformAdapter):
         promoter = canonical_promoter_id(kwargs.get("promoter_id"))
         if not promoter:
             return _error("INVALID_PROMOTER_ID", "京东转链需要服务端数字推广ID")
-        ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"))
-        if not ref.goods_id or "://" in ref.goods_id or ref.goods_id.startswith("//"):
+        ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
+        target_id = ref.goods_id or ref.goods_sign
+        if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
         # The service strips request kwargs before supplying this private bridge.
         material = product_url(kwargs.get("trusted_product_url"))
@@ -266,7 +269,7 @@ class JdAdapter(BasePlatformAdapter):
                 "mobile_url": long or short, "short_url": short, "click_url": long,
                 "j_command": result.get("j_command") or "", "j_short_command": result.get("j_short_command") or "",
                 "promotion_token": token, "token_type": "jcommand" if token else "",
-                "we_app_info": {}, "promoter_id": promoter, "goods_id": ref.goods_id, "goods_sign": "",
+                "we_app_info": {}, "promoter_id": promoter, "goods_id": ref.goods_id, "goods_sign": ref.goods_sign,
                 "attribution_status": "verified" if uid else "anonymous", "need_auth": False,
                 "is_fallback": False, "cacheable": False, "link_type": "京东推广链接"}
 

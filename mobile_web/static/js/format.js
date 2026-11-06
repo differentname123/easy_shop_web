@@ -23,12 +23,25 @@
     return `已售 ${text}`;
   };
   shop.goodsIdentity = goods => {
-    const platform = String(goods.platform || 'pdd').toLowerCase();
-    const id = String(goods.goods_id || goods.product_id || '').trim();
+    const rawPlat = String(goods.platform || 'pdd').toLowerCase();
+    const platform = rawPlat === 'tb' ? 'taobao' : rawPlat;
+    const rawId = String(goods.goods_id || '').trim();
+    const rawSign = String(goods.goods_sign || '').trim();
+    const rawPid = String(goods.product_id || '').trim();
+
+    let gid, sign;
+    if (platform === 'pdd') {
+      gid = rawId || (rawPid && rawPid !== rawSign ? rawPid : '');
+      sign = rawSign || (rawPid && !gid ? rawPid : '');
+    } else {
+      const val = rawId || rawSign || rawPid;
+      gid = val;
+      sign = val;
+    }
     return {
-      platform: platform === 'tb' ? 'taobao' : platform,
-      goods_id: id === '0' || id === 'None' || id.startsWith('sign:') ? '' : id,
-      goods_sign: String(goods.goods_sign || '').trim(),
+      platform,
+      goods_id: gid === '0' || gid === 'None' ? '' : gid,
+      goods_sign: sign,
     };
   };
   shop.goodsKey = goods => {

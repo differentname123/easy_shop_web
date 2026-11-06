@@ -46,7 +46,7 @@ def test_rank_snapshot_is_whitelisted_and_exactly_matches_summary_without_duplic
     assert result["status"] == "success"
     assert len(snapshots) == 1 and isinstance(snapshots[0], DetailSnapshot)
     snapshot, card = snapshots[0], result["data"][0]
-    assert snapshot.ref == ProductRef("taobao", "101", "sign-101")
+    assert snapshot.ref == ProductRef("taobao", "sign-101", "sign-101")
     assert snapshot.data["goods_id"] == card["goods_id"] == snapshot.ref.goods_id
     assert snapshot.data["goods_sign"] == card["goods_sign"] == snapshot.ref.goods_sign
     assert {key: snapshot.data[key] for key in card} == card
@@ -81,11 +81,11 @@ def test_snapshot_source_time_is_recorded_per_batch_before_later_requests_or_pub
 
     platform, official = make_adapter(ids, fetch)
     result = platform.get_recommend_goods(limit=45, detail_sink=sink)
-    expected_ids = [i for i in ids if i != "102"]
+    expected_ids = [f"sign-{i}" for i in ids if i != "102"]
     assert [card["goods_id"] for card in result["data"]] == expected_ids
     assert [s.ref.goods_id for s in snapshots] == expected_ids
     for snapshot in snapshots:
-        batch_index = ids.index(snapshot.ref.goods_id) // 20
+        batch_index = ids.index(snapshot.ref.goods_id.replace("sign-", "")) // 20
         assert snapshot.fetched_at == origin + timedelta(seconds=10 * (batch_index + 1))
     assert published_at[0] == origin + timedelta(seconds=30)
     assert [len(call.args[0]) for call in official.get_goods_details.call_args_list] == [20, 20, 5]
@@ -167,17 +167,17 @@ def test_rank_deduplicates_inputs_and_preserves_missing_item_paging():
     )
     snapshots = []
     result = platform.get_recommend_goods(limit=4, detail_sink=snapshots.append)
-    assert [card["goods_id"] for card in result["data"]] == ["101", "103"]
-    assert [s.ref.goods_id for s in snapshots] == ["101", "103"]
+    assert [card["goods_id"] for card in result["data"]] == ["sign-101", "sign-103"]
+    assert [s.ref.goods_id for s in snapshots] == ["sign-101", "sign-103"]
     assert result["next_offset"] == 4 and result["has_more"] is True
     assert result["next_cursor"]["source"] == {"min_id": "next"}
     official.get_goods_details.assert_called_once_with(["101", "102", "103"])
 
 
 @pytest.mark.parametrize("source_id,echoed,sign,expected_id", [
-    ("101", "101", "fresh-sign", "101"),
-    ("opaque-source-sign", "opaque-source-sign", "fresh-sign", ""),
-    ("101", None, "101", ""),
+    ("101", "101", "fresh-sign", "fresh-sign"),
+    ("opaque-source-sign", "opaque-source-sign", "fresh-sign", "fresh-sign"),
+    ("101", None, "101", "101"),
 ])
 def test_rank_original_id_requires_numeric_source_and_exact_official_echo(source_id, echoed, sign, expected_id):
     row = official_item(source_id, sign)

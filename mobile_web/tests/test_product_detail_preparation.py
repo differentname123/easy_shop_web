@@ -41,7 +41,7 @@ class MemoryDetails:
 
     def add(self, seed):
         with self.lock:
-            self.docs[(seed.ref.platform, seed.ref.goods_id or "sign:" + seed.ref.goods_sign)] = dict(
+            self.docs[(seed.ref.platform, seed.ref.goods_id or seed.ref.goods_sign)] = dict(
                 deepcopy(seed.data), detail_updated_at=seed.fetched_at)
 
     def get_product_detail(self, key, platform="fixture", key_type=None, strict=False):
@@ -62,7 +62,7 @@ class MemoryDetails:
             self.writes += 1
             if self.write_failure:
                 return False
-            key = (document["platform"], document.get("goods_id") or "sign:" + document["goods_sign"])
+            key = (document["platform"], document.get("goods_id") or document["goods_sign"])
             existing = self.docs.get(key)
             if existing and existing["detail_updated_at"] >= document["detail_updated_at"]:
                 return False

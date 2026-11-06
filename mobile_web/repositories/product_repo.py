@@ -36,8 +36,6 @@ class ProductRepository(BaseRepository):
             logger.warning(f"商品集合索引创建提示: {e}")
             return False
 
-    # 内部占位只用于兼容现有 unique(platform, product_id) 索引，不能当作真实 ID 返回。
-    _SIGN_ID_PREFIX = "sign:"
     _platform = staticmethod(normalize_platform)
     _SUMMARY_PROJECTION = {
         "_id": 0,
@@ -91,18 +89,26 @@ class ProductRepository(BaseRepository):
     @classmethod
     def _identity(cls, item: Dict[str, Any]) -> Tuple[str, str, str]:
         platform = cls._platform(item.get("platform"))
-        goods_id = cls._real_goods_id(item.get("goods_id")) or cls._real_goods_id(item.get("product_id"))
-        goods_sign = str(item.get("goods_sign") or "").strip()
+        raw_gid = cls._real_goods_id(item.get("goods_id"))
+        raw_pid = cls._real_goods_id(item.get("product_id"))
+        raw_sign = str(item.get("goods_sign") or "").strip()
+
+        if platform == "pdd":
+            goods_id = raw_gid or (raw_pid if raw_pid != raw_sign else "")
+            goods_sign = raw_sign or (raw_pid if not goods_id else "")
+        else:
+            val = raw_gid or raw_sign or raw_pid
+            goods_id = raw_gid or raw_pid or val
+            goods_sign = raw_sign or val
+
         return platform, goods_id, goods_sign
 
     @staticmethod
     def _identity_filter(platform: str, goods_id: str, goods_sign: str) -> Dict[str, Any]:
-        if goods_id and goods_sign:
-            # 同时匹配 ID 与 Sign-only 旧记录，补到真实 ID 时更新原文档。
+        if goods_id and goods_sign and goods_id != goods_sign:
             return {"platform": platform, "$or": [{"product_id": goods_id}, {"goods_sign": goods_sign}]}
-        if goods_id:
-            return {"platform": platform, "product_id": goods_id}
-        return {"platform": platform, "goods_sign": goods_sign}
+        target = goods_id or goods_sign
+        return {"platform": platform, "$or": [{"product_id": target}, {"goods_sign": target}]}
 
     @classmethod
     def _identity_update(cls, platform: str, goods_id: str, goods_sign: str):
@@ -110,11 +116,14 @@ class ProductRepository(BaseRepository):
         insert_set = {}
         if goods_id:
             update_set["product_id"] = goods_id
-        else:
-            # $setOnInsert 防止不带 ID 的摘要抹掉已有真实 ID。
-            insert_set["product_id"] = cls._SIGN_ID_PREFIX + goods_sign
+        elif goods_sign:
+            insert_set["product_id"] = goods_sign
+
         if goods_sign:
             update_set["goods_sign"] = goods_sign
+        elif platform != "pdd" and goods_id:
+            insert_set["goods_sign"] = goods_id
+
         return update_set, insert_set
 
     @staticmethod
@@ -300,7 +309,7 @@ class ProductRepository(BaseRepository):
         return {
             "platform": platform,
             "platform_name": platform_name(platform),
-            "product_id": goods_id,
+            "product_id": goods_id or goods_sign,
             "goods_id": goods_id,
             "goods_sign": goods_sign,
             "name": doc.get("name", "未命名商品"),

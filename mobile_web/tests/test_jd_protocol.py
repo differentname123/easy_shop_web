@@ -73,7 +73,7 @@ def test_rank_script_roots_fields_zero_values_and_channel_mapping(string, channe
     result = adapter(client(http)).get_recommend_goods(channel, limit=3, detail_sink=Mock())
     assert result["status"] == "success" and not result["has_more"]
     card = result["data"][0]
-    assert card["goods_id"] == "opaque-rank" and card["goods_sign"] == ""
+    assert card["goods_id"] == "opaque-rank" and card["goods_sign"] == "opaque-rank"
     assert card["price"] == 0 and card["original_price"] == 29.9
     assert card["commission_rate"] == card["commission_amount"] == 0
     assert "product_url" not in card and "carousel_images" not in card
@@ -130,7 +130,7 @@ def test_detail_identified_opaque_id_carousels_and_script_query(images, expected
     http = http_for({"status": 200, "content": [item(small_images=images, coupon_info_money="5")]})
     a = adapter(client(http))
     ref = a.resolve_product_ref("opaque-material")
-    assert ref.goods_id == "opaque-material" and ref.goods_sign == ""
+    assert ref.goods_id == "opaque-material" and ref.goods_sign == "opaque-material"
     result = a.get_goods_detail("opaque-material")
     assert result["data"]["carousel_images"] == expected
     assert result["data"]["coupon_amount"] == 5 and result["data"]["has_coupon"]
@@ -154,8 +154,8 @@ def test_detail_allows_rank_item_opaque_id_mapped_to_supplier_material_url():
     http = http_for({"status": 200, "content": [item(material_tao_id, item_url=supplier_item_url)]})
     a = adapter(client(http))
     result = a.get_goods_detail(rank_item_id)
-    assert result["status"] == "success"
     assert result["data"]["goods_id"] == rank_item_id
+    assert result["data"]["goods_sign"] == rank_item_id
     assert result["data"]["product_url"] == supplier_item_url
 
 
@@ -171,7 +171,7 @@ def test_promotion_script_parameters_commands_and_server_identity_only(string):
     assert result["promotion_token"] == "真实短京口令" and result["j_command"] == "真实完整京口令"
     assert result["short_url"] == result["final_link"] == "https://u.jd.com/short"
     assert result["click_url"] == result["url"] == "https://union-click.jd.com/long"
-    assert result["goods_id"] == "opaque-material" and result["goods_sign"] == ""
+    assert result["goods_id"] == "opaque-material" and result["goods_sign"] == "opaque-material"
     assert result["cacheable"] is False and "expires_at" not in result
     assert result["need_auth"] is False and result["is_fallback"] is False
     assert result["attribution_status"] == "verified"

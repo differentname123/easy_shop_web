@@ -170,7 +170,7 @@ def test_identity_only_product_is_not_detail_fallback_but_can_be_completed(catal
     )
     adapter.get_goods_detail.side_effect = [{"status": "error", "error_msg": "upstream failed"}, detail()]
     assert service.get_goods_detail(goods_sign="SIGN_A") == {"status": "error", "error_msg": "upstream failed"}
-    assert service.repo.get_product_identity("SIGN_A")["product_id"] == "sign:SIGN_A"
+    assert service.repo.get_product_identity("SIGN_A")["product_id"] == "SIGN_A"
     assert service.get_goods_detail(goods_sign="SIGN_A")["data"]["price"] == 10
     assert len(collection.docs) == 1
     assert service.repo.get_product_detail("SIGN_A", key_type="sign")["name"] == "商品"

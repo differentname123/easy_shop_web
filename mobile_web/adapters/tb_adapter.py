@@ -92,28 +92,16 @@ class TaobaoAdapter(BasePlatformAdapter):
         }
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
-        raw = _text(goods_id_or_sign)
-        if not goods_id and not goods_sign:
-            if raw.isdigit():
-                goods_id = raw
-            else:
-                goods_sign = raw
-        return ProductRef(self.platform_code, goods_id or "", goods_sign or "")
+        val = _text(goods_sign or goods_id or goods_id_or_sign)
+        return ProductRef(self.platform_code, val, val)
 
     @staticmethod
     def _matches(item, ref):
         returned = _text(item.get("goods_sign"))
         echoed = _text(item.get("input_item_iid"))
         original = _text(item.get("goods_id"))
-        if ref.goods_sign:
-            # TOP re-encrypts item_id across calls; input_item_iid proves which
-            # requested opaque ID this response describes. It is not a raw ID.
-            if ref.goods_sign not in (returned, echoed):
-                return False
-            if ref.goods_id and original and original != ref.goods_sign:
-                return ref.goods_id in (original, echoed, returned)
-            return True
-        return bool(ref.goods_id and ref.goods_id in (original, echoed, returned))
+        key = ref.goods_sign or ref.goods_id
+        return bool(key and key in (returned, echoed, original))
 
     @staticmethod
     def _official_product_url(value):
@@ -136,10 +124,11 @@ class TaobaoAdapter(BasePlatformAdapter):
                    for key in ("seller_id", "goods_name", "goods_image_url"))
 
     def _summary(self, item):
+        raw_id = _text(item.get("goods_sign") or item.get("goods_id"))
         # Explicitly whitelist DTO fields. Never cache click_url/coupon_share_url/raw_item.
         data = {
             "platform": self.platform_code, "platform_name": self.platform_name,
-            "goods_id": _text(item.get("goods_id")), "goods_sign": _text(item.get("goods_sign")),
+            "goods_id": raw_id, "goods_sign": raw_id,
             "name": item.get("goods_name") or "", "image_url": item.get("goods_image_url") or "",
             "price": item.get("price") or 0.0, "original_price": item.get("original_price") or 0.0,
             "coupon_amount": item.get("coupon_amount") or 0.0, "has_coupon": bool(item.get("has_coupon")),
@@ -225,7 +214,7 @@ class TaobaoAdapter(BasePlatformAdapter):
                     return _error("PRODUCT_IDENTITY_MISMATCH", "官方榜单详情商品身份存在冲突", data=[])
                 verified = dict(item)
                 verified["goods_sign"] = sign
-                verified["goods_id"] = source_id if echoed == source_id and source_id.isdigit() else ""
+                verified["goods_id"] = sign
                 by_id[source_id] = (verified, fetched_at)
                 source_by_sign[sign] = source_id
         items, seen = [], set()
@@ -274,12 +263,16 @@ class TaobaoAdapter(BasePlatformAdapter):
         if not items:
             return _error("PRODUCT_IDENTITY_MISMATCH", "官方商品详情未证实请求商品身份")
         item = dict(items[0])
-        if ref.goods_sign:
+        echoed = _text(item.get("input_item_iid"))
+        if echoed and not echoed.isdigit():
             # Keep the proven request identity stable for front-end, Mongo and
             # detail-cache keys instead of replacing it on every encryption round.
-            item["goods_sign"] = ref.goods_sign
-            if item.get("goods_id") == ref.goods_sign:
-                item["goods_id"] = ""
+            item["goods_sign"] = echoed
+            item["goods_id"] = echoed
+        else:
+            canonical = _text(item.get("goods_sign") or item.get("goods_id"))
+            item["goods_sign"] = canonical
+            item["goods_id"] = canonical
         return {"status": "success", "data": item}
 
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):

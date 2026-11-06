@@ -427,7 +427,7 @@ class TestProductRepository(unittest.TestCase):
         for sign in ("SIGN_A", "SIGN_B", "SIGN_C"):
             result = self.repo.get_product_detail(sign, key_type="sign")
             self.assertEqual(result["goods_id"], "")
-            self.assertEqual(result["product_id"], "")
+            self.assertEqual(result["product_id"], sign)
             self.assertEqual(result["goods_sign"], sign)
 
     def test_real_id_upgrades_sign_only_record_without_new_document(self):
@@ -464,7 +464,7 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(self.repo.upsert_home_products([{"goods_id": 0}, {"goods_id": "0"}, {}, None]), 0)
         self.assertFalse(self.repo.upsert_product_detail({"goods_id": "0"}))
         self.assertIsNone(self.repo.get_product_detail("0", key_type="id"))
-        self.assertIsNone(self.repo.get_product_detail("sign:internal", key_type="id"))
+        self.assertIsNone(self.repo.get_product_detail("None", key_type="id"))
         self.assertEqual(self.col.docs, [])
         self.assertEqual(self.col.queries, [])
 
@@ -705,7 +705,7 @@ class TestProductRepository(unittest.TestCase):
             "pdd", {"final_link": "https://example.com/123"}, goods_id="123",
         ))
         before = deepcopy(self.col.docs)
-        for invalid_id in ("0", "sign:internal"):
+        for invalid_id in ("0", "None"):
             with self.subTest(invalid_id=invalid_id):
                 self.assertIsNone(self.repo.get_promotion_link_cache("pdd", goods_id=invalid_id, goods_key="123"))
                 self.assertFalse(self.repo.save_promotion_link_cache(

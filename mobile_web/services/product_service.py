@@ -261,7 +261,17 @@ class ProductService:
     def _make_snapshot(data, fetched_at, platform):
         data = dict(data)
         actual_platform = normalize_platform(data.get("platform") or platform)
-        ref = ProductRef(actual_platform, data.get("goods_id") or data.get("product_id"), data.get("goods_sign"))
+        raw_gid = str(data.get("goods_id") or "").strip()
+        raw_sign = str(data.get("goods_sign") or "").strip()
+        raw_pid = str(data.get("product_id") or "").strip()
+        if actual_platform == "pdd":
+            gid = raw_gid or (raw_pid if raw_pid != raw_sign else "")
+            sign = raw_sign or (raw_pid if not gid else "")
+        else:
+            val = raw_gid or raw_sign or raw_pid
+            gid = raw_gid or raw_pid or val
+            sign = raw_sign or val
+        ref = ProductRef(actual_platform, gid, sign)
         data.update(platform=actual_platform, goods_id=ref.goods_id, goods_sign=ref.goods_sign)
         return DetailSnapshot(ref, data, fetched_at)
 

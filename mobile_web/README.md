@@ -77,8 +77,7 @@ static/js/
 
 ### 身份不等于内容
 
-- `ProductRef` 独立保存平台、真实 ID、Sign。缺失 ID、旧清洗器的 `0` 不是真实 ID。
-- Sign-only 商品内部使用 `product_id = sign:<goods_sign>`，兼容已有 `(platform, product_id)` 唯一索引；对外真实 ID 仍为空。
+- Sign-only 商品内部直接使用 `product_id = <goods_sign>`（无 `sign:` 前缀），满足 `(platform, product_id)` 唯一索引。除拼多多保留数字 `goods_id` 与加密 `goods_sign` 区分外，其他平台（淘宝、京东等）统一遵循 `goods_id == goods_sign == product_id`，下游消费与仓储持久化无需区分数字与非数字。
 - 同平台后来获得真实 ID 时可更新原 Sign-only 文档；不带真实 ID 的摘要不会抹掉已有 ID。
 - 同时提交 ID 与 Sign 不代表二者已验证为同一商品。详情按主标识查找，缓存别名只来自可信响应；推广的辅助 ID 只来自同平台身份投影查询。
 - 摘要可保存上游可信 `product_url`，但不刷新详情来源时间。京东按ID转链只取同平台同商品的服务端物料链接，缺失时查询详情；仅明确数字SKU可构造规范商品地址。不透明itemId不能拼接 `item.jd.com`，客户端同时提供任意URL也不能覆盖可信映射，缺链接明确失败。

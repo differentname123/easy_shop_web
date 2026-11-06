@@ -38,7 +38,7 @@ def test_detail_accepts_official_input_echo_and_preserves_request_identity():
     result = service.get_goods_detail(goods_sign="search-input-id")
     assert result["status"] == "success"
     assert result["data"]["goods_sign"] == "search-input-id"
-    assert result["data"]["goods_id"] == ""
+    assert result["data"]["goods_id"] == "search-input-id"
     assert result["data"]["product_url"] == "https://uland.taobao.com/item/edetail?id=new-detail-id"
     official.get_goods_details.assert_called_once_with(["search-input-id"])
 
@@ -49,12 +49,12 @@ def test_search_detail_and_precise_promotion_keep_sign_primary_across_real_encry
     search = platform.search_goods("测试商品")
     card = search["data"][0]
     detail = platform.get_goods_detail(goods_sign=card["goods_sign"])
-    assert card["goods_id"] == detail["data"]["goods_id"] == ""
+    assert card["goods_id"] == detail["data"]["goods_id"] == "search-input-id"
     assert card["goods_sign"] == detail["data"]["goods_sign"] == "search-input-id"
     official.search_goods.return_value = {"status": "success", "data": [item("new-promotion-search-id")]}
     promotion = platform.convert_promotion_url(card["goods_sign"])
     assert promotion["status"] == "success"
-    assert promotion["goods_sign"] == card["goods_sign"] and promotion["goods_id"] == ""
+    assert promotion["goods_sign"] == card["goods_sign"] and promotion["goods_id"] == "search-input-id"
     assert official.search_goods.call_args.args[0] == detail["data"]["product_url"]
 
 
@@ -74,7 +74,7 @@ def test_verified_sign_does_not_turn_unverified_auxiliary_id_into_an_alias():
     platform, official = adapter()
     result = platform.get_goods_detail(goods_sign="search-input-id", goods_id="client-unverified-id")
     assert result["status"] == "success"
-    assert result["data"]["goods_sign"] == "search-input-id" and result["data"]["goods_id"] == ""
+    assert result["data"]["goods_sign"] == "search-input-id" and result["data"]["goods_id"] == "search-input-id"
     official.get_goods_details.assert_called_once_with(["search-input-id"])
 
 

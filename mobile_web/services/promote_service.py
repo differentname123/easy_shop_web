@@ -29,15 +29,25 @@ class PromoteService:
 
     def _resolve_product_ref(self, ref: ProductRef) -> ProductRef:
         if ref.goods_sign:
-            # Sign 是主标识。客户端另一 ID 必须经同平台仓储确认才可用作兜底。
-            ref = ProductRef(ref.platform, "", ref.goods_sign)
             try:
                 doc = self.repo.get_product_identity(ref.goods_sign, platform=ref.platform)
                 if doc and normalize_platform(doc.get("platform", ref.platform)) == ref.platform:
-                    goods_id = clean_product_id(doc.get("product_id")) or clean_product_id(doc.get("goods_id"))
-                    ref = ProductRef(ref.platform, goods_id, ref.goods_sign)
+                    raw_gid = clean_product_id(doc.get("goods_id"))
+                    if not raw_gid:
+                        pid = clean_product_id(doc.get("product_id"))
+                        if pid and pid != doc.get("goods_sign"):
+                            raw_gid = pid
+                    goods_id = raw_gid or (ref.goods_sign if ref.platform in ("taobao", "jd") else "")
+                    return ProductRef(ref.platform, goods_id, ref.goods_sign)
             except Exception as exc:
                 logger.warning(f"推广商品身份缓存读取失败: {exc}")
+            if ref.platform in ("taobao", "jd"):
+                val = ref.goods_sign or ref.goods_id
+                return ProductRef(ref.platform, val, val)
+            return ProductRef(ref.platform, "", ref.goods_sign)
+        if ref.platform in ("taobao", "jd"):
+            val = ref.goods_id or ref.goods_sign
+            return ProductRef(ref.platform, val, val)
         return ref
 
     @staticmethod
@@ -101,7 +111,11 @@ class PromoteService:
                                                 key_type="sign" if ref.goods_sign else "id")
             if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
                 return ""
-            actual = ProductRef(ref.platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
+            if ref.platform != "pdd":
+                val = str(item.get("goods_id") or item.get("product_id") or item.get("goods_sign") or "").strip()
+                actual = ProductRef(ref.platform, val, val)
+            else:
+                actual = ProductRef(ref.platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
             if (ref.goods_sign and ref.goods_sign != actual.goods_sign
                     or not ref.goods_sign and ref.goods_id != actual.goods_id):
                 return ""

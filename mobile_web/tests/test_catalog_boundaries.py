@@ -44,7 +44,7 @@ def detail(goods_id="123", sign="SIGN_A", **kwargs):
 def test_product_ref_namespaces_platform_identity_type_and_user():
     assert ProductRef("tb", "0", "SIGN").platform == "taobao"
     assert ProductRef("pdd", "0", "SIGN").goods_id == ""
-    assert ProductRef("pdd", "sign:SIGN", "SIGN").goods_id == ""
+    assert ProductRef("pdd", "None", "SIGN").goods_id == ""
     assert ProductRef("pdd", "123").cache_keys() != ProductRef("pdd", "", "123").cache_keys()
     assert ProductRef("pdd", "123").cache_keys() != ProductRef("other", "123").cache_keys()
     assert ProductRef("pdd", "123").cache_keys("u_a") != ProductRef("pdd", "123").cache_keys("u_b")

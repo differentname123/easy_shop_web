@@ -191,7 +191,7 @@ def test_future_existing_clock_does_not_poison_all_future_refreshes():
 @pytest.mark.parametrize("record", [
     {"platform": "pdd", "product_id": "123"},
     {"platform": "pdd", "product_id": "123", "name": "只有摘要", "activity_price": 5},
-    {"platform": "pdd", "product_id": "sign:SIGN", "goods_sign": "SIGN"},
+    {"platform": "pdd", "product_id": "SIGN", "goods_sign": "SIGN"},
 ])
 def test_identity_and_summary_only_records_are_updated_in_place(record):
     repo, col = repository()
@@ -306,7 +306,7 @@ def test_unique_creation_conflict_reloads_the_actual_winner(winner_offset, expec
 def test_repeated_unique_conflicts_during_sign_id_upgrade_are_bounded():
     repo, col = repository()
     col.docs = [
-        {"platform": "pdd", "product_id": "sign:SIGN", "goods_sign": "SIGN"},
+        {"platform": "pdd", "product_id": "SIGN", "goods_sign": "SIGN"},
         {"platform": "pdd", "product_id": "123", "goods_sign": "OTHER"},
     ]
     assert not repo.upsert_product_detail(snapshot())

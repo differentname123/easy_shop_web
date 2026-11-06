@@ -17,7 +17,7 @@ def clean_product_id(value: Any) -> str:
     if isinstance(value, bool) or isinstance(value, (int, float)) and value == 0:
         return ""
     text = str(value).strip() if value is not None else ""
-    return "" if text in ("", "0", "0.0", "None") or text.startswith("sign:") else text
+    return "" if text in ("", "0", "0.0", "None") else text
 
 
 @dataclass(frozen=True)

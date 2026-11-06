@@ -119,7 +119,7 @@ def test_url_only_promotion_does_not_create_a_fake_product_identity(promotion):
 
 def test_sign_only_never_promotes_storage_placeholder_to_real_id(promotion):
     service, adapter, repo = promotion
-    repo.get_product_identity.return_value = {"product_id": "sign:opaque-sign"}
+    repo.get_product_identity.return_value = {"product_id": "opaque-sign", "goods_sign": "opaque-sign"}
     service.convert_link("future_shop", goods_sign="opaque-sign")
     assert adapter.convert_promotion_url.call_args.kwargs["goods_id"] is None
 

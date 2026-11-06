@@ -151,7 +151,7 @@ def test_public_dtos_strip_personal_links_and_keep_sign_only_identity():
     search = adapter.search_goods("词", uid="uid")
     detail = adapter.get_goods_detail(goods_sign="opaque-A", uid="uid")
     for dto in (search["data"][0], detail["data"]):
-        assert dto["goods_id"] == "" and dto["goods_sign"] == "opaque-A"
+        assert dto["goods_id"] == "opaque-A" and dto["goods_sign"] == "opaque-A"
         assert "private" not in json.dumps(dto)
         assert "raw_item" not in dto and "coupon_share_url" not in dto
     assert adapter.get_goods_detail("999")["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
