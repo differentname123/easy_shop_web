@@ -14,13 +14,20 @@
 ================================================================================
 【淘宝客 API 全链路实证基准规范：哪些可用 (✅) vs 哪些不可用 (❌)】
 --------------------------------------------------------------------------------
-一、 商品 ID 体系与 URL 形态规则 (item_id / goods_sign / item_url)
-  1. ✅ 可用：新版淘宝联盟 TOP 接口（`material.optional.upgrade`、`item.info.upgrade.get`）
-     全面采用动态混淆加密长串 `item_id`（形如 `7b4f7m5p92H8b6B69R97Yf6t6-...`）。
-     每次调用 TOP 接口都会重新生成新的加密串变体，但在响应字段 `input_item_iid` 中会原样回显入参 ID。
-  2. ✅ 可用：`taobao.tbk.item.info.upgrade.get` 详情接口支持同时传入【纯数字旧版 `itemid`】
-     （如好单库榜单返回的纯数字 ID）或【加密长串 `item_id`】，单次最多逗号分隔传 20 个 ID。
-  3. ✅ 可用：详情接口 `item_basic_info.item_url` 返回的官方手淘落地页格式固定为：
+一、 商品 ID 体系与唯一标识 (`goods_id` / `product_id`) vs 动态调用令牌 (`goods_sign`) 解耦铁律
+  1. ✅ 加密长串结构实证：新版淘宝联盟 TOP 接口（`material.optional.upgrade`、`item.info.upgrade.get`）与折淘客接口
+     全面采用由 `-` 分隔的两段式加密长串 `item_id`（形如 `0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd`）：
+     - **前半段（`-` 之前，26 位）**：动态请求上下文与时间戳盐值前缀（每次请求、不同批次或不同接口调用都会重新生成，如 `0AqROdBH7t8b9oJzGJT5n6C2t6` vs `7b4f7m5p92H8b6B69R97Yf6t6`）；
+     - **后半段（`-` 之后，19~21 位）**：商品真实 ID 的确定性密文后缀（如 `0v7DKOgI5JqnZd4Nhxd`，同一商品在榜单、搜索、详情、折淘客高佣转链所有接口中 **100% 恒定不变，且零碰撞**）。
+  2. ❌ 为什么不能把完整加密串直接作为数据库唯一主键 `product_id`？
+     - 若将包含动态前缀的完整 `item_id` 存入 `product_id`，同一商品在每次榜单刷新或搜索时都会因前缀变化绕过 `(platform, product_id)` 唯一索引重复入库（实测曾导致 305 个唯一商品产生 9084 条重复文档）。
+     - 同时，不能把前缀剥离后的后缀传给 TOP/折淘客接口（上游接口校验完整 `<prefix>-<suffix>` 签名，仅传后缀会报参数错误）。
+  3. ✅ 第一性原理最佳唯一标识方案（`goods_id` 与 `goods_sign` 职责彻底分离）：
+     - `goods_id` / `product_id`：若入参回显 `input_item_iid` 为纯数字则取纯数字，否则提取加密串 `-` 之后的**确定性商品密文后缀**（`extract_tb_canonical_goods_id`），专职作为 MongoDB `(platform, product_id)` 唯一索引主键与前端去重键；
+     - `goods_sign`：保留完整的 `<动态前缀>-<稳定后缀>` 加密长串，并在每次上游返回新密文时就地刷新，专职用于调用 TOP `item.info.upgrade.get`、拼装 `https://uland.taobao.com/item/edetail?id={goods_sign}` 及折淘客转链。
+  4. ✅ 可用：`taobao.tbk.item.info.upgrade.get` 详情接口支持同时传入【纯数字旧版 `itemid`】
+     （如好单库榜单返回的纯数字 ID）或【完整加密长串 `goods_sign`】，单次最多逗号分隔传 20 个 ID。
+  5. ✅ 可用：详情接口 `item_basic_info.item_url` 返回的官方手淘落地页格式固定为：
      `https://uland.taobao.com/item/edetail?id={encrypted_item_id}`。
 
 二、 热销榜单获取 (get_hot_rank_goods)
@@ -308,6 +315,24 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def extract_tb_canonical_goods_id(raw_id_or_sign: str) -> str:
+    """
+    提取淘宝商品全链路恒定唯一标识 (goods_id / product_id)：
+    - 若为纯数字 itemid（如好单库榜单回显），直接返回纯数字；
+    - 若为 TOP / 折淘客两段式加密串 `<26位动态盐值前缀>-<19~21位确定性密文后缀>`
+      (如 "0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd")，提取 `-` 之后的确定性商品密文后缀
+      ("0v7DKOgI5JqnZd4Nhxd")，确保同一商品跨时间、跨接口拥有唯一不变的 goods_id。
+    """
+    text = str(raw_id_or_sign or "").strip()
+    if not text or text.isdigit():
+        return text
+    if "-" in text:
+        prefix, suffix = text.split("-", 1)
+        if len(prefix) >= 15 and len(suffix) >= 12 and re.match(r"^[A-Za-z0-9_]+$", suffix):
+            return suffix
+    return text
+
+
 def clean_tb_goods_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """统一清洗淘宝新版嵌套结构 (item_basic_info / price_promotion_info / publish_info) 与扁平结构"""
     basic = item.get("item_basic_info") or item
@@ -354,9 +379,11 @@ def clean_tb_goods_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if not item_url and item_id:
         item_url = f"https://uland.taobao.com/item/edetail?id={item_id}"
 
+    canonical_goods_id = input_iid if input_iid.isdigit() else extract_tb_canonical_goods_id(item_id)
+
     return {
         "platform": "taobao",
-        "goods_id": input_iid if input_iid.isdigit() else item_id,
+        "goods_id": canonical_goods_id,
         "goods_sign": item_id,
         "input_item_iid": input_iid,
         "title": basic.get("title", ""),

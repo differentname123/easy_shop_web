@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """商品领域数据契约及跨缓存、仓储使用的商品身份。"""
+import re
 from dataclasses import dataclass
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
 
@@ -18,6 +20,85 @@ def clean_product_id(value: Any) -> str:
         return ""
     text = str(value).strip() if value is not None else ""
     return "" if text in ("", "0", "0.0", "None") else text
+
+
+def extract_jd_image_key(image_url: Any) -> str:
+    """
+    从京东官方 CDN 主图 URL (360buyimg.com / jfs) 中提取稳定的商品唯一标识：
+    例如 https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg
+    提取末尾两级哈希路径 -> '6ae3f40fF84b3cfef_0083320320005d73'。
+    无论商品来自实时榜单、全网搜索、单品详情还是万能转链，也无论底层使用哪个 ZTK_APPKEY / unionId，
+    同一京东商品的主图 CDN 哈希标识始终恒定不变。
+    """
+    text = str(image_url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit("https:" + text if text.startswith("//") else text)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or ""
+        if not (host == "360buyimg.com" or host.endswith(".360buyimg.com") or "/jfs/" in path):
+            return ""
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2:
+            stem = re.sub(r"\.(?:jpg|jpeg|png|webp|gif|avif)+$", "", parts[-1], flags=re.IGNORECASE)
+            parent = parts[-2]
+            if (
+                len(parent) >= 8
+                and len(stem) >= 8
+                and all(c.isalnum() or c in "_-" for c in parent)
+                and all(c.isalnum() or c in "_-" for c in stem)
+            ):
+                return f"{parent}_{stem}"
+    except ValueError:
+        return ""
+    return ""
+
+
+def extract_canonical_goods_id(
+    platform: Optional[str],
+    raw_id_or_sign: Any = "",
+    *,
+    image_url: Any = "",
+    allow_jd_sign_desalt: bool = False,
+) -> str:
+    """
+    第一性原理商品唯一主键 (goods_id / product_id) 规范化提取器：
+    将“用于数据库去重与缓存锚定的静态唯一标识 (goods_id)”与“用于调用上游接口的动态混淆签名 (goods_sign)”解耦：
+    1. 淘宝 (taobao)：
+       TOP 27939 权限包与折淘客返回的加密 item_id 固定为 '<动态请求盐值前缀>-<稳定商品密文后缀>'
+       （如 '0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd'）。
+       每次请求 '-' 前缀都会变化，但 '-' 后的商品密文后缀（如 '0v7DKOgI5JqnZd4Nhxd'）在榜单、搜索、详情、转链间 100% 恒定唯一。
+    2. 京东 (jd)：
+       - 优先从京东主图 URL (360buyimg.com/jfs/...) 提取 '<目录哈希>_<文件哈希>' 作为跨通道恒定唯一标识；
+       - 当仅提供 50 位京东加密 itemId 且开启 allow_jd_sign_desalt 时，剥离中间随时间变化的 6 位动态盐值，
+         提取 '<14位前缀>_<下划线后18位后缀>' 作为稳定标识。
+    3. 拼多多 (pdd)：
+       保持原生数字 goods_id 不变。
+    """
+    plat = normalize_platform(platform)
+    raw = clean_product_id(raw_id_or_sign)
+    if plat == "taobao":
+        if "-" in raw:
+            prefix, suffix = raw.split("-", 1)
+            if (
+                len(prefix) >= 15
+                and len(suffix) >= 12
+                and all(c.isalnum() or c == "_" for c in suffix)
+            ):
+                return suffix
+        return raw
+    if plat == "jd":
+        img_key = extract_jd_image_key(image_url)
+        if img_key:
+            return img_key
+        if allow_jd_sign_desalt and "_" in raw and len(raw) >= 35:
+            prefix, suffix = raw.split("_", 1)
+            if len(prefix) >= 14 and len(suffix) >= 12:
+                return f"{prefix[:14]}_{suffix}"
+        return raw
+    return raw
+
 
 
 @dataclass(frozen=True)

@@ -35,8 +35,8 @@
       sign = rawSign || (rawPid && !gid ? rawPid : '');
     } else {
       const val = rawId || rawSign || rawPid;
-      gid = val;
-      sign = val;
+      gid = rawId || rawPid || val;
+      sign = rawSign || val;
     }
     return {
       platform,

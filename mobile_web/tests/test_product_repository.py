@@ -799,6 +799,43 @@ class TestProductRepository(unittest.TestCase):
                     ))
             self.assertEqual(self.col.docs, [])
 
+    def test_taobao_and_jd_canonical_product_id_deduplicates_rotating_goods_signs(self):
+        # 1. 淘宝：动态前缀变化但 `-` 后缀恒定时，入库合并为唯一 product_id，并刷新最新 goods_sign
+        tb_sign_1 = "0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd"
+        tb_sign_2 = "7b4f7m5p92H8b6B69R97Yf6t6X-0v7DKOgI5JqnZd4Nhxd"
+        self.repo.upsert_home_products([{
+            "platform": "taobao", "goods_id": tb_sign_1, "goods_sign": tb_sign_1,
+            "name": "淘宝同款商品", "price": 29.9,
+        }])
+        self.repo.upsert_home_products([{
+            "platform": "taobao", "goods_id": tb_sign_2, "goods_sign": tb_sign_2,
+            "name": "淘宝同款商品", "price": 26.9,
+        }])
+        tb_docs = [d for d in self.col.docs if d.get("platform") == "taobao"]
+        self.assertEqual(len(tb_docs), 1)
+        self.assertEqual(tb_docs[0]["product_id"], "0v7DKOgI5JqnZd4Nhxd")
+        self.assertEqual(tb_docs[0]["goods_sign"], tb_sign_2)
+        self.assertEqual(tb_docs[0]["activity_price"], 26.9)
+
+        # 2. 京东：跨接口（榜单 itemId vs 搜索/详情 tao_id）拥有相同 360buyimg.com 主图 URL 时，
+        #    统一提取 <parent_hash>_<file_stem> 作为唯一 product_id，并刷新最新 goods_sign
+        jd_img = "https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg"
+        jd_rank_sign = "BWQ9383WurxZ8XgYyttv5GNgYyttv5_3rtcLEOl4l98a1A8AG"
+        jd_search_sign = "H942Tfk1n9iTlRHE8K75IkKfe6mXtQ_3Mqe07A69i2lWGNpGd"
+        self.repo.upsert_home_products([{
+            "platform": "jd", "goods_id": jd_rank_sign, "goods_sign": jd_rank_sign,
+            "name": "京东同款商品", "price": 99.0, "image_url": jd_img,
+        }])
+        self.repo.upsert_home_products([{
+            "platform": "jd", "goods_id": jd_search_sign, "goods_sign": jd_search_sign,
+            "name": "京东同款商品", "price": 89.0, "image_url": jd_img,
+        }])
+        jd_docs = [d for d in self.col.docs if d.get("platform") == "jd"]
+        self.assertEqual(len(jd_docs), 1)
+        self.assertEqual(jd_docs[0]["product_id"], "6ae3f40fF84b3cfef_0083320320005d73")
+        self.assertEqual(jd_docs[0]["goods_sign"], jd_search_sign)
+        self.assertEqual(jd_docs[0]["activity_price"], 89.0)
+
 
 if __name__ == "__main__":
     unittest.main()

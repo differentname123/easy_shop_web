@@ -10,7 +10,12 @@ from typing import Dict, Any, Optional
 from adapters import get_adapter, PlatformUnavailableError
 from adapters.base import build_command_text
 from infrastructure.logging_utils import format_exc_summary
-from models.product import ProductRef, clean_product_id, normalize_platform
+from models.product import (
+    ProductRef,
+    clean_product_id,
+    extract_canonical_goods_id,
+    normalize_platform,
+)
 from models.user import normalize_promoter_id
 from repositories.product_repo import ProductRepository
 from cache import PROMOTION_CACHE, MATERIAL_CACHE, evict_product_from_caches
@@ -38,7 +43,11 @@ class PromoteService:
                         pid = clean_product_id(doc.get("product_id"))
                         if pid and pid != doc.get("goods_sign"):
                             raw_gid = pid
-                    goods_id = raw_gid or (ref.goods_sign if ref.platform in ("taobao", "jd") else "")
+                    goods_id = (
+                        raw_gid
+                        or ref.goods_id
+                        or (extract_canonical_goods_id(ref.platform, ref.goods_sign) if ref.platform in ("taobao", "jd") else "")
+                    )
                     return ProductRef(ref.platform, goods_id, ref.goods_sign)
             except Exception as exc:
                 logger.warning(
@@ -46,12 +55,14 @@ class PromoteService:
                     ref.platform, ref.goods_sign, format_exc_summary(exc),
                 )
             if ref.platform in ("taobao", "jd"):
-                val = ref.goods_sign or ref.goods_id
-                return ProductRef(ref.platform, val, val)
+                sign = ref.goods_sign or ref.goods_id
+                gid = ref.goods_id or extract_canonical_goods_id(ref.platform, sign)
+                return ProductRef(ref.platform, gid, sign)
             return ProductRef(ref.platform, "", ref.goods_sign)
         if ref.platform in ("taobao", "jd"):
-            val = ref.goods_id or ref.goods_sign
-            return ProductRef(ref.platform, val, val)
+            sign = ref.goods_sign or ref.goods_id
+            gid = extract_canonical_goods_id(ref.platform, ref.goods_id or sign)
+            return ProductRef(ref.platform, gid, sign)
         return ref
 
     @staticmethod
@@ -130,15 +141,22 @@ class PromoteService:
         try:
             item = self.repo.get_product_detail(ref.key, platform=ref.platform,
                                                 key_type=kind)
+            if (not isinstance(item, dict) and ref.goods_sign and ref.goods_id
+                    and ref.goods_id != ref.goods_sign and ref.platform in ("taobao", "jd")):
+                item = self.repo.get_product_detail(ref.goods_id, platform=ref.platform,
+                                                    key_type="id")
             if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
                 return ""
             if ref.platform != "pdd":
-                val = str(item.get("goods_id") or item.get("product_id") or item.get("goods_sign") or "").strip()
-                actual = ProductRef(ref.platform, val, val)
+                gid = str(item.get("goods_id") or item.get("product_id") or "").strip()
+                sign = str(item.get("goods_sign") or gid).strip()
+                actual = ProductRef(ref.platform, gid or sign, sign or gid)
             else:
                 actual = ProductRef(ref.platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
-            if (ref.goods_sign and ref.goods_sign != actual.goods_sign
-                    or not ref.goods_sign and ref.goods_id != actual.goods_id):
+            if ref.goods_sign and ref.goods_sign != actual.goods_sign:
+                if not (ref.platform in ("taobao", "jd") and ref.goods_id and ref.goods_id == actual.goods_id):
+                    return ""
+            elif not ref.goods_sign and ref.goods_id != actual.goods_id:
                 return ""
             value = item.get("product_url")
             if isinstance(value, str) and value.strip():

@@ -10,7 +10,13 @@ from infrastructure.jd_client import (
     JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS, SHANGHAI,
     canonical_promoter_id, product_url,
 )
-from models.product import ProductDetail, ProductRef, ProductSummary, clean_product_id
+from models.product import (
+    ProductDetail,
+    ProductRef,
+    ProductSummary,
+    clean_product_id,
+    extract_canonical_goods_id,
+)
 
 
 JD_ORDER_STATUS = {
@@ -134,8 +140,9 @@ class JdAdapter(BasePlatformAdapter):
         return None
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
-        val = _text(goods_sign or goods_id or goods_id_or_sign)
-        return ProductRef(self.platform_code, val, val)
+        sign = _text(goods_sign or goods_id_or_sign or goods_id)
+        gid = clean_product_id(goods_id) or extract_canonical_goods_id(self.platform_code, sign)
+        return ProductRef(self.platform_code, gid, sign)
 
     def _summary(self, item):
         raw_id = _item_id(item)
@@ -150,11 +157,13 @@ class JdAdapter(BasePlatformAdapter):
         if price is None or price < 0 or not name:
             raise ValueError("missing or invalid public product content")
         coupon = _money(item.get("coupon_info_money")) or 0.0
+        image_url = _text(_pick(item.get("pict_url"), item.get("imageUrl")))
+        canonical_id = extract_canonical_goods_id(self.platform_code, raw_id, image_url=image_url) or raw_id
         data = {
             "platform": self.platform_code, "platform_name": self.platform_name,
-            "goods_id": raw_id, "goods_sign": raw_id,
+            "goods_id": canonical_id, "goods_sign": raw_id,
             "name": name,
-            "image_url": _text(_pick(item.get("pict_url"), item.get("imageUrl"))),
+            "image_url": image_url,
             "price": price, "original_price": original if original is not None and original >= 0 else price,
             "coupon_amount": coupon, "has_coupon": coupon > 0,
             "commission_rate": _money(_pick(item.get("tkrate3"), item.get("commissionShare"))) or 0.0,
@@ -226,7 +235,7 @@ class JdAdapter(BasePlatformAdapter):
         return {**result, "data": data}
 
     def _fetch_item(self, ref):
-        target_id = ref.goods_id or ref.goods_sign
+        target_id = ref.goods_sign or ref.goods_id
         if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东需要商品ID而非未经核验的请求URL")
         result = self.client.get_goods_detail(target_id)
@@ -253,7 +262,7 @@ class JdAdapter(BasePlatformAdapter):
         ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
         result = self._fetch_item(ref)
         if result.get("status") != "success":
-            target_id = ref.goods_id or ref.goods_sign
+            target_id = ref.goods_sign or ref.goods_id
             if (result.get("ztk_ambiguous_301") is True
                     and _is_encrypted_jd_item_id(target_id)
                     and self.default_promoter_id):
@@ -286,7 +295,7 @@ class JdAdapter(BasePlatformAdapter):
         if not promoter:
             return _error("INVALID_PROMOTER_ID", "京东转链需要服务端数字推广ID")
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
-        target_id = ref.goods_id or ref.goods_sign
+        target_id = ref.goods_sign or ref.goods_id
         if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
         # The service strips request kwargs before supplying this private bridge.
@@ -464,6 +473,13 @@ class JdAdapter(BasePlatformAdapter):
         if coupon_amount is None:
             coupon_amount = fallback_coupon
 
+        canonical_id = (
+            (product_card or {}).get("goods_id")
+            or extract_canonical_goods_id(self.platform_code, resolved_id)
+            or resolved_id
+        )
+        sign_id = (product_card or {}).get("goods_sign") or resolved_id
+
         return {
             "status": "success",
             "url": long or short,
@@ -477,8 +493,8 @@ class JdAdapter(BasePlatformAdapter):
             "token_type": "jcommand" if token else "",
             "we_app_info": {},
             "promoter_id": promoter,
-            "goods_id": resolved_id,
-            "goods_sign": resolved_id,
+            "goods_id": canonical_id,
+            "goods_sign": sign_id,
             "title": title,
             "price": price,
             "coupon_amount": coupon_amount,

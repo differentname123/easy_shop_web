@@ -7,7 +7,14 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlsplit
 
 from adapters.base import BasePlatformAdapter
-from models.product import DetailSnapshot, ProductRef, ProductSummary, ProductDetail, clean_product_id
+from models.product import (
+    DetailSnapshot,
+    ProductRef,
+    ProductSummary,
+    ProductDetail,
+    clean_product_id,
+    extract_canonical_goods_id,
+)
 from infrastructure.tb_client import TaobaoClient
 from infrastructure.hdk_client import HdkClient
 from infrastructure.ztk_client import ZtkClient, ORDER_WINDOW_SECONDS
@@ -95,8 +102,9 @@ class TaobaoAdapter(BasePlatformAdapter):
         }
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
-        val = _text(goods_sign or goods_id or goods_id_or_sign)
-        return ProductRef(self.platform_code, val, val)
+        sign = _text(goods_sign or goods_id_or_sign or goods_id)
+        gid = extract_canonical_goods_id(self.platform_code, goods_id or sign)
+        return ProductRef(self.platform_code, gid, sign)
 
     @staticmethod
     def _matches(item, ref):
@@ -104,7 +112,15 @@ class TaobaoAdapter(BasePlatformAdapter):
         echoed = _text(item.get("input_item_iid"))
         original = _text(item.get("goods_id"))
         key = ref.goods_sign or ref.goods_id
-        return bool(key and key in (returned, echoed, original))
+        if key and key in (returned, echoed, original):
+            return True
+        canonical_key = extract_canonical_goods_id("taobao", key or ref.goods_id)
+        canonical_returned = extract_canonical_goods_id("taobao", returned or original)
+        return bool(
+            canonical_key
+            and canonical_key != key
+            and canonical_key in (canonical_returned, original)
+        )
 
     @staticmethod
     def _official_product_url(value):
@@ -127,11 +143,12 @@ class TaobaoAdapter(BasePlatformAdapter):
                    for key in ("seller_id", "goods_name", "goods_image_url"))
 
     def _summary(self, item):
-        raw_id = _text(item.get("goods_sign") or item.get("goods_id"))
+        raw_sign = _text(item.get("goods_sign") or item.get("goods_id"))
+        canonical_id = extract_canonical_goods_id(self.platform_code, item.get("goods_id") or raw_sign) or raw_sign
         # Explicitly whitelist DTO fields. Never cache click_url/coupon_share_url/raw_item.
         data = {
             "platform": self.platform_code, "platform_name": self.platform_name,
-            "goods_id": raw_id, "goods_sign": raw_id,
+            "goods_id": canonical_id, "goods_sign": raw_sign,
             "name": item.get("goods_name") or "", "image_url": item.get("goods_image_url") or "",
             "price": item.get("price") or 0.0, "original_price": item.get("original_price") or 0.0,
             "coupon_amount": item.get("coupon_amount") or 0.0, "has_coupon": bool(item.get("has_coupon")),
@@ -227,16 +244,16 @@ class TaobaoAdapter(BasePlatformAdapter):
                     return _error("PRODUCT_IDENTITY_MISMATCH", "官方榜单详情商品身份存在冲突", data=[])
                 verified = dict(item)
                 verified["goods_sign"] = sign
-                verified["goods_id"] = sign
+                verified["goods_id"] = extract_canonical_goods_id(self.platform_code, sign) or sign
                 by_id[source_id] = (verified, fetched_at)
                 source_by_sign[sign] = source_id
         items, seen = [], set()
         seeds = [] if detail_sink is not None else None
         for source_id in ids:
             matched = by_id.get(source_id)
-            if matched and matched[0]["goods_sign"] not in seen:
+            if matched and matched[0]["goods_id"] not in seen:
                 item, fetched_at = matched
-                seen.add(item["goods_sign"])
+                seen.add(item["goods_id"])
                 items.append(self._summary(item))
                 if seeds is not None:
                     seeds.append((item, fetched_at))
@@ -281,11 +298,11 @@ class TaobaoAdapter(BasePlatformAdapter):
             # Keep the proven request identity stable for front-end, Mongo and
             # detail-cache keys instead of replacing it on every encryption round.
             item["goods_sign"] = echoed
-            item["goods_id"] = echoed
+            item["goods_id"] = extract_canonical_goods_id(self.platform_code, echoed) or echoed
         else:
             canonical = _text(item.get("goods_sign") or item.get("goods_id"))
             item["goods_sign"] = canonical
-            item["goods_id"] = canonical
+            item["goods_id"] = extract_canonical_goods_id(self.platform_code, canonical) or canonical
         return {"status": "success", "data": item}
 
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):
@@ -325,7 +342,7 @@ class TaobaoAdapter(BasePlatformAdapter):
         official_target = self._official_product_url((raw.get("item_basic_info") or {}).get("item_url"))
         target = official_target
         if not target:
-            fallback_id = ref.goods_id or item["goods_sign"]
+            fallback_id = ref.goods_id if str(ref.goods_id).isdigit() else (ref.goods_sign or ref.goods_id or item["goods_sign"])
             if str(fallback_id).isdigit():
                 target = "https://item.taobao.com/item.htm?" + urlencode({"id": fallback_id})
             else:
@@ -364,17 +381,19 @@ class TaobaoAdapter(BasePlatformAdapter):
         res = self.official.search_goods(target, page=1, page_size=20)
         if res.get("status") != "success":
             return res
-        expected = ProductRef(self.platform_code, "", item["goods_sign"])
+        expected = ProductRef(self.platform_code, item.get("goods_id", ""), item["goods_sign"])
         candidates = res.get("data") or []
         matches = [candidate for candidate in candidates if self._matches(candidate, expected)
-                   and (not ref.goods_id or not candidate.get("goods_id") or candidate["goods_id"] == ref.goods_id)]
+                   and (not ref.goods_id or not candidate.get("goods_id")
+                        or extract_canonical_goods_id(self.platform_code, candidate["goods_id"]) == ref.goods_id)]
         # Real TOP responses re-encrypt IDs even for the same exact product URL.
         # Only the official detail URL's single precise result can bridge that
         # change, with seller/title/image corroboration; never take a keyword's
         # first item or resolve an ambiguous/mismatching response by position.
         if (not matches and official_target and len(candidates) == 1
                 and self._same_official_product(item, candidates[0])
-                and (not ref.goods_id or not candidates[0].get("goods_id") or candidates[0]["goods_id"] == ref.goods_id)):
+                and (not ref.goods_id or not candidates[0].get("goods_id")
+                     or extract_canonical_goods_id(self.platform_code, candidates[0]["goods_id"]) == ref.goods_id)):
             matches = candidates
         if len(matches) != 1:
             return _error("PRODUCT_IDENTITY_MISMATCH", "精准生链响应与请求商品不一致")
@@ -502,6 +521,7 @@ class TaobaoAdapter(BasePlatformAdapter):
         raw_c = ztk_res.get("raw") if isinstance(ztk_res.get("raw"), dict) else {}
 
         tao_id = clean_product_id(raw_c.get("tao_id")) or (text if is_bare_id else "")
+        canonical_tao_id = extract_canonical_goods_id(self.platform_code, tao_id) or tao_id
         title = _text(raw_c.get("title") or raw_c.get("tao_title") or ztk_res.get("title") or "淘宝精选好物")
         pict_url = _text(raw_c.get("pict_url") or "")
         if pict_url.startswith("//"):
@@ -541,7 +561,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             detail_payload = {
                 "platform": self.platform_code,
                 "platform_name": self.platform_name,
-                "goods_id": tao_id,
+                "goods_id": canonical_tao_id,
                 "goods_sign": tao_id,
                 "name": title,
                 "image_url": pict_url or (gallery[0] if gallery else ""),
@@ -577,7 +597,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             "relation_id": relation_id if (uid and relation_id) else "",
             "need_auth": False,
             "is_fallback": False,
-            "goods_id": tao_id,
+            "goods_id": canonical_tao_id,
             "goods_sign": tao_id,
             "title": title,
             "price": final_price,

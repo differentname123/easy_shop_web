@@ -10,7 +10,13 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from adapters import get_adapter, normalize_platform
 from infrastructure.logging_utils import format_exc_summary
-from models.product import ProductRef, DetailSnapshot, DetailPrefetchResult, utc_millis
+from models.product import (
+    ProductRef,
+    DetailSnapshot,
+    DetailPrefetchResult,
+    extract_canonical_goods_id,
+    utc_millis,
+)
 from repositories.product_repo import ProductRepository
 from cache import (
     RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, MATERIAL_CACHE,
@@ -331,8 +337,13 @@ class ProductService:
 
     def _read_detail(self, ref, strict=False):
         options = {"strict": True} if strict else {}
-        return self.repo.get_product_detail(ref.key, platform=ref.platform,
-                                            key_type="sign" if ref.goods_sign else "id", **options)
+        doc = self.repo.get_product_detail(ref.key, platform=ref.platform,
+                                           key_type="sign" if ref.goods_sign else "id", **options)
+        if (doc is None and ref.goods_sign and ref.goods_id
+                and ref.goods_id != ref.goods_sign and ref.platform in ("taobao", "jd")):
+            doc = self.repo.get_product_detail(ref.goods_id, platform=ref.platform,
+                                               key_type="id", **options)
+        return doc
 
     @staticmethod
     def _make_snapshot(data, fetched_at, platform):
@@ -346,7 +357,14 @@ class ProductService:
             sign = raw_sign or (raw_pid if not gid else "")
         else:
             val = raw_gid or raw_sign or raw_pid
-            gid = raw_gid or raw_pid or val
+            img_url = str(
+                data.get("image_url")
+                or data.get("goods_image_url")
+                or data.get("goods_thumbnail_url")
+                or ""
+            ).strip()
+            raw_id_candidate = raw_gid or raw_pid or val
+            gid = extract_canonical_goods_id(actual_platform, raw_id_candidate, image_url=img_url) or raw_id_candidate
             sign = raw_sign or val
         ref = ProductRef(actual_platform, gid, sign)
         data.update(platform=actual_platform, goods_id=ref.goods_id, goods_sign=ref.goods_sign)

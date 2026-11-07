@@ -80,6 +80,14 @@
        - 短链解包路径 A：先用站长已备案 `pid` 调 `pdd.ddk.goods.zs.unit.url.gen` 解包，从返回的 `url` / `mobile_url` / `multi_group_url` (`duo_coupon_landing.html?...&goods_sign=E9...`) 中直接正则提取 `goods_sign`；
        - 短链解包路径 B：直接将 `https://p.pinduoduo.com/xxx` 作为 `keyword` 传给 `pdd.ddk.goods.search` (`page_size=10`)，精准返回唯一 1 条商品及 `goods_sign`。
   - ❌ 不可用输入：仅包含纯数字 `goods_id` 的手工普通链接 `https://mobile.yangkeduo.com/goods.html?goods_id=123456`（不含 `goods_sign` 且非 `p.pinduoduo.com` 短链时，被拼多多网关 `40009` 拦截，需通过商品标题搜索或使用 `p.pinduoduo.com` 推广短链）。
+
+九、【三平台统一商品唯一标识 (`product_id` / `goods_id`) 与动态调用令牌 (`goods_sign`) 职责解耦基准】
+  - 拼多多天然区分了 **稳定商品主键 (`goods_id` / `product_id`)** 与 **动态加密调用凭证 (`goods_sign`)**，并作为全站三平台（拼多多、淘宝、京东）数据模型的第一性原理基准：
+    1. **`goods_sign`（动态上游调用令牌）**：如 `E932Ts1bVtZgMvVTwfvBVEJF7LgQI9Rz_JQwP5lJQN3` 或 `Y932Ts1b...`，每次列表/搜索请求其前缀可能随上下文变化，但却是调用 `pdd.ddk.goods.detail` 与三层推广转链接口的必传凭证（缺省必报 `40009`）。
+    2. **`goods_id` / `product_id`（恒定商品唯一标识）**：专职用于 MongoDB `products` 集合 `(platform, product_id)` 唯一索引去重及前端卡片列表去重。当推荐流某批次仅返回 `goods_sign` 时，仓储层 `ProductRepository._identity` 先以 `goods_sign` 占位，一旦详情或搜索返回真实 `goods_id`，立即通过 `$or: [{"product_id": goods_id}, {"goods_sign": goods_sign}]` 原地升级同一文档的 `product_id`，绝不分裂出重复文档。
+    3. **横向对齐淘宝与京东**：
+       - 淘宝 (`test_tb_api.py`)：从两段式加密串 `<26位动态盐值前缀>-<19~21位稳定密文后缀>` 中提取 `-` 之后的稳定密文后缀作为 `goods_id` (`product_id`)，完整加密串保留在 `goods_sign`；
+       - 京东 (`test_jd_api.py`)：从 100% 必返的京东官方 CDN 主图 URL (`360buyimg.com/.../jfs/.../<parent_hash>/<file_stem>.jpg`) 中提取 `<parent_hash>_<file_stem>` 作为跨接口恒定的 `goods_id` (`product_id`)，完整 50 位加密 `itemId` 保留在 `goods_sign`。
 ================================================================================
 """
 

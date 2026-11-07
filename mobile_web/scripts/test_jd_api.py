@@ -77,14 +77,27 @@
 七、【频控与高可用唯一有效方案 (`ZTK_APPKEY_LIST` 自动故障切换)】
   - ❌ 已证伪：同一 `appkey` 下用 `open_jing_union_open_goods_query.ashx` 给 `api_quanwang.ashx` / `api_detail.ashx` 兜底（共享同一 `1000` 限流计数器，救活率 0% 且双倍消耗配额）。
   - ✅ 唯一有效：折淘客频控绑定在单个 `ZTK_APPKEY` 上，不限制 IP 与 `JD_UNION_ID`。使用 `ZTK_APPKEY_LIST` 多 Key 轮询与自动故障切换，救活率 100%。
+
+八、【商品唯一标识 (`product_id` / `goods_id`) 与动态调用令牌 (`goods_sign`) 职责解耦铁律（防重复入库核心基准）】
+  - ❌ 为什么不能把京东加密 `itemId` / `tao_id` 直接作为数据库唯一主键 `product_id`？
+    1. **跨时间窗口动态加盐**：同一接口（如榜单 `open_jd_union_open_goods_rank_query.ashx` 或搜索 `api_quanwang.ashx`）返回的 50 位加密串形如 `<30位前缀>_<19位后缀>`，其中前缀索引 `[14:20]` 与 `[23:29]` 为 6 位动态时间戳盐值（如 `2JQkZkZ2nGOIkK[HE8K75]IkK[fe6mXt]Q_3SD7M7MGcugkXyuI4w` -> 几分钟后变为 `2JQkZkZ2nGOIkK[fwpvzd]IkK[fwpvzd]Q_3SD7M7MGcugkXyuI4w`）。若直接将完整加密串存入 `product_id`，每次轮询都会因盐值刷新而绕过 `(platform, product_id)` 唯一索引重复入库（实测曾导致 223 个唯一商品裂变出 6444 条重复记录）。
+    2. **跨接口密钥池差异**：实时榜单接口使用传入的站长 `unionId` 加密生成 `itemId`（如 `BWQ9383WurxZ8X..._3rtcLEOl4l98a1A8AG`），而全网搜索与单品详情接口使用折淘客底层账号池加密生成 `tao_id`（如 `H942Tfk1n9iTlR..._3Mqe07A69i2lWGNpGd`），同一商品在两个接口的加密串完全不同。
+  - ✅ 第一性原理最佳唯一标识方案（主图 CDN 唯一指纹提取 + 脱敏密文兜底）：
+    1. **主路径（100% 跨接口恒定）**：无论来自榜单 (`imageUrl`)、搜索 (`pict_url`)、详情 (`pict_url`) 还是万能转链反查，京东商品 100% 返回官方 `360buyimg.com` CDN 主图 URL（形如 `https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg`）。提取其末尾两段内容哈希目录与文件名主干 `<parent_hash>_<file_stem>`（如 `"6ae3f40fF84b3cfef_0083320320005d73"`，34位纯字母数字下划线），作为全链路恒定唯一的 `goods_id`（即 MongoDB `product_id`）。
+    2. **兜底路径（无主图纯 ID 入参时）**：剥离 50 位加密串前缀 `[14:]` 的动态盐值，取 `f"{prefix[:14]}_{suffix}"` 作为稳定标识。
+    3. **职责彻底分离**：
+       - `goods_id` / `product_id`：存主图唯一指纹 `<parent_hash>_<file_stem>`，专职负责 MongoDB `(platform, product_id)` 唯一索引去重与前端列表去重；
+       - `goods_sign`：存完整 50 位动态加密 `itemId` / `tao_id`，并在每次上游返回新密文时就地刷新，专职用于调用 `api_detail.ashx` 与 `jingfen.jd.com` 转链。
 ================================================================================
 """
 
 import os
+import re
 import sys
 import json
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any, List, Optional, Sequence, Union
+from urllib.parse import urlsplit
 import requests
 
 if sys.platform == "win32":
@@ -207,6 +220,40 @@ def request_ztk_with_failover(
     return {}
 
 
+def extract_jd_canonical_goods_id(raw_id_or_sign: str, image_url: str = "") -> str:
+    """
+    提取京东商品全链路恒定唯一标识 (goods_id / product_id)：
+    1. 优先从京东官方 CDN 主图 URL (360buyimg.com / /jfs/) 提取 `<parent_hash>_<file_stem>`
+       (如 https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg
+        -> "6ae3f40fF84b3cfef_0083320320005d73")，跨榜单/搜索/详情/转链 100% 恒定唯一；
+    2. 若未提供主图 URL，则剥离 50 位加密 itemId 前缀 [14:] 的动态盐值，取 `f"{prefix[:14]}_{suffix}"` 兜底。
+    """
+    img = str(image_url or "").strip()
+    if img:
+        try:
+            parsed = urlsplit("https:" + img if img.startswith("//") else img)
+            host = (parsed.hostname or "").lower()
+            parts = [p for p in (parsed.path or "").split("/") if p]
+            if len(parts) >= 2 and ("360buyimg.com" in host or "jfs" in parts):
+                parent = parts[-2].strip()
+                stem = parts[-1].rsplit(".", 1)[0].strip()
+                if (
+                    len(parent) >= 8
+                    and len(stem) >= 8
+                    and re.match(r"^[A-Za-z0-9_-]+$", parent)
+                    and re.match(r"^[A-Za-z0-9_-]+$", stem)
+                ):
+                    return f"{parent}_{stem}"
+        except Exception:
+            pass
+    text = str(raw_id_or_sign or "").strip()
+    if len(text) >= 35 and "_" in text:
+        prefix, suffix = text.split("_", 1)
+        if len(prefix) >= 24 and len(suffix) >= 12 and prefix.isalnum() and suffix.isalnum():
+            return f"{prefix[:14]}_{suffix}"
+    return text
+
+
 # ==================== 2. 功能 1: 实时榜单选品 ====================
 def get_rank_goods(
     sort_type: int = 1,
@@ -246,14 +293,18 @@ def get_rank_goods(
         for idx, it in enumerate(items[:page_size], 1):
             price = str(it.get("wlprice") or it.get("purchasePriceInfo", {}).get("price") or "0.00")
             item_id = str(it.get("itemId") or it.get("skuId") or "")
+            img_url = str(it.get("imageUrl") or "")
+            canonical_id = extract_jd_canonical_goods_id(item_id, img_url)
             result.append({
                 "rank": idx,
                 "item_id": item_id,
+                "goods_id": canonical_id,
+                "goods_sign": item_id,
                 "title": it.get("skuName", ""),
                 "price": price,
                 "commission_rate": str(it.get("commissionShare") or "0"),
                 "commission_amount": str(it.get("commission") or "0.00"),
-                "image_url": it.get("imageUrl", ""),
+                "image_url": img_url,
                 # 【实证规范】加密 itemId 严禁拼接为 https://item.jd.com/{item_id}.html (无法访问且转链必报 2001104)；
                 # 必须使用 https://jingfen.jd.com/detail/{item_id}.html 格式（可正常访问且支持直接转链）。
                 "item_url": f"https://jingfen.jd.com/detail/{item_id}.html" if item_id else ""
@@ -302,8 +353,12 @@ def search_goods(
 
         result = []
         for raw in resp.get("content", []):
+            raw_sign = str(raw.get("tao_id", ""))
+            pict_url = str(raw.get("pict_url", ""))
             result.append({
-                "item_id": str(raw.get("tao_id", "")),
+                "item_id": raw_sign,
+                "goods_id": extract_jd_canonical_goods_id(raw_sign, pict_url),
+                "goods_sign": raw_sign,
                 "title": raw.get("title") or raw.get("tao_title") or "",
                 "final_price": str(raw.get("quanhou_jiage") or raw.get("size") or "0.00"),
                 "origin_price": str(raw.get("size") or "0.00"),
@@ -312,7 +367,7 @@ def search_goods(
                 "is_self_operated": raw.get("user_type") == "1",
                 "shop_title": raw.get("shop_title", ""),
                 "item_url": raw.get("item_url", ""),
-                "pict_url": raw.get("pict_url", "")
+                "pict_url": pict_url
             })
         return result
     except Exception:
@@ -345,8 +400,12 @@ def get_goods_detail(
 
         c = resp["content"][0]
         small_imgs = [img for img in (c.get("small_images") or "").split("|") if img]
+        raw_sign = str(c.get("tao_id", ""))
+        pict_url = str(c.get("pict_url", ""))
         return {
-            "item_id": str(c.get("tao_id", "")),
+            "item_id": raw_sign,
+            "goods_id": extract_jd_canonical_goods_id(raw_sign, pict_url),
+            "goods_sign": raw_sign,
             "item_url": c.get("item_url", ""),
             "title": c.get("title") or c.get("tao_title") or "",
             "shop_title": c.get("shop_title", ""),

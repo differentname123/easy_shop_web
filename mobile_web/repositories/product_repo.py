@@ -14,7 +14,12 @@ from pymongo.errors import DuplicateKeyError
 from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
-from models.product import clean_product_id, normalize_platform, utc_millis
+from models.product import (
+    clean_product_id,
+    extract_canonical_goods_id,
+    normalize_platform,
+    utc_millis,
+)
 from config import PROMOTION_LINK_TTL, logger
 
 
@@ -102,7 +107,22 @@ class ProductRepository(BaseRepository):
             goods_sign = raw_sign or (raw_pid if not goods_id else "")
         else:
             val = raw_gid or raw_sign or raw_pid
-            goods_id = raw_gid or raw_pid or val
+            img_url = str(
+                item.get("image_url")
+                or item.get("goods_image_url")
+                or item.get("goods_thumbnail_url")
+                or ""
+            ).strip()
+            raw_id_candidate = raw_gid or raw_pid or val
+            goods_id = (
+                extract_canonical_goods_id(
+                    platform,
+                    raw_id_candidate,
+                    image_url=img_url,
+                    allow_jd_sign_desalt=True,
+                )
+                or raw_id_candidate
+            )
             goods_sign = raw_sign or val
 
         return platform, goods_id, goods_sign
@@ -196,7 +216,7 @@ class ProductRepository(BaseRepository):
         product_url = item.get("product_url")
         if isinstance(product_url, str) and product_url.strip():
             clean_url = product_url.strip()
-            target_id = goods_id or goods_sign
+            target_id = goods_sign or goods_id
             if platform == "jd" and len(target_id) >= 25 and "_" in target_id:
                 if clean_url == f"https://item.jd.com/{target_id}.html":
                     clean_url = f"https://jingfen.jd.com/detail/{target_id}.html"
@@ -458,14 +478,17 @@ class ProductRepository(BaseRepository):
         if not goods_list or not isinstance(goods_list, list):
             return 0
 
-        operations = []
+        ops_by_key = {}
         for item in goods_list:
             if not isinstance(item, dict):
                 continue
             mapped = self._build_product_update(item, detail=False, channel_type=channel_type)
             if mapped is not None:
                 filter_spec, update = mapped
-                operations.append(UpdateOne(filter_spec, update, upsert=True))
+                platform, goods_id, goods_sign = self._identity(item)
+                dedup_key = (platform, goods_id or goods_sign)
+                ops_by_key[dedup_key] = UpdateOne(filter_spec, update, upsert=True)
+        operations = list(ops_by_key.values())
 
         if not operations:
             return 0
