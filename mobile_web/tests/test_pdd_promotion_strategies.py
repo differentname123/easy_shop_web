@@ -36,6 +36,7 @@ def strategy(monkeypatch):
     standard = Mock(wraps=pdd_client.generate_goods_promotion_url)
     wash = Mock(wraps=pdd_client.convert_pdd_url)
     monkeypatch.setattr(pdd_client, "call_pdd_api", api)
+    monkeypatch.setattr(pdd_adapter, "call_pdd_api", api)
     monkeypatch.setattr(pdd_client, "generate_goods_promotion_url", standard)
     monkeypatch.setattr(pdd_adapter, "generate_smart_promotion_url", smart)
     monkeypatch.setattr(pdd_adapter, "convert_pdd_url", wash)
@@ -335,3 +336,53 @@ def test_missing_product_input_does_not_attempt_any_gateway_strategy(strategy):
     strategy.standard.assert_not_called()
     strategy.wash.assert_not_called()
     strategy.api.assert_not_called()
+
+
+def test_universal_convert_supports_app_share_ps_url_and_rejects_ambiguous_or_id_only_inputs(strategy):
+    ps_url = "https://mobile.yangkeduo.com/goods.html?ps=LCZB3tRv3Y"
+    resolved_sign = "E9b2fw7kEuRgMvVRwf_BU6TExdHQTO129g_JQ0TyV7qnb"
+    sample_item = {
+        "goods_id": 950876695664,
+        "goods_sign": resolved_sign,
+        "goods_name": "百事可乐无糖生可乐500ml*5瓶",
+        "goods_image_url": "https://img.pddpic.com/pepsi.jpg",
+        "min_group_price": 1150,
+        "coupon_discount": 0,
+        "promotion_rate": 32,
+    }
+    strategy.replies.extend([
+        {"goods_search_response": {"goods_list": [sample_item], "total_count": 1}},
+        {"goods_detail_response": {"goods_details": [sample_item]}},
+        {"rp_promotion_url_generate_response": {"url_list": [{"short_url": PROMOTION}]}},
+    ])
+    res = strategy.adapter.resolve_and_convert_universal(ps_url, uid=None)
+    assert res["status"] == "success"
+    assert res["final_link"] == PROMOTION
+    assert res["goods_id"] == "950876695664"
+    assert res["goods_sign"] == resolved_sign
+    assert res["product"]["name"] == "百事可乐无糖生可乐500ml*5瓶"
+    strategy.wash.assert_not_called()
+
+    # 仅含纯数字 goods_id 的非原始链接由网关返回 40009 后精准映射报错
+    strategy.replies.append(
+        RuntimeError("PDD网关拒绝: [50001:40009] 业务服务错误 - 该查询不是来自终端用户的原始链接")
+    )
+    bad_id_res = strategy.adapter.resolve_and_convert_universal(
+        "https://mobile.yangkeduo.com/goods.html?goods_id=950876695664", uid=None
+    )
+    assert bad_id_res["status"] == "error"
+    assert bad_id_res["error_code"] == "UNSUPPORTED_PDD_ID_ONLY_URL"
+
+    # 非单品链接若触发多结果返回 (total_count != 1)，严格报错拒绝，绝不盲取首条商品
+    strategy.replies.append(
+        {"goods_search_response": {"goods_list": [sample_item, sample_item], "total_count": 1000}}
+    )
+    ambiguous_res = strategy.adapter.resolve_and_convert_universal("https://mobile.yangkeduo.com/", uid=None)
+    assert ambiguous_res["status"] == "error"
+    assert ambiguous_res["error_code"] == "UNRESOLVED_PDD_INPUT"
+
+    # 纯文本标题绝不调用网关搜索
+    plain_res = strategy.adapter.resolve_and_convert_universal("百事可乐无糖生可乐500ml*5瓶", uid=None)
+    assert plain_res["status"] == "error"
+    assert plain_res["error_code"] == "UNRESOLVED_PDD_INPUT"
+

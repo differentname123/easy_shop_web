@@ -271,6 +271,32 @@ def test_hdk_discrete_page_size_does_not_send_unsupported_ui_limit():
     assert http.get.call_args.kwargs["params"]["cid"] == 0
 
 
+def test_hdk_five_page_cap_and_exhausted_page_return_has_more_false():
+    # 第 5 页 (min_id=5, back=20) 返回 20 条且 min_id=6 时，直接标记 has_more=False 终止翻页
+    rows_20 = [{"itemid": str(i)} for i in range(1, 21)]
+    http = SimpleNamespace(get=Mock(return_value=reply({"code": 1, "data": rows_20, "min_id": 6})))
+    client = HdkClient("key", http)
+    page5 = client.get_ranked_ids(1, limit=20, cursor={"min_id": "5"})
+    assert page5["status"] == "success"
+    assert len(page5["item_ids"]) == 20
+    assert page5["has_more"] is False
+    assert page5["next_cursor"] is None
+
+    # 若调用方仍请求 min_id=6，好单库返回 code=0, min_id=0, data=[] ("数据获取完毕！") 时视为正常空尾页而非业务报错
+    http.get.return_value = reply({"code": 0, "msg": "数据获取完毕！", "data": [], "min_id": 0})
+    page6 = client.get_ranked_ids(1, limit=20, cursor={"min_id": "6"})
+    assert page6["status"] == "success"
+    assert page6["item_ids"] == []
+    assert page6["has_more"] is False
+    assert page6["next_cursor"] is None
+
+    # 真正的上游错误（如 key 错误或超时，min_id 为 None）仍返回 UPSTREAM_ERROR
+    http.get.return_value = reply({"code": 0, "msg": "网络超时，页面加载失败。稍后再试~", "data": [], "min_id": None})
+    err = client.get_ranked_ids(1, limit=20, cursor={"min_id": "1"})
+    assert err["status"] == "error"
+    assert err["error_code"] == "UPSTREAM_ERROR"
+
+
 def order_response(orders=None, has_next=False, position="", root="tbk_sc_order_details_get_response"):
     return {root: {"data": {"results": {"publisher_order_dto": orders or []},
             "has_next": has_next, "position_index": position}}}

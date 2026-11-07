@@ -40,6 +40,9 @@ class HdkClient:
             return _error("NETWORK_ERROR", "好单库榜单通信失败")
         if not isinstance(body, dict):
             return _error("PROTOCOL_ERROR", "好单库响应不是对象")
+        if str(body.get("code")) == "0" and body.get("data") == [] and str(body.get("min_id")) == "0":
+            return {"status": "success", "item_ids": [], "source_count": 0,
+                    "has_more": False, "next_cursor": None, "total_count": body.get("total_count")}
         if str(body.get("code")) != "1":
             return _error("UPSTREAM_ERROR", "好单库榜单返回业务错误")
         rows = body.get("data")
@@ -53,6 +56,8 @@ class HdkClient:
             return _error("PROTOCOL_ERROR", "好单库 has_more 无效")
         has_more = explicit_more in (True, 1, "1", "true") if explicit_more is not None else bool(rows) and len(rows) >= back
         if next_id is not None and str(next_id) == "0" and explicit_more is None:
+            has_more = False
+        if back == 20 and next_id is not None and str(next_id).isdigit() and int(next_id) > 5 and explicit_more is None:
             has_more = False
         if has_more and (next_id is None or str(next_id) == min_id or not str(next_id).isdigit() or int(next_id) < 1):
             return _error("PAGINATION_ERROR", "好单库后续页缺少前进游标")

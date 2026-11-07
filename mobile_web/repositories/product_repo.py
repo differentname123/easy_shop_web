@@ -89,6 +89,16 @@ class ProductRepository(BaseRepository):
             },
         }
 
+    @classmethod
+    def _boom_content_filter(cls) -> Dict[str, Any]:
+        """爆单推广与类目聚合仅读取已入库的榜单商品，排除搜索/详情散查及缺少榜单频道标识的记录。"""
+        content_filter = deepcopy(cls._displayable_content_filter())
+        content_filter["channel_type"] = {"$exists": True, "$ne": None}
+        content_filter["$expr"]["$let"]["in"]["$and"].append(
+            {"$in": [{"$type": "$channel_type"}, ["int", "long"]]}
+        )
+        return content_filter
+
     @staticmethod
     def _first_present(data: Dict[str, Any], *keys, default=None):
         """缺失/None 才回退；0、False、空集合是已知值。"""
@@ -211,7 +221,7 @@ class ProductRepository(BaseRepository):
             update_set["source"] = item["source"]
         elif not detail:
             update_set["source"] = f"{platform}_recommend_stream"
-        if not detail and channel_type is not None:
+        if not detail and isinstance(channel_type, int) and not isinstance(channel_type, bool):
             update_set["channel_type"] = channel_type
 
         if detail:
@@ -271,7 +281,7 @@ class ProductRepository(BaseRepository):
         try:
             cursor = (
                 self.col.find(
-                    {"$and": [filter_query, self._displayable_content_filter()]},
+                    {"$and": [filter_query, self._boom_content_filter()]},
                     self._SUMMARY_PROJECTION,
                 )
                 .sort(sort_spec)
@@ -448,7 +458,7 @@ class ProductRepository(BaseRepository):
         if platform and self._platform(platform) != "all":
             filter_query["platform"] = self._platform(platform)
         try:
-            cats = self.col.distinct("category", {"$and": [filter_query, self._displayable_content_filter()]})
+            cats = self.col.distinct("category", {"$and": [filter_query, self._boom_content_filter()]})
             result = []
             for c in cats:
                 text = str(c).strip() if c is not None else ""
