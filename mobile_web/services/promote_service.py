@@ -320,57 +320,11 @@ class PromoteService:
 
         goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign) or "url"
         user_tag = clean_uid or "匿名"
-        identity, context = {}, {}
-        effective_uid = clean_uid
-        need_auth = False
-        auth_ms = 0.0
-        if getattr(adapter, "requires_numeric_promoter_id", False) is True:
-            auth_started = time.perf_counter()
-            if clean_uid:
-                if self.user_service is None:
-                    from services.user_service import UserService
-                    self.user_service = UserService()
-                context = self.user_service.get_numeric_promotion_context(
-                    clean_uid, plat, getattr(adapter, "default_promoter_id", ""))
-                auth_ms = (time.perf_counter() - auth_started) * 1000
-                if context.get("status") != "success":
-                    logger.warning(
-                        "❌ 【推广转链失败】获取推手数字推广位身份时失败 | 平台[%s] 商品[%s] 用户[%s] 耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户账号状态或默认推广位配置>",
-                        plat, goods_tag, user_tag, (time.perf_counter() - total_started) * 1000,
-                        context.get("error_msg") or context.get("error_code") or "推广身份异常",
-                    )
-                    return context
-                numeric_id = context.get("promoter_id")
-            else:
-                numeric_id = getattr(adapter, "default_promoter_id", "")
-            try:
-                identity = {"promoter_id": normalize_promoter_id(numeric_id)}
-            except ValueError:
-                logger.warning(
-                    "❌ 【推广转链失败】平台数字推广位ID格式无效 | 平台[%s] 商品[%s] 用户[%s] 排查方向<请检查环境变量中默认推广位ID(如JD_DEFAULT_POSITION_ID)是否为纯数字>",
-                    plat, goods_tag, user_tag,
-                )
-                return {"status": "error", "error_code": "invalid_promoter_id",
-                        "error_msg": "平台推广身份尚未正确配置"}
-        if clean_uid and getattr(adapter, "requires_authorized_promotion", False):
-            if self.user_service is None:
-                from services.user_service import UserService
-                self.user_service = UserService()
-            auth_started = time.perf_counter()
-            context = self.user_service.get_promotion_context(clean_uid, plat, allow_remote=False)
-            auth_ms = (time.perf_counter() - auth_started) * 1000
-            if context.get("status") != "success":
-                logger.warning(
-                    "❌ 【推广转链失败】读取推手平台渠道授权状态时失败 | 平台[%s] 商品[%s] 用户[%s] 授权耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户中心数据库或授权状态配置>",
-                    plat, goods_tag, user_tag, auth_ms,
-                    context.get("error_msg") or context.get("error_code") or "授权上下文读取失败",
-                )
-                return context
-            if context.get("is_authorized") is True:
-                identity = context.get("identity") or {}
-            else:
-                effective_uid = ""
-                need_auth = True
+        err_resp, effective_uid, identity, context, need_auth, auth_ms = self._resolve_user_promotion_context(
+            plat, adapter, clean_uid, goods_tag=goods_tag, total_started=total_started, log_errors=True
+        )
+        if err_resp is not None:
+            return err_resp
 
         trace: Dict[str, Any] = {}
         data = self._get_link_data(ref, product_url, effective_uid, identity, adapter, kwargs, trace=trace)
@@ -418,23 +372,15 @@ class PromoteService:
             return data
 
         result = self._with_command(data, adapter, kwargs)
+        self._decorate_auth_fallback(
+            result, plat, adapter, context, need_auth=need_auth, personal_fallback=personal_fallback, hint_location="我的页"
+        )
         if need_auth:
-            authorization_status = context.get("authorization_status", "unauthorized")
-            if personal_fallback:
-                message = f"{adapter.platform_name}渠道授权未生效或已失效，请前往我的页重新校验"
-            else:
-                message = (f"您尚未在{adapter.platform_name}完成渠道授权备案" if authorization_status == "unauthorized"
-                           else f"{adapter.platform_name}授权状态待确认，请前往我的页重新校验")
-            result.update(need_auth=True, is_fallback=True, attribution_status="anonymous",
-                          auth_platform=plat, auth_platform_name=adapter.platform_name,
-                          authorization_status=authorization_status,
-                          auth_msg=f"{message}；当前为通用链接，无法计入本人推广佣金。")
             logger.info(
                 "【推广转链】平台[%s] 商品[%s] 用户[%s] 模式[fallback_public] 来源[%s] 结果[降级通用链] 授权状态[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms]",
-                plat, goods_tag, user_tag, source, authorization_status, auth_ms, provider_ms, total_ms,
+                plat, goods_tag, user_tag, source, result.get("authorization_status", "unauthorized"), auth_ms, provider_ms, total_ms,
             )
         elif personal_fallback:
-            result.update(is_fallback=True, attribution_status="anonymous")
             logger.info(
                 "【推广转链】平台[%s] 商品[%s] 用户[%s] 模式[fallback_public] 来源[%s] 结果[降级通用链] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms]",
                 plat, goods_tag, user_tag, source, auth_ms, provider_ms, total_ms,
@@ -446,6 +392,113 @@ class PromoteService:
                 source, auth_ms, provider_ms, total_ms,
             )
         return result
+
+    def _ensure_user_service(self):
+        if self.user_service is None:
+            from services.user_service import UserService
+            self.user_service = UserService()
+        return self.user_service
+
+    def _resolve_user_promotion_context(
+        self,
+        plat: str,
+        adapter: Any,
+        clean_uid: str,
+        *,
+        goods_tag: str = "url",
+        total_started: float = 0.0,
+        log_errors: bool = False,
+    ):
+        """统一解析推手推广位身份（数字 position_id 制或渠道授权备案制）。"""
+        user_tag = clean_uid or "匿名"
+        identity: Dict[str, Any] = {}
+        context: Dict[str, Any] = {}
+        effective_uid = clean_uid
+        need_auth = False
+        auth_ms = 0.0
+
+        if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+            auth_started = time.perf_counter()
+            if clean_uid:
+                context = self._ensure_user_service().get_numeric_promotion_context(
+                    clean_uid, plat, getattr(adapter, "default_promoter_id", "")
+                )
+                auth_ms = (time.perf_counter() - auth_started) * 1000
+                if context.get("status") != "success":
+                    if log_errors:
+                        logger.warning(
+                            "❌ 【推广转链失败】获取推手数字推广位身份时失败 | 平台[%s] 商品[%s] 用户[%s] 耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户账号状态或默认推广位配置>",
+                            plat, goods_tag, user_tag, (time.perf_counter() - total_started) * 1000,
+                            context.get("error_msg") or context.get("error_code") or "推广身份异常",
+                        )
+                    return context, effective_uid, identity, context, need_auth, auth_ms
+                numeric_id = context.get("promoter_id")
+            else:
+                numeric_id = getattr(adapter, "default_promoter_id", "")
+            try:
+                identity = {"promoter_id": normalize_promoter_id(numeric_id)}
+            except ValueError:
+                if log_errors:
+                    logger.warning(
+                        "❌ 【推广转链失败】平台数字推广位ID格式无效 | 平台[%s] 商品[%s] 用户[%s] 排查方向<请检查环境变量中默认推广位ID(如JD_DEFAULT_POSITION_ID)是否为纯数字>",
+                        plat, goods_tag, user_tag,
+                    )
+                err = {"status": "error", "error_code": "invalid_promoter_id", "error_msg": "平台推广身份尚未正确配置"}
+                return err, effective_uid, identity, context, need_auth, auth_ms
+
+        if clean_uid and getattr(adapter, "requires_authorized_promotion", False):
+            auth_started = time.perf_counter()
+            context = self._ensure_user_service().get_promotion_context(clean_uid, plat, allow_remote=False)
+            auth_ms = (time.perf_counter() - auth_started) * 1000
+            if context.get("status") != "success":
+                if log_errors:
+                    logger.warning(
+                        "❌ 【推广转链失败】读取推手平台渠道授权状态时失败 | 平台[%s] 商品[%s] 用户[%s] 授权耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户中心数据库或授权状态配置>",
+                        plat, goods_tag, user_tag, auth_ms,
+                        context.get("error_msg") or context.get("error_code") or "授权上下文读取失败",
+                    )
+                return context, effective_uid, identity, context, need_auth, auth_ms
+            if context.get("is_authorized") is True:
+                identity = context.get("identity") or {}
+            else:
+                effective_uid = ""
+                need_auth = True
+
+        return None, effective_uid, identity, context, need_auth, auth_ms
+
+    @staticmethod
+    def _decorate_auth_fallback(
+        result: Dict[str, Any],
+        plat: str,
+        adapter: Any,
+        context: Dict[str, Any],
+        *,
+        need_auth: bool,
+        personal_fallback: bool,
+        hint_location: str = "我的页",
+    ) -> None:
+        """统一装配未备案/降级通用链的前端提示元数据。"""
+        if need_auth:
+            authorization_status = context.get("authorization_status", "unauthorized")
+            if personal_fallback:
+                message = f"{adapter.platform_name}渠道授权未生效或已失效，请前往{hint_location}重新校验"
+            else:
+                message = (
+                    f"您尚未在{adapter.platform_name}完成渠道授权备案"
+                    if authorization_status == "unauthorized"
+                    else f"{adapter.platform_name}授权状态待确认，请前往{hint_location}重新校验"
+                )
+            result.update(
+                need_auth=True,
+                is_fallback=True,
+                attribution_status="anonymous",
+                auth_platform=plat,
+                auth_platform_name=adapter.platform_name,
+                authorization_status=authorization_status,
+                auth_msg=f"{message}；当前为通用链接，无法计入本人推广佣金。",
+            )
+        elif personal_fallback:
+            result.update(is_fallback=True, attribution_status="anonymous")
 
     @staticmethod
     def detect_platform_from_text(raw_text: str) -> str:
@@ -462,6 +515,7 @@ class PromoteService:
         gsign = str(product.get("goods_sign") or "").strip()
         if not gid and not gsign:
             return
+        snapshot = None
         try:
             from datetime import datetime, timezone
             from models.product import utc_millis
@@ -477,12 +531,6 @@ class PromoteService:
                 ProductService._snapshot_deadline(snapshot),
                 uid=uid,
             )
-        except Exception:
-            pass
-        try:
-            save_fn = getattr(self.repo, "save_product_detail", None)
-            if callable(save_fn):
-                save_fn(deepcopy(product), platform=platform)
         except Exception:
             pass
 
@@ -552,38 +600,11 @@ class PromoteService:
             if not callable(resolve_fn):
                 continue
 
-            identity, context = {}, {}
-            effective_uid = clean_uid
-            need_auth = False
-            if getattr(adapter, "requires_numeric_promoter_id", False) is True:
-                if clean_uid:
-                    if self.user_service is None:
-                        from services.user_service import UserService
-                        self.user_service = UserService()
-                    context = self.user_service.get_numeric_promotion_context(
-                        clean_uid, plat, getattr(adapter, "default_promoter_id", "")
-                    )
-                    if context.get("status") != "success":
-                        return context
-                    numeric_id = context.get("promoter_id")
-                else:
-                    numeric_id = getattr(adapter, "default_promoter_id", "")
-                try:
-                    identity = {"promoter_id": normalize_promoter_id(numeric_id)}
-                except ValueError:
-                    return {"status": "error", "error_code": "invalid_promoter_id", "error_msg": "平台推广身份尚未正确配置"}
-            elif clean_uid and getattr(adapter, "requires_authorized_promotion", False):
-                if self.user_service is None:
-                    from services.user_service import UserService
-                    self.user_service = UserService()
-                context = self.user_service.get_promotion_context(clean_uid, plat, allow_remote=False)
-                if context.get("status") != "success":
-                    return context
-                if context.get("is_authorized") is True:
-                    identity = context.get("identity") or {}
-                else:
-                    effective_uid = ""
-                    need_auth = True
+            err_resp, effective_uid, identity, context, need_auth, _ = self._resolve_user_promotion_context(
+                plat, adapter, clean_uid, total_started=total_started, log_errors=False
+            )
+            if err_resp is not None:
+                return err_resp
 
             adapter_kwargs: Dict[str, Any] = {}
             if getattr(adapter, "requires_authorized_promotion", False):
@@ -635,27 +656,9 @@ class PromoteService:
             if product:
                 result["product"] = product
 
-            if need_auth:
-                authorization_status = context.get("authorization_status", "unauthorized")
-                if personal_fallback:
-                    message = f"{adapter.platform_name}渠道授权未生效或已失效，请前往上方授权区重新校验"
-                else:
-                    message = (
-                        f"您尚未在{adapter.platform_name}完成渠道授权备案"
-                        if authorization_status == "unauthorized"
-                        else f"{adapter.platform_name}授权状态待确认，请前往上方授权区重新校验"
-                    )
-                result.update(
-                    need_auth=True,
-                    is_fallback=True,
-                    attribution_status="anonymous",
-                    auth_platform=plat,
-                    auth_platform_name=adapter.platform_name,
-                    authorization_status=authorization_status,
-                    auth_msg=f"{message}；当前为通用链接，无法计入本人推广佣金。",
-                )
-            elif personal_fallback:
-                result.update(is_fallback=True, attribution_status="anonymous")
+            self._decorate_auth_fallback(
+                result, plat, adapter, context, need_auth=need_auth, personal_fallback=personal_fallback, hint_location="上方授权区"
+            )
 
             total_ms = (time.perf_counter() - total_started) * 1000
             logger.info(

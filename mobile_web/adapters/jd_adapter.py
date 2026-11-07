@@ -6,6 +6,11 @@ import re
 from datetime import datetime
 
 from adapters.base import BasePlatformAdapter
+from infrastructure.http_utils import (
+    error_dict as _error,
+    parse_finite_money as _money,
+    parse_shanghai_timestamp as _timestamp,
+)
 from infrastructure.jd_client import (
     JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS, SHANGHAI,
     canonical_promoter_id, product_url,
@@ -36,38 +41,6 @@ def _text(value):
 
 def _pick(*values):
     return next((value for value in values if value is not None and value != ""), None)
-
-
-def _money(value):
-    if value is None or value == "" or isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-        return round(number, 2) if math.isfinite(number) else None
-    except (ValueError, TypeError, OverflowError):
-        return None
-
-
-def _timestamp(value, *, precise=False):
-    if value is None or value == "" or isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-        if not math.isfinite(number):
-            return None
-        seconds = number / 1000 if number > 10**11 else number
-        return seconds if precise else int(seconds)
-    except (ValueError, TypeError, OverflowError):
-        try:
-            date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            seconds = (date if date.tzinfo else date.replace(tzinfo=SHANGHAI)).timestamp()
-            return seconds if precise else int(seconds)
-        except (ValueError, TypeError, OverflowError, OSError):
-            return None
-
-
-def _error(code, message, **extra):
-    return {"status": "error", "error_code": code, "error_msg": message, **extra}
 
 
 def _item_id(item):
@@ -104,10 +77,6 @@ def _material_url(item):
 class JdAdapter(BasePlatformAdapter):
     platform_code = "jd"
     platform_name = "京东"
-    channels = (
-        {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
-        {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
-    )
     requires_authorized_promotion = False
     requires_numeric_promoter_id = True
     requires_material_url = True
@@ -136,13 +105,6 @@ class JdAdapter(BasePlatformAdapter):
     def can_prefetch_detail(self, ref=None):
         """禁用后台盲目单品详情轮询，避免无故消耗 ZTK_APPKEY_LIST 配额。"""
         return False
-
-    def _available(self, capability):
-        if not self.active:
-            return _error("platform_unavailable", "京东暂未启用")
-        if not self.capabilities.get(capability):
-            return _error("CONFIG_ERROR", "京东该功能缺少必要配置")
-        return None
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
         sign = _text(goods_sign or goods_id_or_sign or goods_id)

@@ -5,7 +5,12 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
 import requests
-from infrastructure.http_utils import SHANGHAI, error_dict as _error, parse_appkey_list
+from infrastructure.http_utils import (
+    SHANGHAI,
+    error_dict as _error,
+    execute_with_key_failover,
+    parse_appkey_list,
+)
 from models.user import normalize_promoter_id
 
 # Documented relay currently uses HTTP. Configure an approved secure alternative
@@ -191,38 +196,27 @@ class JdClient:
 
     def _execute_with_failover(self, endpoint, params, evaluator, *, orders=False):
         """
-        使用 `self.appkey_list` 执行请求：
-        - 从当前健康游标 `self._active_key_index` 开始；
-        - 若成功，更新游标并返回；
-        - 若遇到 `UPSTREAM_ERROR`（如单 Key 触发折淘客 301/1000 限流）或 `NETWORK_ERROR`，自动切换下一个 Key 重试；
-        - 若遇到安全/协议/分页错误（如 `UNSAFE_REDIRECT`, `PROTOCOL_ERROR`, `PAGINATION_ERROR`, `UNTRUSTED_GATEWAY`），立即终止返回。
+        使用 `self.appkey_list` 执行请求（委托 `execute_with_key_failover` 共享粘性游标容灾机制）：
+        - 若遇到安全/协议/分页错误或京东已返回内层确定性业务封套，立即终止返回。
         """
         config_error = self._validate_config(orders=orders)
         if config_error is not None:
             return config_error
 
-        total = len(self.appkey_list)
-        start_idx = self._active_key_index % total
-        last_result = None
+        last_body = None
 
-        for offset in range(total):
-            idx = (start_idx + offset) % total
-            current_key = self.appkey_list[idx]
-            body = self._get(self.api_base + "/" + endpoint, params={"appkey": current_key, **params})
-            result = evaluator(body)
-            if result.get("status") == "success":
-                self._active_key_index = idx
-                self.appkey = current_key
-                return result
-            last_result = result
-            if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR"):
-                return result
-            # 若折淘客网关已正常返回京东联盟内层业务封套（说明当前 appkey 配额正常，而是京东返回如 2001104 商品不在推广中等业务码），
-            # 换用其他折淘客 appkey 仍会得到相同的京东业务错误，立即返回交由上层走详情链接兜底，避免轮询拖慢响应。
-            if isinstance(body, dict) and (PROMOTION_ROOT in body or RANK_ROOT in body or ORDER_ROOT in body):
-                return result
+        def _call(current_key):
+            nonlocal last_body
+            last_body = self._get(self.api_base + "/" + endpoint, params={"appkey": current_key, **params})
+            return evaluator(last_body)
 
-        return last_result
+        return execute_with_key_failover(
+            self,
+            _call,
+            should_stop_early=lambda _res: isinstance(last_body, dict) and (
+                PROMOTION_ROOT in last_body or RANK_ROOT in last_body or ORDER_ROOT in last_body
+            ),
+        )
 
     @staticmethod
     def _page(page, size):

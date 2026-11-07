@@ -24,6 +24,12 @@ def build_command_text(title: str, final_link: str, price=None, coupon=None, app
     return "\n".join(lines)
 
 
+DEFAULT_HOT_CHANNELS = (
+    {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
+    {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
+)
+
+
 class BasePlatformAdapter(ABC):
     """
     电商导购联盟适配器抽象基类
@@ -31,7 +37,7 @@ class BasePlatformAdapter(ABC):
     platform_code: str = ""
     platform_name: str = ""
     active: bool = True
-    channels: tuple = ()
+    channels: tuple = DEFAULT_HOT_CHANNELS
     recommendation_limit: Optional[int] = None
     required_identity_fields: tuple = ()
     requires_authorized_promotion: bool = False
@@ -41,6 +47,24 @@ class BasePlatformAdapter(ABC):
     promotion_scope: str = ""
     order_window_seconds: int = 23 * 3600
     capabilities = None
+
+    def _available(self, capability: str, message: str = "", **extra: Any) -> Optional[Dict[str, Any]]:
+        """统一的平台启用与子能力配置守卫。"""
+        if not self.active:
+            return {
+                "status": "error",
+                "error_code": "platform_unavailable",
+                "error_msg": f"{self.platform_name}暂未启用",
+                **extra,
+            }
+        if self.capabilities is not None and not self.capabilities.get(capability):
+            return {
+                "status": "error",
+                "error_code": "CONFIG_ERROR",
+                "error_msg": message or f"{self.platform_name}该功能缺少必要配置",
+                **extra,
+            }
+        return None
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None) -> ProductRef:
         """公共层不猜测非数字标识的含义；各平台自行解析其兼容输入。"""
@@ -180,6 +204,7 @@ class BasePlatformAdapter(ABC):
 class UnavailablePlatformAdapter(BasePlatformAdapter):
     """未接入平台只保留兼容入口，不能生成假链接或假授权成功。"""
     active = False
+    channels = ()
 
     def _unavailable(self, *args, **kwargs):
         return {

@@ -164,6 +164,27 @@ class TestBaseRepositoryContract(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             _ = repo.col
 
+    def test_seed_resolved_product_seeds_detail_cache_without_repo_io(self):
+        """验证万能转链反查商品后写入 DETAIL_CACHE 且不触发冗余无效的仓储调用"""
+        from cache import DETAIL_CACHE
+        DETAIL_CACHE.clear()
+        repo = MagicMock()
+        service = PromoteService(product_repo=repo)
+        service._seed_resolved_product(
+            "pdd",
+            {
+                "platform": "pdd",
+                "goods_id": "10086",
+                "goods_sign": "E9_SIGN_10086",
+                "name": "维达抽纸整箱",
+                "image_url": "https://img.example.com/1.jpg",
+                "price": 19.9,
+                "original_price": 29.9,
+            },
+        )
+        self.assertGreater(len(DETAIL_CACHE), 0)
+        repo.save_product_detail.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,10 +3,16 @@
 import math
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit
 
 from adapters.base import BasePlatformAdapter
+from infrastructure.http_utils import (
+    SHANGHAI,
+    error_dict as _error,
+    parse_finite_money as _money,
+    parse_shanghai_timestamp as _timestamp,
+)
 from models.product import (
     DetailSnapshot,
     ProductRef,
@@ -20,48 +26,14 @@ from infrastructure.tb_client import TaobaoClient
 from infrastructure.hdk_client import HdkClient
 from infrastructure.ztk_client import ZtkClient, ORDER_WINDOW_SECONDS
 
-SHANGHAI = timezone(timedelta(hours=8))
-
 
 def _text(value):
     return str(value).strip() if value is not None else ""
 
 
-def _money(value):
-    try:
-        value = float(value)
-        return round(value, 2) if math.isfinite(value) else None
-    except (ValueError, TypeError):
-        return None
-
-
-def _timestamp(value):
-    if value is None or value == "":
-        return None
-    try:
-        numeric = float(value)
-        if not math.isfinite(numeric):
-            return None
-        return int(numeric / 1000 if numeric > 10**11 else numeric)
-    except (TypeError, ValueError):
-        try:
-            date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            return int((date if date.tzinfo else date.replace(tzinfo=SHANGHAI)).timestamp())
-        except (ValueError, TypeError, OverflowError):
-            return None
-
-
-def _error(code, message, **extra):
-    return {"status": "error", "error_code": code, "error_msg": message, **extra}
-
-
 class TaobaoAdapter(BasePlatformAdapter):
     platform_code = "taobao"
     platform_name = "淘宝"
-    channels = (
-        {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
-        {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
-    )
     required_identity_fields = ("relation_id",)
     requires_authorized_promotion = True
     order_window_seconds = ORDER_WINDOW_SECONDS

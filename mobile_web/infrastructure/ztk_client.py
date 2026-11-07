@@ -3,7 +3,12 @@
 from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlsplit
 import requests
-from infrastructure.http_utils import SHANGHAI, error_dict as _error, parse_appkey_list
+from infrastructure.http_utils import (
+    SHANGHAI,
+    error_dict as _error,
+    execute_with_key_failover,
+    parse_appkey_list,
+)
 
 ZTK_ORDER_URL = "https://api.zhetaoke.com:10001/api/open_dingdanchaxun2.ashx"
 ZTK_CHANNEL_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl.ashx"
@@ -96,24 +101,14 @@ class ZtkClient:
             return getattr(response, "text", "").strip()
 
     def _run_with_key_failover(self, action):
-        total = len(self.appkey_list)
-        start_idx = self._active_key_index % total
-        last_result = None
-        for offset in range(total):
-            idx = (start_idx + offset) % total
-            current_key = self.appkey_list[idx]
-            result = action(current_key)
-            if result.get("status") == "success":
-                self._active_key_index = idx
-                self.appkey = current_key
-                return result
-            err_msg = str(result.get("error_msg") or "")
-            if last_result is not None and ("sid和appkey不匹配" in err_msg or "sid过期" in err_msg):
-                continue
-            last_result = result
-            if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR"):
-                return result
-        return last_result
+        return execute_with_key_failover(
+            self,
+            action,
+            should_ignore_error=lambda res, _prev: (
+                "sid和appkey不匹配" in str(res.get("error_msg") or "")
+                or "sid过期" in str(res.get("error_msg") or "")
+            ),
+        )
 
     def query_orders(self, start_time, end_time, page=1, page_size=50, cursor=None):
         if not self.appkey_list or not self.sid:

@@ -25,10 +25,6 @@ class PddAdapter(BasePlatformAdapter):
     platform_name = "拼多多"
     requires_authorized_promotion = True
     recommendation_limit = 400
-    channels = (
-        {"channel_type": 5, "name": "实时销量榜", "icon": "fire"},
-        {"channel_type": 1, "name": "今日销量榜", "icon": "crown"},
-    )
 
     def __init__(self, client_id=PDD_CLIENT_ID, client_secret=PDD_CLIENT_SECRET, pid=PDD_PID, enabled=None):
         self.active = settings.pdd_enabled if enabled is None else bool(enabled)

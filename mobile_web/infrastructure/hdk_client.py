@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """好单库榜单HTTP边界，只输出来源ID与分页元数据，不输出商品商业内容。"""
 import requests
+from infrastructure.http_utils import error_dict as _error
 
 HDK_SALES_URL = "https://v2.api.haodanku.com/sales_list"
-
-
-def _error(code, message):
-    return {"status": "error", "error_code": code, "error_msg": message}
 
 
 class HdkClient:

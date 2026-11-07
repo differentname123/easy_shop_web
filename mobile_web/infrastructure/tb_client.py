@@ -19,6 +19,7 @@ import time
 from typing import Dict, Any, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
+from infrastructure.http_utils import error_dict as _error
 
 logger = logging.getLogger("mobile_web")
 
@@ -138,10 +139,6 @@ def call_tb_api(
         return _error(str(sub_code or code), error_detail)
 
     return {"status": "success", "data": result, "raw": result}
-
-
-def _error(code, message):
-    return {"status": "error", "error_code": code, "error_msg": message}
 
 
 def _text(value):

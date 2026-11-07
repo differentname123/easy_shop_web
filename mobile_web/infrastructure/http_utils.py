@@ -20,17 +20,23 @@ def clean_text(value: Any) -> str:
     return "" if text in ("None", "null") else text
 
 
-def clean_money(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
-    """将金额或费率字段安全转换为非负两位小数浮点数。"""
+def parse_finite_money(value: Any) -> Optional[float]:
+    """将金额或费率字段转换为有限两位小数浮点数（保留正负号以供调用方校验非法负值）。"""
     if value is None or value == "" or isinstance(value, bool):
-        return default
+        return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+        return round(number, 2) if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def clean_money(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
+    """将金额或费率字段安全转换为非负两位小数浮点数。"""
+    number = parse_finite_money(value)
+    if number is None or number < 0:
         return default
-    if not math.isfinite(number) or number < 0:
-        return default
-    return round(number, 2)
+    return number
 
 
 def clean_int(value: Any, default: Optional[int] = None) -> Optional[int]:
@@ -58,25 +64,23 @@ def format_shanghai_time(timestamp: Any) -> Optional[str]:
     return datetime.fromtimestamp(int(timestamp), tz=SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_shanghai_timestamp(value: Any) -> Optional[int]:
-    """将北京时间字符串或秒级/毫秒级时间戳统一转换为秒级 UTC 时间戳。"""
+def parse_shanghai_timestamp(value: Any, *, precise: bool = False) -> Any:
+    """将北京时间字符串或秒级/毫秒级时间戳统一转换为 UTC 秒级时间戳（precise=True 时保留浮点秒）。"""
     if value is None or value == "" or isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        if not math.isfinite(value) or value <= 0:
+    try:
+        number = float(value)
+        if not math.isfinite(number):
             return None
-        number = int(value)
-        return number // 1000 if number > 10_000_000_000 else number
-    raw = clean_text(value)
-    if raw.isdigit():
-        number = int(raw)
-        return number // 1000 if number > 10_000_000_000 else (number if number > 0 else None)
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        seconds = number / 1000 if number > 10**11 else number
+        return seconds if precise else int(seconds)
+    except (TypeError, ValueError, OverflowError):
         try:
-            return int(datetime.strptime(raw, fmt).replace(tzinfo=SHANGHAI).timestamp())
-        except ValueError:
-            continue
-    return None
+            date = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            seconds = (date if date.tzinfo else date.replace(tzinfo=SHANGHAI)).timestamp()
+            return seconds if precise else int(seconds)
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
 
 
 def parse_appkey_list(raw: Any, extra_list: Any = None) -> Tuple[str, ...]:
@@ -133,3 +137,39 @@ def should_failover_ztk_key(payload: Any) -> bool:
 def error_dict(code: str, message: str, **extra: Any) -> Dict[str, Any]:
     """构造统一的错误返回字典。"""
     return {"status": "error", "error_code": code, "error_msg": message, **extra}
+
+
+def execute_with_key_failover(
+    client: Any,
+    action: Any,
+    *,
+    should_ignore_error: Any = None,
+    should_stop_early: Any = None,
+) -> Dict[str, Any]:
+    """
+    通用多 AppKey 粘性游标故障转移执行器：
+    - 从 client._active_key_index 开始轮询 client.appkey_list；
+    - 成功时更新 client._active_key_index 和 client.appkey；
+    - 遇到非 UPSTREAM_ERROR / NETWORK_ERROR 的确定性错误或 should_stop_early 命中时立即终止返回。
+    """
+    keys = getattr(client, "appkey_list", ()) or ()
+    total = len(keys)
+    start_idx = getattr(client, "_active_key_index", 0) % total
+    last_result: Optional[Dict[str, Any]] = None
+
+    for offset in range(total):
+        idx = (start_idx + offset) % total
+        current_key = keys[idx]
+        result = action(current_key)
+        if result.get("status") == "success":
+            client._active_key_index = idx
+            client.appkey = current_key
+            return result
+        if last_result is not None and callable(should_ignore_error) and should_ignore_error(result, last_result):
+            continue
+        last_result = result
+        if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR"):
+            return result
+        if callable(should_stop_early) and should_stop_early(result):
+            return result
+    return last_result or error_dict("UPSTREAM_ERROR", "请求失败")

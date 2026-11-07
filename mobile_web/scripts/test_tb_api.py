@@ -178,6 +178,7 @@ ZTK_CONVERT_TKL_PILIANG_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzh
 ZTK_CONVERT_IID_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian.ashx"
 ZTK_PUBLISHER_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_publisher_get.ashx"
 ZTK_INVITECODE_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_invitecode_get.ashx"
+ZTK_AUTH_INFO_URL = "https://api.zhetaoke.com:10001/api/open_taokeshouquaninfo.ashx"
 ZTK_ORDER_URL = "https://api.zhetaoke.com:10001/api/open_dingdanchaxun2.ashx"
 
 _ZTK_KEY_FAILURE_KEYWORDS = (
@@ -868,6 +869,54 @@ def generate_tb_authority_url(uid: str) -> Dict[str, Any]:
 def sync_publisher_after_auth(uid: str) -> Dict[str, Any]:
     """用户在手淘完成授权后，回查并同步 relation_id"""
     return check_publisher_relation_by_user(uid)
+
+
+def check_ztk_sid_authorize_info(sid: Optional[str] = None) -> Dict[str, Any]:
+    """
+    查询折淘客长效 ZTK_SID 淘客授权详情与过期时间 (open_taokeshouquaninfo.ashx)
+    """
+    use_sid = str(sid or ZTK_SID or "").strip()
+    if not use_sid or not ZTK_APPKEY_LIST:
+        return {"status": "error", "error_msg": "未配置折淘客 SID 或 AppKey"}
+    ztk_res = request_ztk_with_failover(ZTK_AUTH_INFO_URL, {"sid": use_sid})
+    if ztk_res["status"] != "success":
+        return {"status": "error", "error_msg": ztk_res.get("error_msg", "查询折淘客授权信息失败")}
+    data = ztk_res.get("data") or {}
+    content = data.get("content") if isinstance(data, dict) else None
+    item = content[0] if isinstance(content, list) and content and isinstance(content[0], dict) else (data if isinstance(data, dict) else {})
+    return {
+        "status": "success",
+        "sid": use_sid,
+        "account_name": item.get("taobao_user_nick") or item.get("account_name") or "",
+        "expire_time": item.get("expire_time") or item.get("w2_expires_in") or "",
+        "raw": item,
+    }
+
+
+def refresh_tb_session_token(refresh_token: str) -> Dict[str, Any]:
+    """
+    通过阿里妈妈官方 TOP `taobao.top.auth.token.refresh` 刷新 Access Token (SessionKey)
+    """
+    token = str(refresh_token or "").strip()
+    if not token:
+        return {"status": "error", "error_msg": "refresh_token 不能为空"}
+    res = call_tb_api(TB_APP_KEY, TB_APP_SECRET, "taobao.top.auth.token.refresh", {"refresh_token": token})
+    if res["status"] != "success":
+        return res
+    token_result = (res["data"].get("top_auth_token_refresh_response") or {}).get("token_result")
+    if isinstance(token_result, str):
+        try:
+            token_result = json.loads(token_result)
+        except Exception:
+            token_result = {}
+    if not isinstance(token_result, dict) or not token_result.get("access_token"):
+        return {"status": "error", "error_msg": "刷新淘宝 Session 响应格式异常"}
+    return {
+        "status": "success",
+        "access_token": str(token_result.get("access_token") or ""),
+        "refresh_token": str(token_result.get("refresh_token") or token),
+        "expires_in": token_result.get("expires_in"),
+    }
 
 
 # ==============================================================================
