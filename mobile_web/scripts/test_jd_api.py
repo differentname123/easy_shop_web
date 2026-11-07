@@ -258,6 +258,32 @@ def extract_jd_canonical_goods_id(raw_id_or_sign: str, image_url: str = "") -> s
     return text
 
 
+def normalize_jd_material_url(raw_url: str, item_id: str = "") -> str:
+    """
+    规范化京东联盟物料链接（基线规则）：
+    - 加密 itemId 严禁拼接为 https://item.jd.com/{encrypted_id}.html（转链必报 2001104）；
+    - 若输入或已有 URL 为加密 itemId 构造的 item.jd.com 链接，统一规范化为 https://jingfen.jd.com/detail/{encrypted_id}.html；
+    - 纯数字 SKU 则保留 https://item.jd.com/{sku}.html。
+    """
+    url = str(raw_url or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    m_item = re.search(r"https?://item\.jd\.com/([^/?#.]+)\.html", url, re.IGNORECASE)
+    if m_item:
+        token = m_item.group(1).strip()
+        if token and not token.isdigit():
+            return f"https://jingfen.jd.com/detail/{token}.html"
+    if url:
+        return url
+    clean_id = str(item_id or "").strip()
+    if not clean_id:
+        return ""
+    if clean_id.isdigit():
+        return f"https://item.jd.com/{clean_id}.html"
+    return f"https://jingfen.jd.com/detail/{clean_id}.html"
+
+
+
 # ==================== 2. 功能 1: 实时榜单选品 ====================
 def get_rank_goods(
     sort_type: int = 1,

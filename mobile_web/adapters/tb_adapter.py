@@ -9,7 +9,9 @@ from urllib.parse import urlencode, urlsplit
 from adapters.base import BasePlatformAdapter
 from infrastructure.http_utils import (
     SHANGHAI,
+    clean_text as _text,
     error_dict as _error,
+    extract_ztk_item_fields,
     parse_finite_money as _money,
     parse_shanghai_timestamp as _timestamp,
 )
@@ -25,10 +27,6 @@ from models.product import (
 from infrastructure.tb_client import TaobaoClient
 from infrastructure.hdk_client import HdkClient
 from infrastructure.ztk_client import ZtkClient, ORDER_WINDOW_SECONDS
-
-
-def _text(value):
-    return str(value).strip() if value is not None else ""
 
 
 class TaobaoAdapter(BasePlatformAdapter):
@@ -455,41 +453,26 @@ class TaobaoAdapter(BasePlatformAdapter):
         password = _text(ztk_res.get("tpwd"))
         raw_c = ztk_res.get("raw") if isinstance(ztk_res.get("raw"), dict) else {}
 
-        tao_id = clean_product_id(raw_c.get("tao_id")) or (text if is_bare_id else "")
+        ztk_fields = extract_ztk_item_fields(
+            raw_c,
+            zero_fallback_to_size=True,
+            include_primary_in_carousel=True,
+            default_mall_name="淘宝天猫好店",
+            default_sales_tip="0",
+        )
+        tao_id = clean_product_id(ztk_fields["tao_id"]) or (text if is_bare_id else "")
         canonical_tao_id = extract_canonical_goods_id(self.platform_code, tao_id) or tao_id
-        title = _text(raw_c.get("title") or raw_c.get("tao_title") or ztk_res.get("title") or "淘宝精选好物")
-        pict_url = _text(raw_c.get("pict_url") or "")
-        if pict_url.startswith("//"):
-            pict_url = "https:" + pict_url
-        small_raw = raw_c.get("small_images") or ""
-        if isinstance(small_raw, str):
-            gallery = [u.strip() for u in small_raw.split("|") if u.strip()]
-        elif isinstance(small_raw, list):
-            gallery = [str(u).strip() for u in small_raw if str(u).strip()]
-        else:
-            gallery = []
-        gallery = [("https:" + u if u.startswith("//") else u) for u in gallery]
-        if pict_url and pict_url not in gallery:
-            gallery.insert(0, pict_url)
-
-        orig_price = _money(raw_c.get("size")) or 0.0
-        final_price = _money(raw_c.get("quanhou_jiage"))
-        if final_price is None:
-            final_price = orig_price
-        coupon_money = _money(raw_c.get("coupon_info_money")) or 0.0
-        if orig_price < final_price:
-            orig_price = round(final_price + coupon_money, 2)
-        comm_rate = _money(raw_c.get("tkrate3")) or 0.0
-        comm_fee = _money(raw_c.get("tkfee3"))
-        if comm_fee is None:
-            comm_fee = round(final_price * comm_rate / 100.0, 2)
-        mall_name = _text(raw_c.get("shop_title") or raw_c.get("nick") or "淘宝天猫好店")
-        sales_tip = _text(raw_c.get("volume") or "0")
-        raw_item_url = _text(raw_c.get("item_url") or "")
-        if raw_item_url.startswith("//"):
-            raw_item_url = "https:" + raw_item_url
-        if not raw_item_url and tao_id:
-            raw_item_url = f"https://uland.taobao.com/item/edetail?id={tao_id}"
+        title = ztk_fields["title"] or _text(ztk_res.get("title") or "淘宝精选好物")
+        pict_url = ztk_fields["image_url"]
+        gallery = ztk_fields["carousel_images"]
+        final_price = ztk_fields["price"]
+        orig_price = ztk_fields["original_price"]
+        coupon_money = ztk_fields["coupon_amount"]
+        comm_rate = ztk_fields["commission_rate"]
+        comm_fee = ztk_fields["commission_amount"]
+        mall_name = ztk_fields["mall_name"]
+        sales_tip = ztk_fields["sales_tip"]
+        raw_item_url = ztk_fields["item_url"] or (f"https://uland.taobao.com/item/edetail?id={tao_id}" if tao_id else "")
 
         product_card = None
         if tao_id and title:

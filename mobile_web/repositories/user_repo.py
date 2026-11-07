@@ -28,6 +28,7 @@ class UserRepository(BaseRepository):
     def __init__(self, db_instance=None):
         self._promoter_index_ready = False
         self._promoter_index_lock = threading.Lock()
+        self._ensured_identity_indexes = set()
         super().__init__(db_instance)
 
     def _init_indexes(self):
@@ -54,6 +55,20 @@ class UserRepository(BaseRepository):
                 self.col.create_index([("promoter_id", 1)], unique=True, name="promoter_id_unique",
                                       partialFilterExpression={"promoter_id": {"$type": "string"}})
                 self._promoter_index_ready = True
+
+    def _ensure_identity_index(self, path: str) -> None:
+        col = self.col
+        cache_key = (id(col), path)
+        if cache_key in self._ensured_identity_indexes:
+            return
+        with self._promoter_index_lock:
+            if cache_key not in self._ensured_identity_indexes:
+                col.create_index(
+                    [(path, 1)],
+                    unique=True,
+                    partialFilterExpression={path: {"$type": "string"}},
+                )
+                self._ensured_identity_indexes.add(cache_key)
 
     @staticmethod
     def _unassigned_promoter(uid):
@@ -324,8 +339,7 @@ class UserRepository(BaseRepository):
                     for identity_key in value:
                         path = f"{field_prefix}.identity.{identity_key}"
                         # 唯一约束无法建立时拒绝保存，不能退回多用户共享同一渠道。
-                        self.col.create_index([(path, 1)], unique=True,
-                                              partialFilterExpression={path: {"$type": "string"}})
+                        self._ensure_identity_index(path)
                 update_fields[f"{field_prefix}.{key}"] = value
 
         res = self.col.update_one(

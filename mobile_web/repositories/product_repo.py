@@ -21,6 +21,7 @@ from models.product import (
     extract_search_keyword,
     is_jd_image_key,
     normalize_platform,
+    resolve_item_identity,
     utc_millis,
 )
 from config import PROMOTION_LINK_TTL, logger
@@ -100,35 +101,7 @@ class ProductRepository(BaseRepository):
 
     @classmethod
     def _identity(cls, item: Dict[str, Any]) -> Tuple[str, str, str]:
-        platform = cls._platform(item.get("platform"))
-        raw_gid = cls._real_goods_id(item.get("goods_id"))
-        raw_pid = cls._real_goods_id(item.get("product_id"))
-        raw_sign = str(item.get("goods_sign") or "").strip()
-
-        if platform == "pdd":
-            goods_id = raw_gid or (raw_pid if raw_pid != raw_sign else "")
-            goods_sign = raw_sign or (raw_pid if not goods_id else "")
-        else:
-            val = raw_gid or raw_sign or raw_pid
-            img_url = str(
-                item.get("image_url")
-                or item.get("goods_image_url")
-                or item.get("goods_thumbnail_url")
-                or ""
-            ).strip()
-            raw_id_candidate = raw_gid or raw_pid or val
-            goods_id = (
-                extract_canonical_goods_id(
-                    platform,
-                    raw_id_candidate,
-                    image_url=img_url,
-                    allow_jd_sign_desalt=True,
-                )
-                or raw_id_candidate
-            )
-            goods_sign = raw_sign or val
-
-        return platform, goods_id, goods_sign
+        return resolve_item_identity(item, allow_jd_sign_desalt=True)
 
     @staticmethod
     def _identity_filter(platform: str, goods_id: str, goods_sign: str) -> Dict[str, Any]:

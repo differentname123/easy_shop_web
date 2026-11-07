@@ -1191,8 +1191,11 @@ def main():
         ztk_bad_rel = convert_channel_url_by_ztk(sample_id, relation_id="9999999999")
         print(f" -> [4c] 未备案/无效 relation_id 拦截验证: status={ztk_bad_rel['status']}, error_code={ztk_bad_rel.get('error_code')}, need_auth={ztk_bad_rel.get('need_auth')}")
 
-    # 5. 验证推手渠道备案查询与邀请链接生成 (含折淘客 90 天 ZTK_SID 自动回退)
+    # 5. 验证推手渠道备案查询与邀请链接生成 (含折淘客 90 天 ZTK_SID 自动回退与授权状态检测)
     print("\n[5/7] 验证淘宝推手渠道备案查询与邀请码生成 (TOP 优先 + 折淘客 90天 SID 自动回退)...")
+    if ZTK_SID:
+        sid_info = check_ztk_sid_authorize_info()
+        print(f" -> 折淘客长效 ZTK_SID 授权状态: status={sid_info.get('status')}, nick={sid_info.get('account_name')}, expire={sid_info.get('expire_time')}")
     rel_res = check_publisher_relation_by_user(test_uid)
     print(f" -> 渠道备案查询: {rel_res}")
     if not rel_res.get("is_authorized"):

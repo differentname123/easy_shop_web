@@ -50,11 +50,93 @@ def clean_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 
 
 def normalize_http_url(value: Any) -> str:
-    """标准化 http/https 链接，支持补全协议相对路径 //。"""
+    """标准化 http/https 链接，支持补全协议相对路径 // 并验证主机名非空。"""
     raw = clean_text(value)
     if raw.startswith("//"):
         raw = "https:" + raw
-    return raw if raw.startswith(("https://", "http://")) else ""
+    if not raw.startswith(("https://", "http://")):
+        return ""
+    rest = raw.split("://", 1)[1]
+    host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip()
+    return raw if host else ""
+
+
+def parse_carousel_images(raw_images: Any, primary_image: str = "") -> List[str]:
+    """解析折淘客/通用商品轮播图列表（支持竖线分隔字符串或列表），自动去重并校验 HTTP URL。"""
+    if isinstance(raw_images, str):
+        candidates = raw_images.split("|")
+    elif isinstance(raw_images, (list, tuple)):
+        candidates = list(raw_images)
+    else:
+        candidates = []
+    images: List[str] = []
+    for item in candidates:
+        normalized = normalize_http_url(item)
+        if normalized and normalized not in images:
+            images.append(normalized)
+    primary = normalize_http_url(primary_image)
+    if primary and primary not in images:
+        images.insert(0, primary)
+    return images
+
+
+def extract_ztk_item_fields(
+    raw_item: Any,
+    *,
+    zero_fallback_to_size: bool = False,
+    include_primary_in_carousel: bool = False,
+    default_mall_name: str = "",
+    default_sales_tip: str = "",
+) -> Dict[str, Any]:
+    """
+    统一解析折淘客 (ZTK) 商品字典字段（复用于淘宝/京东搜索、详情及万能转链反查）。
+    """
+    raw = raw_item if isinstance(raw_item, dict) else {}
+    tao_id = clean_text(raw.get("tao_id") or raw.get("skuId") or raw.get("item_id"))
+    title = clean_text(raw.get("title") or raw.get("tao_title") or raw.get("skuName"))
+    image_url = normalize_http_url(
+        raw.get("pict_url") or raw.get("pic") or raw.get("imageUrl") or raw.get("white_image")
+    )
+    carousel_images = parse_carousel_images(
+        raw.get("small_images") or raw.get("pcDescContent"),
+        primary_image=image_url if include_primary_in_carousel else "",
+    )
+    size_price = max(0.0, clean_money(raw.get("size"), 0.0) or 0.0)
+    raw_quanhou = raw.get("quanhou_jiage")
+    if zero_fallback_to_size:
+        quanhou = max(0.0, clean_money(raw_quanhou, 0.0) or 0.0)
+        price = quanhou if quanhou > 0 else size_price
+    else:
+        fallback_val = size_price if raw_quanhou is None or clean_text(raw_quanhou) == "" else raw_quanhou
+        price = max(0.0, clean_money(fallback_val, 0.0) or 0.0)
+    coupon_amount = max(0.0, clean_money(raw.get("coupon_info_money"), 0.0) or 0.0)
+    if zero_fallback_to_size:
+        original_price = size_price if size_price >= price else round(price + coupon_amount, 2)
+    else:
+        original_price = max(size_price, price)
+    commission_rate = max(0.0, clean_money(raw.get("tkrate3"), 0.0) or 0.0)
+    raw_tkfee = max(0.0, clean_money(raw.get("tkfee3"), 0.0) or 0.0)
+    if zero_fallback_to_size and raw_tkfee <= 0 and price > 0 and commission_rate > 0:
+        commission_amount = round(price * commission_rate / 100.0, 2)
+    else:
+        commission_amount = raw_tkfee
+
+    return {
+        "tao_id": tao_id,
+        "title": title,
+        "image_url": image_url,
+        "carousel_images": carousel_images,
+        "price": price,
+        "original_price": original_price,
+        "coupon_amount": coupon_amount,
+        "has_coupon": coupon_amount > 0,
+        "commission_rate": commission_rate,
+        "commission_amount": commission_amount,
+        "mall_name": clean_text(raw.get("shop_title") or raw.get("nick")) or default_mall_name,
+        "sales_tip": clean_text(raw.get("volume") or raw.get("TKtotalSales")) or default_sales_tip,
+        "item_url": normalize_http_url(raw.get("item_url")),
+    }
+
 
 
 def format_shanghai_time(timestamp: Any) -> Optional[str]:

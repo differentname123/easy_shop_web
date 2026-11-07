@@ -110,13 +110,99 @@ def clean_product_id(value: Any) -> str:
     return "" if text in ("", "0", "0.0", "None") else text
 
 
+import hashlib
+
 _JD_IMAGE_KEY_RE = re.compile(r"^[0-9a-fA-F]{14,22}_[0-9a-fA-F]{12,20}$")
+_JD_JFS_HASH_RE = re.compile(r"^jfs/[0-9a-f]{16}$")
+_JD_ITEM_OR_JINGFEN_URL_RE = re.compile(
+    r"^https?://(?:jingfen\.jd\.com/detail|item\.jd\.com)/([^/?#.]+)\.html$",
+    re.IGNORECASE,
+)
+_JD_ITEM_URL_RE = re.compile(r"^https?://item\.jd\.com/([^/?#.]+)\.html$", re.IGNORECASE)
 
 
 def is_jd_image_key(value: Any) -> bool:
     """判断字符串是否为京东主图 CDN 提取的 <目录哈希>_<文件哈希> 静态唯一标识。"""
     text = clean_product_id(value)
     return bool(text and _JD_IMAGE_KEY_RE.match(text))
+
+
+def is_jd_jfs_hash_id(value: Any) -> bool:
+    """判断字符串是否为京东主图 CDN 提取的 jfs/<16位sha1> 静态唯一标识。"""
+    text = clean_product_id(value)
+    return bool(text and _JD_JFS_HASH_RE.match(text))
+
+
+def extract_jd_jfs_hash_id(image_url: Any, *fallback_urls: Any) -> str:
+    """从京东官方 CDN 主图 URL (360buyimg.com/jfs/...) 提取跨通道恒定的 16 位十六进制哈希作为稳定 goods_id。"""
+    for candidate in (image_url, *fallback_urls):
+        if isinstance(candidate, (list, tuple)):
+            for sub in candidate:
+                res = extract_jd_jfs_hash_id(sub)
+                if res:
+                    return res
+            continue
+        raw = str(candidate or "").strip()
+        if raw.startswith("//"):
+            raw = "https:" + raw
+        if not raw.startswith(("http://", "https://")):
+            continue
+        parsed = urlsplit(raw)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+        if "360buyimg.com" not in host and "/jfs/" not in path:
+            continue
+        idx = path.find("/jfs/")
+        stable_key = (path[idx:].lower() if idx >= 0 else path.lower()).strip("/")
+        if len(stable_key) >= 12:
+            digest = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:16]
+            return f"jfs/{digest}"
+    return ""
+
+
+def extract_jd_encrypted_id_from_url(url: Any) -> str:
+    """从京东 jingfen.jd.com/detail/{id}.html 或加密版 item.jd.com/{id}.html 中提取加密 itemId。"""
+    raw = str(url or "").strip()
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    match = _JD_ITEM_OR_JINGFEN_URL_RE.match(raw)
+    if not match:
+        return ""
+    token = clean_product_id(match.group(1))
+    if not token or token.isdigit() or is_jd_jfs_hash_id(token):
+        return ""
+    return token
+
+
+def normalize_jd_material_url(raw_url: Any, candidate_id: Any = "") -> str:
+    """
+    规范化京东商品物料链接：
+    - 将用加密 itemId 误拼的 https://item.jd.com/{encrypted_id}.html 统一转换为 https://jingfen.jd.com/detail/{encrypted_id}.html；
+    - 当 raw_url 为空且提供 candidate_id 时，数字 SKU 生成 item.jd.com 链接，加密 itemId 生成 jingfen.jd.com 链接。
+    """
+    url = str(raw_url or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    if url and not url.startswith(("http://", "https://")):
+        url = ""
+    cid = clean_product_id(candidate_id)
+    if is_jd_jfs_hash_id(cid):
+        cid = ""
+
+    if url:
+        m_item = _JD_ITEM_URL_RE.match(url)
+        if m_item:
+            token = clean_product_id(m_item.group(1))
+            if token and not token.isdigit():
+                target = cid or ("" if is_jd_jfs_hash_id(token) else token)
+                return f"https://jingfen.jd.com/detail/{target}.html" if target else ""
+        return url
+
+    if not cid:
+        return ""
+    if cid.isdigit():
+        return f"https://item.jd.com/{cid}.html"
+    return f"https://jingfen.jd.com/detail/{cid}.html"
 
 
 def extract_jd_image_key(image_url: Any) -> str:
@@ -196,6 +282,43 @@ def extract_canonical_goods_id(
         return raw
     return raw
 
+
+def resolve_item_identity(
+    item: Dict[str, Any],
+    default_platform: Optional[str] = "pdd",
+    *,
+    allow_jd_sign_desalt: bool = False,
+) -> tuple[str, str, str]:
+    """从商品字典中统一提取规范化三元组 (platform, goods_id, goods_sign)。"""
+    platform = normalize_platform(item.get("platform") or default_platform)
+    raw_gid = clean_product_id(item.get("goods_id"))
+    raw_pid = clean_product_id(item.get("product_id"))
+    raw_sign = str(item.get("goods_sign") or "").strip()
+
+    if platform == "pdd":
+        goods_id = raw_gid or (raw_pid if raw_pid != raw_sign else "")
+        goods_sign = raw_sign or (raw_pid if not goods_id else "")
+    else:
+        val = raw_gid or raw_sign or raw_pid
+        img_url = str(
+            item.get("image_url")
+            or item.get("goods_image_url")
+            or item.get("goods_thumbnail_url")
+            or ""
+        ).strip()
+        raw_id_candidate = raw_gid or raw_pid or val
+        goods_id = (
+            extract_canonical_goods_id(
+                platform,
+                raw_id_candidate,
+                image_url=img_url,
+                allow_jd_sign_desalt=allow_jd_sign_desalt,
+            )
+            or raw_id_candidate
+        )
+        goods_sign = raw_sign or val
+
+    return platform, goods_id, goods_sign
 
 
 @dataclass(frozen=True)

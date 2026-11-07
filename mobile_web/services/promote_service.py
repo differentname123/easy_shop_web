@@ -16,6 +16,7 @@ from models.product import (
     detect_platform_signal,
     extract_canonical_goods_id,
     is_jd_image_key,
+    normalize_jd_material_url,
     normalize_platform,
 )
 from models.user import normalize_promoter_id
@@ -172,11 +173,8 @@ class PromoteService:
             value = item.get("product_url")
             if isinstance(value, str) and value.strip():
                 clean_val = value.strip()
-                if (ref.platform == "jd" and clean_val.startswith("https://item.jd.com/")
-                        and clean_val.endswith(".html")):
-                    cand_id = clean_val[len("https://item.jd.com/"):-len(".html")]
-                    if len(cand_id) >= 25 and "_" in cand_id and not is_jd_image_key(cand_id):
-                        clean_val = f"https://jingfen.jd.com/detail/{cand_id}.html"
+                if ref.platform == "jd":
+                    clean_val = normalize_jd_material_url(clean_val)
                 MATERIAL_CACHE.set(cache_key, clean_val)
                 return clean_val
             return ""

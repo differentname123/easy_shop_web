@@ -185,6 +185,74 @@ class TestBaseRepositoryContract(unittest.TestCase):
         self.assertGreater(len(DETAIL_CACHE), 0)
         repo.save_product_detail.assert_not_called()
 
+    def test_unified_identity_url_and_ztk_parsers(self):
+        """验证跨平台统一抽取的 ZTK 字段解析、京东物料 URL 规范化、商品三元组身份解析与用户索引幂等去重"""
+        from infrastructure.http_utils import extract_ztk_item_fields, parse_carousel_images
+        from models.product import normalize_jd_material_url, resolve_item_identity
+        from repositories.user_repo import UserRepository
+        from types import SimpleNamespace
+
+        # 1. 轮播图去重与主图前置
+        imgs = parse_carousel_images("//img.example.com/a.jpg|https://img.example.com/b.jpg|//img.example.com/a.jpg", "//img.example.com/main.jpg")
+        self.assertEqual(imgs, [
+            "https://img.example.com/main.jpg",
+            "https://img.example.com/a.jpg",
+            "https://img.example.com/b.jpg",
+        ])
+
+        # 2. 折淘客通用字段提取
+        fields = extract_ztk_item_fields(
+            {
+                "tao_id": "0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd",
+                "title": "维达抽纸24包",
+                "pict_url": "//img.alicdn.com/1.jpg",
+                "small_images": "//img.alicdn.com/2.jpg",
+                "size": "39.9",
+                "quanhou_jiage": "29.9",
+                "coupon_info_money": "10",
+                "tkrate3": "10",
+                "tkfee3": "0",
+            },
+            zero_fallback_to_size=True,
+            include_primary_in_carousel=True,
+        )
+        self.assertEqual(fields["price"], 29.9)
+        self.assertEqual(fields["original_price"], 39.9)
+        self.assertEqual(fields["coupon_amount"], 10.0)
+        self.assertEqual(fields["commission_amount"], 2.99)
+        self.assertEqual(len(fields["carousel_images"]), 2)
+
+        # 3. 京东加密 itemId 物料链接纠偏
+        encrypted_id = "BWQ9383WurxZ8XgYyttv5GNgYyttv5_3rtcLEOl4l98a1A8AG"
+        self.assertEqual(
+            normalize_jd_material_url(f"https://item.jd.com/{encrypted_id}.html"),
+            f"https://jingfen.jd.com/detail/{encrypted_id}.html",
+        )
+        self.assertEqual(
+            normalize_jd_material_url("", "100012043978"),
+            "https://item.jd.com/100012043978.html",
+        )
+
+        # 4. 统一商品三元组身份解析
+        plat, gid, gsign = resolve_item_identity({
+            "platform": "tb",
+            "goods_sign": "0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd",
+        })
+        self.assertEqual(plat, "taobao")
+        self.assertEqual(gid, "0v7DKOgI5JqnZd4Nhxd")
+        self.assertEqual(gsign, "0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd")
+
+        # 5. UserRepository 渠道唯一索引在同集合实例上幂等去重，避免每次写操作重复执行 DDL
+        db = MagicMock()
+        col = db.get_collection.return_value
+        col.update_one.return_value = SimpleNamespace(modified_count=1, matched_count=1)
+        user_repo = UserRepository(db_instance=db)
+        col.create_index.reset_mock()
+        user_repo.update_auth_status("u_12345678", "taobao", True, extra={"identity": {"relation_id": "rel_1"}})
+        user_repo.update_auth_status("u_87654321", "taobao", True, extra={"identity": {"relation_id": "rel_2"}})
+        self.assertEqual(col.create_index.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

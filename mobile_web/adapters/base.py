@@ -86,6 +86,41 @@ class BasePlatformAdapter(ABC):
     def build_command_text(self, title, final_link, price=None, coupon=None) -> str:
         return build_command_text(title, final_link, price, coupon, self.platform_name)
 
+    def _universal_error(
+        self,
+        input_type: str,
+        error_msg: str,
+        *,
+        error_code: Optional[str] = None,
+        need_auth: bool = False,
+        product: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        res: Dict[str, Any] = {
+            "status": "error",
+            "input_type": input_type,
+            "need_auth": bool(need_auth),
+            "error_code": error_code,
+            "error_msg": error_msg,
+        }
+        if product is not None:
+            res["product"] = product
+        return res
+
+    def _universal_success(
+        self,
+        input_type: str,
+        promotion: Dict[str, Any],
+        product: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "status": "success",
+            "platform": self.platform_code,
+            "input_type": input_type,
+            "promotion": promotion,
+            "product": product or {},
+        }
+
+
     @abstractmethod
     def get_recommend_goods(
         self,

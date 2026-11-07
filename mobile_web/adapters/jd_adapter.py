@@ -7,6 +7,7 @@ from datetime import datetime
 
 from adapters.base import BasePlatformAdapter
 from infrastructure.http_utils import (
+    clean_text as _text,
     error_dict as _error,
     parse_finite_money as _money,
     parse_shanghai_timestamp as _timestamp,
@@ -33,10 +34,6 @@ JD_ORDER_STATUS = {
     21: "数据异常", 22: "白条拒绝", 23: "拒收", 24: "支付后取消",
     25: "未支付取消", 27: "售后中", 28: "售后退款",
 }
-
-
-def _text(value):
-    return str(value).strip() if value is not None else ""
 
 
 def _pick(*values):
@@ -344,15 +341,51 @@ class JdAdapter(BasePlatformAdapter):
             if result.get("jd_off_promotion") is True:
                 return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
             return result
-        short, long = result.get("short_url") or "", result.get("click_url") or ""
-        token = result.get("j_short_command") or result.get("j_command") or ""
-        return {"status": "success", "url": long or short, "final_link": short or long,
-                "mobile_url": long or short, "short_url": short, "click_url": long,
-                "j_command": result.get("j_command") or "", "j_short_command": result.get("j_short_command") or "",
-                "promotion_token": token, "token_type": "jcommand" if token else "",
-                "we_app_info": {}, "promoter_id": promoter, "goods_id": ref.goods_id, "goods_sign": ref.goods_sign,
-                "attribution_status": "verified" if uid else "anonymous", "need_auth": False,
-                "is_fallback": False, "cacheable": False, "link_type": "京东推广链接"}
+        return self._build_promotion_payload(
+            result,
+            promoter=promoter,
+            goods_id=ref.goods_id,
+            goods_sign=ref.goods_sign,
+            uid=uid,
+        )
+
+    def _build_promotion_payload(
+        self,
+        result: dict,
+        *,
+        promoter: str,
+        goods_id: str = "",
+        goods_sign: str = "",
+        uid=None,
+        **extra,
+    ) -> dict:
+        short = result.get("short_url") or ""
+        long = result.get("click_url") or ""
+        j_cmd = result.get("j_command") or ""
+        j_short_cmd = result.get("j_short_command") or ""
+        token = j_short_cmd or j_cmd
+        return {
+            "status": "success",
+            "url": long or short,
+            "final_link": short or long,
+            "mobile_url": long or short,
+            "short_url": short,
+            "click_url": long,
+            "j_command": j_cmd,
+            "j_short_command": j_short_cmd,
+            "promotion_token": token,
+            "token_type": "jcommand" if token else "",
+            "we_app_info": {},
+            "promoter_id": promoter,
+            "goods_id": goods_id,
+            "goods_sign": goods_sign,
+            "attribution_status": "verified" if uid else "anonymous",
+            "need_auth": False,
+            "is_fallback": False,
+            "cacheable": False,
+            "link_type": "京东推广链接",
+            **extra,
+        }
 
     def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):
         """
@@ -395,8 +428,6 @@ class JdAdapter(BasePlatformAdapter):
         short = conv.get("short_url") or ""
         long = conv.get("click_url") or ""
         j_cmd = conv.get("j_command") or ""
-        j_short_cmd = conv.get("j_short_command") or ""
-        token = j_short_cmd or j_cmd
 
         resolved_id = extracted_encrypted_id
         if extracted_encrypted_id:
@@ -456,31 +487,17 @@ class JdAdapter(BasePlatformAdapter):
         )
         sign_id = (product_card or {}).get("goods_sign") or resolved_id
 
-        return {
-            "status": "success",
-            "url": long or short,
-            "final_link": short or long,
-            "mobile_url": long or short,
-            "short_url": short,
-            "click_url": long,
-            "j_command": j_cmd,
-            "j_short_command": j_short_cmd,
-            "promotion_token": token,
-            "token_type": "jcommand" if token else "",
-            "we_app_info": {},
-            "promoter_id": promoter,
-            "goods_id": canonical_id,
-            "goods_sign": sign_id,
-            "title": title,
-            "price": price,
-            "coupon_amount": coupon_amount,
-            "attribution_status": "verified" if uid else "anonymous",
-            "need_auth": False,
-            "is_fallback": False,
-            "cacheable": False,
-            "link_type": "京东推广链接",
-            "product": product_card,
-        }
+        return self._build_promotion_payload(
+            conv,
+            promoter=promoter,
+            goods_id=canonical_id,
+            goods_sign=sign_id,
+            uid=uid,
+            title=title,
+            price=price,
+            coupon_amount=coupon_amount,
+            product=product_card,
+        )
 
     def check_authority(self, uid):
         if not self.active:
