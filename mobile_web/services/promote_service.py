@@ -417,3 +417,259 @@ class PromoteService:
                 source, auth_ms, provider_ms, total_ms,
             )
         return result
+
+    @staticmethod
+    def detect_platform_from_text(raw_text: str) -> str:
+        """
+        根据用户粘贴的链接、口令或商品标识智能识别所属电商平台 ('pdd' / 'jd' / 'taobao')。
+        """
+        text = str(raw_text or "").strip()
+        if not text:
+            return "pdd"
+        lower = text.lower()
+
+        # 1. 显式域名特征识别
+        if any(d in lower for d in ("u.jd.com", "jingfen.jd.com", "union-click.jd.com", "item.jd.com", "m.jd.com", "3.cn", "jingxi.com", "jd.com")):
+            return "jd"
+        if any(d in lower for d in (
+            "m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn", "s.click.taobao.com",
+            "uland.taobao.com", "item.taobao.com", "detail.tmall.com", "taobao.com", "tmall.com", "alimama.com",
+        )):
+            return "taobao"
+        if any(d in lower for d in ("p.pinduoduo.com", "yangkeduo.com", "pinduoduo.com", "goods_sign=")):
+            return "pdd"
+
+        # 2. 口令与文案特征识别
+        # 京东口令特征：！...！ 或 !...! 伴随京东标识/变形字
+        if re.search(r"[！!][A-Za-z0-9]{10,20}[！!]", text) or any(k in text for k in ("京东", "猄", "崠", "崬", "京口令", "Doōδng")):
+            return "jd"
+        # 淘口令特征：￥...￥ / $...$ / €...€ / ₴...₴ / ¢...¢ / ()（不含 / 防止误匹配 URL 路径）
+        if re.search(r"[￥¥$€₴£¢()（）][A-Za-z0-9]{8,15}[￥¥$€₴£¢()（）]", text) or any(
+            k in text for k in ("淘口令", "手淘", "淘宝", "天猫", "阿里妈妈")
+        ):
+            return "taobao"
+        if any(k in text for k in ("拼多多", "多多进宝", "百亿补贴")) or re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
+            return "pdd"
+
+        # 3. 裸加密商品 ID 特征识别
+        if len(text) >= 25 and "-" in text and re.match(r"^[A-Za-z0-9_-]{25,}$", text):
+            return "taobao"
+        if len(text) >= 25 and not text.isdigit() and re.match(r"^[A-Za-z0-9_]{25,}$", text):
+            return "jd"
+
+        return "pdd"
+
+    def _seed_resolved_product(self, platform: str, product: Optional[dict], uid: Optional[str] = None) -> None:
+        """将万能转链反查到的商品详情写入 DETAIL_CACHE、MATERIAL_CACHE 与本地商品库，确保点击卡片进详情页秒开。"""
+        if not isinstance(product, dict):
+            return
+        gid = clean_product_id(product.get("goods_id"))
+        gsign = str(product.get("goods_sign") or "").strip()
+        if not gid and not gsign:
+            return
+        try:
+            from datetime import datetime, timezone
+            from models.product import utc_millis
+            from services.product_service import ProductService
+            snapshot = ProductService._make_snapshot(
+                product,
+                utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)),
+                platform,
+            )
+            ProductService._cache_detail(
+                platform,
+                {"status": "success", "data": deepcopy(snapshot.data)},
+                ProductService._snapshot_deadline(snapshot),
+                uid=uid,
+            )
+        except Exception:
+            pass
+        try:
+            save_fn = getattr(self.repo, "save_product_detail", None)
+            if callable(save_fn):
+                save_fn(deepcopy(product), platform=platform)
+        except Exception:
+            pass
+
+    def universal_convert(
+        self,
+        raw_text: str,
+        platform: str = "auto",
+        uid: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        万能转链与商品详情反查统一编排入口：
+        支持粘贴淘宝/京东/拼多多的商品链接、推广短链、二合一长链、淘口令、京口令或分享文案，
+        自动识别平台（或按指定平台），生成当前登录推手专属（或未备案降级通用）推广链接/口令，
+        并返回规范化商品卡片以供前端直接预览、复制口令、领券购买或进入详情页。
+        """
+        total_started = time.perf_counter()
+        text = str(raw_text or "").strip()
+        if not text:
+            return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "请粘贴需要转链的商品链接、推广链接或口令文案"}
+
+        lower = text.lower()
+        if re.search(r"https?://", lower) and not any(
+            d in lower
+            for d in (
+                "jd.com", "3.cn", "jingxi.com",
+                "tb.cn", "taobao.com", "tmall.com", "alimama.com",
+                "pinduoduo.com", "yangkeduo.com",
+            )
+        ):
+            return {
+                "status": "error",
+                "error_code": "UNSUPPORTED_URL_DOMAIN",
+                "error_msg": "仅支持淘宝/天猫、京东、拼多多的商品链接或推广短链，请检查粘贴的链接是否正确",
+            }
+
+        req_plat = str(platform or "auto").strip().lower()
+        is_auto = req_plat in ("", "auto")
+        detected_plat = self.detect_platform_from_text(text) if is_auto else normalize_platform(req_plat)
+
+        clean_uid = uid.strip() if isinstance(uid, str) else ""
+        if clean_uid and not _UID_PATTERN.fullmatch(clean_uid):
+            clean_uid = ""
+
+        # 第一性原理：确定性单平台路由，禁止在某平台转链失败后盲目跨平台回退到其他平台全文检索造成张冠李戴
+        candidate_platforms = [detected_plat]
+
+        last_error: Dict[str, Any] = {"status": "error", "error_msg": "未能识别或转换该内容，请检查链接或口令是否有效"}
+        for plat in candidate_platforms:
+            try:
+                adapter = get_adapter(plat)
+            except Exception:
+                continue
+            if not getattr(adapter, "active", False):
+                last_error = {"status": "error", "error_code": "platform_unavailable", "error_msg": f"{adapter.platform_name}暂未接入"}
+                continue
+            resolve_fn = getattr(adapter, "resolve_and_convert_universal", None)
+            if not callable(resolve_fn):
+                continue
+
+            identity, context = {}, {}
+            effective_uid = clean_uid
+            need_auth = False
+            if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+                if clean_uid:
+                    if self.user_service is None:
+                        from services.user_service import UserService
+                        self.user_service = UserService()
+                    context = self.user_service.get_numeric_promotion_context(
+                        clean_uid, plat, getattr(adapter, "default_promoter_id", "")
+                    )
+                    if context.get("status") != "success":
+                        return context
+                    numeric_id = context.get("promoter_id")
+                else:
+                    numeric_id = getattr(adapter, "default_promoter_id", "")
+                try:
+                    identity = {"promoter_id": normalize_promoter_id(numeric_id)}
+                except ValueError:
+                    return {"status": "error", "error_code": "invalid_promoter_id", "error_msg": "平台推广身份尚未正确配置"}
+            elif clean_uid and getattr(adapter, "requires_authorized_promotion", False):
+                if self.user_service is None:
+                    from services.user_service import UserService
+                    self.user_service = UserService()
+                context = self.user_service.get_promotion_context(clean_uid, plat, allow_remote=False)
+                if context.get("status") != "success":
+                    return context
+                if context.get("is_authorized") is True:
+                    identity = context.get("identity") or {}
+                else:
+                    effective_uid = ""
+                    need_auth = True
+
+            adapter_kwargs: Dict[str, Any] = {}
+            if getattr(adapter, "requires_authorized_promotion", False):
+                adapter_kwargs["identity"] = identity
+            if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+                adapter_kwargs["promoter_id"] = identity["promoter_id"]
+
+            data = resolve_fn(text, uid=effective_uid or None, **adapter_kwargs)
+            personal_fallback = False
+            if (
+                effective_uid
+                and getattr(adapter, "requires_authorized_promotion", False)
+                and isinstance(data, dict)
+                and data.get("status") == "error"
+            ):
+                code = data.get("error_code")
+                if code == "AUTH_REQUIRED" and data.get("need_auth") is True:
+                    context = {"authorization_status": "unauthorized"}
+                    need_auth = True
+                    personal_fallback = True
+                elif code == "PERSONAL_PROMOTION_UNAVAILABLE":
+                    personal_fallback = True
+                if personal_fallback:
+                    data = resolve_fn(text, uid=None, identity={})
+
+            if not isinstance(data, dict) or data.get("status") != "success":
+                last_error = data if isinstance(data, dict) else last_error
+                # 若是明确的数字 SKU 不支持或已下架，直接返回给用户，不再盲目尝试其他平台
+                if isinstance(data, dict) and data.get("error_code") in (
+                    "UNSUPPORTED_JD_NUMERIC_SKU",
+                    "UNSUPPORTED_PDD_ID_ONLY_URL",
+                    "PRODUCT_OFF_PROMOTION",
+                ):
+                    break
+                continue
+
+            product = data.get("product") if isinstance(data.get("product"), dict) else None
+            if product:
+                self._seed_resolved_product(plat, product, uid=clean_uid or None)
+
+            cmd_kwargs = {
+                "title": data.get("title") or (product or {}).get("name") or "精选高性价比好物",
+                "price": data.get("price") if data.get("price") is not None else (product or {}).get("price"),
+                "coupon_amount": data.get("coupon_amount") if data.get("coupon_amount") is not None else (product or {}).get("coupon_amount"),
+            }
+            result = self._with_command(data, adapter, cmd_kwargs)
+            result["platform"] = plat
+            result["platform_name"] = adapter.platform_name
+            if product:
+                result["product"] = product
+
+            if need_auth:
+                authorization_status = context.get("authorization_status", "unauthorized")
+                if personal_fallback:
+                    message = f"{adapter.platform_name}渠道授权未生效或已失效，请前往上方授权区重新校验"
+                else:
+                    message = (
+                        f"您尚未在{adapter.platform_name}完成渠道授权备案"
+                        if authorization_status == "unauthorized"
+                        else f"{adapter.platform_name}授权状态待确认，请前往上方授权区重新校验"
+                    )
+                result.update(
+                    need_auth=True,
+                    is_fallback=True,
+                    attribution_status="anonymous",
+                    auth_platform=plat,
+                    auth_platform_name=adapter.platform_name,
+                    authorization_status=authorization_status,
+                    auth_msg=f"{message}；当前为通用链接，无法计入本人推广佣金。",
+                )
+            elif personal_fallback:
+                result.update(is_fallback=True, attribution_status="anonymous")
+
+            total_ms = (time.perf_counter() - total_started) * 1000
+            logger.info(
+                "【万能转链】平台[%s] 识别模式[%s] 用户[%s] 商品[%s] 结果[成功] 总耗时[%.1fms]",
+                plat,
+                "auto" if is_auto else "manual",
+                clean_uid or "匿名",
+                (product or {}).get("goods_id") or data.get("goods_id") or "url",
+                total_ms,
+            )
+            return result
+
+        total_ms = (time.perf_counter() - total_started) * 1000
+        logger.warning(
+            "❌ 【万能转链失败】平台[%s] 用户[%s] 总耗时[%.1fms] 失败原因<%s>",
+            detected_plat,
+            clean_uid or "匿名",
+            total_ms,
+            last_error.get("error_msg") or last_error.get("error_code") or "未知错误",
+        )
+        return last_error
+

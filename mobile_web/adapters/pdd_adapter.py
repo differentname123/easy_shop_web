@@ -2,7 +2,7 @@
 """拼多多边界：SDK 调用、原始字段转换、商品标识与推广降级策略。"""
 import re
 from typing import Dict, Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from adapters.base import BasePlatformAdapter
 from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id
@@ -370,6 +370,152 @@ class PddAdapter(BasePlatformAdapter):
         return self._promotion_result(
             final_direct_url, {}, title, price, coupon, "商品直连保底", is_fallback=True,
         )
+
+    def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs) -> Dict[str, Any]:
+        """
+        拼多多万能转链与详情反查（对齐 scripts/test_pdd_api.py 基准规范 八）：
+        支持输入：
+        1. 拼多多推广短链：https://p.pinduoduo.com/xxx（或含该短链的分享文案）
+        2. 拼多多二合一长链：https://mobile.yangkeduo.com/duo_coupon_landing.html?...&goods_sign=E9...
+        3. 裸加密 goods_sign（如 E932Ts1b... / Y932Ts1b...）
+        4. 拼多多商品分享标题文案
+        """
+        if not self.active:
+            return {"status": "error", "error_code": "platform_unavailable", "error_msg": "拼多多暂未启用"}
+        text = str(raw_text or "").strip()
+        if not text:
+            return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "请输入拼多多推广链接、goods_sign 或商品标题"}
+
+        extracted_sign = ""
+        extracted_id = ""
+        extracted_url = ""
+        product_detail = None
+
+        # 1. 直接匹配 goods_sign 参数或裸加密 goods_sign
+        sign_param_match = re.search(r"goods_sign=([A-Za-z0-9_-]{20,})", text)
+        if sign_param_match:
+            extracted_sign = sign_param_match.group(1)
+        elif re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
+            extracted_sign = text
+
+        # 2. 提取 URL
+        url_match = re.search(r"https?://[^\s\"'<>]+", text)
+        if url_match:
+            extracted_url = url_match.group(0).rstrip("，。！？、,!?)）】")
+            url_lower = extracted_url.lower()
+            if not any(d in url_lower for d in ("pinduoduo.com", "yangkeduo.com")):
+                return {
+                    "status": "error",
+                    "error_code": "INVALID_PDD_URL",
+                    "error_msg": "该链接不属于拼多多平台，请切换对应平台或粘贴 p.pinduoduo.com 推广短链",
+                }
+            if not extracted_sign:
+                try:
+                    qs = parse_qs(urlsplit(extracted_url).query)
+                    if qs.get("goods_sign"):
+                        extracted_sign = qs["goods_sign"][0]
+                    if qs.get("goods_id"):
+                        extracted_id = clean_product_id(qs["goods_id"][0])
+                except Exception:
+                    pass
+
+        if not extracted_sign and extracted_url and "goods.html" in extracted_url and "p.pinduoduo.com" not in extracted_url:
+            return {
+                "status": "error",
+                "error_code": "UNSUPPORTED_PDD_ID_ONLY_URL",
+                "error_msg": "拼多多官方接口 (40009) 已禁止仅含纯数字 goods_id 的普通链接查询，请粘贴 p.pinduoduo.com 推广短链、含 goods_sign 的长链或商品标题",
+            }
+
+        # 3. 若是 p.pinduoduo.com 短链或未知 goods_sign 的长链，先用站长已备案 PID (uid=None) 调 zs.unit.url.gen 解包出 goods_sign
+        if not extracted_sign and extracted_url:
+            try:
+                zs_res = convert_pdd_url(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    pid=self.pid,
+                    source_url=extracted_url,
+                    uid=None,
+                )
+                raw_zs = (zs_res or {}).get("raw_data") or {}
+                unpacked_url = raw_zs.get("url") or raw_zs.get("mobile_url") or raw_zs.get("multi_group_url") or ""
+                if unpacked_url:
+                    qs = parse_qs(urlsplit(unpacked_url).query)
+                    if qs.get("goods_sign"):
+                        extracted_sign = qs["goods_sign"][0]
+                    if qs.get("goods_id"):
+                        extracted_id = clean_product_id(qs["goods_id"][0]) or extracted_id
+                    if not extracted_sign:
+                        m_sign = re.search(r"goods_sign=([A-Za-z0-9_-]{20,})", unpacked_url)
+                        if m_sign:
+                            extracted_sign = m_sign.group(1)
+            except Exception:
+                pass
+
+        # 4. 若仍未拿到 goods_sign，调用 search_goods (page_size=10，仅支持搜 p.pinduoduo.com 短链或非 URL 商品标题，严禁搜任意 URL 字符串)
+        if not extracted_sign:
+            if extracted_url and "p.pinduoduo.com" in extracted_url:
+                search_kw = extracted_url
+            elif not extracted_url:
+                title_bracket = re.search(r"「([^」]{4,})」", text)
+                if title_bracket:
+                    search_kw = title_bracket.group(1).strip()
+                else:
+                    cleaned_kw = re.sub(r"https?://\S+", " ", text)
+                    cleaned_kw = re.sub(r"【(?:拼多多|好物精选|百亿补贴|多多进宝)】", " ", cleaned_kw)
+                    cleaned_kw = re.sub(r"(?:💰|👉|到手价|抢购链接|领券)[^\n]*", " ", cleaned_kw)
+                    search_kw = re.sub(r"\s+", " ", cleaned_kw).strip()
+            else:
+                search_kw = ""
+
+            if search_kw and len(search_kw) >= 2:
+                search_res = self.search_goods(search_kw, page=1, page_size=10, uid=None)
+                if search_res.get("status") == "success" and search_res.get("data"):
+                    first_hit = search_res["data"][0]
+                    extracted_sign = first_hit.get("goods_sign") or ""
+                    extracted_id = first_hit.get("goods_id") or extracted_id
+                    product_detail = first_hit
+
+        if not extracted_sign and not (extracted_url and "p.pinduoduo.com" in extracted_url):
+            return {
+                "status": "error",
+                "error_code": "UNRESOLVED_PDD_INPUT",
+                "error_msg": "未能从输入内容中解析出拼多多商品，请粘贴 p.pinduoduo.com 短链、含 goods_sign 的链接或完整商品标题",
+            }
+
+        # 5. 获取完整商品详情 (pdd.ddk.goods.detail)
+        if extracted_sign:
+            det_res = self.get_goods_detail(goods_sign=extracted_sign, goods_id=extracted_id or None, uid=None)
+            if det_res.get("status") == "success" and isinstance(det_res.get("data"), dict):
+                product_detail = det_res["data"]
+                extracted_id = product_detail.get("goods_id") or extracted_id
+
+        title = (product_detail or {}).get("name") or "拼多多精选好物"
+        price = (product_detail or {}).get("price")
+        coupon = (product_detail or {}).get("coupon_amount")
+
+        # 6. 执行三层智能生链（支持推手归因 uid）
+        conv_res = self.convert_promotion_url(
+            goods_id_or_sign=extracted_sign or extracted_id,
+            uid=uid,
+            goods_id=extracted_id or None,
+            goods_sign=extracted_sign or None,
+            product_url=extracted_url or None,
+            title=title,
+            price=price,
+            coupon_amount=coupon,
+        )
+        if conv_res.get("status") != "success":
+            if product_detail:
+                conv_res["product"] = product_detail
+            return conv_res
+
+        conv_res["goods_id"] = extracted_id
+        conv_res["goods_sign"] = extracted_sign
+        conv_res["title"] = title
+        conv_res["price"] = price
+        conv_res["coupon_amount"] = coupon
+        conv_res["product"] = product_detail
+        return conv_res
 
     def check_authority(self, uid) -> Dict[str, Any]:
         try:

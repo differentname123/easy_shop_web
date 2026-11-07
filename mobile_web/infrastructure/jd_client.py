@@ -272,7 +272,7 @@ class JdClient:
             return _error("PAGINATION_ERROR", "京东商品页长与分页声明不一致")
         return {"status": "success", "data": rows, "has_more": more, "total_count": total}
 
-    def search_goods(self, keyword, page=1, page_size=20):
+    def search_goods(self, keyword, page=1, page_size=20, *, has_coupon=True):
         try:
             page, size = self._page(page, page_size)
             query = keyword.strip()
@@ -288,7 +288,7 @@ class JdClient:
         return self._execute_with_failover(
             "api_quanwang.ashx",
             {"unionId": self.union_id, "q": query, "page": page, "page_size": size,
-             "sort": "new", "youquan": 1, "type": 2},
+             "sort": "new", "youquan": 1 if has_coupon else 0, "type": 2},
             lambda body: self._content(body, page, size),
         )
 
@@ -333,6 +333,49 @@ class JdClient:
                     "click_url": product_url(source.get("clickURL")),
                     "j_command": source.get("jCommand") if isinstance(source.get("jCommand"), str) else "",
                     "j_short_command": source.get("jShortCommand") if isinstance(source.get("jShortCommand"), str) else ""}
+            if not (data["short_url"] or data["click_url"]):
+                return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
+            return {"status": "success", "promoter_id": promoter, **data}
+
+        return self._execute_with_failover(
+            "open_jing_union_open_promotion_byunionid_get.ashx",
+            {"unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter},
+            _evaluate,
+        )
+
+    def convert_universal_material(self, raw_material, promoter_id):
+        """
+        京东万能转链协议入口（对齐 scripts/test_jd_api.py 基准规范 六）：
+        支持直接传入 u.jd.com 短链、京口令文案（含 ！...！）、jingfen.jd.com 详情链或加密 itemId。
+        """
+        promoter = canonical_promoter_id(promoter_id)
+        material = str(raw_material or "").strip()
+        if not promoter or not material or any(ord(c) < 32 and c not in "\r\n\t" for c in material):
+            return _error("INVALID_ARGUMENT", "京东万能转链缺少有效口令/链接或数字推广ID")
+
+        def _evaluate(body):
+            if body.get("status") == "error":
+                return body
+            if isinstance(body, dict) and str(body.get("status")) == "301":
+                content_msg = str(body.get("content") or "").strip()
+                if "数字id" in content_msg or "数字ID" in content_msg:
+                    return _error(
+                        "UNSUPPORTED_JD_NUMERIC_SKU",
+                        "京东联盟接口已不支持纯数字商品ID转链，请粘贴 u.jd.com 短链、京口令或京粉链接",
+                    )
+            result = _result(body, PROMOTION_ROOT, "result")
+            if result["status"] != "success":
+                return result
+            result = result["data"]
+            if str(result.get("code")) != "200" or not isinstance(result.get("data"), dict):
+                return _error("PROTOCOL_ERROR", "京东转链结果无效")
+            source = result["data"]
+            data = {
+                "short_url": product_url(source.get("shortURL")),
+                "click_url": product_url(source.get("clickURL")),
+                "j_command": source.get("jCommand") if isinstance(source.get("jCommand"), str) else "",
+                "j_short_command": source.get("jShortCommand") if isinstance(source.get("jShortCommand"), str) else "",
+            }
             if not (data["short_url"] or data["click_url"]):
                 return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
             return {"status": "success", "promoter_id": promoter, **data}

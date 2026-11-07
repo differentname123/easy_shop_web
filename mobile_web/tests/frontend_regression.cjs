@@ -1741,6 +1741,64 @@ test('switching platforms on Tab 1 while searching preserves activeHomeKeyword a
   assert.equal(feeds.homeGoodsList.value[0].goods_id, 'TB-SEARCH');
 });
 
+test('universal converter on My tab converts command/link, resolves product card, copies command and clears state', async () => {
+  const h = harness({ saved: { easy_shop_token: 'token-A' } }), account = h.makeAccount();
+  h.session.saveUser(user('u_8bb0595a', 'token-A'));
+  account.isLoggedIn.value = true;
+  account.uid.value = 'u_8bb0595a';
+
+  account.universalInput.value = '3！CEDABDWqj8boqBMC！ CZ154 可口可乐';
+  account.universalPlatform.value = 'auto';
+  const converting = account.handleUniversalConvert();
+  assert.equal(account.universalLoading.value, true);
+  assert.equal(h.requests[0].url, '/api/promote/universal');
+  assert.deepEqual(JSON.parse(h.requests[0].options.body), {
+    text: '3！CEDABDWqj8boqBMC！ CZ154 可口可乐',
+    platform: 'auto',
+    uid: 'u_8bb0595a',
+  });
+
+  await h.finish(0, {
+    status: 'success',
+    platform: 'jd',
+    platform_name: '京东',
+    final_link: 'https://u.jd.com/e6UTD49',
+    short_url: 'https://u.jd.com/e6UTD49',
+    promotion_token: '！V4J3W3uA3RfEwWmX！ CA1331',
+    command_text: '【京东】可口可乐\n👉抢购链接：https://u.jd.com/e6UTD49\n【平台口令】！V4J3W3uA3RfEwWmX！ CA1331',
+    attribution_status: 'verified',
+    product: {
+      platform: 'jd',
+      goods_id: 'JD_ENC_1',
+      goods_sign: 'JD_ENC_1',
+      name: '可口可乐汽水整箱',
+      price: 49.2,
+      coupon_amount: 5.0,
+      commission_amount: 1.97,
+    },
+  });
+  await converting;
+
+  assert.equal(account.universalLoading.value, false);
+  assert.equal(account.universalResult.value.platform, 'jd');
+  assert.equal(account.universalResult.value.product.name, '可口可乐汽水整箱');
+
+  account.copyUniversalCommand();
+  assert.ok(h.copied.at(-1).includes('https://u.jd.com/e6UTD49'));
+
+  account.copyUniversalShortLink();
+  assert.equal(h.copied.at(-1), 'https://u.jd.com/e6UTD49');
+
+  account.buyUniversalProduct();
+  assert.equal(h.opened.at(-1), 'https://u.jd.com/e6UTD49');
+
+  account.clearUniversalConvert();
+  assert.equal(account.universalInput.value, '');
+  assert.equal(account.universalResult.value, null);
+  assert.equal(account.universalError.value, '');
+});
+
+
 
 
 

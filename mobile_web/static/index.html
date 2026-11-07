@@ -409,6 +409,136 @@
       </div>
     </div>
 
+    <!-- 万能转链与口令解析面板 -->
+    <div class="universal-convert-card">
+      <div class="universal-header">
+        <div class="universal-title">
+          <svg style="width:16px;height:16px;fill:var(--primary-color)" viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+          <span>万能转链</span>
+          <span class="universal-badge">查券 · 转口令 · 查详情</span>
+        </div>
+        <button v-if="universalInput || universalResult || universalError" class="universal-clear-btn" @click="clearUniversalConvert">
+          清空
+        </button>
+      </div>
+      <p class="universal-desc">
+        支持粘贴<strong>淘宝</strong>（淘口令/m.tb.cn/e.tb.cn/uland）、<strong>京东</strong>（u.jd.com短链/京口令/京粉链）、<strong>拼多多</strong>（p.pinduoduo.com短链/长链/标题），一键转为您的专属推广链并解析商品详情。
+      </p>
+
+      <div class="universal-plat-tabs" role="tablist" aria-label="转链平台选择">
+        <button class="universal-plat-chip" :class="{ active: universalPlatform === 'auto' }" @click="universalPlatform = 'auto'">✨ 智能识别</button>
+        <button class="universal-plat-chip" :class="{ active: universalPlatform === 'taobao' }" @click="universalPlatform = 'taobao'">淘宝</button>
+        <button class="universal-plat-chip" :class="{ active: universalPlatform === 'jd' }" @click="universalPlatform = 'jd'">京东</button>
+        <button class="universal-plat-chip" :class="{ active: universalPlatform === 'pdd' }" @click="universalPlatform = 'pdd'">拼多多</button>
+      </div>
+
+      <div class="universal-input-wrap">
+        <textarea
+          class="universal-textarea"
+          rows="3"
+          v-model="universalInput"
+          placeholder="在此粘贴商品分享文案、淘口令、京口令或推广短链 (如 https://m.tb.cn/... 、https://u.jd.com/... 、https://p.pinduoduo.com/...)"
+        ></textarea>
+      </div>
+
+      <div class="universal-submit-row">
+        <button class="universal-submit-btn" @click="handleUniversalConvert" :disabled="universalLoading">
+          {{ universalLoading ? '正在智能解析与转链...' : '⚡ 一键转链并解析详情' }}
+        </button>
+      </div>
+
+      <div v-if="universalError" class="universal-error-box" role="alert">
+        {{ universalError }}
+      </div>
+
+      <div v-if="universalResult" class="universal-result-box">
+        <div v-if="universalResult.need_auth && universalResult.auth_msg" class="universal-auth-warn">
+          <span>⚠️ {{ universalResult.auth_msg }}</span>
+          <button v-if="isLoggedIn && universalResult.auth_platform" class="universal-auth-link-btn" @click="handleCheckAndGetAuth(universalResult.auth_platform)">
+            立即去备案 ›
+          </button>
+        </div>
+
+        <!-- 反查出的商品详情预览卡 -->
+        <div
+          v-if="universalResult.product"
+          class="universal-product-card"
+          @click="(universalResult.product.goods_id || universalResult.product.goods_sign) && openGoodsDetail(universalResult.product)"
+        >
+          <img
+            :src="universalResult.product.image_url || defaultOrderThumb"
+            @error="handleOrderThumbError"
+            class="universal-product-thumb"
+            alt="商品主图"
+          />
+          <div class="universal-product-info">
+            <div class="universal-product-title">
+              <span class="plat-badge" :class="'plat-' + (universalResult.platform || universalResult.product.platform || 'pdd')">
+                {{ universalResult.platform_name || universalResult.product.platform_name || '精选' }}
+              </span>
+              {{ universalResult.product.name || universalResult.title }}
+            </div>
+            <div class="universal-product-meta" v-if="universalResult.product.mall_name">
+              店铺：{{ universalResult.product.mall_name }}
+            </div>
+            <div class="universal-product-tags">
+              <span v-if="universalResult.product.coupon_amount > 0" class="coupon-tag">
+                <span class="tag-badge">券</span>
+                <span class="tag-val">¥{{ formatMoney(universalResult.product.coupon_amount) }}</span>
+              </span>
+              <span v-if="universalResult.product.commission_amount > 0" class="rebate-tag">
+                <span class="tag-badge">预估佣金</span>
+                <span class="tag-val">¥{{ formatMoney(universalResult.product.commission_amount) }}</span>
+              </span>
+            </div>
+            <div class="universal-product-price-row">
+              <div>
+                <span class="price-label">到手价</span>
+                <span class="price-unit">¥</span>
+                <span class="price-value">{{ formatMoney(universalResult.product.price) }}</span>
+                <span v-if="universalResult.product.original_price > universalResult.product.price" class="price-original">
+                  ¥{{ formatMoney(universalResult.product.original_price) }}
+                </span>
+              </div>
+              <span v-if="universalResult.product.goods_id || universalResult.product.goods_sign" class="universal-detail-hint">
+                查看详情 ›
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 转链口令/链接输出框 -->
+        <div class="universal-command-box" @click="copyUniversalCommand">
+          <div class="universal-command-label">
+            <span>专属推广文案 / 口令（点击即可复制）</span>
+            <span class="universal-attr-tag" :class="universalResult.attribution_status === 'verified' ? 'verified' : 'public'">
+              {{ universalResult.attribution_status === 'verified' ? '✓ 已绑定本人推广归因' : '通用推广链' }}
+            </span>
+          </div>
+          <pre class="universal-command-text">{{ universalResult.command_text || universalResult.promotion_token || universalResult.final_link }}</pre>
+        </div>
+
+        <div class="universal-action-grid">
+          <button class="universal-act-btn primary" @click="copyUniversalCommand">
+            📋 复制推广口令
+          </button>
+          <button class="universal-act-btn outline" @click="copyUniversalShortLink">
+            🔗 复制短链接
+          </button>
+          <button class="universal-act-btn buy" @click="buyUniversalProduct">
+            🛒 直接领券购买
+          </button>
+          <button
+            v-if="universalResult.product && (universalResult.product.goods_id || universalResult.product.goods_sign)"
+            class="universal-act-btn detail"
+            @click="openGoodsDetail(universalResult.product)"
+          >
+            🔍 查看商品详情
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- 本人推广订单板块 (仅已登录推手展示) -->
     <div class="order-section-card" v-if="isLoggedIn">
       <div class="order-sec-header">

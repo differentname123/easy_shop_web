@@ -57,7 +57,24 @@
     本地直接请求京东官方网关获取真实订单行。
   - ⚠️ 协议约束：查询时间窗跨度不得超过 1 小时 (`<= 3600s`)，推荐 `type=3` (按更新时间查询)。
 
-六、【频控与高可用唯一有效方案 (`ZTK_APPKEY_LIST` 自动故障切换)】
+六、【功能 6：万能转链与详情反查 (`convert_and_resolve_universal_input` 第一性原理实现)】
+  - ✅ 可用用户自带输入格式（均支持一步转链为当前推手 `positionId` 的推广短链/京口令，并反查商品详情，共 8 类全覆盖）：
+    1. ✅ 京东联盟加密 `itemId` / `goods_sign`（裸加密 ID）
+    2. ✅ 京粉落地页链接：`https://jingfen.jd.com/detail/{encrypted_id}.html`
+    3. ✅ 已有推广短链接：`https://u.jd.com/xxx`（或包含该短链的混合分享文案）
+    4. ✅ 联盟推广长链接：`https://union-click.jd.com/jdc?e=...`
+    5. ✅ 京东完整口令文案：如 `3！LAHGh6yaj3H2SI21！ CA3576 「抢购...」` 或含 `猄`/`崠` 变形字口令
+    6. ✅ 京东纯短口令 (`jShortCommand`)
+    7. ✅ 本平台生成的完整推广口令文案 (`command_text`，多行含 `u.jd.com` 与短口令)
+    8. ✅ 京东 App 标题分享文案：如 `【京东】「商品完整标题」`（提取完整标题不截断，避免截断分词导致检索 0 结果，调用 `search_jd_goods(has_coupon=False)` 获取加密 `tao_id` 后转链）
+  - ✅ 详情反查机制：
+    - 当输入含京粉加密 ID 时，直接调用 `api_detail.ashx` 获取完整详情；
+    - 当输入为 `u.jd.com` 短链、`union-click.jd.com` 长链或京口令时，先由 `open_jing_union_open_promotion_byunionid_get.ashx` 转出专属 `shortURL` 与 `jCommand`，
+      再以 `q=https://u.jd.com/xxx` 调用 `api_quanwang.ashx` (`youquan=0, type=2`) 精准反查出唯一商品（含加密 `tao_id`、主图、券后价、佣金率等）；
+      即使 `api_quanwang.ashx` 偶发限流，也能从返回的 `jCommand` 文案（`抢购{商品标题}！`）中即时提取商品标题与券额兜底。
+  - ❌ 不可用输入：`https://item.jd.com/{数字SKU}.html`（折淘客与京东联盟新规均已拦截纯数字 SKU 转链，报错 `301: 很抱歉！不支持数字id转链！`，需引导用户使用京东 App 分享出的 `u.jd.com` 短链、京口令或带 `「商品标题」` 的分享文案）。
+
+七、【频控与高可用唯一有效方案 (`ZTK_APPKEY_LIST` 自动故障切换)】
   - ❌ 已证伪：同一 `appkey` 下用 `open_jing_union_open_goods_query.ashx` 给 `api_quanwang.ashx` / `api_detail.ashx` 兜底（共享同一 `1000` 限流计数器，救活率 0% 且双倍消耗配额）。
   - ✅ 唯一有效：折淘客频控绑定在单个 `ZTK_APPKEY` 上，不限制 IP 与 `JD_UNION_ID`。使用 `ZTK_APPKEY_LIST` 多 Key 轮询与自动故障切换，救活率 100%。
 ================================================================================
@@ -516,7 +533,135 @@ def fetch_orders(
         return {"success": False, "orders": [], "error": f"订单查询请求异常: {e}"}
 
 
-# ==================== 7. 主流程执行 ====================
+# ==================== 7. 功能 6: 万能转链与详情反查 (短链/京口令/京粉链/分享文案) ====================
+def convert_and_resolve_universal_input(
+    raw_text: str,
+    promoter_id: Optional[Union[str, int]] = None,
+    appkey_list: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """
+    京东万能转链与商品详情解析基准实现：
+    支持用户输入：
+    1. 京东联盟短链 (`https://u.jd.com/xxx` 或包含该短链的推广文案)
+    2. 京口令 / 短口令 (`！LAHGh6yaj3H2SI21！ CA3576` 或完整京口令文案)
+    3. 京粉详情链接 (`https://jingfen.jd.com/detail/{encrypted_id}.html`) 或裸加密 `itemId`
+    4. 含「商品标题」的京东 APP 分享文案
+    返回转换后的推广链接/京口令 + 反查出的商品详情字典。
+    """
+    import re
+    text = (raw_text or "").strip()
+    if not text:
+        return {"success": False, "error": "输入内容不能为空"}
+
+    def _query_quanwang_single(query_str: str) -> Optional[Dict[str, Any]]:
+        q = query_str.strip()
+        while len(q) < 4:
+            q += q
+        params = {
+            "unionId": JD_UNION_ID,
+            "q": q,
+            "page": 1,
+            "page_size": 5,
+            "sort": "new",
+            "youquan": 0,
+            "type": 2,
+        }
+        resp = request_ztk_with_failover(
+            "api_quanwang.ashx", params,
+            lambda r: str(r.get("status")) == "200" and isinstance(r.get("content"), list) and len(r.get("content")) > 0,
+            appkey_list=appkey_list,
+        )
+        items = resp.get("content") if isinstance(resp, dict) else None
+        if isinstance(items, list) and items:
+            it = items[0]
+            tao_id = str(it.get("tao_id") or it.get("skuId") or "")
+            return {
+                "item_id": tao_id,
+                "title": it.get("title") or it.get("tao_title") or "",
+                "pict_url": it.get("pict_url") or "",
+                "original_price": str(it.get("size") or "0.00"),
+                "final_price": str(it.get("quanhou_jiage") or it.get("size") or "0.00"),
+                "coupon_amount": str(it.get("coupon_info_money") or "0"),
+                "commission_rate": str(it.get("tkrate3") or "0"),
+                "commission_amount": str(it.get("tkfee3") or "0.00"),
+                "shop_title": it.get("shop_title") or it.get("nick") or "",
+                "sales_volume": str(it.get("volume") or "0"),
+                "item_url": f"https://jingfen.jd.com/detail/{tao_id}.html" if tao_id else "",
+            }
+        return None
+
+    # 1. 优先提取单条最干净的可直接转链物料（按确定性优先级：京粉加密ID -> u.jd.com短链 -> union-click长链 -> 京口令）
+    m_jingfen = re.search(r"https?://jingfen\.jd\.com/detail/([A-Za-z0-9_]{25,})\.html", text)
+    encrypted_id = m_jingfen.group(1) if m_jingfen else ""
+    if not encrypted_id and len(text) >= 25 and "_" in text and all(c.isalnum() or c == "_" for c in text):
+        encrypted_id = text
+
+    if encrypted_id:
+        material_url = f"https://jingfen.jd.com/detail/{encrypted_id}.html"
+        conv = convert_promotion_link(material_url, promoter_id=promoter_id, appkey_list=appkey_list)
+        if not conv.get("success"):
+            return conv
+        det = get_goods_detail(encrypted_id, appkey_list=appkey_list)
+        if "error" in det and conv.get("short_url"):
+            det = _query_quanwang_single(conv["short_url"]) or {}
+        return {"success": True, "input_type": "encrypted_item", "promotion": conv, "product": det}
+
+    m_ujd = re.search(r"https?://u\.jd\.com/[A-Za-z0-9]+", text)
+    if m_ujd:
+        u_url = m_ujd.group(0)
+        conv = convert_promotion_link(u_url, promoter_id=promoter_id, appkey_list=appkey_list)
+        if not conv.get("success"):
+            return conv
+        product = _query_quanwang_single(u_url) or _query_quanwang_single(conv.get("short_url") or "") or {}
+        return {"success": True, "input_type": "u_jd_short_url", "promotion": conv, "product": product}
+
+    m_click = re.search(r"https?://union-click\.jd\.com/[^\s\"'<>，。！？、）)】]+", text)
+    if m_click:
+        click_url = m_click.group(0)
+        conv = convert_promotion_link(click_url, promoter_id=promoter_id, appkey_list=appkey_list)
+        if not conv.get("success"):
+            return conv
+        product = _query_quanwang_single(conv.get("short_url") or "") or {}
+        return {"success": True, "input_type": "union_click_url", "promotion": conv, "product": product}
+
+    if re.search(r"[！!][A-Za-z0-9]{6,24}[！!]", text) or re.search(r"\b(?:CA|MF|CZ|ZH)\d{3,5}\b", text):
+        conv = convert_promotion_link(text, promoter_id=promoter_id, appkey_list=appkey_list)
+        if conv.get("success"):
+            product = {}
+            if conv.get("short_url"):
+                product = _query_quanwang_single(conv["short_url"]) or {}
+            return {"success": True, "input_type": "j_command", "promotion": conv, "product": product}
+
+    # 2. 提取商品标题（支持「商品标题」或去除平台前缀后的标题），通过 api_quanwang.ashx 检索加密 item_url 再转链
+    # 注意：切勿对完整商品标题做硬性 [:30] 截断，否则若截断在词中（如“美食大赛”截成“美食大”）会导致京东分词倒排索引 0 命中！
+    m_quote = re.search(r"「([^」]{4,})」", text)
+    if m_quote:
+        keyword = m_quote.group(1).strip()
+    else:
+        cleaned = re.sub(r"https?://\S+", " ", text)
+        cleaned = re.sub(r"^(\s*【[^】]{1,8}】\s*)+", "", cleaned)
+        cleaned = re.sub(r"(点击链接直接打开|抢购好物).*$", "", cleaned).strip()
+        keyword = cleaned
+
+    if keyword and len(keyword) >= 4 and not keyword.isdigit():
+        product = _query_quanwang_single(keyword)
+        if product and product.get("item_url"):
+            conv = convert_promotion_link(product["item_url"], promoter_id=promoter_id, appkey_list=appkey_list)
+            if conv.get("success"):
+                return {"success": True, "input_type": "keyword_match", "promotion": conv, "product": product}
+
+    # 3. 明确拦截无标题的纯数字 SKU 或 item.jd.com/{数字}.html 直链
+    if re.search(r"item(?:\.m)?\.jd\.com/(?:product/)?(\d+)\.html", text) or text.isdigit():
+        return {
+            "success": False,
+            "error_code": "UNSUPPORTED_JD_NUMERIC_SKU",
+            "error": "京东联盟新规已不支持无标题的纯数字商品ID或 item.jd.com 数字直链转链，请粘贴 u.jd.com 短链、京口令、jingfen.jd.com 链接或带「商品标题」的分享文案",
+        }
+
+    return {"success": False, "error": "未能识别或转链该京东内容，请提供 u.jd.com 短链、京口令、jingfen.jd.com 链接或带标题的分享文案"}
+
+
+# ==================== 8. 主流程执行 ====================
 if __name__ == "__main__":
     print("=" * 85)
     print("🚀 京东联盟 API 基础功能验证程序 (极简精炼版 · 多 ZTK_APPKEY_LIST 自动轮询)")
@@ -541,8 +686,10 @@ if __name__ == "__main__":
     for idx, it in enumerate(s_items, 1):
         print(f"  * ({idx}) {it.get('title', '')[:22]}... | 券后: ¥{it.get('final_price')} | 佣金率: {it.get('commission_rate')}% (¥{it.get('commission_amount')})")
 
-    sample_url = s_items[0]["item_url"] if s_items else (b2h[0]["item_url"] if b2h and "item_url" in b2h[0] else "https://u.jd.com/egVs7wU")
-    sample_sku = s_items[0]["item_id"] if s_items else (b2h[0]["item_id"] if b2h and "item_id" in b2h[0] else "6xXY8Ko5uwFbKV5W")
+    sample_item = s_items[0] if s_items else (b2h[0] if b2h and "item_url" in b2h[0] else {})
+    sample_url = sample_item.get("item_url") or "https://u.jd.com/egVs7wU"
+    sample_sku = sample_item.get("item_id") or "6xXY8Ko5uwFbKV5W"
+    sample_title = sample_item.get("title") or "可口可乐"
 
     # 3. 商品详情展示测试
     print(f"\n【3. 商品详情展示】(SKU: {sample_sku[:20]}...)")
@@ -568,8 +715,36 @@ if __name__ == "__main__":
     print(f"     专属精简口令: {link_raw_id.get('j_short_command')}")
     print(f"     专属完整口令: {link_raw_id.get('j_command')}")
 
-    # 5. 增量订单拉取与核心字段打印 (无擅自分成计算)
-    print("\n【5. 增量订单拉取与核心字段打印】")
+    # 5. 万能转链与详情反查全格式矩阵测试 (自生自测 8 种真实生成格式 + 1 种负例拦截)
+    print("\n【5. 万能转链与详情反查全矩阵验证 (8 种真实格式自生自测)】")
+    jd_matrix = [
+        ("5a. 裸加密 itemId", sample_sku),
+        ("5b. 京粉详情链接 (jingfen.jd.com)", sample_url),
+        ("5c. 联盟推广短链 (u.jd.com)", link_default.get("short_url", "")),
+        ("5d. 联盟推广长链 (union-click.jd.com)", link_default.get("click_url", "")),
+        ("5e. 完整京口令文案 (jCommand)", link_default.get("j_command", "")),
+        ("5f. 精简京口令 (jShortCommand)", link_default.get("j_short_command", "")),
+        (
+            "5g. 平台自生成多行推广文案",
+            f"【好物精选】{sample_title}\n【券后特惠】¥19.9\n【抢购口令】长按复制本段全部信息，打开【京东APP】立即领券下单！\n{link_default.get('short_url', '')}\n【平台口令】{link_default.get('j_short_command', '')}",
+        ),
+        ("5h. 京东App带标题分享文案", f"【京东】「{sample_title}」抢购好物"),
+    ]
+    for label, text_in in jd_matrix:
+        if not text_in:
+            continue
+        res = convert_and_resolve_universal_input(text_in, promoter_id=8899)
+        prod = res.get("product") or {}
+        promo = res.get("promotion") or {}
+        print(
+            f"  👉 [{label}]: success={res.get('success')} | type={res.get('input_type')} "
+            f"| 新短链={promo.get('short_url')} | 反查商品={str(prod.get('title') or '')[:20]} (¥{prod.get('final_price')})"
+        )
+    neg_res = convert_and_resolve_universal_input("https://item.jd.com/100012043978.html", promoter_id=8899)
+    print(f"  👉 [5i. 纯数字直链拦截验证]: success={neg_res.get('success')} | error_code={neg_res.get('error_code')}")
+
+    # 6. 增量订单拉取与核心字段打印 (无擅自分成计算)
+    print("\n【6. 增量订单拉取与核心字段打印】")
     test_start = "2026-11-06 05:30:00"
     test_end = "2026-11-06 06:30:00"
     print(f"  查询窗口: {test_start} 至 {test_end} (type=1: 按下单时间)")

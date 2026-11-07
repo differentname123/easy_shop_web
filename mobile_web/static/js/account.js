@@ -184,6 +184,81 @@
     const initializeOrderPlatform = preferred => {
       orderPlatform.value = getPlatforms().find(item => item.code === preferred)?.code || getPlatforms().find(item => item.active)?.code || '';
     };
+    const universalInput = ref(''), universalPlatform = ref('auto'), universalLoading = ref(false);
+    const universalResult = ref(null), universalError = ref('');
+    let universalGeneration = 0;
+    const clearUniversalConvert = () => {
+      universalGeneration += 1;
+      universalInput.value = '';
+      universalResult.value = null;
+      universalError.value = '';
+      universalLoading.value = false;
+    };
+    const handleUniversalConvert = async () => {
+      if (disposed || universalLoading.value) return;
+      const text = (universalInput.value || '').trim();
+      if (!text) return showToast('请先粘贴商品链接、推广短链或口令文案');
+      const generation = ++universalGeneration;
+      universalLoading.value = true;
+      universalError.value = '';
+      universalResult.value = null;
+      try {
+        const token = session.token();
+        const body = {
+          text,
+          platform: universalPlatform.value || 'auto',
+          uid: (isLoggedIn.value && uid.value) ? uid.value : null,
+        };
+        const response = await api.post('/api/promote/universal', body, token ? { token } : {});
+        if (disposed || generation !== universalGeneration) return;
+        const data = response.data || {};
+        if (response.ok && data.status === 'success') {
+          universalResult.value = data;
+          if (data.need_auth && data.auth_msg) {
+            showToast(data.auth_msg);
+          } else {
+            showToast('转链与商品解析成功！');
+          }
+        } else if (response.status === 401) {
+          invalidSession();
+        } else {
+          const msg = data.error_msg || data.detail || '未能解析或转换该内容，请检查输入格式';
+          universalError.value = msg;
+          showToast(msg);
+        }
+      } catch (_) {
+        if (!disposed && generation === universalGeneration) {
+          universalError.value = '网络请求异常，请稍后重试';
+          showToast(universalError.value);
+        }
+      } finally {
+        if (generation === universalGeneration) universalLoading.value = false;
+      }
+    };
+    const copyUniversalCommand = () => {
+      const res = universalResult.value;
+      if (!res) return;
+      const text = res.command_text || res.promotion_token || res.final_link || res.url;
+      if (text) copyText(text, '专属推广口令/文案已复制！');
+    };
+    const copyUniversalShortLink = () => {
+      const res = universalResult.value;
+      if (!res) return;
+      const link = res.short_url || res.final_link || res.url;
+      if (link) copyText(link, '专属推广短链已复制！');
+    };
+    const buyUniversalProduct = () => {
+      const res = universalResult.value;
+      if (!res) return;
+      const link = res.final_link || res.short_url || res.url;
+      if (res.promotion_token) {
+        copyText(res.promotion_token, '口令已自动复制，正在打开购买页...');
+      }
+      if (link && /^https?:\/\//i.test(link)) {
+        if (global.window?.open) global.window.open(link, '_blank', 'noopener');
+        else if (global.location) global.location.href = link;
+      }
+    };
     const handleAvatarError = event => { if (event?.target) event.target.src = DEFAULT_AVATAR; };
     const handleOrderThumbError = event => { if (event?.target && event.target.src !== DEFAULT_ORDER_THUMB) event.target.src = DEFAULT_ORDER_THUMB; };
     return {
@@ -194,9 +269,11 @@
       orderAmountLabel, orderTimeLabel, orderTimeText,
       orderPlatform, orderDays, orderMessage, isSyncingOrders, userOrdersData, syncAndQueryOrders, switchOrderDays,
       switchOrderPlatform, initializeOrderPlatform,
+      universalInput, universalPlatform, universalLoading, universalResult, universalError,
+      handleUniversalConvert, clearUniversalConvert, copyUniversalCommand, copyUniversalShortLink, buyUniversalProduct,
       orderKey: order => shop.orderKey({ ...order, platform: order.platform || orderPlatform.value }),
       defaultAvatar: DEFAULT_AVATAR, handleAvatarError, defaultOrderThumb: DEFAULT_ORDER_THUMB, handleOrderThumbError,
-      dispose: () => { disposed = true; orderGeneration += 1; stopOrderPoll(); closeAccountAuth(); },
+      dispose: () => { disposed = true; orderGeneration += 1; universalGeneration += 1; stopOrderPoll(); closeAccountAuth(); },
     };
   };
 })(globalThis);

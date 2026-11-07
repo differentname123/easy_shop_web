@@ -237,6 +237,94 @@ class TestOffsetAndDetailEnhancements(unittest.TestCase):
         self.assertEqual(tb_channels.get(1), "今日销量榜")
         self.assertEqual(pdd_channels, tb_channels)
 
+    def test_detect_platform_from_text(self):
+        """验证 PromoteService.detect_platform_from_text 能够准确识别淘宝/京东/拼多多链接与口令"""
+        from services.promote_service import PromoteService
+
+        self.assertEqual(PromoteService.detect_platform_from_text("67￥ HU293 2026abcd ￥ https://m.tb.cn/h.xxx 抽纸"), "taobao")
+        self.assertEqual(PromoteService.detect_platform_from_text("https://uland.taobao.com/item/edetail?id=abc"), "taobao")
+        self.assertEqual(PromoteService.detect_platform_from_text("3！CEDABDWqj8boqBMC！ CZ154"), "jd")
+        self.assertEqual(PromoteService.detect_platform_from_text("抢购好物 https://u.jd.com/egUFTPy"), "jd")
+        self.assertEqual(PromoteService.detect_platform_from_text("https://jingfen.jd.com/detail/2JQgZkZ2nGOIkKfwpvzdIkKfwpvzdQ_3SD7M7MGcugkXyuI4w.html"), "jd")
+        self.assertEqual(PromoteService.detect_platform_from_text("https://p.pinduoduo.com/SqikflSS?sc=EFAC"), "pdd")
+        self.assertEqual(PromoteService.detect_platform_from_text("https://mobile.yangkeduo.com/duo_coupon_landing.html?goods_sign=E932Ts1bVtZgMvVTwfvBVEJF7LgQI9Rz_JQwP5lJQN3"), "pdd")
+
+    def test_universal_convert_endpoint_and_detail_cache_seeding(self):
+        """测试 POST /api/promote/universal 万能转链及反查详情自动写入 DETAIL_CACHE"""
+        from unittest.mock import patch
+        from cache import DETAIL_CACHE
+        from models.product import ProductRef
+        from services.product_service import ProductService
+
+        DETAIL_CACHE.clear()
+        mock_adapter = MagicMock()
+        mock_adapter.active = True
+        mock_adapter.platform_code = "taobao"
+        mock_adapter.platform_name = "淘宝"
+        mock_adapter.capabilities = {"detail": True, "promotion": True}
+        mock_adapter.requires_authorized_promotion = True
+        mock_adapter.requires_numeric_promoter_id = False
+        mock_adapter.resolve_product_ref.side_effect = (
+            lambda gid_or_sign="", gid=None, gsign=None: ProductRef("taobao", gid or gid_or_sign, gsign or gid_or_sign)
+        )
+        mock_adapter.build_command_text.return_value = "【淘宝精选】好丽友派\n👉领券链接：https://s.click.taobao.com/abc"
+        mock_adapter.resolve_and_convert_universal.return_value = {
+            "status": "success",
+            "url": "https://uland.taobao.com/coupon/edetail?e=xxx",
+            "final_link": "https://s.click.taobao.com/abc",
+            "short_url": "https://s.click.taobao.com/abc",
+            "promotion_token": "￥JBnB61RqEqX￥",
+            "token_type": "tpwd",
+            "attribution_status": "anonymous",
+            "need_auth": False,
+            "is_fallback": False,
+            "goods_id": "TB_ENC_ID_999",
+            "goods_sign": "TB_ENC_ID_999",
+            "title": "好丽友巧克力派",
+            "price": 8.5,
+            "coupon_amount": 3.0,
+            "product": {
+                "platform": "taobao",
+                "platform_name": "淘宝",
+                "goods_id": "TB_ENC_ID_999",
+                "goods_sign": "TB_ENC_ID_999",
+                "name": "好丽友巧克力派",
+                "image_url": "https://img.alicdn.com/1.jpg",
+                "carousel_images": ["https://img.alicdn.com/1.jpg"],
+                "price": 8.5,
+                "original_price": 11.5,
+                "coupon_amount": 3.0,
+                "has_coupon": True,
+                "commission_rate": 10.0,
+                "commission_amount": 0.85,
+                "sales_tip": "1000+",
+                "mall_name": "好丽友旗舰店",
+                "product_url": "https://uland.taobao.com/item/edetail?id=TB_ENC_ID_999",
+            },
+        }
+
+        with patch("services.promote_service.get_adapter", return_value=mock_adapter), \
+             patch("services.product_service.get_adapter", return_value=mock_adapter):
+            resp = self.client.post(
+                "/api/promote/universal",
+                json={"text": "67￥JBnB61RqEqX￥ https://m.tb.cn/h.xxx 好丽友巧克力派", "platform": "auto"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            body = resp.json()
+            self.assertEqual(body.get("status"), "success")
+            self.assertEqual(body.get("platform"), "taobao")
+            self.assertEqual(body.get("promotion_token"), "￥JBnB61RqEqX￥")
+            self.assertIsNotNone(body.get("product"))
+            self.assertEqual(body["product"].get("goods_id"), "TB_ENC_ID_999")
+            self.assertIn("￥JBnB61RqEqX￥", body.get("command_text", ""))
+
+            # 验证反查出的商品详情已自动种入 DETAIL_CACHE，后续访问详情页可直接秒开
+            svc = ProductService(product_repo=MagicMock())
+            cached_detail = svc.get_goods_detail(platform="taobao", goods_id="TB_ENC_ID_999", goods_sign="TB_ENC_ID_999")
+            self.assertEqual(cached_detail.get("status"), "success")
+            self.assertEqual(cached_detail.get("data", {}).get("name"), "好丽友巧克力派")
+
 
 if __name__ == "__main__":
     unittest.main()
+

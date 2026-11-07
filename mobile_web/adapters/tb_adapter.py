@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlsplit
 
 from adapters.base import BasePlatformAdapter
-from models.product import DetailSnapshot, ProductRef, ProductSummary, ProductDetail
+from models.product import DetailSnapshot, ProductRef, ProductSummary, ProductDetail, clean_product_id
 from infrastructure.tb_client import TaobaoClient
 from infrastructure.hdk_client import HdkClient
 from infrastructure.ztk_client import ZtkClient, ORDER_WINDOW_SECONDS
@@ -398,6 +398,193 @@ class TaobaoAdapter(BasePlatformAdapter):
             result["expires_at"] = expires
         result["cacheable"] = bool(expires)
         return result
+
+    @staticmethod
+    def _extract_candidate_title(text: str) -> str:
+        bracket_match = re.search(r"「([^」]{4,})」", text)
+        if bracket_match:
+            return bracket_match.group(1).strip()
+        cleaned = re.sub(r"https?://\S+", " ", text)
+        cleaned = re.sub(r"[￥¥$€₴£¢()（）/][A-Za-z0-9]{6,20}[￥¥$€₴£¢()（）/]", " ", cleaned)
+        cleaned = re.sub(r"\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{2,6}\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"【(?:淘宝|天猫|好物推荐|手淘分享)[^】]*】", " ", cleaned)
+        cleaned = re.sub(r"\d+\s*[\$￥¥!！:/]+\s*", " ", cleaned)
+        cleaned = re.sub(r"(?:点击链接直接打开|手机淘宝|淘宝App|复制本段|打开手淘)", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，。！？、,!?:：-")
+        if len(cleaned) >= 4 and not re.match(r"^[A-Za-z0-9_-]+$", cleaned):
+            return cleaned
+        return ""
+
+    def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):
+        """
+        淘宝万能转链与详情一步反查（对齐 scripts/test_tb_api.py 基准规范 六）：
+        1. 主路径：基于折淘客 `open_gaoyongzhuanlian_tkl.ashx` (`signurl=5`) + 4段式 `channel_pid`，
+           单次 HTTP 请求同时完成口令/短链/推广链/加密 ID 转链与完整商品详情提取；
+        2. 兜底路径：当用户粘贴普通手淘商品分享（`e.tb.cn` 解包为纯数字 ID 触发 `不支持数字id转链`）或纯商品标题文案时，
+           自动提取 `「商品标题」` 调用官方 TOP `search_goods` 获取加密 `goods_sign`，再交由折淘客一步转链。
+        """
+        if not self.active:
+            return _error("platform_unavailable", "淘宝暂未启用")
+        text = _text(raw_text)
+        if not text:
+            return _error("INVALID_ARGUMENT", "请输入淘宝链接、淘口令或商品ID")
+
+        identity = kwargs.get("identity") or {}
+        relation_id = _text(identity.get("relation_id")) if isinstance(identity, dict) else ""
+        if uid and (not relation_id or relation_id == "0"):
+            return _error("AUTH_REQUIRED", "淘宝个人推广需要已核验渠道身份", need_auth=True, is_fallback=False)
+        if uid and identity.get("external_id") is not None and _text(identity["external_id"]) != _text(uid):
+            return _error("IDENTITY_MISMATCH", "淘宝推广身份与站内用户不一致", need_auth=True, is_fallback=False)
+
+        candidate_title = self._extract_candidate_title(text)
+        if "alimama.com" in text.lower() and not re.search(r"[?&](?:itemId|id|item_id)=[A-Za-z0-9_-]{8,}", text):
+            return _error(
+                "UNSUPPORTED_TB_PORTAL_PAGE",
+                "该链接为阿里妈妈选品库/频道列表页而非具体单品链接，请复制单品的推广链接、淘口令或手淘商品分享文案",
+            )
+        is_bare_numeric = text.isdigit() or bool(
+            re.search(r"(?:item\.taobao\.com|detail\.tmall\.com)/item\.htm\?[^#\s]*id=\d+\b", text)
+            and not candidate_title
+        )
+        if is_bare_numeric:
+            return _error(
+                "UNSUPPORTED_TB_NUMERIC_ID",
+                "淘宝联盟已停用纯数字商品ID直接转链，请粘贴手淘App分享的完整文案（含「商品标题」或淘口令）或推广链接",
+            )
+
+        is_bare_id = bool(re.match(r"^[A-Za-z0-9_-]{8,}$", text)) and not text.startswith(("http://", "https://"))
+        tkl_input = f"https://uland.taobao.com/item/edetail?id={text}" if is_bare_id else text
+
+        if not self._ztk_channel_ready() or not self.channel_pid:
+            if is_bare_id:
+                conv = self.convert_promotion_url(text, uid=uid, identity=identity)
+                if conv.get("status") != "success":
+                    return conv
+                det = self.get_goods_detail(text)
+                if det.get("status") == "success":
+                    conv["product"] = det["data"]
+                return conv
+            return _error("CONFIG_ERROR", "淘宝折淘客万能转链未配置完整 (需 ZTK_APPKEY / ZTK_SID / TB_CHANNEL_PID)")
+
+        rel_arg = relation_id if (uid and relation_id) else ""
+        ztk_res = self.ztk.convert_channel_url(
+            tkl_input,
+            rel_arg,
+            self.channel_pid,
+            allow_public=True,
+        )
+        if (not isinstance(ztk_res, dict) or ztk_res.get("status") != "success") and not self._is_unauthorized_error(ztk_res):
+            if candidate_title and self.official:
+                search_res = self.official.search_goods(candidate_title, page=1, page_size=5)
+                if isinstance(search_res, dict) and search_res.get("status") == "success" and search_res.get("data"):
+                    first_hit = search_res["data"][0]
+                    enc_sign = _text(first_hit.get("goods_sign") or first_hit.get("goods_id"))
+                    if enc_sign:
+                        ztk_res = self.ztk.convert_channel_url(
+                            f"https://uland.taobao.com/item/edetail?id={enc_sign}",
+                            rel_arg,
+                            self.channel_pid,
+                            allow_public=True,
+                        )
+
+        if not isinstance(ztk_res, dict) or ztk_res.get("status") != "success":
+            err = ztk_res.get("error_msg") if isinstance(ztk_res, dict) else "淘宝口令或链接解析转链失败"
+            is_unauth = self._is_unauthorized_error(ztk_res)
+            code = "AUTH_REQUIRED" if is_unauth else (ztk_res.get("error_code") if isinstance(ztk_res, dict) else "PROMOTION_FAILED")
+            if code == "UNSUPPORTED_TB_NUMERIC_ID" or "不支持数字id" in _text(err):
+                code = "UNSUPPORTED_TB_NUMERIC_ID"
+                err = "淘宝联盟已停用纯数字商品ID直接转链，请粘贴手淘App分享的完整文案（含「商品标题」或淘口令）或推广链接"
+            return _error(code or "PROMOTION_FAILED", err, need_auth=is_unauth)
+
+        link = ztk_res.get("final_link") or ztk_res.get("url") or ""
+        short_url = ztk_res.get("short_url") or link
+        password = _text(ztk_res.get("tpwd"))
+        raw_c = ztk_res.get("raw") if isinstance(ztk_res.get("raw"), dict) else {}
+
+        tao_id = clean_product_id(raw_c.get("tao_id")) or (text if is_bare_id else "")
+        title = _text(raw_c.get("title") or raw_c.get("tao_title") or ztk_res.get("title") or "淘宝精选好物")
+        pict_url = _text(raw_c.get("pict_url") or "")
+        if pict_url.startswith("//"):
+            pict_url = "https:" + pict_url
+        small_raw = raw_c.get("small_images") or ""
+        if isinstance(small_raw, str):
+            gallery = [u.strip() for u in small_raw.split("|") if u.strip()]
+        elif isinstance(small_raw, list):
+            gallery = [str(u).strip() for u in small_raw if str(u).strip()]
+        else:
+            gallery = []
+        gallery = [("https:" + u if u.startswith("//") else u) for u in gallery]
+        if pict_url and pict_url not in gallery:
+            gallery.insert(0, pict_url)
+
+        orig_price = _money(raw_c.get("size")) or 0.0
+        final_price = _money(raw_c.get("quanhou_jiage"))
+        if final_price is None:
+            final_price = orig_price
+        coupon_money = _money(raw_c.get("coupon_info_money")) or 0.0
+        if orig_price < final_price:
+            orig_price = round(final_price + coupon_money, 2)
+        comm_rate = _money(raw_c.get("tkrate3")) or 0.0
+        comm_fee = _money(raw_c.get("tkfee3"))
+        if comm_fee is None:
+            comm_fee = round(final_price * comm_rate / 100.0, 2)
+        mall_name = _text(raw_c.get("shop_title") or raw_c.get("nick") or "淘宝天猫好店")
+        sales_tip = _text(raw_c.get("volume") or "0")
+        raw_item_url = _text(raw_c.get("item_url") or "")
+        if raw_item_url.startswith("//"):
+            raw_item_url = "https:" + raw_item_url
+        if not raw_item_url and tao_id:
+            raw_item_url = f"https://uland.taobao.com/item/edetail?id={tao_id}"
+
+        product_card = None
+        if tao_id and title:
+            detail_payload = {
+                "platform": self.platform_code,
+                "platform_name": self.platform_name,
+                "goods_id": tao_id,
+                "goods_sign": tao_id,
+                "name": title,
+                "image_url": pict_url or (gallery[0] if gallery else ""),
+                "price": final_price,
+                "original_price": orig_price,
+                "coupon_amount": coupon_money,
+                "has_coupon": coupon_money > 0,
+                "commission_rate": comm_rate,
+                "commission_amount": comm_fee,
+                "sales_tip": sales_tip,
+                "mall_name": mall_name,
+                "desc": _text(raw_c.get("jianjie") or title),
+                "carousel_images": gallery,
+                "product_url": raw_item_url,
+                "detail_tags": [],
+                "service_guarantees": [],
+                "shop_ratings": {},
+                "specs": [{"label": "店铺名称", "value": mall_name}] if mall_name else [],
+                "coupon_info": {},
+            }
+            product_card = ProductDetail(**detail_payload).to_dict(exclude_unset=True)
+
+        return {
+            "status": "success",
+            "url": link,
+            "final_link": short_url or link,
+            "mobile_url": link,
+            "short_url": short_url,
+            "we_app_info": {},
+            "promotion_token": password,
+            "token_type": "tpwd" if password else "",
+            "attribution_status": "verified" if (uid and relation_id) else "anonymous",
+            "relation_id": relation_id if (uid and relation_id) else "",
+            "need_auth": False,
+            "is_fallback": False,
+            "goods_id": tao_id,
+            "goods_sign": tao_id,
+            "title": title,
+            "price": final_price,
+            "coupon_amount": coupon_money,
+            "link_type": "折淘客渠道淘口令" if (uid and relation_id) else "淘宝高佣淘口令",
+            "product": product_card,
+        }
 
     def _ztk_channel_ready(self) -> bool:
         appkeys = getattr(self.ztk, "appkey_list", None)

@@ -463,6 +463,7 @@ def test_live_empty_order_response_without_data_key_is_accepted_as_empty_page():
 
 def test_jd_detail_301_rate_limit_vs_off_promotion_arbitration_and_eviction():
     from cache import clear_all_caches, is_product_off_promotion, RECOMMEND_CACHE
+    from services.product_service import ProductService
     clear_all_caches()
     off_promo_id = "oxXpYeb9FgS3eszB2h2f3eszB2h2fX_3TYrAutPKopeY0fpzO"
     # 场景1：api_detail.ashx 返回 301 对应宝贝已下架，但转链探针返回 200 成功 -> 判定为 RATE_LIMIT（非真实下架）

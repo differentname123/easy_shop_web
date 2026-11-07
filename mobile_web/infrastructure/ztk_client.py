@@ -106,6 +106,9 @@ class ZtkClient:
                 self._active_key_index = idx
                 self.appkey = current_key
                 return result
+            err_msg = str(result.get("error_msg") or "")
+            if last_result is not None and ("sid和appkey不匹配" in err_msg or "sid过期" in err_msg):
+                continue
             last_result = result
             if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR"):
                 return result
@@ -175,13 +178,13 @@ class ZtkClient:
 
         return self._run_with_key_failover(_query_once)
 
-    def convert_channel_url(self, item_url: str, relation_id: str, pid: str, signurl: int = 5):
+    def convert_channel_url(self, item_url: str, relation_id: str = "", pid: str = "", signurl: int = 5, *, allow_public: bool = False):
         if not self.appkey_list or not self.sid:
             return _error("CONFIG_ERROR", "折淘客渠道转链缺少 appkey 或 sid")
         item_url = str(item_url or "").strip()
         relation_id = str(relation_id or "").strip()
         pid = str(pid or "").strip()
-        if not item_url or not relation_id or not pid:
+        if not item_url or not pid or (not allow_public and not relation_id):
             return _error("INVALID_ARGUMENT", "折淘客渠道转链缺少有效商品链接、relation_id 或 pid")
 
         def _convert_once(current_key):
@@ -190,9 +193,10 @@ class ZtkClient:
                 "sid": self.sid,
                 "pid": pid,
                 "tkl": item_url,
-                "relation_id": relation_id,
                 "signurl": signurl,
             }
+            if relation_id:
+                params["relation_id"] = relation_id
             try:
                 body = self._get_response(ZTK_CHANNEL_URL, params=params)
                 if isinstance(body, dict) and body.get("status") == "error":
@@ -220,6 +224,10 @@ class ZtkClient:
                     msg_text = err_msg or "折淘客渠道转链未返回有效物料"
                     if is_unauthorized:
                         return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {msg_text}", need_auth=True)
+                    if "不支持数字id" in msg_text.lower():
+                        return _error("UNSUPPORTED_TB_NUMERIC_ID", f"折淘客渠道转链失败: {msg_text}")
+                    if "error tkl" in msg_text.lower():
+                        return _error("INVALID_TKL", f"折淘客渠道转链失败: {msg_text}")
                     return _error("UPSTREAM_ERROR", f"折淘客渠道转链失败: {msg_text}")
 
                 if not content or not isinstance(content[0], dict):
@@ -228,6 +236,12 @@ class ZtkClient:
                 target_url = c.get("coupon_click_url") or c.get("item_url") or ""
                 if target_url.startswith("//"):
                     target_url = "https:" + target_url
+                short_url = str(c.get("shorturl") or "").strip()
+                if short_url.startswith("//"):
+                    short_url = "https:" + short_url
+                short_url2 = str(c.get("shorturl2") or "").strip()
+                if short_url2.startswith("//"):
+                    short_url2 = "https:" + short_url2
                 title = c.get("title") or c.get("tao_title") or "渠道推广商品"
                 tpwd = str(c.get("tkl") or "").strip()
                 return {
@@ -236,11 +250,13 @@ class ZtkClient:
                     "final_price": str(c.get("quanhou_jiage") or c.get("size") or "0.00"),
                     "commission_rate": str(c.get("tkrate3") or "0"),
                     "commission_amount": str(c.get("tkfee3") or "0.00"),
-                    "is_channel": True,
+                    "is_channel": bool(relation_id),
                     "pid": pid,
                     "relation_id": relation_id,
                     "url": target_url,
                     "final_link": target_url,
+                    "short_url": short_url or target_url,
+                    "short_url2": short_url2,
                     "mobile_url": target_url,
                     "tpwd": tpwd,
                     "raw": c,

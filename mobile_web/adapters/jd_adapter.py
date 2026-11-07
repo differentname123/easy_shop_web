@@ -2,6 +2,7 @@
 """京东字段/分页适配；无授权、用户仓储或个人转站长兜底。"""
 import hashlib
 import math
+import re
 from datetime import datetime
 
 from adapters.base import BasePlatformAdapter
@@ -335,6 +336,159 @@ class JdAdapter(BasePlatformAdapter):
                 "we_app_info": {}, "promoter_id": promoter, "goods_id": ref.goods_id, "goods_sign": ref.goods_sign,
                 "attribution_status": "verified" if uid else "anonymous", "need_auth": False,
                 "is_fallback": False, "cacheable": False, "link_type": "京东推广链接"}
+
+    def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):
+        """
+        京东万能转链与详情反查（对齐 scripts/test_jd_api.py 基准规范 六）：
+        1. 支持全部 8 种真实输入格式：裸加密 itemId、jingfen.jd.com 详情链、u.jd.com 短链、
+           union-click.jd.com 联盟长链、完整京口令文案、精简京口令、本平台生成多行文案、以及京东 App「商品标题」分享文案；
+        2. 明确拦截不含标题的纯数字 item.jd.com/{数字}.html 或纯数字 SKU（京东联盟接口已不支持数字 ID 转链）；
+        3. 转链成功后，通过 api_detail.ashx（加密ID）或 api_quanwang.ashx（u.jd.com 短链，youquan=0）反查商品详情；
+           若反查接口偶发限流，自动从转链返回的 jCommand 文案提取商品标题与券额构建预览卡片兜底。
+        """
+        unavailable = self._available("promotion")
+        if unavailable:
+            return unavailable
+        promoter = canonical_promoter_id(kwargs.get("promoter_id") or self.default_promoter_id)
+        if not promoter:
+            return _error("INVALID_PROMOTER_ID", "京东转链需要服务端数字推广ID")
+
+        text = _text(raw_text)
+        if not text:
+            return _error("INVALID_ARGUMENT", "请输入京东 u.jd.com 短链、京口令或京粉链接")
+
+        extracted_encrypted_id = ""
+        product_card = None
+        jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
+        u_jd_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9]+", text)
+        union_click_match = re.search(r"https?://union-click\.jd\.com/jdc\?[^\s\"'<>]+", text)
+        jcmd_match = re.search(r"([!！$￥¥%&*(（][A-Za-z0-9]{10,20}[!！$￥¥%&*)）])", text)
+
+        if jf_match:
+            extracted_encrypted_id = jf_match.group(1)
+            material_input = f"https://jingfen.jd.com/detail/{extracted_encrypted_id}.html"
+        elif _is_encrypted_jd_item_id(text):
+            extracted_encrypted_id = text
+            material_input = f"https://jingfen.jd.com/detail/{extracted_encrypted_id}.html"
+        elif u_jd_match:
+            material_input = u_jd_match.group(0)
+        elif union_click_match:
+            material_input = union_click_match.group(0).rstrip("，。！？、,!?)）】")
+        elif jcmd_match:
+            material_input = text
+        elif re.search(r"item\.jd\.com/(\d+)\.html", text) or text.isdigit():
+            return _error(
+                "UNSUPPORTED_JD_NUMERIC_SKU",
+                "京东联盟新规已不支持纯数字商品ID或 item.jd.com 数字直链转链，请粘贴京东 App 分享的 u.jd.com 短链、京口令或含「商品标题」的分享文案",
+            )
+        else:
+            title_bracket = re.search(r"「([^」]{2,})」", text)
+            if title_bracket:
+                keyword = title_bracket.group(1).strip()
+            else:
+                cleaned = re.sub(r"https?://\S+", " ", text)
+                cleaned = re.sub(r"【(?:京东|京东自营|好物推荐|好物分享)】", " ", cleaned)
+                keyword = re.sub(r"\s+", " ", cleaned).strip(" ，。！？、,!?:：-")
+            if len(keyword) < 2:
+                return _error("INVALID_ARGUMENT", "未识别到有效的京东推广链接、京口令或商品标题")
+            try:
+                kw_res = self.client.search_goods(keyword, page=1, page_size=5, has_coupon=False)
+            except TypeError:
+                kw_res = self.client.search_goods(keyword, page=1, page_size=5)
+            if kw_res.get("status") == "success" and isinstance(kw_res.get("data"), list) and kw_res["data"]:
+                for row in kw_res["data"]:
+                    try:
+                        product_card = self._detail(row)
+                        extracted_encrypted_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
+                        break
+                    except Exception:
+                        continue
+            if not extracted_encrypted_id:
+                return _error("PRODUCT_NOT_FOUND", f"未检索到与「{keyword[:24]}」匹配的京东在推商品")
+            material_input = f"https://jingfen.jd.com/detail/{extracted_encrypted_id}.html"
+
+        conv = self.client.convert_universal_material(material_input, promoter)
+        if conv.get("status") != "success":
+            if conv.get("jd_off_promotion") is True:
+                return _error("PRODUCT_OFF_PROMOTION", "该京东商品已取消推广或已下架，请挑选其他好物")
+            return conv
+
+        short = conv.get("short_url") or ""
+        long = conv.get("click_url") or ""
+        j_cmd = conv.get("j_command") or ""
+        j_short_cmd = conv.get("j_short_command") or ""
+        token = j_short_cmd or j_cmd
+
+        resolved_id = extracted_encrypted_id
+        if not product_card and extracted_encrypted_id:
+            det = self.get_goods_detail(extracted_encrypted_id)
+            if det.get("status") == "success" and isinstance(det.get("data"), dict):
+                product_card = det["data"]
+        elif not product_card:
+            search_q = material_input if "u.jd.com/" in material_input else (short or long)
+            if search_q:
+                try:
+                    q_res = self.client.search_goods(search_q, page=1, page_size=5, has_coupon=False)
+                except TypeError:
+                    q_res = self.client.search_goods(search_q, page=1, page_size=5)
+                if q_res.get("status") == "success" and isinstance(q_res.get("data"), list) and q_res["data"]:
+                    for row in q_res["data"]:
+                        try:
+                            product_card = self._detail(row)
+                            resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
+                            break
+                        except Exception:
+                            continue
+
+        # 从 jCommand 文案提取商品标题与优惠券金额作为限流兜底
+        fallback_title = "京东精选推广好物"
+        fallback_coupon = 0.0
+        if j_cmd:
+            t_match = re.search(r"抢购(.+?)！", j_cmd)
+            if t_match:
+                fallback_title = t_match.group(1).strip()
+            c_match = re.search(r"领(\d+(?:\.\d+)?)元优惠券", j_cmd)
+            if c_match:
+                try:
+                    fallback_coupon = round(float(c_match.group(1)), 2)
+                except Exception:
+                    pass
+        if fallback_title == "京东精选推广好物":
+            b_match = re.search(r"「(.+?)」", text)
+            if b_match:
+                fallback_title = b_match.group(1).strip()
+
+        title = (product_card or {}).get("name") or fallback_title
+        price = (product_card or {}).get("price")
+        coupon_amount = (product_card or {}).get("coupon_amount")
+        if coupon_amount is None:
+            coupon_amount = fallback_coupon
+
+        return {
+            "status": "success",
+            "url": long or short,
+            "final_link": short or long,
+            "mobile_url": long or short,
+            "short_url": short,
+            "click_url": long,
+            "j_command": j_cmd,
+            "j_short_command": j_short_cmd,
+            "promotion_token": token,
+            "token_type": "jcommand" if token else "",
+            "we_app_info": {},
+            "promoter_id": promoter,
+            "goods_id": resolved_id,
+            "goods_sign": resolved_id,
+            "title": title,
+            "price": price,
+            "coupon_amount": coupon_amount,
+            "attribution_status": "verified" if uid else "anonymous",
+            "need_auth": False,
+            "is_fallback": False,
+            "cacheable": False,
+            "link_type": "京东推广链接",
+            "product": product_card,
+        }
 
     def check_authority(self, uid):
         if not self.active:
