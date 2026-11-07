@@ -16,6 +16,8 @@ from models.product import (
     ProductSummary,
     clean_product_id,
     extract_canonical_goods_id,
+    extract_jd_image_key,
+    is_jd_image_key,
 )
 
 
@@ -73,8 +75,10 @@ def _item_id(item):
 
 
 def _is_encrypted_jd_item_id(value):
-    """识别京东联盟官方加密 itemId (如榜单/搜索返回的字母数字下划线混合加密 ID)。"""
+    """识别京东联盟官方加密 itemId (如榜单/搜索返回的字母数字下划线混合加密 ID)，排除主图 CDN 哈希键。"""
     text = _text(value)
+    if not text or is_jd_image_key(text):
+        return False
     return len(text) >= 25 and "_" in text and all(c.isalnum() or c == "_" for c in text)
 
 
@@ -238,6 +242,8 @@ class JdAdapter(BasePlatformAdapter):
         target_id = ref.goods_sign or ref.goods_id
         if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东需要商品ID而非未经核验的请求URL")
+        if is_jd_image_key(target_id):
+            return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU，不能直接使用主图哈希 ID")
         result = self.client.get_goods_detail(target_id)
         if result.get("status") != "success":
             return result
@@ -247,7 +253,9 @@ class JdAdapter(BasePlatformAdapter):
         matches = [item for item in rows if _item_id(item) == target_id]
         if not matches and len(rows) == 1:
             single = dict(rows[0])
-            if _material_url(single):
+            returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
+            img_conflict = bool(is_jd_image_key(ref.goods_id) and returned_img_key and returned_img_key != ref.goods_id)
+            if _material_url(single) and not img_conflict:
                 single["tao_id"] = target_id
                 single["skuId"] = target_id
                 matches = [single]

@@ -125,6 +125,16 @@ test('format and product identity helpers reject empty-key and cross-platform ca
   assert.equal(shop.matchesGoodsSummary({ goods_id: 'A', goods_sign: '' }, { goods_id: 'B', goods_sign: '' }), false);
   assert.equal(shop.matchesGoodsSummary({ goods_id: 'A', platform: 'pdd' }, { goods_id: 'A', platform: 'jd' }), false);
   assert.equal(shop.matchesGoodsSummary({ product_id: 'A', platform: 'pdd' }, { goods_id: 'A', platform: 'pdd' }), true);
+  const tbId = shop.goodsIdentity({ platform: 'taobao', goods_id: '5n9p6DJF6yr3QZWzFNY', goods_sign: 'BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY' });
+  assert.equal(tbId.goods_id, '5n9p6DJF6yr3QZWzFNY');
+  assert.equal(tbId.goods_sign, 'BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY');
+  assert.equal(
+    shop.matchesGoodsSummary(
+      { platform: 'taobao', goods_id: '5n9p6DJF6yr3QZWzFNY', goods_sign: 'BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY' },
+      { platform: 'taobao', goods_id: '5n9p6DJF6yr3QZWzFNY', goods_sign: '5n9p6DJF6yr3QZWzFNY' }
+    ),
+    true
+  );
 });
 
 test('home reset fetches the new channel during loading and ignores the older response', async () => {

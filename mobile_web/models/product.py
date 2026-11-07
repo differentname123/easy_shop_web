@@ -22,6 +22,15 @@ def clean_product_id(value: Any) -> str:
     return "" if text in ("", "0", "0.0", "None") else text
 
 
+_JD_IMAGE_KEY_RE = re.compile(r"^[0-9a-fA-F]{14,22}_[0-9a-fA-F]{12,20}$")
+
+
+def is_jd_image_key(value: Any) -> bool:
+    """判断字符串是否为京东主图 CDN 提取的 <目录哈希>_<文件哈希> 静态唯一标识。"""
+    text = clean_product_id(value)
+    return bool(text and _JD_IMAGE_KEY_RE.match(text))
+
+
 def extract_jd_image_key(image_url: Any) -> str:
     """
     从京东官方 CDN 主图 URL (360buyimg.com / jfs) 中提取稳定的商品唯一标识：

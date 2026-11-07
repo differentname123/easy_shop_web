@@ -89,6 +89,15 @@
      - 当主路径遇到 `不支持数字id转链` 或输入为普通商品标题文案时，自动从输入中提取 `「商品标题」`（或清洗 URL/口令后的标题文本），
        调用官方 `taobao.tbk.dg.material.optional.upgrade` (`search_tb_goods`) 检索出加密 `goods_sign`，再交由折淘客一步转链，实现 11 种格式 100% 闭环。
   3. ❌ 不可用输入：不含任何商品标题的纯数字 ID 或 `https://item.taobao.com/item.htm?id={纯数字}`（明确返回 `UNSUPPORTED_TB_NUMERIC_ID` 引导用户粘贴含 `「商品标题」` 的手淘分享文案或淘口令）。
+
+七、 商品唯一标识 (`product_id` / `goods_id`) 与动态调用令牌 (`goods_sign`) 职责解耦及防 `50001` 报错铁律
+  1. **静态主键 vs 动态签名**：
+     - 淘宝 TOP 27939 权限包与折淘客返回的混淆 `item_id` 固定为 `<26位动态盐值前缀>-<19位稳定密文后缀>`（如 `BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY`）。
+     - `goods_id` / `product_id` 提取 `-` 后的 19 位稳定后缀（如 `5n9p6DJF6yr3QZWzFNY`），专职用于 MongoDB `(platform, product_id)` 唯一索引去重；
+     - `goods_sign` 保留完整的 46 位 `<prefix>-<suffix>` 动态密文，专职用于请求上游 `taobao.tbk.item.info.upgrade.get` 详情接口与转链。
+  2. **严禁拿 19 位后缀 `goods_id` 直接请求 TOP 详情接口**：
+     - 若将剥离了 `<prefix>-` 的 19 位 `goods_id`（如 `5n9p6DJF6yr3QZWzFNY`）直接作为 `item_id` 传给 `taobao.tbk.item.info.upgrade.get`，淘宝开放平台必报 `[15:50001] 无结果`！
+     - 防护闭环：前端列表/卡片跳转详情时必须分别透传 `goods_id` 与完整 `goods_sign`（严禁以 `goods_id` 覆盖 `goods_sign`）；当后端收到 `goods_sign == goods_id`（或缺失 `goods_sign`）的请求时，必须先通过内存 `SIGN_BY_ID_CACHE` 或 MongoDB `{"platform": "taobao", "product_id": goods_id}` 索引反查还原出完整的 46 位 `goods_sign`，再命中缓存或调用上游接口。
 ================================================================================
 """
 

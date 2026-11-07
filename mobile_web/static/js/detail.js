@@ -295,6 +295,10 @@
         if (shop.matchesGoodsSummary(summary, requested)) {
           goods.value = summary;
           hasSummary = true;
+          const cachedIdentity = shop.goodsIdentity(summary);
+          if (requested.platform !== 'pdd' && (!requested.goods_sign || requested.goods_sign === requested.goods_id) && cachedIdentity.goods_sign) {
+            requested = { ...requested, goods_sign: cachedIdentity.goods_sign };
+          }
         }
       } catch (_) {}
       if (!hasSummary) browser.startSmartLoading('正在加载商品详情...', [

@@ -20,6 +20,8 @@ CATEGORY_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_CATEGORY, ttl=600)     # �
 PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_PROMOTION, ttl=1800)  # 转链口令 30 分钟
 # 公开商品身份到上游物料URL；不是完整详情或个人推广链接。
 MATERIAL_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_TTL)
+# 规范化静态唯一标识 (platform, goods_id) 到上游动态混淆签名 (goods_sign) 的热映射
+SIGN_BY_ID_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_TTL)
 # 已确认下架/取消推广的商品防复活黑名单（30分钟内拦截榜单滞后快照重新入库或展示）
 OFF_PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=2048, ttl=1800)
 
@@ -45,6 +47,7 @@ def evict_product_from_caches(platform: str, goods_id: str = "", goods_sign: str
         OFF_PROMOTION_CACHE.set((plat, t), True)
         MATERIAL_CACHE.pop((plat, "id", t), None)
         MATERIAL_CACHE.pop((plat, "sign", t), None)
+        SIGN_BY_ID_CACHE.pop((plat, t), None)
     for dkey in DETAIL_CACHE.keys():
         if isinstance(dkey, tuple) and len(dkey) >= 4 and dkey[0] == plat and dkey[3] in targets:
             DETAIL_CACHE.pop(dkey, None)
@@ -83,4 +86,5 @@ def clear_all_caches():
     CATEGORY_CACHE.clear()
     PROMOTION_CACHE.clear()
     MATERIAL_CACHE.clear()
+    SIGN_BY_ID_CACHE.clear()
     OFF_PROMOTION_CACHE.clear()

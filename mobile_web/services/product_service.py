@@ -15,12 +15,13 @@ from models.product import (
     DetailSnapshot,
     DetailPrefetchResult,
     extract_canonical_goods_id,
+    is_jd_image_key,
     utc_millis,
 )
 from repositories.product_repo import ProductRepository
 from cache import (
     RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, MATERIAL_CACHE,
-    evict_product_from_caches, is_product_off_promotion,
+    SIGN_BY_ID_CACHE, evict_product_from_caches, is_product_off_promotion,
 )
 from config import PRODUCT_DETAIL_TTL, logger
 
@@ -139,16 +140,20 @@ class ProductService:
             if is_product_off_promotion(ref.platform, ref.goods_id, ref.goods_sign):
                 continue
             valid_items.append(item)
+            if ref.goods_id and ref.goods_sign and ref.goods_id != ref.goods_sign:
+                SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), ref.goods_sign)
             url = item.get("product_url")
             if ref.key and isinstance(url, str) and url.strip():
                 clean_url = url.strip()
-                kind = "sign" if ref.goods_sign else "id"
-                cache_key = (ref.platform, kind, ref.key)
-                existing_url = MATERIAL_CACHE.get(cache_key)
-                # 防止榜单合成的 item.jd.com/{encrypted_id}.html 覆盖详情页已解析出的权威 jingfen.jd.com 推广链接
-                if isinstance(existing_url, str) and "jingfen.jd.com" in existing_url and "jingfen.jd.com" not in clean_url:
-                    continue
-                MATERIAL_CACHE.set(cache_key, clean_url)
+                for kind, val in (("sign", ref.goods_sign), ("id", ref.goods_id)):
+                    if not val:
+                        continue
+                    cache_key = (ref.platform, kind, val)
+                    existing_url = MATERIAL_CACHE.get(cache_key)
+                    # 防止榜单合成的 item.jd.com/{encrypted_id}.html 覆盖详情页已解析出的权威 jingfen.jd.com 推广链接
+                    if isinstance(existing_url, str) and "jingfen.jd.com" in existing_url and "jingfen.jd.com" not in clean_url:
+                        continue
+                    MATERIAL_CACHE.set(cache_key, clean_url)
         if self.prefetcher is not None:
             try:
                 self.prefetcher.offer_products(valid_items, channel_type=channel_type, snapshots=snapshots)
@@ -294,6 +299,8 @@ class ProductService:
     def _cache_detail(platform: str, result: dict, expires_at: float, uid=None, verified_ref=None):
         item = result.get("data") or {}
         ref = ProductRef(platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
+        if ref.goods_id and ref.goods_sign and ref.goods_id != ref.goods_sign:
+            SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), ref.goods_sign)
         url = item.get("product_url")
         if isinstance(url, str) and url.strip():
             clean_url = url.strip()
@@ -326,8 +333,13 @@ class ProductService:
     @staticmethod
     def _cached_detail(ref, uid=None):
         primary = ProductRef(ref.platform, "" if ref.goods_sign else ref.goods_id, ref.goods_sign)
+        keys = list(primary.cache_keys(uid))
+        if ref.platform in ("taobao", "jd") and ref.goods_id and ref.goods_sign == ref.goods_id:
+            id_key = ("detail", ref.platform, uid or "", "id", ref.goods_id)
+            if id_key not in keys:
+                keys.append(id_key)
         with _DETAIL_CACHE_LOCK:
-            for key in primary.cache_keys(uid):
+            for key in keys:
                 cached = DETAIL_CACHE.get(key)
                 if ProductService._valid_cache_entry(cached):
                     return cached[0], deepcopy(cached[1])
@@ -337,13 +349,42 @@ class ProductService:
 
     def _read_detail(self, ref, strict=False):
         options = {"strict": True} if strict else {}
+        if ref.platform in ("taobao", "jd") and ref.goods_id and (
+            not ref.goods_sign
+            or ref.goods_sign == ref.goods_id
+            or (ref.platform == "jd" and is_jd_image_key(ref.goods_sign))
+        ):
+            doc = self.repo.get_product_detail(ref.goods_id, platform=ref.platform,
+                                               key_type="id", **options)
+            if doc is not None or not ref.goods_sign:
+                return doc
         doc = self.repo.get_product_detail(ref.key, platform=ref.platform,
                                            key_type="sign" if ref.goods_sign else "id", **options)
-        if (doc is None and ref.goods_sign and ref.goods_id
-                and ref.goods_id != ref.goods_sign and ref.platform in ("taobao", "jd")):
+        if doc is None and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd"):
             doc = self.repo.get_product_detail(ref.goods_id, platform=ref.platform,
                                                key_type="id", **options)
         return doc
+
+    @staticmethod
+    def _upgrade_ref_sign(ref: ProductRef, item: Optional[dict] = None) -> ProductRef:
+        if ref.platform not in ("taobao", "jd") or not ref.goods_id:
+            return ref
+        needs_upgrade = (
+            not ref.goods_sign
+            or ref.goods_sign == ref.goods_id
+            or (ref.platform == "jd" and is_jd_image_key(ref.goods_sign))
+        )
+        if not needs_upgrade:
+            return ref
+        if isinstance(item, dict):
+            doc_sign = str(item.get("goods_sign") or "").strip()
+            if doc_sign and doc_sign != ref.goods_id and not (ref.platform == "jd" and is_jd_image_key(doc_sign)):
+                SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), doc_sign)
+                return ProductRef(ref.platform, ref.goods_id, doc_sign)
+        cached_sign = SIGN_BY_ID_CACHE.get((ref.platform, ref.goods_id))
+        if isinstance(cached_sign, str) and cached_sign.strip():
+            return ProductRef(ref.platform, ref.goods_id, cached_sign.strip())
+        return ref
 
     @staticmethod
     def _make_snapshot(data, fetched_at, platform):
@@ -474,12 +515,14 @@ class ProductService:
         ref = adapter.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
         if not ref.key:
             return {"status": "error", "error_msg": "请提供商品 ID 或 Sign", "error_code": "missing_product_identity"}
+        ref = self._upgrade_ref_sign(ref)
         if is_product_off_promotion(plat, ref.goods_id, ref.goods_sign):
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}
         cached = self._cached_detail(ref, uid)
         if cached:
             return cached[1]
         item = self._read_detail(ref)
+        ref = self._upgrade_ref_sign(ref, item)
         deadline = self._detail_expires_at(item) if item else 0.0
         if time.time() < deadline:
             result = self._database_detail(item, "database")
@@ -523,7 +566,9 @@ class ProductService:
                     return DetailPrefetchResult("error")
                 loaded = self._commit_snapshot(snapshot, stop_event=stop_event)
             else:
+                ref = self._upgrade_ref_sign(ref)
                 item = self._read_detail(ref, strict=True)
+                ref = self._upgrade_ref_sign(ref, item)
                 deadline = self._detail_expires_at(item) if item else 0.0
                 if deadline - time.time() > refresh_ahead_seconds:
                     saved = self._document_snapshot(item, ref.platform)

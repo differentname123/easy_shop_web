@@ -17,6 +17,7 @@ from infrastructure.logging_utils import format_exc_summary
 from models.product import (
     clean_product_id,
     extract_canonical_goods_id,
+    is_jd_image_key,
     normalize_platform,
     utc_millis,
 )
@@ -144,7 +145,10 @@ class ProductRepository(BaseRepository):
             insert_set["product_id"] = goods_sign
 
         if goods_sign:
-            update_set["goods_sign"] = goods_sign
+            if platform == "jd" and is_jd_image_key(goods_sign):
+                insert_set["goods_sign"] = goods_sign
+            else:
+                update_set["goods_sign"] = goods_sign
         elif platform != "pdd" and goods_id:
             insert_set["goods_sign"] = goods_id
 
@@ -217,7 +221,7 @@ class ProductRepository(BaseRepository):
         if isinstance(product_url, str) and product_url.strip():
             clean_url = product_url.strip()
             target_id = goods_sign or goods_id
-            if platform == "jd" and len(target_id) >= 25 and "_" in target_id:
+            if platform == "jd" and len(target_id) >= 25 and "_" in target_id and not is_jd_image_key(target_id):
                 if clean_url == f"https://item.jd.com/{target_id}.html":
                     clean_url = f"https://jingfen.jd.com/detail/{target_id}.html"
                 if not detail and clean_url == f"https://jingfen.jd.com/detail/{target_id}.html":

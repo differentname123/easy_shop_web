@@ -14,11 +14,12 @@ from models.product import (
     ProductRef,
     clean_product_id,
     extract_canonical_goods_id,
+    is_jd_image_key,
     normalize_platform,
 )
 from models.user import normalize_promoter_id
 from repositories.product_repo import ProductRepository
-from cache import PROMOTION_CACHE, MATERIAL_CACHE, evict_product_from_caches
+from cache import PROMOTION_CACHE, MATERIAL_CACHE, SIGN_BY_ID_CACHE, evict_product_from_caches
 from config import PROMOTION_LINK_TTL, logger
 
 _UID_PATTERN = re.compile(r"^u_[0-9a-f]{8}$")
@@ -34,6 +35,11 @@ class PromoteService:
     build_command_text = staticmethod(build_command_text)
 
     def _resolve_product_ref(self, ref: ProductRef) -> ProductRef:
+        if ref.platform in ("taobao", "jd") and ref.goods_id:
+            if not ref.goods_sign or ref.goods_sign == ref.goods_id or (ref.platform == "jd" and is_jd_image_key(ref.goods_sign)):
+                cached_sign = SIGN_BY_ID_CACHE.get((ref.platform, ref.goods_id))
+                if isinstance(cached_sign, str) and cached_sign.strip():
+                    ref = ProductRef(ref.platform, ref.goods_id, cached_sign.strip())
         if ref.goods_sign:
             try:
                 doc = self.repo.get_product_identity(ref.goods_sign, platform=ref.platform)
@@ -48,7 +54,8 @@ class PromoteService:
                         or ref.goods_id
                         or (extract_canonical_goods_id(ref.platform, ref.goods_sign) if ref.platform in ("taobao", "jd") else "")
                     )
-                    return ProductRef(ref.platform, goods_id, ref.goods_sign)
+                    doc_sign = str(doc.get("goods_sign") or "").strip() or ref.goods_sign
+                    return ProductRef(ref.platform, goods_id, doc_sign)
             except Exception as exc:
                 logger.warning(
                     "❌ 【转链身份解析降级】读取商品身份缓存时发生异常，已降级使用原始参数继续转链 | 平台[%s] Sign[%s] 异常<%s> 排查方向<请检查MongoDB连接或products集合状态>",
@@ -120,6 +127,8 @@ class PromoteService:
         kind = "sign" if ref.goods_sign else "id"
         cache_key = (ref.platform, kind, ref.key)
         cached = MATERIAL_CACHE.get(cache_key)
+        if not (isinstance(cached, str) and cached) and ref.goods_id:
+            cached = MATERIAL_CACHE.get((ref.platform, "id", ref.goods_id))
         if isinstance(cached, str) and cached:
             if ref.platform != "jd" or "jingfen.jd.com" in cached:
                 return cached
@@ -141,8 +150,7 @@ class PromoteService:
         try:
             item = self.repo.get_product_detail(ref.key, platform=ref.platform,
                                                 key_type=kind)
-            if (not isinstance(item, dict) and ref.goods_sign and ref.goods_id
-                    and ref.goods_id != ref.goods_sign and ref.platform in ("taobao", "jd")):
+            if not isinstance(item, dict) and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd"):
                 item = self.repo.get_product_detail(ref.goods_id, platform=ref.platform,
                                                     key_type="id")
             if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
@@ -164,7 +172,7 @@ class PromoteService:
                 if (ref.platform == "jd" and clean_val.startswith("https://item.jd.com/")
                         and clean_val.endswith(".html")):
                     cand_id = clean_val[len("https://item.jd.com/"):-len(".html")]
-                    if len(cand_id) >= 25 and "_" in cand_id:
+                    if len(cand_id) >= 25 and "_" in cand_id and not is_jd_image_key(cand_id):
                         clean_val = f"https://jingfen.jd.com/detail/{cand_id}.html"
                 MATERIAL_CACHE.set(cache_key, clean_val)
                 return clean_val

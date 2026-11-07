@@ -510,3 +510,51 @@ def test_jd_detail_301_rate_limit_vs_off_promotion_arbitration_and_eviction():
     clear_all_caches()
 
 
+def test_jd_image_key_never_calls_upstream_detail_and_service_upgrades_sign():
+    from cache import clear_all_caches
+    from services.product_service import ProductService
+
+    clear_all_caches()
+    img_key = "6ab9c932F86c506ae_0083320320b195ad"
+    real_sign = "wAQEbTBpySSwDZcuvK0xwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC"
+    cola_img = "https://img14.360buyimg.com/pop/jfs/t1/523108/39/14102/81368/6ab9c932F86c506ae/0083320320b195ad.jpg"
+    wrong_img = "https://img14.360buyimg.com/pop/jfs/t1/506834/27/8256/61208/6a901dbdFd5a8f134/00833203200bd826.png"
+
+    # 1. 直接向 JdAdapter 传入主图哈希 ID 时，必须立刻拦截，绝不请求折淘客 api_detail.ashx
+    c = Mock()
+    a = adapter(c)
+    direct = a.get_goods_detail(goods_id=img_key, goods_sign=img_key)
+    assert direct["status"] == "error" and direct["error_code"] == "INVALID_ARGUMENT"
+    c.get_goods_detail.assert_not_called()
+
+    # 2. 若上游返回的唯一商品主图哈希与请求的 ref.goods_id 冲突，必须拒绝防止串货
+    c.get_goods_detail.return_value = {"status": "success", "data": [
+        item("other_sign_12345678901234567890_123456789012345678", pict_url=wrong_img,
+             item_url="https://jingfen.jd.com/detail/other_sign_12345678901234567890_123456789012345678.html")
+    ]}
+    conflict = a.get_goods_detail(goods_id=img_key, goods_sign=real_sign)
+    assert conflict["status"] == "error" and conflict["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
+
+    # 3. ProductService 收到 goods_sign == goods_id 时，先按 key_type='id' 查库并自动升级为真实 50 位 goods_sign 请求上游
+    c.get_goods_detail.return_value = {"status": "success", "data": [
+        item("wAQDbTBpySSwDZccMINYwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC", title="可口可乐330ml*24", pict_url=cola_img,
+             item_url="https://jingfen.jd.com/detail/wAQDbTBpySSwDZccMINYwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC.html")
+    ]}
+    repo = Mock()
+    repo.get_product_detail.return_value = {
+        "platform": "jd", "product_id": img_key, "goods_id": img_key, "goods_sign": real_sign,
+        "name": "可口可乐330ml*24", "price": 46.9, "image_url": cola_img, "detail_updated_at": None,
+    }
+    repo.upsert_product_detail.return_value = True
+    svc = ProductService(product_repo=repo)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("services.product_service.get_adapter", lambda plat: a)
+        res = svc.get_goods_detail(platform="jd", goods_id=img_key, goods_sign=img_key)
+    assert res["status"] == "success"
+    assert res["data"]["goods_id"] == img_key
+    assert res["data"]["goods_sign"] == real_sign
+    c.get_goods_detail.assert_called_with(real_sign)
+    clear_all_caches()
+
+
+

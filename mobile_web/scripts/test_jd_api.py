@@ -88,6 +88,9 @@
     3. **职责彻底分离**：
        - `goods_id` / `product_id`：存主图唯一指纹 `<parent_hash>_<file_stem>`，专职负责 MongoDB `(platform, product_id)` 唯一索引去重与前端列表去重；
        - `goods_sign`：存完整 50 位动态加密 `itemId` / `tao_id`，并在每次上游返回新密文时就地刷新，专职用于调用 `api_detail.ashx` 与 `jingfen.jd.com` 转链。
+    4. **严禁拿主图哈希 `goods_id` 直接请求 `api_detail.ashx`（防串货铁律）**：
+       - 实测发现：若将 34 位十六进制主图指纹（如 `6ab9c932F86c506ae_0083320320b195ad`）误当作 `tao_id` 传给折淘客 `api_detail.ashx`，折淘客底层会将其下划线后的十进制数字段（如 `0083320320` -> SKU `83320320`）当作普通数字 SKU 解析，从而返回完全无关的工业品（如“西门子PLC”或“编码器”），导致严重的详情页串货与数据库污染！
+       - 防护闭环：前端跳转必须同时透传真实的 `goods_id` 与 50 位 `goods_sign`；后端服务层遇到仅带 `goods_id`（或 `goods_sign == goods_id`）的请求时，必须先通过 `SIGN_BY_ID_CACHE` 或 MongoDB `product_id` 索引反查还原出 50 位真实 `goods_sign`；且 `jd_adapter._fetch_item` 必须硬性拦截 `is_jd_image_key(target_id)` 并校验返回主图指纹一致性。
 ================================================================================
 """
 

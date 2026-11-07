@@ -65,9 +65,15 @@
     if (!summary) return false;
     const cached = shop.goodsIdentity(summary);
     const target = shop.goodsIdentity(requested);
-    return cached.platform === target.platform && Boolean(target.goods_sign
-      ? cached.goods_sign === target.goods_sign
-      : target.goods_id && cached.goods_id === target.goods_id);
+    if (cached.platform !== target.platform) return false;
+    if (target.goods_sign) {
+      if (cached.goods_sign === target.goods_sign) return true;
+      if (target.platform !== 'pdd' && target.goods_id && target.goods_id === target.goods_sign && cached.goods_id === target.goods_id) {
+        return true;
+      }
+      return false;
+    }
+    return Boolean(target.goods_id && cached.goods_id === target.goods_id);
   };
   shop.platformCapability = (platform, capability) => Boolean(platform?.active &&
     (platform.capabilities?.[capability] ?? true));
