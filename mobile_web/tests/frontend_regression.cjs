@@ -1808,7 +1808,37 @@ test('universal converter on My tab converts command/link, resolves product card
   assert.equal(account.universalError.value, '');
 });
 
+test('formatSales converts raw numeric sales >= 10000 to 万+ format while preserving existing strings', () => {
+  const { context: { EasyShop: shop } } = harness();
+  assert.equal(shop.formatSales('1000000'), '已售 100万+');
+  assert.equal(shop.formatSales('45000'), '已售 4.5万+');
+  assert.equal(shop.formatSales('850'), '已售 850');
+  assert.equal(shop.formatSales('已拼10万+件'), '已售 10万+件');
+});
 
+test('handleRegisterOrLogin sends explicit mode=login vs mode=register and universal product title badge stays inline', async () => {
+  const css = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+  assert.ok(css.includes('.universal-product-title .plat-badge'));
+  assert.ok(css.includes('position: static'));
 
+  const h = harness(), account = h.makeAccount();
+  account.formPhone.value = '13900001111';
+  account.formPassword.value = '123456';
+  account.isRegisterMode.value = false;
+
+  const loginAttempt = account.handleRegisterOrLogin();
+  assert.equal(h.requests[0].url, '/api/user/register_or_login');
+  assert.equal(JSON.parse(h.requests[0].options.body).mode, 'login');
+  await h.finish(0, { detail: '该手机号尚未注册，请先切换到「新用户注册」' }, { status: 400 });
+  await loginAttempt;
+  assert.equal(account.isLoggedIn.value, false);
+
+  account.isRegisterMode.value = true;
+  const regAttempt = account.handleRegisterOrLogin();
+  assert.equal(JSON.parse(h.requests[1].options.body).mode, 'register');
+  await h.finish(1, { status: 'success', user: user('u_new123', 'tok_new') });
+  await regAttempt;
+  assert.equal(account.isLoggedIn.value, true);
+});
 
 

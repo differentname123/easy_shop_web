@@ -15,6 +15,7 @@ from models.product import (
     DetailSnapshot,
     DetailPrefetchResult,
     extract_canonical_goods_id,
+    extract_search_keyword,
     is_jd_image_key,
     utc_millis,
 )
@@ -222,7 +223,8 @@ class ProductService:
         unavailable = self._capability_error(adapter, "search")
         if unavailable:
             return unavailable
-        keyword = (keyword or "").strip()[:30]
+        raw_kw = (keyword or "").strip()
+        keyword = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
         cache_key = (plat, uid or "", keyword, page, page_size)
         cached = SEARCH_CACHE.get(cache_key)
         if cached is not None:

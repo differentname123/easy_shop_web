@@ -345,8 +345,8 @@ class TestApiSecurityRoutes(unittest.TestCase):
         res = self.client.get("/api/goods/list?page=0")
         self.assertEqual(res.status_code, 422)
 
-        # 超长 keyword ( > 50)
-        long_kw = "a" * 51
+        # 超长 keyword ( > 500)
+        long_kw = "a" * 501
         res = self.client.get(f"/api/goods/list?keyword={long_kw}")
         self.assertEqual(res.status_code, 422)
 

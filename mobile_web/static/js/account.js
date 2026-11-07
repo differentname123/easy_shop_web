@@ -122,6 +122,7 @@
       try {
         const response = await api.post('/api/user/register_or_login', {
           phone, password, nickname: formNickname.value.trim() || null, invite_code: formInviteCode.value.trim() || null,
+          mode: isRegisterMode.value ? 'register' : 'login',
         });
         if (disposed || !session.isCurrent(snapshot)) return;
         const data = response.data;

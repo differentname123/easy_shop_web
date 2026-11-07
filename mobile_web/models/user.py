@@ -23,6 +23,7 @@ class RegisterOrLoginDTO(BaseModel):
     password: str = Field(..., min_length=6, max_length=32, description="登录密码")
     nickname: Optional[str] = Field(None, max_length=20, description="用户昵称")
     invite_code: Optional[str] = Field(None, max_length=20, description="上级邀请码 (选填)")
+    mode: Optional[str] = Field(None, pattern="^(login|register)$", description="操作意图: login 或 register (选填)")
 
 
 class UserProfile(BaseModel):

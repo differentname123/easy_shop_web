@@ -48,7 +48,7 @@ def get_recommend_goods(
 
 @router.get("/search")
 def search_goods(
-    keyword: str = Query(..., min_length=1, max_length=30, description="搜索关键词 (1-30字)"),
+    keyword: str = Query(..., min_length=1, max_length=500, description="搜索关键词或分享文案"),
     page: int = Query(1, ge=1, le=20, description="页码 (最大20页)"),
     page_size: int = Query(20, ge=1, le=50, description="每页数量 (1-50)"),
     uid: Optional[str] = Query(None, max_length=64, description="推手用户UID"),

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """商品领域数据契约及跨缓存、仓储使用的商品身份。"""
+import math
 import re
 from dataclasses import dataclass
 from copy import deepcopy
@@ -8,10 +9,97 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
+_BARE_YUAN_TAG_RE = re.compile(r"^\d+(?:\.\d+)?元$")
+
 
 def normalize_platform(platform: Optional[str], default: str = "pdd") -> str:
     code = (platform or default).strip().lower()
     return "taobao" if code == "tb" else code
+
+
+def extract_search_keyword(raw_text: Any, max_length: int = 60) -> str:
+    """
+    跨平台统一分享文案清洗与搜索关键词提取器：
+    1. 若包含「商品标题」书名号且内部非纯口令/链接，优先提取「...」内的商品标题；
+    2. 自动剥离 HTTP(S) 链接、淘口令/京口令乱码、平台角标括号及促销引导语；
+    3. 压缩空白并安全截断至 max_length，供三端搜索与万能转链标题反查共用。
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+    bracket_match = re.search(r"「([^」]{2,})」", text)
+    if bracket_match:
+        candidate = bracket_match.group(1).strip()
+        if candidate and not candidate.startswith(("http://", "https://")):
+            return candidate[:max_length].strip()
+
+    cleaned = re.sub(r"https?://\S+", " ", text)
+    cleaned = re.sub(r"[￥¥$€₴£¢()（）/!！$%&*][A-Za-z0-9]{6,22}[￥¥$€₴£¢()（）/!！$%&*]", " ", cleaned)
+    cleaned = re.sub(r"\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{2,6}\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"【(?:淘宝|天猫|京东|京东自营|拼多多|多多进宝|百亿补贴|好物推荐|好物分享|好物精选|手淘分享|券后特惠|特惠参考价|抢购口令|平台口令)[^】]*】",
+        " ",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?:^|\s)\d+\s*[\$￥¥!！:/]+\s*", " ", cleaned)
+    cleaned = re.sub(
+        r"(?:点击链接直接打开|手机淘宝|淘宝App|复制本段|打开手淘|长按复制[^\n]*|💰[^\n]*|👉[^\n]*)",
+        " ",
+        cleaned,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，。！？、,!?:：-")
+    if not cleaned:
+        return ""
+    return cleaned[:max_length].strip()
+
+
+def detect_platform_signal(raw_text: Any) -> Optional[str]:
+    """
+    跨平台统一信号识别器：
+    从链接域名、口令包裹符、平台标识词或裸加密商品 ID 中识别明确平台 ('jd' | 'taobao' | 'pdd')。
+    若输入为不含任何平台特征的纯商品标题，返回 None（交由调用方决定默认行为或提示用户选择平台）。
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+    lower = text.lower()
+
+    # 1. 显式域名特征识别
+    if any(
+        d in lower
+        for d in ("u.jd.com", "jingfen.jd.com", "union-click.jd.com", "item.jd.com", "m.jd.com", "3.cn", "jingxi.com", "jd.com")
+    ):
+        return "jd"
+    if any(
+        d in lower
+        for d in (
+            "m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn", "s.click.taobao.com",
+            "uland.taobao.com", "item.taobao.com", "detail.tmall.com", "taobao.com", "tmall.com", "alimama.com",
+        )
+    ):
+        return "taobao"
+    if any(d in lower for d in ("p.pinduoduo.com", "yangkeduo.com", "pinduoduo.com", "goods_sign=")):
+        return "pdd"
+
+    # 2. 口令与文案特征识别
+    if re.search(r"[！!][A-Za-z0-9]{10,20}[！!]", text) or any(
+        k in text for k in ("京东", "猄", "崠", "崬", "京口令", "Doōδng")
+    ):
+        return "jd"
+    if re.search(r"[￥¥$€₴£¢()（）][A-Za-z0-9]{8,15}[￥¥$€₴£¢()（）]", text) or any(
+        k in text for k in ("淘口令", "手淘", "淘宝", "天猫", "阿里妈妈")
+    ):
+        return "taobao"
+    if any(k in text for k in ("拼多多", "多多进宝", "百亿补贴")) or re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
+        return "pdd"
+
+    # 3. 裸加密商品 ID 特征识别
+    if len(text) >= 25 and "-" in text and re.match(r"^[A-Za-z0-9_-]{25,}$", text):
+        return "taobao"
+    if len(text) >= 25 and not text.isdigit() and re.match(r"^[A-Za-z0-9_]{25,}$", text):
+        return "jd"
+
+    return None
 
 
 def clean_product_id(value: Any) -> str:
@@ -161,6 +249,30 @@ class ProductSummary(BaseModel):
     category: str = "精选好物"
     updated_at: Optional[str] = None
 
+    def __init__(self, **data: Any):
+        if "coupon_amount" in data or "has_coupon" in data:
+            try:
+                c_val = round(max(0.0, float(data.get("coupon_amount") or 0.0)), 2)
+            except (TypeError, ValueError):
+                c_val = 0.0
+            if "coupon_amount" in data:
+                data["coupon_amount"] = c_val
+            if "has_coupon" in data or c_val > 0:
+                data["has_coupon"] = c_val > 0
+        if "price" in data and "original_price" in data:
+            try:
+                p_val = float(data["price"])
+                o_val = float(data["original_price"])
+                c_val = round(max(0.0, float(data.get("coupon_amount") or 0.0)), 2)
+                if math.isfinite(p_val) and math.isfinite(o_val):
+                    if c_val > 0 and o_val <= p_val:
+                        data["original_price"] = round(p_val + c_val, 2)
+                    elif o_val < p_val:
+                        data["original_price"] = round(p_val, 2)
+            except (TypeError, ValueError):
+                pass
+        super().__init__(**data)
+
     def model_dump(self, **kwargs) -> Dict[str, Any]:
         """兼顾 Pydantic v1 (.dict) 与 v2 (.model_dump)"""
         dump_fn = getattr(super(), "model_dump", None)
@@ -181,6 +293,21 @@ class ProductDetail(ProductSummary):
     shop_ratings: Dict[str, str] = Field(default_factory=dict)
     specs: List[Dict[str, str]] = Field(default_factory=list)
     coupon_info: Dict[str, Any] = Field(default_factory=dict)
+
+    def __init__(self, **data: Any):
+        raw_tags = data.get("detail_tags")
+        if isinstance(raw_tags, list):
+            normalized_tags: List[str] = []
+            for tag in raw_tags:
+                t = str(tag or "").strip()
+                if not t:
+                    continue
+                if _BARE_YUAN_TAG_RE.match(t):
+                    t = f"{t}优惠券"
+                if t not in normalized_tags:
+                    normalized_tags.append(t)
+            data["detail_tags"] = normalized_tags
+        super().__init__(**data)
 
 
 _DETAIL_FIELDS = frozenset((getattr(ProductDetail, "model_fields", None) or ProductDetail.__fields__).keys()) | {

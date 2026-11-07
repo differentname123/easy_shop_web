@@ -473,7 +473,7 @@
           />
           <div class="universal-product-info">
             <div class="universal-product-title">
-              <span class="plat-badge" :class="'plat-' + (universalResult.platform || universalResult.product.platform || 'pdd')">
+              <span class="plat-badge" :class="universalResult.platform || universalResult.product.platform || 'pdd'">
                 {{ universalResult.platform_name || universalResult.product.platform_name || '精选' }}
               </span>
               {{ universalResult.product.name || universalResult.title }}

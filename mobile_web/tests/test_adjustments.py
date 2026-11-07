@@ -324,7 +324,121 @@ class TestOffsetAndDetailEnhancements(unittest.TestCase):
             self.assertEqual(cached_detail.get("status"), "success")
             self.assertEqual(cached_detail.get("data", {}).get("name"), "好丽友巧克力派")
 
+    def test_extract_search_keyword_and_long_keyword_routes(self):
+        """验证统一长标题/分享文案清洗器及搜索接口放宽至 500 字符"""
+        from unittest.mock import patch
+        from models.product import extract_search_keyword
+
+        share_text = "67￥ HU293 2026abcd ￥ https://m.tb.cn/h.xxx CZ0001 【淘宝】农夫山泉饮用天然水550ml*24瓶整箱装家庭囤货实惠装大容量"
+        cleaned = extract_search_keyword(share_text)
+        self.assertNotIn("https://", cleaned)
+        self.assertNotIn("HU293", cleaned)
+        self.assertNotIn("CZ0001", cleaned)
+        self.assertIn("农夫山泉饮用天然水", cleaned)
+        self.assertLessEqual(len(cleaned), 60)
+
+        with patch("services.product_service.ProductService.search_home_goods") as mock_search:
+            mock_search.return_value = {"status": "success", "data": [], "has_more": False}
+            res = self.client.get("/api/home/search", params={"keyword": share_text, "platform": "taobao"})
+            self.assertEqual(res.status_code, 200)
+
+    def test_universal_convert_auto_rejects_ambiguous_bare_title(self):
+        """验证万能转链在 auto 模式下对无平台特征的纯商品名返回明确提示"""
+        resp = self.client.post(
+            "/api/promote/universal",
+            json={"text": "农夫山泉饮用天然水550ml*24瓶整箱装", "platform": "auto"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body.get("status"), "error")
+        self.assertEqual(body.get("error_code"), "AMBIGUOUS_PLATFORM_TEXT")
+        self.assertIn("未能从文本中识别出所属平台", body.get("error_msg", ""))
+
+    def test_product_summary_and_detail_commercial_invariants(self):
+        """验证跨平台商品价格/券额/标签的统一归一化不变量"""
+        from models.product import ProductSummary, ProductDetail
+
+        summary = ProductSummary(
+            platform="jd",
+            goods_id="10001",
+            name="京东测试商品",
+            image_url="https://img.example.com/1.jpg",
+            price=29.9,
+            original_price=29.9,
+            coupon_amount=10.0,
+            has_coupon=False,
+        )
+        self.assertTrue(summary.has_coupon)
+        self.assertEqual(summary.original_price, 39.9)
+
+        detail = ProductDetail(
+            platform="taobao",
+            goods_id="20002",
+            name="淘宝测试商品",
+            image_url="https://img.example.com/2.jpg",
+            price=19.9,
+            original_price=0.0,
+            coupon_amount=5.0,
+            detail_tags=["5元", "旗舰店", "5元优惠券", "退货运费险"],
+        )
+        self.assertTrue(detail.has_coupon)
+        self.assertEqual(detail.original_price, 24.9)
+        self.assertEqual(detail.detail_tags, ["5元优惠券", "旗舰店", "退货运费险"])
+
+    def test_command_text_coupon_adaptive_and_long_link_suppression(self):
+        """验证口令文案区分有券/无券，并在已有淘口令时隐藏超长追踪链接且优先使用 short_url"""
+        from adapters.pdd_adapter import PddAdapter
+        from services.promote_service import PromoteService
+
+        adapter = PddAdapter()
+        text_no_coupon = adapter.build_command_text("无券好物", "https://p.pinduoduo.com/short1", 19.9, 0.0)
+        self.assertIn("【特惠参考价】¥19.9", text_no_coupon)
+        self.assertNotIn("已立减", text_no_coupon)
+
+        text_with_coupon = adapter.build_command_text("有券好物", "https://p.pinduoduo.com/short2", 19.9, 5.0)
+        self.assertIn("【券后特惠】¥19.9（已立减 ¥5.0）", text_with_coupon)
+
+        # 验证 _final_link 优先使用 short_url
+        long_uland = "https://uland.taobao.com/coupon/edetail?e=" + ("x" * 180)
+        res_with_short = {
+            "status": "success",
+            "final_link": long_uland,
+            "short_url": "https://s.click.taobao.com/short_abc",
+            "promotion_token": "￥ABCD1234￥",
+        }
+        self.assertEqual(PromoteService._final_link(res_with_short), "https://s.click.taobao.com/short_abc")
+
+        # 验证仅有超长链接 + 口令时，口令文案不拼接超长链接
+        svc = PromoteService(product_repo=MagicMock(), user_service=MagicMock())
+        res_long_only = {
+            "status": "success",
+            "final_link": long_uland,
+            "promotion_token": "￥ABCD1234￥",
+            "title": "超长链接测试商品",
+            "price": 29.9,
+            "coupon_amount": 0.0,
+        }
+        decorated = svc._with_command(
+            res_long_only,
+            adapter,
+            {"title": "超长链接测试商品", "price": 29.9, "coupon_amount": 0.0},
+        )
+        self.assertIn("￥ABCD1234￥", decorated["command_text"])
+        self.assertNotIn(long_uland, decorated["command_text"])
+
+    def test_login_mode_rejects_unregistered_phone(self):
+        """验证登录模式(mode=login)拦截未注册手机号，注册模式(mode=register)正常放行"""
+        mock_db = MagicMock()
+        mock_col = MagicMock()
+        mock_col.find_one.return_value = None
+        mock_db.get_collection.return_value = mock_col
+        repo = UserRepository(db_instance=mock_db)
+        repo._db = mock_db
+
+        with self.assertRaises(ValueError) as ctx:
+            repo.register_or_login(phone="13900001111", password="password123", mode="login")
+        self.assertIn("该手机号尚未注册", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
-

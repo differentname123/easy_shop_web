@@ -28,6 +28,7 @@ def register_or_login(req: RegisterOrLoginRequest):
         password=req.password,
         nickname=req.nickname,
         invite_code=req.invite_code,
+        mode=req.mode,
     )
     if res.get("status") != "success":
         raise HTTPException(status_code=400, detail=res.get("error_msg", "操作失败"))

@@ -51,7 +51,8 @@ class UserService:
         phone: str,
         password: str,
         nickname: Optional[str] = None,
-        invite_code: Optional[str] = None
+        invite_code: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         手机号注册或登录：
@@ -61,12 +62,19 @@ class UserService:
         try:
             valid_phone = self.validate_phone(phone)
             valid_pwd = self.validate_password(password)
-            user = self.repo.register_or_login(
-                phone=valid_phone,
-                password=valid_pwd,
-                nickname=nickname,
-                invite_code=invite_code
-            )
+            repo_kwargs: Dict[str, Any] = {
+                "phone": valid_phone,
+                "password": valid_pwd,
+                "nickname": nickname,
+                "invite_code": invite_code,
+            }
+            if mode:
+                repo_kwargs["mode"] = mode
+            try:
+                user = self.repo.register_or_login(**repo_kwargs)
+            except TypeError:
+                repo_kwargs.pop("mode", None)
+                user = self.repo.register_or_login(**repo_kwargs)
             auth_token = create_access_token(user["uid"])
             user_data = dict(user)
             is_new_user = bool(user_data.pop("_is_new_user", False))

@@ -12,12 +12,15 @@ def build_command_text(title: str, final_link: str, price=None, coupon=None, app
     """共享文案结构；具体平台名称由适配器传入。"""
     lines = [f"【好物精选】{title or '精选高性价比好物'}"]
     if price is not None and float(price) > 0:
-        price_text = f"【券后特惠】¥{price}"
-        if coupon is not None and float(coupon) > 0:
-            price_text += f"（已立减 ¥{coupon}）"
-        lines.append(price_text)
+        has_coupon = coupon is not None and float(coupon) > 0
+        if has_coupon:
+            lines.append(f"【券后特惠】¥{price}（已立减 ¥{coupon}）")
+        else:
+            lines.append(f"【特惠参考价】¥{price}")
     destination = f"【{app_name}APP】" if app_name else "商品页面"
-    lines.extend([f"【抢购口令】长按复制本段全部信息，打开{destination}立即领券下单！", final_link])
+    lines.append(f"【抢购口令】长按复制本段全部信息，打开{destination}立即领券下单！")
+    if final_link:
+        lines.append(final_link)
     return "\n".join(lines)
 
 

@@ -303,13 +303,13 @@
       boomError.value = false;
       return loadBoomGoods(false);
     };
-    const onSearchBoom = () => { activeBoomKeyword = boomSearchKeyword.value.trim(); return loadBoomGoods(true); };
+    const onSearchBoom = () => { activeBoomKeyword = boomSearchKeyword.value.trim(); global.scrollTo(0, 0); return loadBoomGoods(true); };
     const clearBoomSearch = () => { boomSearchKeyword.value = ''; return onSearchBoom(); };
     const switchBoomPlatform = code => {
       if (!boomPlatforms.value.find(item => item.code === code)?.active) { showToast('该平台暂未开放，敬请期待'); return; }
-      boomPlatform.value = code; return loadBoomGoods(true);
+      boomPlatform.value = code; global.scrollTo(0, 0); return loadBoomGoods(true);
     };
-    const switchBoomSort = sort => { boomSortBy.value = sort; return loadBoomGoods(true); };
+    const switchBoomSort = sort => { boomSortBy.value = sort; global.scrollTo(0, 0); return loadBoomGoods(true); };
     return {
       platforms, platformsError, homePlatform, homePlatformName, homeChannels, currentChannel, homeSearchKeyword,
       activeHomeKeyword, homeGoodsList, homeLoading, homeHasMore, homeError, loadHomeChannels, loadPlatforms,

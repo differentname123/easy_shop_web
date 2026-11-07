@@ -17,6 +17,7 @@ from models.product import (
     clean_product_id,
     extract_canonical_goods_id,
     extract_jd_image_key,
+    extract_search_keyword,
     is_jd_image_key,
 )
 
@@ -163,6 +164,13 @@ class JdAdapter(BasePlatformAdapter):
         coupon = _money(item.get("coupon_info_money")) or 0.0
         image_url = _text(_pick(item.get("pict_url"), item.get("imageUrl")))
         canonical_id = extract_canonical_goods_id(self.platform_code, raw_id, image_url=image_url) or raw_id
+        sales_candidates = (
+            _text(item.get("volume")),
+            _text(item.get("inOrderCount30Days")),
+            _text(item.get("sellCount")),
+            _text(item.get("comments")),
+        )
+        sales_tip = next((s for s in sales_candidates if s and s not in ("0", "0.0")), "0")
         data = {
             "platform": self.platform_code, "platform_name": self.platform_name,
             "goods_id": canonical_id, "goods_sign": raw_id,
@@ -172,7 +180,7 @@ class JdAdapter(BasePlatformAdapter):
             "coupon_amount": coupon, "has_coupon": coupon > 0,
             "commission_rate": _money(_pick(item.get("tkrate3"), item.get("commissionShare"))) or 0.0,
             "commission_amount": _money(_pick(item.get("tkfee3"), item.get("commission"))) or 0.0,
-            "sales_tip": _text(_pick(item.get("volume"), item.get("inOrderCount30Days"), "0")),
+            "sales_tip": sales_tip,
             "mall_name": _text(item.get("shop_title")),
         }
         summary = ProductSummary(**data).to_dict(exclude_unset=True)
@@ -183,12 +191,42 @@ class JdAdapter(BasePlatformAdapter):
 
     def _detail(self, item):
         data = self._summary(item)
-        images = item.get("small_images")
+        images = item.get("small_images") or item.get("imgList")
         images = images.split("|") if isinstance(images, str) else images if isinstance(images, list) else []
         images = list(dict.fromkeys(image.strip() for image in images if isinstance(image, str) and image.strip()))
-        data.update(desc=_text(item.get("description")), carousel_images=images,
-                    product_url=_material_url(item), detail_tags=[], service_guarantees=[],
-                    shop_ratings={}, specs=[], coupon_info={})
+        desc = _text(_pick(item.get("description"), item.get("jianjie")))
+        specs = []
+        seen_labels = set()
+        for key, label in (
+            ("brand", "商品品牌"),
+            ("brandName", "商品品牌"),
+            ("category_name", "商品类目"),
+            ("cid1Name", "商品类目"),
+            ("shop_title", "店铺名称"),
+        ):
+            val = _text(item.get(key))
+            if val and label not in seen_labels:
+                seen_labels.add(label)
+                specs.append({"label": label, "value": val})
+        ratings = {
+            target: _text(item[source])
+            for source, target in (("score1", "desc_score"), ("score2", "lgst_score"), ("score3", "serv_score"))
+            if _text(item.get(source)) and _text(item.get(source)) not in ("0", "0.0")
+        }
+        tags = []
+        coupon_str = _text(item.get("coupon_info"))
+        if coupon_str:
+            tags.append(coupon_str)
+        elif data.get("coupon_amount", 0) > 0:
+            tags.append(f"{data['coupon_amount']:g}元优惠券")
+        coupon_info = {
+            k: item[k]
+            for k in ("coupon_start_time", "coupon_end_time", "coupon_total_count", "coupon_remain_count")
+            if item.get(k) not in (None, "")
+        }
+        data.update(desc=desc, carousel_images=images,
+                    product_url=_material_url(item), detail_tags=tags, service_guarantees=[],
+                    shop_ratings=ratings, specs=specs, coupon_info=coupon_info)
         return ProductDetail(**data).to_dict(exclude_unset=True)
 
     def get_recommend_goods(self, channel_type=5, offset=0, limit=20, uid=None, detail_sink=None, **kwargs):
@@ -399,13 +437,7 @@ class JdAdapter(BasePlatformAdapter):
                 "京东联盟新规已不支持纯数字商品ID或 item.jd.com 数字直链转链，请粘贴京东 App 分享的 u.jd.com 短链、京口令或含「商品标题」的分享文案",
             )
         else:
-            title_bracket = re.search(r"「([^」]{2,})」", text)
-            if title_bracket:
-                keyword = title_bracket.group(1).strip()
-            else:
-                cleaned = re.sub(r"https?://\S+", " ", text)
-                cleaned = re.sub(r"【(?:京东|京东自营|好物推荐|好物分享)】", " ", cleaned)
-                keyword = re.sub(r"\s+", " ", cleaned).strip(" ，。！？、,!?:：-")
+            keyword = extract_search_keyword(text, max_length=80)
             if len(keyword) < 2:
                 return _error("INVALID_ARGUMENT", "未识别到有效的京东推广链接、京口令或商品标题")
             try:

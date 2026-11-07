@@ -13,6 +13,7 @@ from infrastructure.logging_utils import format_exc_summary
 from models.product import (
     ProductRef,
     clean_product_id,
+    detect_platform_signal,
     extract_canonical_goods_id,
     is_jd_image_key,
     normalize_platform,
@@ -74,7 +75,7 @@ class PromoteService:
 
     @staticmethod
     def _final_link(result: dict) -> str:
-        for field in ("final_link", "mobile_short_url", "short_url", "mobile_url", "url"):
+        for field in ("short_url", "mobile_short_url", "final_link", "mobile_url", "url"):
             value = result.get(field)
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -112,12 +113,14 @@ class PromoteService:
         coupon = kwargs.get("coupon_amount")
         if coupon is None:
             coupon = kwargs.get("coupon")
+        token = result.get("promotion_token")
+        has_token = isinstance(token, str) and bool(token.strip())
+        link_for_text = "" if (has_token and len(result["final_link"]) > 120) else result["final_link"]
         result["command_text"] = adapter.build_command_text(
             kwargs.get("title") or kwargs.get("name") or kwargs.get("goods_name") or "精选高性价比好物",
-            result["final_link"], kwargs.get("price"), coupon,
+            link_for_text, kwargs.get("price"), coupon,
         )
-        token = result.get("promotion_token")
-        if isinstance(token, str) and token.strip():
+        if has_token:
             result["command_text"] += f"\n【平台口令】{token.strip()}"
         return result
 
@@ -449,41 +452,7 @@ class PromoteService:
         """
         根据用户粘贴的链接、口令或商品标识智能识别所属电商平台 ('pdd' / 'jd' / 'taobao')。
         """
-        text = str(raw_text or "").strip()
-        if not text:
-            return "pdd"
-        lower = text.lower()
-
-        # 1. 显式域名特征识别
-        if any(d in lower for d in ("u.jd.com", "jingfen.jd.com", "union-click.jd.com", "item.jd.com", "m.jd.com", "3.cn", "jingxi.com", "jd.com")):
-            return "jd"
-        if any(d in lower for d in (
-            "m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn", "s.click.taobao.com",
-            "uland.taobao.com", "item.taobao.com", "detail.tmall.com", "taobao.com", "tmall.com", "alimama.com",
-        )):
-            return "taobao"
-        if any(d in lower for d in ("p.pinduoduo.com", "yangkeduo.com", "pinduoduo.com", "goods_sign=")):
-            return "pdd"
-
-        # 2. 口令与文案特征识别
-        # 京东口令特征：！...！ 或 !...! 伴随京东标识/变形字
-        if re.search(r"[！!][A-Za-z0-9]{10,20}[！!]", text) or any(k in text for k in ("京东", "猄", "崠", "崬", "京口令", "Doōδng")):
-            return "jd"
-        # 淘口令特征：￥...￥ / $...$ / €...€ / ₴...₴ / ¢...¢ / ()（不含 / 防止误匹配 URL 路径）
-        if re.search(r"[￥¥$€₴£¢()（）][A-Za-z0-9]{8,15}[￥¥$€₴£¢()（）]", text) or any(
-            k in text for k in ("淘口令", "手淘", "淘宝", "天猫", "阿里妈妈")
-        ):
-            return "taobao"
-        if any(k in text for k in ("拼多多", "多多进宝", "百亿补贴")) or re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
-            return "pdd"
-
-        # 3. 裸加密商品 ID 特征识别
-        if len(text) >= 25 and "-" in text and re.match(r"^[A-Za-z0-9_-]{25,}$", text):
-            return "taobao"
-        if len(text) >= 25 and not text.isdigit() and re.match(r"^[A-Za-z0-9_]{25,}$", text):
-            return "jd"
-
-        return "pdd"
+        return detect_platform_signal(raw_text) or "pdd"
 
     def _seed_resolved_product(self, platform: str, product: Optional[dict], uid: Optional[str] = None) -> None:
         """将万能转链反查到的商品详情写入 DETAIL_CACHE、MATERIAL_CACHE 与本地商品库，确保点击卡片进详情页秒开。"""
@@ -551,7 +520,17 @@ class PromoteService:
 
         req_plat = str(platform or "auto").strip().lower()
         is_auto = req_plat in ("", "auto")
-        detected_plat = self.detect_platform_from_text(text) if is_auto else normalize_platform(req_plat)
+        if is_auto:
+            signal_plat = detect_platform_signal(text)
+            if not signal_plat:
+                return {
+                    "status": "error",
+                    "error_code": "AMBIGUOUS_PLATFORM_TEXT",
+                    "error_msg": "未能从文本中识别出所属平台特征，请在上方选择目标平台（拼多多/淘宝/京东）或粘贴完整分享链接/口令",
+                }
+            detected_plat = signal_plat
+        else:
+            detected_plat = normalize_platform(req_plat)
 
         clean_uid = uid.strip() if isinstance(uid, str) else ""
         if clean_uid and not _UID_PATTERN.fullmatch(clean_uid):

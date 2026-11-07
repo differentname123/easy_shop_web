@@ -5,7 +5,7 @@ from typing import Dict, Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 from adapters.base import BasePlatformAdapter
 from infrastructure.logging_utils import format_exc_summary
-from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id
+from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id, extract_search_keyword
 from config import PDD_CLIENT_ID, PDD_CLIENT_SECRET, PDD_PID, logger, settings
 from infrastructure.pdd_client import (
     call_pdd_api,
@@ -134,6 +134,12 @@ class PddAdapter(BasePlatformAdapter):
                     "limit": limit, "has_more": False, "data": []}
         request_limit = min(limit, self.recommendation_limit - offset)
         try:
+            cursor = kwargs.pop("cursor", None)
+            if cursor and "list_id" not in kwargs:
+                if isinstance(cursor, dict) and cursor.get("list_id"):
+                    kwargs["list_id"] = str(cursor["list_id"]).strip()
+                elif isinstance(cursor, str) and cursor.strip():
+                    kwargs["list_id"] = cursor.strip()
             params = {
                 "channel_type": channel_type, "offset": offset, "limit": request_limit,
                 "pid": self.pid, "custom_parameters": make_custom_parameters(uid=uid) if uid else None,
@@ -153,10 +159,12 @@ class PddAdapter(BasePlatformAdapter):
                 else len(raw_items) >= request_limit and offset + request_limit < self.recommendation_limit
             )
             next_offset = offset + request_limit if (has_total and raw_items) else offset + len(raw_items)
+            list_id = response.get("list_id", "") or kwargs.get("list_id", "")
             return {
                 "status": "success", "total_count": total if total is not None else len(items),
                 "offset": offset, "limit": limit, "next_offset": next_offset,
-                "list_id": response.get("list_id", ""),
+                "list_id": list_id,
+                "next_cursor": list_id if (has_more and list_id) else None,
                 "has_more": has_more,
                 "data": items,
             }
@@ -456,14 +464,7 @@ class PddAdapter(BasePlatformAdapter):
             if extracted_url and "p.pinduoduo.com" in extracted_url:
                 search_kw = extracted_url
             elif not extracted_url:
-                title_bracket = re.search(r"「([^」]{4,})」", text)
-                if title_bracket:
-                    search_kw = title_bracket.group(1).strip()
-                else:
-                    cleaned_kw = re.sub(r"https?://\S+", " ", text)
-                    cleaned_kw = re.sub(r"【(?:拼多多|好物精选|百亿补贴|多多进宝)】", " ", cleaned_kw)
-                    cleaned_kw = re.sub(r"(?:💰|👉|到手价|抢购链接|领券)[^\n]*", " ", cleaned_kw)
-                    search_kw = re.sub(r"\s+", " ", cleaned_kw).strip()
+                search_kw = extract_search_keyword(text, max_length=80)
             else:
                 search_kw = ""
 

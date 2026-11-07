@@ -15,8 +15,10 @@ from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
 from models.product import (
+    _BARE_YUAN_TAG_RE,
     clean_product_id,
     extract_canonical_goods_id,
+    extract_search_keyword,
     is_jd_image_key,
     normalize_platform,
     utc_millis,
@@ -280,7 +282,9 @@ class ProductRepository(BaseRepository):
             filter_query["category"] = category.strip()
 
         if keyword and keyword.strip():
-            safe_kw = re.escape(keyword.strip()[:30])
+            raw_kw = keyword.strip()
+            cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
+            safe_kw = re.escape(cleaned_kw)
             filter_query["name"] = {"$regex": safe_kw, "$options": "i"}
 
         sort_mapping = {
@@ -342,7 +346,11 @@ class ProductRepository(BaseRepository):
         activity_price = self._amount_float(self._first_present(doc, "activity_price", "price", default=0.0))
         original_price = self._amount_float(self._first_present(doc, "original_price", default=activity_price))
         saved_price = self._amount_float(self._first_present(doc, "saved_price", "coupon_amount", default=max(0.0, round(original_price - activity_price, 2))))
-        coupon_amount = self._amount_float(self._first_present(doc, "coupon_amount", "saved_price", default=0.0))
+        coupon_amount = max(0.0, self._amount_float(self._first_present(doc, "coupon_amount", "saved_price", default=0.0)))
+        if coupon_amount > 0 and original_price <= activity_price:
+            original_price = round(activity_price + coupon_amount, 2)
+        elif original_price < activity_price:
+            original_price = activity_price
         commission_rate, commission_amount = self._calc_commission(activity_price, doc.get("commission_amount"))
         if doc.get("commission_rate") is not None:
             commission_rate = self._amount_float(doc["commission_rate"])
@@ -361,7 +369,7 @@ class ProductRepository(BaseRepository):
             "original_price": round(original_price, 2),
             "saved_price": round(saved_price, 2),
             "coupon_amount": round(coupon_amount, 2),
-            "has_coupon": bool(doc["has_coupon"]) if doc.get("has_coupon") is not None else coupon_amount > 0,
+            "has_coupon": coupon_amount > 0,
             "commission_rate": commission_rate,
             "commission_amount": commission_amount,
             "sales_tip": str(self._first_present(doc, "sales_tip", default="0")),
@@ -379,13 +387,24 @@ class ProductRepository(BaseRepository):
         main_img = result["image_url"]
         if not clean_gallery and isinstance(main_img, str) and main_img.startswith("http"):
             clean_gallery = [main_img]
+        raw_tags = doc.get("detail_tags") or []
+        clean_tags: List[str] = []
+        if isinstance(raw_tags, list):
+            for tag in raw_tags:
+                t = str(tag or "").strip()
+                if not t:
+                    continue
+                if _BARE_YUAN_TAG_RE.match(t):
+                    t = f"{t}优惠券"
+                if t not in clean_tags:
+                    clean_tags.append(t)
         result.update({
             "desc": doc.get("desc") or "",
             "brand_name": result["brand"],
             "category_name": result["category"],
             "carousel_images": list(dict.fromkeys(clean_gallery)),
             "product_url": doc.get("product_url") or "",
-            "detail_tags": deepcopy(doc.get("detail_tags") or []),
+            "detail_tags": clean_tags,
             "unified_tags": deepcopy(doc.get("unified_tags") or []),
             "service_guarantees": deepcopy(doc.get("service_guarantees") or []),
             "shop_ratings": deepcopy(doc.get("shop_ratings") or {}),

@@ -14,6 +14,7 @@ from models.product import (
     ProductDetail,
     clean_product_id,
     extract_canonical_goods_id,
+    extract_search_keyword,
 )
 from infrastructure.tb_client import TaobaoClient
 from infrastructure.hdk_client import HdkClient
@@ -364,8 +365,9 @@ class TaobaoAdapter(BasePlatformAdapter):
                 password = token.get("password_simple") or token.get("model") or ""
             if not password:
                 return _error("PROTOCOL_ERROR", "渠道转链未生成有效淘口令")
+            short_url = _text(ztk_res.get("short_url"))
             result = {
-                "status": "success", "url": link, "final_link": link, "mobile_url": link, "short_url": "",
+                "status": "success", "url": link, "final_link": short_url or link, "mobile_url": link, "short_url": short_url,
                 "we_app_info": {}, "promotion_token": password, "token_type": "tpwd",
                 "attribution_status": "verified", "relation_id": relation_id, "need_auth": False,
                 "is_fallback": False, "goods_id": item.get("goods_id", ""),
@@ -420,18 +422,9 @@ class TaobaoAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _extract_candidate_title(text: str) -> str:
-        bracket_match = re.search(r"「([^」]{4,})」", text)
-        if bracket_match:
-            return bracket_match.group(1).strip()
-        cleaned = re.sub(r"https?://\S+", " ", text)
-        cleaned = re.sub(r"[￥¥$€₴£¢()（）/][A-Za-z0-9]{6,20}[￥¥$€₴£¢()（）/]", " ", cleaned)
-        cleaned = re.sub(r"\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{2,6}\b", " ", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"【(?:淘宝|天猫|好物推荐|手淘分享)[^】]*】", " ", cleaned)
-        cleaned = re.sub(r"\d+\s*[\$￥¥!！:/]+\s*", " ", cleaned)
-        cleaned = re.sub(r"(?:点击链接直接打开|手机淘宝|淘宝App|复制本段|打开手淘)", " ", cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，。！？、,!?:：-")
-        if len(cleaned) >= 4 and not re.match(r"^[A-Za-z0-9_-]+$", cleaned):
-            return cleaned
+        kw = extract_search_keyword(text, max_length=80)
+        if len(kw) >= 4 and not re.match(r"^[A-Za-z0-9_-]+$", kw):
+            return kw
         return ""
 
     def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):

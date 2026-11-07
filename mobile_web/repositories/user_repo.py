@@ -147,12 +147,13 @@ class UserRepository(BaseRepository):
         phone: str,
         password: str,
         nickname: Optional[str] = None,
-        invite_code: Optional[str] = None
+        invite_code: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         手机号注册登录一体化：
         - 若手机号已存在：校验密码，成功则登录并平滑升级旧哈希；
-        - 若手机号未存在：自动注册新账号，绑定邀请码，直接登录。
+        - 若手机号未存在：当 mode == 'login' 时明确报错拦截，避免输错手机号静默注册空白新账号；否则注册新账号并登录。
         """
         phone = str(phone).strip()
         now = datetime.now(timezone.utc)
@@ -162,6 +163,10 @@ class UserRepository(BaseRepository):
             stored_hash = existing.get("password_hash")
             if not verify_password(password, stored_hash):
                 raise ValueError("手机号已注册，输入的密码不正确")
+        elif mode == "login":
+            raise ValueError("该手机号尚未注册，请核对手机号或切换至「新用户注册」")
+
+        if existing:
 
             update_fields: Dict[str, Any] = {"last_login_at": now, "last_active_at": now}
             self.col.update_one({"phone": phone}, {"$set": update_fields})

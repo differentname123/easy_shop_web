@@ -2147,6 +2147,7 @@ body {
 }
 
 .universal-product-card {
+  position: relative;
   display: flex;
   gap: 10px;
   background: #fcfcfc;
@@ -2188,6 +2189,16 @@ body {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.universal-product-title .plat-badge {
+  position: static;
+  display: inline-block;
+  vertical-align: 1px;
+  margin-right: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .universal-product-meta {

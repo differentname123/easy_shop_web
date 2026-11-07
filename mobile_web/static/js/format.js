@@ -12,13 +12,21 @@
   };
   shop.formatSales = salesTip => {
     if (!salesTip || salesTip === '0') return '热销爆款';
-    const text = String(salesTip).trim();
+    let text = String(salesTip).trim();
     if (!text || text === '0') return '热销爆款';
     if (text.startsWith('已拼')) {
-      return text.replace(/^已拼\s*/, '已售 ');
-    }
-    if (/^(已售|月销|热销|年销|累计销售)/.test(text)) {
+      text = text.replace(/^已拼\s*/, '');
+    } else if (/^已售\s*/.test(text)) {
+      text = text.replace(/^已售\s*/, '');
+    } else if (/^(月销|热销|年销|累计销售)/.test(text)) {
       return text;
+    }
+    if (/^\d+$/.test(text)) {
+      const num = Number(text);
+      if (num >= 10000) {
+        const wan = (num / 10000).toFixed(1).replace(/\.0$/, '');
+        return `已售 ${wan}万+`;
+      }
     }
     return `已售 ${text}`;
   };
