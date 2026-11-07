@@ -394,12 +394,11 @@ class JdAdapter(BasePlatformAdapter):
 
     def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):
         """
-        京东万能转链与详情反查（对齐 scripts/test_jd_api.py 基准规范 六）：
-        1. 支持全部 8 种真实输入格式：裸加密 itemId、jingfen.jd.com 详情链、u.jd.com 短链、
-           union-click.jd.com 联盟长链、完整京口令文案、精简京口令、本平台生成多行文案、以及京东 App「商品标题」分享文案；
-        2. 明确拦截不含标题的纯数字 item.jd.com/{数字}.html 或纯数字 SKU（京东联盟接口已不支持数字 ID 转链）；
-        3. 转链成功后，通过 api_detail.ashx（加密ID）或 api_quanwang.ashx（u.jd.com 短链，youquan=0）反查商品详情；
-           若反查接口偶发限流，自动从转链返回的 jCommand 文案提取商品标题与券额构建预览卡片兜底。
+        京东万能转链与详情反查（对齐 scripts/test_jd_api.py 基准规范 六：直接原样透传折淘客，零模糊搜索兜底）：
+        1. 直接将用户输入的原始文本透传给折淘客 `open_jing_union_open_promotion_byunionid_get.ashx` (`chainType=3`)，
+           支持裸加密 itemId、jingfen.jd.com 详情链、u.jd.com 短链、union-click.jd.com 长链、京口令及社群混排长文案；
+        2. 明确拦截纯数字 item.jd.com/{数字}.html 或纯数字 SKU，严禁在转链失败时提取文本标题调用 `search_goods` 模糊搜索取首条商品顶替；
+        3. 转链成功后，通过 api_detail.ashx（加密ID）或 api_quanwang.ashx（转链所得 u.jd.com 短链，youquan=0）精准反查商品详情。
         """
         unavailable = self._available("promotion")
         if unavailable:
@@ -415,52 +414,21 @@ class JdAdapter(BasePlatformAdapter):
         extracted_encrypted_id = ""
         product_card = None
         jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
-        u_jd_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9]+", text)
-        union_click_match = re.search(r"https?://union-click\.jd\.com/jdc\?[^\s\"'<>]+", text)
-        jcmd_match = re.search(r"([!！$￥¥%&*(（][A-Za-z0-9]{10,20}[!！$￥¥%&*)）])", text)
-
         if jf_match:
             extracted_encrypted_id = jf_match.group(1)
-            material_input = f"https://jingfen.jd.com/detail/{extracted_encrypted_id}.html"
         elif _is_encrypted_jd_item_id(text):
             extracted_encrypted_id = text
-            material_input = f"https://jingfen.jd.com/detail/{extracted_encrypted_id}.html"
-        elif u_jd_match:
-            material_input = u_jd_match.group(0)
-        elif union_click_match:
-            material_input = union_click_match.group(0).rstrip("，。！？、,!?)）】")
-        elif jcmd_match:
-            material_input = text
-        elif re.search(r"item\.jd\.com/(\d+)\.html", text) or text.isdigit():
-            return _error(
-                "UNSUPPORTED_JD_NUMERIC_SKU",
-                "京东联盟新规已不支持纯数字商品ID或 item.jd.com 数字直链转链，请粘贴京东 App 分享的 u.jd.com 短链、京口令或含「商品标题」的分享文案",
-            )
-        else:
-            keyword = extract_search_keyword(text, max_length=80)
-            if len(keyword) < 2:
-                return _error("INVALID_ARGUMENT", "未识别到有效的京东推广链接、京口令或商品标题")
-            try:
-                kw_res = self.client.search_goods(keyword, page=1, page_size=5, has_coupon=False)
-            except TypeError:
-                kw_res = self.client.search_goods(keyword, page=1, page_size=5)
-            if kw_res.get("status") == "success" and isinstance(kw_res.get("data"), list) and kw_res["data"]:
-                for row in kw_res["data"]:
-                    try:
-                        product_card = self._detail(row)
-                        extracted_encrypted_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
-                        break
-                    except Exception:
-                        continue
-            if not extracted_encrypted_id:
-                return _error("PRODUCT_NOT_FOUND", f"未检索到与「{keyword[:24]}」匹配的京东在推商品")
-            material_input = f"https://jingfen.jd.com/detail/{extracted_encrypted_id}.html"
 
+        material_input = f"https://jingfen.jd.com/detail/{text}.html" if _is_encrypted_jd_item_id(text) else text
         conv = self.client.convert_universal_material(material_input, promoter)
+
         if conv.get("status") != "success":
             if conv.get("jd_off_promotion") is True:
                 return _error("PRODUCT_OFF_PROMOTION", "该京东商品已取消推广或已下架，请挑选其他好物")
             return conv
+
+        if not extracted_encrypted_id and conv.get("tao_id"):
+            extracted_encrypted_id = _text(conv.get("tao_id"))
 
         short = conv.get("short_url") or ""
         long = conv.get("click_url") or ""
@@ -469,12 +437,18 @@ class JdAdapter(BasePlatformAdapter):
         token = j_short_cmd or j_cmd
 
         resolved_id = extracted_encrypted_id
-        if not product_card and extracted_encrypted_id:
+        if extracted_encrypted_id:
             det = self.get_goods_detail(extracted_encrypted_id)
             if det.get("status") == "success" and isinstance(det.get("data"), dict):
                 product_card = det["data"]
-        elif not product_card:
-            search_q = material_input if "u.jd.com/" in material_input else (short or long)
+        if not product_card and isinstance(conv.get("raw_item"), dict):
+            try:
+                product_card = self._detail(conv["raw_item"])
+                resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
+            except Exception:
+                pass
+        if not product_card:
+            search_q = short or long
             if search_q:
                 try:
                     q_res = self.client.search_goods(search_q, page=1, page_size=5, has_coupon=False)

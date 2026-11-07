@@ -381,18 +381,19 @@ class PddAdapter(BasePlatformAdapter):
 
     def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs) -> Dict[str, Any]:
         """
-        拼多多万能转链与详情反查（对齐 scripts/test_pdd_api.py 基准规范 八）：
+        拼多多万能转链与详情反查（对齐 scripts/test_pdd_api.py 基准规范 八：零模糊搜索兜底）：
         支持输入：
         1. 拼多多推广短链：https://p.pinduoduo.com/xxx（或含该短链的分享文案）
         2. 拼多多二合一长链：https://mobile.yangkeduo.com/duo_coupon_landing.html?...&goods_sign=E9...
         3. 裸加密 goods_sign（如 E932Ts1b... / Y932Ts1b...）
-        4. 拼多多商品分享标题文案
+        4. 社群混排长促销文案（如 `★拼多多百亿补贴★...[下单链接：https://p.pinduoduo.com/xxx]返红包...`）
+        严禁在无链接/无 goods_sign 时提取文本标题调用 search_goods 模糊搜索取首条商品顶替。
         """
         if not self.active:
             return {"status": "error", "error_code": "platform_unavailable", "error_msg": "拼多多暂未启用"}
         text = str(raw_text or "").strip()
         if not text:
-            return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "请输入拼多多推广链接、goods_sign 或商品标题"}
+            return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "请输入拼多多推广链接或 goods_sign"}
 
         extracted_sign = ""
         extracted_id = ""
@@ -406,10 +407,10 @@ class PddAdapter(BasePlatformAdapter):
         elif re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
             extracted_sign = text
 
-        # 2. 提取 URL
-        url_match = re.search(r"https?://[^\s\"'<>]+", text)
+        # 2. 提取纯净 ASCII URL，防止混排文案中 `]` 或中文尾缀污染短链
+        url_match = re.search(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text)
         if url_match:
-            extracted_url = url_match.group(0).rstrip("，。！？、,!?)）】")
+            extracted_url = url_match.group(0).rstrip(".,!?)];'\"")
             url_lower = extracted_url.lower()
             if not any(d in url_lower for d in ("pinduoduo.com", "yangkeduo.com")):
                 return {
@@ -431,7 +432,7 @@ class PddAdapter(BasePlatformAdapter):
             return {
                 "status": "error",
                 "error_code": "UNSUPPORTED_PDD_ID_ONLY_URL",
-                "error_msg": "拼多多官方接口 (40009) 已禁止仅含纯数字 goods_id 的普通链接查询，请粘贴 p.pinduoduo.com 推广短链、含 goods_sign 的长链或商品标题",
+                "error_msg": "拼多多官方接口 (40009) 已禁止仅含纯数字 goods_id 的普通链接查询，请粘贴 p.pinduoduo.com 推广短链或含 goods_sign 的长链",
             }
 
         # 3. 若是 p.pinduoduo.com 短链或未知 goods_sign 的长链，先用站长已备案 PID (uid=None) 调 zs.unit.url.gen 解包出 goods_sign
@@ -459,28 +460,20 @@ class PddAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        # 4. 若仍未拿到 goods_sign，调用 search_goods (page_size=10，仅支持搜 p.pinduoduo.com 短链或非 URL 商品标题，严禁搜任意 URL 字符串)
-        if not extracted_sign:
-            if extracted_url and "p.pinduoduo.com" in extracted_url:
-                search_kw = extracted_url
-            elif not extracted_url:
-                search_kw = extract_search_keyword(text, max_length=80)
-            else:
-                search_kw = ""
-
-            if search_kw and len(search_kw) >= 2:
-                search_res = self.search_goods(search_kw, page=1, page_size=10, uid=None)
-                if search_res.get("status") == "success" and search_res.get("data"):
-                    first_hit = search_res["data"][0]
-                    extracted_sign = first_hit.get("goods_sign") or ""
-                    extracted_id = first_hit.get("goods_id") or extracted_id
-                    product_detail = first_hit
+        # 4. 若仍未拿到 goods_sign，仅当存在 p.pinduoduo.com 短链时将短链本身传给 search_goods 精准反查（严禁搜文本标题！）
+        if not extracted_sign and extracted_url and "p.pinduoduo.com" in extracted_url:
+            search_res = self.search_goods(extracted_url, page=1, page_size=10, uid=None)
+            if search_res.get("status") == "success" and search_res.get("data"):
+                first_hit = search_res["data"][0]
+                extracted_sign = first_hit.get("goods_sign") or ""
+                extracted_id = first_hit.get("goods_id") or extracted_id
+                product_detail = first_hit
 
         if not extracted_sign and not (extracted_url and "p.pinduoduo.com" in extracted_url):
             return {
                 "status": "error",
                 "error_code": "UNRESOLVED_PDD_INPUT",
-                "error_msg": "未能从输入内容中解析出拼多多商品，请粘贴 p.pinduoduo.com 短链、含 goods_sign 的链接或完整商品标题",
+                "error_msg": "未能从输入内容中解析出拼多多商品，请粘贴 p.pinduoduo.com 推广短链或含 goods_sign 的链接",
             }
 
         # 5. 获取完整商品详情 (pdd.ddk.goods.detail)

@@ -380,11 +380,64 @@ class JdClient:
                 return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
             return {"status": "success", "promoter_id": promoter, **data}
 
-        return self._execute_with_failover(
+        primary_res = self._execute_with_failover(
             "open_jing_union_open_promotion_byunionid_get.ashx",
             {"unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter},
             _evaluate,
         )
+        if (
+            primary_res.get("status") == "success"
+            or primary_res.get("error_code") in ("UNSUPPORTED_JD_NUMERIC_SKU", "CONFIG_ERROR", "UNSAFE_REDIRECT")
+            or primary_res.get("jd_off_promotion") is True
+        ):
+            return primary_res
+
+        def _evaluate_piliang(body):
+            if body.get("status") == "error":
+                return body
+            if str(body.get("status")) != "200":
+                return _error("UPSTREAM_ERROR", "京东批量文案转链未成功")
+            p_tao_id = str(body.get("tao_id") or "").strip()
+            p_res_url = product_url(body.get("result_url"))
+            if not (p_tao_id or p_res_url):
+                return _error("UPSTREAM_ERROR", "京东批量文案转链未解析出商品")
+            raw_item = dict(body)
+            raw_item.setdefault("pict_url", raw_item.get("pic") or "")
+            if p_tao_id:
+                raw_item.setdefault("item_url", f"https://jingfen.jd.com/detail/{p_tao_id}.html")
+            return {
+                "status": "success",
+                "promoter_id": promoter,
+                "tao_id": p_tao_id,
+                "short_url": p_res_url,
+                "click_url": p_res_url,
+                "j_command": "",
+                "j_short_command": "",
+                "raw_item": raw_item,
+            }
+
+        piliang_res = self._execute_with_failover(
+            "open_gaoyongzhuanlian_tkl_piliang.ashx",
+            {"unionId": self.union_id, "positionId": promoter, "tkl": material, "signurl": 5},
+            _evaluate_piliang,
+        )
+        if piliang_res.get("status") != "success":
+            return primary_res
+
+        target_for_cmd = piliang_res.get("short_url") or (
+            f"https://jingfen.jd.com/detail/{piliang_res['tao_id']}.html" if piliang_res.get("tao_id") else ""
+        )
+        if target_for_cmd:
+            cmd_res = self._execute_with_failover(
+                "open_jing_union_open_promotion_byunionid_get.ashx",
+                {"unionId": self.union_id, "materialId": target_for_cmd, "chainType": "3", "positionId": promoter},
+                _evaluate,
+            )
+            if cmd_res.get("status") == "success":
+                cmd_res["tao_id"] = piliang_res.get("tao_id", "")
+                cmd_res["raw_item"] = piliang_res.get("raw_item")
+                return cmd_res
+        return piliang_res
 
     def query_orders(self, start_time, end_time, page=1, page_size=50, cursor=None):
         try:

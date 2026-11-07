@@ -557,4 +557,71 @@ def test_jd_image_key_never_calls_upstream_detail_and_service_upgrades_sign():
     clear_all_caches()
 
 
+def test_jd_universal_convert_passes_raw_text_directly_and_never_falls_back_to_keyword_search():
+    # 1. 混排文案原样透传给 JdClient.convert_universal_material，单品接口失败时自动透传给 open_gaoyongzhuanlian_tkl_piliang.ashx
+    s = http_for(
+        {
+            "jd_union_open_promotion_byunionid_get_response": {
+                "result": json.dumps({"code": 4002512, "message": "您的1个链接未遵循京粉格式，请调整后重试"}),
+            },
+        },
+        {
+            "status": 200,
+            "plat": "2",
+            "tao_id": "wAQEbTBpySSwDZcuvK0xwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC",
+            "title": "可口可乐330ml*24",
+            "pic": "https://img14.360buyimg.com/pop/jfs/t1/523108/39/14102/81368/6ab9c932F86c506ae/0083320320b195ad.jpg",
+            "size": "49.2",
+            "quanhou_jiage": "44.28",
+            "coupon_info_money": "4.92",
+            "tkrate3": "4",
+            "tkfee3": "1.77",
+            "nick": "可口可乐京东自营旗舰店",
+            "volume": "20000",
+            "result_url": "https://u.jd.com/newshort",
+        },
+        {
+            "jd_union_open_promotion_byunionid_get_response": {
+                "result": json.dumps({
+                    "code": 200,
+                    "data": {
+                        "shortURL": "https://u.jd.com/newshort",
+                        "clickURL": "https://union-click.jd.com/jdc?e=new",
+                        "jCommand": "12:/领5元优惠券！抢购可口可乐330ml*24！ ！ABCD1234EFGH！ CA1234",
+                        "jShortCommand": "！ABCD1234EFGH！ CA1234",
+                    },
+                }),
+            },
+        },
+        {
+            "status": 200,
+            "content": [item("wAQEbTBpySSwDZcuvK0xwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC", title="可口可乐330ml*24")],
+        },
+    )
+    a = adapter(client(s))
+    mixed_text = "★京东超级补贴★ 可口可乐330ml*24 售价：49.2元[下单链接：https://u.jd.com/oldshort]返2元红包！"
+    res = a.resolve_and_convert_universal(mixed_text, promoter_id="8899")
+    assert res["status"] == "success"
+    assert res["short_url"] == "https://u.jd.com/newshort"
+    assert res["promotion_token"] == "！ABCD1234EFGH！ CA1234"
+    assert res["product"]["name"] == "可口可乐330ml*24"
+    assert s.get.call_args_list[0].args[0].endswith("/open_jing_union_open_promotion_byunionid_get.ashx")
+    assert s.get.call_args_list[1].args[0].endswith("/open_gaoyongzhuanlian_tkl_piliang.ashx")
+    assert s.get.call_args_list[2].args[0].endswith("/open_jing_union_open_promotion_byunionid_get.ashx")
+
+    # 2. 当转链失败（如仅含商品标题无链接/口令）时，直接返回错误，绝不调用 search_goods 模糊搜索顶替商品
+    c_fail = Mock()
+    c_fail.convert_universal_material.return_value = {
+        "status": "error",
+        "error_code": "UPSTREAM_ERROR",
+        "error_msg": "未能转链",
+    }
+    a_fail = adapter(c_fail)
+    fail_res = a_fail.resolve_and_convert_universal("【京东】「可口可乐330ml*24」抢购好物", promoter_id="8899")
+    assert fail_res["status"] == "error"
+    c_fail.search_goods.assert_not_called()
+
+
+
+
 

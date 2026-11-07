@@ -665,3 +665,57 @@ def test_taobao_adapter_falls_back_to_ztk_sid_channel_when_top_session_expired()
     assert "inviterCode=ZTKCODE88" in invite_res["auth_url"]
     assert "externalId=u_8bb0595a" in invite_res["auth_url"]
 
+
+def test_universal_convert_promotional_copy_uses_piliang_and_never_falls_back_to_keyword_search():
+    from infrastructure.ztk_client import ZTK_CHANNEL_URL, ZTK_CHANNEL_PILIANG_URL
+
+    promo_copy = (
+        "★天猫双11狂欢节 官方立减85折起★两大瓶值31.8亓！伊利金典鲜牛奶组合售价：34元"
+        "[下单链接：https://uland.TaoBao.com/item/edetail?id=ZBv39R9SnhPDy0vQa9hN8sVtz-PpYd2QbhO7ZkXxOnIn]"
+        "返2亓红包[红包] 下单赠送张凌赫周边！ 伊利鲜奶旗舰店•金典鲜牛奶组合10瓶 有值钱货！"
+    )
+    http = SimpleNamespace(get=Mock(side_effect=[
+        reply({"status": 301, "content": "很抱歉！商品ID解析错误！！！"}),
+        reply({
+            "status": 200,
+            "tao_id": "y3g8ZZZqiRt2KgB4B9YU5OyskUY-NOokyrnFzby6RAz2upW",
+            "title": "【直播间下单更优惠】伊利金典鲜牛奶208ml*8+金典450ml*2组合装",
+            "pic": "https://img.alicdn.com/bao/uploaded/i4/yili.jpg",
+            "quanhou_jiage": "40.3",
+            "size": "100.0",
+            "coupon_info_money": "36",
+            "tkrate3": "2.0",
+            "tkfee3": "0.81",
+            "result_tkl": "(dAM561pUz8d)",
+            "result_url": "https://uland.taobao.com/coupon/edetail?e=yili",
+            "shorturl": "https://s.click.taobao.com/yili123",
+            "shorturl2": "https://s.tb.cn/h.yili123",
+        }),
+    ]))
+    ztk = ZtkClient("ztk_key", "ztk_sid", http, appkey_list=("ztk_key",))
+    official = Mock()
+    adapter = make_adapter(official, ztk=ztk, tb_channel_pid="mm_1_2_3")
+
+    res = adapter.resolve_and_convert_universal(promo_copy, uid=None)
+    assert res["status"] == "success"
+    assert res["title"] == "【直播间下单更优惠】伊利金典鲜牛奶208ml*8+金典450ml*2组合装"
+    assert res["promotion_token"] == "(dAM561pUz8d)"
+    assert res["short_url"] == "https://s.click.taobao.com/yili123"
+    assert res["product"]["goods_id"] == "NOokyrnFzby6RAz2upW"
+    assert res["product"]["goods_sign"] == "y3g8ZZZqiRt2KgB4B9YU5OyskUY-NOokyrnFzby6RAz2upW"
+    assert http.get.call_args_list[0].args == (ZTK_CHANNEL_URL,)
+    assert http.get.call_args_list[1].args == (ZTK_CHANNEL_PILIANG_URL,)
+    official.search_goods.assert_not_called()
+
+    # 当折淘客转链失败时，绝不回退到官方关键词模糊搜索顶替商品
+    http_fail = SimpleNamespace(get=Mock(side_effect=[
+        reply({"status": 301, "content": "很抱歉！商品ID解析错误！！！"}),
+        reply({"status": 301, "content": "很抱歉！转链失败！"}),
+    ]))
+    ztk_fail = ZtkClient("ztk_key", "ztk_sid", http_fail, appkey_list=("ztk_key",))
+    adapter_fail = make_adapter(official, ztk=ztk_fail, tb_channel_pid="mm_1_2_3")
+    fail_res = adapter_fail.resolve_and_convert_universal("「伊利金典鲜牛奶组合」无效口令文本", uid=None)
+    assert fail_res["status"] == "error"
+    official.search_goods.assert_not_called()
+
+

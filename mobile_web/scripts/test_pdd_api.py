@@ -67,7 +67,9 @@
 七、【功能 6：增量订单拉取 (`pdd.ddk.order.list.increment.get`)】
   - ✅ 可用：入参为秒级时间戳 `start_update_time` 与 `end_update_time`（建议窗口 `<= 3600s`），金额单位均为“分”。
 
-八、【功能 7：万能转链与详情反查 (`convert_and_resolve_universal_input` 第一性原理实现)】
+八、【功能 7：万能转链与详情反查 (`convert_and_resolve_universal_input` 第一性原理实现：零模糊搜索兜底)】
+  - ✅ 核心原则：仅对包含明确推广短链 (`p.pinduoduo.com`)、带 `goods_sign` 的长链 (`yangkeduo.com`) 或裸加密 `goods_sign` 的输入进行确定性解析转链，
+    严禁在无链接/无 `goods_sign` 时提取文本标题调用 `pdd.ddk.goods.search` 模糊搜索取首条商品顶替（杜绝转错商品）。
   - ✅ 可用用户自带输入格式（均支持反查出权威 `goods_sign`、商品详情及生成三层最优百亿补贴/领券推广短链，共 8 类全覆盖）：
     1. ✅ 裸加密 `goods_sign`（如 `E932Ts1b...` 或 `Y932Ts1b...`）
     2. ✅ 策略 1 超级红包/百亿补贴推广短链：`https://p.pinduoduo.com/xxx`（含该短链的混合分享文案）
@@ -76,10 +78,10 @@
     5. ✅ 策略 2 常规单品二合一长链：`https://mobile.yangkeduo.com/duo_coupon_landing.html?...&goods_sign=E9...`
     6. ✅ 策略 3 招商推广短链：`pdd.ddk.goods.zs.unit.url.gen` 生成的 `https://p.pinduoduo.com/xxx`
     7. ✅ 本平台生成的完整推广口令文案 (`command_text`，多行含 `【拼多多】`、价格与 `p.pinduoduo.com` 链接)
-    8. ✅ 拼多多 App 标题分享文案：如 `【拼多多】「商品完整标题」`（清洗前缀标签后通过 `pdd.ddk.goods.search` `page_size=10` 检索首条匹配商品并获取 `goods_sign`）
+    8. ✅ 社群混排长促销文案（如 `★拼多多百亿补贴★...[下单链接：https://p.pinduoduo.com/xxx]返红包...`，自动剥离 `]` 及中文后缀提取纯净短链）
        - 短链解包路径 A：先用站长已备案 `pid` 调 `pdd.ddk.goods.zs.unit.url.gen` 解包，从返回的 `url` / `mobile_url` / `multi_group_url` (`duo_coupon_landing.html?...&goods_sign=E9...`) 中直接正则提取 `goods_sign`；
-       - 短链解包路径 B：直接将 `https://p.pinduoduo.com/xxx` 作为 `keyword` 传给 `pdd.ddk.goods.search` (`page_size=10`)，精准返回唯一 1 条商品及 `goods_sign`。
-  - ❌ 不可用输入：仅包含纯数字 `goods_id` 的手工普通链接 `https://mobile.yangkeduo.com/goods.html?goods_id=123456`（不含 `goods_sign` 且非 `p.pinduoduo.com` 短链时，被拼多多网关 `40009` 拦截，需通过商品标题搜索或使用 `p.pinduoduo.com` 推广短链）。
+       - 短链解包路径 B：直接将纯净 `https://p.pinduoduo.com/xxx` 短链本身作为 `keyword` 传给 `pdd.ddk.goods.search` (`page_size=10`)，精准反查唯一 1 条商品及 `goods_sign`。
+  - ❌ 不可用输入：仅包含纯数字 `goods_id` 的普通链接 `https://mobile.yangkeduo.com/goods.html?goods_id=123456` 或无链接/无 `goods_sign` 的纯文本标题（直接拦截报错，绝不模糊搜索兜底）。
 
 九、【三平台统一商品唯一标识 (`product_id` / `goods_id`) 与动态调用令牌 (`goods_sign`) 职责解耦基准】
   - 拼多多天然区分了 **稳定商品主键 (`goods_id` / `product_id`)** 与 **动态加密调用凭证 (`goods_sign`)**，并作为全站三平台（拼多多、淘宝、京东）数据模型的第一性原理基准：
@@ -739,7 +741,7 @@ def fetch_pdd_increment_orders(
 
 
 # ==============================================================================
-# 核心功能 7：万能转链与详情反查 (支持 p.pinduoduo.com 短链 / 长链 / goods_sign / 分享文案)
+# 核心功能 7：万能转链与详情反查 (支持 p.pinduoduo.com 短链 / 长链 / goods_sign，零模糊搜索兜底)
 # ==============================================================================
 def convert_and_resolve_universal_input(
     raw_text: str,
@@ -750,12 +752,12 @@ def convert_and_resolve_universal_input(
     client_secret: str = PDD_CLIENT_SECRET,
 ) -> Dict[str, Any]:
     """
-    拼多多万能转链与详情反查基线函数：
+    拼多多万能转链与详情反查基线函数（第一性原理：仅解析确定性短链/长链/goods_sign，严禁使用标题模糊搜索兜底顶替商品）：
     支持输入类型：
     1. 拼多多推广短链：https://p.pinduoduo.com/xxx (或包含该短链的混合分享文案)
     2. 拼多多二合一/落地长链：https://mobile.yangkeduo.com/duo_coupon_landing.html?...&goods_sign=E9...
     3. 裸加密 goods_sign (如 E932Ts1b... / Y932Ts1b...)
-    4. 拼多多商品分享标题文案
+    4. 社群混排长促销文案（如 `★拼多多百亿补贴★...[下单链接：https://p.pinduoduo.com/xxx]返红包...`）
     """
     text = str(raw_text or "").strip()
     if not text:
@@ -777,10 +779,10 @@ def convert_and_resolve_universal_input(
         extracted_sign = text
         input_type = "encrypted_goods_sign"
 
-    # 2. 提取 URL (p.pinduoduo.com 或 yangkeduo.com)
-    url_match = re.search(r"https?://[^\s\"'<>]+", text)
+    # 2. 提取纯净 ASCII URL (p.pinduoduo.com 或 yangkeduo.com)，防止紧贴 `]` 或中文尾缀污染 URL
+    url_match = re.search(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text)
     if url_match:
-        extracted_url = url_match.group(0).rstrip("，。！？、,!?)）】")
+        extracted_url = url_match.group(0).rstrip(".,!?)];'\"")
         if "p.pinduoduo.com" in extracted_url:
             input_type = "pdd_short_url"
         elif not extracted_sign:
@@ -799,7 +801,7 @@ def convert_and_resolve_universal_input(
             "status": "error",
             "input_type": input_type,
             "error_code": "UNSUPPORTED_PDD_ID_ONLY_URL",
-            "error_msg": "拼多多官方接口 (40009) 已禁止仅含纯数字 goods_id 的普通链接查询，请粘贴 p.pinduoduo.com 推广短链、含 goods_sign 的长链或商品标题",
+            "error_msg": "拼多多官方接口 (40009) 已禁止仅含纯数字 goods_id 的普通链接查询，请粘贴 p.pinduoduo.com 推广短链或含 goods_sign 的长链",
         }
 
     # 3. 若是 p.pinduoduo.com 短链或未知 goods_sign 的长链，先用站长已备案 PID 调 zs.unit.url.gen 解包出 goods_sign
@@ -824,36 +826,23 @@ def convert_and_resolve_universal_input(
                 if m_sign:
                     extracted_sign = m_sign.group(1)
 
-    # 4. 若仍未拿到 goods_sign，调用 pdd.ddk.goods.search (page_size=10，支持直接搜 p.pinduoduo.com 短链或商品标题)
-    if not extracted_sign:
-        if extracted_url and "p.pinduoduo.com" in extracted_url:
-            search_kw = extracted_url
-        elif not extracted_url:
-            title_bracket = re.search(r"「([^」]{4,})」", text)
-            if title_bracket:
-                search_kw = title_bracket.group(1).strip()
-            else:
-                cleaned_kw = re.sub(r"https?://\S+", " ", text)
-                cleaned_kw = re.sub(r"【(?:拼多多|好物精选|百亿补贴|多多进宝)】", " ", cleaned_kw)
-                cleaned_kw = re.sub(r"(?:💰|👉|到手价|抢购链接|领券)[^\n]*", " ", cleaned_kw)
-                search_kw = re.sub(r"\s+", " ", cleaned_kw).strip()
-        else:
-            search_kw = ""
-
-        if search_kw and len(search_kw) >= 2:
-            search_res = search_pdd_goods(search_kw, page=1, page_size=10, uid=None, pid=use_pid, client_id=client_id, client_secret=client_secret)
-            if search_res["status"] == "success" and search_res.get("data"):
-                first_hit = search_res["data"][0]
-                extracted_sign = first_hit.get("goods_sign")
-                extracted_id = first_hit.get("goods_id") or extracted_id
-                product_detail = first_hit
+    # 4. 若仍未拿到 goods_sign，仅当存在 p.pinduoduo.com 短链时将短链本身传给 pdd.ddk.goods.search 精准反查（严禁搜文本标题！）
+    if not extracted_sign and extracted_url and "p.pinduoduo.com" in extracted_url:
+        search_res = search_pdd_goods(
+            extracted_url, page=1, page_size=10, uid=None, pid=use_pid, client_id=client_id, client_secret=client_secret
+        )
+        if search_res["status"] == "success" and search_res.get("data"):
+            first_hit = search_res["data"][0]
+            extracted_sign = first_hit.get("goods_sign")
+            extracted_id = first_hit.get("goods_id") or extracted_id
+            product_detail = first_hit
 
     if not extracted_sign and not (extracted_url and "p.pinduoduo.com" in extracted_url):
         return {
             "status": "error",
             "input_type": input_type,
             "error_code": "UNSUPPORTED_PDD_INPUT",
-            "error_msg": "未能从输入内容中解析出有效的拼多多商品标识 (goods_sign)，请提供拼多多推广短链 (p.pinduoduo.com) 或完整商品标题",
+            "error_msg": "未能从输入内容中解析出有效的拼多多推广链接或商品标识 (goods_sign)，请提供 p.pinduoduo.com 推广短链或含 goods_sign 的链接",
         }
 
     # 5. 获取权威商品详情 (pdd.ddk.goods.detail)
@@ -994,7 +983,7 @@ def main():
     print(f" -> 订单查询结果: status={ord_res['status']}, 数量={len(ord_res.get('order_list', []))}")
 
     # 7. 验证万能转链与详情反查全矩阵 (8 种真实格式自生自测 + 纯数字 goods_id 拦截验证)
-    print("\n[7/7] 验证拼多多万能转链与详情反查全矩阵 (8 种真实格式自生自测)...")
+    print("\n[7/7] 验证拼多多万能转链与详情反查全矩阵 (8 种真实格式自生自测，零模糊搜索兜底)...")
     if sample_sign and conv_owner.get("status") == "success" and conv_std.get("status") == "success":
         rp_short = conv_owner.get("short_url") or conv_owner.get("final_link") or ""
         rp_long = conv_owner.get("url") or ""
@@ -1003,7 +992,7 @@ def main():
         zs_gen = convert_pdd_promotion_url(goods_sign=None, source_url=std_short, uid=None, prefer_subsidy=False)
         zs_short = zs_gen.get("short_url") or zs_gen.get("final_link") or std_short
         platform_cmd = f"【拼多多】{sample_name}\n💰到手价：¥19.9\n👉抢购链接：{std_short}"
-        share_title_copy = f"【拼多多】「{sample_name}」"
+        mixed_pdd_copy = f"★拼多多百亿补贴★ {sample_name} 售价：19.9元[下单链接：{std_short}]返2元红包[红包] 手慢无！"
 
         pdd_cases = [
             ("7a. 裸加密 goods_sign", sample_sign),
@@ -1013,7 +1002,7 @@ def main():
             ("7e. 策略2二合一长链 (duo_coupon_landing)", std_long),
             ("7f. 策略3招商短链 (zs.unit.url.gen)", zs_short),
             ("7g. 平台自生成多行推广文案", platform_cmd),
-            ("7h. 拼多多App带标题分享文案", share_title_copy),
+            ("7h. 社群混排长文案夹带[下单链接：p.pinduoduo.com]", mixed_pdd_copy),
         ]
         for label, text_input in pdd_cases:
             u_res = convert_and_resolve_universal_input(text_input, uid=None)
@@ -1026,7 +1015,7 @@ def main():
 
         u_bad = convert_and_resolve_universal_input("https://mobile.yangkeduo.com/goods.html?goods_id=1016415496258", uid=None)
         print(
-            f" -> [7i. 纯数字直链拦截验证] status={u_bad['status']} | code={u_bad.get('error_code')} "
+            f" -> [7i. 纯数字直链拦截验证 (零兜底)] status={u_bad['status']} | code={u_bad.get('error_code')} "
             f"| msg={u_bad.get('error_msg', '')[:38]}..."
         )
 

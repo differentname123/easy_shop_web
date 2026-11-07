@@ -7,6 +7,7 @@ from infrastructure.http_utils import SHANGHAI, error_dict as _error, parse_appk
 
 ZTK_ORDER_URL = "https://api.zhetaoke.com:10001/api/open_dingdanchaxun2.ashx"
 ZTK_CHANNEL_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl.ashx"
+ZTK_CHANNEL_PILIANG_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl_piliang.ashx"
 ZTK_PUBLISHER_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_publisher_get.ashx"
 ZTK_INVITECODE_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_invitecode_get.ashx"
 ZTK_AUTH_INFO_URL = "https://api.zhetaoke.com:10001/api/open_taokeshouquaninfo.ashx"
@@ -226,9 +227,56 @@ class ZtkClient:
                         return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {msg_text}", need_auth=True)
                     if "不支持数字id" in msg_text.lower():
                         return _error("UNSUPPORTED_TB_NUMERIC_ID", f"折淘客渠道转链失败: {msg_text}")
-                    if "error tkl" in msg_text.lower():
-                        return _error("INVALID_TKL", f"折淘客渠道转链失败: {msg_text}")
-                    return _error("UPSTREAM_ERROR", f"折淘客渠道转链失败: {msg_text}")
+
+                    if "商品id解析错误" in msg_text.lower() or "error tkl" in msg_text.lower():
+                        try:
+                            p_body = self._get_response(
+                                ZTK_CHANNEL_PILIANG_URL,
+                                params={
+                                    "appkey": current_key,
+                                    "sid": self.sid,
+                                    "pid": pid,
+                                    "tkl": item_url,
+                                    "signurl": signurl,
+                                },
+                            )
+                            p_tao_id = str(p_body.get("tao_id") or "").strip() if isinstance(p_body, dict) else ""
+                            if isinstance(p_body, dict) and p_body.get("status") == 200 and p_tao_id:
+                                if relation_id:
+                                    rel_body = self._get_response(
+                                        ZTK_CHANNEL_URL,
+                                        params={
+                                            "appkey": current_key,
+                                            "sid": self.sid,
+                                            "pid": pid,
+                                            "tkl": f"https://uland.taobao.com/item/edetail?id={p_tao_id}",
+                                            "signurl": signurl,
+                                            "relation_id": relation_id,
+                                        },
+                                    )
+                                    if isinstance(rel_body, dict):
+                                        if rel_body.get("status") == 200 and isinstance(rel_body.get("content"), list) and rel_body["content"]:
+                                            status_code = 200
+                                            content = rel_body["content"]
+                                        else:
+                                            rel_err = str(rel_body.get("content") or rel_body.get("msg") or "").strip()
+                                            if "relationid" in rel_err.lower() or "无效的relation" in rel_err.lower():
+                                                return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {rel_err}", need_auth=True)
+                                else:
+                                    c_item = dict(p_body)
+                                    c_item.setdefault("pict_url", c_item.get("pic") or "")
+                                    c_item.setdefault("tkl", c_item.get("result_tkl") or "")
+                                    c_item.setdefault("coupon_click_url", c_item.get("result_url") or "")
+                                    c_item.setdefault("item_url", f"https://uland.taobao.com/item/edetail?id={p_tao_id}")
+                                    status_code = 200
+                                    content = [c_item]
+                        except StopIteration:
+                            pass
+
+                    if status_code != 200 or not content or not isinstance(content, list):
+                        if "error tkl" in msg_text.lower():
+                            return _error("INVALID_TKL", f"折淘客渠道转链失败: {msg_text}")
+                        return _error("UPSTREAM_ERROR", f"折淘客渠道转链失败: {msg_text}")
 
                 if not content or not isinstance(content[0], dict):
                     return _error("PROTOCOL_ERROR", "折淘客渠道转链内容列表为空或格式无效")

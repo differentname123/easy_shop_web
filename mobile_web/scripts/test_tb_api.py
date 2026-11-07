@@ -76,19 +76,19 @@
      因此多 Key 故障切换时，遇到业务确定性错误（如 `无效的relationId`）不得盲目切 Key 覆盖真实原因。
 
 六、 万能转链与口令解析反查 (`convert_and_resolve_universal_input` 第一性原理实现)
-  1. ✅ 主路径（一步闭环最优解）：折淘客 `open_gaoyongzhuanlian_tkl.ashx` 配合 `signurl=5`（详版返回）及 4段式 `TB_CHANNEL_PID`，
-     可直接接收任意带淘宝客推广属性或加密 ID 的输入，并在 **单次 HTTP 请求 (~400ms)** 内同时返回转链结果与完整商品详情：
-     - ✅ 裸加密商品 ID (`item_id` / `goods_sign`，自动包装为 `https://uland.taobao.com/item/edetail?id={id}`)
-     - ✅ 官方手淘落地页：`https://uland.taobao.com/item/edetail?id={encrypted_id}`
-     - ✅ 加密 ID 淘宝直链：`https://item.taobao.com/item.htm?id={encrypted_id}`
-     - ✅ 折淘客淘口令 (`tkl`)、推广短链 (`https://s.click.taobao.com/xxx`)、手淘短链 (`https://s.tb.cn/h.xxx`)、二合一长链 (`https://uland.taobao.com/coupon/edetail?...`)
-     - ✅ 官方 `taobao.tbk.tpwd.create` 生成的完整口令文案 (`model`，含 `https://m.tb.cn/h.xxx`) 及裸 `https://m.tb.cn/h.xxx` 短链
-     - ✅ 本平台生成的完整推广口令文案 (`command_text`)
-  2. ✅ 兜底路径（普通手淘商品分享 `e.tb.cn` / 数字 ID 链接 + `「商品标题」`）：
-     - 阿里妈妈与折淘客已全面废除纯数字 `num_iid` 直接转链（普通手淘 App 分享链接解包后为纯数字 ID，折淘客返回 `301: 很抱歉！不支持数字id转链！！`）。
-     - 当主路径遇到 `不支持数字id转链` 或输入为普通商品标题文案时，自动从输入中提取 `「商品标题」`（或清洗 URL/口令后的标题文本），
-       调用官方 `taobao.tbk.dg.material.optional.upgrade` (`search_tb_goods`) 检索出加密 `goods_sign`，再交由折淘客一步转链，实现 11 种格式 100% 闭环。
-  3. ❌ 不可用输入：不含任何商品标题的纯数字 ID 或 `https://item.taobao.com/item.htm?id={纯数字}`（明确返回 `UNSUPPORTED_TB_NUMERIC_ID` 引导用户粘贴含 `「商品标题」` 的手淘分享文案或淘口令）。
+  1. ✅ 唯一确定性路径（折淘客原生直接透传，零正则拆解、零模糊搜索兜底）：
+     - 除裸加密商品 ID (`item_id` / `goods_sign`) 自动补齐 `https://uland.taobao.com/item/edetail?id={id}` 前缀外，
+       所有用户输入原样直接透传给折淘客高佣转链接口（`signurl=5` + 4段式 `TB_CHANNEL_PID`）：
+       * 主接口 `open_gaoyongzhuanlian_tkl.ashx`：单次 HTTP 请求直接解析并转链淘口令 (`tkl`)、推广短链 (`s.click.taobao.com`)、
+         手淘短链 (`s.tb.cn` / `m.tb.cn`)、二合一长链 (`uland.taobao.com/coupon/edetail`)、官方手淘落地页 (`uland.taobao.com/item/edetail`)、
+         加密 ID 淘宝直链 (`item.taobao.com/item.htm?id={encrypted_id}`) 及平台自生成多行口令文案；
+       * 长文案接口 `open_gaoyongzhuanlian_tkl_piliang.ashx`：当用户输入为夹带 `uland.taobao.com` / `item.taobao.com` 链接的社群长促销文案
+         （如 `★天猫双11★...[下单链接：https://uland.TaoBao.com/item/edetail?id=...]返红包...`）导致 `tkl.ashx` 返回 `商品ID解析错误` 或 `error tkl` 时，
+         自动将原样文案透传给 `open_gaoyongzhuanlian_tkl_piliang.ashx` (`signurl=5`) 由折淘客原生解析出准确的 `tao_id`、商品详情与推广口令/短链
+         （若携带 `relation_id`，则以解析出的 `tao_id` 回调 `tkl.ashx` 完成渠道归因核验）。
+  2. ❌ 严禁任何“标题模糊搜索取第 1 条”兜底（防张冠李戴铁律）：
+     - 阿里妈妈与折淘客已全面废除纯数字 `num_iid` 直接转链（普通手淘 App 分享 `e.tb.cn` 解包后为纯数字 ID，折淘客返回 `301: 很抱歉！不支持数字id转链！！`）。
+     - 当折淘客转链失败（包括 `不支持数字id转链` 或纯文本标题）时，**严禁**提取文案关键词去调用 `taobao.tbk.dg.material.optional.upgrade` 模糊搜索顶替商品，必须直接向用户返回明确错误提示，宁可失败也绝不转出错误商品。
 
 七、 商品唯一标识 (`product_id` / `goods_id`) 与动态调用令牌 (`goods_sign`) 职责解耦及防 `50001` 报错铁律
   1. **静态主键 vs 动态签名**：
@@ -106,6 +106,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
@@ -173,6 +174,7 @@ TOP_GATEWAY_URL = "https://eco.taobao.com/router/rest"
 # ✅ 实证可用域名为 https://v2.api.haodanku.com/sales_list (❌ http://v2.haodanku.com/sales_list DNS 无法解析)
 HDK_SALES_URL = "https://v2.api.haodanku.com/sales_list"
 ZTK_CONVERT_TKL_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl.ashx"
+ZTK_CONVERT_TKL_PILIANG_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl_piliang.ashx"
 ZTK_CONVERT_IID_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian.ashx"
 ZTK_PUBLISHER_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_publisher_get.ashx"
 ZTK_INVITECODE_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_invitecode_get.ashx"
@@ -196,9 +198,9 @@ def _should_failover_ztk_key(payload: Any) -> bool:
     code_val = payload.get("code")
     if status_val in (200, "200") or code_val in (200, "200"):
         return False
-    # 确定性业务错误（relationId无效、不支持数字id转链、口令格式错误等），换 Key 结果相同且备用 Key 可能未绑 sid 报 sid不匹配，禁止切 Key
+    # 确定性业务错误（relationId无效、不支持数字id转链、口令格式错误、商品ID解析错误等），换 Key 结果相同且备用 Key 可能未绑 sid 报 sid不匹配，禁止切 Key
     msg = " ".join(str(payload.get(k) or "") for k in ("content", "msg", "message", "sub_msg")).lower()
-    if any(b in msg for b in ("relationid", "无效的relation", "不支持数字id", "error tkl", "参数错误")):
+    if any(b in msg for b in ("relationid", "无效的relation", "不支持数字id", "error tkl", "商品id解析错误", "参数错误")):
         return False
     return any(kw in msg for kw in _ZTK_KEY_FAILURE_KEYWORDS) or status_val not in (None, 200, "200")
 
@@ -583,6 +585,8 @@ def convert_channel_url_by_ztk(target_url_or_id: str, relation_id: Optional[str]
       ❌ 若只传 1 段 adzone_id (如 "116341500041") 必定报错 `301: 很抱歉！转链失败！`。
     - ✅ 基准规范 2: `open_gaoyongzhuanlian_tkl.ashx` 接收参数名为 `tkl` (传入 uland/item/m.tb.cn 链接或淘口令)，
       ❌ 若误传 `num_iid` 必定报错 `1000: error tkl`。
+    - ✅ 基准规范 3: 当输入为夹带 `uland.taobao.com` / `item.taobao.com` 的长促销文案导致 `tkl.ashx` 返回 `商品ID解析错误`
+      或 `error tkl` 时，直接将原文透传给折淘客文案接口 `open_gaoyongzhuanlian_tkl_piliang.ashx` (`signurl=5`) 原生解析。
     """
     if not ZTK_SID or not ZTK_APPKEY_LIST:
         return {"status": "error", "error_msg": "折淘客 SID 或 AppKey 未配置"}
@@ -609,8 +613,46 @@ def convert_channel_url_by_ztk(target_url_or_id: str, relation_id: Optional[str]
     if failover_res["status"] != "success" and not res_data:
         return failover_res
 
+    item_info: Optional[Dict[str, Any]] = None
     if res_data.get("status") == 200 and isinstance(res_data.get("content"), list) and res_data["content"]:
         item_info = res_data["content"][0]
+
+    err_text = str(res_data.get("content") or res_data.get("msg") or failover_res.get("error_msg") or "")
+    is_unauth = "relationid" in err_text.lower() or "无效的relation" in err_text.lower()
+    is_num_id = "不支持数字id" in err_text.lower()
+
+    if item_info is None and not is_unauth and not is_num_id and (
+        "商品id解析错误" in err_text.lower() or "error tkl" in err_text.lower()
+    ):
+        if "tb.cn" in tkl_input.lower():
+            time.sleep(0.8)
+            retry_res = request_ztk_with_failover(ZTK_CONVERT_TKL_URL, req_params)
+            r_data = retry_res.get("data") if isinstance(retry_res.get("data"), dict) else {}
+            if r_data.get("status") == 200 and isinstance(r_data.get("content"), list) and r_data["content"]:
+                item_info = r_data["content"][0]
+
+        if item_info is None:
+            piliang_res = request_ztk_with_failover(ZTK_CONVERT_TKL_PILIANG_URL, {
+                "sid": ZTK_SID,
+                "pid": TB_CHANNEL_PID,
+                "tkl": tkl_input,
+                "signurl": 5,
+            })
+            p_data = piliang_res.get("data") if isinstance(piliang_res.get("data"), dict) else {}
+            p_tao_id = str(p_data.get("tao_id") or "").strip()
+            if p_data.get("status") == 200 and p_tao_id:
+                if relation_id:
+                    return convert_channel_url_by_ztk(
+                        f"https://uland.taobao.com/item/edetail?id={p_tao_id}",
+                        relation_id=relation_id,
+                    )
+                item_info = dict(p_data)
+                item_info.setdefault("pict_url", item_info.get("pic") or "")
+                item_info.setdefault("tkl", item_info.get("result_tkl") or "")
+                item_info.setdefault("coupon_click_url", item_info.get("result_url") or "")
+                item_info.setdefault("item_url", f"https://uland.taobao.com/item/edetail?id={p_tao_id}")
+
+    if isinstance(item_info, dict):
         final_link = _fix_url(item_info.get("coupon_click_url") or item_info.get("item_url", ""))
         return {
             "status": "success",
@@ -626,9 +668,6 @@ def convert_channel_url_by_ztk(target_url_or_id: str, relation_id: Optional[str]
             "raw_item": item_info,
         }
 
-    err_text = str(res_data.get("content") or res_data.get("msg") or failover_res.get("error_msg") or "")
-    is_unauth = "relationid" in err_text.lower() or "无效的relation" in err_text.lower()
-    is_num_id = "不支持数字id" in err_text.lower()
     return {
         "status": "error",
         "error_code": "AUTH_REQUIRED" if is_unauth else ("UNSUPPORTED_TB_NUMERIC_ID" if is_num_id else "UPSTREAM_ERROR"),
@@ -908,32 +947,15 @@ def fetch_increment_orders_strictly(
 
 
 # ==============================================================================
-# 核心功能 7：万能转链与口令解析反查 (支持淘口令 / m.tb.cn / e.tb.cn / s.click / uland / 商品ID)
+# 核心功能 7：万能转链与口令解析反查 (直接原样透传折淘客，零模糊搜索兜底)
 # ==============================================================================
-def _extract_tb_candidate_title(text: str) -> str:
-    """从手淘分享文案或纯标题中提取用于 TOP 检索的商品标题（不含 URL/口令/引导语）"""
-    bracket_match = re.search(r"「([^」]{4,})」", text)
-    if bracket_match:
-        return bracket_match.group(1).strip()
-    cleaned = re.sub(r"https?://\S+", " ", text)
-    cleaned = re.sub(r"[￥¥$€₴£¢()（）/][A-Za-z0-9]{6,20}[￥¥$€₴£¢()（）/]", " ", cleaned)
-    cleaned = re.sub(r"\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{2,6}\b", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"【(?:淘宝|天猫|好物推荐|手淘分享)[^】]*】", " ", cleaned)
-    cleaned = re.sub(r"\d+\s*[\$￥¥!！:/]+\s*", " ", cleaned)
-    cleaned = re.sub(r"(?:点击链接直接打开|手机淘宝|淘宝App|复制本段|打开手淘)", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，。！？、,!?:：-")
-    if len(cleaned) >= 4 and not re.match(r"^[A-Za-z0-9_-]+$", cleaned):
-        return cleaned
-    return ""
-
-
 def convert_and_resolve_universal_input(
     raw_text: str,
     relation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    淘宝万能转链与详情一步反查基线函数（第一性原理：折淘客 signurl=5 一步主轨 + 官方 TOP 标题搜加密 ID 兜底）：
-    支持全部 11 种真实输入格式：
+    淘宝万能转链与详情一步反查基线函数（第一性原理：直接原样透传折淘客，严禁使用标题模糊搜索兜底顶替商品）：
+    支持全部 11 种真实推广输入格式：
     1. 裸加密商品 ID (item_id / goods_sign)
     2. 官方手淘落地页：https://uland.taobao.com/item/edetail?id=...
     3. 加密 ID 淘宝直链：https://item.taobao.com/item.htm?id=...
@@ -944,57 +966,33 @@ def convert_and_resolve_universal_input(
     8. 官方 tpwd.create 完整口令文案 (model，含 https://m.tb.cn/h.xxx)
     9. 裸官方手淘短链：https://m.tb.cn/h.xxx
     10. 本平台自生成多行推广文案 (command_text)
-    11. 普通手淘商品分享文案（如 `【淘宝】https://e.tb.cn/h.xxx 「商品标题」` 或含数字 ID 直链 + `「商品标题」`）
+    11. 社群混排长促销文案（如 `★天猫双11★...[下单链接：https://uland.TaoBao.com/item/edetail?id=...]返红包...`）
     """
     text = str(raw_text or "").strip()
     if not text:
         return {"status": "error", "error_msg": "输入内容不能为空"}
 
-    if any(k in text for k in ("m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn")):
+    lower_text = text.lower()
+    if any(k in lower_text for k in ("m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn")):
         input_type = "tb_share_short_url_or_tkl"
-    elif "s.click.taobao.com" in text or "uland.taobao.com" in text:
+    elif "s.click.taobao.com" in lower_text or "uland.taobao.com" in lower_text:
         input_type = "tbk_promotion_url"
-    elif "item.taobao.com" in text or "detail.tmall.com" in text:
+    elif "item.taobao.com" in lower_text or "detail.tmall.com" in lower_text:
         input_type = "tb_item_url"
     elif re.search(r"[￥¥$€₴£¢()（）][A-Za-z0-9]{6,}[￥¥$€₴£¢()（）]", text):
         input_type = "tkl_command"
     else:
         input_type = "item_id_or_text"
 
-    # 若是纯数字裸 ID 或无标题的纯数字 item.taobao.com 链接，提前识别
-    is_bare_numeric = text.isdigit() or bool(
-        re.search(r"(?:item\.taobao\.com|detail\.tmall\.com)/item\.htm\?[^#\s]*id=\d+\b", text)
-        and not _extract_tb_candidate_title(text)
-    )
-    if is_bare_numeric:
-        return {
-            "status": "error",
-            "input_type": input_type,
-            "error_code": "UNSUPPORTED_TB_NUMERIC_ID",
-            "error_msg": "淘宝联盟已停用纯数字商品ID直接转链，请粘贴手淘App分享的完整文案（含「商品标题」或淘口令）或推广链接",
-        }
-
-    # 主路径：直接交由折淘客 open_gaoyongzhuanlian_tkl.ashx (signurl=5) 一步解析+转链
+    # 直接原样透传给折淘客 (tkl.ashx + piliang.ashx)，不做任何前置数字ID拦截或标题模糊搜索兜底
     conv_res = convert_channel_url_by_ztk(text, relation_id=relation_id)
-
-    # 兜底路径：当输入为普通手淘分享（e.tb.cn 解包为数字 ID 报 301 不支持数字id转链）或纯标题文案时，提取标题调官方 TOP 搜索拿加密 goods_sign 再转链
-    if conv_res["status"] != "success" and not conv_res.get("need_auth"):
-        candidate_title = _extract_tb_candidate_title(text)
-        if candidate_title:
-            search_res = search_tb_goods(candidate_title, page_no=1, page_size=5)
-            if search_res["status"] == "success" and search_res.get("data"):
-                first_hit = search_res["data"][0]
-                enc_sign = first_hit.get("goods_sign") or first_hit.get("goods_id")
-                if enc_sign:
-                    input_type = "title_search_fallback"
-                    conv_res = convert_channel_url_by_ztk(str(enc_sign), relation_id=relation_id)
 
     if conv_res["status"] != "success":
         err_code = conv_res.get("error_code")
         err_msg = conv_res.get("error_msg", "淘宝万能转链解析失败")
         if err_code == "UNSUPPORTED_TB_NUMERIC_ID" or "不支持数字id" in str(err_msg):
             err_code = "UNSUPPORTED_TB_NUMERIC_ID"
-            err_msg = "淘宝联盟已停用纯数字商品ID直接转链，请粘贴手淘App分享的完整文案（含「商品标题」或淘口令）或推广链接"
+            err_msg = "淘宝联盟已停用纯数字商品ID直接转链，请粘贴淘口令或带推广属性的链接"
         return {
             "status": "error",
             "input_type": input_type,
@@ -1005,6 +1003,7 @@ def convert_and_resolve_universal_input(
 
     raw_item = conv_res.get("raw_item") or {}
     tao_id = str(raw_item.get("tao_id") or "")
+    canonical_id = extract_tb_canonical_goods_id(tao_id) or tao_id
     title = str(raw_item.get("title") or conv_res.get("title") or "淘宝精选商品")
     pict_url = _fix_url(raw_item.get("pict_url") or "")
     small_images_raw = raw_item.get("small_images") or ""
@@ -1041,7 +1040,7 @@ def convert_and_resolve_universal_input(
     item_url = _fix_url(raw_item.get("item_url") or (f"https://uland.taobao.com/item/edetail?id={tao_id}" if tao_id else ""))
     product_card = {
         "platform": "taobao",
-        "goods_id": tao_id,
+        "goods_id": canonical_id,
         "goods_sign": tao_id,
         "title": title,
         "name": title,
@@ -1159,8 +1158,8 @@ def main():
     ord_res = fetch_increment_orders_strictly(start_str, end_str)
     print(f" -> 订单查询结果: status={ord_res['status']}, 数量={len(ord_res.get('order_list', []))}")
 
-    # 7. 验证万能转链与口令解析反查全矩阵 (11 种真实格式自生自测 + 纯数字无标题拦截验证)
-    print("\n[7/7] 验证淘宝万能转链与口令解析反查全矩阵 (11 种真实格式自生自测)...")
+    # 7. 验证万能转链与口令解析反查全矩阵 (11 种真实格式自生自测 + 纯数字直链拦截验证)
+    print("\n[7/7] 验证淘宝万能转链与口令解析反查全矩阵 (11 种真实格式原样透传折淘客)...")
     if sample_id and ztk_std_res.get("status") == "success":
         ztk_tkl = ztk_std_res.get("tpwd") or ""
         ztk_s_click = ztk_std_res.get("short_url") or ""
@@ -1170,7 +1169,11 @@ def main():
         m_tb_match = re.search(r"https?://m\.tb\.cn/\S+", top_model)
         bare_m_tb = m_tb_match.group(0) if m_tb_match else ztk_s_tb
         platform_cmd = f"【好物推荐】{sample_title}\n👉 复制整段口令打开手机淘宝：{ztk_tkl}\n🔗 抢购链接：{ztk_s_click}"
-        normal_app_share = f"【淘宝】https://item.taobao.com/item.htm?id=654321098765 CZ0001 「{sample_title}」\n点击链接直接打开"
+        mixed_uland_copy = (
+            "★天猫双11狂欢节 官方立减85折起★两大瓶值31.8亓！伊利金典鲜牛奶组合售价：34元"
+            "[下单链接：https://uland.TaoBao.com/item/edetail?id=ZBv39R9SnhPDy0vQa9hN8sVtz-PpYd2QbhO7ZkXxOnIn]"
+            "返2亓红包[红包] 下单赠送张凌赫周边！ 伊利鲜奶旗舰店•金典鲜牛奶组合10瓶 有值钱货！"
+        )
 
         tb_cases = [
             ("7a. 裸加密 item_id", sample_id),
@@ -1183,7 +1186,7 @@ def main():
             ("7h. 官方 tpwd.create 完整口令文案 (含 m.tb.cn)", top_model),
             ("7i. 官方手淘短链 (裸 m.tb.cn)", bare_m_tb),
             ("7j. 平台自生成多行推广文案", platform_cmd),
-            ("7k. 普通手淘商品分享文案 (含「商品标题」兜底)", normal_app_share),
+            ("7k. 社群混排长文案夹带 uland.TaoBao.com 链接 (piliang 原样透传)", mixed_uland_copy),
         ]
         for label, text_input in tb_cases:
             u_res = convert_and_resolve_universal_input(text_input, relation_id=None)
@@ -1196,7 +1199,7 @@ def main():
 
         u_bad = convert_and_resolve_universal_input("https://item.taobao.com/item.htm?id=654321098765", relation_id=None)
         print(
-            f" -> [7l. 纯数字无标题直链拦截验证] status={u_bad['status']} | code={u_bad.get('error_code')} "
+            f" -> [7l. 纯数字直链拦截验证 (零兜底)] status={u_bad['status']} | code={u_bad.get('error_code')} "
             f"| msg={u_bad.get('error_msg', '')[:38]}..."
         )
 

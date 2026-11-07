@@ -420,20 +420,14 @@ class TaobaoAdapter(BasePlatformAdapter):
         result["cacheable"] = bool(expires)
         return result
 
-    @staticmethod
-    def _extract_candidate_title(text: str) -> str:
-        kw = extract_search_keyword(text, max_length=80)
-        if len(kw) >= 4 and not re.match(r"^[A-Za-z0-9_-]+$", kw):
-            return kw
-        return ""
-
     def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):
         """
-        淘宝万能转链与详情一步反查（对齐 scripts/test_tb_api.py 基准规范 六）：
+        淘宝万能转链与详情一步反查（对齐 scripts/test_tb_api.py 基准规范 六：直接原样透传折淘客，零模糊搜索兜底）：
         1. 主路径：基于折淘客 `open_gaoyongzhuanlian_tkl.ashx` (`signurl=5`) + 4段式 `channel_pid`，
            单次 HTTP 请求同时完成口令/短链/推广链/加密 ID 转链与完整商品详情提取；
-        2. 兜底路径：当用户粘贴普通手淘商品分享（`e.tb.cn` 解包为纯数字 ID 触发 `不支持数字id转链`）或纯商品标题文案时，
-           自动提取 `「商品标题」` 调用官方 TOP `search_goods` 获取加密 `goods_sign`，再交由折淘客一步转链。
+        2. 文案透传：当输入为夹带 `uland.taobao.com` / `item.taobao.com` 的长促销文案时，由 `ZtkClient.convert_channel_url`
+           自动透传给折淘客文案接口 `open_gaoyongzhuanlian_tkl_piliang.ashx` 原生解析；
+        3. 严禁在转链失败时提取文本标题调用 `search_goods` 模糊搜索取首条商品顶替。
         """
         if not self.active:
             return _error("platform_unavailable", "淘宝暂未启用")
@@ -448,22 +442,11 @@ class TaobaoAdapter(BasePlatformAdapter):
         if uid and identity.get("external_id") is not None and _text(identity["external_id"]) != _text(uid):
             return _error("IDENTITY_MISMATCH", "淘宝推广身份与站内用户不一致", need_auth=True, is_fallback=False)
 
-        candidate_title = self._extract_candidate_title(text)
         if "alimama.com" in text.lower() and not re.search(r"[?&](?:itemId|id|item_id)=[A-Za-z0-9_-]{8,}", text):
             return _error(
                 "UNSUPPORTED_TB_PORTAL_PAGE",
                 "该链接为阿里妈妈选品库/频道列表页而非具体单品链接，请复制单品的推广链接、淘口令或手淘商品分享文案",
             )
-        is_bare_numeric = text.isdigit() or bool(
-            re.search(r"(?:item\.taobao\.com|detail\.tmall\.com)/item\.htm\?[^#\s]*id=\d+\b", text)
-            and not candidate_title
-        )
-        if is_bare_numeric:
-            return _error(
-                "UNSUPPORTED_TB_NUMERIC_ID",
-                "淘宝联盟已停用纯数字商品ID直接转链，请粘贴手淘App分享的完整文案（含「商品标题」或淘口令）或推广链接",
-            )
-
         is_bare_id = bool(re.match(r"^[A-Za-z0-9_-]{8,}$", text)) and not text.startswith(("http://", "https://"))
         tkl_input = f"https://uland.taobao.com/item/edetail?id={text}" if is_bare_id else text
 
@@ -485,19 +468,6 @@ class TaobaoAdapter(BasePlatformAdapter):
             self.channel_pid,
             allow_public=True,
         )
-        if (not isinstance(ztk_res, dict) or ztk_res.get("status") != "success") and not self._is_unauthorized_error(ztk_res):
-            if candidate_title and self.official:
-                search_res = self.official.search_goods(candidate_title, page=1, page_size=5)
-                if isinstance(search_res, dict) and search_res.get("status") == "success" and search_res.get("data"):
-                    first_hit = search_res["data"][0]
-                    enc_sign = _text(first_hit.get("goods_sign") or first_hit.get("goods_id"))
-                    if enc_sign:
-                        ztk_res = self.ztk.convert_channel_url(
-                            f"https://uland.taobao.com/item/edetail?id={enc_sign}",
-                            rel_arg,
-                            self.channel_pid,
-                            allow_public=True,
-                        )
 
         if not isinstance(ztk_res, dict) or ztk_res.get("status") != "success":
             err = ztk_res.get("error_msg") if isinstance(ztk_res, dict) else "淘宝口令或链接解析转链失败"
@@ -505,7 +475,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             code = "AUTH_REQUIRED" if is_unauth else (ztk_res.get("error_code") if isinstance(ztk_res, dict) else "PROMOTION_FAILED")
             if code == "UNSUPPORTED_TB_NUMERIC_ID" or "不支持数字id" in _text(err):
                 code = "UNSUPPORTED_TB_NUMERIC_ID"
-                err = "淘宝联盟已停用纯数字商品ID直接转链，请粘贴手淘App分享的完整文案（含「商品标题」或淘口令）或推广链接"
+                err = "淘宝联盟已停用纯数字商品ID直接转链，请粘贴淘口令或带推广属性的链接"
             return _error(code or "PROMOTION_FAILED", err, need_auth=is_unauth)
 
         link = ztk_res.get("final_link") or ztk_res.get("url") or ""
