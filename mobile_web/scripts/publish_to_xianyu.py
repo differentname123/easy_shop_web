@@ -86,6 +86,13 @@ _OFFLINE_RET_KEYWORDS: Tuple[str, ...] = (
     "未登录",
 )
 
+_RISK_BLOCK_RET_KEYWORDS: Tuple[str, ...] = (
+    "RGV587_ERROR",
+    "FAIL_SYS_USER_VALIDATE",
+    "被挤爆啦",
+    "滑动验证",
+)
+
 
 def _dir_tag(user_data_dir: str) -> str:
     """提取浏览器目录简短标识用于日志展示（如 `xianyu_myself`）。"""
@@ -94,15 +101,16 @@ def _dir_tag(user_data_dir: str) -> str:
 
 
 # ==============================================================================
-# 一、 底层异常定义、跨进程/跨线程串行排队锁、掉线精准检测
+# 一、 底层异常定义、跨进程/跨线程串行排队锁、掉线与风控滑块精准检测
 # ==============================================================================
 class XianyuOfflineError(RuntimeError):
-    """闲鱼账号未登录或会话已过期（掉线）专用异常。"""
+    """闲鱼账号未登录/掉线 或 触发风控滑块验证 专用中断异常。"""
 
-    def __init__(self, user_data_dir: str, reason: str):
+    def __init__(self, user_data_dir: str, reason: str, error_code: str = "ACCOUNT_OFFLINE"):
         self.user_data_dir = user_data_dir
         self.reason = reason
-        super().__init__(f"闲鱼账号掉线/未登录 [{user_data_dir}]: {reason}")
+        self.error_code = error_code
+        super().__init__(f"闲鱼账号异常中断({error_code}) [{user_data_dir}]: {reason}")
 
 
 class XianyuLockTimeoutError(TimeoutError):
@@ -114,16 +122,23 @@ class XianyuLockTimeoutError(TimeoutError):
         super().__init__(f"等待闲鱼浏览器串行锁超时 (>{timeout_sec}s) [{user_data_dir}]")
 
 
-def _build_offline_result(user_data_dir: str, reason: str, action: str = "") -> Dict[str, Any]:
-    """统一构造掉线返回结构，方便上层调用方通过 `res['is_offline']` 立即感知并停止重试。"""
+def _build_offline_result(
+    user_data_dir: str,
+    reason: str,
+    action: str = "",
+    error_code: str = "ACCOUNT_OFFLINE",
+) -> Dict[str, Any]:
+    """统一构造掉线或风控滑块中断返回结构，方便上层通过 `res['is_offline']` 立即停止重试。"""
+    is_risk = error_code == "RISK_CONTROL_BLOCKED"
     res: Dict[str, Any] = {
         "ok": False,
         "is_offline": True,
-        "error_code": "ACCOUNT_OFFLINE",
+        "is_risk_blocked": is_risk,
+        "error_code": error_code,
         "user_data_dir": user_data_dir,
         "message": (
-            f"闲鱼账号处于未登录或掉线状态 ({reason})，"
-            f"请先调用 open_browser_for_manual_use(r'{user_data_dir}') 扫码恢复登录"
+            f"闲鱼账号{'触发风控滑块验证' if is_risk else '处于未登录或掉线状态'} ({reason})，"
+            f"请暂停自动重试并调用 open_browser_for_manual_use(r'{user_data_dir}') 人工处理"
         ),
     }
     if action:
@@ -298,16 +313,18 @@ def launch_persistent_context(
 
 def _attach_auth_tracker(page) -> Dict[str, Any]:
     """
-    在页面上挂载 MTOP 登录态与异常监听器，实时捕获：
+    在页面上挂载 MTOP 登录态与风控监听器，实时捕获：
     - `user_id`      : `mtop.taobao.idlemessage.pc.loginuser.get` 返回的 userId
     - `display_name` : `mtop.idle.web.user.page.nav` 返回的昵称
     - `expired_rets` : 关键接口返回的掉线/未登录错误码列表
+    - `risk_rets`    : 触发阿里滑块/验证码限流（如 `RGV587_ERROR`）的接口列表
     - `failed_apis`  : 任意 MTOP 接口返回的非 SUCCESS 状态码（用于故障诊断日志）
     """
     tracker: Dict[str, Any] = {
         "user_id": "",
         "display_name": "",
         "expired_rets": [],
+        "risk_rets": [],
         "failed_apis": [],
     }
 
@@ -328,6 +345,13 @@ def _attach_auth_tracker(page) -> Dict[str, Any]:
 
         if ret_str and "SUCCESS" not in ret_str and "FAIL_SYS_TOKEN_EMPTY" not in ret_str:
             tracker["failed_apis"].append(f"{api_short}=[{ret_str}]")
+
+        for rkw in _RISK_BLOCK_RET_KEYWORDS:
+            if rkw in ret_str:
+                entry = f"{api_short} -> {ret_str}"
+                if entry not in tracker["risk_rets"]:
+                    tracker["risk_rets"].append(entry)
+                break
 
         if any(api in url for api in _AUTH_CRITICAL_APIS):
             for kw in _OFFLINE_RET_KEYWORDS:
@@ -357,12 +381,45 @@ def _verify_account_online(
     task_name: str = "",
 ) -> str:
     """
-    严格校验当前浏览器目录中的闲鱼账号是否处于在线登录状态：
-    1. 检查关键 MTOP 接口是否返回 `FAIL_SYS_SESSION_EXPIRED` 等掉线错误；
-    2. 检查页面是否弹出了 `passport.goofish.com/mini_login` 或 `login.taobao.com` 登录框 iframe；
-    3. 检查浏览器是否存在 `unb` 登录 Cookie。
-    一旦判定掉线，立即打印醒目告警日志并抛出 `XianyuOfflineError`（绝不死等扫码）。
+    严格校验当前浏览器目录中的闲鱼账号状态（掉线检测 + 滑块风控检测）：
+    1. 检查是否触发阿里滑块/验证码（`RGV587_ERROR` 或页面出现 `punish` / `.baxia-dialog` 滑块弹窗）；
+    2. 检查关键 MTOP 接口是否返回 `FAIL_SYS_SESSION_EXPIRED` 等掉线错误；
+    3. 检查页面是否弹出了 `passport.goofish.com/mini_login` 登录框或缺失 `unb` Cookie。
+    一旦发现异常，立即打印醒目告警日志并抛出 `XianyuOfflineError` 中止当前操作，绝不盲目重试。
     """
+    # 1. 优先检查是否触发滑块/风控验证
+    risk_reasons: List[str] = []
+    if auth_tracker.get("risk_rets"):
+        risk_reasons.append(f"接口返回风控滑块拦截({auth_tracker['risk_rets'][0]})")
+
+    punish_frames = [
+        f.url
+        for f in page.frames
+        if ("punish" in f.url or "baxia" in f.url or "sec.taobao.com" in f.url)
+        and "mini_login" not in f.url
+    ]
+    if punish_frames:
+        risk_reasons.append("页面已弹出阿里安全滑块验证框(baxia/punish)")
+
+    if risk_reasons:
+        reason_str = "；".join(risk_reasons)
+        logger.error(
+            f"\n{'!' * 76}\n"
+            f"🚨 [风控滑块告警] 检测到闲鱼触发安全验证/滑块限制，已立即中止操作以保护账号！\n"
+            f"   ├── 触发任务   : {task_name or '自动化任务'}\n"
+            f"   ├── 浏览器目录 : <{user_data_dir}>\n"
+            f"   ├── 当前页面   : {page.url}\n"
+            f"   ├── 风控证据   : {reason_str}\n"
+            f"   └── 恢复方式   : 请立即停止自动任务，调用 open_browser_for_manual_use(r\"{user_data_dir}\") 手动过滑块或休息后再试！\n"
+            f"{'!' * 76}"
+        )
+        raise XianyuOfflineError(
+            user_data_dir=user_data_dir,
+            reason=reason_str,
+            error_code="RISK_CONTROL_BLOCKED",
+        )
+
+    # 2. 检查是否账号掉线/未登录
     cookies = {c["name"]: c["value"] for c in context.cookies() if c.get("name") and c.get("value")}
     unb = str(cookies.get("unb") or auth_tracker.get("user_id") or "").strip()
 
@@ -394,7 +451,11 @@ def _verify_account_online(
             f"   └── 恢复方式   : 请暂停该账号的后续自动任务，调用 open_browser_for_manual_use(r\"{user_data_dir}\") 重新扫码登录！\n"
             f"{'!' * 76}"
         )
-        raise XianyuOfflineError(user_data_dir=user_data_dir, reason=reason_str)
+        raise XianyuOfflineError(
+            user_data_dir=user_data_dir,
+            reason=reason_str,
+            error_code="ACCOUNT_OFFLINE",
+        )
 
     return unb
 
@@ -548,7 +609,7 @@ def check_login_status(
                 "nick": nick,
             }
     except XianyuOfflineError as e:
-        return _build_offline_result(user_data_dir, e.reason, action="check_login_status")
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="check_login_status")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="check_login_status")
 
@@ -856,7 +917,7 @@ def get_selling_items(
             )
             return result
     except XianyuOfflineError as e:
-        return _build_offline_result(user_data_dir, e.reason, action="get_selling_items")
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="get_selling_items")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="get_selling_items")
 
@@ -1032,7 +1093,7 @@ def publish_item(
             )
             return result
     except XianyuOfflineError as e:
-        return _build_offline_result(user_data_dir, e.reason, action="publish")
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="publish")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="publish")
     finally:
@@ -1156,7 +1217,7 @@ def downshelf_item(
                 "ret": ret_str,
             }
     except XianyuOfflineError as e:
-        return _build_offline_result(user_data_dir, e.reason, action=action_name)
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action=action_name)
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action=action_name)
 
@@ -1585,7 +1646,7 @@ def get_messages(
             )
             return result
     except XianyuOfflineError as e:
-        return _build_offline_result(user_data_dir, e.reason, action="get_messages")
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="get_messages")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="get_messages")
 
@@ -1738,7 +1799,7 @@ def reply_message(
             )
             return result
     except XianyuOfflineError as e:
-        return _build_offline_result(user_data_dir, e.reason, action="reply_message")
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="reply_message")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="reply_message")
 
