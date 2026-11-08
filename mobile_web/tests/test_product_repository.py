@@ -883,6 +883,193 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(jd_docs[0]["goods_sign"], jd_search_sign)
         self.assertEqual(jd_docs[0]["activity_price"], 89.0)
 
+    def test_cost_performance_unit_normalization_and_frequency_grouping(self):
+        now = datetime.datetime(2026, 11, 8, 12, 0, 0)
+        # 质量类：2 个商品为“斤”，1 个商品为“kg” -> 同度量衡最多单位为“斤”（共 3 个商品归入“斤”组）
+        # P1: 2 斤 @ 10 元 -> 0.2 斤/元
+        # P2: 1 kg (= 2 斤) @ 5 元 -> 0.4 斤/元 (斤组第1)
+        # P3: 1 斤 @ 10 元 -> 0.1 斤/元 (斤组第3)
+        # 离散单位“包”：共 2 个商品（少于“斤”组的 3 个，排在“斤”组之后）
+        # P4: 10 包 @ 20 元 -> 0.5 包/元 (包组第2)
+        # P5: 30 包 @ 30 元 -> 1.0 包/元 (包组第1 -> P5 在 P4 前)
+        self.col.docs = [
+            {
+                "platform": "pdd", "product_id": "P1", "name": "苹果2斤", "activity_price": 10.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=5),
+                "format_status": "success",
+                "format_info": {
+                    "price": 10.0,
+                    "pricing_basis": {
+                        "base_unit": "斤", "total_value": 2,
+                        "structure": [{"unit": "斤", "value": 2}],
+                    },
+                },
+            },
+            {
+                "platform": "pdd", "product_id": "P2", "name": "苹果1kg", "activity_price": 5.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=4),
+                "format_status": "success",
+                "format_info": {
+                    "price": 5.0,
+                    "pricing_basis": {
+                        "base_unit": "kg", "total_value": 1,
+                        "structure": [{"unit": "kg", "value": 1}],
+                    },
+                },
+            },
+            {
+                "platform": "pdd", "product_id": "P3", "name": "苹果1斤", "activity_price": 10.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=3),
+                "format_status": "success",
+                "format_info": {
+                    "price": 10.0,
+                    "pricing_basis": {
+                        "base_unit": "斤", "total_value": 1,
+                        "structure": [{"unit": "斤", "value": 1}],
+                    },
+                },
+            },
+            {
+                "platform": "pdd", "product_id": "P4", "name": "抽纸10包", "activity_price": 20.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=2),
+                "format_status": "success",
+                "format_info": {
+                    "price": 20.0,
+                    "pricing_basis": {
+                        "base_unit": "包", "total_value": 10,
+                        "structure": [{"unit": "包", "value": 10}],
+                    },
+                },
+            },
+            {
+                "platform": "pdd", "product_id": "P5", "name": "抽纸30包", "activity_price": 30.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=1),
+                "format_status": "success",
+                "format_info": {
+                    "price": 30.0,
+                    "pricing_basis": {
+                        "base_unit": "包", "total_value": 30,
+                        "structure": [{"unit": "箱", "value": 2}, {"unit": "包", "value": 15}],
+                    },
+                },
+            },
+        ]
+        ranked = self.repo.rank_boom_products_by_cost_performance(platform="pdd")
+        self.assertEqual([item["product_id"] for item in ranked], ["P2", "P1", "P3", "P5", "P4"])
+        for item in ranked:
+            self.assertNotIn("format_info", item)
+            self.assertNotIn("format_status", item)
+            self.assertNotIn("cost_performance_score", item)
+
+    def test_cost_performance_multi_sku_selects_highest_score_valid_sku_and_places_unformatted_last(self):
+        now = datetime.datetime(2026, 11, 8, 12, 0, 0)
+        self.col.docs = [
+            # 未完成 format_info 清洗的商品（新）
+            {
+                "platform": "pdd", "product_id": "UNFORMATTED_NEW", "name": "未清洗新商品",
+                "activity_price": 9.9, "channel_type": 5, "updated_at": now,
+            },
+            # 未完成 format_info 清洗的商品（旧）
+            {
+                "platform": "pdd", "product_id": "UNFORMATTED_OLD", "name": "未清洗旧商品",
+                "activity_price": 8.8, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=10),
+                "format_status": "failed",
+                "format_info": {
+                    "price": 8.8,
+                    "pricing_basis": {"base_unit": "g", "total_value": 500, "structure": [{"unit": "g", "value": 500}]},
+                },
+            },
+            # 单 SKU 商品：500g @ 50元 -> 10 g/元
+            {
+                "platform": "pdd", "product_id": "SINGLE_SKU", "name": "单规格500g",
+                "activity_price": 50.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=2),
+                "format_status": "success",
+                "format_info": {
+                    "price": 50.0,
+                    "pricing_basis": {"base_unit": "g", "total_value": 500, "structure": [{"unit": "g", "value": 500}]},
+                },
+            },
+            # 多 SKU 商品：
+            # - 脏规格：price(10) < activity_price(20)，即使性价比极高也必须过滤
+            # - 低性价比合法规格：100g @ 20元 -> 5 g/元
+            # - 高性价比合法规格：500g * 2袋 @ 50元 -> 20 g/元（应作为该商品代表主规格）
+            {
+                "platform": "pdd", "product_id": "MULTI_SKU", "name": "多规格商品",
+                "activity_price": 20.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=5),
+                "format_status": "success",
+                "sku_info": [
+                    {"sku": "引流脏规格", "price": 10.0},
+                    {"sku": "小包装", "price": 20.0},
+                    {"sku": "家庭大包装", "price": 50.0},
+                ],
+                "format_info": {
+                    "MULTI_SKU_1": {
+                        "price": 10.0,
+                        "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                    },
+                    "MULTI_SKU_2": {
+                        "price": 20.0,
+                        "pricing_basis": {"base_unit": "g", "total_value": 100, "structure": [{"unit": "g", "value": 100}]},
+                    },
+                    "MULTI_SKU_3": {
+                        "price": 50.0,
+                        "pricing_basis": {
+                            "base_unit": "g", "total_value": 1000,
+                            "structure": [{"unit": "袋", "value": 2}, {"unit": "g", "value": 500}],
+                        },
+                    },
+                },
+            },
+        ]
+        ranked = self.repo.rank_boom_products_by_cost_performance(platform="pdd")
+        # MULTI_SKU (20 g/元) > SINGLE_SKU (10 g/元) > UNFORMATTED_NEW > UNFORMATTED_OLD
+        self.assertEqual(
+            [item["product_id"] for item in ranked],
+            ["MULTI_SKU", "SINGLE_SKU", "UNFORMATTED_NEW", "UNFORMATTED_OLD"],
+        )
+
+    def test_service_get_boom_products_uses_cache_and_paginates_cost_performance(self):
+        from cache import BOOM_SORT_CACHE, clear_all_caches, evict_product_from_caches
+        from services.product_service import ProductService
+
+        clear_all_caches()
+        now = datetime.datetime(2026, 11, 8, 12, 0, 0)
+        self.col.docs = [
+            {
+                "platform": "pdd", "product_id": f"P{i}", "name": f"商品{i}",
+                "activity_price": 10.0, "channel_type": 5,
+                "updated_at": now - datetime.timedelta(minutes=i),
+                "format_status": "success",
+                "format_info": {
+                    "price": 10.0,
+                    "pricing_basis": {"base_unit": "g", "total_value": 100 * i, "structure": [{"unit": "g", "value": 100 * i}]},
+                },
+            }
+            for i in range(1, 4)
+        ]
+        service = ProductService(product_repo=self.repo)
+        queries_before = len(self.col.queries)
+        page1 = service.get_boom_products(platform="pdd", page=1, page_size=2)
+        self.assertEqual([item["product_id"] for item in page1["data"]], ["P3", "P2"])
+        self.assertTrue(page1["has_more"])
+        self.assertEqual(page1["total_count"], 3)
+        self.assertEqual(len(self.col.queries), queries_before + 1)
+
+        # 第二页直接命中 BOOM_SORT_CACHE，不再查询数据库
+        page2 = service.get_boom_products(platform="pdd", page=2, page_size=2)
+        self.assertEqual([item["product_id"] for item in page2["data"]], ["P1"])
+        self.assertFalse(page2["has_more"])
+        self.assertEqual(page2["total_count"], 3)
+        self.assertEqual(len(self.col.queries), queries_before + 1)
+
+        # 淘汰单个商品时同步从 BOOM_SORT_CACHE 中剔除该商品且不触发重新查库
+        evict_product_from_caches("pdd", goods_id="P1")
+        after_evict = service.get_boom_products(platform="pdd", page=1, page_size=10)
+        self.assertEqual([item["product_id"] for item in after_evict["data"]], ["P3", "P2"])
+        self.assertEqual(len(self.col.queries), queries_before + 1)
+
+
 
 if __name__ == "__main__":
     unittest.main()
+

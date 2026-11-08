@@ -22,8 +22,8 @@ from models.product import (
 )
 from repositories.product_repo import ProductRepository
 from cache import (
-    RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, MATERIAL_CACHE,
-    SIGN_BY_ID_CACHE, evict_product_from_caches, is_product_off_promotion,
+    RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
+    MATERIAL_CACHE, SIGN_BY_ID_CACHE, evict_product_from_caches, is_product_off_promotion,
 )
 from config import PRODUCT_DETAIL_TTL, logger
 
@@ -31,6 +31,7 @@ _RECOMMEND_CACHE = RECOMMEND_CACHE
 _DETAIL_CACHE = DETAIL_CACHE
 _SEARCH_CACHE = SEARCH_CACHE
 _CATEGORY_CACHE = CATEGORY_CACHE
+_BOOM_SORT_CACHE = BOOM_SORT_CACHE
 _DETAIL_CACHE_LOCK = threading.RLock()
 
 
@@ -581,9 +582,50 @@ class ProductService:
             return DetailPrefetchResult("persist_failed", loaded.snapshot, retryable=True)
         return DetailPrefetchResult("error", loaded.snapshot, retryable=loaded.retryable)
 
-    def get_boom_products(self, platform="all", category=None, keyword=None, sort_by="latest",
+    def get_boom_products(self, platform="all", category=None, keyword=None, sort_by="cost_performance",
                           page=1, page_size=20) -> Dict[str, Any]:
-        result = self.repo.query_boom_products(platform=normalize_platform(platform, "all"), category=category,
+        plat = normalize_platform(platform, "all")
+        page = max(1, min(50, int(page or 1)))
+        page_size = max(1, min(50, int(page_size or 20)))
+        if sort_by == "cost_performance" and hasattr(self.repo, "rank_boom_products_by_cost_performance"):
+            cat_key = category.strip() if category and category.strip() and category.strip() != "全部" else ""
+            raw_kw = keyword.strip() if keyword and keyword.strip() else ""
+            kw_key = (extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]) if raw_kw else ""
+            cache_key = (plat, cat_key, kw_key, sort_by)
+            sorted_items = BOOM_SORT_CACHE.get(cache_key)
+            if sorted_items is None:
+                try:
+                    sorted_items = self.repo.rank_boom_products_by_cost_performance(
+                        platform=plat, category=category, keyword=keyword,
+                    )
+                    BOOM_SORT_CACHE.set(cache_key, sorted_items)
+                except Exception as exc:
+                    logger.error(
+                        "❌ 【爆品库查询失败】按性价比查询本地爆单商品列表时发生异常 | 平台[%s] 分类[%s] 关键词[%s] 排序[%s] 页码[%d] 异常<%s>",
+                        plat, category or "全部", keyword or "-", sort_by, page, format_exc_summary(exc),
+                    )
+                    return {
+                        "status": "error",
+                        "error_msg": str(exc),
+                        "total_count": 0,
+                        "page": page,
+                        "page_size": page_size,
+                        "has_more": False,
+                        "data": [],
+                    }
+            skip = (page - 1) * page_size
+            page_items = deepcopy(sorted_items[skip : skip + page_size])
+            self._offer_products(page_items)
+            return {
+                "status": "success",
+                "total_count": len(page_items) if kw_key else len(sorted_items),
+                "page": page,
+                "page_size": page_size,
+                "has_more": (skip + page_size) < len(sorted_items),
+                "data": page_items,
+            }
+
+        result = self.repo.query_boom_products(platform=plat, category=category,
                                               keyword=keyword, sort_by=sort_by, page=page, page_size=page_size)
         if result.get("status") == "success":
             self._offer_products(result.get("data") or [])

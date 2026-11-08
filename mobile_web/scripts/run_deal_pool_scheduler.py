@@ -1,56 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-好价线报与采集群定时拉取 (`deal_raw_tips`) + 唯一商品清洗入库 (`products`) 一体化守护脚本
-================================================================================================
-零、【核心工程思想与演进铁律（⚠️ 后续所有开发人员与 AI 迭代优化必须严格遵循，严禁违背）】
-  1. 极简基线先行（Baseline First，如无必要勿增实体）：
-     - 越简单越可靠。系统首要目标是建立一个【最简单、最稳定、零脆弱特判】的基准线（Baseline），
-       绝对不要为了在一开始追求极致的转化率，而在代码中堆砌大量复杂的正则表达式、第三方非公开桥接接口、
-       HTML 页面二次爬虫或易误伤的关键词黑名单。任何脆弱的特判都会在长期无人值守运行中成为维护噩梦。
-  2. 第一阶段（极简信号粗筛 -> 入初步表 `deal_raw_tips`）：
-     - 第一阶段绝不使用复杂的正则提取器去抠取商品 ID，只需用最基础、最稳定的【关键字或符号存在性检查】
-       （`has_potential_product_signal`：如包含网址前缀 `http`、主流电商域名关键字、口令符号 `￥/¥/$/!/！`
-       或商品编号关键字 `货号/编号/sku` 等），判断这条数据“是否可能包含想要的商品信息”。
-     - 只要具备潜在商品信号，就值得将其原样幂等存入初步表 `deal_raw_tips`（标记 `clean_status="pending"`）。
-  3. 第二阶段（直接转链核验 -> 入正式表 `products`）：
-     - 清洗的核心生死线是：**能否通过官方转链解析出唯一的商品 (`platform + product_id + goods_sign`)**。
-       如果连唯一商品都转链不出来，一切教程与截图均无意义。
-     - 直接将初步表记录中的候选链接、口令或文本交给项目标准的平台适配器
-       （`JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`）进行转链：
-       * 若能够直接转链出具体的唯一商品（返回非空 `goods_id`、`goods_sign` 与官方 `product` 详情字典），
-         则自然证明该商品真实有效！随后提取并维护爆料时间 (`publish_time`)、到手价 (`deal_price`)、
-         购买教程 (`tutorial_text`)、实付截图 (`tutorial_images`) 等锦上添花信息，幂等入库正式表 `products`。
-       * 若转链失败，不做任何脆弱的偏门回退，直接将上游真实错误码与原因记录到 `deal_raw_tips` 与失败样本日志。
-  4. 数据驱动的渐进式迭代（Data-Driven Iteration）：
-     - 先让这套最简单稳定的基线系统持续运行数小时乃至数天，积累真实的成功/失败分布日志。
-     - 后续优化必须严格基于日志统计数据：只针对失败占比最高、投入产出比（ROI）最高、且能以简单稳定方式解决的环节
-       做渐进式迭代，绝不盲目打补丁。
+好价线报与采集群定时拉取 (`deal_raw_tips`) + 双阶段 AI 提纯 & 官方转链核验 + 高分好价入库 (`products`) 一体化守护脚本
+====================================================================================================================
+零、【核心工程思想与五阶段架构铁律（⚠️ 后续所有开发人员与 AI 迭代优化必须严格遵循，严禁违背）】
+  1. 代码与 AI 职责边界清晰（告别脆弱正则，各司其职）：
+     - 【确定性代码负责】：多源 HTTP 并发拉取、源站中转跳板解包（逛丢 `to.php`/`go.php`、拔草哦 `go.bacaoo.com`、购物党 `data=` Base64）、
+       源页面地址追溯记录（`source_list_page_url` / `source_detail_url`）、官方转链与商品详情 API 调用
+       （`JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`）、链接占位符精确回填、
+       MongoDB 幂等写入与 `quality_score` 高分保护机制。
+     - 【双阶段 AI 负责】：消灭一切脆弱的价格正则、口令截断正则、词表黑名单与分词启发式规则！
+       由 Stage 1 AI 负责群聊连续上下文合并与多链接/口令无损拆解编号；
+       由 Stage 2 AI 结合官方转链真实底牌，负责主商品/优惠券/凑单品角色定性、死链与货不对板铁面淘汰、
+       爆料到手价提取、抄作业教程重构与 0~100 分综合质量评分（`quality_score`）。
 
-一、【两大核心阶段职责】
-  1. 阶段一：多站点增量拉取与潜在商品信号粗筛 (`run_single_cycle` -> 写入初步表 `deal_raw_tips`)
-     - 覆盖 9 大站点、56 个优选频道（T0 核心 25 个频道每轮必跑，T1 扩充 31 个频道偶数轮或 `--all-channels` 跑）；
-     - 增量抓取：自动跳过 `deal_raw_tips` 中已拉取过完整详情的 `source_item_id`，仅对新线报抓详情；
-     - 仅当 `has_potential_product_signal(record)` 为 True 时入库 `deal_raw_tips`，新记录初始化 `clean_status="pending"`。
-  2. 阶段二：直接转链唯一商品核验与正式表入库 (`run_clean_stage` -> 写入正式表 `products` 并回写 `deal_raw_tips`)
-     - 从 `deal_raw_tips` 读取 `clean_status="pending"` 的记录，按 9 大站点均衡轮询；
-     - 提取记录中的候选输入（链接 / 口令 / 正文），直接调用对应平台 `Adapter.resolve_and_convert_universal()` 转链；
-     - 转链成功且拿到唯一商品身份 (`goods_id` + `goods_sign` + `product`) -> 组装完整商品文档 + `deal_info` 专有信息，
-       按 `(platform, product_id)` 唯一索引幂等 Upsert 入正式表 `products`，并回写 `clean_status="cleaned_success"`；
-     - 转链未返回唯一商品 -> 回写 `clean_status="cleaned_failed"` 及精确错误码，输出全维度统计报告供后续观测分析。
+  2. 五阶段端到端流水线（5-Stage Dual-AI & Official API Pipeline）：
+     - 【Stage 1：源站拉取与全量上下文留存 -> 入初步表 `deal_raw_tips`】
+       * 每条数据强制记录 `source_list_page_url`（列表页/群聊页地址，方便人工打开网页比对是否漏抓）与 `source_detail_url`（详情页地址）。
+       * 对于群聊流（`is_group_stream=True`，即折淘客 150+ 个采集群 `xianbao.aspx`）：**100% 消息全量入库**！
+         含潜在商品信号的消息标记为 `clean_status="pending"`；纯文字补充说明或纯晒单截图消息标记为 `clean_status="context_only"`，
+         确保群友“连发多条消息组成一个完整爆料”时上下文零丢失。
+       * 对于网页/榜单独立帖（`is_group_stream=False`）：每条帖子天然独立，满足极简信号 `has_potential_product_signal` 即入库标记 `pending`。
+     - 【Stage 2：AI 阶段一（原始拆解与转链提纯 `prompt/爆料阶段1_原始拆解与转链提纯.txt`）】
+       * 若 `is_group_stream=True`，自动从 `deal_raw_tips` 查询同群 (`group_id`) 前后 ±3 分钟（`±180s`）内的相邻消息（含纯文字/纯晒单图消息）一并送入 AI-1；
+         若 `is_group_stream=False`，仅传入单帖自身（`raw_messages` 长度为 1），绝不跨帖串味。
+       * AI-1 识别并合并属于同一爆料的相邻群消息（`merged_tip_ids`），将所有电商链接/口令拆解为独立编号（`L1`, `L2`...）并在正文中原位替换为 `[#L1]`, `[#L2]` 占位符，汇总晒单图列表 `extracted_images`。
+     - 【Stage 3：官方 API 逐一转链与验真（100% 确定性代码）】
+       * 遍历 AI-1 拆出的 `extracted_targets`，逐一调用 `JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal(clean_input)`：
+         ① `"product"`：成功返回具体 `goods_id`、`goods_sign` 与官方 `product` 详情字典（含真实标题、日常价、券后价、主图、店铺）及我方推广链 `my_promo_link` / 口令 `my_promo_token`；
+         ② `"coupon_or_activity"`：纯优惠券、活动会场、补贴券链接（保留转链后的领券链接/口令或直达券链，绝不丢弃、绝不盲搜冒充单品）；
+         ③ `"failed"`：死链、下架或纯数字无签名 ID。
+     - 【Stage 4：AI 阶段二（底牌终审、教程重构与质量评分 `prompt/爆料阶段2_底牌终审与教程评分.txt`）-> 先落盘 `deal_raw_tips`】
+       * 将 `combined_raw_text`、`extracted_images` 与官方转链底牌 `converted_links` 一并交给 AI-2。
+       * AI-2 铁面淘汰“主商品死链仅凑单品存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”、“指鹿为马货不对板 (`PRODUCT_MISMATCH`)”、“虚拟垃圾 (`VIRTUAL_OR_JUNK`)”；
+       * 锁定唯一主商品 `main_link_id`，归位前置优惠券 `coupon_links` 与凑单品 `filler_links`，提取爆料到手价 `deal_price` / 折合单价 `unit_deal_price` / 凑单逻辑 `price_logic`，重构带 `[#L1]` 占位符的 `tutorial_steps` 与 `tutorial_summary`，并给出 0~100 分 `quality_score`。
+       * 代码将 `[#L1]` 精确替换为我方专属推广链接/口令后，**先将完整清洗结果与评分落盘回写至 `deal_raw_tips`**。
+     - 【Stage 5：高分优品晋升入正式商品库 `products`（Schema 严格隔离 + 高分防覆盖保护）】
+       * 仅将 `is_valid_deal=True` 且 `quality_score >= 60` 的高分爆料晋升写入正式表 `products`。
+       * **顶层字段与 `deal_info` 严格隔离**：`products` 顶层字段（`name`, `price`, `original_price`, `activity_price`, `coupon_amount`, `image_url`, `mall_name`）**100% 保持官方接口真实原貌**，绝不用爆料价覆盖官方价格！爆料专属的 `deal_price`、`unit_deal_price`、`price_logic`、`coupon_links`、`filler_links`、`tutorial_steps`、`tutorial_text`、`user_share_images`、`quality_score`、`source_list_page_url`、`source_detail_url` 全部收纳于 `deal_info` 子文档中。
+       * **高分防覆盖保护**：当同一 `(platform, product_id)` 在 12 小时保鲜期内被多条线报命中时，仅当新线报 `quality_score >= 已有 deal_info.quality_score` 时才更新 `deal_info` 教程与价格，彻底杜绝简陋线报覆盖带券带晒单图的精品作业！
 
-二、【历史尝试过的方法与工程备忘录】
-  1. 核心工程设计准则备忘：详见常量 `ENGINEERING_PHILOSOPHY_MANIFEST`。
-  2. 采集阶段曾尝试并剔除的 19 个站点/频道（含拼多多专项全网排查失败项与替代方案）：详见常量 `EXCLUDED_SITES_AND_CHANNELS_MANIFEST`。
-  3. 清洗与解包阶段曾尝试过的探索（含失败死胡同与验证成功的方案）：详见常量 `CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST`。
-
-三、【全链路可观测性与运维日志体系】
+一、【全链路可观测性与运维日志体系】
   - 主运行日志           : `logs/deal_pool_scheduler.log`
   - 最新一轮综合运维报告 : `logs/latest_cycle_ops_report.json`
   - 最新清洗专项统计报告 : `logs/latest_clean_ops_report.json`
   - 历史轮次时序流水     : `logs/cycle_ops_history.jsonl` & `logs/clean_ops_history.jsonl`
   - 抓取与清洗失败样本库 : `logs/deal_pool_errors.jsonl` & `logs/clean_failed_samples.jsonl`
   - 正式入库商品预览     : `logs/clean_success_preview.jsonl`
-================================================================================================
+====================================================================================================================
 """
 
 import argparse
@@ -65,6 +61,7 @@ import signal
 import sys
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import zip_longest
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -88,13 +85,14 @@ for _path in (PROJECT_ROOT, WORKSPACE_ROOT, CURRENT_DIR):
         sys.path.insert(0, _path)
 
 from adapters import get_adapter, platform_name
-from infrastructure.ai_api import ask_json
+from infrastructure.ai_api.model_api import generate_content
 from infrastructure.mongo import gen_db_object
 from models.product import (
     extract_canonical_goods_id,
     extract_jd_image_key,
     is_jd_image_key,
 )
+from mobile_web.scripts.goods_info_format import string_to_object
 from mobile_web.scripts.test_deal_sites_scraper import (
     fetch_0818tuan_deals,
     fetch_bacaoo_deals,
@@ -110,11 +108,18 @@ from mobile_web.scripts.test_deal_sites_scraper import (
 )
 
 # ==============================================================================
-# 集合名称与日志文件路径常量
+# 集合名称、AI 提示词路径与日志文件路径常量
 # ==============================================================================
 DEFAULT_RAW_COLLECTION_NAME = "deal_raw_tips"
 DEFAULT_FORMAL_PRODUCTS_COLLECTION = "products"
 LEGACY_SHADOW_TEST_COLLECTION = "deal_cleaned_products_test"
+
+PROMPT_DIR = os.path.join(PROJECT_ROOT, "prompt")
+PROMPT_STAGE1_PATH = os.path.join(PROMPT_DIR, "爆料阶段1_原始拆解与转链提纯.txt")
+PROMPT_STAGE2_PATH = os.path.join(PROMPT_DIR, "爆料阶段2_底牌终审与教程评分.txt")
+
+QUALIFIED_DEAL_MIN_SCORE = 60
+DEAL_INFO_PROTECTION_HOURS = 12.0
 
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -213,87 +218,59 @@ EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
 
 
 # ==============================================================================
-# 【核心工程准则备忘录】必须长期坚守的极简基线与数据驱动迭代思想
+# 【核心工程准则备忘录】五阶段双 AI 赋能 + 官方转链验真 + 高分保护准则
 # ==============================================================================
 ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
-    "principle_01_baseline_first": (
-        "【极简基线先行】越简单越可靠，遵循第一性原理（如无必要，勿增实体）。不追求一上来就用复杂的特判补丁把转化率推高，"
-        "而是先建立最简单、最稳定、零脆弱特判的基准线（Baseline），确保系统长期无人值守运行时绝对稳健。"
+    "principle_01_source_page_traceability_and_zero_context_loss": (
+        "【Stage 1：源页面可追溯与群聊全量留存】每条数据必须记录 `source_list_page_url`（列表页/群聊页地址）与 `source_detail_url`（详情页地址），"
+        "方便人工随时打开对应页面比对是否漏抓；折淘客实时采集群（`is_group_stream=True`）100% 保存群内所有消息（含纯文字教程补充与纯晒单截图 `context_only`），"
+        "彻底解决群聊连发多条消息时的上下文粘连丢失问题。"
     ),
-    "principle_02_minimal_signal_check_in_stage1": (
-        "【阶段一拒绝复杂正则提取器】在拉取入初步表 `deal_raw_tips` 阶段，绝不使用脆弱的复杂正则表达式去预抠商品ID或截断URL；"
-        "只需通过最简单的关键字或符号（如网址前缀、主流电商域名、口令符号、货号字样或非空链接/口令数组）判断记录中"
-        "『是否可能包含想要的商品信息』。只要具备潜在信号就入初步表，避免正则漏匹配或误截断。"
+    "principle_02_ai_stage1_semantic_splitting_instead_of_regex": (
+        "【Stage 2：用 Stage 1 AI 替代脆弱正则拆链与群聊合并】彻底取消用复杂正则表达式抠价格、抠口令或按顺序硬猜主商品的做法；"
+        "对群聊流传入同群 ±3 分钟（`±180s`）上下文，对网页/榜单流传入单帖，由 Stage 1 AI 统一完成相邻消息合并（`merged_tip_ids`）、"
+        "全部链接/口令无损拆解编号（`L1, L2...`）与正文 `[#L1]` 占位符替换。"
     ),
-    "principle_03_direct_conversion_as_single_truth_in_stage2": (
-        "【阶段二以直接转链为唯一试金石】在清洗入正式表 `products` 阶段，直接把候选链接/口令/文本交给项目官方平台适配器 "
-        "(`JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`) 进行转链。"
-        "只要能直接转链出具体的唯一商品 (`goods_id` + `goods_sign` + `product` 字典)，就自然证明该商品真实有效，"
-        "随即提取维护爆料时间、到手价、购买教程、实付截图等关键信息并幂等入库正式表 `products`。"
+    "principle_03_official_api_conversion_for_both_products_and_coupons": (
+        "【Stage 3：官方 API 转链验真且优惠券与主商品同等重要】遍历 Stage 1 AI 拆出的所有编号目标，调用官方 `Adapter.resolve_and_convert_universal()`："
+        "既解析出唯一商品的官方真实详情（`convert_status='product'`），也完整保留优惠券/补贴券/活动会场的转链结果（`convert_status='coupon_or_activity'`），"
+        "绝不丢弃前置领券链接，也绝不对优惠券链接做模糊搜索冒充商品。"
     ),
-    "principle_04_data_driven_iteration_from_logs": (
-        "【基于真实运行日志渐进式优化】严禁脱离真实运行数据去臆造第三方非公开桥接接口、HTML二次爬虫或复杂的文本分词黑名单。"
-        "所有未转链成功的记录必须保留精确的上游错误码与失败样本日志，待基线运行数小时至数天后，仅针对日志统计中占比最高、"
-        "性价比最高且不引入脆弱性的真实问题做渐进式迭代。"
+    "principle_04_ai_stage2_audit_and_strict_schema_separation": (
+        "【Stage 4 & Stage 5：Stage 2 AI 底牌终审、评分防覆盖与 Schema 严格隔离】由 Stage 2 AI 结合官方真实商品详情与原始文案进行终审，"
+        "淘汰“主商品死链仅凑单存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”及“货不对板 (`PRODUCT_MISMATCH`)”，生成步骤化教程并打分（0~100 `quality_score`）。"
+        "结果先持久化至 `deal_raw_tips`，再将 `quality_score >= 60` 的优品晋升入 `products`：`products` 顶层价格/标题 100% 保持官方原貌，"
+        "爆料价 `deal_price`、优惠券 `coupon_links`、凑单品 `filler_links`、教程与晒单图全部放入 `deal_info`，且高分爆料受保护不被低分简陋线报覆盖。"
     ),
 }
 
 
 # ==============================================================================
 # 【重要历史档案 2】清洗与解包阶段曾尝试过的探索备忘录（含失败死胡同与验证成功方案）
-# （固化于此，防止后续开发人员走回头路或盲目堆砌脆弱特判）
 # ==============================================================================
 CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST: Dict[str, str] = {
-    "dead_end_01_over_engineered_regex_extractors": (
-        "【曾尝试并移除】在阶段一与阶段二编写冗长复杂的正则表达式（`_RE_UNIQUE_PRODUCT_URL`, `_RE_STRICT_TOKEN`, `_RE_EXPLICIT_SKU`）"
-        "试图预先精确抠出所有平台的链接与口令。"
-        "【问题教训】复杂正则极度脆弱（例如曾把带参数的 `https://s.click.taobao.com/t?e=...` 截断成残缺的 `/t`，或漏掉新型短链），"
-        "且平台 `Adapter.resolve_and_convert_universal()` 本身就支持直接传入原始推广文本/链接/口令进行官方解析。"
-        "【当前基线做法】阶段一仅做最简单的关键字/符号信号判断 (`has_potential_product_signal`)，阶段二直接交由官方 Adapter 转链。"
+    "dead_end_01_over_engineered_regex_extractors_and_price_guessing": (
+        "【曾尝试并移除】编写冗长脆弱的正则表达式去提取价格、截断口令或抠取多链接，并用提取出的爆料价直接覆盖商品顶层 `activity_price`。"
+        "【问题教训】正则无法应对“一行粘连多个链接”、“拍3件共29.9元 vs 单件9.9元”等复杂语义，且用爆料价覆盖官方价格会破坏商品库基准价格体系。"
+        "【当前做法】由 Stage 1 AI 无损拆解多链接/口令，由官方 API 获取真实顶层商品价格，由 Stage 2 AI 提取 `deal_price` / `unit_deal_price` 独立存放于 `deal_info`。"
     ),
-    "dead_end_02_premature_third_party_bridges_and_html_scraping": (
-        "【曾尝试并移除】为了强行拉高早期转化率，在清洗器内部耦合了购物党非公开跳板 (`m.gwdang.com/union/go` 桥接京东数字SKU)、"
-        "逛丢 `go.php` 动态脚本正则抓取、以及 `u.jd.com` 网页 `hrl` 302 探测与人工伪造兜底 `product_card`。"
-        "【问题教训】外部未公开接口与网页内嵌 JS 变量随时会改版或触发限流，一旦失效会导致清洗管线大面积报错甚至合成残缺商品污染正式表。"
-        "【当前基线做法】回归极简稳定基线，完全依赖项目标准 `Adapter.resolve_and_convert_universal()` 官方转链结果；"
-        "对纯数字 SKU 等上游不支持直接转链的情况，诚实记录精确错误码 (`ERR_JD_NUMERIC_SKU` / `ERR_TB_NUMERIC_ID` / `ERR_PDD_NUMERIC_ID`)，"
-        "待基线运行积累充分统计数据后再评估是否需要官方稳健方案。"
+    "dead_end_02_sequential_first_link_wins_and_discarding_coupons": (
+        "【曾尝试并移除】按顺序遍历候选链接，只要第一个链接转出商品就当成主商品 break 退出，且将转不出单品的优惠券短链当成失败丢弃。"
+        "【问题教训】当第 1 个链接是优惠券（转不出单品被丢弃）、第 2 个主商品死链、第 3 个凑单品存活时，顺序遍历会把凑单品当成主商品上架（指鹿为马），"
+        "且丢失前置优惠券会导致京东/淘宝商品购买时比爆料价贵得多。"
+        "【当前做法】Stage 3 对拆出的全部链接逐一转链并区分 `product` 与 `coupon_or_activity`，Stage 4 由 AI-2 对照全量底牌锁定唯一主商品、归位优惠券与凑单品。"
     ),
-    "dead_end_03_fragile_keyword_blacklists_and_bigram_heuristics": (
-        "【曾尝试并移除】在清洗器中硬编码几十个领券词/凑单词黑名单（含异体字“凑単”）、3行滑窗价格正则以及中文二元组分词重叠率校验。"
-        "【问题教训】硬编码词表与分词启发式规则永远无法穷举社区千变万化的文案，极易误杀正常好价商品（如“凑单到手XX元”的标题本身就是主商品），"
-        "导致代码膨胀到上千行且难以维护。"
-        "【当前基线做法】移除所有脆弱的启发式词表过滤，直接将候选输入送入官方 Adapter 转链核验唯一商品。"
-    ),
-    "dead_end_04_title_fuzzy_search_fallback": (
-        "【曾尝试并严厉禁止】当商品链接转链失败时，拿线报标题调用全网模糊搜索 `search_goods(title)` 取第一条商品顶替。"
-        "【问题教训】模糊搜索会返回不同店铺、不同规格甚至手机壳配件，造成严重的“张冠李戴（假商品）”事故，违背“核心是解析出唯一商品”的第一性原理。"
-        "【当前基线做法】全面禁止标题模糊搜索顶替，100% 要求通过官方转链核验出唯一商品身份。"
-    ),
-    "dead_end_05_trusting_convert_success_without_product_identity": (
-        "【曾尝试并修正】仅判断转链接口返回 `status == 'success'` 就入库，忽略了检验 `goods_id`、`goods_sign` 与 `product` 字典是否非空。"
-        "【问题教训】部分平台红包/活动会场短链在联盟接口同样能转链成功，但返回的 `goods_id` 与 `product` 为空，直接入库会产生无商品身份的幽灵记录。"
-        "【当前基线做法】以 `status == 'success' and bool(goods_id and goods_sign and isinstance(product, dict))` 作为唯一商品核验通过的黄金准则。"
-    ),
-    "dead_end_06_local_ai_gateway_sync_blocking": (
-        "【曾尝试并移除】在清洗主循环中同步调用本地大模型网关对每条多链接线报做消歧。"
-        "【问题教训】单次 AI 网关超时重试可阻塞达 60 秒，导致定时任务严重堆积且引入外部不稳定性。"
-        "【当前基线做法】清洗主流程 100% 采用直接转链核验，零外部 AI 阻塞依赖，单条耗时稳定在毫秒至百毫秒级。"
-    ),
-    "dead_end_07_pdd_numeric_goods_id_direct_or_search_api": (
-        "【拼多多专项探索：已尝试并确认上游限制】针对 `https://mobile.yangkeduo.com/goods.html?goods_id=855830242126` 纯数字 ID 链接（主要来自购物党），"
-        "曾验证多多进宝转链 API (`pdd.ddk.goods.zs.unit.url.gen`) 与搜索 API (`pdd.ddk.goods.search`)，上游网关自 2021 年起全面废除纯数字 `goods_id` 查询，"
-        "强制返回 `sub_code=40009 (仅支持通过goodsSign查询)`；同时测试直接请求 `mobile.yangkeduo.com/goods.html` 网页提取 `goods_sign`，"
-        "未登录态 100% 302 跳转至 `login.html` 滑块验证。"
-        "【当前基线做法】不对纯数字 PDD `goods_id` 做无效网页爬虫，快速拦截记为 `ERR_PDD_NUMERIC_ID`，并通过扩充携带合法 `goods_sign` / `p.pinduoduo.com` 短链的四大拼多多源头频道解决源头供给。"
+    "dead_end_03_title_fuzzy_search_fallback": (
+        "【曾尝试并严厉禁止】当商品链接转链失败或遇到优惠券短链时，调用全网模糊搜索 `search_goods` 取列表第一条商品顶替。"
+        "【问题教训】模糊搜索或会场多商品列表首条极易返回毫不相干的商品，造成严重的“张冠李戴（假商品）”事故。"
+        "【当前做法】全面禁止标题模糊搜索顶替；`JdAdapter` 仅在短链唯一命中单品或京口令明确含单品“抢购”标识时采纳详情，否则作为优惠券/会场链返回。"
     ),
     "success_note_01_pdd_four_high_yield_channels_and_bacaoo_unwrap": (
-        "【拼多多专项探索：已验证成功并上线】经全网 9 大站点排查，拼多多此前入库少的主因并非转链率低（携带 `p.pinduoduo.com` 短链或 `goods_sign` 的记录转链成功率达 99.1%），"
-        "而是源头仅开启了折淘客 `plat=3` 1 个专属频道，其余站点的拼多多好价被淘京主洪流稀释截断。现已实测验证并上线四大高转化拼多多专属源：\n"
-        "  1) 逛丢 `channel='pdd'` (`cate.php?m=拼多多`, P1/P2)：每页 30 条纯拼多多好价，服务端 `go.php` 100% 解包出带 `goods_sign=E9...` 的 `duo_coupon_landing.html`，`PddAdapter` 100% 转链成功（同时修复了 `fetch_guangdiu_deals` 旧正则提前在 `div.showpic` 闭合导致标题与商城名为空的 Bug）；\n"
-        "  2) 线报酷 `channel='category_haodan_pdd'` (`/category-haodan-pdd/`, P1/P2)：从 `xb-app.min.js` 的 `window.__xbCfTags` 发现的隐藏官方子流，每页 100 条纯拼多多好单线报，实测 20/20 (100%) 含 `https://p.pinduoduo.com/xxx` 短链；\n"
-        "  3) 线报酷 `channel='category_weibo_pdd'` (`/category-weibo-pdd/`) + `id='art-fujia'` 1L~5L 源站同步评论区解析：微博/豆瓣/酷安博主防限流常将购买短链放在 1L 楼主评论区（位于 `</article>` 之后的 `div#art-fujia .c-neirong`），补充提取后实测 `category_weibo_pdd` 短链提取与转链率从 40% 提升至 100%；\n"
-        "  4) 拔草哦 `channel='pdd'` (`https://youhui.bacaoo.com/mall/1827`) + `POST https://go.bacaoo.com/` 免风控解包：解析 `direct-alink-url` 单品跳板与每 2 小时发布的 50 款《PDD热销产品汇总》合集帖 (`subproduct-alink-url`)，100% 还原出 `https://p.pinduoduo.com/xxx?sc=EFAC` 短链。"
+        "【拼多多专项探索：已验证成功并上线】四大高转化拼多多专属源无缝融入五阶段管线：\n"
+        "  1) 逛丢 `channel='pdd'` (`cate.php?m=拼多多`, P1/P2)：服务端 `go.php` 解包出带 `goods_sign` 的 `duo_coupon_landing.html`；\n"
+        "  2) 线报酷 `channel='category_haodan_pdd'` (`/category-haodan-pdd/`, P1/P2)：每页 100 条纯拼多多好单线报，100% 含 `p.pinduoduo.com` 短链；\n"
+        "  3) 线报酷 `channel='category_weibo_pdd'` (`/category-weibo-pdd/`) + `id='art-fujia'` 1L~5L 楼主同步评论区解析；\n"
+        "  4) 拔草哦 `channel='pdd'` (`https://youhui.bacaoo.com/mall/1827`) + `POST https://go.bacaoo.com/` 解包单品与 50 款合集帖。"
     ),
 }
 
@@ -301,14 +278,19 @@ CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST: Dict[str, str] = {
 # ==============================================================================
 # 标准化清洗错误码体系 (`CLEAN_ERROR_CODES`) —— 供运行后统计分析各失败类型占比
 # ==============================================================================
-ERR_NO_ANCHOR = "ERR_NO_ANCHOR"                               # 未检测到任何潜在商品信号或候选输入为空
+ERR_NO_ANCHOR = "ERR_NO_ANCHOR"                               # Stage 1 AI 未检测到任何有效电商链接或口令
+ERR_MERGED_INTO_NEIGHBOR = "ERR_MERGED_INTO_NEIGHBOR"         # 群聊消息已作为补充碎片合并至同群相邻主线报
 ERR_UNSUPPORTED_PLATFORM = "ERR_UNSUPPORTED_PLATFORM"         # 唯品会/美团/抖音等非淘京拼支持平台
 ERR_TB_NUMERIC_ID = "ERR_TB_NUMERIC_ID"                       # 淘宝/天猫纯数字商品ID（上游接口要求加密ID/口令/短链）
 ERR_PDD_NUMERIC_ID = "ERR_PDD_NUMERIC_ID"                     # 拼多多纯数字goods_id（上游接口要求goods_sign或推广短链）
 ERR_JD_NUMERIC_SKU = "ERR_JD_NUMERIC_SKU"                     # 京东纯数字SKU（上游接口要求京粉加密链/u.jd.com短链/口令）
 ERR_ADAPTER_OFF_PROMOTION = "ERR_ADAPTER_OFF_PROMOTION"       # 商品已下架、已取消推广或活动过期失效
 ERR_ADAPTER_CONVERT_FAILED = "ERR_ADAPTER_CONVERT_FAILED"     # 上游转链接口未解析出有效结果（如口令过期、外链无效等）
-ERR_EMPTY_PRODUCT_IDENTITY = "ERR_EMPTY_PRODUCT_IDENTITY"     # 转链成功但未指向具体单品（如红包/领券/活动会场链接）
+ERR_EMPTY_PRODUCT_IDENTITY = "ERR_EMPTY_PRODUCT_IDENTITY"     # 仅含纯优惠券/红包/活动会场链接，无具体主商品
+ERR_AI2_MAIN_DEAD_ONLY_FILLER = "ERR_AI2_MAIN_DEAD_ONLY_FILLER"  # 主商品死链、仅凑单品存活（AI-2 铁面拦截）
+ERR_AI2_PRODUCT_MISMATCH = "ERR_AI2_PRODUCT_MISMATCH"         # 转链出的官方商品与爆料文案严重货不对板（AI-2 铁面拦截）
+ERR_AI2_VIRTUAL_OR_JUNK = "ERR_AI2_VIRTUAL_OR_JUNK"           # 0.01元引流/邮费补差价/虚拟垃圾商品（AI-2 铁面拦截）
+ERR_LOW_QUALITY_SCORE = "ERR_LOW_QUALITY_SCORE"               # 有效商品但综合质量评分低于60分（仅留存初步表，不晋升正式表）
 
 
 # ==============================================================================
@@ -625,6 +607,11 @@ class DealRawPoolRepository:
             col.create_index([("last_seen_at", -1)], background=True)
             col.create_index([("clean_status", 1), ("source_site", 1)], background=True)
             col.create_index([("clean_error_code", 1)], background=True)
+            col.create_index([("quality_score", -1)], background=True)
+            col.create_index(
+                [("source_site", 1), ("is_group_stream", 1), ("group_id", 1), ("publish_ts", 1)],
+                background=True,
+            )
             col.create_index(
                 [("quality_signals.has_unique_product_anchor", 1), ("clean_status", 1)],
                 background=True,
@@ -637,7 +624,7 @@ class DealRawPoolRepository:
             pcol.create_index([("platform", 1), ("product_id", 1)], unique=True, background=True)
             pcol.create_index("goods_sign", background=True)
             pcol.create_index([("updated_at", -1)], background=True)
-            pcol.create_index([("deal_info.is_deal_tip", 1), ("updated_at", -1)], background=True)
+            pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.quality_score", -1), ("updated_at", -1)], background=True)
             self._indexes_ready = True
         except Exception as e:
             logger.warning("初始化集合索引时发生异常（稍后自动重试）: %s", e)
@@ -699,16 +686,20 @@ class DealRawPoolRepository:
 
     def save_batch(self, records: List[Dict[str, Any]], task_name: str = "") -> Dict[str, int]:
         """
-        第一阶段入初步表 `deal_raw_tips`：
-        仅对包含潜在商品信号（`has_potential_product_signal(rec) == True`）的记录幂等入库，
-        新记录初始化 `clean_status='pending'`，交由第二阶段直接转链核验。
+        【Stage 1：源站拉取入初步表 `deal_raw_tips`】
+        1. 强制记录 `source_list_page_url`（列表页/群聊页地址）与 `source_detail_url`（详情页地址），方便人工打开页面核对是否漏抓；
+        2. 若为连续群聊流（`is_group_stream=True`，即折淘客采集群）：**100% 消息全量入库**！
+           - 含潜在商品信号（链接/口令/货号）的消息标记为 `clean_status='pending'`；
+           - 纯文字教程补充或纯晒单截图消息标记为 `clean_status='context_only'`，供 Stage 2 AI 检索同群前后 ±3 分钟上下文；
+        3. 若为独立网页/榜单帖（`is_group_stream=False`）：仅对包含潜在商品信号的记录入库并标记为 `clean_status='pending'`。
         """
         if not records:
-            return {"inserted": 0, "updated": 0, "skipped_no_signal": 0, "total": 0}
+            return {"inserted": 0, "updated": 0, "skipped_no_signal": 0, "context_only_saved": 0, "total": 0}
 
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         ops = []
         skipped_no_signal = 0
+        context_only_saved = 0
 
         for rec in records:
             if not isinstance(rec, dict):
@@ -720,33 +711,59 @@ class DealRawPoolRepository:
 
             has_full_detail = bool(rec.get("has_full_detail", True))
             quality_signals = evaluate_quality_signals(rec)
+            is_group_stream = bool(
+                rec.get("is_group_stream")
+                or (site == "zhetaoke" and item_id.startswith("xb_"))
+            )
+            hot_metrics = rec.get("hot_metrics") if isinstance(rec.get("hot_metrics"), dict) else {}
+            group_id = str(hot_metrics.get("group_id") or "").strip()
+            pub_time_str = str(rec.get("publish_time") or "").strip()
+            pub_ts = parse_publish_time_epoch(pub_time_str)
+            if pub_ts is None:
+                pub_ts = time.time()
 
-            # 第一阶段判断：若已抓完详情但没有任何可能指向商品的关键字或符号，直接跳过不入库
-            if has_full_detail and not quality_signals["has_unique_product_anchor"]:
-                skipped_no_signal += 1
-                continue
+            has_signal = bool(quality_signals["has_unique_product_anchor"])
+            if has_full_detail and not has_signal:
+                if is_group_stream:
+                    # 群聊中的纯文字说明或纯晒单截图 100% 留存为 context_only，确保相邻 ±3 分钟聚合零丢失
+                    initial_status = "context_only"
+                    context_only_saved += 1
+                else:
+                    skipped_no_signal += 1
+                    continue
+            else:
+                initial_status = "pending"
 
             channel = str(rec.get("source_channel") or "").strip()
             filter_spec = {"source_site": site, "source_item_id": item_id}
+
+            source_url = str(rec.get("source_url") or "").strip()
+            source_list_page_url = str(rec.get("source_list_page_url") or source_url or "").strip()
+            source_detail_url = str(rec.get("source_detail_url") or source_url or source_list_page_url or "").strip()
 
             set_fields: Dict[str, Any] = {
                 "last_seen_at": now,
                 "last_task_name": task_name,
             }
-            if rec.get("hot_metrics"):
-                set_fields["hot_metrics"] = rec["hot_metrics"]
+            if hot_metrics:
+                set_fields["hot_metrics"] = hot_metrics
 
             set_on_insert: Dict[str, Any] = {
                 "source_site": site,
                 "source_item_id": item_id,
                 "first_seen_at": now,
-                "clean_status": "pending",
-                "ai_clean_status": "pending",
+                "clean_status": initial_status,
+                "ai_clean_status": initial_status,
             }
 
             core_fields = {
                 "source_channel": channel,
-                "source_url": rec.get("source_url") or "",
+                "source_url": source_url or source_detail_url,
+                "source_list_page_url": source_list_page_url,
+                "source_detail_url": source_detail_url,
+                "is_group_stream": is_group_stream,
+                "group_id": group_id,
+                "publish_ts": pub_ts,
                 "fetched_at": rec.get("fetched_at") or "",
                 "platform": rec.get("platform") or "unknown",
                 "candidate_goods_id": rec.get("candidate_goods_id") or "",
@@ -755,7 +772,7 @@ class DealRawPoolRepository:
                 "price": rec.get("price"),
                 "image_url": rec.get("image_url") or "",
                 "mall_name": rec.get("mall_name") or "",
-                "publish_time": rec.get("publish_time") or "",
+                "publish_time": pub_time_str,
                 "expire_time": rec.get("expire_time"),
                 "tutorial_text": rec.get("tutorial_text") or "",
                 "tutorial_images": rec.get("tutorial_images") or [],
@@ -786,7 +803,13 @@ class DealRawPoolRepository:
                 ops.append(UpdateOne(filter_spec, update_doc, upsert=False))
 
         if not ops:
-            return {"inserted": 0, "updated": 0, "skipped_no_signal": skipped_no_signal, "total": 0}
+            return {
+                "inserted": 0,
+                "updated": 0,
+                "skipped_no_signal": skipped_no_signal,
+                "context_only_saved": context_only_saved,
+                "total": 0,
+            }
 
         try:
             self.col.delete_many({"has_full_detail": False})
@@ -795,12 +818,20 @@ class DealRawPoolRepository:
                 "inserted": res.upserted_count,
                 "updated": res.modified_count,
                 "skipped_no_signal": skipped_no_signal,
+                "context_only_saved": context_only_saved,
                 "total": len(ops),
             }
         except Exception as e:
             logger.error("❌ 批量写入 MongoDB [%s] 失败，降级写入本地 JSONL 备份: %s", self.collection_name, e)
             self._append_fallback_jsonl(records, task_name)
-            return {"inserted": 0, "updated": 0, "skipped_no_signal": skipped_no_signal, "total": len(ops), "error": str(e)}
+            return {
+                "inserted": 0,
+                "updated": 0,
+                "skipped_no_signal": skipped_no_signal,
+                "context_only_saved": context_only_saved,
+                "total": len(ops),
+                "error": str(e),
+            }
 
     @staticmethod
     def _append_fallback_jsonl(records: List[Dict[str, Any]], task_name: str):
@@ -822,6 +853,9 @@ class DealRawPoolRepository:
         full_detail_docs = col.count_documents({"has_full_detail": True})
         unique_anchor_docs = col.count_documents({"quality_signals.has_unique_product_anchor": True})
         cleaned_success_docs = col.count_documents({"clean_status": "cleaned_success"})
+        cleaned_low_score_docs = col.count_documents({"clean_status": "cleaned_low_score"})
+        merged_neighbor_docs = col.count_documents({"clean_status": "merged_into_parent"})
+        context_only_docs = col.count_documents({"clean_status": "context_only"})
         cleaned_failed_docs = col.count_documents({"clean_status": "cleaned_failed"})
         pending_clean_docs = col.count_documents({"$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]})
 
@@ -860,7 +894,7 @@ class DealRawPoolRepository:
 
         by_clean_error = list(
             col.aggregate([
-                {"$match": {"clean_status": "cleaned_failed"}},
+                {"$match": {"clean_status": {"$in": ["cleaned_failed", "cleaned_low_score"]}}},
                 {"$group": {"_id": "$clean_error_code", "count": {"$sum": 1}}},
                 {"$sort": {"count": -1}},
             ])
@@ -882,6 +916,9 @@ class DealRawPoolRepository:
             "unique_product_anchor_records": unique_anchor_docs,
             "unique_product_anchor_ratio": round(unique_anchor_docs * 100.0 / max(1, total_docs), 1),
             "cleaned_success_records": cleaned_success_docs,
+            "cleaned_low_score_records": cleaned_low_score_docs,
+            "merged_into_parent_records": merged_neighbor_docs,
+            "context_only_records": context_only_docs,
             "cleaned_failed_records": cleaned_failed_docs,
             "pending_clean_records": pending_clean_docs,
             "formal_products_total": formal_total_products,
@@ -896,11 +933,31 @@ class DealRawPoolRepository:
 
 
 # ==============================================================================
-# 阶段二核心：好价线报极简基线清洗器 (`DealPoolCleaner`)
-# 遵循第一性原理：零脆弱特判，直接调用项目官方 Adapter 进行转链核验唯一商品
+# Stage 2 ~ Stage 4 核心：双阶段 AI + 官方 API 转链验真 + 质量评分清洗器 (`DealPoolCleaner`)
 # ==============================================================================
+def parse_publish_time_epoch(pub_str: Any) -> Optional[float]:
+    """将常见发布时间字符串解析为 Unix 时间戳（秒），用于同群 ±3 分钟（±180s）上下文聚合。"""
+    s = str(pub_str or "").strip()
+    if not s:
+        return None
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            dt = datetime.datetime.strptime(s[:19], fmt)
+            return dt.timestamp()
+        except Exception:
+            continue
+    return None
+
+
 def detect_candidate_platform(raw_input: str, default_plat: str = "unknown") -> str:
-    """用最简单的子串包含关系判断候选输入所属平台（jd / taobao / pdd）。"""
+    """判断单条链接或口令所属平台（jd / taobao / pdd）。"""
     s = (raw_input or "").lower()
     if any(d in s for d in _UNSUPPORTED_EXTERNAL_DOMAINS):
         return "unsupported_other"
@@ -921,36 +978,180 @@ def detect_candidate_platform(raw_input: str, default_plat: str = "unknown") -> 
     return "unknown"
 
 
+def is_direct_coupon_or_venue_url(raw_input: str, role_hint: str = "") -> bool:
+    """判断一个 URL 是否为直接的优惠券领取页或活动会场页（无需转出单品也应保留给用户领券）。"""
+    u = (raw_input or "").strip().lower()
+    if not u.startswith(("http://", "https://")):
+        return False
+    coupon_domains_or_paths = (
+        "coupon.m.jd.com",
+        "pro.m.jd.com",
+        "prodev.m.jd.com",
+        "h5.m.jd.com",
+        "jdcoupon",
+        "uland.taobao.com/quan",
+        "market.m.taobao.com",
+        "pages.tmall.com",
+        "pages-fast.m.taobao.com",
+        "taoquan.taobao.com",
+    )
+    if any(k in u for k in coupon_domains_or_paths):
+        return True
+    if role_hint == "coupon_candidate" and any(k in u for k in ("3.cn/", "u.jd.com/", "m.tb.cn/", "s.click.taobao.com/")):
+        return True
+    return False
+
+
 class DealPoolCleaner:
     """
-    好价线报缓冲池极简基线清洗器：
-    直接将初步表记录中的候选链接/口令/文本交给 `JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`
-    进行转链。若能成功转链出具体唯一商品 (`goods_id` + `goods_sign` + `product`)，则提取维护关键信息并入库正式表 `products`。
+    五阶段双 AI 赋能 + 官方 API 转链清洗器：
+    - Stage 2: 调用 AI-1 (`爆料阶段1_原始拆解与转链提纯.txt`) 合并同群 ±3 分钟相邻消息、无损拆解并编号全部链接/口令 (`L1`, `L2`...)；
+    - Stage 3: 确定性调用 `JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`，区分单品 (`product`)、优惠券/会场 (`coupon_or_activity`) 与死链 (`failed`)；
+    - Stage 4: 调用 AI-2 (`爆料阶段2_底牌终审与教程评分.txt`) 结合官方真实商品详情终审主商品/优惠券/凑单品角色、淘汰残次死链、提取爆料到手价、生成步骤化教程并给出 0~100 分 `quality_score`。
     """
 
-    def __init__(self, use_ai_for_multi: bool = False):
-        self.use_ai_for_multi = use_ai_for_multi
+    def __init__(self, use_ai_for_multi: bool = True, ai_batch_size: int = 6, ai_max_workers: int = 4):
+        self.use_ai = True
+        self.ai_batch_size = max(1, ai_batch_size)
+        self.ai_max_workers = max(1, ai_max_workers)
         self.adapters = {
             "jd": get_adapter("jd"),
             "taobao": get_adapter("taobao"),
             "pdd": get_adapter("pdd"),
         }
+        self.prompt_stage1_template = self._load_prompt_file(PROMPT_STAGE1_PATH)
+        self.prompt_stage2_template = self._load_prompt_file(PROMPT_STAGE2_PATH)
+
         # 内存级转链结果缓存，避免不同采集群重复刷屏的同一链接/口令重复调用上游接口
         self.anchor_cache: Dict[str, Dict[str, Any]] = {}
         self.stats_cache_hits = 0
-        self.stats_ai_calls = 0
-        self.stats_jd_sku_bridged = 0
-        self.stats_guangdiu_go_bridged = 0
+        self.stats_ai1_calls = 0
+        self.stats_ai2_calls = 0
 
-    def collect_candidate_inputs(self, doc: Dict[str, Any]) -> List[Dict[str, str]]:
+    @staticmethod
+    def _load_prompt_file(path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception as e:
+            logger.error("读取 AI 提示词文件 [%s] 失败: %s", path, e)
+            return ""
+
+    @staticmethod
+    def _format_raw_message_for_ai1(msg_doc: Dict[str, Any]) -> Dict[str, Any]:
         """
-        从单条 `deal_raw_tips` 记录中按直观顺序收集待转链的候选输入（不做任何复杂正则截取或黑名单特判）：
-        1. `extracted_links` 中的 URL 或加密 item_id；
-        2. `extracted_tokens` 中的口令字符串；
-        3. 若正文 `tutorial_text` 含有信号且尚未覆盖，则将 `tutorial_text` 作为整体交由 Adapter 识别。
+        将单条 `deal_raw_tips` 文档格式化为 Stage 1 AI 标准输入的 `raw_messages` 元素。
+        确保 DOM 属性提取或源站中转解包出的链接/口令（如逛丢 `go.php`、拔草哦 `go.bacaoo.com`、好单库加密ID）
+        100% 出现在 `content` 文本中，不遗漏任何隐藏锚点。
         """
+        title = str(msg_doc.get("title") or "").strip()
+        tut = str(msg_doc.get("tutorial_text") or "").strip()
+        content = tut if tut else title
+        if title and title not in content:
+            content = f"【标题】{title}\n{content}".strip()
+
+        extra_anchor_lines: List[str] = []
+        for lk in msg_doc.get("extracted_links") or []:
+            if not isinstance(lk, dict):
+                continue
+            u = html_lib.unescape(str(lk.get("url") or lk.get("item_id") or "")).strip()
+            lbl = str(lk.get("label") or "附带链接").strip()
+            if u and u not in content:
+                extra_anchor_lines.append(f"{lbl}: {u}")
+        for tk in msg_doc.get("extracted_tokens") or []:
+            tk_s = html_lib.unescape(str(tk or "")).strip()
+            if tk_s and tk_s not in content and not any(tk_s in ln for ln in extra_anchor_lines):
+                extra_anchor_lines.append(f"附带口令/加密ID: {tk_s}")
+
+        if extra_anchor_lines:
+            content = f"{content}\n" + "\n".join(extra_anchor_lines)
+
+        imgs: List[str] = []
+        primary_img = str(msg_doc.get("image_url") or "").strip()
+        if primary_img:
+            imgs.append(primary_img)
+        for im in msg_doc.get("tutorial_images") or []:
+            im_s = str(im or "").strip()
+            if im_s and im_s not in imgs:
+                imgs.append(im_s)
+
+        return {
+            "tip_id": str(msg_doc.get("source_item_id") or ""),
+            "publish_time": str(msg_doc.get("publish_time") or msg_doc.get("fetched_at") or ""),
+            "content": content.strip(),
+            "images": imgs,
+        }
+
+    def build_stage1_task_input(self, doc: Dict[str, Any], raw_col) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+        """
+        构造单条待清洗记录的 Stage 1 AI 输入：
+        - 若 `is_group_stream=True`（折淘客采集群）：从 `deal_raw_tips` 查询同群 (`group_id`) 前后 ±3 分钟（`±180s`）内的相邻消息（含 `context_only` 纯文字/纯图片消息）；
+        - 若 `is_group_stream=False`（网页/榜单独立帖）：仅包含自身单条消息（`raw_messages` 长度为 1）。
+        返回 `(stage1_input_dict, tip_id_to_doc_map)`。
+        """
+        site = str(doc.get("source_site") or "")
+        main_tip_id = str(doc.get("source_item_id") or "")
+        is_group_stream = bool(
+            doc.get("is_group_stream")
+            or (site == "zhetaoke" and main_tip_id.startswith("xb_"))
+        )
+        group_id = str(doc.get("group_id") or (doc.get("hot_metrics") or {}).get("group_id") or "").strip()
+        pub_ts = doc.get("publish_ts")
+        if not isinstance(pub_ts, (int, float)):
+            pub_ts = parse_publish_time_epoch(doc.get("publish_time"))
+
+        neighbor_docs: List[Dict[str, Any]] = [doc]
+        if is_group_stream and group_id and raw_col is not None and isinstance(pub_ts, (int, float)):
+            try:
+                cursor = (
+                    raw_col.find({
+                        "source_site": site,
+                        "group_id": group_id,
+                        "publish_ts": {"$gte": float(pub_ts) - 180.0, "$lte": float(pub_ts) + 180.0},
+                    })
+                    .sort([("publish_ts", 1), ("source_item_id", 1)])
+                    .limit(7)
+                )
+                fetched_neighbors = list(cursor)
+                if fetched_neighbors:
+                    if not any(str(d.get("source_item_id")) == main_tip_id for d in fetched_neighbors):
+                        fetched_neighbors.append(doc)
+                    fetched_neighbors.sort(
+                        key=lambda x: (
+                            float(x.get("publish_ts") or pub_ts),
+                            str(x.get("source_item_id") or ""),
+                        )
+                    )
+                    neighbor_docs = fetched_neighbors
+            except Exception as e:
+                logger.warning("查询同群 [%s] 相邻 ±3 分钟消息异常: %s", group_id, e)
+
+        tip_map: Dict[str, Dict[str, Any]] = {}
+        raw_messages: List[Dict[str, Any]] = []
+        for nd in neighbor_docs:
+            tid = str(nd.get("source_item_id") or "")
+            if not tid or tid in tip_map:
+                continue
+            tip_map[tid] = nd
+            raw_messages.append(self._format_raw_message_for_ai1(nd))
+
+        stage1_item = {
+            "main_tip_id": main_tip_id,
+            "source_site": site,
+            "source_channel": str(doc.get("source_channel") or ""),
+            "is_group_stream": is_group_stream,
+            "raw_messages": raw_messages,
+        }
+        return stage1_item, tip_map
+
+    def _fallback_stage1_extract(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+        """当 AI 网关偶发超时或返回异常时的确定性安全保底拆解器，确保单帖链接绝不因网络波动丢失。"""
+        main_tip_id = str(doc.get("source_item_id") or "")
+        msg = self._format_raw_message_for_ai1(doc)
+        content = msg["content"]
         doc_plat = str(doc.get("platform") or "unknown").strip()
-        candidates: List[Dict[str, str]] = []
+
+        extracted_targets: List[Dict[str, str]] = []
         seen: Set[str] = set()
 
         for lk in doc.get("extracted_links") or []:
@@ -960,72 +1161,182 @@ class DealPoolCleaner:
             if not raw_u or raw_u in seen:
                 continue
             seen.add(raw_u)
+            lid = f"L{len(extracted_targets) + 1}"
             plat = detect_candidate_platform(raw_u, str(lk.get("platform") or doc_plat))
-            candidates.append({
-                "anchor": raw_u,
-                "type": str(lk.get("type") or "link"),
-                "label": str(lk.get("label") or ""),
+            lbl = str(lk.get("label") or "")
+            role = "coupon_candidate" if any(k in (lbl + raw_u).lower() for k in ("券", "coupon", "补贴", "会场")) else "main_candidate"
+            extracted_targets.append({
+                "link_id": lid,
+                "clean_input": raw_u,
                 "platform": plat,
+                "text_role_hint": role,
             })
+            if raw_u in content:
+                content = content.replace(raw_u, f"[#{lid}]")
+            else:
+                content = f"{content} [#{lid}]"
 
         for tk in doc.get("extracted_tokens") or []:
             tk_s = html_lib.unescape(str(tk or "")).strip()
             if not tk_s or tk_s in seen:
                 continue
             seen.add(tk_s)
+            lid = f"L{len(extracted_targets) + 1}"
             plat = detect_candidate_platform(tk_s, doc_plat)
-            candidates.append({
-                "anchor": tk_s,
-                "type": "token",
-                "label": "口令",
+            extracted_targets.append({
+                "link_id": lid,
+                "clean_input": tk_s,
                 "platform": plat,
+                "text_role_hint": "main_candidate",
             })
+            if tk_s in content:
+                content = content.replace(tk_s, f"[#{lid}]")
+            else:
+                content = f"{content} [#{lid}]"
 
-        tutorial_text = html_lib.unescape(str(doc.get("tutorial_text") or "")).strip()
-        if not candidates and tutorial_text:
-            plat = detect_candidate_platform(tutorial_text, doc_plat)
-            candidates.append({
-                "anchor": tutorial_text,
-                "type": "raw_text",
-                "label": "正文文本",
-                "platform": plat,
-            })
+        return {
+            "main_tip_id": main_tip_id,
+            "is_standalone_deal": True,
+            "merged_tip_ids": [main_tip_id],
+            "combined_raw_text": content.strip(),
+            "extracted_images": msg["images"],
+            "extracted_targets": extracted_targets,
+        }
 
-        return candidates
+    def _call_ai_json_array(self, prompt_template: str, batch_payload: List[Dict[str, Any]], stage_label: str) -> List[Dict[str, Any]]:
+        """调用项目统一 AI 接口 `generate_content` 并使用 `string_to_object` 解析 JSON 数组。"""
+        if not batch_payload or not prompt_template:
+            return []
+        full_prompt = (
+            f"{prompt_template}\n\n"
+            f"==================== 本批次待处理输入 JSON 数据 ====================\n"
+            f"{json.dumps(batch_payload, ensure_ascii=False, indent=2)}"
+        )
+        for model_group in ("low", "medium"):
+            try:
+                resp = generate_content(prompt=full_prompt, preset_model_group=model_group)
+                if not resp:
+                    continue
+                if isinstance(resp, dict):
+                    if resp.get("status") != "✅ 成功":
+                        detail = "；".join(str(err) for err in (resp.get("error_history") or []))
+                        raise RuntimeError(detail or str(resp.get("content") or "模型调用失败"))
+                    resp_text = str(resp.get("content") or "")
+                else:
+                    resp_text = str(resp)
+                if not resp_text.strip():
+                    continue
+                parsed = string_to_object(resp_text)
+                if isinstance(parsed, list):
+                    return [item for item in parsed if isinstance(item, dict)]
+                if isinstance(parsed, dict):
+                    return [parsed]
+            except Exception as e:
+                logger.warning("[%s] 调用模型组 (%s) 解析 JSON 异常: %s", stage_label, model_group, e)
+        return []
 
-    def convert_single_candidate(self, cand: Dict[str, str]) -> Dict[str, Any]:
+    def run_ai_stage1_batch(self, stage1_inputs: List[Dict[str, Any]], docs_by_tip_id: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """并发执行 Stage 2（AI-1：原始拆解与转链提纯），返回 `main_tip_id -> ai1_result` 字典。"""
+        results_by_id: Dict[str, Dict[str, Any]] = {}
+        chunks = [
+            stage1_inputs[i : i + self.ai_batch_size]
+            for i in range(0, len(stage1_inputs), self.ai_batch_size)
+        ]
+
+        def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            self.stats_ai1_calls += 1
+            return self._call_ai_json_array(self.prompt_stage1_template, chunk, "AI-Stage1")
+
+        if chunks:
+            with ThreadPoolExecutor(max_workers=min(self.ai_max_workers, len(chunks))) as pool:
+                futures = {pool.submit(_worker, ch): ch for ch in chunks}
+                for fut in as_completed(futures):
+                    try:
+                        arr = fut.result()
+                        for item in arr:
+                            mid = str(item.get("main_tip_id") or "").strip()
+                            if mid:
+                                results_by_id[mid] = item
+                    except Exception as e:
+                        logger.warning("[AI-Stage1] 并发批次执行异常: %s", e)
+
+        # 对任何未命中或格式缺失的记录执行安全兜底，同时补充可能被漏掉的 DOM 显式直达链接
+        for inp in stage1_inputs:
+            mid = str(inp.get("main_tip_id") or "")
+            orig_doc = docs_by_tip_id.get(mid) or {}
+            ai1_res = results_by_id.get(mid)
+            if not isinstance(ai1_res, dict) or "extracted_targets" not in ai1_res:
+                ai1_res = self._fallback_stage1_extract(orig_doc)
+                results_by_id[mid] = ai1_res
+            else:
+                # 若 AI-1 判定为独立线报但漏掉了爬虫已解包的明文直达链（如拔草哦/逛丢解包链），自动补充进 extracted_targets
+                if ai1_res.get("is_standalone_deal", True) and not ai1_res.get("extracted_targets"):
+                    fb = self._fallback_stage1_extract(orig_doc)
+                    if fb.get("extracted_targets"):
+                        ai1_res["extracted_targets"] = fb["extracted_targets"]
+                        ai1_res["combined_raw_text"] = fb["combined_raw_text"]
+                if not ai1_res.get("merged_tip_ids"):
+                    ai1_res["merged_tip_ids"] = [mid]
+                if not ai1_res.get("extracted_images"):
+                    ai1_res["extracted_images"] = self._format_raw_message_for_ai1(orig_doc)["images"]
+
+        return results_by_id
+
+    def convert_single_target(self, target: Dict[str, Any], default_plat: str = "unknown") -> Dict[str, Any]:
         """
-        直接调用对应平台的 `Adapter.resolve_and_convert_universal(anchor)` 进行转链。
+        【Stage 3：官方 API 转链与底牌分类（100% 确定性代码）】
+        对 Stage 1 AI 拆出的单个 `target` (`link_id`, `clean_input`, `platform`, `text_role_hint`) 调用官方 Adapter 转链，
+        精准分类为 `"product"`（具体单品）、`"coupon_or_activity"`（优惠券/活动会场）或 `"failed"`（死链/不支持）。
         """
-        anchor = cand["anchor"]
-        plat = cand["platform"]
+        link_id = str(target.get("link_id") or "L1").strip()
+        clean_input = html_lib.unescape(str(target.get("clean_input") or "")).strip()
+        role_hint = str(target.get("text_role_hint") or "main_candidate").strip()
+        hint_plat = str(target.get("platform") or default_plat or "unknown").strip().lower()
+        plat = detect_candidate_platform(clean_input, hint_plat if hint_plat in ("jd", "taobao", "pdd") else default_plat)
 
-        if plat == "unsupported_other":
+        if not clean_input:
             return {
-                "resolved": False,
-                "error_code": ERR_UNSUPPORTED_PLATFORM,
-                "error_msg": f"非淘京拼支持平台外链: {anchor[:80]}",
+                "link_id": link_id,
+                "clean_input": clean_input,
+                "text_role_hint": role_hint,
+                "convert_status": "failed",
+                "platform": plat,
+                "error_code": ERR_NO_ANCHOR,
+                "error_msg": "空链接或口令",
+                "official_product": None,
+                "my_promo_link": None,
+                "my_promo_token": None,
                 "adapter_res": {},
             }
 
-        # 若平台暂未明确，按 taobao -> jd -> pdd 顺序尝试识别，或若默认已知则直接调对应 Adapter
-        platforms_to_try = [plat] if plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
+        if plat == "unsupported_other":
+            return {
+                "link_id": link_id,
+                "clean_input": clean_input,
+                "text_role_hint": role_hint,
+                "convert_status": "failed",
+                "platform": plat,
+                "error_code": ERR_UNSUPPORTED_PLATFORM,
+                "error_msg": f"非淘京拼支持平台外链: {clean_input[:80]}",
+                "official_product": None,
+                "my_promo_link": None,
+                "my_promo_token": None,
+                "adapter_res": {},
+            }
 
-        last_out: Dict[str, Any] = {
-            "resolved": False,
-            "error_code": ERR_ADAPTER_CONVERT_FAILED,
-            "error_msg": "未能识别平台或转链失败",
-            "adapter_res": {},
-        }
+        platforms_to_try = [plat] if plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
+        last_failed: Optional[Dict[str, Any]] = None
 
         for try_plat in platforms_to_try:
-            cache_key = f"{try_plat}:{anchor}"
+            cache_key = f"{try_plat}:{clean_input}"
             if cache_key in self.anchor_cache:
                 self.stats_cache_hits += 1
                 cached = copy.deepcopy(self.anchor_cache[cache_key])
-                if cached.get("resolved"):
+                cached["link_id"] = link_id
+                cached["text_role_hint"] = role_hint
+                if cached.get("convert_status") in ("product", "coupon_or_activity"):
                     return cached
-                last_out = cached
+                last_failed = cached
                 continue
 
             adapter = self.adapters.get(try_plat)
@@ -1033,259 +1344,756 @@ class DealPoolCleaner:
                 continue
 
             try:
-                res = adapter.resolve_and_convert_universal(anchor)
+                res = adapter.resolve_and_convert_universal(clean_input)
             except Exception as exc:
                 out = {
-                    "resolved": False,
+                    "link_id": link_id,
+                    "clean_input": clean_input,
+                    "text_role_hint": role_hint,
+                    "convert_status": "failed",
+                    "platform": try_plat,
                     "error_code": ERR_ADAPTER_CONVERT_FAILED,
                     "error_msg": f"Adapter({try_plat})调用异常: {exc}",
+                    "official_product": None,
+                    "my_promo_link": None,
+                    "my_promo_token": None,
                     "adapter_res": {},
                 }
                 self.anchor_cache[cache_key] = out
-                last_out = out
+                last_failed = out
                 continue
 
-            if not isinstance(res, dict) or res.get("status") != "success":
-                raw_code = str((res or {}).get("error_code") or "")
-                raw_msg = str((res or {}).get("error_msg") or "转链未返回有效结果")
-                if raw_code == "UNSUPPORTED_TB_NUMERIC_ID" or (try_plat == "taobao" and "不支持数字id" in raw_msg):
-                    err_code = ERR_TB_NUMERIC_ID
-                elif raw_code == "UNSUPPORTED_PDD_ID_ONLY_URL" or (try_plat == "pdd" and "40009" in raw_msg):
-                    err_code = ERR_PDD_NUMERIC_ID
-                elif raw_code == "UNSUPPORTED_JD_NUMERIC_SKU" or (try_plat == "jd" and "不支持数字id" in raw_msg):
-                    err_code = ERR_JD_NUMERIC_SKU
-                elif raw_code == "PRODUCT_OFF_PROMOTION" or any(
-                    k in raw_msg for k in ("下架", "不在推广", "取消推广", "不支持该商品")
-                ):
-                    err_code = ERR_ADAPTER_OFF_PROMOTION
-                else:
-                    err_code = ERR_ADAPTER_CONVERT_FAILED
+            if isinstance(res, dict) and res.get("status") == "success":
+                goods_id = str(res.get("goods_id") or "").strip()
+                goods_sign = str(res.get("goods_sign") or "").strip()
+                product_card = res.get("product")
+                promo_link = str(res.get("final_link") or res.get("url") or "").strip()
+                promo_token = str(res.get("promotion_token") or "").strip()
 
+                if goods_id and goods_sign and isinstance(product_card, dict):
+                    official_price = float(product_card.get("price") or res.get("price") or 0.0)
+                    orig_price = float(product_card.get("original_price") or official_price)
+                    act_price = float(product_card.get("activity_price") or official_price)
+                    cpn_amt = float(product_card.get("coupon_amount") or res.get("coupon_amount") or 0.0)
+                    out = {
+                        "link_id": link_id,
+                        "clean_input": clean_input,
+                        "text_role_hint": role_hint,
+                        "convert_status": "product",
+                        "platform": try_plat,
+                        "goods_id": goods_id,
+                        "goods_sign": goods_sign,
+                        "error_code": "OK",
+                        "error_msg": "",
+                        "official_product": {
+                            "title": str(product_card.get("name") or res.get("title") or "").strip(),
+                            "price": round(official_price, 2),
+                            "original_price": round(orig_price, 2),
+                            "activity_price": round(act_price, 2),
+                            "coupon_amount": round(cpn_amt, 2),
+                            "shop_name": str(product_card.get("mall_name") or "").strip(),
+                        },
+                        "my_promo_link": promo_link or None,
+                        "my_promo_token": promo_token or None,
+                        "adapter_res": res,
+                    }
+                    self.anchor_cache[cache_key] = out
+                    return copy.deepcopy(out)
+
+                # 转链成功但无单一商品详情（例如京东/淘宝优惠券短链、活动会场推广链）
+                if promo_link or promo_token:
+                    out = {
+                        "link_id": link_id,
+                        "clean_input": clean_input,
+                        "text_role_hint": role_hint,
+                        "convert_status": "coupon_or_activity",
+                        "platform": try_plat,
+                        "goods_id": "",
+                        "goods_sign": "",
+                        "error_code": "OK_COUPON",
+                        "error_msg": "",
+                        "official_product": None,
+                        "my_promo_link": promo_link or (clean_input if clean_input.startswith("http") else None),
+                        "my_promo_token": promo_token or None,
+                        "adapter_res": res,
+                    }
+                    self.anchor_cache[cache_key] = out
+                    return copy.deepcopy(out)
+
+            # 若上游未返回单品转链结果，但该链接本身就是可直接打开的官方领券/活动会场链接（如 coupon.m.jd.com），保留为可用优惠券链接
+            if is_direct_coupon_or_venue_url(clean_input, role_hint):
                 out = {
-                    "resolved": False,
-                    "error_code": err_code,
-                    "error_msg": raw_msg,
-                    "adapter_res": res or {},
+                    "link_id": link_id,
+                    "clean_input": clean_input,
+                    "text_role_hint": role_hint,
+                    "convert_status": "coupon_or_activity",
+                    "platform": try_plat,
+                    "goods_id": "",
+                    "goods_sign": "",
+                    "error_code": "OK_DIRECT_COUPON",
+                    "error_msg": "",
+                    "official_product": None,
+                    "my_promo_link": clean_input,
+                    "my_promo_token": None,
+                    "adapter_res": res if isinstance(res, dict) else {},
                 }
                 self.anchor_cache[cache_key] = out
-                last_out = out
-                continue
+                return copy.deepcopy(out)
 
-            goods_id = str(res.get("goods_id") or "").strip()
-            goods_sign = str(res.get("goods_sign") or "").strip()
-            product_card = res.get("product")
-
-            # 黄金准则：必须同时返回非空 goods_id、goods_sign 及官方商品字典才算转链出具体唯一商品
-            if not goods_id or not goods_sign or not isinstance(product_card, dict):
-                out = {
-                    "resolved": False,
-                    "error_code": ERR_EMPTY_PRODUCT_IDENTITY,
-                    "error_msg": "转链成功但未指向具体唯一单品（如红包/领券/活动会场链接）",
-                    "adapter_res": res,
-                }
-                self.anchor_cache[cache_key] = out
-                last_out = out
-                continue
+            raw_code = str((res or {}).get("error_code") or "")
+            raw_msg = str((res or {}).get("error_msg") or "转链未返回有效结果")
+            if raw_code == "UNSUPPORTED_TB_NUMERIC_ID" or (try_plat == "taobao" and "不支持数字id" in raw_msg):
+                err_code = ERR_TB_NUMERIC_ID
+            elif raw_code == "UNSUPPORTED_PDD_ID_ONLY_URL" or (try_plat == "pdd" and "40009" in raw_msg):
+                err_code = ERR_PDD_NUMERIC_ID
+            elif raw_code == "UNSUPPORTED_JD_NUMERIC_SKU" or (try_plat == "jd" and "不支持数字id" in raw_msg):
+                err_code = ERR_JD_NUMERIC_SKU
+            elif raw_code == "PRODUCT_OFF_PROMOTION" or any(
+                k in raw_msg for k in ("下架", "不在推广", "取消推广", "不支持该商品")
+            ):
+                err_code = ERR_ADAPTER_OFF_PROMOTION
+            else:
+                err_code = ERR_ADAPTER_CONVERT_FAILED
 
             out = {
-                "resolved": True,
-                "error_code": "OK",
-                "error_msg": "",
+                "link_id": link_id,
+                "clean_input": clean_input,
+                "text_role_hint": role_hint,
+                "convert_status": "failed",
                 "platform": try_plat,
-                "goods_id": goods_id,
-                "goods_sign": goods_sign,
-                "adapter_res": res,
+                "goods_id": "",
+                "goods_sign": "",
+                "error_code": err_code,
+                "error_msg": raw_msg,
+                "official_product": None,
+                "my_promo_link": None,
+                "my_promo_token": None,
+                "adapter_res": res if isinstance(res, dict) else {},
             }
             self.anchor_cache[cache_key] = out
-            return copy.deepcopy(out)
+            last_failed = out
 
-        return copy.deepcopy(last_out)
+        return copy.deepcopy(last_failed) if last_failed else {
+            "link_id": link_id,
+            "clean_input": clean_input,
+            "text_role_hint": role_hint,
+            "convert_status": "failed",
+            "platform": plat,
+            "goods_id": "",
+            "goods_sign": "",
+            "error_code": ERR_ADAPTER_CONVERT_FAILED,
+            "error_msg": "未能识别平台或转链失败",
+            "official_product": None,
+            "my_promo_link": None,
+            "my_promo_token": None,
+            "adapter_res": {},
+        }
 
-    def clean_one_record(self, doc: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        单条记录的极简基线清洗闭环：
-        收集候选输入 -> 顺位调用官方 Adapter 直接转链 -> 若转链出具体唯一商品则提取维护关键信息并构造正式表文档。
-        """
-        t0 = time.perf_counter()
-        site = str(doc.get("source_site") or "")
-        channel = str(doc.get("source_channel") or "")
-        item_id = str(doc.get("source_item_id") or "")
-        raw_title = str(doc.get("title") or "").strip()
+    def run_ai_stage2_batch(self, stage2_inputs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """并发执行 Stage 4（AI-2：底牌终审、教程重构与质量评分），返回 `main_tip_id -> ai2_result` 字典。"""
+        results_by_id: Dict[str, Dict[str, Any]] = {}
+        if not stage2_inputs:
+            return results_by_id
 
-        candidates = self.collect_candidate_inputs(doc)
-        if not candidates:
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        chunks = [
+            stage2_inputs[i : i + self.ai_batch_size]
+            for i in range(0, len(stage2_inputs), self.ai_batch_size)
+        ]
+
+        def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            self.stats_ai2_calls += 1
+            return self._call_ai_json_array(self.prompt_stage2_template, chunk, "AI-Stage2")
+
+        with ThreadPoolExecutor(max_workers=min(self.ai_max_workers, len(chunks))) as pool:
+            futures = {pool.submit(_worker, ch): ch for ch in chunks}
+            for fut in as_completed(futures):
+                try:
+                    arr = fut.result()
+                    for item in arr:
+                        mid = str(item.get("main_tip_id") or "").strip()
+                        if mid:
+                            results_by_id[mid] = item
+                except Exception as e:
+                    logger.warning("[AI-Stage2] 并发批次执行异常: %s", e)
+
+        return results_by_id
+
+    @staticmethod
+    def _fallback_stage2_evaluate(s2_input: Dict[str, Any]) -> Dict[str, Any]:
+        """当 Stage 2 AI 偶发超时未返回某条记录时的确定性保底终审器。"""
+        mid = str(s2_input.get("main_tip_id") or "")
+        conv_links = s2_input.get("converted_links") or []
+        prod_links = [c for c in conv_links if c.get("convert_status") == "product"]
+        if not prod_links:
             return {
-                "status": "failed",
-                "error_code": ERR_NO_ANCHOR,
-                "error_msg": "记录中无可用候选链接、口令或文本",
-                "source_site": site,
-                "source_channel": channel,
-                "source_item_id": item_id,
-                "title": raw_title,
-                "elapsed_ms": elapsed_ms,
-                "candidate_count": 0,
-                "attempt_errors": [],
+                "main_tip_id": mid,
+                "is_valid_deal": False,
+                "reject_reason": "ALL_PRODUCTS_DEAD",
+                "main_link_id": None,
+                "quality_score": 0,
             }
 
-        resolved_hit: Optional[Dict[str, Any]] = None
-        winning_cand: Optional[Dict[str, str]] = None
-        attempt_errors: List[Dict[str, str]] = []
+        # 若有多个候选但主商品候选全部失败、仅 filler_candidate 存活，严格拒绝
+        main_cands = [c for c in conv_links if c.get("text_role_hint") == "main_candidate"]
+        if main_cands and not any(c.get("convert_status") == "product" for c in main_cands):
+            return {
+                "main_tip_id": mid,
+                "is_valid_deal": False,
+                "reject_reason": "MAIN_PRODUCT_DEAD_ONLY_FILLER",
+                "main_link_id": None,
+                "quality_score": 0,
+            }
 
-        for cand in candidates[:5]:
-            r = self.convert_single_candidate(cand)
-            if r.get("resolved"):
-                resolved_hit = r
-                winning_cand = cand
-                break
-            attempt_errors.append({
-                "anchor": cand["anchor"][:100],
-                "error_code": r["error_code"],
-                "error_msg": r["error_msg"],
+        winning = next((c for c in prod_links if c.get("text_role_hint") == "main_candidate"), prod_links[0])
+        main_lid = winning["link_id"]
+        off_prod = winning.get("official_product") or {}
+        clean_title = str(off_prod.get("title") or "").strip()
+
+        coupon_links = [
+            {"link_id": c["link_id"], "label": "先领优惠券/补贴券"}
+            for c in conv_links
+            if c.get("convert_status") == "coupon_or_activity"
+        ]
+        filler_links = [
+            {
+                "link_id": c["link_id"],
+                "label": f"凑单商品：{str((c.get('official_product') or {}).get('title') or '')[:24]}",
+            }
+            for c in prod_links
+            if c["link_id"] != main_lid
+        ]
+
+        raw_txt = str(s2_input.get("combined_raw_text") or "").strip()
+        imgs = s2_input.get("extracted_images") or []
+        score = 72 + (6 if imgs else 0) + (6 if coupon_links else 0)
+        return {
+            "main_tip_id": mid,
+            "is_valid_deal": True,
+            "reject_reason": None,
+            "main_link_id": main_lid,
+            "clean_title": clean_title,
+            "deal_price": None,
+            "unit_deal_price": None,
+            "price_logic": None,
+            "coupon_links": coupon_links,
+            "filler_links": filler_links,
+            "tutorial_steps": [ln.strip() for ln in raw_txt.splitlines() if ln.strip()][:6],
+            "tutorial_summary": raw_txt,
+            "quality_score": min(95, score),
+            "score_breakdown": {
+                "match_score": 22,
+                "completeness_score": 24,
+                "price_clarity_score": 14,
+                "tutorial_and_image_score": 12 + (6 if imgs else 0),
+            },
+        }
+
+    @staticmethod
+    def _inject_converted_links_into_text(text: str, link_map: Dict[str, Dict[str, Any]]) -> str:
+        """将教程文本中的 `[#L1]`、`[#L2]` 占位符精确替换为我方转链后的专属推广链接/口令。"""
+        out = str(text or "")
+        for lid, cl in link_map.items():
+            placeholder = f"[#{lid}]"
+            if placeholder not in out:
+                continue
+            p_url = str(cl.get("my_promo_link") or "").strip()
+            p_tok = str(cl.get("my_promo_token") or "").strip()
+            if p_url and p_tok:
+                rep = f"{p_url} (口令: {p_tok})"
+            elif p_url:
+                rep = p_url
+            elif p_tok:
+                rep = p_tok
+            else:
+                rep = "[链接已失效]"
+            out = out.replace(placeholder, rep)
+        return out
+
+    def clean_batch_records(self, selected_docs: List[Dict[str, Any]], raw_col) -> List[Dict[str, Any]]:
+        """
+        对一批 `pending` 记录完整执行 Stage 2 (AI-1) -> Stage 3 (官方 API 转链) -> Stage 4 (AI-2 终审与评分)。
+        """
+        if not selected_docs:
+            return []
+
+        t_batch_start = time.perf_counter()
+        docs_by_tip_id: Dict[str, Dict[str, Any]] = {}
+        neighbor_maps_by_id: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        stage1_inputs: List[Dict[str, Any]] = []
+
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            if not mid:
+                continue
+            docs_by_tip_id[mid] = doc
+            s1_inp, tip_map = self.build_stage1_task_input(doc, raw_col)
+            neighbor_maps_by_id[mid] = tip_map
+            stage1_inputs.append(s1_inp)
+
+        # ---------------- Stage 2: 调用 AI-1 合并群上下文并无损拆解全部链接/口令 ----------------
+        logger.info("🤖 [Stage 2 / AI-1] 正在对 %d 条线报执行上下文聚合与多链接/口令无损拆解...", len(stage1_inputs))
+        ai1_results = self.run_ai_stage1_batch(stage1_inputs, docs_by_tip_id)
+
+        # ---------------- Stage 3: 官方 Adapter 逐一转链核验（区分单品、优惠券与死链） ----------------
+        converted_by_tip_id: Dict[str, List[Dict[str, Any]]] = {}
+        stage2_inputs: List[Dict[str, Any]] = []
+        pre_stage2_outcomes: Dict[str, Dict[str, Any]] = {}
+
+        # 若同批次中某条消息已被相邻主线报吸收进 merged_tip_ids，直接标记为 merged_into_parent 避免重复转链
+        absorbed_by_neighbor: Dict[str, str] = {}
+        for mid, ai1_res in ai1_results.items():
+            if not ai1_res.get("is_standalone_deal", True):
+                continue
+            for m_tid in ai1_res.get("merged_tip_ids") or []:
+                m_tid_str = str(m_tid or "").strip()
+                if m_tid_str and m_tid_str != mid:
+                    absorbed_by_neighbor[m_tid_str] = mid
+
+        logger.info("🔗 [Stage 3 / 官方转链] 正在调用淘/京/拼官方 Adapter 核验全部拆解目标...")
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            site = str(doc.get("source_site") or "")
+            channel = str(doc.get("source_channel") or "")
+            raw_title = str(doc.get("title") or "").strip()
+            ai1_res = ai1_results.get(mid) or {}
+
+            if mid in absorbed_by_neighbor or ai1_res.get("is_standalone_deal") is False:
+                parent_id = absorbed_by_neighbor.get(mid) or ""
+                pre_stage2_outcomes[mid] = {
+                    "status": "merged_into_parent",
+                    "error_code": ERR_MERGED_INTO_NEIGHBOR,
+                    "error_msg": f"群聊连续碎片已合并入相邻主线报 {parent_id}".strip(),
+                    "merged_into_tip_id": parent_id,
+                    "source_site": site,
+                    "source_channel": channel,
+                    "source_item_id": mid,
+                    "title": raw_title,
+                    "ai_stage1_result": ai1_res,
+                    "converted_links": [],
+                    "ai_stage2_result": None,
+                    "quality_score": 0,
+                    "candidate_count": 0,
+                    "attempt_errors": [],
+                }
+                continue
+
+            targets = ai1_res.get("extracted_targets") or []
+            if not targets:
+                pre_stage2_outcomes[mid] = {
+                    "status": "failed",
+                    "error_code": ERR_NO_ANCHOR,
+                    "error_msg": "Stage 1 AI 未在爆料文本中识别出任何电商链接或口令",
+                    "source_site": site,
+                    "source_channel": channel,
+                    "source_item_id": mid,
+                    "title": raw_title,
+                    "ai_stage1_result": ai1_res,
+                    "converted_links": [],
+                    "ai_stage2_result": None,
+                    "quality_score": 0,
+                    "candidate_count": 0,
+                    "attempt_errors": [],
+                }
+                continue
+
+            conv_list: List[Dict[str, Any]] = []
+            attempt_errors: List[Dict[str, str]] = []
+            for tgt in targets[:8]:
+                if not isinstance(tgt, dict):
+                    continue
+                c_res = self.convert_single_target(tgt, default_plat=str(doc.get("platform") or "unknown"))
+                conv_list.append(c_res)
+                if c_res["convert_status"] == "failed":
+                    attempt_errors.append({
+                        "link_id": c_res["link_id"],
+                        "anchor": str(c_res.get("clean_input") or "")[:100],
+                        "error_code": c_res["error_code"],
+                        "error_msg": c_res["error_msg"],
+                    })
+
+            converted_by_tip_id[mid] = conv_list
+            prod_convs = [c for c in conv_list if c["convert_status"] == "product"]
+            coupon_convs = [c for c in conv_list if c["convert_status"] == "coupon_or_activity"]
+
+            if not prod_convs:
+                if coupon_convs and not attempt_errors:
+                    primary_err_code = ERR_EMPTY_PRODUCT_IDENTITY
+                    primary_err_msg = "仅包含优惠券或活动会场链接，无具体主商品"
+                else:
+                    primary_err_code = attempt_errors[0]["error_code"] if attempt_errors else ERR_ADAPTER_CONVERT_FAILED
+                    primary_err_msg = attempt_errors[0]["error_msg"] if attempt_errors else "所有候选链接均转链失败"
+                pre_stage2_outcomes[mid] = {
+                    "status": "failed",
+                    "error_code": primary_err_code,
+                    "error_msg": primary_err_msg,
+                    "source_site": site,
+                    "source_channel": channel,
+                    "source_item_id": mid,
+                    "title": raw_title,
+                    "ai_stage1_result": ai1_res,
+                    "converted_links": [
+                        {k: v for k, v in c.items() if k != "adapter_res"}
+                        for c in conv_list
+                    ],
+                    "ai_stage2_result": None,
+                    "quality_score": 0,
+                    "candidate_count": len(targets),
+                    "attempt_errors": attempt_errors,
+                }
+                continue
+
+            # 构造送往 Stage 4 (AI-2) 的精简底牌数据（隐去庞大的 raw_item 字典以提升 AI 推理速度与准确度）
+            ai2_conv_links = [
+                {
+                    "link_id": c["link_id"],
+                    "text_role_hint": c["text_role_hint"],
+                    "convert_status": c["convert_status"],
+                    "platform": c["platform"],
+                    "official_product": c["official_product"],
+                    "my_promo_link": c["my_promo_link"],
+                    "my_promo_token": c["my_promo_token"],
+                }
+                for c in conv_list
+            ]
+            stage2_inputs.append({
+                "main_tip_id": mid,
+                "source_site": site,
+                "is_group_stream": bool(doc.get("is_group_stream")),
+                "combined_raw_text": str(ai1_res.get("combined_raw_text") or ""),
+                "extracted_images": ai1_res.get("extracted_images") or [],
+                "converted_links": ai2_conv_links,
             })
 
-        if not resolved_hit or not winning_cand:
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-            primary_err_code = attempt_errors[0]["error_code"] if attempt_errors else ERR_ADAPTER_CONVERT_FAILED
-            primary_err_msg = attempt_errors[0]["error_msg"] if attempt_errors else "所有候选输入均未能转链出具体商品"
-            return {
-                "status": "failed",
-                "error_code": primary_err_code,
-                "error_msg": primary_err_msg,
-                "source_site": site,
-                "source_channel": channel,
-                "source_item_id": item_id,
-                "title": raw_title,
-                "elapsed_ms": elapsed_ms,
-                "candidate_count": len(candidates),
-                "attempt_errors": attempt_errors,
-            }
+        # ---------------- Stage 4: 调用 AI-2 进行底牌终审、教程重构与 0~100 质量评分 ----------------
+        logger.info("🧠 [Stage 4 / AI-2] 正在对 %d 条转出官方商品的线报执行底牌终审、教程重构与质量评分...", len(stage2_inputs))
+        ai2_results = self.run_ai_stage2_batch(stage2_inputs)
+        s2_input_map = {item["main_tip_id"]: item for item in stage2_inputs}
 
-        # ======================================================================
-        # 直接转链成功解析出唯一商品！提取并维护关键线报信息 (`deal_info`) 准备入正式表 `products`
-        # ======================================================================
-        plat = resolved_hit["platform"]
-        goods_id = resolved_hit["goods_id"]
-        goods_sign = resolved_hit["goods_sign"]
-        adapter_res = resolved_hit["adapter_res"]
-        product_card = copy.deepcopy(adapter_res.get("product") or {})
+        avg_ms = round((time.perf_counter() - t_batch_start) * 1000.0 / max(1, len(selected_docs)), 1)
+        final_results: List[Dict[str, Any]] = []
 
-        my_promo_link = str(adapter_res.get("final_link") or adapter_res.get("url") or "")
-        my_promo_token = str(adapter_res.get("promotion_token") or "")
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            if mid in pre_stage2_outcomes:
+                out = pre_stage2_outcomes[mid]
+                out["elapsed_ms"] = avg_ms
+                final_results.append(out)
+                continue
 
-        # 将原教程中的原始商品链接或口令替换为转链后的推广链接/口令
-        raw_tutorial = str(doc.get("tutorial_text") or "").strip()
-        cleaned_tutorial = raw_tutorial
-        old_anchor_str = winning_cand["anchor"]
-        if my_promo_link and old_anchor_str and old_anchor_str.startswith("http") and old_anchor_str in cleaned_tutorial:
-            cleaned_tutorial = cleaned_tutorial.replace(old_anchor_str, my_promo_link)
-        elif my_promo_token and old_anchor_str and old_anchor_str in cleaned_tutorial:
-            cleaned_tutorial = cleaned_tutorial.replace(old_anchor_str, my_promo_token)
+            site = str(doc.get("source_site") or "")
+            channel = str(doc.get("source_channel") or "")
+            raw_title = str(doc.get("title") or "").strip()
+            ai1_res = ai1_results.get(mid) or {}
+            conv_list = converted_by_tip_id.get(mid) or []
+            s2_inp = s2_input_map.get(mid) or {}
+            ai2_res = ai2_results.get(mid)
+            if not isinstance(ai2_res, dict) or "is_valid_deal" not in ai2_res:
+                ai2_res = self._fallback_stage2_evaluate(s2_inp)
 
-        # 保留同帖中的其余链接作为附属参考链接
-        aux_list: List[Dict[str, Any]] = []
-        for c in candidates:
-            if c["anchor"] != winning_cand["anchor"] and c["type"] != "raw_text":
-                aux_list.append({
-                    "label": c.get("label") or "附属链接",
-                    "url": c["anchor"],
+            conv_summary_for_db = [
+                {k: v for k, v in c.items() if k != "adapter_res"}
+                for c in conv_list
+            ]
+            link_map = {c["link_id"]: c for c in conv_list}
+
+            is_valid = bool(ai2_res.get("is_valid_deal"))
+            main_lid = str(ai2_res.get("main_link_id") or "").strip()
+            main_conv = link_map.get(main_lid)
+            if is_valid and (not main_conv or main_conv.get("convert_status") != "product"):
+                # 若 AI-2 返回的 main_link_id 不在存活单品中，尝试修正或判为无效
+                prod_convs = [c for c in conv_list if c.get("convert_status") == "product"]
+                if prod_convs and ai2_res.get("reject_reason") is None:
+                    main_conv = prod_convs[0]
+                    main_lid = main_conv["link_id"]
+                else:
+                    is_valid = False
+
+            if not is_valid or not main_conv:
+                rej = str(ai2_res.get("reject_reason") or "ALL_PRODUCTS_DEAD").upper()
+                if "FILLER" in rej:
+                    err_code = ERR_AI2_MAIN_DEAD_ONLY_FILLER
+                elif "MISMATCH" in rej:
+                    err_code = ERR_AI2_PRODUCT_MISMATCH
+                elif "VIRTUAL" in rej or "JUNK" in rej:
+                    err_code = ERR_AI2_VIRTUAL_OR_JUNK
+                else:
+                    err_code = ERR_ADAPTER_CONVERT_FAILED
+                final_results.append({
+                    "status": "failed",
+                    "error_code": err_code,
+                    "error_msg": f"AI-2 终审拦截 ({rej})",
+                    "source_site": site,
+                    "source_channel": channel,
+                    "source_item_id": mid,
+                    "title": raw_title,
+                    "ai_stage1_result": ai1_res,
+                    "converted_links": conv_summary_for_db,
+                    "ai_stage2_result": ai2_res,
+                    "quality_score": 0,
+                    "candidate_count": len(conv_list),
+                    "attempt_errors": [],
+                    "elapsed_ms": avg_ms,
+                })
+                continue
+
+            try:
+                quality_score = int(float(ai2_res.get("quality_score") or 0))
+            except Exception:
+                quality_score = 70
+            quality_score = max(0, min(100, quality_score))
+            score_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
+
+            # 组装主商品官方真实详情与爆料专属 deal_info（严格隔离顶层官方价格与爆料价！）
+            plat = main_conv["platform"]
+            goods_id = main_conv["goods_id"]
+            goods_sign = main_conv["goods_sign"]
+            adapter_res = main_conv["adapter_res"]
+            product_card = copy.deepcopy(adapter_res.get("product") or {})
+
+            my_promo_link = str(main_conv.get("my_promo_link") or "")
+            my_promo_token = str(main_conv.get("my_promo_token") or "")
+
+            # 提取并校验 deal_price（仅存于 deal_info，绝不覆盖顶层 price / activity_price）
+            raw_deal_p = ai2_res.get("deal_price")
+            if raw_deal_p is None:
+                raw_deal_p = doc.get("price")
+            deal_price: Optional[float] = None
+            if isinstance(raw_deal_p, (int, float)) and 0 < float(raw_deal_p) < 100000:
+                deal_price = round(float(raw_deal_p), 2)
+            elif isinstance(raw_deal_p, str):
+                try:
+                    val = float(re.sub(r"[^\d.]", "", raw_deal_p))
+                    if 0 < val < 100000:
+                        deal_price = round(val, 2)
+                except Exception:
+                    pass
+
+            unit_deal_price = str(ai2_res.get("unit_deal_price") or "").strip() or None
+            price_logic = str(ai2_res.get("price_logic") or "").strip() or None
+            clean_title = str(ai2_res.get("clean_title") or product_card.get("name") or raw_title).strip()
+
+            # 组装前置优惠券列表 coupon_links 与凑单商品列表 filler_links
+            coupon_links: List[Dict[str, Any]] = []
+            seen_cpn_ids: Set[str] = set()
+            for item in ai2_res.get("coupon_links") or []:
+                if not isinstance(item, dict):
+                    continue
+                lid = str(item.get("link_id") or "").strip()
+                c_obj = link_map.get(lid)
+                if not c_obj or c_obj.get("convert_status") == "failed" or lid == main_lid or lid in seen_cpn_ids:
+                    continue
+                seen_cpn_ids.add(lid)
+                coupon_links.append({
+                    "link_id": lid,
+                    "label": str(item.get("label") or "先领优惠券").strip(),
+                    "url": c_obj.get("my_promo_link") or "",
+                    "token": c_obj.get("my_promo_token") or "",
+                    "platform": c_obj.get("platform") or plat,
+                })
+            # 若 Stage 3 存在已转链成功的 coupon_or_activity 但 AI-2 漏列，自动补齐以免丢券
+            for c_obj in conv_list:
+                lid = c_obj["link_id"]
+                if c_obj.get("convert_status") == "coupon_or_activity" and lid not in seen_cpn_ids and lid != main_lid:
+                    seen_cpn_ids.add(lid)
+                    coupon_links.append({
+                        "link_id": lid,
+                        "label": "领取优惠券/活动补贴",
+                        "url": c_obj.get("my_promo_link") or "",
+                        "token": c_obj.get("my_promo_token") or "",
+                        "platform": c_obj.get("platform") or plat,
+                    })
+
+            filler_links: List[Dict[str, Any]] = []
+            seen_flr_ids: Set[str] = set()
+            for item in ai2_res.get("filler_links") or []:
+                if not isinstance(item, dict):
+                    continue
+                lid = str(item.get("link_id") or "").strip()
+                c_obj = link_map.get(lid)
+                if not c_obj or c_obj.get("convert_status") != "product" or lid == main_lid or lid in seen_flr_ids:
+                    continue
+                seen_flr_ids.add(lid)
+                off_p = c_obj.get("official_product") or {}
+                filler_links.append({
+                    "link_id": lid,
+                    "label": str(item.get("label") or f"凑单商品：{off_p.get('title', '')[:20]}").strip(),
+                    "url": c_obj.get("my_promo_link") or "",
+                    "token": c_obj.get("my_promo_token") or "",
+                    "platform": c_obj.get("platform") or plat,
+                    "goods_id": c_obj.get("goods_id") or "",
+                    "official_title": off_p.get("title") or "",
+                    "official_price": off_p.get("price"),
                 })
 
-        # 保留教程图片/买家实付截图
-        official_img = str(product_card.get("image_url") or "")
-        raw_tutorial_imgs = [str(u).strip() for u in (doc.get("tutorial_images") or []) if str(u or "").strip()]
-        proof_and_guide_images: List[str] = []
-        for img_u in raw_tutorial_imgs:
-            if img_u != official_img and img_u not in proof_and_guide_images:
-                proof_and_guide_images.append(img_u)
+            # 将 tutorial_steps 与 tutorial_summary 中的 [#L1] 占位符替换为我方推广链/口令
+            raw_steps = ai2_res.get("tutorial_steps") if isinstance(ai2_res.get("tutorial_steps"), list) else []
+            tutorial_steps = [
+                self._inject_converted_links_into_text(str(st).strip(), link_map)
+                for st in raw_steps
+                if str(st or "").strip()
+            ]
+            raw_summary = str(ai2_res.get("tutorial_summary") or ai1_res.get("combined_raw_text") or "").strip()
+            tutorial_text = self._inject_converted_links_into_text(raw_summary, link_map)
+            if not tutorial_steps and tutorial_text:
+                tutorial_steps = [ln.strip() for ln in tutorial_text.splitlines() if ln.strip()]
 
-        raw_p = doc.get("price")
-        deal_price = round(float(raw_p), 2) if isinstance(raw_p, (int, float)) and 0 < float(raw_p) < 100000 else None
+            # 提取用户实付晒单图与教程图（排除与官方商品主图完全相同的 URL）
+            official_img = str(product_card.get("image_url") or "").strip()
+            extracted_imgs = [str(u).strip() for u in (ai1_res.get("extracted_images") or []) if str(u or "").strip()]
+            user_share_images: List[str] = []
+            for img_u in extracted_imgs:
+                if img_u != official_img and img_u not in user_share_images:
+                    user_share_images.append(img_u)
 
-        official_price = float(product_card.get("price") or adapter_res.get("price") or deal_price or 0.0)
-        original_price = float(product_card.get("original_price") or official_price)
-        activity_price = float(deal_price) if (isinstance(deal_price, (int, float)) and deal_price > 0) else official_price
-        coupon_amount = float(product_card.get("coupon_amount") or adapter_res.get("coupon_amount") or 0.0)
-        saved_price = round(max(coupon_amount, max(0.0, original_price - activity_price)), 2)
+            # 汇总合并的群消息 ID 与源页面 URL 列表（满足用户核对源页面的需求）
+            merged_tip_ids = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
+            if mid not in merged_tip_ids:
+                merged_tip_ids.insert(0, mid)
+            tip_map = neighbor_maps_by_id.get(mid) or {mid: doc}
+            merged_source_urls: List[str] = []
+            for m_tid in merged_tip_ids:
+                nd = tip_map.get(m_tid) or {}
+                u_det = str(nd.get("source_detail_url") or nd.get("source_url") or "").strip()
+                if u_det and u_det not in merged_source_urls:
+                    merged_source_urls.append(u_det)
 
-        publish_time_str = str(doc.get("publish_time") or doc.get("fetched_at") or "").strip()
+            source_list_page_url = str(doc.get("source_list_page_url") or doc.get("source_url") or "").strip()
+            source_detail_url = str(doc.get("source_detail_url") or doc.get("source_url") or source_list_page_url).strip()
 
-        deal_info = {
-            "is_deal_tip": True,
-            "publish_time": publish_time_str,
-            "expire_time": doc.get("expire_time"),
-            "deal_price": deal_price,
-            "deal_price_text": str(doc.get("price_text") or (f"{deal_price}元" if deal_price else "")),
-            "official_price": official_price,
-            "raw_tip_title": raw_title or str(product_card.get("name") or ""),
-            "tutorial_text": cleaned_tutorial,
-            "tutorial_images": proof_and_guide_images,
-            "auxiliary_links": aux_list,
-            "my_promotion_link": my_promo_link,
-            "my_promotion_token": my_promo_token,
-            "source_site": site,
-            "source_channel": channel,
-            "source_item_id": item_id,
-            "seen_count": int(doc.get("seen_count") or 1),
-            "seen_channels": doc.get("seen_channels") or ([channel] if channel else []),
-            "hot_metrics": doc.get("hot_metrics") or {},
-        }
+            # 严格保持顶层价格 100% 为官方 API 真实价格，绝不用爆料价覆盖！
+            official_price = float(product_card.get("price") or adapter_res.get("price") or 0.0)
+            original_price = float(product_card.get("original_price") or official_price)
+            official_activity_price = float(product_card.get("activity_price") or official_price)
+            coupon_amount = float(product_card.get("coupon_amount") or adapter_res.get("coupon_amount") or 0.0)
+            saved_price = round(max(coupon_amount, max(0.0, original_price - official_activity_price)), 2)
 
-        product_doc = {
-            **product_card,
-            "platform": plat,
-            "platform_name": product_card.get("platform_name") or platform_name(plat),
-            "product_id": goods_id,
-            "goods_id": goods_id,
-            "goods_sign": goods_sign,
-            "name": str(product_card.get("name") or adapter_res.get("title") or raw_title).strip(),
-            "brand": str(product_card.get("brand") or product_card.get("brand_name") or ""),
-            "category": str(product_card.get("category") or product_card.get("category_name") or ""),
-            "price": round(official_price, 2),
-            "original_price": round(original_price, 2),
-            "activity_price": round(activity_price, 2),
-            "saved_price": round(saved_price, 2),
-            "coupon_amount": round(coupon_amount, 2),
-            "has_coupon": coupon_amount > 0,
-            "commission_rate": float(product_card.get("commission_rate") or 0.0),
-            "commission_amount": float(product_card.get("commission_amount") or 0.0),
-            "sales_tip": str(product_card.get("sales_tip") if product_card.get("sales_tip") is not None else "0"),
-            "image_url": official_img or str(doc.get("image_url") or ""),
-            "product_url": str(product_card.get("product_url") or my_promo_link or ""),
-            "mall_name": str(product_card.get("mall_name") or doc.get("mall_name") or ""),
-            "desc": str(product_card.get("desc") or ""),
-            "carousel_images": product_card.get("carousel_images") or ([official_img] if official_img else []),
-            "detail_tags": product_card.get("detail_tags") or [],
-            "service_guarantees": product_card.get("service_guarantees") or [],
-            "shop_ratings": product_card.get("shop_ratings") or {},
-            "specs": product_card.get("specs") or [],
-            "coupon_info": product_card.get("coupon_info") or {},
-            "deal_info": deal_info,
-        }
+            publish_time_str = str(doc.get("publish_time") or doc.get("fetched_at") or "").strip()
+            aux_list = [*coupon_links, *filler_links]
 
-        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-        return {
-            "status": "success",
-            "error_code": "OK",
-            "error_msg": "",
-            "source_site": site,
-            "source_channel": channel,
-            "source_item_id": item_id,
-            "platform": plat,
-            "product_id": goods_id,
-            "goods_sign": goods_sign,
-            "official_title": product_doc["name"],
-            "raw_title": raw_title,
-            "deal_price": deal_price,
-            "official_price": official_price,
-            "winning_anchor": winning_cand["anchor"][:100],
-            "winning_anchor_type": winning_cand["type"],
-            "candidate_count": len(candidates),
-            "tutorial_img_count": len(proof_and_guide_images),
-            "aux_link_count": len(aux_list),
-            "elapsed_ms": elapsed_ms,
-            "product_doc": product_doc,
-        }
+            deal_info = {
+                "is_deal_tip": True,
+                "quality_score": quality_score,
+                "score_breakdown": score_breakdown,
+                "clean_title": clean_title,
+                "publish_time": publish_time_str,
+                "expire_time": doc.get("expire_time"),
+                "deal_price": deal_price,
+                "deal_price_text": str(doc.get("price_text") or (f"{deal_price}元" if deal_price else "")),
+                "unit_deal_price": unit_deal_price,
+                "price_logic": price_logic,
+                "official_price": round(official_price, 2),
+                "raw_tip_title": raw_title or str(product_card.get("name") or ""),
+                "coupon_links": coupon_links,
+                "filler_links": filler_links,
+                "auxiliary_links": aux_list,
+                "tutorial_steps": tutorial_steps,
+                "tutorial_text": tutorial_text,
+                "user_share_images": user_share_images,
+                "tutorial_images": user_share_images,
+                "my_promotion_link": my_promo_link,
+                "my_promotion_token": my_promo_token,
+                "source_site": site,
+                "source_channel": channel,
+                "source_item_id": mid,
+                "source_url": source_detail_url,
+                "source_list_page_url": source_list_page_url,
+                "source_detail_url": source_detail_url,
+                "merged_tip_ids": merged_tip_ids,
+                "merged_source_urls": merged_source_urls,
+                "seen_count": int(doc.get("seen_count") or 1),
+                "seen_channels": doc.get("seen_channels") or ([channel] if channel else []),
+                "hot_metrics": doc.get("hot_metrics") or {},
+            }
+
+            product_doc = {
+                **product_card,
+                "platform": plat,
+                "platform_name": product_card.get("platform_name") or platform_name(plat),
+                "product_id": goods_id,
+                "goods_id": goods_id,
+                "goods_sign": goods_sign,
+                "name": str(product_card.get("name") or adapter_res.get("title") or clean_title).strip(),
+                "brand": str(product_card.get("brand") or product_card.get("brand_name") or ""),
+                "category": str(product_card.get("category") or product_card.get("category_name") or ""),
+                "price": round(official_price, 2),
+                "original_price": round(original_price, 2),
+                "activity_price": round(official_activity_price, 2),
+                "saved_price": round(saved_price, 2),
+                "coupon_amount": round(coupon_amount, 2),
+                "has_coupon": coupon_amount > 0,
+                "commission_rate": float(product_card.get("commission_rate") or 0.0),
+                "commission_amount": float(product_card.get("commission_amount") or 0.0),
+                "sales_tip": str(product_card.get("sales_tip") if product_card.get("sales_tip") is not None else "0"),
+                "image_url": official_img or str(doc.get("image_url") or ""),
+                "product_url": str(product_card.get("product_url") or my_promo_link or ""),
+                "mall_name": str(product_card.get("mall_name") or doc.get("mall_name") or ""),
+                "desc": str(product_card.get("desc") or ""),
+                "carousel_images": product_card.get("carousel_images") or ([official_img] if official_img else []),
+                "detail_tags": product_card.get("detail_tags") or [],
+                "service_guarantees": product_card.get("service_guarantees") or [],
+                "shop_ratings": product_card.get("shop_ratings") or {},
+                "specs": product_card.get("specs") or [],
+                "coupon_info": product_card.get("coupon_info") or {},
+                "deal_info": deal_info,
+            }
+
+            if quality_score < QUALIFIED_DEAL_MIN_SCORE:
+                final_results.append({
+                    "status": "low_score",
+                    "error_code": ERR_LOW_QUALITY_SCORE,
+                    "error_msg": f"综合评分 {quality_score} < {QUALIFIED_DEAL_MIN_SCORE} 分，仅留存初步表不入正式表",
+                    "source_site": site,
+                    "source_channel": channel,
+                    "source_item_id": mid,
+                    "platform": plat,
+                    "product_id": goods_id,
+                    "goods_sign": goods_sign,
+                    "official_title": product_doc["name"],
+                    "title": raw_title,
+                    "deal_price": deal_price,
+                    "official_price": official_price,
+                    "quality_score": quality_score,
+                    "score_breakdown": score_breakdown,
+                    "merged_tip_ids": merged_tip_ids,
+                    "ai_stage1_result": ai1_res,
+                    "converted_links": conv_summary_for_db,
+                    "ai_stage2_result": ai2_res,
+                    "candidate_count": len(conv_list),
+                    "attempt_errors": [],
+                    "elapsed_ms": avg_ms,
+                })
+                continue
+
+            final_results.append({
+                "status": "success",
+                "error_code": "OK",
+                "error_msg": "",
+                "source_site": site,
+                "source_channel": channel,
+                "source_item_id": mid,
+                "platform": plat,
+                "product_id": goods_id,
+                "goods_sign": goods_sign,
+                "official_title": product_doc["name"],
+                "raw_title": raw_title,
+                "deal_price": deal_price,
+                "official_price": official_price,
+                "quality_score": quality_score,
+                "score_breakdown": score_breakdown,
+                "merged_tip_ids": merged_tip_ids,
+                "ai_stage1_result": ai1_res,
+                "converted_links": conv_summary_for_db,
+                "ai_stage2_result": ai2_res,
+                "winning_anchor": str(main_conv.get("clean_input") or "")[:100],
+                "winning_anchor_type": main_conv.get("text_role_hint") or "main_candidate",
+                "candidate_count": len(conv_list),
+                "tutorial_img_count": len(user_share_images),
+                "aux_link_count": len(aux_list),
+                "elapsed_ms": avg_ms,
+                "product_doc": product_doc,
+            })
+
+        return final_results
 
 
 def upsert_cleaned_products_to_formal_table(
@@ -1293,23 +2101,51 @@ def upsert_cleaned_products_to_formal_table(
     product_docs: List[Dict[str, Any]],
 ) -> Dict[str, int]:
     """
-    将直接转链核验通过的唯一商品幂等写入正式表 `products`：
+    【Stage 5：高分好价商品晋升入正式表 `products`（含质量评分防覆盖保护）】
     - 严格以唯一索引 `{"platform": plat, "product_id": pid}` 作为过滤条件；
-    - 更新商品最新详情并挂载 `deal_info`（爆料时间、购买教程、实付截图、推广链接与跨群共振热度）。
+    - 顶层商品属性 (`name`, `price`, `original_price`, `activity_price` 等) 始终保持官方最新数据；
+    - 高分保护法则：
+      1) 同批次多条线报命中同一商品时，按 `deal_info.quality_score` 最高者胜出；
+      2) 若 `products` 表中该商品已有 `deal_info.is_deal_tip == True` 且 `updated_at` 在 12 小时保鲜期内，
+         仅当新线报 `quality_score >= 已有 deal_info.quality_score` 时才更新 `deal_info` 内容，
+         防止低分简陋线报覆盖带优惠券、带凑单教程、带实付晒单图的高分精品线报！
     """
     if not product_docs:
-        return {"upserted": 0, "modified": 0, "matched": 0, "total_ops": 0}
+        return {"upserted": 0, "modified": 0, "matched": 0, "protected_high_score": 0, "total_ops": 0}
 
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    protection_cutoff = now - datetime.timedelta(hours=DEAL_INFO_PROTECTION_HOURS)
 
     grouped_by_pid: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for doc in product_docs:
         grouped_by_pid[(doc["platform"], doc["product_id"])].append(doc)
 
+    # 批量查询正式表中已存在的同款商品，检查其现有 deal_info.quality_score 与更新时间
+    existing_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    try:
+        or_queries = [{"platform": p, "product_id": pid} for (p, pid) in grouped_by_pid.keys()]
+        if or_queries:
+            for ex_doc in formal_col.find(
+                {"$or": or_queries},
+                {"_id": 0, "platform": 1, "product_id": 1, "updated_at": 1, "deal_info.is_deal_tip": 1, "deal_info.quality_score": 1},
+            ):
+                k = (str(ex_doc.get("platform") or ""), str(ex_doc.get("product_id") or ""))
+                existing_map[k] = ex_doc
+    except Exception as e:
+        logger.warning("查询正式表已有商品评分异常: %s", e)
+
     ops = []
+    protected_high_score = 0
+
     for (plat, pid), docs_for_item in grouped_by_pid.items():
-        latest_doc = copy.deepcopy(docs_for_item[-1])
-        deal_info = copy.deepcopy(latest_doc.pop("deal_info", {}) or {})
+        # 按 quality_score 升序排列，取最高分的一条作为胜出者
+        docs_sorted = sorted(
+            docs_for_item,
+            key=lambda x: int((x.get("deal_info") or {}).get("quality_score") or 0),
+        )
+        best_doc = copy.deepcopy(docs_sorted[-1])
+        deal_info = copy.deepcopy(best_doc.pop("deal_info", {}) or {})
+        new_score = int(deal_info.get("quality_score") or 0)
 
         total_seen_inc = 0
         all_sites: List[str] = []
@@ -1329,13 +2165,28 @@ def upsert_cleaned_products_to_formal_table(
         deal_info.pop("seen_channels", None)
 
         set_fields: Dict[str, Any] = {
-            **latest_doc,
+            **best_doc,
             "updated_at": now,
             "detail_updated_at": now,
             "last_clean_source": "deal_pool",
         }
-        for dk, dv in deal_info.items():
-            set_fields[f"deal_info.{dk}"] = dv
+
+        ex_record = existing_map.get((plat, pid))
+        ex_di = (ex_record or {}).get("deal_info") if isinstance((ex_record or {}).get("deal_info"), dict) else {}
+        ex_score = int(ex_di.get("quality_score") or 0)
+        ex_updated = (ex_record or {}).get("updated_at")
+        is_fresh_existing = bool(
+            ex_di.get("is_deal_tip")
+            and isinstance(ex_updated, datetime.datetime)
+            and ex_updated >= protection_cutoff
+        )
+
+        if is_fresh_existing and ex_score > new_score:
+            # 触发高分保护：保留已有的高分 deal_info 教程与价格，仅更新顶层官方商品详情并累加跨群共振热度
+            protected_high_score += 1
+        else:
+            for dk, dv in deal_info.items():
+                set_fields[f"deal_info.{dk}"] = dv
 
         update_spec: Dict[str, Any] = {
             "$set": set_fields,
@@ -1363,6 +2214,7 @@ def upsert_cleaned_products_to_formal_table(
         "upserted": res.upserted_count,
         "modified": res.modified_count,
         "matched": res.matched_count,
+        "protected_high_score": protected_high_score,
         "total_ops": len(ops),
     }
 
@@ -1374,8 +2226,10 @@ def run_clean_stage(
     clean_limit: int = 200,
 ) -> Dict[str, Any]:
     """
-    阶段二（极简基线版）：从初步表 `deal_raw_tips` 读取 `clean_status='pending'` 的记录，
-    按站点均衡轮询，直接调用官方 Adapter 转链核验唯一商品并幂等写入正式表 `products`。
+    执行 Stage 2 ~ Stage 5 完整闭环：
+    从初步表 `deal_raw_tips` 读取 `clean_status='pending'` 的记录 -> 按 9 大站点均衡轮询 ->
+    Stage 2 (AI-1 拆解与群聊上下文合并) -> Stage 3 (官方 Adapter 逐一转链) -> Stage 4 (AI-2 终审评分并先落盘 `deal_raw_tips`) ->
+    Stage 5 (将 `quality_score >= 60` 的高分优品带高分保护写入正式表 `products`)。
     """
     t_start = time.perf_counter()
     raw_col = repo.col
@@ -1387,7 +2241,7 @@ def run_clean_stage(
     )
 
     if not pending_docs:
-        logger.info("✨ [阶段二：清洗入库] 当前初步表 `deal_raw_tips` 无待清洗 (`pending`) 记录，跳过本轮清洗。")
+        logger.info("✨ [阶段二~五：双AI+官方转链清洗] 当前初步表 `deal_raw_tips` 无待清洗 (`pending`) 记录，跳过本轮清洗。")
         return {
             "cycle_num": cycle_num,
             "total_pending_found": 0,
@@ -1417,72 +2271,144 @@ def run_clean_stage(
         selected_docs = interleaved_docs
 
     logger.info(
-        "🧼 ================ 开始第 #%d 轮阶段二：极简基线直接转链清洗与正式表入库 "
-        "(Pending总计=%d条, 本轮执行转链核验=%d条) ================",
+        "🧼 ================ 开始第 #%d 轮 Stage 2~5：双阶段 AI 提纯 + 官方转链验真 + 高分晋升入库 "
+        "(Pending总计=%d条, 本轮执行=%d条) ================",
         cycle_num,
         len(pending_docs),
         len(selected_docs),
     )
 
-    all_processed_results: List[Dict[str, Any]] = []
+    all_processed_results = cleaner.clean_batch_records(selected_docs, raw_col)
     success_product_docs: List[Dict[str, Any]] = []
 
-    for idx, doc in enumerate(selected_docs, 1):
-        res = cleaner.clean_one_record(doc)
-        all_processed_results.append(res)
+    for idx, res in enumerate(all_processed_results, 1):
         site = res["source_site"]
         if res["status"] == "success":
             success_product_docs.append(res["product_doc"])
             logger.info(
-                "  ✅ [转链成功 %03d/%03d] [%-11s] %-6s | ID=%-24s | 线报价=%-6s 官价=%-6s | %s (%.1fms)",
+                "  ✅ [终审通过 %03d/%03d] [%-11s] %-6s | 评分=%2d | ID=%-22s | 爆料价=%-6s 官价=%-6s | %s",
                 idx,
-                len(selected_docs),
+                len(all_processed_results),
                 site,
                 res["platform"],
-                res["product_id"][:24],
+                res.get("quality_score", 0),
+                res["product_id"][:22],
                 str(res["deal_price"]),
                 str(res["official_price"]),
-                str(res["official_title"])[:32],
-                res["elapsed_ms"],
+                str(res["official_title"])[:30],
+            )
+        elif res["status"] == "merged_into_parent":
+            logger.info(
+                "  🔗 [上下文合并 %03d/%03d] [%-11s] %s -> %s",
+                idx,
+                len(all_processed_results),
+                site,
+                res["source_item_id"],
+                res["error_msg"],
+            )
+        elif res["status"] == "low_score":
+            logger.info(
+                "  ⚪ [低分留存 %03d/%03d] [%-11s] 评分=%2d | %s -> %s",
+                idx,
+                len(all_processed_results),
+                site,
+                res.get("quality_score", 0),
+                str(res.get("title") or "")[:28],
+                res["error_msg"],
             )
         else:
             logger.info(
-                "  ❌ [转链未过 %03d/%03d] [%-11s] %-26s | %s -> %s (%.1fms)",
+                "  ❌ [清洗拦截 %03d/%03d] [%-11s] %-28s | %s -> %s",
                 idx,
-                len(selected_docs),
+                len(all_processed_results),
                 site,
                 res["error_code"],
-                str(res.get("title") or "")[:30],
+                str(res.get("title") or "")[:28],
                 res["error_msg"][:45],
-                res["elapsed_ms"],
             )
 
     now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
-    # 1. 将所有成功转链出的唯一商品幂等写入正式表 `products`
-    formal_write_res = upsert_cleaned_products_to_formal_table(formal_col, success_product_docs)
-
-    # 2. 将每条记录的清洗状态与错误码回写至初步表 `deal_raw_tips`
+    # 1. Stage 4 落盘：先将所有记录的 AI-1 拆解结果、Stage 3 转链底牌、AI-2 终审结果与评分回写至初步表 `deal_raw_tips`
     raw_status_ops = []
     failed_samples: List[Dict[str, Any]] = []
     for r in all_processed_results:
         s_site = r["source_site"]
         s_id = r["source_item_id"]
+        common_ai_fields = {
+            "cleaned_at": now_utc,
+            "ai_stage1_result": r.get("ai_stage1_result"),
+            "converted_links": r.get("converted_links") or [],
+            "ai_stage2_result": r.get("ai_stage2_result"),
+            "quality_score": r.get("quality_score", 0),
+        }
         if r["status"] == "success":
             raw_status_ops.append(
                 UpdateOne(
                     {"source_site": s_site, "source_item_id": s_id},
                     {
                         "$set": {
+                            **common_ai_fields,
                             "clean_status": "cleaned_success",
                             "ai_clean_status": "cleaned_success",
-                            "cleaned_at": now_utc,
                             "clean_error_code": "OK",
                             "clean_error_msg": "",
                             "resolved_platform": r["platform"],
                             "resolved_product_id": r["product_id"],
                             "resolved_goods_sign": r["goods_sign"],
                             "resolved_official_title": r["official_title"],
+                            "merged_tip_ids": r.get("merged_tip_ids") or [s_id],
+                        }
+                    },
+                )
+            )
+            # 将被合并吸收的同群相邻消息标记为 merged_into_parent
+            for m_tid in r.get("merged_tip_ids") or []:
+                if m_tid != s_id:
+                    raw_status_ops.append(
+                        UpdateOne(
+                            {"source_site": s_site, "source_item_id": m_tid, "clean_status": {"$in": ["pending", "context_only"]}},
+                            {
+                                "$set": {
+                                    "clean_status": "merged_into_parent",
+                                    "ai_clean_status": "merged_into_parent",
+                                    "merged_into_tip_id": s_id,
+                                    "cleaned_at": now_utc,
+                                }
+                            },
+                        )
+                    )
+        elif r["status"] == "merged_into_parent":
+            raw_status_ops.append(
+                UpdateOne(
+                    {"source_site": s_site, "source_item_id": s_id},
+                    {
+                        "$set": {
+                            **common_ai_fields,
+                            "clean_status": "merged_into_parent",
+                            "ai_clean_status": "merged_into_parent",
+                            "merged_into_tip_id": r.get("merged_into_tip_id") or "",
+                            "clean_error_code": r["error_code"],
+                            "clean_error_msg": r["error_msg"],
+                        }
+                    },
+                )
+            )
+        elif r["status"] == "low_score":
+            raw_status_ops.append(
+                UpdateOne(
+                    {"source_site": s_site, "source_item_id": s_id},
+                    {
+                        "$set": {
+                            **common_ai_fields,
+                            "clean_status": "cleaned_low_score",
+                            "ai_clean_status": "cleaned_low_score",
+                            "clean_error_code": r["error_code"],
+                            "clean_error_msg": r["error_msg"],
+                            "resolved_platform": r.get("platform"),
+                            "resolved_product_id": r.get("product_id"),
+                            "resolved_goods_sign": r.get("goods_sign"),
+                            "resolved_official_title": r.get("official_title"),
                         }
                     },
                 )
@@ -1493,9 +2419,9 @@ def run_clean_stage(
                     {"source_site": s_site, "source_item_id": s_id},
                     {
                         "$set": {
+                            **common_ai_fields,
                             "clean_status": "cleaned_failed",
                             "ai_clean_status": "cleaned_failed",
-                            "cleaned_at": now_utc,
                             "clean_error_code": r["error_code"],
                             "clean_error_msg": r["error_msg"],
                             "clean_attempt_errors": r.get("attempt_errors") or [],
@@ -1521,14 +2447,19 @@ def run_clean_stage(
         except Exception as e:
             logger.error("回写初步表 `deal_raw_tips` 清洗状态异常: %s", e)
 
+    # 2. Stage 5 晋升：将所有通过终审的高分商品（quality_score >= 60）带高分保护幂等写入正式表 `products`
+    formal_write_res = upsert_cleaned_products_to_formal_table(formal_col, success_product_docs)
+
     batch_elapsed_s = round(time.perf_counter() - t_start, 2)
 
     # ==========================================================================
-    # 构建阶段二全维度清洗运维统计报告 (`latest_clean_ops_report.json`)
+    # 构建阶段二~五全维度清洗运维统计报告 (`latest_clean_ops_report.json`)
     # ==========================================================================
     total_scanned = len(all_processed_results)
     has_candidate_cnt = sum(1 for r in all_processed_results if r.get("candidate_count", 0) > 0)
     resolved_cnt = len(success_product_docs)
+    merged_cnt = sum(1 for r in all_processed_results if r["status"] == "merged_into_parent")
+    low_score_cnt = sum(1 for r in all_processed_results if r["status"] == "low_score")
     unique_pids_in_batch = len({(r["platform"], r["product_id"]) for r in all_processed_results if r["status"] == "success"})
 
     formal_total_now = formal_col.count_documents({})
@@ -1542,7 +2473,7 @@ def run_clean_stage(
         s_has_cand = sum(1 for r in s_rows if r.get("candidate_count", 0) > 0)
         s_ok = sum(1 for r in s_rows if r["status"] == "success")
         s_uniq = len({(r["platform"], r["product_id"]) for r in s_rows if r["status"] == "success"})
-        err_counter = Counter(r["error_code"] for r in s_rows if r["status"] != "success")
+        err_counter = Counter(r["error_code"] for r in s_rows if r["status"] not in ("success", "merged_into_parent"))
         site_stats[site] = {
             "scanned": s_total,
             "has_product_candidate": s_has_cand,
@@ -1553,14 +2484,18 @@ def run_clean_stage(
             "failure_breakdown": dict(err_counter.most_common()),
         }
 
-    global_err_counter = Counter(r["error_code"] for r in all_processed_results if r["status"] != "success")
+    global_err_counter = Counter(r["error_code"] for r in all_processed_results if r["status"] not in ("success", "merged_into_parent"))
     plat_counter = Counter(r["platform"] for r in all_processed_results if r["status"] == "success")
 
     with_publish_time = sum(1 for d in success_product_docs if d["deal_info"].get("publish_time"))
     with_tutorial_text = sum(1 for d in success_product_docs if len(d["deal_info"].get("tutorial_text") or "") >= 10)
-    with_proof_images = sum(1 for d in success_product_docs if d["deal_info"].get("tutorial_images"))
+    with_proof_images = sum(1 for d in success_product_docs if d["deal_info"].get("user_share_images"))
     with_aux_links = sum(1 for d in success_product_docs if d["deal_info"].get("auxiliary_links"))
     with_deal_price = sum(1 for d in success_product_docs if d["deal_info"].get("deal_price") is not None)
+    avg_quality_score = round(
+        sum(int(d["deal_info"].get("quality_score") or 0) for d in success_product_docs) / max(1, resolved_cnt),
+        1,
+    ) if resolved_cnt else 0.0
 
     clean_report = {
         "cycle_num": cycle_num,
@@ -1571,12 +2506,16 @@ def run_clean_stage(
             "formal_deal_tip_products_count": formal_deal_total_now,
             "batch_upserted_new_products": formal_write_res["upserted"],
             "batch_modified_existing_products": formal_write_res["modified"],
+            "batch_protected_high_score_products": formal_write_res.get("protected_high_score", 0),
         },
         "global_funnel": {
             "1_total_scanned_tips": total_scanned,
             "2_has_product_candidate_tips": has_candidate_cnt,
             "3_unique_product_resolved_tips": resolved_cnt,
+            "3b_merged_neighbor_tips": merged_cnt,
+            "3c_low_score_filtered_tips": low_score_cnt,
             "4_deduplicated_unique_products_in_batch": unique_pids_in_batch,
+            "avg_quality_score": avg_quality_score,
             "overall_resolution_rate_pct": round(resolved_cnt / max(total_scanned, 1) * 100, 1),
             "candidate_resolution_rate_pct": round(resolved_cnt / max(has_candidate_cnt, 1) * 100, 1) if has_candidate_cnt else 0.0,
             "cross_tip_duplication_rate_pct": round((1 - unique_pids_in_batch / max(resolved_cnt, 1)) * 100, 1) if resolved_cnt else 0.0,
@@ -1599,7 +2538,7 @@ def run_clean_stage(
         "failure_taxonomy_breakdown": {
             code: {
                 "count": cnt,
-                "share_of_failures_pct": round(cnt / max(total_scanned - resolved_cnt, 1) * 100, 1),
+                "share_of_failures_pct": round(cnt / max(total_scanned - resolved_cnt - merged_cnt, 1) * 100, 1),
             }
             for code, cnt in global_err_counter.most_common()
         },
@@ -1608,6 +2547,8 @@ def run_clean_stage(
             "batch_elapsed_seconds": batch_elapsed_s,
             "avg_ms_per_anchored_record": round(batch_elapsed_s * 1000 / max(has_candidate_cnt, 1), 1) if has_candidate_cnt else 0.0,
             "anchor_cache_hits": cleaner.stats_cache_hits,
+            "ai_stage1_calls": cleaner.stats_ai1_calls,
+            "ai_stage2_calls": cleaner.stats_ai2_calls,
         },
         "engineering_philosophy_manifest": ENGINEERING_PHILOSOPHY_MANIFEST,
         "attempted_dead_ends_manifest": CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST,
@@ -1633,36 +2574,36 @@ def run_clean_stage(
     lines = [
         "",
         "┌" + "─" * 98 + "┐",
-        f"│ 🧼 【第 #{cycle_num} 轮 阶段二（极简基线）：直接转链清洗与正式表 (`{repo.formal_collection_name}`) 入库报告】              │",
+        f"│ 🧼 【第 #{cycle_num} 轮 Stage 2~5：双阶段 AI + 官方转链验真 + 高分晋升 (`{repo.formal_collection_name}`) 报告】       │",
         "├" + "─" * 98 + "┤",
         (
             f"│ • 全局转化漏斗 : 本轮扫描Pending={gf['1_total_scanned_tips']}条 -> "
-            f"含候选输入={gf['2_has_product_candidate_tips']}条 -> "
-            f"直接转链成功唯一商品={gf['3_unique_product_resolved_tips']}条"
+            f"AI拆出目标={gf['2_has_product_candidate_tips']}条 -> "
+            f"终审高分通过={gf['3_unique_product_resolved_tips']}条 (均分={gf['avg_quality_score']}) | 群聊合并={merged_cnt}条"
         ),
         (
-            f"│ • 基线转化率   : 直接转链解析率={gf['candidate_resolution_rate_pct']}% | "
-            f"总解析率={gf['overall_resolution_rate_pct']}% | "
-            f"本批去重独立商品={gf['4_deduplicated_unique_products_in_batch']}个 (跨帖同品率={gf['cross_tip_duplication_rate_pct']}%)"
+            f"│ • 终审转化率   : 候选终审通过率={gf['candidate_resolution_rate_pct']}% | "
+            f"总通过率={gf['overall_resolution_rate_pct']}% | "
+            f"本批去重独立商品={gf['4_deduplicated_unique_products_in_batch']}个"
         ),
         (
             f"│ • 正式表入库   : 正式表 `{repo.formal_collection_name}` 本轮新增={fc['batch_upserted_new_products']}个, "
-            f"更新共振={fc['batch_modified_existing_products']}个 | "
-            f"正式表累计好价线报商品={fc['formal_deal_tip_products_count']}个 (全表总商品={fc['formal_products_total_count']}个)"
+            f"更新共振={fc['batch_modified_existing_products']}个 (高分保护防覆盖={fc['batch_protected_high_score_products']}次) | "
+            f"累计好价商品={fc['formal_deal_tip_products_count']}个"
         ),
         (
             f"│ • 引擎效率指标 : 阶段耗时={batch_elapsed_s}s | 单条均耗={clean_report['engine_efficiency_metrics']['avg_ms_per_anchored_record']}ms | "
-            f"转链缓存命中={cleaner.stats_cache_hits}次"
+            f"AI-1调用={cleaner.stats_ai1_calls}次 | AI-2调用={cleaner.stats_ai2_calls}次 | 转链缓存命中={cleaner.stats_cache_hits}次"
         ),
         (
             f"│ • 专有信息保留 : 爆料时间={er['retained_publish_time_pct']}% | "
-            f"完整教程={er['retained_tutorial_text_pct']}% | "
-            f"到手价={er['retained_deal_price_pct']}% | "
-            f"实付/步骤截图={er['retained_proof_or_guide_images_pct']}%({er['retained_proof_or_guide_images_count']}条) | "
-            f"附属链接={er['retained_auxiliary_coupon_or_filler_links_pct']}%({er['retained_auxiliary_coupon_or_filler_links_count']}条)"
+            f"重构教程={er['retained_tutorial_text_pct']}% | "
+            f"爆料价={er['retained_deal_price_pct']}% | "
+            f"晒单/步骤图={er['retained_proof_or_guide_images_pct']}%({er['retained_proof_or_guide_images_count']}条) | "
+            f"优惠券/凑单链={er['retained_auxiliary_coupon_or_filler_links_pct']}%({er['retained_auxiliary_coupon_or_filler_links_count']}条)"
         ),
         "├" + "─" * 98 + "┤",
-        f"│ {'站点 (source_site)':<15} | {'扫描数':>6} | {'含候选数':>8} | {'转链成功':>8} | {'直接转链率':>10} | {'独立商品':>6} | Top 未转链原因 (供后续分析)",
+        f"│ {'站点 (source_site)':<15} | {'扫描数':>6} | {'含候选数':>8} | {'终审通过':>8} | {'终审通过率':>10} | {'独立商品':>6} | Top 拦截原因 (供后续分析)",
         "├" + "─" * 98 + "┤",
     ]
     for site, st in sorted(site_stats.items(), key=lambda x: x[1]["resolved_success"], reverse=True):

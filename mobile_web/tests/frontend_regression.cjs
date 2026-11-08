@@ -1841,4 +1841,23 @@ test('handleRegisterOrLogin sends explicit mode=login vs mode=register and unive
   assert.equal(account.isLoggedIn.value, true);
 });
 
+test('boom tab defaults to cost_performance sort and only renders two sort tabs without unit price on cards', async () => {
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(indexHtml.includes("switchBoomSort('cost_performance')"), 'index.html includes cost_performance sort tab');
+  assert.ok(indexHtml.includes("switchBoomSort('latest')"), 'index.html includes latest sort tab');
+  assert.ok(!indexHtml.includes("switchBoomSort('save_desc')"), 'index.html removes save_desc sort tab');
+  assert.ok(!indexHtml.includes("switchBoomSort('price_asc')"), 'index.html removes price_asc sort tab');
+  assert.ok(!indexHtml.includes("switchBoomSort('price_desc')"), 'index.html removes price_desc sort tab');
+  assert.ok(
+    indexHtml.indexOf("switchBoomSort('cost_performance')") < indexHtml.indexOf("switchBoomSort('latest')"),
+    'cost_performance tab appears before latest tab'
+  );
 
+  const h = harness(), feed = h.makeFeeds();
+  assert.equal(feed.boomSortBy.value, 'cost_performance');
+  const loading = feed.loadBoomGoods(true);
+  const query = new URL(h.requests[0].url, 'https://shop.test').searchParams;
+  assert.equal(query.get('sort_by'), 'cost_performance');
+  await h.finish(0, goodsResponse('boom-1', false));
+  await loading;
+});

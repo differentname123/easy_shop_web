@@ -5,16 +5,20 @@
 本脚本面向“导购/线报网站好价商品监控拉取”需求，作为全项目外部好价数据源探索与验证的唯一权威基线：
 
 一、【核心数据获取与留存原则（重信息完整，轻前置清洗，零丢弃铁律）】
-  1. 绝不因格式混乱、DOM 不统一或正则未命中价格而丢弃任何一条线报记录。
-  2. 商品基础字段（`platform`, `title`, `price`, `price_text`, `image_url`, `mall_name`, `candidate_goods_id`）
-     与“购买/凑单教程上下文”同等重要：
+  1. 绝不因格式混乱、DOM 不统一或未命中价格而丢弃任何一条线报记录；对于折淘客实时采集群（`is_group_stream=True`），
+     连同纯文字补充说明、纯晒单截图消息也 100% 留存入库，供下游 Stage 1 AI 结合同群前后 ±3 分钟上下文精准聚合。
+  2. 每条线报记录强制记录完整的【源页面可追溯锚点】：
+     - `source_list_page_url`：拉取该条爆料时所在的源站列表页/群聊大厅完整页面地址（方便人工直接打开该页面比对是否漏抓）；
+     - `source_detail_url` / `source_url`：能够直接查看该条爆料完整详情的源站详情页或群聊专页地址；
+     - `is_group_stream`：标识该数据源是否为连续群聊流（`True` 仅限折淘客 QQ/微信采集群，需在 Stage 1 AI 联合同群上下文；`False` 为独立网页/榜单帖）。
+  3. 原始图文与链接全量留存（取消脆弱的正则抠价格/抠标题依赖，交由双阶段 AI + 官方转链 API 处理）：
      - `tutorial_text`：将 HTML 中的超链接 (`<a href="URL">锚文本</a>`) 原位展开为 `锚文本 (URL)`，
        将剪贴板属性 (`data-clipboard-text`) 原位展开为 `[口令:...]`，将教程/实付截图 (`<img>`) 原位展开为
-       `[教程图片: URL]`，完整保留多步骤换行结构，供下游 AI 模型直接阅读；
+       `[教程图片: URL]`，完整保留多步骤换行结构，供下游 Stage 1 AI 直接阅读拆解；
      - `tutorial_images`：独立提取的教程截图、实付订单图、商品主图 URL 数组；
-     - `extracted_links`：独立提取的所有前置领券链接、主商品链接、凑单退单链接及站内攻略引用链；
-     - `extracted_tokens`：独立提取的淘口令、京口令、淘宝 46 位加密 `item_id`、京东 50 位加密 `itemId`；
-     - `raw_payload`：100% 留存未裁剪的原始 HTML 正文片段或原始 JSON 节点，作为 AI 清洗的终极兜底。
+     - `extracted_links`：DOM 层提取的所有 `<a href>` 链接及跳板还原后的明文电商链接（如逛丢 `to.php`/`go.php`、拔草哦 `go.bacaoo.com`、购物党 `data=` Base64 解码链接）；
+     - `extracted_tokens`：DOM 层辅助提取的口令/加密 ID 候选；
+     - `raw_payload`：100% 留存未裁剪的原始 HTML 正文片段或原始 JSON 节点，作为终极兜底。
 
 二、【数据源准入的两条硬性铁律（决定哪些站点入驻定时任务、哪些彻底剔除）】
   - 铁律 1（安全稳定拉取基础）：必须能长期、稳定、不被风控拦截地自动拉取；
@@ -341,9 +345,15 @@ def build_deal_record(
     extracted_tokens: Optional[List[str]] = None,
     raw_payload: Any = None,
     explicit_platform: Optional[str] = None,
+    source_list_page_url: str = "",
+    source_detail_url: str = "",
+    is_group_stream: bool = False,
 ) -> Dict[str, Any]:
     """
     构造标准化好价商品与教程留存记录（DealRawRecord）。
+    - `source_list_page_url`：拉取该条爆料时所在的源站列表页/群聊页完整地址（方便人工打开页面比对是否漏抓）；
+    - `source_detail_url` / `source_url`：查看该条爆料完整详情的源站详情页或群聊专页地址；
+    - `is_group_stream`：是否为连续群聊流（True 仅限折淘客采集群，下游 Stage 1 AI 将自动聚合前后 ±3 分钟同群上下文）。
     """
     clean_title = re.sub(r"\s+", " ", html_lib.unescape(str(title or ""))).strip()
     if price is None:
@@ -376,11 +386,18 @@ def build_deal_record(
     if jd_image_key and platform == "unknown":
         platform = "jd"
 
+    primary_source_url = str(source_detail_url or source_url or source_list_page_url or "").strip()
+    list_page_url = str(source_list_page_url or source_url or "").strip()
+    detail_page_url = str(source_detail_url or source_url or list_page_url or "").strip()
+
     return {
         "source_site": source_site,
         "source_channel": source_channel,
         "source_item_id": str(source_item_id or "").strip(),
-        "source_url": str(source_url or "").strip(),
+        "source_url": primary_source_url,
+        "source_list_page_url": list_page_url,
+        "source_detail_url": detail_page_url,
+        "is_group_stream": bool(is_group_stream),
         "fetched_at": utc_now_iso(),
         "platform": platform,
         "candidate_goods_id": jd_image_key or "",
@@ -417,9 +434,10 @@ def fetch_haodanku_wire_report(
     """
     http = session or requests.Session()
     url = "https://www.haodanku.com/HolidayActivity/wire_report"
+    web_page_url = "https://www.haodanku.com/activity/tip_off"
     headers = {
         **DEFAULT_HEADERS,
-        "Referer": "https://www.haodanku.com/activity/tip_off",
+        "Referer": web_page_url,
         "X-Requested-With": "XMLHttpRequest",
     }
     t0 = time.perf_counter()
@@ -503,7 +521,9 @@ def fetch_haodanku_wire_report(
             source_site="haodanku",
             source_channel=f"wire_report:{cate_name}",
             source_item_id=wire_id,
-            source_url=f"https://www.haodanku.com/activity/tip_off#wire_{wire_id}",
+            source_url=f"{web_page_url}#wire_{wire_id}",
+            source_list_page_url=str(resp.url),
+            source_detail_url=f"{web_page_url}#wire_{wire_id}",
             title=title_candidate or f"好单库线报 #{wire_id}",
             image_url=images[0] if images else "",
             mall_name=cate_name,
@@ -542,9 +562,10 @@ def fetch_haodanku_weal_list(
     """
     http = session or requests.Session()
     url = "https://www.haodanku.com/HolidayActivity/weal_list"
+    web_page_url = "https://www.haodanku.com/activity/tip_off"
     headers = {
         **DEFAULT_HEADERS,
-        "Referer": "https://www.haodanku.com/activity/tip_off",
+        "Referer": web_page_url,
         "X-Requested-With": "XMLHttpRequest",
     }
     t0 = time.perf_counter()
@@ -577,7 +598,9 @@ def fetch_haodanku_weal_list(
             source_site="haodanku",
             source_channel="weal_list",
             source_item_id=weal_id or enc_itemid,
-            source_url=uland_url or "https://www.haodanku.com/activity/tip_off",
+            source_url=uland_url or web_page_url,
+            source_list_page_url=str(resp.url),
+            source_detail_url=f"{web_page_url}#weal_{weal_id or enc_itemid}",
             title=short_title,
             price_text=f"{end_price_str}元" if end_price_str else "",
             price=price_val,
@@ -854,6 +877,8 @@ def fetch_xianbao_fun_deals(
             source_channel=f"{channel}:{catename}" if catename else channel,
             source_item_id=item_id,
             source_url=detail_url,
+            source_list_page_url=list_url,
+            source_detail_url=detail_url,
             title=title,
             price_text=f"{price_attr}元" if price_attr else "",
             mall_name=catename,
@@ -993,6 +1018,8 @@ def fetch_0818tuan_deals(
             source_channel="list-1",
             source_item_id=item_id,
             source_url=detail_url,
+            source_list_page_url=list_url,
+            source_detail_url=detail_url,
             title=title,
             publish_time=pub_time,
             tutorial_text=tutorial_text,
@@ -1369,6 +1396,8 @@ def fetch_bacaoo_deals(
                                 source_channel=f"{channel}_muster",
                                 source_item_id=comp_id,
                                 source_url=detail_url,
+                                source_list_page_url=list_url,
+                                source_detail_url=detail_url,
                                 title=f"{sub_title} {sub_price_txt}".strip(),
                                 price_text=sub_price_txt,
                                 image_url=sub_img,
@@ -1439,6 +1468,8 @@ def fetch_bacaoo_deals(
             source_channel=channel,
             source_item_id=pid,
             source_url=detail_url,
+            source_list_page_url=list_url,
+            source_detail_url=detail_url,
             title=title,
             publish_time=pub_time,
             tutorial_text=tutorial_text,
@@ -1552,6 +1583,8 @@ def fetch_iehou_deals(
             source_channel=mode,
             source_item_id=item_id,
             source_url=detail_url,
+            source_list_page_url=list_url,
+            source_detail_url=detail_url,
             title=title,
             publish_time=pub_time,
             tutorial_text=tutorial_text,
@@ -1712,11 +1745,14 @@ def fetch_gwdang_discounts(
             if isinstance(upd_ts, (int, float)) and upd_ts > 1000000000:
                 pub_time = datetime.fromtimestamp(upd_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+            gwd_detail_url = f"https://www.gwdang.com/v2/zhi/detail/1?dp_id={dp_id}"
             rec = build_deal_record(
                 source_site="gwdang",
                 source_channel=mode,
                 source_item_id=dp_id,
-                source_url=f"https://www.gwdang.com/v2/zhi/detail/1?dp_id={dp_id}",
+                source_url=gwd_detail_url,
+                source_list_page_url=url,
+                source_detail_url=gwd_detail_url,
                 title=title or f"购物党好价 #{dp_id}",
                 price_text=price_info or (f"{price_val}元" if price_val else ""),
                 price=price_val,
@@ -1784,6 +1820,8 @@ def fetch_gwdang_discounts(
                 source_channel=mode,
                 source_item_id=stable_id,
                 source_url=url,
+                source_list_page_url=url,
+                source_detail_url=url,
                 title=title,
                 price_text=price_span,
                 image_url=img_url,
@@ -1843,6 +1881,7 @@ def fetch_zhetaoke_xianbao_groups(
 
     plat_label_map = {"1": "tb_groups", "2": "jd_groups", "3": "pdd_groups", "": "all_groups"}
     base_channel = f"group_{group_id}" if group_id else plat_label_map.get(str(plat), f"plat_{plat}")
+    list_page_url = str(getattr(resp, "url", None) or url)
 
     records: List[Dict[str, Any]] = []
     for card_html in cards:
@@ -1853,19 +1892,21 @@ def fetch_zhetaoke_xianbao_groups(
         if not item_id:
             continue
 
-        m_tit = re.search(r'<div\s+class=["\']product-tit1["\'][^>]*>(.*?)</div>', card_html, re.S | re.I)
-        tit_html = m_tit.group(1) if m_tit else ""
-        msg_with_lines = re.sub(r"<br\s*/?>", "\n", tit_html, flags=re.I)
-        raw_msg = html_lib.unescape(re.sub(r"<[^>]+>", "", msg_with_lines)).strip()
-        if not raw_msg:
-            continue
-
         m_img = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', card_html, re.I)
         img_url = ""
         if m_img:
             cand_img = html_lib.unescape(m_img.group(1)).strip()
             if cand_img and "loading.png" not in cand_img:
                 img_url = ("https:" + cand_img) if cand_img.startswith("//") else urljoin(url, cand_img)
+
+        m_tit = re.search(r'<div\s+class=["\']product-tit1["\'][^>]*>(.*?)</div>', card_html, re.S | re.I)
+        tit_html = m_tit.group(1) if m_tit else ""
+        msg_with_lines = re.sub(r"<br\s*/?>", "\n", tit_html, flags=re.I)
+        raw_msg = html_lib.unescape(re.sub(r"<[^>]+>", "", msg_with_lines)).strip()
+        if not raw_msg and not img_url:
+            continue
+        if not raw_msg and img_url:
+            raw_msg = f"[群聊晒单/教程图片: {img_url}]"
 
         m_time = re.search(r'<p\s+class=["\']month-sales["\'][^>]*>(.*?)</p>', card_html, re.S | re.I)
         pub_time = ""
@@ -1907,12 +1948,16 @@ def fetch_zhetaoke_xianbao_groups(
 
         grp_prefix = f"【来源采集群: {src_grp_name} (群ID:{src_grp_id})】\n" if src_grp_name else ""
         tutorial_text = f"{grp_prefix}{raw_msg}".strip()
+        group_detail_url = f"https://www.zhetaoke.com/xianbao.aspx?id={src_grp_id or ''}&plat={plat or ''}"
 
         rec = build_deal_record(
             source_site="zhetaoke",
             source_channel=f"{base_channel}:{src_grp_name}" if src_grp_name else base_channel,
             source_item_id=f"xb_{item_id}",
-            source_url=f"https://www.zhetaoke.com/xianbao.aspx?id={src_grp_id or ''}&plat={plat or ''}",
+            source_url=group_detail_url,
+            source_list_page_url=list_page_url,
+            source_detail_url=f"{group_detail_url}#xb_{item_id}",
+            is_group_stream=True,
             title=title_clean[:120],
             image_url=img_url,
             mall_name=src_grp_name or "折淘客云线报群",
@@ -2019,6 +2064,8 @@ def fetch_zhetaoke_rank_list(
             source_channel=f"rank_{mode}",
             source_item_id=f"rank_{ztk_id or enc_goods_id[:24]}",
             source_url=uland_url or url,
+            source_list_page_url=url,
+            source_detail_url=f"{url}#rank_{ztk_id or enc_goods_id[:24]}",
             title=title,
             price_text=f"券后{price_str}元" if price_str else "",
             price=price_val,
@@ -2250,6 +2297,8 @@ def fetch_guangdiu_deals(
             source_channel=f"{channel}:{mall_name}" if mall_name else channel,
             source_item_id=item_id,
             source_url=detail_url,
+            source_list_page_url=list_url,
+            source_detail_url=detail_url,
             title=title,
             price_text=price_span,
             image_url=img_url,
@@ -2288,9 +2337,10 @@ def fetch_xuandan_deals(
     """
     http = session or requests.Session()
     url = "https://www.xuandan.com/NewHome/msKqList"
+    web_page_url = "https://www.xuandan.com/NewHome/fastBuy"
     headers = {
         **DEFAULT_HEADERS,
-        "Referer": "https://www.xuandan.com/NewHome/fastBuy",
+        "Referer": web_page_url,
         "X-Requested-With": "XMLHttpRequest",
     }
     params = {"page": str(page), "hour_type": str(hour_type or "")}
@@ -2372,6 +2422,8 @@ def fetch_xuandan_deals(
             source_channel=f"fastbuy_h{hour_type or 'all'}",
             source_item_id=tk_id or tb_num_id,
             source_url=goods_link or f"https://item.taobao.com/item.htm?id={tb_num_id}",
+            source_list_page_url=str(resp.url),
+            source_detail_url=f"{web_page_url}#goods_{tk_id or tb_num_id}",
             title=title,
             price_text=f"{last_price_str}元" if last_price_str else "",
             price=price_val,

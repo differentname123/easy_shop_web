@@ -32,7 +32,7 @@
     const boomPlatforms = ref([{ code: 'all', name: '全部', active: true }]);
     const boomPlatform = ref('all');
     const boomSearchKeyword = ref('');
-    const boomSortBy = ref('latest');
+    const boomSortBy = ref('cost_performance');
     const boomGoodsList = ref([]);
     const boomLoading = ref(false);
     const boomHasMore = ref(true);
@@ -249,7 +249,7 @@
           boomPlatform.value = cached.platform || 'all';
           activeBoomKeyword = cached.keyword || '';
           boomSearchKeyword.value = activeBoomKeyword;
-          boomSortBy.value = cached.sortBy || 'latest';
+          boomSortBy.value = cached.sortBy || 'cost_performance';
           boomGoodsList.value = [...cached.list];
           boomPage = cached.page || 1;
           boomHasMore.value = cached.hasMore !== false;

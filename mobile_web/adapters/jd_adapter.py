@@ -442,19 +442,27 @@ class JdAdapter(BasePlatformAdapter):
                 pass
         if not product_card:
             search_q = short or long
-            if search_q:
+            is_coupon_or_venue_url = any(
+                kw in (search_q or "").lower()
+                for kw in ("coupon.m.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "jdcoupon")
+            )
+            if search_q and not is_coupon_or_venue_url:
                 try:
                     q_res = self.client.search_goods(search_q, page=1, page_size=5, has_coupon=False)
                 except TypeError:
                     q_res = self.client.search_goods(search_q, page=1, page_size=5)
                 if q_res.get("status") == "success" and isinstance(q_res.get("data"), list) and q_res["data"]:
-                    for row in q_res["data"]:
-                        try:
-                            product_card = self._detail(row)
-                            resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
-                            break
-                        except Exception:
-                            continue
+                    rows = q_res["data"]
+                    total_cnt = int(q_res.get("total_count") or len(rows))
+                    # 仅当短链唯一命中单件商品或京口令明确含单品“抢购”标识时采纳，防止优惠券/会场短链误抓列表首条商品
+                    if len(rows) == 1 or total_cnt == 1 or ("抢购" in j_cmd):
+                        for row in rows:
+                            try:
+                                product_card = self._detail(row)
+                                resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
+                                break
+                            except Exception:
+                                continue
 
         # 从 jCommand 文案提取商品标题与优惠券金额作为限流兜底
         fallback_title = "京东精选推广好物"

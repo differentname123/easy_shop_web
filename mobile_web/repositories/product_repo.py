@@ -27,8 +27,61 @@ from models.product import (
 from config import PROMOTION_LINK_TTL, logger
 
 
+SKU_UNIT_BASE_MAPPING = {
+    "质量": {
+        "mg": 1,
+        "g": 1000,
+        "克": 1000,
+        "斤": 500000,
+        "kg": 1000000,
+        "Kg": 1000000,
+        "KG": 1000000,
+        "千克": 1000000,
+        "磅": 453592.37,
+    },
+    "容积与体积": {
+        "ml": 1,
+        "mL": 1,
+        "ML": 1,
+        "毫升": 1,
+        "L": 1000,
+        "升": 1000,
+    },
+    "数据存储": {
+        "G": 1,
+        "GB": 1,
+        "TB": 1024,
+    },
+    "电池容量": {
+        "mAh": 1,
+        "Ah": 1000,
+        "AH": 1000,
+    },
+    "功率": {
+        "W": 1,
+        "kW": 1000,
+    },
+    "生物活性成分": {
+        "iu": 1,
+        "IU": 1,
+    },
+    "速率与排量": {
+        "L/日": 1,
+        "升/天": 1,
+    },
+}
+
+UNIT_TO_CATEGORY: Dict[str, str] = {}
+UNIT_TO_MULTIPLIER: Dict[str, float] = {}
+for _cat, _units in SKU_UNIT_BASE_MAPPING.items():
+    for _u, _mul in _units.items():
+        UNIT_TO_CATEGORY[_u] = _cat
+        UNIT_TO_MULTIPLIER[_u] = _mul
+
+
 class ProductRepository(BaseRepository):
     COLLECTION_NAME = "products"
+    _MAX_COST_PERFORMANCE_CANDIDATES = 2000
 
     def _init_indexes(self):
         try:
@@ -58,6 +111,12 @@ class ProductRepository(BaseRepository):
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
             "sales_tip", "image_url", "mall_name", "updated_at", "product_url",
         ), 1),
+    }
+    _COST_PERFORMANCE_PROJECTION = {
+        **_SUMMARY_PROJECTION,
+        "format_info": 1,
+        "format_status": 1,
+        "sku_info": 1,
     }
 
     @staticmethod
@@ -240,6 +299,240 @@ class ProductRepository(BaseRepository):
                     update_set[key] = deepcopy(item[key])
         return self._identity_filter(platform, goods_id, goods_sign), {"$set": update_set, "$setOnInsert": insert_set}
 
+    def _build_boom_filter_query(
+        self,
+        platform: str = "all",
+        category: Optional[str] = None,
+        keyword: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        filter_query: Dict[str, Any] = {}
+        if platform and self._platform(platform) != "all":
+            filter_query["platform"] = self._platform(platform)
+        if category and category.strip() and category != "全部":
+            filter_query["category"] = category.strip()
+        if keyword and keyword.strip():
+            raw_kw = keyword.strip()
+            cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
+            safe_kw = re.escape(cleaned_kw)
+            filter_query["name"] = {"$regex": safe_kw, "$options": "i"}
+        return filter_query
+
+    @classmethod
+    def _is_valid_sku_price(cls, price_val: Any, min_limit_price: Optional[float]) -> bool:
+        """
+        校验规格价格有效性：
+        1. 必须为大于 0 的有限浮点数/整数/Decimal128；
+        2. 若商品存在全局 activity_price，任何规格价格均不得低于该阈值（排除浮点数精度误差）。
+        """
+        if isinstance(price_val, bool) or not isinstance(price_val, (int, float, Decimal128)):
+            return False
+        try:
+            p_float = cls._amount_float(price_val)
+        except (ValueError, TypeError, OverflowError):
+            return False
+        if not math.isfinite(p_float) or p_float <= 0:
+            return False
+        if min_limit_price is not None:
+            if round(p_float, 2) < round(float(min_limit_price), 2):
+                return False
+        return True
+
+    @classmethod
+    def _extract_sku_unit_entries(cls, doc: Dict[str, Any]) -> List[Tuple[float, str, Dict[str, float]]]:
+        """
+        从商品的 format_info 中提取所有合法规格的 (sku_price, raw_base_unit, extracted_units)。
+        尚未完成 format_info 清洗或无有效规格的商品返回空列表（归入末尾兜底组）。
+        """
+        if "format_status" in doc and doc.get("format_status") not in (None, "success"):
+            return []
+        raw_format_info = doc.get("format_info")
+        if not isinstance(raw_format_info, dict) or not raw_format_info:
+            return []
+
+        raw_act = cls._first_present(doc, "activity_price", "price")
+        min_act_price = None
+        if raw_act is not None and not isinstance(raw_act, bool):
+            try:
+                act_f = cls._amount_float(raw_act)
+                if math.isfinite(act_f) and act_f > 0:
+                    min_act_price = float(act_f)
+            except (ValueError, TypeError, OverflowError):
+                min_act_price = None
+
+        raw_sku_list: List[Tuple[float, Dict[str, Any]]] = []
+        if "pricing_basis" in raw_format_info and isinstance(raw_format_info.get("pricing_basis"), dict):
+            sku_price = raw_format_info.get("price")
+            if cls._is_valid_sku_price(sku_price, min_act_price):
+                raw_sku_list.append((cls._amount_float(sku_price), raw_format_info))
+        else:
+            sku_info_list = doc.get("sku_info") if isinstance(doc.get("sku_info"), list) else []
+            product_id = str(doc.get("product_id") or doc.get("goods_id") or doc.get("goods_sign") or "").strip()
+            if sku_info_list and product_id:
+                for idx in range(1, len(sku_info_list) + 1):
+                    sku_fmt = raw_format_info.get(f"{product_id}_{idx}")
+                    if not isinstance(sku_fmt, dict) or not isinstance(sku_fmt.get("pricing_basis"), dict):
+                        continue
+                    sku_price = sku_fmt.get("price")
+                    if cls._is_valid_sku_price(sku_price, min_act_price):
+                        raw_sku_list.append((cls._amount_float(sku_price), sku_fmt))
+
+            if not raw_sku_list:
+                for sku_fmt in raw_format_info.values():
+                    if isinstance(sku_fmt, dict) and isinstance(sku_fmt.get("pricing_basis"), dict):
+                        sku_price = sku_fmt.get("price")
+                        if cls._is_valid_sku_price(sku_price, min_act_price):
+                            raw_sku_list.append((cls._amount_float(sku_price), sku_fmt))
+
+        entries: List[Tuple[float, str, Dict[str, float]]] = []
+        for sku_price, sku_fmt in raw_sku_list:
+            pricing_basis = sku_fmt.get("pricing_basis") or {}
+            raw_structure = pricing_basis.get("structure")
+            raw_base_unit = str(pricing_basis.get("base_unit") or "").strip() or "件"
+            raw_total_val = pricing_basis.get("total_value")
+
+            total_val_float = None
+            if raw_total_val is not None and not isinstance(raw_total_val, bool):
+                try:
+                    tv = float(raw_total_val)
+                    if math.isfinite(tv) and tv > 0:
+                        total_val_float = tv
+                except (ValueError, TypeError):
+                    total_val_float = None
+
+            extracted_units: Dict[str, float] = {}
+            current_accum = 1.0
+            if isinstance(raw_structure, list) and raw_structure:
+                for struct_item in raw_structure:
+                    if not isinstance(struct_item, dict):
+                        continue
+                    u = str(struct_item.get("unit") or "").strip()
+                    v = struct_item.get("value")
+                    val_float = 1.0
+                    if v is not None and not isinstance(v, bool):
+                        try:
+                            vf = float(v)
+                            if math.isfinite(vf) and vf > 0:
+                                val_float = vf
+                        except (ValueError, TypeError):
+                            val_float = 1.0
+                    current_accum *= val_float
+                    if u:
+                        extracted_units[u] = current_accum
+
+            if raw_base_unit:
+                final_val = total_val_float if total_val_float is not None else current_accum
+                extracted_units[raw_base_unit] = final_val
+
+            if not extracted_units:
+                extracted_units["件"] = 1.0
+
+            entries.append((sku_price, raw_base_unit, extracted_units))
+
+        return entries
+
+    def rank_boom_products_by_cost_performance(
+        self,
+        platform: str = "all",
+        category: Optional[str] = None,
+        keyword: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        查询爆单库候选商品并按性价比排序：
+        1. 提取各商品合法规格的单位结构，按同类度量衡出现频次统一目标单位（如 kg/斤/克 -> g）；
+        2. 多 SKU 商品取其合法规格中性价比最高的主规格参与排序；
+        3. 按出现最多的单位优先、同单位内性价比从高到低排序，第二多的单位次之，依此类推；
+        4. 尚未完成 format_info 清洗的商品按最新上架顺序排在末尾用作兜底。
+        """
+        filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
+        cursor = (
+            self.col.find(
+                {"$and": [filter_query, self._boom_content_filter()]},
+                self._COST_PERFORMANCE_PROJECTION,
+            )
+            .sort([("updated_at", -1)])
+            .limit(self._MAX_COST_PERFORMANCE_CANDIDATES)
+            .max_time_ms(2000)
+        )
+        raw_docs = list(cursor)
+
+        formatted_candidates: List[Tuple[Dict[str, Any], List[Tuple[float, str, Dict[str, float]]]]] = []
+        unformatted_items: List[Dict[str, Any]] = []
+        category_unit_counts: Dict[str, Dict[str, int]] = {}
+
+        for doc in raw_docs:
+            summary = self._normalize_doc_summary(doc)
+            sku_entries = self._extract_sku_unit_entries(doc)
+            if not sku_entries:
+                unformatted_items.append(summary)
+                continue
+
+            formatted_candidates.append((summary, sku_entries))
+            for _, _, extracted_units in sku_entries:
+                for u in extracted_units.keys():
+                    cat = UNIT_TO_CATEGORY.get(u)
+                    if cat:
+                        if cat not in category_unit_counts:
+                            category_unit_counts[cat] = {}
+                        category_unit_counts[cat][u] = category_unit_counts[cat].get(u, 0) + 1
+
+        category_target_unit: Dict[str, str] = {}
+        for cat, counts in category_unit_counts.items():
+            category_target_unit[cat] = max(counts.items(), key=lambda x: x[1])[0]
+
+        unit_groups: Dict[str, List[Tuple[float, int, Dict[str, Any]]]] = {}
+        for idx, (summary, sku_entries) in enumerate(formatted_candidates):
+            best_unit = "件"
+            best_score = -1.0
+
+            for sku_price, raw_base_unit, extracted_units in sku_entries:
+                normalized_units: Dict[str, float] = {}
+                for u, val in extracted_units.items():
+                    cat = UNIT_TO_CATEGORY.get(u)
+                    final_u = u
+                    final_val = val
+                    if cat and cat in category_target_unit:
+                        tgt_u = category_target_unit[cat]
+                        if u != tgt_u:
+                            orig_mul = UNIT_TO_MULTIPLIER[u]
+                            tgt_mul = UNIT_TO_MULTIPLIER[tgt_u]
+                            final_val = val * (orig_mul / tgt_mul)
+                        final_u = tgt_u
+                    normalized_units[final_u] = round(final_val, 4) if isinstance(final_val, float) else final_val
+
+                cat = UNIT_TO_CATEGORY.get(raw_base_unit)
+                primary_base_unit = category_target_unit[cat] if (cat and cat in category_target_unit) else raw_base_unit
+                if primary_base_unit not in normalized_units:
+                    primary_base_unit = next(iter(normalized_units.keys()), "件")
+
+                raw_val = normalized_units.get(primary_base_unit)
+                val_num = float(raw_val) if raw_val and raw_val > 0 else 1.0
+                score = round(val_num / sku_price, 6) if sku_price and sku_price > 0 else 0.0
+
+                if score > best_score:
+                    best_score = score
+                    best_unit = primary_base_unit
+
+            unit_groups.setdefault(best_unit, []).append((best_score, -idx, summary))
+
+        # 同一单位内部：按性价比从高到低排序（分值相同时保持 updated_at 最新优先）
+        for unit, group in unit_groups.items():
+            group.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        # 不同单位之间：按该单位对应的商品数量从多到少排序（数量相同时按该组最高性价比得分排序）
+        ordered_units = sorted(
+            unit_groups.keys(),
+            key=lambda u: (len(unit_groups[u]), unit_groups[u][0][0]),
+            reverse=True,
+        )
+
+        sorted_items: List[Dict[str, Any]] = []
+        for unit in ordered_units:
+            sorted_items.extend(item for _, _, item in unit_groups[unit])
+
+        # 尚未完成 format_info 清洗的商品排在末尾用作兜底
+        sorted_items.extend(unformatted_items)
+        return sorted_items
+
     def query_boom_products(
         self,
         platform: str = "all",
@@ -250,25 +543,48 @@ class ProductRepository(BaseRepository):
         page_size: int = 20,
     ) -> Dict[str, Any]:
         """
-        分页查询爆单库商品（游标探测无慢查询 count_documents）
+        分页查询爆单库商品（支持 cost_performance 性价比全局分组排序及 latest 游标探测分页）
         """
         page = max(1, min(50, int(page or 1)))
         page_size = max(1, min(50, int(page_size or 20)))
         skip = (page - 1) * page_size
 
-        filter_query: Dict[str, Any] = {}
+        if sort_by == "cost_performance":
+            try:
+                sorted_items = self.rank_boom_products_by_cost_performance(
+                    platform=platform, category=category, keyword=keyword,
+                )
+                page_items = sorted_items[skip : skip + page_size]
+                has_more = (skip + page_size) < len(sorted_items)
+                return {
+                    "status": "success",
+                    "total_count": len(page_items) if keyword else len(sorted_items),
+                    "page": page,
+                    "page_size": page_size,
+                    "has_more": has_more,
+                    "data": page_items,
+                }
+            except Exception as e:
+                logger.error(
+                    "❌ 【爆品库查询失败】按性价比查询本地爆单商品列表时发生异常 | 平台[%s] 分类[%s] 关键词[%s] 排序[%s] 页码[%d] 异常<%s> 排查方向<请检查MongoDB连接状态、查询超时(2000ms)或format_info结构>",
+                    self._platform(platform) if platform else "all",
+                    category or "全部",
+                    keyword or "-",
+                    sort_by,
+                    page,
+                    format_exc_summary(e),
+                )
+                return {
+                    "status": "error",
+                    "error_msg": str(e),
+                    "total_count": 0,
+                    "page": page,
+                    "page_size": page_size,
+                    "has_more": False,
+                    "data": [],
+                }
 
-        if platform and self._platform(platform) != "all":
-            filter_query["platform"] = self._platform(platform)
-
-        if category and category.strip() and category != "全部":
-            filter_query["category"] = category.strip()
-
-        if keyword and keyword.strip():
-            raw_kw = keyword.strip()
-            cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
-            safe_kw = re.escape(cleaned_kw)
-            filter_query["name"] = {"$regex": safe_kw, "$options": "i"}
+        filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
 
         sort_mapping = {
             "latest": [("updated_at", -1)],

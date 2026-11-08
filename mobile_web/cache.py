@@ -17,6 +17,7 @@ RECOMMEND_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_RECOMMEND, ttl=300)   # �
 DETAIL_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_TTL)         # 商品详情 10 分钟
 SEARCH_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_SEARCH, ttl=180)         # 关键词搜索 3 分钟
 CATEGORY_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_CATEGORY, ttl=600)     # 爆单库类目 10 分钟
+BOOM_SORT_CACHE = ThreadSafeTTLCache(maxsize=64, ttl=120)                    # 爆单库性价比全局排序快照 2 分钟
 PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_PROMOTION, ttl=1800)  # 转链口令 30 分钟
 # 公开商品身份到上游物料URL；不是完整详情或个人推广链接。
 MATERIAL_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_TTL)
@@ -54,6 +55,26 @@ def evict_product_from_caches(platform: str, goods_id: str = "", goods_sign: str
     for pkey in PROMOTION_CACHE.keys():
         if isinstance(pkey, tuple) and len(pkey) >= 4 and pkey[1] == plat and pkey[3] in targets:
             PROMOTION_CACHE.pop(pkey, None)
+    for bkey in BOOM_SORT_CACHE.keys():
+        if not (isinstance(bkey, tuple) and len(bkey) >= 1 and bkey[0] in (plat, "all")):
+            continue
+        cached_list = BOOM_SORT_CACHE.get(bkey)
+        if not isinstance(cached_list, list):
+            continue
+        filtered_list = [
+            item for item in cached_list
+            if not (
+                isinstance(item, dict)
+                and str(item.get("platform") or "").strip().lower() == plat
+                and (
+                    str(item.get("goods_id") or "").strip() in targets
+                    or str(item.get("goods_sign") or "").strip() in targets
+                    or str(item.get("product_id") or "").strip() in targets
+                )
+            )
+        ]
+        if len(filtered_list) != len(cached_list):
+            BOOM_SORT_CACHE.set(bkey, filtered_list)
     for list_cache in (RECOMMEND_CACHE, SEARCH_CACHE):
         for lkey in list_cache.keys():
             if not (isinstance(lkey, tuple) and len(lkey) >= 1 and lkey[0] == plat):
@@ -84,6 +105,7 @@ def clear_all_caches():
     DETAIL_CACHE.clear()
     SEARCH_CACHE.clear()
     CATEGORY_CACHE.clear()
+    BOOM_SORT_CACHE.clear()
     PROMOTION_CACHE.clear()
     MATERIAL_CACHE.clear()
     SIGN_BY_ID_CACHE.clear()
