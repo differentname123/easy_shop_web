@@ -88,13 +88,13 @@ if hasattr(sys.stdout, "reconfigure"):
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-if CURRENT_DIR not in sys.path:
-    sys.path.insert(0, CURRENT_DIR)
+WORKSPACE_ROOT = os.path.dirname(PROJECT_ROOT)
+for _path in (WORKSPACE_ROOT, PROJECT_ROOT, CURRENT_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
-from infrastructure.mongo import gen_db_object
-from test_deal_sites_scraper import (
+from mobile_web.infrastructure.mongo import gen_db_object
+from mobile_web.scripts.test_deal_sites_scraper import (
     fetch_0818tuan_deals,
     fetch_bacaoo_deals,
     fetch_guangdiu_deals,

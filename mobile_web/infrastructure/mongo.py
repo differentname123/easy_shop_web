@@ -4,7 +4,7 @@ import urllib.parse
 
 from pymongo import MongoClient
 
-from infrastructure.settings import get_settings
+from .settings import get_settings
 
 
 class MongoBase:
