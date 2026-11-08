@@ -479,10 +479,14 @@ class ProductRepository(BaseRepository):
         for cat, counts in category_unit_counts.items():
             category_target_unit[cat] = max(counts.items(), key=lambda x: x[1])[0]
 
-        unit_groups: Dict[str, List[Tuple[float, int, Dict[str, Any]]]] = {}
+        # 1. 收集所有商品的主单位集合 (active_base_units) 及每个商品在各单位下的最高性价比得分
+        product_unit_scores: List[Tuple[str, Dict[str, float]]] = []
+        active_base_units = set()
+
         for idx, (summary, sku_entries) in enumerate(formatted_candidates):
-            best_unit = "件"
-            best_score = -1.0
+            unit_best_scores: Dict[str, float] = {}
+            best_primary_unit = "件"
+            best_primary_score = -1.0
 
             for sku_price, raw_base_unit, extracted_units in sku_entries:
                 normalized_units: Dict[str, float] = {}
@@ -503,22 +507,35 @@ class ProductRepository(BaseRepository):
                 primary_base_unit = category_target_unit[cat] if (cat and cat in category_target_unit) else raw_base_unit
                 if primary_base_unit not in normalized_units:
                     primary_base_unit = next(iter(normalized_units.keys()), "件")
+                active_base_units.add(primary_base_unit)
 
-                raw_val = normalized_units.get(primary_base_unit)
-                val_num = float(raw_val) if raw_val and raw_val > 0 else 1.0
-                score = round(val_num / sku_price, 6) if sku_price and sku_price > 0 else 0.0
+                for u, raw_val in normalized_units.items():
+                    val_num = float(raw_val) if raw_val and raw_val > 0 else 1.0
+                    score = round(val_num / sku_price, 6) if sku_price and sku_price > 0 else 0.0
+                    if score > unit_best_scores.get(u, -1.0):
+                        unit_best_scores[u] = score
+                    if u == primary_base_unit and score > best_primary_score:
+                        best_primary_score = score
+                        best_primary_unit = primary_base_unit
 
-                if score > best_score:
-                    best_score = score
-                    best_unit = primary_base_unit
+            product_unit_scores.append((best_primary_unit, unit_best_scores))
 
-            unit_groups.setdefault(best_unit, []).append((best_score, -idx, summary))
+        # 2. 将商品放入其支持的各个主单位分组中（同一单位内部按性价比从高到低排序）
+        unit_groups: Dict[str, List[Tuple[float, int, int]]] = {}
+        for idx, (best_primary_unit, unit_best_scores) in enumerate(product_unit_scores):
+            matched_any = False
+            for u, score in unit_best_scores.items():
+                if u in active_base_units:
+                    unit_groups.setdefault(u, []).append((score, -idx, idx))
+                    matched_any = True
+            if not matched_any:
+                score = unit_best_scores.get(best_primary_unit, 0.0)
+                unit_groups.setdefault(best_primary_unit, []).append((score, -idx, idx))
 
-        # 同一单位内部：按性价比从高到低排序（分值相同时保持 updated_at 最新优先）
-        for unit, group in unit_groups.items():
+        for group in unit_groups.values():
             group.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-        # 不同单位之间：按该单位对应的商品数量从多到少排序（数量相同时按该组最高性价比得分排序）
+        # 3. 不同单位之间：按商品数量从多到少排序，并按数量比例计算每轮轮询名额 (quota)
         ordered_units = sorted(
             unit_groups.keys(),
             key=lambda u: (len(unit_groups[u]), unit_groups[u][0][0]),
@@ -526,8 +543,40 @@ class ProductRepository(BaseRepository):
         )
 
         sorted_items: List[Dict[str, Any]] = []
-        for unit in ordered_units:
-            sorted_items.extend(item for _, _, item in unit_groups[unit])
+        if ordered_units:
+            counts = [len(unit_groups[u]) for u in ordered_units]
+            min_count = max(1, min(counts))
+            max_count = max(counts)
+            # 若最大组与最小组悬殊过大（超过 5 倍），将单轮最大名额封顶为 5，确保少见单位的好商品也能在首屏靠前展示
+            base_step = float(min_count) if (max_count / min_count) <= 5 else (max_count / 5.0)
+            unit_quotas = {
+                u: max(1, int(len(unit_groups[u]) / base_step + 0.5))
+                for u in ordered_units
+            }
+
+            unit_cursors = {u: 0 for u in ordered_units}
+            emitted_indices = set()
+            total_formatted = len(formatted_candidates)
+
+            while len(emitted_indices) < total_formatted:
+                progressed = False
+                for u in ordered_units:
+                    group = unit_groups[u]
+                    cursor = unit_cursors[u]
+                    quota = unit_quotas[u]
+                    taken = 0
+                    while cursor < len(group) and taken < quota:
+                        _, _, cand_idx = group[cursor]
+                        cursor += 1
+                        if cand_idx in emitted_indices:
+                            continue
+                        emitted_indices.add(cand_idx)
+                        sorted_items.append(formatted_candidates[cand_idx][0])
+                        taken += 1
+                        progressed = True
+                    unit_cursors[u] = cursor
+                if not progressed:
+                    break
 
         # 尚未完成 format_info 清洗的商品排在末尾用作兜底
         sorted_items.extend(unformatted_items)

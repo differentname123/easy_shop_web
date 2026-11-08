@@ -955,11 +955,57 @@ class TestProductRepository(unittest.TestCase):
             },
         ]
         ranked = self.repo.rank_boom_products_by_cost_performance(platform="pdd")
-        self.assertEqual([item["product_id"] for item in ranked], ["P2", "P1", "P3", "P5", "P4"])
+        # “斤”组共 3 个商品 (P2 > P1 > P3)，“包”组共 2 个商品 (P5 > P4) -> 按 2 : 1 比例轮询穿插
+        self.assertEqual([item["product_id"] for item in ranked], ["P2", "P1", "P5", "P3", "P4"])
         for item in ranked:
             self.assertNotIn("format_info", item)
             self.assertNotIn("format_status", item)
             self.assertNotIn("cost_performance_score", item)
+
+        # 验证跨单位重复第 1 名自动顺延去重：
+        # T1 同时具备“包”(1.0包/元, 第1) 和“抽”(100抽/元, 第1)
+        # “包”组有 3 个商品 (T1 > T3 > T2)，“抽”组有 2 个商品 (T1 > T2)
+        # 第一轮：“包”取 2 个 (T1, T3)，接着“抽”取 1 个时因 T1 已出列，自动顺延取 T2
+        self.col.docs = [
+            {
+                "platform": "pdd", "product_id": "T1", "name": "维达20包*100抽", "activity_price": 20.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=3),
+                "format_status": "success",
+                "format_info": {
+                    "price": 20.0,
+                    "pricing_basis": {
+                        "base_unit": "抽", "total_value": 2000,
+                        "structure": [{"unit": "包", "value": 20}, {"unit": "抽", "value": 100}],
+                    },
+                },
+            },
+            {
+                "platform": "pdd", "product_id": "T2", "name": "清风15包*100抽", "activity_price": 30.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=2),
+                "format_status": "success",
+                "format_info": {
+                    "price": 30.0,
+                    "pricing_basis": {
+                        "base_unit": "抽", "total_value": 1500,
+                        "structure": [{"unit": "包", "value": 15}, {"unit": "抽", "value": 100}],
+                    },
+                },
+            },
+            {
+                "platform": "pdd", "product_id": "T3", "name": "心相印18包", "activity_price": 20.0,
+                "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=1),
+                "format_status": "success",
+                "format_info": {
+                    "price": 20.0,
+                    "pricing_basis": {
+                        "base_unit": "包", "total_value": 18,
+                        "structure": [{"unit": "包", "value": 18}],
+                    },
+                },
+            },
+        ]
+        dedup_ranked = self.repo.rank_boom_products_by_cost_performance(platform="pdd")
+        self.assertEqual([item["product_id"] for item in dedup_ranked], ["T1", "T3", "T2"])
 
     def test_cost_performance_multi_sku_selects_highest_score_valid_sku_and_places_unformatted_last(self):
         now = datetime.datetime(2026, 11, 8, 12, 0, 0)
