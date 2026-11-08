@@ -24,32 +24,46 @@
     只要通道能稳定产出含唯一商品锚点的记录，即使混有杂讯（有效比例低）也完全可取，后续通过正则/关键字规则过滤即可。
 
 三、【10 个候选网站与细分频道最终取舍结论（严禁后续重复踩坑尝试已剔除站点）】
-  1. ✅ 正式纳入定时任务的 6 大站点（26 个有效子频道）：
-     - 【好单库 (`haodanku.com`)】：免登纯净 JSON（`wire_report` 京东/淘宝/百补/综合 + `weal_list` 福利清单），0 风控，
-       100% (74/74) 包含 `https://u.jd.com/xxx` 短链或淘宝 46 位加密 `item_id`。
+  1. ✅ 正式纳入定时任务的 9 大站点（49 个有效子频道）：
+     - 【好单库 (`haodanku.com`)】：免登纯净 JSON（`wire_report` 京东10004/淘宝10003/百补10005/飞猪10367/综合0 + `weal_list` 福利清单），0 风控，
+       100% 包含 `https://u.jd.com/xxx` 短链或淘宝 46 位加密 `item_id`。
+     - 【折淘客 (`zhetaoke.com`)】：免登直连 150+ 个真实 QQ/微信采集群实时大厅 (`xianbao.aspx` 京东群/淘宝群/拼多多群/综合群及高产群专流) +
+       咚咚抢 (`/list/dongdong.html`) + 实时热销爆款榜 (`/list/love_1_0_1.html`)，单页直出 60 条群消息，无需二次抓详情，0 风控，高密产出 `u.jd.com`、`p.pinduoduo.com`、括号淘口令 `(11位码) MU918` 与 `uland.taobao.com`。
+     - 【逛丢 (`guangdiu.com`)】：全网实时折扣 (`index.php` + `cheaps.php` 九块九)，通过 `detail.php` 解码 `to.php?u=` 加上 `go.php?id=` 提取明文 `item.jd.com/{sku}.html`、`union-click.jd.com`、`s.click.taobao.com`，
+       不仅覆盖逛丢自有好价，还能在服务端合法还原其同步自“什么值得买”好价的真实电商直链！
+     - 【选单网 (`xuandan.com`)】：免登淘客快抢群发素材 JSON 接口 (`/NewHome/msKqList`)，100% 同时返回 12 位淘宝纯数字 `ShoopGoodsId`、`uland.taobao.com` 二合一链、券链与社群推广文案 `TjRemark`。
      - 【购物党 (`gwdang.com`)】：5 大折扣榜（`0-hour_3`/`0-lowest`/`0-s_lowest`/`0-lower_11`/`0-latest`），间隔 >=3s 零风控；
-       通过解码内嵌 `data=` Base64 + zlib 载荷，100% (100/100) 提取原始平台唯一 SKU (`dp_id`) 与 `buy_steps` 中的领券/购买链接。
-     - 【0818团 (`0818tuan.com`)】：纯静态 HTML（第1~2页），0 风控，71.4% (80/112) 直接包含京东/手淘唯一商品短链。
-     - 【线报酷 (`new.xianbao.fun`) 12 个有效频道】：SSR 静态直出，0 风控，产出大量唯一商品短链、淘口令与 12 位京东货号：
-       * 高密度频道：`latest` (100%)、`category_haodan` (95.6%)、`haodan_hot` (95.1%)、`hot_1h` (85.4%)、`category_weibo` (69.7%)、`weibo_hot` (58.6%)
-       * 中低密度但含唯一商品频道：`category_douban_maizu` (40.7%)、`kuan_hot` (34.9%)、`douban_hot` (23.3%)、`category_man` (17.0%)、`xinzuanba_hot` (12.0%)、`zuankeba_hot` (6.7%)
-     - 【拔草哦 (`youhui.bacaoo.com`)】：0 风控，35.0% (7/20) 含唯一商品短链或口令。
-     - 【网猴线报 (`iehou.com/page-dayhot.htm`)】：24H 热榜 0 风控，17.0% (17/100) 含唯一商品短链或口令。
+       通过解码内嵌 `data=` Base64 + zlib 载荷，100% 提取原始平台唯一 SKU (`dp_id`) 与 `buy_steps` 中的领券/购买链接。
+     - 【0818团 (`0818tuan.com`)】：纯静态 HTML（第1~2页），0 风控，71.4% 直接包含京东/手淘唯一商品短链。
+     - 【线报酷 (`new.xianbao.fun`) 20 个有效频道】：SSR 静态直出，0 风控，涵盖全站热榜、好单、微博、豆瓣各买组/拼组/狗组/猫组、赚客吧、新赚吧、酷安、慢友等实时流与热榜。
+     - 【拔草哦 (`youhui.bacaoo.com`)】：0 风控，35.0% 含唯一商品短链或口令。
+     - 【网猴线报 (`iehou.com/page-dayhot.htm`)】：24H 热榜 0 风控，17.0% 含唯一商品短链或口令。
 
-  2. ❌ 已明确剔除的站点与子频道（代码保留探针函数仅供历史对照，定时任务严禁启用，切勿以为遗漏而重新尝试）：
-     - ❌ 【什么值得买 (`smzdm.com` 及其线报酷镜像 `zhidemai`/`zhidemai_hot`) —— 违反铁律 1 & 铁律 2】：
+  2. ❌ 已明确排查并剔除的 13 个站点与子频道（代码保留说明，严禁后续人员误以为遗漏而重复浪费时间尝试）：
+     - ❌ 【什么值得买直连 (`smzdm.com` 及其线报酷镜像 `zhidemai`/`zhidemai_hot`) —— 违反铁律 1 & 铁律 2】：
        ① 风控严苛：`faxian.smzdm.com` 高频触发腾讯防水墙 `TCaptcha.js`，异步接口 `/json_more` 触发 `202 probe.js`；
-       ② 无唯一商品锚点 (0/183 = 0.0%)：全站所有商品链接（含正文内凑单链接）均被替换为加密跳板 `https://go.smzdm.com/{加密串}`
-          （带 `probe.js` 动态挑战），无法直接还原目标平台 URL 或商品 SKU，拉下来的数据仅有泛泛的商品标题关键字。
+       ② 无唯一商品锚点 (0/183 = 0.0%)：全站所有商品外链均被替换为加密跳板 `https://go.smzdm.com/{加密串}`（带 `probe.js` 拦截），图片也被重写为 `zdmimg.com`，无法直接还原目标商品 ID。（注：其高优好价已通过【逛丢 `guangdiu`】服务端明文跳板曲线捕获！）
      - ❌ 【慢慢买 (`cu.manmanbuy.com`) —— 违反铁律 2】：
-       详情页 `discuxiao_{id}.aspx` 为前端 `crypto-js` 动态加密跳转，实测 0/43 (0.0%) 含唯一商品链接、口令或数字 SKU，仅有泛泛标题。
+       详情页 `discuxiao_{id}.aspx` 为前端 `crypto-js` 动态加密跳转，实测 0/43 (0.0%) 含唯一商品链接、口令或数字 SKU。
      - ❌ 【55海淘 (`55haitao.com/deals`) —— 违反铁律 2】：
        实测 0/22 (0.0%) 含国内电商商品，100% 为海外美网/英网海淘链接，无国内淘京拼 CPS 价值。
-     - ❌ 【大淘客 (`dataoke.com/xp/xb`) —— 违反铁律 1】：
+     - ❌ 【大淘客网页端 (`dataoke.com/xp/xb`) —— 违反铁律 1】：
        网页端强依赖登录态 Cookie 极易失效，且底层数据与免登录的好单库 (`haodanku`) 100% 同源。
+     - ❌ 【实惠猪 (`shihuizhu.com`) & 惠喵 (`huim.com`) —— 违反铁律 1】：
+       直连请求直接被服务端防火墙 RST 断开 (`ConnectionResetError 10054`) 或拒绝非浏览器 TLS 指纹。
+     - ❌ 【轻淘客 (`qingtaoke.com`) & 买手党 (`maishoudang.com`) & 好品推 (`haopintui.com`) —— 违反铁律 1】：
+       站点连接超时、关停或接口已失效，无法稳定拉取。
+     - ❌ 【没得比 (`meidebi.com`) —— 违反铁律 2】：
+       全站商品外链均为内部加密跳转且无明文口令/SKU，实测有效唯一商品直链为 0。
+     - ❌ 【聚超值 (`best.pconline.com.cn`) —— 违反铁律 2】：
+       改版后以长篇评测图文为主，528KB 首页仅 2 个静态推广位，无实时好价线报流。
+     - ❌ 【好单库快抢页 (`/Index/get_fastbuy_items`) & 多好单 (`duohaodan.com`) —— 违反铁律 1】：
+       未登录态下返回 `status: 0 (fastwait.png)` 占位或强制要求联盟账号登录。
+     - ❌ 【赚客吧原站 (`zuanke8.com`) / 小刀娱乐网 (`xiaodao.la`) / 爱Q生活网 (`iqnew.com`) / 葫芦侠 (`huluxia`)】：
+       原站存在防 CC 盾或超时；且小刀/爱Q/葫芦侠/免费福利 (`mianfei`) 板块实测全为网盘资源、游戏辅助、软件绿软等非电商内容（赚客吧电商线报已通过 `xianbao_fun/category_zuankeba` 完整捕获）。
      - ❌ 【线报酷子频道：微博超话 (`weibo_chaohua_hot`) & 小嘀咕 (`xiaodigu_hot`) —— 违反铁律 2】：
        * `weibo_chaohua_hot`：实测 0/90 (0.0%) 含唯一商品锚点（超话封杀外链与口令，100% 为“买这个+纯订单截图”谜语帖）；
-       * `xiaodigu_hot`：实测 73 条中有效电商唯一商品为 0（全为银行数币/水帖/连载小说）。
+       * `xiaodigu_hot`：实测 0/73 (0.0%) 含电商唯一商品（全为银行数币/水帖/连载小说）。
      - ❌ 【网猴线报首页最新流 (`iehou.com/` index) —— 重复且低效】：
        首页最新流几乎全被微博抽奖刷屏，有效好价已被其 `page-dayhot.htm` (24H热榜) 100% 覆盖。
 ================================================================================
@@ -64,7 +78,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 import requests
 
@@ -110,7 +124,8 @@ _EXPLICIT_YUAN_RE = re.compile(
     re.IGNORECASE,
 )
 _TOKEN_RE = re.compile(
-    r"(?:[￥¥$€₴£¢()（）!！](?=[0-9]*[A-Za-z])[A-Za-z0-9]{6,22}[￥¥$€₴£¢()（）!！]"
+    r"(?:[￥¥$€₴£¢()（）!！](?=[0-9]*[A-Za-z])(?=[A-Za-z]*[0-9])[A-Za-z0-9]{6,22}[￥¥$€₴£¢()（）!！]"
+    r"|(?<![A-Za-z0-9:/._-])/(?=[0-9]*[A-Za-z])(?=[A-Za-z]*[0-9])[A-Za-z0-9]{8,16}/(?![A-Za-z0-9_.-])"
     r"|\b[A-Za-z0-9_-]{24,28}-[A-Za-z0-9_]{16,22}\b"
     r"|\b[A-Za-z0-9]{25,35}_[A-Za-z0-9]{15,22}\b)"
 )
@@ -500,9 +515,11 @@ def fetch_haodanku_wire_report(
     return {
         "status": "success" if resp.status_code == 200 and str(body.get("code")) == "200" else "error",
         "http_status": resp.status_code,
+        "request_url": str(resp.url),
         "elapsed_ms": elapsed_ms,
         "count": len(records),
         "total": (body.get("data") or {}).get("total"),
+        "detail_errors": [],
         "records": records,
     }
 
@@ -578,9 +595,11 @@ def fetch_haodanku_weal_list(
     return {
         "status": "success" if resp.status_code == 200 and str(body.get("code")) == "200" else "error",
         "http_status": resp.status_code,
+        "request_url": str(resp.url),
         "elapsed_ms": elapsed_ms,
         "count": len(records),
         "total": (body.get("data") or {}).get("total"),
+        "detail_errors": [],
         "records": records,
     }
 
@@ -634,10 +653,15 @@ def fetch_xianbao_fun_deals(
         "category_haodan": "/category-haodan/" if page <= 1 else f"/category-haodan/page/{page}/",
         "category_weibo": "/category-weibo/" if page <= 1 else f"/category-weibo/page/{page}/",
         "category_weibo_chaohua": "/category-weibo-chaohua/" if page <= 1 else f"/category-weibo-chaohua/page/{page}/",
+        "category_douban": "/category-douban/" if page <= 1 else f"/category-douban/page/{page}/",
         "category_douban_maizu": "/category-douban-maizu/" if page <= 1 else f"/category-douban-maizu/page/{page}/",
         "category_douban_pinzu": "/category-douban-pinzu/" if page <= 1 else f"/category-douban-pinzu/page/{page}/",
+        "category_douban_gouzu": "/category-douban-gouzu/" if page <= 1 else f"/category-douban-gouzu/page/{page}/",
+        "category_douban_maobathtub": "/category-douban-maobathtub/" if page <= 1 else f"/category-douban-maobathtub/page/{page}/",
+        "category_douban_maolife": "/category-douban-maolife/" if page <= 1 else f"/category-douban-maolife/page/{page}/",
         "category_zuankeba": "/category-zuankeba/" if page <= 1 else f"/category-zuankeba/page/{page}/",
         "category_xinzuanba": "/category-xinzuanba/" if page <= 1 else f"/category-xinzuanba/page/{page}/",
+        "category_kuan": "/category-kuan/" if page <= 1 else f"/category-kuan/page/{page}/",
         "category_man": "/category-man/" if page <= 1 else f"/category-man/page/{page}/",
         "latest": "/" if page <= 1 else f"/page/{page}/",
     }
@@ -656,6 +680,7 @@ def fetch_xianbao_fun_deals(
     )
 
     records: List[Dict[str, Any]] = []
+    detail_errors: List[Dict[str, Any]] = []
     detail_fetched = 0
     skip_set = skip_detail_ids or set()
 
@@ -783,7 +808,24 @@ def fetch_xianbao_fun_deals(
                         if extra_hot_metrics.get("brand") or extra_hot_metrics.get("category"):
                             meta_prefix = f"【商城:{catename} | 品牌:{extra_hot_metrics.get('brand', '')} | 分类:{extra_hot_metrics.get('category', '')}】"
                             tutorial_text = f"{meta_prefix}\n{tutorial_text}".strip()
+                else:
+                    detail_errors.append({
+                        "item_id": item_id,
+                        "detail_url": detail_url,
+                        "stage": "detail_fetch",
+                        "http_status": rd.status_code,
+                        "error_type": f"HTTP_{rd.status_code}",
+                        "error": f"详情页返回非200状态码: {rd.status_code}",
+                    })
             except Exception as e:
+                detail_errors.append({
+                    "item_id": item_id,
+                    "detail_url": detail_url,
+                    "stage": "detail_fetch",
+                    "http_status": None,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                })
                 tutorial_text = f"{preview_text}\n[详情拉取异常: {type(e).__name__}: {e}]".strip()
 
         rec = build_deal_record(
@@ -808,9 +850,11 @@ def fetch_xianbao_fun_deals(
     return {
         "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
         "http_status": resp.status_code,
+        "request_url": list_url,
         "elapsed_ms": elapsed_ms,
         "count": len(records),
         "detail_fetched": detail_fetched,
+        "detail_errors": detail_errors,
         "records": records,
     }
 
@@ -843,6 +887,7 @@ def fetch_0818tuan_deals(
     )
 
     records: List[Dict[str, Any]] = []
+    detail_errors: List[Dict[str, Any]] = []
     seen_ids: set = set()
     detail_fetched = 0
     skip_set = skip_detail_ids or set()
@@ -902,7 +947,24 @@ def fetch_0818tuan_deals(
                             clean_xb, base_url=detail_url
                         )
                         tutorial_text = html_to_tutorial_text(clean_xb, base_url=detail_url)
+                else:
+                    detail_errors.append({
+                        "item_id": item_id,
+                        "detail_url": detail_url,
+                        "stage": "detail_fetch",
+                        "http_status": rd.status_code,
+                        "error_type": f"HTTP_{rd.status_code}",
+                        "error": f"详情页返回非200状态码: {rd.status_code}",
+                    })
             except Exception as e:
+                detail_errors.append({
+                    "item_id": item_id,
+                    "detail_url": detail_url,
+                    "stage": "detail_fetch",
+                    "http_status": None,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                })
                 tutorial_text = f"{title}\n[详情拉取异常: {type(e).__name__}: {e}]"
 
         rec = build_deal_record(
@@ -924,9 +986,11 @@ def fetch_0818tuan_deals(
     return {
         "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
         "http_status": resp.status_code,
+        "request_url": list_url,
         "elapsed_ms": elapsed_ms,
         "count": len(records),
         "detail_fetched": detail_fetched,
+        "detail_errors": detail_errors,
         "records": records,
     }
 
@@ -1164,6 +1228,7 @@ def fetch_bacaoo_deals(
     item_ids = [pid for pid in all_pids if pid not in nav_ids]
 
     records: List[Dict[str, Any]] = []
+    detail_errors: List[Dict[str, Any]] = []
     detail_fetched = 0
     skip_set = skip_detail_ids or set()
 
@@ -1208,7 +1273,24 @@ def fetch_bacaoo_deals(
                             desc_html, base_url=detail_url
                         )
                         tutorial_text = html_to_tutorial_text(desc_html, base_url=detail_url)
+                else:
+                    detail_errors.append({
+                        "item_id": pid,
+                        "detail_url": detail_url,
+                        "stage": "detail_fetch",
+                        "http_status": rd.status_code,
+                        "error_type": f"HTTP_{rd.status_code}",
+                        "error": f"详情页返回非200状态码: {rd.status_code}",
+                    })
             except Exception as e:
+                detail_errors.append({
+                    "item_id": pid,
+                    "detail_url": detail_url,
+                    "stage": "detail_fetch",
+                    "http_status": None,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                })
                 tutorial_text = f"{title}\n[详情拉取异常: {type(e).__name__}: {e}]"
 
         rec = build_deal_record(
@@ -1230,9 +1312,11 @@ def fetch_bacaoo_deals(
     return {
         "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
         "http_status": resp.status_code,
+        "request_url": f"{base}/",
         "elapsed_ms": elapsed_ms,
         "count": len(records),
         "detail_fetched": detail_fetched,
+        "detail_errors": detail_errors,
         "records": records,
     }
 
@@ -1263,6 +1347,7 @@ def fetch_iehou_deals(
     )
 
     records: List[Dict[str, Any]] = []
+    detail_errors: List[Dict[str, Any]] = []
     seen_ids: set = set()
     detail_fetched = 0
     skip_set = skip_detail_ids or set()
@@ -1301,7 +1386,24 @@ def fetch_iehou_deals(
                             msg_html, base_url=detail_url
                         )
                         tutorial_text = html_to_tutorial_text(msg_html, base_url=detail_url)
+                else:
+                    detail_errors.append({
+                        "item_id": item_id,
+                        "detail_url": detail_url,
+                        "stage": "detail_fetch",
+                        "http_status": rd.status_code,
+                        "error_type": f"HTTP_{rd.status_code}",
+                        "error": f"详情页返回非200状态码: {rd.status_code}",
+                    })
             except Exception as e:
+                detail_errors.append({
+                    "item_id": item_id,
+                    "detail_url": detail_url,
+                    "stage": "detail_fetch",
+                    "http_status": None,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                })
                 tutorial_text = f"{title}\n[详情拉取异常: {type(e).__name__}: {e}]"
 
         rec = build_deal_record(
@@ -1323,9 +1425,11 @@ def fetch_iehou_deals(
     return {
         "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
         "http_status": resp.status_code,
+        "request_url": list_url,
         "elapsed_ms": elapsed_ms,
         "count": len(records),
         "detail_fetched": detail_fetched,
+        "detail_errors": detail_errors,
         "records": records,
     }
 
@@ -1553,8 +1657,597 @@ def fetch_gwdang_discounts(
     return {
         "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
         "http_status": resp.status_code,
+        "request_url": getattr(resp, "url", None) or url,
         "elapsed_ms": elapsed_ms,
         "count": len(records),
+        "detail_fetched": len(records),
+        "detail_errors": [],
+        "records": records,
+    }
+
+
+def fetch_zhetaoke_xianbao_groups(
+    plat: str = "",
+    group_id: str = "",
+    page: int = 1,
+    session: Optional[requests.Session] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """
+    【T0-4A】折淘客 150+ 个真实 QQ/微信采集群实时线报大厅 (`https://www.zhetaoke.com/xianbao.aspx`)
+    - 免登录、零风控，单次 GET 直接返回 60 条完整群聊线报（无需二次请求详情页！）。
+    - 参数说明：
+      * `plat`: `""` (全平台综合群流), `"1"` (淘宝全群汇总), `"2"` (京东全群汇总), `"3"` (拼多多全群汇总)
+      * `group_id`: 指定单个采集群 ID（如 `"10000030"` 新京东带主图采集群、`"1067573294"` 云线报群9京东、
+        `"725556337"` 云线报群5综合、`"10000072"` 优质猫超线报群、`"10000176"` 宝妈羊毛群③ 等）
+    """
+    http = session or requests.Session()
+    url = "https://www.zhetaoke.com/xianbao.aspx"
+    params = {
+        "id": str(group_id or ""),
+        "page": str(page),
+        "q": "",
+        "plat": str(plat or ""),
+    }
+    t0 = time.perf_counter()
+    resp = http.get(url, params=params, headers=DEFAULT_HEADERS, timeout=timeout)
+    resp.encoding = "utf-8"
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    cards = re.findall(
+        r'(<div\s+class=["\']sc-product["\'][^>]*>.*?<div\s+class=["\']product-bottom["\'][^>]*>.*?</div>\s*</div>\s*</div>)',
+        resp.text,
+        re.S | re.I,
+    )
+
+    plat_label_map = {"1": "tb_groups", "2": "jd_groups", "3": "pdd_groups", "": "all_groups"}
+    base_channel = f"group_{group_id}" if group_id else plat_label_map.get(str(plat), f"plat_{plat}")
+
+    records: List[Dict[str, Any]] = []
+    for card_html in cards:
+        m_id = re.search(r'class=["\'][^"\']*copytext-btn1[^"\']*["\'][^>]*data-id=["\'](\d+)["\']', card_html, re.I)
+        if not m_id:
+            m_id = re.search(r'data-id=["\'](\d+)["\']', card_html, re.I)
+        item_id = m_id.group(1) if m_id else ""
+        if not item_id:
+            continue
+
+        m_tit = re.search(r'<div\s+class=["\']product-tit1["\'][^>]*>(.*?)</div>', card_html, re.S | re.I)
+        tit_html = m_tit.group(1) if m_tit else ""
+        msg_with_lines = re.sub(r"<br\s*/?>", "\n", tit_html, flags=re.I)
+        raw_msg = html_lib.unescape(re.sub(r"<[^>]+>", "", msg_with_lines)).strip()
+        if not raw_msg:
+            continue
+
+        m_img = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', card_html, re.I)
+        img_url = ""
+        if m_img:
+            cand_img = html_lib.unescape(m_img.group(1)).strip()
+            if cand_img and "loading.png" not in cand_img:
+                img_url = ("https:" + cand_img) if cand_img.startswith("//") else urljoin(url, cand_img)
+
+        m_time = re.search(r'<p\s+class=["\']month-sales["\'][^>]*>(.*?)</p>', card_html, re.S | re.I)
+        pub_time = ""
+        if m_time:
+            t_txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(m_time.group(1)))).strip()
+            m_dt = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)", t_txt)
+            pub_time = m_dt.group(1) if m_dt else t_txt
+
+        m_grp = re.search(
+            r'<div\s+class=["\']product-bottom["\'][^>]*>.*?<a[^>]+href=["\']/xianbao\.aspx\?id=(\d+)[^"\']*["\'][^>]*>(.*?)</a>',
+            card_html,
+            re.S | re.I,
+        )
+        src_grp_id = m_grp.group(1).strip() if m_grp else str(group_id or "")
+        src_grp_name = re.sub(r"<[^>]+>", "", html_lib.unescape(m_grp.group(2))).strip() if m_grp else ""
+
+        links, imgs, tokens = extract_links_images_and_tokens(tit_html, base_url=url)
+        if img_url and img_url not in imgs:
+            imgs.insert(0, img_url)
+
+        # 提取首行有效商品描述作为标题，完整保留群聊多行教程在 tutorial_text
+        lines = [ln.strip() for ln in raw_msg.splitlines() if ln.strip()]
+        title_line = ""
+        for ln in lines:
+            if not ln.startswith("http") and not re.fullmatch(r"[￥¥$€₴£¢()（）!！/A-Za-z0-9\s_-]{6,26}", ln):
+                title_line = ln
+                break
+        if not title_line:
+            title_line = lines[0] if lines else f"折淘客群线报 #{item_id}"
+        title_clean = re.sub(r"https?://\S+", "", title_line).strip() or title_line[:80]
+
+        explicit_plat = None
+        if str(plat) == "2" or "京东" in src_grp_name:
+            explicit_plat = "jd"
+        elif str(plat) == "1" or any(k in src_grp_name for k in ("淘宝", "猫超", "天猫")):
+            explicit_plat = "taobao"
+        elif str(plat) == "3" or "拼多多" in src_grp_name:
+            explicit_plat = "pdd"
+
+        grp_prefix = f"【来源采集群: {src_grp_name} (群ID:{src_grp_id})】\n" if src_grp_name else ""
+        tutorial_text = f"{grp_prefix}{raw_msg}".strip()
+
+        rec = build_deal_record(
+            source_site="zhetaoke",
+            source_channel=f"{base_channel}:{src_grp_name}" if src_grp_name else base_channel,
+            source_item_id=f"xb_{item_id}",
+            source_url=f"https://www.zhetaoke.com/xianbao.aspx?id={src_grp_id or ''}&plat={plat or ''}",
+            title=title_clean[:120],
+            image_url=img_url,
+            mall_name=src_grp_name or "折淘客云线报群",
+            publish_time=pub_time,
+            hot_metrics={
+                "group_id": src_grp_id,
+                "group_name": src_grp_name,
+                "plat_filter": str(plat or "all"),
+            },
+            tutorial_text=tutorial_text,
+            tutorial_images=imgs,
+            extracted_links=links,
+            extracted_tokens=tokens,
+            raw_payload=card_html,
+            explicit_platform=explicit_plat,
+        )
+        rec["has_full_detail"] = True
+        records.append(rec)
+
+    return {
+        "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
+        "http_status": resp.status_code,
+        "request_url": getattr(resp, "url", None) or url,
+        "elapsed_ms": elapsed_ms,
+        "count": len(records),
+        "detail_fetched": len(records),
+        "detail_errors": [],
+        "records": records,
+    }
+
+
+def fetch_zhetaoke_rank_list(
+    mode: str = "dongdong",
+    page: int = 1,
+    session: Optional[requests.Session] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """
+    【T0-4B】折淘客咚咚抢 & 全天实时热销爆款榜 (`https://www.zhetaoke.com/list/dongdong.html` / `/list/love_1_0_1.html`)
+    - 100% 包含 `https://uland.taobao.com/item/edetail?id=...` 二合一领券链与淘宝 46 位加密 `data-goods-id`。
+    """
+    http = session or requests.Session()
+    if mode == "dongdong":
+        url = "https://www.zhetaoke.com/list/dongdong.html" if page <= 1 else f"https://www.zhetaoke.com/list/dongdong_{page}.html"
+    else:
+        url = f"https://www.zhetaoke.com/list/love_1_0_{page}.html"
+
+    t0 = time.perf_counter()
+    resp = http.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+    resp.encoding = "utf-8"
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    cards = re.split(r'<div\s+class=["\']sc-product["\'][^>]*>', resp.text, flags=re.I)[1:]
+
+    records: List[Dict[str, Any]] = []
+    for card_html in cards:
+        m_btn = re.search(
+            r'data-goods-id=["\']([^"\']+)["\'][^>]*data-id=["\'](\d+)["\']',
+            card_html,
+            re.I,
+        )
+        enc_goods_id = m_btn.group(1).strip() if m_btn else ""
+        ztk_id = m_btn.group(2).strip() if m_btn else ""
+
+        m_uland = re.search(r'href=["\'](https?://uland\.taobao\.com/[^"\']+)["\']', card_html, re.I)
+        uland_url = html_lib.unescape(m_uland.group(1)).strip() if m_uland else (
+            f"https://uland.taobao.com/item/edetail?id={enc_goods_id}" if enc_goods_id else ""
+        )
+        if not ztk_id and not enc_goods_id:
+            continue
+
+        m_tit = re.search(r'<div\s+class=["\']product-tit["\'][^>]*>.*?<a[^>]*>(.*?)</a>', card_html, re.S | re.I)
+        title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html_lib.unescape(m_tit.group(1)))).strip() if m_tit else f"折淘客爆款 #{ztk_id}"
+
+        m_img = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', card_html, re.I)
+        img_url = ""
+        if m_img:
+            cand_img = html_lib.unescape(m_img.group(1)).strip()
+            if cand_img and "loading.png" not in cand_img:
+                img_url = ("https:" + cand_img) if cand_img.startswith("//") else urljoin(url, cand_img)
+
+        m_price = re.search(r'<span\s+class=["\']price-num["\'][^>]*>\s*([\d.]+)', card_html, re.I)
+        price_str = m_price.group(1).strip() if m_price else ""
+        try:
+            price_val = float(price_str) if price_str else None
+        except ValueError:
+            price_val = None
+
+        m_sales = re.search(r'<p\s+class=["\']month-sales["\'][^>]*>.*?<span>(\d+)</span>', card_html, re.S | re.I)
+        sales_cnt = int(m_sales.group(1)) if m_sales else 0
+
+        links = []
+        if uland_url:
+            links.append({
+                "label": title or "淘宝二合一领券页",
+                "url": uland_url,
+                "item_id": enc_goods_id,
+                "type": "tb_encrypted_id",
+                "platform": "taobao",
+            })
+
+        rec = build_deal_record(
+            source_site="zhetaoke",
+            source_channel=f"rank_{mode}",
+            source_item_id=f"rank_{ztk_id or enc_goods_id[:24]}",
+            source_url=uland_url or url,
+            title=title,
+            price_text=f"券后{price_str}元" if price_str else "",
+            price=price_val,
+            image_url=img_url,
+            mall_name="淘宝/天猫",
+            hot_metrics={"month_sales": sales_cnt, "rank_mode": mode},
+            tutorial_text=f"【折淘客{mode}爆款】{title}\n券后价: {price_str}元 (月销:{sales_cnt})\n二合一落地页: {uland_url}\n加密ID: {enc_goods_id}".strip(),
+            tutorial_images=[img_url] if img_url else [],
+            extracted_links=links,
+            extracted_tokens=[enc_goods_id] if enc_goods_id else [],
+            raw_payload=card_html,
+            explicit_platform="taobao",
+        )
+        rec["has_full_detail"] = True
+        records.append(rec)
+
+    return {
+        "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
+        "http_status": resp.status_code,
+        "request_url": getattr(resp, "url", None) or url,
+        "elapsed_ms": elapsed_ms,
+        "count": len(records),
+        "detail_fetched": len(records),
+        "detail_errors": [],
+        "records": records,
+    }
+
+
+def fetch_guangdiu_deals(
+    channel: str = "latest",
+    page: int = 1,
+    fetch_detail: bool = True,
+    max_details: int = 15,
+    session: Optional[requests.Session] = None,
+    timeout: float = 10.0,
+    skip_detail_ids: Optional[set] = None,
+) -> Dict[str, Any]:
+    """
+    【T0-5】逛丢全网实时折扣与值得买明文还原源 (`https://guangdiu.com/`)
+    - 重大价值：逛丢实时同步全网及“什么值得买”好价，并在服务端将值得买的加密链还原为明文
+      `to.php?u=https%3A%2F%2Fitem.jd.com%2F{sku}.html` 或 `go.php?id={id}` 中的 `union-click.jd.com` / `s.click.taobao.com`！
+    - 支持频道 `channel`:
+      * `"latest"` -> `https://guangdiu.com/` 或 `https://guangdiu.com/index.php?p={page}` (国内实时折扣流)
+      * `"cheaps"` -> `https://guangdiu.com/cheaps.php` (九块九白菜好价流)
+    """
+    http = session or requests.Session()
+    base = "https://guangdiu.com"
+    if channel == "cheaps":
+        list_url = f"{base}/cheaps.php" if page <= 1 else f"{base}/cheaps.php?p={page}"
+    else:
+        list_url = f"{base}/" if page <= 1 else f"{base}/index.php?p={page}"
+
+    t0 = time.perf_counter()
+    resp = http.get(list_url, headers=DEFAULT_HEADERS, timeout=timeout)
+    resp.encoding = "utf-8"
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    blocks = re.findall(
+        r'(<div\s+class=["\']gooditem\b[^"\']*["\'][^>]*>.*?<div\s+class=["\']infocontent["\'][^>]*>.*?</div>\s*</div>\s*</div>\s*</div>)',
+        resp.text,
+        re.S | re.I,
+    )
+    if not blocks:
+        # 兼容 cheaps.php 的精简卡片结构
+        blocks = re.findall(
+            r'(<div\s+class=["\'][^"\']*\bgooditem\b[^"\']*["\'][^>]*>.*?detail\.php\?id=\d+.*?</div>\s*</div>)',
+            resp.text,
+            re.S | re.I,
+        )
+
+    records: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    detail_fetched = 0
+    detail_errors: List[Dict[str, Any]] = []
+    skip_set = skip_detail_ids or set()
+
+    for blk in blocks:
+        m_a = re.search(
+            r'<a[^>]+href=["\'](?:https?://guangdiu\.com/)?detail\.php\?id=(\d+)["\'][^>]*>(.*?)</a>',
+            blk,
+            re.S | re.I,
+        )
+        if not m_a:
+            continue
+        item_id = m_a.group(1).strip()
+        if item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+
+        detail_url = f"{base}/detail.php?id={item_id}"
+        go_url = f"{base}/go.php?id={item_id}"
+
+        a_inner = m_a.group(2)
+        m_emph = re.search(r'<span\s+class=["\']emphricepart["\'][^>]*>(.*?)</span>', a_inner, re.S | re.I)
+        price_span = re.sub(r"<[^>]+>", "", html_lib.unescape(m_emph.group(1))).strip() if m_emph else ""
+        title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html_lib.unescape(a_inner))).strip()
+
+        m_img = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', blk, re.I)
+        img_url = html_lib.unescape(m_img.group(1)).strip() if m_img else ""
+
+        m_mall = re.search(r'class=["\'][^"\']*rightmallname[^"\']*["\'][^>]*>(.*?)</a>', blk, re.S | re.I)
+        mall_name = re.sub(r"<[^>]+>", "", html_lib.unescape(m_mall.group(1))).strip() if m_mall else ""
+
+        m_abs = re.search(r'<div\s+class=["\']abstractcontent["\'][^>]*>(.*?)</div>', blk, re.S | re.I)
+        preview_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(m_abs.group(1)))).strip() if m_abs else ""
+
+        tutorial_text = f"【{mall_name or '逛丢好价'}】{title}\n{preview_text}".strip()
+        tutorial_images: List[str] = [img_url] if img_url else []
+        extracted_links: List[Dict[str, Any]] = []
+        extracted_tokens: List[str] = []
+        raw_payload: Any = blk
+        has_full_detail = False
+
+        if fetch_detail and detail_fetched < max_details and item_id not in skip_set:
+            try:
+                rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
+                rd.encoding = "utf-8"
+                if rd.status_code == 200:
+                    detail_fetched += 1
+                    has_full_detail = True
+                    det_html = rd.text
+
+                    m_dabs = re.search(
+                        r'(<div[^>]+id=["\']dabstract["\'][^>]*>.*?</div>)\s*<a[^>]+class=["\']dgotobutton',
+                        det_html,
+                        re.S | re.I,
+                    )
+                    if not m_dabs:
+                        m_dabs = re.search(r'(<div[^>]+id=["\']dabstract["\'][^>]*>.*?</div>)', det_html, re.S | re.I)
+
+                    dabs_html = m_dabs.group(1) if m_dabs else ""
+                    # 将逛丢内部跳板 to.php?u=https%3A%2F%2Fitem.jd.com%2F... 自动解包为真实电商直链
+                    def _unwrap_to_php(m_u: re.Match) -> str:
+                        return html_lib.unescape(unquote(m_u.group(1)))
+
+                    unwrapped_dabs = re.sub(
+                        r"(?:https?://guangdiu\.com/)?to\.php\?[^\s\"'<>]*\bu=(https?%3A%2F%2F[^&\"'\s<>]+)",
+                        _unwrap_to_php,
+                        dabs_html,
+                        flags=re.I,
+                    )
+                    raw_payload = unwrapped_dabs or dabs_html or det_html[:4000]
+                    extracted_links, step_imgs, extracted_tokens = extract_links_images_and_tokens(
+                        unwrapped_dabs or det_html, base_url=detail_url
+                    )
+                    for im in step_imgs:
+                        if im not in tutorial_images:
+                            tutorial_images.append(im)
+
+                    # 请求轻量级 go.php?id={item_id} (~200字节)，兼容随机 8 位 JS 变量名提取主商品直达链接
+                    try:
+                        r_go = http.get(go_url, headers={**DEFAULT_HEADERS, "Referer": detail_url}, timeout=timeout)
+                        r_go.encoding = "utf-8"
+                        if r_go.status_code == 200:
+                            m_var = re.search(
+                                r"var\s+[A-Za-z0-9_]+\s*=\s*['\"](https?://[^'\"]+|/[^'\"]+)['\"]",
+                                r_go.text,
+                                re.I,
+                            )
+                            if m_var:
+                                go_target = html_lib.unescape(m_var.group(1)).strip()
+                                m_inner_u = re.search(r"[?&]u=(https?%3A%2F%2F[^&\"'\s]+)", go_target, re.I)
+                                if m_inner_u:
+                                    go_target = unquote(m_inner_u.group(1))
+                                elif go_target.startswith("/"):
+                                    go_target = urljoin(base, go_target)
+                                if go_target and not any(lk.get("url") == go_target for lk in extracted_links):
+                                    extracted_links.insert(0, {
+                                        "label": "逛丢直达购买链",
+                                        "url": go_target,
+                                        "type": "guangdiu_go_target",
+                                        "platform": detect_platform_signal(f"{go_target} {mall_name}") or "unknown",
+                                    })
+                        else:
+                            detail_errors.append({
+                                "item_id": item_id,
+                                "error_url": go_url,
+                                "http_status": r_go.status_code,
+                                "error_type": f"GoRedirectHTTP_{r_go.status_code}",
+                            })
+                    except Exception as e_go:
+                        detail_errors.append({
+                            "item_id": item_id,
+                            "error_url": go_url,
+                            "http_status": None,
+                            "error_type": type(e_go).__name__,
+                            "error": str(e_go)[:160],
+                        })
+
+                    dabs_text = html_to_tutorial_text(unwrapped_dabs, base_url=detail_url) if unwrapped_dabs else preview_text
+                    go_urls_str = "\n".join(
+                        f"直达链接: {lk['url']}" for lk in extracted_links if lk.get("type") == "guangdiu_go_target"
+                    )
+                    tutorial_text = f"【{mall_name or '逛丢好价'}】{title}\n{dabs_text}\n{go_urls_str}".strip()
+                else:
+                    detail_errors.append({
+                        "item_id": item_id,
+                        "error_url": detail_url,
+                        "http_status": rd.status_code,
+                        "error_type": f"HTTP_{rd.status_code}",
+                    })
+            except Exception as e:
+                detail_errors.append({
+                    "item_id": item_id,
+                    "error_url": detail_url,
+                    "http_status": None,
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:160],
+                })
+                tutorial_text = f"{tutorial_text}\n[详情拉取异常: {type(e).__name__}: {e}]"
+
+        rec = build_deal_record(
+            source_site="guangdiu",
+            source_channel=f"{channel}:{mall_name}" if mall_name else channel,
+            source_item_id=item_id,
+            source_url=detail_url,
+            title=title,
+            price_text=price_span,
+            image_url=img_url,
+            mall_name=mall_name,
+            tutorial_text=tutorial_text,
+            tutorial_images=tutorial_images,
+            extracted_links=extracted_links,
+            extracted_tokens=extracted_tokens,
+            raw_payload=raw_payload,
+        )
+        rec["has_full_detail"] = has_full_detail
+        records.append(rec)
+
+    return {
+        "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
+        "http_status": resp.status_code,
+        "request_url": list_url,
+        "elapsed_ms": elapsed_ms,
+        "count": len(records),
+        "detail_fetched": detail_fetched,
+        "detail_errors": detail_errors,
+        "records": records,
+    }
+
+
+def fetch_xuandan_deals(
+    hour_type: str = "",
+    page: int = 1,
+    session: Optional[requests.Session] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """
+    【T0-6】选单网秒杀快抢群发素材免登 JSON 接口 (`https://www.xuandan.com/NewHome/msKqList`)
+    - 100% 同时返回淘宝 12 位纯数字商品 ID (`ShoopGoodsId`)、`uland.taobao.com` 46位加密二合一链 (`GoodsLink`)、
+      优惠券链接 (`ActLink`) 以及社群发单员编写的湊单/金币实付文案 (`TjRemark`)！
+    """
+    http = session or requests.Session()
+    url = "https://www.xuandan.com/NewHome/msKqList"
+    headers = {
+        **DEFAULT_HEADERS,
+        "Referer": "https://www.xuandan.com/NewHome/fastBuy",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    params = {"page": str(page), "hour_type": str(hour_type or "")}
+    t0 = time.perf_counter()
+    resp = http.get(url, params=params, headers=headers, timeout=timeout)
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+    body = resp.json()
+    raw_items = body.get("List") if isinstance(body, dict) else []
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    records: List[Dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        tk_id = str(item.get("tk_GoodsId") or "").strip()
+        tb_num_id = str(item.get("ShoopGoodsId") or "").strip()
+        if not tk_id and not tb_num_id:
+            continue
+
+        title = str(item.get("GoodsName") or "").strip()
+        remark = html_lib.unescape(str(item.get("TjRemark") or "")).strip()
+        goods_link = str(item.get("GoodsLink") or "").strip()
+        act_link = str(item.get("ActLink") or "").strip()
+        img_url = str(item.get("ImgUrl") or "").strip()
+        shop_name = str(item.get("shopName") or "淘宝/天猫").strip()
+        last_price_str = str(item.get("LastPrice") or "").strip()
+        try:
+            price_val = float(last_price_str) if last_price_str else None
+        except ValueError:
+            price_val = None
+
+        links: List[Dict[str, Any]] = []
+        if goods_link:
+            links.append({
+                "label": title or "淘宝二合一领券页",
+                "url": goods_link,
+                "item_id": tb_num_id,
+                "type": "tb_encrypted_id",
+                "platform": "taobao",
+            })
+        if tb_num_id.isdigit():
+            tb_direct = f"https://item.taobao.com/item.htm?id={tb_num_id}"
+            links.append({
+                "label": "淘宝商品数字ID直达页",
+                "url": tb_direct,
+                "item_id": tb_num_id,
+                "type": "tb_numeric_sku",
+                "platform": "taobao",
+            })
+        if act_link:
+            links.append({
+                "label": "选单网优惠券链接",
+                "url": act_link,
+                "type": "coupon_url",
+                "platform": "taobao",
+            })
+
+        extra_links, extra_imgs, extra_tokens = extract_links_images_and_tokens(remark, base_url="https://www.xuandan.com")
+        for lk in extra_links:
+            if not any(x.get("url") == lk.get("url") for x in links):
+                links.append(lk)
+
+        images = [img_url] if img_url else []
+        for im in extra_imgs:
+            if im not in images:
+                images.append(im)
+
+        tutorial_text = (
+            f"【{shop_name}】{title}\n"
+            f"群发凑单文案: {remark}\n"
+            f"到手价: {last_price_str}元 | 淘宝商品ID: {tb_num_id}\n"
+            f"二合一链接: {goods_link}"
+        ).strip()
+
+        rec = build_deal_record(
+            source_site="xuandan",
+            source_channel=f"fastbuy_h{hour_type or 'all'}",
+            source_item_id=tk_id or tb_num_id,
+            source_url=goods_link or f"https://item.taobao.com/item.htm?id={tb_num_id}",
+            title=title,
+            price_text=f"{last_price_str}元" if last_price_str else "",
+            price=price_val,
+            image_url=img_url,
+            mall_name=shop_name,
+            publish_time=str(item.get("BeginTime") or ""),
+            expire_time=str(item.get("EndTime") or "") or None,
+            hot_metrics={
+                "sale_count": item.get("SaleCount"),
+                "tk_money": item.get("TkMoney"),
+                "act_money": item.get("ActMoney"),
+            },
+            tutorial_text=tutorial_text,
+            tutorial_images=images,
+            extracted_links=links,
+            extracted_tokens=extra_tokens,
+            raw_payload=item,
+            explicit_platform="taobao",
+        )
+        if tb_num_id.isdigit():
+            rec["candidate_goods_id"] = tb_num_id
+        rec["has_full_detail"] = True
+        records.append(rec)
+
+    return {
+        "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
+        "http_status": resp.status_code,
+        "request_url": getattr(resp, "url", None) or url,
+        "elapsed_ms": elapsed_ms,
+        "count": len(records),
+        "detail_fetched": len(records),
+        "detail_errors": [],
         "records": records,
     }
 
