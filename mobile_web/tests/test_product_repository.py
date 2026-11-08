@@ -1048,23 +1048,28 @@ class TestProductRepository(unittest.TestCase):
             for i in range(1, 4)
         ]
         service = ProductService(product_repo=self.repo)
+        # 1. 无搜索关键词时：跨品类商品无可比性，即使传入 cost_performance 也使用最新上架 (latest) 排序
+        no_kw_res = service.get_boom_products(platform="pdd", sort_by="cost_performance", page=1, page_size=3)
+        self.assertEqual([item["product_id"] for item in no_kw_res["data"]], ["P1", "P2", "P3"])
+
+        # 2. 有搜索关键词时：默认使用性价比最高 (cost_performance) 排序并写入 BOOM_SORT_CACHE
         queries_before = len(self.col.queries)
-        page1 = service.get_boom_products(platform="pdd", page=1, page_size=2)
+        page1 = service.get_boom_products(platform="pdd", keyword="商品", page=1, page_size=2)
         self.assertEqual([item["product_id"] for item in page1["data"]], ["P3", "P2"])
         self.assertTrue(page1["has_more"])
-        self.assertEqual(page1["total_count"], 3)
+        self.assertEqual(page1["total_count"], 2)
         self.assertEqual(len(self.col.queries), queries_before + 1)
 
         # 第二页直接命中 BOOM_SORT_CACHE，不再查询数据库
-        page2 = service.get_boom_products(platform="pdd", page=2, page_size=2)
+        page2 = service.get_boom_products(platform="pdd", keyword="商品", page=2, page_size=2)
         self.assertEqual([item["product_id"] for item in page2["data"]], ["P1"])
         self.assertFalse(page2["has_more"])
-        self.assertEqual(page2["total_count"], 3)
+        self.assertEqual(page2["total_count"], 1)
         self.assertEqual(len(self.col.queries), queries_before + 1)
 
         # 淘汰单个商品时同步从 BOOM_SORT_CACHE 中剔除该商品且不触发重新查库
         evict_product_from_caches("pdd", goods_id="P1")
-        after_evict = service.get_boom_products(platform="pdd", page=1, page_size=10)
+        after_evict = service.get_boom_products(platform="pdd", keyword="商品", page=1, page_size=10)
         self.assertEqual([item["product_id"] for item in after_evict["data"]], ["P3", "P2"])
         self.assertEqual(len(self.col.queries), queries_before + 1)
 

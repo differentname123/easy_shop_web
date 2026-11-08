@@ -582,16 +582,23 @@ class ProductService:
             return DetailPrefetchResult("persist_failed", loaded.snapshot, retryable=True)
         return DetailPrefetchResult("error", loaded.snapshot, retryable=loaded.retryable)
 
-    def get_boom_products(self, platform="all", category=None, keyword=None, sort_by="cost_performance",
+    def get_boom_products(self, platform="all", category=None, keyword=None, sort_by=None,
                           page=1, page_size=20) -> Dict[str, Any]:
         plat = normalize_platform(platform, "all")
         page = max(1, min(50, int(page or 1)))
         page_size = max(1, min(50, int(page_size or 20)))
-        if sort_by == "cost_performance" and hasattr(self.repo, "rank_boom_products_by_cost_performance"):
+        raw_kw = keyword.strip() if keyword and keyword.strip() else ""
+        kw_key = (extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]) if raw_kw else ""
+
+        # 无搜索词时商品跨品类无可比性，统一使用最新上架排序；有搜索词时默认使用性价比排序
+        if not kw_key:
+            effective_sort = "latest" if sort_by in (None, "", "cost_performance") else sort_by
+        else:
+            effective_sort = "cost_performance" if sort_by in (None, "") else sort_by
+
+        if effective_sort == "cost_performance" and kw_key and hasattr(self.repo, "rank_boom_products_by_cost_performance"):
             cat_key = category.strip() if category and category.strip() and category.strip() != "全部" else ""
-            raw_kw = keyword.strip() if keyword and keyword.strip() else ""
-            kw_key = (extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]) if raw_kw else ""
-            cache_key = (plat, cat_key, kw_key, sort_by)
+            cache_key = (plat, cat_key, kw_key, effective_sort)
             sorted_items = BOOM_SORT_CACHE.get(cache_key)
             if sorted_items is None:
                 try:
@@ -602,7 +609,7 @@ class ProductService:
                 except Exception as exc:
                     logger.error(
                         "❌ 【爆品库查询失败】按性价比查询本地爆单商品列表时发生异常 | 平台[%s] 分类[%s] 关键词[%s] 排序[%s] 页码[%d] 异常<%s>",
-                        plat, category or "全部", keyword or "-", sort_by, page, format_exc_summary(exc),
+                        plat, category or "全部", keyword or "-", effective_sort, page, format_exc_summary(exc),
                     )
                     return {
                         "status": "error",
@@ -626,7 +633,7 @@ class ProductService:
             }
 
         result = self.repo.query_boom_products(platform=plat, category=category,
-                                              keyword=keyword, sort_by=sort_by, page=page, page_size=page_size)
+                                              keyword=keyword, sort_by=effective_sort, page=page, page_size=page_size)
         if result.get("status") == "success":
             self._offer_products(result.get("data") or [])
         return result

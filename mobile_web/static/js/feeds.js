@@ -32,7 +32,7 @@
     const boomPlatforms = ref([{ code: 'all', name: '全部', active: true }]);
     const boomPlatform = ref('all');
     const boomSearchKeyword = ref('');
-    const boomSortBy = ref('cost_performance');
+    const boomSortBy = ref('latest');
     const boomGoodsList = ref([]);
     const boomLoading = ref(false);
     const boomHasMore = ref(true);
@@ -249,7 +249,7 @@
           boomPlatform.value = cached.platform || 'all';
           activeBoomKeyword = cached.keyword || '';
           boomSearchKeyword.value = activeBoomKeyword;
-          boomSortBy.value = cached.sortBy || 'cost_performance';
+          boomSortBy.value = activeBoomKeyword ? (cached.sortBy || 'cost_performance') : 'latest';
           boomGoodsList.value = [...cached.list];
           boomPage = cached.page || 1;
           boomHasMore.value = cached.hasMore !== false;
@@ -303,13 +303,24 @@
       boomError.value = false;
       return loadBoomGoods(false);
     };
-    const onSearchBoom = () => { activeBoomKeyword = boomSearchKeyword.value.trim(); global.scrollTo(0, 0); return loadBoomGoods(true); };
+    const onSearchBoom = () => {
+      activeBoomKeyword = boomSearchKeyword.value.trim();
+      boomSortBy.value = activeBoomKeyword ? 'cost_performance' : 'latest';
+      global.scrollTo(0, 0);
+      return loadBoomGoods(true);
+    };
     const clearBoomSearch = () => { boomSearchKeyword.value = ''; return onSearchBoom(); };
     const switchBoomPlatform = code => {
       if (!boomPlatforms.value.find(item => item.code === code)?.active) { showToast('该平台暂未开放，敬请期待'); return; }
       boomPlatform.value = code; global.scrollTo(0, 0); return loadBoomGoods(true);
     };
-    const switchBoomSort = sort => { boomSortBy.value = sort; global.scrollTo(0, 0); return loadBoomGoods(true); };
+    const switchBoomSort = sort => {
+      if (sort === 'cost_performance' && !activeBoomKeyword) {
+        showToast('请先搜索商品后再按性价比排序');
+        return false;
+      }
+      boomSortBy.value = sort; global.scrollTo(0, 0); return loadBoomGoods(true);
+    };
     return {
       platforms, platformsError, homePlatform, homePlatformName, homeChannels, currentChannel, homeSearchKeyword,
       activeHomeKeyword, homeGoodsList, homeLoading, homeHasMore, homeError, loadHomeChannels, loadPlatforms,

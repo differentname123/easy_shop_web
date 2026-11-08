@@ -1674,7 +1674,7 @@ test('boom state snapshot is scoped to session and restores platform, sort, keyw
   const restored = h.makeFeeds();
   assert.equal(restored.restoreBoomState(), true);
   assert.equal(restored.boomPlatform.value, 'pdd');
-  assert.equal(restored.boomSortBy.value, 'price_desc');
+  assert.equal(restored.boomSortBy.value, 'cost_performance');
   assert.equal(restored.boomSearchKeyword.value, '纸巾');
   assert.equal(restored.boomGoodsList.value.length, 1);
   assert.equal(restored.boomGoodsList.value[0].goods_id, 'B1');
@@ -1841,23 +1841,45 @@ test('handleRegisterOrLogin sends explicit mode=login vs mode=register and unive
   assert.equal(account.isLoggedIn.value, true);
 });
 
-test('boom tab defaults to cost_performance sort and only renders two sort tabs without unit price on cards', async () => {
+test('boom tab uses latest sort without search and automatically switches to cost_performance sort on search', async () => {
   const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
-  assert.ok(indexHtml.includes("switchBoomSort('cost_performance')"), 'index.html includes cost_performance sort tab');
   assert.ok(indexHtml.includes("switchBoomSort('latest')"), 'index.html includes latest sort tab');
+  assert.ok(indexHtml.includes("switchBoomSort('cost_performance')"), 'index.html includes cost_performance sort tab');
   assert.ok(!indexHtml.includes("switchBoomSort('save_desc')"), 'index.html removes save_desc sort tab');
   assert.ok(!indexHtml.includes("switchBoomSort('price_asc')"), 'index.html removes price_asc sort tab');
   assert.ok(!indexHtml.includes("switchBoomSort('price_desc')"), 'index.html removes price_desc sort tab');
   assert.ok(
-    indexHtml.indexOf("switchBoomSort('cost_performance')") < indexHtml.indexOf("switchBoomSort('latest')"),
-    'cost_performance tab appears before latest tab'
+    indexHtml.indexOf("switchBoomSort('latest')") < indexHtml.indexOf("switchBoomSort('cost_performance')"),
+    'latest tab appears before cost_performance tab'
   );
 
   const h = harness(), feed = h.makeFeeds();
+  // 1. 无搜索时默认使用 latest 排序
+  assert.equal(feed.boomSortBy.value, 'latest');
+  const initialLoad = feed.loadBoomGoods(true);
+  assert.equal(new URL(h.requests[0].url, 'https://shop.test').searchParams.get('sort_by'), 'latest');
+  await h.finish(0, goodsResponse('boom-latest-1', false));
+  await initialLoad;
+
+  // 未搜索时点击性价比排序会提示先搜索，保持 latest
+  assert.equal(feed.switchBoomSort('cost_performance'), false);
+  assert.equal(feed.boomSortBy.value, 'latest');
+  assert.equal(h.toasts.at(-1), '请先搜索商品后再按性价比排序');
+
+  // 2. 搜索时自动切换为 cost_performance 排序
+  feed.boomSearchKeyword.value = '抽纸';
+  const searchLoad = feed.onSearchBoom();
   assert.equal(feed.boomSortBy.value, 'cost_performance');
-  const loading = feed.loadBoomGoods(true);
-  const query = new URL(h.requests[0].url, 'https://shop.test').searchParams;
-  assert.equal(query.get('sort_by'), 'cost_performance');
-  await h.finish(0, goodsResponse('boom-1', false));
-  await loading;
+  const searchQuery = new URL(h.requests[1].url, 'https://shop.test').searchParams;
+  assert.equal(searchQuery.get('keyword'), '抽纸');
+  assert.equal(searchQuery.get('sort_by'), 'cost_performance');
+  await h.finish(1, goodsResponse('boom-cp-1', false));
+  await searchLoad;
+
+  // 3. 清空搜索时自动切回 latest 排序
+  const clearLoad = feed.clearBoomSearch();
+  assert.equal(feed.boomSortBy.value, 'latest');
+  assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('sort_by'), 'latest');
+  await h.finish(2, goodsResponse('boom-latest-2', false));
+  await clearLoad;
 });

@@ -14,7 +14,7 @@ def list_boom_goods(
     platform: str = Query("all", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台代码，all 查询全部本地商品"),
     category: Optional[str] = Query(None, max_length=20, description="商品分类"),
     keyword: Optional[str] = Query(None, max_length=500, description="关键词或分享文案模糊查询"),
-    sort_by: str = Query("cost_performance", pattern="^(cost_performance|latest|save_desc|price_asc|price_desc)$", description="排序"),
+    sort_by: Optional[str] = Query(None, pattern="^(cost_performance|latest|save_desc|price_asc|price_desc)$", description="排序（无搜索默认 latest，有搜索默认 cost_performance）"),
     page: int = Query(1, ge=1, le=50, description="页码 (最大50页)"),
     page_size: int = Query(20, ge=1, le=50, description="每页数量 (最大50条)"),
 ):

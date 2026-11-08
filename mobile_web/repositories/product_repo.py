@@ -549,7 +549,7 @@ class ProductRepository(BaseRepository):
         page_size = max(1, min(50, int(page_size or 20)))
         skip = (page - 1) * page_size
 
-        if sort_by == "cost_performance":
+        if sort_by == "cost_performance" and keyword and keyword.strip():
             try:
                 sorted_items = self.rank_boom_products_by_cost_performance(
                     platform=platform, category=category, keyword=keyword,
