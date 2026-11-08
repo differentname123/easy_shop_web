@@ -28,7 +28,7 @@
 
 一、【两大核心阶段职责】
   1. 阶段一：多站点增量拉取与潜在商品信号粗筛 (`run_single_cycle` -> 写入初步表 `deal_raw_tips`)
-     - 覆盖 9 大站点、50 个优选频道（T0 核心 22 个频道每轮必跑，T1 扩充 28 个频道偶数轮或 `--all-channels` 跑）；
+     - 覆盖 9 大站点、56 个优选频道（T0 核心 25 个频道每轮必跑，T1 扩充 31 个频道偶数轮或 `--all-channels` 跑）；
      - 增量抓取：自动跳过 `deal_raw_tips` 中已拉取过完整详情的 `source_item_id`，仅对新线报抓详情；
      - 仅当 `has_potential_product_signal(record)` 为 True 时入库 `deal_raw_tips`，新记录初始化 `clean_status="pending"`。
   2. 阶段二：直接转链唯一商品核验与正式表入库 (`run_clean_stage` -> 写入正式表 `products` 并回写 `deal_raw_tips`)
@@ -40,8 +40,8 @@
 
 二、【历史尝试过的方法与工程备忘录】
   1. 核心工程设计准则备忘：详见常量 `ENGINEERING_PHILOSOPHY_MANIFEST`。
-  2. 采集阶段曾尝试并剔除的 14 个站点/频道：详见常量 `EXCLUDED_SITES_AND_CHANNELS_MANIFEST`。
-  3. 清洗阶段曾尝试过的探索与为何回归极简基线的备忘：详见常量 `CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST`。
+  2. 采集阶段曾尝试并剔除的 19 个站点/频道（含拼多多专项全网排查失败项与替代方案）：详见常量 `EXCLUDED_SITES_AND_CHANNELS_MANIFEST`。
+  3. 清洗与解包阶段曾尝试过的探索（含失败死胡同与验证成功的方案）：详见常量 `CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST`。
 
 三、【全链路可观测性与运维日志体系】
   - 主运行日志           : `logs/deal_pool_scheduler.log`
@@ -133,7 +133,7 @@ CLEAN_SUCCESS_PREVIEW_JSONL = os.path.join(LOG_DIR, "clean_success_preview.jsonl
 
 
 # ==============================================================================
-# 【重要历史档案 1】采集阶段曾尝试并明确剔除的 14 个站点与频道备忘字典
+# 【重要历史档案 1】采集阶段曾尝试并明确剔除的 19 个站点与频道备忘字典
 # （均经实测验证违反“零风控稳定拉取”或“无唯一商品锚点”，固化于此严禁后人重复尝试）
 # ==============================================================================
 EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
@@ -185,6 +185,30 @@ EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
         "【已尝试并放弃】违反铁律1稳定性要求：2小时14轮实测中有7轮返回0条空包且单次阻塞高达11.4秒（失败率50%），"
         "且其有效商品已被 100% 零报错的 0-latest / 0-lowest / 0-s_lowest / 0-lower_11 四个频道完全覆盖。"
     ),
+    "zhetaoke_inactive_pdd_subgroups (折淘客特定拼多多群 id=10000039/10000068/10000107 及 q=拼多多 搜索)": (
+        "【拼多多专项探索：已尝试并放弃】实测折淘客下拉框中的 `10000039 (MK拼多多采集群)`、`10000068 (高佣拼多多采集群)`、"
+        "`10000107 (拼多北大学采集群)` 返回 0 条记录（群已停更）；且 `xianbao.aspx?q=拼多多` 服务端不支持按平台词过滤。"
+        "（有效方案：`plat='3'` 即 `折淘客_拼多多采集群汇总` 已 100% 汇总折淘客全站所有活跃群的拼多多线报）。"
+    ),
+    "haodanku_wire_report_pdd_and_tehuigou (好单库 wire_report 各 type 参数及 /haodan/tehuigou.html)": (
+        "【拼多多专项探索：已尝试并放弃】实测遍历 `get_wire_report_items` 的 `type=0~5` 及 `category_type=0,10001~10008,10367` "
+        "均只有淘宝(type=1/2)与京东(type=3)，拼多多条数为 0；网页端 `/haodan/tehuigou.html` 仅为 460 字节前端 JS 空壳 (`cms_web.min.js`)，无 SSR 数据。"
+        "（替代方案：好单库体系内的拼多多线报已通过【线报酷 `category_haodan_pdd` (`/category-haodan-pdd/`)】100% 捕获，实测 20/20 含 `p.pinduoduo.com` 短链）。"
+    ),
+    "gwdang_pdd_numeric_only_site_370 (购物党 site_id=370 拼多多商品及详情页 /v2/zhi/detail/1)": (
+        "【拼多多专项探索：已尝试并放弃】购物党折扣流中虽包含 `site_id=370` (拼多多) 记录，但其实测 Base64 `buy_steps` 解码结果与详情页 "
+        "`/v2/zhi/detail/1?dp_id={dp_id}-370` 均仅提供纯数字 `goods_id` 链接 (`https://mobile.yangkeduo.com/goods.html?goods_id=990159885102`)，"
+        "不含 `goods_sign` 或 `p.pinduoduo.com` 推广短链，多多进宝官方转链网关 100% 拒识 (`sub_code=40009, ERR_PDD_NUMERIC_ID`)，严禁无效二次请求详情页。"
+    ),
+    "xianbao_fun/category_zhidemai_pdd & category_manmanmai_pdd (线报酷-值得买拼多多 / 慢慢买拼多多子流)": (
+        "【拼多多专项探索：已尝试并放弃】虽然 `xb-app.min.js` 中定义了 `/category-zhidemai-pdd/` 与 `/category-manmanmai-pdd/` 路由，"
+        "但实测其详情页外链依然是 `go.smzdm.com` (带 probe.js 指纹锁) 和 `cu.manmanbuy.com/discuxiao_.aspx` (前端加密跳板)，0% 含明文 `p.pinduoduo.com` 短链。"
+        "（替代方案：什么值得买的拼多多好价已通过【逛丢 `channel='pdd'` (`cate.php?m=拼多多`)】服务端 `go.php` 解包出带 `goods_sign` 的 `duo_coupon_landing.html` 100% 捕获）。"
+    ),
+    "guangdiu_cheaps_php_empty (逛丢九块九 cheaps.php 及 cheaps.php?m=拼多多)": (
+        "【拼多多专项探索：已尝试并放弃】实测 `https://guangdiu.com/cheaps.php` 与 `cheaps.php?m=拼多多` 服务端返回的 `<div class='cheapcontent'></div>` 为空容器（0 条商品）。"
+        "（有效方案：必须使用 `https://guangdiu.com/cate.php?m=%E6%8B%BC%E5%A4%9A%E5%A4%9A`，每页稳定返回 30 条纯拼多多好价）。"
+    ),
 }
 
 
@@ -216,7 +240,7 @@ ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
 
 
 # ==============================================================================
-# 【重要历史档案 2】清洗阶段曾尝试过的探索与为何回归极简基线的备忘录
+# 【重要历史档案 2】清洗与解包阶段曾尝试过的探索备忘录（含失败死胡同与验证成功方案）
 # （固化于此，防止后续开发人员走回头路或盲目堆砌脆弱特判）
 # ==============================================================================
 CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST: Dict[str, str] = {
@@ -256,6 +280,21 @@ CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST: Dict[str, str] = {
         "【问题教训】单次 AI 网关超时重试可阻塞达 60 秒，导致定时任务严重堆积且引入外部不稳定性。"
         "【当前基线做法】清洗主流程 100% 采用直接转链核验，零外部 AI 阻塞依赖，单条耗时稳定在毫秒至百毫秒级。"
     ),
+    "dead_end_07_pdd_numeric_goods_id_direct_or_search_api": (
+        "【拼多多专项探索：已尝试并确认上游限制】针对 `https://mobile.yangkeduo.com/goods.html?goods_id=855830242126` 纯数字 ID 链接（主要来自购物党），"
+        "曾验证多多进宝转链 API (`pdd.ddk.goods.zs.unit.url.gen`) 与搜索 API (`pdd.ddk.goods.search`)，上游网关自 2021 年起全面废除纯数字 `goods_id` 查询，"
+        "强制返回 `sub_code=40009 (仅支持通过goodsSign查询)`；同时测试直接请求 `mobile.yangkeduo.com/goods.html` 网页提取 `goods_sign`，"
+        "未登录态 100% 302 跳转至 `login.html` 滑块验证。"
+        "【当前基线做法】不对纯数字 PDD `goods_id` 做无效网页爬虫，快速拦截记为 `ERR_PDD_NUMERIC_ID`，并通过扩充携带合法 `goods_sign` / `p.pinduoduo.com` 短链的四大拼多多源头频道解决源头供给。"
+    ),
+    "success_note_01_pdd_four_high_yield_channels_and_bacaoo_unwrap": (
+        "【拼多多专项探索：已验证成功并上线】经全网 9 大站点排查，拼多多此前入库少的主因并非转链率低（携带 `p.pinduoduo.com` 短链或 `goods_sign` 的记录转链成功率达 99.1%），"
+        "而是源头仅开启了折淘客 `plat=3` 1 个专属频道，其余站点的拼多多好价被淘京主洪流稀释截断。现已实测验证并上线四大高转化拼多多专属源：\n"
+        "  1) 逛丢 `channel='pdd'` (`cate.php?m=拼多多`, P1/P2)：每页 30 条纯拼多多好价，服务端 `go.php` 100% 解包出带 `goods_sign=E9...` 的 `duo_coupon_landing.html`，`PddAdapter` 100% 转链成功（同时修复了 `fetch_guangdiu_deals` 旧正则提前在 `div.showpic` 闭合导致标题与商城名为空的 Bug）；\n"
+        "  2) 线报酷 `channel='category_haodan_pdd'` (`/category-haodan-pdd/`, P1/P2)：从 `xb-app.min.js` 的 `window.__xbCfTags` 发现的隐藏官方子流，每页 100 条纯拼多多好单线报，实测 20/20 (100%) 含 `https://p.pinduoduo.com/xxx` 短链；\n"
+        "  3) 线报酷 `channel='category_weibo_pdd'` (`/category-weibo-pdd/`) + `id='art-fujia'` 1L~5L 源站同步评论区解析：微博/豆瓣/酷安博主防限流常将购买短链放在 1L 楼主评论区（位于 `</article>` 之后的 `div#art-fujia .c-neirong`），补充提取后实测 `category_weibo_pdd` 短链提取与转链率从 40% 提升至 100%；\n"
+        "  4) 拔草哦 `channel='pdd'` (`https://youhui.bacaoo.com/mall/1827`) + `POST https://go.bacaoo.com/` 免风控解包：解析 `direct-alink-url` 单品跳板与每 2 小时发布的 50 款《PDD热销产品汇总》合集帖 (`subproduct-alink-url`)，100% 还原出 `https://p.pinduoduo.com/xxx?sc=EFAC` 短链。"
+    ),
 }
 
 
@@ -278,12 +317,12 @@ ERR_EMPTY_PRODUCT_IDENTITY = "ERR_EMPTY_PRODUCT_IDENTITY"     # 转链成功但�
 SITE_DISPLAY_NAMES: Dict[str, str] = {
     "zhetaoke": "折淘客 (150+采集群/爆款榜)",
     "haodanku": "好单库 (实时线报群/福利单)",
-    "guangdiu": "逛丢 (全网与值得买明文还原)",
+    "guangdiu": "逛丢 (全网/值得买/拼多多明文还原)",
     "xuandan": "选单网 (淘客快抢群发素材)",
     "gwdang": "购物党 (历史低价/比价精选)",
     "0818tuan": "0818团 (实战凑单线报)",
-    "xianbao_fun": "线报酷 (20频道全网社区聚合)",
-    "bacaoo": "拔草哦 (国内优惠口令)",
+    "xianbao_fun": "线报酷 (22频道全网与拼多多聚合)",
+    "bacaoo": "拔草哦 (国内优惠与拼多多商城专区)",
     "iehou": "网猴线报 (24H热榜)",
 }
 
@@ -301,9 +340,9 @@ OPS_TROUBLESHOOTING_PLAYBOOK: Dict[str, Dict[str, str]] = {
         "timeout_or_conn": "好单库请求超时：偶发连接池陈旧套接字断开，脚本已在每轮开始时自动重建 Session，下一轮将自动恢复。",
     },
     "guangdiu": {
-        "endpoint": "https://guangdiu.com/ | https://guangdiu.com/detail.php?id={id} | https://guangdiu.com/go.php?id={id}",
+        "endpoint": "https://guangdiu.com/ | https://guangdiu.com/cate.php?m=%E6%8B%BC%E5%A4%9A%E5%A4%9A | https://guangdiu.com/go.php?id={id}",
         "http_403_429": "逛丢触发限流：请调低 `--max-new-details`（如从 20 调为 12）或增大详情页请求间隔。",
-        "empty_or_parse": "逛丢列表或详情解析为 0：请访问报错的 `detail.php?id=` 或 `go.php?id=` 路径，检查 `div.gooditem` 或 `go.php` 中的 `var <随机名>='...'` 脚本格式是否变更。",
+        "empty_or_parse": "逛丢列表或详情解析为 0：请访问报错的 `cate.php`、`detail.php?id=` 或 `go.php?id=` 路径，检查 `div.gooditem` 或 `go.php` 中的 `var <随机名>='...'` 脚本格式是否变更。",
         "timeout_or_conn": "逛丢请求超时：单次详情页超时不影响同批其余商品入库，已跳过的 ID 会在下一轮自动补抓。",
     },
     "xuandan": {
@@ -325,15 +364,15 @@ OPS_TROUBLESHOOTING_PLAYBOOK: Dict[str, Dict[str, str]] = {
         "timeout_or_conn": "0818团详情页超时：单篇帖子超时已记录到 `deal_pool_errors.jsonl`，下一轮会自动重试未入库详情。",
     },
     "xianbao_fun": {
-        "endpoint": "https://new.xianbao.fun/ | https://new.xianbao.fun/plus/json/push.json | https://new.xianbao.fun/{cat}/{id}.html",
+        "endpoint": "https://new.xianbao.fun/ | https://new.xianbao.fun/category-haodan-pdd/ | https://new.xianbao.fun/{cat}/{id}.html",
         "http_403_429": "线报酷触发频率限制：请将线报酷各频道间 `pause_sec` 从 0.5s 提升至 1.0s。",
         "empty_or_parse": "线报酷某分类返回 0 条：请访问错误路径 URL 检查 `tr.article-list` 表格行结构是否正常。",
-        "timeout_or_conn": "线报酷单篇详情页超时：线报酷包含 20 个细分频道，单篇详情超时不影响整体入库，下一轮会自动补抓。",
+        "timeout_or_conn": "线报酷单篇详情页超时：线报酷包含 22 个细分频道，单篇详情超时不影响整体入库，下一轮会自动补抓。",
     },
     "bacaoo": {
-        "endpoint": "https://youhui.bacaoo.com/ | https://youhui.bacaoo.com/info_{id}.html",
+        "endpoint": "https://youhui.bacaoo.com/ | https://youhui.bacaoo.com/mall/1827 | https://go.bacaoo.com/",
         "http_403_429": "拔草哦返回 403/429：请调大请求间隔或检查 User-Agent。",
-        "empty_or_parse": "拔草哦解析为 0 条：请访问 `https://youhui.bacaoo.com/` 检查 `.publish-list` 节点是否变更。",
+        "empty_or_parse": "拔草哦解析为 0 条：请访问 `https://youhui.bacaoo.com/mall/1827` 检查 `.publish-list` 节点或 `POST https://go.bacaoo.com/` 响应是否变更。",
         "timeout_or_conn": "拔草哦连接超时：站点带宽较小偶有抖动，连续 ≥3 轮失败再排查网络。",
     },
     "iehou": {
@@ -1837,12 +1876,12 @@ def run_single_cycle(
 ) -> Dict[str, Any]:
     """
     执行单轮完整【阶段一：拉取入初步表】+【阶段二：清洗入正式表】闭环：
-    - T0 核心源（22 个任务）全量覆盖 9 大站点，每轮必跑；
-    - T1 扩充源（28 个任务）涵盖细分采集群、豆瓣专组与比价榜，在 `--all-channels` 或偶数轮运行。
+    - T0 核心源（25 个任务）全量覆盖 9 大站点与高转化拼多多专属源，每轮必跑；
+    - T1 扩充源（31 个任务）涵盖细分采集群、拼多多扩展翻页、豆瓣专组与比价榜，在 `--all-channels` 或偶数轮运行。
     """
     fetch_start = time.perf_counter()
     include_medium = run_all_tiers or (cycle_num % 2 == 0)
-    cycle_mode = "FULL_50_CHANNELS" if include_medium else "T0_22_ALL_9_SITES"
+    cycle_mode = "FULL_56_CHANNELS" if include_medium else "T0_25_ALL_9_SITES"
     if channel_health_tracker is None:
         channel_health_tracker = {}
 
@@ -1852,7 +1891,7 @@ def run_single_cycle(
     bacaoo_done = repo.get_existing_detailed_ids("bacaoo", limit=2000)
     iehou_done = repo.get_existing_detailed_ids("iehou", limit=2000)
 
-    # ---------------- T0 高频核心源（每轮必跑：22 个高产频道，100% 覆盖全部 9 大站点） ----------------
+    # ---------------- T0 高频核心源（每轮必跑：25 个高产频道，100% 覆盖全部 9 大站点 + 四大拼多多专属源） ----------------
     tasks: List[Tuple[str, str, str, str, Callable[[], Dict[str, Any]], float]] = [
         (
             "好单库_京东实时采集群",
@@ -1950,6 +1989,21 @@ def run_single_cycle(
             0.5,
         ),
         (
+            "逛丢_拼多多专属好价流",
+            "guangdiu",
+            "T0_high_freq",
+            "https://guangdiu.com/cate.php?m=%E6%8B%BC%E5%A4%9A%E5%A4%9A",
+            lambda: fetch_guangdiu_deals(
+                channel="pdd",
+                page=1,
+                fetch_detail=True,
+                max_details=max_new_details_per_channel,
+                session=session,
+                skip_detail_ids=guangdiu_done,
+            ),
+            0.5,
+        ),
+        (
             "选单网_快抢群发素材_全天",
             "xuandan",
             "T0_high_freq",
@@ -1985,6 +2039,21 @@ def run_single_cycle(
             "T0_high_freq",
             "https://youhui.bacaoo.com/",
             lambda: fetch_bacaoo_deals(
+                channel="youhui",
+                fetch_detail=True,
+                max_details=max_new_details_per_channel,
+                session=session,
+                skip_detail_ids=bacaoo_done,
+            ),
+            0.5,
+        ),
+        (
+            "拔草哦_拼多多商城专区",
+            "bacaoo",
+            "T0_high_freq",
+            "https://youhui.bacaoo.com/mall/1827",
+            lambda: fetch_bacaoo_deals(
+                channel="pdd",
                 fetch_detail=True,
                 max_details=max_new_details_per_channel,
                 session=session,
@@ -2052,6 +2121,21 @@ def run_single_cycle(
             0.5,
         ),
         (
+            "线报酷_好单拼多多专属流",
+            "xianbao_fun",
+            "T0_high_freq",
+            "https://new.xianbao.fun/category-haodan-pdd/",
+            lambda: fetch_xianbao_fun_deals(
+                channel="category_haodan_pdd",
+                page=1,
+                fetch_detail=True,
+                max_details=max_new_details_per_channel,
+                session=session,
+                skip_detail_ids=xianbao_done,
+            ),
+            0.5,
+        ),
+        (
             "线报酷_微博好价热榜",
             "xianbao_fun",
             "T0_high_freq",
@@ -2100,7 +2184,7 @@ def run_single_cycle(
 
     if include_medium:
         tasks.extend([
-            # ---------------- T1 中频扩充源（28 个细分采集群、豆瓣专组与比价榜频道） ----------------
+            # ---------------- T1 中频扩充源（31 个细分采集群、拼多多扩充翻页、豆瓣专组与比价榜频道） ----------------
             (
                 "好单库_飞猪旅行生活券群",
                 "haodanku",
@@ -2181,6 +2265,21 @@ def run_single_cycle(
                 0.5,
             ),
             (
+                "逛丢_拼多多专属好价流_P2",
+                "guangdiu",
+                "T1_med_freq",
+                "https://guangdiu.com/cate.php?m=%E6%8B%BC%E5%A4%9A%E5%A4%9A&p=2",
+                lambda: fetch_guangdiu_deals(
+                    channel="pdd",
+                    page=2,
+                    fetch_detail=True,
+                    max_details=max_new_details_per_channel,
+                    session=session,
+                    skip_detail_ids=guangdiu_done,
+                ),
+                0.5,
+            ),
+            (
                 "选单网_快抢群发素材_整点",
                 "xuandan",
                 "T1_med_freq",
@@ -2223,6 +2322,36 @@ def run_single_cycle(
                     max_details=max_new_details_per_channel,
                     session=session,
                     skip_detail_ids=tuan0818_done,
+                ),
+                0.5,
+            ),
+            (
+                "线报酷_好单拼多多专属流_P2",
+                "xianbao_fun",
+                "T1_med_freq",
+                "https://new.xianbao.fun/category-haodan-pdd/page/2/",
+                lambda: fetch_xianbao_fun_deals(
+                    channel="category_haodan_pdd",
+                    page=2,
+                    fetch_detail=True,
+                    max_details=max_new_details_per_channel,
+                    session=session,
+                    skip_detail_ids=xianbao_done,
+                ),
+                0.5,
+            ),
+            (
+                "线报酷_微博拼多多专属流",
+                "xianbao_fun",
+                "T1_med_freq",
+                "https://new.xianbao.fun/category-weibo-pdd/",
+                lambda: fetch_xianbao_fun_deals(
+                    channel="category_weibo_pdd",
+                    page=1,
+                    fetch_detail=True,
+                    max_details=max_new_details_per_channel,
+                    session=session,
+                    skip_detail_ids=xianbao_done,
                 ),
                 0.5,
             ),

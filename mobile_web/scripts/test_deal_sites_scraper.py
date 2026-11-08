@@ -24,26 +24,25 @@
     只要通道能稳定产出含唯一商品锚点的记录，即使混有杂讯（有效比例低）也完全可取，后续通过正则/关键字规则过滤即可。
 
 三、【10 个候选网站与细分频道最终取舍结论（严禁后续重复踩坑尝试已剔除站点）】
-  1. ✅ 正式纳入定时任务的 9 大站点（49 个有效子频道）：
+  1. ✅ 正式纳入定时任务的 9 大站点（55 个有效子频道，含新增拼多多高产专属流）：
      - 【好单库 (`haodanku.com`)】：免登纯净 JSON（`wire_report` 京东10004/淘宝10003/百补10005/飞猪10367/综合0 + `weal_list` 福利清单），0 风控，
        100% 包含 `https://u.jd.com/xxx` 短链或淘宝 46 位加密 `item_id`。
      - 【折淘客 (`zhetaoke.com`)】：免登直连 150+ 个真实 QQ/微信采集群实时大厅 (`xianbao.aspx` 京东群/淘宝群/拼多多群/综合群及高产群专流) +
        咚咚抢 (`/list/dongdong.html`) + 实时热销爆款榜 (`/list/love_1_0_1.html`)，单页直出 60 条群消息，无需二次抓详情，0 风控，高密产出 `u.jd.com`、`p.pinduoduo.com`、括号淘口令 `(11位码) MU918` 与 `uland.taobao.com`。
-     - 【逛丢 (`guangdiu.com`)】：全网实时折扣 (`index.php` + `cheaps.php` 九块九)，通过 `detail.php` 解码 `to.php?u=` 加上 `go.php?id=` 提取明文 `item.jd.com/{sku}.html`、`union-click.jd.com`、`s.click.taobao.com`，
-       不仅覆盖逛丢自有好价，还能在服务端合法还原其同步自“什么值得买”好价的真实电商直链！
+     - 【逛丢 (`guangdiu.com`)】：全网实时折扣 (`index.php` 综合流 + **`cate.php?m=拼多多` 拼多多专属商城流**)，通过 `detail.php` 解码 `to.php?u=` 加上 `go.php?id=` 提取明文 `item.jd.com/{sku}.html`、`union-click.jd.com`、`s.click.taobao.com` 以及带完整加密 `goods_sign` 的拼多多 `duo_coupon_landing.html` 二合一长链（实测拼多多专流单页 30 条 100% 解包出 `goods_sign`，转链成功率 100%），不仅覆盖逛丢自有好价，还能在服务端合法还原其同步自“什么值得买”好价的真实电商直链！
      - 【选单网 (`xuandan.com`)】：免登淘客快抢群发素材 JSON 接口 (`/NewHome/msKqList`)，100% 同时返回 12 位淘宝纯数字 `ShoopGoodsId`、`uland.taobao.com` 二合一链、券链与社群推广文案 `TjRemark`。
-     - 【购物党 (`gwdang.com`)】：5 大折扣榜（`0-hour_3`/`0-lowest`/`0-s_lowest`/`0-lower_11`/`0-latest`），间隔 >=3s 零风控；
+     - 【购物党 (`gwdang.com`)】：4 大稳定折扣榜（`0-lowest`/`0-s_lowest`/`0-lower_11`/`0-latest`），间隔 >=3s 零风控；
        通过解码内嵌 `data=` Base64 + zlib 载荷，100% 提取原始平台唯一 SKU (`dp_id`) 与 `buy_steps` 中的领券/购买链接。
      - 【0818团 (`0818tuan.com`)】：纯静态 HTML（第1~2页），0 风控，71.4% 直接包含京东/手淘唯一商品短链。
-     - 【线报酷 (`new.xianbao.fun`) 20 个有效频道】：SSR 静态直出，0 风控，涵盖全站热榜、好单、微博、豆瓣各买组/拼组/狗组/猫组、赚客吧、新赚吧、酷安、慢友等实时流与热榜。
-     - 【拔草哦 (`youhui.bacaoo.com`)】：0 风控，35.0% 含唯一商品短链或口令。
+     - 【线报酷 (`new.xianbao.fun`) 22 个有效频道】：SSR 静态直出，0 风控，涵盖全站热榜、好单、微博、**好单拼多多专属流 (`/category-haodan-pdd/`，单页100条纯拼多多且实测 100% 含 `p.pinduoduo.com` 短链)**、**微博拼多多专属流 (`/category-weibo-pdd/`，单页100条纯拼多多，配合详情页 `id="art-fujia"` 1L~5L 楼主同步评论区解析后 100% 提取 `p.pinduoduo.com` 短链)**、豆瓣各买组/拼组/狗组/猫组、赚客吧、新赚吧、酷安、慢友等实时流与热榜。
+     - 【拔草哦 (`youhui.bacaoo.com`)】：涵盖首页国内优惠 (`/`) 与 **拼多多商城专区 (`/mall/1827`，含每2小时更新一次的 50 款《PDD热销产品汇总》合集帖)**，0 风控；通过免登直连 `POST https://go.bacaoo.com/` 解包 `direct-alink-url` 与合集子商品 `subproduct-alink-url`，100% 还原出明文 `https://p.pinduoduo.com/xxx?sc=EFAC` 推广短链。
      - 【网猴线报 (`iehou.com/page-dayhot.htm`)】：24H 热榜 0 风控，17.0% 含唯一商品短链或口令。
 
-  2. ❌ 已明确排查并剔除的 13 个站点与子频道（代码保留说明，严禁后续人员误以为遗漏而重复浪费时间尝试）：
-     - ❌ 【什么值得买直连 (`smzdm.com` 及其线报酷镜像 `zhidemai`/`zhidemai_hot`) —— 违反铁律 1 & 铁律 2】：
+  2. ❌ 已明确排查并剔除的站点与子频道（代码保留说明，严禁后续人员误以为遗漏而重复浪费时间尝试）：
+     - ❌ 【什么值得买直连 (`smzdm.com` 及其线报酷镜像 `zhidemai`/`zhidemai_hot`/`category-zhidemai-pdd`) —— 违反铁律 1 & 铁律 2】：
        ① 风控严苛：`faxian.smzdm.com` 高频触发腾讯防水墙 `TCaptcha.js`，异步接口 `/json_more` 触发 `202 probe.js`；
-       ② 无唯一商品锚点 (0/183 = 0.0%)：全站所有商品外链均被替换为加密跳板 `https://go.smzdm.com/{加密串}`（带 `probe.js` 拦截），图片也被重写为 `zdmimg.com`，无法直接还原目标商品 ID。（注：其高优好价已通过【逛丢 `guangdiu`】服务端明文跳板曲线捕获！）
-     - ❌ 【慢慢买 (`cu.manmanbuy.com`) —— 违反铁律 2】：
+       ② 无唯一商品锚点 (0/183 = 0.0%)：全站所有商品外链（含 `/category-zhidemai-pdd/`）均被替换为加密跳板 `https://go.smzdm.com/{加密串}`（带 `probe.js` 拦截），图片也被重写为 `zdmimg.com`，无法直接还原目标商品 ID。（注：其高优好价及拼多多好价已通过【逛丢 `guangdiu`】`index.php` 与 `cate.php?m=拼多多` 服务端明文跳板曲线捕获！）
+     - ❌ 【慢慢买 (`cu.manmanbuy.com` 及其线报酷镜像 `category-manmanmai-pdd`) —— 违反铁律 2】：
        详情页 `discuxiao_{id}.aspx` 为前端 `crypto-js` 动态加密跳转，实测 0/43 (0.0%) 含唯一商品链接、口令或数字 SKU。
      - ❌ 【55海淘 (`55haitao.com/deals`) —— 违反铁律 2】：
        实测 0/22 (0.0%) 含国内电商商品，100% 为海外美网/英网海淘链接，无国内淘京拼 CPS 价值。
@@ -57,8 +56,16 @@
        全站商品外链均为内部加密跳转且无明文口令/SKU，实测有效唯一商品直链为 0。
      - ❌ 【聚超值 (`best.pconline.com.cn`) —— 违反铁律 2】：
        改版后以长篇评测图文为主，528KB 首页仅 2 个静态推广位，无实时好价线报流。
-     - ❌ 【好单库快抢页 (`/Index/get_fastbuy_items`) & 多好单 (`duohaodan.com`) —— 违反铁律 1】：
-       未登录态下返回 `status: 0 (fastwait.png)` 占位或强制要求联盟账号登录。
+     - ❌ 【好单库快抢页 (`/Index/get_fastbuy_items`) / 多好单 (`duohaodan.com`) / 线报酷好单特惠购 (`/haodan/tehuigou.html`) —— 违反铁律 1】：
+       未登录态下返回 `status: 0 (fastwait.png)` 占位或强制要求登录；`/haodan/tehuigou.html` 仅为 460 字节前端 JS 空壳 (`cms_web.min.js`)，无 SSR 商品列表。
+     - ❌ 【好单库实时线报接口 (`HolidayActivity/wire_report`) 寻源拼多多 —— 实测 0 条拼多多】：
+       遍历实测 `type=0~5, 10001~10008, 10367` 全部参数，好单库网页端线报仅开放淘宝(10003)、京东(10004)、唯品会与飞猪(10367)，接口内拼多多条数为 0；其拼多多线报实际已通过【线报酷 `/category-haodan-pdd/`】100% 聚合捕获。
+     - ❌ 【折淘客拼多多细分单群 (`id=10000039 MK拼多多采集群` / `10000068 高佣拼多多采集群` / `10000107 拼多北大学采集群`) 与 `q=拼多多` 搜索】：
+       实测扫描折淘客全部 200 个采集群，上述拼多多单群当前均处于停更状态（今日消息数为 0），`q=拼多多/pinduoduo` 搜索亦为 0 条；折淘客全站拼多多消息已由 `plat=3` (`折淘客_拼多多采集群汇总`) 100% 汇总覆盖，无需单独轮询死群。
+     - ❌ 【购物党拼多多条目 (`gwdang.com` `site_id=370`) 及详情页 `/v2/zhi/detail/1` 二次抓取 —— 违反拼多多 `goods_sign` 铁律】：
+       实测购物党内嵌 Base64 `buy_steps` 与详情页 `/v2/zhi/detail/1?dp_id=...` 均仅存储拼多多纯数字 `goods_id` 裸链 (`https://mobile.yangkeduo.com/goods.html?goods_id=990159885102`)，无加密 `goods_sign` 或 `p.pinduoduo.com` 短链，必被拼多多网关以 `sub_code=40009 (ERR_PDD_NUMERIC_ID)` 拒绝，严禁为其编写详情页二次爬虫或标题模糊搜索兜底。
+     - ❌ 【逛丢九块九桌面版 (`guangdiu.com/cheaps.php` 及 `cheaps.php?m=拼多多`) —— 服务端空容器】：
+       实测桌面端 `cheaps.php` 返回的 `<div class="cheapcontent"></div>` 为空容器（0 条商品块），无需纳入定时任务。
      - ❌ 【赚客吧原站 (`zuanke8.com`) / 小刀娱乐网 (`xiaodao.la`) / 爱Q生活网 (`iqnew.com`) / 葫芦侠 (`huluxia`)】：
        原站存在防 CC 盾或超时；且小刀/爱Q/葫芦侠/免费福利 (`mianfei`) 板块实测全为网盘资源、游戏辅助、软件绿软等非电商内容（赚客吧电商线报已通过 `xianbao_fun/category_zuankeba` 完整捕获）。
      - ❌ 【线报酷子频道：微博超话 (`weibo_chaohua_hot`) & 小嘀咕 (`xiaodigu_hot`) —— 违反铁律 2】：
@@ -78,7 +85,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import unquote, urljoin
+from urllib.parse import quote, unquote, urljoin
 
 import requests
 
@@ -628,7 +635,9 @@ def fetch_xianbao_fun_deals(
       * `"kuan_hot"`           -> `/kuan-hot.html` (酷安热榜聚合)
       * `"zhidemai"`           -> `/category-zhidemai/` (什么值得买实时聚合流)
       * `"category_haodan"`    -> `/category-haodan/` (好单线报实时聚合流)
+      * `"category_haodan_pdd"` -> `/category-haodan-pdd/` (好单线报-拼多多专属流，单页100条纯拼多多且100%含短链)
       * `"category_weibo"`     -> `/category-weibo/` (微博线报实时聚合流)
+      * `"category_weibo_pdd"` -> `/category-weibo-pdd/` (微博线报-拼多多专属流，单页100条纯拼多多)
       * `"category_douban_maizu"` -> `/category-douban-maizu/` (豆瓣买组实时流)
       * `"category_douban_pinzu"` -> `/category-douban-pinzu/` (豆瓣拼组实时流)
       * `"category_zuankeba"`  -> `/category-zuankeba/` (赚客吧实时流)
@@ -651,7 +660,9 @@ def fetch_xianbao_fun_deals(
         "kuan_hot": "/kuan-hot.html",
         "zhidemai": "/category-zhidemai/" if page <= 1 else f"/category-zhidemai/page/{page}/",
         "category_haodan": "/category-haodan/" if page <= 1 else f"/category-haodan/page/{page}/",
+        "category_haodan_pdd": "/category-haodan-pdd/" if page <= 1 else f"/category-haodan-pdd/page/{page}/",
         "category_weibo": "/category-weibo/" if page <= 1 else f"/category-weibo/page/{page}/",
+        "category_weibo_pdd": "/category-weibo-pdd/" if page <= 1 else f"/category-weibo-pdd/page/{page}/",
         "category_weibo_chaohua": "/category-weibo-chaohua/" if page <= 1 else f"/category-weibo-chaohua/page/{page}/",
         "category_douban": "/category-douban/" if page <= 1 else f"/category-douban/page/{page}/",
         "category_douban_maizu": "/category-douban-maizu/" if page <= 1 else f"/category-douban-maizu/page/{page}/",
@@ -796,6 +807,16 @@ def fetch_xianbao_fun_deals(
 
                     if m_art:
                         art_fragment = m_art.group(1)
+                        # 同步提取详情页 id="art-fujia" 中的源站同步评论区（微博/豆瓣/酷安/赚客吧楼主常将购买短链或口令放在 1L~5L 评论中）
+                        if 'id="art-fujia"' in det_html:
+                            fujia_sub = det_html.split('id="art-fujia"', 1)[1].split('id="postcmt"', 1)[0]
+                            cmt_blocks = re.findall(
+                                r'(<div[^>]*class=["\'][^"\']*c-neirong[^"\']*["\'][^>]*>.*?</div>)',
+                                fujia_sub,
+                                re.S | re.I,
+                            )
+                            if cmt_blocks:
+                                art_fragment = art_fragment + "\n" + "\n".join(cmt_blocks[:8])
                         raw_payload = art_fragment
                         extracted_links, tutorial_images, extracted_tokens = extract_links_images_and_tokens(
                             art_fragment, base_url=detail_url
@@ -1208,6 +1229,7 @@ def fetch_smzdm_faxian_deals(
 
 
 def fetch_bacaoo_deals(
+    channel: str = "youhui",
     fetch_detail: bool = True,
     max_details: int = 5,
     session: Optional[requests.Session] = None,
@@ -1215,15 +1237,24 @@ def fetch_bacaoo_deals(
     skip_detail_ids: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
-    【T1-2】拔草哦国内优惠 (`https://youhui.bacaoo.com/` + `/p/{id}`)
+    【T1-2】拔草哦国内优惠与拼多多商城专区 (`https://youhui.bacaoo.com/` + `/mall/1827` + `/p/{id}`)
+    - 支持 `channel`:
+      * `"youhui"` -> `https://youhui.bacaoo.com/` (国内优惠综合流)
+      * `"pdd"`    -> `https://youhui.bacaoo.com/mall/1827` (拔草哦拼多多商城专区，含每2小时更新的50款《PDD热销产品汇总》合集帖)
+    - 核心增强：
+      1. 自动识别合集帖中的 `<span class="embed-card main-site">` 子商品卡片，拆分为独立线报记录 (`{pid}_sub_{sub_id}`)；
+      2. 自动通过免登 `POST https://go.bacaoo.com/` 解包 `direct-alink-url` 与 `subproduct-alink-url`，提取明文 `https://p.pinduoduo.com/...` 短链。
     """
     http = session or requests.Session()
     base = "https://youhui.bacaoo.com"
+    go_endpoint = "https://go.bacaoo.com/"
+    list_url = f"{base}/mall/1827" if channel == "pdd" else f"{base}/"
     t0 = time.perf_counter()
-    resp = http.get(base + "/", headers=DEFAULT_HEADERS, timeout=timeout)
+    resp = http.get(list_url, headers=DEFAULT_HEADERS, timeout=timeout)
+    resp.encoding = "utf-8"
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    nav_ids = {"2642", "40625", "59702"}
+    nav_ids = {"2642", "40625", "59702", "206427", "218823", "154872"}
     all_pids = list(dict.fromkeys(re.findall(r'href=["\']/p/(\d+)["\']', resp.text)))
     item_ids = [pid for pid in all_pids if pid not in nav_ids]
 
@@ -1232,10 +1263,33 @@ def fetch_bacaoo_deals(
     detail_fetched = 0
     skip_set = skip_detail_ids or set()
 
+    def _unwrap_bacaoo_go(post_data: Dict[str, str], referer_url: str) -> str:
+        try:
+            rg = http.post(
+                go_endpoint,
+                data=post_data,
+                headers={**DEFAULT_HEADERS, "Referer": referer_url},
+                timeout=timeout,
+            )
+            rg.encoding = "utf-8"
+            if rg.status_code == 200:
+                m_loc = re.search(r'location\.href\s*=\s*["\'](https?://[^"\']+)["\']', rg.text, re.I)
+                if not m_loc:
+                    m_loc = re.search(r'<div[^>]*class=["\']link["\'][^>]*>.*?href=["\'](https?://[^"\']+)["\']', rg.text, re.S | re.I)
+                if m_loc:
+                    return html_lib.unescape(m_loc.group(1)).strip()
+        except Exception:
+            pass
+        return ""
+
     for pid in item_ids[: max(max_details, 15)]:
         detail_url = f"{base}/p/{pid}"
-        m_anchor = re.search(rf'<a[^>]*href=["\']/p/{pid}["\'][^>]*>(.*?)</a>', resp.text, re.S | re.I)
+        m_anchor = re.search(rf'<a[^>]*href=["\']/p/{pid}["\'][^>]*title=["\']([^"\']+)["\']', resp.text, re.I)
+        if not m_anchor:
+            m_anchor = re.search(rf'<a[^>]*href=["\']/p/{pid}["\'][^>]*>([^<]{{4,}})</a>', resp.text, re.S | re.I)
         title = re.sub(r"<[^>]+>", "", html_lib.unescape(m_anchor.group(1))).strip() if m_anchor else f"拔草哦优惠 #{pid}"
+        if title == "阅读全文":
+            title = f"拔草哦优惠 #{pid}"
 
         pub_time = ""
         tutorial_text = title
@@ -1245,9 +1299,13 @@ def fetch_bacaoo_deals(
         raw_payload: Any = ""
         has_full_detail = False
 
+        if pid not in skip_set and sum(1 for s in skip_set if s.startswith(f"{pid}_sub_")) >= 48:
+            skip_set.add(pid)
+
         if fetch_detail and detail_fetched < max_details and pid not in skip_set:
             try:
-                rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": base + "/"}, timeout=timeout)
+                rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
+                rd.encoding = "utf-8"
                 if rd.status_code == 200:
                     detail_fetched += 1
                     has_full_detail = True
@@ -1261,6 +1319,77 @@ def fetch_bacaoo_deals(
                     if m_time:
                         pub_time = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(m_time.group(1)))).strip()
 
+                    # 1. 检查是否为包含 50 款子商品的《热销产品汇总》合集帖 (embed-card main-site)
+                    sub_cards = re.findall(
+                        r'(<span\s+class=["\']embed-card\s+main-site["\'][^>]*>.*?</span>\s*</span>)',
+                        det_html,
+                        re.S | re.I,
+                    )
+                    if sub_cards:
+                        sub_unwrapped_this_cycle = 0
+                        all_subs_done = True
+                        for sc_html in sub_cards:
+                            m_subid = re.search(r'class=["\'][^"\']*subproduct-alink-url[^"\']*["\'][^>]*data-id=["\'](\d+)["\']|data-id=["\'](\d+)["\'][^>]*class=["\'][^"\']*subproduct-alink-url', sc_html, re.I)
+                            if not m_subid:
+                                m_subid = re.search(r'data-id=["\'](\d+)["\']', sc_html, re.I)
+                            if not m_subid:
+                                continue
+                            sub_id = (m_subid.group(1) or (m_subid.group(2) if m_subid.lastindex and m_subid.lastindex >= 2 else "")).strip()
+                            if not sub_id:
+                                continue
+                            comp_id = f"{pid}_sub_{sub_id}"
+                            if comp_id in skip_set:
+                                continue
+                            if sub_unwrapped_this_cycle >= 12:
+                                all_subs_done = False
+                                continue
+
+                            m_sub_img = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', sc_html, re.I)
+                            sub_img = html_lib.unescape(m_sub_img.group(1)).strip() if m_sub_img else ""
+                            m_sub_price = re.search(r'<strong[^>]*class=["\']price["\'][^>]*>(.*?)</strong>', sc_html, re.S | re.I)
+                            sub_price_txt = re.sub(r"<[^>]+>", "", html_lib.unescape(m_sub_price.group(1))).strip() if m_sub_price else ""
+                            m_sub_abs = re.search(r'<div[^>]*class=["\']card-abstract["\'][^>]*>(.*?)</div>', sc_html, re.S | re.I)
+                            sub_title = re.sub(r"<[^>]+>", "", html_lib.unescape(m_sub_abs.group(1))).strip() if m_sub_abs else f"{title} #{sub_id}"
+
+                            target_u = _unwrap_bacaoo_go({"id": sub_id, "pos": "cn_subproduct_url"}, detail_url)
+                            sub_unwrapped_this_cycle += 1
+                            if not target_u:
+                                continue
+
+                            sub_plat = detect_platform_signal(f"{target_u} {title} {sub_title}") or ("pdd" if channel == "pdd" else "unknown")
+                            sub_links = [{
+                                "label": "拔草哦热销汇总直达链",
+                                "url": target_u,
+                                "type": "bacaoo_subproduct_go",
+                                "platform": sub_plat,
+                            }]
+                            sub_tut = f"【{title}】{sub_title} {sub_price_txt}\n直达链接: {target_u}".strip()
+                            sub_rec = build_deal_record(
+                                source_site="bacaoo",
+                                source_channel=f"{channel}_muster",
+                                source_item_id=comp_id,
+                                source_url=detail_url,
+                                title=f"{sub_title} {sub_price_txt}".strip(),
+                                price_text=sub_price_txt,
+                                image_url=sub_img,
+                                mall_name="拼多多" if sub_plat == "pdd" else "",
+                                publish_time=pub_time,
+                                tutorial_text=sub_tut,
+                                tutorial_images=[sub_img] if sub_img else [],
+                                extracted_links=sub_links,
+                                extracted_tokens=[],
+                                raw_payload=sc_html,
+                                explicit_platform=sub_plat if sub_plat != "unknown" else None,
+                            )
+                            sub_rec["has_full_detail"] = True
+                            records.append(sub_rec)
+
+                        if all_subs_done:
+                            skip_set.add(pid)
+                        # 合集帖已拆分为独立子商品记录，不再生成冗余的父帖聚合记录
+                        continue
+
+                    # 2. 常规单品帖解析
                     m_desc = re.search(
                         r'(<div[^>]*class=["\'][^"\']*describe\s+art-con[^"\']*["\'][^>]*>.*?</div>\s*</div>)',
                         det_html,
@@ -1273,6 +1402,18 @@ def fetch_bacaoo_deals(
                             desc_html, base_url=detail_url
                         )
                         tutorial_text = html_to_tutorial_text(desc_html, base_url=detail_url)
+
+                    if not any(lk.get("platform") in ("pdd", "jd", "taobao") for lk in extracted_links):
+                        direct_u = _unwrap_bacaoo_go({"id": pid, "field": "link_pc", "pos": "cn_direct_url"}, detail_url)
+                        if direct_u and not any(lk.get("url") == direct_u for lk in extracted_links):
+                            d_plat = detect_platform_signal(f"{direct_u} {title}") or ("pdd" if channel == "pdd" else "unknown")
+                            extracted_links.insert(0, {
+                                "label": "拔草哦直达链接",
+                                "url": direct_u,
+                                "type": "bacaoo_direct_go",
+                                "platform": d_plat,
+                            })
+                            tutorial_text = f"{tutorial_text}\n直达链接: {direct_u}".strip()
                 else:
                     detail_errors.append({
                         "item_id": pid,
@@ -1295,7 +1436,7 @@ def fetch_bacaoo_deals(
 
         rec = build_deal_record(
             source_site="bacaoo",
-            source_channel="youhui",
+            source_channel=channel,
             source_item_id=pid,
             source_url=detail_url,
             title=title,
@@ -1312,7 +1453,7 @@ def fetch_bacaoo_deals(
     return {
         "status": "success" if resp.status_code == 200 and len(records) > 0 else "error",
         "http_status": resp.status_code,
-        "request_url": f"{base}/",
+        "request_url": list_url,
         "elapsed_ms": elapsed_ms,
         "count": len(records),
         "detail_fetched": detail_fetched,
@@ -1918,14 +2059,19 @@ def fetch_guangdiu_deals(
     """
     【T0-5】逛丢全网实时折扣与值得买明文还原源 (`https://guangdiu.com/`)
     - 重大价值：逛丢实时同步全网及“什么值得买”好价，并在服务端将值得买的加密链还原为明文
-      `to.php?u=https%3A%2F%2Fitem.jd.com%2F{sku}.html` 或 `go.php?id={id}` 中的 `union-click.jd.com` / `s.click.taobao.com`！
+      `to.php?u=https%3A%2F%2Fitem.jd.com%2F{sku}.html` 或 `go.php?id={id}` 中的 `union-click.jd.com` / `s.click.taobao.com`
+      以及带完整加密 `goods_sign` 的拼多多 `duo_coupon_landing.html` 二合一长链！
     - 支持频道 `channel`:
       * `"latest"` -> `https://guangdiu.com/` 或 `https://guangdiu.com/index.php?p={page}` (国内实时折扣流)
-      * `"cheaps"` -> `https://guangdiu.com/cheaps.php` (九块九白菜好价流)
+      * `"pdd"`    -> `https://guangdiu.com/cate.php?m=%E6%8B%BC%E5%A4%9A%E5%A4%9A` (拼多多专属商城筛选流，单页30条100%纯拼多多)
+      * `"cheaps"` -> `https://guangdiu.com/cheaps.php` (九块九白菜好价流，注：桌面版当前服务端容器为空，仅保留枚举兼容)
     """
     http = session or requests.Session()
     base = "https://guangdiu.com"
-    if channel == "cheaps":
+    if channel == "pdd":
+        pdd_m = quote("拼多多")
+        list_url = f"{base}/cate.php?m={pdd_m}" if page <= 1 else f"{base}/cate.php?m={pdd_m}&p={page}"
+    elif channel == "cheaps":
         list_url = f"{base}/cheaps.php" if page <= 1 else f"{base}/cheaps.php?p={page}"
     else:
         list_url = f"{base}/" if page <= 1 else f"{base}/index.php?p={page}"
@@ -1936,17 +2082,10 @@ def fetch_guangdiu_deals(
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
     blocks = re.findall(
-        r'(<div\s+class=["\']gooditem\b[^"\']*["\'][^>]*>.*?<div\s+class=["\']infocontent["\'][^>]*>.*?</div>\s*</div>\s*</div>\s*</div>)',
+        r'(<div\s+class=["\'][^"\']*\bgooditem\b[^"\']*["\'][^>]*>.*?)(?=<div\s+class=["\'][^"\']*\bgooditem\b|<div\s+class=["\'][^"\']*\b(?:page|centerfix)\b|$)',
         resp.text,
         re.S | re.I,
     )
-    if not blocks:
-        # 兼容 cheaps.php 的精简卡片结构
-        blocks = re.findall(
-            r'(<div\s+class=["\'][^"\']*\bgooditem\b[^"\']*["\'][^>]*>.*?detail\.php\?id=\d+.*?</div>\s*</div>)',
-            resp.text,
-            re.S | re.I,
-        )
 
     records: List[Dict[str, Any]] = []
     seen_ids: set = set()
@@ -1956,10 +2095,22 @@ def fetch_guangdiu_deals(
 
     for blk in blocks:
         m_a = re.search(
-            r'<a[^>]+href=["\'](?:https?://guangdiu\.com/)?detail\.php\?id=(\d+)["\'][^>]*>(.*?)</a>',
+            r'<a[^>]+class=["\'][^"\']*goodname[^"\']*["\'][^>]*href=["\'](?:https?://guangdiu\.com/)?detail\.php\?id=(\d+)["\'][^>]*>(.*?)</a>',
             blk,
             re.S | re.I,
         )
+        if not m_a:
+            m_a = re.search(
+                r'<a[^>]+href=["\'](?:https?://guangdiu\.com/)?detail\.php\?id=(\d+)["\'][^>]*class=["\'][^"\']*goodname[^"\']*["\'][^>]*>(.*?)</a>',
+                blk,
+                re.S | re.I,
+            )
+        if not m_a:
+            m_a = re.search(
+                r'<a[^>]+href=["\'](?:https?://guangdiu\.com/)?detail\.php\?id=(\d+)["\'][^>]*>(.*?)</a>',
+                blk,
+                re.S | re.I,
+            )
         if not m_a:
             continue
         item_id = m_a.group(1).strip()
@@ -1974,15 +2125,20 @@ def fetch_guangdiu_deals(
         m_emph = re.search(r'<span\s+class=["\']emphricepart["\'][^>]*>(.*?)</span>', a_inner, re.S | re.I)
         price_span = re.sub(r"<[^>]+>", "", html_lib.unescape(m_emph.group(1))).strip() if m_emph else ""
         title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html_lib.unescape(a_inner))).strip()
+        if not title:
+            m_alt = re.search(r'<img[^>]+alt=["\']([^"\']+)["\']', blk, re.I)
+            if m_alt:
+                title = html_lib.unescape(m_alt.group(1)).strip()
 
         m_img = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', blk, re.I)
         img_url = html_lib.unescape(m_img.group(1)).strip() if m_img else ""
 
         m_mall = re.search(r'class=["\'][^"\']*rightmallname[^"\']*["\'][^>]*>(.*?)</a>', blk, re.S | re.I)
-        mall_name = re.sub(r"<[^>]+>", "", html_lib.unescape(m_mall.group(1))).strip() if m_mall else ""
+        mall_name = re.sub(r"<[^>]+>", "", html_lib.unescape(m_mall.group(1))).strip() if m_mall else ("拼多多" if channel == "pdd" else "")
 
-        m_abs = re.search(r'<div\s+class=["\']abstractcontent["\'][^>]*>(.*?)</div>', blk, re.S | re.I)
+        m_abs = re.search(r'<(?:div|a)\s+class=["\']abstractcontent["\'][^>]*>(.*?)</(?:div|a)>', blk, re.S | re.I)
         preview_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(m_abs.group(1)))).strip() if m_abs else ""
+        preview_text = re.sub(r"\s*完整阅读>\s*$", "", preview_text).strip()
 
         tutorial_text = f"【{mall_name or '逛丢好价'}】{title}\n{preview_text}".strip()
         tutorial_images: List[str] = [img_url] if img_url else []
