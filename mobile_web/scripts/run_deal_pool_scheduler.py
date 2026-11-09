@@ -1725,6 +1725,113 @@ class DealPoolCleaner:
         out = re.sub(r"\s*\[#L\d+\]", "", out)
         return out.strip()
 
+    @classmethod
+    def _build_clean_original_copywriting(
+        cls,
+        combined_raw_text: str,
+        ai1_targets: List[Dict[str, Any]],
+        link_map: Dict[str, Dict[str, Any]],
+        doc: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        生成保留原博主“活人感话术”（Emoji、情绪词、神价卖点、原始排版）的纯净文案 `original_copywriting`：
+        1. 剥离我方爬虫内部注入的头部/尾部标签（如 `【来源采集群:...】`、`【标题】`、`[教程图片...]`、`-->`、`附带链接:`）；
+        2. 彻底剔除原文中残留的第三方原始链接与口令（含前后缀如 `1(...) CZ0001`、`-/ Cb79`），仅在对应位置保留 `[#L1]` 锚点；
+        3. 将 `[#L1]`、`[#L2]` 原位替换为我方转链后的专属推广链接/口令（失败链接自动抹除，绝不泄露第三方链接）；
+        4. 自动去重因标题拼接或群消息合并产生的相邻重复行。
+        """
+        out = str(combined_raw_text or "").strip()
+        if not out and doc:
+            out = str(doc.get("content") or doc.get("title") or "").strip()
+        if not out:
+            return ""
+
+        # 1. 剥离爬虫内部附加标签
+        out = re.sub(r"【(?:来源采集群:[^】]*|折淘客[^】]*)】\s*", "", out)
+        out = re.sub(r"\[教程图片(?:\s*[:：][^\]]*)?\]\s*", "", out)
+        out = re.sub(r"(?m)^\s*-->\s*$", "", out)
+        out = re.sub(r"(?m)^\s*(?:附带链接|附带口令/加密ID|加密ID)\s*[:：].*$", "", out)
+        out = re.sub(r"(?m)^\s*二合一落地页\s*[:：]\s*", "下单链接: ", out)
+
+        # 2. 处理 AI-1 拆出的待转链目标：若原文同时存在原始串与 [#L...] 则删去原始串，若仅有原始串则替换为 [#L...]
+        for t in ai1_targets or []:
+            if not isinstance(t, dict):
+                continue
+            lid = str(t.get("link_id") or "").strip()
+            c_in = cls._strip_markdown_link_wrapper(str(t.get("clean_input") or "").strip())
+            if not c_in or len(c_in) < 4:
+                continue
+            placeholder = f"[#{lid}]" if lid else ""
+            if placeholder and placeholder in out and c_in in out:
+                out = out.replace(c_in, "")
+            elif placeholder and placeholder not in out and c_in in out:
+                out = out.replace(c_in, placeholder)
+
+        # 兜底清理 doc 中预提取的原始第三方链接/口令
+        if doc:
+            for raw_tok in (doc.get("extracted_tokens") or []) + (doc.get("extracted_links") or []):
+                rt = str(raw_tok or "").strip()
+                if rt and len(rt) >= 6 and rt in out:
+                    if "[#L1]" not in out and "L1" in link_map:
+                        out = out.replace(rt, "[#L1]", 1)
+                    out = out.replace(rt, "")
+
+        # 清理 [#L...] 前后粘连的淘口令/京口令壳子（如 `7[#L1]/ CZ0001`、`1([#L1]) CZ4176`、`-/ Cb79`）及未替换的孤立口令残骸
+        out = re.sub(
+            r"(?i)(?:(?<=\s)|^)\d?[\(（\$￥!！/\-]*\s*(\[#L\d+\])\s*[\)）\$￥!！/\-]*(?:\s*(?:CZ|MF|HU|CA|ZH|MU|AC|CB)\s*\d+)?/*(?=\s|$)",
+            r"\1",
+            out,
+        )
+        out = re.sub(
+            r"(?i)(?:(?<=\s)|^)\d?\([A-Za-z0-9]{8,16}\)\s*(?:/\s*)?(?:(?:CZ|MF|HU|CA|ZH|MU|AC|CB)\s*\d+)?/*(?=\s|$)",
+            "",
+            out,
+        )
+        out = re.sub(
+            r"(?i)(?:(?<=\s)|^)[-/\\$￥!！\s]*(?:CZ|MF|HU|CA|ZH|MU|AC|CB)\s*\d{2,6}/*(?=\s|$)",
+            "",
+            out,
+        )
+
+        # 3. 注入我方转链后的专属推广链接/口令
+        out = cls._inject_converted_links_into_text(out, link_map)
+
+        # 防护：剔除任何未在我方推广链集合中的第三方电商链接残余（如已失效的第三方券链接）
+        my_urls = {
+            str(v.get("my_promo_link") or "").strip()
+            for v in (link_map or {}).values()
+            if str(v.get("my_promo_link") or "").strip()
+        }
+
+        def _strip_foreign_url(m: re.Match) -> str:
+            u = m.group(0)
+            return u if u in my_urls else ""
+
+        out = re.sub(
+            r"https?://(?:u\.jd\.com|3\.cn|coupon\.m\.jd\.com|item\.jd\.com|jingfen\.jd\.com|union-click\.jd\.com|m\.tb\.cn|s\.click\.taobao\.com|uland\.taobao\.com|item\.taobao\.com|detail\.tmall\.com|yangkeduo\.com|p\.pinduoduo\.com|t\.cn)/[^\s\u4e00-\u9fa5\"'<>）)]+",
+            _strip_foreign_url,
+            out,
+        )
+
+        # 4. 逐行清理 `【标题】` 前缀、死链剥离后残留的空引导词行（如孤立的 `"领"`），并消除相邻重复行
+        cleaned_lines: List[str] = []
+        prev_norm = ""
+        for raw_ln in out.splitlines():
+            ln = re.sub(r"^\s*【标题】\s*", "", raw_ln).strip()
+            ln = re.sub(r"\s{2,}", " ", ln).strip()
+            if not ln:
+                continue
+            if re.fullmatch(r"(?:领|领券|先领|再领|凑单|凑|拍)\s*[:：]?", ln):
+                continue
+            norm = re.sub(r"[\s,，.。!！~～:：;；\-—_（）()\[\]【】]", "", ln)
+            if norm and norm == prev_norm:
+                continue
+            cleaned_lines.append(ln)
+            if norm:
+                prev_norm = norm
+
+        return "\n".join(cleaned_lines).strip()
+
     @staticmethod
     def _load_active_formal_products(formal_col) -> Dict[Tuple[str, str], Dict[str, Any]]:
         """
@@ -2449,12 +2556,24 @@ class DealPoolCleaner:
             if not tutorial_steps and tutorial_text:
                 tutorial_steps = [ln.strip() for ln in tutorial_text.splitlines() if ln.strip()]
 
-            # 提取用户实付晒单图与教程图（排除与官方商品主图完全相同的 URL）
+            # 生成保留原博主“活人感话术”（Emoji、情绪词、卖点文案）且剔除第三方链接/口令并注入我方推广链的纯净原始话术
+            original_copywriting = self._build_clean_original_copywriting(
+                str(ai1_res.get("combined_raw_text") or ""),
+                ai1_res.get("extracted_targets") or [],
+                link_map,
+                doc=doc,
+            )
+
+            # 提取用户实付晒单图与教程图（排除与官方商品主图完全相同的 URL，并剥离偶发的 Markdown 链接包裹）
             official_img = str(product_card.get("image_url") or "").strip()
-            extracted_imgs = [str(u).strip() for u in (ai1_res.get("extracted_images") or []) if str(u or "").strip()]
+            extracted_imgs = [
+                self._strip_markdown_link_wrapper(str(u).strip())
+                for u in (ai1_res.get("extracted_images") or [])
+                if str(u or "").strip()
+            ]
             user_share_images: List[str] = []
             for img_u in extracted_imgs:
-                if img_u != official_img and img_u not in user_share_images:
+                if img_u and img_u != official_img and img_u not in user_share_images:
                     user_share_images.append(img_u)
 
             # 汇总合并的群消息 ID 与源页面 URL 列表（满足用户核对源页面的需求）
@@ -2496,6 +2615,7 @@ class DealPoolCleaner:
                 "price_logic": price_logic,
                 "official_price": round(official_price, 2),
                 "raw_tip_title": raw_title or str(product_card.get("name") or ""),
+                "original_copywriting": original_copywriting,
                 "coupon_links": coupon_links,
                 "filler_links": filler_links,
                 "auxiliary_links": aux_list,
@@ -2568,6 +2688,7 @@ class DealPoolCleaner:
                     "quality_score": quality_score,
                     "score_breakdown": score_breakdown,
                     "merged_tip_ids": merged_tip_ids,
+                    "original_copywriting": original_copywriting,
                     "ai_stage1_result": ai1_res,
                     "converted_links": conv_summary_for_db,
                     "ai_stage2_result": ai2_res,
@@ -2594,6 +2715,7 @@ class DealPoolCleaner:
                 "quality_score": quality_score,
                 "score_breakdown": score_breakdown,
                 "merged_tip_ids": merged_tip_ids,
+                "original_copywriting": original_copywriting,
                 "ai_stage1_result": ai1_res,
                 "converted_links": conv_summary_for_db,
                 "ai_stage2_result": ai2_res,
@@ -2892,6 +3014,8 @@ def run_clean_stage(
             "ai_stage2_result": r.get("ai_stage2_result"),
             "quality_score": r.get("quality_score", 0),
         }
+        if r.get("original_copywriting"):
+            common_ai_fields["original_copywriting"] = r["original_copywriting"]
         if r["status"] == "success":
             raw_status_ops.append(
                 UpdateOne(
