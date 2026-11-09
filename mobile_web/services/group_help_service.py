@@ -53,15 +53,17 @@ def decode_qr_from_image_bytes(image_bytes: bytes) -> str:
 
     detector = cv2.QRCodeDetector()
 
-    # 依次尝试：原图灰度 -> 下半部分(拼多多海报二维码通常在底部) -> 右下角 -> 左下角 -> 中下部
-    crops = [gray_full]
+    # 优先扫描下半部分与右下角(拼多多海报二维码常驻位置，大幅缩短大图解码耗时)，再回退全图扫描
+    crops = []
     if h >= 200 and w >= 200:
         crops.extend([
-            gray_full[int(h * 0.45):, :],
             gray_full[int(h * 0.45):, int(w * 0.35):],
+            gray_full[int(h * 0.45):, :],
             gray_full[int(h * 0.45):, :int(w * 0.65)],
-            gray_full[int(h * 0.25):int(h * 0.85), :],
         ])
+    crops.append(gray_full)
+    if h >= 200 and w >= 200:
+        crops.append(gray_full[int(h * 0.25):int(h * 0.85), :])
 
     for crop in crops:
         if crop.size == 0:
@@ -228,11 +230,11 @@ class GroupHelpService:
 
         formatted = format_group_doc(doc)
         if is_new:
-            msg = "✅ 二维码核验通过，拼团已成功收录！后台正在自动识别商品与差额人数（约需数秒），识别完成后立即展示。"
+            msg = "✅ 二维码核验通过，已加入【我的团】！正在自动识别商品名称与人数（约 10~20 秒），识别完立即上架大厅。"
         elif formatted["parse_status"] == "parsed":
-            msg = "✅ 该拼团已收录并在大厅展示中！"
+            msg = "✅ 该拼团已在大厅展示中，您可在【我的团】查看实时进度！"
         else:
-            msg = "✅ 该拼团已收录，正在后台排队识别商品信息，请稍候刷新查看。"
+            msg = "✅ 该拼团已收录，正在识别商品名称（约 10~20 秒），可在【我的团】查看实时状态。"
 
         return {
             "status": "success",

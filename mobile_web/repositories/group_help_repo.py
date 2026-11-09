@@ -27,10 +27,11 @@ class GroupHelpRepository(BaseRepository):
             [
                 ("parse_status", ASCENDING),
                 ("group_status", ASCENDING),
-                ("expires_at", DESCENDING),
+                ("click_count", ASCENDING),
+                ("remain_people", ASCENDING),
                 ("created_at", DESCENDING),
             ],
-            name="idx_status_expires_created",
+            name="idx_status_click_remain_created",
         )
         col.create_index([("goods_name", ASCENDING)], name="idx_goods_name")
         col.create_index([("keywords", ASCENDING)], name="idx_keywords")
@@ -286,7 +287,14 @@ class GroupHelpRepository(BaseRepository):
         total = self.col.count_documents(query)
         cursor = (
             self.col.find(query, {"_id": 0})
-            .sort([("group_status", ASCENDING), ("created_at", DESCENDING)])
+            .sort(
+                [
+                    ("group_status", ASCENDING),
+                    ("click_count", ASCENDING),
+                    ("remain_people", ASCENDING),
+                    ("created_at", DESCENDING),
+                ]
+            )
             .skip(safe_offset)
             .limit(safe_limit)
         )

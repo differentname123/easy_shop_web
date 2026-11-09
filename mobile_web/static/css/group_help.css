@@ -4,8 +4,7 @@
   --gh-primary-dark: #c91f16;
   --gh-primary-light: #fff1f0;
   --gh-orange: #fa541c;
-  --gh-green: #13c2c2;
-  --gh-success: #52c41a;
+  --gh-success: #389e0d;
   --gh-bg: #f5f6f8;
   --gh-card: #ffffff;
   --gh-text-main: #1f2329;
@@ -43,27 +42,19 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 10px;
 }
 
-.gh-brand {
+.gh-search-row {
   display: flex;
-  align-items: center;
   gap: 8px;
+  align-items: center;
+  margin-top: 10px;
 }
 
 .gh-brand h1 {
   font-size: 17px;
   font-weight: 700;
   letter-spacing: 0.3px;
-}
-
-.gh-brand-badge {
-  font-size: 11px;
-  background: rgba(255, 255, 255, 0.22);
-  padding: 2px 7px;
-  border-radius: 99px;
-  font-weight: 500;
 }
 
 .gh-upload-trigger-btn {
@@ -74,7 +65,7 @@ body {
   color: var(--gh-primary);
   border: none;
   border-radius: 99px;
-  padding: 6px 12px;
+  padding: 6px 13px;
   font-size: 13px;
   font-weight: 700;
   cursor: pointer;
@@ -83,12 +74,6 @@ body {
 
 .gh-upload-trigger-btn:active {
   transform: scale(0.97);
-}
-
-.gh-search-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
 }
 
 .gh-search-input-wrap {
@@ -190,27 +175,32 @@ body {
   white-space: nowrap;
 }
 
-/* 后台 AI 识图排队提示条 */
-.gh-pending-banner {
-  margin: 10px 12px 0;
-  padding: 9px 12px;
-  background: #fffbe6;
-  border: 1px solid #ffe58f;
-  border-radius: 10px;
-  color: #ad6800;
-  font-size: 12.5px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* 排序说明条与我的团说明条 */
+.gh-sort-hint {
+  margin: 8px 12px 0;
+  padding: 6px 11px;
+  background: #fff7e6;
+  border-radius: 8px;
+  color: #ad4e00;
+  font-size: 12px;
+}
+
+.gh-mine-tip {
+  padding: 7px 11px;
+  background: #f0f5ff;
+  border-radius: 8px;
+  color: #1d39c4;
+  font-size: 12px;
 }
 
 .gh-pulse-dot {
-  width: 8px;
-  height: 8px;
-  background: #faad14;
+  width: 7px;
+  height: 7px;
+  background: #fa8c16;
   border-radius: 50%;
+  display: inline-block;
+  margin-right: 4px;
   animation: ghPulse 1.2s infinite ease-in-out;
-  flex-shrink: 0;
 }
 
 @keyframes ghPulse {
@@ -248,8 +238,8 @@ body {
 }
 
 .gh-thumb-box {
-  width: 96px;
-  height: 96px;
+  width: 94px;
+  height: 94px;
   border-radius: 8px;
   overflow: hidden;
   background: #f2f3f5;
@@ -268,7 +258,7 @@ body {
   bottom: 0;
   left: 0;
   right: 0;
-  background: rgba(0, 0, 0, 0.58);
+  background: rgba(0, 0, 0, 0.56);
   color: #fff;
   font-size: 10px;
   text-align: center;
@@ -315,6 +305,47 @@ body {
   border-color: #d9d9d9;
 }
 
+/* 我的团专属状态徽章 */
+.gh-my-status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.gh-my-status-badge.status-pending {
+  background: #fff7e6;
+  color: #d46b08;
+  border: 1px solid #ffd591;
+}
+
+.gh-my-status-badge.status-active {
+  background: #f6ffed;
+  color: #237804;
+  border: 1px solid #b7eb8f;
+}
+
+.gh-my-status-badge.status-inactive {
+  background: #f5f5f5;
+  color: #595959;
+  border: 1px solid #d9d9d9;
+}
+
+.gh-my-status-badge.status-failed {
+  background: #fff1f0;
+  color: #cf1322;
+  border: 1px solid #ffa39e;
+}
+
+.gh-my-pending-desc {
+  font-size: 12px;
+  color: var(--gh-text-sub);
+  line-height: 1.45;
+  margin: 4px 0 6px;
+}
+
 .gh-timer-text {
   font-size: 11px;
   color: var(--gh-text-muted);
@@ -329,27 +360,47 @@ body {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  margin-bottom: 4px;
+  margin-bottom: 5px;
 }
 
-.gh-kw-row {
+/* 前往人数提示行 */
+.gh-meta-row {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+  align-items: center;
+  gap: 6px;
   margin-bottom: 6px;
+  flex-wrap: wrap;
 }
 
-.gh-kw-chip {
-  font-size: 10.5px;
-  color: var(--gh-text-sub);
-  background: #f2f4f7;
-  padding: 1px 6px;
+.gh-click-tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1.5px 7px;
   border-radius: 4px;
+  background: #f2f4f7;
+  color: #4e5969;
+}
+
+.gh-click-tag.is-fresh {
+  background: #e6fffb;
+  color: #006d75;
+  border: 1px solid #87e8de;
+}
+
+.gh-remain-inline {
+  font-size: 12px;
+  color: var(--gh-text-sub);
+}
+
+.gh-remain-inline b {
+  color: var(--gh-primary);
 }
 
 .gh-card-footer {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
 }
 
@@ -376,7 +427,7 @@ body {
   color: #fff;
   border: none;
   border-radius: 99px;
-  padding: 5px 12px;
+  padding: 5px 13px;
   font-size: 12.5px;
   font-weight: 700;
   cursor: pointer;
@@ -387,10 +438,35 @@ body {
   color: #666;
 }
 
+.gh-my-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gh-mini-outline-btn {
+  border: 1px solid #ffccc7;
+  background: #fff2f0;
+  color: var(--gh-primary);
+  padding: 3px 9px;
+  border-radius: 99px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.gh-text-btn {
+  border: none;
+  background: transparent;
+  color: var(--gh-text-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
 /* 空状态 */
 .gh-empty-box {
-  margin: 36px 16px;
-  padding: 32px 20px;
+  margin: 32px 16px;
+  padding: 30px 20px;
   background: #fff;
   border-radius: 14px;
   text-align: center;
@@ -398,7 +474,7 @@ body {
 }
 
 .gh-empty-icon {
-  font-size: 40px;
+  font-size: 38px;
   margin-bottom: 10px;
 }
 
@@ -478,8 +554,8 @@ body {
 }
 
 .gh-detail-poster {
-  width: 104px;
-  height: 104px;
+  width: 96px;
+  height: 96px;
   border-radius: 10px;
   object-fit: cover;
   border: 1px solid var(--gh-border);
@@ -490,20 +566,25 @@ body {
 .gh-detail-meta {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
 }
 
 .gh-detail-title {
-  font-size: 15px;
+  font-size: 14.5px;
   font-weight: 700;
   line-height: 1.4;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
   color: var(--gh-text-main);
 }
 
-.gh-detail-sub {
-  font-size: 12px;
-  color: var(--gh-text-sub);
-  margin-top: 4px;
+.gh-detail-bottom-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 /* 一键参团主按钮区 */
@@ -543,6 +624,18 @@ body {
   cursor: pointer;
 }
 
+.gh-btn-secondary {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid #d9d9d9;
+  border-radius: 10px;
+  background: #f7f8fa;
+  color: var(--gh-text-sub);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
 /* 醒目的用户共创状态维护区 */
 .gh-cocreate-box {
   background: #fff9f5;
@@ -555,23 +648,13 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 6px;
+  margin-bottom: 10px;
 }
 
 .gh-cocreate-title {
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 800;
   color: #d4380d;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.gh-cocreate-tip {
-  font-size: 12px;
-  color: #873800;
-  line-height: 1.45;
-  margin-bottom: 11px;
 }
 
 .gh-feedback-grid {
@@ -653,6 +736,142 @@ body {
   background: #fa541c;
   color: #fff;
   border-color: #fa541c;
+}
+
+.gh-credit-footnote {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #ffe7ba;
+  font-size: 11px;
+  color: #ad4e00;
+  line-height: 1.4;
+}
+
+/* 发团分步进度弹窗 & 首次诚信提醒弹窗 */
+.gh-progress-dialog,
+.gh-credit-dialog {
+  width: 100%;
+  max-width: 400px;
+  background: #fff;
+  border-radius: 16px;
+  padding: 18px 16px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.24);
+}
+
+.gh-progress-title,
+.gh-credit-dialog-title {
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--gh-text-main);
+  margin-bottom: 14px;
+  text-align: center;
+}
+
+.gh-step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.gh-step-item {
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #f7f8fa;
+  border: 1px solid #ebeef5;
+}
+
+.gh-step-item.active {
+  background: #fff7e6;
+  border-color: #ffd591;
+}
+
+.gh-step-item.done {
+  background: #f6ffed;
+  border-color: #b7eb8f;
+}
+
+.gh-step-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #e4e7ed;
+  color: #666;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.gh-step-item.active .gh-step-icon {
+  background: #fa8c16;
+  color: #fff;
+}
+
+.gh-step-item.done .gh-step-icon {
+  background: #52c41a;
+  color: #fff;
+}
+
+.gh-spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: ghSpin 0.8s linear infinite;
+}
+
+@keyframes ghSpin {
+  to { transform: rotate(360deg); }
+}
+
+.gh-step-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.gh-step-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--gh-text-main);
+  margin-bottom: 3px;
+}
+
+.gh-step-elapsed {
+  color: #d46b08;
+  font-weight: 600;
+  margin-left: 4px;
+}
+
+.gh-step-desc {
+  font-size: 12px;
+  color: var(--gh-text-sub);
+  line-height: 1.45;
+}
+
+.gh-progress-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gh-credit-dialog-body {
+  font-size: 13px;
+  color: var(--gh-text-main);
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.gh-credit-dialog-actions {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 10px;
 }
 
 /* 底部固定导航栏 (与首页保持一致) */

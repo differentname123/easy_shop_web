@@ -387,3 +387,66 @@ def test_24h_auto_expiration():
     assert len(res_24h["items"]) == 0
     doc = repo.get_by_group_order_id("3495229659187109999")
     assert doc["group_status"] == GROUP_STATUS_EXPIRED
+
+
+def test_search_sorts_by_click_count_ascending_first():
+    """验证搜索与列表排序：前往次数少(click_count升序)的团排在前面，同名次下差人数少的优先。"""
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    base_ts = 1_700_000_000.0
+
+    # 团 A：较早发布，但 0 人前往 (click_count = 0)
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": "3495229659187100001",
+            "short_url": "https://file-link.pinduoduo.com/a",
+            "redirect_url": "https://mobile.yangkeduo.com/group7.html?group_order_id=3495229659187100001",
+            "created_at": base_ts + 10,
+        }
+    )
+    repo.mark_parse_succeeded(
+        "3495229659187100001",
+        {"goods_name": "安耳悠隔音耳塞", "group_price": 23.2, "total_people": 3, "remain_people": 2},
+        now=base_ts + 15,
+    )
+
+    # 团 B：最新入库，但已有 3 人点击前往 (click_count = 3)
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": "3495229659187100002",
+            "short_url": "https://file-link.pinduoduo.com/b",
+            "redirect_url": "https://mobile.yangkeduo.com/group7.html?group_order_id=3495229659187100002",
+            "created_at": base_ts + 100,
+        }
+    )
+    repo.mark_parse_succeeded(
+        "3495229659187100002",
+        {"goods_name": "安耳悠睡眠耳塞", "group_price": 23.2, "total_people": 3, "remain_people": 1},
+        now=base_ts + 105,
+    )
+    for _ in range(3):
+        repo.increment_click("3495229659187100002", now=base_ts + 110)
+
+    # 团 C：已有 1 人点击前往 (click_count = 1)
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": "3495229659187100003",
+            "short_url": "https://file-link.pinduoduo.com/c",
+            "redirect_url": "https://mobile.yangkeduo.com/group7.html?group_order_id=3495229659187100003",
+            "created_at": base_ts + 50,
+        }
+    )
+    repo.mark_parse_succeeded(
+        "3495229659187100003",
+        {"goods_name": "安耳悠降噪耳塞", "group_price": 23.2, "total_people": 3, "remain_people": 1},
+        now=base_ts + 55,
+    )
+    repo.increment_click("3495229659187100003", now=base_ts + 60)
+
+    res = repo.search_groups(keyword="耳塞", now=base_ts + 200)
+    ordered_ids = [item["group_order_id"] for item in res["items"]]
+    assert ordered_ids == [
+        "3495229659187100001",  # 0 人前往
+        "3495229659187100003",  # 1 人前往
+        "3495229659187100002",  # 3 人前往
+    ]
+

@@ -121,6 +121,7 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
         "total_people": int(doc.get("total_people") or 0),
         "remain_people": int(doc.get("remain_people") if doc.get("remain_people") is not None else 1),
         "parse_status": str(doc.get("parse_status") or PARSE_STATUS_PENDING),
+        "parse_error": str(doc.get("parse_error") or ""),
         "group_status": effective_status,
         "click_count": int(doc.get("click_count") or 0),
         "feedback_count": int(doc.get("feedback_count") or 0),
