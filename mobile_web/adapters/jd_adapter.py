@@ -440,7 +440,7 @@ class JdAdapter(BasePlatformAdapter):
                 resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
             except Exception:
                 pass
-        if not product_card:
+        if not product_card and "tao_id" not in conv:
             search_q = short or long
             is_coupon_or_venue_url = any(
                 kw in (search_q or "").lower()
@@ -468,7 +468,7 @@ class JdAdapter(BasePlatformAdapter):
         fallback_title = "京东精选推广好物"
         fallback_coupon = 0.0
         if j_cmd:
-            t_match = re.search(r"抢购(.+?)！", j_cmd)
+            t_match = re.search(r"抢购(.+?)(?:[！!]|$)", j_cmd)
             if t_match:
                 fallback_title = t_match.group(1).strip()
             c_match = re.search(r"领(\d+(?:\.\d+)?)元优惠券", j_cmd)

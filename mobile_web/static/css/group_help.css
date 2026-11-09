@@ -1,0 +1,709 @@
+/* 拼多多多人团互助独立样式表 (与主站样式解耦) */
+:root {
+  --gh-primary: #e02e24;
+  --gh-primary-dark: #c91f16;
+  --gh-primary-light: #fff1f0;
+  --gh-orange: #fa541c;
+  --gh-green: #13c2c2;
+  --gh-success: #52c41a;
+  --gh-bg: #f5f6f8;
+  --gh-card: #ffffff;
+  --gh-text-main: #1f2329;
+  --gh-text-sub: #646a73;
+  --gh-text-muted: #8f959e;
+  --gh-border: #ebeef5;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+  background-color: var(--gh-bg);
+  color: var(--gh-text-main);
+  padding-bottom: 76px;
+}
+
+/* 顶部固定导航与搜索区 */
+.gh-header {
+  position: sticky;
+  top: 0;
+  z-index: 90;
+  background: linear-gradient(135deg, #e02e24 0%, #ff5722 100%);
+  padding: 12px 14px 10px;
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(224, 46, 36, 0.18);
+}
+
+.gh-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.gh-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gh-brand h1 {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.gh-brand-badge {
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.22);
+  padding: 2px 7px;
+  border-radius: 99px;
+  font-weight: 500;
+}
+
+.gh-upload-trigger-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #fff;
+  color: var(--gh-primary);
+  border: none;
+  border-radius: 99px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+}
+
+.gh-upload-trigger-btn:active {
+  transform: scale(0.97);
+}
+
+.gh-search-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.gh-search-input-wrap {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  background: #fff;
+  border-radius: 99px;
+  padding: 0 12px;
+  height: 36px;
+}
+
+.gh-search-input-wrap svg {
+  width: 17px;
+  height: 17px;
+  fill: var(--gh-text-muted);
+  margin-right: 6px;
+  flex-shrink: 0;
+}
+
+.gh-search-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  font-size: 13.5px;
+  color: var(--gh-text-main);
+  background: transparent;
+}
+
+.gh-clear-btn {
+  border: none;
+  background: #e8eaed;
+  color: #666;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gh-search-btn {
+  height: 36px;
+  padding: 0 14px;
+  border-radius: 99px;
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* 筛选栏 */
+.gh-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #fff;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--gh-border);
+  gap: 8px;
+  overflow-x: auto;
+}
+
+.gh-filter-chips {
+  display: flex;
+  gap: 8px;
+}
+
+.gh-chip {
+  border: 1px solid #e4e7ed;
+  background: #f7f8fa;
+  color: var(--gh-text-sub);
+  padding: 5px 11px;
+  border-radius: 99px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.gh-chip.active {
+  background: var(--gh-primary-light);
+  border-color: var(--gh-primary);
+  color: var(--gh-primary);
+  font-weight: 700;
+}
+
+.gh-refresh-btn {
+  border: none;
+  background: transparent;
+  color: var(--gh-text-sub);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* 后台 AI 识图排队提示条 */
+.gh-pending-banner {
+  margin: 10px 12px 0;
+  padding: 9px 12px;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 10px;
+  color: #ad6800;
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gh-pulse-dot {
+  width: 8px;
+  height: 8px;
+  background: #faad14;
+  border-radius: 50%;
+  animation: ghPulse 1.2s infinite ease-in-out;
+  flex-shrink: 0;
+}
+
+@keyframes ghPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.4); opacity: 0.45; }
+}
+
+/* 拼团列表卡片 */
+.gh-list {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.gh-card {
+  background: var(--gh-card);
+  border-radius: 12px;
+  padding: 11px;
+  display: flex;
+  gap: 11px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+  cursor: pointer;
+  position: relative;
+  border: 1px solid transparent;
+  transition: transform 0.12s ease;
+}
+
+.gh-card:active {
+  transform: scale(0.99);
+}
+
+.gh-card.is-inactive {
+  opacity: 0.68;
+}
+
+.gh-thumb-box {
+  width: 96px;
+  height: 96px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f2f3f5;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.gh-thumb-box img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.gh-thumb-tag {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(0, 0, 0, 0.58);
+  color: #fff;
+  font-size: 10px;
+  text-align: center;
+  padding: 2px 0;
+}
+
+.gh-card-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.gh-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.gh-remain-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  background: #fff1f0;
+  color: var(--gh-primary);
+  border: 1px solid #ffa39e;
+}
+
+.gh-remain-badge.badge-full {
+  background: #f6ffed;
+  color: #389e0d;
+  border-color: #b7eb8f;
+}
+
+.gh-remain-badge.badge-expired {
+  background: #f5f5f5;
+  color: #8c8c8c;
+  border-color: #d9d9d9;
+}
+
+.gh-timer-text {
+  font-size: 11px;
+  color: var(--gh-text-muted);
+}
+
+.gh-goods-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--gh-text-main);
+  line-height: 1.38;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.gh-kw-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.gh-kw-chip {
+  font-size: 10.5px;
+  color: var(--gh-text-sub);
+  background: #f2f4f7;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.gh-card-footer {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.gh-price-wrap {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+}
+
+.gh-price-label {
+  font-size: 11px;
+  color: var(--gh-primary);
+  font-weight: 600;
+}
+
+.gh-price-val {
+  font-size: 17px;
+  font-weight: 800;
+  color: var(--gh-primary);
+}
+
+.gh-join-btn {
+  background: linear-gradient(90deg, #ff5722, #e02e24);
+  color: #fff;
+  border: none;
+  border-radius: 99px;
+  padding: 5px 12px;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.gh-join-btn.btn-disabled {
+  background: #d9d9d9;
+  color: #666;
+}
+
+/* 空状态 */
+.gh-empty-box {
+  margin: 36px 16px;
+  padding: 32px 20px;
+  background: #fff;
+  border-radius: 14px;
+  text-align: center;
+  color: var(--gh-text-sub);
+}
+
+.gh-empty-icon {
+  font-size: 40px;
+  margin-bottom: 10px;
+}
+
+.gh-empty-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--gh-text-main);
+  margin-bottom: 6px;
+}
+
+.gh-empty-sub {
+  font-size: 12.5px;
+  color: var(--gh-text-muted);
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+/* 弹窗与抽屉 */
+.gh-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.56);
+  z-index: 200;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.gh-sheet {
+  width: 100%;
+  max-width: 540px;
+  max-height: 88vh;
+  background: #fff;
+  border-radius: 18px 18px 0 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: ghSlideUp 0.2s ease-out;
+}
+
+@keyframes ghSlideUp {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.gh-sheet-header {
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--gh-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.gh-sheet-close {
+  border: none;
+  background: #f2f3f5;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 18px;
+  color: #666;
+  cursor: pointer;
+}
+
+.gh-sheet-content {
+  padding: 14px 16px 24px;
+  overflow-y: auto;
+}
+
+/* 详情头部信息 */
+.gh-detail-top {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.gh-detail-poster {
+  width: 104px;
+  height: 104px;
+  border-radius: 10px;
+  object-fit: cover;
+  border: 1px solid var(--gh-border);
+  flex-shrink: 0;
+  cursor: zoom-in;
+}
+
+.gh-detail-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.gh-detail-title {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.4;
+  margin-bottom: 8px;
+  color: var(--gh-text-main);
+}
+
+.gh-detail-sub {
+  font-size: 12px;
+  color: var(--gh-text-sub);
+  margin-top: 4px;
+}
+
+/* 一键参团主按钮区 */
+.gh-jump-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.gh-btn-app-jump {
+  width: 100%;
+  padding: 13px 16px;
+  border: none;
+  border-radius: 12px;
+  background: linear-gradient(90deg, #ff5722 0%, #e02e24 100%);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(224, 46, 36, 0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.gh-btn-h5-jump {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid #ffccc7;
+  border-radius: 10px;
+  background: #fff2f0;
+  color: var(--gh-primary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* 醒目的用户共创状态维护区 */
+.gh-cocreate-box {
+  background: #fff9f5;
+  border: 1.5px solid #ffbb96;
+  border-radius: 14px;
+  padding: 13px;
+}
+
+.gh-cocreate-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.gh-cocreate-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #d4380d;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.gh-cocreate-tip {
+  font-size: 12px;
+  color: #873800;
+  line-height: 1.45;
+  margin-bottom: 11px;
+}
+
+.gh-feedback-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.gh-fb-btn {
+  padding: 9px 6px;
+  border-radius: 9px;
+  border: 1px solid #d9d9d9;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.gh-fb-btn:active {
+  transform: scale(0.96);
+}
+
+.gh-fb-btn.fb-joined {
+  border-color: #95de64;
+  background: #f6ffed;
+  color: #237804;
+}
+
+.gh-fb-btn.fb-full {
+  border-color: #ff7875;
+  background: #fff1f0;
+  color: #cf1322;
+}
+
+.gh-fb-btn.fb-expired {
+  border-color: #d9d9d9;
+  background: #fafafa;
+  color: #595959;
+}
+
+.gh-remain-calibrate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px dashed #ffd8bf;
+}
+
+.gh-calibrate-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #873800;
+}
+
+.gh-calibrate-btns {
+  display: flex;
+  gap: 6px;
+}
+
+.gh-cal-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid #ff9c6e;
+  background: #fff;
+  color: #d4380d;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.gh-cal-btn.active {
+  background: #fa541c;
+  color: #fff;
+  border-color: #fa541c;
+}
+
+/* 底部固定导航栏 (与首页保持一致) */
+.gh-bottom-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  background: #fff;
+  border-top: 1px solid var(--gh-border);
+  display: flex;
+  z-index: 100;
+}
+
+.gh-tab-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--gh-text-muted);
+  text-decoration: none;
+  font-size: 11px;
+  gap: 2px;
+}
+
+.gh-tab-item svg {
+  width: 22px;
+  height: 22px;
+  fill: currentColor;
+}
+
+.gh-tab-item.active {
+  color: var(--gh-primary);
+  font-weight: 700;
+}
+
+/* Toast 提示 */
+.gh-toast {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(0, 0, 0, 0.82);
+  color: #fff;
+  padding: 11px 18px;
+  border-radius: 10px;
+  font-size: 13.5px;
+  z-index: 400;
+  max-width: 86vw;
+  text-align: center;
+  line-height: 1.45;
+}

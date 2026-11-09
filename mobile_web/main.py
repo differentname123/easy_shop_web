@@ -27,8 +27,10 @@ from api.goods import router as goods_router
 from api.user import router as user_router
 from api.promote import router as promote_router
 from api.order import router as order_router
+from api.group_help import router as group_help_router, group_help_worker
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+GROUP_HELP_ENABLED = True  # 多人团互助独立模块总开关，置为 False 即可一键下线
 
 
 @asynccontextmanager
@@ -96,9 +98,13 @@ async def lifespan(app: FastAPI):
         elif settings.warmup_enabled:
             warmup_thread = threading.Thread(target=warm_connections, name="platform-warmup", daemon=False)
             warmup_thread.start()
+        if GROUP_HELP_ENABLED and settings.detail_prefetch_enabled:
+            group_help_worker.start()
         yield
     finally:
         warmup_stop.set()
+        if GROUP_HELP_ENABLED:
+            await asyncio.to_thread(group_help_worker.stop)
         if prefetcher is not None:
             # stop 先封 admission/set Event/丢排队项，再完整 join；同步 I/O 由自身超时返回。
             await asyncio.to_thread(prefetcher.stop)
@@ -194,6 +200,8 @@ def create_app() -> FastAPI:
 
     for router in (home_router, goods_router, user_router, promote_router, order_router):
         application.include_router(router)
+    if GROUP_HELP_ENABLED:
+        application.include_router(group_help_router)
     if os.path.isdir(STATIC_DIR):
         application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -208,6 +216,11 @@ def create_app() -> FastAPI:
     @application.get("/detail", response_class=HTMLResponse)
     def detail_page():
         return _html_page("detail.html", "商品详情页构建中...")
+
+    if GROUP_HELP_ENABLED:
+        @application.get("/group_help", response_class=HTMLResponse)
+        def group_help_page():
+            return _html_page("group_help.html", "多人团互助页面正在构建中...")
 
     @application.get("/health")
     def health_check():

@@ -1,41 +1,45 @@
 # 任务 (Task)
 将消息末尾 `<deal_stage1_input>` 标签内传入的原始好价爆料任务列表，解析并清洗为标准化的 JSON 数组（List）。
 本阶段（AI 阶段 1）的核心职责是：**彻底替代脆弱的正则表达式**，依靠大模型的语义与结构理解能力，一步完成：
-1. **同群连续消息合并**（当 `is_group_stream` 为 `true` 时，识别前后相邻群消息中哪些属于当前爆料的前置优惠券、凑单商品、纯文字补充教程或买家实付晒单图，将其合并为一条完整爆料；若当前主消息本身只是其他主帖的纯附属尾巴，则标记跳过）；
-2. **精准拆解独立的待转链项 (`extracted_targets`)**（无论一句话里粘连了多少个网址、淘口令、京口令、加密商品 ID 或 HTML 标签属性，全部精准剥离中文粘连，拆解为可直接传给官方转链 API 的独立纯净字符串，并在合并正文中用 `[#L1]`、`[#L2]` 锚点原位标记）；
+1. **同群连续消息合并**（当 `is_group_stream` 为 `true` 时，识别前后相邻群消息中哪些属于当前爆料的前置优惠券、凑单商品、纯文字补充教程或买家实付晒单图，将其合并为一条完整爆料；若当前主消息 (`main_tip_id`) 本身只是其他主帖的纯附属尾巴，则标记跳过）；
+2. **精准拆解独立的淘/京/拼待转链项 (`extracted_targets`)**（无论一句话里粘连了多少个网址、淘口令、京口令、加密商品 ID 或 HTML 标签属性，全部精准剥离中文粘连，拆解为可直接传给官方转链 API 的独立纯净字符串，并在合并正文中用 `[#L1]`、`[#L2]` 锚点原位标记）；
 3. **无损提取全部图片 (`extracted_images`)**（包括实付订单截图、凑单购物车截图、商品图）。
 
 ---
 
 ## 验收标准：
-- **输出格式**：严格输出合法的 JSON 数组（List），数组元素与输入任务通过 `task_id` 一一对应，不输出任何 JSON 以外的解释文字。
+- **输出格式**：严格输出合法的 JSON 数组（List），数组元素与输入任务通过 `main_tip_id` 一一对应，不输出任何 JSON 以外的解释文字。
 - **连续消息合并准确性**：
-  - 当 `is_group_stream == false`（普通网页/排行榜单帖）时，`raw_messages` 仅有 1 条消息，必须设置 `is_standalone_deal: true`，`merged_tip_ids` 仅包含当前 `tip_id`。
-  - 当 `is_group_stream == true`（微信/QQ 采集群实时消息流）时，`raw_messages` 包含当前主消息（`is_target: true`）及其同群前后 3 分钟内的相邻消息。必须仔细阅读上下文：
-    - 若当前主消息（`is_target: true`）本身**不包含任何主推商品信息**，而仅仅是上一条主商品消息的纯凑单品补充（如仅写 `"2、凑单商品拍1件 https://..."`）、纯文字提醒（如仅写 `"记得去购物车勾选满200-20"`）或纯晒单截图，必须判定 `is_standalone_deal: false`，`skip_reason: "TAIL_FRAGMENT_OF_NEIGHBOR"`。
-    - 若当前主消息包含主推商品爆料，则将 `raw_messages` 中与该商品属于同一次爆料作业的前后邻居消息（如前置领券帖、后续凑单帖、纯文字教程帖、实付晒单图帖）全部吸收合并，将其 `tip_id` 填入 `merged_tip_ids`（必须包含主消息自身的 `tip_id`）；与本商品无关的其他独立商品爆料邻居绝不能混入！
-- **待转链项 (`extracted_targets`) 拆解纯净度**：
-  - 必须从选定合并的消息（`raw_content` 及 `preset_links` / `preset_tokens`）中，找出所有电商链接、短链、淘口令、京口令、淘宝加密 ID（约 35~50 位含字母数字下划线或中划线的加密串）、京东加密 ID、拼多多含 `goods_sign` 链接或 `p.pinduoduo.com` 短链。
+  - 当 `is_group_stream == false`（普通网页/排行榜单帖）时，`raw_messages` 仅有 1 条消息，必须设置 `is_standalone_deal: true`，`merged_tip_ids` 仅包含当前 `main_tip_id`。
+  - 当 `is_group_stream == true`（微信/QQ 采集群实时消息流）时，`raw_messages` 包含当前主消息（`tip_id == main_tip_id`）及其同群前后 3 分钟内的相邻消息。必须仔细阅读上下文：
+    - 若当前主消息（`tip_id == main_tip_id`）本身**不包含任何主推商品信息**，而仅仅是上一条主商品消息的纯凑单品补充（如仅写 `"2、凑单商品拍1件 https://..."`）、纯文字提醒（如仅写 `"记得去购物车勾选满200-20"`）或纯晒单截图，必须判定 `is_standalone_deal: false`，`skip_reason: "TAIL_FRAGMENT_OF_NEIGHBOR"`。
+    - 若当前主消息包含主推商品爆料，则将 `raw_messages` 中与该商品属于同一次爆料作业的前后邻居消息（如前置领券帖、后续凑单帖、纯文字教程帖、实付晒单图帖）全部吸收合并，将其 `tip_id` 填入 `merged_tip_ids`（必须包含 `main_tip_id` 自身）；与本商品无关的其他独立商品爆料邻居绝不能混入！
+- **待转链项 (`extracted_targets`) 拆解纯净度与平台准入**：
+  - **仅提取淘宝/天猫 (`taobao`)、京东 (`jd`)、拼多多 (`pdd`) 三大平台的有效目标**：包括电商长短链（`u.jd.com`、`3.cn`、`item.jd.com`、`jingfen.jd.com`、`union-click.jd.com`、`m.tb.cn`、`s.click.taobao.com`、`uland.taobao.com`、`item.taobao.com`、`detail.tmall.com`、`yangkeduo.com`、`p.pinduoduo.com` 等）、淘口令（含 `￥...￥` / `$...$` / `/.../` / `CZ00` / `MF168` / `HU` 等）、京口令（含 `！...！` / `!...!` / `CA` / `MF` 等）、淘宝加密 ID（约 35~55 位含字母数字下划线或中划线的加密串）、京东加密 ID（30 位以上字母数字串）、拼多多 `goods_sign`。
+  - **严禁将以下无效内容放入 `extracted_targets`**（若帖子仅包含以下内容而无任何淘/京/拼商品或优惠券目标，必须输出 `"extracted_targets": []`）：
+    1. **图片链接**：任何 `.jpg`、`.jpeg`、`.png`、`.gif`、`.webp` 等图片 URL（图片只能放入 `extracted_images`，绝不能当成转链目标）；
+    2. **线报网站自身内链或未解包中转页**：如 `guangdiu.com/go.php`、`new.xianbao.fun`、`youhui.bacaoo.com`、`0818tuan.com`、`iehou.com` 等源站自身网址；
+    3. **非淘/京/拼三大平台的外链或羊毛**：如银行 App 活动/立减金、美团、滴滴、饿了么、唯品会、抖音、快手、小红书、微信公众号文章 (`mp.weixin.qq.com`)、百度网盘、B站视频 (`b23.tv`) 等。
   - **一句话多链接/多口令强制拆分**：若一句话内连续出现多个 URL 或多个口令（如 `"先领券https://u.jd.com/aaa111再领https://u.jd.com/bbb222拍下88￥AbCdEf12￥/"`），必须拆分为多个独立的 `extracted_targets` 元素！
   - 每个元素的 `clean_input` 必须是**剥离了前后粘连汉字、HTML 标签后的纯净单个链接或单个口令**（例如 `"https://u.jd.com/aaa111"` 或 `"88￥AbCdEf12￥/"` 或 `"(aBcDeFg1234) MU918"`）。
   - 按出现顺序编号为 `"L1"`, `"L2"`, `"L3"`...，并在 `combined_raw_text` 中对应位置保留或插入 `[#L1]`, `[#L2]` 标记，使下游能精确知晓每个链接在原文句子中的位置与作用。
 - **平台与初步语境角色标注**：
-  - `platform`：只能是 `"jd"`（京东：`jd.com`/`3.cn`/`jingfen`/京口令`！...！`等）、`"taobao"`（淘宝/天猫：`tb.cn`/`taobao.com`/`tmall.com`/`uland.taobao.com`/淘口令等）、`"pdd"`（拼多多：`pinduoduo.com`/`yangkeduo.com`等）或 `"other"`（其他不支持平台如唯品会/美团/抖音等）。
-  - `text_role_hint`：根据原文措辞给出初步语境提示，只能是 `"coupon"`（领券/补贴/红包/礼金/会场）、`"main_product"`（主推商品）、`"filler_product"`（凑单品/加购退单品）或 `"unknown"`（原文未标明角色的裸链）。
+  - `platform`：只能是 `"jd"`（京东）、`"taobao"`（淘宝/天猫）或 `"pdd"`（拼多多）。
+  - `text_role_hint`：根据原文措辞给出初步语境提示，只能是 `"coupon_candidate"`（领券/补贴/红包/礼金/活动会场）、`"main_candidate"`（主推商品）或 `"filler_candidate"`（凑单品/加购退单品）。
 
 ---
 
 # 输出 JSON 协议 (Output Schema)
 
-严格输出如下结构的 JSON 数组：
+严格输出如下结构的 JSON 数组（直接输出 JSON 数组本身，不要添加额外解释）：
 
 ```json
 [
   {
-    "task_id": "原样回传输入的 task_id",
+    "main_tip_id": "原样回传输入的 main_tip_id",
     "is_standalone_deal": true,
     "skip_reason": null,
-    "merged_tip_ids": ["zhetaoke:xb_101", "zhetaoke:xb_102", "zhetaoke:xb_103"],
+    "merged_tip_ids": ["xb_101", "xb_102", "xb_103"],
     "combined_raw_text": "合并后的完整爆料与教程文本，其中各链接/口令位置标有 [#L1]、[#L2]、[#L3] 锚点，保留换行与步骤结构",
     "extracted_images": [
       "https://example.com/image1.jpg"
@@ -45,21 +49,21 @@
         "link_id": "L1",
         "clean_input": "https://u.jd.com/aaa111",
         "platform": "jd",
-        "text_role_hint": "coupon",
+        "text_role_hint": "coupon_candidate",
         "context_label": "先领200-20黑五补贴券"
       },
       {
         "link_id": "L2",
         "clean_input": "https://u.jd.com/bbb222",
         "platform": "jd",
-        "text_role_hint": "main_product",
+        "text_role_hint": "main_candidate",
         "context_label": "维达超韧抽纸24包整箱"
       },
       {
         "link_id": "L3",
         "clean_input": "https://u.jd.com/ccc333",
         "platform": "jd",
-        "text_role_hint": "filler_product",
+        "text_role_hint": "filler_candidate",
         "context_label": "凑单商品拍1件"
       }
     ]

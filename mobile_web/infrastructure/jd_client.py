@@ -380,10 +380,11 @@ class JdClient:
             _evaluate,
         )
         if (
-            primary_res.get("status") == "success"
-            or primary_res.get("error_code") in ("UNSUPPORTED_JD_NUMERIC_SKU", "CONFIG_ERROR", "UNSAFE_REDIRECT")
+            primary_res.get("error_code") in ("UNSUPPORTED_JD_NUMERIC_SKU", "CONFIG_ERROR", "UNSAFE_REDIRECT")
             or primary_res.get("jd_off_promotion") is True
         ):
+            return primary_res
+        if primary_res.get("status") == "success" and "jingfen.jd.com/detail/" in material:
             return primary_res
 
         def _evaluate_piliang(body):
@@ -393,11 +394,13 @@ class JdClient:
                 return _error("UPSTREAM_ERROR", "京东批量文案转链未成功")
             p_tao_id = str(body.get("tao_id") or "").strip()
             p_res_url = product_url(body.get("result_url"))
+            p_res_tkl = str(body.get("result_tkl") or "").strip()
             if not (p_tao_id or p_res_url):
                 return _error("UPSTREAM_ERROR", "京东批量文案转链未解析出商品")
-            raw_item = dict(body)
-            raw_item.setdefault("pict_url", raw_item.get("pic") or "")
+            raw_item = None
             if p_tao_id:
+                raw_item = dict(body)
+                raw_item.setdefault("pict_url", raw_item.get("pic") or "")
                 raw_item.setdefault("item_url", f"https://jingfen.jd.com/detail/{p_tao_id}.html")
             return {
                 "status": "success",
@@ -405,8 +408,8 @@ class JdClient:
                 "tao_id": p_tao_id,
                 "short_url": p_res_url,
                 "click_url": p_res_url,
-                "j_command": "",
-                "j_short_command": "",
+                "j_command": p_res_tkl,
+                "j_short_command": p_res_tkl,
                 "raw_item": raw_item,
             }
 
@@ -415,6 +418,16 @@ class JdClient:
             {"unionId": self.union_id, "positionId": promoter, "tkl": material, "signurl": 5},
             _evaluate_piliang,
         )
+        if primary_res.get("status") == "success":
+            if piliang_res.get("status") == "success":
+                primary_res["tao_id"] = piliang_res.get("tao_id", "")
+                primary_res["raw_item"] = piliang_res.get("raw_item")
+                if not primary_res.get("j_command") and piliang_res.get("j_command"):
+                    primary_res["j_command"] = piliang_res["j_command"]
+                if not primary_res.get("j_short_command") and piliang_res.get("j_short_command"):
+                    primary_res["j_short_command"] = piliang_res["j_short_command"]
+            return primary_res
+
         if piliang_res.get("status") != "success":
             return primary_res
 
