@@ -692,8 +692,8 @@ def generate_content(
                 metrics["attempts"] += 1
                 _log(
                     f"[模型网关/请求] 发起模型请求 | 模型: [{current_model}]"
-                    f" | 尝试: [{attempt}/{max_retries_per_model}] | 附件: [{len(paths)}]",
-                    logging.DEBUG,
+                    f" | 尝试: [{attempt}/{max_retries_per_model}] | 附件: [{len(paths)}]"
+                    + (f" | 提示词预览: [{_preview(prompt)}]" if metrics["attempts"] == 1 else ""),
                 )
                 request_started = time.perf_counter()
                 status_code = None
@@ -733,6 +733,7 @@ def generate_content(
                         f" | 尝试: [{attempt}/{max_retries_per_model} (累计:{metrics['attempts']})]"
                         f" | 附件: [{len(paths)}] | Token: [{_format_usage_summary(usage)}]"
                         f" | 耗时: [{req_cost:.2f}s]"
+                        f" | 响应预览: [{_preview(reply)}]"
                     )
                     level = logging.INFO
                     request_event["status"] = "✅ 成功"

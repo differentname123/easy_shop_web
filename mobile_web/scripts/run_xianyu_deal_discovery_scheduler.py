@@ -322,10 +322,14 @@ def select_verified_category_champions(
 
     eval_col = db.get_collection(EVAL_COLLECTION_NAME)
     cooldown_str = (datetime.datetime.now() - datetime.timedelta(hours=cooldown_hours)).strftime("%Y-%m-%d %H:%M:%S")
-    evaluated_keys = {
-        (d.get("platform"), str(d.get("product_id")))
-        for d in eval_col.find({"evaluated_at": {"$gte": cooldown_str}}, {"platform": 1, "product_id": 1})
-    }
+    recent_eval_docs = list(
+        eval_col.find(
+            {"evaluated_at": {"$gte": cooldown_str}},
+            {"platform": 1, "product_id": 1, "category_name": 1},
+        )
+    )
+    evaluated_keys = {(d.get("platform"), str(d.get("product_id"))) for d in recent_eval_docs}
+    evaluated_categories = {str(d.get("category_name") or "").strip() for d in recent_eval_docs if d.get("category_name")}
 
     query = {
         "$and": [
@@ -340,17 +344,12 @@ def select_verified_category_champions(
         ]
     }
     projection = {**repo._COST_PERFORMANCE_PROJECTION, "channel_type": 1}
-    raw_docs = list(
-        repo.col.find(query, projection)
-        .sort([("updated_at", -1)])
-        .limit(4000)
-    )
+    raw_docs = list(repo.col.find(query, projection).sort([("updated_at", -1)]))
 
     by_cat: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any], float]]] = defaultdict(list)
     for doc in raw_docs:
-        plat = normalize_platform(doc.get("platform") or "pdd")
         pid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
-        if not pid or (plat, pid) in evaluated_keys:
+        if not pid:
             continue
         act_price = _num(doc.get("activity_price") or doc.get("price"), 0.0)
         if act_price <= 0:
@@ -361,17 +360,21 @@ def select_verified_category_champions(
         cat_name, primary_sku = cat_and_sku
         by_cat[cat_name].append((doc, primary_sku, act_price))
 
-    # 按分类下商品丰富度从高到低遍历分类
+    # 严格按每个类别对应的商品总数量从多到少排序选择
     sorted_cats = sorted(by_cat.items(), key=lambda kv: len(kv[1]), reverse=True)
+    top_preview = ", ".join(f"{k}({len(v)}款)" for k, v in sorted_cats[:10])
     logger.info(
         f"📊 [步骤1/源头扫描] 72h内有channel_type且已结构化商品={len(raw_docs)} | "
-        f"归入core_entities最高分分类数={len(sorted_cats)} | 本轮目标选取分类数={max_categories}"
+        f"归入core_entities最高分分类数={len(sorted_cats)} | 本轮目标选取分类数={max_categories} | "
+        f"商品数量最多前10分类=[{top_preview}]"
     )
 
     champions: List[Dict[str, Any]] = []
     for cat_name, raw_items in sorted_cats:
         if len(champions) >= max_categories:
             break
+        if cat_name in evaluated_categories:
+            continue
 
         # 统计该分类内各物理维度的最高频标准单位（与 ProductRepository 单位归一化保持一致）
         dim_counts: Dict[str, Dict[str, int]] = {}
@@ -951,7 +954,7 @@ def run_discovery_cycle(
         bxy = record["best_xianyu_product"]
         logger.info(
             f"🏁 [分类比价结论 #{idx}] 分类=【{record['category_name']}】 | "
-            f"结论={'✅我方更优' if record['is_my_product_better'] else '❌闲鱼更优/无优势'} (final_winner={record['final_winner']}) | "
+            f"结论={'🏆我方更优' if record['is_my_product_better'] else '闲鱼更优/无优势'} (final_winner={record['final_winner']}) | "
             f"依据={cr['comparison_basis']} | 核心比值(我方/闲鱼)={cr['cost_performance_ratio']} (各unit比值={cr['unit_cp_ratios']}) | "
             f"大模型判断={cr['llm_winner']} | 我方价=¥{record['activity_price']}({cr['my_unit_cost_performance']}) vs "
             f"闲鱼最佳ID={bxy['item_id']}(¥{bxy['comparable_price']}, {cr['xianyu_unit_cost_performance']}) | "
@@ -971,7 +974,7 @@ def run_discovery_cycle(
     for r in records:
         cr = r["comparison_result"]
         bxy = r["best_xianyu_product"]
-        tag = "✅我方胜" if r["is_my_product_better"] else "❌闲鱼胜"
+        tag = "🏆我方更优" if r["is_my_product_better"] else "闲鱼更优"
         logger.info(
             f"   📌 [{tag}] 分类=【{r['category_name']}】 | 比值={str(cr['cost_performance_ratio']):<8} "
             f"(依据={cr['comparison_basis']}, LLM判断={cr['llm_winner']}) | "
