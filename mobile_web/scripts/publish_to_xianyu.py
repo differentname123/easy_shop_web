@@ -2108,14 +2108,21 @@ def search_xianyu_items(
             _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
             _dismiss_guest_login_modal(page)
 
-            # 2. 在首页搜索框输入关键字并触发搜索
+            # 2. 在首页搜索框聚焦填入关键字（强校验 input_value 防止被默认热词占位符顶替）并点击“搜索”按钮
             search_packets.clear()
-            search_input = page.locator(
-                "input[class*='search-input'], input[placeholder*='搜索'], input[type='text']"
-            ).first
+            search_input = page.locator("input[class*='search-input'], input[type='text']").first
             if search_input.count() > 0:
-                search_input.fill(kw_clean)
-                search_input.press("Enter")
+                for _ in range(3):
+                    search_input.click()
+                    search_input.fill(kw_clean)
+                    page.wait_for_timeout(150)
+                    if search_input.input_value().strip() == kw_clean:
+                        break
+                search_btn = page.locator("button[class*='search-icon'], button:has-text('搜索')").first
+                if search_btn.count() > 0:
+                    search_btn.click()
+                else:
+                    search_input.press("Enter")
             else:
                 page.goto(f"{GOOFISH_HOME_URL}/search?q={quote(kw_clean)}", wait_until="domcontentloaded", timeout=30000)
 

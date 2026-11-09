@@ -574,23 +574,28 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(self.col.queries[-1]["$and"][0], {"platform": "taobao"})
         self.assertEqual(self.col.queries[-1]["$and"][1], self.repo._boom_content_filter())
 
-    def test_boom_products_and_categories_only_query_ranking_data_excluding_search_and_detail_only_records(self):
-        # 1. 搜索摘要入库 (channel_type=None) 与单商品详情入库均不得进入爆单推广或爆单分类
+    def test_boom_products_require_channel_type_by_default_but_relax_on_keyword_search(self):
+        # 1. 无搜索词时（默认最新浏览）：搜索摘要入库 (channel_type=None) 与单商品详情入库均不得进入爆单推广或爆单分类
         self.repo.upsert_home_products([{
-            "platform": "jd", "goods_id": "search-jd-1", "name": "京东搜索商品",
+            "platform": "jd", "goods_id": "search-jd-1", "name": "京东搜索可乐商品",
             "price": 39.9, "category": "搜索专属类目", "product_url": "https://item.jd.com/search-jd-1.html",
         }], channel_type=None)
         self.repo.upsert_product_detail({
-            "platform": "taobao", "goods_id": "detail-tb-1", "name": "淘宝详情预取或散查商品",
+            "platform": "taobao", "goods_id": "detail-tb-1", "name": "淘宝详情预取可乐商品",
             "price": 59.9, "category": "详情专属类目",
         })
         self.assertEqual(self.repo.query_boom_products()["data"], [])
         self.assertEqual(self.repo.get_categories(), [])
-        # 但详情缓存与物料链接反查仍可正常命中
-        self.assertEqual(self.repo.get_product_detail("search-jd-1", platform="jd")["name"], "京东搜索商品")
-        self.assertEqual(self.repo.get_product_detail("detail-tb-1", platform="taobao")["name"], "淘宝详情预取或散查商品")
+        # 但有搜索关键词时，放开 channel_type 限制，能够检索出已入库的搜索/详情商品
+        kw_items = self.repo.query_boom_products(keyword="可乐")["data"]
+        self.assertEqual({item["product_id"] for item in kw_items}, {"search-jd-1", "detail-tb-1"})
+        ranked_kw_items = self.repo.rank_boom_products_by_cost_performance(keyword="可乐")
+        self.assertEqual({item["product_id"] for item in ranked_kw_items}, {"search-jd-1", "detail-tb-1"})
+        # 详情缓存与物料链接反查仍可正常命中
+        self.assertEqual(self.repo.get_product_detail("search-jd-1", platform="jd")["name"], "京东搜索可乐商品")
+        self.assertEqual(self.repo.get_product_detail("detail-tb-1", platform="taobao")["name"], "淘宝详情预取可乐商品")
 
-        # 2. 非法 channel_type (None / bool / str / list) 同样被爆单查询排除
+        # 2. 无搜索词时，非法 channel_type (None / bool / str / list) 同样被爆单默认列表排除
         for invalid_channel in (None, True, False, "5", [5]):
             with self.subTest(invalid_channel=invalid_channel):
                 self.col.docs = [{
@@ -599,6 +604,8 @@ class TestProductRepository(unittest.TestCase):
                 }]
                 self.assertEqual(self.repo.query_boom_products()["data"], [])
                 self.assertEqual(self.repo.get_categories(), [])
+                # 有搜索词时则可搜出该可展示商品
+                self.assertEqual([x["product_id"] for x in self.repo.query_boom_products(keyword="脏频道")["data"]], ["bad-ch"])
 
         # 3. 榜单商品 (channel_type=1 或 5) 可被爆单推广和分类正常查询，且后续详情入库或搜索更新不会抹除其榜单属性
         self.col.docs = []

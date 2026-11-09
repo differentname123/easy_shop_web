@@ -149,9 +149,11 @@ class ProductRepository(BaseRepository):
         }
 
     @classmethod
-    def _boom_content_filter(cls) -> Dict[str, Any]:
-        """爆单推广与类目聚合仅读取已入库的榜单商品，排除搜索/详情散查及缺少榜单频道标识的记录。"""
+    def _boom_content_filter(cls, keyword: Optional[str] = None) -> Dict[str, Any]:
+        """无搜索词时仅读取已入库的榜单商品（要求整数 channel_type）；有搜索词时放开 channel_type 限制，检索全部可展示商品。"""
         content_filter = deepcopy(cls._displayable_content_filter())
+        if keyword and str(keyword).strip():
+            return content_filter
         content_filter["channel_type"] = {"$exists": True, "$ne": None}
         content_filter["$expr"]["$let"]["in"]["$and"].append(
             {"$in": [{"$type": "$channel_type"}, ["int", "long"]]}
@@ -446,7 +448,7 @@ class ProductRepository(BaseRepository):
         filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
         cursor = (
             self.col.find(
-                {"$and": [filter_query, self._boom_content_filter()]},
+                {"$and": [filter_query, self._boom_content_filter(keyword=keyword)]},
                 self._COST_PERFORMANCE_PROJECTION,
             )
             .sort([("updated_at", -1)])
@@ -646,7 +648,7 @@ class ProductRepository(BaseRepository):
         try:
             cursor = (
                 self.col.find(
-                    {"$and": [filter_query, self._boom_content_filter()]},
+                    {"$and": [filter_query, self._boom_content_filter(keyword=keyword)]},
                     self._SUMMARY_PROJECTION,
                 )
                 .sort(sort_spec)

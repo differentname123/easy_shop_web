@@ -113,57 +113,63 @@ def _ask_ai_json(prompt: str, tag: str, timeout: int = 75) -> Optional[Any]:
 # 步骤 1：72h 商品库跨品类粗筛 + AI-1 全局选品官
 # ==============================================================================
 def _summarize_product_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """从 MongoDB `products` 文档提取紧凑的客观摘要（零正则假设）。"""
+    """从 MongoDB `products` 文档提取紧凑的客观摘要（仅依据官方真实直买价与已有 AI 结构化字段）。"""
     price = _num(doc.get("activity_price") or doc.get("price"))
-    if price <= 5.0:  # 过滤 ≤5 元的极低客单价引流小物件（无代拍差价空间）
+    if price <= 8.0:  # 过滤 ≤8 元的极低客单价小物件（无代拍差价空间）
         return None
     orig_price = max(price, _num(doc.get("original_price"), price))
     coupon = _num(doc.get("coupon_amount") or doc.get("saved_price"))
     commission = _num(doc.get("commission_amount"))
     net_cost = round(max(0.01, price - commission), 2)
 
-    # 提取已有 AI 结构化标签与规格（若有）
     fi = doc.get("format_info") if isinstance(doc.get("format_info"), dict) else {}
     first_sku = next((v for v in fi.values() if isinstance(v, dict)), {})
     ces = first_sku.get("core_entities") or []
     sub_cat = str(ces[0].get("name") if (ces and isinstance(ces[0], dict)) else "").strip()
-    category = sub_cat or str(doc.get("category") or "综合").strip()
+    category = sub_cat or str(doc.get("category") or "").strip()
+    if not category:
+        return None
 
-    kws = [
-        f"{kw.get('attribute_name')}:{kw.get('attribute_value')}"
-        for kw in (first_sku.get("decision_keywords") or [])
-        if isinstance(kw, dict) and kw.get("attribute_value")
-    ]
+    brand = str(doc.get("brand") or "").strip()
+    kws: List[str] = []
+    for kw in first_sku.get("decision_keywords") or []:
+        if not isinstance(kw, dict):
+            continue
+        k = str(kw.get("attribute_name") or "").strip()
+        v = str(kw.get("attribute_value") or "").strip()
+        if k == "品牌" and v and v not in ("无", "其他", "无品牌", "未知", "通用"):
+            brand = v
+        elif k and v:
+            kws.append(f"{k}:{v}")
+
     pb = first_sku.get("pricing_basis") if isinstance(first_sku.get("pricing_basis"), dict) else {}
+    total_val = _num(pb.get("total_value"), 0.0)
+    base_unit = str(pb.get("base_unit") or "").strip()
     spec_hint = str(pb.get("equivalent_description") or "").strip()
-    if not spec_hint and pb.get("total_value") and pb.get("base_unit"):
-        spec_hint = f"{pb.get('total_value')}{pb.get('base_unit')}"
+    if not spec_hint and total_val > 0 and base_unit:
+        spec_hint = f"{total_val:g}{base_unit}"
 
-    deal_info = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
-    deal_price = _num(deal_info.get("deal_price"))
-    deal_score = _num(deal_info.get("quality_score"))
-
-    # 客观优惠吸引力度指标（用于同分类内部初筛排序，把最有潜力的喂给 AI-1）
-    discount_saved = max(coupon, round(orig_price - price, 2), round(price - deal_price, 2) if deal_price > 0 else 0.0)
-    discount_rate = round(discount_saved / orig_price, 3) if orig_price > 0 else 0.0
+    unit_cost = round(net_cost / total_val, 5) if total_val > 0 else 0.0
+    coupon_rate = round(coupon / orig_price, 3) if orig_price > 0 else 0.0
 
     return {
         "product_id": str(doc.get("product_id") or "").strip(),
         "goods_sign": str(doc.get("goods_sign") or "").strip(),
         "platform": normalize_platform(doc.get("platform") or "pdd"),
         "category_name": category,
-        "brand": str(doc.get("brand") or "").strip(),
+        "brand": brand,
         "name": str(doc.get("name") or "").strip(),
         "attributes_summary": " | ".join(kws[:6]),
         "spec_hint": spec_hint,
+        "total_value": total_val,
+        "base_unit": base_unit,
+        "unit_cost": unit_cost,
         "db_price": round(price, 2),
         "db_original_price": round(orig_price, 2),
         "db_coupon_amount": round(coupon, 2),
         "db_commission_amount": round(commission, 2),
         "db_net_cost": net_cost,
-        "deal_price": round(deal_price, 2) if deal_price > 0 else None,
-        "deal_quality_score": deal_score,
-        "discount_rate": discount_rate,
+        "coupon_rate": coupon_rate,
         "sales_tip": str(doc.get("sales_tip") or "0"),
         "product_url": str(doc.get("product_url") or ""),
         "image_url": str(doc.get("image_url") or ""),
@@ -178,13 +184,12 @@ def select_candidates_by_ai(
     cooldown_hours: int = 24,
 ) -> List[Dict[str, Any]]:
     """
-    步骤 1：从 72h 商品库跨分类均衡采样约 40 个高折扣候选，交由 AI-1 一次性选出 Top N 最具闲鱼转卖潜力的商品。
+    步骤 1：从 72h 商品库按分类筛选直买单位成本最低 / 官方领券力度最大的候选池，交由 AI-1 一次性选出 Top N 商品。
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     cutoff_dt = now_utc - datetime.timedelta(hours=hours_window)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 读取冷却期内已评估过的商品，避免重复探测
     eval_col = db.get_collection(EVAL_COLLECTION_NAME)
     cooldown_str = (now_utc - datetime.timedelta(hours=cooldown_hours)).strftime("%Y-%m-%d %H:%M:%S")
     evaluated_keys = {
@@ -196,7 +201,8 @@ def select_candidates_by_ai(
     raw_docs = list(
         p_col.find(
             {
-                "price": {"$gt": 5},
+                "format_status": "success",
+                "price": {"$gt": 8},
                 "$or": [
                     {"updated_at": {"$gte": cutoff_dt.replace(tzinfo=None)}},
                     {"updated_at": {"$gte": cutoff_str}},
@@ -204,34 +210,40 @@ def select_candidates_by_ai(
             }
         )
         .sort("updated_at", -1)
-        .limit(2500)
+        .limit(3500)
     )
 
     by_cat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for doc in raw_docs:
         item = _summarize_product_doc(doc)
-        if not item or not item["product_id"] or not item["name"]:
+        if not item or not item["product_id"] or not item["name"] or not item["brand"]:
             continue
         if (item["platform"], item["product_id"]) in evaluated_keys:
             continue
         by_cat[item["category_name"]].append(item)
 
-    # 跨分类均衡采样：按类别内最高优惠力度对类别排序，每类最多取前 2 个，汇总约 40 个精简池喂给 AI-1
-    ranked_cats = sorted(
-        by_cat.items(),
-        key=lambda kv: max((x["deal_quality_score"] * 0.01 + x["discount_rate"]) for x in kv[1]),
-        reverse=True,
-    )
+    # 在每个品类内部找出「同度量衡下单位成本远低于同类中位数的商品」或「官方直减大额券商品」
     shortlist: List[Dict[str, Any]] = []
-    for _, items in ranked_cats:
-        items.sort(key=lambda x: (x["deal_quality_score"], x["discount_rate"], x["db_coupon_amount"]), reverse=True)
-        shortlist.extend(items[:2])
-        if len(shortlist) >= 40:
-            break
+    for cat_name, items in by_cat.items():
+        if len(items) < 2:
+            continue
+        valid_uc = sorted(x["unit_cost"] for x in items if x["unit_cost"] > 0 and x["total_value"] > 1)
+        median_uc = valid_uc[len(valid_uc) // 2] if valid_uc else 0.0
+        for x in items:
+            uc_saving = round((median_uc - x["unit_cost"]) / median_uc, 3) if (median_uc > 0 and x["unit_cost"] > 0 and x["total_value"] > 1) else 0.0
+            x["cat_median_unit_cost"] = median_uc
+            x["uc_saving_vs_cat_median"] = max(0.0, uc_saving)
+            x["pre_rank_score"] = round(max(x["uc_saving_vs_cat_median"], x["coupon_rate"]), 3)
+        items.sort(key=lambda x: (x["pre_rank_score"], x["db_coupon_amount"]), reverse=True)
+        if items[0]["pre_rank_score"] >= 0.15:
+            shortlist.append(items[0])
+
+    shortlist.sort(key=lambda x: (x["pre_rank_score"], x["db_coupon_amount"]), reverse=True)
+    shortlist = shortlist[:40]
 
     logger.info(
-        f"📊 [步骤1/候选池采样] 72h内扫描商品={len(raw_docs)} | 过滤已评={len(evaluated_keys)} | "
-        f"覆盖细分品类={len(by_cat)} | 送入AI-1精选池={len(shortlist)}条"
+        f"📊 [步骤1/候选池采样] 72h内结构化商品={len(raw_docs)} | 过滤已评={len(evaluated_keys)} | "
+        f"覆盖有品牌细分品类={len(by_cat)} | 送入AI-1跨品类冠军池={len(shortlist)}条"
     )
     if not shortlist:
         return []
@@ -249,28 +261,31 @@ def select_candidates_by_ai(
             "current_price": x["db_price"],
             "coupon": x["db_coupon_amount"],
             "my_net_cost": x["db_net_cost"],
-            "deal_price": x["deal_price"],
+            "unit_cost_saving_vs_category_median": f"{x['uc_saving_vs_cat_median']*100:.0f}%",
             "sales": x["sales_tip"],
         }
         for x in shortlist
     ]
 
     prompt_ai1 = (
-        f"你是一位精通闲鱼无货源代拍套利的资深选品总监。请从以下 {len(ai_pool)} 款最近72小时内更新的内部高折扣商品池中，"
-        f"挑选出 **最值得去闲鱼比价上架的前 {max_candidates} 款商品**（尽量覆盖不同品类）。\n\n"
+        f"你是一位精通闲鱼无货源代拍套利的资深选品总监。请从以下 {len(ai_pool)} 个不同品类的内部低价冠军商品中，"
+        f"挑选出 **最值得去闲鱼比价上架的前 {max_candidates} 款商品**（每个品类最多选1款）。\n\n"
         "【选品标准】：\n"
-        "1. **硬通货品牌标品优先**：知名品牌、型号/规格清晰明确（如整箱饮料/纸巾、品牌个护家清、数码小家电、大牌日用等），买家在闲鱼搜词精准、无需选尺码且不易售后扯皮；\n"
-        "2. **真实低成本优势**：当前 `my_net_cost`（或 `deal_price`）相比日常价 `original_price` 有显著折扣（如大额券、百亿补贴或高分好价），在闲鱼有充足的差价空间（建议优先选净成本 ≥ 12 元的商品，确保单笔绝对利润可观）；\n"
-        "3. **生成精准闲鱼搜索词**：提取真实买家在闲鱼搜索该同款商品时最常用的自然精简关键词 `xianyu_search_keyword`（3~4个词，格式：`品牌 + 核心品名 + 关键规格/数量`，绝不要带电商促销废话）。\n\n"
+        "1. **硬通货品牌标品优先**：知名大牌、规格/数量100%明确（如整箱饮料/牛奶/抽纸、知名家清个护、数码配件、知名小家电等），买家在闲鱼搜词精准、无需选尺码且不易售后扯皮；\n"
+        "2. **真实直买净成本极低**：注意只看我方官方直买净成本 `my_net_cost`！优先挑选 `my_net_cost` 相比日常价或同类中位单价有显著优势、且净成本在 15~150 元之间的商品（确保单笔绝对差价可观）；\n"
+        "3. **生成闲鱼精准搜索词（防屏蔽铁律）**：\n"
+        "   - `xianyu_search_keyword`：用 `品牌/子品牌 + 核心单品词 + 关键规格数字`（如 `\"维达 抽纸 120抽 20包\"`、`\"可口可乐 300ml 24瓶\"`、`\"伊利 金典 250ml 16盒\"`）；**若子品牌本身已足够明确（如“安慕希”、“金典”、“特仑苏”、“得宝”），请勿叠加强监管泛品类词（如去掉“酸奶”直接写 `\"伊利 安慕希 16盒\"`），防止触发闲鱼搜索词过滤**；\n"
+        "   - `backup_search_keyword`：更精简的兜底搜索词（仅 `核心品牌/系列 + 规格数字`，如 `\"安慕希 16盒\"`）。\n\n"
         f"【候选商品池 JSON】：\n{json.dumps(ai_pool, ensure_ascii=False, indent=2)}\n\n"
         "请严格返回如下 JSON 数组格式（不要输出任何额外解释）：\n"
         "```json\n"
         "[\n"
         "  {\n"
         "    \"product_id\": \"入选商品的product_id\",\n"
-        "    \"xianyu_search_keyword\": \"品牌 核心品名 关键规格\",\n"
-        "    \"my_spec_anchor\": \"我方商品的清晰规格基准（如：120抽*20包整箱 / 500ml*24瓶）\",\n"
-        "    \"select_reason\": \"简述为何该商品及价格在闲鱼极具代拍套利潜力\"\n"
+        "    \"xianyu_search_keyword\": \"主搜索词\",\n"
+        "    \"backup_search_keyword\": \"精简兜底搜索词\",\n"
+        "    \"my_spec_anchor\": \"我方商品的清晰规格基准（如：120抽*20包整箱 / 300ml*24瓶）\",\n"
+        "    \"select_reason\": \"简述为何该商品的直买净成本 my_net_cost 在闲鱼极具代拍套利潜力\"\n"
         "  }\n"
         "]\n"
         "```"
@@ -290,13 +305,14 @@ def select_candidates_by_ai(
         if pid in item_map and kw:
             cand = dict(item_map[pid])
             cand["xianyu_search_keyword"] = kw
+            cand["backup_search_keyword"] = str(pick.get("backup_search_keyword") or "").strip()
             cand["my_spec_summary"] = str(pick.get("my_spec_anchor") or cand["spec_hint"] or "").strip()
             cand["ai_select_reason"] = str(pick.get("select_reason") or "").strip()
             selected.append(cand)
             logger.info(
                 f"🎯 [步骤1/AI入选 #{len(selected)}] 类别=【{cand['category_name']}】 | "
-                f"净成本=¥{cand['db_net_cost']} (现价=¥{cand['db_price']}, 原价=¥{cand['db_original_price']}) | "
-                f"搜索词=【{kw}】 | 规格=【{cand['my_spec_summary']}】 | 理由={cand['ai_select_reason']}"
+                f"净成本=¥{cand['db_net_cost']} (现价=¥{cand['db_price']}, 券=¥{cand['db_coupon_amount']}) | "
+                f"搜索词=【{kw}】(备:【{cand['backup_search_keyword']}】) | 规格=【{cand['my_spec_summary']}】 | 理由={cand['ai_select_reason']}"
             )
             if len(selected) >= max_candidates:
                 break
@@ -348,11 +364,12 @@ def evaluate_candidate_with_xianyu_ai(
 ) -> Dict[str, Any]:
     """
     对单个候选商品：
-    1. 免登录搜闲鱼拿前 20 条概览；
+    1. 免登录搜闲鱼拿前 20 条概览（若主搜索词被闲鱼词表过滤导致结果不含品牌词，自动切换 backup_search_keyword 重搜）；
     2. 自动对价格最低的前 K 条（外加想要人数最多的 1 条）抓取完整详情与 `sku_list`；
     3. 一次性交由 AI-2 完成真假低价鉴别、同款基准锁定、0~100 吸引力评分与建议定价。
     """
     kw = cand["xianyu_search_keyword"]
+    backup_kw = cand.get("backup_search_keyword") or ""
     my_cost = cand["my_net_cost"]
     logger.info(
         f"🔍 [步骤2/闲鱼采集] 候选=【{cand['name'][:30]}】 | 我方净成本=¥{my_cost} | 搜索词=【{kw}】"
@@ -365,6 +382,26 @@ def evaluate_candidate_with_xianyu_ai(
         debug=debug_browser,
     )
     raw_items = search_res.get("items") or []
+
+    # 若主搜索词包含被闲鱼过滤的泛词导致返回结果中完全不含我方品牌词，自动用精简兜底词重搜一次
+    brand_short = cand["brand"].split("/")[-1].strip()[:2] if cand["brand"] else ""
+    if raw_items and brand_short and backup_kw and backup_kw != kw:
+        brand_hit_cnt = sum(1 for x in raw_items if brand_short in str(x.get("title") or ""))
+        if brand_hit_cnt == 0:
+            logger.info(f"🔄 [搜索词自动降级] 主搜索词【{kw}】疑似触发闲鱼词过滤(品牌命中=0)，切换精简词【{backup_kw}】重搜...")
+            time.sleep(1.5)
+            retry_res = search_xianyu_items(
+                keyword=backup_kw,
+                max_items=max_search_items,
+                user_data_dir=guest_user_data_dir,
+                debug=debug_browser,
+            )
+            if retry_res.get("ok") and retry_res.get("items"):
+                search_res = retry_res
+                raw_items = retry_res["items"]
+                kw = backup_kw
+                cand["xianyu_search_keyword"] = backup_kw
+
     if not search_res.get("ok") or not raw_items:
         logger.warning(f"⚠️ [闲鱼搜索无结果] 搜索词=【{kw}】 | msg={search_res.get('message')}")
         return _pack_evaluation_doc(cand, search_res, [], {})
@@ -415,7 +452,6 @@ def evaluate_candidate_with_xianyu_ai(
         "attributes": cand["attributes_summary"],
         "my_live_price": cand["my_compare_price"],
         "my_net_cost": cand["my_net_cost"],
-        "deal_price": cand.get("deal_price"),
     }
     overview_compact = [
         {
