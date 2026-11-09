@@ -1899,11 +1899,15 @@ test('desktop icon tags, manifest and add-to-home-screen guide work without logi
   assert.equal(manifest.display, 'standalone');
   assert.equal(manifest.icons.length, 2);
 
-  // 1. 普通浏览器访问：展示引导条，点击弹出分步指引，关闭后持久化
+  // 1. 普通浏览器首次访问：刚进入时不打扰（showDesktopBanner 为 false），使用满 45 秒后才展示引导条
   const h1 = harness({ url: 'https://shop.test/' });
   h1.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15';
   const browser1 = h1.context.EasyShop.createBrowserTools({ ref: h1.context.Vue.ref });
   assert.equal(browser1.isStandalone.value, false);
+  assert.equal(browser1.showDesktopBanner.value, false);
+  const delayTimers = [...h1.timers.values()].filter(t => t.delay === 45000);
+  assert.equal(delayTimers.length, 1);
+  delayTimers[0].callback();
   assert.equal(browser1.showDesktopBanner.value, true);
   browser1.triggerAddToDesktop();
   assert.equal(browser1.isDesktopGuideOpen.value, true);

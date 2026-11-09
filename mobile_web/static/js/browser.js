@@ -89,11 +89,26 @@
     };
     const DESKTOP_INSTALLED_KEY = 'easy_shop_desktop_installed';
     const DESKTOP_DISMISSED_KEY = 'easy_shop_desktop_banner_dismissed';
+    const DESKTOP_SESSION_START_KEY = 'easy_shop_session_start_at';
+    const DESKTOP_BANNER_DELAY_MS = 45000;
     const safeGetStorage = key => {
       try { return global.localStorage ? global.localStorage.getItem(key) : null; } catch (_) { return null; }
     };
     const safeSetStorage = (key, val) => {
       try { if (global.localStorage) global.localStorage.setItem(key, val); } catch (_) {}
+    };
+    const getSessionElapsedMs = () => {
+      try {
+        const now = Date.now();
+        if (!global.sessionStorage) return 0;
+        const raw = global.sessionStorage.getItem(DESKTOP_SESSION_START_KEY);
+        const startAt = raw ? Number(raw) : NaN;
+        if (Number.isFinite(startAt) && startAt > 0 && now >= startAt) {
+          return now - startAt;
+        }
+        global.sessionStorage.setItem(DESKTOP_SESSION_START_KEY, String(now));
+      } catch (_) {}
+      return 0;
     };
     const detectStandalone = () => {
       try {
@@ -118,13 +133,24 @@
     const isStandalone = ref(initialStandalone);
     const desktopGuidePlatform = ref(detectGuidePlatform());
     const isDesktopGuideOpen = ref(false);
-    const showDesktopBanner = ref(
-      !initialStandalone &&
+    const canShowBanner = !initialStandalone &&
       safeGetStorage(DESKTOP_INSTALLED_KEY) !== '1' &&
-      safeGetStorage(DESKTOP_DISMISSED_KEY) !== '1'
-    );
+      safeGetStorage(DESKTOP_DISMISSED_KEY) !== '1';
+    const elapsedMs = canShowBanner ? getSessionElapsedMs() : 0;
+    const showDesktopBanner = ref(Boolean(canShowBanner && elapsedMs >= DESKTOP_BANNER_DELAY_MS));
+    let bannerDelayTimer = null;
+    if (canShowBanner && !showDesktopBanner.value) {
+      bannerDelayTimer = global.setTimeout(() => {
+        bannerDelayTimer = null;
+        if (!isStandalone.value && safeGetStorage(DESKTOP_INSTALLED_KEY) !== '1' && safeGetStorage(DESKTOP_DISMISSED_KEY) !== '1') {
+          showDesktopBanner.value = true;
+        }
+      }, Math.max(0, DESKTOP_BANNER_DELAY_MS - elapsedMs));
+    }
 
     const dismissDesktopBanner = () => {
+      global.clearTimeout(bannerDelayTimer);
+      bannerDelayTimer = null;
       showDesktopBanner.value = false;
       safeSetStorage(DESKTOP_DISMISSED_KEY, '1');
     };
@@ -140,6 +166,8 @@
     const dispose = () => {
       stopSmartLoading();
       global.clearTimeout(toastTimer);
+      global.clearTimeout(bannerDelayTimer);
+      bannerDelayTimer = null;
     };
     return {
       toastMessage, smartLoading, showToast, copyText, startSmartLoading, stopSmartLoading, jumpToLink,
