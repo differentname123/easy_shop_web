@@ -261,7 +261,7 @@ ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
     "principle_05_parallel_producer_consumer_and_early_termination": (
         "【高吞吐架构：拉取/清洗双线程并行 + 转链并发化 + 唯一商品标识提前终止（Early Termination）】"
         "1) Stage 1 多源定时拉取（Producer）与 Stage 2~5 积压清洗（Consumer）在持续模式下分为两个独立线程并行运行，互不耽搁时间；"
-        "2) Stage 2/4 AI 采用 `batch_size=15` 批量分组 + `8` 线程并发请求；Stage 3 官方转链按 `(platform, clean_input)` 去重后采用 `10` 线程并发调用；"
+        "2) Stage 2/4 AI 采用 `batch_size=10` 批量分组 + `10` 线程并发请求；Stage 3 官方转链按 `(platform, clean_input)` 去重后采用 `10` 线程并发调用；"
         "3) 双层确定性提前终止（Early Termination）：当单锚点线报在 Stage 2 前命中 `anchor_cache` 已入库商品，或 Stage 3 转链拿到商品唯一标识 `(platform, goods_id)` "
         "发现该商品已在正式库 `products`（12h 保鲜期内）或同批次已有更优线报正在处理时，立即提前终止并跳过后续 AI 调用（标记 `OK_SKIPPED_ALREADY_CLEANED`），"
         "仅向正式表 `products` 累加跨群/跨站共振热度，大幅节省工作量与 AI 算力！"
@@ -1073,8 +1073,8 @@ class DealPoolCleaner:
     def __init__(
         self,
         use_ai_for_multi: bool = True,
-        ai_batch_size: int = 15,
-        ai_max_workers: int = 8,
+        ai_batch_size: int = 10,
+        ai_max_workers: int = 10,
         convert_max_workers: int = 10,
     ):
         self.use_ai = True
@@ -1455,14 +1455,24 @@ class DealPoolCleaner:
             cache_key = f"{try_plat}:{clean_input}"
             with self._cache_lock:
                 if cache_key in self.anchor_cache:
-                    self.stats_cache_hits += 1
                     cached = copy.deepcopy(self.anchor_cache[cache_key])
                     cached["link_id"] = link_id
                     cached["text_role_hint"] = role_hint
-                    if cached.get("convert_status") in ("product", "coupon_or_activity"):
+                    c_status = cached.get("convert_status")
+                    if c_status == "coupon_or_activity":
+                        self.stats_cache_hits += 1
                         return cached
-                    last_failed = cached
-                    continue
+                    if c_status == "product":
+                        # 仅当缓存中包含完整的 adapter_res.product 字典时才直接复用；
+                        # 若是从数据库预热的精简缓存（无 adapter_res）且未能触发前置早停（说明需要作为新商品入库），则重新请求官方接口补全完整字段
+                        c_ares = cached.get("adapter_res")
+                        if isinstance(c_ares, dict) and isinstance(c_ares.get("product"), dict) and c_ares.get("product"):
+                            self.stats_cache_hits += 1
+                            return cached
+                    else:
+                        self.stats_cache_hits += 1
+                        last_failed = cached
+                        continue
 
             adapter = self.adapters.get(try_plat)
             if not adapter:
@@ -1898,15 +1908,33 @@ class DealPoolCleaner:
         converted_by_tip_id: Dict[str, List[Dict[str, Any]]] = {}
         stage2_inputs: List[Dict[str, Any]] = []
 
-        # 若同批次中某条消息已被相邻主线报吸收进 merged_tip_ids，直接标记为 merged_into_parent 避免重复转链
+        # 若同批次中某条消息已被相邻主线报吸收进 merged_tip_ids，直接标记为 merged_into_parent 避免重复转链。
+        # 注意：按提取目标数与合并碎片数从多到少排序，且已被吸收的子碎片或已作为父节点吸收他人的主线报不可被反向吸收（防止 A 吸收 B、B 又吸收 A 导致双方同归于尽）
         absorbed_by_neighbor: Dict[str, str] = {}
-        for mid, ai1_res in ai1_results.items():
+        active_parent_ids: Set[str] = set()
+        sorted_ai1_items = sorted(
+            ai1_results.items(),
+            key=lambda kv: (
+                len((kv[1] or {}).get("extracted_targets") or []),
+                len((kv[1] or {}).get("merged_tip_ids") or []),
+            ),
+            reverse=True,
+        )
+        for mid, ai1_res in sorted_ai1_items:
             if not ai1_res.get("is_standalone_deal", True):
+                continue
+            if mid in absorbed_by_neighbor:
                 continue
             for m_tid in ai1_res.get("merged_tip_ids") or []:
                 m_tid_str = str(m_tid or "").strip()
-                if m_tid_str and m_tid_str != mid:
+                if (
+                    m_tid_str
+                    and m_tid_str != mid
+                    and m_tid_str not in absorbed_by_neighbor
+                    and m_tid_str not in active_parent_ids
+                ):
                     absorbed_by_neighbor[m_tid_str] = mid
+                    active_parent_ids.add(mid)
 
         # 收集本批次所有需要转链的去重目标 (plat_hint, clean_input)，并发执行官方 Adapter 转链
         t_stage3_start = time.perf_counter()
@@ -2332,11 +2360,21 @@ class DealPoolCleaner:
             score_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
 
             # 组装主商品官方真实详情与爆料专属 deal_info（严格隔离顶层官方价格与爆料价！）
-            plat = main_conv["platform"]
-            goods_id = main_conv["goods_id"]
-            goods_sign = main_conv["goods_sign"]
-            adapter_res = main_conv["adapter_res"]
-            product_card = copy.deepcopy(adapter_res.get("product") or {})
+            plat = str(main_conv.get("platform") or "")
+            goods_id = str(main_conv.get("goods_id") or "")
+            goods_sign = str(main_conv.get("goods_sign") or "")
+            adapter_res = main_conv.get("adapter_res") if isinstance(main_conv.get("adapter_res"), dict) else {}
+            product_card = copy.deepcopy(adapter_res.get("product") if isinstance(adapter_res.get("product"), dict) else {})
+            off_prod_fallback = main_conv.get("official_product") if isinstance(main_conv.get("official_product"), dict) else {}
+            if not product_card and off_prod_fallback:
+                product_card = {
+                    "name": off_prod_fallback.get("title") or "",
+                    "price": off_prod_fallback.get("price") or 0.0,
+                    "original_price": off_prod_fallback.get("original_price") or off_prod_fallback.get("price") or 0.0,
+                    "activity_price": off_prod_fallback.get("activity_price") or off_prod_fallback.get("price") or 0.0,
+                    "coupon_amount": off_prod_fallback.get("coupon_amount") or 0.0,
+                    "mall_name": off_prod_fallback.get("shop_name") or "",
+                }
 
             my_promo_link = str(main_conv.get("my_promo_link") or "")
             my_promo_token = str(main_conv.get("my_promo_token") or "")
@@ -4539,14 +4577,14 @@ def main():
     parser.add_argument(
         "--ai-batch-size",
         type=int,
-        default=15,
-        help="单次 AI 请求打包处理的线报条数（默认: 15）",
+        default=10,
+        help="单次 AI 请求打包处理的线报条数（默认: 10，兼顾低调用次数与防 8k Token 输出截断）",
     )
     parser.add_argument(
         "--ai-workers",
         type=int,
-        default=8,
-        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 8）",
+        default=10,
+        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 10）",
     )
     parser.add_argument(
         "--convert-workers",

@@ -87,6 +87,24 @@ def save_json(json_path, data):
     os.replace(tmp_path, path)
 
 
+class _WindowsSafeTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """Windows 多进程/多线程安全按天轮转 Handler：避免跨进程占用导致午夜 0 点反复抛出 WinError 32。"""
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            # Windows 下若另一进程（如 goods_info_format 与 scheduler 并行）正持有日志文件句柄，
+            # os.rename 会抛 PermissionError (WinError 32)；此时重新打开流并推进下次轮转时间，避免后续每次写日志无限报错刷屏
+            if not self.delay and self.stream is None:
+                self.stream = self._open()
+            current_time = int(time.time())
+            new_rollover_at = self.computeRollover(current_time)
+            while new_rollover_at <= current_time:
+                new_rollover_at += self.interval
+            self.rolloverAt = new_rollover_at
+
+
 def setup_logger(app_name="model_api"):
     """初始化独立命名的 model_api 日志记录器（延迟创建文件，避免 import 产生空日志）。"""
     for _stream in (sys.stdout, sys.stderr):
@@ -110,7 +128,7 @@ def setup_logger(app_name="model_api"):
             try:
                 log_dir = _APP_DIR / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
-                file_handler = TimedRotatingFileHandler(
+                file_handler = _WindowsSafeTimedRotatingFileHandler(
                     filename=str(log_dir / f"{app_name}.log"),
                     when="midnight",
                     interval=1,
@@ -269,10 +287,24 @@ class _HttpLogsFilter(logging.Filter):
 
 logger = setup_logger(app_name="model_api")
 _http_filter = _HttpLogsFilter()
-for handler in logger.handlers:
-    handler.addFilter(_http_filter)
-    if not isinstance(handler.formatter, _RedactingFormatter):
-        handler.setFormatter(_RedactingFormatter(handler.formatter))
+
+
+def _suppress_noisy_http_logs():
+    """屏蔽 httpx / httpcore / openai / urllib3 输出的 HTTP Request: POST ... "HTTP/1.1 200 OK" 噪音日志。"""
+    for noisy_name in ("httpx", "httpx2", "httpcore", "openai", "urllib3"):
+        lg = logging.getLogger(noisy_name)
+        lg.setLevel(logging.WARNING)
+        if _http_filter not in lg.filters:
+            lg.addFilter(_http_filter)
+    for target_logger in (logger, logging.getLogger()):
+        for handler in target_logger.handlers:
+            if _http_filter not in handler.filters:
+                handler.addFilter(_http_filter)
+            if target_logger is logger and not isinstance(handler.formatter, _RedactingFormatter):
+                handler.setFormatter(_RedactingFormatter(handler.formatter))
+
+
+_suppress_noisy_http_logs()
 
 
 def _close_client(client, context):
@@ -642,6 +674,7 @@ def generate_content(
     每次请求（含重试/切换/中断）按请求模型名统计，在 finally 中一次合并写盘。
     能确定模型的准备失败单独计数，不计入请求次数或成功率；无法确定模型时不虚构模型名。
     """
+    _suppress_noisy_http_logs()
     started = time.perf_counter()
     called_at_bj = _beijing_now()
     trace_id = uuid.uuid4().hex

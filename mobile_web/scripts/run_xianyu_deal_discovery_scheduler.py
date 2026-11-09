@@ -32,6 +32,7 @@ import math
 import os
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -101,6 +102,92 @@ def _num(val: Any, default: float = 0.0) -> float:
         return f if math.isfinite(f) else default
     except Exception:
         return default
+
+
+# ==============================================================================
+# 运维可读性日志排版工具（中英文等宽对齐 + 性价比/规格人类可读格式化）
+# ==============================================================================
+def _disp_width(text: str) -> int:
+    """计算字符串在终端等宽字体下的显示列宽（中文全角/Emoji占2列，英文数字占1列，组合变体符占0列）。"""
+    w = 0
+    for ch in str(text or ""):
+        cp = ord(ch)
+        if cp in (0xFE0E, 0xFE0F, 0x200D) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            continue
+        if (
+            unicodedata.east_asian_width(ch) in ("W", "F")
+            or (0x1F300 <= cp <= 0x1FAFF)
+            or (0x2600 <= cp <= 0x27BF)
+        ):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _pad_col(val: Any, width: int, align: str = "left", truncate: bool = True) -> str:
+    """按终端显示列宽对齐字段，保证中英文混排表格严格上下对齐。"""
+    s = str(val if val is not None else "").replace("\r", " ").replace("\n", " ").strip()
+    cur_w = _disp_width(s)
+    if truncate and cur_w > width:
+        out_chars: List[str] = []
+        acc = 0
+        target = max(1, width - 2)
+        for ch in s:
+            cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if acc + cw > target:
+                break
+            out_chars.append(ch)
+            acc += cw
+        s = "".join(out_chars) + ".."
+        cur_w = _disp_width(s)
+    pad_len = max(0, width - cur_w)
+    if align == "right":
+        return (" " * pad_len) + s
+    return s + (" " * pad_len)
+
+
+def _fmt_num_clean(v: Any) -> str:
+    f = _num(v, 0.0)
+    if f <= 0:
+        return "0"
+    if abs(f - round(f)) < 1e-6:
+        return str(int(round(f)))
+    if f >= 100:
+        return f"{f:.1f}".rstrip("0").rstrip(".")
+    if f >= 1:
+        return f"{f:.2f}".rstrip("0").rstrip(".")
+    return f"{f:.4f}".rstrip("0").rstrip(".")
+
+
+def _ordered_unit_keys(d: Dict[str, Any], focus_unit: Optional[str] = None) -> List[str]:
+    if not isinstance(d, dict):
+        return []
+    keys = list(d.keys())
+    if focus_unit and focus_unit in keys:
+        keys.remove(focus_unit)
+        keys.insert(0, focus_unit)
+    return keys
+
+
+def _fmt_qty_human(qty_map: Dict[str, float], focus_unit: Optional[str] = None) -> str:
+    if not isinstance(qty_map, dict) or not qty_map:
+        return "-"
+    keys = _ordered_unit_keys(qty_map, focus_unit)
+    parts = [f"{_fmt_num_clean(qty_map[u])}{u}" for u in keys[:3]]
+    return " / ".join(parts)
+
+
+def _fmt_cp_human(cp_map: Dict[str, float], focus_unit: Optional[str] = None) -> str:
+    if not isinstance(cp_map, dict) or not cp_map:
+        return "-"
+    keys = _ordered_unit_keys(cp_map, focus_unit)
+    parts: List[str] = []
+    for idx, u in enumerate(keys[:3]):
+        prefix = "★" if (focus_unit and u == focus_unit and len(keys) > 1) else ""
+        parts.append(f"{prefix}{_fmt_num_clean(cp_map[u])}{u}/元")
+    return " | ".join(parts)
+
 
 
 # ==============================================================================
@@ -305,7 +392,7 @@ def _verify_live_activity_price(platform: str, product_id: str, goods_sign: str,
 def select_verified_category_champions(
     db: Any,
     hours_window: int = 72,
-    max_categories: int = 5,
+    max_categories: int = 20,
     cooldown_hours: int = 24,
 ) -> List[Dict[str, Any]]:
     """
@@ -362,11 +449,11 @@ def select_verified_category_champions(
 
     # 严格按每个类别对应的商品总数量从多到少排序选择
     sorted_cats = sorted(by_cat.items(), key=lambda kv: len(kv[1]), reverse=True)
-    top_preview = ", ".join(f"{k}({len(v)}款)" for k, v in sorted_cats[:10])
+    top_preview = ", ".join(f"{k}({len(v)}款)" for k, v in sorted_cats[:20])
     logger.info(
         f"📊 [步骤1/源头扫描] 72h内有channel_type且已结构化商品={len(raw_docs)} | "
         f"归入core_entities最高分分类数={len(sorted_cats)} | 本轮目标选取分类数={max_categories} | "
-        f"商品数量最多前10分类=[{top_preview}]"
+        f"商品数量最多前20分类=[{top_preview}]"
     )
 
     champions: List[Dict[str, Any]] = []
@@ -893,6 +980,335 @@ def _build_final_record(
     }
 
 
+def _build_verdict_summary(record: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    返回 (简短结论标签, 比值显示文本, 量化胜负一句话解释)
+    """
+    cr = record.get("comparison_result") or {}
+    cand = record.get("candidate_product") or {}
+    bxy = record.get("best_xianyu_product") or {}
+    final_winner = str(record.get("final_winner") or "no_comparable")
+    basis = str(cr.get("comparison_basis") or "no_comparable")
+    matched_u = cr.get("matched_unit")
+    cp_ratio = cr.get("cost_performance_ratio")
+    my_cp_map = cr.get("my_unit_cost_performance") or {}
+    xy_cp_map = cr.get("xianyu_unit_cost_performance") or {}
+
+    if not cr.get("has_comparable_item") or final_winner == "no_comparable":
+        return (
+            "⚪ 无可比款",
+            "N/A",
+            "闲鱼未搜索到同品牌同规格的可比商品",
+        )
+
+    if basis == "unit_ratio" and cp_ratio is not None and matched_u:
+        my_u_cp = _fmt_num_clean(my_cp_map.get(matched_u, 0.0))
+        xy_u_cp = _fmt_num_clean(xy_cp_map.get(matched_u, 0.0))
+        my_u_qty = _fmt_num_clean((cand.get("unit_quantities") or {}).get(matched_u, 0.0))
+        xy_u_qty = _fmt_num_clean((bxy.get("unit_quantities") or {}).get(matched_u, 0.0))
+        ratio_str = f"{cp_ratio:.2f}x ({matched_u})"
+        if final_winner == "my_product":
+            pct = (cp_ratio - 1.0) * 100.0
+            quant_str = (
+                f"赢在单价更低：按单位[{matched_u}]对齐，我方 ¥{record['activity_price']:.2f} 买 {my_u_qty}{matched_u} "
+                f"(每元可得 {my_u_cp}{matched_u}) vs 闲鱼 ¥{bxy.get('comparable_price', 0):.2f} 买 {xy_u_qty}{matched_u} "
+                f"(每元可得 {xy_u_cp}{matched_u}) -> 我方性价比是闲鱼的 {cp_ratio:.2f} 倍 (高出 +{pct:.1f}%)"
+            )
+            return "🏆 我方胜出", ratio_str, quant_str
+        elif final_winner == "xianyu_product":
+            pct = (1.0 - cp_ratio) * 100.0
+            quant_str = (
+                f"输在单价偏高：按单位[{matched_u}]对齐，我方 ¥{record['activity_price']:.2f} 买 {my_u_qty}{matched_u} "
+                f"(每元可得 {my_u_cp}{matched_u}) vs 闲鱼 ¥{bxy.get('comparable_price', 0):.2f} 买 {xy_u_qty}{matched_u} "
+                f"(每元可得 {xy_u_cp}{matched_u}) -> 我方性价比仅为闲鱼的 {cp_ratio:.2f} 倍 (低了 -{pct:.1f}%)"
+            )
+            return "🏳️ 闲鱼更优", ratio_str, quant_str
+        else:
+            quant_str = (
+                f"双方持平：按单位[{matched_u}]对齐，双方每元均可买 {my_u_cp}{matched_u} (比值 {cp_ratio:.2f}x)"
+            )
+            return "🤝 双方持平", ratio_str, quant_str
+
+    # 跨单位 AI 兜底判断
+    ratio_str = "AI跨单位判定"
+    if final_winner == "my_product":
+        quant_str = (
+            f"赢在整体规格价格比（跨单位AI兜底判定）：我方 ¥{record['activity_price']:.2f} "
+            f"[{_fmt_qty_human(cand.get('unit_quantities') or {})}] vs "
+            f"闲鱼 ¥{bxy.get('comparable_price', 0):.2f} [{_fmt_qty_human(bxy.get('unit_quantities') or {})}]"
+        )
+        return "🏆 我方胜出", ratio_str, quant_str
+    elif final_winner == "xianyu_product":
+        quant_str = (
+            f"输在整体规格价格比（跨单位AI兜底判定）：我方 ¥{record['activity_price']:.2f} "
+            f"[{_fmt_qty_human(cand.get('unit_quantities') or {})}] vs "
+            f"闲鱼 ¥{bxy.get('comparable_price', 0):.2f} [{_fmt_qty_human(bxy.get('unit_quantities') or {})}]"
+        )
+        return "🏳️ 闲鱼更优", ratio_str, quant_str
+    return "🤝 双方持平", ratio_str, "跨单位AI判定双方性价比相当"
+
+
+def _format_champions_summary_table(champions: List[Dict[str, Any]]) -> str:
+    """将步骤 2 选出的所有分类候选冠军格式化为对齐表格，方便运维在比价开始前一眼看清候选池。"""
+    sep = "-" * 136
+    lines = [
+        "",
+        "=" * 136,
+        f"📋 【阶段 1 汇总：本轮入选的 {len(champions)} 个大类性价比冠军候选清单】（已通过官方接口实时核验价格）",
+        sep,
+        (
+            f"{_pad_col('序号', 4)} | "
+            f"{_pad_col('分类名称(库内数)', 18)} | "
+            f"{_pad_col('平台与商品ID', 19)} | "
+            f"{_pad_col('核验价格', 10)} | "
+            f"{_pad_col('规格数量', 16)} | "
+            f"{_pad_col('我方单位性价比(每1元)', 24)} | "
+            f"{_pad_col('闲鱼搜索词', 18)} | "
+            f"我方商品标题与属性"
+        ),
+        sep,
+    ]
+    for i, c in enumerate(champions, 1):
+        cat_label = f"{c['category_name']}({c.get('category_item_count', 0)}款)"
+        plat_id = f"{str(c['platform']).upper()}:{c['product_id']}"
+        price_str = f"¥{c['activity_price']:.2f}"
+        p_unit = c.get("primary_unit")
+        qty_str = _fmt_qty_human(c.get("unit_quantities") or {}, p_unit)
+        cp_str = _fmt_cp_human(c.get("unit_cost_performance") or {}, p_unit)
+        kw_str = str(c.get("search_keyword") or "")
+        desc_str = f"{c['name']} [{c.get('decision_keywords_summary') or '无扩展属性'}]"
+        lines.append(
+            f"{_pad_col(f'#{i}', 4)} | "
+            f"{_pad_col(cat_label, 18)} | "
+            f"{_pad_col(plat_id, 19)} | "
+            f"{_pad_col(price_str, 10)} | "
+            f"{_pad_col(qty_str, 16)} | "
+            f"{_pad_col(cp_str, 24)} | "
+            f"{_pad_col(kw_str, 18)} | "
+            f"{desc_str}"
+        )
+    lines.append("=" * 136)
+    return "\n".join(lines)
+
+
+def _format_single_comparison_card(idx: int, total: int, record: Dict[str, Any]) -> str:
+    """
+    将单个商品与闲鱼最优商品的比价结果排版为严格上下对齐的【对战卡片】，
+    一眼看清：我方描述/价格/性价比 vs 他方最优描述/价格/性价比，以及赢在哪里、输在哪里。
+    """
+    cand = record.get("candidate_product") or {}
+    bxy = record.get("best_xianyu_product") or {}
+    cr = record.get("comparison_result") or {}
+    audit = record.get("xianyu_audit_trail") or {}
+
+    badge, ratio_str, quant_explain = _build_verdict_summary(record)
+    focus_u = cr.get("matched_unit") or cand.get("primary_unit")
+
+    my_plat_id = f"{str(record['platform']).upper()}:{record['product_id']}"
+    my_price = f"¥{record['activity_price']:.2f}"
+    my_qty = _fmt_qty_human(cand.get("unit_quantities") or {}, focus_u)
+    my_cp = _fmt_cp_human(cr.get("my_unit_cost_performance") or {}, focus_u)
+    my_desc = f"【规格属性: {cand.get('decision_keywords_summary') or '默认规格'}】 标题: {record['name']}"
+
+    if cr.get("has_comparable_item") and bxy.get("item_id"):
+        xy_plat_id = f"XY :{bxy['item_id']}"
+        xy_price = f"¥{_num(bxy.get('comparable_price'), 0.0):.2f}"
+        xy_qty = _fmt_qty_human(bxy.get("unit_quantities") or {}, focus_u)
+        xy_cp = _fmt_cp_human(cr.get("xianyu_unit_cost_performance") or {}, focus_u)
+        xy_spec = str(bxy.get("spec_description") or "").strip()
+        xy_desc = f"【提取规格: {xy_spec or '见标题'}】 标题: {bxy.get('title') or ''}"
+    else:
+        xy_plat_id = "XY :无可比商品"
+        xy_price = "-"
+        xy_qty = "-"
+        xy_cp = "-"
+        xy_desc = "未在闲鱼搜索结果中找到同款或同规格可比商品"
+
+    border_eq = "=" * 140
+    border_dash = "-" * 140
+    header_line = (
+        f"🏁 【单品比价结论 #{idx}/{total}】 "
+        f"分类: 【{record['category_name']}】(库内{cand.get('category_item_count', '-')}款)  |  "
+        f"结论: {badge}  |  性价比比值(我方/闲鱼): {ratio_str}  |  "
+        f"闲鱼搜索词: \"{audit.get('search_keyword', '')}\"(召回{audit.get('raw_search_count', 0)}款)"
+    )
+    col_header = (
+        f"{_pad_col('对比角色', 10)} | "
+        f"{_pad_col('平台与商品编号', 19)} | "
+        f"{_pad_col('对比价格', 10)} | "
+        f"{_pad_col('提取规格数量', 18)} | "
+        f"{_pad_col('单位性价比 (每1元可得)', 26)} | "
+        f"核心规格与商品标题描述"
+    )
+    my_row = (
+        f"{_pad_col('[我方商品]', 10)} | "
+        f"{_pad_col(my_plat_id, 19)} | "
+        f"{_pad_col(my_price, 10)} | "
+        f"{_pad_col(my_qty, 18)} | "
+        f"{_pad_col(my_cp, 26)} | "
+        f"{my_desc}"
+    )
+    xy_row = (
+        f"{_pad_col('[闲鱼最优]', 10)} | "
+        f"{_pad_col(xy_plat_id, 19)} | "
+        f"{_pad_col(xy_price, 10)} | "
+        f"{_pad_col(xy_qty, 18)} | "
+        f"{_pad_col(xy_cp, 26)} | "
+        f"{xy_desc}"
+    )
+
+    lines = [
+        "",
+        border_eq,
+        header_line,
+        border_dash,
+        col_header,
+        border_dash,
+        my_row,
+        xy_row,
+        border_dash,
+        f"⚖️  胜负关键点 : {quant_explain}",
+        f"📝 AI详细理由 : {cr.get('llm_reason') or '-'}",
+        border_eq,
+    ]
+    return "\n".join(lines)
+
+
+def _format_batch_summary_report(batch_id: str, elapsed: float, records: List[Dict[str, Any]]) -> str:
+    """
+    在整轮任务结束时输出【运维全局总结汇总报告】：
+    包含：
+      1. 顶部汇总表格（所有分类一行一个，严格列对齐）；
+      2. 逐个分类的【我方商品 vs 闲鱼最优】上下对齐明细汇总，无需往上翻日志即可复盘全部商品。
+    """
+    win_cnt = sum(1 for r in records if r.get("final_winner") == "my_product")
+    lose_cnt = sum(1 for r in records if r.get("final_winner") == "xianyu_product")
+    tie_cnt = sum(1 for r in records if r.get("final_winner") == "tie")
+    none_cnt = sum(1 for r in records if r.get("final_winner") not in ("my_product", "xianyu_product", "tie"))
+
+    eq_line = "=" * 144
+    dash_line = "-" * 144
+    lines = [
+        "",
+        eq_line,
+        (
+            f"📊 【闲鱼比价探测 · 本轮运维全局总结报告】 "
+            f"批次: {batch_id}  |  总耗时: {elapsed:.1f}s  |  "
+            f"参评分类: {len(records)} 个  |  "
+            f"🏆 我方胜出: {win_cnt}  |  🏳️ 闲鱼更优: {lose_cnt}  |  🤝 持平: {tie_cnt}  |  ⚪ 无可比: {none_cnt}"
+        ),
+        eq_line,
+        "【一、全部分类胜负一表通览】",
+        dash_line,
+        (
+            f"{_pad_col('序号', 4)} | "
+            f"{_pad_col('分类(库内数)', 16)} | "
+            f"{_pad_col('胜负结论', 12)} | "
+            f"{_pad_col('比值(我/闲)', 14)} | "
+            f"{_pad_col('我方价格', 9)} | "
+            f"{_pad_col('闲鱼最优价', 10)} | "
+            f"{_pad_col('我方性价比(每1元)', 22)} | "
+            f"{_pad_col('闲鱼性价比(每1元)', 22)} | "
+            f"胜负核心摘要"
+        ),
+        dash_line,
+    ]
+
+    for idx, r in enumerate(records, 1):
+        cand = r.get("candidate_product") or {}
+        bxy = r.get("best_xianyu_product") or {}
+        cr = r.get("comparison_result") or {}
+        badge, ratio_str, quant_explain = _build_verdict_summary(r)
+        focus_u = cr.get("matched_unit") or cand.get("primary_unit")
+
+        cat_col = f"{r['category_name']}({cand.get('category_item_count', '-')}款)"
+        my_p_col = f"¥{r['activity_price']:.2f}"
+        xy_p_col = f"¥{_num(bxy.get('comparable_price'), 0.0):.2f}" if cr.get("has_comparable_item") else "-"
+        my_cp_col = _fmt_cp_human(cr.get("my_unit_cost_performance") or {}, focus_u)
+        xy_cp_col = _fmt_cp_human(cr.get("xianyu_unit_cost_performance") or {}, focus_u) if cr.get("has_comparable_item") else "-"
+
+        lines.append(
+            f"{_pad_col(f'#{idx}', 4)} | "
+            f"{_pad_col(cat_col, 16)} | "
+            f"{_pad_col(badge, 12)} | "
+            f"{_pad_col(ratio_str, 14)} | "
+            f"{_pad_col(my_p_col, 9)} | "
+            f"{_pad_col(xy_p_col, 10)} | "
+            f"{_pad_col(my_cp_col, 22)} | "
+            f"{_pad_col(xy_cp_col, 22)} | "
+            f"{quant_explain}"
+        )
+
+    lines.extend([
+        dash_line,
+        "",
+        "【二、逐商品 [我方候选 vs 闲鱼最优] 对齐明细汇总（直接上下对比描述、价格、规格与性价比）】",
+        dash_line,
+        (
+            f"{_pad_col('序号/角色', 13)} | "
+            f"{_pad_col('分类名称', 12)} | "
+            f"{_pad_col('平台与编号', 19)} | "
+            f"{_pad_col('对比价格', 9)} | "
+            f"{_pad_col('提取规格量', 16)} | "
+            f"{_pad_col('单位性价比(每1元)', 24)} | "
+            f"核心规格与商品完整描述"
+        ),
+        dash_line,
+    ])
+
+    for idx, r in enumerate(records, 1):
+        cand = r.get("candidate_product") or {}
+        bxy = r.get("best_xianyu_product") or {}
+        cr = r.get("comparison_result") or {}
+        badge, ratio_str, quant_explain = _build_verdict_summary(r)
+        focus_u = cr.get("matched_unit") or cand.get("primary_unit")
+
+        my_plat_id = f"{str(r['platform']).upper()}:{r['product_id']}"
+        my_price = f"¥{r['activity_price']:.2f}"
+        my_qty = _fmt_qty_human(cand.get("unit_quantities") or {}, focus_u)
+        my_cp = _fmt_cp_human(cr.get("my_unit_cost_performance") or {}, focus_u)
+        my_desc = f"【规格属性: {cand.get('decision_keywords_summary') or '默认规格'}】 标题: {r['name']}"
+
+        if cr.get("has_comparable_item") and bxy.get("item_id"):
+            xy_plat_id = f"XY :{bxy['item_id']}"
+            xy_price = f"¥{_num(bxy.get('comparable_price'), 0.0):.2f}"
+            xy_qty = _fmt_qty_human(bxy.get("unit_quantities") or {}, focus_u)
+            xy_cp = _fmt_cp_human(cr.get("xianyu_unit_cost_performance") or {}, focus_u)
+            xy_spec = str(bxy.get("spec_description") or "").strip()
+            xy_desc = f"【提取规格: {xy_spec or '见标题'}】 标题: {bxy.get('title') or ''}"
+        else:
+            xy_plat_id = "XY :无可比商品"
+            xy_price = "-"
+            xy_qty = "-"
+            xy_cp = "-"
+            xy_desc = "未找到可比商品"
+
+        lines.append(
+            f"{_pad_col(f'[#{idx} 我方商品]', 13)} | "
+            f"{_pad_col(r['category_name'], 12)} | "
+            f"{_pad_col(my_plat_id, 19)} | "
+            f"{_pad_col(my_price, 9)} | "
+            f"{_pad_col(my_qty, 16)} | "
+            f"{_pad_col(my_cp, 24)} | "
+            f"{my_desc}"
+        )
+        lines.append(
+            f"{_pad_col(f'[#{idx} 闲鱼最优]', 13)} | "
+            f"{_pad_col(r['category_name'], 12)} | "
+            f"{_pad_col(xy_plat_id, 19)} | "
+            f"{_pad_col(xy_price, 9)} | "
+            f"{_pad_col(xy_qty, 16)} | "
+            f"{_pad_col(xy_cp, 24)} | "
+            f"{xy_desc}"
+        )
+        lines.append(f"   ├─ ⚖️ 胜负解析: {badge} (比值: {ratio_str}) | {quant_explain}")
+        lines.append(f"   └─ 📝 AI说明  : {cr.get('llm_reason') or '-'}")
+        lines.append(dash_line)
+
+    lines.append(eq_line)
+    return "\n".join(lines)
+
+
 # ==============================================================================
 # 主流程编排与运行入口
 # ==============================================================================
@@ -929,11 +1345,14 @@ def run_discovery_cycle(
         logger.warning("⚠️ [本轮结束] 未选出满足条件的分类候选商品。")
         return []
 
+    logger.info(_format_champions_summary_table(champions))
+
     records: List[Dict[str, Any]] = []
     for idx, cand in enumerate(champions, 1):
         logger.info(
-            f"\n--- ▶️ [正在比价第 {idx}/{len(champions)} 个分类冠军] "
-            f"分类=【{cand['category_name']}】 | {cand['name'][:42]} ---"
+            f"\n>>> ▶️ [开始比价第 {idx}/{len(champions)} 个分类冠军] "
+            f"分类=【{cand['category_name']}】(库内{cand.get('category_item_count', '-')}款) | "
+            f"我方候选=【{cand['name'][:40]}】(¥{cand['activity_price']:.2f})"
         )
         record = compare_candidate_with_xianyu(
             candidate=cand,
@@ -950,43 +1369,19 @@ def run_discovery_cycle(
         )
         records.append(record)
 
-        cr = record["comparison_result"]
-        bxy = record["best_xianyu_product"]
-        logger.info(
-            f"🏁 [分类比价结论 #{idx}] 分类=【{record['category_name']}】 | "
-            f"结论={'🏆我方更优' if record['is_my_product_better'] else '闲鱼更优/无优势'} (final_winner={record['final_winner']}) | "
-            f"依据={cr['comparison_basis']} | 核心比值(我方/闲鱼)={cr['cost_performance_ratio']} (各unit比值={cr['unit_cp_ratios']}) | "
-            f"大模型判断={cr['llm_winner']} | 我方价=¥{record['activity_price']}({cr['my_unit_cost_performance']}) vs "
-            f"闲鱼最佳ID={bxy['item_id']}(¥{bxy['comparable_price']}, {cr['xianyu_unit_cost_performance']}) | "
-            f"理由={cr['llm_reason']}"
-        )
+        logger.info(_format_single_comparison_card(idx, len(champions), record))
         if idx < len(champions):
             time.sleep(2.0)
 
     elapsed = time.monotonic() - t0
-    better_cnt = sum(1 for r in records if r.get("is_my_product_better"))
-    logger.info(
-        f"\n{'=' * 92}\n"
-        f"✅ [闲鱼高性价比探测任务/完成] 批次={batch_id} | 总耗时={elapsed:.1f}s | "
-        f"评估分类数={len(records)} | 我方性价比高于闲鱼数={better_cnt}\n"
-        f"{'=' * 92}"
-    )
-    for r in records:
-        cr = r["comparison_result"]
-        bxy = r["best_xianyu_product"]
-        tag = "🏆我方更优" if r["is_my_product_better"] else "闲鱼更优"
-        logger.info(
-            f"   📌 [{tag}] 分类=【{r['category_name']}】 | 比值={str(cr['cost_performance_ratio']):<8} "
-            f"(依据={cr['comparison_basis']}, LLM判断={cr['llm_winner']}) | "
-            f"我方¥{r['activity_price']} vs 闲鱼最佳({bxy['item_id']})¥{bxy['comparable_price']} | {r['name'][:34]}"
-        )
+    logger.info(_format_batch_summary_report(batch_id, elapsed, records))
     return records
 
 
 def main():
     parser = argparse.ArgumentParser(description="闲鱼高性价比商品探测与比价定时任务")
     parser.add_argument("--hours-window", type=int, default=72, help="内部商品库扫描时间窗口（默认72小时）")
-    parser.add_argument("--max-categories", "--max-candidates", dest="max_categories", type=int, default=5, help="单轮探测分类数（默认5）")
+    parser.add_argument("--max-categories", "--max-candidates", dest="max_categories", type=int, default=20, help="单轮探测分类数（默认20）")
     parser.add_argument("--max-search-items", type=int, default=20, help="每次闲鱼搜索抓取的商品数（默认20）")
     parser.add_argument("--max-detail-checks", type=int, default=0, help="每次自动补充详情与SKU的前排低价商品数（默认0，仅搜索不额外开详情）")
     parser.add_argument("--cooldown-hours", type=int, default=24, help="同一商品重复比价冷却期（默认24小时）")
