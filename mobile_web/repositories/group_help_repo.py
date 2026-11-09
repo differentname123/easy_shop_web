@@ -71,6 +71,24 @@ class GroupHelpRepository(BaseRepository):
                     return_document=ReturnDocument.AFTER,
                 )
                 return updated or existing, True
+
+            # 若该团此前被标为已满/已结束，团长重新上传海报时自动恢复上架
+            if existing.get("group_status") != GROUP_STATUS_ACTIVE or int(existing.get("remain_people") or 0) <= 0:
+                restored_remain = max(1, int(existing.get("remain_people") or 1))
+                updated = self.col.find_one_and_update(
+                    {"group_order_id": gid},
+                    {
+                        "$set": {
+                            "group_status": GROUP_STATUS_ACTIVE,
+                            "remain_people": restored_remain,
+                            "updated_at": now,
+                            "expires_at": max(float(existing.get("expires_at") or 0), now + 3600),
+                        }
+                    },
+                    projection={"_id": 0},
+                    return_document=ReturnDocument.AFTER,
+                )
+                return updated or existing, False
             return existing, False
 
         doc = {

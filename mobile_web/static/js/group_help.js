@@ -1,4 +1,4 @@
-// 拼多多多人团互助独立前端控制器 (零阻塞后台上传 + 本地缓存含失败记录 + 手机返回键防误退)
+// 拼多多多人团互助独立前端控制器 (零阻塞后台上传 + 本地缓存含失败记录 + 手机返回键防误退 + 跨端扫码自适应)
 (function (global) {
   'use strict';
   const { createApp, ref, onMounted, onUnmounted } = global.Vue;
@@ -51,7 +51,7 @@
         }, duration);
       };
 
-      // ==================== 手机返回键历史栈管理 (防止看详情返回时跳出页面) ====================
+      // ==================== 手机返回键历史栈管理 (仅针对详情抽屉与海报大图，防止返回跳出页面或打断文件选择) ====================
       const pushModalHistory = () => {
         try {
           if (global.history && typeof global.history.pushState === 'function') {
@@ -114,7 +114,6 @@
           return parsed
             .filter(it => it && (it.group_order_id || it.local_id))
             .map(it => {
-              // 若上次刷新页面时卡在 uploading，标记为失败以便用户重传
               if (it.parse_status === 'uploading') {
                 return {
                   ...it,
@@ -342,6 +341,13 @@
         fetchGroups(true);
       };
 
+      const onKeywordInput = () => {
+        if (!keyword.value.trim() && activeKeyword.value) {
+          activeKeyword.value = '';
+          fetchGroups(true);
+        }
+      };
+
       const clearSearch = () => {
         keyword.value = '';
         activeKeyword.value = '';
@@ -519,10 +525,13 @@
         popModalHistorySilently();
       };
 
+      const openPosterAndRecord = item => {
+        if (!item) return;
+        recordClick(item.group_order_id);
+        openFullPoster(item.poster_url);
+      };
+
       const openHelpGuide = (failedItem = null) => {
-        if (!helpModal.value.visible) {
-          pushModalHistory();
-        }
         helpModal.value = {
           visible: true,
           failedItem: failedItem || null,
@@ -530,13 +539,16 @@
       };
 
       const closeHelpGuide = () => {
-        if (!helpModal.value.visible) return;
         helpModal.value = { visible: false, failedItem: null };
-        popModalHistorySilently();
       };
 
       const goSeeOthersExample = () => {
         closeHelpGuide();
+        // 如果列表里已经有别人上传的团，直接弹出第一张真实海报大图供用户直观参考
+        if (items.value.length > 0 && items.value[0].poster_url) {
+          openFullPoster(items.value[0].poster_url);
+          return;
+        }
         filterMode.value = 'active';
         fetchGroups(true);
       };
@@ -557,11 +569,14 @@
         }
       };
 
-      // ==================== 参团跳转与计数 ====================
+      // ==================== 参团跳转与计数 (keepalive 防丢失 + 跨端环境自适应) ====================
       const recordClick = async gid => {
         if (!gid) return;
         try {
-          const resp = await global.fetch(`/api/group_help/click/${gid}`, { method: 'POST' });
+          const resp = await global.fetch(`/api/group_help/click/${gid}`, {
+            method: 'POST',
+            keepalive: true,
+          });
           const json = await resp.json();
           if (json.status === 'success' && json.data) {
             const idx = items.value.findIndex(it => it.group_order_id === gid);
@@ -574,9 +589,22 @@
         } catch (_) {}
       };
 
+      const isMobileNonWeChat = () => {
+        const ua = String((global.navigator && global.navigator.userAgent) || '');
+        const isMobile = /Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(ua);
+        const isWeChat = /MicroMessenger/i.test(ua);
+        return isMobile && !isWeChat;
+      };
+
       const jumpToApp = item => {
         if (!item) return;
         recordClick(item.group_order_id);
+        // 在微信内置浏览器或电脑浏览器中，pinduoduo:// 协议无法直接唤醒 App，直接展示高清二维码海报扫码参团
+        if (!isMobileNonWeChat()) {
+          openFullPoster(item.poster_url);
+          showToast('请长按或使用手机扫描二维码参团', 3000);
+          return;
+        }
         global.location.href = item.app_wake_url;
       };
 
@@ -601,7 +629,6 @@
         } catch (_) {}
 
         if (isTakedown && !isMyOwnGroup(gid) && !hasAcked) {
-          pushModalHistory();
           creditWarnModal.value = {
             visible: true,
             pendingAction: action,
@@ -613,13 +640,11 @@
       };
 
       const cancelCreditWarn = () => {
-        if (!creditWarnModal.value.visible) return;
         creditWarnModal.value = {
           visible: false,
           pendingAction: '',
           pendingRemain: null,
         };
-        popModalHistorySilently();
       };
 
       const confirmCreditWarnAndSubmit = () => {
@@ -661,6 +686,10 @@
               }
             }
             showToast('状态已更新，感谢反馈！');
+            // 若该团已满或已失效下架，自动收起详情抽屉方便用户继续看其他团
+            if (json.data.group_status !== 'active') {
+              closeDetail();
+            }
           } else {
             showToast(json.error_msg || '反馈失败');
           }
@@ -685,6 +714,24 @@
             const idx = items.value.findIndex(it => it.group_order_id === item.group_order_id);
             if (idx !== -1) items.value.splice(idx, 1);
             showToast('已将该团下架');
+          }
+        } catch (_) {
+          showToast('操作失败');
+        }
+      };
+
+      const quickMyGroupRelist = async item => {
+        if (!item || !item.group_order_id) return;
+        try {
+          const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'set_remain', remain_people: 1 }),
+          });
+          const json = await resp.json();
+          if (resp.ok && json.status === 'success' && json.data) {
+            upsertMyGroup(json.data, false);
+            showToast('已重新上架大厅展示');
           }
         } catch (_) {
           showToast('操作失败');
@@ -731,7 +778,9 @@
         refreshMyGroups,
         removeMyGroup,
         quickMyGroupTakedown,
+        quickMyGroupRelist,
         onSearch,
+        onKeywordInput,
         clearSearch,
         switchFilter,
         triggerUpload,
@@ -740,6 +789,7 @@
         closeDetail,
         openFullPoster,
         closeFullPoster,
+        openPosterAndRecord,
         openHelpGuide,
         closeHelpGuide,
         goSeeOthersExample,

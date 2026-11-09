@@ -17,6 +17,8 @@ r"""
        - `delete_item(...)`                 : 将指定 `item_id` 商品彻底删除
        - `get_messages(...)`                : 纯消息监控（获取谁发了消息、何时发的、发了什么内容、明确谈论的是哪件商品 `item_id`/`item_title`/`is_my_item`）
        - `reply_message(...)`               : 向指定买家（可选进一步限定 `item_id`）发送回复消息
+       - `search_xianyu_items(...)`         : 免登录搜索指定关键字的闲鱼商品概览列表（含标题描述、价格、想要人数、是否包邮等）
+       - `get_xianyu_item_detail(...)`      : 免登录获取指定商品的完整详情（含完整文字描述 `desc`、多规格 `sku_list` 及各规格对应价格与库存）
        - `check_login_status(...)`          : 快速检测指定浏览器目录账号是否在线
        - `open_browser_for_manual_use(...)` : 手动打开该独立浏览器目录扫码登录或日常维护
 =========================================================================================
@@ -36,7 +38,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -55,6 +57,7 @@ logger = logging.getLogger("publish_to_xianyu")
 # 全局默认配置与串行锁配置
 # ==============================================================================
 DEFAULT_USER_DATA_DIR = r"W:\temp\xianyu_myself"
+DEFAULT_GUEST_USER_DATA_DIR = r"W:\temp\xianyu_guest"
 GOOFISH_HOME_URL = "https://www.goofish.com"
 GOOFISH_PUBLISH_URL = "https://www.goofish.com/publish"
 GOOFISH_PERSONAL_URL = "https://www.goofish.com/personal"
@@ -1805,10 +1808,601 @@ def reply_message(
 
 
 # ==============================================================================
+# 六、 免登录公开市场比价检索（搜索关键字商品概览 + 获取指定商品完整详情与多规格价格）
+# ==============================================================================
+def _verify_guest_no_risk_block(
+    page,
+    auth_tracker: Dict[str, Any],
+    user_data_dir: str,
+    task_name: str = "",
+) -> None:
+    """
+    免登录（访客模式）专用风控检测：
+    不要求账号登录（允许无 `unb` Cookie、允许存在 `mini_login` 弹窗），
+    但一旦检测到触发阿里滑块/限流（`RGV587_ERROR` 或页面出现 `baxia/punish` 滑块验证框），
+    立即打印告警并抛出 `XianyuOfflineError(error_code="RISK_CONTROL_BLOCKED")` 中止操作。
+    """
+    risk_reasons: List[str] = []
+    if auth_tracker.get("risk_rets"):
+        risk_reasons.append(f"接口返回风控滑块拦截({auth_tracker['risk_rets'][0]})")
+
+    punish_frames = [
+        f.url
+        for f in page.frames
+        if ("punish" in f.url or "baxia" in f.url or "sec.taobao.com" in f.url)
+        and "mini_login" not in f.url
+    ]
+    if punish_frames:
+        risk_reasons.append("页面已弹出阿里安全滑块验证框(baxia/punish)")
+
+    if risk_reasons:
+        reason_str = "；".join(risk_reasons)
+        logger.error(
+            f"\n{'!' * 76}\n"
+            f"🚨 [风控滑块告警/免登录检索] 检测到闲鱼触发安全验证/滑块限制，已立即中止操作！\n"
+            f"   ├── 触发任务   : {task_name or '免登录检索任务'}\n"
+            f"   ├── 浏览器目录 : <{user_data_dir}>\n"
+            f"   ├── 当前页面   : {page.url}\n"
+            f"   ├── 风控证据   : {reason_str}\n"
+            f"   └── 恢复方式   : 请暂停检索或调用 open_browser_for_manual_use(r\"{user_data_dir}\") 手动过滑块，或更换新的访客目录！\n"
+            f"{'!' * 76}"
+        )
+        raise XianyuOfflineError(
+            user_data_dir=user_data_dir,
+            reason=reason_str,
+            error_code="RISK_CONTROL_BLOCKED",
+        )
+
+
+def _dismiss_guest_login_modal(page) -> None:
+    """移除未登录状态下前端弹出的登录遮罩层（不影响页面正常搜索与浏览）。"""
+    try:
+        page.evaluate(
+            """() => {
+                document.querySelectorAll('.ant-modal-root, [class*="login-modal"]').forEach(el => el.remove());
+                if (document.body && document.body.style) {
+                    document.body.style.overflow = 'auto';
+                }
+            }"""
+        )
+    except Exception:
+        pass
+
+
+def _parse_float_price(val: Any, default: float = 0.0) -> float:
+    """从字符串（如 '¥55'、'38.99'）或数字中安全提取浮点数价格。"""
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return round(float(val), 2)
+    s = str(val).strip()
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    return round(float(m.group(1)), 2) if m else default
+
+
+def _parse_int_num(val: Any, default: int = 0) -> int:
+    """从字符串（如 '19人想要'、'187'）或数字中安全提取整数。"""
+    if val is None:
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    s = str(val).strip()
+    m = re.search(r"(\d+)", s)
+    return int(m.group(1)) if m else default
+
+
+def _parse_search_result_item(item_wrap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """解析 `mtop.taobao.idlemtopsearch.pc.search` 单条商品卡片数据。"""
+    if not isinstance(item_wrap, dict):
+        return None
+    ex = (
+        ((item_wrap.get("data") or {}).get("item") or {})
+        .get("main", {})
+        .get("exContent")
+    )
+    if not isinstance(ex, dict):
+        return None
+
+    dp = ex.get("detailParams") or {}
+    item_id = str(ex.get("itemId") or dp.get("itemId") or "").strip()
+    if not item_id:
+        return None
+
+    # 标题与外显描述：优先取 detailParams.title（含换行完整摘要），其次取 ex.title
+    title = str(dp.get("title") or ex.get("title") or "").strip()
+
+    # 价格提取：优先取 detailParams.soldPrice，其次拼接 ex.price 数组
+    raw_sold_price = dp.get("soldPrice")
+    if raw_sold_price is not None and str(raw_sold_price).strip() != "":
+        price = _parse_float_price(raw_sold_price)
+        raw_price_text = str(raw_sold_price).strip()
+    else:
+        price_parts = ex.get("price") or []
+        if isinstance(price_parts, list):
+            joined = "".join(str(p.get("text") or "") for p in price_parts if isinstance(p, dict))
+        else:
+            joined = str(price_parts)
+        price = _parse_float_price(joined)
+        raw_price_text = joined.strip()
+
+    original_price = _parse_float_price(ex.get("oriPrice"), default=0.0)
+
+    # 解析 fishTags（提取 "XX人想要"、是否包邮、卖家信用标签等）
+    want_cnt = _parse_int_num(ex.get("wantCnt") or dp.get("wantCnt"), default=0)
+    is_free_shipping = "包邮" in title
+    credit_tags: List[str] = []
+
+    fish_tags = ex.get("fishTags") or {}
+    if isinstance(fish_tags, dict):
+        for region_val in fish_tags.values():
+            if not isinstance(region_val, dict):
+                continue
+            tlist = region_val.get("tagList") or []
+            for t in tlist:
+                if not isinstance(t, dict):
+                    continue
+                tdata = t.get("data") or {}
+                content = str(tdata.get("content") or "").strip()
+                if not content:
+                    continue
+                if "想要" in content and want_cnt == 0:
+                    want_cnt = _parse_int_num(content, default=0)
+                elif content == "freeShippingIcon" or "包邮" in content:
+                    is_free_shipping = True
+                elif not content.startswith("¥") and content not in credit_tags:
+                    credit_tags.append(content)
+
+    shop_label = ex.get("userFishShopLabel") or {}
+    if isinstance(shop_label, dict):
+        for t in shop_label.get("tagList") or []:
+            if isinstance(t, dict):
+                c = str((t.get("data") or {}).get("content") or "").strip()
+                if c and c not in credit_tags:
+                    credit_tags.append(c)
+
+    pic_url = str(ex.get("picUrl") or "").strip()
+    if pic_url.startswith("//"):
+        pic_url = "https:" + pic_url
+
+    return {
+        "item_id": item_id,
+        "item_url": f"https://www.goofish.com/item?id={item_id}",
+        "title": title,
+        "price": price,
+        "raw_price_text": raw_price_text,
+        "original_price": original_price,
+        "want_cnt": want_cnt,
+        "is_free_shipping": is_free_shipping,
+        "area": str(ex.get("area") or "").strip(),
+        "seller_nick": str(ex.get("userNickName") or dp.get("userNick") or "").strip(),
+        "seller_tags": credit_tags,
+        "image_url": pic_url,
+    }
+
+
+def _parse_sku_entry(sku: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """解析商品详情 `itemDO.skuList` 中的单个规格（SKU）信息与对应价格。"""
+    if not isinstance(sku, dict):
+        return None
+
+    # 价格：优先使用 priceInCent / price（单位均为分）
+    price_cent = sku.get("priceInCent")
+    if price_cent is None:
+        price_cent = sku.get("price")
+    sku_price = round(float(price_cent) / 100.0, 2) if price_cent is not None else 0.0
+
+    specs: Dict[str, str] = {}
+    spec_parts: List[str] = []
+
+    # 方式1：从 propertyList 提取规格名和规格值
+    prop_list = sku.get("propertyList") or []
+    if isinstance(prop_list, list) and prop_list:
+        for p in prop_list:
+            if not isinstance(p, dict):
+                continue
+            p_name = str(p.get("propertyText") or p.get("propertyName") or "").strip()
+            p_val = str(p.get("actualValueText") or p.get("valueText") or "").strip()
+            if p_name or p_val:
+                key = p_name or "规格"
+                specs[key] = p_val
+                spec_parts.append(f"{key}: {p_val}" if p_name else p_val)
+
+    # 方式2：从 features.idlePvPairs 提取（格式如 "228680331#颜色^0#邮票修狗$100018377#适用型号^0#15pro"）
+    features = sku.get("features") or {}
+    if not spec_parts and isinstance(features, dict):
+        pv_pairs = str(features.get("idlePvPairs") or "").strip()
+        if pv_pairs:
+            for seg in pv_pairs.split("$"):
+                if "^" in seg:
+                    left, right = seg.split("^", 1)
+                    p_name = left.split("#", 1)[-1].strip() if "#" in left else left.strip()
+                    p_val = right.split("#", 1)[-1].strip() if "#" in right else right.strip()
+                    if p_name or p_val:
+                        key = p_name or "规格"
+                        specs[key] = p_val
+                        spec_parts.append(f"{key}: {p_val}" if p_name else p_val)
+
+    # 方式3：兜底从 propertyImage.pvPairDO 提取
+    if not spec_parts:
+        pv_do = ((sku.get("propertyImage") or {}).get("pvPairDO")) or {}
+        if isinstance(pv_do, dict):
+            p_name = str(pv_do.get("propertyText") or "").strip()
+            p_val = str(pv_do.get("actualValueText") or pv_do.get("valueText") or "").strip()
+            if p_name or p_val:
+                key = p_name or "规格"
+                specs[key] = p_val
+                spec_parts.append(f"{key}: {p_val}" if p_name else p_val)
+
+    qty_raw = sku.get("quantity")
+    if qty_raw is None and isinstance(features, dict):
+        qty_raw = features.get("idleOriginalQuantity")
+    quantity = _parse_int_num(qty_raw, default=0)
+
+    return {
+        "sku_id": str(sku.get("inventoryId") or sku.get("skuId") or "").strip(),
+        "spec_text": " | ".join(spec_parts),
+        "specs": specs,
+        "price": sku_price,
+        "quantity": quantity,
+    }
+
+
+def search_xianyu_items(
+    keyword: str,
+    max_items: int = 30,
+    user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
+    debug: bool = False,
+    lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+) -> Dict[str, Any]:
+    """
+    免登录搜索指定关键字的闲鱼商品概览信息：
+    - 使用指定的 `user_data_dir`（默认 `W:\\temp\\xianyu_guest`，无需登录任何闲鱼账号）；
+    - 自动访问首页完成匿名 `_m_h5_tk` 令牌握手并移除登录遮罩，随后触发关键字搜索；
+    - 拦截并解析 `mtop.taobao.idlemtopsearch.pc.search` 接口返回的商品列表（单次最多 30 条），
+      提取每个商品的 `item_id`、`title`（含列表外显描述）、`price`、`original_price`、`want_cnt`（想要人数）、
+      `is_free_shipping`（是否包邮）、`area`、`seller_nick`、`seller_tags`、`image_url` 等概览数据。
+    """
+    kw_clean = str(keyword or "").strip()
+    if not kw_clean:
+        raise ValueError("search_xianyu_items: 搜索关键字 keyword 不能为空")
+
+    limit = max(1, int(max_items or 30))
+    tag = _dir_tag(user_data_dir)
+    t0 = time.monotonic()
+
+    try:
+        with _browser_session_guard(
+            user_data_dir=user_data_dir,
+            debug=debug,
+            task_name=f"search_xianyu_items:{kw_clean[:20]}",
+            lock_timeout_sec=lock_timeout_sec,
+        ) as (context, page, auth_tracker):
+            search_packets: List[Dict[str, Any]] = []
+
+            def _bind_search_listener(target_page) -> None:
+                def _on_response(resp):
+                    if "mtop.taobao.idlemtopsearch.pc.search/" in resp.url:
+                        try:
+                            body = resp.json()
+                            if isinstance(body, dict):
+                                search_packets.append(body)
+                        except Exception:
+                            pass
+
+                target_page.on("response", _on_response)
+
+            _bind_search_listener(page)
+            context.on("page", _bind_search_listener)
+
+            # 1. 打开闲鱼首页初始化/刷新匿名 _m_h5_tk 令牌
+            page.goto(GOOFISH_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+            for _ in range(15):
+                cookies = {c["name"]: c["value"] for c in context.cookies() if c.get("name")}
+                if cookies.get("_m_h5_tk"):
+                    break
+                page.wait_for_timeout(200)
+            page.wait_for_timeout(1000)
+
+            _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
+            _dismiss_guest_login_modal(page)
+
+            # 2. 在首页搜索框输入关键字并触发搜索
+            search_packets.clear()
+            search_input = page.locator(
+                "input[class*='search-input'], input[placeholder*='搜索'], input[type='text']"
+            ).first
+            if search_input.count() > 0:
+                search_input.fill(kw_clean)
+                search_input.press("Enter")
+            else:
+                page.goto(f"{GOOFISH_HOME_URL}/search?q={quote(kw_clean)}", wait_until="domcontentloaded", timeout=30000)
+
+            # 3. 等待搜索 MTOP 数据包返回（最长等待 8 秒）
+            success_packet: Optional[Dict[str, Any]] = None
+            for _ in range(32):
+                for pkt in reversed(search_packets):
+                    ret_str = " | ".join(str(x) for x in (pkt.get("ret") or []))
+                    if "SUCCESS" in ret_str:
+                        success_packet = pkt
+                        break
+                if success_packet is not None or auth_tracker.get("risk_rets"):
+                    break
+                page.wait_for_timeout(250)
+
+            active_page = context.pages[-1] if context.pages else page
+            _verify_guest_no_risk_block(active_page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
+
+            if success_packet is None:
+                elapsed = time.monotonic() - t0
+                logger.warning(
+                    f"⚠️ [免登录搜索/未捕获有效数据包] 目录={tag} | 关键字=【{kw_clean}】 | "
+                    f"已捕获包数={len(search_packets)} | 失败接口={auth_tracker.get('failed_apis')} | 耗时={elapsed:.2f}s"
+                )
+                return {
+                    "ok": False,
+                    "is_offline": False,
+                    "is_risk_blocked": False,
+                    "action": "search_xianyu_items",
+                    "error_code": "SEARCH_PACKET_EMPTY",
+                    "user_data_dir": user_data_dir,
+                    "keyword": kw_clean,
+                    "total_count": 0,
+                    "items": [],
+                    "message": f"未捕获到关键字【{kw_clean}】的有效闲鱼搜索数据包",
+                }
+
+            raw_list = (success_packet.get("data") or {}).get("resultList") or []
+            parsed_items: List[Dict[str, Any]] = []
+            for wrap in raw_list:
+                item_obj = _parse_search_result_item(wrap)
+                if item_obj is not None:
+                    parsed_items.append(item_obj)
+                    if len(parsed_items) >= limit:
+                        break
+
+            prices = sorted(x["price"] for x in parsed_items if x["price"] > 0)
+            min_p = prices[0] if prices else 0.0
+            max_p = prices[-1] if prices else 0.0
+            med_p = prices[len(prices) // 2] if prices else 0.0
+            elapsed = time.monotonic() - t0
+
+            logger.info(
+                f"[免登录搜索/完成] ✅ 目录={tag} | 关键字=【{kw_clean}】 | 返回商品数={len(parsed_items)} | "
+                f"价格区间=¥{min_p}~¥{max_p} (中位价=¥{med_p}) | 耗时={elapsed:.2f}s"
+            )
+            return {
+                "ok": True,
+                "is_offline": False,
+                "is_risk_blocked": False,
+                "action": "search_xianyu_items",
+                "user_data_dir": user_data_dir,
+                "keyword": kw_clean,
+                "total_count": len(parsed_items),
+                "price_summary": {
+                    "min_price": min_p,
+                    "median_price": med_p,
+                    "max_price": max_p,
+                },
+                "items": parsed_items,
+            }
+    except XianyuOfflineError as e:
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="search_xianyu_items")
+    except XianyuLockTimeoutError as e:
+        return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="search_xianyu_items")
+
+
+def get_xianyu_item_detail(
+    item_id_or_url: str,
+    user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
+    debug: bool = False,
+    lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+) -> Dict[str, Any]:
+    """
+    免登录获取指定闲鱼商品的完整详情（含完整文字描述 + 多规格 SKU 及对应价格明细）：
+    - 支持直接传入商品数字 ID（如 `"1069653908592"`）或商品详情页链接（如 `"https://www.goofish.com/item?id=1069653908592"`）；
+    - 使用指定的 `user_data_dir`（默认 `W:\\temp\\xianyu_guest`，无需登录任何闲鱼账号）；
+    - 自动校验/初始化匿名 `_m_h5_tk` 令牌并拦截 `mtop.taobao.idle.pc.detail` 响应；
+    - 返回完整文字描述 (`desc`)、售价 (`price`)、运费 (`transport_fee`)、想要人数 (`want_cnt`)、浏览量 (`browse_cnt`)，
+      以及当商品存在多规格时完整的 `sku_list`（每个规格的名称 `spec_text`、结构化属性 `specs`、对应价格 `price`、库存 `quantity`）。
+    """
+    raw_target = str(item_id_or_url or "").strip()
+    if not raw_target:
+        raise ValueError("get_xianyu_item_detail: item_id_or_url 不能为空")
+
+    id_match = re.search(r"[?&]id=(\d+)", raw_target)
+    if id_match:
+        item_id = id_match.group(1)
+    else:
+        digits_match = re.search(r"(\d{8,})", raw_target)
+        item_id = digits_match.group(1) if digits_match else raw_target
+
+    detail_url = f"{GOOFISH_HOME_URL}/item?id={item_id}"
+    tag = _dir_tag(user_data_dir)
+    t0 = time.monotonic()
+
+    try:
+        with _browser_session_guard(
+            user_data_dir=user_data_dir,
+            debug=debug,
+            task_name=f"get_xianyu_item_detail:{item_id}",
+            lock_timeout_sec=lock_timeout_sec,
+        ) as (context, page, auth_tracker):
+            detail_packets: List[Dict[str, Any]] = []
+
+            def _on_response(resp):
+                if "mtop.taobao.idle.pc.detail/" in resp.url:
+                    try:
+                        body = resp.json()
+                        if isinstance(body, dict):
+                            detail_packets.append(body)
+                    except Exception:
+                        pass
+
+            page.on("response", _on_response)
+
+            # 1. 若当前浏览器目录尚未生成匿名 _m_h5_tk 令牌，先访问首页初始化
+            cookies = {c["name"]: c["value"] for c in context.cookies() if c.get("name")}
+            if not cookies.get("_m_h5_tk"):
+                page.goto(GOOFISH_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+                for _ in range(15):
+                    cookies = {c["name"]: c["value"] for c in context.cookies() if c.get("name")}
+                    if cookies.get("_m_h5_tk"):
+                        break
+                    page.wait_for_timeout(200)
+                page.wait_for_timeout(600)
+                _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name="get_xianyu_item_detail")
+
+            # 2. 访问目标商品详情页并等待 mtop.taobao.idle.pc.detail 响应
+            success_packet: Optional[Dict[str, Any]] = None
+            for attempt in range(2):
+                detail_packets.clear()
+                page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+                for _ in range(32):
+                    for pkt in reversed(detail_packets):
+                        ret_str = " | ".join(str(x) for x in (pkt.get("ret") or []))
+                        if "SUCCESS" in ret_str and isinstance((pkt.get("data") or {}).get("itemDO"), dict):
+                            success_packet = pkt
+                            break
+                    if success_packet is not None or auth_tracker.get("risk_rets"):
+                        break
+                    page.wait_for_timeout(250)
+
+                _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name="get_xianyu_item_detail")
+                if success_packet is not None:
+                    break
+
+                # 若首次因匿名令牌过期未拿到数据包，回首页刷新一次匿名令牌后重试
+                if attempt == 0:
+                    page.goto(GOOFISH_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(1500)
+                    _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name="get_xianyu_item_detail")
+
+            if success_packet is None:
+                elapsed = time.monotonic() - t0
+                logger.warning(
+                    f"⚠️ [免登录详情/未捕获有效数据包] 目录={tag} | 商品ID={item_id} | "
+                    f"已捕获包数={len(detail_packets)} | 失败接口={auth_tracker.get('failed_apis')} | 耗时={elapsed:.2f}s"
+                )
+                return {
+                    "ok": False,
+                    "is_offline": False,
+                    "is_risk_blocked": False,
+                    "action": "get_xianyu_item_detail",
+                    "error_code": "DETAIL_PACKET_EMPTY",
+                    "user_data_dir": user_data_dir,
+                    "item_id": item_id,
+                    "item_url": detail_url,
+                    "message": f"未捕获到商品 ({item_id}) 的有效详情数据包",
+                }
+
+            data = success_packet.get("data") or {}
+            item_do = data.get("itemDO") or {}
+            seller_do = data.get("sellerDO") or {}
+
+            desc = str(item_do.get("desc") or "").strip()
+            title = str(item_do.get("title") or "").strip()
+            if not title and desc:
+                title = desc.splitlines()[0].strip()
+
+            price = _parse_float_price(item_do.get("soldPrice"), default=0.0)
+            original_price = _parse_float_price(item_do.get("originalPrice"), default=0.0)
+            transport_fee = _parse_float_price(item_do.get("transportFee"), default=0.0)
+
+            rel_tags = item_do.get("priceRelativeTags") or []
+            has_baoyou_tag = any(
+                isinstance(t, dict) and ("包邮" in str(t.get("text") or "") or (t.get("trackParams") or {}).get("tagType") == "baoyou")
+                for t in rel_tags
+            )
+            is_free_shipping = bool(transport_fee == 0.0 and (has_baoyou_tag or "包邮" in desc or "包邮" in title))
+
+            # 解析多规格 SKU 列表
+            raw_skus = item_do.get("skuList") or item_do.get("idleItemSkuList") or []
+            sku_list: List[Dict[str, Any]] = []
+            if isinstance(raw_skus, list):
+                for s in raw_skus:
+                    parsed_sku = _parse_sku_entry(s)
+                    if parsed_sku is not None:
+                        sku_list.append(parsed_sku)
+
+            sku_prices = [s["price"] for s in sku_list if s["price"] > 0]
+            min_price = _parse_float_price(item_do.get("minPrice"), default=(min(sku_prices) if sku_prices else price))
+            max_price = _parse_float_price(item_do.get("maxPrice"), default=(max(sku_prices) if sku_prices else price))
+
+            # 解析属性标签 cpvLabels（如品牌、成色、规格属性等）
+            cpv_labels: List[Dict[str, str]] = []
+            for lbl in item_do.get("cpvLabels") or []:
+                if isinstance(lbl, dict):
+                    p_name = str(lbl.get("propertyName") or "").strip()
+                    v_name = str(lbl.get("valueName") or "").strip()
+                    if p_name or v_name:
+                        cpv_labels.append({"name": p_name, "value": v_name})
+
+            # 解析图片列表
+            images: List[str] = []
+            for img in item_do.get("imageInfos") or []:
+                if isinstance(img, dict):
+                    u = str(img.get("url") or "").strip()
+                    if u.startswith("//"):
+                        u = "https:" + u
+                    if u and u not in images:
+                        images.append(u)
+
+            want_cnt = _parse_int_num(item_do.get("wantCnt"), default=0)
+            browse_cnt = _parse_int_num(item_do.get("browseCnt"), default=0)
+            quantity = _parse_int_num(item_do.get("quantity"), default=1)
+
+            seller_nick = str(seller_do.get("nick") or "").strip()
+            seller_city = str(seller_do.get("city") or seller_do.get("publishCity") or "").strip()
+            seller_sold_count = _parse_int_num(seller_do.get("hasSoldNumInteger"), default=0)
+            seller_good_rate = str(seller_do.get("newGoodRatioRate") or "").strip()
+
+            elapsed = time.monotonic() - t0
+            logger.info(
+                f"[免登录详情/完成] ✅ 目录={tag} | 商品ID={item_id} | 售价=¥{price} (区间=¥{min_price}~¥{max_price}) | "
+                f"多规格数={len(sku_list)} | 想要={want_cnt} | 浏览={browse_cnt} | 耗时={elapsed:.2f}s"
+            )
+            return {
+                "ok": True,
+                "is_offline": False,
+                "is_risk_blocked": False,
+                "action": "get_xianyu_item_detail",
+                "user_data_dir": user_data_dir,
+                "item_id": item_id,
+                "item_url": detail_url,
+                "title": title,
+                "desc": desc,
+                "price": price,
+                "original_price": original_price,
+                "transport_fee": transport_fee,
+                "is_free_shipping": is_free_shipping,
+                "min_price": min_price,
+                "max_price": max_price,
+                "has_multi_sku": len(sku_list) > 0,
+                "sku_list": sku_list,
+                "cpv_labels": cpv_labels,
+                "want_cnt": want_cnt,
+                "browse_cnt": browse_cnt,
+                "quantity": quantity,
+                "images": images,
+                "seller_nick": seller_nick,
+                "seller_city": seller_city,
+                "seller_sold_count": seller_sold_count,
+                "seller_good_rate": seller_good_rate,
+            }
+    except XianyuOfflineError as e:
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="get_xianyu_item_detail")
+    except XianyuLockTimeoutError as e:
+        return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="get_xianyu_item_detail")
+
+
+# ==============================================================================
 #                                  函数调用示例
 # ==============================================================================
 if __name__ == "__main__":
     USER_DATA_DIR = r"W:\temp\xianyu_myself"
+    GUEST_USER_DATA_DIR = r"W:\temp\xianyu_guest"
 
     # # 场景一：手动打开独立浏览器目录扫码登录或日常维护（关闭窗口自动保存退出）
     # open_browser_for_manual_use(
@@ -1841,15 +2435,15 @@ if __name__ == "__main__":
     # )
     # print("在售查询结果:", json.dumps(selling_res, ensure_ascii=False, indent=2))
 
-    # 场景五：纯消息监控（获取谁发了信息、何时发的、发了什么内容、明确谈论的是哪件商品）
-    msg_res = get_messages(
-        user_data_dir=USER_DATA_DIR,
-        only_unread=False,
-        only_my_items=False,
-        max_sessions=3,
-        debug=False,
-    )
-    print("消息监控结果:", json.dumps(msg_res, ensure_ascii=False, indent=2))
+    # # 场景五：纯消息监控（获取谁发了信息、何时发的、发了什么内容、明确谈论的是哪件商品）
+    # msg_res = get_messages(
+    #     user_data_dir=USER_DATA_DIR,
+    #     only_unread=False,
+    #     only_my_items=False,
+    #     max_sessions=3,
+    #     debug=False,
+    # )
+    # print("消息监控结果:", json.dumps(msg_res, ensure_ascii=False, indent=2))
 
     # # 场景六：根据商品与买家定制话术并回复消息（支持可选传入 item_id 精准校验会话商品）
     # reply_res = reply_message(
@@ -1860,3 +2454,22 @@ if __name__ == "__main__":
     #     debug=False,
     # )
     # print("消息回复结果:", json.dumps(reply_res, ensure_ascii=False, indent=2))
+
+    # 场景七：免登录搜索指定关键字的闲鱼商品概览 + 获取指定商品完整详情（含完整描述与多规格SKU价格）
+    search_res = search_xianyu_items(
+        keyword="可口可乐 330ml 24罐",
+        max_items=5,
+        user_data_dir=GUEST_USER_DATA_DIR,
+        debug=False,
+    )
+    print("免登录搜索结果:", json.dumps(search_res, ensure_ascii=False, indent=2))
+
+    if search_res.get("ok") and search_res.get("items"):
+        first_id = search_res["items"][0]["item_id"]
+        detail_res = get_xianyu_item_detail(
+            item_id_or_url=first_id,
+            user_data_dir=GUEST_USER_DATA_DIR,
+            debug=False,
+        )
+        print("免登录商品详情:", json.dumps(detail_res, ensure_ascii=False, indent=2))
+

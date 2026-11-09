@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="format-detection" content="telephone=no">
   <title>拼多多多人团互助</title>
-  <link rel="stylesheet" href="/static/css/group_help.css?v=20261109-3">
+  <link rel="stylesheet" href="/static/css/group_help.css?v=20261109-4">
   <script src="/static/js/vue.global.prod.js?v=ux-20261107-2"></script>
 </head>
 <body>
@@ -36,10 +36,12 @@
       <div class="gh-search-input-wrap">
         <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
         <input
-          type="text"
+          type="search"
+          enterkeyhint="search"
           class="gh-search-input"
           placeholder="搜索商品名称..."
           v-model="keyword"
+          @input="onKeywordInput"
           @keyup.enter="onSearch"
         />
         <button v-if="keyword" class="gh-clear-btn" @click="clearSearch">✕</button>
@@ -156,6 +158,13 @@
                 >
                   已满下架
                 </button>
+                <button
+                  v-else-if="item.remaining_seconds > 0"
+                  class="gh-mini-outline-btn"
+                  @click="quickMyGroupRelist(item)"
+                >
+                  重新上架
+                </button>
                 <button class="gh-text-btn" @click="removeMyGroup(item)">删除</button>
               </div>
             </div>
@@ -236,7 +245,7 @@
             :src="selectedGroup.poster_url"
             :alt="selectedGroup.goods_name"
             class="gh-detail-poster"
-            @click="openFullPoster(selectedGroup.poster_url)"
+            @click="openPosterAndRecord(selectedGroup)"
           />
           <div class="gh-detail-meta">
             <div class="gh-detail-title">{{ selectedGroup.goods_name }}</div>
@@ -245,19 +254,23 @@
               <span class="gh-remain-badge">{{ statusBadgeText(selectedGroup) }}</span>
             </div>
             <div class="gh-sub-meta">
-              {{ selectedGroup.click_count }}人去过 · 剩{{ formatRemaining(selectedGroup.remaining_seconds) }} · 点击左图可放大扫码
+              {{ selectedGroup.click_count }}人去过 · 剩{{ formatRemaining(selectedGroup.remaining_seconds) }}
             </div>
           </div>
         </div>
 
-        <!-- 主操作：唯一醒目大按钮 -->
+        <!-- 主操作：唤醒App参团 + 看大图扫码/网页打开 -->
         <div class="gh-jump-section">
           <button class="gh-btn-app-jump" @click="jumpToApp(selectedGroup)">
             🚀 去拼多多参团
           </button>
           <div class="gh-h5-fallback-row">
+            <button class="gh-link-btn" @click="openPosterAndRecord(selectedGroup)">
+              📷 看二维码大图扫码
+            </button>
+            <span class="gh-link-sep">|</span>
             <button class="gh-link-btn" @click="jumpToH5(selectedGroup)">
-              未唤醒App？点此网页打开
+              🌐 网页打开
             </button>
           </div>
         </div>
@@ -315,12 +328,12 @@
           2. 不要上传普通商品截图或没有二维码的页面截图。
         </p>
         <p style="margin-top:8px;color:#d4380d;font-weight:600">
-          💡 不清楚长什么样？您可以先点开大厅里其他人发的团，点击商品小图看看别人发的是哪种图片！
+          💡 不清楚长什么样？点下方【看看别人发的图】即可直接查看标准样式！
         </p>
       </div>
 
       <div class="gh-dialog-actions">
-        <button class="gh-btn-secondary" @click="goSeeOthersExample">去看看别人的图</button>
+        <button class="gh-btn-secondary" @click="goSeeOthersExample">看看别人发的图</button>
         <button class="gh-btn-app-jump" style="padding:10px;font-size:14px" @click="reuploadFromHelp">
           上传拼团图片
         </button>
@@ -350,15 +363,18 @@
   <!-- 点击放大查看完整二维码海报图 -->
   <div
     class="gh-modal-mask"
-    style="align-items:center;padding:20px;z-index:300"
+    style="align-items:center;padding:20px;z-index:300;flex-direction:column;gap:10px"
     v-if="fullPosterUrl"
     @click="closeFullPoster"
   >
     <img
       :src="fullPosterUrl"
       alt="拼团分享海报"
-      style="max-width:92vw;max-height:84vh;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,0.4)"
+      style="max-width:92vw;max-height:80vh;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,0.4)"
     />
+    <span style="color:#fff;font-size:12.5px;background:rgba(0,0,0,0.6);padding:4px 12px;border-radius:99px">
+      长按或使用拼多多/微信扫描图中二维码参团 · 点击任意处关闭
+    </span>
   </div>
 
   <!-- 底部固定导航栏 -->
@@ -385,6 +401,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=20261109-3"></script>
+<script src="/static/js/group_help.js?v=20261109-4"></script>
 </body>
 </html>
