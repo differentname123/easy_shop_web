@@ -898,7 +898,7 @@ def _build_final_record(
 # ==============================================================================
 def run_discovery_cycle(
     hours_window: int = 72,
-    max_categories: int = 5,
+    max_categories: int = 20,
     max_search_items: int = 20,
     max_detail_checks: int = 0,
     cooldown_hours: int = 24,
