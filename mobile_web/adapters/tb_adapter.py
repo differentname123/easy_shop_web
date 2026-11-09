@@ -443,9 +443,9 @@ class TaobaoAdapter(BasePlatformAdapter):
             err = ztk_res.get("error_msg") if isinstance(ztk_res, dict) else "淘宝口令或链接解析转链失败"
             is_unauth = self._is_unauthorized_error(ztk_res)
             code = "AUTH_REQUIRED" if is_unauth else (ztk_res.get("error_code") if isinstance(ztk_res, dict) else "PROMOTION_FAILED")
-            if code == "UNSUPPORTED_TB_NUMERIC_ID" or "不支持数字id" in _text(err):
+            if code == "UNSUPPORTED_TB_NUMERIC_ID" or "不支持数字id" in _text(err) or ("e.tb.cn" in text.lower() and "商品id解析错误" in _text(err).lower()):
                 code = "UNSUPPORTED_TB_NUMERIC_ID"
-                err = "淘宝联盟已停用纯数字商品ID直接转链，请粘贴淘口令或带推广属性的链接"
+                err = "淘宝联盟已停用纯数字商品ID（及手淘原生 e.tb.cn 普通分享链接）直接转链，请粘贴淘口令、带推广属性的链接或在首页搜索该商品标题"
             return _error(code or "PROMOTION_FAILED", err, need_auth=is_unauth)
 
         link = ztk_res.get("final_link") or ztk_res.get("url") or ""

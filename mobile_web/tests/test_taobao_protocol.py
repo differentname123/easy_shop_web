@@ -745,3 +745,21 @@ def test_universal_convert_promotional_copy_uses_piliang_and_never_falls_back_to
     official.search_goods.assert_not_called()
 
 
+    # 当输入为手淘 App 原生普通分享文案 (e.tb.cn 纯数字 ID) 时，明确返回 UNSUPPORTED_TB_NUMERIC_ID 指引，绝不爬虫或搜索兜底
+    http_etb = SimpleNamespace(get=Mock(side_effect=[
+        reply({"status": 301, "content": "很抱歉！商品ID解析错误！！！"}),
+        reply({"status": 301, "content": "很抱歉！商品ID解析错误！！！"}),
+    ]))
+    ztk_etb = ZtkClient("ztk_key", "ztk_sid", http_etb, appkey_list=("ztk_key",))
+    adapter_etb = make_adapter(official, ztk=ztk_etb, tb_channel_pid="mm_1_2_3")
+    etb_res = adapter_etb.resolve_and_convert_universal(
+        "【淘宝】大促价保 https://e.tb.cn/h.jRvbZZRGv5sOyfM?tk=k4VE6XYnYTX CZ057 「可口可乐碳酸饮料mini经典270ml*24罐整箱汽水原味」",
+        uid=None,
+    )
+    assert etb_res["status"] == "error"
+    assert etb_res["error_code"] == "UNSUPPORTED_TB_NUMERIC_ID"
+    assert "e.tb.cn" in etb_res["error_msg"]
+    official.search_goods.assert_not_called()
+
+
+

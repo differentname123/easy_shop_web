@@ -25,8 +25,11 @@
   3. ✅ 第一性原理最佳唯一标识方案（`goods_id` 与 `goods_sign` 职责彻底分离）：
      - `goods_id` / `product_id`：若入参回显 `input_item_iid` 为纯数字则取纯数字，否则提取加密串 `-` 之后的**确定性商品密文后缀**（`extract_tb_canonical_goods_id`），专职作为 MongoDB `(platform, product_id)` 唯一索引主键与前端去重键；
      - `goods_sign`：保留完整的 `<动态前缀>-<稳定后缀>` 加密长串，并在每次上游返回新密文时就地刷新，专职用于调用 TOP `item.info.upgrade.get`、拼装 `https://uland.taobao.com/item/edetail?id={goods_sign}` 及折淘客转链。
-  4. ✅ 可用：`taobao.tbk.item.info.upgrade.get` 详情接口支持同时传入【纯数字旧版 `itemid`】
-     （如好单库榜单返回的纯数字 ID）或【完整加密长串 `goods_sign`】，单次最多逗号分隔传 20 个 ID。
+  4. ⚠️ 2026最新实证修正（纯数字 `itemid` 已彻底停用）：
+     - 早期 `taobao.tbk.item.info.upgrade.get` 曾支持传入纯数字 `itemid`，但目前阿里妈妈已全面下线纯数字商品 ID 查询，
+       传入纯数字（如 `item_id="1005078294807"`）必报 `-4003: 您输入的商品ID不合法，请使用升级后的新商品ID`；
+     - 折淘客 `api_detail.ashx` 与 `api_quanwang.ashx` 传入纯数字同样必报 `301: 目前不支持数字id`；
+     - 好单库 `sales_list` 现已同步升级为返回两段式加密 `itemid`，单次最多逗号分隔传 20 个加密 ID 调用 `item.info.upgrade.get`。
   5. ✅ 可用：详情接口 `item_basic_info.item_url` 返回的官方手淘落地页格式固定为：
      `https://uland.taobao.com/item/edetail?id={encrypted_item_id}`。
 
@@ -75,20 +78,36 @@
      若使用未绑定该 `sid` 的备用 `appkey` 请求，会返回 `301: 授权账号sid过期或者sid和appkey不匹配！`。
      因此多 Key 故障切换时，遇到业务确定性错误（如 `无效的relationId`）不得盲目切 Key 覆盖真实原因。
 
-六、 万能转链与口令解析反查 (`convert_and_resolve_universal_input` 第一性原理实现)
-  1. ✅ 唯一确定性路径（折淘客原生直接透传，零正则拆解、零模糊搜索兜底）：
+六、 万能转链与口令解析反查 (`convert_and_resolve_universal_input` 第一性原理实现与历史尝试实证记录)
+  1. ✅ 主路径（淘客推广链接/口令 -> 折淘客原生直接透传）：
      - 除裸加密商品 ID (`item_id` / `goods_sign`) 自动补齐 `https://uland.taobao.com/item/edetail?id={id}` 前缀外，
-       所有用户输入原样直接透传给折淘客高佣转链接口（`signurl=5` + 4段式 `TB_CHANNEL_PID`）：
+       所有用户输入优先原样透传给折淘客高佣转链接口（`signurl=5` + 4段式 `TB_CHANNEL_PID`）：
        * 主接口 `open_gaoyongzhuanlian_tkl.ashx`：单次 HTTP 请求直接解析并转链淘口令 (`tkl`)、推广短链 (`s.click.taobao.com`)、
-         手淘短链 (`s.tb.cn` / `m.tb.cn`)、二合一长链 (`uland.taobao.com/coupon/edetail`)、官方手淘落地页 (`uland.taobao.com/item/edetail`)、
+         淘客手淘短链 (`s.tb.cn` / `m.tb.cn`)、二合一长链 (`uland.taobao.com/coupon/edetail`)、官方手淘落地页 (`uland.taobao.com/item/edetail`)、
          加密 ID 淘宝直链 (`item.taobao.com/item.htm?id={encrypted_id}`) 及平台自生成多行口令文案；
        * 长文案接口 `open_gaoyongzhuanlian_tkl_piliang.ashx`：当用户输入为夹带 `uland.taobao.com` / `item.taobao.com` 链接的社群长促销文案
          （如 `★天猫双11★...[下单链接：https://uland.TaoBao.com/item/edetail?id=...]返红包...`）导致 `tkl.ashx` 返回 `商品ID解析错误` 或 `error tkl` 时，
          自动将原样文案透传给 `open_gaoyongzhuanlian_tkl_piliang.ashx` (`signurl=5`) 由折淘客原生解析出准确的 `tao_id`、商品详情与推广口令/短链
          （若携带 `relation_id`，则以解析出的 `tao_id` 回调 `tkl.ashx` 完成渠道归因核验）。
-  2. ❌ 严禁任何“标题模糊搜索取第 1 条”兜底（防张冠李戴铁律）：
-     - 阿里妈妈与折淘客已全面废除纯数字 `num_iid` 直接转链（普通手淘 App 分享 `e.tb.cn` 解包后为纯数字 ID，折淘客返回 `301: 很抱歉！不支持数字id转链！！`）。
-     - 当折淘客转链失败（包括 `不支持数字id转链` 或纯文本标题）时，**严禁**提取文案关键词去调用 `taobao.tbk.dg.material.optional.upgrade` 模糊搜索顶替商品，必须直接向用户返回明确错误提示，宁可失败也绝不转出错误商品。
+  2. ❌ 已明确验证不可直接转链的输入格式与零兜底红线（严禁后续踩坑）：
+     - ❌ **纯数字 ID 淘宝直链**（`https://item.taobao.com/item.htm?id=1005078294807`）与 **手机淘宝 App 原生普通商品分享文案**
+       （如 `【淘宝】大促价保 https://e.tb.cn/h.jRvbZZRGv5sOyfM?tk=k4VE6XYnYTX CZ057 「可口可乐碳酸饮料mini经典270ml*24罐整箱汽水原味」`）：
+       * **根本原因（淘宝联盟官方防比价/禁数字ID政策）**：
+         普通消费者从手淘 App 直接点击「分享 -> 复制链接」生成的 `e.tb.cn` 短链并非淘客推广链，其静态 HTML (`var url = '...'`)
+         解包后僅包含 12~13 位纯数字商品 ID（如 `shareDetailItemId=1005078294807&id=1005078294807`），不含 46 位联盟加密 `item_id`。
+       * **全平台单步接口穷尽实测（均被官方底层封堵 ❌）**：
+         1) **折淘客**：`open_gaoyongzhuanlian_tkl.ashx`、`open_gaoyongzhuanlian_tkl_piliang.ashx`、`open_shangpin_id.ashx` 均返回 `301: 很抱歉！商品ID解析错误！！！`；`api_detail.ashx` 返回 `301: 目前不支持数字id！`。
+         2) **好单库**：`v2.api.haodanku.com/ratesurl` 与 `item_detail` 传入 `1005078294807` 或 `e.tb.cn` 均返回 `code=0: 无效商品ID / 暂不支持搜索`。
+         3) **阿里妈妈官方 TOP**：
+            - `taobao.tbk.item.info.upgrade.get(item_id="1005078294807")` 直接报错 `-4003: 您输入的商品ID不合法，请使用升级后的新商品ID`；
+            - `taobao.tbk.dg.material.optional.upgrade(q="https://e.tb.cn/...")` 直接报错 `50001: 无结果`；
+            - `taobao.tbk.dg.material.optional.upgrade(q="https://item.taobao.com/item.htm?id=1005078294807")` 或 `q="完整商品标题"`：
+              **实测关键发现**——阿里妈妈网关虽能定位到该单品（返回 `total_results=1`、标题、图片、价格），但因触发淘宝联盟防比价/防纯数字ID转链限制，**官方网关在返回 JSON 中故意将 `"item_id": ""`、`"click_url": ""`、`"coupon_share_url": ""` 全部抹成空字符串**（仅返回 `trace_code`），从根源上禁止将其直接转为淘客链接！
+       * **为什么严禁编写“爬 `e.tb.cn` 网页 + 抠标题调搜索接口 + 详情比对”的多步绕过逻辑？**
+         因为任何绕过淘宝联盟数字 ID 限制的方案都必须串联多个脆弱的外部假设（依赖用户未删改 `「标题」`、依赖 `e.tb.cn` 静态页 `var url` 格式不变、依赖商家标题与联盟搜索索引实时一致、依赖无同名同价克隆店、依赖折淘客 `api_quanwang` 或 TOP `title[:-1]` 截字搜索），链条长、外部依赖极多，任何一环变动即失效或转错商品。
+         因此**架构决策明确不对此类普通手淘原生数字链接做曲线适配**，统一返回 `UNSUPPORTED_TB_NUMERIC_ID` 并明确提示用户粘贴淘口令、带推广属性的链接或在首页搜索商品标题。
+     - ❌ **阿里妈妈联盟后台选品库/活动聚合页**：`https://pub.alimama.com/portal/v2/pages/promo/goods/index.htm?pageId=...`
+       -> 该 URL 为选品库列表容器而非单个商品，必须明确拦截并提示用户复制具体单品链接。
 
 七、 商品唯一标识 (`product_id` / `goods_id`) 与动态调用令牌 (`goods_sign`) 职责解耦及防 `50001` 报错铁律
   1. **静态主键 vs 动态签名**：
@@ -1003,8 +1022,8 @@ def convert_and_resolve_universal_input(
     relation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    淘宝万能转链与详情一步反查基线函数（第一性原理：直接原样透传折淘客，严禁使用标题模糊搜索兜底顶替商品）：
-    支持全部 11 种真实推广输入格式：
+    淘宝万能转链与详情一步反查基线函数：
+    支持全部 11 种真实推广输入格式（直接透传折淘客，严禁标题搜索兜底）：
     1. 裸加密商品 ID (item_id / goods_sign)
     2. 官方手淘落地页：https://uland.taobao.com/item/edetail?id=...
     3. 加密 ID 淘宝直链：https://item.taobao.com/item.htm?id=...
@@ -1033,15 +1052,15 @@ def convert_and_resolve_universal_input(
     else:
         input_type = "item_id_or_text"
 
-    # 直接原样透传给折淘客 (tkl.ashx + piliang.ashx)，不做任何前置数字ID拦截或标题模糊搜索兜底
+    # 直接原样透传给折淘客 (tkl.ashx + piliang.ashx)，绝不截取标题做搜索兜底
     conv_res = convert_channel_url_by_ztk(text, relation_id=relation_id)
 
     if conv_res["status"] != "success":
         err_code = conv_res.get("error_code")
         err_msg = conv_res.get("error_msg", "淘宝万能转链解析失败")
-        if err_code == "UNSUPPORTED_TB_NUMERIC_ID" or "不支持数字id" in str(err_msg):
+        if err_code == "UNSUPPORTED_TB_NUMERIC_ID" or "不支持数字id" in str(err_msg) or ("e.tb.cn" in lower_text and "商品id解析错误" in str(err_msg).lower()):
             err_code = "UNSUPPORTED_TB_NUMERIC_ID"
-            err_msg = "淘宝联盟已停用纯数字商品ID直接转链，请粘贴淘口令或带推广属性的链接"
+            err_msg = "淘宝联盟已停用纯数字商品ID（及手淘原生 e.tb.cn 普通分享链接）直接转链，请粘贴淘口令、带推广属性的链接或在首页搜索该商品标题"
         return {
             "status": "error",
             "input_type": input_type,
@@ -1210,8 +1229,8 @@ def main():
     ord_res = fetch_increment_orders_strictly(start_str, end_str)
     print(f" -> 订单查询结果: status={ord_res['status']}, 数量={len(ord_res.get('order_list', []))}")
 
-    # 7. 验证万能转链与口令解析反查全矩阵 (11 种真实格式自生自测 + 纯数字直链拦截验证)
-    print("\n[7/7] 验证淘宝万能转链与口令解析反查全矩阵 (11 种真实格式原样透传折淘客)...")
+    # 7. 验证万能转链与口令解析反查全矩阵 (11 种真实格式自生自测 + 纯数字直链及原生 e.tb.cn 零兜底拦截验证)
+    print("\n[7/7] 验证淘宝万能转链与口令解析反查全矩阵 (11 种真实格式验证)...")
     if sample_id and ztk_std_res.get("status") == "success":
         ztk_tkl = ztk_std_res.get("tpwd") or ""
         ztk_s_click = ztk_std_res.get("short_url") or ""
@@ -1249,10 +1268,13 @@ def main():
                 f"| 反查商品={prod.get('name', '')[:18]} (¥{prod.get('price')}) | 新口令={promo.get('tpwd')}"
             )
 
-        u_bad = convert_and_resolve_universal_input("https://item.taobao.com/item.htm?id=654321098765", relation_id=None)
+        u_bad = convert_and_resolve_universal_input(
+            "【淘宝】大促价保 https://e.tb.cn/h.jRvbZZRGv5sOyfM?tk=k4VE6XYnYTX CZ057 「可口可乐碳酸饮料mini经典270ml*24罐整箱汽水原味」",
+            relation_id=None,
+        )
         print(
-            f" -> [7l. 纯数字直链拦截验证 (零兜底)] status={u_bad['status']} | code={u_bad.get('error_code')} "
-            f"| msg={u_bad.get('error_msg', '')[:38]}..."
+            f" -> [7l. 纯数字直链/手淘原生 e.tb.cn 拦截验证 (零兜底)] status={u_bad['status']} | code={u_bad.get('error_code')} "
+            f"| msg={u_bad.get('error_msg', '')[:42]}..."
         )
 
 
