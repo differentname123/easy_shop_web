@@ -87,10 +87,64 @@
         }
       }, 400);
     };
+    const DESKTOP_INSTALLED_KEY = 'easy_shop_desktop_installed';
+    const DESKTOP_DISMISSED_KEY = 'easy_shop_desktop_banner_dismissed';
+    const safeGetStorage = key => {
+      try { return global.localStorage ? global.localStorage.getItem(key) : null; } catch (_) { return null; }
+    };
+    const safeSetStorage = (key, val) => {
+      try { if (global.localStorage) global.localStorage.setItem(key, val); } catch (_) {}
+    };
+    const detectStandalone = () => {
+      try {
+        if (typeof global.matchMedia === 'function' && global.matchMedia('(display-mode: standalone)').matches) return true;
+        if (global.navigator && global.navigator.standalone === true) return true;
+        if (global.location && typeof global.location.search === 'string') {
+          const from = new URLSearchParams(global.location.search).get('from');
+          if (from === 'desktop' || from === 'homescreen' || from === 'pwa') return true;
+        }
+      } catch (_) {}
+      return false;
+    };
+    const detectGuidePlatform = () => {
+      const ua = String((global.navigator && global.navigator.userAgent) || '').toLowerCase();
+      if (ua.includes('micromessenger')) return 'wechat';
+      if (/iphone|ipad|ipod/.test(ua)) return 'ios';
+      return 'android';
+    };
+
+    const initialStandalone = detectStandalone();
+    if (initialStandalone) safeSetStorage(DESKTOP_INSTALLED_KEY, '1');
+    const isStandalone = ref(initialStandalone);
+    const desktopGuidePlatform = ref(detectGuidePlatform());
+    const isDesktopGuideOpen = ref(false);
+    const showDesktopBanner = ref(
+      !initialStandalone &&
+      safeGetStorage(DESKTOP_INSTALLED_KEY) !== '1' &&
+      safeGetStorage(DESKTOP_DISMISSED_KEY) !== '1'
+    );
+
+    const dismissDesktopBanner = () => {
+      showDesktopBanner.value = false;
+      safeSetStorage(DESKTOP_DISMISSED_KEY, '1');
+    };
+    const closeDesktopGuide = (hideBanner = false) => {
+      isDesktopGuideOpen.value = false;
+      if (hideBanner) dismissDesktopBanner();
+    };
+    const triggerAddToDesktop = () => {
+      desktopGuidePlatform.value = detectGuidePlatform();
+      isDesktopGuideOpen.value = true;
+    };
+
     const dispose = () => {
       stopSmartLoading();
       global.clearTimeout(toastTimer);
     };
-    return { toastMessage, smartLoading, showToast, copyText, startSmartLoading, stopSmartLoading, jumpToLink, dispose };
+    return {
+      toastMessage, smartLoading, showToast, copyText, startSmartLoading, stopSmartLoading, jumpToLink,
+      isStandalone, desktopGuidePlatform, isDesktopGuideOpen, showDesktopBanner,
+      triggerAddToDesktop, dismissDesktopBanner, closeDesktopGuide, dispose,
+    };
   };
 })(globalThis);

@@ -2311,6 +2311,174 @@ body {
   border-color: #adc6ff;
 }
 
+/* ================== 添加到手机桌面：轻量引导浮条与分步指引弹窗 ================== */
+.a2hs-banner {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(var(--tab-height) + var(--safe-bottom) + 8px);
+  width: calc(100% - 24px);
+  max-width: 516px;
+  background: rgba(34, 34, 34, 0.94);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: #ffffff;
+  border-radius: 14px;
+  padding: 9px 10px 9px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+  z-index: 985;
+  animation: fadeIn 0.25s ease-out;
+}
 
+.a2hs-banner-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+  cursor: pointer;
+}
 
+.a2hs-banner-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  flex-shrink: 0;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+}
 
+.a2hs-banner-texts {
+  min-width: 0;
+  flex: 1;
+}
+
+.a2hs-banner-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffffff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.a2hs-banner-sub {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.78);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.a2hs-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.a2hs-banner-btn {
+  background: var(--accent-gradient);
+  color: #ffffff;
+  border: none;
+  border-radius: 16px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.a2hs-banner-close {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.65);
+  border: none;
+  width: 24px;
+  height: 24px;
+  font-size: 14px;
+  line-height: 24px;
+  text-align: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.a2hs-guide-body {
+  padding: 4px 0 8px;
+}
+
+.a2hs-guide-preview {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #fff7f6;
+  border: 1px solid #ffccc7;
+  border-radius: 12px;
+  padding: 12px;
+  margin-bottom: 14px;
+}
+
+.a2hs-guide-logo {
+  width: 48px;
+  height: 48px;
+  border-radius: 11px;
+  flex-shrink: 0;
+  box-shadow: 0 3px 10px rgba(224, 46, 36, 0.22);
+}
+
+.a2hs-guide-appname {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-main);
+  margin-bottom: 3px;
+}
+
+.a2hs-guide-appdesc {
+  font-size: 12px;
+  color: var(--text-sub);
+  line-height: 1.4;
+}
+
+.a2hs-step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.a2hs-step-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: #f7f8fa;
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.a2hs-step-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--primary-color);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.a2hs-step-text {
+  font-size: 13px;
+  color: var(--text-main);
+  line-height: 1.5;
+}
+
+.a2hs-step-text b {
+  color: var(--primary-color);
+}

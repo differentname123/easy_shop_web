@@ -80,15 +80,15 @@
 请仔细比对 `combined_raw_text` 与 `converted_links` 中的 `official_product`：
 - **情况 A：所有商品均转链失败（`ALL_PRODUCTS_DEAD`）**
   如果 `converted_links` 中没有任何一个 `"convert_status": "product"` 的链接，必须判定 `"is_valid_deal": false`，`"reject_reason": "ALL_PRODUCTS_DEAD"`。
-- **情况 B：主商品死链，仅凑单品存活（`MAIN_PRODUCT_DEAD_ONLY_FILLER`）**
-  如果爆料文本包含主商品和凑单品（例如文案主推“蓝月亮洗衣液 `[#L2]`”，用“得力回形针 `[#L3]`”凑单），但 `[#L2]` 转链失败（`failed`），只有凑单品 `[#L3]` 转链成功（`product`）。**绝不能把凑单品当成主商品上架！** 必须判定 `"is_valid_deal": false`，`"reject_reason": "MAIN_PRODUCT_DEAD_ONLY_FILLER"`。
+- **情况 B：主商品未转出单品（死链或仅为纯券链），仅凑单品存活（`MAIN_PRODUCT_DEAD_ONLY_FILLER`）**
+  **`main_link_id` 必须严格指向一个 `"convert_status": "product"` 且带有真实 `official_product` 的链接！** 如果爆料文本包含主商品和凑单品（例如文案主推“蓝月亮洗衣液 `[#L2]`”，用“得力回形针 `[#L3]`”凑单），但主商品 `[#L2]` 转链失败（`failed`）或仅识别为优惠券（`coupon_or_activity`，无 `official_product`），只有凑单品 `[#L3]` 转出了单品（`product`）。**绝不能把凑单品当成主商品上架，也绝不能把 `coupon_or_activity` 选作 `main_link_id`！** 必须判定 `"is_valid_deal": false`，`"reject_reason": "MAIN_PRODUCT_DEAD_ONLY_FILLER"`。
 - **情况 C：指鹿为马 / 货不对板（`PRODUCT_MISMATCH`）**
   如果爆料文本明确描述的是商品 A（如“维达抽纸24包”），但对应链接转出来的官方商品标题却是完全不相干的商品 B（如“手机壳”、“数据线”），必须判定 `"is_valid_deal": false`，`"reject_reason": "PRODUCT_MISMATCH"`。
   *(注：如果原始文案本身比较简略，比如只写了“手慢无 9.9元 `[#L1]`”或“大牌零食好价 `[#L1]`”，只要 `[#L1]` 转出了正常实物商品且不冲突，即视为匹配通过)*。
 - **情况 D：虚拟垃圾 / 1分钱引流 / 纯抽奖定金（`VIRTUAL_OR_JUNK`）**
   如果主商品是邮费补差价专拍链接、0.01元虚拟测试链接、纯抽奖码、电子书/网盘教程等非正常电商商品，判定 `"is_valid_deal": false`，`"reject_reason": "VIRTUAL_OR_JUNK"`。
-- **情况 E：多主商品推荐（一帖推多品）**
-  如果一条线报同时推荐了 2~3 个并列同级的好价商品（并非凑单品，而是“这几款都好价，任选”），请挑选其中 **`convert_status == "product"` 且性价比最高/最核心的第 1 个商品** 作为 `main_link_id`，其余存活的并列商品可放入 `filler_links` 并在 `label` 中注明“同场好价备选：xxx”， যাতে用户不会错过。
+- **情况 E：同帖推多款同品牌/同系列好价**
+  如果一条线报同时推荐了 2~3 个并列同级的好价商品（并非凑单品，而是“这几款都好价，任选”），请挑选其中 **`convert_status == "product"` 且与本帖核心主题最吻合的第 1 个商品** 作为 `main_link_id`，其余存活的并列商品可放入 `filler_links` 并在 `label` 中注明“同场好价备选：xxx”。
 
 #### 2. 优惠券链接（`coupon_links`）与凑单链接（`filler_links`）归位
 - **优惠券（`coupon_links`）**：凡是文案中用于领券、领补贴、进活动会场的链接（通常是 `convert_status == "coupon_or_activity"`，或文案明确写“领券 `[#L1]`”且存在另一个主商品链接），将其放入 `coupon_links`，并为每个券生成简明准确的按钮文案 `label`（例如 `"先领200-20补贴券"`、`"领取品类神券"`、`"活动会场领券"`）。

@@ -420,8 +420,10 @@ class JdClient:
         )
         if primary_res.get("status") == "success":
             if piliang_res.get("status") == "success":
-                primary_res["tao_id"] = piliang_res.get("tao_id", "")
-                primary_res["raw_item"] = piliang_res.get("raw_item")
+                if piliang_res.get("tao_id"):
+                    primary_res["tao_id"] = piliang_res["tao_id"]
+                if piliang_res.get("raw_item"):
+                    primary_res["raw_item"] = piliang_res["raw_item"]
                 if not primary_res.get("j_command") and piliang_res.get("j_command"):
                     primary_res["j_command"] = piliang_res["j_command"]
                 if not primary_res.get("j_short_command") and piliang_res.get("j_short_command"):

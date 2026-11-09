@@ -5,10 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="format-detection" content="telephone=no">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
-  <title>优选导购 - 极速省赚</title>
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261107-2">
+  <meta name="theme-color" content="#e02e24">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="查券省钱">
+  <title>查券省钱</title>
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261109-2">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261107-2"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261109-2"></script>
 </head>
 <body>
 <div id="app">
@@ -630,6 +637,12 @@
 
     <!-- 菜单说明列表 -->
     <div class="menu-list">
+      <div class="menu-item" v-if="!isStandalone" @click="triggerAddToDesktop">
+        <span style="display:flex;align-items:center;gap:6px;">
+          <span>📲 添加到手机桌面</span>
+        </span>
+        <span style="color:var(--primary-color);font-size:12px;font-weight:600">查看步骤 ›</span>
+      </div>
       <div class="menu-item" @click="copyText('easyeverything98', '官方客服微信号已复制：easyeverything98')">
         <span style="display:flex;align-items:center;gap:6px;">
           <span>💬 官方客服微信</span>
@@ -662,6 +675,21 @@
     <svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/></svg>
   </button>
 
+  <!-- 首页轻量添加到手机桌面引导浮条（点 ✕ 关闭后不再自动打扰） -->
+  <div class="a2hs-banner" v-if="showDesktopBanner && !isStandalone && currentTab === 'home'">
+    <div class="a2hs-banner-left" @click="triggerAddToDesktop">
+      <img src="/static/icons/icon-192.png?v=20261109-2" alt="查券省钱" class="a2hs-banner-icon" />
+      <div class="a2hs-banner-texts">
+        <div class="a2hs-banner-title">把「查券省钱」放到手机桌面</div>
+        <div class="a2hs-banner-sub">买前点我查优惠券，像 App 一样方便</div>
+      </div>
+    </div>
+    <div class="a2hs-banner-actions">
+      <button type="button" class="a2hs-banner-btn" @click="triggerAddToDesktop">添加桌面</button>
+      <button type="button" class="a2hs-banner-close" @click="dismissDesktopBanner" title="关闭提示" aria-label="关闭提示">✕</button>
+    </div>
+  </div>
+
   <!-- ==================== 底部固定导航栏 (TabBar) ==================== -->
   <footer class="bottom-tab-bar">
     <div class="tab-item" :class="{ active: currentTab === 'home' }" @click="currentTab = 'home'">
@@ -681,6 +709,77 @@
       <span>我的</span>
     </div>
   </footer>
+
+  <!-- ==================== 添加到手机桌面两步引导弹窗 ==================== -->
+  <div class="modal-backdrop" v-if="isDesktopGuideOpen" @click.self="closeDesktopGuide(false)">
+    <div class="sheet-dialog">
+      <div class="sheet-header">
+        <span>添加到手机桌面</span>
+        <button class="sheet-close" @click="closeDesktopGuide(false)">×</button>
+      </div>
+      <div class="a2hs-guide-body">
+        <div class="a2hs-guide-preview">
+          <img src="/static/icons/icon-192.png?v=20261109-2" alt="查券省钱" class="a2hs-guide-logo" />
+          <div>
+            <div class="a2hs-guide-appname">查券省钱</div>
+            <div class="a2hs-guide-appdesc">按下方两步操作即可把图标放到手机桌面，随时点开查券</div>
+          </div>
+        </div>
+
+        <!-- 微信内置浏览器指引 -->
+        <div class="a2hs-step-list" v-if="desktopGuidePlatform === 'wechat'">
+          <div class="a2hs-step-card">
+            <span class="a2hs-step-num">1</span>
+            <div class="a2hs-step-text">
+              点击微信右上角的 <b>「···」</b> 更多按钮
+            </div>
+          </div>
+          <div class="a2hs-step-card">
+            <span class="a2hs-step-num">2</span>
+            <div class="a2hs-step-text">
+              安卓可直接点击 <b>「添加到桌面」</b>；苹果请先选 <b>「在默认浏览器中打开」</b>，再点底部分享按钮选择 <b>「添加到主屏幕」</b>
+            </div>
+          </div>
+        </div>
+
+        <!-- iOS Safari / 苹果浏览器指引 -->
+        <div class="a2hs-step-list" v-else-if="desktopGuidePlatform === 'ios'">
+          <div class="a2hs-step-card">
+            <span class="a2hs-step-num">1</span>
+            <div class="a2hs-step-text">
+              点击浏览器底部工具栏的 <b>「分享」</b> 按钮（方框带向上箭头 📤 或 <b>···</b> 菜单）
+            </div>
+          </div>
+          <div class="a2hs-step-card">
+            <span class="a2hs-step-num">2</span>
+            <div class="a2hs-step-text">
+              在弹出菜单中向下滑动，点击 <b>「添加到主屏幕」</b> 即可生成桌面图标
+            </div>
+          </div>
+        </div>
+
+        <!-- Android 浏览器指引 -->
+        <div class="a2hs-step-list" v-else>
+          <div class="a2hs-step-card">
+            <span class="a2hs-step-num">1</span>
+            <div class="a2hs-step-text">
+              点击浏览器底部或右上角的 <b>「菜单」</b> 按钮（<b>≡</b> 或 <b>⋮</b>）
+            </div>
+          </div>
+          <div class="a2hs-step-card">
+            <span class="a2hs-step-num">2</span>
+            <div class="a2hs-step-text">
+              选择 <b>「添加到桌面」</b> 或 <b>「添加到主屏幕 / 书签」</b>（勾选手机桌面）即可
+            </div>
+          </div>
+        </div>
+
+        <div class="pop-action-btns">
+          <button type="button" class="btn-primary-block" @click="closeDesktopGuide(true)">我知道了</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- ==================== 渠道授权引导弹窗 ==================== -->
   <div class="modal-backdrop" v-if="isAuthModalOpen" @click.self="closeAccountAuth">
@@ -744,12 +843,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261107-2"></script>
-<script src="/static/js/session.js?v=ux-20261107-2"></script>
-<script src="/static/js/format.js?v=ux-20261107-2"></script>
-<script src="/static/js/browser.js?v=ux-20261107-2"></script>
-<script src="/static/js/feeds.js?v=ux-20261107-2"></script>
-<script src="/static/js/account.js?v=ux-20261107-2"></script>
-<script src="/static/js/app.js?v=ux-20261107-2"></script>
+<script src="/static/js/api.js?v=ux-20261109-2"></script>
+<script src="/static/js/session.js?v=ux-20261109-2"></script>
+<script src="/static/js/format.js?v=ux-20261109-2"></script>
+<script src="/static/js/browser.js?v=ux-20261109-2"></script>
+<script src="/static/js/feeds.js?v=ux-20261109-2"></script>
+<script src="/static/js/account.js?v=ux-20261109-2"></script>
+<script src="/static/js/app.js?v=ux-20261109-2"></script>
 </body>
 </html>

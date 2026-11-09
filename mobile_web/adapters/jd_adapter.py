@@ -430,17 +430,20 @@ class JdAdapter(BasePlatformAdapter):
         j_cmd = conv.get("j_command") or ""
 
         resolved_id = extracted_encrypted_id
-        if extracted_encrypted_id:
+        if isinstance(conv.get("raw_item"), dict):
+            try:
+                cand_card = self._detail(conv["raw_item"])
+                if (cand_card.get("price") or 0) > 0:
+                    product_card = cand_card
+                    resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
+            except Exception:
+                pass
+        if not product_card and extracted_encrypted_id:
             det = self.get_goods_detail(extracted_encrypted_id)
             if det.get("status") == "success" and isinstance(det.get("data"), dict):
                 product_card = det["data"]
-        if not product_card and isinstance(conv.get("raw_item"), dict):
-            try:
-                product_card = self._detail(conv["raw_item"])
                 resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
-            except Exception:
-                pass
-        if not product_card and "tao_id" not in conv:
+        if not product_card:
             search_q = short or long
             is_coupon_or_venue_url = any(
                 kw in (search_q or "").lower()
@@ -454,15 +457,16 @@ class JdAdapter(BasePlatformAdapter):
                 if q_res.get("status") == "success" and isinstance(q_res.get("data"), list) and q_res["data"]:
                     rows = q_res["data"]
                     total_cnt = int(q_res.get("total_count") or len(rows))
-                    # 仅当短链唯一命中单件商品或京口令明确含单品“抢购”标识时采纳，防止优惠券/会场短链误抓列表首条商品
-                    if len(rows) == 1 or total_cnt == 1 or ("抢购" in j_cmd):
-                        for row in rows:
-                            try:
-                                product_card = self._detail(row)
+                    # 【遵循绝对可靠原则】：仅当转链所得短链 100% 唯一命中单件商品 (len(rows)==1 且 total_cnt==1) 时采纳，
+                    # 严禁因口令含“抢购”字样就从多商品会场列表中盲取首条！
+                    if len(rows) == 1 and total_cnt == 1:
+                        try:
+                            cand_card = self._detail(rows[0])
+                            if (cand_card.get("price") or 0) > 0:
+                                product_card = cand_card
                                 resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
-                                break
-                            except Exception:
-                                continue
+                        except Exception:
+                            pass
 
         # 从 jCommand 文案提取商品标题与优惠券金额作为限流兜底
         fallback_title = "京东精选推广好物"

@@ -9,11 +9,12 @@
 
 ## 验收标准：
 - **输出格式**：严格输出合法的 JSON 数组（List），数组元素与输入任务通过 `main_tip_id` 一一对应，不输出任何 JSON 以外的解释文字。
-- **连续消息合并准确性**：
+- **连续消息合并准确性（宁缺毋滥，严禁将不同商品捏合）**：
   - 当 `is_group_stream == false`（普通网页/排行榜单帖）时，`raw_messages` 仅有 1 条消息，必须设置 `is_standalone_deal: true`，`merged_tip_ids` 仅包含当前 `main_tip_id`。
   - 当 `is_group_stream == true`（微信/QQ 采集群实时消息流）时，`raw_messages` 包含当前主消息（`tip_id == main_tip_id`）及其同群前后 3 分钟内的相邻消息。必须仔细阅读上下文：
-    - 若当前主消息（`tip_id == main_tip_id`）本身**不包含任何主推商品信息**，而仅仅是上一条主商品消息的纯凑单品补充（如仅写 `"2、凑单商品拍1件 https://..."`）、纯文字提醒（如仅写 `"记得去购物车勾选满200-20"`）或纯晒单截图，必须判定 `is_standalone_deal: false`，`skip_reason: "TAIL_FRAGMENT_OF_NEIGHBOR"`。
-    - 若当前主消息包含主推商品爆料，则将 `raw_messages` 中与该商品属于同一次爆料作业的前后邻居消息（如前置领券帖、后续凑单帖、纯文字教程帖、实付晒单图帖）全部吸收合并，将其 `tip_id` 填入 `merged_tip_ids`（必须包含 `main_tip_id` 自身）；与本商品无关的其他独立商品爆料邻居绝不能混入！
+    - 若当前主消息（`tip_id == main_tip_id`）本身**不包含任何主推商品信息**，而仅仅是上一条主商品消息的纯附属碎片（如仅写 `"2、凑单商品拍1件 https://..."`、仅补发一个孤立淘口令 `"("`、纯文字提醒 `"记得去购物车勾选满200-20"` 或纯晒单截图），必须判定 `is_standalone_deal: false`，`skip_reason: "TAIL_FRAGMENT_OF_NEIGHBOR"`。
+    - 若当前主消息包含明确的主推商品爆料，**仅允许合并与该主商品明确属于同一次作业的纯附属碎片**（如针对该商品的前置领券楼层、明确标有“凑单/加购退”的辅助楼层、紧随其后的孤立口令补充楼层、该商品的实付晒单图楼层）。
+    - **【铁律】严禁将同群内各自带有独立商品名/品牌的两个不同商品爆料合并为一条！** 许多采集群是机器人高频转发群（每隔十几秒就发一个全新品类的独立商品，如上一条是“超亚暖贴”或“舒肤佳沐浴露”，当前条是“华熙生物次抛精华”），只要邻居消息本身是一条讲述另一款独立商品的完整线报，**绝对禁止将其并入 `merged_tip_ids`，也绝对禁止提取邻居消息里的链接**！拿不准是否属于同一作业时，一律不合并（仅保留 `main_tip_id` 自身）。
 - **待转链项 (`extracted_targets`) 拆解纯净度与平台准入**：
   - **仅提取淘宝/天猫 (`taobao`)、京东 (`jd`)、拼多多 (`pdd`) 三大平台的有效目标**：包括电商长短链（`u.jd.com`、`3.cn`、`item.jd.com`、`jingfen.jd.com`、`union-click.jd.com`、`m.tb.cn`、`s.click.taobao.com`、`uland.taobao.com`、`item.taobao.com`、`detail.tmall.com`、`yangkeduo.com`、`p.pinduoduo.com` 等）、淘口令（含 `￥...￥` / `$...$` / `/.../` / `CZ00` / `MF168` / `HU` 等）、京口令（含 `！...！` / `!...!` / `CA` / `MF` 等）、淘宝加密 ID（约 35~55 位含字母数字下划线或中划线的加密串）、京东加密 ID（30 位以上字母数字串）、拼多多 `goods_sign`。
   - **严禁将以下无效内容放入 `extracted_targets`**（若帖子仅包含以下内容而无任何淘/京/拼商品或优惠券目标，必须输出 `"extracted_targets": []`）：
@@ -21,7 +22,7 @@
     2. **线报网站自身内链或未解包中转页**：如 `guangdiu.com/go.php`、`new.xianbao.fun`、`youhui.bacaoo.com`、`0818tuan.com`、`iehou.com` 等源站自身网址；
     3. **非淘/京/拼三大平台的外链或羊毛**：如银行 App 活动/立减金、美团、滴滴、饿了么、唯品会、抖音、快手、小红书、微信公众号文章 (`mp.weixin.qq.com`)、百度网盘、B站视频 (`b23.tv`) 等。
   - **一句话多链接/多口令强制拆分**：若一句话内连续出现多个 URL 或多个口令（如 `"先领券https://u.jd.com/aaa111再领https://u.jd.com/bbb222拍下88￥AbCdEf12￥/"`），必须拆分为多个独立的 `extracted_targets` 元素！
-  - 每个元素的 `clean_input` 必须是**剥离了前后粘连汉字、HTML 标签后的纯净单个链接或单个口令**（例如 `"https://u.jd.com/aaa111"` 或 `"88￥AbCdEf12￥/"` 或 `"(aBcDeFg1234) MU918"`）。
+  - 每个元素的 `clean_input` 必须是**剥离了前后粘连汉字、HTML 标签以及 Markdown 链接语法 `[...](...)` 后的纯净单个裸链接或单个口令**（例如只能输出 `"https://u.jd.com/aaa111"`，**严禁输出 `"[https://u.jd.com/aaa111](https://u.jd.com/aaa111)"`**）。
   - 按出现顺序编号为 `"L1"`, `"L2"`, `"L3"`...，并在 `combined_raw_text` 中对应位置保留或插入 `[#L1]`, `[#L2]` 标记，使下游能精确知晓每个链接在原文句子中的位置与作用。
 - **平台与初步语境角色标注**：
   - `platform`：只能是 `"jd"`（京东）、`"taobao"`（淘宝/天猫）或 `"pdd"`（拼多多）。

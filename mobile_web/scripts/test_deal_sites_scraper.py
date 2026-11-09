@@ -27,27 +27,29 @@
     淘宝46位加密 `item_id`、淘口令/京口令、或明确的 10~15 位数字 SKU/货号），绝不能只是泛泛的商品标题关键字。
     只要通道能稳定产出含唯一商品锚点的记录，即使混有杂讯（有效比例低）也完全可取，后续通过正则/关键字规则过滤即可。
 
-三、【10 个候选网站与细分频道最终取舍结论（严禁后续重复踩坑尝试已剔除站点）】
-  1. ✅ 正式纳入定时任务的 9 大站点（55 个有效子频道，含新增拼多多高产专属流）：
+三、【候选网站与细分频道最终取舍结论（严禁后续重复踩坑尝试已剔除站点）】
+  1. ✅ 正式纳入定时任务的 8 大高可靠站点（51 个有效子频道，含拼多多高产专属流）：
      - 【好单库 (`haodanku.com`)】：免登纯净 JSON（`wire_report` 京东10004/淘宝10003/百补10005/飞猪10367/综合0 + `weal_list` 福利清单），0 风控，
        100% 包含 `https://u.jd.com/xxx` 短链或淘宝 46 位加密 `item_id`。
      - 【折淘客 (`zhetaoke.com`)】：免登直连 150+ 个真实 QQ/微信采集群实时大厅 (`xianbao.aspx` 京东群/淘宝群/拼多多群/综合群及高产群专流) +
        咚咚抢 (`/list/dongdong.html`) + 实时热销爆款榜 (`/list/love_1_0_1.html`)，单页直出 60 条群消息，无需二次抓详情，0 风控，高密产出 `u.jd.com`、`p.pinduoduo.com`、括号淘口令 `(11位码) MU918` 与 `uland.taobao.com`。
-     - 【逛丢 (`guangdiu.com`)】：全网实时折扣 (`index.php` 综合流 + **`cate.php?m=拼多多` 拼多多专属商城流**)，通过 `detail.php` 解码 `to.php?u=` 加上 `go.php?id=` 提取明文 `item.jd.com/{sku}.html`、`union-click.jd.com`、`s.click.taobao.com` 以及带完整加密 `goods_sign` 的拼多多 `duo_coupon_landing.html` 二合一长链（实测拼多多专流单页 30 条 100% 解包出 `goods_sign`，转链成功率 100%），不仅覆盖逛丢自有好价，还能在服务端合法还原其同步自“什么值得买”好价的真实电商直链！
-     - 【选单网 (`xuandan.com`)】：免登淘客快抢群发素材 JSON 接口 (`/NewHome/msKqList`)，100% 同时返回 12 位淘宝纯数字 `ShoopGoodsId`、`uland.taobao.com` 二合一链、券链与社群推广文案 `TjRemark`。
-     - 【购物党 (`gwdang.com`)】：4 大稳定折扣榜（`0-lowest`/`0-s_lowest`/`0-lower_11`/`0-latest`），间隔 >=3s 零风控；
-       通过解码内嵌 `data=` Base64 + zlib 载荷，100% 提取原始平台唯一 SKU (`dp_id`) 与 `buy_steps` 中的领券/购买链接。
+     - 【逛丢 (`guangdiu.com`)】：全网实时折扣 (`index.php` 综合流 + **`cate.php?m=拼多多` 拼多多专属商城流**)，通过 `detail.php` 解码 `to.php?u=` 加上 `go.php?id=` 提取明文 `union-click.jd.com`、`s.click.taobao.com` 以及带完整加密 `goods_sign` 的拼多多 `duo_coupon_landing.html` 二合一长链（实测拼多多专流单页 30 条 100% 解包出 `goods_sign`，转链成功率 100%），不仅覆盖逛丢自有好价，还能在服务端合法还原其同步自“什么值得买”好价的真实电商直链！
+     - 【选单网 (`xuandan.com`)】：免登淘客快抢群发素材 JSON 接口 (`/NewHome/msKqList`)，100% 同时返回 `uland.taobao.com` 二合一加密链、券链与社群推广文案 `TjRemark`。
      - 【0818团 (`0818tuan.com`)】：纯静态 HTML（第1~2页），0 风控，71.4% 直接包含京东/手淘唯一商品短链。
-     - 【线报酷 (`new.xianbao.fun`) 22 个有效频道】：SSR 静态直出，0 风控，涵盖全站热榜、好单、微博、**好单拼多多专属流 (`/category-haodan-pdd/`，单页100条纯拼多多且实测 100% 含 `p.pinduoduo.com` 短链)**、**微博拼多多专属流 (`/category-weibo-pdd/`，单页100条纯拼多多，配合详情页 `id="art-fujia"` 1L~5L 楼主同步评论区解析后 100% 提取 `p.pinduoduo.com` 短链)**、豆瓣各买组/拼组/狗组/猫组、赚客吧、新赚吧、酷安、慢友等实时流与热榜。
+     - 【线报酷 (`new.xianbao.fun`) 21 个高可靠频道】：SSR 静态直出，0 风控，涵盖全站热榜、好单、微博、**好单拼多多专属流 (`/category-haodan-pdd/`，单页100条纯拼多多且实测 100% 含 `p.pinduoduo.com` 短链)**、**微博拼多多专属流 (`/category-weibo-pdd/`，单页100条纯拼多多，配合详情页 `id="art-fujia"` 1L~5L 楼主同步评论区解析后 100% 提取 `p.pinduoduo.com` 短链)**、豆瓣各买组/拼组/狗组/猫组、赚客吧、新赚吧、酷安等实时流与热榜。
      - 【拔草哦 (`youhui.bacaoo.com`)】：涵盖首页国内优惠 (`/`) 与 **拼多多商城专区 (`/mall/1827`，含每2小时更新一次的 50 款《PDD热销产品汇总》合集帖)**，0 风控；通过免登直连 `POST https://go.bacaoo.com/` 解包 `direct-alink-url` 与合集子商品 `subproduct-alink-url`，100% 还原出明文 `https://p.pinduoduo.com/xxx?sc=EFAC` 推广短链。
-     - 【网猴线报 (`iehou.com/page-dayhot.htm`)】：24H 热榜 0 风控，17.0% 含唯一商品短链或口令。
+     - 【网猴线报 (`iehou.com/page-dayhot.htm`)】：24H 热榜 0 风控，含唯一商品短链或口令。
 
-  2. ❌ 已明确排查并剔除的站点与子频道（代码保留说明，严禁后续人员误以为遗漏而重复浪费时间尝试）：
+  2. ❌ 已明确排查并彻底剔除的站点与子频道（代码保留明确说明，严禁后续人员误以为遗漏而重新尝试监控）：
+     - ❌ 【购物党全站所有频道 (`gwdang.com`：`0-latest` / `0-lowest` / `0-s_lowest` / `0-lower_11` / `0-hour_3`) —— 实测 99.7% 失败率，已整站放弃】：
+       ① 实证数据：经 8 轮完整线上运行，共清洗 320 条购物党记录，其中 **319 条转链失败（失败率高达 99.7%：`ERR_JD_NUMERIC_SKU`=130、`ERR_ADAPTER_CONVERT_FAILED`=81、`ERR_EMPTY_PRODUCT_IDENTITY`=53、`ERR_TB_NUMERIC_ID`=36）**，唯一 1 条成功还是因为主商品死链后误把凑单品顶替为主商品；
+       ② 核心根因：购物党全站（无论京东、天猫淘宝还是拼多多）主商品均仅存储纯数字 SKU 裸链（`item.jd.com/{数字}.html`、`detail.tmall.com/item.htm?id={数字}`、`goods.html?goods_id={数字}`），三大联盟官方转链 API 100% 拒绝纯数字 ID 直转（强制要求 `u.jd.com`/`jingfen` 加密短链、淘宝 46 位加密 ID/淘口令、拼多多 `goods_sign`/`p.pinduoduo.com` 短链）；
+       ③ 工程铁律：系统严禁为了解析纯数字 ID 而使用“商品全称调用搜索接口反向模糊匹配”这种长链路不稳定方案（极易搜出同品牌不同规格或山寨店造成张冠李戴），因此购物党有效转化率为 **0.0%**，必须整站永久剔除，严禁后续人员重新加入定时任务！
+     - ❌ 【慢慢买 (`cu.manmanbuy.com`) 及其线报酷镜像频道 (`xianbao_fun/category_man` `/category-man/`、`category-manmanmai-pdd`) —— 实测 97.8% 失败率，已彻底放弃】：
+       实测线上清洗 90 条 `category_man`（慢友线报聚合）记录，其中 **87 条失败（失败率 97.8%）**；根因是其详情页外链全为 `https://cu.manmanbuy.com/discuxiao_{id}.aspx` 前端 `crypto-js` 动态加密跳转壳，无明文商品推广短链或口令，且严禁在采集端编写多跳破解爬虫，故彻底剔除。
      - ❌ 【什么值得买直连 (`smzdm.com` 及其线报酷镜像 `zhidemai`/`zhidemai_hot`/`category-zhidemai-pdd`) —— 违反铁律 1 & 铁律 2】：
        ① 风控严苛：`faxian.smzdm.com` 高频触发腾讯防水墙 `TCaptcha.js`，异步接口 `/json_more` 触发 `202 probe.js`；
        ② 无唯一商品锚点 (0/183 = 0.0%)：全站所有商品外链（含 `/category-zhidemai-pdd/`）均被替换为加密跳板 `https://go.smzdm.com/{加密串}`（带 `probe.js` 拦截），图片也被重写为 `zdmimg.com`，无法直接还原目标商品 ID。（注：其高优好价及拼多多好价已通过【逛丢 `guangdiu`】`index.php` 与 `cate.php?m=拼多多` 服务端明文跳板曲线捕获！）
-     - ❌ 【慢慢买 (`cu.manmanbuy.com` 及其线报酷镜像 `category-manmanmai-pdd`) —— 违反铁律 2】：
-       详情页 `discuxiao_{id}.aspx` 为前端 `crypto-js` 动态加密跳转，实测 0/43 (0.0%) 含唯一商品链接、口令或数字 SKU。
      - ❌ 【55海淘 (`55haitao.com/deals`) —— 违反铁律 2】：
        实测 0/22 (0.0%) 含国内电商商品，100% 为海外美网/英网海淘链接，无国内淘京拼 CPS 价值。
      - ❌ 【大淘客网页端 (`dataoke.com/xp/xb`) —— 违反铁律 1】：
@@ -66,8 +68,6 @@
        遍历实测 `type=0~5, 10001~10008, 10367` 全部参数，好单库网页端线报仅开放淘宝(10003)、京东(10004)、唯品会与飞猪(10367)，接口内拼多多条数为 0；其拼多多线报实际已通过【线报酷 `/category-haodan-pdd/`】100% 聚合捕获。
      - ❌ 【折淘客拼多多细分单群 (`id=10000039 MK拼多多采集群` / `10000068 高佣拼多多采集群` / `10000107 拼多北大学采集群`) 与 `q=拼多多` 搜索】：
        实测扫描折淘客全部 200 个采集群，上述拼多多单群当前均处于停更状态（今日消息数为 0），`q=拼多多/pinduoduo` 搜索亦为 0 条；折淘客全站拼多多消息已由 `plat=3` (`折淘客_拼多多采集群汇总`) 100% 汇总覆盖，无需单独轮询死群。
-     - ❌ 【购物党拼多多条目 (`gwdang.com` `site_id=370`) 及详情页 `/v2/zhi/detail/1` 二次抓取 —— 违反拼多多 `goods_sign` 铁律】：
-       实测购物党内嵌 Base64 `buy_steps` 与详情页 `/v2/zhi/detail/1?dp_id=...` 均仅存储拼多多纯数字 `goods_id` 裸链 (`https://mobile.yangkeduo.com/goods.html?goods_id=990159885102`)，无加密 `goods_sign` 或 `p.pinduoduo.com` 短链，必被拼多多网关以 `sub_code=40009 (ERR_PDD_NUMERIC_ID)` 拒绝，严禁为其编写详情页二次爬虫或标题模糊搜索兜底。
      - ❌ 【逛丢九块九桌面版 (`guangdiu.com/cheaps.php` 及 `cheaps.php?m=拼多多`) —— 服务端空容器】：
        实测桌面端 `cheaps.php` 返回的 `<div class="cheapcontent"></div>` 为空容器（0 条商品块），无需纳入定时任务。
      - ❌ 【赚客吧原站 (`zuanke8.com`) / 小刀娱乐网 (`xiaodao.la`) / 爱Q生活网 (`iqnew.com`) / 葫芦侠 (`huluxia`)】：
@@ -665,7 +665,7 @@ def fetch_xianbao_fun_deals(
       * `"category_douban_pinzu"` -> `/category-douban-pinzu/` (豆瓣拼组实时流)
       * `"category_zuankeba"`  -> `/category-zuankeba/` (赚客吧实时流)
       * `"category_xinzuanba"` -> `/category-xinzuanba/` (新赚吧实时流)
-      * `"category_man"`       -> `/category-man/` (慢慢买省钱控实时聚合流)
+      * `"category_man"`       -> `/category-man/` (【❌已废弃禁入定时调度】慢慢买省钱控聚合流：外链全为 `cu.manmanbuy.com/discuxiao_.aspx` 前端加密跳板，实测 90 条中 87 条失败=97.8%失败率)
       * `"latest"`             -> `/` 或 `/page/{page}/` (全网实时聚合流，100条/页)
     """
     http = session or requests.Session()
@@ -722,7 +722,7 @@ def fetch_xianbao_fun_deals(
         if "置顶" in li_html and "/gonggao/" in li_html:
             continue
         m_a = re.search(
-            r'<a\b([^>]*href=["\']((?:/[^"\']+\.html|https?://www\.smzdm\.com/p/\d+/?|https?://cu\.manmanbuy\.com/discuxiao_\d+\.aspx))["\'][^>]*)>(.*?)</a>',
+            r'<a\b([^>]*href=["\'](/[^"\']+\.html)["\'][^>]*)>(.*?)</a>',
             li_html,
             re.S | re.I,
         )
@@ -730,7 +730,7 @@ def fetch_xianbao_fun_deals(
             continue
         a_attrs, raw_href, a_inner = m_a.group(1), m_a.group(2), m_a.group(3)
         detail_url = urljoin(base, raw_href)
-        m_id = re.search(r"(?:/|discuxiao_)(\d+)(?:\.html|\.aspx|/?$)", raw_href)
+        m_id = re.search(r"/(\d+)\.html", raw_href)
         item_id = m_id.group(1) if m_id else raw_href
 
         title = re.sub(r"<[^>]+>", "", html_lib.unescape(a_inner)).strip()
@@ -754,19 +754,7 @@ def fetch_xianbao_fun_deals(
         has_full_detail = False
         extra_hot_metrics: Dict[str, Any] = {"comments": comments_cnt}
 
-        if "cu.manmanbuy.com/discuxiao_" in detail_url:
-            # 慢慢买聚合条目在列表属性中已包含完整摘要，discuxiao 页为纯前端跳转壳
-            has_full_detail = True
-            extracted_links, tutorial_images, extracted_tokens = extract_links_images_and_tokens(
-                preview_text or li_html, base_url=detail_url
-            )
-            extracted_links.append({
-                "label": "慢慢买优惠页",
-                "url": detail_url,
-                "type": "manmanbuy_detail",
-                "platform": detect_platform_signal(f"{catename} {title} {preview_text}") or "unknown",
-            })
-        elif fetch_detail and detail_fetched < max_details and item_id not in skip_set:
+        if fetch_detail and detail_fetched < max_details and item_id not in skip_set:
             try:
                 rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
                 if rd.status_code == 200:
@@ -775,58 +763,20 @@ def fetch_xianbao_fun_deals(
                     det_html = rd.text
                     extra_go_links: List[Dict[str, Any]] = []
                     extra_ld_imgs: List[str] = []
-                    if "smzdm.com/p/" in detail_url:
-                        m_ld = re.search(
-                            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-                            det_html,
-                            re.S | re.I,
-                        )
-                        if m_ld:
-                            try:
-                                ld_obj = json.loads(m_ld.group(1).strip())
-                                pub_time = str(ld_obj.get("pubDate") or ld_obj.get("upDate") or pub_time)
-                                for ld_img in ld_obj.get("images") or []:
-                                    if ld_img and ld_img not in extra_ld_imgs:
-                                        extra_ld_imgs.append(ld_img)
-                            except Exception:
-                                pass
-                        # 提取值得买详情页 dataLayer 中的品牌、商城、分类等结构化商品元数据
-                        m_brand = re.search(r"['\"]品牌['\"]\s*:\s*['\"]([^'\"]+)['\"]", det_html)
-                        m_mall_dl = re.search(r"['\"]商城['\"]\s*:\s*['\"]([^'\"]+)['\"]", det_html)
-                        m_cate_dl = re.search(r"['\"]category['\"]\s*:\s*['\"]([^'\"]+)['\"]", det_html)
-                        if m_brand:
-                            extra_hot_metrics["brand"] = m_brand.group(1).strip()
-                        if m_mall_dl and not catename:
-                            catename = m_mall_dl.group(1).strip()
-                        if m_cate_dl:
-                            extra_hot_metrics["category"] = m_cate_dl.group(1).strip()
-                        for go_u in dict.fromkeys(re.findall(r"https?://go\.smzdm\.com/[a-zA-Z0-9_/]+", det_html)):
-                            extra_go_links.append({
-                                "label": "值得买直达跳转链",
-                                "url": go_u,
-                                "type": "smzdm_go_link",
-                                "platform": detect_platform_signal(catename) or "unknown",
-                            })
-                        m_art = re.search(
-                            r'(<article[^>]*class=["\'][^"\']*txt-detail[^"\']*["\'][^>]*>.*?</article>)',
-                            det_html,
-                            re.S | re.I,
-                        )
-                    else:
-                        m_time_full = re.search(
-                            r'<time[^>]*class=["\'][^"\']*time[^"\']*["\'][^>]*title=["\']([^"\']+)["\']',
-                            det_html,
-                            re.I,
-                        )
-                        if m_time_full:
-                            pub_time = html_lib.unescape(m_time_full.group(1)).strip()
-                        m_art = re.search(
-                            r'(<div[^>]*class=["\'][^"\']*article-content[^"\']*["\'][^>]*>.*?</div>)\s*(?:<div|<footer|</article)',
-                            det_html,
-                            re.S | re.I,
-                        )
-                        if not m_art:
-                            m_art = re.search(r"(<article[^>]*>.*?</article>)", det_html, re.S | re.I)
+                    m_time_full = re.search(
+                        r'<time[^>]*class=["\'][^"\']*time[^"\']*["\'][^>]*title=["\']([^"\']+)["\']',
+                        det_html,
+                        re.I,
+                    )
+                    if m_time_full:
+                        pub_time = html_lib.unescape(m_time_full.group(1)).strip()
+                    m_art = re.search(
+                        r'(<div[^>]*class=["\'][^"\']*article-content[^"\']*["\'][^>]*>.*?</div>)\s*(?:<div|<footer|</article)',
+                        det_html,
+                        re.S | re.I,
+                    )
+                    if not m_art:
+                        m_art = re.search(r"(<article[^>]*>.*?</article>)", det_html, re.S | re.I)
 
                     if m_art:
                         art_fragment = m_art.group(1)
@@ -1647,16 +1597,13 @@ def fetch_gwdang_discounts(
     timeout: float = 10.0,
 ) -> Dict[str, Any]:
     """
-    【T1-4】购物党折扣精选 (`https://www.gwdang.com/v2/home/discount/{mode}`)
-    - 推荐高含金量模式：
-      * `"0-hour_3"`   -> 3小时最热好价
-      * `"0-lowest"`   -> N天历史低价
-      * `"0-s_lowest"` -> 全网同款最低价
-      * `"0-lower_11"` -> 低于双11价
-      * `"0-latest"`   -> 全站最新好价折扣
-    - 核心升级：自动解码页面内嵌的 `data=` Base64 + zlib 压缩 JSON 载荷，100% 提取完整商品标题、
-      品牌、店铺、商城、历史低价标签 (`usp`) 以及包含领券链 (`coupon.m.jd.com`) 与商品购买链
-      (`jingfen.jd.com` / `item.jd.com` / 天猫淘宝) 的完整 `buy_steps` 凑单教程！
+    【❌已整站废弃禁入定时调度 —— 严禁后续人员重新启用】购物党折扣精选 (`https://www.gwdang.com/v2/home/discount/{mode}`)
+    - 废弃原因（血泪实测结论）：
+      1) 经 8 轮线上周期实测清洗 320 条购物党记录，其中 319 条转链失败（失败率 99.7%：`ERR_JD_NUMERIC_SKU`=130、
+         `ERR_ADAPTER_CONVERT_FAILED`=81、`ERR_EMPTY_PRODUCT_IDENTITY`=53、`ERR_TB_NUMERIC_ID`=36），唯一 1 条成功系主商品失败后误拿凑单品顶替；
+      2) 根因是购物党全站（京东/天猫淘宝/拼多多）主商品 100% 仅提供纯数字 SKU 链接（`item.jd.com/{数字}.html`、
+         `detail.tmall.com/item.htm?id={数字}`、`goods.html?goods_id={数字}`），三大联盟官方转链 API 100% 拒识纯数字 ID；
+      3) 遵循“严禁使用商品全称反向模糊搜索解析纯数字 ID”的工程铁律，本函数仅作为探索基线保留，严禁重新加入 `run_deal_pool_scheduler.py`！
     """
     import hashlib as _hashlib
 
@@ -1701,8 +1648,6 @@ def fetch_gwdang_discounts(
             if img_url and img_url not in step_imgs:
                 step_imgs.insert(0, img_url)
 
-            # 从 dp_id (如 "10048223326472-3") 提取原始平台商品 SKU 链接作为双保险
-            raw_sku = dp_id.split("-")[0].strip()
             site_id_str = str(info.get("site_id") or (dp_id.split("-")[1] if "-" in dp_id else "")).strip()
             explicit_plat = detect_platform_signal(f"{site_name} {shop_name}")
             if not explicit_plat:
@@ -1712,28 +1657,6 @@ def fetch_gwdang_discounts(
                     explicit_plat = "taobao"
                 elif "拼多多" in site_name:
                     explicit_plat = "pdd"
-
-            if raw_sku.isdigit():
-                if explicit_plat == "jd":
-                    sku_url = f"https://item.jd.com/{raw_sku}.html"
-                    if not any(lk.get("url") == sku_url for lk in links):
-                        links.append({
-                            "label": "京东商品直达页(dp_id解码)",
-                            "url": sku_url,
-                            "item_id": raw_sku,
-                            "type": "gwdang_dp_sku",
-                            "platform": "jd",
-                        })
-                elif explicit_plat == "taobao":
-                    sku_url = f"https://detail.tmall.com/item.htm?id={raw_sku}"
-                    if not any(lk.get("url") == sku_url for lk in links):
-                        links.append({
-                            "label": "淘宝/天猫商品直达页(dp_id解码)",
-                            "url": sku_url,
-                            "item_id": raw_sku,
-                            "type": "gwdang_dp_sku",
-                            "platform": "taobao",
-                        })
 
             steps_text = html_to_tutorial_text(buy_steps_html, base_url=url)
             usp_str = f" | 低价标签: {', '.join(usp_list)}" if usp_list else ""

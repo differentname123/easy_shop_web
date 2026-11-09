@@ -159,7 +159,9 @@ def create_app() -> FastAPI:
         client = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "127.0.0.1")
         req_path = _request_path(request)
         path_only = request.url.path
-        is_noisy_asset = path_only.startswith("/static/") or path_only in ("/favicon.ico", "/health")
+        is_noisy_asset = path_only.startswith("/static/") or path_only in (
+            "/favicon.ico", "/apple-touch-icon.png", "/manifest.json", "/health",
+        )
         try:
             response = await call_next(request)
         except Exception as exc:
@@ -207,7 +209,24 @@ def create_app() -> FastAPI:
 
     @application.get("/favicon.ico")
     def favicon():
+        icon_path = os.path.join(STATIC_DIR, "icons", "icon-192.png")
+        if os.path.isfile(icon_path):
+            return FileResponse(icon_path, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
         return Response(content=b"", media_type="image/x-icon")
+
+    @application.get("/apple-touch-icon.png")
+    def apple_touch_icon():
+        icon_path = os.path.join(STATIC_DIR, "icons", "apple-touch-icon.png")
+        if os.path.isfile(icon_path):
+            return FileResponse(icon_path, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+        return Response(content=b"", media_type="image/png")
+
+    @application.get("/manifest.json")
+    def web_manifest():
+        manifest_path = os.path.join(STATIC_DIR, "manifest.json")
+        if os.path.isfile(manifest_path):
+            return FileResponse(manifest_path, media_type="application/manifest+json", headers={"Cache-Control": "no-cache"})
+        return JSONResponse(content={})
 
     @application.get("/", response_class=HTMLResponse)
     def index_page():

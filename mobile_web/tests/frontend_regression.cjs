@@ -98,7 +98,7 @@ function harness({ url = 'https://shop.test/', saved = {}, sessionSaved = {}, cl
     await flush();
   };
   return { context, api, session, requests, mounted, unmounted, copied, timers, toasts, opened, scrolled,
-    fire: name => [...(listeners.get(name) || [])].forEach(callback => callback()),
+    fire: (name, event) => [...(listeners.get(name) || [])].forEach(callback => callback(event)),
     load, makeFeeds, makeAccount, finish, summaryKey, feedKey, get page() { return page; } };
 }
 const goodsResponse = (id, hasMore = true) => ({ status: 'success', data: [{ goods_id: id, platform: 'pdd' }], has_more: hasMore });
@@ -1883,3 +1883,53 @@ test('boom tab uses latest sort without search and automatically switches to cos
   await h.finish(2, goodsResponse('boom-latest-2', false));
   await clearLoad;
 });
+
+test('desktop icon tags, manifest and add-to-home-screen guide work without login state', () => {
+  for (const page of ['index.html', 'detail.html', 'group_help.html']) {
+    const html = fs.readFileSync(path.join(root, 'static', page), 'utf8');
+    assert.ok(html.includes('/static/icons/apple-touch-icon.png'), `${page} links apple-touch-icon`);
+    assert.ok(html.includes('/static/icons/icon-192.png'), `${page} links icon-192`);
+    assert.ok(html.includes('/manifest.json'), `${page} links manifest.json`);
+  }
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(indexHtml.includes('<title>查券省钱</title>'), 'index.html uses concise title');
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'static', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.name, '查券省钱');
+  assert.equal(manifest.short_name, '查券省钱');
+  assert.equal(manifest.display, 'standalone');
+  assert.equal(manifest.icons.length, 2);
+
+  // 1. 普通浏览器访问：展示引导条，点击弹出分步指引，关闭后持久化
+  const h1 = harness({ url: 'https://shop.test/' });
+  h1.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15';
+  const browser1 = h1.context.EasyShop.createBrowserTools({ ref: h1.context.Vue.ref });
+  assert.equal(browser1.isStandalone.value, false);
+  assert.equal(browser1.showDesktopBanner.value, true);
+  browser1.triggerAddToDesktop();
+  assert.equal(browser1.isDesktopGuideOpen.value, true);
+  assert.equal(browser1.desktopGuidePlatform.value, 'ios');
+  browser1.closeDesktopGuide(true);
+  assert.equal(browser1.isDesktopGuideOpen.value, false);
+  assert.equal(browser1.showDesktopBanner.value, false);
+  assert.equal(h1.context.localStorage.getItem('easy_shop_desktop_banner_dismissed'), '1');
+  browser1.dispose();
+
+  // 2. 微信内置浏览器识别为 wechat 引导
+  const h2 = harness({ url: 'https://shop.test/' });
+  h2.context.navigator.userAgent = 'Mozilla/5.0 (Linux; Android 14) MicroMessenger/8.0.50';
+  const browser2 = h2.context.EasyShop.createBrowserTools({ ref: h2.context.Vue.ref });
+  browser2.triggerAddToDesktop();
+  assert.equal(browser2.isDesktopGuideOpen.value, true);
+  assert.equal(browser2.desktopGuidePlatform.value, 'wechat');
+  browser2.dispose();
+
+  // 3. 从桌面图标启动 (?from=desktop)：自动识别为 standalone 并隐藏引导条
+  const h3 = harness({ url: 'https://shop.test/?from=desktop' });
+  const browser3 = h3.context.EasyShop.createBrowserTools({ ref: h3.context.Vue.ref });
+  assert.equal(browser3.isStandalone.value, true);
+  assert.equal(browser3.showDesktopBanner.value, false);
+  assert.equal(h3.context.localStorage.getItem('easy_shop_desktop_installed'), '1');
+  browser3.dispose();
+});
+
+

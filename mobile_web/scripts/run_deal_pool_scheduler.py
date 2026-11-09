@@ -2,18 +2,26 @@
 """
 好价线报与采集群定时拉取 (`deal_raw_tips`) + 双阶段 AI 提纯 & 官方转链核验 + 高分好价入库 (`products`) 一体化守护脚本
 ====================================================================================================================
-零、【核心工程思想与五阶段架构铁律（⚠️ 后续所有开发人员与 AI 迭代优化必须严格遵循，严禁违背）】
-  1. 代码与 AI 职责边界清晰（告别脆弱正则，各司其职）：
-     - 【确定性代码负责】：多源 HTTP 并发拉取、源站中转跳板解包（逛丢 `to.php`/`go.php`、拔草哦 `go.bacaoo.com`、购物党 `data=` Base64）、
-       源页面地址追溯记录（`source_list_page_url` / `source_detail_url`）、官方转链与商品详情 API 调用
-       （`JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`）、链接占位符精确回填、
-       MongoDB 幂等写入与 `quality_score` 高分保护机制。
-     - 【双阶段 AI 负责】：消灭一切脆弱的价格正则、口令截断正则、词表黑名单与分词启发式规则！
-       由 Stage 1 AI 负责群聊连续上下文合并与多链接/口令无损拆解编号；
-       由 Stage 2 AI 结合官方转链真实底牌，负责主商品/优惠券/凑单品角色定性、死链与货不对板铁面淘汰、
-       爆料到手价提取、抄作业教程重构与 0~100 分综合质量评分（`quality_score`）。
+零、【第一性原理与核心工程铁律（⚠️ 后续所有开发人员与 AI 迭代优化必须严格遵循，严禁违背）】
+  ★ 最高准则（极简、确定、绝对可靠 —— KISS & Absolute Reliability First）：
+    1. 不要为了一点边角转换率的提升而把系统变得复杂和脆弱！
+       例如：面对纯数字商品 ID（`item.jd.com/{数字}.html`），**严禁采用“提取商品全称去反向模糊搜索再比对”这类链路冗长、极不稳定的方案**。
+    2. 一切都要可靠！任何数据源、子频道、转链方式或降级兜底，只要不可靠、不稳定、需要靠“猜”或“碰运气”，**直接果断放弃该方案的应用**，绝不妥协！
+       - 主商品链接若未转出官方单品详情（`convert_status != "product"`），**直接放弃整条线报**，严禁拿存活的凑单品链接顶替主商品；
+       - AI-1 或 AI-2 若偶发调用失败或未返回结果，**直接放弃该条记录**，严禁用启发式规则伪造拆解或伪造高分强行入库；
+       - AI-2 若未提取到明确的单一爆料价（`deal_price=null`），保持为空，**严禁回退使用旧爬虫正则抠出的数字**；
+       - 对于全站仅提供纯数字 SKU 或加密跳板、无官方推广短链/口令的渠道（如购物党 `gwdang`、慢慢买 `category_man`），**直接从采集源中剔除放弃**。
+    3. 代码与 AI 职责边界清晰（告别脆弱正则与启发式补丁，各司其职）：
+       - 【确定性代码负责】：多源 HTTP 并发拉取、确定性源站跳板解包（逛丢 `to.php`/`go.php`、拔草哦 `go.bacaoo.com`）、
+         源页面地址追溯记录（`source_list_page_url` / `source_detail_url`）、官方转链与商品详情 API 调用
+         （`JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`）、链接占位符精确回填、
+         MongoDB 幂等写入与 `quality_score` 高分保护机制。
+       - 【双阶段 AI 负责】：消灭一切脆弱的价格正则、口令截断正则、词表黑名单与启发式规则！
+         由 Stage 1 AI 负责群聊同商品附属碎片合并与多链接/口令无损拆解编号；
+         由 Stage 2 AI 结合官方转链真实底牌，负责主商品/优惠券/凑单品角色定性、死链与货不对板铁面淘汰、
+         爆料到手价提取、抄作业教程重构与 0~100 分综合质量评分（`quality_score`）。
 
-  2. 五阶段端到端流水线（5-Stage Dual-AI & Official API Pipeline）：
+  ★ 五阶段端到端流水线（5-Stage Dual-AI & Official API Pipeline）：
      - 【Stage 1：源站拉取与全量上下文留存 -> 入初步表 `deal_raw_tips`】
        * 每条数据强制记录 `source_list_page_url`（列表页/群聊页地址，方便人工打开网页比对是否漏抓）与 `source_detail_url`（详情页地址）。
        * 对于群聊流（`is_group_stream=True`，即折淘客 150+ 个采集群 `xianbao.aspx`）：**100% 消息全量入库**！
@@ -23,7 +31,7 @@
      - 【Stage 2：AI 阶段一（原始拆解与转链提纯 `prompt/爆料阶段1_原始拆解与转链提纯.txt`）】
        * 若 `is_group_stream=True`，自动从 `deal_raw_tips` 查询同群 (`group_id`) 前后 ±3 分钟（`±180s`）内的相邻消息（含纯文字/纯晒单图消息）一并送入 AI-1；
          若 `is_group_stream=False`，仅传入单帖自身（`raw_messages` 长度为 1），绝不跨帖串味。
-       * AI-1 识别并合并属于同一爆料的相邻群消息（`merged_tip_ids`），将所有电商链接/口令拆解为独立编号（`L1`, `L2`...）并在正文中原位替换为 `[#L1]`, `[#L2]` 占位符，汇总晒单图列表 `extracted_images`。
+       * AI-1 仅合并属于同一主商品的附属碎片消息（严禁合并同群内两个独立商品），将所有电商链接/口令拆解为独立编号（`L1`, `L2`...）并在正文中原位替换为 `[#L1]`, `[#L2]` 占位符，汇总晒单图列表 `extracted_images`。
      - 【Stage 3：官方 API 逐一转链与验真（100% 确定性代码）】
        * 遍历 AI-1 拆出的 `extracted_targets`，逐一调用 `JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal(clean_input)`：
          ① `"product"`：成功返回具体 `goods_id`、`goods_sign` 与官方 `product` 详情字典（含真实标题、日常价、券后价、主图、店铺）及我方推广链 `my_promo_link` / 口令 `my_promo_token`；
@@ -31,8 +39,8 @@
          ③ `"failed"`：死链、下架或纯数字无签名 ID。
      - 【Stage 4：AI 阶段二（底牌终审、教程重构与质量评分 `prompt/爆料阶段2_底牌终审与教程评分.txt`）-> 先落盘 `deal_raw_tips`】
        * 将 `combined_raw_text`、`extracted_images` 与官方转链底牌 `converted_links` 一并交给 AI-2。
-       * AI-2 铁面淘汰“主商品死链仅凑单品存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”、“指鹿为马货不对板 (`PRODUCT_MISMATCH`)”、“虚拟垃圾 (`VIRTUAL_OR_JUNK`)”；
-       * 锁定唯一主商品 `main_link_id`，归位前置优惠券 `coupon_links` 与凑单品 `filler_links`，提取爆料到手价 `deal_price` / 折合单价 `unit_deal_price` / 凑单逻辑 `price_logic`，重构带 `[#L1]` 占位符的 `tutorial_steps` 与 `tutorial_summary`，并给出 0~100 分 `quality_score`。
+       * AI-2 铁面淘汰“主商品未转出单品仅凑单品存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”、“指鹿为马货不对板 (`PRODUCT_MISMATCH`)”、“虚拟垃圾 (`VIRTUAL_OR_JUNK`)”；
+       * 锁定唯一主商品 `main_link_id`（必须严格为 `convert_status == "product"` 且非凑单品），归位前置优惠券 `coupon_links` 与凑单品 `filler_links`，提取爆料到手价 `deal_price` / 折合单价 `unit_deal_price` / 凑单逻辑 `price_logic`，重构带 `[#L1]` 占位符的 `tutorial_steps` 与 `tutorial_summary`，并给出 0~100 分 `quality_score`。
        * 代码将 `[#L1]` 精确替换为我方专属推广链接/口令后，**先将完整清洗结果与评分落盘回写至 `deal_raw_tips`**。
      - 【Stage 5：高分优品晋升入正式商品库 `products`（Schema 严格隔离 + 高分防覆盖保护）】
        * 仅将 `is_valid_deal=True` 且 `quality_score >= 60` 的高分爆料晋升写入正式表 `products`。
@@ -186,9 +194,16 @@ EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
     "iehou/latest (网猴线报-首页最新流)": (
         "【已尝试并放弃】冗余低效：首页实时流被微博抽奖刷屏（实测有效率 0%），有价值内容已被 iehou/dayhot (24H热榜) 100% 覆盖。"
     ),
-    "gwdang/0-hour_3 (购物党-3小时最热折扣)": (
-        "【已尝试并放弃】违反铁律1稳定性要求：2小时14轮实测中有7轮返回0条空包且单次阻塞高达11.4秒（失败率50%），"
-        "且其有效商品已被 100% 零报错的 0-latest / 0-lowest / 0-s_lowest / 0-lower_11 四个频道完全覆盖。"
+    "gwdang_all_channels (购物党全频道 0-hour_3 / 0-latest / 0-lowest / 0-s_lowest / 0-lower_11)": (
+        "【已尝试并彻底放弃】违反绝对可靠原则：经 8 轮完整周期实测处理 320 条购物党记录，其中 319 条失败（99.7% 失败率："
+        "`ERR_JD_NUMERIC_SKU`=130, `ERR_ADAPTER_CONVERT_FAILED`=81, `ERR_EMPTY_PRODUCT_IDENTITY`=53, `ERR_TB_NUMERIC_ID`=36），"
+        "唯一 1 条成功记录系主商品纯数字京东链接失败后将凑单品误顶替为主商品。根因在于购物党全站主商品均仅提供纯数字 SKU 链接 "
+        "(`item.jd.com/{数字}.html` / `detail.tmall.com/item.htm?id={数字}` / `goods.html?goods_id={数字}`)，"
+        "官方三大联盟接口 100% 拒识纯数字 ID，且严禁使用脆弱的“商品全称反向模糊搜索”，故整站果断放弃！"
+    ),
+    "xianbao_fun/category_man (线报酷-慢友线报聚合 / 慢慢买镜像)": (
+        "【已尝试并放弃】违反绝对可靠原则：实测 90 条记录中 87 条失败（97.8% 失败率），底层全为 `cu.manmanbuy.com/discuxiao_{id}.aspx` "
+        "前端加密跳板，无明文商品推广链接或口令，果断剔除。"
     ),
     "zhetaoke_inactive_pdd_subgroups (折淘客特定拼多多群 id=10000039/10000068/10000107 及 q=拼多多 搜索)": (
         "【拼多多专项探索：已尝试并放弃】实测折淘客下拉框中的 `10000039 (MK拼多多采集群)`、`10000068 (高佣拼多多采集群)`、"
@@ -199,11 +214,6 @@ EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
         "【拼多多专项探索：已尝试并放弃】实测遍历 `get_wire_report_items` 的 `type=0~5` 及 `category_type=0,10001~10008,10367` "
         "均只有淘宝(type=1/2)与京东(type=3)，拼多多条数为 0；网页端 `/haodan/tehuigou.html` 仅为 460 字节前端 JS 空壳 (`cms_web.min.js`)，无 SSR 数据。"
         "（替代方案：好单库体系内的拼多多线报已通过【线报酷 `category_haodan_pdd` (`/category-haodan-pdd/`)】100% 捕获，实测 20/20 含 `p.pinduoduo.com` 短链）。"
-    ),
-    "gwdang_pdd_numeric_only_site_370 (购物党 site_id=370 拼多多商品及详情页 /v2/zhi/detail/1)": (
-        "【拼多多专项探索：已尝试并放弃】购物党折扣流中虽包含 `site_id=370` (拼多多) 记录，但其实测 Base64 `buy_steps` 解码结果与详情页 "
-        "`/v2/zhi/detail/1?dp_id={dp_id}-370` 均仅提供纯数字 `goods_id` 链接 (`https://mobile.yangkeduo.com/goods.html?goods_id=990159885102`)，"
-        "不含 `goods_sign` 或 `p.pinduoduo.com` 推广短链，多多进宝官方转链网关 100% 拒识 (`sub_code=40009, ERR_PDD_NUMERIC_ID`)，严禁无效二次请求详情页。"
     ),
     "xianbao_fun/category_zhidemai_pdd & category_manmanmai_pdd (线报酷-值得买拼多多 / 慢慢买拼多多子流)": (
         "【拼多多专项探索：已尝试并放弃】虽然 `xb-app.min.js` 中定义了 `/category-zhidemai-pdd/` 与 `/category-manmanmai-pdd/` 路由，"
@@ -221,6 +231,11 @@ EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
 # 【核心工程准则备忘录】五阶段双 AI 赋能 + 官方转链验真 + 高分保护准则
 # ==============================================================================
 ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
+    "principle_00_kiss_and_absolute_reliability_first": (
+        "【最高准则：极简与绝对可靠（KISS & Absolute Reliability First）】"
+        "1) 不要为了一点边角转换率而把系统变得复杂脆弱（如严禁使用“商品全称反向模糊搜索解析纯数字ID”这种长链路不稳定方案）；"
+        "2) 一切都要可靠，凡是不可靠、不稳定、需要靠猜或启发式硬凑的方案（如拿存活凑单品顶替主商品、AI 失败时伪造高分入库、回退旧正则价格、抓取全站纯数字ID源）一律直接放弃！"
+    ),
     "principle_01_source_page_traceability_and_zero_context_loss": (
         "【Stage 1：源页面可追溯与群聊全量留存】每条数据必须记录 `source_list_page_url`（列表页/群聊页地址）与 `source_detail_url`（详情页地址），"
         "方便人工随时打开对应页面比对是否漏抓；折淘客实时采集群（`is_group_stream=True`）100% 保存群内所有消息（含纯文字教程补充与纯晒单截图 `context_only`），"
@@ -228,17 +243,17 @@ ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
     ),
     "principle_02_ai_stage1_semantic_splitting_instead_of_regex": (
         "【Stage 2：用 Stage 1 AI 替代脆弱正则拆链与群聊合并】彻底取消用复杂正则表达式抠价格、抠口令或按顺序硬猜主商品的做法；"
-        "对群聊流传入同群 ±3 分钟（`±180s`）上下文，对网页/榜单流传入单帖，由 Stage 1 AI 统一完成相邻消息合并（`merged_tip_ids`）、"
-        "全部链接/口令无损拆解编号（`L1, L2...`）与正文 `[#L1]` 占位符替换。"
+        "对群聊流传入同群 ±3 分钟（`±180s`）上下文，对网页/榜单流传入单帖，由 Stage 1 AI 仅合并同一主商品的附属碎片（严禁合并同群不同商品），"
+        "完成全部链接/口令无损拆解编号（`L1, L2...`）与正文 `[#L1]` 占位符替换。"
     ),
     "principle_03_official_api_conversion_for_both_products_and_coupons": (
         "【Stage 3：官方 API 转链验真且优惠券与主商品同等重要】遍历 Stage 1 AI 拆出的所有编号目标，调用官方 `Adapter.resolve_and_convert_universal()`："
         "既解析出唯一商品的官方真实详情（`convert_status='product'`），也完整保留优惠券/补贴券/活动会场的转链结果（`convert_status='coupon_or_activity'`），"
-        "绝不丢弃前置领券链接，也绝不对优惠券链接做模糊搜索冒充商品。"
+        "绝不丢弃前置领券链接，也绝不对优惠券链接或会场多商品链接做模糊搜索冒充单品。"
     ),
     "principle_04_ai_stage2_audit_and_strict_schema_separation": (
         "【Stage 4 & Stage 5：Stage 2 AI 底牌终审、评分防覆盖与 Schema 严格隔离】由 Stage 2 AI 结合官方真实商品详情与原始文案进行终审，"
-        "淘汰“主商品死链仅凑单存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”及“货不对板 (`PRODUCT_MISMATCH`)”，生成步骤化教程并打分（0~100 `quality_score`）。"
+        "淘汰“主商品未转出单品仅凑单存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”及“货不对板 (`PRODUCT_MISMATCH`)”，生成步骤化教程并打分（0~100 `quality_score`）。"
         "结果先持久化至 `deal_raw_tips`，再将 `quality_score >= 60` 的优品晋升入 `products`：`products` 顶层价格/标题 100% 保持官方原貌，"
         "爆料价 `deal_price`、优惠券 `coupon_links`、凑单品 `filler_links`、教程与晒单图全部放入 `deal_info`，且高分爆料受保护不被低分简陋线报覆盖。"
     ),
@@ -260,10 +275,16 @@ CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST: Dict[str, str] = {
         "且丢失前置优惠券会导致京东/淘宝商品购买时比爆料价贵得多。"
         "【当前做法】Stage 3 对拆出的全部链接逐一转链并区分 `product` 与 `coupon_or_activity`，Stage 4 由 AI-2 对照全量底牌锁定唯一主商品、归位优惠券与凑单品。"
     ),
-    "dead_end_03_title_fuzzy_search_fallback": (
-        "【曾尝试并严厉禁止】当商品链接转链失败或遇到优惠券短链时，调用全网模糊搜索 `search_goods` 取列表第一条商品顶替。"
-        "【问题教训】模糊搜索或会场多商品列表首条极易返回毫不相干的商品，造成严重的“张冠李戴（假商品）”事故。"
-        "【当前做法】全面禁止标题模糊搜索顶替；`JdAdapter` 仅在短链唯一命中单品或京口令明确含单品“抢购”标识时采纳详情，否则作为优惠券/会场链返回。"
+    "dead_end_03_title_fuzzy_search_and_reverse_title_resolution": (
+        "【曾尝试并严厉禁止】当商品链接转链失败、为纯数字 SKU (`item.jd.com/{数字}.html`) 或遇到优惠券短链时，用商品全称或标题调用全网搜索 `search_goods` 反向解析或取首条顶替。"
+        "【问题教训】用商品全称反向搜索链路极长且极不稳定，极易抓到同款不同规格、第三方山寨店或凑单品，造成“牛头不对马嘴”事故。"
+        "【当前做法】彻底放弃对纯数字 SKU 的反向标题解析；`JdAdapter` / `PddAdapter` 仅在推广短链 100% 唯一命中单件商品 (`len==1` 且 `total_count==1`) 时采纳详情，否则直接放弃。"
+    ),
+    "dead_end_04_heuristic_fallbacks_when_ai_or_main_link_fails": (
+        "【曾尝试并彻底移除】1) 当 AI-2 选定的 `main_link_id` 不是 `product` 时，用 `prod_convs[0]` 盲目替补主商品（实测导致将凑单洗衣液当成主商品紫草油入库）；"
+        "2) 当 AI-2 返回 `deal_price=null` 时，回退读取旧爬虫正则字段 `doc.get('price')`（实测将“80抽湿巾”抠成 80.0 元）；"
+        "3) 当 AI-1/AI-2 超时失败时，用 `_fallback_stage1_extract` / `_fallback_stage2_evaluate` 伪造 72 分高分放行入库。"
+        "【当前做法】严格执行“不可靠即直接放弃”：主商品非 `product` 直接淘汰，AI 未返回结果直接淘汰，`deal_price=null` 保持为空绝不回退旧正则。"
     ),
     "success_note_01_pdd_four_high_yield_channels_and_bacaoo_unwrap": (
         "【拼多多专项探索：已验证成功并上线】四大高转化拼多多专属源无缝融入五阶段管线：\n"
@@ -301,9 +322,8 @@ SITE_DISPLAY_NAMES: Dict[str, str] = {
     "haodanku": "好单库 (实时线报群/福利单)",
     "guangdiu": "逛丢 (全网/值得买/拼多多明文还原)",
     "xuandan": "选单网 (淘客快抢群发素材)",
-    "gwdang": "购物党 (历史低价/比价精选)",
     "0818tuan": "0818团 (实战凑单线报)",
-    "xianbao_fun": "线报酷 (22频道全网与拼多多聚合)",
+    "xianbao_fun": "线报酷 (21频道全网与拼多多聚合)",
     "bacaoo": "拔草哦 (国内优惠与拼多多商城专区)",
     "iehou": "网猴线报 (24H热榜)",
 }
@@ -332,12 +352,6 @@ OPS_TROUBLESHOOTING_PLAYBOOK: Dict[str, Dict[str, str]] = {
         "http_403_429": "选单网接口限流：请确认请求头包含 `Referer: https://www.xuandan.com/NewHome/fastBuy`。",
         "empty_or_parse": "选单网返回 0 条：整点场 (`hour_type=1`) 在非整点促销时段可能为空；若全天场 (`hour_type=''`) 为空，请检查 JSON 响应 `List` 数组结构。",
         "timeout_or_conn": "选单网连接超时：单轮超时无需人工干预，若连续 ≥3 轮失败请测试 `https://www.xuandan.com/NewHome/fastBuy` 可用性。",
-    },
-    "gwdang": {
-        "endpoint": "https://www.gwdang.com/v2/home/discount/{mode}",
-        "http_403_429": "购物党触发 429 频率保护：请确保各购物党频道之间的 `pause_sec` 保持 ≥ 3.0 秒，严禁并发请求。",
-        "empty_or_parse": "购物党返回 0 条：请访问对应错误 URL，检查页面内 `data = [...]` 内嵌 JSON 变量名是否变更。",
-        "timeout_or_conn": "购物党接口响应慢/超时：购物党部分聚合查询偶有后端慢查询，若某子频道连续 ≥5 轮超时可将其从 T1 任务列表中注释隔离。",
     },
     "0818tuan": {
         "endpoint": "http://www.0818tuan.com/list-1-{page}.html | http://www.0818tuan.com/xb/{id}.html",
@@ -1185,67 +1199,31 @@ class DealPoolCleaner:
         }
         return stage1_item, tip_map
 
+    @staticmethod
+    def _strip_markdown_link_wrapper(raw_val: str) -> str:
+        """若字符串被包裹在 `[...](https://...)` Markdown 语法中，提取圆括号内的真实 URL。"""
+        s = html_lib.unescape(str(raw_val or "")).strip()
+        if s.startswith("[") and "](" in s and s.endswith(")"):
+            inner = s.split("](", 1)[-1][:-1].strip()
+            if inner:
+                return inner
+        return s
+
     def _fallback_stage1_extract(self, doc: Dict[str, Any]) -> Dict[str, Any]:
-        """当 AI 网关偶发超时或返回异常时的确定性安全保底拆解器，确保单帖链接绝不因网络波动丢失。"""
+        """
+        【遵循核心铁律：Fail-Closed】
+        当 Stage 1 AI 未返回某条记录的拆解结果时，严禁使用脆弱的本地启发式规则猜测链接角色，
+        直接返回空的 `extracted_targets=[]` 拒绝本条记录，确保绝不把未受 AI-1 语义提纯的残缺锚点送入下游。
+        """
         main_tip_id = str(doc.get("source_item_id") or "")
         msg = self._format_raw_message_for_ai1(doc, is_target=True)
-        content = msg["content"]
-        doc_plat = str(doc.get("platform") or "unknown").strip()
-
-        extracted_targets: List[Dict[str, str]] = []
-        seen: Set[str] = set()
-
-        for lk in doc.get("extracted_links") or []:
-            if not isinstance(lk, dict):
-                continue
-            raw_u = html_lib.unescape(str(lk.get("url") or lk.get("item_id") or "")).strip()
-            if not raw_u or raw_u in seen:
-                continue
-            plat = detect_candidate_platform(raw_u, str(lk.get("platform") or doc_plat))
-            if plat == "unsupported_other":
-                continue
-            seen.add(raw_u)
-            lid = f"L{len(extracted_targets) + 1}"
-            lbl = str(lk.get("label") or "")
-            role = "coupon_candidate" if any(k in (lbl + raw_u).lower() for k in ("券", "coupon", "补贴", "会场")) else "main_candidate"
-            extracted_targets.append({
-                "link_id": lid,
-                "clean_input": raw_u,
-                "platform": plat,
-                "text_role_hint": role,
-            })
-            if raw_u in content:
-                content = content.replace(raw_u, f"[#{lid}]")
-            else:
-                content = f"{content} [#{lid}]"
-
-        for tk in doc.get("extracted_tokens") or []:
-            tk_s = html_lib.unescape(str(tk or "")).strip()
-            if not tk_s or tk_s in seen:
-                continue
-            plat = detect_candidate_platform(tk_s, doc_plat)
-            if plat == "unsupported_other":
-                continue
-            seen.add(tk_s)
-            lid = f"L{len(extracted_targets) + 1}"
-            extracted_targets.append({
-                "link_id": lid,
-                "clean_input": tk_s,
-                "platform": plat,
-                "text_role_hint": "main_candidate",
-            })
-            if tk_s in content:
-                content = content.replace(tk_s, f"[#{lid}]")
-            else:
-                content = f"{content} [#{lid}]"
-
         return {
             "main_tip_id": main_tip_id,
             "is_standalone_deal": True,
             "merged_tip_ids": [main_tip_id],
-            "combined_raw_text": content.strip(),
+            "combined_raw_text": msg["content"].strip(),
             "extracted_images": msg["images"],
-            "extracted_targets": extracted_targets,
+            "extracted_targets": [],
             "_from_fallback": True,
         }
 
@@ -1330,7 +1308,7 @@ class DealPoolCleaner:
                     except Exception as e:
                         logger.warning("[AI-Stage1] 并发批次执行异常: %s", str(e).splitlines()[0][:200])
 
-        # 仅当 AI-1 真正未返回某条记录时才执行安全保底拆解；完全尊重 AI-1 对非电商/纯文字帖输出 extracted_targets=[] 的判断
+        # 若 AI-1 未返回某条记录，严格执行 Fail-Closed 拒绝；若正常返回，标准化 clean_input 与角色枚举
         for inp in stage1_inputs:
             mid = str(inp.get("main_tip_id") or "")
             orig_doc = docs_by_tip_id.get(mid) or {}
@@ -1346,7 +1324,7 @@ class DealPoolCleaner:
                 for idx_t, tgt in enumerate(ai1_res.get("extracted_targets") or [], 1):
                     if not isinstance(tgt, dict):
                         continue
-                    c_inp = html_lib.unescape(str(tgt.get("clean_input") or "")).strip()
+                    c_inp = self._strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
                     if not c_inp:
                         continue
                     raw_role = str(tgt.get("text_role_hint") or "main_candidate").strip().lower()
@@ -1375,7 +1353,7 @@ class DealPoolCleaner:
         精准分类为 `"product"`（具体单品）、`"coupon_or_activity"`（优惠券/活动会场）或 `"failed"`（死链/不支持）。
         """
         link_id = str(target.get("link_id") or "L1").strip()
-        clean_input = html_lib.unescape(str(target.get("clean_input") or "")).strip()
+        clean_input = self._strip_markdown_link_wrapper(str(target.get("clean_input") or ""))
         role_hint = str(target.get("text_role_hint") or "main_candidate").strip()
         hint_plat = str(target.get("platform") or default_plat or "unknown").strip().lower()
         plat = detect_candidate_platform(clean_input, hint_plat if hint_plat in ("jd", "taobao", "pdd") else default_plat)
@@ -1609,74 +1587,18 @@ class DealPoolCleaner:
 
     @staticmethod
     def _fallback_stage2_evaluate(s2_input: Dict[str, Any]) -> Dict[str, Any]:
-        """当 Stage 2 AI 偶发超时未返回某条记录时的确定性保底终审器。"""
+        """
+        【遵循核心铁律：Fail-Closed】
+        当 Stage 2 AI 未返回某条记录的终审结果时，严禁用本地规则伪造 72 分及格分蒙混入正式库 `products`，
+        直接标记为 `is_valid_deal=False` 拦截，确保进入正式库的每一件商品 100% 经过 AI-2 铁面验真。
+        """
         mid = str(s2_input.get("main_tip_id") or "")
-        conv_links = s2_input.get("converted_links") or []
-        prod_links = [c for c in conv_links if c.get("convert_status") == "product"]
-        if not prod_links:
-            return {
-                "main_tip_id": mid,
-                "is_valid_deal": False,
-                "reject_reason": "ALL_PRODUCTS_DEAD",
-                "main_link_id": None,
-                "quality_score": 0,
-                "_from_fallback": True,
-            }
-
-        # 若有多个候选但主商品候选全部失败、仅 filler_candidate 存活，严格拒绝
-        main_cands = [c for c in conv_links if c.get("text_role_hint") == "main_candidate"]
-        if main_cands and not any(c.get("convert_status") == "product" for c in main_cands):
-            return {
-                "main_tip_id": mid,
-                "is_valid_deal": False,
-                "reject_reason": "MAIN_PRODUCT_DEAD_ONLY_FILLER",
-                "main_link_id": None,
-                "quality_score": 0,
-                "_from_fallback": True,
-            }
-
-        winning = next((c for c in prod_links if c.get("text_role_hint") == "main_candidate"), prod_links[0])
-        main_lid = winning["link_id"]
-        off_prod = winning.get("official_product") or {}
-        clean_title = str(off_prod.get("title") or "").strip()
-
-        coupon_links = [
-            {"link_id": c["link_id"], "label": "先领优惠券/补贴券"}
-            for c in conv_links
-            if c.get("convert_status") == "coupon_or_activity"
-        ]
-        filler_links = [
-            {
-                "link_id": c["link_id"],
-                "label": f"凑单商品：{str((c.get('official_product') or {}).get('title') or '')[:24]}",
-            }
-            for c in prod_links
-            if c["link_id"] != main_lid
-        ]
-
-        raw_txt = str(s2_input.get("combined_raw_text") or "").strip()
-        imgs = s2_input.get("extracted_images") or []
-        score = 72 + (6 if imgs else 0) + (6 if coupon_links else 0)
         return {
             "main_tip_id": mid,
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": main_lid,
-            "clean_title": clean_title,
-            "deal_price": None,
-            "unit_deal_price": None,
-            "price_logic": None,
-            "coupon_links": coupon_links,
-            "filler_links": filler_links,
-            "tutorial_steps": [ln.strip() for ln in raw_txt.splitlines() if ln.strip()][:6],
-            "tutorial_summary": raw_txt,
-            "quality_score": min(95, score),
-            "score_breakdown": {
-                "match_score": 22,
-                "completeness_score": 24,
-                "price_clarity_score": 14,
-                "tutorial_and_image_score": 12 + (6 if imgs else 0),
-            },
+            "is_valid_deal": False,
+            "reject_reason": "AI2_AUDIT_UNAVAILABLE",
+            "main_link_id": None,
+            "quality_score": 0,
             "_from_fallback": True,
         }
 
@@ -1906,14 +1828,21 @@ class DealPoolCleaner:
             is_valid = bool(ai2_res.get("is_valid_deal"))
             main_lid = str(ai2_res.get("main_link_id") or "").strip()
             main_conv = link_map.get(main_lid)
-            if is_valid and (not main_conv or main_conv.get("convert_status") != "product"):
-                # 若 AI-2 返回的 main_link_id 不在存活单品中，尝试修正或判为无效
-                prod_convs = [c for c in conv_list if c.get("convert_status") == "product"]
-                if prod_convs and ai2_res.get("reject_reason") is None:
-                    main_conv = prod_convs[0]
-                    main_lid = main_conv["link_id"]
-                else:
-                    is_valid = False
+            declared_filler_ids = {
+                str(item.get("link_id") or "").strip()
+                for item in (ai2_res.get("filler_links") or [])
+                if isinstance(item, dict)
+            }
+            # 【严格遵循核心铁律】：主商品 main_link_id 必须指向真实存活的官方单品 ("product") 且绝不能位于凑单品列表内；
+            # 若主商品链接无效，严禁在代码中盲目拿 prod_convs[0] 凑单品顶替主商品，必须直接判为无效拦截！
+            if is_valid and (
+                not main_conv
+                or main_conv.get("convert_status") != "product"
+                or main_lid in declared_filler_ids
+            ):
+                is_valid = False
+                if not ai2_res.get("reject_reason"):
+                    ai2_res["reject_reason"] = "MAIN_PRODUCT_DEAD_ONLY_FILLER"
 
             if not is_valid or not main_conv:
                 rej = str(ai2_res.get("reject_reason") or "ALL_PRODUCTS_DEAD").upper()
@@ -1946,7 +1875,7 @@ class DealPoolCleaner:
             try:
                 quality_score = int(float(ai2_res.get("quality_score") or 0))
             except Exception:
-                quality_score = 70
+                quality_score = 0
             quality_score = max(0, min(100, quality_score))
             score_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
 
@@ -1960,10 +1889,8 @@ class DealPoolCleaner:
             my_promo_link = str(main_conv.get("my_promo_link") or "")
             my_promo_token = str(main_conv.get("my_promo_token") or "")
 
-            # 提取并校验 deal_price（仅存于 deal_info，绝不覆盖顶层 price / activity_price）
+            # 提取并校验 deal_price（仅信任 AI-2 语义核验后的 deal_price，严禁回退使用旧爬虫正则提取的 doc.get("price")！）
             raw_deal_p = ai2_res.get("deal_price")
-            if raw_deal_p is None:
-                raw_deal_p = doc.get("price")
             deal_price: Optional[float] = None
             if isinstance(raw_deal_p, (int, float)) and 0 < float(raw_deal_p) < 100000:
                 deal_price = round(float(raw_deal_p), 2)
@@ -1979,7 +1906,7 @@ class DealPoolCleaner:
             price_logic = str(ai2_res.get("price_logic") or "").strip() or None
             clean_title = str(ai2_res.get("clean_title") or product_card.get("name") or raw_title).strip()
 
-            # 组装前置优惠券列表 coupon_links 与凑单商品列表 filler_links
+            # 组装前置优惠券列表 coupon_links 与凑单商品列表 filler_links（100% 遵循 AI-2 终审结论，严禁盲目追加 AI-2 已剔除的无关外链）
             coupon_links: List[Dict[str, Any]] = []
             seen_cpn_ids: Set[str] = set()
             for item in ai2_res.get("coupon_links") or []:
@@ -1997,18 +1924,6 @@ class DealPoolCleaner:
                     "token": c_obj.get("my_promo_token") or "",
                     "platform": c_obj.get("platform") or plat,
                 })
-            # 若 Stage 3 存在已转链成功的 coupon_or_activity 但 AI-2 漏列，自动补齐以免丢券
-            for c_obj in conv_list:
-                lid = c_obj["link_id"]
-                if c_obj.get("convert_status") == "coupon_or_activity" and lid not in seen_cpn_ids and lid != main_lid:
-                    seen_cpn_ids.add(lid)
-                    coupon_links.append({
-                        "link_id": lid,
-                        "label": "领取优惠券/活动补贴",
-                        "url": c_obj.get("my_promo_link") or "",
-                        "token": c_obj.get("my_promo_token") or "",
-                        "platform": c_obj.get("platform") or plat,
-                    })
 
             filler_links: List[Dict[str, Any]] = []
             seen_flr_ids: Set[str] = set()
@@ -2076,6 +1991,7 @@ class DealPoolCleaner:
 
             publish_time_str = str(doc.get("publish_time") or doc.get("fetched_at") or "").strip()
             aux_list = [*coupon_links, *filler_links]
+            deal_price_text = f"{deal_price}元" if deal_price is not None else (unit_deal_price or "")
 
             deal_info = {
                 "is_deal_tip": True,
@@ -2085,7 +2001,7 @@ class DealPoolCleaner:
                 "publish_time": publish_time_str,
                 "expire_time": doc.get("expire_time"),
                 "deal_price": deal_price,
-                "deal_price_text": str(doc.get("price_text") or (f"{deal_price}元" if deal_price else "")),
+                "deal_price_text": deal_price_text,
                 "unit_deal_price": unit_deal_price,
                 "price_logic": price_logic,
                 "official_price": round(official_price, 2),
@@ -2944,12 +2860,13 @@ def run_single_cycle(
 ) -> Dict[str, Any]:
     """
     执行单轮完整【阶段一：拉取入初步表】+【阶段二：清洗入正式表】闭环：
-    - T0 核心源（25 个任务）全量覆盖 9 大站点与高转化拼多多专属源，每轮必跑；
-    - T1 扩充源（31 个任务）涵盖细分采集群、拼多多扩展翻页、豆瓣专组与比价榜，在 `--all-channels` 或偶数轮运行。
+    - T0 核心源（24 个高可靠任务）全量覆盖 8 大高可靠站点与高转化拼多多专属源，每轮必跑；
+    - T1 扩充源（27 个高可靠任务）涵盖细分采集群、拼多多扩展翻页与豆瓣/赚客吧/酷安专组，在 `--all-channels` 或偶数轮运行。
+    - 已永久放弃 `gwdang`（购物党 100% 纯数字 SKU 0% 转化）与 `xianbao_fun/category_man`（慢慢买 `discuxiao_` 加密跳板壳）。
     """
     fetch_start = time.perf_counter()
     include_medium = run_all_tiers or (cycle_num % 2 == 0)
-    cycle_mode = "FULL_56_CHANNELS" if include_medium else "T0_25_ALL_9_SITES"
+    cycle_mode = "FULL_51_RELIABLE_CHANNELS" if include_medium else "T0_24_ALL_8_RELIABLE_SITES"
     if channel_health_tracker is None:
         channel_health_tracker = {}
 
@@ -2959,7 +2876,7 @@ def run_single_cycle(
     bacaoo_done = repo.get_existing_detailed_ids("bacaoo", limit=2000)
     iehou_done = repo.get_existing_detailed_ids("iehou", limit=2000)
 
-    # ---------------- T0 高频核心源（每轮必跑：25 个高产频道，100% 覆盖全部 9 大站点 + 四大拼多多专属源） ----------------
+    # ---------------- T0 高频核心源（每轮必跑：24 个高产频道，100% 覆盖全部 8 大高可靠站点 + 四大拼多多专属源） ----------------
     tasks: List[Tuple[str, str, str, str, Callable[[], Dict[str, Any]], float]] = [
         (
             "好单库_京东实时采集群",
@@ -3079,14 +2996,10 @@ def run_single_cycle(
             lambda: fetch_xuandan_deals(hour_type="", page=1, session=session),
             0.4,
         ),
-        (
-            "购物党_最新好价折扣",
-            "gwdang",
-            "T0_high_freq",
-            "https://www.gwdang.com/v2/home/discount/0-latest",
-            lambda: fetch_gwdang_discounts(mode="0-latest", session=session),
-            1.2,
-        ),
+        # 🚨【严禁恢复：购物党_最新好价折扣 (gwdang / 0-latest) 已永久剔除】
+        # 原因：实测 320 条购物党记录中 319 条转链失败（99.7% 失败率），因其全站主商品 100% 为纯数字 SKU 裸链
+        # (`item.jd.com/{数字}.html` / `detail.tmall.com/item.htm?id={数字}`)，三大联盟官方接口 100% 拒识纯数字 ID，
+        # 且严禁使用脆弱的“商品全称反向模糊搜索”，有效产出为 0%，请勿以为遗漏而重新添加！
         (
             "0818团_实战凑单线报_P1",
             "0818tuan",
@@ -3252,7 +3165,7 @@ def run_single_cycle(
 
     if include_medium:
         tasks.extend([
-            # ---------------- T1 中频扩充源（31 个细分采集群、拼多多扩充翻页、豆瓣专组与比价榜频道） ----------------
+            # ---------------- T1 中频扩充源（27 个高可靠细分采集群、拼多多扩充翻页、豆瓣/赚客吧/酷安频道） ----------------
             (
                 "好单库_飞猪旅行生活券群",
                 "haodanku",
@@ -3355,30 +3268,8 @@ def run_single_cycle(
                 lambda: fetch_xuandan_deals(hour_type="1", page=1, session=session),
                 0.4,
             ),
-            (
-                "购物党_N天历史最低价",
-                "gwdang",
-                "T1_med_freq",
-                "https://www.gwdang.com/v2/home/discount/0-lowest",
-                lambda: fetch_gwdang_discounts(mode="0-lowest", session=session),
-                3.0,
-            ),
-            (
-                "购物党_全网同款最低价",
-                "gwdang",
-                "T1_med_freq",
-                "https://www.gwdang.com/v2/home/discount/0-s_lowest",
-                lambda: fetch_gwdang_discounts(mode="0-s_lowest", session=session),
-                3.0,
-            ),
-            (
-                "购物党_低于双11好价",
-                "gwdang",
-                "T1_med_freq",
-                "https://www.gwdang.com/v2/home/discount/0-lower_11",
-                lambda: fetch_gwdang_discounts(mode="0-lower_11", session=session),
-                3.0,
-            ),
+            # 🚨【严禁恢复：购物党 T1 频道 (0-lowest / 0-s_lowest / 0-lower_11) 已永久剔除】
+            # 原因同上：全站主商品 100% 为纯数字 SKU，官方转链 API 100% 拒识，实测 99.7% 失败率（详见顶部 EXCLUDED_SITES_AND_CHANNELS_MANIFEST）。
             (
                 "0818团_实战凑单线报_P2",
                 "0818tuan",
@@ -3618,21 +3509,9 @@ def run_single_cycle(
                 ),
                 0.5,
             ),
-            (
-                "线报酷_慢友线报聚合",
-                "xianbao_fun",
-                "T1_med_freq",
-                "https://new.xianbao.fun/category-man/",
-                lambda: fetch_xianbao_fun_deals(
-                    channel="category_man",
-                    page=1,
-                    fetch_detail=True,
-                    max_details=max_new_details_per_channel,
-                    session=session,
-                    skip_detail_ids=xianbao_done,
-                ),
-                0.5,
-            ),
+            # 🚨【严禁恢复：线报酷_慢友线报聚合 (xianbao_fun / category_man) 已永久剔除】
+            # 原因：实测 90 条记录中 87 条失败（97.8% 失败率），底层外链全为慢慢买 `cu.manmanbuy.com/discuxiao_{id}.aspx`
+            # 前端加密跳板壳，无明文商品推广链或口令，请勿以为遗漏而重新添加！
         ])
 
     total_inserted = 0
