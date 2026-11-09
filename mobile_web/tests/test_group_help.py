@@ -156,8 +156,8 @@ class _MemoryDB:
         return self.collections[name]
 
 
-def _make_poster_image_bytes(qr_text: str = "", poster_size=(750, 1200)) -> bytes:
-    """生成模拟拼多多多人团分享海报图（二维码位于右下角区域）。"""
+def _make_poster_image_bytes(qr_text: str = "", poster_size=(750, 1200), position: str = "bottom_right") -> bytes:
+    """生成模拟拼多多多人团分享海报图（支持二维码位于左上角、正中间或右下角等任意位置）。"""
     w, h = poster_size
     canvas = np.full((h, w, 3), 245, dtype=np.uint8)
     canvas[40:640, 40 : w - 40] = (220, 230, 240)
@@ -170,8 +170,12 @@ def _make_poster_image_bytes(qr_text: str = "", poster_size=(750, 1200)) -> byte
         qr_resized = cv2.resize(qr_mat, (qr_w * scale, qr_h * scale), interpolation=cv2.INTER_NEAREST)
         qr_rgb = cv2.cvtColor(qr_resized, cv2.COLOR_GRAY2RGB)
         rh, rw = qr_rgb.shape[:2]
-        y0 = h - rh - 80
-        x0 = w - rw - 60
+        if position == "top_left":
+            y0, x0 = 60, 60
+        elif position == "center":
+            y0, x0 = (h - rh) // 2, (w - rw) // 2
+        else:
+            y0, x0 = h - rh - 80, w - rw - 60
         canvas[y0 : y0 + rh, x0 : x0 + rw] = qr_rgb
 
     pil_img = Image.fromarray(canvas)
@@ -180,11 +184,12 @@ def _make_poster_image_bytes(qr_text: str = "", poster_size=(750, 1200)) -> byte
     return buf.getvalue()
 
 
-def test_qr_decoder_detects_bottom_right_qr_in_poster():
+def test_qr_decoder_detects_qr_in_any_position():
     short_url = "https://file-link.pinduoduo.com/ntkk9Kybjt"
-    img_bytes = _make_poster_image_bytes(short_url)
-    decoded = decode_qr_from_image_bytes(img_bytes)
-    assert decoded == short_url
+    for pos in ("bottom_right", "top_left", "center"):
+        img_bytes = _make_poster_image_bytes(short_url, position=pos)
+        decoded = decode_qr_from_image_bytes(img_bytes)
+        assert decoded == short_url
 
 
 def test_qr_decoder_returns_empty_for_image_without_qr():
@@ -255,7 +260,7 @@ def test_group_help_full_closed_loop(tmp_path, monkeypatch):
         # 1. 访问独立前端页面
         page_resp = client.get("/group_help")
         assert page_resp.status_code == 200
-        assert "多人团互助大厅" in page_resp.text
+        assert "多人团互助" in page_resp.text
 
         # 2. 上传无二维码图片 -> 报错拦截
         no_qr_b64 = base64.b64encode(_make_poster_image_bytes("")).decode("ascii")

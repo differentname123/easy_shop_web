@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="format-detection" content="telephone=no">
-  <title>拼多多多人团互助大厅 - 快速凑团</title>
-  <link rel="stylesheet" href="/static/css/group_help.css?v=20261109-2">
+  <title>拼多多多人团互助</title>
+  <link rel="stylesheet" href="/static/css/group_help.css?v=20261109-3">
   <script src="/static/js/vue.global.prod.js?v=ux-20261107-2"></script>
 </head>
 <body>
@@ -20,15 +20,16 @@
     @change="onFileSelected"
   />
 
-  <!-- 顶部标题 + 上传入口 + 搜索框 -->
+  <!-- 顶部标题 + 传图发团 + 问号说明 + 搜索框 -->
   <header class="gh-header">
     <div class="gh-title-row">
-      <div class="gh-brand">
-        <h1>🤝 多人团互助大厅</h1>
+      <h1 class="gh-title">多人团互助</h1>
+      <div class="gh-upload-group">
+        <button class="gh-upload-trigger-btn" @click="triggerUpload">
+          <span>➕ 传二维码发团</span>
+        </button>
+        <button class="gh-help-icon-btn" @click="openHelpGuide(null)" title="需要上传什么图片？">?</button>
       </div>
-      <button class="gh-upload-trigger-btn" @click="triggerUpload" :disabled="uploading">
-        <span>{{ uploading ? '⏳ 核验中...' : '➕ 传二维码发团' }}</span>
-      </button>
     </div>
 
     <div class="gh-search-row" v-if="filterMode !== 'mine'">
@@ -37,17 +38,17 @@
         <input
           type="text"
           class="gh-search-input"
-          placeholder="搜商品名称，优先展示少人前往的团..."
+          placeholder="搜索商品名称..."
           v-model="keyword"
           @keyup.enter="onSearch"
         />
-        <button v-if="keyword" class="gh-clear-btn" @click="clearSearch" title="清空">✕</button>
+        <button v-if="keyword" class="gh-clear-btn" @click="clearSearch">✕</button>
       </div>
       <button class="gh-search-btn" @click="onSearch">搜索</button>
     </div>
   </header>
 
-  <!-- 导航标签栏：正在凑团 | 仅差1人 | 查看我的团 -->
+  <!-- 导航标签栏：正在凑团 | 仅差1人 | 我的团 -->
   <nav class="gh-filter-bar">
     <div class="gh-filter-chips">
       <button
@@ -55,21 +56,21 @@
         :class="{ active: filterMode === 'active' }"
         @click="switchFilter('active')"
       >
-        🔥 正在凑团
+        正在凑团
       </button>
       <button
         class="gh-chip"
         :class="{ active: filterMode === 'almost' }"
         @click="switchFilter('almost')"
       >
-        ⚡ 仅差 1 人
+        仅差 1 人
       </button>
       <button
         class="gh-chip"
         :class="{ active: filterMode === 'mine' }"
         @click="switchFilter('mine')"
       >
-        🙋 查看我的团<span v-if="myGroups.length > 0"> ({{ myGroups.length }})</span>
+        我的团<span v-if="myGroups.length > 0"> ({{ myGroups.length }})</span>
       </button>
     </div>
     <button
@@ -80,92 +81,73 @@
     </button>
   </nav>
 
-  <!-- 排序规则温和说明条（大厅模式下） -->
-  <div v-if="filterMode !== 'mine' && items.length > 0" class="gh-sort-hint">
-    <span>💡 已按「前往人数从少到多」排序，排在前面的拼团更有可能有空位</span>
-  </div>
-
-  <!-- ==================== 视图 A：查看我的团（纯本地缓存） ==================== -->
+  <!-- ==================== 视图 A：我的团（本地记录，含上传中/已上架/失败记录） ==================== -->
   <main class="gh-list" v-if="filterMode === 'mine'">
-    <div class="gh-mine-tip">
-      <span>📌 这里展示您在本机上传过的拼团（保存在浏览器本地，无需登录）。</span>
-    </div>
-
     <template v-if="myGroups.length > 0">
       <div
         v-for="item in myGroups"
-        :key="item.group_order_id"
-        class="gh-card gh-my-card"
-        @click="item.parse_status === 'parsed' ? openDetail(item) : null"
+        :key="item.local_id || item.group_order_id"
+        class="gh-card"
+        @click="onMyGroupCardClick(item)"
       >
-        <div class="gh-thumb-box" @click.stop="fullPosterUrl = item.poster_url">
-          <img :src="item.poster_url" alt="我的拼团海报" loading="lazy" />
-          <div class="gh-thumb-tag">点击看原图</div>
+        <div class="gh-thumb-box" @click.stop="openFullPoster(item.poster_url || item.local_thumb)">
+          <img :src="item.poster_url || item.local_thumb" alt="拼团图片" loading="lazy" />
         </div>
 
         <div class="gh-card-body">
-          <!-- 状态 1：正在后台识别商品名称与人数 -->
-          <template v-if="item.parse_status === 'pending'">
+          <!-- 状态 1：后台正在上传或识别商品名 -->
+          <template v-if="item.parse_status === 'uploading' || item.parse_status === 'pending'">
             <div>
               <div class="gh-status-row">
                 <span class="gh-my-status-badge status-pending">
                   <span class="gh-pulse-dot"></span>
-                  正在识别商品信息...
+                  {{ item.parse_status === 'uploading' ? '正在核验二维码...' : '已收录 · 正在识别商品名...' }}
                 </span>
               </div>
-              <div class="gh-my-pending-desc">
-                ✅ 二维码已核验入库！系统正在读取海报中的商品名称与价格（约需 10~20 秒），识别完将自动上架大厅供大家搜索。
+              <div class="gh-my-desc">
+                系统正在后台自动识别商品信息（约10~20秒），识别完成后自动上架展示。
               </div>
             </div>
             <div class="gh-card-footer">
-              <span class="gh-timer-text">🔄 页面将自动刷新上架状态</span>
-              <button class="gh-text-btn" @click.stop="removeMyGroup(item.group_order_id)">移除记录</button>
+              <span class="gh-sub-meta">自动刷新中</span>
+              <button class="gh-text-btn" @click.stop="removeMyGroup(item)">删除</button>
             </div>
           </template>
 
-          <!-- 状态 2：识别失败 -->
+          <!-- 状态 2：上传或识别失败（点击可查看原因与示例引导） -->
           <template v-else-if="item.parse_status === 'failed'">
             <div>
               <div class="gh-status-row">
-                <span class="gh-my-status-badge status-failed">⚠️ 商品信息识别未成功</span>
+                <span class="gh-my-status-badge status-failed">❌ 上传未成功</span>
+                <span class="gh-link-hint">点击查看原因 ›</span>
               </div>
-              <div class="gh-my-pending-desc">
-                未能从图片中看清商品标题，请重新上传一张清晰的拼多多开团分享海报。
+              <div class="gh-my-desc is-error">
+                {{ item.parse_error || '未识别到有效的拼多多多人团二维码' }}
               </div>
             </div>
             <div class="gh-card-footer">
-              <button class="gh-join-btn" @click.stop="triggerUpload">重新上传</button>
-              <button class="gh-text-btn" @click.stop="removeMyGroup(item.group_order_id)">移除记录</button>
+              <button class="gh-mini-outline-btn" @click.stop="openHelpGuide(item)">查看要求</button>
+              <button class="gh-text-btn" @click.stop="removeMyGroup(item)">删除</button>
             </div>
           </template>
 
-          <!-- 状态 3：已识别完成（展示中 / 已满 / 已结束） -->
+          <!-- 状态 3：已识别完成 -->
           <template v-else>
             <div>
               <div class="gh-status-row">
                 <span class="gh-my-status-badge" :class="myGroupStatusClass(item)">
                   {{ myGroupStatusText(item) }}
                 </span>
-                <span class="gh-timer-text" v-if="item.group_status === 'active'">
-                  剩 {{ formatRemaining(item.remaining_seconds) }}
+                <span class="gh-sub-meta">
+                  {{ item.click_count || 0 }}人去过<template v-if="item.group_status === 'active'"> · 差{{ item.remain_people }}人</template>
                 </span>
               </div>
               <h3 class="gh-goods-title">{{ item.goods_name }}</h3>
-              <div class="gh-meta-row">
-                <span class="gh-click-tag" :class="{ 'is-fresh': item.click_count === 0 }">
-                  {{ item.click_count === 0 ? '🔥 暂无人前往' : '👀 已有 ' + item.click_count + ' 人前往' }}
-                </span>
-                <span class="gh-remain-inline" v-if="item.group_status === 'active'">
-                  · 还差 <b>{{ item.remain_people }}</b> 人
-                </span>
-              </div>
             </div>
 
             <div class="gh-card-footer">
-              <div class="gh-price-wrap">
-                <span class="gh-price-val" v-if="item.group_price">¥{{ item.group_price }}</span>
-                <span class="gh-price-val" v-else style="font-size:13px">见海报</span>
-              </div>
+              <span class="gh-price-val" v-if="item.group_price">¥{{ item.group_price }}</span>
+              <span class="gh-sub-meta" v-else>见海报</span>
               <div class="gh-my-actions" @click.stop>
                 <button
                   v-if="item.group_status === 'active'"
@@ -174,7 +156,7 @@
                 >
                   已满下架
                 </button>
-                <button class="gh-text-btn" @click="removeMyGroup(item.group_order_id)">移除</button>
+                <button class="gh-text-btn" @click="removeMyGroup(item)">删除</button>
               </div>
             </div>
           </template>
@@ -182,280 +164,184 @@
       </div>
     </template>
 
-    <!-- 我的团为空状态 -->
     <div v-else class="gh-empty-box">
-      <div class="gh-empty-icon">🙋</div>
-      <div class="gh-empty-title">您还没有上传过拼团</div>
-      <div class="gh-empty-sub">
-        点击右上角【➕ 传二维码发团】上传拼多多多人团分享海报，<br>
-        即可在此随时查看识别上架进度与已有多少人前往参团。
-      </div>
-      <button class="gh-join-btn" style="padding:9px 20px;font-size:13.5px" @click="triggerUpload">
+      <div class="gh-empty-title">暂无发团记录</div>
+      <div class="gh-empty-sub">上传拼多多多人团二维码图片后，可在此查看上架状态。</div>
+      <button class="gh-join-btn" style="padding:9px 22px;font-size:14px" @click="triggerUpload">
         ➕ 传二维码发团
       </button>
     </div>
   </main>
 
-  <!-- ==================== 视图 B：大厅拼团卡片列表 ==================== -->
+  <!-- ==================== 视图 B：大厅拼团列表 ==================== -->
   <template v-else>
     <main class="gh-list" v-if="items.length > 0">
       <div
         v-for="item in items"
         :key="item.group_order_id"
         class="gh-card"
-        :class="{ 'is-inactive': item.group_status !== 'active' }"
         @click="openDetail(item)"
       >
         <div class="gh-thumb-box">
           <img :src="item.poster_url" :alt="item.goods_name" loading="lazy" />
-          <div class="gh-thumb-tag">点击参团</div>
         </div>
 
         <div class="gh-card-body">
           <div>
             <div class="gh-status-row">
-              <span class="gh-remain-badge" :class="statusBadgeClass(item)">
-                {{ statusBadgeText(item) }}
-              </span>
-              <span class="gh-timer-text">剩 {{ formatRemaining(item.remaining_seconds) }}</span>
+              <span class="gh-remain-badge">{{ statusBadgeText(item) }}</span>
+              <span class="gh-sub-meta">{{ item.click_count }}人去过 · 剩{{ formatRemaining(item.remaining_seconds) }}</span>
             </div>
             <h3 class="gh-goods-title">{{ item.goods_name }}</h3>
-            <div class="gh-meta-row">
-              <span class="gh-click-tag" :class="{ 'is-fresh': item.click_count === 0 }">
-                {{ item.click_count === 0 ? '🔥 暂无人前往 · 名额充足' : '👀 已有 ' + item.click_count + ' 人前往' }}
-              </span>
-            </div>
           </div>
 
           <div class="gh-card-footer">
-            <div class="gh-price-wrap">
-              <span class="gh-price-label">拼团价</span>
-              <span class="gh-price-val" v-if="item.group_price">¥{{ item.group_price }}</span>
-              <span class="gh-price-val" v-else style="font-size:13px">见海报</span>
-            </div>
-            <button class="gh-join-btn" :class="{ 'btn-disabled': item.group_status !== 'active' }">
-              {{ item.group_status === 'active' ? '去参团 ›' : '已结束' }}
-            </button>
+            <span class="gh-price-val" v-if="item.group_price">¥{{ item.group_price }}</span>
+            <span class="gh-sub-meta" v-else>价格见图</span>
+            <button class="gh-join-btn">去参团</button>
           </div>
         </div>
       </div>
 
       <div v-if="hasMore" style="text-align:center;padding:12px 0;">
         <button class="gh-chip" @click="fetchGroups(false)" :disabled="loading">
-          {{ loading ? '加载中...' : '加载更多拼团' }}
+          {{ loading ? '加载中...' : '加载更多' }}
         </button>
       </div>
     </main>
 
-    <!-- 空状态引导 -->
     <div v-else-if="!loading" class="gh-empty-box">
-      <div class="gh-empty-icon">📦</div>
       <div class="gh-empty-title">
-        {{ activeKeyword ? '未搜到「' + activeKeyword + '」相关的进行中拼团' : '当前暂无正在凑人的多人团' }}
+        {{ activeKeyword ? '未搜到「' + activeKeyword + '」相关的拼团' : '当前暂无正在凑人的团' }}
       </div>
-      <div class="gh-empty-sub">
-        点击右上角【➕ 传二维码发团】上传拼多多多人团分享海报图，<br>
-        系统自动识别商品名称后即可挂入大厅供大家搜索参团！
-      </div>
-      <button class="gh-join-btn" style="padding:9px 20px;font-size:13.5px" @click="triggerUpload">
-        ➕ 上传我的拼团二维码图片
+      <div class="gh-empty-sub">点击右上角【➕ 传二维码发团】发布您的多人团</div>
+      <button class="gh-join-btn" style="padding:9px 22px;font-size:14px" @click="triggerUpload">
+        ➕ 传二维码发团
       </button>
     </div>
   </template>
 
-  <!-- ==================== 弹窗 1：发团两阶段进度反馈窗口 ==================== -->
-  <div class="gh-modal-mask" style="align-items:center;padding:18px" v-if="uploadProgress.visible">
-    <div class="gh-progress-dialog">
-      <div class="gh-progress-title">
-        <span v-if="uploadProgress.stage === 'verifying'">🔍 正在核验您的拼团二维码</span>
-        <span v-else-if="uploadProgress.stage === 'recognizing'">✅ 二维码核验通过，已收录！</span>
-        <span v-else-if="uploadProgress.stage === 'done'">🎉 您的拼团已成功上架大厅！</span>
-      </div>
-
-      <div class="gh-step-list">
-        <!-- 第 1 步：识别二维码并核验链接 -->
-        <div class="gh-step-item" :class="{ active: uploadProgress.stage === 'verifying', done: uploadProgress.stage !== 'verifying' }">
-          <div class="gh-step-icon">
-            <span v-if="uploadProgress.stage === 'verifying'" class="gh-spinner"></span>
-            <span v-else>✓</span>
-          </div>
-          <div class="gh-step-body">
-            <div class="gh-step-name">
-              第 1 步：解析海报二维码并核验有效团链
-              <span v-if="uploadProgress.stage === 'verifying'" class="gh-step-elapsed">({{ uploadProgress.elapsed }}s)</span>
-            </div>
-            <div class="gh-step-desc" v-if="uploadProgress.stage === 'verifying'">
-              正在读取图片二维码并向拼多多确认拼团有效性，通常需要 <b>5~10 秒</b>，请稍候...
-            </div>
-            <div class="gh-step-desc" v-else>
-              已确认是有效的拼多多多人团，并已加入【查看我的团】。
-            </div>
-          </div>
-        </div>
-
-        <!-- 第 2 步：后台识别商品名称与人数 -->
-        <div class="gh-step-item" :class="{ active: uploadProgress.stage === 'recognizing', done: uploadProgress.stage === 'done' }">
-          <div class="gh-step-icon">
-            <span v-if="uploadProgress.stage === 'recognizing'" class="gh-spinner"></span>
-            <span v-else-if="uploadProgress.stage === 'done'">✓</span>
-            <span v-else>2</span>
-          </div>
-          <div class="gh-step-body">
-            <div class="gh-step-name">第 2 步：提取海报商品名称与剩余人数</div>
-            <div class="gh-step-desc" v-if="uploadProgress.stage === 'verifying'">
-              核验通过后，系统将自动读取商品标题以便其他用户搜索。
-            </div>
-            <div class="gh-step-desc" v-else-if="uploadProgress.stage === 'recognizing'">
-              正在为您智能读取海报上的商品标题与价格（预计 <b>10~20 秒</b>）。<br>
-              <b>💡 您现在无需原地干等！</b>识别完成后会自动上架大厅展示。
-            </div>
-            <div class="gh-step-desc" v-else-if="uploadProgress.stage === 'done' && uploadProgress.group">
-              已识别商品：<b>{{ uploadProgress.group.goods_name }}</b>，现已在大厅公开展示！
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="gh-progress-actions" v-if="uploadProgress.stage !== 'verifying'">
-        <button class="gh-btn-app-jump" style="padding:11px;font-size:14px" @click="goToMyGroupsFromModal">
-          🙋 去【查看我的团】看实时状态
-        </button>
-        <button class="gh-btn-secondary" @click="closeUploadProgress">
-          我知道了，继续逛大厅
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <!-- ==================== 弹窗 2：拼团详情 + 一键跳转 + 状态共创抽屉 ==================== -->
+  <!-- ==================== 弹窗 1：拼团详情抽屉（主次分明，极简清爽） ==================== -->
   <div class="gh-modal-mask" v-if="selectedGroup" @click.self="closeDetail">
     <div class="gh-sheet">
       <div class="gh-sheet-header">
-        <span>参团与状态反馈</span>
+        <span>拼团详情</span>
         <button class="gh-sheet-close" @click="closeDetail">×</button>
       </div>
 
       <div class="gh-sheet-content">
-        <!-- 1. 商品精简核心信息（不含团单号等冗余字段） -->
+        <!-- 核心商品信息（大字体突出） -->
         <div class="gh-detail-top">
           <img
             :src="selectedGroup.poster_url"
             :alt="selectedGroup.goods_name"
             class="gh-detail-poster"
-            @click="fullPosterUrl = selectedGroup.poster_url"
-            title="点击放大查看二维码海报"
+            @click="openFullPoster(selectedGroup.poster_url)"
           />
           <div class="gh-detail-meta">
-            <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-              <span class="gh-remain-badge" :class="statusBadgeClass(selectedGroup)">
-                {{ statusBadgeText(selectedGroup) }}
-              </span>
-              <span class="gh-timer-text">剩 {{ formatRemaining(selectedGroup.remaining_seconds) }}</span>
-            </div>
             <div class="gh-detail-title">{{ selectedGroup.goods_name }}</div>
-            <div class="gh-detail-bottom-row">
-              <div class="gh-price-wrap" v-if="selectedGroup.group_price">
-                <span class="gh-price-label">拼团价</span>
-                <span class="gh-price-val">¥{{ selectedGroup.group_price }}</span>
-              </div>
-              <span class="gh-click-tag" :class="{ 'is-fresh': selectedGroup.click_count === 0 }">
-                {{ selectedGroup.click_count === 0 ? '🔥 暂无人前往' : '👀 已有 ' + selectedGroup.click_count + ' 人前往' }}
-              </span>
+            <div class="gh-detail-price-row">
+              <span class="gh-detail-price" v-if="selectedGroup.group_price">¥{{ selectedGroup.group_price }}</span>
+              <span class="gh-remain-badge">{{ statusBadgeText(selectedGroup) }}</span>
+            </div>
+            <div class="gh-sub-meta">
+              {{ selectedGroup.click_count }}人去过 · 剩{{ formatRemaining(selectedGroup.remaining_seconds) }} · 点击左图可放大扫码
             </div>
           </div>
         </div>
 
-        <!-- 2. 一键跳转参团按钮区 -->
+        <!-- 主操作：唯一醒目大按钮 -->
         <div class="gh-jump-section">
           <button class="gh-btn-app-jump" @click="jumpToApp(selectedGroup)">
-            <span>🚀 一键唤醒拼多多 App 参团</span>
+            🚀 去拼多多参团
           </button>
-          <button class="gh-btn-h5-jump" @click="jumpToH5(selectedGroup)">
-            <span>🌐 浏览器打开参团页（或点上方海报扫码）</span>
-          </button>
+          <div class="gh-h5-fallback-row">
+            <button class="gh-link-btn" @click="jumpToH5(selectedGroup)">
+              未唤醒App？点此网页打开
+            </button>
+          </div>
         </div>
 
-        <!-- 3. 醒目的用户共创状态反馈区 -->
+        <!-- 次级操作：简洁状态反馈 -->
         <div class="gh-cocreate-box">
-          <div class="gh-cocreate-header">
-            <div class="gh-cocreate-title">
-              <span>🤝 跳转查看后，顺手反馈实际状态：</span>
-            </div>
-          </div>
-
+          <div class="gh-cocreate-label">参团后可顺手更新状态：</div>
           <div class="gh-feedback-grid">
             <button
               class="gh-fb-btn fb-joined"
               :disabled="submittingFeedback"
               @click="requestFeedback('joined_one')"
             >
-              <span style="font-size:16px">🎉</span>
-              <span>我已参团</span>
-              <span style="font-size:10px;font-weight:500">(差额 -1)</span>
+              🎉 我已参团
             </button>
-
             <button
               class="gh-fb-btn fb-full"
               :disabled="submittingFeedback"
               @click="requestFeedback('mark_full')"
             >
-              <span style="font-size:16px">🔴</span>
-              <span>人已满</span>
-              <span style="font-size:10px;font-weight:500">(立即下架)</span>
+              🔴 人已满
             </button>
-
             <button
               class="gh-fb-btn fb-expired"
               :disabled="submittingFeedback"
               @click="requestFeedback('mark_expired')"
             >
-              <span style="font-size:16px">⚪</span>
-              <span>已失效</span>
-              <span style="font-size:10px;font-weight:500">(立即下架)</span>
+              ⚪ 已失效
             </button>
           </div>
-
-          <div class="gh-remain-calibrate">
-            <span class="gh-calibrate-label">🎯 实测还差几人：</span>
-            <div class="gh-calibrate-btns">
-              <button
-                v-for="n in [1, 2, 3, 4]"
-                :key="n"
-                class="gh-cal-btn"
-                :class="{ active: selectedGroup.group_status === 'active' && selectedGroup.remain_people === n }"
-                :disabled="submittingFeedback"
-                @click="requestFeedback('set_remain', n)"
-              >
-                差{{ n }}人
-              </button>
-            </div>
-          </div>
-
           <div class="gh-credit-footnote">
-            🛡️ 请以拼多多实际状态为准；若反馈与实际情况有差错（恶意下架他人拼团），将被禁止使用本功能。
+            请按实际情况反馈，恶意乱标下架他人拼团将被停用功能
           </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- ==================== 弹窗 3：首次下架诚信提醒确认框（仅首次弹出，不反复打扰） ==================== -->
-  <div class="gh-modal-mask" style="align-items:center;padding:20px;z-index:260" v-if="creditWarnModal.visible">
-    <div class="gh-credit-dialog">
-      <div class="gh-credit-dialog-title">🛡️ 诚信反馈提醒（仅首次提示）</div>
-      <div class="gh-credit-dialog-body">
-        <p>标记「人已满」或「已失效」会<b>立即将该拼团从大厅下架</b>。</p>
-        <p style="margin-top:8px;color:#cf1322;font-weight:600">
-          ⚠️ 请确认您已跳转查看过真实情况！如果反馈情况与多人团实际情况有差错（乱标或恶意下架他人拼团），您将被禁止继续使用互助功能。
+  <!-- ==================== 弹窗 2：问号说明 / 失败原因与示例引导弹窗 ==================== -->
+  <div class="gh-modal-mask" style="align-items:center;padding:20px;z-index:250" v-if="helpModal.visible" @click.self="closeHelpGuide">
+    <div class="gh-dialog">
+      <div class="gh-dialog-title">
+        {{ helpModal.failedItem ? '⚠️ 为什么这张图上传未成功？' : '📌 应该上传哪种拼团图片？' }}
+      </div>
+
+      <!-- 若是从失败记录点进来的，先展示具体失败原因 -->
+      <div class="gh-failed-reason-box" v-if="helpModal.failedItem">
+        原因：{{ helpModal.failedItem.parse_error || '未在图片中识别到有效的拼多多多人团二维码' }}
+      </div>
+
+      <div class="gh-dialog-body">
+        <p><b>请上传带有二维码的【拼多多多人团分享图】：</b></p>
+        <p style="margin-top:6px">
+          1. 在拼多多打开您的多人团，点击<b>【邀请好友】</b>，保存带有<b>二维码</b>的分享海报图片。<br>
+          2. 不要上传普通商品截图或没有二维码的页面截图。
         </p>
-        <p style="margin-top:8px;font-size:12px;color:#8f959e">
-          * 为不打扰您的使用，本提示仅首次出现，后续可一键直接反馈。感谢您的热心守信！
+        <p style="margin-top:8px;color:#d4380d;font-weight:600">
+          💡 不清楚长什么样？您可以先点开大厅里其他人发的团，点击商品小图看看别人发的是哪种图片！
         </p>
       </div>
-      <div class="gh-credit-dialog-actions">
-        <button class="gh-btn-secondary" @click="cancelCreditWarn">点错了，取消</button>
-        <button class="gh-btn-app-jump" style="padding:10px;font-size:13.5px" @click="confirmCreditWarnAndSubmit">
-          我已知晓，如实反馈
+
+      <div class="gh-dialog-actions">
+        <button class="gh-btn-secondary" @click="goSeeOthersExample">去看看别人的图</button>
+        <button class="gh-btn-app-jump" style="padding:10px;font-size:14px" @click="reuploadFromHelp">
+          上传拼团图片
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗 3：首次下架诚信提醒（仅首次触发） ==================== -->
+  <div class="gh-modal-mask" style="align-items:center;padding:20px;z-index:260" v-if="creditWarnModal.visible" @click.self="cancelCreditWarn">
+    <div class="gh-dialog">
+      <div class="gh-dialog-title">🛡️ 诚信反馈提醒（仅提示一次）</div>
+      <div class="gh-dialog-body">
+        <p>该操作会<b>直接将此拼团从大厅下架</b>。</p>
+        <p style="margin-top:8px;color:#cf1322;font-weight:600">
+          如果反馈情况与多人团实际情况有差错（乱标或恶意下架他人拼团），您将被禁止使用本功能。
+        </p>
+      </div>
+      <div class="gh-dialog-actions">
+        <button class="gh-btn-secondary" @click="cancelCreditWarn">取消</button>
+        <button class="gh-btn-app-jump" style="padding:10px;font-size:14px" @click="confirmCreditWarnAndSubmit">
+          确认如实反馈
         </button>
       </div>
     </div>
@@ -466,11 +352,11 @@
     class="gh-modal-mask"
     style="align-items:center;padding:20px;z-index:300"
     v-if="fullPosterUrl"
-    @click="fullPosterUrl = ''"
+    @click="closeFullPoster"
   >
     <img
       :src="fullPosterUrl"
-      alt="拼团分享完整海报"
+      alt="拼团分享海报"
       style="max-width:92vw;max-height:84vh;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,0.4)"
     />
   </div>
@@ -499,6 +385,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=20261109-2"></script>
+<script src="/static/js/group_help.js?v=20261109-3"></script>
 </body>
 </html>

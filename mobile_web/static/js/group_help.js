@@ -1,4 +1,4 @@
-// 拼多多多人团互助独立前端控制器 (与主站 JS 完全解耦，本地缓存“我的团”)
+// 拼多多多人团互助独立前端控制器 (零阻塞后台上传 + 本地缓存含失败记录 + 手机返回键防误退)
 (function (global) {
   'use strict';
   const { createApp, ref, onMounted, onUnmounted } = global.Vue;
@@ -17,7 +17,6 @@
       const hasMore = ref(false);
       const pendingCount = ref(0);
       const loading = ref(false);
-      const uploading = ref(false);
       const submittingFeedback = ref(false);
 
       const myGroups = ref([]);
@@ -26,15 +25,13 @@
       const toastMsg = ref('');
       const fileInputRef = ref(null);
 
-      // 上传两阶段可视化进度弹窗状态
-      const uploadProgress = ref({
+      // 问号说明 / 失败原因引导弹窗
+      const helpModal = ref({
         visible: false,
-        stage: 'verifying', // 'verifying' | 'recognizing' | 'done'
-        elapsed: 1,
-        group: null,
+        failedItem: null,
       });
 
-      // 首次下架他人拼团时的诚信提醒弹窗状态（仅首次触发）
+      // 首次下架他人拼团时的诚信提醒弹窗（仅首次触发）
       const creditWarnModal = ref({
         visible: false,
         pendingAction: '',
@@ -43,9 +40,10 @@
 
       let toastTimer = null;
       let pollTimer = null;
-      let uploadElapsedTimer = null;
+      let pushedHistoryCount = 0;
+      let ignoreNextPopState = false;
 
-      const showToast = (msg, duration = 3000) => {
+      const showToast = (msg, duration = 2800) => {
         toastMsg.value = msg;
         if (toastTimer) global.clearTimeout(toastTimer);
         toastTimer = global.setTimeout(() => {
@@ -53,14 +51,79 @@
         }, duration);
       };
 
-      // ==================== 本地缓存“我的团” (无数据库用户交集) ====================
+      // ==================== 手机返回键历史栈管理 (防止看详情返回时跳出页面) ====================
+      const pushModalHistory = () => {
+        try {
+          if (global.history && typeof global.history.pushState === 'function') {
+            global.history.pushState({ ghModal: true }, '');
+            pushedHistoryCount += 1;
+          }
+        } catch (_) {}
+      };
+
+      const popModalHistorySilently = () => {
+        if (pushedHistoryCount > 0) {
+          pushedHistoryCount -= 1;
+          ignoreNextPopState = true;
+          try {
+            global.history.back();
+          } catch (_) {
+            ignoreNextPopState = false;
+          }
+        }
+      };
+
+      const onWindowPopState = () => {
+        if (ignoreNextPopState) {
+          ignoreNextPopState = false;
+          return;
+        }
+        if (pushedHistoryCount > 0) {
+          pushedHistoryCount -= 1;
+        }
+        if (fullPosterUrl.value) {
+          fullPosterUrl.value = '';
+          return;
+        }
+        if (creditWarnModal.value.visible) {
+          creditWarnModal.value.visible = false;
+          return;
+        }
+        if (helpModal.value.visible) {
+          helpModal.value.visible = false;
+          helpModal.value.failedItem = null;
+          return;
+        }
+        if (selectedGroup.value) {
+          selectedGroup.value = null;
+        }
+      };
+
+      // ==================== 本地缓存“我的团” (含上传中、已收录、失败记录) ====================
+      const getRecordKey = item => {
+        if (!item) return '';
+        return item.group_order_id || item.local_id || '';
+      };
+
       const loadMyGroupsFromStorage = () => {
         try {
           const raw = global.localStorage.getItem(MY_GROUPS_STORAGE_KEY);
           if (!raw) return [];
           const parsed = JSON.parse(raw);
           if (!Array.isArray(parsed)) return [];
-          return parsed.filter(it => it && typeof it.group_order_id === 'string');
+          return parsed
+            .filter(it => it && (it.group_order_id || it.local_id))
+            .map(it => {
+              // 若上次刷新页面时卡在 uploading，标记为失败以便用户重传
+              if (it.parse_status === 'uploading') {
+                return {
+                  ...it,
+                  parse_status: 'failed',
+                  parse_error: '上传中断，请重新上传拼团二维码图片',
+                };
+              }
+              return it;
+            });
         } catch (_) {
           return [];
         }
@@ -73,11 +136,15 @@
         } catch (_) {}
       };
 
-      const upsertMyGroup = (groupData, moveToTop = false) => {
-        if (!groupData || !groupData.group_order_id) return;
-        const gid = groupData.group_order_id;
+      const upsertMyGroup = (groupData, moveToTop = false, matchLocalId = '') => {
+        if (!groupData) return;
         const list = myGroups.value.slice();
-        const idx = list.findIndex(it => it.group_order_id === gid);
+        const gid = groupData.group_order_id || '';
+        const lid = matchLocalId || groupData.local_id || '';
+
+        const idx = list.findIndex(
+          it => (gid && it.group_order_id === gid) || (lid && it.local_id === lid)
+        );
         if (idx !== -1) {
           const merged = { ...list[idx], ...groupData };
           if (moveToTop) {
@@ -93,21 +160,24 @@
         saveMyGroupsToStorage(myGroups.value);
       };
 
-      const removeMyGroup = gid => {
-        myGroups.value = myGroups.value.filter(it => it.group_order_id !== gid);
+      const removeMyGroup = item => {
+        const key = getRecordKey(item);
+        if (!key) return;
+        myGroups.value = myGroups.value.filter(it => getRecordKey(it) !== key);
         saveMyGroupsToStorage(myGroups.value);
-        showToast('已从本机记录中移除');
+        showToast('已删除该条本地记录');
       };
 
       const isMyOwnGroup = gid => {
-        return myGroups.value.some(it => it.group_order_id === gid);
+        return Boolean(gid) && myGroups.value.some(it => it.group_order_id === gid);
       };
 
       const refreshMyGroups = async (showNotice = false, onlyPending = false) => {
         if (myGroups.value.length === 0) return;
-        const targets = onlyPending
-          ? myGroups.value.filter(it => it.parse_status === 'pending')
-          : myGroups.value.slice();
+        const targets = myGroups.value.filter(it => {
+          if (!it.group_order_id) return false;
+          return onlyPending ? it.parse_status === 'pending' : true;
+        });
         if (targets.length === 0) return;
 
         let newlyParsedGroup = null;
@@ -119,7 +189,7 @@
               const json = await resp.json();
               if (json.status === 'success' && json.data) {
                 const wasPending = item.parse_status === 'pending';
-                upsertMyGroup(json.data, false);
+                upsertMyGroup(json.data, false, item.local_id || '');
                 if (wasPending && json.data.parse_status === 'parsed') {
                   newlyParsedGroup = json.data;
                 }
@@ -129,15 +199,7 @@
         );
 
         if (newlyParsedGroup) {
-          if (
-            uploadProgress.value.visible &&
-            uploadProgress.value.group &&
-            uploadProgress.value.group.group_order_id === newlyParsedGroup.group_order_id
-          ) {
-            uploadProgress.value.stage = 'done';
-            uploadProgress.value.group = newlyParsedGroup;
-          }
-          showToast(`🎉 您的拼团「${newlyParsedGroup.goods_name}」已识别完成并上架大厅！`, 3600);
+          showToast(`🎉 您的拼团「${newlyParsedGroup.goods_name}」已上架大厅！`, 3400);
           if (filterMode.value !== 'mine') {
             fetchGroups(true);
           }
@@ -147,33 +209,25 @@
         managePendingPoll();
       };
 
-      // ==================== 状态格式化辅助 ====================
+      // ==================== 状态文案格式化 ====================
       const formatRemaining = seconds => {
         const s = Math.max(0, Number(seconds) || 0);
         if (s <= 0) return '已到期';
         const hrs = Math.floor(s / 3600);
         const mins = Math.floor((s % 3600) / 60);
-        if (hrs > 0) return `${hrs}小时${mins}分`;
+        if (hrs > 0) return `${hrs}小时`;
         return `${Math.max(1, mins)}分钟`;
       };
 
       const statusBadgeText = item => {
         if (!item) return '';
         if (item.group_status === 'full' || item.remain_people <= 0) {
-          return '🎉 已拼满';
+          return '已拼满';
         }
         if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
-          return '⚪ 已结束';
+          return '已结束';
         }
-        const prefix = item.total_people > 0 ? `${item.total_people}人团·` : '';
-        return `${prefix}还差 ${item.remain_people} 人`;
-      };
-
-      const statusBadgeClass = item => {
-        if (!item) return '';
-        if (item.group_status === 'full' || item.remain_people <= 0) return 'badge-full';
-        if (item.group_status === 'expired' || item.remaining_seconds <= 0) return 'badge-expired';
-        return '';
+        return `差 ${item.remain_people} 人`;
       };
 
       const myGroupStatusText = item => {
@@ -219,7 +273,7 @@
             syncSelectedGroup();
             managePendingPoll();
           } else {
-            showToast(json.error_msg || '加载多人团列表失败');
+            showToast(json.error_msg || '加载列表失败');
           }
         } catch (_) {
           showToast('网络异常，请稍后重试');
@@ -239,7 +293,8 @@
         }
       };
 
-      const hasLocalPending = () => myGroups.value.some(it => it.parse_status === 'pending');
+      const hasLocalPending = () =>
+        myGroups.value.some(it => it.parse_status === 'pending' && it.group_order_id);
 
       const managePendingPoll = () => {
         const shouldPoll = hasLocalPending() || pendingCount.value > 0;
@@ -272,7 +327,7 @@
               global.clearInterval(pollTimer);
               pollTimer = null;
             }
-          }, 3000);
+          }, 3500);
         } else if (!shouldPoll && pollTimer) {
           global.clearInterval(pollTimer);
           pollTimer = null;
@@ -303,9 +358,8 @@
         }
       };
 
-      // ==================== 图片轻量压缩与两阶段上传反馈 ====================
+      // ==================== 零阻塞后台上传 + 失败留存本地记录 ====================
       const triggerUpload = () => {
-        if (uploading.value) return;
         if (fileInputRef.value) {
           fileInputRef.value.value = '';
           fileInputRef.value.click();
@@ -320,63 +374,31 @@
           reader.readAsDataURL(file);
         });
 
-      const compressImageDataUrl = file =>
-        new Promise(async (resolve, reject) => {
-          try {
-            const rawDataUrl = await readFileAsDataUrl(file);
-            const img = new global.Image();
-            img.onload = () => {
-              try {
-                const maxSide = 1440;
-                let w = img.naturalWidth || img.width;
-                let h = img.naturalHeight || img.height;
-                if (w > maxSide || h > maxSide) {
-                  const scale = maxSide / Math.max(w, h);
-                  w = Math.max(1, Math.round(w * scale));
-                  h = Math.max(1, Math.round(h * scale));
-                }
-                const canvas = global.document.createElement('canvas');
-                canvas.width = w;
-                canvas.height = h;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0, w, h);
-                resolve(canvas.toDataURL('image/jpeg', 0.88));
-              } catch (_) {
-                resolve(rawDataUrl);
+      const resizeImageDataUrl = (rawDataUrl, maxSide, quality) =>
+        new Promise(resolve => {
+          const img = new global.Image();
+          img.onload = () => {
+            try {
+              let w = img.naturalWidth || img.width;
+              let h = img.naturalHeight || img.height;
+              if (w > maxSide || h > maxSide) {
+                const scale = maxSide / Math.max(w, h);
+                w = Math.max(1, Math.round(w * scale));
+                h = Math.max(1, Math.round(h * scale));
               }
-            };
-            img.onerror = () => resolve(rawDataUrl);
-            img.src = rawDataUrl;
-          } catch (err) {
-            reject(err);
-          }
+              const canvas = global.document.createElement('canvas');
+              canvas.width = w;
+              canvas.height = h;
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(img, 0, 0, w, h);
+              resolve(canvas.toDataURL('image/jpeg', quality));
+            } catch (_) {
+              resolve(rawDataUrl);
+            }
+          };
+          img.onerror = () => resolve(rawDataUrl);
+          img.src = rawDataUrl;
         });
-
-      const startUploadElapsedTimer = () => {
-        if (uploadElapsedTimer) global.clearInterval(uploadElapsedTimer);
-        uploadProgress.value.elapsed = 1;
-        uploadElapsedTimer = global.setInterval(() => {
-          uploadProgress.value.elapsed += 1;
-        }, 1000);
-      };
-
-      const stopUploadElapsedTimer = () => {
-        if (uploadElapsedTimer) {
-          global.clearInterval(uploadElapsedTimer);
-          uploadElapsedTimer = null;
-        }
-      };
-
-      const closeUploadProgress = () => {
-        stopUploadElapsedTimer();
-        uploadProgress.value.visible = false;
-      };
-
-      const goToMyGroupsFromModal = () => {
-        closeUploadProgress();
-        filterMode.value = 'mine';
-        refreshMyGroups(false, false);
-      };
 
       const onFileSelected = async event => {
         const file = event.target && event.target.files && event.target.files[0];
@@ -385,62 +407,159 @@
           showToast('图片不能超过 10MB');
           return;
         }
-        uploading.value = true;
-        uploadProgress.value = {
-          visible: true,
-          stage: 'verifying',
-          elapsed: 1,
-          group: null,
-        };
-        startUploadElapsedTimer();
 
+        const localId = 'local_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+        let rawDataUrl = '';
         try {
-          const dataUrl = await compressImageDataUrl(file);
-          const resp = await global.fetch('/api/group_help/upload', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image_base64: dataUrl }),
-          });
-          const json = await resp.json();
-          stopUploadElapsedTimer();
-
-          if (resp.ok && json.status === 'success' && json.data) {
-            upsertMyGroup(json.data, true);
-            uploadProgress.value.group = json.data;
-            if (json.data.parse_status === 'parsed') {
-              uploadProgress.value.stage = 'done';
-            } else {
-              uploadProgress.value.stage = 'recognizing';
-            }
-            managePendingPoll();
-            if (filterMode.value !== 'mine') {
-              fetchGroups(true);
-            }
-          } else {
-            closeUploadProgress();
-            showToast(
-              json.error_msg || '未识别到有效的拼多多拼团二维码，请上传开团分享海报图',
-              4000
-            );
-          }
+          rawDataUrl = await readFileAsDataUrl(file);
         } catch (_) {
-          closeUploadProgress();
-          showToast('上传失败，请检查网络后重试');
-        } finally {
-          uploading.value = false;
+          showToast('无法读取所选图片');
+          return;
         }
+
+        // 生成轻量本地缩略图存入“我的团”，立即非阻塞反馈给用户
+        const thumbUrl = await resizeImageDataUrl(rawDataUrl, 180, 0.7);
+        const initialRecord = {
+          local_id: localId,
+          group_order_id: '',
+          goods_name: '正在核验拼团二维码...',
+          parse_status: 'uploading',
+          parse_error: '',
+          group_status: 'active',
+          local_thumb: thumbUrl,
+          poster_url: thumbUrl,
+          click_count: 0,
+          remain_people: 1,
+          remaining_seconds: 86400,
+          created_at: Math.floor(Date.now() / 1000),
+        };
+        upsertMyGroup(initialRecord, true, localId);
+        showToast('已提交后台识别！可在【我的团】随时查看结果', 3000);
+
+        // 后台异步压缩并上传，不阻塞用户当前浏览
+        (async () => {
+          try {
+            const uploadDataUrl = await resizeImageDataUrl(rawDataUrl, 1440, 0.88);
+            const resp = await global.fetch('/api/group_help/upload', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ image_base64: uploadDataUrl }),
+            });
+            const json = await resp.json();
+            if (resp.ok && json.status === 'success' && json.data) {
+              upsertMyGroup(
+                {
+                  ...json.data,
+                  local_id: localId,
+                  local_thumb: thumbUrl,
+                },
+                false,
+                localId
+              );
+              managePendingPoll();
+              if (filterMode.value !== 'mine') {
+                fetchGroups(true);
+              }
+            } else {
+              const errMsg =
+                (json && json.error_msg) || '未在图片中识别到有效的拼多多多人团二维码';
+              upsertMyGroup(
+                {
+                  ...initialRecord,
+                  goods_name: '上传未成功',
+                  parse_status: 'failed',
+                  parse_error: errMsg,
+                },
+                false,
+                localId
+              );
+              showToast('⚠️ 图片未能通过核验，请点【我的团】查看原因', 3500);
+            }
+          } catch (_) {
+            upsertMyGroup(
+              {
+                ...initialRecord,
+                goods_name: '上传未成功',
+                parse_status: 'failed',
+                parse_error: '网络请求异常，请检查网络后重新上传',
+              },
+              false,
+              localId
+            );
+            showToast('⚠️ 上传网络异常，已记录在【我的团】', 3200);
+          }
+        })();
       };
 
-      // ==================== 详情、一键跳转与前往计数 ====================
+      // ==================== 弹窗交互与问号引导 ====================
       const openDetail = item => {
+        if (!selectedGroup.value) {
+          pushModalHistory();
+        }
         selectedGroup.value = { ...item };
       };
 
       const closeDetail = () => {
+        if (!selectedGroup.value) return;
         selectedGroup.value = null;
+        popModalHistorySilently();
       };
 
+      const openFullPoster = url => {
+        if (!url) return;
+        if (!fullPosterUrl.value) {
+          pushModalHistory();
+        }
+        fullPosterUrl.value = url;
+      };
+
+      const closeFullPoster = () => {
+        if (!fullPosterUrl.value) return;
+        fullPosterUrl.value = '';
+        popModalHistorySilently();
+      };
+
+      const openHelpGuide = (failedItem = null) => {
+        if (!helpModal.value.visible) {
+          pushModalHistory();
+        }
+        helpModal.value = {
+          visible: true,
+          failedItem: failedItem || null,
+        };
+      };
+
+      const closeHelpGuide = () => {
+        if (!helpModal.value.visible) return;
+        helpModal.value = { visible: false, failedItem: null };
+        popModalHistorySilently();
+      };
+
+      const goSeeOthersExample = () => {
+        closeHelpGuide();
+        filterMode.value = 'active';
+        fetchGroups(true);
+      };
+
+      const reuploadFromHelp = () => {
+        closeHelpGuide();
+        triggerUpload();
+      };
+
+      const onMyGroupCardClick = item => {
+        if (!item) return;
+        if (item.parse_status === 'failed') {
+          openHelpGuide(item);
+        } else if (item.parse_status === 'parsed') {
+          openDetail(item);
+        } else {
+          showToast('正在后台识别商品信息，请稍候...');
+        }
+      };
+
+      // ==================== 参团跳转与计数 ====================
       const recordClick = async gid => {
+        if (!gid) return;
         try {
           const resp = await global.fetch(`/api/group_help/click/${gid}`, { method: 'POST' });
           const json = await resp.json();
@@ -458,7 +577,6 @@
       const jumpToApp = item => {
         if (!item) return;
         recordClick(item.group_order_id);
-        showToast('正在唤醒拼多多 App... 查看后欢迎顺手反馈状态！', 3000);
         global.location.href = item.app_wake_url;
       };
 
@@ -468,7 +586,7 @@
         global.open(item.h5_join_url, '_blank', 'noopener,noreferrer');
       };
 
-      // ==================== 众包状态共创 & 首次诚信提醒 ====================
+      // ==================== 状态反馈 & 首次诚信提醒 ====================
       const requestFeedback = (action, remainPeople = null) => {
         if (!selectedGroup.value || submittingFeedback.value) return;
         const gid = selectedGroup.value.group_order_id;
@@ -482,8 +600,8 @@
           hasAcked = global.localStorage.getItem(CREDIT_WARN_ACK_KEY) === '1';
         } catch (_) {}
 
-        // 仅当用户对非自己上传的团执行下架类操作，且是本机首次操作时，弹出一次诚信提醒
         if (isTakedown && !isMyOwnGroup(gid) && !hasAcked) {
+          pushModalHistory();
           creditWarnModal.value = {
             visible: true,
             pendingAction: action,
@@ -495,11 +613,13 @@
       };
 
       const cancelCreditWarn = () => {
+        if (!creditWarnModal.value.visible) return;
         creditWarnModal.value = {
           visible: false,
           pendingAction: '',
           pendingRemain: null,
         };
+        popModalHistorySilently();
       };
 
       const confirmCreditWarnAndSubmit = () => {
@@ -540,12 +660,12 @@
                 items.value[idx] = json.data;
               }
             }
-            showToast(json.message || '✅ 状态已更新，感谢您的反馈！');
+            showToast('状态已更新，感谢反馈！');
           } else {
-            showToast(json.error_msg || '提交反馈失败');
+            showToast(json.error_msg || '反馈失败');
           }
         } catch (_) {
-          showToast('提交反馈网络异常');
+          showToast('网络异常');
         } finally {
           submittingFeedback.value = false;
         }
@@ -564,14 +684,15 @@
             upsertMyGroup(json.data, false);
             const idx = items.value.findIndex(it => it.group_order_id === item.group_order_id);
             if (idx !== -1) items.value.splice(idx, 1);
-            showToast('已将该团标记为已满并从大厅下架');
+            showToast('已将该团下架');
           }
         } catch (_) {
-          showToast('操作失败，请稍后重试');
+          showToast('操作失败');
         }
       };
 
       onMounted(() => {
+        global.addEventListener('popstate', onWindowPopState);
         myGroups.value = loadMyGroupsFromStorage();
         fetchGroups(true);
         if (myGroups.value.length > 0) {
@@ -580,9 +701,9 @@
       });
 
       onUnmounted(() => {
+        global.removeEventListener('popstate', onWindowPopState);
         if (pollTimer) global.clearInterval(pollTimer);
         if (toastTimer) global.clearTimeout(toastTimer);
-        stopUploadElapsedTimer();
       });
 
       return {
@@ -594,18 +715,16 @@
         hasMore,
         pendingCount,
         loading,
-        uploading,
         submittingFeedback,
         myGroups,
         selectedGroup,
         fullPosterUrl,
         toastMsg,
         fileInputRef,
-        uploadProgress,
+        helpModal,
         creditWarnModal,
         formatRemaining,
         statusBadgeText,
-        statusBadgeClass,
         myGroupStatusText,
         myGroupStatusClass,
         fetchGroups,
@@ -617,10 +736,15 @@
         switchFilter,
         triggerUpload,
         onFileSelected,
-        closeUploadProgress,
-        goToMyGroupsFromModal,
         openDetail,
         closeDetail,
+        openFullPoster,
+        closeFullPoster,
+        openHelpGuide,
+        closeHelpGuide,
+        goSeeOthersExample,
+        reuploadFromHelp,
+        onMyGroupCardClick,
         jumpToApp,
         jumpToH5,
         requestFeedback,

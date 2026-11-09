@@ -39,7 +39,11 @@ _DEFAULT_HEADERS = {
 
 
 def decode_qr_from_image_bytes(image_bytes: bytes) -> str:
-    """使用 OpenCV 多区域/多尺度增强解码图片中的二维码，返回二维码文本（未识别到则返回空字符串）。"""
+    """
+    对整张图片进行全局二维码识别（不假设二维码固定在某角落）：
+    1. 先对全图做直接识别与二值化识别；
+    2. 若二维码在整图中占比过小，使用覆盖全图 100% 区域的均匀重叠滑动窗口（上/中/下 × 左/中/右）扫描全图。
+    """
     if not image_bytes:
         return ""
     try:
@@ -50,51 +54,43 @@ def decode_qr_from_image_bytes(image_bytes: bytes) -> str:
     rgb_arr = np.array(pil_img)
     gray_full = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
     h, w = gray_full.shape[:2]
+    if h == 0 or w == 0:
+        return ""
 
     detector = cv2.QRCodeDetector()
 
-    # 优先扫描下半部分与右下角(拼多多海报二维码常驻位置，大幅缩短大图解码耗时)，再回退全图扫描
-    crops = []
+    # 1. 全图优先，随后按均匀重叠网格覆盖全图所有区域（上/中/下、左/中/右一视同仁，不绑定特定角落）
+    regions = [gray_full]
     if h >= 200 and w >= 200:
-        crops.extend([
-            gray_full[int(h * 0.45):, int(w * 0.35):],
-            gray_full[int(h * 0.45):, :],
-            gray_full[int(h * 0.45):, :int(w * 0.65)],
-        ])
-    crops.append(gray_full)
-    if h >= 200 and w >= 200:
-        crops.append(gray_full[int(h * 0.25):int(h * 0.85), :])
+        for y0, y1 in ((0.0, 0.6), (0.2, 0.8), (0.4, 1.0)):
+            band = gray_full[int(h * y0) : int(h * y1), :]
+            regions.append(band)
+            for x0, x1 in ((0.0, 0.65), (0.2, 0.8), (0.35, 1.0)):
+                regions.append(band[:, int(w * x0) : int(w * x1)])
 
-    for crop in crops:
-        if crop.size == 0:
+    for reg in regions:
+        if reg.size == 0:
             continue
-        # 1. 直接检测
-        try:
-            text, _, _ = detector.detectAndDecode(crop)
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-        except Exception:
-            pass
-
-        # 2. 放大 1.6 倍后再检测（针对高分辨率海报中的小尺寸二维码）
-        ch, cw = crop.shape[:2]
-        if max(ch, cw) < 1200:
+        rh, rw = reg.shape[:2]
+        scales = [reg]
+        if max(rh, rw) < 1000:
+            scales.append(
+                cv2.resize(reg, (int(rw * 1.5), int(rh * 1.5)), interpolation=cv2.INTER_CUBIC)
+            )
+        for img in scales:
             try:
-                upscaled = cv2.resize(crop, (int(cw * 1.6), int(ch * 1.6)), interpolation=cv2.INTER_CUBIC)
-                text, _, _ = detector.detectAndDecode(upscaled)
+                text, _, _ = detector.detectAndDecode(img)
                 if isinstance(text, str) and text.strip():
                     return text.strip()
             except Exception:
                 pass
-
-        # 3. 二值化增强后再检测
-        try:
-            _, thresh = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-            text, _, _ = detector.detectAndDecode(thresh)
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-        except Exception:
-            pass
+            try:
+                _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                text, _, _ = detector.detectAndDecode(thresh)
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            except Exception:
+                pass
 
     return ""
 
