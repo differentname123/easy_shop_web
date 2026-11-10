@@ -14,6 +14,7 @@ from models.group_help import (
     PARSE_STATUS_FAILED,
     PARSE_STATUS_PARSED,
     PARSE_STATUS_PENDING,
+    validate_and_normalize_parsed_poster,
 )
 
 
@@ -50,7 +51,7 @@ class GroupHelpRepository(BaseRepository):
         existing = self.get_by_group_order_id(gid)
 
         if existing is not None:
-            # 若之前解析失败，允许用户重新上传触发再次解析
+            # 若之前解析失败，允许用户重新上传完整海报触发再次解析，并重置上传基准时间
             if existing.get("parse_status") == PARSE_STATUS_FAILED:
                 updated = self.col.find_one_and_update(
                     {"group_order_id": gid},
@@ -63,6 +64,7 @@ class GroupHelpRepository(BaseRepository):
                             "parse_attempts": 0,
                             "parse_error": "",
                             "group_status": GROUP_STATUS_ACTIVE,
+                            "created_at": now,
                             "updated_at": now,
                             "expires_at": now + DEFAULT_GROUP_TTL_SECONDS,
                         }
@@ -152,7 +154,8 @@ class GroupHelpRepository(BaseRepository):
         parsed_data: Dict[str, Any],
         now: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """将大模型识别出的商品信息、还差人数、剩余时间回写至数据库并设为已上线。"""
+        """校验大模型识别结果并将商品信息、还差人数、海报剩余时间回写至数据库后设为已上线。"""
+        validated = validate_and_normalize_parsed_poster(parsed_data)
         current_ts = float(now if now is not None else time.time())
         gid = str(group_order_id or "").strip()
         existing = self.get_by_group_order_id(gid)
@@ -161,40 +164,15 @@ class GroupHelpRepository(BaseRepository):
 
         created_at = float(existing.get("created_at") or current_ts)
         default_expires = created_at + DEFAULT_GROUP_TTL_SECONDS
-        ai_rem_sec = parsed_data.get("remaining_seconds")
-        if isinstance(ai_rem_sec, (int, float)) and not isinstance(ai_rem_sec, bool) and 60 <= ai_rem_sec <= DEFAULT_GROUP_TTL_SECONDS:
-            expires_at = min(default_expires, current_ts + float(ai_rem_sec))
+        ai_rem_sec = validated.get("remaining_seconds")
+        if ai_rem_sec is not None:
+            expires_at = min(default_expires, created_at + float(ai_rem_sec))
         else:
-            expires_at = float(existing.get("expires_at") or default_expires)
+            expires_at = min(default_expires, float(existing.get("expires_at") or default_expires))
 
-        remain_people = parsed_data.get("remain_people")
-        if not isinstance(remain_people, int) or isinstance(remain_people, bool) or remain_people < 0:
-            remain_people = 1
-        total_people = parsed_data.get("total_people")
-        if not isinstance(total_people, int) or isinstance(total_people, bool) or total_people < 0:
-            total_people = 0
-        if total_people > 0 and remain_people >= total_people:
-            remain_people = max(1, total_people - 1)
-
-        group_status = GROUP_STATUS_FULL if remain_people == 0 else GROUP_STATUS_ACTIVE
-        goods_name = str(parsed_data.get("goods_name") or "").strip() or "拼多多百亿补贴多人团商品"
-        raw_keywords = parsed_data.get("keywords") or []
-        keywords = []
-        for kw in raw_keywords:
-            if isinstance(kw, str) and kw.strip() and kw.strip() not in keywords:
-                keywords.append(kw.strip()[:32])
-
-        group_price = parsed_data.get("group_price")
-        if isinstance(group_price, (int, float)) and not isinstance(group_price, bool) and group_price > 0:
-            group_price = round(float(group_price), 2)
-        else:
-            group_price = None
-
-        original_price = parsed_data.get("original_price")
-        if isinstance(original_price, (int, float)) and not isinstance(original_price, bool) and original_price > 0:
-            original_price = round(float(original_price), 2)
-        else:
-            original_price = None
+        remain_people = validated["remain_people"]
+        total_people = validated["total_people"]
+        group_status = GROUP_STATUS_FULL if remain_people <= 0 else GROUP_STATUS_ACTIVE
 
         return self.col.find_one_and_update(
             {"group_order_id": gid},
@@ -202,10 +180,10 @@ class GroupHelpRepository(BaseRepository):
                 "$set": {
                     "parse_status": PARSE_STATUS_PARSED,
                     "parse_error": "",
-                    "goods_name": goods_name,
-                    "keywords": keywords,
-                    "group_price": group_price,
-                    "original_price": original_price,
+                    "goods_name": validated["goods_name"],
+                    "keywords": validated["keywords"],
+                    "group_price": validated["group_price"],
+                    "original_price": validated["original_price"],
                     "total_people": total_people,
                     "remain_people": remain_people,
                     "group_status": group_status,

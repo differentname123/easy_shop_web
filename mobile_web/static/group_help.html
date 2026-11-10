@@ -148,7 +148,7 @@
                   {{ myGroupStatusText(item) }}
                 </span>
                 <span class="gh-sub-meta">
-                  {{ item.click_count || 0 }}人去过<template v-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0"> · 差{{ item.remain_people }}人</template>
+                  {{ item.click_count || 0 }}人去过<template v-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0"> · 差{{ item.remain_people }}人 · 剩{{ formatRemaining(item.remaining_seconds) }}</template>
                 </span>
               </div>
               <h3 class="gh-goods-title">{{ item.goods_name }}</h3>
@@ -390,10 +390,10 @@
       </div>
 
       <div class="gh-dialog-body">
-        <p><b>请上传带有二维码的【拼多多多人团分享图】：</b></p>
+        <p><b>请上传完整的【拼多多多人团分享海报】：</b></p>
         <p style="margin-top:6px">
-          1. 在拼多多打开您的多人团，点击<b>【邀请好友】</b>，保存带有<b>二维码</b>的分享海报图片。<br>
-          2. 不要上传普通商品截图或没有二维码的页面截图。
+          1. 在拼多多打开您的多人团，点击<b>【邀请好友】</b>，保存完整的<b>分享海报原图</b>（需包含商品主图、标题、拼团价、还差人数及右下角二维码）。<br>
+          2. 请勿仅截取局部二维码，或上传无二维码的普通商品截图。
         </p>
         <p style="margin-top:8px;color:#d4380d;font-weight:600">
           💡 不清楚长什么样？点下方【看看别人发的图】即可直接查看标准样式！

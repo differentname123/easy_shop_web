@@ -469,3 +469,137 @@ def test_search_sorts_by_click_count_ascending_first():
         "3495229659187100002",  # 3 人前往
     ]
 
+
+def test_incomplete_poster_rejected_and_remaining_time_formats(tmp_path):
+    """
+    验证：
+    1. 用户仅截取局部二维码上传（无商品名称或无价格）时，即使二维码有效且 is_group_poster=True，也必须拦截为 failed，绝不上线大厅；
+    2. 大模型返回不同格式的剩余时间（如 "05:30:00"、"剩余 12小时"、"18000"）均能被准确解析并作为存活倒计时，而非默认 24 小时。
+    """
+    from models.group_help import (
+        PARSE_STATUS_FAILED,
+        parse_remaining_seconds,
+        validate_and_normalize_parsed_poster,
+    )
+
+    # 1. 多格式剩余时间解析验证
+    assert parse_remaining_seconds(raw_time="23:00:00") == 23 * 3600
+    assert parse_remaining_seconds(raw_time="05:30:00") == 5 * 3600 + 30 * 60
+    assert parse_remaining_seconds(raw_time="剩余 12小时") == 12 * 3600
+    assert parse_remaining_seconds(raw_time="45分钟") == 45 * 60
+    assert parse_remaining_seconds(raw_time=None, raw_seconds="18000") == 18000
+    assert parse_remaining_seconds(raw_time="00:00:00") == 0
+
+    # 2. 缺关键字段校验拦截验证
+    with pytest.raises(ValueError, match="商品名称"):
+        validate_and_normalize_parsed_poster(
+            {
+                "is_group_poster": True,
+                "goods_name": "",
+                "group_price": None,
+                "total_people": 0,
+                "remain_people": 1,
+            }
+        )
+    with pytest.raises(ValueError, match="拼团价格"):
+        validate_and_normalize_parsed_poster(
+            {
+                "is_group_poster": True,
+                "goods_name": "百事可乐500ml*20瓶",
+                "group_price": None,
+                "total_people": 3,
+                "remain_people": 2,
+            }
+        )
+
+    # 3. 服务层端到端拦截局部二维码图片 & 准确应用海报剩余时间
+    import time as _time
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    base_ts = _time.time()
+    poster_dir = tmp_path / "posters"
+    poster_dir.mkdir(parents=True, exist_ok=True)
+
+    # 案例 A：局部二维码图（无商品名、无价格）
+    gid_bad = "3495190924788381111"
+    bad_img_path = poster_dir / f"{gid_bad}.jpg"
+    bad_img_path.write_bytes(_make_poster_image_bytes("https://file-link.pinduoduo.com/bad"))
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": gid_bad,
+            "short_url": "https://file-link.pinduoduo.com/bad",
+            "redirect_url": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid_bad}",
+            "poster_path": str(bad_img_path),
+            "created_at": base_ts,
+        }
+    )
+
+    def fake_ai_partial_qr(prompt, file_paths=None, **kwargs):
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": True,
+                    "goods_name": "",
+                    "keywords": [],
+                    "group_price": None,
+                    "original_price": None,
+                    "total_people": 0,
+                    "remain_people": 1,
+                    "remaining_time": None,
+                    "remaining_seconds": None,
+                }
+            ),
+        }
+
+    svc_bad = GroupHelpService(repo=repo, poster_dir=poster_dir, ai_generator=fake_ai_partial_qr)
+    stats_bad = svc_bad.process_pending_batch(batch_size=2)
+    assert stats_bad["parsed"] == 0
+    assert stats_bad["failed"] == 1
+    bad_doc = repo.get_by_group_order_id(gid_bad)
+    assert bad_doc["parse_status"] == PARSE_STATUS_FAILED
+    assert "商品名称" in bad_doc["parse_error"]
+    assert len(repo.search_groups(now=base_ts + 10)["items"]) == 0
+
+    # 案例 B：真实海报识别出剩余 5小时30分 ("05:30:00")，到期时间应为上传时间 + 19800s，而非 24h
+    gid_good = "3495190924788382222"
+    good_img_path = poster_dir / f"{gid_good}.jpg"
+    good_img_path.write_bytes(_make_poster_image_bytes("https://file-link.pinduoduo.com/good"))
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": gid_good,
+            "short_url": "https://file-link.pinduoduo.com/good",
+            "redirect_url": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid_good}",
+            "poster_path": str(good_img_path),
+            "created_at": base_ts,
+        }
+    )
+
+    def fake_ai_5h30m(prompt, file_paths=None, **kwargs):
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": True,
+                    "goods_name": "百事可乐碳酸汽水500ml*20瓶整箱装",
+                    "keywords": ["百事可乐", "汽水"],
+                    "group_price": 32.9,
+                    "original_price": 45.0,
+                    "total_people": 3,
+                    "remain_people": 2,
+                    "remaining_time": "05:30:00",
+                    "remaining_seconds": None,
+                }
+            ),
+        }
+
+    svc_good = GroupHelpService(repo=repo, poster_dir=poster_dir, ai_generator=fake_ai_5h30m)
+    stats_good = svc_good.process_pending_batch(batch_size=2)
+    assert stats_good["parsed"] == 1
+    good_doc = repo.get_by_group_order_id(gid_good)
+    assert good_doc["parse_status"] == PARSE_STATUS_PARSED
+    assert good_doc["expires_at"] == base_ts + (5 * 3600 + 30 * 60)
+    # 5小时后仍在架，6小时后自动下线（而非等到24小时）
+    assert len(repo.search_groups(now=base_ts + 5 * 3600)["items"]) == 1
+    assert len(repo.search_groups(now=base_ts + 6 * 3600)["items"]) == 0
+
+

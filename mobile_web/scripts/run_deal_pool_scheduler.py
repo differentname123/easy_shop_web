@@ -261,7 +261,7 @@ ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
     "principle_05_parallel_producer_consumer_and_early_termination": (
         "【高吞吐架构：拉取/清洗双线程并行 + 转链并发化 + 唯一商品标识提前终止（Early Termination）】"
         "1) Stage 1 多源定时拉取（Producer）与 Stage 2~5 积压清洗（Consumer）在持续模式下分为两个独立线程并行运行，互不耽搁时间；"
-        "2) Stage 2/4 AI 采用 `batch_size=10` 批量分组 + `10` 线程并发请求；Stage 3 官方转链按 `(platform, clean_input)` 去重后采用 `10` 线程并发调用；"
+        "2) Stage 2/4 AI 采用 `batch_size=10` 批量分组 + `20` 线程并发请求；Stage 3 官方转链按 `(platform, clean_input)` 去重后采用 `10` 线程并发调用；"
         "3) 双层确定性提前终止（Early Termination）：当单锚点线报在 Stage 2 前命中 `anchor_cache` 已入库商品，或 Stage 3 转链拿到商品唯一标识 `(platform, goods_id)` "
         "发现该商品已在正式库 `products`（12h 保鲜期内）或同批次已有更优线报正在处理时，立即提前终止并跳过后续 AI 调用（标记 `OK_SKIPPED_ALREADY_CLEANED`），"
         "仅向正式表 `products` 累加跨群/跨站共振热度，大幅节省工作量与 AI 算力！"
@@ -1074,7 +1074,7 @@ class DealPoolCleaner:
         self,
         use_ai_for_multi: bool = True,
         ai_batch_size: int = 10,
-        ai_max_workers: int = 10,
+        ai_max_workers: int = 20,
         convert_max_workers: int = 10,
     ):
         self.use_ai = True
@@ -4707,8 +4707,8 @@ def main():
     parser.add_argument(
         "--ai-workers",
         type=int,
-        default=10,
-        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 10）",
+        default=20,
+        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 20）",
     )
     parser.add_argument(
         "--convert-workers",

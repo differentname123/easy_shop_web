@@ -21,6 +21,7 @@ from models.group_help import (
     is_pdd_qr_url,
     is_valid_group_order_id,
     parse_group_redirect_url,
+    validate_and_normalize_parsed_poster,
 )
 from repositories.group_help_repo import GroupHelpRepository
 
@@ -284,20 +285,22 @@ class GroupHelpService:
                 return False
 
             parsed_json = extract_json_object(res.get("content", ""))
-            if parsed_json.get("is_group_poster") is False and not str(parsed_json.get("goods_name") or "").strip():
-                self.repo.mark_parse_failed(
-                    gid,
-                    "未能在图中识别出拼团商品信息，请上传完整的拼多多多人团邀请海报",
-                    permanent=True,
-                )
+            try:
+                validated_data = validate_and_normalize_parsed_poster(parsed_json)
+            except ValueError as val_err:
+                reason = str(val_err)
+                self.repo.mark_parse_failed(gid, reason, permanent=True)
+                logger.info("【多人团识图拦截】团单[%s] 图片关键信息缺失拒绝上线 | 原因<%s>", gid, reason)
                 return False
-            self.repo.mark_parse_succeeded(gid, parsed_json)
+
+            self.repo.mark_parse_succeeded(gid, validated_data)
             logger.info(
-                "【多人团识图完成】团单[%s] 商品[%s] 价格[%s] 差额[%s人]",
+                "【多人团识图完成】团单[%s] 商品[%s] 价格[%s] 差额[%s人] 剩余秒数[%s]",
                 gid,
-                parsed_json.get("goods_name"),
-                parsed_json.get("group_price"),
-                parsed_json.get("remain_people"),
+                validated_data.get("goods_name"),
+                validated_data.get("group_price"),
+                validated_data.get("remain_people"),
+                validated_data.get("remaining_seconds"),
             )
             return True
         except Exception as exc:

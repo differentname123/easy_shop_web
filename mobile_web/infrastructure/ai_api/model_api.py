@@ -928,30 +928,86 @@ def probe_models(json_path):
 
 
 if __name__ == "__main__":
-    # 示例 1：使用本地 Antigravity 的 Gemini 3.8 Flash (High) 进行纯文本生成
-    res_flash = generate_content(
-        prompt="用一句话分析比特币减半对矿工的长期影响。",
-        model="antigravity-3.8-flash-high",
-    )
-    print("Flash (High) 文本结果:", res_flash)
+    test_models = [
+        "antigravity-argon-high",
+        "antigravity-3.8-flash-high",
+        "antigravity-3.8-flash-medium",
+    ]
+    # 使用需要多步逻辑推理/电商凑单计算的同题测试，并限制最终输出简短，使耗时主要反映内部思考深度
+    test_prompts = [
+        (
+            "某电商平台大促规则如下：1) 跨店满减每满300减50（上不封顶，按商品原价计算）；"
+            "2) 店铺券满500减60（仅限A店商品原价累计满500可用，与跨店满减叠加）；"
+            "3) 品类券满800减80（全平台可用，按原价计算，但不可与店铺券同时使用，系统自动选更优方案）；"
+            "4) 88VIP打95折（在原价基础上先打95折，还是在扣除所有满减/券之后的实付金额基础上打95折？"
+            "假设规则为：先算95折后的折后价，再减去跨店满减和优惠券）。"
+            "小明购买A店商品X（原价360元）、A店商品Y（原价280元）、B店商品Z（原价290元）。"
+            "请问小明最优实付总金额是多少元？A店商品X分摊后的最终单品实付价是多少元（保留2位小数）？"
+            "请只输出最终结论（不超过100字）。"
+        ),
+        (
+            "有5个盒子编号1~5，每个盒子里放着红球、蓝球、绿球、黄球、白球中的一种（颜色互不相同）。已知："
+            "1) 红球在偶数号盒子里；"
+            "2) 蓝球和绿球所在的盒子编号相邻；"
+            "3) 黄球的盒子编号比白球大，且黄球不在5号盒；"
+            "4) 绿球不在1号盒，且1号盒与蓝球的盒子编号之差大于2；"
+            "5) 如果红球在2号盒，则白球不在1号盒。"
+            "请推导出1~5号盒子分别是什么颜色的球，只输出最终对应关系（不超过80字）。"
+        ),
+        (
+            "一个3升水壶和一个5升水壶（均无刻度），水无限供应。现在需要精确量出4升水，"
+            "并且在此基础上，如果变成7升水壶和11升水壶，要精确量出6升水最少需要几次倒水操作"
+            "（装满、倒空、从A壶倒入B壶各算1次操作）？请只输出两个问题的最少操作次数及7升/11升的步骤简述（不超过120字）。"
+        ),
+        (
+            "某跨境商品采购成本为120元/件，国际物流首重1kg为35元，续重每0.5kg（不足0.5kg按0.5kg计）为12元。"
+            "单件商品净重380g，独立包装盒重60g；若每满4件需额外套一个加固大外箱（每个大外箱重450g）。"
+            "平台抽佣8%（按售价计），支付通道费1.5%（按售价计），退货率预估为10%（退货商品无法二次销售，且寄出物流费不退）。"
+            "若客户一单购买6件并放在同一个包裹发货，商家希望这笔订单的净利润率（净利润/总售价）达到20%，"
+            "请问单件最低定价应为多少元（保留2位小数）？请只输出最终单件定价及总物流费（不超过80字）。"
+        ),
+        (
+            "甲、乙、丙、丁四人参加100米决赛，赛前五位观众预测如下（每人说了两句话，且每位观众都恰好猜对了一半、猜错了一半）："
+            "观众A：甲是第2名，乙是第3名；"
+            "观众B：丙是第4名，乙是第2名；"
+            "观众C：丁是第2名，丙是第3名；"
+            "观众D：甲是第1名，丁是第3名；"
+            "观众E：丙是第1名，丁是第4名。"
+            "请问这四句话是否存在逻辑矛盾？如果去掉观众E的预测，甲乙丙丁的第1~4名顺序是什么？请只输出最终结论（不超过80字）。"
+        ),
+    ]
 
-    # 示例 2：使用本地 Antigravity 的 Gemini 4 Argon (High) 进行纯文本生成
-    res_argon = generate_content(
-        prompt="请输出一个包含 coin 和 sentiment 字段的 JSON 示例。",
-        model="antigravity-argon-high",
-    )
-    print("Argon (High) 文本结果:", res_argon)
-    for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="antigravity-3.8-flash-medium")
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="antigravity-3.8-flash-high")
+    stats = {m: [] for m in test_models}
+    print("=" * 80)
+    print(f"开始对 3 个 Antigravity 模型进行 {len(test_prompts)} 轮同题推理与耗时对比测试...")
+    print("=" * 80)
 
-    # 示例 3：传入本地图片路径 (file_paths) 进行多模态图片分析（支持单张或多张图片）
-    # res_img = generate_content(
-    #     prompt="请分别描述这些图片的内容，并标明对应的文件名。",
-    #     model="antigravity-argon-high",  # 或 "antigravity-3.8-flash-high"
-    #     file_paths=[
-    #         r"C:\Users\zxh\Desktop\temp\test.jpg",
-    #         r"C:\Users\zxh\Desktop\temp\cdcf1d36-1214-40a1-9166-47ddda572ea7.png",
-    #     ],
-    # )
-    # print("图片分析结果:", res_img)
+    for round_idx, prompt_text in enumerate(test_prompts, 1):
+        print(f"\n【第 {round_idx}/{len(test_prompts)} 轮】测试题目: {prompt_text[:55]}...")
+        for m in test_models:
+            res = generate_content(
+                prompt=prompt_text,
+                model=m,
+                max_retries_per_model=2,
+            )
+            cost = res["metrics"]["total_time_seconds"]
+            attempts = res["metrics"]["attempts"]
+            status = res["status"]
+            content_one_line = res["content"].replace("\r", " ").replace("\n", " ")
+            stats[m].append(cost)
+            print(f"  - [{m:<28}] 状态: {status} | 耗时: {cost:6.2f}s (尝试:{attempts}) | 回答: {content_one_line[:90]}")
+
+    print("\n" + "=" * 80)
+    print("📊 多轮同题测试汇总统计（按平均耗时从高到低排序）：")
+    print("=" * 80)
+    summary_rows = []
+    for m, times in stats.items():
+        avg_t = sum(times) / len(times) if times else 0.0
+        summary_rows.append((avg_t, min(times), max(times), m, times))
+    summary_rows.sort(reverse=True)
+    for rank, (avg_t, min_t, max_t, m, times) in enumerate(summary_rows, 1):
+        rounds_str = ", ".join(f"{t:.2f}s" for t in times)
+        print(
+            f"第 {rank} 名: {m:<28} | 平均耗时: {avg_t:6.2f}s | 最小: {min_t:5.2f}s | 最大: {max_t:6.2f}s | 各轮: [{rounds_str}]"
+        )
+

@@ -163,3 +163,169 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
         "h5_join_url": jumps.get("h5_join_url") or doc.get("h5_join_url", ""),
         "brand_card_url": jumps.get("brand_card_url") or doc.get("brand_card_url", ""),
     }
+
+
+_INVALID_GOODS_NAMES = {
+    "商品完整名称",
+    "拼多多百亿补贴多人团商品",
+    "拼多多多人团商品",
+    "未知商品",
+    "未识别",
+    "无",
+    "null",
+    "none",
+    "商品名称",
+}
+
+
+def _parse_single_time_value(val: Any) -> Optional[int]:
+    """将单个时间值（HH:MM:SS 字符串、中文时长字符串或秒数数值）解析为秒数。"""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        sec = int(round(float(val)))
+        return sec if sec >= 0 else None
+    if not isinstance(val, str):
+        return None
+
+    s = val.strip().replace("：", ":")
+    if not s or s.lower() in ("null", "none", "n/a", "未知", "无"):
+        return None
+
+    # 1. 纯数字字符串（秒数）
+    if re.match(r"^\d+(?:\.\d+)?$", s):
+        return int(round(float(s)))
+
+    # 2. 标准 HH:MM:SS 或 HH:MM 格式
+    m_colon = re.search(r"(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?", s)
+    if m_colon:
+        h = int(m_colon.group(1))
+        m = int(m_colon.group(2))
+        sec = int(m_colon.group(3)) if m_colon.group(3) is not None else 0
+        return h * 3600 + m * 60 + sec
+
+    # 3. 含中文或英文单位的时长字符串（如“剩余 23小时”、“5小时30分”、“45分钟”）
+    total_sec = 0.0
+    matched_unit = False
+    for pat, mult in (
+        (r"(\d+(?:\.\d+)?)\s*(?:天|日)", 86400.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:小时|时|hr|h)(?!\w)", 3600.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:分钟|分|min|m)(?!\w)", 60.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:秒钟|秒|sec|s)(?!\w)", 1.0),
+    ):
+        m_u = re.search(pat, s, flags=re.IGNORECASE)
+        if m_u:
+            total_sec += float(m_u.group(1)) * mult
+            matched_unit = True
+    if matched_unit:
+        return int(round(total_sec))
+
+    return None
+
+
+def parse_remaining_seconds(raw_time: Any = None, raw_seconds: Any = None) -> Optional[int]:
+    """
+    统一解析大模型返回的剩余时间（优先使用标准 HH:MM:SS / 时长文本，其次使用秒数）：
+    - 若明确为 0 秒，返回 0（表示海报显示该团已结束）；
+    - 若为有效正数，限制在 [60, DEFAULT_GROUP_TTL_SECONDS] 区间并返回整数秒；
+    - 若未提供或无法解析，返回 None。
+    """
+    sec = _parse_single_time_value(raw_time)
+    if sec is None:
+        sec = _parse_single_time_value(raw_seconds)
+    if sec is None:
+        return None
+    if sec <= 0:
+        return 0
+    return min(max(60, sec), DEFAULT_GROUP_TTL_SECONDS)
+
+
+def _parse_positive_float(val: Any) -> Optional[float]:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        num = float(val)
+    elif isinstance(val, str):
+        m = re.search(r"\d+(?:\.\d+)?", val.replace(",", ""))
+        if not m:
+            return None
+        num = float(m.group(0))
+    else:
+        return None
+    if num <= 0 or num > 100000:
+        return None
+    return round(num, 2)
+
+
+def _parse_int_field(val: Any) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return int(round(float(val)))
+    if isinstance(val, str):
+        m = re.search(r"\d+", val)
+        if m:
+            return int(m.group(0))
+    return None
+
+
+def validate_and_normalize_parsed_poster(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    对大模型返回的海报解析结果执行严格的字段校验与标准化：
+    必须同时具备有效的商品名称、拼团价格、差额人数，且未过期，否则拒绝上线并抛出可读原因。
+    """
+    if not isinstance(parsed_data, dict):
+        raise ValueError("海报识别数据结构不合法")
+
+    if parsed_data.get("is_group_poster") is False:
+        raise ValueError(
+            "图片不是完整的拼多多多人团分享海报，请上传包含商品图、商品标题、拼团价及二维码的完整海报（勿仅截取局部二维码）"
+        )
+
+    goods_name = str(parsed_data.get("goods_name") or "").strip()
+    if len(goods_name) < 3 or goods_name.lower() in _INVALID_GOODS_NAMES:
+        raise ValueError(
+            "图片中未识别到商品名称，请上传包含商品主图、标题、价格和二维码的完整拼团海报（勿仅截取局部二维码）"
+        )
+
+    group_price = _parse_positive_float(parsed_data.get("group_price"))
+    if group_price is None:
+        raise ValueError("图片中未识别到有效的拼团价格，请上传包含商品标题与拼团价的完整分享海报")
+
+    remain_people = _parse_int_field(parsed_data.get("remain_people"))
+    if remain_people is None or remain_people < 1 or remain_people > 20:
+        raise ValueError("图片中未识别到有效的成团差额人数（如“还差X人”），请上传完整的拼团邀请海报")
+
+    total_people = _parse_int_field(parsed_data.get("total_people")) or 0
+    if total_people < 0 or total_people > 50:
+        total_people = 0
+    if total_people > 0 and remain_people >= total_people:
+        remain_people = max(1, total_people - 1)
+
+    rem_sec = parse_remaining_seconds(
+        raw_time=parsed_data.get("remaining_time"),
+        raw_seconds=parsed_data.get("remaining_seconds"),
+    )
+    if rem_sec == 0:
+        raise ValueError("图片上显示的拼团剩余时间已结束，无法上架")
+
+    original_price = _parse_positive_float(parsed_data.get("original_price"))
+
+    raw_keywords = parsed_data.get("keywords") or []
+    keywords: List[str] = []
+    if isinstance(raw_keywords, list):
+        for kw in raw_keywords:
+            if isinstance(kw, str) and kw.strip() and kw.strip() not in keywords:
+                keywords.append(kw.strip()[:32])
+
+    return {
+        "is_group_poster": True,
+        "goods_name": goods_name,
+        "keywords": keywords,
+        "group_price": group_price,
+        "original_price": original_price,
+        "total_people": total_people,
+        "remain_people": remain_people,
+        "remaining_seconds": rem_sec,
+    }
+
