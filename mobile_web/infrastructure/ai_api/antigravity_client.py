@@ -1449,7 +1449,7 @@ def get_client(
     """
     获取全局客户端实例：
     - 若未指定 `sub_account_email` 且 `SUB_ACCOUNT_EMAIL is None`（默认）：
-      返回 `AntigravityPoolClient` 多小号智能随机路由池（支持高并发 + 按模型权限自动筛选小号）；
+      返回 `AntigravityPoolClient` 多小号智能随机路由池（支持高并发 + 白名单随机调度）；
     - 若显式指定了单个 `sub_account_email`：
       返回绑定该单一小号的 `AntigravityClient`。
     """
@@ -1532,7 +1532,7 @@ if __name__ == "__main__":
     print(f"[1] 桌面端当前登录账号自动快照: {archived_desktop or '未检测到'} (大号保护名单: {sorted(EXCLUDED_MAIN_ACCOUNTS)})")
     pool_client = AntigravityPoolClient()
     rows = pool_client.get_pool_status()
-    print(f"[2] 账号池可用小号数量: {len(rows)} 个 (Flash 总并发上限={sum(2 for r in rows if r['supports_flash'])}, Argon 总并发上限={sum(2 for r in rows if r['supports_argon'])}):")
+    print(f"[2] 账号池可用小号数量: {len(rows)} 个 (单号并发上限=2 | Flash 总并发上限={sum(2 for r in rows if r['supports_flash'])}, Argon 总并发上限={sum(2 for r in rows if r['supports_argon'])}):")
     for idx, r in enumerate(rows, 1):
         models_tag = f"Argon={'✅' if r['supports_argon'] else '❌'} | 3.8-Flash={'✅' if r['supports_flash'] else '❌'}"
         print(
