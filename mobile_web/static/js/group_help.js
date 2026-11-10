@@ -5,6 +5,8 @@
 
   const MY_GROUPS_STORAGE_KEY = 'pdd_gh_my_groups_v1';
   const CREDIT_WARN_ACK_KEY = 'pdd_gh_credit_ack_v1';
+  const ONBOARD_DISMISSED_KEY = 'pdd_gh_onboard_dismissed_v1';
+  const UPLOAD_GUIDE_ACK_KEY = 'pdd_gh_upload_guide_ack_v1';
   const MAX_LOCAL_MY_GROUPS = 30;
 
   createApp({
@@ -25,6 +27,7 @@
       const fullPosterUrl = ref('');
       const toastMsg = ref('');
       const fileInputRef = ref(null);
+      const showOnboardGuide = ref(true);
 
       const localPendingCount = computed(
         () =>
@@ -34,6 +37,13 @@
       );
 
       const hasJoinedGroup = gid => Boolean(gid && joinedGroupIds.value[gid]);
+
+      const dismissOnboardGuide = () => {
+        showOnboardGuide.value = false;
+        try {
+          global.localStorage.setItem(ONBOARD_DISMISSED_KEY, '1');
+        } catch (_) {}
+      };
 
       // 问号说明 / 失败原因引导弹窗
       const helpModal = ref({
@@ -428,11 +438,22 @@
       };
 
       // ==================== 零阻塞后台上传 + 失败留存本地记录 ====================
-      const triggerUpload = () => {
+      const openFilePickerDirectly = () => {
         if (fileInputRef.value) {
           fileInputRef.value.value = '';
           fileInputRef.value.click();
         }
+      };
+
+      const triggerUpload = () => {
+        try {
+          const acked = global.localStorage.getItem(UPLOAD_GUIDE_ACK_KEY) === '1';
+          if (!acked && myGroups.value.length === 0) {
+            openHelpGuide(null);
+            return;
+          }
+        } catch (_) {}
+        openFilePickerDirectly();
       };
 
       const readFileAsDataUrl = file =>
@@ -620,8 +641,11 @@
       };
 
       const reuploadFromHelp = () => {
+        try {
+          global.localStorage.setItem(UPLOAD_GUIDE_ACK_KEY, '1');
+        } catch (_) {}
         closeHelpGuide();
-        triggerUpload();
+        openFilePickerDirectly();
       };
 
       const openUploadResultModal = item => {
@@ -929,6 +953,11 @@
 
       onMounted(() => {
         global.addEventListener('popstate', onWindowPopState);
+        try {
+          showOnboardGuide.value = global.localStorage.getItem(ONBOARD_DISMISSED_KEY) !== '1';
+        } catch (_) {
+          showOnboardGuide.value = true;
+        }
         myGroups.value = loadMyGroupsFromStorage();
         fetchGroups(true);
         if (myGroups.value.length > 0) {
@@ -958,6 +987,8 @@
         fullPosterUrl,
         toastMsg,
         fileInputRef,
+        showOnboardGuide,
+        dismissOnboardGuide,
         helpModal,
         creditWarnModal,
         uploadResultModal,

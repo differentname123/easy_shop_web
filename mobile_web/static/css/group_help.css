@@ -745,3 +745,175 @@ body {
   text-align: center;
   line-height: 1.45;
 }
+
+/* 新手快速上手引导条（可收起） */
+.gh-onboard-card {
+  margin: 10px 12px 0;
+  padding: 11px 12px;
+  background: linear-gradient(180deg, #fff9f5 0%, #ffffff 100%);
+  border: 1px solid #ffd8bf;
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(224, 46, 36, 0.05);
+}
+
+.gh-onboard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.gh-onboard-title {
+  font-size: 13px;
+  font-weight: 800;
+  color: #d4380d;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.gh-onboard-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gh-onboard-link {
+  border: none;
+  background: transparent;
+  color: var(--gh-primary);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.gh-onboard-close {
+  border: none;
+  background: #f2f3f5;
+  color: #8c8c8c;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gh-onboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.gh-onboard-step {
+  background: #fff;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  padding: 8px 9px;
+}
+
+.gh-onboard-step-tag {
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--gh-text-main);
+  margin-bottom: 3px;
+}
+
+.gh-onboard-step-desc {
+  font-size: 11.5px;
+  color: var(--gh-text-sub);
+  line-height: 1.4;
+}
+
+/* 弹窗内正误海报可视化对比卡片 */
+.gh-poster-compare {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.gh-sample-box {
+  border-radius: 10px;
+  padding: 9px;
+  font-size: 11.5px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.gh-sample-box.is-good {
+  background: #f6ffed;
+  border: 1.5px solid #95de64;
+}
+
+.gh-sample-box.is-bad {
+  background: #fff1f0;
+  border: 1.5px solid #ffa39e;
+}
+
+.gh-sample-header {
+  font-weight: 800;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.gh-sample-box.is-good .gh-sample-header {
+  color: #237804;
+}
+
+.gh-sample-box.is-bad .gh-sample-header {
+  color: #cf1322;
+}
+
+.gh-mock-poster {
+  background: #fff;
+  border-radius: 6px;
+  padding: 7px;
+  border: 1px solid #e8e8e8;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.gh-mock-img {
+  height: 40px;
+  background: #fff2e8;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #d4380d;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.gh-mock-bar {
+  background: #e02e24;
+  color: #fff;
+  border-radius: 4px;
+  padding: 4px 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.gh-mock-qr {
+  background: #fff;
+  color: #1f2329;
+  padding: 1px 4px;
+  border-radius: 2px;
+  font-size: 9.5px;
+  font-weight: 800;
+}
+
+.gh-mock-meta {
+  font-size: 10.5px;
+  color: #595959;
+  line-height: 1.35;
+}
+

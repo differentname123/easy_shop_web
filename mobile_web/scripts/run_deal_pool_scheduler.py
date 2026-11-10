@@ -1104,6 +1104,23 @@ class DealPoolCleaner:
         self.stats_early_terminated_post_stage3 = 0
         self.last_batch_stage_timings: Dict[str, float] = {}
 
+    @staticmethod
+    def _build_anchor_cache_keys(plat: str, raw_anchor: str) -> List[str]:
+        """生成锚点缓存的主键列表：除完整字符串外，若为淘口令则额外提取 11 位核心字母数字码作为二级索引键。"""
+        s = str(raw_anchor or "").strip()
+        if not s:
+            return []
+        keys = [f"{plat}:{s}"]
+        if plat == "taobao" and not s.lower().startswith("http"):
+            m = re.search(r"[￥$€£₴¢(（《【「/!！~|]\s*([A-Za-z0-9]{11})\s*[￥$€£₴¢)）》】」/!！~|]", s)
+            if m:
+                tk = m.group(1)
+                if any(c.isalpha() for c in tk) and any(c.isdigit() for c in tk):
+                    tk_key = f"taobao:tk:{tk}"
+                    if tk_key not in keys:
+                        keys.append(tk_key)
+        return keys
+
     def warmup_anchor_cache_from_db(self, raw_col) -> None:
         """
         启动时从初步表 `deal_raw_tips` 预热最近 12 小时内已成功转链的 `converted_links` 缓存，
@@ -1133,10 +1150,11 @@ class DealPoolCleaner:
                         c_plat = str(cl.get("platform") or "").strip()
                         c_inp = str(cl.get("clean_input") or "").strip()
                         if c_plat in ("jd", "taobao", "pdd") and c_inp and c_status in ("product", "coupon_or_activity"):
-                            ckey = f"{c_plat}:{c_inp}"
-                            if ckey not in self.anchor_cache:
-                                self.anchor_cache[ckey] = copy.deepcopy(cl)
-                                loaded += 1
+                            cl_copy = copy.deepcopy(cl)
+                            for ckey in self._build_anchor_cache_keys(c_plat, c_inp):
+                                if ckey not in self.anchor_cache:
+                                    self.anchor_cache[ckey] = cl_copy
+                                    loaded += 1
             if loaded > 0:
                 logger.info("🔥 [转链缓存预热] 已从 `deal_raw_tips` 恢复最近 12h 有效转链锚点 %d 个", loaded)
         except Exception as e:
@@ -1476,10 +1494,11 @@ class DealPoolCleaner:
         last_failed: Optional[Dict[str, Any]] = None
 
         for try_plat in platforms_to_try:
-            cache_key = f"{try_plat}:{clean_input}"
+            cache_keys = self._build_anchor_cache_keys(try_plat, clean_input)
             with self._cache_lock:
-                if cache_key in self.anchor_cache:
-                    cached = copy.deepcopy(self.anchor_cache[cache_key])
+                hit_key = next((k for k in cache_keys if k in self.anchor_cache), None)
+                if hit_key is not None:
+                    cached = copy.deepcopy(self.anchor_cache[hit_key])
                     cached["link_id"] = link_id
                     cached["text_role_hint"] = role_hint
                     c_status = cached.get("convert_status")
@@ -1519,7 +1538,8 @@ class DealPoolCleaner:
                     "adapter_res": {},
                 }
                 with self._cache_lock:
-                    self.anchor_cache[cache_key] = out
+                    for ck in cache_keys:
+                        self.anchor_cache[ck] = out
                 last_failed = out
                 continue
 
@@ -1558,7 +1578,8 @@ class DealPoolCleaner:
                         "adapter_res": res,
                     }
                     with self._cache_lock:
-                        self.anchor_cache[cache_key] = out
+                        for ck in cache_keys:
+                            self.anchor_cache[ck] = out
                     return copy.deepcopy(out)
 
                 # 转链成功但无单一商品详情（例如京东/淘宝优惠券短链、活动会场推广链）
@@ -1579,7 +1600,8 @@ class DealPoolCleaner:
                         "adapter_res": res,
                     }
                     with self._cache_lock:
-                        self.anchor_cache[cache_key] = out
+                        for ck in cache_keys:
+                            self.anchor_cache[ck] = out
                     return copy.deepcopy(out)
 
             # 若上游未返回单品转链结果，但该链接本身就是可直接打开的官方领券/活动会场链接（如 coupon.m.jd.com），保留为可用优惠券链接
@@ -1600,7 +1622,8 @@ class DealPoolCleaner:
                     "adapter_res": res if isinstance(res, dict) else {},
                 }
                 with self._cache_lock:
-                    self.anchor_cache[cache_key] = out
+                    for ck in cache_keys:
+                        self.anchor_cache[ck] = out
                 return copy.deepcopy(out)
 
             raw_code = str((res or {}).get("error_code") or "")
@@ -1634,7 +1657,8 @@ class DealPoolCleaner:
                 "adapter_res": res if isinstance(res, dict) else {},
             }
             with self._cache_lock:
-                self.anchor_cache[cache_key] = out
+                for ck in cache_keys:
+                    self.anchor_cache[ck] = out
             last_failed = out
 
         return copy.deepcopy(last_failed) if last_failed else {
@@ -1982,8 +2006,9 @@ class DealPoolCleaner:
             raw_title = str(doc.get("title") or "").strip()
 
             # 【Tier 1 前置提前终止（Before AI-1）】：
-            # 若该记录僅含单一明确链接/口令，且该链接/口令已命中 `anchor_cache` 的 `"product"`，
-            # 同时其唯一商品标识 `(platform, goods_id)` 已在正式库 `products` 12h 保鲜期内清洗入库，
+            # 当该记录所含全部链接/口令 100% 均已命中 `anchor_cache`（即无任何未知新链接），
+            # 且其中所有单品 (`"product"`) 锚点指向同一个唯一商品标识 `(platform, goods_id)`（排除多商品/主次混淆可能），
+            # 同时该唯一商品已在正式库 `products` 12h 保鲜期内清洗入库，
             # 则直接提前终止（跳过 AI-1、Stage 3 与 AI-2），仅累加跨站/跨群共振热度！
             raw_anchors: List[str] = []
             for lk in doc.get("extracted_links") or []:
@@ -1997,20 +2022,39 @@ class DealPoolCleaner:
                     raw_anchors.append(tk_s)
 
             matched_cached_conv: Optional[Dict[str, Any]] = None
-            if len(raw_anchors) == 1:
-                only_anchor = raw_anchors[0]
+            matched_cached_list: List[Dict[str, Any]] = []
+            if raw_anchors:
                 def_plat = str(doc.get("platform") or "unknown").strip().lower()
-                guess_plat = detect_candidate_platform(only_anchor, def_plat)
-                plats_to_check = [guess_plat] if guess_plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
+                all_anchors_cached = True
                 with self._cache_lock:
-                    for cp in plats_to_check:
-                        c_entry = self.anchor_cache.get(f"{cp}:{only_anchor}")
-                        if c_entry and c_entry.get("convert_status") == "product":
-                            c_pid = str(c_entry.get("goods_id") or "")
-                            if (cp, c_pid) in active_formal_products:
-                                matched_cached_conv = copy.deepcopy(c_entry)
-                                self.stats_cache_hits += 1
+                    for anchor_item in raw_anchors:
+                        guess_plat = detect_candidate_platform(anchor_item, def_plat)
+                        plats_to_check = [guess_plat] if guess_plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
+                        found_entry = None
+                        for cp in plats_to_check:
+                            for ck in self._build_anchor_cache_keys(cp, anchor_item):
+                                if ck in self.anchor_cache:
+                                    found_entry = self.anchor_cache[ck]
+                                    break
+                            if found_entry is not None:
                                 break
+                        if found_entry is None:
+                            all_anchors_cached = False
+                            break
+                        matched_cached_list.append(found_entry)
+
+                    if all_anchors_cached and matched_cached_list:
+                        prod_entries = [e for e in matched_cached_list if e.get("convert_status") == "product"]
+                        unique_pids = {
+                            (str(e.get("platform") or ""), str(e.get("goods_id") or ""))
+                            for e in prod_entries
+                            if e.get("platform") and e.get("goods_id")
+                        }
+                        if len(unique_pids) == 1:
+                            only_pid = next(iter(unique_pids))
+                            if only_pid in active_formal_products:
+                                matched_cached_conv = copy.deepcopy(prod_entries[0])
+                                self.stats_cache_hits += len(matched_cached_list)
 
             if matched_cached_conv is not None:
                 c_plat = str(matched_cached_conv.get("platform") or "")
@@ -2037,9 +2081,9 @@ class DealPoolCleaner:
                     "quality_score": ex_info.get("quality_score", 75),
                     "merged_tip_ids": [mid],
                     "ai_stage1_result": {"early_terminated": "pre_ai1_cache_hit"},
-                    "converted_links": [{k: v for k, v in matched_cached_conv.items() if k != "adapter_res"}],
+                    "converted_links": [{k: v for k, v in e.items() if k != "adapter_res"} for e in matched_cached_list],
                     "ai_stage2_result": {"early_terminated": "pre_ai1_cache_hit"},
-                    "candidate_count": 1,
+                    "candidate_count": len(raw_anchors),
                     "attempt_errors": [],
                     "resonance_update": {
                         "platform": c_plat,
@@ -2943,7 +2987,7 @@ def run_clean_stage(
     repo: DealRawPoolRepository,
     cleaner: DealPoolCleaner,
     cycle_num: int,
-    clean_limit: int = 300,
+    clean_limit: int = 1000,
 ) -> Dict[str, Any]:
     """
     执行 Stage 2 ~ Stage 5 完整闭环：
@@ -4627,7 +4671,7 @@ def run_single_cycle(
     cycle_num: int,
     max_new_details_per_channel: int = 20,
     run_all_tiers: bool = False,
-    clean_limit: int = 300,
+    clean_limit: int = 1000,
     channel_health_tracker: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
@@ -4801,8 +4845,8 @@ def main():
     parser.add_argument(
         "--clean-limit",
         type=int,
-        default=300,
-        help="每批阶段二~五最多清洗核验的 pending 记录条数（默认: 300）",
+        default=1000,
+        help="每批阶段二~五最多清洗核验的 pending 记录条数（默认: 1000，即 100 批）",
     )
     parser.add_argument(
         "--ai-batch-size",

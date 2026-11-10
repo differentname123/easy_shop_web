@@ -12,7 +12,7 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=20261110-1">
+  <link rel="stylesheet" href="/static/css/group_help.css?v=20261110-2">
   <script src="/static/js/vue.global.prod.js?v=ux-20261107-2"></script>
 </head>
 <body>
@@ -33,9 +33,9 @@
       <h1 class="gh-title">多人团互助</h1>
       <div class="gh-upload-group">
         <button class="gh-upload-trigger-btn" @click="triggerUpload">
-          <span>➕ 传二维码发团</span>
+          <span>➕ 传海报发团</span>
         </button>
-        <button class="gh-help-icon-btn" @click="openHelpGuide(null)" title="需要上传什么图片？">?</button>
+        <button class="gh-help-icon-btn" @click="openHelpGuide(null)" title="玩法与海报要求">?</button>
       </div>
     </div>
 
@@ -193,15 +193,40 @@
 
     <div v-else class="gh-empty-box">
       <div class="gh-empty-title">暂无发团记录</div>
-      <div class="gh-empty-sub">上传拼多多多人团二维码图片后，可在此查看上架状态。</div>
+      <div class="gh-empty-sub">在拼多多开团后点击【邀请好友】保存完整分享海报，上传后即可自动识别上架。</div>
       <button class="gh-join-btn" style="padding:9px 22px;font-size:14px" @click="triggerUpload">
-        ➕ 传二维码发团
+        ➕ 传海报发团
       </button>
     </div>
   </main>
 
   <!-- ==================== 视图 B：大厅拼团列表 ==================== -->
   <template v-else>
+    <!-- 新手 2 步快速上手引导条（首次访问默认展开，可一键收起，也可点顶部 ? 随时唤出） -->
+    <div v-if="showOnboardGuide" class="gh-onboard-card">
+      <div class="gh-onboard-head">
+        <span class="gh-onboard-title">👋 新手 2 步快速上手</span>
+        <div class="gh-onboard-actions">
+          <button class="gh-onboard-link" @click="openHelpGuide(null)">看标准海报示例 ›</button>
+          <button class="gh-onboard-close" @click="dismissOnboardGuide" title="收起引导">✕</button>
+        </div>
+      </div>
+      <div class="gh-onboard-grid">
+        <div class="gh-onboard-step">
+          <div class="gh-onboard-step-tag">🛒 1. 怎么参团省钱？</div>
+          <div class="gh-onboard-step-desc">
+            点下方商品 → 唤醒拼多多或扫码参团 → 拼成后顺手点<b>「我已参团」</b>
+          </div>
+        </div>
+        <div class="gh-onboard-step" @click="openHelpGuide(null)" style="cursor:pointer">
+          <div class="gh-onboard-step-tag">📤 2. 怎么发团凑人？</div>
+          <div class="gh-onboard-step-desc">
+            拼多多开团点<b>「邀请好友」保存完整海报</b> → 点右上角<b>「➕ 传海报发团」</b>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 顶部实时识图进度提示条（仅当用户刚上传图片正在后台识图时展示） -->
     <div
       v-if="localPendingCount > 0"
@@ -257,9 +282,9 @@
       <div class="gh-empty-title">
         {{ activeKeyword ? '未搜到「' + activeKeyword + '」相关的拼团' : '当前暂无正在凑人的团' }}
       </div>
-      <div class="gh-empty-sub">点击右上角【➕ 传二维码发团】发布您的多人团</div>
+      <div class="gh-empty-sub">点击右上角【➕ 传海报发团】发布您的多人团完整分享海报</div>
       <button class="gh-join-btn" style="padding:9px 22px;font-size:14px" @click="triggerUpload">
-        ➕ 传二维码发团
+        ➕ 传海报发团
       </button>
     </div>
   </template>
@@ -401,29 +426,54 @@
   <div class="gh-modal-mask" style="align-items:center;padding:20px;z-index:250" v-if="helpModal.visible" @click.self="closeHelpGuide">
     <div class="gh-dialog">
       <div class="gh-dialog-title">
-        {{ helpModal.failedItem ? '⚠️ 为什么这张图上传未成功？' : '📌 应该上传哪种拼团图片？' }}
+        {{ helpModal.failedItem ? '⚠️ 为什么这张图上传未成功？' : '📌 10秒看懂：如何上传拼团海报？' }}
       </div>
 
       <!-- 若是从失败记录点进来的，先展示具体失败原因 -->
       <div class="gh-failed-reason-box" v-if="helpModal.failedItem">
-        原因：{{ helpModal.failedItem.parse_error || '未在图片中识别到有效的拼多多多人团二维码' }}
+        原因：{{ helpModal.failedItem.parse_error || '未在图片中识别到完整的拼多多多人团商品与二维码信息' }}
       </div>
 
-      <div class="gh-dialog-body">
-        <p><b>请上传完整的【拼多多多人团分享海报】：</b></p>
-        <p style="margin-top:6px">
-          1. 在拼多多打开您的多人团，点击<b>【邀请好友】</b>，保存完整的<b>分享海报原图</b>（需包含商品主图、标题、拼团价、还差人数及右下角二维码）。<br>
-          2. 请勿仅截取局部二维码，或上传无二维码的普通商品截图。
-        </p>
-        <p style="margin-top:8px;color:#d4380d;font-weight:600">
-          💡 不清楚长什么样？点下方【看看别人发的图】即可直接查看标准样式！
+      <div class="gh-dialog-body" style="margin-bottom:12px">
+        <p>在拼多多开团后，点击<b>【邀请好友】</b>保存<b>完整分享海报原图</b>：</p>
+
+        <!-- 内置正误海报可视化对比（无需依赖外部图片，秒看懂） -->
+        <div class="gh-poster-compare">
+          <div class="gh-sample-box is-good">
+            <div class="gh-sample-header">✅ 正确：完整海报</div>
+            <div class="gh-mock-poster">
+              <div class="gh-mock-img">🖼️ 商品主图</div>
+              <div class="gh-mock-bar">
+                <span>多人团 ¥24.9</span>
+                <span class="gh-mock-qr">二维码</span>
+              </div>
+              <div class="gh-mock-meta">
+                <b>商品完整标题...</b><br>
+                <span style="color:#e02e24;font-weight:700">还差2人</span> · 剩余23小时
+              </div>
+            </div>
+          </div>
+
+          <div class="gh-sample-box is-bad">
+            <div class="gh-sample-header">❌ 错误：无法上架</div>
+            <div class="gh-mock-poster" style="justify-content:center;height:100%;color:#cf1322;font-size:11px;line-height:1.45">
+              <div>🚫 <b>只截局部二维码</b><br><span style="color:#8c8c8c;font-size:10px">(缺商品名和价格)</span></div>
+              <div style="border-top:1px dashed #ffd8bf;padding-top:4px">🚫 <b>普通商品详情截图</b><br><span style="color:#8c8c8c;font-size:10px">(无参团二维码)</span></div>
+            </div>
+          </div>
+        </div>
+
+        <p style="font-size:12px;color:#646a73">
+          💡 上传后系统自动识别商品名、价格与剩余时间；若大厅已有同款同价在拼商品，还会提醒您直接参团更快拼成！
         </p>
       </div>
 
       <div class="gh-dialog-actions">
-        <button class="gh-btn-secondary" @click="goSeeOthersExample">看看别人发的图</button>
-        <button class="gh-btn-app-jump" style="padding:10px;font-size:14px" @click="reuploadFromHelp">
-          上传拼团图片
+        <button class="gh-btn-secondary" @click="items.length > 0 ? goSeeOthersExample() : closeHelpGuide()">
+          {{ items.length > 0 ? '看真实海报大图' : '先逛逛大厅' }}
+        </button>
+        <button class="gh-btn-app-jump" style="padding:10px;font-size:13.5px" @click="reuploadFromHelp">
+          去相册选海报上传
         </button>
       </div>
     </div>
@@ -575,6 +625,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=20261110-3"></script>
+<script src="/static/js/group_help.js?v=20261110-4"></script>
 </body>
 </html>
