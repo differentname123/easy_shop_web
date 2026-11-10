@@ -10,10 +10,12 @@ from models.group_help import (
     GROUP_STATUS_ACTIVE,
     GROUP_STATUS_EXPIRED,
     GROUP_STATUS_FULL,
+    GROUP_STATUS_PENDING_CONFIRM,
     MAX_PARSE_ATTEMPTS,
     PARSE_STATUS_FAILED,
     PARSE_STATUS_PARSED,
     PARSE_STATUS_PENDING,
+    is_highly_similar_goods,
     validate_and_normalize_parsed_poster,
 )
 
@@ -51,55 +53,37 @@ class GroupHelpRepository(BaseRepository):
         existing = self.get_by_group_order_id(gid)
 
         if existing is not None:
-            # 若之前解析失败，允许用户重新上传完整海报触发再次解析，并重置上传基准时间
-            if existing.get("parse_status") == PARSE_STATUS_FAILED:
-                updated = self.col.find_one_and_update(
-                    {"group_order_id": gid},
-                    {
-                        "$set": {
-                            "short_url": data.get("short_url", existing.get("short_url", "")),
-                            "redirect_url": data.get("redirect_url", existing.get("redirect_url", "")),
-                            "poster_path": data.get("poster_path", existing.get("poster_path", "")),
-                            "parse_status": PARSE_STATUS_PENDING,
-                            "parse_attempts": 0,
-                            "parse_error": "",
-                            "group_status": GROUP_STATUS_ACTIVE,
-                            "created_at": now,
-                            "updated_at": now,
-                            "expires_at": now + DEFAULT_GROUP_TTL_SECONDS,
-                        }
-                    },
-                    projection={"_id": 0},
-                    return_document=ReturnDocument.AFTER,
-                )
-                return updated or existing, True
-
-            # 若该团此前被标为已满/已结束或已过有效期，团长重新上传海报时自动恢复上架
             is_expired_time = float(existing.get("expires_at") or 0) <= now
-            if (
-                existing.get("group_status") != GROUP_STATUS_ACTIVE
-                or int(existing.get("remain_people") or 0) <= 0
-                or is_expired_time
-            ):
-                restored_remain = max(1, int(existing.get("remain_people") or 1))
-                updated = self.col.find_one_and_update(
-                    {"group_order_id": gid},
-                    {
-                        "$set": {
-                            "short_url": data.get("short_url", existing.get("short_url", "")),
-                            "redirect_url": data.get("redirect_url", existing.get("redirect_url", "")),
-                            "poster_path": data.get("poster_path", existing.get("poster_path", "")),
-                            "group_status": GROUP_STATUS_ACTIVE,
-                            "remain_people": restored_remain,
-                            "updated_at": now,
-                            "expires_at": max(float(existing.get("expires_at") or 0), now + 3600),
-                        }
-                    },
-                    projection={"_id": 0},
-                    return_document=ReturnDocument.AFTER,
-                )
-                return updated or existing, False
-            return existing, False
+            is_active_online = (
+                existing.get("parse_status") == PARSE_STATUS_PARSED
+                and existing.get("group_status") == GROUP_STATUS_ACTIVE
+                and int(existing.get("remain_people") or 0) > 0
+                and not is_expired_time
+            )
+            if is_active_online:
+                return existing, False
+
+            # 若之前审核未通过，或已满/已结束重新上传新海报，统一进入 pending 重新执行大模型合规与字段审核
+            updated = self.col.find_one_and_update(
+                {"group_order_id": gid},
+                {
+                    "$set": {
+                        "short_url": data.get("short_url", existing.get("short_url", "")),
+                        "redirect_url": data.get("redirect_url", existing.get("redirect_url", "")),
+                        "poster_path": data.get("poster_path", existing.get("poster_path", "")),
+                        "parse_status": PARSE_STATUS_PENDING,
+                        "parse_attempts": 0,
+                        "parse_error": "",
+                        "group_status": GROUP_STATUS_ACTIVE,
+                        "created_at": now,
+                        "updated_at": now,
+                        "expires_at": now + DEFAULT_GROUP_TTL_SECONDS,
+                    }
+                },
+                projection={"_id": 0},
+                return_document=ReturnDocument.AFTER,
+            )
+            return updated or existing, True
 
         doc = {
             "group_order_id": gid,
@@ -148,13 +132,59 @@ class GroupHelpRepository(BaseRepository):
         )
         return list(cursor)
 
+    def find_matching_active_group(
+        self,
+        goods_name: str,
+        group_price: Optional[float],
+        exclude_group_order_id: str = "",
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """查找大厅中正在凑人的同款同价商品（价格完全一致且商品名称高度相似）。"""
+        if not goods_name or group_price is None or group_price <= 0:
+            return None
+        current_ts = float(now if now is not None else time.time())
+        exclude_gid = str(exclude_group_order_id or "").strip()
+
+        cursor = (
+            self.col.find(
+                {
+                    "parse_status": PARSE_STATUS_PARSED,
+                    "group_status": GROUP_STATUS_ACTIVE,
+                    "expires_at": {"$gt": current_ts},
+                    "remain_people": {"$gt": 0},
+                },
+                {"_id": 0},
+            )
+            .sort(
+                [
+                    ("remain_people", ASCENDING),
+                    ("click_count", ASCENDING),
+                    ("created_at", DESCENDING),
+                ]
+            )
+            .limit(100)
+        )
+        target_price = float(group_price)
+        for cand in cursor:
+            cand_gid = str(cand.get("group_order_id") or "").strip()
+            if not cand_gid or cand_gid == exclude_gid:
+                continue
+            cand_price = cand.get("group_price")
+            if not isinstance(cand_price, (int, float)) or isinstance(cand_price, bool):
+                continue
+            if abs(float(cand_price) - target_price) >= 0.01:
+                continue
+            if is_highly_similar_goods(goods_name, str(cand.get("goods_name") or "")):
+                return cand
+        return None
+
     def mark_parse_succeeded(
         self,
         group_order_id: str,
         parsed_data: Dict[str, Any],
         now: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """校验大模型识别结果并将商品信息、还差人数、海报剩余时间回写至数据库后设为已上线。"""
+        """校验大模型识别结果并将商品信息、还差人数、海报剩余时间回写至数据库。若已有同款同价在拼团则标记为待确认。"""
         validated = validate_and_normalize_parsed_poster(parsed_data)
         current_ts = float(now if now is not None else time.time())
         gid = str(group_order_id or "").strip()
@@ -172,7 +202,22 @@ class GroupHelpRepository(BaseRepository):
 
         remain_people = validated["remain_people"]
         total_people = validated["total_people"]
-        group_status = GROUP_STATUS_FULL if remain_people <= 0 else GROUP_STATUS_ACTIVE
+
+        matched_group_order_id = ""
+        if remain_people <= 0:
+            group_status = GROUP_STATUS_FULL
+        else:
+            matched_doc = self.find_matching_active_group(
+                goods_name=validated["goods_name"],
+                group_price=validated["group_price"],
+                exclude_group_order_id=gid,
+                now=current_ts,
+            )
+            if matched_doc is not None:
+                group_status = GROUP_STATUS_PENDING_CONFIRM
+                matched_group_order_id = str(matched_doc.get("group_order_id") or "")
+            else:
+                group_status = GROUP_STATUS_ACTIVE
 
         return self.col.find_one_and_update(
             {"group_order_id": gid},
@@ -187,6 +232,7 @@ class GroupHelpRepository(BaseRepository):
                     "total_people": total_people,
                     "remain_people": remain_people,
                     "group_status": group_status,
+                    "matched_group_order_id": matched_group_order_id,
                     "expires_at": expires_at,
                     "updated_at": current_ts,
                 },
@@ -334,7 +380,7 @@ class GroupHelpRepository(BaseRepository):
         remain_people: Optional[int] = None,
         now: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """用户共创维护多人团状态：支持标记已满、标记已失效、我已参团(-1)、直接修改还差几人。"""
+        """用户共创维护多人团状态：支持标记已满、标记已失效、我已参团(-1)、修改还差几人、确认继续上架自己的团。"""
         current_ts = float(now if now is not None else time.time())
         gid = str(group_order_id or "").strip()
         existing = self.get_by_group_order_id(gid)
@@ -347,8 +393,18 @@ class GroupHelpRepository(BaseRepository):
         if act == "mark_full":
             update_fields["group_status"] = GROUP_STATUS_FULL
             update_fields["remain_people"] = 0
+            update_fields["matched_group_order_id"] = ""
         elif act == "mark_expired":
             update_fields["group_status"] = GROUP_STATUS_EXPIRED
+            update_fields["matched_group_order_id"] = ""
+        elif act == "confirm_publish":
+            cur_rem = max(1, int(existing.get("remain_people") or 1))
+            update_fields["remain_people"] = cur_rem
+            update_fields["group_status"] = GROUP_STATUS_ACTIVE
+            update_fields["matched_group_order_id"] = ""
+            expires_at = float(existing.get("expires_at") or 0)
+            if expires_at <= current_ts + 3600:
+                update_fields["expires_at"] = max(expires_at, current_ts + 3600)
         elif act == "joined_one":
             cur_rem = int(existing.get("remain_people") if existing.get("remain_people") is not None else 1)
             new_rem = max(0, cur_rem - 1)
@@ -362,6 +418,7 @@ class GroupHelpRepository(BaseRepository):
             if val < 0 or val > 20:
                 raise ValueError("剩余人数需在 0 到 20 之间")
             update_fields["remain_people"] = val
+            update_fields["matched_group_order_id"] = ""
             if val == 0:
                 update_fields["group_status"] = GROUP_STATUS_FULL
             else:

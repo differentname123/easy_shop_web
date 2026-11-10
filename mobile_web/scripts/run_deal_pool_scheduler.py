@@ -1338,22 +1338,35 @@ class DealPoolCleaner:
                 logger.warning("[%s] 调用模型组 (%s) 解析 JSON 异常: %s", stage_label, model_group, err_brief)
         return []
 
-    def run_ai_stage1_batch(self, stage1_inputs: List[Dict[str, Any]], docs_by_tip_id: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def run_ai_stage1_batch(
+        self,
+        stage1_inputs: List[Dict[str, Any]],
+        docs_by_tip_id: Dict[str, Dict[str, Any]],
+        total_pending_count: int = 0,
+    ) -> Dict[str, Dict[str, Any]]:
         """并发执行 Stage 2（AI-1：原始拆解与转链提纯），返回 `main_tip_id -> ai1_result` 字典。"""
         results_by_id: Dict[str, Dict[str, Any]] = {}
+        total_items = len(stage1_inputs)
         chunks = [
             stage1_inputs[i : i + self.ai_batch_size]
-            for i in range(0, len(stage1_inputs), self.ai_batch_size)
+            for i in range(0, total_items, self.ai_batch_size)
         ]
+        total_batches = len(chunks)
 
         def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             self.stats_ai1_calls += 1
             return self._call_ai_json_array(self.prompt_stage1_template, chunk, "AI-Stage1")
 
         if chunks:
-            with ThreadPoolExecutor(max_workers=min(self.ai_max_workers, len(chunks))) as pool:
+            t_s1 = time.perf_counter()
+            done_batches = 0
+            done_items = 0
+            with ThreadPoolExecutor(max_workers=min(self.ai_max_workers, total_batches)) as pool:
                 futures = {pool.submit(_worker, ch): ch for ch in chunks}
                 for fut in as_completed(futures):
+                    ch = futures[fut]
+                    done_batches += 1
+                    done_items += len(ch)
                     try:
                         arr = fut.result()
                         for item in arr:
@@ -1367,6 +1380,17 @@ class DealPoolCleaner:
                                 results_by_id[mid] = item
                     except Exception as e:
                         logger.warning("[AI-Stage1] 并发批次执行异常: %s", str(e).splitlines()[0][:200])
+                    logger.info(
+                        "  📊 [阶段2-AI拆解 进度 %02d/%02d批 (%3d%%)] 已拆解=%3d/%3d条 (本轮还剩%3d条) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
+                        done_batches,
+                        total_batches,
+                        int(done_batches * 100 / max(1, total_batches)),
+                        done_items,
+                        total_items,
+                        max(0, total_items - done_items),
+                        time.perf_counter() - t_s1,
+                        max(0, total_pending_count - done_items),
+                    )
 
         # 若 AI-1 未返回某条记录，严格执行 Fail-Closed 拒绝；若正常返回，标准化 clean_input 与角色枚举
         for inp in stage1_inputs:
@@ -1629,7 +1653,11 @@ class DealPoolCleaner:
             "adapter_res": {},
         }
 
-    def run_stage3_concurrent_conversions(self, unique_targets: List[Tuple[Dict[str, Any], str]]) -> None:
+    def run_stage3_concurrent_conversions(
+        self,
+        unique_targets: List[Tuple[Dict[str, Any], str]],
+        total_pending_count: int = 0,
+    ) -> None:
         """
         并发执行 Stage 3 官方 API 转链：
         先对本批次所有去重后的 `(target, default_plat)` 通过多线程池并发调用 `convert_single_target`，
@@ -1638,6 +1666,10 @@ class DealPoolCleaner:
         if not unique_targets:
             return
 
+        total_targets = len(unique_targets)
+        step = max(25, total_targets // 5)
+        t_s3 = time.perf_counter()
+
         def _conv_worker(item: Tuple[Dict[str, Any], str]) -> None:
             tgt, def_plat = item
             try:
@@ -1645,32 +1677,57 @@ class DealPoolCleaner:
             except Exception as e:
                 logger.warning("[Stage3-并发转链] 单目标转链异常: %s", str(e)[:160])
 
-        with ThreadPoolExecutor(max_workers=min(self.convert_max_workers, len(unique_targets))) as pool:
+        done_cnt = 0
+        with ThreadPoolExecutor(max_workers=min(self.convert_max_workers, total_targets)) as pool:
             futures = [pool.submit(_conv_worker, it) for it in unique_targets]
             for fut in as_completed(futures):
+                done_cnt += 1
                 try:
                     fut.result()
                 except Exception:
                     pass
+                if done_cnt % step == 0 or done_cnt == total_targets:
+                    logger.info(
+                        "  📊 [阶段3-官方转链 进度 %3d/%3d个 (%3d%%)] 已核验=%3d个 (还剩%3d个) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
+                        done_cnt,
+                        total_targets,
+                        int(done_cnt * 100 / max(1, total_targets)),
+                        done_cnt,
+                        max(0, total_targets - done_cnt),
+                        time.perf_counter() - t_s3,
+                        total_pending_count,
+                    )
 
-    def run_ai_stage2_batch(self, stage2_inputs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def run_ai_stage2_batch(
+        self,
+        stage2_inputs: List[Dict[str, Any]],
+        total_pending_count: int = 0,
+    ) -> Dict[str, Dict[str, Any]]:
         """并发执行 Stage 4（AI-2：底牌终审、教程重构与质量评分），返回 `main_tip_id -> ai2_result` 字典。"""
         results_by_id: Dict[str, Dict[str, Any]] = {}
         if not stage2_inputs:
             return results_by_id
 
+        total_items = len(stage2_inputs)
         chunks = [
             stage2_inputs[i : i + self.ai_batch_size]
-            for i in range(0, len(stage2_inputs), self.ai_batch_size)
+            for i in range(0, total_items, self.ai_batch_size)
         ]
+        total_batches = len(chunks)
+        t_s4 = time.perf_counter()
+        done_batches = 0
+        done_items = 0
 
         def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             self.stats_ai2_calls += 1
             return self._call_ai_json_array(self.prompt_stage2_template, chunk, "AI-Stage2")
 
-        with ThreadPoolExecutor(max_workers=min(self.ai_max_workers, len(chunks))) as pool:
+        with ThreadPoolExecutor(max_workers=min(self.ai_max_workers, total_batches)) as pool:
             futures = {pool.submit(_worker, ch): ch for ch in chunks}
             for fut in as_completed(futures):
+                ch = futures[fut]
+                done_batches += 1
+                done_items += len(ch)
                 try:
                     arr = fut.result()
                     for item in arr:
@@ -1682,6 +1739,17 @@ class DealPoolCleaner:
                             results_by_id[mid] = item
                 except Exception as e:
                     logger.warning("[AI-Stage2] 并发批次执行异常: %s", str(e).splitlines()[0][:200])
+                logger.info(
+                    "  📊 [阶段4-AI终审 进度 %02d/%02d批 (%3d%%)] 已终审=%3d/%3d条 (本轮还剩%3d条) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
+                    done_batches,
+                    total_batches,
+                    int(done_batches * 100 / max(1, total_batches)),
+                    done_items,
+                    total_items,
+                    max(0, total_items - done_items),
+                    time.perf_counter() - t_s4,
+                    total_pending_count,
+                )
 
         return results_by_id
 
@@ -1884,6 +1952,7 @@ class DealPoolCleaner:
         selected_docs: List[Dict[str, Any]],
         raw_col,
         formal_col=None,
+        total_pending_count: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         对一批 `pending` 记录完整执行：
@@ -1997,15 +2066,21 @@ class DealPoolCleaner:
         ai1_hits_before = self.stats_ai1_model_hits
         ai1_fb_before = self.stats_ai1_fallbacks
         logger.info(
-            "🤖 [Stage 2 / AI-1] 正在并发拆解 %d 条线报 (batch_size=%d, workers=%d)...",
+            "🤖 [阶段2-AI拆解 启动] 正在并发拆解 %d 条线报 (每批=%d条, 共%d批, 并发=%d线程) | 📦 库内总存货Pending=%d条...",
             len(stage1_inputs),
             self.ai_batch_size,
+            (len(stage1_inputs) + self.ai_batch_size - 1) // self.ai_batch_size if stage1_inputs else 0,
             self.ai_max_workers,
+            total_pending_count,
         )
-        ai1_results = self.run_ai_stage1_batch(stage1_inputs, docs_by_tip_id) if stage1_inputs else {}
+        ai1_results = (
+            self.run_ai_stage1_batch(stage1_inputs, docs_by_tip_id, total_pending_count=total_pending_count)
+            if stage1_inputs
+            else {}
+        )
         t_ai1_elapsed = round(time.perf_counter() - t_ai1_start, 2)
         logger.info(
-            "🤖 [Stage 2 / AI-1 完成] 耗时=%.2fs | 本批模型直出=%d条, 保底兜底=%d条",
+            "🤖 [阶段2-AI拆解 完成] 耗时=%.2fs | 本批模型直出=%d条, 保底兜底=%d条",
             t_ai1_elapsed,
             self.stats_ai1_model_hits - ai1_hits_before,
             self.stats_ai1_fallbacks - ai1_fb_before,
@@ -2069,15 +2144,16 @@ class DealPoolCleaner:
                     unique_target_map[ukey] = (tgt, def_plat)
 
         logger.info(
-            "🔗 [Stage 3 / 并发官方转链] 正在并发核验 %d 个独立链接/口令 (总引用=%d次, workers=%d)...",
+            "🔗 [阶段3-官方转链 启动] 正在并发核验 %d 个独立链接/口令 (总引用=%d次, 并发=%d线程) | 📦 库内总存货Pending=%d条...",
             len(unique_target_map),
             total_target_mentions,
             self.convert_max_workers,
+            total_pending_count,
         )
-        self.run_stage3_concurrent_conversions(list(unique_target_map.values()))
+        self.run_stage3_concurrent_conversions(list(unique_target_map.values()), total_pending_count=total_pending_count)
         t_stage3_elapsed = round(time.perf_counter() - t_stage3_start, 2)
         logger.info(
-            "🔗 [Stage 3 / 并发官方转链完成] 耗时=%.2fs | 累计缓存命中=%d次",
+            "🔗 [阶段3-官方转链 完成] 耗时=%.2fs | 累计缓存命中=%d次",
             t_stage3_elapsed,
             self.stats_cache_hits,
         )
@@ -2367,12 +2443,14 @@ class DealPoolCleaner:
         ai2_hits_before = self.stats_ai2_model_hits
         ai2_fb_before = self.stats_ai2_fallbacks
         logger.info(
-            "🧠 [Stage 4 / AI-2] 正在并发终审 %d 条新唯一商品线报 (batch_size=%d, workers=%d)...",
+            "🧠 [阶段4-AI终审 启动] 正在并发终审 %d 条新唯一商品线报 (每批=%d条, 共%d批, 并发=%d线程) | 📦 库内总存货Pending=%d条...",
             len(stage2_inputs),
             self.ai_batch_size,
+            (len(stage2_inputs) + self.ai_batch_size - 1) // self.ai_batch_size if stage2_inputs else 0,
             self.ai_max_workers,
+            total_pending_count,
         )
-        ai2_results = self.run_ai_stage2_batch(stage2_inputs)
+        ai2_results = self.run_ai_stage2_batch(stage2_inputs, total_pending_count=total_pending_count)
         t_ai2_elapsed = round(time.perf_counter() - t_ai2_start, 2)
         s2_input_map = {item["main_tip_id"]: item for item in stage2_inputs}
         self.last_batch_stage_timings = {
@@ -2930,14 +3008,20 @@ def run_clean_stage(
         selected_docs = selected_docs[:clean_limit]
 
     logger.info(
-        "🧼 ================ 开始第 #%d 轮 Stage 2~5：双阶段 AI 提纯 + 并发转链验真 + 唯一商品早停 + 高分晋升 "
-        "(Pending总计=%d条, 本轮执行=%d条) ================",
+        "🧼 ================ 开始第 #%d 轮 [阶段2~5：AI清洗与入库] "
+        "(📦 库内待清洗存货Pending=%d条 | 本轮执行=%d条 | 执行后预计剩余=%d条) ================",
         cycle_num,
         len(pending_docs),
         len(selected_docs),
+        max(0, len(pending_docs) - len(selected_docs)),
     )
 
-    all_processed_results = cleaner.clean_batch_records(selected_docs, raw_col, formal_col=formal_col)
+    all_processed_results = cleaner.clean_batch_records(
+        selected_docs,
+        raw_col,
+        formal_col=formal_col,
+        total_pending_count=len(pending_docs),
+    )
     success_product_docs: List[Dict[str, Any]] = []
     early_terminated_results: List[Dict[str, Any]] = []
 
@@ -4278,10 +4362,23 @@ def run_fetch_stage(
     total_fetched = 0
     task_reports: List[Dict[str, Any]] = []
     cycle_error_paths: List[Dict[str, Any]] = []
+    total_tasks = len(tasks)
+    try:
+        cur_pending_cnt = repo.col.count_documents(
+            {"$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]}
+        )
+    except Exception:
+        cur_pending_cnt = 0
 
-    logger.info("================ 开始第 #%d 轮阶段一：多站点好价拉取 (共 %d 个规范频道任务) ================", cycle_num, len(tasks))
+    logger.info(
+        "================ 开始第 #%d 轮 [阶段1-多站点拉取] (共 %d 个频道任务 | 📦 当前库内待清洗存货Pending=%d条) ================",
+        cycle_num,
+        total_tasks,
+        cur_pending_cnt,
+    )
 
-    for task_name, site_key, freq_tier, default_url, fn, pause_sec in tasks:
+    for task_idx, (task_name, site_key, freq_tier, default_url, fn, pause_sec) in enumerate(tasks, 1):
+        rem_tasks = total_tasks - task_idx
         t0 = time.perf_counter()
         ch_state = channel_health_tracker.setdefault(
             task_name,
@@ -4351,7 +4448,10 @@ def run_fetch_stage(
                 }
                 cycle_error_paths.append(err_item)
                 logger.warning(
-                    "  ⚠️ [%-22s] 详情页子路径异常 | URL=%s | 类型=%s | 详情=%s",
+                    "  ⚠️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 详情页子路径异常 | URL=%s | 类型=%s | 详情=%s",
+                    task_idx,
+                    total_tasks,
+                    rem_tasks,
                     task_name,
                     err_item["error_url"],
                     err_item["error_type"],
@@ -4362,8 +4462,8 @@ def run_fetch_stage(
                 ch_state["consecutive_failures"] = 0
                 task_status = "success"
                 logger.info(
-                    "  ✅ [%-22s] 拉取=%3d条 (新抓详情=%2d, 详情异常=%d) | 入库新增=%3d 更新=%3d | 含唯一商品锚点=%3d条 | 耗时=%6.1fms",
-                    task_name, cnt, det_cnt, len(detail_errors), ins, upd, unique_cnt, cost_ms,
+                    "  ✅ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 拉取=%3d条(新详情=%2d) | 新增=%3d 更新=%3d (本轮累计新增=%3d) | 耗时=%6.1fms",
+                    task_idx, total_tasks, rem_tasks, task_name, cnt, det_cnt, ins, upd, total_inserted, cost_ms,
                 )
             else:
                 ch_state["consecutive_failures"] += 1
@@ -4395,7 +4495,10 @@ def run_fetch_stage(
                 }
                 cycle_error_paths.append(err_item)
                 logger.warning(
-                    "  ⚠️ [%-22s] 列表返回为空或状态码异常 (连续=%d轮) | 错误路径=%s | HTTP=%s | 耗时=%.1fms | 建议=%s",
+                    "  ⚠️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 列表为空或异常 (连续=%d轮) | URL=%s | HTTP=%s | 耗时=%.1fms | 建议=%s",
+                    task_idx,
+                    total_tasks,
+                    rem_tasks,
                     task_name,
                     ch_state["consecutive_failures"],
                     req_url,
@@ -4449,7 +4552,10 @@ def run_fetch_stage(
             }
             cycle_error_paths.append(err_item)
             logger.warning(
-                "  ❌ [%-22s] 拉取异常 (连续=%d轮, 耗时=%.1fms) | 错误路径=%s | 异常=%s: %s | 运维建议=%s",
+                "  ❌ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 拉取异常 (连续=%d轮, 耗时=%.1fms) | 错误路径=%s | 异常=%s: %s | 运维建议=%s",
+                task_idx,
+                total_tasks,
+                rem_tasks,
                 task_name,
                 ch_state["consecutive_failures"],
                 cost_ms,

@@ -187,8 +187,39 @@ class GroupHelpService:
     def get_poster_file_path(self, group_order_id: str) -> Optional[Path]:
         if not is_valid_group_order_id(group_order_id):
             return None
-        path = self.poster_dir / f"{str(group_order_id).strip()}.jpg"
+        gid = str(group_order_id).strip()
+        doc = self.repo.get_by_group_order_id(gid)
+        # 仅对外展示已通过合规审核与字段校验的拼团海报，未审核或审核失败的图片保留在服务器磁盘但对外不可访问
+        if not doc or doc.get("parse_status") != "parsed":
+            return None
+        path = self.poster_dir / f"{gid}.jpg"
         return path if path.is_file() else None
+
+    def _format_with_matched_group(self, doc: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+        current_ts = float(now if now is not None else time.time())
+        formatted = format_group_doc(doc, now=current_ts)
+        matched_gid = str(doc.get("matched_group_order_id") or "").strip()
+        if formatted["group_status"] == "pending_confirm" and matched_gid:
+            matched_doc = self.repo.get_by_group_order_id(matched_gid)
+            is_match_still_active = bool(
+                matched_doc
+                and matched_doc.get("parse_status") == "parsed"
+                and matched_doc.get("group_status") == "active"
+                and int(matched_doc.get("remain_people") or 0) > 0
+                and float(matched_doc.get("expires_at") or 0) > current_ts
+            )
+            if is_match_still_active:
+                formatted["matched_group"] = format_group_doc(matched_doc, now=current_ts)
+            else:
+                # 若此前匹配到的在拼团已满或已过期，自动将该用户的团转正上架
+                promoted = self.repo.apply_user_feedback(
+                    group_order_id=formatted["group_order_id"],
+                    action="confirm_publish",
+                    now=current_ts,
+                )
+                if promoted:
+                    formatted = format_group_doc(promoted, now=current_ts)
+        return formatted
 
     def submit_poster_image(self, image_bytes: bytes) -> Dict[str, Any]:
         """
@@ -210,13 +241,26 @@ class GroupHelpService:
         link_meta = resolve_pdd_qr_link(qr_text, http_get=self._http_get)
         gid = link_meta["group_order_id"]
 
-        poster_path = self._save_poster_image(gid, image_bytes)
-        record_input = {
-            **link_meta,
-            "poster_path": str(poster_path),
-            "created_at": time.time(),
-        }
-        doc, is_new = self.repo.create_or_refresh_initial_group(record_input)
+        now = time.time()
+        existing = self.repo.get_by_group_order_id(gid)
+        is_active_online = bool(
+            existing
+            and existing.get("parse_status") == "parsed"
+            and existing.get("group_status") == "active"
+            and int(existing.get("remain_people") or 0) > 0
+            and float(existing.get("expires_at") or 0) > now
+        )
+        if is_active_online:
+            # 已通过审核且正在展示中的拼团，严禁被未审核的新上传图片覆盖原海报
+            doc, is_new = existing, False
+        else:
+            poster_path = self._save_poster_image(gid, image_bytes)
+            record_input = {
+                **link_meta,
+                "poster_path": str(poster_path),
+                "created_at": now,
+            }
+            doc, is_new = self.repo.create_or_refresh_initial_group(record_input)
 
         # 唤醒后台定时任务立即处理
         if callable(self._wake_callback):
@@ -225,9 +269,9 @@ class GroupHelpService:
             except Exception:
                 pass
 
-        formatted = format_group_doc(doc)
+        formatted = self._format_with_matched_group(doc, now=now)
         if is_new:
-            msg = "✅ 二维码核验通过，已加入【我的团】！正在自动识别商品名称与人数（约 10~20 秒），识别完立即上架大厅。"
+            msg = "✅ 二维码核验通过，已加入【我的团】！正在自动识别商品名称与人数（约 10~20 秒），识别完立即反馈。"
         elif formatted["parse_status"] == "parsed":
             msg = "✅ 该拼团已在大厅展示中，您可在【我的团】查看实时进度！"
         else:
@@ -247,9 +291,9 @@ class GroupHelpService:
             except Exception:
                 pass
         return (
-            "请识别这张拼多多多人团分享海报图中的商品名称(goods_name)、搜索关键词数组(keywords)、"
-            "拼团价(group_price)、几人团(total_people)、还差几人(remain_people)、剩余时间秒数(remaining_seconds)，"
-            "严格只输出 JSON 对象。"
+            "请审核并识别这张拼多多多人团分享海报图中的合规性(is_compliant)、是否完整海报(is_group_poster)、"
+            "商品名称(goods_name)、搜索关键词数组(keywords)、拼团价(group_price)、几人团(total_people)、"
+            "还差几人(remain_people)、剩余时间(remaining_time, HH:MM:SS格式)，严格只输出 JSON 对象。"
         )
 
     def parse_single_pending_group(self, doc: Dict[str, Any]) -> bool:
@@ -289,8 +333,9 @@ class GroupHelpService:
                 validated_data = validate_and_normalize_parsed_poster(parsed_json)
             except ValueError as val_err:
                 reason = str(val_err)
+                # 保留磁盘上的原始图片供后续复盘分析，仅在数据库标记 failed 阻断外部访问
                 self.repo.mark_parse_failed(gid, reason, permanent=True)
-                logger.info("【多人团识图拦截】团单[%s] 图片关键信息缺失拒绝上线 | 原因<%s>", gid, reason)
+                logger.info("【多人团识图拦截】团单[%s] 图片未通过审核拒绝上线 | 原因<%s>", gid, reason)
                 return False
 
             self.repo.mark_parse_succeeded(gid, validated_data)
@@ -359,7 +404,7 @@ class GroupHelpService:
         doc = self.repo.get_by_group_order_id(group_order_id)
         if not doc:
             return None
-        return format_group_doc(doc)
+        return self._format_with_matched_group(doc)
 
     def record_jump_click(self, group_order_id: str) -> Optional[Dict[str, Any]]:
         doc = self.repo.increment_click(group_order_id)

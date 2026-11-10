@@ -48,6 +48,14 @@
         pendingRemain: null,
       });
 
+      // 审核完成反馈 / 发现相同在拼商品选择弹窗
+      const uploadResultModal = ref({
+        visible: false,
+        mode: '', // 'matched' | 'published'
+        ownGroup: null,
+        matchedGroup: null,
+      });
+
       let toastTimer = null;
       let pollTimer = null;
       let pushedHistoryCount = 0;
@@ -93,6 +101,10 @@
         }
         if (fullPosterUrl.value) {
           fullPosterUrl.value = '';
+          return;
+        }
+        if (uploadResultModal.value.visible) {
+          uploadResultModal.value.visible = false;
           return;
         }
         if (creditWarnModal.value.visible) {
@@ -224,12 +236,12 @@
         );
 
         if (newlyParsedGroup) {
-          showToast(`🎉 您的拼团「${newlyParsedGroup.goods_name}」已上架大厅！`, 3400);
-          if (filterMode.value !== 'mine') {
+          openUploadResultModal(newlyParsedGroup);
+          if (newlyParsedGroup.group_status === 'active' && filterMode.value !== 'mine') {
             fetchGroups(true);
           }
         } else if (newlyFailedGroup) {
-          showToast('⚠️ 拼团图片未能识别出商品信息，请点【我的团】查看原因', 3500);
+          showToast('⚠️ 拼团图片未能通过核验，请点【我的团】查看原因', 3500);
         } else if (showNotice) {
           showToast('已同步最新状态');
         }
@@ -261,6 +273,9 @@
 
       const myGroupStatusText = item => {
         if (!item) return '';
+        if (item.group_status === 'pending_confirm') {
+          return '🟡 发现同款 · 待您确认';
+        }
         if (item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0) {
           return '🟢 大厅展示中';
         }
@@ -272,6 +287,9 @@
 
       const myGroupStatusClass = item => {
         if (!item) return 'status-inactive';
+        if (item.group_status === 'pending_confirm') {
+          return 'status-pending';
+        }
         if (item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0) {
           return 'status-active';
         }
@@ -493,7 +511,7 @@
                 localId
               );
               if (json.data.parse_status === 'parsed') {
-                showToast(json.message || '✅ 该拼团已在大厅展示中！', 3000);
+                openUploadResultModal(json.data);
               }
               managePendingPoll();
               if (filterMode.value !== 'mine') {
@@ -591,10 +609,99 @@
         triggerUpload();
       };
 
+      const openUploadResultModal = item => {
+        if (!item || item.parse_status !== 'parsed') return;
+        if (item.group_status === 'pending_confirm' && item.matched_group) {
+          uploadResultModal.value = {
+            visible: true,
+            mode: 'matched',
+            ownGroup: { ...item },
+            matchedGroup: { ...item.matched_group },
+          };
+        } else {
+          uploadResultModal.value = {
+            visible: true,
+            mode: 'published',
+            ownGroup: { ...item },
+            matchedGroup: null,
+          };
+        }
+      };
+
+      const closeUploadResultModal = () => {
+        uploadResultModal.value = {
+          visible: false,
+          mode: '',
+          ownGroup: null,
+          matchedGroup: null,
+        };
+      };
+
+      const viewPublishedOwnGroup = () => {
+        const own = uploadResultModal.value.ownGroup;
+        closeUploadResultModal();
+        if (own) {
+          openDetail(own);
+        }
+      };
+
+      const chooseJoinMatchedGroup = async () => {
+        const matched = uploadResultModal.value.matchedGroup;
+        const own = uploadResultModal.value.ownGroup;
+        closeUploadResultModal();
+        // 用户选择直接去拼已有同款团，将其待确认的重复团设为已结束并从“我的团”清理
+        if (own && own.group_order_id) {
+          try {
+            global.fetch(`/api/group_help/feedback/${own.group_order_id}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'mark_expired' }),
+              keepalive: true,
+            });
+          } catch (_) {}
+          myGroups.value = myGroups.value.filter(it => it.group_order_id !== own.group_order_id);
+          saveMyGroupsToStorage(myGroups.value);
+        }
+        if (matched) {
+          openDetail(matched);
+        }
+      };
+
+      const choosePublishOwnGroup = async () => {
+        const own = uploadResultModal.value.ownGroup;
+        if (!own || !own.group_order_id || submittingFeedback.value) return;
+        submittingFeedback.value = true;
+        try {
+          const resp = await global.fetch(`/api/group_help/feedback/${own.group_order_id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'confirm_publish' }),
+          });
+          const json = await resp.json();
+          if (resp.ok && json.status === 'success' && json.data) {
+            upsertMyGroup(json.data, false);
+            closeUploadResultModal();
+            showToast('🎉 您的拼团已上架互助大厅！', 3200);
+            if (filterMode.value !== 'mine') {
+              fetchGroups(true);
+            }
+            openDetail(json.data);
+          } else {
+            showToast((json && json.error_msg) || '上架失败，请稍后重试');
+          }
+        } catch (_) {
+          showToast('网络异常，请稍后重试');
+        } finally {
+          submittingFeedback.value = false;
+        }
+      };
+
       const onMyGroupCardClick = item => {
         if (!item) return;
         if (item.parse_status === 'failed') {
           openHelpGuide(item);
+        } else if (item.parse_status === 'parsed' && item.group_status === 'pending_confirm') {
+          openUploadResultModal(item);
         } else if (item.parse_status === 'parsed') {
           openDetail(item);
         } else {
@@ -822,6 +929,7 @@
         fileInputRef,
         helpModal,
         creditWarnModal,
+        uploadResultModal,
         hasJoinedGroup,
         formatRemaining,
         statusBadgeText,
@@ -847,6 +955,11 @@
         closeHelpGuide,
         goSeeOthersExample,
         reuploadFromHelp,
+        openUploadResultModal,
+        closeUploadResultModal,
+        viewPublishedOwnGroup,
+        chooseJoinMatchedGroup,
+        choosePublishOwnGroup,
         onMyGroupCardClick,
         jumpToApp,
         jumpToH5,

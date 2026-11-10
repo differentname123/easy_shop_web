@@ -602,4 +602,170 @@ def test_incomplete_poster_rejected_and_remaining_time_formats(tmp_path):
     assert len(repo.search_groups(now=base_ts + 5 * 3600)["items"]) == 1
     assert len(repo.search_groups(now=base_ts + 6 * 3600)["items"]) == 0
 
+    # 案例 C：夹带外部广告或违规敏感信息的图片（即便带有商品名称与价格，is_compliant=False 也必须一票否决；物理文件保留在服务器供复盘分析，但禁止对外访问）
+    gid_risk = "3495190924788383333"
+    risk_img_path = poster_dir / f"{gid_risk}.jpg"
+    risk_img_path.write_bytes(_make_poster_image_bytes("https://file-link.pinduoduo.com/risk"))
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": gid_risk,
+            "short_url": "https://file-link.pinduoduo.com/risk",
+            "redirect_url": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid_risk}",
+            "poster_path": str(risk_img_path),
+            "created_at": base_ts,
+        }
+    )
 
+    def fake_ai_non_compliant(prompt, file_paths=None, **kwargs):
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": True,
+                    "is_compliant": False,
+                    "reject_reason": "图片包含非官方涂改或夹带外部广告及敏感违规内容",
+                    "goods_name": "某商品名称",
+                    "keywords": ["商品"],
+                    "group_price": 19.9,
+                    "original_price": 39.9,
+                    "total_people": 3,
+                    "remain_people": 2,
+                    "remaining_time": "20:00:00",
+                    "remaining_seconds": 72000,
+                }
+            ),
+        }
+
+    svc_risk = GroupHelpService(repo=repo, poster_dir=poster_dir, ai_generator=fake_ai_non_compliant)
+    # 审核前（pending 状态）也禁止外部直接访问海报图片
+    assert svc_risk.get_poster_file_path(gid_risk) is None
+    stats_risk = svc_risk.process_pending_batch(batch_size=2)
+    assert stats_risk["parsed"] == 0
+    assert stats_risk["failed"] == 1
+    risk_doc = repo.get_by_group_order_id(gid_risk)
+    assert risk_doc["parse_status"] == PARSE_STATUS_FAILED
+    assert "外部广告" in risk_doc["parse_error"]
+    # 物理图片保留在服务器本地供后续分析误判/漏判，但对外接口严格禁止访问
+    assert risk_img_path.exists()
+    assert svc_risk.get_poster_file_path(gid_risk) is None
+
+
+def test_duplicate_active_group_matching_and_confirm_publish(tmp_path):
+    """
+    验证：
+    1. 商品名称高度相似且拼团价完全一致的在拼商品智能匹配；
+    2. 匹配命中时新上传的团处于 pending_confirm 状态（暂不上架大厅），详情接口返回 matched_group 供前端弹窗提示用户直接去拼或继续上传自己的团；
+    3. 用户点击“继续上传我的团”(confirm_publish) 后立即转为 active 上架大厅。
+    """
+    import time as _time
+    from models.group_help import (
+        GROUP_STATUS_PENDING_CONFIRM,
+        is_highly_similar_goods,
+    )
+
+    # 1. 标题相似度函数校验
+    assert is_highly_similar_goods(
+        "维达超韧抽纸3层130抽24包整箱装",
+        "【百亿补贴】维达超韧抽纸3层130抽24包整箱装家用实惠装",
+    )
+    # 规格数字不同（24包 vs 18包）绝不误判为同款
+    assert not is_highly_similar_goods(
+        "维达超韧抽纸3层130抽24包整箱装",
+        "维达超韧抽纸3层130抽18包整箱装",
+    )
+    # 同品牌不同款式（隔音耳塞 vs 睡眠耳塞）不误判为同款
+    assert not is_highly_similar_goods("安耳悠隔音耳塞", "安耳悠睡眠耳塞")
+
+    # 2. 端到端流程验证
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    base_ts = _time.time()
+    poster_dir = tmp_path / "posters"
+    poster_dir.mkdir(parents=True, exist_ok=True)
+
+    # 先已有一个在线可拼的团 A
+    gid_a = "3495229659187108001"
+    img_a = poster_dir / f"{gid_a}.jpg"
+    img_a.write_bytes(_make_poster_image_bytes("https://file-link.pinduoduo.com/ga"))
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": gid_a,
+            "short_url": "https://file-link.pinduoduo.com/ga",
+            "redirect_url": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid_a}",
+            "poster_path": str(img_a),
+            "created_at": base_ts,
+        }
+    )
+    repo.mark_parse_succeeded(
+        gid_a,
+        {
+            "goods_name": "维达超韧抽纸3层130抽24包整箱装",
+            "keywords": ["维达", "抽纸"],
+            "group_price": 26.9,
+            "original_price": 39.9,
+            "total_people": 3,
+            "remain_people": 1,
+            "remaining_seconds": 36000,
+        },
+        now=base_ts + 2,
+    )
+
+    # 新用户上传了同款同价的团 B
+    gid_b = "3495229659187108002"
+    img_b = poster_dir / f"{gid_b}.jpg"
+    img_b.write_bytes(_make_poster_image_bytes("https://file-link.pinduoduo.com/gb"))
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": gid_b,
+            "short_url": "https://file-link.pinduoduo.com/gb",
+            "redirect_url": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid_b}",
+            "poster_path": str(img_b),
+            "created_at": base_ts + 10,
+        }
+    )
+
+    def fake_ai_same_product(prompt, file_paths=None, **kwargs):
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": True,
+                    "is_compliant": True,
+                    "reject_reason": "",
+                    "goods_name": "维达超韧抽纸3层130抽24包整箱装家用实惠装",
+                    "keywords": ["维达", "抽纸", "24包"],
+                    "group_price": 26.9,
+                    "original_price": 39.9,
+                    "total_people": 3,
+                    "remain_people": 2,
+                    "remaining_time": "18:00:00",
+                    "remaining_seconds": 64800,
+                }
+            ),
+        }
+
+    svc = GroupHelpService(repo=repo, poster_dir=poster_dir, ai_generator=fake_ai_same_product)
+    stats = svc.process_pending_batch(batch_size=2)
+    assert stats["parsed"] == 1
+
+    # 团 B 应处于 pending_confirm 状态，且绑定了团 A 的详情
+    detail_b = svc.get_group_detail(gid_b)
+    assert detail_b["parse_status"] == PARSE_STATUS_PARSED
+    assert detail_b["group_status"] == GROUP_STATUS_PENDING_CONFIRM
+    assert detail_b["matched_group_order_id"] == gid_a
+    assert detail_b["matched_group"] is not None
+    assert detail_b["matched_group"]["group_order_id"] == gid_a
+    assert detail_b["matched_group"]["group_price"] == 26.9
+
+    # 此时大厅列表中只有团 A，团 B 尚未上架
+    hall_before = repo.search_groups(now=base_ts + 20)
+    assert [it["group_order_id"] for it in hall_before["items"]] == [gid_a]
+
+    # 用户选择“继续上传我的团” (confirm_publish)
+    published_b = svc.submit_feedback(gid_b, action="confirm_publish")
+    assert published_b["group_status"] == GROUP_STATUS_ACTIVE
+    assert published_b["matched_group_order_id"] == ""
+    assert published_b["matched_group"] is None
+
+    # 确认发布后，团 A 和团 B 均在大厅展示
+    hall_after = repo.search_groups(now=base_ts + 25)
+    assert len(hall_after["items"]) == 2

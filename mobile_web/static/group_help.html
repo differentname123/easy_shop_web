@@ -99,8 +99,8 @@
         class="gh-card"
         @click="onMyGroupCardClick(item)"
       >
-        <div class="gh-thumb-box" @click.stop="openFullPoster(item.poster_url || item.local_thumb)">
-          <img :src="item.poster_url || item.local_thumb" alt="拼团图片" loading="lazy" />
+        <div class="gh-thumb-box" @click.stop="openFullPoster(item.parse_status === 'parsed' ? item.poster_url : (item.local_thumb || item.poster_url))">
+          <img :src="item.parse_status === 'parsed' ? item.poster_url : (item.local_thumb || item.poster_url)" alt="拼团图片" loading="lazy" />
         </div>
 
         <div class="gh-card-body">
@@ -162,7 +162,15 @@
               <span class="gh-sub-meta" v-else>见海报</span>
               <div class="gh-my-actions" @click.stop>
                 <button
-                  v-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0"
+                  v-if="item.group_status === 'pending_confirm'"
+                  class="gh-mini-outline-btn"
+                  style="border-color:#d46b08;color:#d46b08;background:#fff7e6"
+                  @click="openUploadResultModal(item)"
+                >
+                  去确认
+                </button>
+                <button
+                  v-else-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0"
                   class="gh-mini-outline-btn"
                   @click="quickMyGroupTakedown(item)"
                 >
@@ -428,6 +436,92 @@
     </div>
   </div>
 
+  <!-- ==================== 弹窗 4：审核完成反馈 / 发现相同在拼商品选择弹窗 ==================== -->
+  <div
+    class="gh-modal-mask"
+    style="align-items:center;padding:20px;z-index:270"
+    v-if="uploadResultModal.visible"
+    @click.self="closeUploadResultModal"
+  >
+    <div class="gh-dialog">
+      <!-- 模式 A：匹配到相同价格且名称高度相似的在拼商品 -->
+      <template v-if="uploadResultModal.mode === 'matched' && uploadResultModal.matchedGroup">
+        <div class="gh-dialog-title">💡 发现相同的在拼商品！</div>
+        <div class="gh-dialog-body">
+          <p>大厅中已有<b>同款同价</b>的商品正在凑团，直接去参团可更快拼成发货！您也可以选择继续上传自己的团：</p>
+          <div
+            class="gh-card"
+            style="margin-top:10px;border:1.5px solid #ffd591;background:#fffbe6;box-shadow:none"
+            @click="chooseJoinMatchedGroup"
+          >
+            <div class="gh-thumb-box" style="width:68px;height:68px">
+              <img :src="uploadResultModal.matchedGroup.poster_url" :alt="uploadResultModal.matchedGroup.goods_name" />
+            </div>
+            <div class="gh-card-body">
+              <div class="gh-status-row">
+                <span class="gh-remain-badge">{{ statusBadgeText(uploadResultModal.matchedGroup) }}</span>
+                <span class="gh-sub-meta">剩{{ formatRemaining(uploadResultModal.matchedGroup.remaining_seconds) }}</span>
+              </div>
+              <div class="gh-goods-title" style="font-size:13px">{{ uploadResultModal.matchedGroup.goods_name }}</div>
+              <div class="gh-price-val" style="font-size:15px">¥{{ uploadResultModal.matchedGroup.group_price }}</div>
+            </div>
+          </div>
+        </div>
+        <div class="gh-dialog-actions">
+          <button
+            class="gh-btn-secondary"
+            :disabled="submittingFeedback"
+            @click="choosePublishOwnGroup"
+          >
+            继续上传我的团
+          </button>
+          <button
+            class="gh-btn-app-jump"
+            style="padding:10px;font-size:14px"
+            @click="chooseJoinMatchedGroup"
+          >
+            🚀 直接去拼这个团
+          </button>
+        </div>
+      </template>
+
+      <!-- 模式 B：全新商品审核通过并已上架 -->
+      <template v-else-if="uploadResultModal.ownGroup">
+        <div class="gh-dialog-title">🎉 审核通过，您的拼团已上架！</div>
+        <div class="gh-dialog-body">
+          <p>您的拼团海报已通过审核并展示在互助大厅，点击下方卡片或按钮即可查看您的分享团详情：</p>
+          <div
+            class="gh-card"
+            style="margin-top:10px;border:1.5px solid #b7eb8f;background:#f6ffed;box-shadow:none"
+            @click="viewPublishedOwnGroup"
+          >
+            <div class="gh-thumb-box" style="width:68px;height:68px">
+              <img :src="uploadResultModal.ownGroup.poster_url" :alt="uploadResultModal.ownGroup.goods_name" />
+            </div>
+            <div class="gh-card-body">
+              <div class="gh-status-row">
+                <span class="gh-remain-badge">{{ statusBadgeText(uploadResultModal.ownGroup) }}</span>
+                <span class="gh-sub-meta">剩{{ formatRemaining(uploadResultModal.ownGroup.remaining_seconds) }}</span>
+              </div>
+              <div class="gh-goods-title" style="font-size:13px">{{ uploadResultModal.ownGroup.goods_name }}</div>
+              <div class="gh-price-val" style="font-size:15px">¥{{ uploadResultModal.ownGroup.group_price }}</div>
+            </div>
+          </div>
+        </div>
+        <div class="gh-dialog-actions">
+          <button class="gh-btn-secondary" @click="closeUploadResultModal">知道了</button>
+          <button
+            class="gh-btn-app-jump"
+            style="padding:10px;font-size:14px"
+            @click="viewPublishedOwnGroup"
+          >
+            查看我的拼团
+          </button>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <!-- 点击放大查看完整二维码海报图 -->
   <div
     class="gh-modal-mask"
@@ -469,6 +563,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=20261110-1"></script>
+<script src="/static/js/group_help.js?v=20261110-2"></script>
 </body>
 </html>
