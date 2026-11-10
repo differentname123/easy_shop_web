@@ -158,6 +158,7 @@ API_KEY = get_config("local_api_key", "")
 HIGH_MODEL_LIST = [
     # {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
     {"model_name": "gpt-6.1-sol-max", "权重": 1, "备注": "来源codex 订阅账号"},
+    {"model_name": "antigravity-argon-high", "权重": 1, "备注": "来源antigravity 本地客户端"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
 ]
@@ -169,8 +170,7 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
-
-
+    {"model_name": "antigravity-3.8-flash-high", "权重": 4, "备注": "来源antigravity 本地客户端"},
     # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
 
 
@@ -202,7 +202,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
-
+    {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。
@@ -942,7 +942,9 @@ if __name__ == "__main__":
     )
     print("Argon (High) 文本结果:", res_argon)
     for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemini-3.8-flash-high")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="antigravity-3.8-flash-medium")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="antigravity-3.8-flash-high")
+
     # 示例 3：传入本地图片路径 (file_paths) 进行多模态图片分析（支持单张或多张图片）
     # res_img = generate_content(
     #     prompt="请分别描述这些图片的内容，并标明对应的文件名。",

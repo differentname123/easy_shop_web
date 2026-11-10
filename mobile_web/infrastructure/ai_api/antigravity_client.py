@@ -27,12 +27,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-# 仅暴露用户指定的两个 High 模式专属模型名（同时兼容原名）
+# 暴露指定的 Antigravity 本地模型名（同时兼容原名）
 MODEL_ALIASES: Dict[str, str] = {
     "antigravity-argon-high": "MODEL_PLACEHOLDER_M417",
     "gemini-4-argon-high": "MODEL_PLACEHOLDER_M417",
     "antigravity-3.8-flash-high": "MODEL_PLACEHOLDER_M318",
     "gemini-3.8-flash-high": "MODEL_PLACEHOLDER_M318",
+    "antigravity-3.8-flash-medium": "MODEL_PLACEHOLDER_M319",
+    "gemini-3.8-flash-medium": "MODEL_PLACEHOLDER_M319",
 }
 
 DEFAULT_LOG_PATH = Path(os.environ.get("APPDATA", "")) / "Antigravity" / "logs" / "language_server.log"
