@@ -387,6 +387,15 @@ def test_24h_auto_expiration():
     res_23h = repo.search_groups(now=base_ts + 23 * 3600)
     assert len(res_23h["items"]) == 1
 
+    # 有效期内若误标已满，可恢复上架但绝不延长原定 expires_at
+    orig_expires = repo.get_by_group_order_id("3495229659187109999")["expires_at"]
+    repo.apply_user_feedback("3495229659187109999", action="mark_full", now=base_ts + 3600)
+    restored = repo.apply_user_feedback(
+        "3495229659187109999", action="set_remain", remain_people=2, now=base_ts + 3700
+    )
+    assert restored["group_status"] == GROUP_STATUS_ACTIVE
+    assert restored["expires_at"] == orig_expires
+
     # 24 小时 + 1 秒后自动过期下线
     expired_now = base_ts + 24 * 3600 + 1
     res_24h = repo.search_groups(now=expired_now)
@@ -394,18 +403,20 @@ def test_24h_auto_expiration():
     doc = repo.get_by_group_order_id("3495229659187109999")
     assert doc["group_status"] == GROUP_STATUS_EXPIRED
 
-    # 过期后通过 set_remain 重新上架，应自动恢复为 active 并顺延有效期
-    relisted = repo.apply_user_feedback(
-        "3495229659187109999",
-        action="set_remain",
-        remain_people=2,
-        now=expired_now + 10,
-    )
-    assert relisted["group_status"] == GROUP_STATUS_ACTIVE
-    assert relisted["remain_people"] == 2
-    assert relisted["expires_at"] >= expired_now + 3600
-    res_after_relist = repo.search_groups(now=expired_now + 20)
-    assert len(res_after_relist["items"]) == 1
+    # 超过 24 小时已失效的拼团，严禁再通过 set_remain 重新上架或执行 mark_full 下架
+    with pytest.raises(ValueError, match="无法重新上架或修改状态"):
+        repo.apply_user_feedback(
+            "3495229659187109999",
+            action="set_remain",
+            remain_people=2,
+            now=expired_now + 10,
+        )
+    with pytest.raises(ValueError, match="无法重新上架或修改状态"):
+        repo.apply_user_feedback(
+            "3495229659187109999",
+            action="mark_full",
+            now=expired_now + 10,
+        )
 
 
 def test_search_sorts_by_click_count_ascending_first():

@@ -133,6 +133,7 @@
           if (!raw) return [];
           const parsed = JSON.parse(raw);
           if (!Array.isArray(parsed)) return [];
+          const nowSec = Math.floor(Date.now() / 1000);
           return parsed
             .filter(it => it && (it.group_order_id || it.local_id))
             .map(it => {
@@ -141,6 +142,14 @@
                   ...it,
                   parse_status: 'failed',
                   parse_error: '上传中断，请重新上传拼团二维码图片',
+                };
+              }
+              if (it.expires_at && it.parse_status === 'parsed') {
+                const rem = Math.max(0, Math.floor(Number(it.expires_at) - nowSec));
+                return {
+                  ...it,
+                  remaining_seconds: rem,
+                  group_status: rem <= 0 ? 'expired' : it.group_status,
                 };
               }
               return it;
@@ -260,11 +269,11 @@
 
       const statusBadgeText = item => {
         if (!item) return '';
-        if (item.group_status === 'full' || item.remain_people <= 0) {
-          return '已拼满';
-        }
         if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
           return '已结束';
+        }
+        if (item.group_status === 'full' || item.remain_people <= 0) {
+          return '已拼满';
         }
         const totalNum = Number(item.total_people) || 0;
         const prefix = totalNum >= 2 ? `${totalNum}人团 · ` : '';
@@ -273,6 +282,9 @@
 
       const myGroupStatusText = item => {
         if (!item) return '';
+        if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
+          return '⚪ 已到期失效';
+        }
         if (item.group_status === 'pending_confirm') {
           return '🟡 发现同款 · 待您确认';
         }
@@ -282,11 +294,14 @@
         if (item.group_status === 'full' || item.remain_people <= 0) {
           return '🎉 已拼满下架';
         }
-        return '⚪ 已结束下架';
+        return '⚪ 已到期失效';
       };
 
       const myGroupStatusClass = item => {
         if (!item) return 'status-inactive';
+        if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
+          return 'status-inactive';
+        }
         if (item.group_status === 'pending_confirm') {
           return 'status-pending';
         }
@@ -859,6 +874,11 @@
 
       const quickMyGroupTakedown = async item => {
         if (!item || !item.group_order_id) return;
+        if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
+          showToast('该拼团已到期失效，无需下架');
+          refreshMyGroups(false, false);
+          return;
+        }
         try {
           const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
             method: 'POST',
@@ -871,6 +891,9 @@
             const idx = items.value.findIndex(it => it.group_order_id === item.group_order_id);
             if (idx !== -1) items.value.splice(idx, 1);
             showToast('已将该团下架');
+          } else {
+            showToast((json && json.error_msg) || '操作失败');
+            refreshMyGroups(false, false);
           }
         } catch (_) {
           showToast('操作失败');
@@ -879,6 +902,11 @@
 
       const quickMyGroupRelist = async item => {
         if (!item || !item.group_order_id) return;
+        if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
+          showToast('该拼团已超过24小时有效期失效，无法重新上架');
+          refreshMyGroups(false, false);
+          return;
+        }
         const targetRemain = item.remain_people > 0 ? item.remain_people : 1;
         try {
           const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
@@ -889,7 +917,10 @@
           const json = await resp.json();
           if (resp.ok && json.status === 'success' && json.data) {
             upsertMyGroup(json.data, false);
-            showToast(`已重新上架大厅展示（差${json.data.remain_people}人）`);
+            showToast(`已恢复上架大厅展示（差${json.data.remain_people}人）`);
+          } else {
+            showToast((json && json.error_msg) || '该拼团已失效，无法恢复上架');
+            refreshMyGroups(false, false);
           }
         } catch (_) {
           showToast('操作失败');

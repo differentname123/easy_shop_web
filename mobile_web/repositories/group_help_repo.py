@@ -54,16 +54,20 @@ class GroupHelpRepository(BaseRepository):
 
         if existing is not None:
             is_expired_time = float(existing.get("expires_at") or 0) <= now
-            is_active_online = (
-                existing.get("parse_status") == PARSE_STATUS_PARSED
-                and existing.get("group_status") == GROUP_STATUS_ACTIVE
-                and int(existing.get("remain_people") or 0) > 0
-                and not is_expired_time
-            )
-            if is_active_online:
+            if existing.get("parse_status") == PARSE_STATUS_PARSED:
+                if is_expired_time or existing.get("group_status") == GROUP_STATUS_EXPIRED:
+                    raise ValueError(
+                        "该拼团已超过有效期失效（拼多多拼团仅24小时有效），请在拼多多重新发起新团后再上传最新海报"
+                    )
                 return existing, False
 
-            # 若之前审核未通过，或已满/已结束重新上传新海报，统一进入 pending 重新执行大模型合规与字段审核
+            # 若之前因图片残缺等原因未通过审核（failed/pending），允许在原 24 小时有效期内重新上传完整海报重试
+            orig_created = float(existing.get("created_at") or now)
+            orig_expires = float(existing.get("expires_at") or (orig_created + DEFAULT_GROUP_TTL_SECONDS))
+            if orig_expires <= now:
+                raise ValueError(
+                    "该拼团已超过24小时有效期失效，请在拼多多重新发起新团后再上传最新海报"
+                )
             updated = self.col.find_one_and_update(
                 {"group_order_id": gid},
                 {
@@ -75,9 +79,7 @@ class GroupHelpRepository(BaseRepository):
                         "parse_attempts": 0,
                         "parse_error": "",
                         "group_status": GROUP_STATUS_ACTIVE,
-                        "created_at": now,
                         "updated_at": now,
-                        "expires_at": now + DEFAULT_GROUP_TTL_SECONDS,
                     }
                 },
                 projection={"_id": 0},
@@ -388,6 +390,25 @@ class GroupHelpRepository(BaseRepository):
             return None
 
         act = str(action or "").strip()
+        expires_at = float(existing.get("expires_at") or 0)
+        is_time_expired = expires_at <= current_ts
+        is_marked_expired = existing.get("group_status") == GROUP_STATUS_EXPIRED
+
+        if is_time_expired or is_marked_expired:
+            if existing.get("group_status") != GROUP_STATUS_EXPIRED:
+                existing = (
+                    self.col.find_one_and_update(
+                        {"group_order_id": gid},
+                        {"$set": {"group_status": GROUP_STATUS_EXPIRED, "updated_at": current_ts}},
+                        projection={"_id": 0},
+                        return_document=ReturnDocument.AFTER,
+                    )
+                    or existing
+                )
+            if act == "mark_expired":
+                return existing
+            raise ValueError("该拼团已超过有效期失效（拼多多拼团仅24小时有效），无法重新上架或修改状态")
+
         update_fields: Dict[str, Any] = {"updated_at": current_ts}
 
         if act == "mark_full":
@@ -402,9 +423,6 @@ class GroupHelpRepository(BaseRepository):
             update_fields["remain_people"] = cur_rem
             update_fields["group_status"] = GROUP_STATUS_ACTIVE
             update_fields["matched_group_order_id"] = ""
-            expires_at = float(existing.get("expires_at") or 0)
-            if expires_at <= current_ts + 3600:
-                update_fields["expires_at"] = max(expires_at, current_ts + 3600)
         elif act == "joined_one":
             cur_rem = int(existing.get("remain_people") if existing.get("remain_people") is not None else 1)
             new_rem = max(0, cur_rem - 1)
@@ -423,9 +441,6 @@ class GroupHelpRepository(BaseRepository):
                 update_fields["group_status"] = GROUP_STATUS_FULL
             else:
                 update_fields["group_status"] = GROUP_STATUS_ACTIVE
-                expires_at = float(existing.get("expires_at") or 0)
-                if expires_at <= current_ts + 3600:
-                    update_fields["expires_at"] = max(expires_at, current_ts + 3600)
         else:
             raise ValueError(f"不支持的反馈操作类型: {act}")
 

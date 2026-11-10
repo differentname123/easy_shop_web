@@ -118,11 +118,15 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
     current_ts = float(now if now is not None else time.time())
     gid = str(doc.get("group_order_id") or "")
     created_at = float(doc.get("created_at") or current_ts)
-    expires_at = float(doc.get("expires_at") or (created_at + DEFAULT_GROUP_TTL_SECONDS))
+    raw_expires = float(doc.get("expires_at") or (created_at + DEFAULT_GROUP_TTL_SECONDS))
+    expires_at = min(raw_expires, created_at + DEFAULT_GROUP_TTL_SECONDS)
     remaining_seconds = max(0, int(expires_at - current_ts))
 
     raw_status = str(doc.get("group_status") or GROUP_STATUS_ACTIVE)
-    if remaining_seconds <= 0 and raw_status in (GROUP_STATUS_ACTIVE, GROUP_STATUS_PENDING_CONFIRM):
+    if raw_status == GROUP_STATUS_EXPIRED:
+        effective_status = GROUP_STATUS_EXPIRED
+        remaining_seconds = 0
+    elif remaining_seconds <= 0:
         effective_status = GROUP_STATUS_EXPIRED
     else:
         effective_status = raw_status
@@ -292,7 +296,7 @@ def validate_and_normalize_parsed_poster(parsed_data: Dict[str, Any]) -> Dict[st
     if parsed_data.get("is_compliant") is False:
         raise ValueError(
             reject_reason
-            or "图片包含非官方原生内容、夹带外部广告信息或存在违规风险，不予上架（请上传纯净的拼多多官方分享海报）"
+            or "图片包含明显违规或外部引流广告信息，不予上架（请上传正常的拼多多分享海报）"
         )
 
     if parsed_data.get("is_group_poster") is False:
@@ -300,9 +304,6 @@ def validate_and_normalize_parsed_poster(parsed_data: Dict[str, Any]) -> Dict[st
             reject_reason
             or "图片不是完整的拼多多多人团分享海报，请上传包含商品图、商品标题、拼团价及二维码的完整海报（勿仅截取局部二维码）"
         )
-
-    if reject_reason:
-        raise ValueError(reject_reason)
 
     goods_name = str(parsed_data.get("goods_name") or "").strip()
     if len(goods_name) < 3 or goods_name.lower() in _INVALID_GOODS_NAMES:
@@ -316,7 +317,7 @@ def validate_and_normalize_parsed_poster(parsed_data: Dict[str, Any]) -> Dict[st
 
     remain_people = _parse_int_field(parsed_data.get("remain_people"))
     if remain_people is None or remain_people < 1 or remain_people > 20:
-        raise ValueError("图片中未识别到有效的成团差额人数（如“还差X人”），请上传完整的拼团邀请海报")
+        remain_people = 1
 
     total_people = _parse_int_field(parsed_data.get("total_people")) or 0
     if total_people < 0 or total_people > 50:

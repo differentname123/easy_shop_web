@@ -162,7 +162,7 @@
               <span class="gh-sub-meta" v-else>见海报</span>
               <div class="gh-my-actions" @click.stop>
                 <button
-                  v-if="item.group_status === 'pending_confirm'"
+                  v-if="item.group_status === 'pending_confirm' && item.remaining_seconds > 0"
                   class="gh-mini-outline-btn"
                   style="border-color:#d46b08;color:#d46b08;background:#fff7e6"
                   @click="openUploadResultModal(item)"
@@ -177,11 +177,11 @@
                   已满下架
                 </button>
                 <button
-                  v-else
+                  v-else-if="item.group_status === 'full' && item.remaining_seconds > 0"
                   class="gh-mini-outline-btn"
                   @click="quickMyGroupRelist(item)"
                 >
-                  重新上架
+                  未满恢复
                 </button>
                 <button class="gh-text-btn" @click="removeMyGroup(item)">删除</button>
               </div>
@@ -315,13 +315,25 @@
           </div>
         </div>
 
-        <!-- 次级操作 A：当拼团已下架（已满/已结束）时，提供恢复上架入口 -->
+        <!-- 次级操作 A1：当拼团已超过24小时有效期或已标记失效时，不可再上架或下架 -->
         <div
           class="gh-cocreate-box"
-          v-if="selectedGroup.group_status !== 'active' || selectedGroup.remaining_seconds <= 0 || selectedGroup.remain_people <= 0"
+          v-if="selectedGroup.remaining_seconds <= 0 || selectedGroup.group_status === 'expired'"
+        >
+          <div class="gh-cocreate-header" style="margin-bottom:0">
+            <span class="gh-cocreate-label" style="color:#8c8c8c">
+              ⚪ 该拼团已超过有效期或已失效（拼多多拼团仅24小时有效），无法继续参团或重新上架。
+            </span>
+          </div>
+        </div>
+
+        <!-- 次级操作 A2：仍在有效期内但被标记已拼满时，允许误操作恢复 -->
+        <div
+          class="gh-cocreate-box"
+          v-else-if="selectedGroup.group_status !== 'active' || selectedGroup.remain_people <= 0"
         >
           <div class="gh-cocreate-header">
-            <span class="gh-cocreate-label">该拼团已下架，如实际仍在凑人可恢复上架：</span>
+            <span class="gh-cocreate-label">该拼团已标记拼满下架（仍在有效期内），如实际未满可恢复：</span>
           </div>
           <div class="gh-feedback-grid" style="grid-template-columns: repeat(2, 1fr);">
             <button
@@ -329,14 +341,14 @@
               :disabled="submittingFeedback"
               @click="submitFeedback('set_remain', 1)"
             >
-              🔄 恢复上架 (差1人)
+              🔄 未满恢复 (差1人)
             </button>
             <button
               class="gh-fb-btn fb-joined"
               :disabled="submittingFeedback"
               @click="submitFeedback('set_remain', 2)"
             >
-              🔄 恢复上架 (差2人)
+              🔄 未满恢复 (差2人)
             </button>
           </div>
         </div>
@@ -563,6 +575,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=20261110-2"></script>
+<script src="/static/js/group_help.js?v=20261110-3"></script>
 </body>
 </html>
