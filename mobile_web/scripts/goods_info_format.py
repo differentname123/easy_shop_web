@@ -234,7 +234,8 @@ def pending_format_query(recent_days=RECENT_DAYS):
     1. 仅限最近一周（recent_days 天）内更新的数据
     2. 尚未成功格式化，或者标记了 need_reformat: True
     3. 或者已存在 format_info，但未达到预期 SKU 数量（支持漏洗或分批补洗）
-    4. 且累计重试次数未超过阈值
+    4. 或者单规格商品的当前价格与 format_info 清洗价格不一致（支持价格变动重洗）
+    5. 且累计重试次数未超过阈值
     """
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=recent_days)
     return {
@@ -250,6 +251,20 @@ def pending_format_query(recent_days=RECENT_DAYS):
                             "$gt": [
                                 {"$size": {"$ifNull": ["$sku_info", []]}},
                                 {"$size": {"$objectToArray": {"$ifNull": ["$format_info", {}]}}},
+                            ]
+                        }
+                    },
+                    # 当单规格商品的当前价格与 format_info 清洗价格不一致时重新清洗
+                    {
+                        "$expr": {
+                            "$and": [
+                                {"$eq": [{"$size": {"$ifNull": ["$sku_info", []]}}, 0]},
+                                {
+                                    "$let": {
+                                        "vars": {"entries": {"$objectToArray": {"$ifNull": ["$format_info", {}]}}},
+                                        "in": {"$not": [{"$in": ["$activity_price", "$$entries.v.price"]}]},
+                                    }
+                                },
                             ]
                         }
                     },
@@ -500,16 +515,21 @@ def run_format_round(product_manager):
     state_lock = threading.Lock()
 
     for product in products:
-        is_reformat = bool(product.get("need_reformat"))
-        if is_reformat:
-            total_reformat_prods += 1
-
         product_id = str(product.get("product_id")).strip()
         name = str(product.get("name") or "").strip()
         sku_info = product.get("sku_info")
         raw_format_info = product.get("format_info")
         has_invalid_format_info = "format_info" in product and not isinstance(raw_format_info, dict)
         existing_format_info = raw_format_info if isinstance(raw_format_info, dict) else {}
+
+        has_price_mismatch = (
+            not sku_info
+            and isinstance(existing_format_info.get(f"{product_id}_0"), dict)
+            and existing_format_info[f"{product_id}_0"].get("price") != product.get("activity_price")
+        )
+        is_reformat = bool(product.get("need_reformat")) or has_price_mismatch
+        if is_reformat:
+            total_reformat_prods += 1
 
         # 针对重洗（或旧版单层结构、或 format_info 为 null/非字典）商品，第一次拉取时直接将数据库和内存中的
         # need_reformat 设为 False、清空旧 format_info、重置 format_retry_count 为 0
