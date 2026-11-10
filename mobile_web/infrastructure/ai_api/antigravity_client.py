@@ -7,17 +7,23 @@ Antigravity Official Local Client (100% Safe, Zero Reverse-Proxy / Zero Token Ex
 1. 本模块【绝不提取】任何 OAuth Token，也【绝不伪造】任何发往 Google 的请求头或 TLS 指纹。
 2. 默认直接通过本地回环地址 (127.0.0.1) 调用您电脑上正在运行的官方 Antigravity 客户端自带的
    `language_server.exe` 原生接口。
-3. 纯文本走无状态 `GetModelResponse`；带图片的多模态走 `StartCascade` + `SendUserCascadeMessage`
+3. 所有请求（无论纯文本还是多模态图片）100% 严格向桌面客户端原生使用方式看齐：
+   统一走 `StartCascade` -> `SendUserCascadeMessage` -> `WaitForConversationFullyIdle` -> `GetCascadeTrajectory`，
    并在 `finally` 中立即调用 `DeleteCascadeTrajectory` + `JetboxDeleteSummary` 自动无痕销毁会话。
+4. 内置基于操作系统内核文件锁的【多进程全局并发限制（默认全局并发=2）+ 跨进程错峰发包】，
+   即使同时运行多个 Python 脚本进程，整机总并发也严格不超过设定上限。
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import random
 import re
+import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -25,6 +31,11 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 # 暴露指定的 Antigravity 本地模型名（同时兼容原名）
@@ -47,6 +58,11 @@ DEFAULT_LS_BIN = (
     / "bin"
     / "language_server.exe"
 )
+GLOBAL_LOCK_DIR = (
+    Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+    / "Antigravity"
+    / "client_locks"
+)
 
 
 class AntigravityClient:
@@ -55,8 +71,8 @@ class AntigravityClient:
     - 如果 Antigravity 桌面客户端已打开，直接零开销复用其后台进程；
     - 如果 Antigravity 桌面客户端已关闭且 auto_start=True（默认），会自动在后台静默拉起官方
       language_server.exe 独立进程（无窗口、低内存、自动读取 Windows 凭据管理器登录态）；
-    - 内置【安全受控并发（Semaphore）+ 错峰发包间隔（Stagger）】，既支持多线程并行提速，
-      又确保不会出现超量并发或同一毫秒突发请求。
+    - 内置【跨进程全局并发控制（默认 max_concurrency=2 对多进程全局生效）+ 跨进程错峰发包间隔（Stagger）】，
+      既支持多线程/多进程并行提速，又确保绝不会出现超量并发或同一毫秒突发请求。
     """
 
     def __init__(
@@ -76,12 +92,83 @@ class AntigravityClient:
         self._http_port = http_port
         self._csrf_token = csrf_token
 
-        self._concurrency_sem = threading.BoundedSemaphore(max(1, int(max_concurrency)))
+        self._max_concurrency = max(1, int(max_concurrency))
+        self._concurrency_sem = threading.BoundedSemaphore(self._max_concurrency)
         self._pacing_lock = threading.Lock()
         self._discovery_lock = threading.Lock()
         self._last_dispatch_ts: float = 0.0
         self._min_stagger = max(0.0, float(min_stagger_seconds))
         self._max_stagger = max(self._min_stagger, float(max_stagger_seconds))
+
+    @staticmethod
+    def _try_lock_fd(fd: int) -> bool:
+        """尝试对文件描述符第 0 字节加非阻塞排他锁（OS 内核级锁，进程退出自动释放）。"""
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.name == "nt":
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _unlock_fd(fd: int) -> None:
+        """释放文件描述符第 0 字节的排他锁。"""
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.name == "nt":
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+    @contextlib.contextmanager
+    def _acquire_global_slot(self):
+        """
+        跨进程 + 跨线程全局并发槽位锁（如 max_concurrency=2 对本机所有 Python 进程同时生效）：
+        1. 先获取当前进程内 BoundedSemaphore；
+        2. 轮询争抢 0 .. max_concurrency-1 号全局锁文件槽位；
+        3. 获取槽位后执行跨进程错峰延迟 (_wait_for_stagger_slot)。
+        """
+        with self._concurrency_sem:
+            GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+            locked_fd: Optional[int] = None
+            while locked_fd is None:
+                for slot_idx in range(self._max_concurrency):
+                    slot_file = GLOBAL_LOCK_DIR / f"ag_concurrency_slot_{slot_idx}.lock"
+                    fd: Optional[int] = None
+                    try:
+                        fd = os.open(str(slot_file), os.O_CREAT | os.O_RDWR)
+                        if os.fstat(fd).st_size == 0:
+                            try:
+                                os.write(fd, b"0")
+                            except OSError:
+                                pass
+                        if self._try_lock_fd(fd):
+                            locked_fd = fd
+                            break
+                        os.close(fd)
+                    except OSError:
+                        if fd is not None:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+                if locked_fd is None:
+                    time.sleep(random.uniform(0.08, 0.16))
+
+            try:
+                self._wait_for_stagger_slot()
+                yield
+            finally:
+                self._unlock_fd(locked_fd)
+                try:
+                    os.close(locked_fd)
+                except OSError:
+                    pass
 
     @staticmethod
     def _get_live_ls_processes() -> Dict[int, str]:
@@ -217,11 +304,11 @@ class AntigravityClient:
                     self._csrf_token = live_procs[pid]
                     return self._http_port, self._csrf_token
 
-            if self.auto_start:
+            if self.auto_start and not live_procs:
                 return self._start_headless_server()
 
             raise RuntimeError(
-                "未能自动检测到正在运行的 Antigravity (language_server.exe)，且 auto_start=False。"
+                "未能自动检测到正在运行的 Antigravity (language_server.exe)。"
             )
 
     def _ensure_connection_info(self) -> tuple[int, str]:
@@ -230,16 +317,63 @@ class AntigravityClient:
         return self._discover_local_server()
 
     def _wait_for_stagger_slot(self) -> None:
-        """确保每次大模型请求的发起时间错开 0.8~1.8 秒，消除『同一毫秒并发轰炸』的脚本特征。"""
+        """跨进程确保每次大模型请求的发起时间错开 0.8~1.8 秒，消除『同一毫秒并发轰炸』的脚本特征。"""
         if self._max_stagger <= 0:
             return
         with self._pacing_lock:
-            now = time.monotonic()
-            target_gap = random.uniform(self._min_stagger, self._max_stagger)
-            wait_sec = (self._last_dispatch_ts + target_gap) - now
-            if wait_sec > 0:
-                time.sleep(wait_sec)
-            self._last_dispatch_ts = time.monotonic()
+            GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+            pacing_lock_file = GLOBAL_LOCK_DIR / "ag_pacing.lock"
+            pacing_state_file = GLOBAL_LOCK_DIR / "ag_pacing.state"
+            fd: Optional[int] = None
+            while fd is None:
+                candidate_fd: Optional[int] = None
+                try:
+                    candidate_fd = os.open(str(pacing_lock_file), os.O_CREAT | os.O_RDWR)
+                    if os.fstat(candidate_fd).st_size == 0:
+                        try:
+                            os.write(candidate_fd, b"0")
+                        except OSError:
+                            pass
+                    if self._try_lock_fd(candidate_fd):
+                        fd = candidate_fd
+                        break
+                    os.close(candidate_fd)
+                except OSError:
+                    if candidate_fd is not None:
+                        try:
+                            os.close(candidate_fd)
+                        except OSError:
+                            pass
+                time.sleep(random.uniform(0.03, 0.08))
+
+            try:
+                now = time.time()
+                last_ts = self._last_dispatch_ts
+                if pacing_state_file.exists():
+                    try:
+                        raw_ts = pacing_state_file.read_text(encoding="utf-8").strip()
+                        if raw_ts:
+                            last_ts = max(last_ts, float(raw_ts))
+                    except (OSError, ValueError):
+                        pass
+
+                target_gap = random.uniform(self._min_stagger, self._max_stagger)
+                wait_sec = (last_ts + target_gap) - now
+                if 0 < wait_sec <= (self._max_stagger + 5.0):
+                    time.sleep(wait_sec)
+
+                dispatch_ts = time.time()
+                self._last_dispatch_ts = dispatch_ts
+                try:
+                    pacing_state_file.write_text(f"{dispatch_ts:.6f}", encoding="utf-8")
+                except OSError:
+                    pass
+            finally:
+                self._unlock_fd(fd)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _post_rpc(
         self,
@@ -251,8 +385,7 @@ class AntigravityClient:
     ) -> Dict[str, Any]:
         """调用本地官方 LanguageServerService ConnectRPC 接口（强制直连 127.0.0.1，不经过外部代理）。"""
         if apply_rate_limit:
-            with self._concurrency_sem:
-                self._wait_for_stagger_slot()
+            with self._acquire_global_slot():
                 return self._post_rpc_inner(method, payload, retry_discovery=retry_discovery, timeout=timeout)
         return self._post_rpc_inner(method, payload, retry_discovery=retry_discovery, timeout=timeout)
 
@@ -292,7 +425,14 @@ class AntigravityClient:
             )
             setattr(err, "status_code", exc.code)
             raise err from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise TimeoutError(f"调用本地 Antigravity LanguageServer ({method}) 响应超时 ({req_timeout}s)") from exc
         except (urllib.error.URLError, ConnectionError) as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise TimeoutError(
+                    f"调用本地 Antigravity LanguageServer ({method}) 响应超时 ({req_timeout}s)"
+                ) from exc
             if retry_discovery:
                 with self._discovery_lock:
                     self._http_port = None
@@ -302,7 +442,7 @@ class AntigravityClient:
 
     @staticmethod
     def resolve_model_enum(model: str) -> str:
-        """将模型名称转换为内部枚举名（仅允许指定的两个 High 模型或枚举）。"""
+        """将模型名称转换为内部枚举名。"""
         if model.startswith("MODEL_"):
             return model
         if model in MODEL_ALIASES:
@@ -321,34 +461,25 @@ class AntigravityClient:
         timeout: Optional[float] = None,
     ) -> tuple[str, Optional[Dict[str, int]]]:
         """
-        统一的模型生成接口（同时支持纯文本与多张图片分析，返回 (reply_text, usage_dict)）。
-        - 无图片时：走极速无状态 GetModelResponse 接口；
-        - 有图片时：走 StartCascade -> SendUserCascadeMessage (含 media) -> GetCascadeTrajectory，
-          并在 finally 中调用 DeleteCascadeTrajectory + JetboxDeleteSummary 彻底无痕销毁临时会话。
+        统一的模型生成接口（严格与桌面客户端原生对话行为保持一致，返回 (reply_text, usage_dict)）。
+        - 无论纯文本还是多模态图片，统一走客户端原生 Cascade 会话流：
+          StartCascade -> SendUserCascadeMessage -> WaitForConversationFullyIdle -> GetCascadeTrajectory
+        - 在 finally 中立即调用 DeleteCascadeTrajectory + JetboxDeleteSummary 彻底无痕销毁临时会话。
+        - 全程受跨进程全局并发锁（默认 max_concurrency=2）与错峰发包保护。
         """
         target_model = self.resolve_model_enum(model or self.default_model)
         full_prompt = f"{system_prompt.strip()}\n\n{prompt}" if system_prompt else prompt
         req_timeout = float(timeout) if timeout is not None else self.timeout
+        workspace_uri = Path.cwd().resolve().as_uri()
 
-        # 通道 A：无图片附件 -> 走无状态 GetModelResponse
-        if not media:
-            resp = self._post_rpc(
-                "GetModelResponse",
-                {"prompt": full_prompt, "model": target_model},
-                apply_rate_limit=True,
-                timeout=req_timeout,
-            )
-            return resp.get("response", ""), None
-
-        # 通道 B：含图片附件 -> 走多模态 Cascade 通道并自动无痕清理
-        with self._concurrency_sem:
-            self._wait_for_stagger_slot()
+        with self._acquire_global_slot():
             start_resp = self._post_rpc_inner(
                 "StartCascade",
                 {
                     "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT",
                     "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
                     "requestedModel": target_model,
+                    "workspaceUris": [workspace_uri],
                 },
                 timeout=min(req_timeout, 30.0),
             )
@@ -358,23 +489,32 @@ class AntigravityClient:
 
             try:
                 no_tool_guard = (
-                    "【系统强制约束：当前为非交互式多模态分析模式，严禁调用任何工具(tools/subagents/commands)，"
-                    "请直接阅读上传的图片与下方提示词，直接输出最终文本或JSON结果。】\n\n"
+                    "【系统强制约束：当前为非交互式分析与生成模式，严禁调用任何工具(tools/subagents/commands)，"
+                    "请直接阅读下方提供的上下文与提示词，直接输出最终文本或JSON结果。】\n\n"
                 )
+                send_payload: Dict[str, Any] = {
+                    "cascadeId": cascade_id,
+                    "items": [{"text": no_tool_guard + full_prompt}],
+                    "cascadeConfig": {
+                        "plannerConfig": {
+                            "conversational": {"agenticMode": False},
+                            "requestedModel": {"model": target_model},
+                            "planModel": target_model,
+                            "useAiCredits": True,
+                            "supportsLatexRendering": True,
+                        },
+                        "executorConfig": {
+                            "useCoreDirect": True,
+                        },
+                        "conversationHistoryConfig": {},
+                    },
+                }
+                if media:
+                    send_payload["media"] = media
+
                 self._post_rpc_inner(
                     "SendUserCascadeMessage",
-                    {
-                        "cascadeId": cascade_id,
-                        "items": [{"text": no_tool_guard + full_prompt}],
-                        "media": media,
-                        "cascadeConfig": {
-                            "plannerConfig": {
-                                "conversational": {"agenticMode": False},
-                                "requestedModel": {"model": target_model},
-                                "planModel": target_model,
-                            }
-                        },
-                    },
+                    send_payload,
                     timeout=req_timeout,
                 )
                 wait_resp = self._post_rpc_inner(
@@ -384,10 +524,10 @@ class AntigravityClient:
                         "inactivityTimeoutSeconds": max(15, int(req_timeout)),
                         "returnOnExecutorError": True,
                     },
-                    timeout=req_timeout + 10.0,
+                    timeout=req_timeout + 15.0,
                 )
                 if wait_resp.get("timedOut"):
-                    raise TimeoutError(f"Antigravity 多模态图片分析超时 ({req_timeout}s)")
+                    raise TimeoutError(f"Antigravity Cascade 生成等待超时 ({req_timeout}s)")
 
                 traj_resp = self._post_rpc_inner(
                     "GetCascadeTrajectory",
@@ -401,7 +541,15 @@ class AntigravityClient:
                     and (s.get("plannerResponse") or {}).get("response")
                 ]
                 if not planner_steps:
-                    raise RuntimeError("Antigravity 多模态调用未返回有效的 plannerResponse 文本")
+                    error_steps = [
+                        s for s in steps
+                        if s.get("status") in ("CORTEX_STEP_STATUS_ERROR", "CORTEX_STEP_STATUS_CANCELED")
+                    ]
+                    if error_steps:
+                        raise RuntimeError(
+                            f"Antigravity Cascade 执行异常结束: {error_steps[-1].get('status')}"
+                        )
+                    raise RuntimeError("Antigravity Cascade 调用未返回有效的 plannerResponse 文本")
 
                 last_step = planner_steps[-1]
                 reply_text = (last_step.get("plannerResponse") or {}).get("response", "")
