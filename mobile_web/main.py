@@ -98,7 +98,7 @@ async def lifespan(app: FastAPI):
         elif settings.warmup_enabled:
             warmup_thread = threading.Thread(target=warm_connections, name="platform-warmup", daemon=False)
             warmup_thread.start()
-        if GROUP_HELP_ENABLED and settings.detail_prefetch_enabled:
+        if GROUP_HELP_ENABLED and (settings.detail_prefetch_enabled or settings.warmup_enabled):
             group_help_worker.start()
         yield
     finally:

@@ -51,15 +51,28 @@ def is_pdd_qr_url(url: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in _ALLOWED_PDD_DOMAINS)
 
 
-def build_group_jump_urls(group_order_id: str) -> Dict[str, str]:
-    """根据 19 位 group_order_id 构造跨端参团链接。"""
+def build_group_jump_urls(
+    group_order_id: str,
+    refer_share_channel: str = "",
+    refer_share_uin: str = "",
+    refer_share_id: str = "",
+) -> Dict[str, str]:
+    """根据 19 位 group_order_id（及可选分享追踪参数）构造跨端参团链接。"""
     gid = str(group_order_id).strip()
+    params = [("group_order_id", gid)]
+    if refer_share_channel:
+        params.append(("refer_share_channel", str(refer_share_channel).strip()))
+    if refer_share_uin:
+        params.append(("refer_share_uin", str(refer_share_uin).strip()))
+    if refer_share_id:
+        params.append(("refer_share_id", str(refer_share_id).strip()))
+    query_str = urllib.parse.urlencode(params)
     return {
-        "app_wake_url": f"pinduoduo://com.xunmeng.pinduoduo/group7.html?group_order_id={gid}",
-        "h5_join_url": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid}",
+        "app_wake_url": f"pinduoduo://com.xunmeng.pinduoduo/group7.html?{query_str}",
+        "h5_join_url": f"https://mobile.yangkeduo.com/group7.html?{query_str}",
         "brand_card_url": (
             "https://mobile.yangkeduo.com/pincard_ask.html"
-            f"?__rp_name=brand_amazing_price_group&_pdd_tc=ffffff&_pdd_sbs=1&group_order_id={gid}"
+            f"?__rp_name=brand_amazing_price_group&_pdd_tc=ffffff&_pdd_sbs=1&{query_str}"
         ),
     }
 
@@ -82,7 +95,12 @@ def parse_group_redirect_url(url: str) -> Dict[str, str]:
     refer_share_uin = (qs.get("refer_share_uin") or [""])[0].strip()
     refer_share_id = (qs.get("refer_share_id") or [""])[0].strip()
 
-    jumps = build_group_jump_urls(group_order_id)
+    jumps = build_group_jump_urls(
+        group_order_id,
+        refer_share_channel=refer_share_channel,
+        refer_share_uin=refer_share_uin,
+        refer_share_id=refer_share_id,
+    )
     return {
         "group_order_id": group_order_id,
         "redirect_url": url.strip(),
@@ -107,20 +125,31 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
     else:
         effective_status = raw_status
 
-    jumps = build_group_jump_urls(gid) if gid else {}
+    jumps = (
+        build_group_jump_urls(
+            gid,
+            refer_share_channel=str(doc.get("refer_share_channel") or ""),
+            refer_share_uin=str(doc.get("refer_share_uin") or ""),
+            refer_share_id=str(doc.get("refer_share_id") or ""),
+        )
+        if gid
+        else {}
+    )
     keywords: List[str] = [
         str(k).strip() for k in (doc.get("keywords") or []) if isinstance(k, str) and str(k).strip()
     ]
+    parse_status = str(doc.get("parse_status") or PARSE_STATUS_PENDING)
+    fallback_name = "商品信息识别未成功" if parse_status == PARSE_STATUS_FAILED else "正在识别商品名称..."
 
     return {
         "group_order_id": gid,
-        "goods_name": str(doc.get("goods_name") or "").strip() or "正在识别商品名称...",
+        "goods_name": str(doc.get("goods_name") or "").strip() or fallback_name,
         "keywords": keywords,
         "group_price": doc.get("group_price"),
         "original_price": doc.get("original_price"),
         "total_people": int(doc.get("total_people") or 0),
         "remain_people": int(doc.get("remain_people") if doc.get("remain_people") is not None else 1),
-        "parse_status": str(doc.get("parse_status") or PARSE_STATUS_PENDING),
+        "parse_status": parse_status,
         "parse_error": str(doc.get("parse_error") or ""),
         "group_status": effective_status,
         "click_count": int(doc.get("click_count") or 0),
@@ -130,7 +159,7 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
         "expires_at": int(expires_at),
         "remaining_seconds": remaining_seconds,
         "poster_url": f"/api/group_help/poster/{gid}",
-        "app_wake_url": doc.get("app_wake_url") or jumps.get("app_wake_url", ""),
-        "h5_join_url": doc.get("h5_join_url") or jumps.get("h5_join_url", ""),
-        "brand_card_url": doc.get("brand_card_url") or jumps.get("brand_card_url", ""),
+        "app_wake_url": jumps.get("app_wake_url") or doc.get("app_wake_url", ""),
+        "h5_join_url": jumps.get("h5_join_url") or doc.get("h5_join_url", ""),
+        "brand_card_url": jumps.get("brand_card_url") or doc.get("brand_card_url", ""),
     }

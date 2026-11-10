@@ -12,7 +12,7 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=20261109-4">
+  <link rel="stylesheet" href="/static/css/group_help.css?v=20261110-1">
   <script src="/static/js/vue.global.prod.js?v=ux-20261107-2"></script>
 </head>
 <body>
@@ -46,7 +46,7 @@
           type="search"
           enterkeyhint="search"
           class="gh-search-input"
-          placeholder="搜索商品名称..."
+          placeholder="搜索商品名称、关键词或团单号..."
           v-model="keyword"
           @input="onKeywordInput"
           @keyup.enter="onSearch"
@@ -148,25 +148,28 @@
                   {{ myGroupStatusText(item) }}
                 </span>
                 <span class="gh-sub-meta">
-                  {{ item.click_count || 0 }}人去过<template v-if="item.group_status === 'active'"> · 差{{ item.remain_people }}人</template>
+                  {{ item.click_count || 0 }}人去过<template v-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0"> · 差{{ item.remain_people }}人</template>
                 </span>
               </div>
               <h3 class="gh-goods-title">{{ item.goods_name }}</h3>
             </div>
 
             <div class="gh-card-footer">
-              <span class="gh-price-val" v-if="item.group_price">¥{{ item.group_price }}</span>
+              <div class="gh-price-group" v-if="item.group_price">
+                <span class="gh-price-val">¥{{ item.group_price }}</span>
+                <span class="gh-origin-price" v-if="item.original_price && item.original_price > item.group_price">¥{{ item.original_price }}</span>
+              </div>
               <span class="gh-sub-meta" v-else>见海报</span>
               <div class="gh-my-actions" @click.stop>
                 <button
-                  v-if="item.group_status === 'active'"
+                  v-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0"
                   class="gh-mini-outline-btn"
                   @click="quickMyGroupTakedown(item)"
                 >
                   已满下架
                 </button>
                 <button
-                  v-else-if="item.remaining_seconds > 0"
+                  v-else
                   class="gh-mini-outline-btn"
                   @click="quickMyGroupRelist(item)"
                 >
@@ -191,6 +194,19 @@
 
   <!-- ==================== 视图 B：大厅拼团列表 ==================== -->
   <template v-else>
+    <!-- 顶部实时识图进度提示条（仅当用户刚上传图片正在后台识图时展示） -->
+    <div
+      v-if="localPendingCount > 0"
+      class="gh-pending-banner"
+      @click="switchFilter('mine')"
+    >
+      <span class="gh-pending-banner-text">
+        <span class="gh-pulse-dot"></span>
+        您有 {{ localPendingCount }} 个拼团正在识别商品信息（约10~20秒），完成后自动上架
+      </span>
+      <span class="gh-pending-banner-link">查看进度 ›</span>
+    </div>
+
     <main class="gh-list" v-if="items.length > 0">
       <div
         v-for="item in items"
@@ -212,7 +228,10 @@
           </div>
 
           <div class="gh-card-footer">
-            <span class="gh-price-val" v-if="item.group_price">¥{{ item.group_price }}</span>
+            <div class="gh-price-group" v-if="item.group_price">
+              <span class="gh-price-val">¥{{ item.group_price }}</span>
+              <span class="gh-origin-price" v-if="item.original_price && item.original_price > item.group_price">¥{{ item.original_price }}</span>
+            </div>
             <span class="gh-sub-meta" v-else>价格见图</span>
             <button class="gh-join-btn">去参团</button>
           </div>
@@ -258,6 +277,12 @@
             <div class="gh-detail-title">{{ selectedGroup.goods_name }}</div>
             <div class="gh-detail-price-row">
               <span class="gh-detail-price" v-if="selectedGroup.group_price">¥{{ selectedGroup.group_price }}</span>
+              <span
+                class="gh-origin-price"
+                v-if="selectedGroup.original_price && selectedGroup.group_price && selectedGroup.original_price > selectedGroup.group_price"
+              >
+                ¥{{ selectedGroup.original_price }}
+              </span>
               <span class="gh-remain-badge">{{ statusBadgeText(selectedGroup) }}</span>
             </div>
             <div class="gh-sub-meta">
@@ -282,16 +307,52 @@
           </div>
         </div>
 
-        <!-- 次级操作：简洁状态反馈 -->
-        <div class="gh-cocreate-box">
-          <div class="gh-cocreate-label">参团后可顺手更新状态：</div>
-          <div class="gh-feedback-grid">
+        <!-- 次级操作 A：当拼团已下架（已满/已结束）时，提供恢复上架入口 -->
+        <div
+          class="gh-cocreate-box"
+          v-if="selectedGroup.group_status !== 'active' || selectedGroup.remaining_seconds <= 0 || selectedGroup.remain_people <= 0"
+        >
+          <div class="gh-cocreate-header">
+            <span class="gh-cocreate-label">该拼团已下架，如实际仍在凑人可恢复上架：</span>
+          </div>
+          <div class="gh-feedback-grid" style="grid-template-columns: repeat(2, 1fr);">
             <button
               class="gh-fb-btn fb-joined"
               :disabled="submittingFeedback"
+              @click="submitFeedback('set_remain', 1)"
+            >
+              🔄 恢复上架 (差1人)
+            </button>
+            <button
+              class="gh-fb-btn fb-joined"
+              :disabled="submittingFeedback"
+              @click="submitFeedback('set_remain', 2)"
+            >
+              🔄 恢复上架 (差2人)
+            </button>
+          </div>
+        </div>
+
+        <!-- 次级操作 B：进行中的拼团简洁状态反馈 -->
+        <div class="gh-cocreate-box" v-else>
+          <div class="gh-cocreate-header">
+            <span class="gh-cocreate-label">参团后可顺手更新状态：</span>
+            <button
+              v-if="selectedGroup.remain_people === 1 && (!selectedGroup.total_people || selectedGroup.total_people >= 3)"
+              class="gh-calibrate-link"
+              :disabled="submittingFeedback"
+              @click="submitFeedback('set_remain', 2)"
+            >
+              实际还差2人?
+            </button>
+          </div>
+          <div class="gh-feedback-grid">
+            <button
+              class="gh-fb-btn fb-joined"
+              :disabled="submittingFeedback || hasJoinedGroup(selectedGroup.group_order_id)"
               @click="requestFeedback('joined_one')"
             >
-              🎉 我已参团
+              {{ hasJoinedGroup(selectedGroup.group_order_id) ? '✓ 已反馈参团' : '🎉 我已参团' }}
             </button>
             <button
               class="gh-fb-btn fb-full"
@@ -391,7 +452,7 @@
       <span>首页</span>
     </a>
     <a class="gh-tab-item" href="/?tab=boom">
-      <svg viewBox="0 0 24 24"><path d="M13.5.67s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.61 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8C20 8.61 17.41 3.8 13.5.67z"/></svg>
+      <svg viewBox="0 0 24 24"><path d="M13.5.67s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.61 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8C20 8.61 17.41 3.8 13.5.67zM11.71 19c-1.78 0-3.22-1.4-3.22-3.14 0-1.62 1.05-2.76 2.81-3.12 1.77-.36 3.6-1.21 4.62-2.58.39 1.29.59 2.65.59 4.04 0 2.65-2.15 4.8-4.8 4.8z"/></svg>
       <span>爆单推广</span>
     </a>
     <a class="gh-tab-item active" href="/group_help">
@@ -408,6 +469,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=20261109-4"></script>
+<script src="/static/js/group_help.js?v=20261110-1"></script>
 </body>
 </html>

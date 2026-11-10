@@ -284,6 +284,13 @@ class GroupHelpService:
                 return False
 
             parsed_json = extract_json_object(res.get("content", ""))
+            if parsed_json.get("is_group_poster") is False and not str(parsed_json.get("goods_name") or "").strip():
+                self.repo.mark_parse_failed(
+                    gid,
+                    "未能在图中识别出拼团商品信息，请上传完整的拼多多多人团邀请海报",
+                    permanent=True,
+                )
+                return False
             self.repo.mark_parse_succeeded(gid, parsed_json)
             logger.info(
                 "【多人团识图完成】团单[%s] 商品[%s] 价格[%s] 差额[%s人]",

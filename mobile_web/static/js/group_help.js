@@ -1,7 +1,7 @@
 // 拼多多多人团互助独立前端控制器 (零阻塞后台上传 + 本地缓存含失败记录 + 手机返回键防误退 + 跨端扫码自适应)
 (function (global) {
   'use strict';
-  const { createApp, ref, onMounted, onUnmounted } = global.Vue;
+  const { createApp, ref, computed, onMounted, onUnmounted } = global.Vue;
 
   const MY_GROUPS_STORAGE_KEY = 'pdd_gh_my_groups_v1';
   const CREDIT_WARN_ACK_KEY = 'pdd_gh_credit_ack_v1';
@@ -20,10 +20,20 @@
       const submittingFeedback = ref(false);
 
       const myGroups = ref([]);
+      const joinedGroupIds = ref({});
       const selectedGroup = ref(null);
       const fullPosterUrl = ref('');
       const toastMsg = ref('');
       const fileInputRef = ref(null);
+
+      const localPendingCount = computed(
+        () =>
+          myGroups.value.filter(
+            it => it && (it.parse_status === 'uploading' || it.parse_status === 'pending')
+          ).length
+      );
+
+      const hasJoinedGroup = gid => Boolean(gid && joinedGroupIds.value[gid]);
 
       // 问号说明 / 失败原因引导弹窗
       const helpModal = ref({
@@ -141,16 +151,29 @@
         const gid = groupData.group_order_id || '';
         const lid = matchLocalId || groupData.local_id || '';
 
-        const idx = list.findIndex(
-          it => (gid && it.group_order_id === gid) || (lid && it.local_id === lid)
-        );
-        if (idx !== -1) {
-          const merged = { ...list[idx], ...groupData };
-          if (moveToTop) {
-            list.splice(idx, 1);
+        const matchedIndices = [];
+        for (let i = 0; i < list.length; i += 1) {
+          const it = list[i];
+          if ((gid && it.group_order_id === gid) || (lid && it.local_id === lid)) {
+            matchedIndices.push(i);
+          }
+        }
+
+        if (matchedIndices.length > 0) {
+          const primaryIdx = matchedIndices[0];
+          let base = {};
+          for (let k = matchedIndices.length - 1; k >= 0; k -= 1) {
+            base = { ...base, ...list[matchedIndices[k]] };
+          }
+          const merged = { ...base, ...groupData };
+          for (let k = matchedIndices.length - 1; k >= 1; k -= 1) {
+            list.splice(matchedIndices[k], 1);
+          }
+          if (moveToTop && primaryIdx > 0) {
+            list.splice(primaryIdx, 1);
             list.unshift(merged);
           } else {
-            list[idx] = merged;
+            list[primaryIdx] = merged;
           }
         } else {
           list.unshift({ ...groupData });
@@ -180,6 +203,7 @@
         if (targets.length === 0) return;
 
         let newlyParsedGroup = null;
+        let newlyFailedGroup = null;
         await Promise.all(
           targets.map(async item => {
             try {
@@ -191,6 +215,8 @@
                 upsertMyGroup(json.data, false, item.local_id || '');
                 if (wasPending && json.data.parse_status === 'parsed') {
                   newlyParsedGroup = json.data;
+                } else if (wasPending && json.data.parse_status === 'failed') {
+                  newlyFailedGroup = json.data;
                 }
               }
             } catch (_) {}
@@ -202,6 +228,8 @@
           if (filterMode.value !== 'mine') {
             fetchGroups(true);
           }
+        } else if (newlyFailedGroup) {
+          showToast('⚠️ 拼团图片未能识别出商品信息，请点【我的团】查看原因', 3500);
         } else if (showNotice) {
           showToast('已同步最新状态');
         }
@@ -226,7 +254,9 @@
         if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
           return '已结束';
         }
-        return `差 ${item.remain_people} 人`;
+        const totalNum = Number(item.total_people) || 0;
+        const prefix = totalNum >= 2 ? `${totalNum}人团 · ` : '';
+        return `${prefix}差 ${item.remain_people} 人`;
       };
 
       const myGroupStatusText = item => {
@@ -462,6 +492,9 @@
                 false,
                 localId
               );
+              if (json.data.parse_status === 'parsed') {
+                showToast(json.message || '✅ 该拼团已在大厅展示中！', 3000);
+              }
               managePendingPoll();
               if (filterMode.value !== 'mine') {
                 fetchGroups(true);
@@ -592,8 +625,8 @@
       const isMobileNonWeChat = () => {
         const ua = String((global.navigator && global.navigator.userAgent) || '');
         const isMobile = /Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(ua);
-        const isWeChat = /MicroMessenger/i.test(ua);
-        return isMobile && !isWeChat;
+        const isBlockedWebView = /MicroMessenger|QQ\/|Weibo|AlipayClient|DingTalk/i.test(ua);
+        return isMobile && !isBlockedWebView;
       };
 
       const jumpToApp = item => {
@@ -618,6 +651,10 @@
       const requestFeedback = (action, remainPeople = null) => {
         if (!selectedGroup.value || submittingFeedback.value) return;
         const gid = selectedGroup.value.group_order_id;
+        if (action === 'joined_one' && hasJoinedGroup(gid)) {
+          showToast('您已反馈过参团，无需重复点击');
+          return;
+        }
         const isTakedown =
           action === 'mark_full' ||
           action === 'mark_expired' ||
@@ -672,6 +709,13 @@
           });
           const json = await resp.json();
           if (resp.ok && json.status === 'success' && json.data) {
+            if (action === 'joined_one') {
+              joinedGroupIds.value = { ...joinedGroupIds.value, [gid]: true };
+            } else if (action === 'set_remain') {
+              const nextJoined = { ...joinedGroupIds.value };
+              delete nextJoined[gid];
+              joinedGroupIds.value = nextJoined;
+            }
             selectedGroup.value = json.data;
             if (isMyOwnGroup(gid)) {
               upsertMyGroup(json.data, false);
@@ -684,8 +728,14 @@
               } else {
                 items.value[idx] = json.data;
               }
+            } else if (json.data.group_status === 'active' && filterMode.value !== 'mine') {
+              fetchGroups(true);
             }
-            showToast('状态已更新，感谢反馈！');
+            showToast(
+              action === 'set_remain'
+                ? `已更新为还差 ${json.data.remain_people} 人！`
+                : '状态已更新，感谢反馈！'
+            );
             // 若该团已满或已失效下架，自动收起详情抽屉方便用户继续看其他团
             if (json.data.group_status !== 'active') {
               closeDetail();
@@ -722,16 +772,17 @@
 
       const quickMyGroupRelist = async item => {
         if (!item || !item.group_order_id) return;
+        const targetRemain = item.remain_people > 0 ? item.remain_people : 1;
         try {
           const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'set_remain', remain_people: 1 }),
+            body: JSON.stringify({ action: 'set_remain', remain_people: targetRemain }),
           });
           const json = await resp.json();
           if (resp.ok && json.status === 'success' && json.data) {
             upsertMyGroup(json.data, false);
-            showToast('已重新上架大厅展示');
+            showToast(`已重新上架大厅展示（差${json.data.remain_people}人）`);
           }
         } catch (_) {
           showToast('操作失败');
@@ -761,6 +812,7 @@
         total,
         hasMore,
         pendingCount,
+        localPendingCount,
         loading,
         submittingFeedback,
         myGroups,
@@ -770,6 +822,7 @@
         fileInputRef,
         helpModal,
         creditWarnModal,
+        hasJoinedGroup,
         formatRemaining,
         statusBadgeText,
         myGroupStatusText,

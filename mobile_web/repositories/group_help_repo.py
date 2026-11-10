@@ -72,13 +72,21 @@ class GroupHelpRepository(BaseRepository):
                 )
                 return updated or existing, True
 
-            # 若该团此前被标为已满/已结束，团长重新上传海报时自动恢复上架
-            if existing.get("group_status") != GROUP_STATUS_ACTIVE or int(existing.get("remain_people") or 0) <= 0:
+            # 若该团此前被标为已满/已结束或已过有效期，团长重新上传海报时自动恢复上架
+            is_expired_time = float(existing.get("expires_at") or 0) <= now
+            if (
+                existing.get("group_status") != GROUP_STATUS_ACTIVE
+                or int(existing.get("remain_people") or 0) <= 0
+                or is_expired_time
+            ):
                 restored_remain = max(1, int(existing.get("remain_people") or 1))
                 updated = self.col.find_one_and_update(
                     {"group_order_id": gid},
                     {
                         "$set": {
+                            "short_url": data.get("short_url", existing.get("short_url", "")),
+                            "redirect_url": data.get("redirect_url", existing.get("redirect_url", "")),
+                            "poster_path": data.get("poster_path", existing.get("poster_path", "")),
                             "group_status": GROUP_STATUS_ACTIVE,
                             "remain_people": restored_remain,
                             "updated_at": now,
@@ -379,9 +387,10 @@ class GroupHelpRepository(BaseRepository):
             if val == 0:
                 update_fields["group_status"] = GROUP_STATUS_FULL
             else:
+                update_fields["group_status"] = GROUP_STATUS_ACTIVE
                 expires_at = float(existing.get("expires_at") or 0)
-                if expires_at > current_ts:
-                    update_fields["group_status"] = GROUP_STATUS_ACTIVE
+                if expires_at <= current_ts + 3600:
+                    update_fields["expires_at"] = max(expires_at, current_ts + 3600)
         else:
             raise ValueError(f"不支持的反馈操作类型: {act}")
 

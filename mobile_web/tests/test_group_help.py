@@ -388,10 +388,24 @@ def test_24h_auto_expiration():
     assert len(res_23h["items"]) == 1
 
     # 24 小时 + 1 秒后自动过期下线
-    res_24h = repo.search_groups(now=base_ts + 24 * 3600 + 1)
+    expired_now = base_ts + 24 * 3600 + 1
+    res_24h = repo.search_groups(now=expired_now)
     assert len(res_24h["items"]) == 0
     doc = repo.get_by_group_order_id("3495229659187109999")
     assert doc["group_status"] == GROUP_STATUS_EXPIRED
+
+    # 过期后通过 set_remain 重新上架，应自动恢复为 active 并顺延有效期
+    relisted = repo.apply_user_feedback(
+        "3495229659187109999",
+        action="set_remain",
+        remain_people=2,
+        now=expired_now + 10,
+    )
+    assert relisted["group_status"] == GROUP_STATUS_ACTIVE
+    assert relisted["remain_people"] == 2
+    assert relisted["expires_at"] >= expired_now + 3600
+    res_after_relist = repo.search_groups(now=expired_now + 20)
+    assert len(res_after_relist["items"]) == 1
 
 
 def test_search_sorts_by_click_count_ascending_first():
