@@ -54,18 +54,12 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 }
 
 # ==============================================================================
-# 【核心配置 2】小号沙箱账号池（SUB_ACCOUNT_POOL）
-# - 调用方只需传入模型指令，内部会自动从池中筛选【拥有该模型权限且有剩余额度】的小号，
-#   并优先挑选当前并发槽位空闲的小号进行【随机路由】；
-# - 每个小号独立限制并发=2（6 个小号同时在线时，Flash 模型最高支持 6*2=12 并发，Argon 模型支持 2*2=4 并发）；
-# - 若您后续在客户端登录并归档了新小号，只要不在 EXCLUDED_MAIN_ACCOUNTS 中，也会自动纳入可用池。
+# 【核心配置 2】小号沙箱白名单账号池（SUB_ACCOUNT_POOL）
+# - 严格采用白名单策略：仅使用下列显式配置的可用小号，不做自动探测扫描；
+# - 每个小号独立限制并发=2（当前 2 个白名单小号总并发 = 2 * 2 = 4）。
 # ==============================================================================
 SUB_ACCOUNT_POOL: List[str] = [
     "guardianriedel689@gmail.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
-    "hangocbich966@gmail.com",      # Google AI Pro   (支持: 3.8-Flash)
-    "just4mike@usa.com",            # Google AI Pro   (支持: 3.8-Flash)
-    "kate.bergeron@usa.com",        # Google AI Pro   (支持: 3.8-Flash)
-    "proxgemini096@gmail.com",      # Google AI Pro   (支持: 3.8-Flash)
     "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
 ]
 
@@ -1285,11 +1279,8 @@ class AntigravityPoolClient:
 
         known_sandboxes = sync_all_known_accounts_to_sandboxes()
         raw_pool = list(account_pool) if account_pool is not None else list(SUB_ACCOUNT_POOL)
-        # 自动把本机已归档但尚未写入 SUB_ACCOUNT_POOL 的新小号也纳入池中（严格排除大号）
-        for archived_email in sorted(known_sandboxes.keys()):
-            if archived_email not in raw_pool and archived_email not in EXCLUDED_MAIN_ACCOUNTS:
-                raw_pool.append(archived_email)
 
+        # 严格白名单模式：仅纳入 SUB_ACCOUNT_POOL 中显式指定的小号（且排除大号）
         self.account_pool: List[str] = []
         for em in raw_pool:
             norm = em.strip().lower()
@@ -1298,7 +1289,7 @@ class AntigravityPoolClient:
 
         if not self.account_pool:
             raise RuntimeError(
-                f"小号沙箱池为空！请检查 SUB_ACCOUNT_POOL 或先在客户端登录小号归档。已排除大号: {EXCLUDED_MAIN_ACCOUNTS}"
+                f"小号白名单池为空！请检查 SUB_ACCOUNT_POOL: {raw_pool}。已排除大号: {EXCLUDED_MAIN_ACCOUNTS}"
             )
 
     def _get_worker(self, email: str) -> AntigravityClient:
@@ -1315,17 +1306,9 @@ class AntigravityPoolClient:
                 self._workers[norm] = worker
             return worker
 
-    def get_eligible_workers(self, target_model_enum: str) -> List[AntigravityClient]:
-        """筛选出账号池中支持 `target_model_enum` 且有剩余额度的小号节点。"""
-        eligible: List[AntigravityClient] = []
-        for email in self.account_pool:
-            worker = self._get_worker(email)
-            if worker.supports_model(target_model_enum):
-                eligible.append(worker)
-        if not eligible:
-            # 若本地缓存未命中，回退返回全部池内节点由实际调用判定
-            eligible = [self._get_worker(em) for em in self.account_pool]
-        return eligible
+    def get_eligible_workers(self, target_model_enum: str = "") -> List[AntigravityClient]:
+        """直接返回白名单池中的所有小号节点（不做动态探测）。"""
+        return [self._get_worker(email) for email in self.account_pool]
 
     def ask_with_usage(
         self,
