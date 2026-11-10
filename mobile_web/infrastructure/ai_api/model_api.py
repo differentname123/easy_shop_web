@@ -38,11 +38,13 @@ try:
     from .antigravity_client import (
         MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
         get_client as get_antigravity_client,
+        set_sub_account,
     )
 except ImportError:
     from antigravity_client import (
         MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
         get_client as get_antigravity_client,
+        set_sub_account,
     )
 
 
@@ -170,7 +172,7 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
-    {"model_name": "antigravity-3.8-flash-high", "权重": 40, "备注": "来源antigravity 本地客户端"},
+    {"model_name": "antigravity-3.8-flash-high", "权重": 100, "备注": "来源antigravity 本地客户端"},
     # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
 
 
@@ -202,7 +204,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
-    {"model_name": "antigravity-3.8-flash-medium", "权重": 4, "备注": "来源antigravity 本地客户端"},
+    {"model_name": "antigravity-3.8-flash-medium", "权重": 10, "备注": "来源antigravity 本地客户端"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。
@@ -763,6 +765,8 @@ def generate_content(
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
                     metrics["model_used"] = response_model_name
+                    if isinstance(usage, dict) and usage.get("account_email"):
+                        metrics["account_used"] = usage.get("account_email")
                     result["status"] = "✅ 成功"
                     result["content"] = reply.strip()
                     req_cost = time.perf_counter() - request_started
@@ -778,14 +782,24 @@ def generate_content(
                     request_event["response_model"] = response_model_name
                 except Exception as exc:
                     status_code = getattr(exc, "status_code", None) or status_code
+                    failed_account = getattr(exc, "account_email", None)
+                    failed_port = getattr(exc, "sandbox_port", None)
+                    if failed_account:
+                        metrics["account_used"] = failed_account
+                    acc_tag = (
+                        f" | 账号: [{failed_account}" + (f"(Port:{failed_port})]" if failed_port else "]")
+                        if failed_account
+                        else ""
+                    )
                     error = _redact(f"[尝试{metrics['attempts']}] model: {current_model}"
-                                    f" | Error: {type(exc).__name__}: {exc}")
+                                    + (f" | account: {failed_account}" if failed_account else "")
+                                    + f" | Error: {type(exc).__name__}: {exc}")
                     result["error_history"].append(error)
                     request_event["status"] = "❌ 失败"
                     request_event["error"] = error
                     terminal = attempt == max_retries_per_model and model_index == len(models) - 1
                     if attempt < max_retries_per_model:
-                        action = f"等待 {delay:g}s 后重试同模型"
+                        action = f"等待 {delay:g}s 后重试同模型" + ("(自动切换池中其他小号)" if failed_account else "")
                     elif not terminal:
                         action = f"切换备用模型 {models[model_index + 1]}"
                     else:
@@ -800,7 +814,7 @@ def generate_content(
                     req_cost = time.perf_counter() - request_started
                     if terminal:
                         completion_log = (
-                            f"❌ [模型网关/失败] 所有候选模型尝试耗尽 | 最终模型: [{current_model}]"
+                            f"❌ [模型网关/失败] 所有候选模型尝试耗尽 | 最终模型: [{current_model}]{acc_tag}"
                             f" | 累计尝试: [{metrics['attempts']}] | HTTP: [{status_code or 'N/A'}]"
                             f" | 总耗时: [{time.perf_counter() - started:.2f}s]"
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 160)}]"
@@ -809,7 +823,7 @@ def generate_content(
                         level = logging.ERROR
                     else:
                         completion_log = (
-                            f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]"
+                            f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]{acc_tag}"
                             f" | 尝试: [{attempt}/{max_retries_per_model} (累计:{metrics['attempts']})]"
                             f" | HTTP: [{status_code or 'N/A'}] | 耗时: [{req_cost:.2f}s]"
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 140)}]"
@@ -933,8 +947,11 @@ def probe_models(json_path):
 
 
 if __name__ == "__main__":
+    # 默认直接启用 SUB_ACCOUNT_POOL 多小号随机池（无需手动指定单个账号）
     test_models = [
-        "gemini-web-3.8-flash-thinking-max"
+        "antigravity-argon-high",
+        "antigravity-3.8-flash-high",
+        "antigravity-3.8-flash-medium",
     ]
     # 使用需要多步逻辑推理/电商凑单计算的同题测试，并限制最终输出简短，使耗时主要反映内部思考深度
     test_prompts = [
@@ -995,10 +1012,14 @@ if __name__ == "__main__":
             )
             cost = res["metrics"]["total_time_seconds"]
             attempts = res["metrics"]["attempts"]
+            acc_used = res["metrics"].get("account_used") or "未知"
             status = res["status"]
             content_one_line = res["content"].replace("\r", " ").replace("\n", " ")
             stats[m].append(cost)
-            print(f"  - [{m:<28}] 状态: {status} | 耗时: {cost:6.2f}s (尝试:{attempts}) | 回答: {content_one_line[:90]}")
+            print(
+                f"  - [{m:<28}] 状态: {status} | 账号: {acc_used:<28} "
+                f"| 耗时: {cost:6.2f}s (尝试:{attempts}) | 回答: {content_one_line[:75]}"
+            )
 
     print("\n" + "=" * 80)
     print("📊 多轮同题测试汇总统计（按平均耗时从高到低排序）：")

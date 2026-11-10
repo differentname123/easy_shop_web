@@ -4,7 +4,9 @@
 from .antigravity_client import (
     MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
     SUB_ACCOUNT_EMAIL,
+    SUB_ACCOUNT_POOL,
     AntigravityClient,
+    AntigravityPoolClient,
     archive_current_desktop_account,
     ask,
     ask_antigravity,
@@ -12,13 +14,16 @@ from .antigravity_client import (
     ask_json,
     get_client,
     set_sub_account,
+    set_sub_account_pool,
 )
 from .model_api import generate_content, probe_models
 
 __all__ = [
     "ANTIGRAVITY_MODEL_ALIASES",
     "SUB_ACCOUNT_EMAIL",
+    "SUB_ACCOUNT_POOL",
     "AntigravityClient",
+    "AntigravityPoolClient",
     "archive_current_desktop_account",
     "ask",
     "ask_antigravity",
@@ -28,4 +33,5 @@ __all__ = [
     "get_client",
     "probe_models",
     "set_sub_account",
+    "set_sub_account_pool",
 ]

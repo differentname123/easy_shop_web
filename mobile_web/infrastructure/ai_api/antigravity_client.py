@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Antigravity Official Local Client (100% Safe, Native Cascade + Sub-Account Sandbox Isolation)
-=============================================================================================
+Antigravity Official Local Client (Multi-Account Sandbox Pool + High Concurrency + Native Cascade)
+==================================================================================================
 
-原理说明（为什么绝对安全、不会封号、且大号小号完全物理隔离）：
+原理说明（为什么绝对安全、高并发、且大号小号 100% 物理隔离）：
 1. 本模块【绝不伪造】任何发往 Google 的请求头或 TLS 指纹，100% 由官方原版 `language_server.exe` 发起通信。
-2. 支持【小号沙箱隔离模式（SUB_ACCOUNT_EMAIL）】：
-   - 利用官方 `language_server.exe` 内置的 `SSH_CONNECTION` 文件凭证存储机制与独立 `USERPROFILE` 沙箱目录，
-     在同一台 Windows 电脑上启动与桌面端大号完全物理隔离的小号专属 `language_server.exe` 进程；
-   - 桌面端大号继续使用 Windows 凭据管理器（`gemini:antigravity`），小号沙箱只读写独立沙箱目录
-     `%LOCALAPPDATA%\\Antigravity\\sandboxes\\<小号邮箱>\\.gemini\\jetski-standalone-oauth-token`；
-   - 每次连接时强制调用 `GetUserStatus` 校验云端返回的真实邮箱（`userStatus.email`），若与配置的小号不一致立即熔断抛错，
-     100% 杜绝误用大号客户端能力。
+2. 支持【多小号沙箱账号池（SUB_ACCOUNT_POOL）】：
+   - 池子中的每个小号都会在 `%LOCALAPPDATA%\\Antigravity\\sandboxes\\<小号邮箱>\\` 下启动各自物理隔离的
+     官方 `language_server.exe` 进程（独立进程、独立端口、独立登录态文件、独立设备 UUID）；
+   - 桌面端大号（`EXCLUDED_MAIN_ACCOUNTS`）被严格排除在账号池之外，100% 绝不触碰大号；
+   - 每个小号独立享有 `max_concurrency_per_account=2` 的跨进程并发锁与独立错峰锁（6 个小号即支持最高 12 并发）；
+   - 调用方只需指定模型名（如 `antigravity-3.8-flash-high` 或 `antigravity-argon-high`），内部路由器会自动
+     识别哪些小号拥有该模型的调用权限与剩余额度，并从当前空闲槽位的小号中【随机选择】一个执行；
+   - 每次调用（无论成功或异常重试）均会返回并记录实际使用的小号邮箱与沙箱端口，方便溯源与成功率复盘。
 3. 所有请求（无论纯文本还是多模态图片）100% 严格向桌面客户端原生使用方式看齐：
    统一走 `StartCascade` -> `SendUserCascadeMessage` -> `WaitForConversationFullyIdle` -> `GetCascadeTrajectory`，
    并在 `finally` 中立即调用 `DeleteCascadeTrajectory` + `JetboxDeleteSummary` 自动无痕销毁会话。
-4. 内置基于操作系统内核文件锁的【多进程全局并发限制（默认全局并发=2）+ 跨进程错峰发包】，
-   即使同时运行多个 Python 脚本进程，整机总并发也严格不超过设定上限。
 """
 
 from __future__ import annotations
@@ -48,13 +47,32 @@ else:
 
 
 # ==============================================================================
-# 【核心配置】指定用于后台 AI 调用的独立小号邮箱（Sub-Account Sandbox）
-# - 填入小号邮箱（如 "richard.nowak@usa.com"）：强制使用与桌面端大号完全物理隔离的小号沙箱进程；
-# - 设为 None 或 ""：默认直接复用桌面端当前登录的账号；
-# - 也可通过环境变量 ANTIGRAVITY_SUB_ACCOUNT 动态覆盖。
+# 【核心配置 1】桌面端大号保护名单（严禁放入小号池，100% 物理隔离保护）
 # ==============================================================================
+EXCLUDED_MAIN_ACCOUNTS: set[str] = {
+    "zhuxiaohu98@gmail.com",
+}
+
+# ==============================================================================
+# 【核心配置 2】小号沙箱账号池（SUB_ACCOUNT_POOL）
+# - 调用方只需传入模型指令，内部会自动从池中筛选【拥有该模型权限且有剩余额度】的小号，
+#   并优先挑选当前并发槽位空闲的小号进行【随机路由】；
+# - 每个小号独立限制并发=2（6 个小号同时在线时，Flash 模型最高支持 6*2=12 并发，Argon 模型支持 2*2=4 并发）；
+# - 若您后续在客户端登录并归档了新小号，只要不在 EXCLUDED_MAIN_ACCOUNTS 中，也会自动纳入可用池。
+# ==============================================================================
+SUB_ACCOUNT_POOL: List[str] = [
+    "guardianriedel689@gmail.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
+    "hangocbich966@gmail.com",      # Google AI Pro   (支持: 3.8-Flash)
+    "just4mike@usa.com",            # Google AI Pro   (支持: 3.8-Flash)
+    "kate.bergeron@usa.com",        # Google AI Pro   (支持: 3.8-Flash)
+    "proxgemini096@gmail.com",      # Google AI Pro   (支持: 3.8-Flash)
+    "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
+]
+
+# 若设为 None（默认），则启用上面的 SUB_ACCOUNT_POOL 多小号随机池；
+# 若填入单个邮箱（或通过环境变量 ANTIGRAVITY_SUB_ACCOUNT 指定），则强制只使用该单一小号。
 SUB_ACCOUNT_EMAIL: Optional[str] = (
-    os.environ.get("ANTIGRAVITY_SUB_ACCOUNT", "richard.nowak@usa.com").strip() or None
+    os.environ.get("ANTIGRAVITY_SUB_ACCOUNT", "").strip().lower() or None
 )
 
 
@@ -316,13 +334,9 @@ def archive_current_desktop_account() -> Optional[str]:
 
 class AntigravityClient:
     """
-    基于官方本地 language_server.exe 的安全调用客户端（支持小号沙箱物理隔离）。
-    - 当设置了 `sub_account_email`（默认读取模块顶部 `SUB_ACCOUNT_EMAIL`）：
-      强制连接/启动该小号专属的隔离沙箱 `language_server.exe` 进程，并通过 `GetUserStatus`
-      硬性校验云端返回的真实邮箱（`userStatus.email`），绝不触碰桌面端正在使用的大号；
-    - 当 `sub_account_email=None`：
-      直接复用桌面客户端当前打开的后台进程（若关闭则静默自启）；
-    - 内置【跨进程全局并发控制（默认 max_concurrency=2 对多进程全局生效）+ 跨进程错峰发包间隔（Stagger）】。
+    基于官方本地 language_server.exe 的单账号沙箱客户端（或被 AntigravityPoolClient 调度的工作节点）。
+    - 每个小号拥有独立的 `language_server.exe` 沙箱进程、独立的跨进程并发锁（默认单号并发=2）与独立的错峰锁；
+    - 连接建立时强制通过 `GetUserStatus` 校验云端返回的真实邮箱（`userStatus.email`），并自动缓存该账号支持的模型列表。
     """
 
     def __init__(
@@ -341,10 +355,12 @@ class AntigravityClient:
         self.timeout = timeout
         self.auto_start = auto_start
         self.sub_account_email = sub_account_email.strip().lower() if sub_account_email else None
+        self._lock_key = _sanitize_email_dirname(self.sub_account_email) if self.sub_account_email else "default"
         self._http_port = http_port
         self._csrf_token = csrf_token
         self._server_pid: Optional[int] = None
         self._verified_email: Optional[str] = None
+        self._supported_model_quotas: Dict[str, float] = {}
 
         self._max_concurrency = max(1, int(max_concurrency))
         self._concurrency_sem = threading.BoundedSemaphore(self._max_concurrency)
@@ -384,41 +400,56 @@ class AntigravityClient:
         except OSError:
             pass
 
-    @contextlib.contextmanager
-    def _acquire_global_slot(self):
-        """
-        跨进程 + 跨线程全局并发槽位锁（如 max_concurrency=2 对本机所有 Python 进程同时生效）：
-        1. 先获取当前进程内 BoundedSemaphore；
-        2. 轮询争抢 0 .. max_concurrency-1 号全局锁文件槽位；
-        3. 获取槽位后执行跨进程错峰延迟 (_wait_for_stagger_slot)。
-        """
-        with self._concurrency_sem:
-            GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-            locked_fd: Optional[int] = None
-            while locked_fd is None:
-                for slot_idx in range(self._max_concurrency):
-                    slot_file = GLOBAL_LOCK_DIR / f"ag_concurrency_slot_{slot_idx}.lock"
-                    fd: Optional[int] = None
+    def _try_acquire_os_slot_fd(self) -> Optional[int]:
+        """尝试非阻塞获取当前账号专属的 0 .. max_concurrency-1 号跨进程并发锁文件槽位。"""
+        GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        for slot_idx in range(self._max_concurrency):
+            slot_file = GLOBAL_LOCK_DIR / f"ag_slot_{self._lock_key}_{slot_idx}.lock"
+            fd: Optional[int] = None
+            try:
+                fd = os.open(str(slot_file), os.O_CREAT | os.O_RDWR)
+                if os.fstat(fd).st_size == 0:
                     try:
-                        fd = os.open(str(slot_file), os.O_CREAT | os.O_RDWR)
-                        if os.fstat(fd).st_size == 0:
-                            try:
-                                os.write(fd, b"0")
-                            except OSError:
-                                pass
-                        if self._try_lock_fd(fd):
-                            locked_fd = fd
-                            break
+                        os.write(fd, b"0")
+                    except OSError:
+                        pass
+                if self._try_lock_fd(fd):
+                    return fd
+                os.close(fd)
+            except OSError:
+                if fd is not None:
+                    try:
                         os.close(fd)
                     except OSError:
-                        if fd is not None:
-                            try:
-                                os.close(fd)
-                            except OSError:
-                                pass
+                        pass
+        return None
+
+    @contextlib.contextmanager
+    def _acquire_account_slot(self, pre_acquired_fd: Optional[int] = None):
+        """
+        获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=2 个跨进程并发槽位）：
+        - 若由账号池调度器传入了已经非阻塞抢到的 `pre_acquired_fd`，则直接使用；
+        - 否则在当前账号的槽位上等待直到空闲。
+        """
+        if pre_acquired_fd is not None:
+            try:
+                self._wait_for_stagger_slot()
+                yield
+            finally:
+                self._unlock_fd(pre_acquired_fd)
+                try:
+                    os.close(pre_acquired_fd)
+                except OSError:
+                    pass
+                self._concurrency_sem.release()
+            return
+
+        with self._concurrency_sem:
+            locked_fd: Optional[int] = None
+            while locked_fd is None:
+                locked_fd = self._try_acquire_os_slot_fd()
                 if locked_fd is None:
                     time.sleep(random.uniform(0.08, 0.16))
-
             try:
                 self._wait_for_stagger_slot()
                 yield
@@ -429,6 +460,35 @@ class AntigravityClient:
                 except OSError:
                     pass
 
+    def try_claim_idle_slot(self) -> Optional[int]:
+        """
+        供多账号池调度器调用：非阻塞尝试抢占当前小号的一个空闲并发槽位。
+        若当前小号未满载（并发 < 2），立即返回锁文件 fd；若已满载，立即返回 None。
+        """
+        if not self._concurrency_sem.acquire(blocking=False):
+            return None
+        fd = self._try_acquire_os_slot_fd()
+        if fd is None:
+            self._concurrency_sem.release()
+            return None
+        return fd
+
+    @staticmethod
+    def _hidden_subprocess_kwargs() -> Dict[str, Any]:
+        """
+        构造完全静默的子进程启动参数（严禁混用 DETACHED_PROCESS）：
+        - 在 Windows 中，仅使用 `CREATE_NO_WINDOW (0x08000000)` + `SW_HIDE` 会为 `language_server.exe`
+          分配一个隐藏控制台，其后续派生的任何子进程（如 git.exe / cmd.exe）都会继承该隐藏控制台，绝不闪黑框。
+        """
+        kwargs: Dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+            si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kwargs["startupinfo"] = si
+        return kwargs
+
     @staticmethod
     def _get_live_ls_processes() -> Dict[int, Dict[str, str]]:
         """获取当前正在运行的 language_server.exe 进程列表: {pid: {'csrf_token': ..., 'cmdline': ...}}。"""
@@ -437,11 +497,20 @@ class AntigravityClient:
             cmd = [
                 "powershell",
                 "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
                 "-Command",
                 "Get-CimInstance Win32_Process -Filter \"Name='language_server.exe'\" "
                 "| Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress",
             ]
-            out = subprocess.check_output(cmd, text=True, timeout=10, stderr=subprocess.DEVNULL).strip()
+            out = subprocess.check_output(
+                cmd,
+                text=True,
+                timeout=10,
+                stderr=subprocess.DEVNULL,
+                **AntigravityClient._hidden_subprocess_kwargs(),
+            ).strip()
             if not out:
                 return live
             data = json.loads(out)
@@ -521,20 +590,21 @@ class AntigravityClient:
         csrf_token: str,
         pid: Optional[int] = None,
         wait_seconds: float = 10.0,
+        sandbox_dir: Optional[Path] = None,
     ) -> tuple[int, str]:
         """
-        【防串号核心铁闸】：连接建立后立即调用 GetUserStatus，向 Google 云端核实当前进程的真实账号邮箱。
-        如果配置了 `self.sub_account_email`，则返回的 `userStatus.email` 必须 100% 严格匹配该小号，
-        否则立即抛出异常熔断，绝不允许误用大号！
+        【防串号核心铁闸】：连接建立后立即调用 GetUserStatus，向 Google 云端核实当前进程的真实账号邮箱，
+        同时提取该账号支持的所有模型枚举与剩余额度缓存在本地。
         """
         deadline = time.time() + max(1.0, wait_seconds)
         actual_email: Optional[str] = None
+        status_data: Dict[str, Any] = {}
         last_err: Optional[Exception] = None
 
         while time.time() < deadline:
             try:
-                status = self._raw_rpc_call(port, csrf_token, "GetUserStatus", {}, timeout=8.0)
-                email = ((status.get("userStatus") or {}).get("email") or "").strip().lower()
+                status_data = self._raw_rpc_call(port, csrf_token, "GetUserStatus", {}, timeout=8.0)
+                email = ((status_data.get("userStatus") or {}).get("email") or "").strip().lower()
                 if email:
                     actual_email = email
                     break
@@ -555,18 +625,79 @@ class AntigravityClient:
                 f"已强制拦截本次调用，确保绝不消耗大号额度。"
             )
 
+        # 解析并缓存该账号支持的模型枚举与剩余额度
+        configs = (
+            (status_data.get("userStatus") or {})
+            .get("cascadeModelConfigData", {})
+            .get("clientModelConfigs", [])
+        )
+        quotas: Dict[str, float] = {}
+        for cfg in configs:
+            m_enum = (cfg.get("modelOrAlias") or {}).get("model")
+            rem = (cfg.get("quotaInfo") or {}).get("remainingFraction")
+            if m_enum:
+                quotas[str(m_enum)] = float(rem) if rem is not None else 1.0
+        if quotas:
+            self._supported_model_quotas = quotas
+
         self._http_port = port
         self._csrf_token = csrf_token
         self._server_pid = pid
         self._verified_email = actual_email
+
+        if sandbox_dir is not None:
+            try:
+                (sandbox_dir / "sandbox_runtime.json").write_text(
+                    json.dumps(
+                        {
+                            "pid": pid,
+                            "port": port,
+                            "csrf_token": csrf_token,
+                            "email": actual_email,
+                            "supported_model_quotas": self._supported_model_quotas,
+                            "updated_at": time.time(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+
         return port, csrf_token
 
+    def supports_model(self, target_model_enum: str) -> bool:
+        """
+        判断当前小号是否拥有目标模型（如 Argon 或 Flash）的调用权限且剩余额度 > 0。
+        优先读取本地 `sandbox_runtime.json` 缓存，若无缓存则触发一次连接探活。
+        """
+        if not self._supported_model_quotas and self.sub_account_email:
+            runtime_file = (
+                SANDBOX_ROOT_DIR
+                / _sanitize_email_dirname(self.sub_account_email)
+                / "sandbox_runtime.json"
+            )
+            if runtime_file.exists():
+                try:
+                    rt = json.loads(runtime_file.read_text(encoding="utf-8"))
+                    cached_q = rt.get("supported_model_quotas")
+                    if isinstance(cached_q, dict) and cached_q:
+                        self._supported_model_quotas = {str(k): float(v) for k, v in cached_q.items()}
+                except Exception:
+                    pass
+
+        if not self._supported_model_quotas:
+            try:
+                self._ensure_connection_info()
+            except Exception:
+                return False
+
+        if not self._supported_model_quotas:
+            return True
+        return self._supported_model_quotas.get(target_model_enum, 0.0) > 0.0
+
     def _start_sandbox_or_headless_server(self, sandbox_dir: Optional[Path] = None) -> tuple[int, str]:
-        """
-        后台静默启动官方 language_server.exe（无 GUI 窗口）：
-        - 若传入 `sandbox_dir`（小号沙箱模式）：通过 `SSH_CONNECTION` + 独立 `USERPROFILE` 启动完全物理隔离的进程；
-        - 若未传 `sandbox_dir`（默认模式）：启动默认无头进程。
-        """
+        """后台静默启动官方 language_server.exe（无 GUI 窗口、子进程继承隐藏控制台绝不闪框）。"""
         if not DEFAULT_LS_BIN.exists():
             raise RuntimeError(f"未找到官方 language_server.exe: {DEFAULT_LS_BIN}")
 
@@ -584,7 +715,6 @@ class AntigravityClient:
             local_dir.mkdir(parents=True, exist_ok=True)
 
             log_path = sandbox_dir / "language_server_sandbox.log"
-            # 触发官方 language_server.exe 内置的文件凭证模式，彻底隔离 Windows 凭据管理器中的大号凭证
             env["SSH_CONNECTION"] = "127.0.0.1 22 127.0.0.1 22"
             env["USERPROFILE"] = str(sandbox_dir)
             env["HOME"] = str(sandbox_dir)
@@ -608,22 +738,18 @@ class AntigravityClient:
             "--app_data_dir", "antigravity",
             "--api_server_url", "https://generativelanguage.googleapis.com",
             "--cloud_code_endpoint", "https://daily-cloudcode-pa.googleapis.com",
-            "--enable_sidecars",
         ]
         if sandbox_dir is not None:
             args.extend(["--gemini_dir", str(sandbox_dir / ".gemini")])
 
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
-            subprocess, "DETACHED_PROCESS", 0x00000008
-        )
         proc = subprocess.Popen(
             args,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             env=env,
-            creationflags=creationflags,
             close_fds=True,
+            **self._hidden_subprocess_kwargs(),
         )
 
         http_port: Optional[int] = None
@@ -653,13 +779,14 @@ class AntigravityClient:
             csrf_token=csrf_token,
             pid=proc.pid,
             wait_seconds=12.0,
+            sandbox_dir=sandbox_dir,
         )
 
     @contextlib.contextmanager
     def _acquire_discovery_file_lock(self):
         """跨进程服务发现/启动互斥锁：防止多个 Python 进程同时启动时重复拉起多个沙箱 language_server.exe。"""
         GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-        lock_file = GLOBAL_LOCK_DIR / "ag_discovery.lock"
+        lock_file = GLOBAL_LOCK_DIR / f"ag_discovery_{self._lock_key}.lock"
         fd: Optional[int] = None
         while fd is None:
             candidate_fd: Optional[int] = None
@@ -691,39 +818,46 @@ class AntigravityClient:
                 pass
 
     def _discover_local_server(self) -> tuple[int, str]:
-        """
-        自动发现或拉起官方 language_server.exe：
-        - 当配置了 `self.sub_account_email`（小号沙箱模式）时：
-          【绝不读取】桌面端大号的 `DEFAULT_LOG_PATH`，只连接或启动该小号专属沙箱目录下的进程，
-          并强制通过 `GetUserStatus` 验证云端账号身份！
-        - 当未配置 `self.sub_account_email` 时：
-          复用桌面端进程或启动无头进程。
-        """
+        """自动发现或拉起当前小号沙箱专属的官方 language_server.exe。"""
         with self._discovery_lock:
             if self._http_port and self._csrf_token:
                 return self._http_port, self._csrf_token
 
             with self._acquire_discovery_file_lock():
-                live_procs = self._get_live_ls_processes()
-
-                # 分支 A：小号沙箱隔离模式（100% 物理隔离桌面端大号）
                 if self.sub_account_email:
                     known_sandboxes = sync_all_known_accounts_to_sandboxes()
                     sandbox_dir = known_sandboxes.get(self.sub_account_email)
                     if not sandbox_dir:
                         available = sorted(known_sandboxes.keys())
                         raise RuntimeError(
-                            f"未找到小号 [{self.sub_account_email}] 的已归档登录凭证！\n"
-                            f"当前已归档可用的账号列表: {available}\n"
-                            f"👉 若要添加新小号：请先在 Antigravity 客户端登录一次该新小号，然后运行 "
-                            f"`python -m mobile_web.infrastructure.ai_api.antigravity_client` 自动完成凭证归档，之后客户端即可切回大号。"
+                            f"未找到小号 [{self.sub_account_email}] 的已归档登录凭证！可用账号: {available}"
                         )
 
+                    # 1. 优先直接读取 sandbox_runtime.json 通过 HTTP 探活（零子进程开销，不拉起 powershell）
+                    runtime_file = sandbox_dir / "sandbox_runtime.json"
+                    if runtime_file.exists():
+                        try:
+                            rt = json.loads(runtime_file.read_text(encoding="utf-8"))
+                            rt_port = int(rt.get("port") or 0)
+                            rt_token = str(rt.get("csrf_token") or "")
+                            rt_pid = int(rt.get("pid") or 0) or None
+                            if rt_port and rt_token:
+                                return self._verify_and_bind_connection(
+                                    port=rt_port,
+                                    csrf_token=rt_token,
+                                    pid=rt_pid,
+                                    wait_seconds=2.5,
+                                    sandbox_dir=sandbox_dir,
+                                )
+                        except Exception:
+                            pass
+
+                    # 2. 回退通过进程表查找
+                    live_procs = self._get_live_ls_processes()
                     sandbox_log = sandbox_dir / "language_server_sandbox.log"
                     pid, port = self._parse_log_pid_and_port(sandbox_log)
                     if pid and port and pid in live_procs:
                         cmdline = live_procs[pid].get("cmdline") or ""
-                        # 确保该 PID 确实属于当前小号沙箱目录
                         if str(sandbox_dir).lower() in cmdline.lower():
                             try:
                                 return self._verify_and_bind_connection(
@@ -731,6 +865,7 @@ class AntigravityClient:
                                     csrf_token=live_procs[pid]["csrf_token"],
                                     pid=pid,
                                     wait_seconds=5.0,
+                                    sandbox_dir=sandbox_dir,
                                 )
                             except Exception:
                                 pass
@@ -742,7 +877,8 @@ class AntigravityClient:
                         f"小号 [{self.sub_account_email}] 的沙箱 language_server.exe 未运行且 auto_start=False。"
                     )
 
-                # 分支 B：默认模式（未指定小号，直接复用桌面客户端当前账号）
+                # 默认模式（未指定小号，直接复用桌面客户端当前账号）
+                live_procs = self._get_live_ls_processes()
                 for log_path in (DEFAULT_LOG_PATH, HEADLESS_LOG_PATH):
                     pid, port = self._parse_log_pid_and_port(log_path)
                     if pid and port and pid in live_procs:
@@ -766,13 +902,13 @@ class AntigravityClient:
         return self._discover_local_server()
 
     def _wait_for_stagger_slot(self) -> None:
-        """跨进程确保每次大模型请求的发起时间错开 0.8~1.8 秒，消除『同一毫秒并发轰炸』的脚本特征。"""
+        """按单个小号维度进行跨进程错峰（0.8~1.8 秒），不同小号之间互不等待、可同时并行发包！"""
         if self._max_stagger <= 0:
             return
         with self._pacing_lock:
             GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-            pacing_lock_file = GLOBAL_LOCK_DIR / "ag_pacing.lock"
-            pacing_state_file = GLOBAL_LOCK_DIR / "ag_pacing.state"
+            pacing_lock_file = GLOBAL_LOCK_DIR / f"ag_pacing_{self._lock_key}.lock"
+            pacing_state_file = GLOBAL_LOCK_DIR / f"ag_pacing_{self._lock_key}.state"
             fd: Optional[int] = None
             while fd is None:
                 candidate_fd: Optional[int] = None
@@ -834,7 +970,7 @@ class AntigravityClient:
     ) -> Dict[str, Any]:
         """调用本地官方 LanguageServerService ConnectRPC 接口（强制直连 127.0.0.1，不经过外部代理）。"""
         if apply_rate_limit:
-            with self._acquire_global_slot():
+            with self._acquire_account_slot():
                 return self._post_rpc_inner(method, payload, retry_discovery=retry_discovery, timeout=timeout)
         return self._post_rpc_inner(method, payload, retry_discovery=retry_discovery, timeout=timeout)
 
@@ -908,125 +1044,124 @@ class AntigravityClient:
         system_prompt: Optional[str] = None,
         media: Optional[List[Dict[str, str]]] = None,
         timeout: Optional[float] = None,
+        _pre_acquired_fd: Optional[int] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         """
-        统一的模型生成接口（严格与桌面客户端原生对话行为保持一致，返回 (reply_text, usage_dict)）。
-        - 无论纯文本还是多模态图片，统一走客户端原生 Cascade 会话流：
-          StartCascade -> SendUserCascadeMessage -> WaitForConversationFullyIdle -> GetCascadeTrajectory
-        - 在 finally 中立即调用 DeleteCascadeTrajectory + JetboxDeleteSummary 彻底无痕销毁临时会话。
-        - 全程受跨进程全局并发锁（默认 max_concurrency=2）与错峰发包保护。
-        - 返回的 usage_dict 中额外携带经云端验证的 `account_email` 与 `sandbox_port`，便于日志审计。
+        单账号的统一模型生成接口（走原生 Cascade 会话流，自动无痕清理，并在返回结果与异常上均绑定账号信息）。
         """
         target_model = self.resolve_model_enum(model or self.default_model)
         full_prompt = f"{system_prompt.strip()}\n\n{prompt}" if system_prompt else prompt
         req_timeout = float(timeout) if timeout is not None else self.timeout
-        workspace_uri = Path.cwd().resolve().as_uri()
 
-        with self._acquire_global_slot():
-            start_resp = self._post_rpc_inner(
-                "StartCascade",
-                {
-                    "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT",
-                    "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
-                    "requestedModel": target_model,
-                    "workspaceUris": [workspace_uri],
-                },
-                timeout=min(req_timeout, 30.0),
-            )
-            cascade_id = start_resp.get("cascadeId")
-            if not cascade_id:
-                raise RuntimeError("StartCascade 未返回有效的 cascadeId")
-
-            try:
-                no_tool_guard = (
-                    "【系统强制约束：当前为非交互式分析与生成模式，严禁调用任何工具(tools/subagents/commands)，"
-                    "请直接阅读下方提供的上下文与提示词，直接输出最终文本或JSON结果。】\n\n"
-                )
-                send_payload: Dict[str, Any] = {
-                    "cascadeId": cascade_id,
-                    "items": [{"text": no_tool_guard + full_prompt}],
-                    "cascadeConfig": {
-                        "plannerConfig": {
-                            "conversational": {"agenticMode": False},
-                            "requestedModel": {"model": target_model},
-                            "planModel": target_model,
-                            "useAiCredits": True,
-                            "supportsLatexRendering": True,
-                        },
-                        "executorConfig": {
-                            "useCoreDirect": True,
-                        },
-                        "conversationHistoryConfig": {},
-                    },
-                }
-                if media:
-                    send_payload["media"] = media
-
-                self._post_rpc_inner(
-                    "SendUserCascadeMessage",
-                    send_payload,
-                    timeout=req_timeout,
-                )
-                wait_resp = self._post_rpc_inner(
-                    "WaitForConversationFullyIdle",
+        try:
+            with self._acquire_account_slot(pre_acquired_fd=_pre_acquired_fd):
+                start_resp = self._post_rpc_inner(
+                    "StartCascade",
                     {
-                        "conversationId": cascade_id,
-                        "inactivityTimeoutSeconds": max(15, int(req_timeout)),
-                        "returnOnExecutorError": True,
+                        "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT",
+                        "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+                        "requestedModel": target_model,
+                        "workspaceUris": [],
                     },
-                    timeout=req_timeout + 15.0,
+                    timeout=min(req_timeout, 30.0),
                 )
-                if wait_resp.get("timedOut"):
-                    raise TimeoutError(f"Antigravity Cascade 生成等待超时 ({req_timeout}s)")
+                cascade_id = start_resp.get("cascadeId")
+                if not cascade_id:
+                    raise RuntimeError("StartCascade 未返回有效的 cascadeId")
 
-                traj_resp = self._post_rpc_inner(
-                    "GetCascadeTrajectory",
-                    {"cascadeId": cascade_id},
-                    timeout=30.0,
-                )
-                steps = traj_resp.get("trajectory", {}).get("steps", [])
-                planner_steps = [
-                    s for s in steps
-                    if s.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
-                    and (s.get("plannerResponse") or {}).get("response")
-                ]
-                if not planner_steps:
-                    error_steps = [
+                try:
+                    no_tool_guard = (
+                        "【系统强制约束：当前为非交互式分析与生成模式，严禁调用任何工具(tools/subagents/commands)，"
+                        "请直接阅读下方提供的上下文与提示词，直接输出最终文本或JSON结果。】\n\n"
+                    )
+                    send_payload: Dict[str, Any] = {
+                        "cascadeId": cascade_id,
+                        "items": [{"text": no_tool_guard + full_prompt}],
+                        "cascadeConfig": {
+                            "plannerConfig": {
+                                "conversational": {"agenticMode": False},
+                                "requestedModel": {"model": target_model},
+                                "planModel": target_model,
+                                "useAiCredits": True,
+                                "supportsLatexRendering": True,
+                            },
+                            "executorConfig": {
+                                "useCoreDirect": True,
+                            },
+                            "conversationHistoryConfig": {},
+                        },
+                    }
+                    if media:
+                        send_payload["media"] = media
+
+                    self._post_rpc_inner(
+                        "SendUserCascadeMessage",
+                        send_payload,
+                        timeout=req_timeout,
+                    )
+                    wait_resp = self._post_rpc_inner(
+                        "WaitForConversationFullyIdle",
+                        {
+                            "conversationId": cascade_id,
+                            "inactivityTimeoutSeconds": max(15, int(req_timeout)),
+                            "returnOnExecutorError": True,
+                        },
+                        timeout=req_timeout + 15.0,
+                    )
+                    if wait_resp.get("timedOut"):
+                        raise TimeoutError(f"Antigravity Cascade 生成等待超时 ({req_timeout}s)")
+
+                    traj_resp = self._post_rpc_inner(
+                        "GetCascadeTrajectory",
+                        {"cascadeId": cascade_id},
+                        timeout=30.0,
+                    )
+                    steps = traj_resp.get("trajectory", {}).get("steps", [])
+                    planner_steps = [
                         s for s in steps
-                        if s.get("status") in ("CORTEX_STEP_STATUS_ERROR", "CORTEX_STEP_STATUS_CANCELED")
+                        if s.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+                        and (s.get("plannerResponse") or {}).get("response")
                     ]
-                    if error_steps:
-                        raise RuntimeError(
-                            f"Antigravity Cascade 执行异常结束: {error_steps[-1].get('status')}"
-                        )
-                    raise RuntimeError("Antigravity Cascade 调用未返回有效的 plannerResponse 文本")
+                    if not planner_steps:
+                        error_steps = [
+                            s for s in steps
+                            if s.get("status") in ("CORTEX_STEP_STATUS_ERROR", "CORTEX_STEP_STATUS_CANCELED")
+                        ]
+                        if error_steps:
+                            raise RuntimeError(
+                                f"Antigravity Cascade 执行异常结束: {error_steps[-1].get('status')}"
+                            )
+                        raise RuntimeError("Antigravity Cascade 调用未返回有效的 plannerResponse 文本")
 
-                last_step = planner_steps[-1]
-                reply_text = (last_step.get("plannerResponse") or {}).get("response", "")
-                model_usage = (last_step.get("metadata") or {}).get("modelUsage") or {}
-                p_tok = int(model_usage.get("inputTokens") or 0)
-                c_tok = int(model_usage.get("outputTokens") or 0)
-                usage_dict: Dict[str, Any] = {
-                    "prompt_tokens": p_tok,
-                    "completion_tokens": c_tok,
-                    "total_tokens": p_tok + c_tok,
-                    "account_email": self._verified_email or self.sub_account_email or "desktop",
-                    "sandbox_port": self._http_port,
-                    "sandbox_pid": self._server_pid,
-                }
-                return reply_text, usage_dict
-            finally:
-                # 无论成功或异常，立即无痕删除临时会话与桌面端摘要记录
-                for cleanup_method in ("DeleteCascadeTrajectory", "JetboxDeleteSummary"):
-                    try:
-                        self._post_rpc_inner(
-                            cleanup_method,
-                            {"cascadeId": cascade_id},
-                            retry_discovery=False,
-                            timeout=10.0,
-                        )
-                    except Exception:
-                        pass
+                    last_step = planner_steps[-1]
+                    reply_text = (last_step.get("plannerResponse") or {}).get("response", "")
+                    model_usage = (last_step.get("metadata") or {}).get("modelUsage") or {}
+                    p_tok = int(model_usage.get("inputTokens") or 0)
+                    c_tok = int(model_usage.get("outputTokens") or 0)
+                    usage_dict: Dict[str, Any] = {
+                        "prompt_tokens": p_tok,
+                        "completion_tokens": c_tok,
+                        "total_tokens": p_tok + c_tok,
+                        "account_email": self._verified_email or self.sub_account_email or "desktop",
+                        "sandbox_port": self._http_port,
+                        "sandbox_pid": self._server_pid,
+                    }
+                    return reply_text, usage_dict
+                finally:
+                    for cleanup_method in ("DeleteCascadeTrajectory", "JetboxDeleteSummary"):
+                        try:
+                            self._post_rpc_inner(
+                                cleanup_method,
+                                {"cascadeId": cascade_id},
+                                retry_discovery=False,
+                                timeout=10.0,
+                            )
+                        except Exception:
+                            pass
+        except Exception as exc:
+            setattr(exc, "account_email", self._verified_email or self.sub_account_email or "desktop")
+            setattr(exc, "sandbox_port", self._http_port)
+            raise
 
     def ask(
         self,
@@ -1075,15 +1210,11 @@ class AntigravityClient:
         return self._post_rpc("GetUserStatus", {})
 
     def get_active_account_info(self) -> Dict[str, Any]:
-        """
-        获取当前客户端实际连接的账号详情，并与桌面客户端大号进行物理隔离对比校验。
-        不依赖剩余额度百分比，直接通过 Google 云端返回的 `userStatus.email` + 进程 PID + 端口进行 100% 实名确权。
-        """
+        """获取当前客户端实际连接的账号详情，并与桌面客户端大号进行物理隔离对比校验。"""
         status = self.get_user_status().get("userStatus", {})
         active_email = (status.get("email") or "").strip().lower()
         tier_name = ((status.get("userTier") or {}).get("name")) or "Unknown"
 
-        # 检测桌面客户端当前进程与邮箱（仅作只读对比展示）
         desktop_email = None
         kr_blob = _read_windows_keyring_oauth_blob()
         if kr_blob:
@@ -1126,15 +1257,219 @@ class AntigravityClient:
         return result
 
 
+class AntigravityPoolClient:
+    """
+    多小号沙箱智能随机路由池客户端（对外接口与 AntigravityClient 完全一致）：
+    1. 自动维护 `SUB_ACCOUNT_POOL`（及本机已归档的所有非大号沙箱）对应的 `AntigravityClient` 工作节点；
+    2. 调用方只需传入 `model` 和 `prompt`，无需关心底层账号：
+       - 自动根据请求的模型（如 `antigravity-argon-high` 或 `antigravity-3.8-flash-high`）筛选出
+         拥有该模型权限且有剩余额度的小号集合；
+       - 将候选小号集合随机打乱（`random.shuffle`），优先抢占当前并发槽位空闲的小号立即执行；
+       - 若某个小号报错触发外层重试，下一轮尝试会自动避开刚刚失败的小号，切换到池中其他小号！
+    3. 总并发能力随小号数量线性叠加：每个小号限制并发=2，N 个小号即可提供 N*2 的总并发度。
+    """
+
+    def __init__(
+        self,
+        account_pool: Optional[List[str]] = None,
+        max_concurrency_per_account: int = 2,
+        default_model: str = "antigravity-3.8-flash-high",
+        timeout: float = 120.0,
+    ) -> None:
+        self.default_model = default_model
+        self.timeout = timeout
+        self.max_concurrency_per_account = max(1, int(max_concurrency_per_account))
+        self._pool_lock = threading.Lock()
+        self._workers: Dict[str, AntigravityClient] = {}
+        self._thread_local = threading.local()
+
+        known_sandboxes = sync_all_known_accounts_to_sandboxes()
+        raw_pool = list(account_pool) if account_pool is not None else list(SUB_ACCOUNT_POOL)
+        # 自动把本机已归档但尚未写入 SUB_ACCOUNT_POOL 的新小号也纳入池中（严格排除大号）
+        for archived_email in sorted(known_sandboxes.keys()):
+            if archived_email not in raw_pool and archived_email not in EXCLUDED_MAIN_ACCOUNTS:
+                raw_pool.append(archived_email)
+
+        self.account_pool: List[str] = []
+        for em in raw_pool:
+            norm = em.strip().lower()
+            if norm and norm not in EXCLUDED_MAIN_ACCOUNTS and norm in known_sandboxes and norm not in self.account_pool:
+                self.account_pool.append(norm)
+
+        if not self.account_pool:
+            raise RuntimeError(
+                f"小号沙箱池为空！请检查 SUB_ACCOUNT_POOL 或先在客户端登录小号归档。已排除大号: {EXCLUDED_MAIN_ACCOUNTS}"
+            )
+
+    def _get_worker(self, email: str) -> AntigravityClient:
+        norm = email.strip().lower()
+        with self._pool_lock:
+            worker = self._workers.get(norm)
+            if worker is None:
+                worker = AntigravityClient(
+                    default_model=self.default_model,
+                    timeout=self.timeout,
+                    max_concurrency=self.max_concurrency_per_account,
+                    sub_account_email=norm,
+                )
+                self._workers[norm] = worker
+            return worker
+
+    def get_eligible_workers(self, target_model_enum: str) -> List[AntigravityClient]:
+        """筛选出账号池中支持 `target_model_enum` 且有剩余额度的小号节点。"""
+        eligible: List[AntigravityClient] = []
+        for email in self.account_pool:
+            worker = self._get_worker(email)
+            if worker.supports_model(target_model_enum):
+                eligible.append(worker)
+        if not eligible:
+            # 若本地缓存未命中，回退返回全部池内节点由实际调用判定
+            eligible = [self._get_worker(em) for em in self.account_pool]
+        return eligible
+
+    def ask_with_usage(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        media: Optional[List[Dict[str, str]]] = None,
+        timeout: Optional[float] = None,
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """
+        从账号池中自动随机挑选支持目标模型且有空闲并发槽位的小号执行请求。
+        返回 `(reply_text, usage_dict)`，其中 `usage_dict["account_email"]` 为本次实际执行的小号邮箱。
+        """
+        target_model = AntigravityClient.resolve_model_enum(model or self.default_model)
+        candidates = self.get_eligible_workers(target_model)
+
+        # 如果同一线程刚刚在某个小号上失败过，优先将其排到队尾，确保重试时自动换号
+        last_failed = getattr(self._thread_local, "last_failed_email", None)
+
+        chosen_worker: Optional[AntigravityClient] = None
+        claimed_fd: Optional[int] = None
+
+        while chosen_worker is None:
+            shuffled = list(candidates)
+            random.shuffle(shuffled)
+            if last_failed and len(shuffled) > 1:
+                shuffled.sort(key=lambda w: 1 if w.sub_account_email == last_failed else 0)
+
+            for worker in shuffled:
+                fd = worker.try_claim_idle_slot()
+                if fd is not None:
+                    chosen_worker = worker
+                    claimed_fd = fd
+                    break
+
+            if chosen_worker is None:
+                time.sleep(random.uniform(0.08, 0.16))
+
+        try:
+            reply, usage = chosen_worker.ask_with_usage(
+                prompt=prompt,
+                model=model,
+                system_prompt=system_prompt,
+                media=media,
+                timeout=timeout,
+                _pre_acquired_fd=claimed_fd,
+            )
+            self._thread_local.last_failed_email = None
+            return reply, usage
+        except Exception as exc:
+            self._thread_local.last_failed_email = chosen_worker.sub_account_email
+            if not getattr(exc, "account_email", None):
+                setattr(exc, "account_email", chosen_worker.sub_account_email)
+            raise
+
+    def ask(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        media: Optional[List[Dict[str, str]]] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
+        reply, _ = self.ask_with_usage(
+            prompt=prompt,
+            model=model,
+            system_prompt=system_prompt,
+            media=media,
+            timeout=timeout,
+        )
+        return reply
+
+    def ask_json(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        media: Optional[List[Dict[str, str]]] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        json_instruction = (
+            (system_prompt or "")
+            + "\n请严格只输出合法的 JSON 对象，不要包含 ```json 代码块包裹或任何额外解释文字。"
+        ).strip()
+        raw = self.ask(
+            prompt=prompt,
+            model=model,
+            system_prompt=json_instruction,
+            media=media,
+            timeout=timeout,
+        ).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+
+    def get_pool_status(self) -> List[Dict[str, Any]]:
+        """获取账号池中每个小号的实时连接状态、等级与模型支持情况。"""
+        rows: List[Dict[str, Any]] = []
+        for email in self.account_pool:
+            w = self._get_worker(email)
+            try:
+                info = w.get_active_account_info()
+                rows.append(
+                    {
+                        "email": email,
+                        "status": "✅ 在线",
+                        "tier": info.get("tier"),
+                        "pid": info.get("active_pid"),
+                        "port": info.get("active_port"),
+                        "supports_argon": w.supports_model("MODEL_PLACEHOLDER_M417"),
+                        "supports_flash": w.supports_model("MODEL_PLACEHOLDER_M318"),
+                    }
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        "email": email,
+                        "status": f"❌ 异常 ({exc})",
+                        "tier": "Unknown",
+                        "pid": None,
+                        "port": None,
+                        "supports_argon": False,
+                        "supports_flash": False,
+                    }
+                )
+        return rows
+
+
 _default_client_lock = threading.Lock()
-_default_client: Optional[AntigravityClient] = None
+_default_client: Optional[Any] = None
 
 
 def get_client(
     max_concurrency: int = 2,
     sub_account_email: Optional[str] = None,
-) -> AntigravityClient:
-    """获取进程级全局共享的 AntigravityClient 单例（自动绑定配置的小号沙箱）。"""
+) -> Any:
+    """
+    获取全局客户端实例：
+    - 若未指定 `sub_account_email` 且 `SUB_ACCOUNT_EMAIL is None`（默认）：
+      返回 `AntigravityPoolClient` 多小号智能随机路由池（支持高并发 + 按模型权限自动筛选小号）；
+    - 若显式指定了单个 `sub_account_email`：
+      返回绑定该单一小号的 `AntigravityClient`。
+    """
     global _default_client
     target_email = (
         sub_account_email.strip().lower()
@@ -1142,19 +1477,43 @@ def get_client(
         else (SUB_ACCOUNT_EMAIL.strip().lower() if SUB_ACCOUNT_EMAIL else None)
     )
     with _default_client_lock:
-        if _default_client is None or _default_client.sub_account_email != target_email:
-            _default_client = AntigravityClient(
-                max_concurrency=max_concurrency,
-                sub_account_email=target_email,
-            )
+        if target_email:
+            if not isinstance(_default_client, AntigravityClient) or _default_client.sub_account_email != target_email:
+                _default_client = AntigravityClient(
+                    max_concurrency=max_concurrency,
+                    sub_account_email=target_email,
+                )
+        else:
+            if not isinstance(_default_client, AntigravityPoolClient):
+                _default_client = AntigravityPoolClient(
+                    max_concurrency_per_account=max_concurrency,
+                )
     return _default_client
 
 
-def set_sub_account(email: Optional[str], max_concurrency: int = 2) -> AntigravityClient:
-    """在代码中动态切换当前使用的小号邮箱，并返回绑定新小号的客户端实例。"""
-    global SUB_ACCOUNT_EMAIL
+def set_sub_account(email: Optional[str], max_concurrency: int = 2) -> Any:
+    """
+    - 传入具体邮箱（如 `set_sub_account("guardianriedel689@gmail.com")`）：锁定只使用该小号；
+    - 传入 `None` 或 `""`（如 `set_sub_account(None)`）：恢复使用 `SUB_ACCOUNT_POOL` 多小号随机池。
+    """
+    global SUB_ACCOUNT_EMAIL, _default_client
     SUB_ACCOUNT_EMAIL = email.strip().lower() if email and email.strip() else None
+    with _default_client_lock:
+        _default_client = None
     return get_client(max_concurrency=max_concurrency, sub_account_email=SUB_ACCOUNT_EMAIL)
+
+
+def set_sub_account_pool(emails: List[str], max_concurrency_per_account: int = 2) -> AntigravityPoolClient:
+    """动态设置小号账号池列表并启用多小号随机路由池。"""
+    global SUB_ACCOUNT_POOL, SUB_ACCOUNT_EMAIL, _default_client
+    SUB_ACCOUNT_POOL = [e.strip().lower() for e in emails if e and e.strip()]
+    SUB_ACCOUNT_EMAIL = None
+    with _default_client_lock:
+        _default_client = AntigravityPoolClient(
+            account_pool=SUB_ACCOUNT_POOL,
+            max_concurrency_per_account=max_concurrency_per_account,
+        )
+    return _default_client
 
 
 def ask_antigravity(
@@ -1178,23 +1537,23 @@ ask_json = ask_antigravity_json
 
 
 if __name__ == "__main__":
-    print("=" * 76)
-    print("Antigravity 小号沙箱隔离状态自检 & 凭证自动归档工具")
-    print("=" * 76)
+    import sys
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    print("=" * 88)
+    print("Antigravity 多小号沙箱池 (SUB_ACCOUNT_POOL) 状态自检 & 凭证自动归档工具")
+    print("=" * 88)
     archived_desktop = archive_current_desktop_account()
     all_sandboxes = sync_all_known_accounts_to_sandboxes()
-    print(f"[1] 桌面端当前登录账号自动快照: {archived_desktop or '未检测到'}")
-    print(f"[2] 本机已归档可直接配置使用的小号沙箱 ({len(all_sandboxes)} 个):")
-    for idx, (em, sdir) in enumerate(sorted(all_sandboxes.items()), 1):
-        marker = "  <-- 当前 SUB_ACCOUNT_EMAIL 配置" if em == (SUB_ACCOUNT_EMAIL or "").lower() else ""
-        print(f"    {idx}. {em}  ({sdir}){marker}")
-
-    print("-" * 76)
-    client = get_client()
-    info = client.get_active_account_info()
-    print("[3] 实时物理隔离与账号实名核验结果 (基于 Google GetUserStatus.email):")
-    print(f"    - 桌面客户端 (大号) : Email={info['desktop_main_email']} | PID={info['desktop_main_pid']} | Port={info['desktop_main_port']}")
-    print(f"    - 代码沙箱端 (小号) : Email={info['verified_active_email']} | PID={info['active_pid']} | Port={info['active_port']} | 等级={info['tier']}")
-    print(f"    - 进程物理隔离校验  : {'✅ 已完全隔离 (独立进程/独立端口)' if info['is_process_isolated'] else '⚠️ 共用进程'}")
-    print(f"    - 大小号身份隔离校验: {'✅ 确认正在使用小号 (绝不触碰大号)' if info['is_account_isolated'] else '⚠️ 当前与桌面端为同一账号'}")
-    print("=" * 76)
+    print(f"[1] 桌面端当前登录账号自动快照: {archived_desktop or '未检测到'} (大号保护名单: {sorted(EXCLUDED_MAIN_ACCOUNTS)})")
+    pool_client = AntigravityPoolClient()
+    rows = pool_client.get_pool_status()
+    print(f"[2] 账号池可用小号数量: {len(rows)} 个 (Flash 总并发上限={sum(2 for r in rows if r['supports_flash'])}, Argon 总并发上限={sum(2 for r in rows if r['supports_argon'])}):")
+    for idx, r in enumerate(rows, 1):
+        models_tag = f"Argon={'✅' if r['supports_argon'] else '❌'} | 3.8-Flash={'✅' if r['supports_flash'] else '❌'}"
+        print(
+            f"    {idx}. {r['email']:<30} | {r['status']} | 等级: {str(r['tier']):<16} "
+            f"| PID: {str(r['pid']):<6} | Port: {str(r['port']):<6} | {models_tag}"
+        )
+    print("=" * 88)
