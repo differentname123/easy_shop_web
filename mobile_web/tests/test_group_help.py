@@ -780,3 +780,88 @@ def test_duplicate_active_group_matching_and_confirm_publish(tmp_path):
     # 确认发布后，团 A 和团 B 均在大厅展示
     hall_after = repo.search_groups(now=base_ts + 25)
     assert len(hall_after["items"]) == 2
+
+
+def test_reupload_qr_only_for_existing_group_order_id_must_not_bypass_audit(tmp_path):
+    """
+    验证：当某个 group_order_id 已在库中处于 parsed 状态时，若用户截取该团的纯二维码局部图再次上传，
+    系统绝不能直接复用旧的 parsed 状态放行，必须重置为 pending 重新送审并拦截为 failed。
+    """
+    from models.group_help import PARSE_STATUS_FAILED
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    poster_dir = tmp_path / "posters"
+    poster_dir.mkdir(parents=True, exist_ok=True)
+    gid = "3495190924788381111"
+    short_url = "https://file-link.pinduoduo.com/eYg3ajkbMq"
+
+    def fake_http_get(url, headers=None, allow_redirects=False, timeout=8):
+        return SimpleNamespace(
+            status_code=307,
+            headers={"Location": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid}"},
+            text="",
+        )
+
+    # 第一次上传完整海报并审核通过
+    svc_pass = GroupHelpService(
+        repo=repo,
+        poster_dir=poster_dir,
+        http_get=fake_http_get,
+        ai_generator=lambda prompt, file_paths=None, **kw: {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": True,
+                    "is_compliant": True,
+                    "reject_reason": null if False else None,
+                    "goods_name": "【富之鲜】8斤新干蒜金乡紫白皮大蒜头",
+                    "keywords": ["大蒜"],
+                    "group_price": 24.99,
+                    "original_price": 41.59,
+                    "total_people": 3,
+                    "remain_people": 2,
+                    "remaining_time": "23:00:00",
+                    "remaining_seconds": 82800,
+                }
+            ),
+        },
+    )
+    up1 = svc_pass.submit_poster_image(_make_poster_image_bytes(short_url))
+    assert up1["data"]["parse_status"] == PARSE_STATUS_PENDING
+    svc_pass.process_pending_batch(batch_size=2)
+    assert repo.get_by_group_order_id(gid)["parse_status"] == PARSE_STATUS_PARSED
+
+    # 第二次：用户截取该同一个团单的纯二维码局部图上传
+    svc_qr_only = GroupHelpService(
+        repo=repo,
+        poster_dir=poster_dir,
+        http_get=fake_http_get,
+        ai_generator=lambda prompt, file_paths=None, **kw: {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": False,
+                    "is_compliant": True,
+                    "reject_reason": "仅截取了局部二维码，缺失商品名称与价格",
+                    "goods_name": "",
+                    "keywords": [],
+                    "group_price": None,
+                    "original_price": None,
+                    "total_people": 0,
+                    "remain_people": 0,
+                    "remaining_time": None,
+                    "remaining_seconds": None,
+                }
+            ),
+        },
+    )
+    up2 = svc_qr_only.submit_poster_image(_make_poster_image_bytes(short_url))
+    # 上传接口必须返回 pending，严禁直接返回 parsed
+    assert up2["data"]["parse_status"] == PARSE_STATUS_PENDING
+    svc_qr_only.process_pending_batch(batch_size=2)
+    # 审核后必须变为 failed 并从大厅下线
+    doc_after = repo.get_by_group_order_id(gid)
+    assert doc_after["parse_status"] == PARSE_STATUS_FAILED
+    assert len(repo.search_groups()["items"]) == 0
+    assert svc_qr_only.get_poster_file_path(gid) is None
+

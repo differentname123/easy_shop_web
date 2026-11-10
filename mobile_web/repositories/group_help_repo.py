@@ -53,21 +53,14 @@ class GroupHelpRepository(BaseRepository):
         existing = self.get_by_group_order_id(gid)
 
         if existing is not None:
-            is_expired_time = float(existing.get("expires_at") or 0) <= now
-            if existing.get("parse_status") == PARSE_STATUS_PARSED:
-                if is_expired_time or existing.get("group_status") == GROUP_STATUS_EXPIRED:
-                    raise ValueError(
-                        "该拼团已超过有效期失效（拼多多拼团仅24小时有效），请在拼多多重新发起新团后再上传最新海报"
-                    )
-                return existing, False
-
-            # 若之前因图片残缺等原因未通过审核（failed/pending），允许在原 24 小时有效期内重新上传完整海报重试
             orig_created = float(existing.get("created_at") or now)
             orig_expires = float(existing.get("expires_at") or (orig_created + DEFAULT_GROUP_TTL_SECONDS))
-            if orig_expires <= now:
+            if orig_expires <= now or existing.get("group_status") == GROUP_STATUS_EXPIRED:
                 raise ValueError(
-                    "该拼团已超过24小时有效期失效，请在拼多多重新发起新团后再上传最新海报"
+                    "该拼团已超过有效期失效（拼多多拼团仅24小时有效），请在拼多多重新发起新团后再上传最新海报"
                 )
+
+            # 每次上传新图片均重置为 pending 重新执行大模型合规与关键信息审核，严禁跳过审核直接复用旧状态
             updated = self.col.find_one_and_update(
                 {"group_order_id": gid},
                 {

@@ -243,24 +243,21 @@ class GroupHelpService:
 
         now = time.time()
         existing = self.repo.get_by_group_order_id(gid)
-        is_active_online = bool(
-            existing
-            and existing.get("parse_status") == "parsed"
-            and existing.get("group_status") == "active"
-            and int(existing.get("remain_people") or 0) > 0
-            and float(existing.get("expires_at") or 0) > now
-        )
-        if is_active_online:
-            # 已通过审核且正在展示中的拼团，严禁被未审核的新上传图片覆盖原海报
-            doc, is_new = existing, False
-        else:
-            poster_path = self._save_poster_image(gid, image_bytes)
-            record_input = {
-                **link_meta,
-                "poster_path": str(poster_path),
-                "created_at": now,
-            }
-            doc, is_new = self.repo.create_or_refresh_initial_group(record_input)
+        if existing is not None:
+            is_expired_time = float(existing.get("expires_at") or 0) <= now
+            if is_expired_time or existing.get("group_status") == "expired":
+                raise ValueError(
+                    "该拼团已超过有效期失效（拼多多拼团仅24小时有效），请在拼多多重新发起新团后再上传最新海报"
+                )
+
+        # 每次上传的图片都必须保存并进入 pending 重新走大模型审核（严禁直接复用旧审核结果导致局部二维码图蒙混过关）
+        poster_path = self._save_poster_image(gid, image_bytes)
+        record_input = {
+            **link_meta,
+            "poster_path": str(poster_path),
+            "created_at": now,
+        }
+        doc, is_new = self.repo.create_or_refresh_initial_group(record_input)
 
         # 唤醒后台定时任务立即处理
         if callable(self._wake_callback):
@@ -270,12 +267,7 @@ class GroupHelpService:
                 pass
 
         formatted = self._format_with_matched_group(doc, now=now)
-        if is_new:
-            msg = "✅ 二维码核验通过，已加入【我的团】！正在自动识别商品名称与人数（约 10~20 秒），识别完立即反馈。"
-        elif formatted["parse_status"] == "parsed":
-            msg = "✅ 该拼团已在大厅展示中，您可在【我的团】查看实时进度！"
-        else:
-            msg = "✅ 该拼团已收录，正在识别商品名称（约 10~20 秒），可在【我的团】查看实时状态。"
+        msg = "✅ 二维码核验通过，已加入【我的团】！正在自动审核并识别商品关键信息（约 10~20 秒），完成后立即反馈。"
 
         return {
             "status": "success",

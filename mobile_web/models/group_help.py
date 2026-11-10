@@ -317,7 +317,7 @@ def validate_and_normalize_parsed_poster(parsed_data: Dict[str, Any]) -> Dict[st
 
     remain_people = _parse_int_field(parsed_data.get("remain_people"))
     if remain_people is None or remain_people < 1 or remain_people > 20:
-        remain_people = 1
+        raise ValueError("图片中未识别到有效的成团差额人数（如“还差X人”），请上传完整的拼团邀请海报")
 
     total_people = _parse_int_field(parsed_data.get("total_people")) or 0
     if total_people < 0 or total_people > 50:
