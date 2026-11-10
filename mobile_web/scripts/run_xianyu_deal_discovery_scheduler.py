@@ -29,17 +29,21 @@
 """
 
 import argparse
+import concurrent.futures
+import contextlib
 import datetime
 import json
 import logging
 import math
 import os
+import queue
+import re
 import sys
 import time
 import unicodedata
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -61,6 +65,7 @@ from mobile_web.scripts.goods_info_format import read_file_to_str, string_to_obj
 from mobile_web.scripts.publish_to_xianyu import (
     DEFAULT_GUEST_USER_DATA_DIR,
     get_xianyu_item_detail,
+    get_xianyu_item_details_batch,
     search_xianyu_items,
 )
 from repositories.product_repo import (
@@ -79,7 +84,12 @@ COARSE_FILTER_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼同款商品初筛.t
 COMPARISON_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼同款比价与性价比计算.txt")
 
 LLM_MAX_ATTEMPTS = 3
+LLM_CALL_TIMEOUT_SEC = 90
+LLM_MAX_RETRIES_PER_MODEL = 1
 MAX_CATEGORY_CANDIDATES_FOR_AI1 = 20
+DEFAULT_STAGE1_WORKERS = 5
+DEFAULT_COMPARE_WORKERS = 3
+DEFAULT_MAX_DETAIL_CHECKS = 10
 
 # 单位精确度优先级：物理度量衡 > 精细计数单位 > 包装计数单位 > 模糊容器/兜底单位
 PRECISE_PHYSICAL_UNITS = {"g", "kg", "斤", "两", "mg", "ml", "l", "L", "m", "cm", "mm"}
@@ -296,20 +306,27 @@ def _compute_unit_cp(unit_quantities: Dict[str, float], activity_price: float) -
     }
 
 
+def _resolve_candidate_brand(doc: Dict[str, Any], sku_fmt: Dict[str, Any]) -> str:
+    """优先从 `doc.brand` 或 `sku_fmt.decision_keywords` 提取有效品牌名（过滤无品牌/店铺名）。"""
+    invalid_brands = {"无", "其他", "无品牌", "无品牌/无注册商标", "品牌随机", "未知", "通用", "other", "none"}
+    raw_b = str(doc.get("brand") or "").strip()
+    if raw_b and raw_b.lower() not in invalid_brands and not any(w in raw_b for w in ("店", "专营", "旗舰", "超市", "生活馆")):
+        return raw_b
+
+    kws = sku_fmt.get("decision_keywords") or []
+    for kw in kws:
+        if isinstance(kw, dict) and str(kw.get("attribute_name") or "").strip() in ("品牌", "厂家", "厂商", "生产品牌"):
+            val = str(kw.get("attribute_value") or "").strip()
+            if val and val.lower() not in invalid_brands:
+                return val
+    return ""
+
+
 def _build_fallback_search_keywords(doc: Dict[str, Any], sku_fmt: Dict[str, Any], category_name: str) -> Tuple[str, str]:
     """当大模型搜索词字段缺失时的保底拼接规则。"""
-    kws = sku_fmt.get("decision_keywords") or []
-    brand = ""
-    for kw in kws:
-        if isinstance(kw, dict) and kw.get("attribute_name") == "品牌":
-            val = str(kw.get("attribute_value") or "").strip()
-            if val and val not in ("无", "其他", "无品牌", "品牌随机", "未知", "通用"):
-                brand = val
-                break
-    if not brand:
-        raw_b = str(doc.get("brand") or "").strip()
-        if raw_b and not any(w in raw_b for w in ("店", "专营", "旗舰", "超市", "生活馆", "官方")):
-            brand = raw_b.split("/")[-1].strip()
+    brand = _resolve_candidate_brand(doc, sku_fmt)
+    if "/" in brand:
+        brand = brand.split("/")[-1].strip()
 
     base_parts: List[str] = []
     if brand and brand not in category_name:
@@ -326,7 +343,10 @@ def _select_top_candidates_for_category(
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     从当前分类的所有候选商品中，综合各主要单位的性价比排名筛选出前 `max_count`（最多 20）个候选商品。
-    优先选择拥有明确物理/计数定量单位（如 g/ml/抽/张/片/包）的高性价比商品。
+    排序与筛选策略（纯通用量化指标，不硬编码特定品类或词汇）：
+    1. 优先精确物理/计数单位（优先级 >= 3），避免仅有模糊容器单位的商品挤占精确量化商品；
+    2. 优先非推测（not is_inferred）且具备品牌的商品；
+    3. 同等条件下按单位性价比 `unit_cost_performance` 从高到低排序。
     """
     for grp in unit_groups.values():
         grp.sort(key=lambda x: x[0], reverse=True)
@@ -334,7 +354,7 @@ def _select_top_candidates_for_category(
     ordered_units = sorted(
         unit_groups.keys(),
         key=lambda u: (
-            1 if _unit_priority_score(u) >= 2 else 0,
+            2 if _unit_priority_score(u) >= 3 else (1 if _unit_priority_score(u) == 2 else 0),
             len(unit_groups[u]),
             _unit_priority_score(u),
             unit_groups[u][0][0],
@@ -343,30 +363,38 @@ def _select_top_candidates_for_category(
     )
     top_unit = ordered_units[0]
 
-    if len(cat_candidates) <= max_count:
-        ranked = sorted(
-            cat_candidates,
-            key=lambda c: (
-                0 if (c["sku_fmt"].get("pricing_basis") or {}).get("is_inferred") else 1,
-                c["unit_cost_performance"].get(top_unit, 0.0),
-                max(c["unit_cost_performance"].values() or [0.0]),
-            ),
-            reverse=True,
+    def _cand_rank_key(c: Dict[str, Any]) -> Tuple[Any, ...]:
+        doc = c["doc"]
+        sku_fmt = c["sku_fmt"]
+        has_precise_u = 1 if any(_unit_priority_score(u) >= 3 for u in c["unit_quantities"].keys()) else 0
+        is_not_inferred = 0 if (sku_fmt.get("pricing_basis") or {}).get("is_inferred") else 1
+        has_brand = 1 if _resolve_candidate_brand(doc, sku_fmt) else 0
+        top_cp = c["unit_cost_performance"].get(top_unit, 0.0)
+        max_cp = max(c["unit_cost_performance"].values() or [0.0])
+        return (
+            has_precise_u,
+            is_not_inferred,
+            has_brand,
+            top_cp,
+            max_cp,
         )
+
+    if len(cat_candidates) <= max_count:
+        ranked = sorted(cat_candidates, key=_cand_rank_key, reverse=True)
         return top_unit, ranked
 
     selected_indices: List[int] = []
     seen_indices: Set[int] = set()
 
-    # 先从主单位取前排高性价比商品
+    # 1. 从主单位取前排高性价比商品
     for _, idx in unit_groups[top_unit]:
-        if len(selected_indices) >= max(12, max_count // 2):
+        if len(selected_indices) >= max(14, (max_count * 2) // 3):
             break
         if idx not in seen_indices:
             seen_indices.add(idx)
             selected_indices.append(idx)
 
-    # 再从其他精确物理/计数单位轮询补充高性价比商品，避免因单位表記差异漏掉极高性价比标品
+    # 2. 从其他精确物理/计数单位轮询补充高性价比商品，避免因单位表记差异漏选
     other_units = [u for u in ordered_units[1:] if _unit_priority_score(u) >= 2]
     round_pos = 0
     while len(selected_indices) < max_count and other_units:
@@ -385,29 +413,17 @@ def _select_top_candidates_for_category(
             break
         round_pos += 1
 
-    # 若仍不足 max_count，则从主单位及剩余候选中补齐
-    for _, idx in unit_groups[top_unit]:
+    # 3. 若仍不足 max_count，则按综合排序从剩余候选中补齐
+    remaining_indices = [i for i in range(len(cat_candidates)) if i not in seen_indices]
+    remaining_indices.sort(key=lambda i: _cand_rank_key(cat_candidates[i]), reverse=True)
+    for idx in remaining_indices:
         if len(selected_indices) >= max_count:
             break
-        if idx not in seen_indices:
-            seen_indices.add(idx)
-            selected_indices.append(idx)
-
-    for idx in range(len(cat_candidates)):
-        if len(selected_indices) >= max_count:
-            break
-        if idx not in seen_indices:
-            seen_indices.add(idx)
-            selected_indices.append(idx)
+        seen_indices.add(idx)
+        selected_indices.append(idx)
 
     selected_list = [cat_candidates[i] for i in selected_indices[:max_count]]
-    selected_list.sort(
-        key=lambda c: (
-            c["unit_cost_performance"].get(top_unit, 0.0),
-            max(c["unit_cost_performance"].values() or [0.0]),
-        ),
-        reverse=True,
-    )
+    selected_list.sort(key=_cand_rank_key, reverse=True)
     return top_unit, selected_list
 
 
@@ -453,8 +469,8 @@ def _select_standard_product_and_keywords_by_llm(
 ) -> Tuple[bool, Optional[Dict[str, Any]], str, str, Dict[str, Any]]:
     """
     【AI 第 1 步】：将该分类下的前 20 个候选商品交给 `medium` 模型组 + `闲鱼搜索关键字生成.txt`：
-    - 判断是否存在可在闲鱼进行同款一对一比价的标品；
-    - 选出性价比最高的 1 个标品 `selected_product_id`；
+    - 判断是否存在可在闲鱼进行同款一对一比价的商品（含定量标品及有具体系列/款号/货号的鞋服内衣）；
+    - 选出性价比最高的 1 个正装商品 `selected_product_id`；
     - 生成闲鱼同款主搜索词 `search_keyword` 与备用搜索词 `backup_search_keyword`。
     """
     prompt_template = read_file_to_str(KEYWORD_PROMPT_PATH)
@@ -468,11 +484,12 @@ def _select_standard_product_and_keywords_by_llm(
         if not pid:
             continue
         cand_map[pid] = c
+        resolved_brand = _resolve_candidate_brand(doc, sku_fmt)
         candidates_for_llm.append({
             "product_id": pid,
             "platform": normalize_platform(doc.get("platform") or "pdd"),
             "name": str(doc.get("name") or "").strip(),
-            "brand": str(doc.get("brand") or "").strip(),
+            "brand": resolved_brand,
             "activity_price": c["db_activity_price"],
             "decision_keywords": sku_fmt.get("decision_keywords") or [],
             "pricing_basis": sku_fmt.get("pricing_basis") or {},
@@ -501,11 +518,16 @@ def _select_standard_product_and_keywords_by_llm(
             prompt_to_send += (
                 f"\n\n⚠️【上次返回校验失败修正提示（第 {attempt}/{LLM_MAX_ATTEMPTS} 次尝试）】：\n"
                 f"你上一次返回的数据未通过校验，原因：{last_err}。\n"
-                f"若存在可比标品，请务必确保 `selected_product_id` 严格取自给定候选列表：{sorted(valid_ids)}，并严格输出合法 JSON！"
+                f"若存在可比商品，请务必确保 `selected_product_id` 严格取自给定候选列表：{sorted(valid_ids)}，并严格输出合法 JSON！"
             )
 
         t0 = time.monotonic()
-        res = generate_content(prompt=prompt_to_send, preset_model_group="medium")
+        res = generate_content(
+            prompt=prompt_to_send,
+            preset_model_group="medium",
+            timeout=LLM_CALL_TIMEOUT_SEC,
+            max_retries_per_model=LLM_MAX_RETRIES_PER_MODEL,
+        )
         elapsed = time.monotonic() - t0
         last_model = (res.get("metrics") or {}).get("model_used")
         last_trace = res.get("trace_id")
@@ -514,7 +536,7 @@ def _select_standard_product_and_keywords_by_llm(
         if "成功" not in str(res.get("status") or "") or not last_raw:
             last_err = f"模型网关调用失败({res.get('status')})"
             logger.warning(
-                f"⚠️ [步骤1/AI标品选拔第{attempt}/{LLM_MAX_ATTEMPTS}次调用失败] 分类=【{category_name}】 | 模型={last_model} | 原因={last_err}"
+                f"⚠️ [步骤1/AI标品选拔第{attempt}/{LLM_MAX_ATTEMPTS}次调用失败] 分类=【{category_name}】 | 模型={last_model} | 耗时={elapsed:.1f}s | 原因={last_err}"
             )
             continue
 
@@ -523,7 +545,7 @@ def _select_standard_product_and_keywords_by_llm(
         except Exception as exc:
             last_err = f"JSON解析异常: {exc}"
             logger.warning(
-                f"⚠️ [步骤1/AI标品选拔第{attempt}/{LLM_MAX_ATTEMPTS}次JSON解析失败] 分类=【{category_name}】 | 原因={last_err}"
+                f"⚠️ [步骤1/AI标品选拔第{attempt}/{LLM_MAX_ATTEMPTS}次JSON解析失败] 分类=【{category_name}】 | 耗时={elapsed:.1f}s | 原因={last_err}"
             )
             continue
 
@@ -531,7 +553,7 @@ def _select_standard_product_and_keywords_by_llm(
         if not is_ok:
             last_err = err_reason
             logger.warning(
-                f"⚠️ [步骤1/AI标品选拔第{attempt}/{LLM_MAX_ATTEMPTS}次校验未通过] 分类=【{category_name}】 | 原因={err_reason}"
+                f"⚠️ [步骤1/AI标品选拔第{attempt}/{LLM_MAX_ATTEMPTS}次校验未通过] 分类=【{category_name}】 | 耗时={elapsed:.1f}s | 原因={err_reason}"
             )
             continue
 
@@ -597,18 +619,177 @@ def _verify_live_activity_price(platform: str, product_id: str, goods_sign: str,
     return round(fallback_price, 2) if fallback_price > 0 else None
 
 
+def _evaluate_single_category_step1(
+    cat_name: str,
+    raw_items: List[Tuple[Dict[str, Any], Dict[str, Any], float]],
+) -> Optional[Dict[str, Any]]:
+    """对单个分类执行 Step 1（计算单位性价比 -> 筛选前20候选 -> 第1个AI选拔标品与搜索词 -> 官方接口验价）。"""
+    dim_counts: Dict[str, Dict[str, int]] = {}
+    parsed_entries = []
+    for doc, sku_fmt, act_price in raw_items:
+        raw_base_unit, extracted_units = _extract_raw_units(sku_fmt)
+        parsed_entries.append((doc, sku_fmt, act_price, raw_base_unit, extracted_units))
+        for u in extracted_units.keys():
+            dim = UNIT_TO_CATEGORY.get(u)
+            if dim:
+                dim_counts.setdefault(dim, {})
+                dim_counts[dim][u] = dim_counts[dim].get(u, 0) + 1
+
+    dim_target_unit = {dim: max(cnts.items(), key=lambda x: x[1])[0] for dim, cnts in dim_counts.items()}
+
+    cat_candidates: List[Dict[str, Any]] = []
+    unit_groups: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
+
+    for idx, (doc, sku_fmt, act_price, raw_base_unit, extracted_units) in enumerate(parsed_entries):
+        unit_quantities: Dict[str, float] = {}
+        for u, val in extracted_units.items():
+            unit_quantities[u] = round(float(val), 4)
+            dim = UNIT_TO_CATEGORY.get(u)
+            if dim and dim in dim_target_unit:
+                tgt_u = dim_target_unit[dim]
+                if tgt_u != u:
+                    conv_val = float(val) * (UNIT_TO_MULTIPLIER[u] / UNIT_TO_MULTIPLIER[tgt_u])
+                    unit_quantities[tgt_u] = round(conv_val, 4)
+
+        unit_cp = _compute_unit_cp(unit_quantities, act_price)
+        dim = UNIT_TO_CATEGORY.get(raw_base_unit)
+        primary_unit = dim_target_unit[dim] if (dim and dim in dim_target_unit) else raw_base_unit
+        if primary_unit not in unit_cp:
+            primary_unit = next(iter(unit_cp.keys()), "件")
+
+        cat_candidates.append({
+            "doc": doc,
+            "sku_fmt": sku_fmt,
+            "db_activity_price": round(act_price, 2),
+            "primary_unit": primary_unit,
+            "unit_quantities": unit_quantities,
+            "unit_cost_performance": unit_cp,
+        })
+        for u, cp_val in unit_cp.items():
+            unit_groups[u].append((cp_val, idx))
+
+    if not cat_candidates:
+        return None
+
+    top_unit, top20_pool = _select_top_candidates_for_category(
+        cat_candidates=cat_candidates,
+        unit_groups=unit_groups,
+        max_count=MAX_CATEGORY_CANDIDATES_FOR_AI1,
+    )
+
+    active_pool = list(top20_pool)
+    winner: Optional[Dict[str, Any]] = None
+    main_kw = ""
+    backup_kw = ""
+    llm_kw_meta: Dict[str, Any] = {}
+
+    for _verify_round in range(1, 3):
+        if not active_pool:
+            break
+        has_std, chosen_cand, m_kw, b_kw, kw_meta = _select_standard_product_and_keywords_by_llm(
+            category_name=cat_name,
+            candidates=active_pool,
+        )
+        llm_kw_meta = kw_meta
+        if not has_std or chosen_cand is None:
+            reason = (kw_meta.get("parsed_json") or {}).get("selection_reason") or "无可比标品"
+            logger.info(
+                f"⏭️ [步骤1/AI判定无标品跳过] 分类=【{cat_name}】(共{len(raw_items)}款, 送审{len(active_pool)}款) | "
+                f"模型={kw_meta.get('model_used')} | 耗时={kw_meta.get('elapsed_seconds', 0)}s | 原因={reason}"
+            )
+            break
+
+        w_doc = chosen_cand["doc"]
+        plat = normalize_platform(w_doc.get("platform") or "pdd")
+        pid = str(w_doc.get("product_id") or w_doc.get("goods_id") or "").strip()
+        gsign = str(w_doc.get("goods_sign") or "").strip()
+
+        live_price = _verify_live_activity_price(plat, pid, gsign, chosen_cand["db_activity_price"])
+        if live_price is None or live_price <= 0:
+            active_pool = [
+                c for c in active_pool
+                if str(c["doc"].get("product_id") or c["doc"].get("goods_id") or "").strip() != pid
+            ]
+            continue
+
+        if live_price > chosen_cand["db_activity_price"] * 1.30 and len(active_pool) > 1:
+            logger.warning(
+                f"⚠️ [官方验价优惠失效] [{plat.upper()}:{pid}] 实时价¥{live_price} 较入库价¥{chosen_cand['db_activity_price']} 暴涨，顺延重选"
+            )
+            active_pool = [
+                c for c in active_pool
+                if str(c["doc"].get("product_id") or c["doc"].get("goods_id") or "").strip() != pid
+            ]
+            continue
+
+        chosen_cand["verified_activity_price"] = live_price
+        chosen_cand["unit_cost_performance"] = _compute_unit_cp(chosen_cand["unit_quantities"], live_price)
+        winner = chosen_cand
+        main_kw = m_kw
+        backup_kw = b_kw
+        break
+
+    if not winner:
+        return None
+
+    w_doc = winner["doc"]
+    w_sku = winner["sku_fmt"]
+    if not main_kw:
+        main_kw, backup_kw = _build_fallback_search_keywords(w_doc, w_sku, cat_name)
+
+    best_primary_unit = top_unit
+    if best_primary_unit not in winner["unit_cost_performance"] or _unit_priority_score(best_primary_unit) == 0:
+        sorted_cand_units = _ordered_unit_keys(winner["unit_cost_performance"])
+        if sorted_cand_units:
+            best_primary_unit = sorted_cand_units[0]
+
+    kws_list = [
+        f"{k.get('attribute_name')}:{k.get('attribute_value')}"
+        for k in (w_sku.get("decision_keywords") or [])
+        if isinstance(k, dict) and k.get("attribute_value")
+    ]
+    sel_reason = str((llm_kw_meta.get("parsed_json") or {}).get("selection_reason") or "").strip()
+    resolved_brand = _resolve_candidate_brand(w_doc, w_sku)
+    return {
+        "platform": normalize_platform(w_doc.get("platform") or "pdd"),
+        "product_id": str(w_doc.get("product_id") or w_doc.get("goods_id") or "").strip(),
+        "goods_sign": str(w_doc.get("goods_sign") or "").strip(),
+        "channel_type": w_doc.get("channel_type"),
+        "category_name": cat_name,
+        "category_item_count": len(raw_items),
+        "category_top20_count": len(top20_pool),
+        "name": str(w_doc.get("name") or "").strip(),
+        "brand": resolved_brand,
+        "db_activity_price": winner["db_activity_price"],
+        "activity_price": winner["verified_activity_price"],
+        "primary_unit": best_primary_unit,
+        "unit_quantities": winner["unit_quantities"],
+        "unit_cost_performance": winner["unit_cost_performance"],
+        "decision_keywords_summary": " | ".join(kws_list),
+        "pricing_basis": w_sku.get("pricing_basis") or {},
+        "search_keyword": main_kw,
+        "backup_search_keyword": backup_kw,
+        "selection_reason": sel_reason,
+        "llm_keyword_output": llm_kw_meta,
+        "product_url": str(w_doc.get("product_url") or ""),
+        "image_url": str(w_doc.get("image_url") or ""),
+        "updated_at": str(w_doc.get("updated_at") or ""),
+    }
+
+
 def select_verified_category_champions(
     db: Any,
     hours_window: int = 72,
     max_categories: int = 20,
     cooldown_hours: int = 24,
+    stage1_workers: int = DEFAULT_STAGE1_WORKERS,
 ) -> List[Dict[str, Any]]:
     """
-    步骤 1（源头过滤 + 类内前 20 交由第 1 个 AI 选出可比标品与搜索词 + 官方实时价格验证）：
+    步骤 1（源头过滤 + 多线程并发调用第 1 个 AI 选出可比标品与搜索词 + 官方实时价格验证）：
     1. 查询 72h 内、`channel_type` 存在且有值、`format_status == "success"` 的商品；
     2. 过滤掉已在 `xianyu_deal_evaluations` 中存在记录的商品（确保只选尚未比价过的商品）；
-    3. 按 `core_entities` 最高 `score` 的 `name` 归类（保留所有分类，分的再小也不合并）；
-    4. 每个分类筛选出前 20 个商品交由【第 1 个 AI】选出 1 个高性价比标品并生成同款搜索词，同时完成官方实时验价。
+    3. 按 `core_entities` 最高 `score` 的 `name` 归类（保留所有分类）；
+    4. 使用线程池并发对分类前 20 个商品交由【第 1 个 AI】选出 1 个高性价比标品并完成官方实时验价。
     """
     repo = ProductRepository()
     now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -665,180 +846,49 @@ def select_verified_category_champions(
     sorted_cats = sorted(by_cat.items(), key=lambda kv: len(kv[1]), reverse=True)
     top_preview = ", ".join(f"{k}({len(v)}款)" for k, v in sorted_cats[:20])
     target_cat_desc = "全部" if max_categories <= 0 else str(max_categories)
+    workers = max(1, int(stage1_workers or DEFAULT_STAGE1_WORKERS))
     logger.info(
         f"📊 [步骤1/源头扫描] 72h内有channel_type且已结构化商品={len(raw_docs)} | "
         f"已过滤历史已比价商品={skipped_evaluated_cnt} | 剩余未比价分类数={len(sorted_cats)} | "
-        f"本轮目标选出标品分类数={target_cat_desc} | 商品数量最多前20分类=[{top_preview}]"
+        f"本轮目标选出标品分类数={target_cat_desc} (并发线程={workers}) | 商品数量最多前20分类=[{top_preview}]"
     )
 
     champions: List[Dict[str, Any]] = []
-    for cat_name, raw_items in sorted_cats:
-        if max_categories > 0 and len(champions) >= max_categories:
-            break
+    cursor = 0
+    total_cats = len(sorted_cats)
 
-        # 统计该分类内各物理维度的最高频标准单位
-        dim_counts: Dict[str, Dict[str, int]] = {}
-        parsed_entries = []
-        for doc, sku_fmt, act_price in raw_items:
-            raw_base_unit, extracted_units = _extract_raw_units(sku_fmt)
-            parsed_entries.append((doc, sku_fmt, act_price, raw_base_unit, extracted_units))
-            for u in extracted_units.keys():
-                dim = UNIT_TO_CATEGORY.get(u)
-                if dim:
-                    dim_counts.setdefault(dim, {})
-                    dim_counts[dim][u] = dim_counts[dim].get(u, 0) + 1
-
-        dim_target_unit = {dim: max(cnts.items(), key=lambda x: x[1])[0] for dim, cnts in dim_counts.items()}
-
-        cat_candidates: List[Dict[str, Any]] = []
-        unit_groups: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
-
-        for idx, (doc, sku_fmt, act_price, raw_base_unit, extracted_units) in enumerate(parsed_entries):
-            unit_quantities: Dict[str, float] = {}
-            for u, val in extracted_units.items():
-                unit_quantities[u] = round(float(val), 4)
-                dim = UNIT_TO_CATEGORY.get(u)
-                if dim and dim in dim_target_unit:
-                    tgt_u = dim_target_unit[dim]
-                    if tgt_u != u:
-                        conv_val = float(val) * (UNIT_TO_MULTIPLIER[u] / UNIT_TO_MULTIPLIER[tgt_u])
-                        unit_quantities[tgt_u] = round(conv_val, 4)
-
-            unit_cp = _compute_unit_cp(unit_quantities, act_price)
-            dim = UNIT_TO_CATEGORY.get(raw_base_unit)
-            primary_unit = dim_target_unit[dim] if (dim and dim in dim_target_unit) else raw_base_unit
-            if primary_unit not in unit_cp:
-                primary_unit = next(iter(unit_cp.keys()), "件")
-
-            cat_candidates.append({
-                "doc": doc,
-                "sku_fmt": sku_fmt,
-                "db_activity_price": round(act_price, 2),
-                "primary_unit": primary_unit,
-                "unit_quantities": unit_quantities,
-                "unit_cost_performance": unit_cp,
-            })
-            for u, cp_val in unit_cp.items():
-                unit_groups[u].append((cp_val, idx))
-
-        if not cat_candidates:
-            continue
-
-        top_unit, top20_pool = _select_top_candidates_for_category(
-            cat_candidates=cat_candidates,
-            unit_groups=unit_groups,
-            max_count=MAX_CATEGORY_CANDIDATES_FOR_AI1,
-        )
-
-        # 调用【第 1 个 AI】从该类前 20 商品中选出 1 个高性价比标品 + 生成搜索词，并验证官方实时价格
-        active_pool = list(top20_pool)
-        winner: Optional[Dict[str, Any]] = None
-        main_kw = ""
-        backup_kw = ""
-        llm_kw_meta: Dict[str, Any] = {}
-
-        for verify_round in range(1, 3):
-            if not active_pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        while cursor < total_cats:
+            if max_categories > 0 and len(champions) >= max_categories:
                 break
-            has_std, chosen_cand, m_kw, b_kw, kw_meta = _select_standard_product_and_keywords_by_llm(
-                category_name=cat_name,
-                candidates=active_pool,
-            )
-            llm_kw_meta = kw_meta
-            if not has_std or chosen_cand is None:
-                reason = (kw_meta.get("parsed_json") or {}).get("selection_reason") or "无可比标品"
-                logger.info(
-                    f"⏭️ [步骤1/AI判定无标品跳过] 分类=【{cat_name}】(共{len(raw_items)}款, 送审{len(active_pool)}款) | "
-                    f"模型={kw_meta.get('model_used')} | 原因={reason}"
-                )
-                break
+            needed = (max_categories - len(champions)) if max_categories > 0 else workers * 2
+            batch_size = min(total_cats - cursor, max(workers, needed + 2))
+            batch_slice = sorted_cats[cursor : cursor + batch_size]
+            cursor += batch_size
 
-            w_doc = chosen_cand["doc"]
-            plat = normalize_platform(w_doc.get("platform") or "pdd")
-            pid = str(w_doc.get("product_id") or w_doc.get("goods_id") or "").strip()
-            gsign = str(w_doc.get("goods_sign") or "").strip()
-
-            live_price = _verify_live_activity_price(plat, pid, gsign, chosen_cand["db_activity_price"])
-            if live_price is None or live_price <= 0:
-                active_pool = [
-                    c for c in active_pool
-                    if str(c["doc"].get("product_id") or c["doc"].get("goods_id") or "").strip() != pid
-                ]
-                continue
-
-            # 若实时价格比入库价格暴涨超过 30%，说明原优惠已失效，剔除后重选
-            if live_price > chosen_cand["db_activity_price"] * 1.30 and len(active_pool) > 1:
-                logger.warning(
-                    f"⚠️ [官方验价优惠失效] [{plat.upper()}:{pid}] 实时价¥{live_price} 较入库价¥{chosen_cand['db_activity_price']} 暴涨，顺延重选"
-                )
-                active_pool = [
-                    c for c in active_pool
-                    if str(c["doc"].get("product_id") or c["doc"].get("goods_id") or "").strip() != pid
-                ]
-                continue
-
-            chosen_cand["verified_activity_price"] = live_price
-            chosen_cand["unit_cost_performance"] = _compute_unit_cp(chosen_cand["unit_quantities"], live_price)
-            winner = chosen_cand
-            main_kw = m_kw
-            backup_kw = b_kw
-            break
-
-        if not winner:
-            continue
-
-        w_doc = winner["doc"]
-        w_sku = winner["sku_fmt"]
-        if not main_kw:
-            main_kw, backup_kw = _build_fallback_search_keywords(w_doc, w_sku, cat_name)
-
-        # 选择该商品最精确的单位作为 primary_unit
-        best_primary_unit = top_unit
-        if best_primary_unit not in winner["unit_cost_performance"] or _unit_priority_score(best_primary_unit) == 0:
-            sorted_cand_units = _ordered_unit_keys(winner["unit_cost_performance"])
-            if sorted_cand_units:
-                best_primary_unit = sorted_cand_units[0]
-
-        kws_list = [
-            f"{k.get('attribute_name')}:{k.get('attribute_value')}"
-            for k in (w_sku.get("decision_keywords") or [])
-            if isinstance(k, dict) and k.get("attribute_value")
-        ]
-        sel_reason = str((llm_kw_meta.get("parsed_json") or {}).get("selection_reason") or "").strip()
-        champion_record = {
-            "platform": normalize_platform(w_doc.get("platform") or "pdd"),
-            "product_id": str(w_doc.get("product_id") or w_doc.get("goods_id") or "").strip(),
-            "goods_sign": str(w_doc.get("goods_sign") or "").strip(),
-            "channel_type": w_doc.get("channel_type"),
-            "category_name": cat_name,
-            "category_item_count": len(raw_items),
-            "category_top20_count": len(top20_pool),
-            "name": str(w_doc.get("name") or "").strip(),
-            "brand": str(w_doc.get("brand") or "").strip(),
-            "db_activity_price": winner["db_activity_price"],
-            "activity_price": winner["verified_activity_price"],
-            "primary_unit": best_primary_unit,
-            "unit_quantities": winner["unit_quantities"],
-            "unit_cost_performance": winner["unit_cost_performance"],
-            "decision_keywords_summary": " | ".join(kws_list),
-            "pricing_basis": w_sku.get("pricing_basis") or {},
-            "search_keyword": main_kw,
-            "backup_search_keyword": backup_kw,
-            "selection_reason": sel_reason,
-            "llm_keyword_output": llm_kw_meta,
-            "product_url": str(w_doc.get("product_url") or ""),
-            "image_url": str(w_doc.get("image_url") or ""),
-            "updated_at": str(w_doc.get("updated_at") or ""),
-        }
-        champions.append(champion_record)
-        logger.info(
-            f"🎯 [步骤1/AI标品入选 #{len(champions)}] 分类=【{cat_name}】(共{len(raw_items)}款, AI审{len(top20_pool)}款) | "
-            f"[{champion_record['platform'].upper()}:{champion_record['product_id']}] | "
-            f"验价后activity_price=¥{champion_record['activity_price']} (入库=¥{champion_record['db_activity_price']}) | "
-            f"各unit数量={champion_record['unit_quantities']} | 各unit性价比={champion_record['unit_cost_performance']} | "
-            f"闲鱼搜索词=【{main_kw}】(备用=【{backup_kw}】, 模型={llm_kw_meta.get('model_used')}) | "
-            f"选拔理由={sel_reason} | 标题={champion_record['name'][:36]}"
-        )
+            future_pairs = [
+                (cat_name, raw_items, executor.submit(_evaluate_single_category_step1, cat_name, raw_items))
+                for cat_name, raw_items in batch_slice
+            ]
+            for cat_name, raw_items, fut in future_pairs:
+                try:
+                    champ = fut.result()
+                except Exception as exc:
+                    logger.warning(f"⚠️ [步骤1/分类选拔异常] 分类=【{cat_name}】 | 异常={exc}")
+                    continue
+                if champ is not None:
+                    if max_categories > 0 and len(champions) >= max_categories:
+                        continue
+                    champions.append(champ)
+                    llm_kw_meta = champ.get("llm_keyword_output") or {}
+                    logger.info(
+                        f"🎯 [步骤1/AI标品入选 #{len(champions)}] 分类=【{cat_name}】(共{len(raw_items)}款, AI审{champ['category_top20_count']}款) | "
+                        f"[{champ['platform'].upper()}:{champ['product_id']}] | "
+                        f"验价后activity_price=¥{champ['activity_price']} (入库=¥{champ['db_activity_price']}) | "
+                        f"各unit数量={champ['unit_quantities']} | 各unit性价比={champ['unit_cost_performance']} | "
+                        f"闲鱼搜索词=【{champ['search_keyword']}】(备用=【{champ['backup_search_keyword']}】, 模型={llm_kw_meta.get('model_used')}) | "
+                        f"选拔理由={champ['selection_reason']} | 标题={champ['name'][:36]}"
+                    )
 
     return champions
 
@@ -929,7 +979,12 @@ def _filter_comparable_xianyu_items_by_llm(
             )
 
         t0 = time.monotonic()
-        res = generate_content(prompt=prompt_to_send, preset_model_group="medium")
+        res = generate_content(
+            prompt=prompt_to_send,
+            preset_model_group="medium",
+            timeout=LLM_CALL_TIMEOUT_SEC,
+            max_retries_per_model=LLM_MAX_RETRIES_PER_MODEL,
+        )
         elapsed = time.monotonic() - t0
         content = str(res.get("content") or "").strip()
         model_used = (res.get("metrics") or {}).get("model_used") or "unknown"
@@ -981,6 +1036,46 @@ def _filter_comparable_xianyu_items_by_llm(
 # ==============================================================================
 # 步骤 3 & 4：拉取可比商品详情/多规格/运费 + 第 3 个 AI 终审比价 + 比值计算
 # ==============================================================================
+@contextlib.contextmanager
+def _borrow_guest_dir(
+    default_dir: str,
+    guest_dir_pool: Optional["queue.Queue[str]"] = None,
+) -> Iterator[str]:
+    """仅在执行浏览器操作（初搜或批量拉取详情）期间借用访客浏览器目录，进入 AI 思考前立即归还。"""
+    if guest_dir_pool is None:
+        yield default_dir
+        return
+    borrowed = guest_dir_pool.get()
+    try:
+        yield borrowed
+    finally:
+        guest_dir_pool.put(borrowed)
+
+
+def _prepare_coarse_items_for_llm(
+    raw_items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Set[str]]:
+    coarse_items_for_llm: List[Dict[str, Any]] = []
+    raw_card_map: Dict[str, Dict[str, Any]] = {}
+    valid_coarse_ids: Set[str] = set()
+    for x in raw_items:
+        iid = str(x.get("item_id") or "").strip()
+        if not iid or iid in valid_coarse_ids:
+            continue
+        valid_coarse_ids.add(iid)
+        raw_card_map[iid] = x
+        coarse_items_for_llm.append({
+            "item_id": iid,
+            "title": x.get("title"),
+            "display_price": x.get("price"),
+            "want_cnt": x.get("want_cnt"),
+            "is_free_shipping": x.get("is_free_shipping"),
+            "seller_nick": x.get("seller_nick"),
+            "area": x.get("area"),
+        })
+    return coarse_items_for_llm, raw_card_map, valid_coarse_ids
+
+
 def _validate_llm_comparison_response(
     parsed: Any,
     valid_xianyu_ids: Set[str],
@@ -1039,51 +1134,70 @@ def compare_candidate_with_xianyu(
     candidate: Dict[str, Any],
     guest_user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
     max_search_items: int = 20,
-    max_detail_checks: int = 0,
+    max_detail_checks: int = DEFAULT_MAX_DETAIL_CHECKS,
     debug_browser: bool = False,
+    guest_dir_pool: Optional["queue.Queue[str]"] = None,
 ) -> Dict[str, Any]:
     """
     完整执行第 2 步与第 3 步：
-    1. 搜索闲鱼最多 20 条商品概览；
+    1. 搜索闲鱼最多 20 条商品概览（仅在浏览器搜索期间占用访客目录）；
     2. 调用【第 2 个 AI】筛选出所有与我方标品属于同款可比商品的 `comparable_item_ids`；
-    3. 对筛出的每个 `comparable_item_ids` 依次调用 `get_xianyu_item_detail`，获取完整描述 `desc`、多规格 `sku_list` 与真实运费 `transport_fee`；
+       - 若主搜索词返回结果 < 6 条，或第 2 个 AI 判定同款可比商品为 0 条，自动切换备用词 `backup_search_keyword` 重搜并重新初筛；
+    3. 仅针对第 2 个 AI 筛出的同款商品（最多前 `max_detail_checks` 个），在同一个浏览器会话内调用 `get_xianyu_item_details_batch` 批量获取完整描述 `desc`、多规格 `sku_list` 与真实运费 `transport_fee`（自动清理登录弹窗）；
     4. 调用【第 3 个 AI】基于完整详情、多规格价格和邮费进行终审比价；
     5. 计算单位性价比比值并组装完整入库文档。
     """
     kw = candidate["search_keyword"]
     backup_kw = candidate["backup_search_keyword"]
     my_price = candidate["activity_price"]
+    cat_name = candidate["category_name"]
+
+    my_candidate_for_llm = {
+        "product_id": candidate["product_id"],
+        "platform": candidate["platform"],
+        "category_name": cat_name,
+        "name": candidate["name"],
+        "brand": candidate["brand"],
+        "decision_keywords": candidate["decision_keywords_summary"],
+        "pricing_basis": candidate.get("pricing_basis") or {},
+        "activity_price": candidate["activity_price"],
+        "unit_quantities": candidate["unit_quantities"],
+        "unit_cost_performance": candidate["unit_cost_performance"],
+    }
 
     logger.info(
-        f"🔍 [步骤2/闲鱼搜索] 分类=【{candidate['category_name']}】 | 标品=【{candidate['name'][:32]}】 | "
+        f"🔍 [步骤2/闲鱼搜索] 分类=【{cat_name}】 | 标品=【{candidate['name'][:32]}】 | "
         f"我方activity_price=¥{my_price} | 我方unit性价比={candidate['unit_cost_performance']} | 搜索词=【{kw}】"
     )
 
-    search_res = search_xianyu_items(
-        keyword=kw,
-        max_items=max_search_items,
-        user_data_dir=guest_user_data_dir,
-        debug=debug_browser,
-    )
-    raw_items = search_res.get("items") or []
-
-    # 若主搜索词返回结果过少（< 3条），自动用备用搜索词重搜
-    if len(raw_items) < 3 and backup_kw and backup_kw != kw:
-        logger.info(f"🔄 [步骤2/搜索词扩召回] 主搜索词【{kw}】仅返回 {len(raw_items)} 条，切换【{backup_kw}】重搜...")
-        time.sleep(1.5)
-        retry_res = search_xianyu_items(
-            keyword=backup_kw,
+    with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+        search_res = search_xianyu_items(
+            keyword=kw,
             max_items=max_search_items,
-            user_data_dir=guest_user_data_dir,
+            user_data_dir=active_gdir,
             debug=debug_browser,
         )
+    raw_items = search_res.get("items") or []
+    used_backup = False
+
+    # 情况 A：若主搜索词返回结果过少（< 6条），直接用备用搜索词扩召回
+    if len(raw_items) < 6 and backup_kw and backup_kw != kw:
+        logger.info(f"🔄 [步骤2/搜索词扩召回] 分类=【{cat_name}】 | 主词【{kw}】仅返回 {len(raw_items)} 条，切换备用词【{backup_kw}】重搜...")
+        with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+            retry_res = search_xianyu_items(
+                keyword=backup_kw,
+                max_items=max_search_items,
+                user_data_dir=active_gdir,
+                debug=debug_browser,
+            )
+        used_backup = True
         if retry_res.get("ok") and len(retry_res.get("items") or []) > len(raw_items):
             search_res = retry_res
             raw_items = retry_res["items"]
             kw = backup_kw
 
     if not search_res.get("ok") or not raw_items:
-        logger.warning(f"⚠️ [步骤2/闲鱼搜索为空] 搜索词=【{kw}】 | msg={search_res.get('message')}")
+        logger.warning(f"⚠️ [步骤2/闲鱼搜索为空] 分类=【{cat_name}】 | 搜索词=【{kw}】 | msg={search_res.get('message')}")
         return _build_final_record(
             candidate=candidate,
             used_keyword=kw,
@@ -1097,38 +1211,7 @@ def compare_candidate_with_xianyu(
             fallback_error="no_xianyu_search_results",
         )
 
-    # 构造提供给【第 2 个 AI】的 20 条闲鱼概览列表
-    coarse_items_for_llm: List[Dict[str, Any]] = []
-    raw_card_map: Dict[str, Dict[str, Any]] = {}
-    valid_coarse_ids: Set[str] = set()
-    for x in raw_items:
-        iid = str(x.get("item_id") or "").strip()
-        if not iid:
-            continue
-        valid_coarse_ids.add(iid)
-        raw_card_map[iid] = x
-        coarse_items_for_llm.append({
-            "item_id": iid,
-            "title": x.get("title"),
-            "display_price": x.get("price"),
-            "want_cnt": x.get("want_cnt"),
-            "is_free_shipping": x.get("is_free_shipping"),
-            "seller_nick": x.get("seller_nick"),
-            "area": x.get("area"),
-        })
-
-    my_candidate_for_llm = {
-        "product_id": candidate["product_id"],
-        "platform": candidate["platform"],
-        "category_name": candidate["category_name"],
-        "name": candidate["name"],
-        "brand": candidate["brand"],
-        "decision_keywords": candidate["decision_keywords_summary"],
-        "pricing_basis": candidate.get("pricing_basis") or {},
-        "activity_price": candidate["activity_price"],
-        "unit_quantities": candidate["unit_quantities"],
-        "unit_cost_performance": candidate["unit_cost_performance"],
-    }
+    coarse_items_for_llm, raw_card_map, valid_coarse_ids = _prepare_coarse_items_for_llm(raw_items)
 
     # 调用【第 2 个 AI】筛选同款可比商品 ID 列表
     step2_comp_ids, step2_llm_meta, step2_reason = _filter_comparable_xianyu_items_by_llm(
@@ -1137,9 +1220,33 @@ def compare_candidate_with_xianyu(
         valid_xianyu_ids=valid_coarse_ids,
     )
 
+    # 情况 B：若主搜索词返回的全是异品牌推荐（导致第 2 个 AI 初筛同款数为 0），且尚未试过备用搜索词，自动切换备用词重搜 + 重新初筛！
+    if not step2_comp_ids and not used_backup and backup_kw and backup_kw != kw:
+        logger.info(
+            f"🔄 [步骤2/初筛0同款触发备用词重搜] 分类=【{cat_name}】 | 主词【{kw}】初筛同款为0，切换备用词【{backup_kw}】重搜..."
+        )
+        with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+            retry_res = search_xianyu_items(
+                keyword=backup_kw,
+                max_items=max_search_items,
+                user_data_dir=active_gdir,
+                debug=debug_browser,
+            )
+        retry_items = retry_res.get("items") or []
+        if retry_res.get("ok") and retry_items:
+            search_res = retry_res
+            raw_items = retry_items
+            kw = backup_kw
+            coarse_items_for_llm, raw_card_map, valid_coarse_ids = _prepare_coarse_items_for_llm(raw_items)
+            step2_comp_ids, step2_llm_meta, step2_reason = _filter_comparable_xianyu_items_by_llm(
+                my_candidate_for_llm=my_candidate_for_llm,
+                coarse_items_for_llm=coarse_items_for_llm,
+                valid_xianyu_ids=valid_coarse_ids,
+            )
+
     if not step2_comp_ids:
         logger.info(
-            f"⚪ [步骤2/初筛无同款可比商品] 分类=【{candidate['category_name']}】 | 搜索词=【{kw}】 | 原因={step2_reason}"
+            f"⚪ [步骤2/初筛无同款可比商品] 分类=【{cat_name}】 | 搜索词=【{kw}】 | 原因={step2_reason}"
         )
         return _build_final_record(
             candidate=candidate,
@@ -1160,22 +1267,25 @@ def compare_candidate_with_xianyu(
             fallback_error="",
         )
 
-    # 步骤 3：对第 2 个 AI 筛出的所有同款可比商品依次调用 get_xianyu_item_detail 获取详情、多规格价格与运费
+    # 步骤 3：仅对第 2 个 AI 筛出的同款可比商品（默认最多取前 10 个）在单次浏览器会话内批量拉取详情、SKU 价格与运费
     ids_to_fetch = step2_comp_ids[:max_detail_checks] if max_detail_checks > 0 else step2_comp_ids
     logger.info(
-        f"📦 [步骤3/拉取闲鱼同款详情] 准备依次调用 get_xianyu_item_detail 拉取 {len(ids_to_fetch)} 个同款候选商品的完整详情、SKU价格与运费..."
+        f"📦 [步骤3/批量拉取闲鱼同款详情] 分类=【{cat_name}】 | AI初筛同款={len(step2_comp_ids)}款 -> "
+        f"单次浏览器会话批量拉取前 {len(ids_to_fetch)} 款的完整详情、SKU价格与运费..."
     )
+
+    with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+        batch_det_res = get_xianyu_item_details_batch(
+            item_ids=ids_to_fetch,
+            user_data_dir=active_gdir,
+            debug=debug_browser,
+        )
+    details_by_id = batch_det_res.get("details_by_id") or {}
 
     detailed_items_for_llm: List[Dict[str, Any]] = []
     valid_detailed_ids: Set[str] = set()
     for idx, iid in enumerate(ids_to_fetch, 1):
-        if idx > 1:
-            time.sleep(1.2)
-        det = get_xianyu_item_detail(
-            item_id_or_url=iid,
-            user_data_dir=guest_user_data_dir,
-            debug=debug_browser,
-        )
+        det = details_by_id.get(iid) or {}
         raw_card = raw_card_map.get(iid) or {}
         if not det.get("ok"):
             logger.warning(
@@ -1213,14 +1323,14 @@ def compare_candidate_with_xianyu(
             "detail_verified_info": detail_info,
         })
         logger.info(
-            f"   ├─ ✅ ({idx}/{len(ids_to_fetch)}) 详情拉取成功 [XY:{iid}] | "
+            f"   ├─ ✅ ({idx}/{len(ids_to_fetch)}) 详情核验就绪 [XY:{iid}] | "
             f"详情价=¥{det.get('price')} (区间:¥{det.get('min_price')}~¥{det.get('max_price')}) | "
             f"运费=¥{det.get('transport_fee')}({'包邮' if det.get('is_free_shipping') else '不包邮'}) | "
             f"多规格={det.get('has_multi_sku')}({len(sku_list_clean)}个SKU) | 标题={(det.get('title') or raw_card.get('title') or '')[:30]}"
         )
 
     if not detailed_items_for_llm:
-        logger.warning(f"⚠️ [步骤3/同款详情全部拉取失败] 分类=【{candidate['category_name']}】 | 初筛IDs={ids_to_fetch}")
+        logger.warning(f"⚠️ [步骤3/同款详情全部拉取失败] 分类=【{cat_name}】 | 初筛IDs={ids_to_fetch}")
         return _build_final_record(
             candidate=candidate,
             used_keyword=kw,
@@ -1267,6 +1377,8 @@ def compare_candidate_with_xianyu(
         res = generate_content(
             prompt=prompt_to_send,
             preset_model_group="medium",
+            timeout=LLM_CALL_TIMEOUT_SEC,
+            max_retries_per_model=LLM_MAX_RETRIES_PER_MODEL,
         )
         elapsed = time.monotonic() - t0
         content = str(res.get("content") or "").strip()
@@ -1283,7 +1395,7 @@ def compare_candidate_with_xianyu(
         if "成功" not in str(res.get("status") or "") or not content:
             last_error_msg = f"模型网关调用失败({res.get('status')})"
             logger.warning(
-                f"⚠️ [步骤3/AI终审比价第{attempt}/{LLM_MAX_ATTEMPTS}次调用失败] 模型={model_used} | 耗时={elapsed:.1f}s | 原因={last_error_msg}"
+                f"⚠️ [步骤3/AI终审比价第{attempt}/{LLM_MAX_ATTEMPTS}次调用失败] 分类=【{cat_name}】 | 模型={model_used} | 耗时={elapsed:.1f}s | 原因={last_error_msg}"
             )
             continue
 
@@ -1292,7 +1404,7 @@ def compare_candidate_with_xianyu(
         except Exception as exc:
             last_error_msg = f"JSON解析异常: {exc}"
             logger.warning(
-                f"⚠️ [步骤3/AI终审比价第{attempt}/{LLM_MAX_ATTEMPTS}次JSON解析失败] 模型={model_used} | 耗时={elapsed:.1f}s | 原因={last_error_msg}"
+                f"⚠️ [步骤3/AI终审比价第{attempt}/{LLM_MAX_ATTEMPTS}次JSON解析失败] 分类=【{cat_name}】 | 模型={model_used} | 耗时={elapsed:.1f}s | 原因={last_error_msg}"
             )
             continue
 
@@ -1300,14 +1412,14 @@ def compare_candidate_with_xianyu(
         if not is_ok:
             last_error_msg = err_reason
             logger.warning(
-                f"⚠️ [步骤3/AI终审比价第{attempt}/{LLM_MAX_ATTEMPTS}次数据校验未通过] 模型={model_used} | 耗时={elapsed:.1f}s | 校验失败原因={err_reason}"
+                f"⚠️ [步骤3/AI终审比价第{attempt}/{LLM_MAX_ATTEMPTS}次数据校验未通过] 分类=【{cat_name}】 | 模型={model_used} | 耗时={elapsed:.1f}s | 校验失败原因={err_reason}"
             )
             continue
 
         validated_llm_data = clean_dict
         llm_call_meta["parsed_json"] = dict(clean_dict)
         logger.info(
-            f"🤖 [步骤3/AI终审比价校验通过] 模型={model_used} | 尝试={attempt}/{LLM_MAX_ATTEMPTS} | 耗时={elapsed:.1f}s | "
+            f"🤖 [步骤3/AI终审比价校验通过] 分类=【{cat_name}】 | 模型={model_used} | 尝试={attempt}/{LLM_MAX_ATTEMPTS} | 耗时={elapsed:.1f}s | "
             f"最佳闲鱼ID={clean_dict.get('best_xianyu_item_id')} | 含邮总价=¥{clean_dict.get('best_xianyu_price')} | llm_winner={clean_dict.get('llm_winner')}"
         )
         break
@@ -1838,17 +1950,24 @@ def run_discovery_cycle(
     hours_window: int = 72,
     max_categories: int = 20,
     max_search_items: int = 20,
-    max_detail_checks: int = 0,
+    max_detail_checks: int = DEFAULT_MAX_DETAIL_CHECKS,
     cooldown_hours: int = 24,
     guest_user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
     debug_browser: bool = False,
+    stage1_workers: int = DEFAULT_STAGE1_WORKERS,
+    compare_workers: int = DEFAULT_COMPARE_WORKERS,
 ) -> List[Dict[str, Any]]:
     t0 = time.monotonic()
     batch_id = datetime.datetime.now().strftime("disc_%Y%m%d_%H%M%S")
+    s1_workers = max(1, int(stage1_workers or DEFAULT_STAGE1_WORKERS))
+    cmp_workers = max(1, int(compare_workers or DEFAULT_COMPARE_WORKERS))
+    detail_cap_desc = f"前{max_detail_checks}款" if max_detail_checks > 0 else "全部"
     logger.info(
         f"\n{'=' * 92}\n"
         f"🚀 [闲鱼高性价比商品探测与比价任务/启动] 批次={batch_id} | 时间窗={hours_window}h | "
-        f"探测标品分类数={max_categories if max_categories > 0 else '全部'} | 访客目录=<{guest_user_data_dir}>\n"
+        f"探测标品分类数={max_categories if max_categories > 0 else '全部'} | "
+        f"并发配置=(阶段1选品={s1_workers}线程, 阶段2/3比价={cmp_workers}线程, 同款详情上限={detail_cap_desc}) | "
+        f"访客主目录=<{guest_user_data_dir}>\n"
         f"{'=' * 92}"
     )
 
@@ -1862,6 +1981,7 @@ def run_discovery_cycle(
         hours_window=hours_window,
         max_categories=max_categories,
         cooldown_hours=cooldown_hours,
+        stage1_workers=s1_workers,
     )
     if not champions:
         logger.warning("⚠️ [本轮结束] 未选出满足条件的可比标品候选商品。")
@@ -1869,43 +1989,65 @@ def run_discovery_cycle(
 
     logger.info(_format_champions_summary_table(champions))
 
-    records: List[Dict[str, Any]] = []
-    for idx, cand in enumerate(champions, 1):
+    # 构建浏览器访客目录池：仅在执行闲鱼初搜/批量详情时借用，AI 思考期间立即归还，实现浏览器与 AI 流水线重叠
+    guest_dir_pool: "queue.Queue[str]" = queue.Queue()
+    num_guest_dirs = min(2, cmp_workers) if cmp_workers > 1 else 1
+    for i in range(num_guest_dirs):
+        gdir = guest_user_data_dir if i == 0 else f"{guest_user_data_dir}_{i + 1}"
+        guest_dir_pool.put(gdir)
+
+    total_champions = len(champions)
+    indexed_records: Dict[int, Dict[str, Any]] = {}
+
+    def _run_single_champion(idx: int, cand: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         logger.info(
-            f"\n>>> ▶️ [开始比价第 {idx}/{len(champions)} 个分类标品冠军] "
+            f"\n>>> ▶️ [开始比价第 {idx}/{total_champions} 个分类标品冠军] "
             f"分类=【{cand['category_name']}】(库内{cand.get('category_item_count', '-')}款) | "
             f"我方标品=【{cand['name'][:40]}】(¥{cand['activity_price']:.2f})"
         )
-        record = compare_candidate_with_xianyu(
+        rec = compare_candidate_with_xianyu(
             candidate=cand,
             guest_user_data_dir=guest_user_data_dir,
             max_search_items=max_search_items,
             max_detail_checks=max_detail_checks,
             debug_browser=debug_browser,
+            guest_dir_pool=guest_dir_pool,
         )
-        record["batch_id"] = batch_id
+        rec["batch_id"] = batch_id
         eval_col.update_one(
-            {"platform": record["platform"], "product_id": record["product_id"]},
-            {"$set": record},
+            {"platform": rec["platform"], "product_id": rec["product_id"]},
+            {"$set": rec},
             upsert=True,
         )
-        records.append(record)
+        logger.info(_format_single_comparison_card(idx, total_champions, rec))
+        return idx, rec
 
-        logger.info(_format_single_comparison_card(idx, len(champions), record))
-        if idx < len(champions):
-            time.sleep(2.0)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cmp_workers) as executor:
+        futures = [
+            executor.submit(_run_single_champion, idx, cand)
+            for idx, cand in enumerate(champions, 1)
+        ]
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                idx, rec = fut.result()
+                indexed_records[idx] = rec
+            except Exception as exc:
+                logger.exception(f"❌ [分类比价子任务异常] {exc}")
 
+    records = [indexed_records[i] for i in sorted(indexed_records.keys())]
     elapsed = time.monotonic() - t0
     logger.info(_format_batch_summary_report(batch_id, elapsed, records))
     return records
 
 
 def main():
-    parser = argparse.ArgumentParser(description="闲鱼高性价比商品探测与比价定时任务（三步 AI 严选标品与详情含邮精准比价版）")
+    parser = argparse.ArgumentParser(description="闲鱼高性价比商品探测与比价定时任务（三步 AI 严选标品与详情含邮精准比价 + 并发流水线版）")
     parser.add_argument("--hours-window", type=int, default=72, help="内部商品库扫描时间窗口（默认72小时）")
     parser.add_argument("--max-categories", "--max-candidates", dest="max_categories", type=int, default=20, help="单轮探测有效标品分类数（默认20，传0表示不限数量遍历所有分类）")
     parser.add_argument("--max-search-items", type=int, default=20, help="每次闲鱼搜索抓取的概览商品数（默认20）")
-    parser.add_argument("--max-detail-checks", type=int, default=0, help="对第2步AI筛出的同款商品最多拉取多少个详情（默认0表示全部拉取详情）")
+    parser.add_argument("--max-detail-checks", type=int, default=DEFAULT_MAX_DETAIL_CHECKS, help="对第2步AI筛出的同款商品最多拉取多少个详情（默认10，传0表示不限）")
+    parser.add_argument("--stage1-workers", type=int, default=DEFAULT_STAGE1_WORKERS, help="阶段1（AI选标品+官方验价）并发线程数（默认5）")
+    parser.add_argument("--compare-workers", type=int, default=DEFAULT_COMPARE_WORKERS, help="阶段2/3（闲鱼比价流水线）并发线程数（默认3）")
     parser.add_argument("--cooldown-hours", type=int, default=24, help="保留参数兼容（已默认过滤所有在xianyu_deal_evaluations中有记录的商品）")
     parser.add_argument("--guest-dir", type=str, default=DEFAULT_GUEST_USER_DATA_DIR, help="免登录闲鱼浏览器目录")
     parser.add_argument("--debug-browser", action="store_true", help="是否显示浏览器窗口")
@@ -1923,6 +2065,8 @@ def main():
                 cooldown_hours=args.cooldown_hours,
                 guest_user_data_dir=args.guest_dir,
                 debug_browser=args.debug_browser,
+                stage1_workers=args.stage1_workers,
+                compare_workers=args.compare_workers,
             )
         except KeyboardInterrupt:
             logger.info("👋 收到中断信号，任务退出。")
@@ -1937,3 +2081,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
