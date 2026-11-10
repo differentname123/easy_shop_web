@@ -573,13 +573,18 @@ def _atomic_write_model_usage(path, data):
 
 
 def _format_usage_summary(usage):
-    """将 OpenAI usage 字典提炼为紧凑易读的输入/输出/总计 Token 摘要。"""
+    """将 OpenAI usage 字典提炼为紧凑易读的输入/输出/总计 Token 摘要（若含小号沙箱信息则一并展示）。"""
     if not isinstance(usage, dict):
         return "未知"
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
-    return f"输入:{prompt_tokens}/输出:{completion_tokens}/总计:{total_tokens}"
+    base = f"输入:{prompt_tokens}/输出:{completion_tokens}/总计:{total_tokens}"
+    account_email = usage.get("account_email")
+    if account_email:
+        port = usage.get("sandbox_port")
+        return f"{base} | 账号:{account_email}" + (f"(Port:{port})" if port else "")
+    return base
 
 
 def _save_model_usage(events):
@@ -929,9 +934,7 @@ def probe_models(json_path):
 
 if __name__ == "__main__":
     test_models = [
-        "antigravity-argon-high",
-        "antigravity-3.8-flash-high",
-        "antigravity-3.8-flash-medium",
+        "gemini-web-3.8-flash-thinking-max"
     ]
     # 使用需要多步逻辑推理/电商凑单计算的同题测试，并限制最终输出简短，使耗时主要反映内部思考深度
     test_prompts = [
