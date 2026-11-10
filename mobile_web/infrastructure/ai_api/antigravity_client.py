@@ -66,9 +66,9 @@ class AntigravityClient:
         default_model: str = "antigravity-3.8-flash-high",
         timeout: float = 120.0,
         auto_start: bool = True,
-        max_concurrency: int = 2,
-        min_stagger_seconds: float = 0.8,
-        max_stagger_seconds: float = 1.8,
+        max_concurrency: int = 5,
+        min_stagger_seconds: float = 0.2,
+        max_stagger_seconds: float = 0.5,
     ) -> None:
         self.default_model = default_model
         self.timeout = timeout
@@ -502,7 +502,7 @@ _default_client_lock = threading.Lock()
 _default_client: Optional[AntigravityClient] = None
 
 
-def get_client(max_concurrency: int = 2) -> AntigravityClient:
+def get_client(max_concurrency: int = 5) -> AntigravityClient:
     """获取进程级全局共享的 AntigravityClient 单例。"""
     global _default_client
     if _default_client is None:

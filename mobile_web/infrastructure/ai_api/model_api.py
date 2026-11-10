@@ -193,7 +193,7 @@ MEDIUM_MODEL_LIST = [
 LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
 
-    {"model_name": "gemma-aistudio-api-key-4-31b-it", "权重": 0, "备注": "来源api key aistudio "},
+    # {"model_name": "gemma-aistudio-api-key-4-31b-it", "权重": 0, "备注": "来源api key aistudio "},
     {"model_name": "gemini-aistudio-api-key-3.5-flash", "权重": 0.1, "备注": "来源api key aistudio "},
 
 
@@ -202,7 +202,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
-    {"model_name": "antigravity-3.8-flash-medium", "权重": 10, "备注": "来源antigravity 本地客户端"},
+    {"model_name": "antigravity-3.8-flash-medium", "权重": 4, "备注": "来源antigravity 本地客户端"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。
