@@ -2135,18 +2135,31 @@ def search_xianyu_items(
             # 2. 在首页搜索框聚焦填入关键字（强校验 input_value 防止被默认热词占位符顶替）并点击“搜索”按钮
             search_packets.clear()
             search_input = page.locator("input[class*='search-input'], input[type='text']").first
+            input_ready = False
             if search_input.count() > 0:
                 for _ in range(3):
-                    search_input.click()
-                    search_input.fill(kw_clean)
+                    _dismiss_guest_login_modal(page)
+                    try:
+                        search_input.click(timeout=3000)
+                        search_input.fill(kw_clean, timeout=3000)
+                    except Exception:
+                        _dismiss_guest_login_modal(page)
+                        continue
                     page.wait_for_timeout(150)
                     if search_input.input_value().strip() == kw_clean:
+                        input_ready = True
                         break
+            if input_ready:
+                _dismiss_guest_login_modal(page)
                 search_btn = page.locator("button[class*='search-icon'], button:has-text('搜索')").first
-                if search_btn.count() > 0:
-                    search_btn.click()
-                else:
-                    search_input.press("Enter")
+                try:
+                    if search_btn.count() > 0:
+                        search_btn.click(timeout=3000)
+                    else:
+                        search_input.press("Enter", timeout=3000)
+                except Exception:
+                    _dismiss_guest_login_modal(page)
+                    page.goto(f"{GOOFISH_HOME_URL}/search?q={quote(kw_clean)}", wait_until="domcontentloaded", timeout=30000)
             else:
                 page.goto(f"{GOOFISH_HOME_URL}/search?q={quote(kw_clean)}", wait_until="domcontentloaded", timeout=30000)
 

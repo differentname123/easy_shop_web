@@ -83,13 +83,30 @@ KEYWORD_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼搜索关键字生成.txt"
 COARSE_FILTER_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼同款商品初筛.txt")
 COMPARISON_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼同款比价与性价比计算.txt")
 
+# ==============================================================================
+# 运行控制变量（直接在此处修改变量值即可控制脚本行为）
+# ==============================================================================
+ENABLE_LOOP = True                                 # 是否持续循环运行（True=循环运行，False=仅运行单轮后退出）
+LOOP_INTERVAL_HOURS = 1.0                          # 每轮结束后的等待间隔小时数（1.0 表示每隔 1 小时运行一轮）
+SCAN_HOURS_WINDOW = 72                             # 内部商品库扫描时间窗口（小时）
+MAX_CATEGORIES_PER_ROUND = 20                      # 单轮探测的有效标品分类数（设为 0 表示不限数量）
+MAX_XIANYU_SEARCH_ITEMS = 20                       # 每次闲鱼搜索抓取的概览商品数
+MAX_DETAIL_CHECKS_PER_CATEGORY = 10                # 每个分类最多拉取多少个初筛同款闲鱼商品详情
+STAGE1_WORKERS = 5                                 # 阶段 1（AI 选标品 + 官方验价）并发线程数
+COMPARE_WORKERS = 3                                # 阶段 2/3（闲鱼比价流水线）并发线程数
+DEBUG_BROWSER = False                              # 是否显示浏览器窗口（False=后台无头模式，True=显示窗口）
+GUEST_USER_DATA_DIR = DEFAULT_GUEST_USER_DATA_DIR  # 免登录闲鱼浏览器缓存目录
+
 LLM_MAX_ATTEMPTS = 3
 LLM_CALL_TIMEOUT_SEC = 90
 LLM_MAX_RETRIES_PER_MODEL = 1
 MAX_CATEGORY_CANDIDATES_FOR_AI1 = 20
-DEFAULT_STAGE1_WORKERS = 5
-DEFAULT_COMPARE_WORKERS = 3
-DEFAULT_MAX_DETAIL_CHECKS = 10
+DEFAULT_STAGE1_WORKERS = STAGE1_WORKERS
+DEFAULT_COMPARE_WORKERS = COMPARE_WORKERS
+DEFAULT_MAX_DETAIL_CHECKS = MAX_DETAIL_CHECKS_PER_CATEGORY
+
+# 记录当前进程内因“无标品”被跳过的分类次数，配合数据库历史比价次数实现全分类均匀轮转
+_SESSION_SKIPPED_CAT_COUNTS: Dict[str, int] = defaultdict(int)
 
 # 单位精确度优先级：物理度量衡 > 精细计数单位 > 包装计数单位 > 模糊容器/兜底单位
 PRECISE_PHYSICAL_UNITS = {"g", "kg", "斤", "两", "mg", "ml", "l", "L", "m", "cm", "mm"}
@@ -800,7 +817,7 @@ def select_verified_category_champions(
     all_eval_docs = list(
         eval_col.find(
             {},
-            {"platform": 1, "product_id": 1},
+            {"platform": 1, "product_id": 1, "category_name": 1},
         )
     )
     evaluated_keys = {
@@ -808,6 +825,13 @@ def select_verified_category_champions(
         for d in all_eval_docs
         if d.get("product_id")
     }
+    cat_eval_counts: Dict[str, int] = defaultdict(int)
+    for d in all_eval_docs:
+        cname = str(d.get("category_name") or "").strip()
+        if cname:
+            cat_eval_counts[cname] += 1
+    for cname, skip_cnt in _SESSION_SKIPPED_CAT_COUNTS.items():
+        cat_eval_counts[cname] += skip_cnt
 
     query = {
         "$and": [
@@ -843,14 +867,20 @@ def select_verified_category_champions(
         cat_name, primary_sku = cat_and_sku
         by_cat[cat_name].append((doc, primary_sku, act_price))
 
-    sorted_cats = sorted(by_cat.items(), key=lambda kv: len(kv[1]), reverse=True)
-    top_preview = ", ".join(f"{k}({len(v)}款)" for k, v in sorted_cats[:20])
+    # 均匀轮转排序：优先选择已比价次数最少（如0次）的分类，同次数下再按分类商品数从多到少排序
+    sorted_cats = sorted(
+        by_cat.items(),
+        key=lambda kv: (cat_eval_counts.get(kv[0], 0), -len(kv[1])),
+    )
+    top_preview = ", ".join(
+        f"{k}({len(v)}款/已比{cat_eval_counts.get(k, 0)}次)" for k, v in sorted_cats[:20]
+    )
     target_cat_desc = "全部" if max_categories <= 0 else str(max_categories)
     workers = max(1, int(stage1_workers or DEFAULT_STAGE1_WORKERS))
     logger.info(
         f"📊 [步骤1/源头扫描] 72h内有channel_type且已结构化商品={len(raw_docs)} | "
         f"已过滤历史已比价商品={skipped_evaluated_cnt} | 剩余未比价分类数={len(sorted_cats)} | "
-        f"本轮目标选出标品分类数={target_cat_desc} (并发线程={workers}) | 商品数量最多前20分类=[{top_preview}]"
+        f"本轮目标选出标品分类数={target_cat_desc} (并发线程={workers}) | 本轮优先轮转前20分类=[{top_preview}]"
     )
 
     champions: List[Dict[str, Any]] = []
@@ -876,19 +906,21 @@ def select_verified_category_champions(
                 except Exception as exc:
                     logger.warning(f"⚠️ [步骤1/分类选拔异常] 分类=【{cat_name}】 | 异常={exc}")
                     continue
-                if champ is not None:
-                    if max_categories > 0 and len(champions) >= max_categories:
-                        continue
-                    champions.append(champ)
-                    llm_kw_meta = champ.get("llm_keyword_output") or {}
-                    logger.info(
-                        f"🎯 [步骤1/AI标品入选 #{len(champions)}] 分类=【{cat_name}】(共{len(raw_items)}款, AI审{champ['category_top20_count']}款) | "
-                        f"[{champ['platform'].upper()}:{champ['product_id']}] | "
-                        f"验价后activity_price=¥{champ['activity_price']} (入库=¥{champ['db_activity_price']}) | "
-                        f"各unit数量={champ['unit_quantities']} | 各unit性价比={champ['unit_cost_performance']} | "
-                        f"闲鱼搜索词=【{champ['search_keyword']}】(备用=【{champ['backup_search_keyword']}】, 模型={llm_kw_meta.get('model_used')}) | "
-                        f"选拔理由={champ['selection_reason']} | 标题={champ['name'][:36]}"
-                    )
+                if champ is None:
+                    _SESSION_SKIPPED_CAT_COUNTS[cat_name] += 1
+                    continue
+                if max_categories > 0 and len(champions) >= max_categories:
+                    continue
+                champions.append(champ)
+                llm_kw_meta = champ.get("llm_keyword_output") or {}
+                logger.info(
+                    f"🎯 [步骤1/AI标品入选 #{len(champions)}] 分类=【{cat_name}】(共{len(raw_items)}款, AI审{champ['category_top20_count']}款) | "
+                    f"[{champ['platform'].upper()}:{champ['product_id']}] | "
+                    f"验价后activity_price=¥{champ['activity_price']} (入库=¥{champ['db_activity_price']}) | "
+                    f"各unit数量={champ['unit_quantities']} | 各unit性价比={champ['unit_cost_performance']} | "
+                    f"闲鱼搜索词=【{champ['search_keyword']}】(备用=【{champ['backup_search_keyword']}】, 模型={llm_kw_meta.get('model_used')}) | "
+                    f"选拔理由={champ['selection_reason']} | 标题={champ['name'][:36]}"
+                )
 
     return champions
 
@@ -2041,42 +2073,27 @@ def run_discovery_cycle(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="闲鱼高性价比商品探测与比价定时任务（三步 AI 严选标品与详情含邮精准比价 + 并发流水线版）")
-    parser.add_argument("--hours-window", type=int, default=72, help="内部商品库扫描时间窗口（默认72小时）")
-    parser.add_argument("--max-categories", "--max-candidates", dest="max_categories", type=int, default=20, help="单轮探测有效标品分类数（默认20，传0表示不限数量遍历所有分类）")
-    parser.add_argument("--max-search-items", type=int, default=20, help="每次闲鱼搜索抓取的概览商品数（默认20）")
-    parser.add_argument("--max-detail-checks", type=int, default=DEFAULT_MAX_DETAIL_CHECKS, help="对第2步AI筛出的同款商品最多拉取多少个详情（默认10，传0表示不限）")
-    parser.add_argument("--stage1-workers", type=int, default=DEFAULT_STAGE1_WORKERS, help="阶段1（AI选标品+官方验价）并发线程数（默认5）")
-    parser.add_argument("--compare-workers", type=int, default=DEFAULT_COMPARE_WORKERS, help="阶段2/3（闲鱼比价流水线）并发线程数（默认3）")
-    parser.add_argument("--cooldown-hours", type=int, default=24, help="保留参数兼容（已默认过滤所有在xianyu_deal_evaluations中有记录的商品）")
-    parser.add_argument("--guest-dir", type=str, default=DEFAULT_GUEST_USER_DATA_DIR, help="免登录闲鱼浏览器目录")
-    parser.add_argument("--debug-browser", action="store_true", help="是否显示浏览器窗口")
-    parser.add_argument("--loop", action="store_true", help="是否启用常驻定时循环模式")
-    parser.add_argument("--interval-hours", type=float, default=4.0, help="循环模式间隔小时数（默认4小时）")
-    args = parser.parse_args()
-
     while True:
         try:
             run_discovery_cycle(
-                hours_window=args.hours_window,
-                max_categories=args.max_categories,
-                max_search_items=args.max_search_items,
-                max_detail_checks=args.max_detail_checks,
-                cooldown_hours=args.cooldown_hours,
-                guest_user_data_dir=args.guest_dir,
-                debug_browser=args.debug_browser,
-                stage1_workers=args.stage1_workers,
-                compare_workers=args.compare_workers,
+                hours_window=SCAN_HOURS_WINDOW,
+                max_categories=MAX_CATEGORIES_PER_ROUND,
+                max_search_items=MAX_XIANYU_SEARCH_ITEMS,
+                max_detail_checks=MAX_DETAIL_CHECKS_PER_CATEGORY,
+                guest_user_data_dir=GUEST_USER_DATA_DIR,
+                debug_browser=DEBUG_BROWSER,
+                stage1_workers=STAGE1_WORKERS,
+                compare_workers=COMPARE_WORKERS,
             )
         except KeyboardInterrupt:
             logger.info("👋 收到中断信号，任务退出。")
             break
         except Exception as exc:
             logger.exception(f"❌ [探测轮次异常] {exc}")
-        if not args.loop:
+        if not ENABLE_LOOP:
             break
-        logger.info(f"⏳ 等待 {args.interval_hours} 小时后执行下一轮...")
-        time.sleep(max(60.0, args.interval_hours * 3600.0))
+        logger.info(f"⏳ 本轮执行完毕，等待 {LOOP_INTERVAL_HOURS} 小时后执行下一轮...")
+        time.sleep(max(60.0, LOOP_INTERVAL_HOURS * 3600.0))
 
 
 if __name__ == "__main__":
