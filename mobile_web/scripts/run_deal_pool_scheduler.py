@@ -3489,71 +3489,14 @@ def run_clean_stage(
             success_product_docs.extend(commit_info["success_product_docs"])
             early_terminated_results.extend(commit_info["early_terminated_results"])
             failed_samples.extend(commit_info["failed_samples"])
-
-            for res in batch_res:
-                done_items += 1
-                all_processed_results.append(res)
-                idx = done_items
-                site = res["source_site"]
-                if res["status"] == "success":
-                    logger.info(
-                        "  ✅ [终审通过 %03d/%03d] [%-11s] %-6s | 评分=%2d | ID=%-22s | 爆料价=%-6s 官价=%-6s | %s",
-                        idx,
-                        total_selected,
-                        site,
-                        res["platform"],
-                        res.get("quality_score", 0),
-                        res["product_id"][:22],
-                        str(res["deal_price"]),
-                        str(res["official_price"]),
-                        str(res["official_title"])[:30],
-                    )
-                elif res["status"] == "early_terminated":
-                    logger.info(
-                        "  ⚡ [提前终止 %03d/%03d] [%-11s] %-6s | ID=%-22s | %s | %s",
-                        idx,
-                        total_selected,
-                        site,
-                        res.get("platform") or "-",
-                        str(res.get("product_id") or "")[:22],
-                        res.get("error_msg", "")[:42],
-                        str(res.get("official_title") or res.get("title") or "")[:26],
-                    )
-                elif res["status"] == "merged_into_parent":
-                    logger.info(
-                        "  🔗 [上下文合并 %03d/%03d] [%-11s] %s -> %s",
-                        idx,
-                        total_selected,
-                        site,
-                        res["source_item_id"],
-                        res["error_msg"],
-                    )
-                elif res["status"] == "low_score":
-                    logger.info(
-                        "  ⚪ [低分留存 %03d/%03d] [%-11s] 评分=%2d | %s -> %s",
-                        idx,
-                        total_selected,
-                        site,
-                        res.get("quality_score", 0),
-                        str(res.get("title") or "")[:28],
-                        res["error_msg"],
-                    )
-                else:
-                    logger.info(
-                        "  ❌ [清洗拦截 %03d/%03d] [%-11s] %-28s | %s -> %s",
-                        idx,
-                        total_selected,
-                        site,
-                        res["error_code"],
-                        str(res.get("title") or "")[:28],
-                        res["error_msg"][:45],
-                    )
+            done_items += len(batch_res)
+            all_processed_results.extend(batch_res)
 
             b_succ = len(commit_info["success_product_docs"])
             b_early = len(commit_info["early_terminated_results"])
-            b_fail = len(batch_res) - b_succ - b_early
+            b_filtered = len(batch_res) - b_succ - b_early
             logger.info(
-                "💾 [批次实时落盘 %03d/%03d批 (%3d%%)] 本批%2d条已写库(终审入库=%d, 早停共振=%d, 拦截/合并=%d) | "
+                "💾 [批次实时落盘 %03d/%03d批 (%3d%%)] 本批%2d条已写库(终审入库=%d, 早停共振=%d, 过滤/合并=%d) | "
                 "本轮累计已落盘=%d/%d条(累计新增商品=%d, 更新共振=%d) | 已耗时=%.1fs | 📦 库内剩余Pending=%d条",
                 done_batches,
                 total_mini_batches,
@@ -3561,7 +3504,7 @@ def run_clean_stage(
                 len(batch_res),
                 b_succ,
                 b_early,
-                b_fail,
+                b_filtered,
                 done_items,
                 total_selected,
                 formal_write_res["upserted"],
