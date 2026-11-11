@@ -55,10 +55,13 @@ cd /root/easy_shop_web
 # 1. 拉取最新代码
 git pull origin main
 
-# 2. 重启商城后台服务
+# 2. 同步安装新增 Python 依赖（走腾讯云镜像源加速，已安装的包会自动秒跳过）
+/root/easy_shop_web/mobile_web/.venv/bin/python -m pip install -i https://mirrors.cloud.tencent.com/pypi/simple -r /root/easy_shop_web/mobile_web/requirements.txt
+
+# 3. 重启商城后台服务
 systemctl restart mobile_web.service
 
-# 3. 检查运行状态
+# 4. 检查运行状态
 systemctl status mobile_web.service
 ```
 
@@ -186,3 +189,14 @@ nginx -t && systemctl reload nginx
   1. 检查 MongoDB 是否存活：`systemctl status mongod`。
   2. 检查 `/root/easy_shop_web/mobile_web/config.local.json` 中的 `local_mongo_user` 和 `local_mongo_password` 是否填入正确账号密码。
   3. 运行连通性自检命令确认：`/root/easy_shop_web/mobile_web/.venv/bin/python run.py --check-mongo`。
+
+---
+
+### 🚨 故障 6：发版重启后报 `502 Bad Gateway`，日志报 `ModuleNotFoundError`（如 `No module named 'cv2'`）
+* **根本原因：** 拉取新代码（如新增二维码识别/图片上传模块）后，未在 `.venv` 虚拟环境中同步安装新增的第三方依赖包；或者在无桌面的 Linux 服务器上误装了带 GUI 依赖的 `opencv-python`（缺少 `libGL.so.1`），而非无头版 `opencv-python-headless`。
+* **排查与解决：**
+  1. 使用腾讯云内网 PyPI 镜像源一键同步完整依赖并重启服务：
+     ```bash
+     /root/easy_shop_web/mobile_web/.venv/bin/python -m pip install -i https://mirrors.cloud.tencent.com/pypi/simple -r /root/easy_shop_web/mobile_web/requirements.txt && systemctl restart mobile_web.service
+     ```
+  2. 执行 `systemctl status mobile_web.service` 确认状态为 `active (running)`。
