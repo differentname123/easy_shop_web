@@ -562,6 +562,12 @@ def _collect_browser_failure_diag(
         pass
 
     tips = _collect_page_error_tips(page)
+    raw_failed = list(dict.fromkeys(auth_tracker.get("failed_apis") or []))
+    non_guest_session_failed = [
+        x for x in raw_failed
+        if not ("FAIL_SYS_SESSION_EXPIRED" in x and ("loginuser.get" in x or "user.page.nav" in x))
+    ]
+    clean_failed = (non_guest_session_failed or raw_failed)[-5:]
     return {
         "mode": "headless" if headless else "headed",
         "url": cur_url,
@@ -570,7 +576,7 @@ def _collect_browser_failure_diag(
         "has_login_frame": has_login_frame,
         "has_punish_frame": has_punish_frame,
         "page_tips": tips or str(body_hint or "").strip(),
-        "failed_apis": list(auth_tracker.get("failed_apis") or [])[-5:],
+        "failed_apis": clean_failed,
         "risk_rets": list(auth_tracker.get("risk_rets") or []),
     }
 
@@ -2419,6 +2425,7 @@ def get_xianyu_item_detail(
 
             # 2. 访问目标商品详情页并等待 mtop.taobao.idle.pc.detail 响应
             success_packet: Optional[Dict[str, Any]] = None
+            biz_not_found = False
             for attempt in range(2):
                 detail_packets.clear()
                 page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
@@ -2429,13 +2436,16 @@ def get_xianyu_item_detail(
                         if "SUCCESS" in ret_str and isinstance((pkt.get("data") or {}).get("itemDO"), dict):
                             success_packet = pkt
                             break
-                    if success_packet is not None or auth_tracker.get("risk_rets"):
+                        if "FAIL_BIZ_" in ret_str:
+                            biz_not_found = True
+                            break
+                    if success_packet is not None or biz_not_found or auth_tracker.get("risk_rets"):
                         break
                     page.wait_for_timeout(200)
 
                 _dismiss_guest_login_modal(page)
                 _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name="get_xianyu_item_detail")
-                if success_packet is not None:
+                if success_packet is not None or biz_not_found:
                     break
 
                 # 若首次因匿名令牌过期未拿到数据包，回首页刷新一次匿名令牌后重试
@@ -2668,6 +2678,7 @@ def get_xianyu_item_details_batch(
                 t_item = time.monotonic()
                 detail_url = f"{GOOFISH_HOME_URL}/item?id={item_id}"
                 success_packet: Optional[Dict[str, Any]] = None
+                biz_not_found = False
                 auth_tracker["failed_apis"].clear()
 
                 for attempt in range(2):
@@ -2680,13 +2691,16 @@ def get_xianyu_item_details_batch(
                             if "SUCCESS" in ret_str and isinstance((pkt.get("data") or {}).get("itemDO"), dict):
                                 success_packet = pkt
                                 break
-                        if success_packet is not None or auth_tracker.get("risk_rets"):
+                            if "FAIL_BIZ_" in ret_str:
+                                biz_not_found = True
+                                break
+                        if success_packet is not None or biz_not_found or auth_tracker.get("risk_rets"):
                             break
                         page.wait_for_timeout(200)
 
                     _dismiss_guest_login_modal(page)
                     _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name=f"batch_detail:{item_id}")
-                    if success_packet is not None:
+                    if success_packet is not None or biz_not_found:
                         break
 
                     if attempt == 0:

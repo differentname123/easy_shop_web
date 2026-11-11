@@ -1547,6 +1547,10 @@ def compare_candidate_with_xianyu(
         llm_data=validated_llm_data,
         llm_call_meta=llm_call_meta,
         fallback_error=last_error_msg if not validated_llm_data else "",
+        batch_det_res=batch_det_res,
+        detail_failed_count=detail_failed_count,
+        browser_aborted=False,
+        debug_browser=debug_browser,
     )
 
 
@@ -1561,6 +1565,10 @@ def _build_final_record(
     llm_data: Dict[str, Any],
     llm_call_meta: Dict[str, Any],
     fallback_error: str = "",
+    batch_det_res: Optional[Dict[str, Any]] = None,
+    detail_failed_count: int = 0,
+    browser_aborted: bool = False,
+    debug_browser: bool = False,
 ) -> Dict[str, Any]:
     """
     步骤 4：
@@ -1634,8 +1642,12 @@ def _build_final_record(
     else:
         chosen_unit = None
         cp_ratio = None
-        comparison_basis = "llm_judgment_fallback" if has_comp else "no_comparable"
-        final_winner = llm_winner if has_comp else "no_comparable"
+        if browser_aborted:
+            comparison_basis = "browser_error"
+            final_winner = "browser_error"
+        else:
+            comparison_basis = "llm_judgment_fallback" if has_comp else "no_comparable"
+            final_winner = llm_winner if has_comp else "no_comparable"
 
     is_my_better = final_winner == "my_product"
 
@@ -1716,11 +1728,19 @@ def _build_final_record(
             },
         },
         "xianyu_audit_trail": {
+            "browser_mode": "headless" if not debug_browser else "headed",
+            "browser_aborted": bool(browser_aborted),
+            "is_risk_blocked": bool(search_res.get("is_risk_blocked") or (batch_det_res or {}).get("is_risk_blocked")),
             "search_keyword": used_keyword,
             "search_ok": bool(search_res.get("ok")),
+            "search_error_code": str(search_res.get("error_code") or ""),
+            "search_error_message": str(search_res.get("message") or "") if not search_res.get("ok") else "",
             "raw_search_count": len(coarse_items_for_llm),
             "step2_comparable_item_ids": step2_comparable_ids,
+            "batch_detail_ok": bool((batch_det_res or {}).get("ok", True)),
+            "batch_detail_error_code": str((batch_det_res or {}).get("error_code") or ""),
             "step3_detail_fetched_count": len(xianyu_items_for_llm),
+            "step3_detail_failed_count": int(detail_failed_count),
             "comparable_item_ids": llm_data.get("comparable_item_ids") or [],
             "xianyu_coarse_items": coarse_items_for_llm,
             "xianyu_items_fed_to_llm": xianyu_items_for_llm,
@@ -1735,12 +1755,20 @@ def _build_verdict_summary(record: Dict[str, Any]) -> Tuple[str, str, str]:
     cr = record.get("comparison_result") or {}
     cand = record.get("candidate_product") or {}
     bxy = record.get("best_xianyu_product") or {}
+    audit = record.get("xianyu_audit_trail") or {}
     final_winner = str(record.get("final_winner") or "no_comparable")
     basis = str(cr.get("comparison_basis") or "no_comparable")
     matched_u = cr.get("matched_unit")
     cp_ratio = cr.get("cost_performance_ratio")
     my_cp_map = cr.get("my_unit_cost_performance") or {}
     xy_cp_map = cr.get("xianyu_unit_cost_performance") or {}
+
+    if audit.get("browser_aborted") or final_winner == "browser_error":
+        return (
+            "🚨 检索异常",
+            "ERR",
+            f"闲鱼浏览器检索异常中断：{cr.get('llm_reason') or '请搜索上方 ❌ 错误日志定位原因'}",
+        )
 
     if not cr.get("has_comparable_item") or final_winner == "no_comparable":
         return (
@@ -1865,12 +1893,22 @@ def _format_single_comparison_card(idx: int, total: int, record: Dict[str, Any])
         tfee = bxy.get("transport_fee")
         fee_tag = f"运费¥{tfee}" if tfee is not None else ("包邮" if bxy.get("is_free_shipping") else "运费见详情")
         xy_desc = f"【提取规格({fee_tag}): {xy_spec or '见标题'}】 标题: {bxy.get('title') or ''}"
+    elif audit.get("browser_aborted"):
+        xy_plat_id = "XY :检索异常中断"
+        xy_price = "-"
+        xy_qty = "-"
+        xy_cp = "-"
+        xy_desc = cr.get("llm_reason") or "闲鱼无头浏览器检索异常中断，详见上方 ❌ 错误日志"
     else:
         xy_plat_id = "XY :无可比商品"
         xy_price = "-"
         xy_qty = "-"
         xy_cp = "-"
         xy_desc = "未在闲鱼搜索结果中找到同品牌同规格且邮费清晰的可比商品"
+
+    det_ok = audit.get("step3_detail_fetched_count", 0)
+    det_fail = audit.get("step3_detail_failed_count", 0)
+    det_stat_str = f"拉取详情{det_ok}款" if det_fail == 0 else f"拉取详情{det_ok}款(失败{det_fail}款)"
 
     border_eq = "=" * 140
     border_dash = "-" * 140
@@ -1879,7 +1917,7 @@ def _format_single_comparison_card(idx: int, total: int, record: Dict[str, Any])
         f"分类: 【{record['category_name']}】(库内{cand.get('category_item_count', '-')}款)  |  "
         f"结论: {badge}  |  性价比比值(我方/闲鱼): {ratio_str}  |  "
         f"闲鱼搜索: \"{audit.get('search_keyword', '')}\"(初搜{audit.get('raw_search_count', 0)}->"
-        f"AI初筛同款{len(audit.get('step2_comparable_item_ids') or [])}->拉取详情{audit.get('step3_detail_fetched_count', 0)}款)"
+        f"AI初筛同款{len(audit.get('step2_comparable_item_ids') or [])}->{det_stat_str})"
     )
     col_header = (
         f"{_pad_col('对比角色', 10)} | "
@@ -1930,7 +1968,31 @@ def _format_batch_summary_report(batch_id: str, elapsed: float, records: List[Di
     win_cnt = sum(1 for r in records if r.get("final_winner") == "my_product")
     lose_cnt = sum(1 for r in records if r.get("final_winner") == "xianyu_product")
     tie_cnt = sum(1 for r in records if r.get("final_winner") == "tie")
-    none_cnt = sum(1 for r in records if r.get("final_winner") not in ("my_product", "xianyu_product", "tie"))
+    err_cnt = sum(1 for r in records if (r.get("xianyu_audit_trail") or {}).get("browser_aborted"))
+    none_cnt = sum(
+        1
+        for r in records
+        if r.get("final_winner") not in ("my_product", "xianyu_product", "tie")
+        and not (r.get("xianyu_audit_trail") or {}).get("browser_aborted")
+    )
+
+    search_err_cnt = sum(1 for r in records if not (r.get("xianyu_audit_trail") or {}).get("search_ok", True))
+    risk_block_cnt = sum(1 for r in records if (r.get("xianyu_audit_trail") or {}).get("is_risk_blocked"))
+    batch_abort_cnt = sum(1 for r in records if not (r.get("xianyu_audit_trail") or {}).get("batch_detail_ok", True))
+    item_det_fail_cnt = sum(int((r.get("xianyu_audit_trail") or {}).get("step3_detail_failed_count") or 0) for r in records)
+    item_det_ok_cnt = sum(int((r.get("xianyu_audit_trail") or {}).get("step3_detail_fetched_count") or 0) for r in records)
+
+    if search_err_cnt == 0 and risk_block_cnt == 0 and batch_abort_cnt == 0:
+        health_status = (
+            f"✅ 浏览器检索健康 (初搜失败=0 | 风控滑块=0 | 会话中断=0 | "
+            f"详情成功拉取={item_det_ok_cnt}个, 单品未捕获={item_det_fail_cnt}个)"
+        )
+    else:
+        health_status = (
+            f"🚨 检测到浏览器检索异常！(初搜失败={search_err_cnt} | 风控滑块={risk_block_cnt} | "
+            f"批量详情中断={batch_abort_cnt} | 详情成功={item_det_ok_cnt}个, 失败={item_det_fail_cnt}个) "
+            f"-> 请在日志中搜索 ❌ 或 🚨 排查现场诊断！"
+        )
 
     eq_line = "=" * 144
     dash_line = "-" * 144
@@ -1941,8 +2003,10 @@ def _format_batch_summary_report(batch_id: str, elapsed: float, records: List[Di
             f"📊 【闲鱼比价探测 · 本轮运维全局总结报告】 "
             f"批次: {batch_id}  |  总耗时: {elapsed:.1f}s  |  "
             f"参评标品分类: {len(records)} 个  |  "
-            f"🏆 我方胜出: {win_cnt}  |  🏳️ 闲鱼更优: {lose_cnt}  |  🤝 持平: {tie_cnt}  |  ⚪ 无可比: {none_cnt}"
+            f"🏆 我方胜出: {win_cnt}  |  🏳️ 闲鱼更优: {lose_cnt}  |  🤝 持平: {tie_cnt}  |  "
+            f"⚪ 无可比: {none_cnt}  |  🚨 检索异常: {err_cnt}"
         ),
+        f"🌐 浏览器检索健康度: {health_status}",
         eq_line,
         "【一、全部分类胜负一表通览】",
         dash_line,
@@ -2006,6 +2070,7 @@ def _format_batch_summary_report(batch_id: str, elapsed: float, records: List[Di
         cand = r.get("candidate_product") or {}
         bxy = r.get("best_xianyu_product") or {}
         cr = r.get("comparison_result") or {}
+        audit = r.get("xianyu_audit_trail") or {}
         badge, ratio_str, quant_explain = _build_verdict_summary(r)
         focus_u = cr.get("matched_unit") or cand.get("primary_unit")
 
@@ -2022,6 +2087,12 @@ def _format_batch_summary_report(batch_id: str, elapsed: float, records: List[Di
             xy_cp = _fmt_cp_human(cr.get("xianyu_unit_cost_performance") or {}, focus_u)
             xy_spec = str(bxy.get("spec_description") or "").strip()
             xy_desc = f"【提取规格: {xy_spec or '见标题'}】 标题: {bxy.get('title') or ''}"
+        elif audit.get("browser_aborted"):
+            xy_plat_id = "XY :检索异常中断"
+            xy_price = "-"
+            xy_qty = "-"
+            xy_cp = "-"
+            xy_desc = cr.get("llm_reason") or "闲鱼无头浏览器检索异常中断"
         else:
             xy_plat_id = "XY :无可比商品"
             xy_price = "-"
@@ -2074,13 +2145,14 @@ def run_discovery_cycle(
     s1_workers = max(1, int(stage1_workers or DEFAULT_STAGE1_WORKERS))
     cmp_workers = max(1, int(compare_workers or DEFAULT_COMPARE_WORKERS))
     detail_cap_desc = f"前{max_detail_checks}款" if max_detail_checks > 0 else "全部"
+    browser_mode_desc = "无头静默(headless)" if not debug_browser else "有头窗口(headed)"
     logger.info(
-        f"\n{'=' * 92}\n"
+        f"\n{'=' * 96}\n"
         f"🚀 [闲鱼高性价比商品探测与比价任务/启动] 批次={batch_id} | 时间窗={hours_window}h | "
         f"探测标品分类数={max_categories if max_categories > 0 else '全部'} | "
         f"并发配置=(阶段1选品={s1_workers}线程, 阶段2/3比价={cmp_workers}线程, 同款详情上限={detail_cap_desc}) | "
-        f"访客主目录=<{guest_user_data_dir}>\n"
-        f"{'=' * 92}"
+        f"浏览器模式={browser_mode_desc} | 访客主目录=<{guest_user_data_dir}>\n"
+        f"{'=' * 96}"
     )
 
     db = gen_db_object()
@@ -2126,11 +2198,17 @@ def run_discovery_cycle(
             guest_dir_pool=guest_dir_pool,
         )
         rec["batch_id"] = batch_id
-        eval_col.update_one(
-            {"platform": rec["platform"], "product_id": rec["product_id"]},
-            {"$set": rec},
-            upsert=True,
-        )
+        if (rec.get("xianyu_audit_trail") or {}).get("browser_aborted"):
+            logger.warning(
+                f"⚠️ [跳过入库] 分类=【{rec['category_name']}】 | 商品=[{rec['platform'].upper()}:{rec['product_id']}] "
+                f"因闲鱼浏览器检索异常中断，暂不写入比价记录库，保留后续轮次重试机会"
+            )
+        else:
+            eval_col.update_one(
+                {"platform": rec["platform"], "product_id": rec["product_id"]},
+                {"$set": rec},
+                upsert=True,
+            )
         logger.info(_format_single_comparison_card(idx, total_champions, rec))
         return idx, rec
 
