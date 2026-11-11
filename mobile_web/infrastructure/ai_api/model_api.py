@@ -668,6 +668,8 @@ def generate_content(
     max_retries_per_model=3,
     timeout=600,
     preset_model_group="medium",
+    stop_on_timeout=False,
+    slot_acquire_timeout=5.0,
 ):
     """同步生成文本；file_paths 为路径 list/tuple，不修改调用参数。
 
@@ -691,6 +693,7 @@ def generate_content(
         "metrics": {"model_used": None, "total_time_seconds": 0.0, "attempts": 0},
         "error_history": [],
         "trace_id": trace_id,
+        "timed_out": False,
     }
     metrics = result["metrics"]
     client = None
@@ -721,13 +724,32 @@ def generate_content(
                 raise RuntimeError("未安装 openai 库，请执行 pip install openai")
             if not API_KEY:
                 raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
-            # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
+            # : timeout 沿用 SDK 请求超时语义；当启用 stop_on_timeout 时每次请求按剩余时间窗口动态收敛。
             client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
 
         # : 沿用所有普通请求异常均重试/降级的规则，包括鉴权失败和无有效文本响应。
         for model_index, current_model in enumerate(models):
             delay = 2.0
+            has_fallback_model = model_index < len(models) - 1
             for attempt in range(1, max_retries_per_model + 1):
+                elapsed_so_far = time.perf_counter() - started
+                if stop_on_timeout and elapsed_so_far >= float(timeout):
+                    result["timed_out"] = True
+                    result["error_history"].append(
+                        f"[超时跳过] 总耗时 {elapsed_so_far:.2f}s 已达上限 {float(timeout):.1f}s，终止后续模型尝试"
+                    )
+                    _log(
+                        f"⏱️ [模型网关/超时跳过] 已达 AI 总超时上限 ({float(timeout):.1f}s)，跳过后续候选模型"
+                        f" | 已尝试: [{metrics['attempts']}次] | 总耗时: [{elapsed_so_far:.2f}s]",
+                        logging.WARNING,
+                    )
+                    return result
+
+                req_timeout = (
+                    max(5.0, float(timeout) - elapsed_so_far)
+                    if stop_on_timeout
+                    else float(timeout)
+                )
                 metrics["model_used"] = current_model
                 metrics["attempts"] += 1
                 _log(
@@ -740,19 +762,30 @@ def generate_content(
                 usage = None
                 request_event = _new_model_usage_event(current_model, trace_id)
                 usage_events.append(request_event)
+                skip_same_model = False
+                budget_exhausted = False
                 try:
                     if current_model in ANTIGRAVITY_MODEL_ALIASES:
+                        ag_slot_timeout = (
+                            float(slot_acquire_timeout)
+                            if (has_fallback_model and slot_acquire_timeout is not None)
+                            else (min(req_timeout, 30.0) if stop_on_timeout else None)
+                        )
                         reply, usage = get_antigravity_client().ask_with_usage(
                             prompt=ag_prompt,
                             model=current_model,
                             media=ag_media,
-                            timeout=timeout,
+                            timeout=req_timeout,
+                            slot_acquire_timeout=ag_slot_timeout,
                         )
                         status_code = 200
                         response_model_name = current_model
                     else:
                         raw = client.chat.completions.with_raw_response.create(
-                            model=current_model, messages=messages, stream=False,
+                            model=current_model,
+                            messages=messages,
+                            stream=False,
+                            timeout=req_timeout,
                         )
                         status_code = raw.status_code
                         response = raw.parse()
@@ -784,6 +817,22 @@ def generate_content(
                     status_code = getattr(exc, "status_code", None) or status_code
                     failed_account = getattr(exc, "account_email", None)
                     failed_port = getattr(exc, "sandbox_port", None)
+                    is_slot_busy = bool(getattr(exc, "is_slot_busy", False))
+                    skip_same_model = bool(getattr(exc, "skip_same_model_retry", False))
+                    exc_name_lower = type(exc).__name__.lower()
+                    exc_msg_lower = str(exc).lower()
+                    is_req_timeout = (not is_slot_busy) and (
+                        isinstance(exc, TimeoutError)
+                        or "timeout" in exc_name_lower
+                        or "timed out" in exc_msg_lower
+                        or "超时" in str(exc)
+                    )
+                    budget_exhausted = bool(stop_on_timeout) and (
+                        is_req_timeout or (time.perf_counter() - started) >= float(timeout)
+                    )
+                    if budget_exhausted:
+                        result["timed_out"] = True
+
                     if failed_account:
                         metrics["account_used"] = failed_account
                     acc_tag = (
@@ -795,12 +844,18 @@ def generate_content(
                                     + (f" | account: {failed_account}" if failed_account else "")
                                     + f" | Error: {type(exc).__name__}: {exc}")
                     result["error_history"].append(error)
-                    request_event["status"] = "❌ 失败"
+                    request_event["status"] = "❌ 准备失败" if is_slot_busy else "❌ 失败"
                     request_event["error"] = error
-                    terminal = attempt == max_retries_per_model and model_index == len(models) - 1
-                    if attempt < max_retries_per_model:
+                    terminal = budget_exhausted or (
+                        (skip_same_model or attempt == max_retries_per_model) and not has_fallback_model
+                    )
+                    if budget_exhausted:
+                        action = f"已达 AI 超时阈值 ({float(timeout):g}s)，立即跳过本批不继续重试"
+                    elif skip_same_model and has_fallback_model:
+                        action = f"本地槽位繁忙，5s快速切换备用模型 {models[model_index + 1]}"
+                    elif attempt < max_retries_per_model:
                         action = f"等待 {delay:g}s 后重试同模型" + ("(自动切换池中其他小号)" if failed_account else "")
-                    elif not terminal:
+                    elif has_fallback_model:
                         action = f"切换备用模型 {models[model_index + 1]}"
                     else:
                         action = "所有候选模型尝试耗尽，返回失败结果"
@@ -814,13 +869,14 @@ def generate_content(
                     req_cost = time.perf_counter() - request_started
                     if terminal:
                         completion_log = (
-                            f"❌ [模型网关/失败] 所有候选模型尝试耗尽 | 最终模型: [{current_model}]{acc_tag}"
+                            f"❌ [模型网关/失败] {'AI调用超时跳过' if budget_exhausted else '所有候选模型尝试耗尽'}"
+                            f" | 最终模型: [{current_model}]{acc_tag}"
                             f" | 累计尝试: [{metrics['attempts']}] | HTTP: [{status_code or 'N/A'}]"
                             f" | 总耗时: [{time.perf_counter() - started:.2f}s]"
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 160)}]"
                             f" | 排查方向: [{hint}]"
                         )
-                        level = logging.ERROR
+                        level = logging.WARNING if budget_exhausted else logging.ERROR
                     else:
                         completion_log = (
                             f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]{acc_tag}"
@@ -829,7 +885,7 @@ def generate_content(
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 140)}]"
                             f" | 后续动作: [{action}]"
                         )
-                        level = logging.WARNING
+                        level = logging.INFO if is_slot_busy else logging.WARNING
                 except BaseException as exc:
                     request_event["status"] = "⚠️ 中断"
                     request_event["error"] = _redact(f"[请求中断] {type(exc).__name__}: {exc}")
@@ -841,6 +897,10 @@ def generate_content(
                 _log(completion_log, level)
                 if result["status"] == "✅ 成功":
                     return result
+                if budget_exhausted:
+                    return result
+                if skip_same_model:
+                    break
                 if attempt < max_retries_per_model:
                     time.sleep(delay)
                     delay = min(delay * 2, 600.0)

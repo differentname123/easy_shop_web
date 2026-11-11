@@ -99,6 +99,13 @@ USER_GEMINI_TOKEN_PATH = Path.home() / ".gemini" / "jetski-standalone-oauth-toke
 ANTIGRAVITY_TOOLS_ACCOUNTS_DIR = Path.home() / ".antigravity_tools" / "accounts"
 
 
+class SlotAcquireTimeoutError(TimeoutError):
+    """本地 Antigravity 并发槽位等待超时（通知上层网关跳过同模型重试并立即切换备用模型）。"""
+
+    skip_same_model_retry = True
+    is_slot_busy = True
+
+
 def _sanitize_email_dirname(email: str) -> str:
     """将邮箱名转换为安全的文件夹名称。"""
     clean = email.strip().lower().replace("@", "_at_")
@@ -419,11 +426,15 @@ class AntigravityClient:
         return None
 
     @contextlib.contextmanager
-    def _acquire_account_slot(self, pre_acquired_fd: Optional[int] = None):
+    def _acquire_account_slot(
+        self,
+        pre_acquired_fd: Optional[int] = None,
+        slot_acquire_timeout: Optional[float] = None,
+    ):
         """
         获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=2 个跨进程并发槽位）：
         - 若由账号池调度器传入了已经非阻塞抢到的 `pre_acquired_fd`，则直接使用；
-        - 否则在当前账号的槽位上等待直到空闲。
+        - 否则在当前账号的槽位上等待直到空闲（若配置了 slot_acquire_timeout 则超时快速抛出 SlotAcquireTimeoutError）。
         """
         if pre_acquired_fd is not None:
             try:
@@ -438,21 +449,36 @@ class AntigravityClient:
                 self._concurrency_sem.release()
             return
 
-        with self._concurrency_sem:
-            locked_fd: Optional[int] = None
+        wait_started = time.perf_counter()
+        if slot_acquire_timeout is not None:
+            acquired = self._concurrency_sem.acquire(timeout=max(0.01, float(slot_acquire_timeout)))
+            if not acquired:
+                raise SlotAcquireTimeoutError(
+                    f"等待 Antigravity 本地并发槽位超过 {float(slot_acquire_timeout):.1f}s，立即切换其他模型"
+                )
+        else:
+            self._concurrency_sem.acquire()
+
+        locked_fd: Optional[int] = None
+        try:
             while locked_fd is None:
                 locked_fd = self._try_acquire_os_slot_fd()
                 if locked_fd is None:
+                    if slot_acquire_timeout is not None and (time.perf_counter() - wait_started) >= float(slot_acquire_timeout):
+                        raise SlotAcquireTimeoutError(
+                            f"等待 Antigravity 本地文件锁槽位超过 {float(slot_acquire_timeout):.1f}s，立即切换其他模型"
+                        )
                     time.sleep(random.uniform(0.08, 0.16))
-            try:
-                self._wait_for_stagger_slot()
-                yield
-            finally:
+            self._wait_for_stagger_slot()
+            yield
+        finally:
+            if locked_fd is not None:
                 self._unlock_fd(locked_fd)
                 try:
                     os.close(locked_fd)
                 except OSError:
                     pass
+            self._concurrency_sem.release()
 
     def try_claim_idle_slot(self) -> Optional[int]:
         """
@@ -1039,6 +1065,7 @@ class AntigravityClient:
         media: Optional[List[Dict[str, str]]] = None,
         timeout: Optional[float] = None,
         _pre_acquired_fd: Optional[int] = None,
+        slot_acquire_timeout: Optional[float] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         """
         单账号的统一模型生成接口（走原生 Cascade 会话流，自动无痕清理，并在返回结果与异常上均绑定账号信息）。
@@ -1048,7 +1075,10 @@ class AntigravityClient:
         req_timeout = float(timeout) if timeout is not None else self.timeout
 
         try:
-            with self._acquire_account_slot(pre_acquired_fd=_pre_acquired_fd):
+            with self._acquire_account_slot(
+                pre_acquired_fd=_pre_acquired_fd,
+                slot_acquire_timeout=slot_acquire_timeout,
+            ):
                 start_resp = self._post_rpc_inner(
                     "StartCascade",
                     {
@@ -1317,10 +1347,12 @@ class AntigravityPoolClient:
         system_prompt: Optional[str] = None,
         media: Optional[List[Dict[str, str]]] = None,
         timeout: Optional[float] = None,
+        slot_acquire_timeout: Optional[float] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         """
         从账号池中自动随机挑选支持目标模型且有空闲并发槽位的小号执行请求。
         返回 `(reply_text, usage_dict)`，其中 `usage_dict["account_email"]` 为本次实际执行的小号邮箱。
+        若传入 `slot_acquire_timeout` 且在限定秒数内所有小号槽位均满载，则快速抛出 `SlotAcquireTimeoutError` 供上层立即切换其他模型。
         """
         target_model = AntigravityClient.resolve_model_enum(model or self.default_model)
         candidates = self.get_eligible_workers(target_model)
@@ -1330,6 +1362,7 @@ class AntigravityPoolClient:
 
         chosen_worker: Optional[AntigravityClient] = None
         claimed_fd: Optional[int] = None
+        wait_started = time.perf_counter()
 
         while chosen_worker is None:
             shuffled = list(candidates)
@@ -1345,6 +1378,10 @@ class AntigravityPoolClient:
                     break
 
             if chosen_worker is None:
+                if slot_acquire_timeout is not None and (time.perf_counter() - wait_started) >= float(slot_acquire_timeout):
+                    raise SlotAcquireTimeoutError(
+                        f"等待 Antigravity 本地空闲槽位超过 {float(slot_acquire_timeout):.1f}s，立即切换其他模型"
+                    )
                 time.sleep(random.uniform(0.08, 0.16))
 
         try:
