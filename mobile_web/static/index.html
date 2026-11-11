@@ -10,12 +10,12 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="查券省钱">
   <title>查券省钱</title>
-  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
-  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261109-2">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261111-3">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261109-2"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261111-3"></script>
 </head>
 <body>
 <div id="app">
@@ -29,7 +29,7 @@
           <input 
             type="text" 
             class="search-input" 
-            :placeholder="'搜索' + homePlatformName() + '优惠商品...'"
+            :placeholder="'搜' + homePlatformName() + '商品，或直接粘贴分享链接/口令...'"
             v-model="homeSearchKeyword"
             @keyup.enter="onSearchHome"
           />
@@ -59,7 +59,7 @@
       </nav>
       <nav class="search-status-bar" v-else>
         <span class="search-status-text">当前在 <b>{{ homePlatformName() }}</b> 搜索「{{ activeHomeKeyword }}」，点上方平台可切换搜索</span>
-        <button type="button" class="search-back-btn" @click="clearHomeSearch">返回精选榜单</button>
+        <button type="button" class="search-back-btn" @click="clearHomeSearch">返回热销榜单</button>
       </nav>
     </header>
 
@@ -71,6 +71,12 @@
         <span v-else class="pull-refresh-arrow" :class="{ 'arrow-up': pullStatus === 'ready' }">↓</span>
         <span class="pull-refresh-text">{{ pullText }}</span>
       </div>
+    </div>
+
+    <!-- 新用户价值主张轻引导条（可一键关闭记忆） -->
+    <div class="value-guide-strip" v-if="showValueGuide && !activeHomeKeyword">
+      <span class="value-guide-text">🔥 <b>全网真实销量热榜</b> · 跟着大家买不踩雷 · 直达官方 App 领券下单</span>
+      <button type="button" class="value-guide-close" @click="dismissValueGuide" title="关闭提示" aria-label="关闭提示">✕</button>
     </div>
 
     <!-- 首页商品双列网格 -->
@@ -100,7 +106,7 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span class="price-label">{{ item.has_coupon ? '券后' : '参考' }}</span>
+                <span class="price-label">{{ item.has_coupon ? '券后' : '好价' }}</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>
@@ -152,28 +158,28 @@
     <!-- 首屏或搜索加载中提示 -->
     <div v-if="homeLoading && homeGoodsList.length === 0" class="loading-wrap" style="padding-top: 4px;">
       <span class="loading-spinner"></span>
-      <span>{{ homeSearchKeyword ? '正在搜索商品与优惠信息...' : '正在为您获取商品推荐...' }}</span>
+      <span>{{ homeSearchKeyword ? '正在搜索商品与实在好价...' : '正在为您获取实时热销榜单...' }}</span>
     </div>
 
     <div v-if="!homeLoading && homeError" class="empty-wrap" @click="retryLoadHomeGoods">{{ platformsError ? '平台信息暂不可用，请刷新页面重试' : '加载失败，点击重试' }}</div>
-    <div v-if="!homeLoading && !homeError && !homeHasMore && homeGoodsList.length === 0" class="empty-wrap">暂无符合条件的商品</div>
-    <div v-if="!homeLoading && !homeError && homeHasMore" class="loading-wrap" @click="loadHomeGoods(false)">
-      <button class="retry-btn">继续加载下一页</button>
+    <div v-if="!homeLoading && !homeError && !homeHasMore && homeGoodsList.length === 0" class="empty-wrap">暂无符合条件的商品，换个关键词或切换上方平台试试</div>
+    <div v-if="!homeLoading && !homeError && homeHasMore" class="loading-wrap continue-load-wrap" :class="{ 'is-subtle': homeGoodsList.length > 0 }" @click="loadHomeGoods(false)">
+      <button type="button" class="continue-load-btn">下滑自动加载 · 点击加载下一页</button>
     </div>
     <div id="homeBottomSentinel" style="height: 10px;"></div>
   </div>
 
-  <!-- ==================== TAB 2: 爆单推广 (数据库爆品) ==================== -->
+  <!-- ==================== TAB 2: 严选好价 (人工与算法精选高性价比库) ==================== -->
   <div v-show="currentTab === 'boom'" class="tab-page tab-boom" :class="{ 'is-searching': Boolean(activeBoomKeyword) }">
     <header class="top-header" :class="{ 'header-hidden': isHeaderHidden }">
-      <!-- 爆单搜索栏 -->
+      <!-- 严选好价搜索栏 -->
       <div class="search-box">
         <div class="search-input-wrap">
           <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
           <input 
             type="text" 
             class="search-input" 
-            placeholder="在爆单库中搜索商品..." 
+            placeholder="在严选好价库中搜高性价比商品..." 
             v-model="boomSearchKeyword"
             @keyup.enter="onSearchBoom"
           />
@@ -201,11 +207,11 @@
       <div class="sort-bar" v-if="activeBoomKeyword">
         <span class="sort-item" :class="{ active: boomSortBy === 'latest' }" @click="switchBoomSort('latest')">最新上架</span>
         <span class="sort-item" :class="{ active: boomSortBy === 'cost_performance' }" @click="switchBoomSort('cost_performance')">性价比最高</span>
-        <button type="button" class="search-back-btn" @click="clearBoomSearch">返回全部爆品</button>
+        <button type="button" class="search-back-btn" @click="clearBoomSearch">返回严选好价</button>
       </div>
     </header>
 
-    <!-- 爆单库下拉刷新指示区 -->
+    <!-- 严选好价下拉刷新指示区 -->
     <div class="pull-refresh-indicator" :class="{ transitioning: isTransitioning, visible: pullDistance > 0 || isRefreshing }" :style="{ height: pullDistance + 'px' }">
       <div class="pull-refresh-content">
         <span v-if="pullStatus === 'refreshing'" class="pull-refresh-spinner"></span>
@@ -215,7 +221,12 @@
       </div>
     </div>
 
-    <!-- 爆单商品列表 (格式与首页保持100%完全一致) -->
+    <!-- 严选好价核心价值提示条 -->
+    <div class="value-guide-strip curated-strip" v-if="!activeBoomKeyword">
+      <span class="value-guide-text">✨ <b>人工与算法双重严选</b> · 精挑细选高性价比好物 · 到手皆为实在好价</span>
+    </div>
+
+    <!-- 严选商品列表 (格式与首页保持100%完全一致) -->
     <main class="goods-grid" v-if="boomGoodsList.length > 0">
       <div 
         v-for="item in boomGoodsList" 
@@ -242,7 +253,7 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span class="price-label">{{ item.has_coupon ? '券后' : '参考' }}</span>
+                <span class="price-label">{{ item.has_coupon ? '券后' : '好价' }}</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>
@@ -260,7 +271,7 @@
       </div>
     </main>
 
-    <!-- 爆单首屏骨架屏 -->
+    <!-- 严选首屏骨架屏 -->
     <div v-if="boomLoading && boomGoodsList.length === 0" class="goods-grid skeleton-grid">
       <div v-for="n in 6" :key="n" class="goods-card skeleton-card">
         <div class="skeleton-thumb"></div>
@@ -275,21 +286,21 @@
       </div>
     </div>
 
-    <!-- 爆单加载状态提示 -->
+    <!-- 严选加载状态提示 -->
     <div v-if="boomLoading && boomGoodsList.length === 0" class="loading-wrap" style="padding-top: 4px;">
       <span class="loading-spinner"></span>
-      <span>正在从精选库检索爆款好物...</span>
+      <span>正在从严选好价库检索高性价比好物...</span>
     </div>
 
     <div v-if="boomLoading && boomGoodsList.length > 0" class="loading-wrap">
       <span class="loading-spinner"></span>
-      <span>正在加载更多爆款好物...</span>
+      <span>正在加载更多严选好物...</span>
     </div>
     <div v-if="!boomLoading && boomError && boomGoodsList.length > 0" class="loading-wrap retry-wrap" @click="retryLoadBoomGoods">
       <span class="retry-btn">加载失败，点击重试 ↻</span>
     </div>
-    <div v-if="!boomLoading && boomError && boomGoodsList.length === 0" class="empty-wrap" @click="retryLoadBoomGoods">加载爆品失败，点击重试 ↻</div>
-    <div v-if="!boomLoading && !boomError && boomGoodsList.length === 0" class="empty-wrap">未检索到符合条件的爆款商品</div>
+    <div v-if="!boomLoading && boomError && boomGoodsList.length === 0" class="empty-wrap" @click="retryLoadBoomGoods">加载严选好物失败，点击重试 ↻</div>
+    <div v-if="!boomLoading && !boomError && boomGoodsList.length === 0" class="empty-wrap">暂未检索到符合条件的严选好物</div>
     <div v-if="!boomLoading && !boomError && !boomHasMore && boomGoodsList.length > 0" class="loading-wrap" style="color:var(--text-muted)">已到底部，无更多商品</div>
     <div id="boomBottomSentinel" style="height: 10px;"></div>
   </div>
@@ -320,6 +331,9 @@
             <div class="uid-badge" v-if="userProfile.invite_code" @click="copyText(userProfile.invite_code, '我的专属邀请码已复制')">
               邀请码: {{ userProfile.invite_code }} <span>[复制]</span>
             </div>
+            <div class="uid-badge share-invite-badge" @click="shareSiteInvite">
+              📤 分享邀请链接
+            </div>
           </div>
         </div>
       </div>
@@ -332,24 +346,29 @@
         <div class="user-meta">
           <h3>我的账户 (未登录)</h3>
           <p style="font-size:12px;opacity:0.9">无需登录也可领券；登录后可查看本人推广订单与佣金记录</p>
+          <div class="badges-wrap" style="margin-top:6px">
+            <div class="uid-badge share-invite-badge" @click="shareSiteInvite">
+              📤 推荐网站给好友
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- 万能转链与口令解析面板（置于首屏最上方，无论游客或登录推手均可即开即用） -->
+    <!-- 链接/口令直达解析面板（置于首屏最上方，无论游客或登录用户均可即开即用） -->
     <div class="universal-convert-card">
       <div class="universal-header">
         <div class="universal-title">
           <svg style="width:16px;height:16px;fill:var(--primary-color)" viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
-          <span>万能转链</span>
-          <span class="universal-badge">查券 · 转口令 · 查详情</span>
+          <span>链接/口令查好价</span>
+          <span class="universal-badge">粘链接 · 查好价 · 转专属口令</span>
         </div>
         <button v-if="universalInput || universalResult || universalError" class="universal-clear-btn" @click="clearUniversalConvert">
           清空
         </button>
       </div>
       <p class="universal-desc">
-        支持粘贴<strong>淘宝</strong>（淘口令/m.tb.cn/e.tb.cn/uland）、<strong>京东</strong>（u.jd.com短链/京口令/京粉链）、<strong>拼多多</strong>（p.pinduoduo.com / yangkeduo.com 分享短链与长链），一键转为您的专属推广链并解析商品详情（搜商品名称请前往「首页」搜索）。
+        在<strong>淘宝、京东、拼多多</strong> App 点击「分享 → 复制链接/口令」粘贴到下方，即可一键查询实在好价并生成专属下单口令与链接（搜商品名称请用「首页」搜索）。
       </p>
 
       <div class="universal-plat-tabs" role="tablist" aria-label="转链平台选择">
@@ -370,12 +389,15 @@
 
       <div class="universal-submit-row">
         <button class="universal-submit-btn" @click="handleUniversalConvert" :disabled="universalLoading">
-          {{ universalLoading ? '正在智能解析与转链...' : '⚡ 一键转链并解析详情' }}
+          {{ universalLoading ? '正在智能解析好价与口令...' : '⚡ 一键解析好价与专属口令' }}
         </button>
       </div>
 
       <div v-if="universalError" class="universal-error-box" role="alert">
-        {{ universalError }}
+        <div>{{ universalError }}</div>
+        <button v-if="universalSuggestedKeyword" type="button" class="universal-search-fallback-btn" @click="searchUniversalKeyword">
+          🔍 去首页搜索「{{ universalSuggestedKeyword }}」
+        </button>
       </div>
 
       <div v-if="universalResult" class="universal-result-box">
@@ -432,6 +454,9 @@
               </span>
             </div>
           </div>
+        </div>
+        <div v-else class="universal-no-preview-tip">
+          ✓ 已生成专属下单通道（该短链未返回图文卡片，可直接复制下方口令或点击领券购买）
         </div>
 
         <!-- 转链口令/链接输出框 -->
@@ -648,7 +673,7 @@
         <span style="display:flex;align-items:center;gap:6px;">
           <span>💬 官方客服微信</span>
         </span>
-        <span style="color:var(--primary);font-size:13px;font-weight:600">easyeverything98 <span style="font-size:11px;font-weight:normal;opacity:0.8">[点击复制]</span></span>
+        <span style="color:var(--primary-color);font-size:13px;font-weight:600">easyeverything98 <span style="font-size:11px;font-weight:normal;opacity:0.8">[点击复制]</span></span>
       </div>
       <div class="menu-item" @click="showToast('商品佣金为预估，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。')">
         <span>订单佣金与平台结算说明</span>
@@ -679,7 +704,7 @@
   <!-- 首页轻量添加到手机桌面引导浮条（点 ✕ 关闭后不再自动打扰） -->
   <div class="a2hs-banner" v-if="showDesktopBanner && !isStandalone && currentTab === 'home'">
     <div class="a2hs-banner-left" @click="triggerAddToDesktop">
-      <img src="/static/icons/icon-192.png?v=20261109-2" alt="查券省钱" class="a2hs-banner-icon" />
+      <img src="/static/icons/icon-192.png?v=20261111-1" alt="查券省钱" class="a2hs-banner-icon" />
       <div class="a2hs-banner-texts">
         <div class="a2hs-banner-title">把「查券省钱」放到手机桌面</div>
         <div class="a2hs-banner-sub">买前点我查优惠券，像 App 一样方便</div>
@@ -699,7 +724,7 @@
     </div>
     <div class="tab-item" :class="{ active: currentTab === 'boom' }" @click="currentTab = 'boom'">
       <svg viewBox="0 0 24 24"><path d="M13.5.67s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.61 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8C20 8.61 17.41 3.8 13.5.67zM11.71 19c-1.78 0-3.22-1.4-3.22-3.14 0-1.62 1.05-2.76 2.81-3.12 1.77-.36 3.6-1.21 4.62-2.58.39 1.29.59 2.65.59 4.04 0 2.65-2.15 4.8-4.8 4.8z"/></svg>
-      <span>爆单推广</span>
+      <span>严选好价</span>
     </div>
     <a class="tab-item" href="/group_help" style="text-decoration:none">
       <svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
@@ -720,7 +745,7 @@
       </div>
       <div class="a2hs-guide-body">
         <div class="a2hs-guide-preview">
-          <img src="/static/icons/icon-192.png?v=20261109-2" alt="查券省钱" class="a2hs-guide-logo" />
+          <img src="/static/icons/icon-192.png?v=20261111-1" alt="查券省钱" class="a2hs-guide-logo" />
           <div>
             <div class="a2hs-guide-appname">查券省钱</div>
             <div class="a2hs-guide-appdesc">按下方两步操作即可把图标放到手机桌面，随时点开查券</div>
@@ -844,12 +869,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261109-2"></script>
-<script src="/static/js/session.js?v=ux-20261109-2"></script>
-<script src="/static/js/format.js?v=ux-20261109-2"></script>
-<script src="/static/js/browser.js?v=ux-20261109-2"></script>
-<script src="/static/js/feeds.js?v=ux-20261109-2"></script>
-<script src="/static/js/account.js?v=ux-20261109-2"></script>
-<script src="/static/js/app.js?v=ux-20261109-2"></script>
+<script src="/static/js/api.js?v=ux-20261111-3"></script>
+<script src="/static/js/session.js?v=ux-20261111-3"></script>
+<script src="/static/js/format.js?v=ux-20261111-3"></script>
+<script src="/static/js/browser.js?v=ux-20261111-3"></script>
+<script src="/static/js/feeds.js?v=ux-20261111-3"></script>
+<script src="/static/js/account.js?v=ux-20261111-3"></script>
+<script src="/static/js/app.js?v=ux-20261111-3"></script>
 </body>
 </html>

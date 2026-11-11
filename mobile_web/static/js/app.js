@@ -8,14 +8,37 @@
       const api = shop.createApi();
       const session = shop.createSessionStore();
       const browser = shop.createBrowserTools({ ref });
-      const account = shop.createAccount({ ref, api, session, getPlatforms: () => feeds.platforms.value,
-        copyText: browser.copyText, showToast: browser.showToast });
-      let initialized = false;
+      let feeds = null;
       const currentTab = ref('home');
       const isHeaderHidden = ref(false);
       const showBackToTop = ref(false);
-      let referralUid = '';
       let lastScrollTop = 0;
+      const scrollToTop = () => {
+        isHeaderHidden.value = false;
+        showBackToTop.value = false;
+        lastScrollTop = 0;
+        global.scrollTo(0, 0);
+      };
+      const jumpToHomeKeywordSearch = async (keyword, suggestedPlatform) => {
+        const cleanKw = String(keyword || '').trim();
+        if (!cleanKw || !feeds) return;
+        currentTab.value = 'home';
+        scrollToTop();
+        feeds.homeSearchKeyword.value = cleanKw;
+        feeds.activeHomeKeyword.value = cleanKw;
+        if (suggestedPlatform && feeds.platforms.value.some(p => p.code === suggestedPlatform && p.active) && feeds.homePlatform.value !== suggestedPlatform) {
+          return feeds.switchHomePlatform(suggestedPlatform);
+        }
+        return feeds.onSearchHome();
+      };
+      const account = shop.createAccount({
+        ref, api, session, getPlatforms: () => feeds ? feeds.platforms.value : [],
+        copyText: browser.copyText, showToast: browser.showToast,
+        onSearchKeyword: jumpToHomeKeywordSearch,
+        shouldBlockDirectJump: browser.shouldBlockDirectJump,
+      });
+      let initialized = false;
+      let referralUid = '';
       let touchStartX = 0;
       let touchStartY = 0;
       let canPull = false;
@@ -33,17 +56,43 @@
       const getScrollTop = () => global.pageYOffset ||
         (global.document && (global.document.documentElement.scrollTop || global.document.body.scrollTop ||
         (global.document.scrollingElement ? global.document.scrollingElement.scrollTop : 0))) || 0;
-      const scrollToTop = () => {
-        isHeaderHidden.value = false;
-        showBackToTop.value = false;
-        lastScrollTop = 0;
-        global.scrollTo(0, 0);
-      };
       let bottomObserver = null;
       let observerTimer = null;
       let walletRestore = null;
-      const feeds = shop.createFeeds({ ref, api, getUid: () => account.isLoggedIn.value ? account.uid.value : '',
+      feeds = shop.createFeeds({ ref, api, getUid: () => account.isLoggedIn.value ? account.uid.value : '',
         getScope: session.scope, showToast: browser.showToast });
+      const smartSearch = async (sourceTab) => {
+        const inputRef = sourceTab === 'boom' ? feeds.boomSearchKeyword : feeds.homeSearchKeyword;
+        const raw = String(inputRef.value || '').trim();
+        if (raw && typeof shop.extractInternalShareRoute === 'function') {
+          const internalRoute = shop.extractInternalShareRoute(raw, global.location ? global.location.origin : '');
+          if (internalRoute) {
+            inputRef.value = '';
+            global.location.href = internalRoute;
+            return;
+          }
+        }
+        if (raw && typeof shop.detectLinkOrToken === 'function') {
+          const detected = shop.detectLinkOrToken(raw);
+          if (detected.isEtbShareWithTitle && detected.keyword) {
+            inputRef.value = '';
+            browser.showToast('已提取分享文案中的商品名称，正在为您搜索好价...');
+            return jumpToHomeKeywordSearch(detected.keyword, 'taobao');
+          }
+          if (detected.isLinkOrToken) {
+            inputRef.value = '';
+            currentTab.value = 'user';
+            account.universalPlatform.value = 'auto';
+            account.universalInput.value = raw;
+            scrollToTop();
+            browser.showToast('已识别分享链接/口令，正在为您解析专属通道...');
+            return account.handleUniversalConvert();
+          }
+        }
+        return sourceTab === 'boom' ? feeds.onSearchBoom() : feeds.onSearchHome();
+      };
+      const onSearchHome = () => smartSearch('home');
+      const onSearchBoom = () => smartSearch('boom');
       const restoreAccount = () => {
         if (walletRestore) return walletRestore;
         walletRestore = account.fetchUserInfo().then(restored => {
@@ -199,7 +248,10 @@
       onMounted(async () => {
         const params = new URLSearchParams(global.location.search);
         referralUid = params.get('uid') || '';
-        account.formInviteCode.value = params.get('invite_code') || '';
+        const urlInvite = params.get('invite_code') || '';
+        if (urlInvite && session.savePendingInvite) session.savePendingInvite(urlInvite);
+        account.formInviteCode.value = urlInvite || (session.pendingInvite ? session.pendingInvite() : '') || '';
+        if (account.formInviteCode.value) account.isRegisterMode.value = true;
         if (['home', 'boom', 'user'].includes(params.get('tab'))) {
           currentTab.value = params.get('tab');
         } else {
@@ -271,7 +323,8 @@
         } else if (newTab === 'user') restoreAccount();
       });
       return {
-        ...browser, ...account, ...feeds, currentTab, isHeaderHidden, showBackToTop, scrollToTop,
+        ...browser, ...account, ...feeds, onSearchHome, onSearchBoom,
+        currentTab, isHeaderHidden, showBackToTop, scrollToTop,
         pullDistance, pullStatus, isRefreshing, isTransitioning, pullText, executeRefresh,
         formatPhone: shop.formatPhone, formatMoney: shop.formatMoney, formatSales: shop.formatSales,
         goodsKey: shop.goodsKey, openGoodsDetail,

@@ -55,26 +55,27 @@ class GroupHelpRepository(BaseRepository):
         if existing is not None:
             orig_created = float(existing.get("created_at") or now)
             orig_expires = float(existing.get("expires_at") or (orig_created + DEFAULT_GROUP_TTL_SECONDS))
-            if orig_expires <= now or existing.get("group_status") == GROUP_STATUS_EXPIRED:
+            if orig_expires <= now:
                 raise ValueError(
                     "该拼团已超过有效期失效（拼多多拼团仅24小时有效），请在拼多多重新发起新团后再上传最新海报"
                 )
 
+            set_fields: Dict[str, Any] = {
+                "short_url": data.get("short_url", existing.get("short_url", "")),
+                "redirect_url": data.get("redirect_url", existing.get("redirect_url", "")),
+                "refer_share_id": data.get("refer_share_id") or existing.get("refer_share_id", ""),
+                "poster_path": data.get("poster_path", existing.get("poster_path", "")),
+                "parse_status": PARSE_STATUS_PENDING,
+                "parse_attempts": 0,
+                "parse_error": "",
+                "group_status": GROUP_STATUS_ACTIVE,
+                "updated_at": now,
+            }
+
             # 每次上传新图片均重置为 pending 重新执行大模型合规与关键信息审核，严禁跳过审核直接复用旧状态
             updated = self.col.find_one_and_update(
                 {"group_order_id": gid},
-                {
-                    "$set": {
-                        "short_url": data.get("short_url", existing.get("short_url", "")),
-                        "redirect_url": data.get("redirect_url", existing.get("redirect_url", "")),
-                        "poster_path": data.get("poster_path", existing.get("poster_path", "")),
-                        "parse_status": PARSE_STATUS_PENDING,
-                        "parse_attempts": 0,
-                        "parse_error": "",
-                        "group_status": GROUP_STATUS_ACTIVE,
-                        "updated_at": now,
-                    }
-                },
+                {"$set": set_fields},
                 projection={"_id": 0},
                 return_document=ReturnDocument.AFTER,
             )
@@ -91,6 +92,9 @@ class GroupHelpRepository(BaseRepository):
             "h5_join_url": str(data.get("h5_join_url") or ""),
             "brand_card_url": str(data.get("brand_card_url") or ""),
             "poster_path": str(data.get("poster_path") or ""),
+            "owner_token": str(data.get("owner_token") or ""),
+            "owner_uid": str(data.get("owner_uid") or ""),
+            "last_takedown_uid": "",
             "parse_status": PARSE_STATUS_PENDING,
             "parse_attempts": 0,
             "parse_error": "",
@@ -374,6 +378,8 @@ class GroupHelpRepository(BaseRepository):
         action: str,
         remain_people: Optional[int] = None,
         now: Optional[float] = None,
+        operator_uid: str = "",
+        is_owner: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """用户共创维护多人团状态：支持标记已满、标记已失效、我已参团(-1)、修改还差几人、确认继续上架自己的团。"""
         current_ts = float(now if now is not None else time.time())
@@ -401,6 +407,8 @@ class GroupHelpRepository(BaseRepository):
                 return existing
             raise ValueError("该拼团已超过有效期失效（拼多多拼团仅24小时有效），无法重新上架或修改状态")
 
+        prev_rem = int(existing.get("remain_people") if existing.get("remain_people") is not None else 1)
+        was_active = existing.get("group_status") == GROUP_STATUS_ACTIVE and prev_rem > 0
         update_fields: Dict[str, Any] = {"updated_at": current_ts}
 
         if act == "mark_full":
@@ -416,8 +424,7 @@ class GroupHelpRepository(BaseRepository):
             update_fields["group_status"] = GROUP_STATUS_ACTIVE
             update_fields["matched_group_order_id"] = ""
         elif act == "joined_one":
-            cur_rem = int(existing.get("remain_people") if existing.get("remain_people") is not None else 1)
-            new_rem = max(0, cur_rem - 1)
+            new_rem = max(0, prev_rem - 1)
             update_fields["remain_people"] = new_rem
             if new_rem == 0:
                 update_fields["group_status"] = GROUP_STATUS_FULL
@@ -429,12 +436,16 @@ class GroupHelpRepository(BaseRepository):
                 raise ValueError("剩余人数需在 0 到 20 之间")
             update_fields["remain_people"] = val
             update_fields["matched_group_order_id"] = ""
-            if val == 0:
-                update_fields["group_status"] = GROUP_STATUS_FULL
-            else:
-                update_fields["group_status"] = GROUP_STATUS_ACTIVE
+            update_fields["group_status"] = GROUP_STATUS_FULL if val == 0 else GROUP_STATUS_ACTIVE
         else:
             raise ValueError(f"不支持的反馈操作类型: {act}")
+
+        target_status = update_fields.get("group_status", existing.get("group_status"))
+        now_offline = target_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED)
+        clean_op_uid = str(operator_uid or "").strip()
+
+        if was_active and now_offline:
+            update_fields["last_takedown_uid"] = "" if is_owner else clean_op_uid
 
         return self.col.find_one_and_update(
             {"group_order_id": gid},
@@ -445,3 +456,21 @@ class GroupHelpRepository(BaseRepository):
             projection={"_id": 0},
             return_document=ReturnDocument.AFTER,
         )
+
+    def pop_last_takedown_uid(self, group_order_id: str, exclude_uid: str = "") -> str:
+        """原子取出并清空最近一次下架该团的非团长用户 UID（单次下架最多追责一次，且不罚团长本人）。"""
+        gid = str(group_order_id or "").strip()
+        existing = self.get_by_group_order_id(gid)
+        if not existing:
+            return ""
+        by_uid = str(existing.get("last_takedown_uid") or "").strip()
+        if not by_uid or (exclude_uid and by_uid == str(exclude_uid).strip()):
+            return ""
+        updated = self.col.find_one_and_update(
+            {"group_order_id": gid, "last_takedown_uid": by_uid},
+            {"$set": {"last_takedown_uid": ""}},
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+        return by_uid if updated else ""
+

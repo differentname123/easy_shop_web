@@ -19,6 +19,11 @@ GROUP_STATUS_EXPIRED = "expired"
 DEFAULT_GROUP_TTL_SECONDS = 86400  # 默认 24 小时后自动下线
 MAX_PARSE_ATTEMPTS = 3
 
+# 防恶意下架极简阈值：内存级 10 分钟最多下架他人 3 个团；被团长恢复推翻满 2 次直接停用下架权限
+TAKEDOWN_RATE_WINDOW_SECONDS = 600
+MAX_TAKEDOWNS_PER_WINDOW = 3
+PERMANENT_BAN_STRIKES = 2
+
 _GROUP_ORDER_ID_RE = re.compile(r"^\d{15,24}$")
 _ALLOWED_PDD_DOMAINS = (
     "pinduoduo.com",
@@ -26,10 +31,53 @@ _ALLOWED_PDD_DOMAINS = (
 )
 
 
+class GroupHelpAuthRequiredError(Exception):
+    """执行他人拼团下架类操作但未登录时抛出（映射 HTTP 401）。"""
+
+    def __init__(self, message: str = "为防止恶意乱标下架，执行该操作请先登录账号"):
+        super().__init__(message)
+        self.error_code = "auth_required"
+
+
+class GroupHelpPermissionError(Exception):
+    """下架权限被停用、触发短时限频或非团长恢复他人拼团时抛出（映射 HTTP 403 / 429）。"""
+
+    def __init__(self, message: str, error_code: str = "takedown_banned", status_code: int = 403):
+        super().__init__(message)
+        self.error_code = error_code
+        self.status_code = status_code
+
+
+def is_takedown_feedback(doc: Dict[str, Any], action: str, remain_people: Optional[int] = None) -> bool:
+    """判断本次反馈操作是否属于会将拼团下架（置为已满或已失效）的动作。"""
+    act = str(action or "").strip()
+    if act in ("mark_full", "mark_expired"):
+        return True
+    if act == "set_remain" and remain_people is not None and not isinstance(remain_people, bool):
+        return int(remain_people) <= 0
+    if act == "joined_one":
+        cur_rem = int(doc.get("remain_people") if doc.get("remain_people") is not None else 1)
+        return cur_rem <= 1
+    return False
+
+
+def is_relist_feedback(doc: Dict[str, Any], action: str, remain_people: Optional[int] = None) -> bool:
+    """判断本次反馈操作是否属于将已下架（已满/已失效）拼团重新恢复上架的动作。"""
+    act = str(action or "").strip()
+    if act != "set_remain" or remain_people is None or isinstance(remain_people, bool):
+        return False
+    if int(remain_people) < 1:
+        return False
+    cur_status = str(doc.get("group_status") or GROUP_STATUS_ACTIVE)
+    cur_rem = int(doc.get("remain_people") if doc.get("remain_people") is not None else 1)
+    return cur_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED) or cur_rem <= 0
+
+
 class GroupFeedbackRequest(BaseModel):
     """用户共创维护拼团状态的请求载荷。"""
     action: str = Field(..., description="动作类型: joined_one | mark_full | mark_expired | set_remain | confirm_publish")
     remain_people: Optional[int] = Field(default=None, description="当 action=set_remain 时指定的剩余差额人数")
+    owner_token: Optional[str] = Field(default=None, max_length=64, description="发团团长管理口令（仅团长本人本地持有）")
 
 
 def is_valid_group_order_id(value: Any) -> bool:

@@ -12,8 +12,8 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=20261110-2">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261107-2"></script>
+  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261111-3">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261111-3"></script>
 </head>
 <body>
 <div id="group-help-app">
@@ -169,13 +169,14 @@
                 >
                   去确认
                 </button>
-                <button
-                  v-else-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0"
-                  class="gh-mini-outline-btn"
-                  @click="quickMyGroupTakedown(item)"
-                >
-                  已满下架
-                </button>
+                <template v-else-if="item.group_status === 'active' && item.remaining_seconds > 0 && item.remain_people > 0">
+                  <button class="gh-mini-share-btn" @click="shareGroup(item)">
+                    分享凑人
+                  </button>
+                  <button class="gh-mini-outline-btn" @click="quickMyGroupTakedown(item)">
+                    已满下架
+                  </button>
+                </template>
                 <button
                   v-else-if="(item.group_status === 'full' || item.group_status === 'expired') && item.remaining_seconds > 0"
                   class="gh-mini-outline-btn"
@@ -337,6 +338,12 @@
             <button class="gh-link-btn" @click="jumpToH5(selectedGroup)">
               🌐 网页打开
             </button>
+            <template v-if="selectedGroup.group_status === 'active' && selectedGroup.remaining_seconds > 0 && selectedGroup.remain_people > 0">
+              <span class="gh-link-sep">|</span>
+              <button class="gh-link-btn gh-link-share" @click="shareGroup(selectedGroup)">
+                📤 分享凑人
+              </button>
+            </template>
           </div>
         </div>
 
@@ -352,29 +359,39 @@
           </div>
         </div>
 
-        <!-- 次级操作 A2：仍在有效期内但被标记已拼满或已失效时，允许误操作恢复 -->
+        <!-- 次级操作 A2：仍在有效期内但被标记已拼满或已失效时，仅发团团长本人可恢复上架并触发误标追责 -->
         <div
           class="gh-cocreate-box"
           v-else-if="selectedGroup.group_status !== 'active' || selectedGroup.remain_people <= 0"
         >
-          <div class="gh-cocreate-header">
-            <span class="gh-cocreate-label">该拼团已标记下架（仍在24小时有效期内），如实际未满可恢复上架：</span>
-          </div>
-          <div class="gh-feedback-grid" style="grid-template-columns: repeat(2, 1fr);">
-            <button
-              class="gh-fb-btn fb-joined"
-              :disabled="submittingFeedback"
-              @click="submitFeedback('set_remain', 1)"
-            >
-              🔄 未满恢复 (差1人)
-            </button>
-            <button
-              class="gh-fb-btn fb-joined"
-              :disabled="submittingFeedback"
-              @click="submitFeedback('set_remain', 2)"
-            >
-              🔄 未满恢复 (差2人)
-            </button>
+          <template v-if="isMyOwnGroup(selectedGroup.group_order_id)">
+            <div class="gh-cocreate-header">
+              <span class="gh-cocreate-label">该拼团已标记下架（仍在24小时有效期内），如实际未满可一键恢复上架：</span>
+            </div>
+            <div class="gh-feedback-grid" style="grid-template-columns: repeat(2, 1fr);">
+              <button
+                class="gh-fb-btn fb-joined"
+                :disabled="submittingFeedback"
+                @click="submitFeedback('set_remain', 1)"
+              >
+                🔄 未满恢复 (差1人)
+              </button>
+              <button
+                class="gh-fb-btn fb-joined"
+                :disabled="submittingFeedback"
+                @click="submitFeedback('set_remain', 2)"
+              >
+                🔄 未满恢复 (差2人)
+              </button>
+            </div>
+            <div class="gh-credit-footnote">
+              如该团被他人错误下架，您恢复上架后系统将自动限制该账号的下架权限
+            </div>
+          </template>
+          <div v-else class="gh-cocreate-header" style="margin-bottom:0">
+            <span class="gh-cocreate-label" style="color:#8c8c8c">
+              ⚪ 该拼团已标记下架（如实际未满，仅发团团长本人可恢复上架）
+            </span>
           </div>
         </div>
 
@@ -394,28 +411,31 @@
           <div class="gh-feedback-grid">
             <button
               class="gh-fb-btn fb-joined"
-              :disabled="submittingFeedback || hasJoinedGroup(selectedGroup.group_order_id)"
+              :disabled="isJoinedBtnDisabled(selectedGroup)"
               @click="requestFeedback('joined_one')"
             >
               {{ hasJoinedGroup(selectedGroup.group_order_id) ? '✓ 已反馈参团' : '🎉 我已参团' }}
             </button>
             <button
               class="gh-fb-btn fb-full"
-              :disabled="submittingFeedback"
+              :disabled="submittingFeedback || isTakedownBlockedForSelected"
               @click="requestFeedback('mark_full')"
             >
               🔴 人已满
             </button>
             <button
               class="gh-fb-btn fb-expired"
-              :disabled="submittingFeedback"
+              :disabled="submittingFeedback || isTakedownBlockedForSelected"
               @click="requestFeedback('mark_expired')"
             >
               ⚪ 已失效
             </button>
           </div>
-          <div class="gh-credit-footnote">
-            请按实际情况反馈，恶意乱标下架他人拼团将被停用功能
+          <div class="gh-ban-notice" v-if="isTakedownBlockedForSelected">
+            ⚠️ {{ viewerGuard.reason || '因误标下架他人拼团被团长恢复，您的下架反馈权限当前已被限制（仍可正常浏览、参团和发团）' }}
+          </div>
+          <div class="gh-credit-footnote" v-else>
+            多人团差≥2人点「我已参团」免登录；下架他人拼团需登录，若团长恢复上架将限制误标账号的下架权限
           </div>
         </div>
       </div>
@@ -486,7 +506,7 @@
       <div class="gh-dialog-body">
         <p>该操作会<b>直接将此拼团从大厅下架</b>。</p>
         <p style="margin-top:8px;color:#cf1322;font-weight:600">
-          如果反馈情况与多人团实际情况有差错（乱标或恶意下架他人拼团），您将被禁止使用本功能。
+          若该团实际未满、随后被团长本人恢复上架，系统将自动限制您下架他人拼团的权限（仍可正常浏览、参团和发团）。
         </p>
       </div>
       <div class="gh-dialog-actions">
@@ -551,7 +571,7 @@
       <template v-else-if="uploadResultModal.ownGroup">
         <div class="gh-dialog-title">🎉 审核通过，您的拼团已上架！</div>
         <div class="gh-dialog-body">
-          <p>您的拼团海报已通过审核并展示在互助大厅，点击下方卡片或按钮即可查看您的分享团详情：</p>
+          <p>您的拼团海报已展示在互助大厅，一键复制本团链接发给微信好友/群聊，点开就能直接参团：</p>
           <div
             class="gh-card"
             style="margin-top:10px;border:1.5px solid #b7eb8f;background:#f6ffed;box-shadow:none"
@@ -571,16 +591,87 @@
           </div>
         </div>
         <div class="gh-dialog-actions">
-          <button class="gh-btn-secondary" @click="closeUploadResultModal">知道了</button>
+          <button class="gh-btn-secondary" @click="viewPublishedOwnGroup">查看我的拼团</button>
           <button
             class="gh-btn-app-jump"
-            style="padding:10px;font-size:14px"
-            @click="viewPublishedOwnGroup"
+            style="padding:10px;font-size:13.5px"
+            @click="sharePublishedOwnGroup"
           >
-            查看我的拼团
+            📤 复制链接喊人凑团
           </button>
         </div>
       </template>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗 5：下架他人拼团 10秒快捷登录/注册弹窗（与主站账号互通） ==================== -->
+  <div
+    class="gh-modal-mask"
+    style="align-items:center;padding:20px;z-index:280"
+    v-if="authModal.visible"
+    @click.self="closeAuthModal"
+  >
+    <div class="gh-dialog">
+      <div class="gh-dialog-title">🔐 登录后反馈下架状态</div>
+      <div class="gh-dialog-body" style="margin-bottom:12px">
+        <p style="font-size:12.5px;color:#646a73;margin-bottom:10px">
+          浏览、参团、发团及多人团减1人均免登录；仅<b>「将他人拼团下架」</b>需绑定账号以防恶意乱标（与主站账号互通）：
+        </p>
+
+        <div class="gh-auth-tabs">
+          <button
+            type="button"
+            class="gh-auth-tab"
+            :class="{ active: !authModal.isRegister }"
+            @click="authModal.isRegister = false; authModal.errorMsg = ''"
+          >
+            手机号登录
+          </button>
+          <button
+            type="button"
+            class="gh-auth-tab"
+            :class="{ active: authModal.isRegister }"
+            @click="authModal.isRegister = true; authModal.errorMsg = ''"
+          >
+            新用户快速注册
+          </button>
+        </div>
+
+        <div class="gh-auth-field">
+          <input
+            type="tel"
+            maxlength="11"
+            class="gh-auth-input"
+            placeholder="请输入11位手机号"
+            v-model.trim="authModal.phone"
+            @keyup.enter="submitInlineAuth"
+          />
+        </div>
+        <div class="gh-auth-field">
+          <input
+            type="password"
+            class="gh-auth-input"
+            placeholder="请输入密码（至少6位）"
+            v-model="authModal.password"
+            @keyup.enter="submitInlineAuth"
+          />
+        </div>
+        <div class="gh-auth-err" v-if="authModal.errorMsg">{{ authModal.errorMsg }}</div>
+      </div>
+
+      <div class="gh-dialog-actions">
+        <button class="gh-btn-secondary" :disabled="authModal.submitting" @click="closeAuthModal">
+          暂不操作
+        </button>
+        <button
+          class="gh-btn-app-jump"
+          style="padding:10px;font-size:13.5px"
+          :disabled="authModal.submitting"
+          @click="submitInlineAuth"
+        >
+          {{ authModal.submitting ? '提交中...' : (authModal.isRegister ? '注册并继续反馈' : '登录并继续反馈') }}
+        </button>
+      </div>
     </div>
   </div>
 
@@ -609,7 +700,7 @@
     </a>
     <a class="gh-tab-item" href="/?tab=boom">
       <svg viewBox="0 0 24 24"><path d="M13.5.67s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.61 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8C20 8.61 17.41 3.8 13.5.67zM11.71 19c-1.78 0-3.22-1.4-3.22-3.14 0-1.62 1.05-2.76 2.81-3.12 1.77-.36 3.6-1.21 4.62-2.58.39 1.29.59 2.65.59 4.04 0 2.65-2.15 4.8-4.8 4.8z"/></svg>
-      <span>爆单推广</span>
+      <span>严选好价</span>
     </a>
     <a class="gh-tab-item active" href="/group_help">
       <svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
@@ -625,6 +716,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=20261110-4"></script>
+<script src="/static/js/group_help.js?v=ux-20261111-3"></script>
 </body>
 </html>

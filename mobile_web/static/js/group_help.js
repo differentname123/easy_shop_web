@@ -7,6 +7,13 @@
   const CREDIT_WARN_ACK_KEY = 'pdd_gh_credit_ack_v1';
   const ONBOARD_DISMISSED_KEY = 'pdd_gh_onboard_dismissed_v1';
   const UPLOAD_GUIDE_ACK_KEY = 'pdd_gh_upload_guide_ack_v1';
+  const JOINED_GROUPS_KEY = 'pdd_gh_joined_gids_v1';
+  const EASY_SHOP_TOKEN_KEY = 'easy_shop_token';
+  const EASY_SHOP_UID_KEY = 'easy_shop_uid';
+  const EASY_SHOP_PHONE_KEY = 'easy_shop_phone';
+  const EASY_SHOP_INVITE_KEY = 'easy_shop_invite_code';
+  const EASY_SHOP_PENDING_INVITE_KEY = 'easy_shop_pending_invite';
+  const DEFAULT_PAGE_TITLE = '拼多多多人团互助';
   const MAX_LOCAL_MY_GROUPS = 30;
 
   createApp({
@@ -29,6 +36,16 @@
       const fileInputRef = ref(null);
       const showOnboardGuide = ref(true);
 
+      const authToken = ref('');
+      const viewerGuard = ref({
+        logged_in: false,
+        uid: '',
+        phone: '',
+        can_takedown: false,
+        strikes: 0,
+        reason: '',
+      });
+
       const localPendingCount = computed(
         () =>
           myGroups.value.filter(
@@ -37,6 +54,57 @@
       );
 
       const hasJoinedGroup = gid => Boolean(gid && joinedGroupIds.value[gid]);
+
+      const persistJoinedGroups = mapObj => {
+        try {
+          const keys = Object.keys(mapObj || {}).slice(-60);
+          const compact = {};
+          keys.forEach(k => {
+            if (mapObj[k]) compact[k] = 1;
+          });
+          global.localStorage.setItem(JOINED_GROUPS_KEY, JSON.stringify(compact));
+        } catch (_) {}
+      };
+
+      const loadJoinedGroupsFromStorage = () => {
+        try {
+          const raw = global.localStorage.getItem(JOINED_GROUPS_KEY);
+          if (!raw) return {};
+          const parsed = JSON.parse(raw);
+          return parsed && typeof parsed === 'object' ? parsed : {};
+        } catch (_) {
+          return {};
+        }
+      };
+
+      const loadSavedAuthToken = () => {
+        try {
+          authToken.value = String(global.localStorage.getItem(EASY_SHOP_TOKEN_KEY) || '').trim();
+        } catch (_) {
+          authToken.value = '';
+        }
+      };
+
+      const clearExpiredAuth = () => {
+        authToken.value = '';
+        try {
+          global.localStorage.removeItem(EASY_SHOP_TOKEN_KEY);
+          global.localStorage.removeItem(EASY_SHOP_UID_KEY);
+          global.localStorage.removeItem(EASY_SHOP_PHONE_KEY);
+          global.localStorage.removeItem(EASY_SHOP_INVITE_KEY);
+        } catch (_) {}
+      };
+
+      const applyViewerGuard = guard => {
+        if (!guard || typeof guard !== 'object') return;
+        if (guard.token_expired) {
+          clearExpiredAuth();
+        }
+        viewerGuard.value = {
+          ...viewerGuard.value,
+          ...guard,
+        };
+      };
 
       const dismissOnboardGuide = () => {
         showOnboardGuide.value = false;
@@ -54,6 +122,18 @@
       // 首次下架他人拼团时的诚信提醒弹窗（仅首次触发）
       const creditWarnModal = ref({
         visible: false,
+        pendingAction: '',
+        pendingRemain: null,
+      });
+
+      // 下架他人拼团未登录时的 10 秒快捷登录/注册弹窗（与主站账号完全互通）
+      const authModal = ref({
+        visible: false,
+        isRegister: false,
+        phone: '',
+        password: '',
+        submitting: false,
+        errorMsg: '',
         pendingAction: '',
         pendingRemain: null,
       });
@@ -79,11 +159,93 @@
         }, duration);
       };
 
-      // ==================== 手机返回键历史栈管理 (仅针对详情抽屉与海报大图，防止返回跳出页面或打断文件选择) ====================
-      const pushModalHistory = () => {
+      const syncGroupPageTitle = group => {
+        if (!global.document) return;
+        if (group && group.goods_name) {
+          const rem = group.group_status === 'active' && Number(group.remain_people) > 0
+            ? `差${group.remain_people}人 `
+            : '';
+          const price = group.group_price ? `¥${group.group_price}` : '好价';
+          const shortName = String(group.goods_name).trim().slice(0, 26);
+          global.document.title = `【${rem}${price}】${shortName} - 多人团互助`;
+        } else {
+          global.document.title = DEFAULT_PAGE_TITLE;
+        }
+      };
+
+      const fallbackCopyText = (text, successMsg) => {
+        if (!global.document || !global.document.createElement || !global.document.body) {
+          showToast(successMsg, 3200);
+          return;
+        }
+        const input = global.document.createElement('textarea');
+        input.value = text;
+        input.readOnly = true;
+        if (input.style) {
+          input.style.position = 'fixed';
+          input.style.top = '-9999px';
+          input.style.left = '-9999px';
+          input.style.opacity = '0';
+        }
+        global.document.body.appendChild(input);
+        if (typeof input.select === 'function') input.select();
+        if (typeof input.setSelectionRange === 'function') {
+          try {
+            input.setSelectionRange(0, String(text).length);
+          } catch (_) {}
+        }
+        try {
+          if (global.document.execCommand && global.document.execCommand('copy')) {
+            showToast(successMsg, 3200);
+          } else {
+            showToast('复制失败，请手动复制浏览器地址栏链接');
+          }
+        } catch (_) {
+          showToast('复制失败，请手动复制浏览器地址栏链接');
+        } finally {
+          global.document.body.removeChild(input);
+        }
+      };
+
+      const copyShareText = (text, successMsg) => {
+        if (!text) return;
+        if (global.navigator && global.navigator.clipboard && global.navigator.clipboard.writeText) {
+          return global.navigator.clipboard
+            .writeText(text)
+            .then(() => showToast(successMsg, 3200))
+            .catch(() => fallbackCopyText(text, successMsg));
+        }
+        fallbackCopyText(text, successMsg);
+      };
+
+      const buildGroupShareText = group => {
+        if (!group || !group.group_order_id) return '';
+        const origin = String((global.location && global.location.origin) || '').replace(/\/+$/, '');
+        const qs = new URLSearchParams({ gid: String(group.group_order_id) });
+        try {
+          const myInv = String(global.localStorage.getItem(EASY_SHOP_INVITE_KEY) || '').trim();
+          if (/^[A-Za-z0-9_-]{3,32}$/.test(myInv)) qs.set('invite_code', myInv);
+        } catch (_) {}
+        const shareUrl = `${origin}/group_help?${qs.toString()}`;
+        const rem = Math.max(1, Number(group.remain_people) || 1);
+        const pricePart = group.group_price ? `¥${group.group_price} ` : '';
+        const shortName = String(group.goods_name || '拼多多好物').trim().slice(0, 42);
+        return `🔥 拼多多多人团【还差${rem}人】${pricePart}拼「${shortName}」，点链接直接参团（大厅还有更多凑团好价）👉 ${shareUrl}`;
+      };
+
+      const shareGroup = group => {
+        const target = group || selectedGroup.value;
+        const text = buildGroupShareText(target);
+        if (!text) return;
+        return copyShareText(text, '✅ 凑团分享链接已复制，快去微信粘贴喊人拼团吧！');
+      };
+
+      // ==================== 手机返回键历史栈管理 (打开详情时同步 ?gid= 链接供微信右上角直接转发，返回时留在互助大厅) ====================
+      const pushModalHistory = (gid = '') => {
         try {
           if (global.history && typeof global.history.pushState === 'function') {
-            global.history.pushState({ ghModal: true }, '');
+            const nextUrl = gid ? `/group_help?gid=${encodeURIComponent(gid)}` : undefined;
+            global.history.pushState({ ghModal: true, gid: gid || '' }, '', nextUrl);
             pushedHistoryCount += 1;
           }
         } catch (_) {}
@@ -113,6 +275,10 @@
           fullPosterUrl.value = '';
           return;
         }
+        if (authModal.value.visible) {
+          authModal.value.visible = false;
+          return;
+        }
         if (uploadResultModal.value.visible) {
           uploadResultModal.value.visible = false;
           return;
@@ -128,6 +294,7 @@
         }
         if (selectedGroup.value) {
           selectedGroup.value = null;
+          syncGroupPageTitle(null);
         }
       };
 
@@ -223,6 +390,45 @@
 
       const isMyOwnGroup = gid => {
         return Boolean(gid) && myGroups.value.some(it => it.group_order_id === gid);
+      };
+
+      const getOwnerToken = gid => {
+        if (!gid) return '';
+        const rec = myGroups.value.find(it => it && it.group_order_id === gid);
+        return rec && rec.owner_token ? String(rec.owner_token) : '';
+      };
+
+      const buildAuthHeaders = (includeJson = false) => {
+        const headers = {};
+        if (includeJson) {
+          headers['Content-Type'] = 'application/json';
+        }
+        loadSavedAuthToken();
+        if (authToken.value) {
+          headers['Authorization'] = `Bearer ${authToken.value}`;
+        }
+        return headers;
+      };
+
+      const buildFeedbackBody = (gid, action, remainPeople = null) => {
+        const payload = { action };
+        if (remainPeople !== null) payload.remain_people = remainPeople;
+        const ownerTok = getOwnerToken(gid);
+        if (ownerTok) payload.owner_token = ownerTok;
+        return JSON.stringify(payload);
+      };
+
+      const isTakedownBlockedForSelected = computed(() => {
+        if (!selectedGroup.value) return false;
+        if (isMyOwnGroup(selectedGroup.value.group_order_id)) return false;
+        return Boolean(viewerGuard.value.logged_in && viewerGuard.value.can_takedown === false);
+      });
+
+      const isJoinedBtnDisabled = group => {
+        if (!group || submittingFeedback.value) return true;
+        if (hasJoinedGroup(group.group_order_id)) return true;
+        if (Number(group.remain_people) <= 1 && isTakedownBlockedForSelected.value) return true;
+        return false;
       };
 
       const refreshMyGroups = async (showNotice = false, onlyPending = false) => {
@@ -337,7 +543,9 @@
             offset: String(offset),
             limit: '20',
           });
-          const resp = await global.fetch(`/api/group_help/list?${params}`);
+          const resp = await global.fetch(`/api/group_help/list?${params}`, {
+            headers: buildAuthHeaders(false),
+          });
           const json = await resp.json();
           if (json.status === 'success' && json.data) {
             const list = json.data.items || [];
@@ -345,6 +553,9 @@
             total.value = Number(json.data.total || 0);
             hasMore.value = Boolean(json.data.has_more);
             pendingCount.value = Number(json.data.pending_count || 0);
+            if (json.data.viewer_guard) {
+              applyViewerGuard(json.data.viewer_guard);
+            }
             syncSelectedGroup();
             managePendingPoll();
           } else {
@@ -365,6 +576,7 @@
           myGroups.value.find(it => it.group_order_id === gid);
         if (found) {
           selectedGroup.value = { ...found };
+          syncGroupPageTitle(selectedGroup.value);
         }
       };
 
@@ -387,13 +599,18 @@
                   offset: '0',
                   limit: String(Math.max(20, items.value.length)),
                 });
-                const resp = await global.fetch(`/api/group_help/list?${params}`);
+                const resp = await global.fetch(`/api/group_help/list?${params}`, {
+                  headers: buildAuthHeaders(false),
+                });
                 const json = await resp.json();
                 if (json.status === 'success' && json.data) {
                   items.value = json.data.items || [];
                   total.value = Number(json.data.total || 0);
                   hasMore.value = Boolean(json.data.has_more);
                   pendingCount.value = Number(json.data.pending_count || 0);
+                  if (json.data.viewer_guard) {
+                    applyViewerGuard(json.data.viewer_guard);
+                  }
                   syncSelectedGroup();
                 }
               } catch (_) {}
@@ -535,14 +752,16 @@
             const uploadDataUrl = await resizeImageDataUrl(rawDataUrl, 1440, 0.88);
             const resp = await global.fetch('/api/group_help/upload', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: buildAuthHeaders(true),
               body: JSON.stringify({ image_base64: uploadDataUrl }),
             });
             const json = await resp.json();
             if (resp.ok && json.status === 'success' && json.data) {
+              const ownerPatch = json.owner_token ? { owner_token: String(json.owner_token) } : {};
               upsertMyGroup(
                 {
                   ...json.data,
+                  ...ownerPatch,
                   local_id: localId,
                   local_thumb: thumbUrl,
                 },
@@ -589,22 +808,25 @@
 
       // ==================== 弹窗交互与问号引导 ====================
       const openDetail = item => {
+        if (!item) return;
         if (!selectedGroup.value) {
-          pushModalHistory();
+          pushModalHistory(item.group_order_id || '');
         }
         selectedGroup.value = { ...item };
+        syncGroupPageTitle(selectedGroup.value);
       };
 
       const closeDetail = () => {
         if (!selectedGroup.value) return;
         selectedGroup.value = null;
+        syncGroupPageTitle(null);
         popModalHistorySilently();
       };
 
       const openFullPoster = url => {
         if (!url) return;
         if (!fullPosterUrl.value) {
-          pushModalHistory();
+          pushModalHistory('');
         }
         fullPosterUrl.value = url;
       };
@@ -687,17 +909,28 @@
         }
       };
 
+      const sharePublishedOwnGroup = () => {
+        const own = uploadResultModal.value.ownGroup;
+        closeUploadResultModal();
+        if (own) {
+          shareGroup(own);
+          openDetail(own);
+        }
+      };
+
       const chooseJoinMatchedGroup = async () => {
         const matched = uploadResultModal.value.matchedGroup;
         const own = uploadResultModal.value.ownGroup;
         closeUploadResultModal();
         // 用户选择直接去拼已有同款团，将其待确认的重复团设为已结束并从“我的团”清理
         if (own && own.group_order_id) {
+          const ownHeaders = buildAuthHeaders(true);
+          const ownBody = buildFeedbackBody(own.group_order_id, 'mark_expired');
           try {
             global.fetch(`/api/group_help/feedback/${own.group_order_id}`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ action: 'mark_expired' }),
+              headers: ownHeaders,
+              body: ownBody,
               keepalive: true,
             });
           } catch (_) {}
@@ -716,8 +949,8 @@
         try {
           const resp = await global.fetch(`/api/group_help/feedback/${own.group_order_id}`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'confirm_publish' }),
+            headers: buildAuthHeaders(true),
+            body: buildFeedbackBody(own.group_order_id, 'confirm_publish'),
           });
           const json = await resp.json();
           if (resp.ok && json.status === 'success' && json.data) {
@@ -766,6 +999,7 @@
             if (isMyOwnGroup(gid)) upsertMyGroup(json.data, false);
             if (selectedGroup.value && selectedGroup.value.group_order_id === gid) {
               selectedGroup.value = json.data;
+              syncGroupPageTitle(selectedGroup.value);
             }
           }
         } catch (_) {}
@@ -796,7 +1030,107 @@
         global.open(item.h5_join_url, '_blank', 'noopener,noreferrer');
       };
 
-      // ==================== 状态反馈 & 首次诚信提醒 ====================
+      // ==================== 10秒内联快捷登录/注册弹窗（与主站账号互通，仅在非团长执行下架操作时唤出） ====================
+      const openAuthModal = (action = '', remainPeople = null) => {
+        authModal.value = {
+          visible: true,
+          isRegister: false,
+          phone: '',
+          password: '',
+          submitting: false,
+          errorMsg: '',
+          pendingAction: action,
+          pendingRemain: remainPeople,
+        };
+      };
+
+      const closeAuthModal = () => {
+        authModal.value = {
+          ...authModal.value,
+          visible: false,
+          submitting: false,
+          errorMsg: '',
+        };
+      };
+
+      const submitInlineAuth = async () => {
+        if (authModal.value.submitting) return;
+        const phone = String(authModal.value.phone || '').trim();
+        const password = String(authModal.value.password || '').trim();
+        if (!/^1[3-9]\d{9}$/.test(phone)) {
+          authModal.value.errorMsg = '请输入有效的11位中国大陆手机号';
+          return;
+        }
+        if (password.length < 6) {
+          authModal.value.errorMsg = '密码长度不能少于6位';
+          return;
+        }
+        authModal.value.errorMsg = '';
+        authModal.value.submitting = true;
+        try {
+          const reqPayload = {
+            phone,
+            password,
+            mode: authModal.value.isRegister ? 'register' : 'login',
+          };
+          if (authModal.value.isRegister) {
+            try {
+              const pendingInv = String(
+                global.localStorage.getItem(EASY_SHOP_PENDING_INVITE_KEY) || ''
+              ).trim();
+              if (/^[A-Za-z0-9_-]{3,32}$/.test(pendingInv)) {
+                reqPayload.invite_code = pendingInv;
+              }
+            } catch (_) {}
+          }
+          const resp = await global.fetch('/api/user/register_or_login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(reqPayload),
+          });
+          const json = await resp.json();
+          if (resp.ok && json.status === 'success' && json.user && json.user.auth_token) {
+            const u = json.user;
+            authToken.value = String(u.auth_token);
+            try {
+              global.localStorage.setItem(EASY_SHOP_TOKEN_KEY, u.auth_token);
+              global.localStorage.setItem(EASY_SHOP_UID_KEY, u.uid || '');
+              global.localStorage.setItem(EASY_SHOP_PHONE_KEY, u.phone || '');
+              if (u.invite_code) {
+                global.localStorage.setItem(EASY_SHOP_INVITE_KEY, u.invite_code);
+              }
+              global.localStorage.removeItem(EASY_SHOP_PENDING_INVITE_KEY);
+            } catch (_) {}
+            const nextAction = authModal.value.pendingAction;
+            const nextRemain = authModal.value.pendingRemain;
+            closeAuthModal();
+            // 同步该账号的下架信用状态
+            try {
+              const gResp = await global.fetch('/api/group_help/list?limit=1', {
+                headers: buildAuthHeaders(false),
+              });
+              const gJson = await gResp.json();
+              if (gJson && gJson.data && gJson.data.viewer_guard) {
+                applyViewerGuard(gJson.data.viewer_guard);
+              }
+            } catch (_) {}
+            if (nextAction) {
+              requestFeedback(nextAction, nextRemain);
+            } else {
+              showToast('登录成功！');
+            }
+          } else {
+            authModal.value.errorMsg =
+              (json && (json.detail || json.error_msg)) || '登录失败，请核对手机号与密码';
+          }
+        } catch (_) {
+          authModal.value.errorMsg = '网络异常，请稍后重试';
+        } finally {
+          authModal.value.submitting = false;
+        }
+      };
+
+      // ==================== 状态反馈 & 防恶意下架门禁 & 首次诚信提醒 ====================
       const requestFeedback = (action, remainPeople = null) => {
         if (!selectedGroup.value || submittingFeedback.value) return;
         const gid = selectedGroup.value.group_order_id;
@@ -807,20 +1141,33 @@
         const isTakedown =
           action === 'mark_full' ||
           action === 'mark_expired' ||
+          (action === 'set_remain' && remainPeople !== null && Number(remainPeople) <= 0) ||
           (action === 'joined_one' && Number(selectedGroup.value.remain_people) <= 1);
 
-        let hasAcked = false;
-        try {
-          hasAcked = global.localStorage.getItem(CREDIT_WARN_ACK_KEY) === '1';
-        } catch (_) {}
+        if (isTakedown && !isMyOwnGroup(gid)) {
+          loadSavedAuthToken();
+          if (!authToken.value) {
+            openAuthModal(action, remainPeople);
+            return;
+          }
+          if (viewerGuard.value.logged_in && viewerGuard.value.can_takedown === false) {
+            showToast(viewerGuard.value.reason || '您的下架反馈权限当前已被限制', 3600);
+            return;
+          }
 
-        if (isTakedown && !isMyOwnGroup(gid) && !hasAcked) {
-          creditWarnModal.value = {
-            visible: true,
-            pendingAction: action,
-            pendingRemain: remainPeople,
-          };
-          return;
+          let hasAcked = false;
+          try {
+            hasAcked = global.localStorage.getItem(CREDIT_WARN_ACK_KEY) === '1';
+          } catch (_) {}
+
+          if (!hasAcked) {
+            creditWarnModal.value = {
+              visible: true,
+              pendingAction: action,
+              pendingRemain: remainPeople,
+            };
+            return;
+          }
         }
         submitFeedback(action, remainPeople);
       };
@@ -849,23 +1196,33 @@
         const gid = selectedGroup.value.group_order_id;
         submittingFeedback.value = true;
         try {
-          const payload = { action };
-          if (remainPeople !== null) payload.remain_people = remainPeople;
           const resp = await global.fetch(`/api/group_help/feedback/${gid}`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            headers: buildAuthHeaders(true),
+            body: buildFeedbackBody(gid, action, remainPeople),
           });
           const json = await resp.json();
+          if (json && json.viewer_guard) {
+            applyViewerGuard(json.viewer_guard);
+          }
+          if (resp.status === 401 || (json && json.error_code === 'auth_required')) {
+            clearExpiredAuth();
+            openAuthModal(action, remainPeople);
+            return;
+          }
           if (resp.ok && json.status === 'success' && json.data) {
             if (action === 'joined_one') {
-              joinedGroupIds.value = { ...joinedGroupIds.value, [gid]: true };
+              const nextJoined = { ...joinedGroupIds.value, [gid]: true };
+              joinedGroupIds.value = nextJoined;
+              persistJoinedGroups(nextJoined);
             } else if (action === 'set_remain') {
               const nextJoined = { ...joinedGroupIds.value };
               delete nextJoined[gid];
               joinedGroupIds.value = nextJoined;
+              persistJoinedGroups(nextJoined);
             }
             selectedGroup.value = json.data;
+            syncGroupPageTitle(selectedGroup.value);
             if (isMyOwnGroup(gid)) {
               upsertMyGroup(json.data, false);
             }
@@ -880,17 +1237,21 @@
             } else if (json.data.group_status === 'active' && filterMode.value !== 'mine') {
               fetchGroups(true);
             }
-            showToast(
-              action === 'set_remain'
-                ? `已更新为还差 ${json.data.remain_people} 人！`
-                : '状态已更新，感谢反馈！'
-            );
+            if (json.penalized_saboteur) {
+              showToast('✅ 已恢复上架大厅！已自动对误标下架该团的账号执行违规限制', 3600);
+            } else {
+              showToast(
+                action === 'set_remain'
+                  ? `已更新为还差 ${json.data.remain_people} 人！`
+                  : '状态已更新，感谢反馈！'
+              );
+            }
             // 若该团已满或已失效下架，自动收起详情抽屉方便用户继续看其他团
             if (json.data.group_status !== 'active') {
               closeDetail();
             }
           } else {
-            showToast(json.error_msg || '反馈失败');
+            showToast((json && json.error_msg) || '反馈失败', 3400);
           }
         } catch (_) {
           showToast('网络异常');
@@ -909,8 +1270,8 @@
         try {
           const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'mark_full' }),
+            headers: buildAuthHeaders(true),
+            body: buildFeedbackBody(item.group_order_id, 'mark_full'),
           });
           const json = await resp.json();
           if (resp.ok && json.status === 'success' && json.data) {
@@ -938,13 +1299,20 @@
         try {
           const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'set_remain', remain_people: targetRemain }),
+            headers: buildAuthHeaders(true),
+            body: buildFeedbackBody(item.group_order_id, 'set_remain', targetRemain),
           });
           const json = await resp.json();
           if (resp.ok && json.status === 'success' && json.data) {
             upsertMyGroup(json.data, false);
-            showToast(`已恢复上架大厅展示（差${json.data.remain_people}人）`);
+            if (json.penalized_saboteur) {
+              showToast(
+                `✅ 已恢复上架（差${json.data.remain_people}人），并已对误标下架该团的账号执行违规限制！`,
+                3600
+              );
+            } else {
+              showToast(`已恢复上架大厅展示（差${json.data.remain_people}人）`);
+            }
           } else {
             showToast((json && json.error_msg) || '该拼团已失效，无法恢复上架');
             refreshMyGroups(false, false);
@@ -954,6 +1322,33 @@
         }
       };
 
+      // ==================== 分享直达链接自动弹开 & 已拼满留存引导 ====================
+      const openDeepLinkedGroup = async gid => {
+        if (!/^[0-9]{10,28}$/.test(gid)) return;
+        try {
+          if (global.history && typeof global.history.replaceState === 'function') {
+            global.history.replaceState(null, '', '/group_help');
+          }
+        } catch (_) {}
+        try {
+          const resp = await global.fetch(`/api/group_help/detail/${encodeURIComponent(gid)}`);
+          const json = await resp.json();
+          if (resp.ok && json && json.status === 'success' && json.data) {
+            const d = json.data;
+            if (
+              d.parse_status === 'parsed' &&
+              d.group_status === 'active' &&
+              Number(d.remaining_seconds) > 0 &&
+              Number(d.remain_people) > 0
+            ) {
+              openDetail(d);
+              return;
+            }
+          }
+          showToast('该拼团刚刚拼满或已结束，快看看大厅其他正在凑人的好价拼团吧！', 3800);
+        } catch (_) {}
+      };
+
       onMounted(() => {
         global.addEventListener('popstate', onWindowPopState);
         try {
@@ -961,8 +1356,22 @@
         } catch (_) {
           showOnboardGuide.value = true;
         }
+        let deepGid = '';
+        try {
+          const params = new URLSearchParams((global.location && global.location.search) || '');
+          const inv = String(params.get('invite_code') || '').trim();
+          if (/^[A-Za-z0-9_-]{3,32}$/.test(inv)) {
+            global.localStorage.setItem(EASY_SHOP_PENDING_INVITE_KEY, inv);
+          }
+          deepGid = String(params.get('gid') || '').trim();
+        } catch (_) {}
+        loadSavedAuthToken();
+        joinedGroupIds.value = loadJoinedGroupsFromStorage();
         myGroups.value = loadMyGroupsFromStorage();
         fetchGroups(true);
+        if (deepGid) {
+          openDeepLinkedGroup(deepGid);
+        }
         if (myGroups.value.length > 0) {
           refreshMyGroups(false, false);
         }
@@ -992,8 +1401,16 @@
         fileInputRef,
         showOnboardGuide,
         dismissOnboardGuide,
+        viewerGuard,
+        isMyOwnGroup,
+        isTakedownBlockedForSelected,
+        isJoinedBtnDisabled,
         helpModal,
         creditWarnModal,
+        authModal,
+        openAuthModal,
+        closeAuthModal,
+        submitInlineAuth,
         uploadResultModal,
         hasJoinedGroup,
         formatRemaining,
@@ -1023,6 +1440,8 @@
         openUploadResultModal,
         closeUploadResultModal,
         viewPublishedOwnGroup,
+        sharePublishedOwnGroup,
+        shareGroup,
         chooseJoinMatchedGroup,
         choosePublishOwnGroup,
         onMyGroupCardClick,
@@ -1036,3 +1455,4 @@
     },
   }).mount('#group-help-app');
 })(window);
+

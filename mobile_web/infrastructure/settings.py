@@ -44,9 +44,11 @@ class Settings:
     tb_session: str = field(default="", repr=False)
     tb_inviter_code: str = field(default="", repr=False)
     hdk_api_key: str = field(default="", repr=False)
+    hdk_api_key_list: tuple = field(default=(), repr=False)
     ztk_appkey: str = field(default="", repr=False)
     ztk_appkey_list: tuple = field(default=(), repr=False)
     ztk_sid: str = field(default="", repr=False)
+    ztk_sid_list: tuple = field(default=(), repr=False)
     detail_prefetch_enabled: bool = True
     detail_prefetch_interval_seconds: int = 300
     jd_enabled: bool = False
@@ -167,6 +169,20 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
     ztk_appkey_list = tuple(merged_keys)
     ztk_appkey = ztk_appkey_list[0] if ztk_appkey_list else ""
 
+    explicit_sids = _parse_key_entries(values.get("zhetaoke_sid_list", None), "zhetaoke_sid_list")
+    primary_sids = _parse_key_entries(values.get("zhetaoke_sid", ""), "zhetaoke_sid")
+    ztk_sid_list = tuple(explicit_sids if explicit_sids else primary_sids)
+    ztk_sid = ztk_sid_list[0] if ztk_sid_list else ""
+
+    primary_hdk = _parse_key_entries(values.get("haodanku_api_key", ""), "haodanku_api_key")
+    extra_hdk = _parse_key_entries(values.get("haodanku_api_key_list", None), "haodanku_api_key_list")
+    merged_hdk = []
+    for hk in primary_hdk + extra_hdk:
+        if hk and hk not in merged_hdk:
+            merged_hdk.append(hk)
+    hdk_api_key_list = tuple(merged_hdk)
+    hdk_api_key = hdk_api_key_list[0] if hdk_api_key_list else ""
+
     # Identity values stay strings, including values larger than JavaScript's safe integers.
     for name, value in (("myself_jd_union_id", jd_union_id), ("myself_jd_position_id", jd_position_id)):
         if value and (not value.isascii() or not value.isdigit() or not value.lstrip("0")):
@@ -249,8 +265,8 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
         pdd_enabled=pdd_enabled, taobao_enabled=taobao_enabled,
         tb_app_key=tb_app_key, tb_app_secret=tb_app_secret, tb_pid=tb_pid, tb_adzone_id=tb_adzone_id,
         tb_session=text("taobao_session").strip(), tb_inviter_code=text("taobao_inviter_code").strip(),
-        hdk_api_key=text("haodanku_api_key").strip(),
-        ztk_appkey=ztk_appkey, ztk_appkey_list=ztk_appkey_list, ztk_sid=text("zhetaoke_sid").strip(),
+        hdk_api_key=hdk_api_key, hdk_api_key_list=hdk_api_key_list,
+        ztk_appkey=ztk_appkey, ztk_appkey_list=ztk_appkey_list, ztk_sid=ztk_sid, ztk_sid_list=ztk_sid_list,
         jd_enabled=jd_enabled, jd_union_id=jd_union_id, jd_position_id=jd_position_id,
         jd_app_key=jd_app_key, jd_app_secret=jd_app_secret, jd_api_base=jd_api_base,
     )

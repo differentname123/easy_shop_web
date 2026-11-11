@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """跨平台客户端与适配器的公共解析、时间转换与折淘客多 Key 容灾工具。"""
 import math
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 SHANGHAI = timezone(timedelta(hours=8))
+_KEY_CURSOR_LOCK = threading.Lock()
+ZTK_KEY_COOLDOWN_SECONDS = 60.0
 
 ZTK_KEY_FAILURE_KEYWORDS = (
     "appkey", "key", "频次", "频率", "超限", "上限", "次数", "黑名单",
@@ -227,26 +231,61 @@ def execute_with_key_failover(
     *,
     should_ignore_error: Any = None,
     should_stop_early: Any = None,
+    round_robin: bool = False,
 ) -> Dict[str, Any]:
     """
-    通用多 AppKey 粘性游标故障转移执行器：
-    - 从 client._active_key_index 开始轮询 client.appkey_list；
-    - 成功时更新 client._active_key_index 和 client.appkey；
+    通用多 AppKey 容灾与健康轮询执行器：
+    - `round_robin=False`（默认，如绑定单一账号 `sid` 的淘宝客户端）：从 `client._active_key_index` 粘性主备容灾；
+    - `round_robin=True`（如无账号绑定的京东折淘客客户端）：在健康 Key 间线程安全 50/50 轮询分摊配额；
+    - 若某 Key 失败而同次请求的备用 Key 成功（确证该 Key 自身限流/异常），将其隔离冷却 60s，期间优先使用健康 Key，到期自动恢复；
     - 遇到非 UPSTREAM_ERROR / NETWORK_ERROR 的确定性错误或 should_stop_early 命中时立即终止返回。
     """
     keys = getattr(client, "appkey_list", ()) or ()
     total = len(keys)
-    start_idx = getattr(client, "_active_key_index", 0) % total
-    last_result: Optional[Dict[str, Any]] = None
+    if total == 0:
+        return error_dict("CONFIG_ERROR", "缺少可用 appkey")
 
-    for offset in range(total):
-        idx = (start_idx + offset) % total
+    with _KEY_CURSOR_LOCK:
+        now = time.monotonic()
+        cooldowns: Dict[int, float] = getattr(client, "_key_cooldown_until", None)
+        if not isinstance(cooldowns, dict):
+            cooldowns = {}
+            try:
+                client._key_cooldown_until = cooldowns
+            except Exception:
+                pass
+
+        if round_robin and total > 1:
+            rr_idx = getattr(client, "_rr_key_cursor", 0) % total
+            try:
+                client._rr_key_cursor = (rr_idx + 1) % total
+            except Exception:
+                pass
+            ring = [(rr_idx + offset) % total for offset in range(total)]
+            healthy = [i for i in ring if now >= cooldowns.get(i, 0.0)]
+            cooling = [i for i in ring if now < cooldowns.get(i, 0.0)]
+            candidate_indices = healthy + cooling
+        else:
+            start_idx = getattr(client, "_active_key_index", 0) % total
+            candidate_indices = [(start_idx + offset) % total for offset in range(total)]
+
+    last_result: Optional[Dict[str, Any]] = None
+    failed_indices: List[int] = []
+
+    for idx in candidate_indices:
         current_key = keys[idx]
         result = action(current_key)
         if result.get("status") == "success":
-            client._active_key_index = idx
-            client.appkey = current_key
+            with _KEY_CURSOR_LOCK:
+                client._active_key_index = idx
+                client.appkey = current_key
+                cooldowns.pop(idx, None)
+                if failed_indices:
+                    until_ts = time.monotonic() + ZTK_KEY_COOLDOWN_SECONDS
+                    for f_idx in failed_indices:
+                        cooldowns[f_idx] = until_ts
             return result
+        failed_indices.append(idx)
         if last_result is not None and callable(should_ignore_error) and should_ignore_error(result, last_result):
             continue
         last_result = result
@@ -255,3 +294,27 @@ def execute_with_key_failover(
         if callable(should_stop_early) and should_stop_early(result):
             return result
     return last_result or error_dict("UPSTREAM_ERROR", "请求失败")
+
+
+def sanitize_user_error_message(error_code: Any, raw_msg: Any, platform_name: str = "") -> str:
+    """将上游网关或第三方中转原始报错统一清洗为面向普通用户的友好提示。"""
+    code = clean_text(error_code).upper()
+    msg = clean_text(raw_msg)
+    plat = clean_text(platform_name) or "该平台"
+    lower = msg.lower()
+
+    if code in ("AMBIGUOUS_PLATFORM_TEXT", "KEYWORD_NOT_LINK", "UNSUPPORTED_URL_DOMAIN", "PRODUCT_OFF_PROMOTION"):
+        return msg
+    if code == "UNSUPPORTED_TB_NUMERIC_ID":
+        return "手淘普通分享链接（e.tb.cn）暂不支持直接解析，请复制淘口令，或点击下方按钮在「首页」搜索该商品"
+    if code == "UNSUPPORTED_PDD_ID_ONLY_URL":
+        return "该链接缺少分享参数，请在拼多多 App 点击商品页「分享 → 复制链接」后重新粘贴，或在「首页」搜索商品名称"
+    if code == "UNSUPPORTED_JD_NUMERIC_SKU":
+        return "暂不支持纯数字京东商品编号直接转链，请粘贴京东 App 分享链接（u.jd.com）或京口令，或在「首页」搜索"
+    if code == "AUTH_REQUIRED" or "relationid" in lower or "relation_id" in lower:
+        return f"您的{plat}推广渠道尚未完成授权或已失效，请在「我的」页面下方完成渠道授权后再试"
+    if code == "INVALID_TKL" or "error tkl" in lower or "商品id解析错误" in lower:
+        return f"未能识别该{plat}口令或链接，请确认粘贴的是完整的商品分享口令/短链，或在「首页」搜索商品名称"
+    if any(k in lower for k in ("折淘客", "ztk", "appkey", "sid", "40009", "goods_id", "api_", "gateway", "网关拒绝")):
+        return f"暂未能解析该{plat}链接，请确认商品仍在售且分享链接完整有效，或在「首页」搜索同款商品"
+    return msg or f"暂未能解析该{plat}链接，请检查链接或口令是否完整有效"

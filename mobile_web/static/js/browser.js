@@ -163,6 +163,20 @@
       isDesktopGuideOpen.value = true;
     };
 
+    const isWeChatBrowser = () => /micromessenger/i.test(String((global.navigator && global.navigator.userAgent) || ''));
+    const shouldBlockDirectJump = (linkInfo, fallbackUrl = '') => {
+      const target = (linkInfo && (linkInfo.final_link || linkInfo.short_url || linkInfo.url)) || fallbackUrl || '';
+      if (!target) return true;
+      if (!isWeChatBrowser()) return false;
+      return /(?:^|\/\/|\.)(?:taobao\.com|tmall\.com|tb\.cn|alimama\.com)(?:\/|\?|$)/i.test(target);
+    };
+    const VALUE_GUIDE_DISMISSED_KEY = 'easy_shop_value_guide_dismissed';
+    const showValueGuide = ref(safeGetStorage(VALUE_GUIDE_DISMISSED_KEY) !== '1');
+    const dismissValueGuide = () => {
+      showValueGuide.value = false;
+      safeSetStorage(VALUE_GUIDE_DISMISSED_KEY, '1');
+    };
+
     const dispose = () => {
       stopSmartLoading();
       global.clearTimeout(toastTimer);
@@ -171,6 +185,7 @@
     };
     return {
       toastMessage, smartLoading, showToast, copyText, startSmartLoading, stopSmartLoading, jumpToLink,
+      isWeChatBrowser, shouldBlockDirectJump, showValueGuide, dismissValueGuide,
       isStandalone, desktopGuidePlatform, isDesktopGuideOpen, showDesktopBanner,
       triggerAddToDesktop, dismissDesktopBanner, closeDesktopGuide, dispose,
     };

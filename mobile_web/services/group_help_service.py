@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """拼多多多人团互助服务层：同步二维码解码与 307 免登录核验 + 后台定时大模型识图任务。"""
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -17,13 +19,20 @@ from PIL import Image
 from config import logger
 from infrastructure.logging_utils import format_exc_summary
 from models.group_help import (
+    MAX_TAKEDOWNS_PER_WINDOW,
+    TAKEDOWN_RATE_WINDOW_SECONDS,
+    GroupHelpAuthRequiredError,
+    GroupHelpPermissionError,
     format_group_doc,
     is_pdd_qr_url,
+    is_relist_feedback,
+    is_takedown_feedback,
     is_valid_group_order_id,
     parse_group_redirect_url,
     validate_and_normalize_parsed_poster,
 )
 from repositories.group_help_repo import GroupHelpRepository
+from repositories.user_repo import UserRepository
 
 _APP_DIR = Path(__file__).resolve().parent.parent
 _POSTER_DIR = _APP_DIR / "runtime" / "group_posters"
@@ -162,15 +171,70 @@ class GroupHelpService:
         poster_dir: Optional[Path] = None,
         http_get: Optional[Callable] = None,
         ai_generator: Optional[Callable] = None,
+        user_repo: Optional[UserRepository] = None,
     ):
         self.repo = repo if repo is not None else GroupHelpRepository()
+        if user_repo is not None:
+            self.user_repo = user_repo
+        elif getattr(self.repo, "_db", None) is not None:
+            self.user_repo = UserRepository(db_instance=self.repo._db)
+        else:
+            self.user_repo = UserRepository()
         self.poster_dir = Path(poster_dir) if poster_dir is not None else _POSTER_DIR
         self._http_get = http_get
         self._ai_generator = ai_generator
         self._wake_callback: Optional[Callable[[], None]] = None
+        self._takedown_ts: Dict[str, list] = {}
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
         self._wake_callback = callback
+
+    @staticmethod
+    def _has_owner_binding(doc: Dict[str, Any]) -> bool:
+        return bool(
+            str(doc.get("owner_token") or "").strip()
+            or str(doc.get("owner_uid") or "").strip()
+        )
+
+    @staticmethod
+    def _is_group_owner(doc: Dict[str, Any], owner_token: str = "", viewer_uid: str = "") -> bool:
+        stored_uid = str(doc.get("owner_uid") or "").strip()
+        clean_uid = str(viewer_uid or "").strip()
+        if stored_uid and clean_uid and stored_uid == clean_uid:
+            return True
+        stored = str(doc.get("owner_token") or "").strip()
+        candidate = str(owner_token or "").strip()
+        return bool(stored and candidate and hmac.compare_digest(stored, candidate))
+
+    def get_viewer_guard(
+        self,
+        viewer_uid: Optional[str] = None,
+        token_expired: bool = False,
+    ) -> Dict[str, Any]:
+        """返回当前访问者在多人团互助中的登录状态与下架权限信息。"""
+        clean_uid = str(viewer_uid or "").strip()
+        if not clean_uid:
+            return {
+                "logged_in": False,
+                "token_expired": bool(token_expired),
+                "uid": "",
+                "phone": "",
+                "can_takedown": False,
+                "strikes": 0,
+                "reason": "",
+            }
+        guard = self.user_repo.get_group_help_guard(clean_uid)
+        if not guard:
+            return {
+                "logged_in": False,
+                "token_expired": True,
+                "uid": "",
+                "phone": "",
+                "can_takedown": False,
+                "strikes": 0,
+                "reason": "",
+            }
+        return {**guard, "token_expired": False}
 
     def _save_poster_image(self, group_order_id: str, image_bytes: bytes) -> Path:
         self.poster_dir.mkdir(parents=True, exist_ok=True)
@@ -221,13 +285,18 @@ class GroupHelpService:
                     formatted = format_group_doc(promoted, now=current_ts)
         return formatted
 
-    def submit_poster_image(self, image_bytes: bytes) -> Dict[str, Any]:
+    def submit_poster_image(
+        self,
+        image_bytes: bytes,
+        owner_token: str = "",
+        viewer_uid: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         第一步（同步执行）：
         1. 校验图片体积与格式；
         2. 识别图片中的二维码；
         3. 免登录请求 307 重定向提取 group_order_id 等关键字段；
-        4. 保存海报并在 pdd_multi_groups 表新增一行待解析记录，立即向用户反馈已收录。
+        4. 为新团签发随机 owner_token，保存海报并在 pdd_multi_groups 表写入待解析记录。
         """
         if not image_bytes:
             raise ValueError("上传的图片内容为空")
@@ -243,20 +312,30 @@ class GroupHelpService:
 
         now = time.time()
         existing = self.repo.get_by_group_order_id(gid)
+        issued_owner_token = ""
+        clean_uid = str(viewer_uid or "").strip()
+
         if existing is not None:
-            is_expired_time = float(existing.get("expires_at") or 0) <= now
-            if is_expired_time or existing.get("group_status") == "expired":
+            if float(existing.get("expires_at") or 0) <= now:
                 raise ValueError(
                     "该拼团已超过有效期失效（拼多多拼团仅24小时有效），请在拼多多重新发起新团后再上传最新海报"
                 )
+            if self._is_group_owner(existing, owner_token=owner_token, viewer_uid=clean_uid) and owner_token:
+                issued_owner_token = str(owner_token).strip()
+        else:
+            issued_owner_token = secrets.token_hex(12)
 
         # 每次上传的图片都必须保存并进入 pending 重新走大模型审核（严禁直接复用旧审核结果导致局部二维码图蒙混过关）
         poster_path = self._save_poster_image(gid, image_bytes)
-        record_input = {
+        record_input: Dict[str, Any] = {
             **link_meta,
             "poster_path": str(poster_path),
             "created_at": now,
         }
+        if existing is None:
+            record_input["owner_token"] = issued_owner_token
+            record_input["owner_uid"] = clean_uid
+
         doc, is_new = self.repo.create_or_refresh_initial_group(record_input)
 
         # 唤醒后台定时任务立即处理
@@ -269,12 +348,15 @@ class GroupHelpService:
         formatted = self._format_with_matched_group(doc, now=now)
         msg = "✅ 二维码核验通过，已加入【我的团】！正在自动审核并识别商品关键信息（约 10~20 秒），完成后立即反馈。"
 
-        return {
+        result: Dict[str, Any] = {
             "status": "success",
             "is_new": is_new,
             "message": msg,
             "data": formatted,
         }
+        if issued_owner_token:
+            result["owner_token"] = issued_owner_token
+        return result
 
     def _load_prompt(self) -> str:
         if _PROMPT_FILE.is_file():
@@ -376,6 +458,8 @@ class GroupHelpService:
         filter_mode: str = "active",
         offset: int = 0,
         limit: int = 20,
+        viewer_uid: Optional[str] = None,
+        token_expired: bool = False,
     ) -> Dict[str, Any]:
         now = time.time()
         raw = self.repo.search_groups(
@@ -390,6 +474,9 @@ class GroupHelpService:
             "total": raw["total"],
             "has_more": raw["has_more"],
             "pending_count": raw["pending_count"],
+            "viewer_guard": self.get_viewer_guard(
+                viewer_uid=viewer_uid, token_expired=token_expired
+            ),
         }
 
     def get_group_detail(self, group_order_id: str) -> Optional[Dict[str, Any]]:
@@ -404,20 +491,183 @@ class GroupHelpService:
             return None
         return format_group_doc(doc)
 
+    def submit_feedback_detailed(
+        self,
+        group_order_id: str,
+        action: str,
+        remain_people: Optional[int] = None,
+        viewer_uid: Optional[str] = None,
+        owner_token: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        统一处理多人团状态反馈与极简防破坏闭环：
+        1. 团长本人（凭本地 owner_token）可免登录自由管理自己的团；
+        2. 非团长执行会导致拼团下架的操作（已满/已失效/仅剩1人时点我已参团）必须登录且未被停用下架权限；
+        3. 非下架类操作（如多人差额时点“我已参团”人数-1、向上校准人数）免登录可用，被禁下架权限的用户仍可使用；
+        4. 当团长本人点击「未满恢复」将已下架的拼团恢复上架时，自动对最近一次下架该团的非团长账号计数 +1（满2次停用下架权限）。
+        """
+        now = time.time()
+        existing = self.repo.get_by_group_order_id(group_order_id)
+        if not existing:
+            return None
+
+        act = str(action or "").strip()
+        if float(existing.get("expires_at") or 0) <= now:
+            expired_doc = self.repo.apply_user_feedback(
+                group_order_id=group_order_id,
+                action=act,
+                remain_people=remain_people,
+                now=now,
+            )
+            if not expired_doc:
+                return None
+            return {
+                "data": format_group_doc(expired_doc, now=now),
+                "penalized_saboteur": False,
+                "viewer_guard": self.get_viewer_guard(viewer_uid),
+            }
+
+        guard = self.get_viewer_guard(viewer_uid)
+        verified_uid = guard["uid"] if guard["logged_in"] else ""
+        is_owner = self._is_group_owner(existing, owner_token=owner_token, viewer_uid=verified_uid)
+        has_owner = self._has_owner_binding(existing)
+
+        if act == "confirm_publish":
+            if has_owner and not is_owner:
+                raise GroupHelpPermissionError(
+                    "仅发团团长本人可确认上架该拼团", error_code="owner_only", status_code=403
+                )
+            updated = self.repo.apply_user_feedback(
+                group_order_id=group_order_id,
+                action=act,
+                remain_people=remain_people,
+                now=now,
+                operator_uid=verified_uid,
+                is_owner=is_owner,
+            )
+            return (
+                {
+                    "data": format_group_doc(updated, now=now),
+                    "penalized_saboteur": False,
+                    "viewer_guard": guard,
+                }
+                if updated
+                else None
+            )
+
+        if is_relist_feedback(existing, act, remain_people):
+            if has_owner and not is_owner:
+                raise GroupHelpPermissionError(
+                    "该拼团已下架，如实际未满仅限发团团长本人恢复上架",
+                    error_code="owner_only",
+                    status_code=403,
+                )
+            updated = self.repo.apply_user_feedback(
+                group_order_id=group_order_id,
+                action=act,
+                remain_people=remain_people,
+                now=now,
+                operator_uid=verified_uid,
+                is_owner=is_owner,
+            )
+            penalized_saboteur = False
+            if is_owner and updated and updated.get("group_status") == "active":
+                saboteur_uid = self.repo.pop_last_takedown_uid(
+                    group_order_id, exclude_uid=verified_uid
+                )
+                if saboteur_uid:
+                    self.user_repo.inc_false_group_takedown(saboteur_uid, group_order_id)
+                    penalized_saboteur = True
+            return (
+                {
+                    "data": format_group_doc(updated, now=now),
+                    "penalized_saboteur": penalized_saboteur,
+                    "viewer_guard": self.get_viewer_guard(verified_uid),
+                }
+                if updated
+                else None
+            )
+
+        if is_takedown_feedback(existing, act, remain_people):
+            recent_ts = []
+            if not is_owner:
+                if not guard["logged_in"]:
+                    raise GroupHelpAuthRequiredError(
+                        "为防止恶意乱标下架他人拼团，执行下架类反馈请先登录账号（10秒即可完成，参团与发团无需登录）"
+                    )
+                if not guard["can_takedown"]:
+                    raise GroupHelpPermissionError(
+                        guard["reason"], error_code="takedown_banned", status_code=403
+                    )
+                cutoff = now - TAKEDOWN_RATE_WINDOW_SECONDS
+                recent_ts = [t for t in self._takedown_ts.get(verified_uid, []) if t >= cutoff]
+                if len(recent_ts) >= MAX_TAKEDOWNS_PER_WINDOW:
+                    self._takedown_ts[verified_uid] = recent_ts
+                    raise GroupHelpPermissionError(
+                        "您短时间内下架他人拼团过于频繁，请稍后再试",
+                        error_code="takedown_rate_limited",
+                        status_code=429,
+                    )
+            updated = self.repo.apply_user_feedback(
+                group_order_id=group_order_id,
+                action=act,
+                remain_people=remain_people,
+                now=now,
+                operator_uid=verified_uid,
+                is_owner=is_owner,
+            )
+            if not is_owner and verified_uid and updated:
+                self._takedown_ts[verified_uid] = recent_ts + [now]
+            return (
+                {
+                    "data": format_group_doc(updated, now=now),
+                    "penalized_saboteur": False,
+                    "viewer_guard": self.get_viewer_guard(verified_uid),
+                }
+                if updated
+                else None
+            )
+
+        # 非下架类反馈（多人差额时点“我已参团”人数-1，或向上校准差额人数）：免登录可用，被禁下架权限用户仍可使用
+        if act == "set_remain" and not is_owner and remain_people is not None and not isinstance(remain_people, bool):
+            cur_rem = int(existing.get("remain_people") if existing.get("remain_people") is not None else 1)
+            if 0 < int(remain_people) < cur_rem:
+                raise ValueError("参团减少人数请直接点击「我已参团」")
+
+        updated = self.repo.apply_user_feedback(
+            group_order_id=group_order_id,
+            action=act,
+            remain_people=remain_people,
+            now=now,
+            operator_uid=verified_uid,
+            is_owner=is_owner,
+        )
+        return (
+            {
+                "data": format_group_doc(updated, now=now),
+                "penalized_saboteur": False,
+                "viewer_guard": guard,
+            }
+            if updated
+            else None
+        )
+
     def submit_feedback(
         self,
         group_order_id: str,
         action: str,
         remain_people: Optional[int] = None,
+        viewer_uid: Optional[str] = None,
+        owner_token: str = "",
     ) -> Optional[Dict[str, Any]]:
-        doc = self.repo.apply_user_feedback(
+        res = self.submit_feedback_detailed(
             group_order_id=group_order_id,
             action=action,
             remain_people=remain_people,
+            viewer_uid=viewer_uid,
+            owner_token=owner_token,
         )
-        if not doc:
-            return None
-        return format_group_doc(doc)
+        return res["data"] if res else None
 
 
 class GroupHelpWorker:

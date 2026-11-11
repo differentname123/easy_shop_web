@@ -15,9 +15,10 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
-from auth import hash_password, verify_password
+from auth import hash_password, verify_password, mask_phone
 from config import logger
 from models.product import normalize_platform
+from models.group_help import PERMANENT_BAN_STRIKES
 
 DEFAULT_AVATAR = "https://img.pddpic.com/mms-avatar/default_avatar.png"
 
@@ -347,3 +348,48 @@ class UserRepository(BaseRepository):
             {"$set": update_fields}
         )
         return res.modified_count > 0 or res.matched_count > 0
+
+    def get_group_help_guard(self, uid: str) -> Optional[Dict[str, Any]]:
+        """获取用户在多人团互助中的下架权限状态（仅读取单整数字段 gh_false_takedowns）。"""
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return None
+        user = self.get_user_by_uid(clean_uid)
+        if not user:
+            return None
+        strikes = max(0, int(user.get("gh_false_takedowns") or 0))
+        banned = strikes >= PERMANENT_BAN_STRIKES
+        return {
+            "logged_in": True,
+            "uid": str(user["uid"]),
+            "phone": mask_phone(user.get("phone")),
+            "can_takedown": not banned,
+            "strikes": strikes,
+            "reason": (
+                "因多次错误下架他人仍在凑团的商品，您的「人已满 / 已失效」下架权限已停用"
+                "（仍可正常浏览、参团、发团及为多人差额拼团点「我已参团」）"
+                if banned
+                else ""
+            ),
+        }
+
+    def inc_false_group_takedown(self, uid: str, group_order_id: str = "") -> Optional[Dict[str, Any]]:
+        """当团长恢复上架被他人下架的拼团时，对该下架用户的误标计数原子 +1。"""
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return None
+        updated = self.col.find_one_and_update(
+            {"uid": clean_uid},
+            {"$inc": {"gh_false_takedowns": 1}},
+        )
+        if not updated:
+            return None
+        guard = self.get_group_help_guard(clean_uid)
+        logger.warning(
+            "【多人团防破坏处罚】用户[%s] 因错误下架团单[%s]被团长恢复上架，累计误标[%s]次",
+            clean_uid,
+            group_order_id,
+            guard["strikes"] if guard else "?",
+        )
+        return guard
+

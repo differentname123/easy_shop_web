@@ -3,8 +3,11 @@
 import hashlib
 import math
 import re
+import threading
+import time
 from datetime import datetime
 
+import requests
 from adapters.base import BasePlatformAdapter
 from infrastructure.http_utils import (
     clean_text as _text,
@@ -78,6 +81,9 @@ class JdAdapter(BasePlatformAdapter):
     requires_numeric_promoter_id = True
     requires_material_url = True
     order_window_seconds = ORDER_WINDOW_SECONDS
+    _universal_rate_lock = threading.Lock()
+    _last_universal_finish_ts = 0.0
+    _UNIVERSAL_PACE_SECONDS = 0.35
 
     def __init__(self, settings=None, client=None, **overrides):
         if settings is None:
@@ -406,110 +412,135 @@ class JdAdapter(BasePlatformAdapter):
         if not text:
             return _error("INVALID_ARGUMENT", "请输入京东 u.jd.com 短链、京口令或京粉链接")
 
-        extracted_encrypted_id = ""
-        product_card = None
-        jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
-        if jf_match:
-            extracted_encrypted_id = jf_match.group(1)
-        elif _is_encrypted_jd_item_id(text):
-            extracted_encrypted_id = text
+        def _do_resolve():
+            extracted_encrypted_id = ""
+            product_card = None
+            detail_lookup_failed = False
+            jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
+            if jf_match:
+                extracted_encrypted_id = jf_match.group(1)
+            elif _is_encrypted_jd_item_id(text):
+                extracted_encrypted_id = text
 
-        material_input = f"https://jingfen.jd.com/detail/{text}.html" if _is_encrypted_jd_item_id(text) else text
-        conv = self.client.convert_universal_material(material_input, promoter)
+            material_input = f"https://jingfen.jd.com/detail/{text}.html" if _is_encrypted_jd_item_id(text) else text
+            conv = self.client.convert_universal_material(material_input, promoter)
 
-        if conv.get("status") != "success":
-            if conv.get("jd_off_promotion") is True:
-                return _error("PRODUCT_OFF_PROMOTION", "该京东商品已取消推广或已下架，请挑选其他好物")
-            return conv
+            if conv.get("status") != "success":
+                if conv.get("jd_off_promotion") is True:
+                    return _error("PRODUCT_OFF_PROMOTION", "该京东商品已取消推广或已下架，请挑选其他好物")
+                return conv
 
-        if not extracted_encrypted_id and conv.get("tao_id"):
-            extracted_encrypted_id = _text(conv.get("tao_id"))
+            if not extracted_encrypted_id and conv.get("tao_id"):
+                extracted_encrypted_id = _text(conv.get("tao_id"))
 
-        short = conv.get("short_url") or ""
-        long = conv.get("click_url") or ""
-        j_cmd = conv.get("j_command") or ""
+            short = conv.get("short_url") or ""
+            long = conv.get("click_url") or ""
+            j_cmd = conv.get("j_command") or ""
 
-        resolved_id = extracted_encrypted_id
-        if isinstance(conv.get("raw_item"), dict):
-            try:
-                cand_card = self._detail(conv["raw_item"])
-                if (cand_card.get("price") or 0) > 0:
-                    product_card = cand_card
-                    resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
-            except Exception:
-                pass
-        if not product_card and extracted_encrypted_id:
-            det = self.get_goods_detail(extracted_encrypted_id)
-            if det.get("status") == "success" and isinstance(det.get("data"), dict):
-                product_card = det["data"]
-                resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
-        if not product_card:
-            search_q = short or long
-            is_coupon_or_venue_url = any(
-                kw in (search_q or "").lower()
-                for kw in ("coupon.m.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "jdcoupon")
-            )
-            if search_q and not is_coupon_or_venue_url:
+            resolved_id = extracted_encrypted_id
+            if isinstance(conv.get("raw_item"), dict):
                 try:
-                    q_res = self.client.search_goods(search_q, page=1, page_size=5, has_coupon=False)
-                except TypeError:
-                    q_res = self.client.search_goods(search_q, page=1, page_size=5)
-                if q_res.get("status") == "success" and isinstance(q_res.get("data"), list) and q_res["data"]:
-                    rows = q_res["data"]
-                    total_cnt = int(q_res.get("total_count") or len(rows))
-                    # 【遵循绝对可靠原则】：仅当转链所得短链 100% 唯一命中单件商品 (len(rows)==1 且 total_cnt==1) 时采纳，
-                    # 严禁因口令含“抢购”字样就从多商品会场列表中盲取首条！
-                    if len(rows) == 1 and total_cnt == 1:
-                        try:
-                            cand_card = self._detail(rows[0])
-                            if (cand_card.get("price") or 0) > 0:
-                                product_card = cand_card
-                                resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
-                        except Exception:
-                            pass
-
-        # 从 jCommand 文案提取商品标题与优惠券金额作为限流兜底
-        fallback_title = "京东精选推广好物"
-        fallback_coupon = 0.0
-        if j_cmd:
-            t_match = re.search(r"抢购(.+?)(?:[！!]|$)", j_cmd)
-            if t_match:
-                fallback_title = t_match.group(1).strip()
-            c_match = re.search(r"领(\d+(?:\.\d+)?)元优惠券", j_cmd)
-            if c_match:
-                try:
-                    fallback_coupon = round(float(c_match.group(1)), 2)
+                    cand_card = self._detail(conv["raw_item"])
+                    if (cand_card.get("price") or 0) > 0:
+                        product_card = cand_card
+                        resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
                 except Exception:
                     pass
-        if fallback_title == "京东精选推广好物":
-            b_match = re.search(r"「(.+?)」", text)
-            if b_match:
-                fallback_title = b_match.group(1).strip()
+            if not product_card and extracted_encrypted_id:
+                det = self.get_goods_detail(extracted_encrypted_id)
+                if det.get("status") == "success" and isinstance(det.get("data"), dict):
+                    product_card = det["data"]
+                    resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
+                elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
+                    detail_lookup_failed = True
+            if not product_card:
+                search_q = short or long
+                is_coupon_or_venue_url = any(
+                    kw in (search_q or "").lower()
+                    for kw in ("coupon.m.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "jdcoupon")
+                )
+                if search_q and not is_coupon_or_venue_url:
+                    try:
+                        q_res = self.client.search_goods(search_q, page=1, page_size=5, has_coupon=False)
+                    except TypeError:
+                        q_res = self.client.search_goods(search_q, page=1, page_size=5)
+                    if q_res.get("status") != "success":
+                        if q_res.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
+                            detail_lookup_failed = True
+                    elif isinstance(q_res.get("data"), list) and q_res["data"]:
+                        rows = q_res["data"]
+                        total_cnt = int(q_res.get("total_count") or len(rows))
+                        # 【遵循绝对可靠原则】：仅当转链所得短链 100% 唯一命中单件商品 (len(rows)==1 且 total_cnt==1) 时采纳，
+                        # 严禁因口令含“抢购”字样就从多商品会场列表中盲取首条！
+                        if len(rows) == 1 and total_cnt == 1:
+                            try:
+                                cand_card = self._detail(rows[0])
+                                if (cand_card.get("price") or 0) > 0:
+                                    product_card = cand_card
+                                    resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
+                            except Exception:
+                                pass
 
-        title = (product_card or {}).get("name") or fallback_title
-        price = (product_card or {}).get("price")
-        coupon_amount = (product_card or {}).get("coupon_amount")
-        if coupon_amount is None:
-            coupon_amount = fallback_coupon
+            # 从 jCommand 文案提取商品标题与优惠券金额作为限流兜底
+            fallback_title = "京东精选推广好物"
+            fallback_coupon = 0.0
+            if j_cmd:
+                t_match = re.search(r"抢购(.+?)(?:[！!]|$)", j_cmd)
+                if t_match:
+                    fallback_title = t_match.group(1).strip()
+                c_match = re.search(r"领(\d+(?:\.\d+)?)元优惠券", j_cmd)
+                if c_match:
+                    try:
+                        fallback_coupon = round(float(c_match.group(1)), 2)
+                    except Exception:
+                        pass
+            if fallback_title == "京东精选推广好物":
+                b_match = re.search(r"「(.+?)」", text)
+                if b_match:
+                    fallback_title = b_match.group(1).strip()
 
-        canonical_id = (
-            (product_card or {}).get("goods_id")
-            or extract_canonical_goods_id(self.platform_code, resolved_id)
-            or resolved_id
-        )
-        sign_id = (product_card or {}).get("goods_sign") or resolved_id
+            title = (product_card or {}).get("name") or fallback_title
+            price = (product_card or {}).get("price")
+            coupon_amount = (product_card or {}).get("coupon_amount")
+            if coupon_amount is None:
+                coupon_amount = fallback_coupon
 
-        return self._build_promotion_payload(
-            conv,
-            promoter=promoter,
-            goods_id=canonical_id,
-            goods_sign=sign_id,
-            uid=uid,
-            title=title,
-            price=price,
-            coupon_amount=coupon_amount,
-            product=product_card,
-        )
+            canonical_id = (
+                (product_card or {}).get("goods_id")
+                or extract_canonical_goods_id(self.platform_code, resolved_id)
+                or resolved_id
+            )
+            sign_id = (product_card or {}).get("goods_sign") or resolved_id
+
+            extra_fields = {
+                "title": title,
+                "price": price,
+                "coupon_amount": coupon_amount,
+                "product": product_card,
+            }
+            if detail_lookup_failed and product_card is None:
+                extra_fields["detail_lookup_failed"] = True
+
+            return self._build_promotion_payload(
+                conv,
+                promoter=promoter,
+                goods_id=canonical_id,
+                goods_sign=sign_id,
+                uid=uid,
+                **extra_fields,
+            )
+
+        # 真实网络会话下按京东联盟单 unionId QPS 阈值执行单通道匀速间隔（0.35s），避免多线程并发把京东反查打成伪 301；离线单元测试零等待
+        if isinstance(getattr(self.client, "http", None), requests.Session):
+            with JdAdapter._universal_rate_lock:
+                wait_s = JdAdapter._UNIVERSAL_PACE_SECONDS - (time.monotonic() - JdAdapter._last_universal_finish_ts)
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                try:
+                    return _do_resolve()
+                finally:
+                    JdAdapter._last_universal_finish_ts = time.monotonic()
+        return _do_resolve()
 
     def check_authority(self, uid):
         if not self.active:

@@ -8,18 +8,32 @@
     const currentImgIndex = ref(0);
     const isLoggedIn = ref(false);
     const uid = ref('');
+    const myInviteCode = ref('');
     const isDeepLoading = ref(true);
     const detailError = ref(false);
     const detailErrorMsg = ref('');
     const isOffPromotion = ref(false);
+    const canOperateDetail = computed(() => Boolean(goods.value && !isOffPromotion.value));
+    const syncDocumentTitle = () => {
+      if (!global.document) return;
+      if (goods.value && goods.value.name && !isOffPromotion.value) {
+        const shortName = String(goods.value.name).trim().slice(0, 28);
+        global.document.title = `【好价 ¥${shop.formatMoney(goods.value.price)}】${shortName} - 查券省钱`;
+      } else {
+        global.document.title = '商品详情 - 查券省钱';
+      }
+    };
     const generatedCommand = ref('');
-    const commandModal = ref({ visible: false, text: '', token: '', link: '' });
+    const commandModal = ref({ visible: false, text: '', token: '', link: '', wechatGuide: false });
     const closeCommandModal = () => {
-      commandModal.value = { visible: false, text: '', token: '', link: '' };
+      commandModal.value = { visible: false, text: '', token: '', link: '', wechatGuide: false };
     };
     const copyCommandFromModal = () => {
       if (!commandModal.value.text) return;
-      browser.copyText(commandModal.value.text, `推广口令与链接已复制，可前往${platformName.value}使用`);
+      browser.copyText(
+        commandModal.value.text,
+        commandModal.value.wechatGuide ? `口令已复制，请打开${platformName.value} App 领券下单` : `推广口令与链接已复制，可前往${platformName.value}使用`,
+      );
     };
     let requested = null;
     let referralUid = '';
@@ -36,7 +50,7 @@
     const platformName = computed(() => goods.value?.platform_name || goods.value?.platform || requested?.platform || '平台');
     const canUse = info => !disposed && info && promotionSessions.has(info) && session.isCurrent(promotionSessions.get(info));
     const invalidateSession = () => {
-      session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; isLoggedIn.value = false;
+      session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; myInviteCode.value = ''; isLoggedIn.value = false;
       generatedCommand.value = ''; closeCommandModal(); closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
     };
     const carouselList = computed(() => {
@@ -59,7 +73,17 @@
       currentImgIndex.value = Math.round(carouselRef.value.scrollLeft / width);
     };
     const goHome = () => { global.location.href = '/'; };
-    const goToRegister = () => { global.location.href = '/?tab=user'; };
+    const goToRegister = () => {
+      const inv = session.pendingInvite ? session.pendingInvite() : '';
+      global.location.href = inv ? `/?${new URLSearchParams({ tab: 'user', invite_code: inv })}` : '/?tab=user';
+    };
+    const handleShareDetail = () => {
+      if (!canOperateDetail.value || !goods.value) return;
+      const origin = (global.location && global.location.origin) || '';
+      const inv = isLoggedIn.value ? (myInviteCode.value || (session.myInviteCode ? session.myInviteCode() : '')) : '';
+      const shareText = shop.buildDetailShareText(goods.value, origin, inv);
+      if (shareText) browser.copyText(shareText, '✅ 好价分享文案已复制，快发给微信好友吧！');
+    };
     const goBack = () => {
       if (global.history.length > 1) return global.history.back();
       try {
@@ -87,10 +111,12 @@
           verifiedSession = result.session;
           identitySnapshot = result.session;
           uid.value = result.user.uid;
+          myInviteCode.value = result.user.invite_code || '';
           isLoggedIn.value = true;
         } else if (!result.stale) {
           verifiedSession = null;
           uid.value = '';
+          myInviteCode.value = '';
           isLoggedIn.value = false;
           if (result.missing) session.clear();
           identitySnapshot = session.capture();
@@ -117,11 +143,13 @@
             specs: detail.specs || goods.value?.specs,
             service_guarantees: detail.service_guarantees || goods.value?.service_guarantees,
           };
+          syncDocumentTitle();
         } else {
           if (data?.error_code === 'PRODUCT_OFF_PROMOTION') {
             isOffPromotion.value = true;
             detailErrorMsg.value = data.error_msg || '该商品已取消推广或已下架，请挑选其他好物';
             goods.value = null;
+            syncDocumentTitle();
             try { global.sessionStorage.removeItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`); } catch (_) {}
             browser.showToast(detailErrorMsg.value);
           }
@@ -214,7 +242,23 @@
     };
     const executeJumpToBuy = info => {
       if (!canUse(info)) return;
-      const content = info.command_text || info.final_link;
+      const content = info.command_text || info.promotion_token || info.final_link;
+      if (browser.shouldBlockDirectJump && browser.shouldBlockDirectJump(info, goods.value?.product_url || '')) {
+        if (content) {
+          generatedCommand.value = content;
+          commandModal.value = {
+            visible: true,
+            text: content,
+            token: info.promotion_token || info.j_short_command || info.we_app_web_view_short_url || '',
+            link: info.short_url || info.final_link || '',
+            wechatGuide: true,
+          };
+          browser.copyText(content, `口令已复制，请打开${platformName.value} App 领券下单`);
+        } else {
+          browser.showToast('暂无有效跳转链接或口令');
+        }
+        return;
+      }
       if (content) {
         generatedCommand.value = content;
         browser.copyText(content, `已复制推广信息，正在前往${platformName.value}领券...`);
@@ -231,12 +275,14 @@
           text: content,
           token: info.promotion_token || info.j_short_command || info.we_app_web_view_short_url || '',
           link: info.short_url || info.final_link || '',
+          wechatGuide: false,
         };
         browser.copyText(content, successTip || `推广口令与链接已复制，可前往${platformName.value}使用`);
       }
       else browser.showToast('暂无有效口令');
     };
     const handleJumpToBuy = async () => {
+      if (!canOperateDetail.value) return;
       const info = await handleGenerateLink(`正在连接${platformName.value}领券通道...`, '获取购买链接失败，请重试');
       if (disposed || !info) return;
       if (info.need_auth) {
@@ -246,6 +292,7 @@
       executeJumpToBuy(info);
     };
     const handleCopyPromoteLink = async () => {
+      if (!canOperateDetail.value) return;
       const info = await handleGenerateLink(`正在生成${platformName.value}推广口令与链接...`);
       if (disposed || !info) return;
       if (info.need_auth) {
@@ -287,6 +334,8 @@
     };
     const initialize = async () => {
       const params = new URLSearchParams(global.location.search);
+      const incomingInvite = params.get('invite_code') || '';
+      if (incomingInvite && session.savePendingInvite) session.savePendingInvite(incomingInvite);
       requested = shop.goodsIdentity({ goods_id: params.get('goods_id'), goods_sign: params.get('goods_sign'), platform: params.get('platform') });
       referralUid = params.get('uid') || '';
       let hasSummary = false;
@@ -295,6 +344,7 @@
         if (shop.matchesGoodsSummary(summary, requested)) {
           goods.value = summary;
           hasSummary = true;
+          syncDocumentTitle();
           const cachedIdentity = shop.goodsIdentity(summary);
           if (requested.platform !== 'pdd' && (!requested.goods_sign || requested.goods_sign === requested.goods_id) && cachedIdentity.goods_sign) {
             requested = { ...requested, goods_sign: cachedIdentity.goods_sign };
@@ -327,8 +377,8 @@
     };
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
-      isDeepLoading, detailError, detailErrorMsg, isOffPromotion, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
-      onCarouselScroll, goHome, goBack, goToRegister,
+      isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
+      onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail: loadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,

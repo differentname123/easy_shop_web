@@ -1,6 +1,6 @@
 /* ==========================================================================
-   移动端电商导购与返利服务 - 专属样式表
-   适配手机屏幕、全面屏手势、iOS安全区与微信小程序 web-view
+   查券省钱 · 严选好价导购服务 - 专属样式表
+   适配手机屏幕、桌面宽屏多列网格、iOS安全区与微信内置浏览器
    ========================================================================== */
 
 :root {
@@ -740,7 +740,7 @@ body {
   100% { transform: translateX(100%); }
 }
 
-/* ================== “我的” 返利推手中心 ================== */
+/* ================== “我的” 推广账户中心 ================== */
 .user-profile-header {
   background: var(--accent-gradient);
   color: #fff;
@@ -796,6 +796,14 @@ body {
   margin-left: 4px;
   font-size: 10px;
   opacity: 0.9;
+}
+
+.uid-badge.share-invite-badge {
+  background: rgba(255, 255, 255, 0.95);
+  color: var(--primary-color);
+  font-weight: 700;
+  padding: 3px 10px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
 }
 
 /* 注册与登录卡片 (未登录时展示) */
@@ -899,7 +907,7 @@ body {
   color: var(--text-sub);
 }
 
-/* ================== 我的返利订单板块 ================== */
+/* ================== 我的推广订单板块 ================== */
 .order-section-card {
   background: #fff;
   border-radius: 12px;
@@ -2503,4 +2511,148 @@ body {
 
 .a2hs-step-text b {
   color: var(--primary-color);
+}
+
+/* ================== 新用户价值主张轻引导条 & 严选好价提示条 ================== */
+.value-guide-strip {
+  margin: 6px 10px 2px;
+  padding: 8px 10px 8px 12px;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #fff2f0 0%, #fff7e6 100%);
+  border: 1px solid #ffd8bf;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.value-guide-strip.curated-strip {
+  background: linear-gradient(90deg, #fffbe6 0%, #fff1f0 100%);
+  border-color: #ffe58f;
+}
+
+.value-guide-text {
+  font-size: 12px;
+  color: #873800;
+  line-height: 1.45;
+}
+
+.value-guide-text b {
+  color: var(--primary-color);
+  font-weight: 700;
+}
+
+.value-guide-close {
+  background: transparent;
+  border: none;
+  color: #ad6800;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+.value-guide-close:hover {
+  opacity: 1;
+}
+
+/* 分页继续加载轻量次级样式（保留触底与空页兜底，不喧宾夺主） */
+.continue-load-wrap.is-subtle {
+  padding: 10px 16px 16px;
+}
+
+.continue-load-btn {
+  background: transparent;
+  border: 1px dashed #d9d9d9;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 6px 16px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.continue-load-btn:active {
+  background: #f0f2f5;
+}
+
+/* 链接解析错填关键词一键搜同款恢复按钮 & 短链无图文预览提示 */
+.universal-search-fallback-btn {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: var(--accent-gradient);
+  color: #ffffff;
+  border: none;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(224, 46, 36, 0.22);
+}
+
+.universal-no-preview-tip {
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  color: #389e0d;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  margin-bottom: 10px;
+}
+
+/* 详情页失效/加载异常时底部操作按钮禁用态 */
+.detail-bottom-nav button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+  filter: grayscale(0.45);
+  pointer-events: none;
+}
+
+/* ================== 平板与桌面宽屏自适应多列布局 ================== */
+@media (min-width: 768px) {
+  #app,
+  .top-header,
+  .bottom-tab-bar,
+  .detail-bottom-nav,
+  .detail-nav-bar {
+    max-width: 760px !important;
+  }
+
+  .goods-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    padding: 10px 12px;
+  }
+}
+
+@media (min-width: 1080px) {
+  #app,
+  .top-header,
+  .bottom-tab-bar {
+    max-width: 980px !important;
+  }
+
+  .goods-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+    padding: 12px 14px;
+  }
+
+  .tab-user .universal-convert-card,
+  .tab-user .auth-reg-card,
+  .tab-user .stats-card,
+  .tab-user .order-section-card,
+  .tab-user .auth-card,
+  .tab-user .menu-list,
+  .tab-user .section-title {
+    max-width: 680px;
+    margin-left: auto;
+    margin-right: auto;
+  }
 }

@@ -4,7 +4,7 @@
   const shop = global.EasyShop = global.EasyShop || {};
   const DEFAULT_AVATAR = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="32" fill="%23f0f2f5"/><circle cx="32" cy="24" r="12" fill="%23cbd5e1"/><path d="M14 54c0-10 8-18 18-18s18 8 18 18" fill="%23cbd5e1"/></svg>';
   const DEFAULT_ORDER_THUMB = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="%23f1f5f9"/><path d="M20 22h24l-2 22H22L20 22zm7 0v-2a5 5 0 0 1 10 0v2" fill="none" stroke="%2394a3b8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  shop.createAccount = function ({ ref, api, session, getPlatforms = () => [], copyText = () => {}, showToast }) {
+  shop.createAccount = function ({ ref, api, session, getPlatforms = () => [], copyText = () => {}, showToast, onSearchKeyword = null, shouldBlockDirectJump = () => false }) {
     const emptyProfile = () => ({ uid: '', phone: '', nickname: '未登录', avatar: DEFAULT_AVATAR,
       invite_code: '', invited_by: null, balance: 0, total_rebate: 0, pending_rebate: 0, auth_status: {} });
     const emptyOrders = () => ({ total_count: 0, total_commission: 0, settled_commission: 0, refund_commission: 0, refund_count: 0, order_list: [] });
@@ -129,6 +129,7 @@
         if (response.ok && data.status === 'success' && data.user) {
           orderGeneration += 1; closeAccountAuth(); userOrdersData.value = emptyOrders();
           session.saveUser(data.user); applyUser(data.user);
+          if (session.clearPendingInvite) session.clearPendingInvite();
           showToast(isRegisterMode.value ? '注册并登录成功！' : '登录成功！'); formPassword.value = '';
           syncAndQueryOrders(false);
         } else showToast(data.detail || data.error_msg || '操作失败');
@@ -139,7 +140,7 @@
       if (disposed) return;
       if (!requiresAuthorization(platform)) return showToast(`${platformName(platform)}无需授权`);
       if (!supportsPlatform(platform, 'authorization')) return showToast(`${platformName(platform)}授权暂未接入或未配置`);
-      if (!isLoggedIn.value || !uid.value) return showToast('请先完成手机号登记注册');
+      if (!isLoggedIn.value || !uid.value) { try { global.document?.querySelector?.('.auth-reg-card')?.scrollIntoView?.({ behavior: 'smooth', block: 'center' }); } catch (_) {} return showToast('请先完成手机号登记注册'); }
       if (!session.token()) return invalidSession();
       const snapshot = session.capture(), generation = ++authGeneration;
       recheck.stop(); isCheckingAuth.value = true;
@@ -186,22 +187,30 @@
       orderPlatform.value = getPlatforms().find(item => item.code === preferred)?.code || getPlatforms().find(item => item.active)?.code || '';
     };
     const universalInput = ref(''), universalPlatform = ref('auto'), universalLoading = ref(false);
-    const universalResult = ref(null), universalError = ref('');
+    const universalResult = ref(null), universalError = ref(''), universalSuggestedKeyword = ref(''), universalSuggestedPlatform = ref('');
     let universalGeneration = 0;
     const clearUniversalConvert = () => {
       universalGeneration += 1;
       universalInput.value = '';
       universalResult.value = null;
-      universalError.value = '';
+      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform.value = '';
       universalLoading.value = false;
     };
     const handleUniversalConvert = async () => {
       if (disposed || universalLoading.value) return;
       const text = (universalInput.value || '').trim();
       if (!text) return showToast('请先粘贴商品链接、推广短链或口令文案');
+      if (typeof shop.extractInternalShareRoute === 'function') {
+        const internalRoute = shop.extractInternalShareRoute(text, global.location ? global.location.origin : '');
+        if (internalRoute) {
+          universalInput.value = '';
+          if (global.location) global.location.href = internalRoute;
+          return;
+        }
+      }
       const generation = ++universalGeneration;
       universalLoading.value = true;
-      universalError.value = '';
+      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform.value = '';
       universalResult.value = null;
       try {
         const token = session.token();
@@ -224,7 +233,7 @@
           invalidSession();
         } else {
           const msg = data.error_msg || data.detail || '未能解析或转换该内容，请检查输入格式';
-          universalError.value = msg;
+          universalError.value = msg; universalSuggestedKeyword.value = data.suggested_keyword || ''; universalSuggestedPlatform.value = data.suggested_platform || '';
         }
       } catch (_) {
         if (!disposed && generation === universalGeneration) {
@@ -250,6 +259,7 @@
       const res = universalResult.value;
       if (!res) return;
       const link = res.final_link || res.short_url || res.url;
+      if (shouldBlockDirectJump(res, link)) { copyText(res.promotion_token || res.command_text || link, '淘口令已复制，请打开手机淘宝 App 领券下单'); return; }
       if (res.promotion_token) {
         copyText(res.promotion_token, '口令已自动复制，正在打开购买页...');
       }
@@ -258,18 +268,25 @@
         else if (global.location) global.location.href = link;
       }
     };
+    const searchUniversalKeyword = () => { if (universalSuggestedKeyword.value && typeof onSearchKeyword === 'function') onSearchKeyword(universalSuggestedKeyword.value, universalSuggestedPlatform.value); };
+    const shareSiteInvite = () => {
+      const origin = (global.location && global.location.origin) || '';
+      const code = isLoggedIn.value ? (userProfile.value.invite_code || (session.myInviteCode ? session.myInviteCode() : '') || '') : '';
+      const text = shop.buildSiteShareText(origin, code);
+      copyText(text, code ? '✅ 专属邀请链接已复制，好友打开注册即自动填写邀请码！' : '✅ 网站推荐链接已复制，快发给微信好友吧！');
+    };
     const handleAvatarError = event => { if (event?.target) event.target.src = DEFAULT_AVATAR; };
     const handleOrderThumbError = event => { if (event?.target && event.target.src !== DEFAULT_ORDER_THUMB) event.target.src = DEFAULT_ORDER_THUMB; };
     return {
       isLoggedIn, uid, userPhone, userProfile, isRegisterMode, formPhone, formPassword, formNickname, formInviteCode,
-      isSubmittingAuth, handleRegisterOrLogin, handleLogout, fetchUserInfo,
+      isSubmittingAuth, handleRegisterOrLogin, handleLogout, fetchUserInfo, shareSiteInvite,
       isAuthModalOpen, currentAuthInfo, isCheckingAuth, handleCheckAndGetAuth, handleRecheckAuth, closeAccountAuth, openAccountAuth,
       refreshAuthorization: recheck.refresh, resumePendingAuthorization, platformName, supportsPlatform, requiresAuthorization,
       orderAmountLabel, orderTimeLabel, orderTimeText,
       orderPlatform, orderDays, orderMessage, isSyncingOrders, userOrdersData, syncAndQueryOrders, switchOrderDays,
       switchOrderPlatform, initializeOrderPlatform,
-      universalInput, universalPlatform, universalLoading, universalResult, universalError,
-      handleUniversalConvert, clearUniversalConvert, copyUniversalCommand, copyUniversalShortLink, buyUniversalProduct,
+      universalInput, universalPlatform, universalLoading, universalResult, universalError, universalSuggestedKeyword, universalSuggestedPlatform,
+      handleUniversalConvert, clearUniversalConvert, copyUniversalCommand, copyUniversalShortLink, buyUniversalProduct, searchUniversalKeyword,
       orderKey: order => shop.orderKey({ ...order, platform: order.platform || orderPlatform.value }),
       defaultAvatar: DEFAULT_AVATAR, handleAvatarError, defaultOrderThumb: DEFAULT_ORDER_THUMB, handleOrderThumbError,
       dispose: () => { disposed = true; orderGeneration += 1; universalGeneration += 1; stopOrderPoll(); closeAccountAuth(); },

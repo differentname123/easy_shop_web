@@ -3,10 +3,30 @@
   'use strict';
   const shop = global.EasyShop = global.EasyShop || {};
   shop.createSessionStore = function (storage = global.localStorage) {
-    const keys = { token: 'easy_shop_token', uid: 'easy_shop_uid', phone: 'easy_shop_phone' };
+    const keys = {
+      token: 'easy_shop_token',
+      uid: 'easy_shop_uid',
+      phone: 'easy_shop_phone',
+      myInvite: 'easy_shop_invite_code',
+    };
+    const pendingInviteKey = 'easy_shop_pending_invite';
     let generation = 0;
     let pendingRestore = null;
     const token = () => storage.getItem(keys.token) || '';
+    const myInviteCode = () => {
+      try { return storage.getItem(keys.myInvite) || ''; } catch (_) { return ''; }
+    };
+    const savePendingInvite = code => {
+      const clean = String(code || '').trim().slice(0, 32);
+      if (!/^[A-Za-z0-9_-]{3,32}$/.test(clean)) return;
+      try { storage.setItem(pendingInviteKey, clean); } catch (_) {}
+    };
+    const pendingInvite = () => {
+      try { return storage.getItem(pendingInviteKey) || ''; } catch (_) { return ''; }
+    };
+    const clearPendingInvite = () => {
+      try { storage.removeItem(pendingInviteKey); } catch (_) {}
+    };
     const capture = () => ({ generation, token: token() });
     const isCurrent = snapshot => snapshot.generation === generation && snapshot.token === token();
     const clear = () => {
@@ -20,6 +40,7 @@
       generation += 1;
       storage.setItem(keys.uid, user.uid || '');
       storage.setItem(keys.phone, user.phone || '');
+      if (user.invite_code) storage.setItem(keys.myInvite, user.invite_code);
       if (user.auth_token) storage.setItem(keys.token, user.auth_token);
       pendingRestore = null;
       return capture();
@@ -85,8 +106,11 @@
           typeof saved.platform === 'string' && /^[a-z][a-z0-9_]*$/.test(saved.platform) ? saved.platform : '';
       } catch (_) { forgetPendingAuthorization(); return ''; }
     };
-    return { token, capture, isCurrent, clear, saveUser, restore, scope,
-      rememberAuthorization, consumePendingAuthorization, forgetPendingAuthorization };
+    return {
+      token, myInviteCode, savePendingInvite, pendingInvite, clearPendingInvite,
+      capture, isCurrent, clear, saveUser, restore, scope,
+      rememberAuthorization, consumePendingAuthorization, forgetPendingAuthorization,
+    };
   };
   // Three active checks at most, plus explicit/return-to-page refresh within the same budget.
   shop.createAuthRecheck = function ({ api, session, onResult, onInvalid, onError = () => {} }) {

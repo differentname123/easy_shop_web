@@ -49,10 +49,13 @@ class TaobaoAdapter(BasePlatformAdapter):
             adzone = pid.rsplit("_", 1)[-1] if pid.startswith("mm_") and len(pid.split("_")) == 4 else ""
         self.official = official_client if official_client is not None else TaobaoClient(
             key, secret, adzone, setting("tb_session"), setting("tb_inviter_code"))
-        self.hdk = hdk_client if hdk_client is not None else HdkClient(setting("hdk_api_key"))
+        hdk_keys = setting("hdk_api_key_list", ())
+        self.hdk = hdk_client if hdk_client is not None else HdkClient(
+            setting("hdk_api_key"), api_key_list=hdk_keys)
         ztk_keys = setting("ztk_appkey_list", ())
+        ztk_sids = setting("ztk_sid_list", ())
         self.ztk = ztk_client if ztk_client is not None else ZtkClient(
-            setting("ztk_appkey"), setting("ztk_sid"), appkey_list=ztk_keys)
+            setting("ztk_appkey"), setting("ztk_sid"), appkey_list=ztk_keys, sid_list=ztk_sids)
         pid_val = _text(setting("tb_pid"))
         pid_prefix = _text(setting("tb_pid_prefix"))
         if not pid_prefix and pid_val.startswith("mm_") and len(pid_val.split("_")) == 4:
@@ -63,10 +66,12 @@ class TaobaoAdapter(BasePlatformAdapter):
         self.channel_pid = _text(setting("tb_channel_pid")) or f"{pid_prefix}_{channel_adzone}"
         official_ok = bool(official_client is not None or key and secret)
         search_ok = bool(official_client is not None or official_ok and adzone)
+        has_hdk_key = bool(getattr(self.hdk, "appkey_list", None) or setting("hdk_api_key") or hdk_keys)
         has_ztk_key = bool(getattr(self.ztk, "appkey_list", None) or setting("ztk_appkey") or ztk_keys)
-        has_ztk_channel = bool(has_ztk_key and setting("ztk_sid"))
+        has_ztk_sid = bool(getattr(self.ztk, "sid_list", None) or setting("ztk_sid") or ztk_sids)
+        has_ztk_channel = bool(has_ztk_key and has_ztk_sid)
         self.capabilities = {
-            "recommend": bool(official_ok and (hdk_client is not None or setting("hdk_api_key"))),
+            "recommend": bool(official_ok and (hdk_client is not None or has_hdk_key)),
             "search": search_ok, "detail": official_ok, "promotion": search_ok,
             "authorization": bool(official_client is not None or official_ok and (setting("tb_session") or has_ztk_channel)),
             "orders": bool(ztk_client is not None or has_ztk_channel),

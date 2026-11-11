@@ -194,9 +194,9 @@ class JdClient:
             return _error("CONFIG_ERROR", "京东中继网关配置无效")
         return None
 
-    def _execute_with_failover(self, endpoint, params, evaluator, *, orders=False):
+    def _execute_with_failover(self, endpoint, params, evaluator, *, orders=False, extra_stop_early=None):
         """
-        使用 `self.appkey_list` 执行请求（委托 `execute_with_key_failover` 共享粘性游标容灾机制）：
+        使用 `self.appkey_list` 执行请求（委托 `execute_with_key_failover` 共享健康轮询与容灾机制）：
         - 若遇到安全/协议/分页错误或京东已返回内层确定性业务封套，立即终止返回。
         """
         config_error = self._validate_config(orders=orders)
@@ -213,9 +213,13 @@ class JdClient:
         return execute_with_key_failover(
             self,
             _call,
-            should_stop_early=lambda _res: isinstance(last_body, dict) and (
-                PROMOTION_ROOT in last_body or RANK_ROOT in last_body or ORDER_ROOT in last_body
+            should_stop_early=lambda res: (
+                (isinstance(last_body, dict) and (
+                    PROMOTION_ROOT in last_body or RANK_ROOT in last_body or ORDER_ROOT in last_body
+                ))
+                or (callable(extra_stop_early) and extra_stop_early(res))
             ),
+            round_robin=True,
         )
 
     @staticmethod
@@ -279,12 +283,32 @@ class JdClient:
                 query += query
         except (TypeError, ValueError, AttributeError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东搜索关键词或分页无效")
-        return self._execute_with_failover(
+        ambiguous_empty_hits = 0
+
+        def _evaluate_search(body):
+            nonlocal ambiguous_empty_hits
+            if (
+                isinstance(body, dict)
+                and str(body.get("status")) in ("300", "301")
+                and any(
+                    kw in str(body.get("content") or body.get("msg") or "")
+                    for kw in ("无符合条件的数据", "无数据", "没有数据", "暂无数据", "没有找到")
+                )
+            ):
+                ambiguous_empty_hits += 1
+                return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_empty=True)
+            return self._content(body, page, size)
+
+        res = self._execute_with_failover(
             "api_quanwang.ashx",
             {"unionId": self.union_id, "q": query, "page": page, "page_size": size,
              "sort": "new", "youquan": 1 if has_coupon else 0, "type": 2},
-            lambda body: self._content(body, page, size),
+            _evaluate_search,
+            extra_stop_early=lambda _r: ambiguous_empty_hits >= 2,
         )
+        if res.get("ztk_ambiguous_empty"):
+            return {"status": "success", "data": [], "has_more": False, "total_count": 0}
+        return res
 
     def get_goods_detail(self, goods_id):
         if not isinstance(goods_id, str) or not goods_id.strip():
@@ -401,6 +425,7 @@ class JdClient:
             if p_tao_id:
                 raw_item = dict(body)
                 raw_item.setdefault("pict_url", raw_item.get("pic") or "")
+                raw_item.setdefault("shop_title", raw_item.get("nick") or "")
                 raw_item.setdefault("item_url", f"https://jingfen.jd.com/detail/{p_tao_id}.html")
             return {
                 "status": "success",

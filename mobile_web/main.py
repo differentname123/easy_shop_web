@@ -137,7 +137,7 @@ def _html_page(filename: str, fallback: str):
 
 def create_app() -> FastAPI:
     application = FastAPI(
-        title="移动端电商导购与返利服务",
+        title="查券省钱 · 严选好价导购服务",
         description="官方推荐、爆单库、推手授权与带 UID 佣金转链",
         version="2.0.0",
         lifespan=lifespan,

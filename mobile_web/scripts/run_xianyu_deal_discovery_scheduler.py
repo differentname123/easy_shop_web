@@ -91,7 +91,7 @@ LOOP_INTERVAL_HOURS = 1.0                          # 每轮结束后的等待间
 SCAN_HOURS_WINDOW = 72                             # 内部商品库扫描时间窗口（小时）
 MAX_CATEGORIES_PER_ROUND = 20                      # 单轮探测的有效标品分类数（设为 0 表示不限数量）
 MAX_XIANYU_SEARCH_ITEMS = 20                       # 每次闲鱼搜索抓取的概览商品数
-MAX_DETAIL_CHECKS_PER_CATEGORY = 10                # 每个分类最多拉取多少个初筛同款闲鱼商品详情
+MAX_DETAIL_CHECKS_PER_CATEGORY = 20                # 每个分类最多拉取多少个初筛同款闲鱼商品详情
 STAGE1_WORKERS = 5                                 # 阶段 1（AI 选标品 + 官方验价）并发线程数
 COMPARE_WORKERS = 3                                # 阶段 2/3（闲鱼比价流水线）并发线程数
 DEBUG_BROWSER = False                              # 是否显示浏览器窗口（False=后台无头模式，True=显示窗口）

@@ -81,13 +81,36 @@ def parse_order_response(body):
 
 
 class ZtkClient:
-    def __init__(self, appkey="", sid="", http_session=None, timeout=(3.0, 12.0), signurl=2, appkey_list=None):
+    def __init__(self, appkey="", sid="", http_session=None, timeout=(3.0, 12.0), signurl=2, appkey_list=None, sid_list=None):
         self.appkey_list = parse_appkey_list(appkey, appkey_list)
         self.appkey = self.appkey_list[0] if self.appkey_list else ""
+        if isinstance(sid_list, (list, tuple)) and sid_list:
+            explicit_sids = [
+                part.strip()
+                for entry in sid_list
+                if isinstance(entry, str) and not isinstance(entry, bool)
+                for part in entry.split(",")
+                if part.strip() and not any(ord(c) < 33 for c in part.strip())
+            ]
+        else:
+            explicit_sids = list(parse_appkey_list(sid_list))
+        parsed_sids = explicit_sids if explicit_sids else list(parse_appkey_list(sid))
+        self.sid_list = tuple(parsed_sids)
+        self.sid = self.sid_list[0] if self.sid_list else ""
         self._active_key_index = 0
-        self.sid = sid
         self.http = http_session or requests.Session()
         self.timeout, self.signurl = timeout, signurl
+
+    def _sid_for_key(self, current_key: str) -> str:
+        if self.sid_list:
+            try:
+                idx = self.appkey_list.index(current_key)
+                if idx < len(self.sid_list):
+                    return self.sid_list[idx]
+            except ValueError:
+                pass
+            return self.sid_list[0]
+        return str(self.sid or "").strip()
 
     def _get_response(self, url, **kwargs):
         response = self.http.get(url, timeout=self.timeout, allow_redirects=False, **kwargs)
@@ -101,6 +124,7 @@ class ZtkClient:
             return getattr(response, "text", "").strip()
 
     def _run_with_key_failover(self, action):
+        all_keys_have_paired_sid = len(self.appkey_list) > 1 and len(self.sid_list) >= len(self.appkey_list)
         return execute_with_key_failover(
             self,
             action,
@@ -108,10 +132,11 @@ class ZtkClient:
                 "sid和appkey不匹配" in str(res.get("error_msg") or "")
                 or "sid过期" in str(res.get("error_msg") or "")
             ),
+            round_robin=all_keys_have_paired_sid,
         )
 
     def query_orders(self, start_time, end_time, page=1, page_size=50, cursor=None):
-        if not self.appkey_list or not self.sid:
+        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
             return _error("CONFIG_ERROR", "淘宝订单缺少折淘客 appkey 或 sid")
         try:
             start, end = int(start_time), int(end_time)
@@ -127,7 +152,7 @@ class ZtkClient:
             if not 1 <= page <= 100 or page > 1 and not position:
                 raise ValueError
             base_params = {
-                "sid": self.sid, "signurl": self.signurl,
+                "signurl": self.signurl,
                 "query_type": 4, "order_scene": 2,
                 "start_time": datetime.fromtimestamp(start, SHANGHAI).strftime("%Y-%m-%d %H:%M:%S"),
                 "end_time": datetime.fromtimestamp(end, SHANGHAI).strftime("%Y-%m-%d %H:%M:%S"),
@@ -139,7 +164,7 @@ class ZtkClient:
             return _error("INVALID_ARGUMENT", "订单时间窗、分页或游标无效（最大20分钟）")
 
         def _query_once(current_key):
-            params = {"appkey": current_key, **base_params}
+            params = {"appkey": current_key, "sid": self._sid_for_key(current_key), **base_params}
             try:
                 body = self._get_response(ZTK_ORDER_URL, params=params)
                 if isinstance(body, dict) and body.get("status") == "error":
@@ -175,7 +200,7 @@ class ZtkClient:
         return self._run_with_key_failover(_query_once)
 
     def convert_channel_url(self, item_url: str, relation_id: str = "", pid: str = "", signurl: int = 5, *, allow_public: bool = False):
-        if not self.appkey_list or not self.sid:
+        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
             return _error("CONFIG_ERROR", "折淘客渠道转链缺少 appkey 或 sid")
         item_url = str(item_url or "").strip()
         relation_id = str(relation_id or "").strip()
@@ -184,9 +209,10 @@ class ZtkClient:
             return _error("INVALID_ARGUMENT", "折淘客渠道转链缺少有效商品链接、relation_id 或 pid")
 
         def _convert_once(current_key):
+            cur_sid = self._sid_for_key(current_key)
             params = {
                 "appkey": current_key,
-                "sid": self.sid,
+                "sid": cur_sid,
                 "pid": pid,
                 "tkl": item_url,
                 "signurl": signurl,
@@ -209,11 +235,19 @@ class ZtkClient:
                 if not err_msg:
                     err_msg = str(body.get("msg") or body.get("error_msg") or "").strip()
 
+                err_lower = err_msg.lower()
+                is_key_or_sid_err = "appkey" in err_lower or "sid" in err_lower
                 is_unauthorized = (
-                    "relationId" in err_msg
-                    or "relation_id" in err_msg
-                    or "无效的relation" in err_msg
-                    or any(keyword in err_msg for keyword in ("未授权", "未备案", "渠道关系无效", "渠道失效", "无效的渠道"))
+                    not is_key_or_sid_err
+                    and (
+                        "relationid" in err_lower
+                        or "relation_id" in err_lower
+                        or "无效的relation" in err_lower
+                        or (
+                            bool(relation_id)
+                            and any(keyword in err_msg for keyword in ("未授权", "未备案", "渠道关系无效", "渠道失效", "无效的渠道"))
+                        )
+                    )
                 )
 
                 if status_code != 200 or not content or not isinstance(content, list):
@@ -229,7 +263,7 @@ class ZtkClient:
                                 ZTK_CHANNEL_PILIANG_URL,
                                 params={
                                     "appkey": current_key,
-                                    "sid": self.sid,
+                                    "sid": cur_sid,
                                     "pid": pid,
                                     "tkl": item_url,
                                     "signurl": signurl,
@@ -242,7 +276,7 @@ class ZtkClient:
                                         ZTK_CHANNEL_URL,
                                         params={
                                             "appkey": current_key,
-                                            "sid": self.sid,
+                                            "sid": cur_sid,
                                             "pid": pid,
                                             "tkl": f"https://uland.taobao.com/item/edetail?id={p_tao_id}",
                                             "signurl": signurl,
@@ -314,7 +348,7 @@ class ZtkClient:
         通过折淘客 90 天长效 sid 调用 open_sc_publisher_get.ashx 核验推手淘宝渠道备案关系。
         当本地自用型 TOP 应用的 24h taobao_session 过期时，提供无缝长效渠道核验能力。
         """
-        if not self.appkey_list or not str(self.sid or "").strip():
+        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
             return _error("CONFIG_ERROR", "折淘客渠道核验缺少 appkey 或 sid")
         clean_uid = str(uid or "").strip()
         if not clean_uid:
@@ -323,7 +357,7 @@ class ZtkClient:
         def _check_once(current_key):
             params = {
                 "appkey": current_key,
-                "sid": str(self.sid).strip(),
+                "sid": self._sid_for_key(current_key),
                 "relation_app": "common",
                 "info_type": 1,
                 "external_id": clean_uid,
@@ -393,11 +427,11 @@ class ZtkClient:
         if not clean_uid:
             return _error("INVALID_IDENTITY", "授权链接需要站内 UID")
         code = str(inviter_code or "").strip()
-        if not code and self.appkey_list and str(self.sid or "").strip():
+        if not code and self.appkey_list and (self.sid_list or str(self.sid or "").strip()):
             def _fetch_code(current_key):
                 params = {
                     "appkey": current_key,
-                    "sid": str(self.sid).strip(),
+                    "sid": self._sid_for_key(current_key),
                     "relation_app": "common",
                     "code_type": 1,
                 }
@@ -425,12 +459,12 @@ class ZtkClient:
 
     def get_auth_info(self):
         """查询折淘客 sid 授权详情及过期时间 (open_taokeshouquaninfo.ashx)。"""
-        if not self.appkey_list or not str(self.sid or "").strip():
+        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
             return _error("CONFIG_ERROR", "缺少折淘客 appkey 或 sid")
 
         def _info_once(current_key):
             try:
-                body = self._get_response(ZTK_AUTH_INFO_URL, params={"appkey": current_key, "sid": str(self.sid).strip()})
+                body = self._get_response(ZTK_AUTH_INFO_URL, params={"appkey": current_key, "sid": self._sid_for_key(current_key)})
                 if not isinstance(body, dict) or body.get("status") != 200 or not isinstance(body.get("data"), list) or not body["data"]:
                     return _error("UPSTREAM_ERROR", "未查询到折淘客授权信息")
                 return {"status": "success", "data": body["data"][0]}

@@ -72,9 +72,12 @@ def main(argv=None):
     for key in ("local_mongo_host", "local_mongo_port", "local_mongo_db_name"):
         if values[key] is None or values[key] == "":
             values[key] = FIELDS[key]
-    # authSource 是可选的兼容扩展；空值不迁入，也不带入其他账号/服务配置。
+    # authSource 及多 Key 池属于可选的兼容扩展；空值不迁入，也不带入其他账号/服务配置。
     if source.get("mongo_auth_source") not in (None, ""):
         values["mongo_auth_source"] = source["mongo_auth_source"]
+    for pool_key in ("zhetaoke_appkey_list", "zhetaoke_sid_list", "haodanku_api_key_list"):
+        if source.get(pool_key) not in (None, "", []):
+            values[pool_key] = source[pool_key]
     auth_secret = source.get("web_auth_secret", "")
     generated = not _safe_secret(auth_secret)
     values["web_auth_secret"] = secrets.token_urlsafe(48) if generated else auth_secret

@@ -1094,7 +1094,7 @@ class DealPoolCleaner:
         self,
         use_ai_for_multi: bool = True,
         ai_batch_size: int = 10,
-        ai_max_workers: int = 10,
+        ai_max_workers: int = 20,
         convert_max_workers: int = 10,
         ai_timeout: float = DEFAULT_AI_TIMEOUT_SECONDS,
     ):
@@ -1126,6 +1126,23 @@ class DealPoolCleaner:
         self.stats_early_terminated_pre_ai1 = 0
         self.stats_early_terminated_post_stage3 = 0
         self.last_batch_stage_timings: Dict[str, float] = {}
+
+    def _evict_transient_failed_cache(self) -> None:
+        """
+        每轮 Stage 3 结束后驱逐内存缓存中的暂态转链失败项 (`ERR_ADAPTER_CONVERT_FAILED`)，
+        保证进入 `retry_pending` 的记录在下一轮扫描时能真正重新请求上游 API，
+        同时保留确定性永久错误（如纯数字 SKU、商品已下架、非支持平台）避免无意义重复请求。
+        """
+        with self._cache_lock:
+            stale_keys = [
+                k
+                for k, v in self.anchor_cache.items()
+                if isinstance(v, dict)
+                and v.get("convert_status") == "failed"
+                and v.get("error_code") == ERR_ADAPTER_CONVERT_FAILED
+            ]
+            for k in stale_keys:
+                self.anchor_cache.pop(k, None)
 
     @staticmethod
     def _build_anchor_cache_keys(plat: str, raw_anchor: str) -> List[str]:
@@ -1720,8 +1737,8 @@ class DealPoolCleaner:
                             self.anchor_cache[ck] = out
                     return copy.deepcopy(out)
 
-                # 转链成功但无单一商品详情（例如京东/淘宝优惠券短链、活动会场推广链）
-                if promo_link or promo_token:
+                # 转链成功但无单一商品详情（例如京东/淘宝优惠券短链、活动会场推广链；若详情反查发生暂态报错则不伪装成优惠券，交由重试队列复核）
+                if not res.get("detail_lookup_failed") and (promo_link or promo_token):
                     out = {
                         "link_id": link_id,
                         "clean_input": clean_input,
@@ -1765,7 +1782,11 @@ class DealPoolCleaner:
                 return copy.deepcopy(out)
 
             raw_code = str((res or {}).get("error_code") or "")
-            raw_msg = str((res or {}).get("error_msg") or "转链未返回有效结果")
+            raw_msg = (
+                "商品详情反查触发临时限流或网络波动"
+                if isinstance(res, dict) and res.get("detail_lookup_failed")
+                else str((res or {}).get("error_msg") or "转链未返回有效结果")
+            )
             if raw_code == "UNSUPPORTED_TB_NUMERIC_ID" or (try_plat == "taobao" and "不支持数字id" in raw_msg):
                 err_code = ERR_TB_NUMERIC_ID
             elif raw_code == "UNSUPPORTED_PDD_ID_ONLY_URL" or (try_plat == "pdd" and "40009" in raw_msg):
@@ -1823,8 +1844,8 @@ class DealPoolCleaner:
     ) -> None:
         """
         并发执行 Stage 3 官方 API 转链：
-        先对本批次所有去重后的 `(target, default_plat)` 通过多线程池并发调用 `convert_single_target`，
-        将转链结果写入线程安全的 `self.anchor_cache`，大幅缩短网络 IO 等待时间。
+        - 淘宝/拼多多通过多线程池全速并发转链；
+        - 京东独立走单通道匀速车道（配合双 AppKey 轮询 + 0.35s 间隔），既避免触发京东联盟单 unionId 频控，又不占用淘/拼并发工作线程。
         """
         if not unique_targets:
             return
@@ -1832,6 +1853,25 @@ class DealPoolCleaner:
         total_targets = len(unique_targets)
         step = max(25, total_targets // 5)
         t_s3 = time.perf_counter()
+        done_cnt = 0
+        prog_lock = threading.Lock()
+
+        def _record_done() -> None:
+            nonlocal done_cnt
+            with prog_lock:
+                done_cnt += 1
+                cur_done = done_cnt
+            if not quiet_sub_logs and (cur_done % step == 0 or cur_done == total_targets):
+                logger.info(
+                    "  📊 [阶段3-官方转链 进度 %3d/%3d个 (%3d%%)] 已核验=%3d个 (还剩%3d个) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
+                    cur_done,
+                    total_targets,
+                    int(cur_done * 100 / max(1, total_targets)),
+                    cur_done,
+                    max(0, total_targets - cur_done),
+                    time.perf_counter() - t_s3,
+                    total_pending_count,
+                )
 
         def _conv_worker(item: Tuple[Dict[str, Any], str]) -> None:
             tgt, def_plat = item
@@ -1839,37 +1879,41 @@ class DealPoolCleaner:
                 self.convert_single_target(tgt, default_plat=def_plat)
             except Exception as e:
                 logger.warning("[Stage3-并发转链] 单目标转链异常: %s", str(e)[:160])
+            finally:
+                _record_done()
 
         if total_targets == 1:
             _conv_worker(unique_targets[0])
-            if not quiet_sub_logs:
-                logger.info(
-                    "  📊 [阶段3-官方转链 进度   1/  1个 (100%%)] 已核验=  1个 (还剩  0个) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
-                    time.perf_counter() - t_s3,
-                    total_pending_count,
-                )
             return
 
-        done_cnt = 0
-        with ThreadPoolExecutor(max_workers=min(self.convert_max_workers, total_targets)) as pool:
-            futures = [pool.submit(_conv_worker, it) for it in unique_targets]
+        jd_targets: List[Tuple[Dict[str, Any], str]] = []
+        other_targets: List[Tuple[Dict[str, Any], str]] = []
+        for it in unique_targets:
+            tgt, def_plat = it
+            c_inp = self._strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
+            hint_p = str(tgt.get("platform") or def_plat or "unknown").strip().lower()
+            det_p = detect_candidate_platform(c_inp, hint_p if hint_p in ("jd", "taobao", "pdd") else def_plat)
+            if det_p == "jd":
+                jd_targets.append(it)
+            else:
+                other_targets.append(it)
+
+        def _jd_lane_runner() -> None:
+            for jd_it in jd_targets:
+                _conv_worker(jd_it)
+
+        worker_slots = min(self.convert_max_workers, max(1, len(other_targets))) + (1 if jd_targets else 0)
+        with ThreadPoolExecutor(max_workers=max(1, worker_slots)) as pool:
+            futures = []
+            if jd_targets:
+                futures.append(pool.submit(_jd_lane_runner))
+            for o_it in other_targets:
+                futures.append(pool.submit(_conv_worker, o_it))
             for fut in as_completed(futures):
-                done_cnt += 1
                 try:
                     fut.result()
                 except Exception:
                     pass
-                if not quiet_sub_logs and (done_cnt % step == 0 or done_cnt == total_targets):
-                    logger.info(
-                        "  📊 [阶段3-官方转链 进度 %3d/%3d个 (%3d%%)] 已核验=%3d个 (还剩%3d个) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
-                        done_cnt,
-                        total_targets,
-                        int(done_cnt * 100 / max(1, total_targets)),
-                        done_cnt,
-                        max(0, total_targets - done_cnt),
-                        time.perf_counter() - t_s3,
-                        total_pending_count,
-                    )
 
     def run_ai_stage2_batch(
         self,
@@ -2060,7 +2104,7 @@ class DealPoolCleaner:
         out = re.sub(r"[ \t]*\(\s*https?://[^)\s]+\s*\)", "", out)
 
         # 3. 先完整清除整段淘口令/京口令壳子、小程序跳转码与裸网址（防止后续内层口令替换后残留 `8:// CZ3456` 外壳）
-        out = re.sub(r"#小程序://\S+", "", out)
+        out = re.sub(r"(?:#小程序|mp)://\S+", "", out)
         out = re.sub(r"https?://[^\s\u4e00-\u9fa5\"'<>）)\]]+", "", out)
         out = re.sub(
             r"(?<![A-Za-z0-9])(?:u\.jd\.com|3\.cn|m\.tb\.cn|s\.click\.taobao\.com|p\.pinduoduo\.com)/[A-Za-z0-9_.\-?=&/%]+",
@@ -2097,6 +2141,7 @@ class DealPoolCleaner:
                 out = out.replace(sp, "")
 
         out = re.sub(r"\s*\[#L\d+\]", "", out)
+        out = re.sub(r"(?:(?<=\s)|^)(?:/:/|/:|:/)(?=\s|$)", "", out)
 
         # 5. 保留原博主的原始行文与表情，仅剔除因整行只有链接被删空后留下的纯空白行
         kept_lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
@@ -2291,6 +2336,17 @@ class DealPoolCleaner:
                 }
                 continue
 
+            saved_ai1 = doc.get("ai_stage1_result")
+            if (
+                doc.get("clean_error_code") == ERR_ADAPTER_CONVERT_FAILED
+                and not bool(doc.get("is_group_stream") or (site == "zhetaoke" and mid.startswith("xb_")))
+                and isinstance(saved_ai1, dict)
+                and not saved_ai1.get("_from_fallback")
+                and saved_ai1.get("extracted_targets")
+            ):
+                neighbor_maps_by_id[mid] = {mid: doc}
+                continue
+
             s1_inp, tip_map = self.build_stage1_task_input(doc, raw_col)
             neighbor_maps_by_id[mid] = tip_map
             stage1_inputs.append(s1_inp)
@@ -2325,6 +2381,12 @@ class DealPoolCleaner:
             if stage1_inputs
             else {}
         )
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            if mid and mid not in ai1_results and mid not in pre_stage2_outcomes:
+                saved_ai1 = doc.get("ai_stage1_result")
+                if isinstance(saved_ai1, dict) and not saved_ai1.get("_from_fallback") and saved_ai1.get("extracted_targets"):
+                    ai1_results[mid] = copy.deepcopy(saved_ai1)
         t_ai1_elapsed = round(time.perf_counter() - t_ai1_start, 2)
         if not quiet_sub_logs:
             logger.info(
@@ -2522,7 +2584,55 @@ class DealPoolCleaner:
             prod_convs = [c for c in conv_list if c["convert_status"] == "product"]
             coupon_convs = [c for c in conv_list if c["convert_status"] == "coupon_or_activity"]
 
+            conv_summary_s3 = [
+                {k: v for k, v in c.items() if k != "adapter_res"}
+                for c in conv_list
+            ]
+
             if not prod_convs:
+                transient_err = next(
+                    (e for e in attempt_errors if e["error_code"] == ERR_ADAPTER_CONVERT_FAILED),
+                    None,
+                )
+                if transient_err is not None:
+                    new_retries = int(doc.get("clean_retry_count") or 0) + 1
+                    self.stats_ai_retries_scheduled += 1
+                    if new_retries < MAX_CLEAN_RETRIES:
+                        pre_stage2_outcomes[mid] = {
+                            "status": "retry_pending",
+                            "error_code": ERR_ADAPTER_CONVERT_FAILED,
+                            "error_msg": f"官方转链或反查暂态失败，保留待下轮重试 ({new_retries}/{MAX_CLEAN_RETRIES}): {transient_err['error_msg']}",
+                            "retry_count": new_retries,
+                            "source_site": site,
+                            "source_channel": channel,
+                            "source_item_id": mid,
+                            "title": raw_title,
+                            "ai_stage1_result": ai1_res,
+                            "converted_links": conv_summary_s3,
+                            "ai_stage2_result": None,
+                            "quality_score": 0,
+                            "candidate_count": len(targets),
+                            "attempt_errors": attempt_errors,
+                        }
+                    else:
+                        pre_stage2_outcomes[mid] = {
+                            "status": "failed",
+                            "error_code": ERR_ADAPTER_CONVERT_FAILED,
+                            "error_msg": f"官方转链连续 {new_retries} 轮失败，达最大重试上限({MAX_CLEAN_RETRIES}次)放弃: {transient_err['error_msg']}",
+                            "retry_count": new_retries,
+                            "source_site": site,
+                            "source_channel": channel,
+                            "source_item_id": mid,
+                            "title": raw_title,
+                            "ai_stage1_result": ai1_res,
+                            "converted_links": conv_summary_s3,
+                            "ai_stage2_result": None,
+                            "quality_score": 0,
+                            "candidate_count": len(targets),
+                            "attempt_errors": attempt_errors,
+                        }
+                    continue
+
                 if coupon_convs and not attempt_errors:
                     primary_err_code = ERR_EMPTY_PRODUCT_IDENTITY
                     primary_err_msg = "仅包含优惠券或活动会场链接，无具体主商品"
@@ -2538,10 +2648,7 @@ class DealPoolCleaner:
                     "source_item_id": mid,
                     "title": raw_title,
                     "ai_stage1_result": ai1_res,
-                    "converted_links": [
-                        {k: v for k, v in c.items() if k != "adapter_res"}
-                        for c in conv_list
-                    ],
+                    "converted_links": conv_summary_s3,
                     "ai_stage2_result": None,
                     "quality_score": 0,
                     "candidate_count": len(targets),
@@ -2549,9 +2656,41 @@ class DealPoolCleaner:
                 }
                 continue
 
-            # 若存活的单品链接 100% 是凑单品 (filler_candidate) 而主商品死链，直接按铁律提前拦截，无需浪费 AI-2
+            # 若存活的单品链接 100% 是凑单品 (filler_candidate) 而主商品死链，先排查主商品是否属于暂态 API 报错
             main_prod_convs = [c for c in prod_convs if c.get("text_role_hint") != "filler_candidate"]
             if not main_prod_convs:
+                transient_main_err = next(
+                    (
+                        c
+                        for c in conv_list
+                        if c["convert_status"] == "failed"
+                        and c["error_code"] == ERR_ADAPTER_CONVERT_FAILED
+                        and c.get("text_role_hint") != "filler_candidate"
+                    ),
+                    None,
+                )
+                if transient_main_err is not None:
+                    new_retries = int(doc.get("clean_retry_count") or 0) + 1
+                    self.stats_ai_retries_scheduled += 1
+                    if new_retries < MAX_CLEAN_RETRIES:
+                        pre_stage2_outcomes[mid] = {
+                            "status": "retry_pending",
+                            "error_code": ERR_ADAPTER_CONVERT_FAILED,
+                            "error_msg": f"主商品官方转链暂态失败，保留待下轮重试 ({new_retries}/{MAX_CLEAN_RETRIES}): {transient_main_err['error_msg']}",
+                            "retry_count": new_retries,
+                            "source_site": site,
+                            "source_channel": channel,
+                            "source_item_id": mid,
+                            "title": raw_title,
+                            "ai_stage1_result": ai1_res,
+                            "converted_links": conv_summary_s3,
+                            "ai_stage2_result": None,
+                            "quality_score": 0,
+                            "candidate_count": len(targets),
+                            "attempt_errors": attempt_errors,
+                        }
+                        continue
+
                 pre_stage2_outcomes[mid] = {
                     "status": "failed",
                     "error_code": ERR_AI2_MAIN_DEAD_ONLY_FILLER,
@@ -2561,10 +2700,7 @@ class DealPoolCleaner:
                     "source_item_id": mid,
                     "title": raw_title,
                     "ai_stage1_result": ai1_res,
-                    "converted_links": [
-                        {k: v for k, v in c.items() if k != "adapter_res"}
-                        for c in conv_list
-                    ],
+                    "converted_links": conv_summary_s3,
                     "ai_stage2_result": None,
                     "quality_score": 0,
                     "candidate_count": len(targets),
@@ -2615,10 +2751,7 @@ class DealPoolCleaner:
                     "quality_score": ex_info.get("quality_score", 75),
                     "merged_tip_ids": merged_tids,
                     "ai_stage1_result": ai1_res,
-                    "converted_links": [
-                        {k: v for k, v in c.items() if k != "adapter_res"}
-                        for c in conv_list
-                    ],
+                    "converted_links": conv_summary_s3,
                     "ai_stage2_result": {"early_terminated": "post_stage3_existing_product"},
                     "candidate_count": len(targets),
                     "attempt_errors": attempt_errors,
@@ -2638,6 +2771,9 @@ class DealPoolCleaner:
                 + min(len(str(ai1_res.get("combined_raw_text") or "")), 500) / 50.0
             )
             post_stage3_candidates.append((mid, doc, ai1_res, conv_list, single_main_pid, richness_score))
+
+        # 本轮 Stage 3 结果消费完毕后，立即驱逐暂态失败缓存项，确保下轮 retry_pending 能真实重新请求上游接口
+        self._evict_transient_failed_cache()
 
         # 第二遍扫描 Stage 3 结果：【同批次内相同唯一商品 `(platform, goods_id)` 去重提前终止】
         # 若同批次有多条线报转链出同一个新 `(platform, goods_id)`，仅选信息最丰富的一条送入 Stage 4 (AI-2)，其余同批重复线报提前终止并累加共振！
@@ -3755,7 +3891,7 @@ def run_clean_stage(
     batch_elapsed_s = round(time.perf_counter() - t_start, 2)
     remaining_pending_now = max(0, total_pending_initial - total_selected + retry_pending_cnt)
     logger.info(
-        "💾 [窗口落盘完成] 本轮处理=%d条 (终审入库=%d, 早停共振=%d, 超时待重试=%d, 过滤/合并=%d) | "
+        "💾 [窗口落盘完成] 本轮处理=%d条 (终审入库=%d, 早停共振=%d, 暂态待重试=%d, 过滤/合并=%d) | "
         "正式表新增=%d, 更新共振=%d | 总耗时=%.2fs | 📦 库内剩余Pending≈%d条",
         len(all_processed_results),
         len(success_product_docs),
@@ -3942,7 +4078,7 @@ def run_clean_stage(
             f"含候选={gf['2_has_product_candidate_tips']}条 -> "
             f"有效命中={gf['3_unique_product_resolved_tips']}条 "
             f"(AI-2新审={resolved_cnt}条[均分{gf['avg_quality_score']}] + ⚡早停跳过AI={early_terminated_cnt}条) | "
-            f"群聊合并={merged_cnt}条 | 超时待重试={retry_pending_cnt}条 | 超7天清扫={expired_over_7d_cnt}条"
+            f"群聊合并={merged_cnt}条 | 暂态待重试={retry_pending_cnt}条 | 超7天清扫={expired_over_7d_cnt}条"
         ),
         (
             f"│ • 终审转化率   : 候选有效率={gf['candidate_resolution_rate_pct']}% | "
@@ -5304,8 +5440,8 @@ def main():
     parser.add_argument(
         "--ai-workers",
         type=int,
-        default=10,
-        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 10）",
+        default=20,
+        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 20，匹配单窗口 20 批一轮并发完成）",
     )
     parser.add_argument(
         "--ai-timeout",
@@ -5579,6 +5715,7 @@ def main():
             was_idle = False
             new_fetch_event.clear()
             clean_cycle += 1
+            t_round_start = time.perf_counter()
             try:
                 c_rep = run_clean_stage(
                     repo=repo,
@@ -5595,10 +5732,13 @@ def main():
                 time.sleep(10)
                 continue
 
-            clean_sleep = max(1, int(args.clean_interval))
+            round_elapsed = time.perf_counter() - t_round_start
+            clean_sleep = max(3, int(round(args.clean_interval - round_elapsed)))
             logger.info(
-                "⏳ [清洗线程/Consumer] 第 #%d 轮清洗完毕，等待 %d 秒后进入第 #%d 轮各平台最新均匀清洗...",
+                "⏳ [清洗线程/Consumer] 第 #%d 轮清洗完毕 (本轮耗时=%.1fs, 目标周期=%ds)，等待 %d 秒后进入第 #%d 轮各平台最新均匀清洗...",
                 clean_cycle,
+                round_elapsed,
+                int(args.clean_interval),
                 clean_sleep,
                 clean_cycle + 1,
             )

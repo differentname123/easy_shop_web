@@ -65,6 +65,15 @@ class _MemoryCollection:
     def create_index(self, keys, **kwargs):
         self.indexes.append((keys, kwargs))
 
+    @staticmethod
+    def _get_field(doc, key):
+        cur = doc
+        for part in key.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
+
     @classmethod
     def _match(cls, doc, query):
         for k, v in query.items():
@@ -76,7 +85,7 @@ class _MemoryCollection:
                 if not any(cls._match(doc, sub) for sub in v):
                     return False
                 continue
-            val = doc.get(k)
+            val = cls._get_field(doc, k) if "." in k else doc.get(k)
             if isinstance(v, dict):
                 if "$lt" in v and not (val is not None and val < v["$lt"]):
                     return False
@@ -136,6 +145,13 @@ class _MemoryCollection:
                 res.pop("_id", None)
                 return res
         return None
+
+    def update_one(self, query, update):
+        for d in self.docs:
+            if self._match(d, query):
+                self._apply_update(d, update)
+                return SimpleNamespace(acknowledged=True, matched_count=1, modified_count=1)
+        return SimpleNamespace(acknowledged=True, matched_count=0, modified_count=0)
 
     def update_many(self, query, update):
         count = 0
@@ -283,6 +299,8 @@ def test_group_help_full_closed_loop(tmp_path, monkeypatch):
         up_data = up_resp.json()
         assert up_data["status"] == "success"
         assert up_data["is_new"] is True
+        assert up_data["owner_token"]
+        owner_token = up_data["owner_token"]
         assert up_data["data"]["group_order_id"] == "3495229659187101111"
         assert up_data["data"]["parse_status"] == PARSE_STATUS_PENDING
         assert "pinduoduo://com.xunmeng.pinduoduo/group7.html?group_order_id=3495229659187101111" in up_data["data"]["app_wake_url"]
@@ -297,11 +315,12 @@ def test_group_help_full_closed_loop(tmp_path, monkeypatch):
         assert batch_stats["parsed"] == 1
         assert len(ai_calls) == 1
 
-        # 7. 大模型解析完成后：列表可正常展示并支持关键词搜索
+        # 7. 大模型解析完成后：列表可正常展示并支持关键词搜索（绝不对外泄露 owner_token）
         list_after = client.get("/api/group_help/list").json()["data"]
         assert list_after["pending_count"] == 0
         assert len(list_after["items"]) == 1
         item = list_after["items"][0]
+        assert "owner_token" not in item
         assert item["parse_status"] == PARSE_STATUS_PARSED
         assert item["group_status"] == GROUP_STATUS_ACTIVE
         assert item["goods_name"] == "维达超韧抽纸3层130抽24包整箱装家用实惠装"
@@ -325,7 +344,7 @@ def test_group_help_full_closed_loop(tmp_path, monkeypatch):
         assert click_resp["data"]["click_count"] == 1
 
         # 9. 用户共创状态维护测试
-        # (a) 反馈“我已参团” -> 还差人数从 2 减为 1
+        # (a) 匿名用户反馈“我已参团”（当前还差 2 人，不触发下架） -> 免登录直接从 2 减为 1
         fb1 = client.post(
             "/api/group_help/feedback/3495229659187101111",
             json={"action": "joined_one"},
@@ -337,10 +356,18 @@ def test_group_help_full_closed_loop(tmp_path, monkeypatch):
         almost_list = client.get("/api/group_help/list", params={"filter_mode": "almost"}).json()["data"]
         assert len(almost_list["items"]) == 1
 
-        # (b) 再次反馈“我已参团” -> 还差人数减为 0，自动变为 full (人已满) 并从进行中列表下线
-        fb2 = client.post(
+        # (b) 此时仅差 1 人，若匿名路人再次点击“我已参团”（会导致该团直接下架） -> 必须返回 401 要求登录
+        anon_takedown = client.post(
             "/api/group_help/feedback/3495229659187101111",
             json={"action": "joined_one"},
+        )
+        assert anon_takedown.status_code == 401
+        assert anon_takedown.json()["error_code"] == "auth_required"
+
+        # 团长本人（JSON body 携带本地 owner_token）免登录即可管理/下架/恢复自己的团
+        fb2 = client.post(
+            "/api/group_help/feedback/3495229659187101111",
+            json={"action": "joined_one", "owner_token": owner_token},
         ).json()
         assert fb2["data"]["remain_people"] == 0
         assert fb2["data"]["group_status"] == GROUP_STATUS_FULL
@@ -348,18 +375,19 @@ def test_group_help_full_closed_loop(tmp_path, monkeypatch):
         active_after_full = client.get("/api/group_help/list", params={"filter_mode": "active"}).json()["data"]
         assert len(active_after_full["items"]) == 0
 
-        # (c) 用户共创直接校准人数：实测还差 3 人 -> 重新恢复为 active
+        # (c) 团长本人恢复上架：实测还差 3 人 -> 重新恢复为 active，且不会误罚团长自己
         fb3 = client.post(
             "/api/group_help/feedback/3495229659187101111",
-            json={"action": "set_remain", "remain_people": 3},
+            json={"action": "set_remain", "remain_people": 3, "owner_token": owner_token},
         ).json()
         assert fb3["data"]["remain_people"] == 3
         assert fb3["data"]["group_status"] == GROUP_STATUS_ACTIVE
+        assert fb3["penalized_saboteur"] is False
 
-        # (d) 用户共创直接标记“已失效” -> 立即下线
+        # (d) 团长直接标记“已失效” -> 立即下线
         fb4 = client.post(
             "/api/group_help/feedback/3495229659187101111",
-            json={"action": "mark_expired"},
+            json={"action": "mark_expired", "owner_token": owner_token},
         ).json()
         assert fb4["data"]["group_status"] == GROUP_STATUS_EXPIRED
 
@@ -873,4 +901,276 @@ def test_reupload_qr_only_for_existing_group_order_id_must_not_bypass_audit(tmp_
     assert doc_after["parse_status"] == PARSE_STATUS_FAILED
     assert len(repo.search_groups()["items"]) == 0
     assert svc_qr_only.get_poster_file_path(gid) is None
+
+
+def test_anti_sabotage_owner_relist_penalizes_saboteur_but_keeps_non_takedown_actions(tmp_path, monkeypatch):
+    """
+    验证精简版防恶意下架全链路（零跨层脆弱耦合）：
+    1. 差 >=2 人时匿名可「我已参团」(-1)；但触发下架（差1人点参团 / 人已满 / 已失效）必须登录(401)；
+    2. 团长自己下架再恢复绝不惩罚团长；非团长不可替他人恢复上架(403)以防恶意栽赃，路人重传海报不泄露 owner_token；
+    3. 登录用户恶意下架他人团 -> 团长点击「未满恢复」 -> 精准累加 gh_false_takedowns（第1次容错保留权限，第2次起永久禁用下架权限）；
+    4. 被禁用下架权限的用户，依然可以正常浏览、发自己的团、管理自己的团、以及为差 >=2 人的团点「我已参团」；
+    5. 短时进程内存防扫荡：单账号 10 分钟内最多下架他人 3 个团，第 4 个返回 429。
+    """
+    from dataclasses import replace
+    import config
+    import main as main_module
+    from api import user as user_api
+    from services.user_service import UserService
+
+    mem_db = _MemoryDB()
+    repo = GroupHelpRepository(db_instance=mem_db)
+    poster_dir = tmp_path / "posters"
+    poster_dir.mkdir(parents=True, exist_ok=True)
+
+    url_map = {}
+
+    def fake_http_get(url, headers=None, allow_redirects=False, timeout=8):
+        return SimpleNamespace(status_code=307, headers={"Location": url_map[url]}, text="")
+
+    ai_remain_map = {}
+
+    def fake_ai_gen(prompt, file_paths=None, **kw):
+        fp = str((file_paths or [""])[0])
+        matched_gid = "000"
+        for k in ai_remain_map:
+            if k in fp:
+                matched_gid = k
+                break
+        rem = ai_remain_map.get(matched_gid, 3)
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": True,
+                    "is_compliant": True,
+                    "reject_reason": "",
+                    "goods_name": f"测试防破坏商品_{matched_gid[-4:]}",
+                    "keywords": ["测试"],
+                    "group_price": float(int(matched_gid[-2:]) + 10.9),
+                    "original_price": 59.9,
+                    "total_people": rem + 1,
+                    "remain_people": rem,
+                    "remaining_time": "22:00:00",
+                    "remaining_seconds": 79200,
+                }
+            ),
+        }
+
+    service = GroupHelpService(
+        repo=repo,
+        poster_dir=poster_dir,
+        http_get=fake_http_get,
+        ai_generator=fake_ai_gen,
+    )
+    monkeypatch.setattr(group_help_api, "group_help_service", service)
+    monkeypatch.setattr(user_api, "user_service", UserService(user_repo=service.user_repo))
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(config.settings, warmup_enabled=False, detail_prefetch_enabled=False),
+    )
+
+    def publish_group(client, gid: str, remain: int, share_id: str = "share-v1", headers=None):
+        short_url = f"https://file-link.pinduoduo.com/s{gid[-6:]}"
+        url_map[short_url] = (
+            f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid}&refer_share_id={share_id}"
+        )
+        ai_remain_map[gid] = remain
+        b64 = base64.b64encode(_make_poster_image_bytes(short_url)).decode("ascii")
+        resp = client.post(
+            "/api/group_help/upload",
+            headers=headers or {},
+            json={"image_base64": b64},
+        )
+        assert resp.status_code == 200
+        service.process_pending_batch(batch_size=5)
+        return resp.json()
+
+    app = create_app()
+    with TestClient(app) as client:
+        reg_sab = client.post(
+            "/api/user/register_or_login",
+            json={"phone": "13800138001", "password": "password123", "mode": "register"},
+        ).json()["user"]
+        sab_headers = {"Authorization": f"Bearer {reg_sab['auth_token']}"}
+
+        reg_owner = client.post(
+            "/api/user/register_or_login",
+            json={"phone": "13800138002", "password": "password123", "mode": "register"},
+        ).json()["user"]
+        owner_jwt_headers = {"Authorization": f"Bearer {reg_owner['auth_token']}"}
+
+        # 1. 匿名团长 A 发布差 3 人的团 G1（获得本地 owner_token）
+        gid1 = "3495229659187200011"
+        up1 = publish_group(client, gid1, remain=3)
+        owner_tok_1 = up1["owner_token"]
+        assert owner_tok_1
+
+        # 路人重传 G1 海报绝不能拿到 owner_token
+        stranger_reup = publish_group(client, gid1, remain=3)
+        assert stranger_reup.get("owner_token", "") == ""
+
+        # 匿名路人在 remain=3 时点「我已参团」-> 免登录成功减为 2
+        anon_ok = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            json={"action": "joined_one"},
+        )
+        assert anon_ok.status_code == 200
+        assert anon_ok.json()["data"]["remain_people"] == 2
+
+        # 匿名路人尝试直接「已失效」或「人已满」下架 G1 -> 401 拦截
+        for act in ("mark_expired", "mark_full"):
+            r401 = client.post(f"/api/group_help/feedback/{gid1}", json={"action": act})
+            assert r401.status_code == 401
+            assert r401.json()["error_code"] == "auth_required"
+
+        # 2. 登录态团长自己下架再恢复自己的团 G_SELF -> 绝不惩罚团长自己
+        gid_self = "3495229659187200012"
+        publish_group(client, gid_self, remain=2, headers=owner_jwt_headers)
+        r_self_down = client.post(
+            f"/api/group_help/feedback/{gid_self}",
+            headers=owner_jwt_headers,
+            json={"action": "mark_full"},
+        )
+        assert r_self_down.status_code == 200
+        r_self_up = client.post(
+            f"/api/group_help/feedback/{gid_self}",
+            headers=owner_jwt_headers,
+            json={"action": "set_remain", "remain_people": 2},
+        )
+        assert r_self_up.status_code == 200
+        assert r_self_up.json()["penalized_saboteur"] is False
+        assert service.get_viewer_guard(reg_owner["uid"])["strikes"] == 0
+
+        # 3. 破坏者 saboteur 第 1 次恶意将 G1 标为「已失效」下架
+        sab_down_1 = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            headers=sab_headers,
+            json={"action": "mark_expired"},
+        )
+        assert sab_down_1.status_code == 200
+        assert sab_down_1.json()["data"]["group_status"] == GROUP_STATUS_EXPIRED
+
+        # 非团长路人试图替 G1 点「未满恢复」（防栽赃保护）-> 403 owner_only
+        frame_attempt = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            headers=owner_jwt_headers,
+            json={"action": "set_remain", "remain_people": 2},
+        )
+        assert frame_attempt.status_code == 403
+        assert frame_attempt.json()["error_code"] == "owner_only"
+        assert service.get_viewer_guard(reg_sab["uid"])["strikes"] == 0
+
+        # 团长 A 携带 owner_token 恢复上架 G1 -> 记 saboteur 第 1 次违规（给予 1 次误触容错，此时仍可操作）
+        owner_relist_1 = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            json={"action": "set_remain", "remain_people": 2, "owner_token": owner_tok_1},
+        )
+        assert owner_relist_1.status_code == 200
+        assert owner_relist_1.json()["penalized_saboteur"] is True
+
+        guard_after_1 = service.get_viewer_guard(reg_sab["uid"])
+        assert guard_after_1["strikes"] == 1
+        assert guard_after_1["can_takedown"] is True
+
+        # 幂等保护：团长自己再下架并恢复 G1，绝不会对 saboteur 重复累加第 2 次处罚
+        client.post(
+            f"/api/group_help/feedback/{gid1}",
+            json={"action": "mark_full", "owner_token": owner_tok_1},
+        )
+        relist_again = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            json={"action": "set_remain", "remain_people": 2, "owner_token": owner_tok_1},
+        )
+        assert relist_again.json()["penalized_saboteur"] is False
+        assert service.get_viewer_guard(reg_sab["uid"])["strikes"] == 1
+
+        # 4. 破坏者 saboteur 第 2 次恶意下架团 G2 -> 团长恢复上架后累计满 2 次，永久停用其下架他人拼团权限！
+        gid2 = "3495229659187200024"
+        up2 = publish_group(client, gid2, remain=2)
+        owner_tok_2 = up2["owner_token"]
+        sab_down_2 = client.post(
+            f"/api/group_help/feedback/{gid2}",
+            headers=sab_headers,
+            json={"action": "mark_expired"},
+        )
+        assert sab_down_2.status_code == 200
+
+        owner_relist_2 = client.post(
+            f"/api/group_help/feedback/{gid2}",
+            json={"action": "set_remain", "remain_people": 2, "owner_token": owner_tok_2},
+        )
+        assert owner_relist_2.status_code == 200
+        assert owner_relist_2.json()["penalized_saboteur"] is True
+
+        guard_after_2 = service.get_viewer_guard(reg_sab["uid"])
+        assert guard_after_2["strikes"] == 2
+        assert guard_after_2["can_takedown"] is False
+
+        # 5. 外科手术式权限验证：saboteur 被禁后不可下架任何他人拼团(403)，但仍可对差 >=2 人的团点「我已参团」以及管理自己的团！
+        blocked_full = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            headers=sab_headers,
+            json={"action": "mark_full"},
+        )
+        assert blocked_full.status_code == 403
+        assert blocked_full.json()["error_code"] == "takedown_banned"
+
+        # 在 G1 差 2 人时点「我已参团」(2 -> 1，不下架) 完全放行！
+        allowed_join = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            headers=sab_headers,
+            json={"action": "joined_one"},
+        )
+        assert allowed_join.status_code == 200
+        assert allowed_join.json()["data"]["remain_people"] == 1
+        assert allowed_join.json()["data"]["group_status"] == GROUP_STATUS_ACTIVE
+
+        # 当 G1 只差 1 人时，再点「我已参团」（会触发 1 -> 0 下架）则被账号级封禁拦截(403)
+        blocked_last_seat = client.post(
+            f"/api/group_help/feedback/{gid1}",
+            headers=sab_headers,
+            json={"action": "joined_one"},
+        )
+        assert blocked_last_seat.status_code == 403
+        assert blocked_last_seat.json()["error_code"] == "takedown_banned"
+
+        # saboteur 发自己的团并下架自己的团不受影响
+        gid_sab_own = "3495229659187200013"
+        up_sab_own = publish_group(client, gid_sab_own, remain=1, headers=sab_headers)
+        own_down = client.post(
+            f"/api/group_help/feedback/{gid_sab_own}",
+            headers=sab_headers,
+            json={"action": "mark_full", "owner_token": up_sab_own["owner_token"]},
+        )
+        assert own_down.status_code == 200
+
+        # 6. 短时防扫荡频控验证：新账号 10 分钟内连续下架 3 个团放行，第 4 个返回 429
+        reg_burst = client.post(
+            "/api/user/register_or_login",
+            json={"phone": "13800138009", "password": "password123", "mode": "register"},
+        ).json()["user"]
+        burst_headers = {"Authorization": f"Bearer {reg_burst['auth_token']}"}
+        for idx in range(3):
+            gid_k = f"349522965918720003{idx}"
+            publish_group(client, gid_k, remain=1)
+            ok_r = client.post(
+                f"/api/group_help/feedback/{gid_k}",
+                headers=burst_headers,
+                json={"action": "mark_full"},
+            )
+            assert ok_r.status_code == 200
+
+        gid_4th = "3495229659187200039"
+        publish_group(client, gid_4th, remain=1)
+        rate_limited = client.post(
+            f"/api/group_help/feedback/{gid_4th}",
+            headers=burst_headers,
+            json={"action": "mark_full"},
+        )
+        assert rate_limited.status_code == 429
+        assert rate_limited.json()["error_code"] == "takedown_rate_limited"
+
+
 

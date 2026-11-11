@@ -174,7 +174,8 @@ class PddAdapter(BasePlatformAdapter):
     def search_goods(self, keyword, page=1, page_size=20, uid=None, **kwargs) -> Dict[str, Any]:
         try:
             size = max(1, min(100, int(page_size or 20)))
-            params = {"keyword": keyword, "pid": self.pid, "page": page, "page_size": size,
+            gateway_size = size
+            params = {"keyword": keyword, "pid": self.pid, "page": page, "page_size": gateway_size,
                       "custom_parameters": make_custom_parameters(uid=uid) if uid else None, **kwargs}
             try:
                 res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
@@ -182,7 +183,18 @@ class PddAdapter(BasePlatformAdapter):
                 # 【对齐 test_pdd_api.py 实证基准】：
                 # 若当前登录用户尚未完成拼多多推手备案 (触发 60001 未传入已经授权备案过的相关参数)，
                 # 公共商品搜索自动回退为不传 custom_parameters（站长已备案 PID 级）重试，避免阻断用户搜索。
-                if uid and self._is_unauthorized_error(first_exc):
+                if size < 10 and ("pageSize" in str(first_exc) or "3000000" in str(first_exc)):
+                    gateway_size = 10
+                    params["page_size"] = 10
+                    try:
+                        res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+                    except Exception as retry_exc:
+                        if uid and self._is_unauthorized_error(retry_exc):
+                            params["custom_parameters"] = None
+                            res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+                        else:
+                            raise
+                elif uid and self._is_unauthorized_error(first_exc):
                     params["custom_parameters"] = None
                     res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
                 else:
@@ -192,10 +204,12 @@ class PddAdapter(BasePlatformAdapter):
             items = [self._normalize_goods_summary(clean_goods_item(item, source_type="pdd_search"))
                      for item in raw_items if item]
             total = response.get("total_count")
+            has_more = page * size < total if total is not None else (len(items) > size if gateway_size > size else len(raw_items) >= gateway_size)
+            items = items[:size]
             return {
                 "status": "success", "total_count": total if total is not None else len(items),
                 "page": page, "page_size": size, "list_id": response.get("list_id", ""),
-                "has_more": page * size < total if total is not None else len(raw_items) >= size,
+                "has_more": has_more,
                 "data": items,
             }
         except Exception as exc:
@@ -319,7 +333,7 @@ class PddAdapter(BasePlatformAdapter):
             result["cacheable"] = False
         if need_auth:
             result["auth_platform"] = "pdd"
-            result["auth_msg"] = "检测到您尚未在拼多多完成渠道授权备案，当前链接为官方通用链接，无法计入推手佣金返利"
+            result["auth_msg"] = "检测到您尚未在拼多多完成渠道授权备案，当前链接为官方通用链接，无法计入本人推广佣金"
         return result
 
     def convert_promotion_url(self, goods_id_or_sign, uid=None, **kwargs) -> Dict[str, Any]:

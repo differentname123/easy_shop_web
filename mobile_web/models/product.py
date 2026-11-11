@@ -102,6 +102,66 @@ def detect_platform_signal(raw_text: Any) -> Optional[str]:
     return None
 
 
+_SUPPORTED_ECOMMERCE_DOMAINS = (
+    "jd.com", "3.cn", "jingxi.com",
+    "tb.cn", "taobao.com", "tmall.com", "alimama.com",
+    "pinduoduo.com", "yangkeduo.com",
+)
+_TPWD_TOKEN_RE = re.compile(r"[￥¥$€₴£¢()（）/!！$%&*][A-Za-z0-9]{8,22}[￥¥$€₴£¢()（）/!！$%&*]")
+_JCMD_TOKEN_RE = re.compile(r"[！!][A-Za-z0-9]{10,20}[！!]")
+_SHARE_CODE_RE = re.compile(r"\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{3,6}\b", re.IGNORECASE)
+_BARE_ENCRYPTED_ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
+
+
+def classify_user_input(raw_text: Any) -> Dict[str, Any]:
+    """
+    跨入口（首页搜索 / 严选搜索 / 链接解析）统一输入分类器：
+    从第一性原理区分「纯搜索词」、「电商分享链接/口令/加密ID」与「非支持的外站链接」，
+    避免搜索框把纯链接当关键词盲搜，也避免转链框把纯商品名发往上游接口报错。
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return {
+            "kind": "empty",
+            "platform": None,
+            "keyword": "",
+            "has_link_or_token": False,
+        }
+
+    lower = text.lower()
+    has_http = bool(re.search(r"https?://", lower))
+    has_supported_domain = any(d in lower for d in _SUPPORTED_ECOMMERCE_DOMAINS)
+    if has_http and not has_supported_domain:
+        return {
+            "kind": "unsupported_url",
+            "platform": None,
+            "keyword": extract_search_keyword(text, max_length=60),
+            "has_link_or_token": True,
+        }
+
+    is_bare_encrypted_id = bool(
+        len(text) >= 25 and not text.isdigit() and _BARE_ENCRYPTED_ID_RE.match(text)
+    )
+    has_token_signal = bool(
+        has_supported_domain
+        or "goods_sign=" in lower
+        or _TPWD_TOKEN_RE.search(text)
+        or _JCMD_TOKEN_RE.search(text)
+        or _SHARE_CODE_RE.search(text)
+        or is_bare_encrypted_id
+    )
+    platform = detect_platform_signal(text)
+    keyword = "" if is_bare_encrypted_id else extract_search_keyword(text, max_length=60)
+
+    return {
+        "kind": "link_or_token" if has_token_signal else "keyword",
+        "platform": platform,
+        "keyword": keyword,
+        "has_link_or_token": has_token_signal,
+    }
+
+
+
 def clean_product_id(value: Any) -> str:
     """0 是旧清洗函数的缺省值，不可作为真实商品 ID。"""
     if isinstance(value, bool) or isinstance(value, (int, float)) and value == 0:

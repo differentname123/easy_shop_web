@@ -9,9 +9,11 @@ from copy import deepcopy
 from typing import Dict, Any, Optional
 from adapters import get_adapter, PlatformUnavailableError
 from adapters.base import build_command_text
+from infrastructure.http_utils import sanitize_user_error_message
 from infrastructure.logging_utils import format_exc_summary
 from models.product import (
     ProductRef,
+    classify_user_input,
     clean_product_id,
     detect_platform_signal,
     extract_canonical_goods_id,
@@ -549,15 +551,8 @@ class PromoteService:
         if not text:
             return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "请粘贴需要转链的商品链接、推广链接或口令文案"}
 
-        lower = text.lower()
-        if re.search(r"https?://", lower) and not any(
-            d in lower
-            for d in (
-                "jd.com", "3.cn", "jingxi.com",
-                "tb.cn", "taobao.com", "tmall.com", "alimama.com",
-                "pinduoduo.com", "yangkeduo.com",
-            )
-        ):
+        classified = classify_user_input(text)
+        if classified["kind"] == "unsupported_url":
             return {
                 "status": "error",
                 "error_code": "UNSUPPORTED_URL_DOMAIN",
@@ -566,17 +561,28 @@ class PromoteService:
 
         req_plat = str(platform or "auto").strip().lower()
         is_auto = req_plat in ("", "auto")
+        suggested_kw = classified["keyword"]
         if is_auto:
-            signal_plat = detect_platform_signal(text)
+            signal_plat = classified["platform"]
             if not signal_plat:
                 return {
                     "status": "error",
                     "error_code": "AMBIGUOUS_PLATFORM_TEXT",
-                    "error_msg": "未能从文本中识别出所属平台特征，请在上方选择目标平台（拼多多/淘宝/京东）或粘贴完整分享链接/口令",
+                    "error_msg": "未能从文本中识别出所属平台链接或口令；若您只有商品名称，请前往「首页」搜索，或粘贴完整的商品分享链接/口令",
+                    "suggested_keyword": suggested_kw,
                 }
             detected_plat = signal_plat
         else:
             detected_plat = normalize_platform(req_plat)
+
+        if not classified["has_link_or_token"]:
+            return {
+                "status": "error",
+                "error_code": "KEYWORD_NOT_LINK",
+                "error_msg": "您输入的是商品名称而非分享链接或口令，无法直接转链；请点击下方按钮去「首页」搜索该商品，或粘贴平台分享链接/口令",
+                "suggested_keyword": suggested_kw or text[:60],
+                "suggested_platform": detected_plat,
+            }
 
         clean_uid = uid.strip() if isinstance(uid, str) else ""
         if clean_uid and not _UID_PATTERN.fullmatch(clean_uid):
@@ -586,9 +592,11 @@ class PromoteService:
         candidate_platforms = [detected_plat]
 
         last_error: Dict[str, Any] = {"status": "error", "error_msg": "未能识别或转换该内容，请检查链接或口令是否有效"}
+        last_platform_name = ""
         for plat in candidate_platforms:
             try:
                 adapter = get_adapter(plat)
+                last_platform_name = getattr(adapter, "platform_name", "") or ""
             except Exception:
                 continue
             if not getattr(adapter, "active", False):
@@ -629,7 +637,7 @@ class PromoteService:
                     data = resolve_fn(text, uid=None, identity={})
 
             if not isinstance(data, dict) or data.get("status") != "success":
-                last_error = data if isinstance(data, dict) else last_error
+                last_error = dict(data) if isinstance(data, dict) else dict(last_error)
                 # 若是明确的数字 SKU 不支持或已下架，直接返回给用户，不再盲目尝试其他平台
                 if isinstance(data, dict) and data.get("error_code") in (
                     "UNSUPPORTED_JD_NUMERIC_SKU",
@@ -655,7 +663,7 @@ class PromoteService:
                 result["product"] = product
 
             self._decorate_auth_fallback(
-                result, plat, adapter, context, need_auth=need_auth, personal_fallback=personal_fallback, hint_location="上方授权区"
+                result, plat, adapter, context, need_auth=need_auth, personal_fallback=personal_fallback, hint_location="下方推广渠道授权区"
             )
 
             total_ms = (time.perf_counter() - total_started) * 1000
@@ -670,12 +678,21 @@ class PromoteService:
             return result
 
         total_ms = (time.perf_counter() - total_started) * 1000
+        raw_err_msg = last_error.get("error_msg") or last_error.get("error_code") or "未知错误"
         logger.warning(
             "❌ 【万能转链失败】平台[%s] 用户[%s] 总耗时[%.1fms] 失败原因<%s>",
             detected_plat,
             clean_uid or "匿名",
             total_ms,
-            last_error.get("error_msg") or last_error.get("error_code") or "未知错误",
+            raw_err_msg,
         )
+        last_error["error_msg"] = sanitize_user_error_message(
+            last_error.get("error_code"),
+            last_error.get("error_msg"),
+            platform_name=last_platform_name,
+        )
+        if suggested_kw and last_error.get("error_code") != "PRODUCT_OFF_PROMOTION":
+            last_error["suggested_keyword"] = suggested_kw
+            last_error["suggested_platform"] = detected_plat
         return last_error
 

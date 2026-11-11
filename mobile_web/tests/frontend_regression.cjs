@@ -49,8 +49,8 @@ function harness({ url = 'https://shop.test/', saved = {}, sessionSaved = {}, cl
   };
   const context = {
     URL, URLSearchParams, document,
-    location: { href: url, search: new URL(url).search },
-    history: { length: 1, replaceState() {}, back() {} },
+    location: { href: url, search: new URL(url).search, origin: new URL(url).origin },
+    history: { length: 1, replaceState() {}, pushState() {}, back() {} },
     localStorage: storage(saved), sessionStorage: storage(sessionSaved),
     pageYOffset: 0, innerHeight: 800, innerWidth: 375,
     addEventListener: addListener, removeEventListener: removeListener,
@@ -1993,5 +1993,361 @@ test('concept unification: activeBoomKeyword reactivity, first-screen universal 
   assert.ok(appJs.includes('global.history.replaceState'), 'app.js syncs currentTab to URL via history.replaceState');
 });
 
+test('smart search auto-routes links/tokens to universal converter, extracts e.tb.cn titles, and supports 1-click keyword recovery', async () => {
+  const h = harness();
+  h.load('app');
+  const boot = h.mounted[0]();
+  await flush();
+  await h.finish(0, { status: 'success', data: platformFixtures });
+  await h.finish(1, { status: 'success', data: channelFixtures });
+  await h.finish(2, goodsResponse('PDD-1', false));
+  await boot;
 
+  // 1. 首页搜索框粘贴京东分享短链 -> 自动切到「我的」页并触发链接解析，无需用户区分入口
+  h.page.homeSearchKeyword.value = 'https://u.jd.com/e6UTD49';
+  const convertPromise = h.page.onSearchHome();
+  assert.equal(h.page.currentTab.value, 'user');
+  assert.equal(h.page.homeSearchKeyword.value, '');
+  assert.equal(h.page.universalInput.value, 'https://u.jd.com/e6UTD49');
+  assert.equal(h.requests.at(-1).url, '/api/promote/universal');
+  await h.finish(h.requests.length - 1, {
+    status: 'success',
+    platform: 'jd',
+    platform_name: '京东',
+    final_link: 'https://u.jd.com/e6UTD49',
+    command_text: 'https://u.jd.com/e6UTD49',
+  });
+  await convertPromise;
+  assert.equal(h.page.universalResult.value.final_link, 'https://u.jd.com/e6UTD49');
 
+  // 2. 首页搜索框粘贴带商品标题的 e.tb.cn 手淘短链 -> 自动提取商品标题并在淘宝频道搜索同款
+  h.page.currentTab.value = 'home';
+  h.page.homeSearchKeyword.value = '【淘宝】https://e.tb.cn/h.6AbCdEf 「心相印茶语抽纸整箱」点击链接直接打开';
+  const etbSearch = h.page.onSearchHome();
+  await h.finish(h.requests.length - 1, { status: 'success', data: channelFixtures });
+  const searchReq = h.requests.at(-1);
+  assert.ok(searchReq.url.startsWith('/api/home/search?'));
+  assert.equal(new URL(searchReq.url, 'https://shop.test').searchParams.get('platform'), 'taobao');
+  assert.equal(new URL(searchReq.url, 'https://shop.test').searchParams.get('keyword'), '心相印茶语抽纸整箱');
+  await h.finish(h.requests.length - 1, { status: 'success', data: [{ goods_sign: 'TB-PAPER', platform: 'taobao' }], has_more: false });
+  await etbSearch;
+
+  // 3. 在链接解析框误输纯商品名 -> 返回 suggested_keyword 并支持一键跳回首页搜索
+  h.page.currentTab.value = 'user';
+  h.page.universalPlatform.value = 'pdd';
+  h.page.universalInput.value = '蓝牙耳机';
+  const wrongInput = h.page.handleUniversalConvert();
+  await h.finish(h.requests.length - 1, {
+    status: 'error',
+    error_code: 'KEYWORD_NOT_LINK',
+    error_msg: '这里用于解析商品分享链接或口令哦～搜索「蓝牙耳机」请点击下方按钮前往首页搜索。',
+    suggested_keyword: '蓝牙耳机',
+    suggested_platform: 'pdd',
+  });
+  await wrongInput;
+  assert.equal(h.page.universalSuggestedKeyword.value, '蓝牙耳机');
+  const recoverSearch = h.page.searchUniversalKeyword();
+  await h.finish(h.requests.length - 1, { status: 'success', data: channelFixtures });
+  const recUrl = new URL(h.requests.at(-1).url, 'https://shop.test');
+  assert.equal(h.page.currentTab.value, 'home');
+  assert.equal(recUrl.searchParams.get('platform'), 'pdd');
+  assert.equal(recUrl.searchParams.get('keyword'), '蓝牙耳机');
+  await h.finish(h.requests.length - 1, goodsResponse('EARPHONE-1', false));
+  await recoverSearch;
+});
+
+test('WeChat browser intercepts Taobao jump into command modal while detail disables CTAs on invalid goods, with zero sensitive words', async () => {
+  // 1. 失效商品详情页底部操作按钮处于不可操作态 (canOperateDetail === false)
+  const hInvalid = harness({ url: 'https://shop.test/detail?goods_id=INVALID_999&platform=pdd' });
+  hInvalid.load('detail');
+  const initInvalid = hInvalid.mounted[0]();
+  await hInvalid.finish(0, { status: 'error', error_code: 'PRODUCT_OFF_PROMOTION', error_msg: '该商品已下架' }, { status: 404 });
+  await initInvalid;
+  assert.equal(hInvalid.page.canOperateDetail.value, false);
+  await hInvalid.page.handleJumpToBuy();
+  await hInvalid.page.handleCopyPromoteLink();
+  assert.equal(hInvalid.requests.length, 1, 'disabled detail CTAs never fire promote/convert');
+
+  // 2. 微信内置浏览器点击淘宝商品「立即领券下单」时不触发白屏 location 跳转，而是弹出淘口令复制引导窗
+  const hWx = harness({ url: 'https://shop.test/detail?goods_sign=TB_GOODS_1&platform=taobao' });
+  hWx.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) MicroMessenger/8.0.50';
+  hWx.load('detail');
+  const initWx = hWx.mounted[0]();
+  await hWx.finish(0, {
+    status: 'success',
+    data: { goods_sign: 'TB_GOODS_1', platform: 'taobao', platform_name: '淘宝', name: '淘宝测试好物', price: 19.9 },
+  });
+  await initWx;
+  assert.equal(hWx.page.canOperateDetail.value, true);
+  const buyWx = hWx.page.handleJumpToBuy();
+  await flush();
+  await hWx.finish(1, {
+    status: 'success',
+    final_link: 'https://uland.taobao.com/coupon/edetail?e=test',
+    short_url: 'https://s.click.taobao.com/abc',
+    promotion_token: '￥TB123456￥',
+    command_text: '【淘宝】淘宝测试好物 ￥TB123456￥',
+  });
+  await buyWx;
+  assert.equal(hWx.page.commandModal.value.visible, true);
+  assert.equal(hWx.page.commandModal.value.wechatGuide, true);
+  assert.equal([...hWx.timers.values()].some(t => t.delay === 400), false, 'WeChat Taobao buy does not navigate into blocked white screen');
+  assert.ok(hWx.copied.at(-1).includes('￥TB123456￥'));
+
+  // 3. 导航命名统一为「严选好价」且全量前端静态资源零敏感词
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
+  const groupHelpJs = fs.readFileSync(path.join(root, 'static', 'js', 'group_help.js'), 'utf8');
+  const groupHelpCss = fs.readFileSync(path.join(root, 'static', 'css', 'group_help.css'), 'utf8');
+  const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+  assert.ok(indexHtml.includes('<span>严选好价</span>'));
+  assert.ok(groupHelpHtml.includes('<span>严选好价</span>'));
+  assert.equal(indexHtml.includes('<span>爆单推广</span>'), false);
+  const forbidden = /返利|返现|打钱|提现红包|购物补贴|折合到手|自动存入钱包|随时提现/;
+  for (const [name, content] of [
+    ['index.html', indexHtml],
+    ['detail.html', detailHtml],
+    ['group_help.html', groupHelpHtml],
+    ['group_help.js', groupHelpJs],
+    ['group_help.css', groupHelpCss],
+    ['style.css', styleCss],
+  ]) {
+    assert.equal(forbidden.test(content), false, `${name} must not contain any WeChat-sensitive rebate/cash words`);
+  }
+});
+
+test('group_help anti-sabotage UI allows anonymous multi-seat join, prompts inline login on takedown, and keeps non-takedown feedback enabled for banned users', async () => {
+  const h = harness({ url: 'https://shop.test/group_help' });
+  h.load('group_help');
+  h.mounted[0]();
+  await flush();
+  // Initial /api/group_help/list response
+  await h.finish(0, {
+    status: 'success',
+    data: {
+      items: [
+        { group_order_id: '3495229659187300001', goods_name: '维达抽纸', group_status: 'active', remain_people: 2, total_people: 3, remaining_seconds: 36000 },
+      ],
+      total: 1,
+      has_more: false,
+      pending_count: 0,
+      viewer_guard: { logged_in: false, can_takedown: false, strikes: 0, permanent_ban: false, reason: '' },
+    },
+  });
+
+  // 1. 匿名打开差 2 人的团，点击「我已参团」无需登录即可直接提交 -1
+  h.page.openDetail(h.page.items.value[0]);
+  assert.equal(h.page.isJoinedBtnDisabled(h.page.selectedGroup.value), false);
+  h.page.requestFeedback('joined_one');
+  assert.equal(h.page.authModal.value.visible, false, 'multi-seat joined_one does not require login');
+  assert.equal(h.requests.at(-1).url, '/api/group_help/feedback/3495229659187300001');
+  await h.finish(h.requests.length - 1, {
+    status: 'success',
+    data: { group_order_id: '3495229659187300001', goods_name: '维达抽纸', group_status: 'active', remain_people: 1, total_people: 3, remaining_seconds: 35990 },
+  });
+  assert.equal(h.page.hasJoinedGroup('3495229659187300001'), true);
+  assert.equal(h.page.isJoinedBtnDisabled(h.page.selectedGroup.value), true, 'same device cannot click joined_one twice on same group');
+
+  // 2. 匿名点击下架类按钮（「已失效」）-> 自动拉起内联 10 秒快捷登录/注册弹窗
+  h.page.requestFeedback('mark_expired');
+  assert.equal(h.page.authModal.value.visible, true);
+  assert.equal(h.page.authModal.value.pendingAction, 'mark_expired');
+
+  // 内联完成注册登录 -> 自动接力弹首次诚信提醒 -> 确认后携带 Bearer token 提交下架
+  h.page.authModal.value.isRegister = true;
+  h.page.authModal.value.phone = '13800138888';
+  h.page.authModal.value.password = 'secret123';
+  const authPromise = h.page.submitInlineAuth();
+  await flush();
+  await h.finish(h.requests.length - 1, {
+    status: 'success',
+    user: { uid: 'u_sab1', phone: '138****8888', auth_token: 'tok_sab1' },
+  });
+  // Sync viewer_guard via /api/group_help/list?limit=1
+  await h.finish(h.requests.length - 1, {
+    status: 'success',
+    data: { items: [], total: 0, has_more: false, pending_count: 0, viewer_guard: { logged_in: true, uid: 'u_sab1', can_takedown: true, strikes: 0, permanent_ban: false, reason: '' } },
+  });
+  await authPromise;
+  assert.equal(h.page.authModal.value.visible, false);
+  assert.equal(h.page.creditWarnModal.value.visible, true);
+  h.page.confirmCreditWarnAndSubmit();
+  assert.equal(h.requests.at(-1).options.headers.Authorization, 'Bearer tok_sab1');
+  await h.finish(h.requests.length - 1, {
+    status: 'success',
+    data: { group_order_id: '3495229659187300001', goods_name: '维达抽纸', group_status: 'expired', remain_people: 1, total_people: 3, remaining_seconds: 35980 },
+  });
+
+  // 3. 当该账号因乱标被团长恢复而限制下架权限 (can_takedown === false) 时：
+  //    - 对差 2 人的他人拼团：「人已满 / 已失效」被禁用 (isTakedownBlockedForSelected === true)，但「我已参团」依然可用！
+  //    - 对差 1 人的他人拼团：「我已参团」也被禁用（因为点完会触发下架）！
+  //    - 对自己发布的拼团：不受他人下架限制影响！
+  const fetchBanned = h.page.fetchGroups(true);
+  await h.finish(h.requests.length - 1, {
+    status: 'success',
+    data: {
+      items: [
+        { group_order_id: '3495229659187300002', goods_name: '清风抽纸(差2人)', group_status: 'active', remain_people: 2, total_people: 3, remaining_seconds: 30000 },
+        { group_order_id: '3495229659187300003', goods_name: '心相印抽纸(差1人)', group_status: 'active', remain_people: 1, total_people: 2, remaining_seconds: 30000 },
+      ],
+      total: 2,
+      has_more: false,
+      pending_count: 0,
+      viewer_guard: { logged_in: true, uid: 'u_sab1', can_takedown: false, strikes: 2, permanent_ban: true, reason: '下架权限已停用' },
+    },
+  });
+  await fetchBanned;
+
+  h.page.openDetail(h.page.items.value[0]); // remain_people === 2
+  assert.equal(h.page.isTakedownBlockedForSelected.value, true);
+  assert.equal(h.page.isJoinedBtnDisabled(h.page.selectedGroup.value), false, 'banned user can still click joined_one when remain_people >= 2');
+
+  h.page.openDetail(h.page.items.value[1]); // remain_people === 1
+  assert.equal(h.page.isTakedownBlockedForSelected.value, true);
+  assert.equal(h.page.isJoinedBtnDisabled(h.page.selectedGroup.value), true, 'banned user cannot take down 1-remaining group via joined_one');
+
+  h.page.myGroups.value = [{ group_order_id: '3495229659187300009', owner_token: 'own_tok', group_status: 'full', remain_people: 1, remaining_seconds: 20000 }];
+  h.page.openDetail(h.page.myGroups.value[0]);
+  assert.equal(h.page.isTakedownBlockedForSelected.value, false, 'banned user can still manage their own group');
+
+  // 4. 极简团长恢复：owner_token 直接走标准 JSON body，不引入自定义 HTTP 请求头
+  const relistP = h.page.quickMyGroupRelist(h.page.myGroups.value[0]);
+  const relistReq = h.requests.at(-1);
+  assert.equal(relistReq.options.headers['X-Group-Owner-Token'], undefined);
+  assert.deepEqual(JSON.parse(relistReq.options.body), {
+    action: 'set_remain',
+    remain_people: 1,
+    owner_token: 'own_tok',
+  });
+  await h.finish(h.requests.length - 1, {
+    status: 'success',
+    penalized_saboteur: true,
+    data: { group_order_id: '3495229659187300009', goods_name: '自有拼团', group_status: 'active', remain_people: 1, remaining_seconds: 19995 },
+  });
+  await relistP;
+});
+
+test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, detail/site share copy, invite_code persistence, and internal link routing', async () => {
+  // 1. 多人团分享直达链接 (?gid=...&invite_code=...)：在架拼团自动弹开详情并动态更新标题，复制分享带 invite_code
+  const hActive = harness({
+    url: 'https://shop.test/group_help?gid=3495229659187300088&invite_code=INV_FROM_FRIEND',
+    saved: { easy_shop_invite_code: 'INV_MY_SELF' },
+  });
+  hActive.load('group_help');
+  hActive.mounted[0]();
+  await flush();
+  assert.equal(hActive.context.localStorage.getItem('easy_shop_pending_invite'), 'INV_FROM_FRIEND');
+  const listIdx = hActive.requests.findIndex(r => r.url.startsWith('/api/group_help/list'));
+  const detailIdx = hActive.requests.findIndex(r => r.url === '/api/group_help/detail/3495229659187300088');
+  assert.ok(listIdx >= 0 && detailIdx >= 0);
+  await hActive.finish(listIdx, {
+    status: 'success',
+    data: { items: [], total: 0, has_more: false, pending_count: 0, viewer_guard: { logged_in: false, can_takedown: false, strikes: 0, reason: '' } },
+  });
+  await hActive.finish(detailIdx, {
+    status: 'success',
+    data: {
+      group_order_id: '3495229659187300088',
+      goods_name: '维达超韧抽纸24包整箱',
+      group_price: 26.9,
+      parse_status: 'parsed',
+      group_status: 'active',
+      remain_people: 2,
+      total_people: 3,
+      remaining_seconds: 36000,
+    },
+  });
+  assert.equal(hActive.page.selectedGroup.value.group_order_id, '3495229659187300088');
+  assert.equal(hActive.context.document.title, '【差2人 ¥26.9】维达超韧抽纸24包整箱 - 多人团互助');
+  await hActive.page.shareGroup(hActive.page.selectedGroup.value);
+  assert.ok(hActive.copied.at(-1).includes('https://shop.test/group_help?gid=3495229659187300088&invite_code=INV_MY_SELF'));
+  hActive.page.closeDetail();
+  assert.equal(hActive.context.document.title, '拼多多多人团互助');
+
+  // 2. 多人团分享直达链接已拼满或已结束时：优雅留存在互助大厅并弹出友好提示，绝不白屏或报错劝退
+  const hFull = harness({ url: 'https://shop.test/group_help?gid=3495229659187300099' });
+  hFull.load('group_help');
+  hFull.mounted[0]();
+  await flush();
+  await hFull.finish(0, {
+    status: 'success',
+    data: { items: [], total: 0, has_more: false, pending_count: 0 },
+  });
+  await hFull.finish(1, {
+    status: 'success',
+    data: {
+      group_order_id: '3495229659187300099',
+      goods_name: '已拼满商品',
+      parse_status: 'parsed',
+      group_status: 'full',
+      remain_people: 0,
+      remaining_seconds: 12000,
+    },
+  });
+  assert.equal(hFull.page.selectedGroup.value, null);
+  assert.ok(hFull.page.toastMsg.value.includes('该拼团刚刚拼满或已结束'));
+
+  // 3. 商品详情页好价分享 & 访客点开分享链接保留 invite_code 直达注册预填
+  const hDetail = harness({
+    url: 'https://shop.test/detail?goods_id=G100&goods_sign=SIGN100&platform=pdd&invite_code=INV_SHARER',
+  });
+  hDetail.load('detail');
+  const initDetail = hDetail.mounted[0]();
+  await hDetail.finish(0, {
+    status: 'success',
+    data: { goods_id: 'G100', goods_sign: 'SIGN100', platform: 'pdd', name: '农夫山泉矿泉水24瓶', price: 19.9, has_coupon: true, coupon_amount: 5 },
+  });
+  await initDetail;
+  assert.equal(hDetail.context.localStorage.getItem('easy_shop_pending_invite'), 'INV_SHARER', 'guest session.clear preserves pending invite');
+  assert.equal(hDetail.context.document.title, '【好价 ¥19.90】农夫山泉矿泉水24瓶 - 查券省钱');
+  await hDetail.page.handleShareDetail();
+  assert.equal(hDetail.requests.length, 1, 'sharing detail page copies site link without triggering promote/convert');
+  assert.ok(hDetail.copied.at(-1).includes('https://shop.test/detail?'));
+  assert.ok(hDetail.copied.at(-1).includes('goods_id=G100'));
+  assert.ok(hDetail.copied.at(-1).includes('（立减¥5.00）'));
+  hDetail.page.goToRegister();
+  assert.equal(hDetail.context.location.href, '/?tab=user&invite_code=INV_SHARER');
+
+  // 4. 主站「我的」页一键分享邀请链接 + 粘贴站内分享文案自动路由直达（不误调电商转链 API）
+  const hApp = harness({
+    url: 'https://shop.test/?invite_code=INV_URL_INIT',
+  });
+  hApp.load('app');
+  const bootApp = hApp.mounted[0]();
+  await flush();
+  await hApp.finish(0, { status: 'success', data: platformFixtures });
+  await hApp.finish(1, { status: 'success', data: channelFixtures });
+  await hApp.finish(2, goodsResponse('HOME-1', false));
+  await bootApp;
+  assert.equal(hApp.page.formInviteCode.value, 'INV_URL_INIT');
+  assert.equal(hApp.page.isRegisterMode.value, true);
+
+  // 未登录分享整站推荐链接 -> 纯净根域名链接；登录后分享 -> 自动携带专属 invite_code
+  hApp.page.shareSiteInvite();
+  assert.ok(hApp.copied.at(-1).includes('https://shop.test/'));
+  hApp.session.saveUser({ uid: 'u_inv', phone: '13800001111', auth_token: 'tok_inv', invite_code: 'INV_VIP88' });
+  hApp.page.isLoggedIn.value = true;
+  hApp.page.userProfile.value = { ...hApp.page.userProfile.value, invite_code: 'INV_VIP88' };
+  hApp.page.shareSiteInvite();
+  assert.ok(hApp.copied.at(-1).includes('https://shop.test/?invite_code=INV_VIP88'));
+
+  // 首页搜索框或万能解析框粘贴站内多人团/商品详情分享文案 -> 直接站内跳转，绝不发往 /api/promote/universal
+  const reqCountBeforeRoute = hApp.requests.length;
+  hApp.page.homeSearchKeyword.value = '🔥 拼多多多人团【还差1人】👉 https://shop.test/group_help?gid=3495229659187300088';
+  await hApp.page.onSearchHome();
+  assert.equal(hApp.context.location.href, '/group_help?gid=3495229659187300088');
+  assert.equal(hApp.requests.length, reqCountBeforeRoute);
+
+  hApp.page.universalInput.value = '🛒 发现一个好价商品 👉 https://shop.test/detail?goods_id=G100&platform=pdd';
+  await hApp.page.handleUniversalConvert();
+  assert.equal(hApp.context.location.href, '/detail?goods_id=G100&platform=pdd');
+  assert.equal(hApp.requests.length, reqCountBeforeRoute);
+
+  // 5. 全站新增分享文案与控制器文件零微信敏感词校验
+  const forbidden = /返利|返现|打钱|提现红包|购物补贴|折合到手|自动存入钱包|随时提现/;
+  for (const jsName of ['format.js', 'detail.js', 'account.js', 'app.js', 'session.js', 'group_help.js']) {
+    const jsContent = fs.readFileSync(path.join(scripts, jsName), 'utf8');
+    assert.equal(forbidden.test(jsContent), false, `${jsName} must remain 100% free of WeChat-sensitive words`);
+  }
+});

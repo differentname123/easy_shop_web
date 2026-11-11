@@ -371,7 +371,18 @@ body {
 .gh-my-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 7px;
+}
+
+.gh-mini-share-btn {
+  border: 1px solid var(--gh-primary);
+  background: var(--gh-primary);
+  color: #fff;
+  padding: 4px 10px;
+  border-radius: 99px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .gh-mini-outline-btn {
@@ -391,6 +402,11 @@ body {
   color: var(--gh-text-muted);
   font-size: 12px;
   cursor: pointer;
+}
+
+.gh-link-btn.gh-link-share {
+  color: var(--gh-primary);
+  font-weight: 700;
 }
 
 .gh-pulse-dot {
@@ -916,4 +932,72 @@ body {
   color: #595959;
   line-height: 1.35;
 }
+
+/* 防恶意下架限制提示与内联快捷登录弹窗 */
+.gh-ban-notice {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fff1f0;
+  border: 1px solid #ffa39e;
+  color: #cf1322;
+  font-size: 11.5px;
+  line-height: 1.45;
+  font-weight: 600;
+}
+
+.gh-auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  background: #f2f3f5;
+  padding: 3px;
+  border-radius: 9px;
+  margin-bottom: 12px;
+}
+
+.gh-auth-tab {
+  border: none;
+  background: transparent;
+  color: var(--gh-text-sub);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 6px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.gh-auth-tab.active {
+  background: #fff;
+  color: var(--gh-primary);
+  font-weight: 800;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+}
+
+.gh-auth-field {
+  margin-bottom: 10px;
+}
+
+.gh-auth-input {
+  width: 100%;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid #dcdfe6;
+  border-radius: 9px;
+  font-size: 14px;
+  color: var(--gh-text-main);
+  outline: none;
+}
+
+.gh-auth-input:focus {
+  border-color: var(--gh-primary);
+}
+
+.gh-auth-err {
+  color: #cf1322;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
 

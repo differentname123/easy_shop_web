@@ -129,6 +129,8 @@ def call_tb_api(
                 method,
                 sub_code or code,
             )
+        elif str(sub_code) == "50001" and method == "taobao.tbk.dg.material.optional.upgrade":
+            logger.debug("【淘宝搜索无结果】接口[%s] 返回空结果 [50001]", method)
         else:
             logger.warning(
                 "❌ 【淘宝网关异常】淘宝开放平台返回业务错误 | 接口[%s] 错误码[%s] | 详情<%s> | 排查方向<请检查TOP应用权限、SessionKey有效期或请求参数>",
@@ -274,6 +276,17 @@ def search_tb_material_upgrade(
         biz_params=biz_params,
     )
     if res.get("status") != "success":
+        err_code = str(res.get("error_code") or "")
+        err_msg = str(res.get("error_msg") or "")
+        if err_code == "50001" or "无结果" in err_msg:
+            return {
+                "status": "success",
+                "total_count": 0,
+                "page": biz_params["page_no"],
+                "page_size": biz_params["page_size"],
+                "has_more": False,
+                "data": [],
+            }
         return {**res, "data": [], "total_count": 0}
 
     resp_body = res.get("data", {}).get("tbk_dg_material_optional_upgrade_response")

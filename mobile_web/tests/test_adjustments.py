@@ -439,6 +439,67 @@ class TestOffsetAndDetailEnhancements(unittest.TestCase):
             repo.register_or_login(phone="13900001111", password="password123", mode="login")
         self.assertIn("该手机号尚未注册", str(ctx.exception))
 
+    def test_classify_user_input_and_universal_keyword_interception(self):
+        """验证标准输入意图分类器及万能转链对纯关键词的零网络开销拦截"""
+        from models.product import classify_user_input
+        from infrastructure.http_utils import sanitize_user_error_message
+
+        # 1. 纯关键词 vs 分享口令/短链 vs 不支持外链
+        kw_res = classify_user_input("心相印抽纸整箱")
+        self.assertEqual(kw_res["kind"], "keyword")
+        self.assertEqual(kw_res["keyword"], "心相印抽纸整箱")
+
+        tb_res = classify_user_input("78￥CZ0001 AbCdEfGhIjK￥ https://m.tb.cn/h.5xyz 「维达抽纸整箱」")
+        self.assertEqual(tb_res["kind"], "link_or_token")
+        self.assertEqual(tb_res["platform"], "taobao")
+        self.assertEqual(tb_res["keyword"], "维达抽纸整箱")
+
+        bad_url = classify_user_input("https://www.baidu.com/s?wd=抽纸")
+        self.assertEqual(bad_url["kind"], "unsupported_url")
+
+        # 2. 报错脱敏：彻底剔除折淘客/ZTK/40009/relationId等技术黑话
+        sanitized = sanitize_user_error_message("UPSTREAM_ERROR", "折淘客ZTK请求失败: errorCode=40009 relationId sid invalid", "淘宝")
+        self.assertNotIn("折淘客", sanitized)
+        self.assertNotIn("ZTK", sanitized)
+        self.assertNotIn("40009", sanitized)
+        self.assertNotIn("relationId", sanitized)
+
+        # 3. PromoteService.universal_convert 在平台选定为 taobao/jd/pdd 时拦截纯关键词并返回建议搜索词
+        from services.promote_service import PromoteService
+        svc = PromoteService(product_repo=MagicMock(), user_service=MagicMock())
+        intercepted = svc.universal_convert(raw_text="维达抽纸整箱", platform="taobao")
+        self.assertEqual(intercepted["status"], "error")
+        self.assertEqual(intercepted["error_code"], "KEYWORD_NOT_LINK")
+        self.assertEqual(intercepted["suggested_keyword"], "维达抽纸整箱")
+        self.assertEqual(intercepted["suggested_platform"], "taobao")
+
+    def test_tb_and_jd_empty_search_normalized_to_success_zero_items(self):
+        """验证淘宝 50001 无结果与京东 301 无符合条件的数据均被标准化为空列表而非网关异常"""
+        from infrastructure.tb_client import search_tb_material_upgrade
+        from infrastructure.jd_client import JdClient
+
+        tb_empty = search_tb_material_upgrade(
+            app_key="test_key",
+            app_secret="test_secret",
+            adzone_id="123456",
+            keyword="zzzznotfound999999xyz",
+            _api_call=lambda **_kw: {"status": "error", "error_code": "50001", "error_msg": "[15:50001] 无结果"},
+        )
+        self.assertEqual(tb_empty["status"], "success")
+        self.assertEqual(tb_empty["data"], [])
+        self.assertFalse(tb_empty["has_more"])
+
+        mock_http = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": 301, "content": "无符合条件的数据"}
+        mock_http.get.return_value = mock_resp
+        jd_client = JdClient(appkey="appkey_1", union_id="1000001", http_session=mock_http)
+        jd_empty = jd_client.search_goods("zzzznotfound999999xyz")
+        self.assertEqual(jd_empty["status"], "success")
+        self.assertEqual(jd_empty["data"], [])
+        self.assertFalse(jd_empty["has_more"])
+
 
 if __name__ == "__main__":
     unittest.main()
