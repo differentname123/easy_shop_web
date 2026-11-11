@@ -204,7 +204,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
-    {"model_name": "antigravity-3.8-flash-medium", "权重": 0.9, "备注": "来源antigravity 本地客户端 (占组内总权重 30%，其余启用项合计=2.1)"},
+    {"model_name": "antigravity-3.8-flash-medium", "权重": 0.35, "备注": "来源antigravity 本地客户端 (占组内总权重约14%，匹配本地2并发槽位)"},
     # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在统一的 logs/runtime/model_usage.json，不随调用程序的工作目录变化。
