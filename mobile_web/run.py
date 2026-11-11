@@ -15,6 +15,8 @@ def main(argv=None):
     checks = parser.add_mutually_exclusive_group()
     checks.add_argument("--check", action="store_true", help="校验 config.local.json 配置有效性")
     checks.add_argument("--check-mongo", action="store_true", help="只读 ping Mongo 连通性")
+    checks.add_argument("--check-ai", action="store_true", help="校验当前系统环境对应的 AI 接口连通性")
+    parser.add_argument("--cloud", action="store_true", help="配合 --check-ai 使用：在 Windows 本地提前测试 cloud_ai 云端配置")
     args = parser.parse_args(argv)
 
     try:
@@ -43,6 +45,30 @@ def main(argv=None):
                 db.close()
         print("MongoDB ping 成功；未创建索引、未修改业务数据。")
         return 0
+
+    if args.check_ai:
+        from infrastructure.ai_api.model_api import generate_content
+        res = generate_content(
+            prompt='请仅回复 JSON: {"ok": true}',
+            max_retries_per_model=2,
+            timeout=30,
+            stop_on_timeout=True,
+            force_cloud=bool(args.cloud),
+        )
+        metrics = res.get("metrics") or {}
+        mode_label = "Linux云端(cloud_ai)" if metrics.get("runtime_mode") == "linux_cloud" else "Windows本地(local_api_url)"
+        if res.get("status") == "✅ 成功":
+            slot_info = f" | 密钥槽: {metrics['key_slot']}" if metrics.get("key_slot") else ""
+            print(
+                f"AI 连通性自检成功 | 环境: {mode_label} | 命中模型: {metrics.get('model_used')}{slot_info} "
+                f"| 耗时: {metrics.get('total_time_seconds')}s"
+            )
+            return 0
+        print(
+            f"AI 连通性自检失败 | 环境: {mode_label} | {res.get('content') or '请检查 config.local.json 中的 cloud_ai 配置'}",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.check:
         print("配置校验通过；未连接 MongoDB 或外部平台。")

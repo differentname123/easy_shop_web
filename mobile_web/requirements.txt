@@ -10,3 +10,5 @@ opencv-python-headless
 numpy
 Pillow
 python-multipart
+openai
+socksio

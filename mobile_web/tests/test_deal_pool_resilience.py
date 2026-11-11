@@ -439,3 +439,170 @@ def test_settings_parses_multi_key_pools_for_ztk_and_hdk(tmp_path):
     assert loaded.ztk_sid_list == ("sid-1", "sid-2", "sid-3", "sid-4")
     assert loaded.hdk_api_key_list == ("hdk-1", "hdk-2", "hdk-3")
 
+
+def test_select_models_excludes_zero_weight_models_from_primary_and_fallbacks():
+    from mobile_web.infrastructure.ai_api.model_api import (
+        LOW_MODEL_LIST,
+        MEDIUM_MODEL_LIST,
+        _select_models,
+    )
+
+    zero_low = {m["model_name"] for m in LOW_MODEL_LIST if m.get("权重", 0) <= 0}
+    zero_med = {m["model_name"] for m in MEDIUM_MODEL_LIST if m.get("权重", 0) <= 0}
+    assert "gemini-aistudio-api-key-3.5-flash" in zero_low
+
+    for _ in range(100):
+        chosen_low = _select_models(None, None, "low")
+        assert chosen_low
+        assert zero_low.isdisjoint(chosen_low)
+
+        chosen_med = _select_models(None, None, "medium")
+        assert chosen_med
+        assert zero_med.isdisjoint(chosen_med)
+
+
+def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries():
+    from mobile_web.scripts.run_deal_pool_scheduler import ERR_AI_TIMEOUT_RETRY
+
+    cleaner = DealPoolCleaner(ai_batch_size=6, ai_max_workers=2, convert_max_workers=2)
+    cleaner.warmup_anchor_cache_from_db = lambda _col: None
+
+    fake_jd_adapter = MagicMock()
+    fake_jd_adapter.resolve_and_convert_universal.return_value = {
+        "status": "success",
+        "goods_id": "100999888777",
+        "goods_sign": "https://u.jd.com/ok_prod",
+        "final_link": "https://u.jd.com/ok_prod",
+        "url": "https://u.jd.com/ok_prod",
+        "promotion_token": "",
+        "product": {
+            "platform": "jd",
+            "product_id": "100999888777",
+            "name": "清风原木纯品抽纸24包",
+            "price": 22.9,
+            "original_price": 36.9,
+            "activity_price": 22.9,
+            "coupon_amount": 14.0,
+            "mall_name": "清风京东自营旗舰店",
+            "image": "https://img14.360buyimg.com/n1/jfs/qf.jpg",
+        },
+    }
+    cleaner.adapters["jd"] = fake_jd_adapter
+
+    ai1_calls = {"n": 0}
+    ai2_attempt = {"n": 0}
+
+    def _fake_stage1(stage1_inputs, docs_by_tip_id, neighbor_maps_by_id=None, total_pending_count=0, quiet_sub_logs=False):
+        ai1_calls["n"] += 1
+        return {
+            inp["main_tip_id"]: {
+                "main_tip_id": inp["main_tip_id"],
+                "is_standalone_deal": True,
+                "merged_tip_ids": [inp["main_tip_id"]],
+                "combined_raw_text": "清风抽纸好价 [#L1]",
+                "extracted_images": [],
+                "extracted_targets": [
+                    {
+                        "link_id": "L1",
+                        "raw_span": "https://u.jd.com/o1abcde",
+                        "clean_input": "https://u.jd.com/o1abcde",
+                        "platform": "jd",
+                        "text_role_hint": "main_candidate",
+                    }
+                ],
+                "_from_fallback": False,
+            }
+            for inp in stage1_inputs
+        }
+
+    def _fake_stage2(stage2_inputs, total_pending_count=0, quiet_sub_logs=False):
+        ai2_attempt["n"] += 1
+        if ai2_attempt["n"] == 1:
+            return {}  # Simulate Stage 4 AI-2 timeout on Round 1
+        return {
+            inp["main_tip_id"]: {
+                "main_tip_id": inp["main_tip_id"],
+                "is_valid_deal": True,
+                "main_link_id": "L1",
+                "coupon_links": [],
+                "filler_links": [],
+                "deal_price": 22.9,
+                "tutorial_steps": ["1. 点击 [#L1] 下单实付22.9元"],
+                "quality_score": 85,
+                "score_breakdown": {"price_advantage": 35, "brand_reputation": 25, "completeness": 25},
+            }
+            for inp in stage2_inputs
+        }
+
+    cleaner.run_ai_stage1_batch = _fake_stage1
+    cleaner.run_ai_stage2_batch = _fake_stage2
+
+    raw_col = MagicMock()
+    raw_col.find.return_value = []
+    base_doc = {
+        "source_site": "guangdiu",
+        "source_channel": "最新好价",
+        "source_item_id": "gd_9001",
+        "platform": "jd",
+        "title": "清风抽纸24包22.9元",
+        "tutorial_text": "清风抽纸好价 https://u.jd.com/o1abcde",
+        "extracted_links": [{"url": "https://u.jd.com/o1abcde", "platform": "jd"}],
+        "extracted_tokens": [],
+        "clean_retry_count": 0,
+    }
+
+    # Round 1: AI-1 succeeds, AI-2 times out -> retry_pending with ERR_AI_TIMEOUT_RETRY
+    r1 = cleaner.clean_batch_records([base_doc], raw_col, shared_active_products={}, quiet_sub_logs=True)
+    assert r1[0]["status"] == "retry_pending"
+    assert r1[0]["error_code"] == ERR_AI_TIMEOUT_RETRY
+    assert ai1_calls["n"] == 1
+
+    # Round 2: Retried after AI-2 timeout -> reuses saved_ai1 without re-calling AI-1!
+    doc_r2 = dict(
+        base_doc,
+        clean_retry_count=1,
+        clean_error_code=ERR_AI_TIMEOUT_RETRY,
+        ai_stage1_result=r1[0]["ai_stage1_result"],
+    )
+    r2 = cleaner.clean_batch_records([doc_r2], raw_col, shared_active_products={}, quiet_sub_logs=True)
+    assert r2[0]["status"] == "success"
+    assert ai1_calls["n"] == 1
+
+    # Contrast: If AI-1 itself timed out (_from_fallback=True), retry MUST still invoke AI-1!
+    doc_ai1_fb = dict(
+        base_doc,
+        source_item_id="gd_9002",
+        clean_retry_count=1,
+        clean_error_code=ERR_AI_TIMEOUT_RETRY,
+        ai_stage1_result={"main_tip_id": "gd_9002", "extracted_targets": [], "_from_fallback": True},
+    )
+    r3 = cleaner.clean_batch_records([doc_ai1_fb], raw_col, shared_active_products={}, quiet_sub_logs=True)
+    assert r3[0]["status"] == "success"
+    assert ai1_calls["n"] == 2
+
+
+def test_jd_client_per_key_pacing_reserves_slots_per_appkey_and_skips_mocks(monkeypatch):
+    import requests
+    from infrastructure.jd_client import JdClient
+
+    sleeps = []
+    fake_clock = {"t": 1000.0}
+    monkeypatch.setattr("infrastructure.jd_client.time.monotonic", lambda: fake_clock["t"])
+    monkeypatch.setattr("infrastructure.jd_client.time.sleep", lambda s: sleeps.append(round(s, 3)))
+    monkeypatch.setattr(JdClient, "_KEY_NEXT_ALLOWED_TS", {})
+
+    # 1. Mocked http_session incurs zero pacing sleep
+    mock_cli = JdClient(appkey_list=["k-mock"], union_id="2035679405", http_session=SimpleNamespace(get=lambda *a, **kw: None))
+    mock_cli._pace_real_http_by_key({"params": {"appkey": "k-mock"}})
+    assert sleeps == []
+    assert JdClient._KEY_NEXT_ALLOWED_TS == {}
+
+    # 2. Real requests.Session spaces same-key calls by 0.22s while allowing distinct keys immediately
+    real_cli = JdClient(appkey_list=["k-real-1", "k-real-2"], union_id="2035679405", http_session=requests.Session())
+    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-1"}})
+    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-2"}})
+    assert sleeps == []  # First call on each independent key does not wait on the other!
+
+    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-1"}})
+    assert sleeps == [0.22]  # Immediate second call on k-real-1 waits 0.22s
+

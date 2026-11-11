@@ -530,16 +530,7 @@ class JdAdapter(BasePlatformAdapter):
                 **extra_fields,
             )
 
-        # 真实网络会话下按京东联盟单 unionId QPS 阈值执行单通道匀速间隔（0.35s），避免多线程并发把京东反查打成伪 301；离线单元测试零等待
-        if isinstance(getattr(self.client, "http", None), requests.Session):
-            with JdAdapter._universal_rate_lock:
-                wait_s = JdAdapter._UNIVERSAL_PACE_SECONDS - (time.monotonic() - JdAdapter._last_universal_finish_ts)
-                if wait_s > 0:
-                    time.sleep(wait_s)
-                try:
-                    return _do_resolve()
-                finally:
-                    JdAdapter._last_universal_finish_ts = time.monotonic()
+        # 真实网络限速已下沉至 JdClient._get 按单 appkey 预约 0.22s 发包间隔（锁内零网络 RTT 等待），离线单元测试零等待
         return _do_resolve()
 
     def check_authority(self, uid):

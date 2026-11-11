@@ -441,7 +441,7 @@ def gen_goods_format_info(sku_task_batch, prompt_text=None):
     errors, content = [], ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
-            result = generate_content(prompt=full_prompt, preset_model_group="low")
+            result = generate_content(prompt=full_prompt, preset_model_group="low", timeout=150)
             model_used = (result.get("metrics") or {}).get("model_used")
             if model_used:
                 outcome["model_used"] = model_used

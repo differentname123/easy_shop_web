@@ -1093,8 +1093,8 @@ class DealPoolCleaner:
     def __init__(
         self,
         use_ai_for_multi: bool = True,
-        ai_batch_size: int = 10,
-        ai_max_workers: int = 20,
+        ai_batch_size: int = 6,
+        ai_max_workers: int = 12,
         convert_max_workers: int = 10,
         ai_timeout: float = DEFAULT_AI_TIMEOUT_SECONDS,
     ):
@@ -1845,7 +1845,7 @@ class DealPoolCleaner:
         """
         并发执行 Stage 3 官方 API 转链：
         - 淘宝/拼多多通过多线程池全速并发转链；
-        - 京东独立走单通道匀速车道（配合双 AppKey 轮询 + 0.35s 间隔），既避免触发京东联盟单 unionId 频控，又不占用淘/拼并发工作线程。
+        - 京东独立走最多 3 通道受控并发车道（配合 JdClient 单 AppKey 0.22s 发包间隔与多 Key 轮询），兼顾高吞吐与零频控且不挤占淘/拼工作线程。
         """
         if not unique_targets:
             return
@@ -1898,14 +1898,23 @@ class DealPoolCleaner:
             else:
                 other_targets.append(it)
 
+        jd_iter = iter(jd_targets)
+        jd_iter_lock = threading.Lock()
+        jd_lane_count = min(3, len(jd_targets))
+
         def _jd_lane_runner() -> None:
-            for jd_it in jd_targets:
+            while True:
+                with jd_iter_lock:
+                    jd_it = next(jd_iter, None)
+                if jd_it is None:
+                    break
                 _conv_worker(jd_it)
 
-        worker_slots = min(self.convert_max_workers, max(1, len(other_targets))) + (1 if jd_targets else 0)
-        with ThreadPoolExecutor(max_workers=max(1, worker_slots)) as pool:
+        other_slots = min(self.convert_max_workers, len(other_targets)) if other_targets else 0
+        worker_slots = max(1, other_slots + jd_lane_count)
+        with ThreadPoolExecutor(max_workers=worker_slots) as pool:
             futures = []
-            if jd_targets:
+            for _ in range(jd_lane_count):
                 futures.append(pool.submit(_jd_lane_runner))
             for o_it in other_targets:
                 futures.append(pool.submit(_conv_worker, o_it))
@@ -2338,7 +2347,7 @@ class DealPoolCleaner:
 
             saved_ai1 = doc.get("ai_stage1_result")
             if (
-                doc.get("clean_error_code") == ERR_ADAPTER_CONVERT_FAILED
+                doc.get("clean_error_code") in (ERR_ADAPTER_CONVERT_FAILED, ERR_AI_TIMEOUT_RETRY)
                 and not bool(doc.get("is_group_stream") or (site == "zhetaoke" and mid.startswith("xb_")))
                 and isinstance(saved_ai1, dict)
                 and not saved_ai1.get("_from_fallback")
@@ -5434,14 +5443,14 @@ def main():
     parser.add_argument(
         "--ai-batch-size",
         type=int,
-        default=10,
-        help="单次 AI 请求打包处理的线报条数（默认: 10，兼顾低调用次数与防 8k Token 输出截断）",
+        default=6,
+        help="单次 AI 请求打包处理的线报条数（默认: 6，抑制思考模型长批 90s 尾部超时与输出截断）",
     )
     parser.add_argument(
         "--ai-workers",
         type=int,
-        default=20,
-        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 20，匹配单窗口 20 批一轮并发完成）",
+        default=12,
+        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 12，分波利用本地高速槽位并避免瞬时打满网关）",
     )
     parser.add_argument(
         "--ai-timeout",

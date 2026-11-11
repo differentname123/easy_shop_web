@@ -33,5 +33,13 @@
   "web_detail_prefetch_interval_seconds": 300,
   "web_log_dir": "runtime/logs",
   "web_log_level": "INFO",
-  "pdd_dns_mode": "auto"
+  "pdd_dns_mode": "auto",
+  "local_api_url": "http://127.0.0.1:8317/v1",
+  "local_api_key": "",
+  "cloud_ai": {
+    "api_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "api_keys": [],
+    "proxy_url": "",
+    "models": []
+  }
 }

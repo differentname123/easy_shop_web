@@ -35,6 +35,11 @@ except ImportError:
     OpenAI = None
 
 try:
+    import httpx
+except ImportError:
+    httpx = None
+
+try:
     from .antigravity_client import (
         MODEL_ALIASES as ANTIGRAVITY_MODEL_ALIASES,
         get_client as get_antigravity_client,
@@ -153,8 +158,204 @@ else:
 
 __all__ = ["generate_content", "probe_models", "ANTIGRAVITY_MODEL_ALIASES"]
 
-BASE_URL = get_config("local_api_url", "http://127.0.0.1:8317/v1")
-API_KEY = get_config("local_api_key", "")
+_INITIAL_BASE_URL = get_config("local_api_url", "http://127.0.0.1:8317/v1")
+_INITIAL_API_KEY = get_config("local_api_key", "")
+BASE_URL = _INITIAL_BASE_URL
+API_KEY = _INITIAL_API_KEY
+_RUNTIME_OS_NAME = os.name
+
+_KEY_POOL_LOCK = threading.Lock()
+_KEY_POOL_CURSORS = {}
+_KEY_COOLDOWN_UNTIL = {}
+
+
+def _clean_str_list(raw):
+    """将字符串列表/元组或逗号分隔字符串规整为去重非空字符串列表。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(part).strip() for part in raw if isinstance(part, (str, int, float)) and not isinstance(part, bool)]
+    else:
+        return []
+    result = []
+    seen = set()
+    for item in items:
+        if item and item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result
+
+
+def _is_linux_cloud_runtime(force_cloud=False):
+    """自动判断当前是否为 Linux 云服务器环境（Windows 为本地开发环境，非 Windows 自动走 cloud_ai）。"""
+    if force_cloud:
+        return True
+    env_mode = os.environ.get("AI_RUNTIME_MODE", "").strip().lower()
+    if env_mode in ("cloud", "linux"):
+        return True
+    if env_mode in ("local", "windows"):
+        return False
+    return _RUNTIME_OS_NAME != "nt"
+
+
+def _collect_provider_routes(raw_providers, default_base_url, default_proxy_url, default_keys, all_secrets):
+    """解析多厂商路由列表并返回 (model_routes, provider_models)。"""
+    model_routes = {}
+    provider_models = []
+    if isinstance(raw_providers, (list, tuple)):
+        for idx, prov in enumerate(raw_providers):
+            if not isinstance(prov, dict):
+                continue
+            p_name = str(prov.get("name") or f"provider_{idx + 1}").strip()
+            p_url = str(prov.get("base_url") or prov.get("api_url") or default_base_url).strip() or default_base_url
+            p_proxy = str(prov.get("proxy_url") if "proxy_url" in prov else default_proxy_url).strip()
+            p_keys = _clean_str_list(prov.get("api_keys"))
+            p_single = str(prov.get("api_key") or "").strip()
+            if p_single and p_single not in p_keys:
+                p_keys.append(p_single)
+            if not p_keys:
+                p_keys = list(default_keys)
+            all_secrets.update(p_keys)
+            p_models = _clean_str_list(prov.get("models"))
+            for m_name in p_models:
+                if m_name not in provider_models:
+                    provider_models.append(m_name)
+                if m_name not in model_routes:
+                    model_routes[m_name] = {
+                        "base_url": p_url,
+                        "api_keys": p_keys,
+                        "proxy_url": p_proxy,
+                        "pool_id": f"{p_name}:{p_url}",
+                    }
+    return model_routes, provider_models
+
+
+def _resolve_ai_runtime(force_cloud=False, require_keys_on_cloud_block=False):
+    """按操作系统自动切换同一份 config.local.json 中的 AI 配置：
+    - Windows 本地环境：忽略 cloud_ai，使用 local_api_url / local_api_key 与预置模型组；
+    - Linux 云服务器（或 force_cloud=True）：自动启用 cloud_ai（官方 Key 池 + 海外代理 + 官方模型名）。
+    """
+    cfg_url = str(get_config("local_api_url", "http://127.0.0.1:8317/v1") or "").strip()
+    local_base_url = str(BASE_URL or "").strip() if BASE_URL != _INITIAL_BASE_URL else (cfg_url or "http://127.0.0.1:8317/v1")
+
+    cfg_single_key = str(get_config("local_api_key", "") or "").strip()
+    local_single_key = str(API_KEY or "").strip() if API_KEY != _INITIAL_API_KEY else cfg_single_key
+    local_key_list = _clean_str_list(get_config("local_api_key_list", []))
+    if local_single_key and local_single_key not in local_key_list:
+        local_key_list.append(local_single_key)
+
+    cloud_cfg = get_config("cloud_ai", None)
+    all_secrets = set(local_key_list)
+    if API_KEY:
+        all_secrets.add(str(API_KEY))
+    if isinstance(cloud_cfg, dict):
+        all_secrets.update(_clean_str_list(cloud_cfg.get("api_keys")))
+        c_single = str(cloud_cfg.get("api_key") or "").strip()
+        if c_single:
+            all_secrets.add(c_single)
+        if isinstance(cloud_cfg.get("providers"), (list, tuple)):
+            for p in cloud_cfg.get("providers"):
+                if isinstance(p, dict):
+                    all_secrets.update(_clean_str_list(p.get("api_keys")))
+                    if p.get("api_key"):
+                        all_secrets.add(str(p.get("api_key")).strip())
+
+    is_cloud_os = _is_linux_cloud_runtime(force_cloud=force_cloud)
+    monkeypatched = (BASE_URL != _INITIAL_BASE_URL) or (API_KEY != _INITIAL_API_KEY)
+
+    if is_cloud_os and (force_cloud or (isinstance(cloud_cfg, dict) and not monkeypatched)):
+        c_dict = cloud_cfg if isinstance(cloud_cfg, dict) else {}
+        base_url = (
+            str(c_dict.get("api_url") or c_dict.get("base_url") or "").strip()
+            or "https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+        key_list = _clean_str_list(c_dict.get("api_keys"))
+        c_single_key = str(c_dict.get("api_key") or "").strip()
+        if c_single_key and c_single_key not in key_list:
+            key_list.append(c_single_key)
+        proxy_url = str(c_dict.get("proxy_url") or "").strip()
+        raw_models = c_dict.get("models", None)
+        raw_providers = c_dict.get("providers", None)
+        model_routes, provider_models = _collect_provider_routes(
+            raw_providers, base_url, proxy_url, key_list, all_secrets
+        )
+        configured_models = raw_models if raw_models not in (None, "", []) else (provider_models or None)
+        if require_keys_on_cloud_block:
+            if not key_list and not any(r.get("api_keys") for r in model_routes.values()):
+                raise ValueError("检测到 Linux 云端环境（或 --cloud），请在 config.local.json 的 cloud_ai.api_keys 中填入官方 API Key")
+            if configured_models is None:
+                raise ValueError("检测到 Linux 云端环境（或 --cloud），请在 config.local.json 的 cloud_ai.models 中填入官方模型名（如 gemini-3.8-flash）")
+        return {
+            "runtime_mode": "linux_cloud",
+            "default_base_url": base_url,
+            "default_keys": key_list,
+            "default_proxy_url": proxy_url,
+            "configured_models": configured_models,
+            "model_routes": model_routes,
+            "all_secrets": all_secrets,
+        }
+
+    proxy_url = str(get_config("ai_proxy_url", "") or "").strip()
+    raw_models = get_config("ai_models", None)
+    raw_providers = get_config("ai_providers", None)
+    model_routes, provider_models = _collect_provider_routes(
+        raw_providers, local_base_url, proxy_url, local_key_list, all_secrets
+    )
+    configured_models = raw_models if raw_models not in (None, "", []) else (provider_models or None)
+    return {
+        "runtime_mode": "linux_cloud" if is_cloud_os else "windows_local",
+        "default_base_url": local_base_url,
+        "default_keys": local_key_list,
+        "default_proxy_url": proxy_url,
+        "configured_models": configured_models,
+        "model_routes": model_routes,
+        "all_secrets": all_secrets,
+    }
+
+
+def _pick_api_key(pool_id, keys):
+    """从 Key 池中轮询挑选下一个健康 Key（优先跳过冷却中的 429/鉴权失败 Key）。返回 (api_key, key_label)。"""
+    if not keys:
+        return "", ""
+    if len(keys) == 1:
+        return keys[0], "Key#1/1"
+    now = time.monotonic()
+    with _KEY_POOL_LOCK:
+        start = _KEY_POOL_CURSORS.get(pool_id, 0) % len(keys)
+        chosen_idx = None
+        earliest_idx = start
+        earliest_until = float("inf")
+        for offset in range(len(keys)):
+            idx = (start + offset) % len(keys)
+            k = keys[idx]
+            until = _KEY_COOLDOWN_UNTIL.get(k, 0.0)
+            if until <= now:
+                chosen_idx = idx
+                break
+            if until < earliest_until:
+                earliest_until = until
+                earliest_idx = idx
+        if chosen_idx is None:
+            chosen_idx = earliest_idx
+        _KEY_POOL_CURSORS[pool_id] = (chosen_idx + 1) % len(keys)
+        return keys[chosen_idx], f"Key#{chosen_idx + 1}/{len(keys)}"
+
+
+def _mark_key_cooldown(api_key, status_code=None, error_text=""):
+    """当某个官方 API Key 触发 429 配额限流或 401/403 权限失败时，短暂标记冷却以便优先切到其他 Key。"""
+    if not api_key:
+        return False
+    lower = str(error_text or "").lower()
+    is_rate_limit = status_code == 429 or "429" in lower or "rate limit" in lower or "quota" in lower or "resource_exhausted" in lower
+    is_auth_err = status_code in (401, 403)
+    if not (is_rate_limit or is_auth_err):
+        return False
+    cooldown = 300.0 if is_auth_err else 60.0
+    with _KEY_POOL_LOCK:
+        _KEY_COOLDOWN_UNTIL[api_key] = time.monotonic() + cooldown
+    return True
 
 # 示例模型名沿用原需求；请按网关实际支持的模型补充，每个模型名在组内只出现一次。
 HIGH_MODEL_LIST = [
@@ -237,17 +438,24 @@ MEDIA_TYPES = {
 
 
 def _redact(value):
-    """统一隐藏配置密钥、常见凭据和 URL 用户信息。"""
+    """统一隐藏配置密钥、常见凭据（含 Google AIzaSy 与 OpenAI sk-）和代理/数据库 URL 账号密码。"""
     text = str(value)
-    if API_KEY:
-        text = re.sub(re.escape(API_KEY), "***", text)
+    try:
+        secrets_set = _resolve_ai_runtime().get("all_secrets") or set()
+    except Exception:
+        secrets_set = {API_KEY} if API_KEY else set()
+    for secret in sorted(secrets_set, key=len, reverse=True):
+        if secret:
+            text = re.sub(re.escape(secret), "***", text)
     text = re.sub(r"(?i)sk-[a-z0-9_-]+", "***", text)
+    text = re.sub(r"AIzaSy[A-Za-z0-9_-]+", "***", text)
+    text = re.sub(r"\bAQ\.[A-Za-z0-9._-]{12,}", "***", text)
     text = re.sub(r"(?i)(\bBearer\s+)[^\s,'\"<>]+", r"\1***", text)
     text = re.sub(
         r"(?i)((?:api[_-]?key|access[_-]?token|authorization)[\"']?\s*[:=]\s*[\"']?)[^&\s,'\"}<>]+",
         r"\1***", text,
     )
-    return re.sub(r"(https?://)[^/\s@]+@", r"\1***@", text)
+    return re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@]+@", r"\1***@", text)
 
 
 def _preview(value, limit=120):
@@ -404,8 +612,8 @@ def _build_antigravity_payload(prompt, file_paths):
     return "\n\n".join(text_parts), media_list
 
 
-def _select_models(model, fallback_model_list, preset_model_group):
-    """显式模型使用指定备用列表；未指定模型时，按预制组生成完整尝试顺序。"""
+def _select_models(model, fallback_model_list, preset_model_group, configured_models=None):
+    """显式模型使用指定备用列表；未指定模型时优先使用云端配置的 ai_models，否则按预制组生成尝试顺序。"""
     if model is not None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model 必须是非空字符串或 None")
@@ -423,11 +631,30 @@ def _select_models(model, fallback_model_list, preset_model_group):
 
     if not isinstance(preset_model_group, str) or preset_model_group not in ("high", "medium", "low"):
         raise ValueError("preset_model_group 必须是 high、medium 或 low")
-    group = {
-        "high": HIGH_MODEL_LIST,
-        "medium": MEDIUM_MODEL_LIST,
-        "low": LOW_MODEL_LIST,
-    }[preset_model_group]
+
+    if configured_models is not None:
+        if isinstance(configured_models, str):
+            cleaned = _clean_str_list(configured_models)
+            if cleaned:
+                return cleaned
+        elif isinstance(configured_models, (list, tuple)) and configured_models:
+            if all(isinstance(item, str) for item in configured_models):
+                cleaned = _clean_str_list(configured_models)
+                if not cleaned:
+                    raise ValueError("ai_models 至少需要包含一个非空模型名")
+                return cleaned
+            group = configured_models
+        else:
+            group = None
+    else:
+        group = None
+
+    if group is None:
+        group = {
+            "high": HIGH_MODEL_LIST,
+            "medium": MEDIUM_MODEL_LIST,
+            "low": LOW_MODEL_LIST,
+        }[preset_model_group]
     if not isinstance(group, (list, tuple)) or not group:
         raise ValueError(f"{preset_model_group} 预制模型组必须是非空列表")
     names = []
@@ -451,9 +678,15 @@ def _select_models(model, fallback_model_list, preset_model_group):
     largest_weight = max(weights)
     if largest_weight <= 0:
         raise ValueError("预制模型组至少需要一个权重大于 0 的模型")
-    # 归一化避免多个很大的有限权重相加后溢出；不改变相对概率。
-    primary = random.choices(names, weights=[w / largest_weight for w in weights], k=1)[0]
-    fallbacks = [name for name in names if name != primary]
+    positive_names = [name for name, w in zip(names, weights) if w > 0]
+    positive_weights = [w for w in weights if w > 0]
+    # 归一化避免多个很大的有限权重相加后溢出；不改变相对概率，且严格排除权重为 0 的禁用模型进入备用列表。
+    primary = random.choices(
+        positive_names,
+        weights=[w / largest_weight for w in positive_weights],
+        k=1,
+    )[0]
+    fallbacks = [name for name in positive_names if name != primary]
     random.shuffle(fallbacks)
     return [primary] + fallbacks
 
@@ -660,6 +893,31 @@ def _save_model_usage(events):
             _atomic_write_model_usage(path, data)
 
 
+def _create_openai_client(base_url, api_key, proxy_url, timeout):
+    """创建隔离的 OpenAI SDK 客户端；配置 ai_proxy_url 时挂载专属 httpx.Client，不影响全局网络环境。"""
+    if OpenAI is None:
+        raise RuntimeError("未安装 openai 库，请执行 pip install openai")
+    if not api_key:
+        raise ValueError("未配置 API 密钥，请检查配置项 local_api_key 或 local_api_key_list")
+    if proxy_url:
+        if httpx is None:
+            raise RuntimeError("未安装 httpx 库，无法配置 ai_proxy_url")
+        http_cli = httpx.Client(proxy=proxy_url, timeout=timeout, trust_env=False)
+        try:
+            oa_cli = OpenAI(
+                base_url=base_url,
+                api_key=api_key,
+                max_retries=0,
+                timeout=timeout,
+                http_client=http_cli,
+            )
+        except BaseException:
+            _close_client(http_cli, "init_openai_proxy_client")
+            raise
+        return oa_cli, http_cli
+    return OpenAI(base_url=base_url, api_key=api_key, max_retries=0, timeout=timeout), None
+
+
 def generate_content(
     prompt,
     model=None,
@@ -670,6 +928,7 @@ def generate_content(
     preset_model_group="medium",
     stop_on_timeout=False,
     slot_acquire_timeout=5.0,
+    force_cloud=False,
 ):
     """同步生成文本；file_paths 为路径 list/tuple，不修改调用参数。
 
@@ -677,9 +936,8 @@ def generate_content(
     model_used/total_time_seconds/attempts。尝试次数包含首次请求，总耗时包含附件读取、等待、清理和统计保存。
     普通异常按既有契约返回失败字典；KeyboardInterrupt/SystemExit 等系统级中断继续传播。
 
-    model=None 时按 preset_model_group 的权重选主模型，组内其余模型随机排序备用，
-    此时 fallback_model_list 由模型组自动生成；显式 model 时使用传入的备用模型名列表，
-    保留顺序并去重，preset_model_group 不参与选择。零权重模型不作为主模型，但仍可备用。
+    Windows 环境默认走 local_api_url 与 preset_model_group 预置模型组；Linux 云服务器（或 force_cloud=True）
+    自动启用 config.local.json 中的 cloud_ai 配置（官方 Key 池 + 海外代理 + 官方模型列表）。
     每次请求（含重试/切换/中断）按请求模型名统计，在 finally 中一次合并写盘。
     能确定模型的准备失败单独计数，不计入请求次数或成功率；无法确定模型时不虚构模型名。
     """
@@ -696,13 +954,24 @@ def generate_content(
         "timed_out": False,
     }
     metrics = result["metrics"]
-    client = None
+    owned_clients = []
+    client_cache = {}
     selected_model = model if isinstance(model, str) and model.strip() else None
     usage_events = []
     try:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt 必须是非空字符串")
-        models = _select_models(model, fallback_model_list, preset_model_group)
+        runtime = _resolve_ai_runtime(
+            force_cloud=force_cloud,
+            require_keys_on_cloud_block=(model is None),
+        )
+        metrics["runtime_mode"] = runtime["runtime_mode"]
+        models = _select_models(
+            model,
+            fallback_model_list,
+            preset_model_group,
+            configured_models=runtime["configured_models"],
+        )
         selected_model = models[0]
         if type(max_retries_per_model) is not int or max_retries_per_model < 1:
             raise ValueError("max_retries_per_model 必须是正整数")
@@ -719,19 +988,49 @@ def generate_content(
         messages = [{"role": "user", "content": _build_content(prompt, paths)}] if needs_openai else None
         ag_prompt, ag_media = _build_antigravity_payload(prompt, paths) if needs_antigravity else (prompt, [])
 
+        def _route_for_model(m_name):
+            route = runtime["model_routes"].get(m_name)
+            if route:
+                return route
+            return {
+                "base_url": runtime["default_base_url"],
+                "api_keys": runtime["default_keys"],
+                "proxy_url": runtime["default_proxy_url"],
+                "pool_id": f"default:{runtime['default_base_url']}",
+            }
+
+        def _get_cached_client(base_url, api_key, proxy_url):
+            cache_key = (base_url, proxy_url, api_key)
+            if cache_key not in client_cache:
+                oa_cli, http_cli = _create_openai_client(base_url, api_key, proxy_url, timeout)
+                owned_clients.append(oa_cli)
+                if http_cli is not None:
+                    owned_clients.append(http_cli)
+                client_cache[cache_key] = oa_cli
+            return client_cache[cache_key]
+
         if needs_openai:
             if OpenAI is None:
                 raise RuntimeError("未安装 openai 库，请执行 pip install openai")
-            if not API_KEY:
-                raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
-            # : timeout 沿用 SDK 请求超时语义；当启用 stop_on_timeout 时每次请求按剩余时间窗口动态收敛。
-            client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
+            has_any_key = any(
+                bool(_route_for_model(m)["api_keys"])
+                for m in models
+                if m not in ANTIGRAVITY_MODEL_ALIASES
+            )
+            if not has_any_key:
+                raise ValueError("未配置 API 密钥，请检查配置项 local_api_key 或 local_api_key_list")
 
         # : 沿用所有普通请求异常均重试/降级的规则，包括鉴权失败和无有效文本响应。
         for model_index, current_model in enumerate(models):
             delay = 2.0
             has_fallback_model = model_index < len(models) - 1
-            for attempt in range(1, max_retries_per_model + 1):
+            is_ag_model = current_model in ANTIGRAVITY_MODEL_ALIASES
+            route = None if is_ag_model else _route_for_model(current_model)
+            route_keys = [] if is_ag_model else route["api_keys"]
+            max_attempts = max_retries_per_model
+            attempt = 0
+            while attempt < max_attempts:
+                attempt += 1
                 elapsed_so_far = time.perf_counter() - started
                 if stop_on_timeout and elapsed_so_far >= float(timeout):
                     result["timed_out"] = True
@@ -750,11 +1049,16 @@ def generate_content(
                     if stop_on_timeout
                     else float(timeout)
                 )
+                used_api_key = ""
+                key_label = ""
+                if not is_ag_model:
+                    used_api_key, key_label = _pick_api_key(route["pool_id"], route_keys)
+                key_tag = f" | 密钥槽: [{key_label}]" if len(route_keys) > 1 else ""
                 metrics["model_used"] = current_model
                 metrics["attempts"] += 1
                 _log(
-                    f"[模型网关/请求] 发起模型请求 | 模型: [{current_model}]"
-                    f" | 尝试: [{attempt}/{max_retries_per_model}] | 附件: [{len(paths)}]"
+                    f"[模型网关/请求] 发起模型请求 | 模型: [{current_model}]{key_tag}"
+                    f" | 尝试: [{attempt}/{max_attempts}] | 附件: [{len(paths)}]"
                     + (f" | 提示词预览: [{_preview(prompt)}]" if metrics["attempts"] == 1 else ""),
                 )
                 request_started = time.perf_counter()
@@ -764,8 +1068,9 @@ def generate_content(
                 usage_events.append(request_event)
                 skip_same_model = False
                 budget_exhausted = False
+                step_delay = delay
                 try:
-                    if current_model in ANTIGRAVITY_MODEL_ALIASES:
+                    if is_ag_model:
                         ag_slot_timeout = (
                             float(slot_acquire_timeout)
                             if (has_fallback_model and slot_acquire_timeout is not None)
@@ -781,7 +1086,10 @@ def generate_content(
                         status_code = 200
                         response_model_name = current_model
                     else:
-                        raw = client.chat.completions.with_raw_response.create(
+                        active_client = _get_cached_client(
+                            route["base_url"], used_api_key, route["proxy_url"]
+                        )
+                        raw = active_client.chat.completions.with_raw_response.create(
                             model=current_model,
                             messages=messages,
                             stream=False,
@@ -798,14 +1106,16 @@ def generate_content(
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
                     metrics["model_used"] = response_model_name
+                    if key_label and len(route_keys) > 1:
+                        metrics["key_slot"] = key_label
                     if isinstance(usage, dict) and usage.get("account_email"):
                         metrics["account_used"] = usage.get("account_email")
                     result["status"] = "✅ 成功"
                     result["content"] = reply.strip()
                     req_cost = time.perf_counter() - request_started
                     completion_log = (
-                        f"[模型网关/生成] 调用成功 | 模型: [{metrics['model_used']}]"
-                        f" | 尝试: [{attempt}/{max_retries_per_model} (累计:{metrics['attempts']})]"
+                        f"[模型网关/生成] 调用成功 | 模型: [{metrics['model_used']}]{key_tag}"
+                        f" | 尝试: [{attempt}/{max_attempts} (累计:{metrics['attempts']})]"
                         f" | 附件: [{len(paths)}] | Token: [{_format_usage_summary(usage)}]"
                         f" | 耗时: [{req_cost:.2f}s]"
                         f" | 响应预览: [{_preview(reply)}]"
@@ -833,39 +1143,57 @@ def generate_content(
                     if budget_exhausted:
                         result["timed_out"] = True
 
+                    cooled_key = False
+                    if used_api_key:
+                        cooled_key = _mark_key_cooldown(
+                            used_api_key,
+                            status_code=status_code,
+                            error_text=f"{type(exc).__name__}: {exc}",
+                        )
+                        if cooled_key and len(route_keys) > 1:
+                            max_attempts = max(max_attempts, min(len(route_keys), 8))
+                            step_delay = 0.2
+
                     if failed_account:
                         metrics["account_used"] = failed_account
                     acc_tag = (
                         f" | 账号: [{failed_account}" + (f"(Port:{failed_port})]" if failed_port else "]")
                         if failed_account
-                        else ""
+                        else key_tag
                     )
                     error = _redact(f"[尝试{metrics['attempts']}] model: {current_model}"
                                     + (f" | account: {failed_account}" if failed_account else "")
+                                    + (f" | {key_label}" if len(route_keys) > 1 else "")
                                     + f" | Error: {type(exc).__name__}: {exc}")
                     result["error_history"].append(error)
                     request_event["status"] = "❌ 准备失败" if is_slot_busy else "❌ 失败"
                     request_event["error"] = error
                     terminal = budget_exhausted or (
-                        (skip_same_model or attempt == max_retries_per_model) and not has_fallback_model
+                        (skip_same_model or attempt == max_attempts) and not has_fallback_model
                     )
                     if budget_exhausted:
                         action = f"已达 AI 超时阈值 ({float(timeout):g}s)，立即跳过本批不继续重试"
                     elif skip_same_model and has_fallback_model:
                         action = f"本地槽位繁忙，5s快速切换备用模型 {models[model_index + 1]}"
-                    elif attempt < max_retries_per_model:
-                        action = f"等待 {delay:g}s 后重试同模型" + ("(自动切换池中其他小号)" if failed_account else "")
+                    elif attempt < max_attempts:
+                        if cooled_key and len(route_keys) > 1:
+                            action = "当前密钥限流/不可用，立即自动切换池中下一个 API Key 重试"
+                        else:
+                            action = f"等待 {step_delay:g}s 后重试同模型" + (
+                                "(自动切换池中其他小号)" if failed_account
+                                else ("(轮换下一个 API Key)" if len(route_keys) > 1 else "")
+                            )
                     elif has_fallback_model:
                         action = f"切换备用模型 {models[model_index + 1]}"
                     else:
                         action = "所有候选模型尝试耗尽，返回失败结果"
                     hint = {
                         400: "请求格式或附件类型不被模型接受，请检查网关协议和附件支持",
-                        401: "密钥无效或过期，请检查 local_api_key",
+                        401: "密钥无效或过期，请检查 local_api_key / local_api_key_list",
                         403: "当前密钥无权访问此模型，请检查模型权限",
                         404: "模型名称或接口路由不存在，请检查模型名及 local_api_url",
                         429: "请求过于频繁或额度不足，请检查服务端限流与余额",
-                    }.get(status_code, "服务连接或上游模型账号池不可用，请检查网关状态")
+                    }.get(status_code, "服务连接或上游模型账号池不可用，请检查网关及 ai_proxy_url 状态")
                     req_cost = time.perf_counter() - request_started
                     if terminal:
                         completion_log = (
@@ -880,7 +1208,7 @@ def generate_content(
                     else:
                         completion_log = (
                             f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]{acc_tag}"
-                            f" | 尝试: [{attempt}/{max_retries_per_model} (累计:{metrics['attempts']})]"
+                            f" | 尝试: [{attempt}/{max_attempts} (累计:{metrics['attempts']})]"
                             f" | HTTP: [{status_code or 'N/A'}] | 耗时: [{req_cost:.2f}s]"
                             f" | 原因: [{_preview(f'{type(exc).__name__}: {exc}', 140)}]"
                             f" | 后续动作: [{action}]"
@@ -901,9 +1229,10 @@ def generate_content(
                     return result
                 if skip_same_model:
                     break
-                if attempt < max_retries_per_model:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 600.0)
+                if attempt < max_attempts:
+                    time.sleep(step_delay)
+                    if not (cooled_key and len(route_keys) > 1):
+                        delay = min(delay * 2, 600.0)
     except Exception as exc:
         error = _redact(f"[处理失败] {type(exc).__name__}: {exc}")
         result["error_history"].append(error)
@@ -917,9 +1246,10 @@ def generate_content(
              f" | 原因: [{error}] | 排查方向: [检查调用参数、附件文件路径/格式及网关配置]", logging.ERROR)
     finally:
         try:
-            cleanup_error = _close_client(client, f"generate_content / trace_id={trace_id}")
-            if cleanup_error:
-                result["error_history"].append(cleanup_error)
+            for c in owned_clients:
+                cleanup_error = _close_client(c, f"generate_content / trace_id={trace_id}")
+                if cleanup_error:
+                    result["error_history"].append(cleanup_error)
         finally:
             try:
                 _save_model_usage(usage_events)
@@ -949,14 +1279,17 @@ def probe_models(json_path):
         "details": [],
     }
     prompt = "你是谁，简单的介绍一下自己，能够画一只小狗或者生成小狗的视频吗，或者创作一首歌"
-    client = None
+    probe_clients = []
     available_models = []
     try:
-        if OpenAI is None:
-            raise RuntimeError("未安装 openai 库，请执行 pip install openai")
-        if not API_KEY:
-            raise ValueError("未配置 API 密钥，请检查环境变量或配置文件。")
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=15.0)
+        runtime = _resolve_ai_runtime()
+        api_key, _ = _pick_api_key(f"probe:{runtime['default_base_url']}", runtime["default_keys"])
+        client, http_cli = _create_openai_client(
+            runtime["default_base_url"], api_key, runtime["default_proxy_url"], 15.0
+        )
+        probe_clients.append(client)
+        if http_cli is not None:
+            probe_clients.append(http_cli)
         models_page = client.models.list()
         # : 沿用仅处理当前页 data 的规则，不自动翻页、去重或按模型能力筛选。
         available_models = sorted(model.id for model in models_page.data)
@@ -971,7 +1304,8 @@ def probe_models(json_path):
         _log(f"❌ [模型探测/列表] 获取失败，将保存空报告 | 原因: [{report['error']}]"
              " | 排查: [检查网关地址、密钥权限及模型列表接口支持]", logging.ERROR)
     finally:
-        _close_client(client, "probe_models / 模型列表")
+        for c in probe_clients:
+            _close_client(c, "probe_models / 模型列表")
 
     report["total_models"] = len(available_models)
     # : 沿用原提示词及非空文本判定；成功不代表支持图像/视频/歌曲生成，每模型仍使用 360 秒请求超时。

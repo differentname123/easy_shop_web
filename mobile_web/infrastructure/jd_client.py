@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """京东/折京客薄协议边界；支持多 ZTK_APPKEY_LIST 自动轮询与故障切换，与 scripts/test_jd_api.py 严格对齐。"""
 import json
+import threading
+import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
@@ -161,8 +163,35 @@ class JdClient:
         self.http = http_session if http_session is not None else requests.Session()
         self.timeout = timeout
 
+    _KEY_PACE_LOCK = threading.Lock()
+    _KEY_NEXT_ALLOWED_TS = {}
+    _MIN_KEY_DISPATCH_INTERVAL_SEC = 0.22
+
+    def _pace_real_http_by_key(self, kwargs):
+        """仅在真实未被打桩的 requests.Session 下按单 appkey 预约发包时间槽；锁内零 sleep、零网络 I/O，离线单元测试零等待。"""
+        if type(self.http) is not requests.Session:
+            return
+        get_fn = getattr(self.http, "get", None)
+        if not getattr(get_fn, "__module__", "").startswith("requests"):
+            return
+        params = kwargs.get("params")
+        appkey = str(params.get("appkey") or "") if isinstance(params, dict) else ""
+        if not appkey:
+            return
+        interval = float(self._MIN_KEY_DISPATCH_INTERVAL_SEC)
+        if interval <= 0:
+            return
+        with JdClient._KEY_PACE_LOCK:
+            now = time.monotonic()
+            scheduled = max(now, JdClient._KEY_NEXT_ALLOWED_TS.get(appkey, 0.0))
+            JdClient._KEY_NEXT_ALLOWED_TS[appkey] = scheduled + interval
+            wait_s = scheduled - now
+        if wait_s > 0:
+            time.sleep(wait_s)
+
     def _get(self, url, **kwargs):
         try:
+            self._pace_real_http_by_key(kwargs)
             response = self.http.get(url, timeout=self.timeout, allow_redirects=False, **kwargs)
             if 300 <= response.status_code < 400:
                 return _error("UNSAFE_REDIRECT", "京东接口重定向被拒绝")

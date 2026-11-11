@@ -81,10 +81,37 @@ systemctl status mobile_web.service
   tail -n 100 -f /root/easy_shop_web/mobile_web/runtime/logs/*.log
   ```
 
-* **无损自检（测试配置及 Mongo 连通性，不发外部真实网络请求）:**
+* **无损自检（测试配置、Mongo 连通性及云端 AI 识图连通性）:**
   ```bash
+  # 1. 检测本地 MongoDB 连通性
   /root/easy_shop_web/mobile_web/.venv/bin/python /root/easy_shop_web/mobile_web/run.py --check-mongo
+
+  # 2. 检测云端 AI 接口（Linux 下自动读取 cloud_ai：海外代理 + 多官方 API Key 轮询池）
+  /root/easy_shop_web/mobile_web/.venv/bin/python /root/easy_shop_web/mobile_web/run.py --check-ai
   ```
+
+🟣 **本地与云端共用同一份 `config.local.json` 的 AI 配置（按 Windows / Linux 自动切换）**
+无需维护两份配置文件，直接在本地 `mobile_web/config.local.json` 末尾一次性补上 `"cloud_ai"` 块即可，整份文件随时可直接上传覆盖云服务器：
+* **在 Windows 本地运行**：代码自动识别为 Windows，忽略 `cloud_ai`，照旧走 `local_api_url` (`127.0.0.1:8317`) 与本地预置模型组（在 Windows 上可用 `python run.py --check-ai --cloud` 提前测试云端配置）；
+* **在 Linux 云服务器运行**：代码自动识别为 Linux，自动启用 `cloud_ai`（跳过本地模型组，仅 AI 请求走 `proxy_url` 海外代理，拼多多/淘宝/京东仍 100% 国内直连）：
+```json
+  "local_api_url": "http://127.0.0.1:8317/v1",
+  "local_api_key": "你原有的本地网关Key保持不动",
+  "cloud_ai": {
+    "api_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "api_keys": [
+      "填入你的第1个官方API_Key",
+      "填入你的第2个官方API_Key"
+    ],
+    "proxy_url": "http://你的海外服务器IP:代理端口",
+    "models": [
+      "gemini-3.5-flash-lite",
+      "gemini-3-flash-preview",
+      "gemini-2.5-flash",
+      "gemini-3.1-flash-lite"
+    ]
+  }
+```
 
 🔵 **Nginx 配置修改与重载**
 ```bash
