@@ -345,3 +345,61 @@ def test_single_shared_config_auto_switches_between_windows_and_linux(tmp_path, 
         )
     ]
 
+
+def test_linux_missing_cloud_ai_fails_fast_with_clear_upload_hint(tmp_path, monkeypatch):
+    """Linux 云端若忘记同步上传 config.local.json（缺少 cloud_ai），应秒级快速失败并给出明确提示，不再去连 127.0.0.1:8317。"""
+    old_server_cfg = tmp_path / "old_server_config.local.json"
+    old_server_cfg.write_text(
+        json.dumps(
+            {
+                "local_api_url": "http://127.0.0.1:8317/v1",
+                "local_api_key": "sk-old-local",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WEB_CONFIG_FILE", str(old_server_cfg))
+    monkeypatch.delenv("AI_RUNTIME_MODE", raising=False)
+    monkeypatch.setattr(model_api, "_RUNTIME_OS_NAME", "posix")
+
+    res = model_api.generate_content(prompt='请仅回复 JSON: {"ok": true}', max_retries_per_model=2)
+    assert res["status"] == "❌ 失败"
+    assert res["metrics"]["attempts"] == 0
+    assert res["metrics"]["runtime_mode"] == "linux_cloud"
+    assert "缺少 cloud_ai 配置块" in res["content"]
+    assert "config.local.json 不会随 git 上传" in res["content"]
+
+
+def test_openai_v3_default_httpx_client_works_without_legacy_httpx(monkeypatch):
+    """兼容 openai>=3.x（仅安装 httpx2 / DefaultHttpxClient、未安装旧版 httpx）时的海外代理客户端构造。"""
+    captured = {}
+
+    def fake_default_httpx_client(**kwargs):
+        captured["http_kwargs"] = kwargs
+        return SimpleNamespace(close=lambda: None)
+
+    def fake_openai_ctor(**kwargs):
+        captured["openai_kwargs"] = kwargs
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(model_api, "httpx", None)
+    monkeypatch.setattr(model_api, "_INITIAL_HTTPX", None)
+    monkeypatch.setattr(model_api, "DefaultHttpxClient", fake_default_httpx_client)
+    monkeypatch.setattr(model_api, "OpenAI", fake_openai_ctor)
+    monkeypatch.setattr(model_api, "_INITIAL_OPENAI", fake_openai_ctor)
+
+    oa_cli, http_cli = model_api._create_openai_client(
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "AIzaSyTestKey",
+        "https://u:p@proxy.example.com:443",
+        20,
+    )
+    assert oa_cli is not None and http_cli is not None
+    assert captured["http_kwargs"] == {
+        "proxy": "https://u:p@proxy.example.com:443",
+        "timeout": 20,
+        "trust_env": False,
+    }
+    assert captured["openai_kwargs"]["http_client"] is http_cli
+
+

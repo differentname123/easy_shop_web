@@ -128,6 +128,17 @@ def _unit_priority_score(unit: str) -> int:
     return 1
 
 
+class _ForwardWarningToFileHandler(logging.Handler):
+    """将底层浏览器模块（publish_to_xianyu）的 WARNING/ERROR/EXCEPTION 日志同步写入主任务日志文件，共享单句柄避免 Windows 轮转锁冲突。"""
+
+    def __init__(self, target_fh: logging.Handler):
+        super().__init__(level=logging.WARNING)
+        self._target_fh = target_fh
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._target_fh.handle(record)
+
+
 def _setup_logger() -> logging.Logger:
     lg = logging.getLogger("xianyu_deal_discovery")
     if lg.handlers:
@@ -141,6 +152,10 @@ def _setup_logger() -> logging.Logger:
     fh.setFormatter(fmt)
     lg.addHandler(fh)
     lg.propagate = False
+
+    xy_lg = logging.getLogger("publish_to_xianyu")
+    if not any(isinstance(h, _ForwardWarningToFileHandler) for h in xy_lg.handlers):
+        xy_lg.addHandler(_ForwardWarningToFileHandler(fh))
     return lg
 
 
@@ -1209,11 +1224,16 @@ def compare_candidate_with_xianyu(
             user_data_dir=active_gdir,
             debug=debug_browser,
         )
+    if not search_res.get("ok"):
+        logger.error(
+            f"❌ [步骤2/闲鱼搜索异常失败] 分类=【{cat_name}】 | 搜索词=【{kw}】 | "
+            f"错误码={search_res.get('error_code')} | 目录={search_res.get('user_data_dir')} | 原因={search_res.get('message')}"
+        )
     raw_items = search_res.get("items") or []
     used_backup = False
 
-    # 情况 A：若主搜索词返回结果过少（< 6条），直接用备用搜索词扩召回
-    if len(raw_items) < 6 and backup_kw and backup_kw != kw:
+    # 情况 A：若未触发风控滑块且主搜索词返回结果过少（< 6条），直接用备用搜索词扩召回
+    if not search_res.get("is_risk_blocked") and len(raw_items) < 6 and backup_kw and backup_kw != kw:
         logger.info(f"🔄 [步骤2/搜索词扩召回] 分类=【{cat_name}】 | 主词【{kw}】仅返回 {len(raw_items)} 条，切换备用词【{backup_kw}】重搜...")
         with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
             retry_res = search_xianyu_items(
@@ -1223,13 +1243,20 @@ def compare_candidate_with_xianyu(
                 debug=debug_browser,
             )
         used_backup = True
-        if retry_res.get("ok") and len(retry_res.get("items") or []) > len(raw_items):
+        if not retry_res.get("ok"):
+            logger.error(
+                f"❌ [步骤2/备用词搜索异常失败] 分类=【{cat_name}】 | 备用词=【{backup_kw}】 | "
+                f"错误码={retry_res.get('error_code')} | 目录={retry_res.get('user_data_dir')} | 原因={retry_res.get('message')}"
+            )
+            if not search_res.get("ok"):
+                search_res = retry_res
+        elif not search_res.get("ok") or len(retry_res.get("items") or []) > len(raw_items):
             search_res = retry_res
-            raw_items = retry_res["items"]
+            raw_items = retry_res.get("items") or []
             kw = backup_kw
 
-    if not search_res.get("ok") or not raw_items:
-        logger.warning(f"⚠️ [步骤2/闲鱼搜索为空] 分类=【{cat_name}】 | 搜索词=【{kw}】 | msg={search_res.get('message')}")
+    if not search_res.get("ok"):
+        err_msg = f"[闲鱼搜索异常:{search_res.get('error_code') or 'UNKNOWN'}] {search_res.get('message') or '未知检索异常'}"
         return _build_final_record(
             candidate=candidate,
             used_keyword=kw,
@@ -1240,7 +1267,26 @@ def compare_candidate_with_xianyu(
             xianyu_items_for_llm=[],
             llm_data={},
             llm_call_meta={},
-            fallback_error="no_xianyu_search_results",
+            fallback_error=err_msg,
+            browser_aborted=True,
+            debug_browser=debug_browser,
+        )
+
+    if not raw_items:
+        logger.info(f"⚪ [步骤2/闲鱼搜索无结果] 分类=【{cat_name}】 | 搜索词=【{kw}】 | 闲鱼返回 0 条商品")
+        return _build_final_record(
+            candidate=candidate,
+            used_keyword=kw,
+            search_res=search_res,
+            coarse_items_for_llm=[],
+            step2_comparable_ids=[],
+            step2_llm_meta={},
+            xianyu_items_for_llm=[],
+            llm_data={},
+            llm_call_meta={},
+            fallback_error="闲鱼搜索正常返回 0 条商品",
+            browser_aborted=False,
+            debug_browser=debug_browser,
         )
 
     coarse_items_for_llm, raw_card_map, valid_coarse_ids = _prepare_coarse_items_for_llm(raw_items)
@@ -1263,6 +1309,11 @@ def compare_candidate_with_xianyu(
                 max_items=max_search_items,
                 user_data_dir=active_gdir,
                 debug=debug_browser,
+            )
+        if not retry_res.get("ok"):
+            logger.error(
+                f"❌ [步骤2/初筛0同款后备用词重搜异常失败] 分类=【{cat_name}】 | 备用词=【{backup_kw}】 | "
+                f"错误码={retry_res.get('error_code')} | 目录={retry_res.get('user_data_dir')} | 原因={retry_res.get('message')}"
             )
         retry_items = retry_res.get("items") or []
         if retry_res.get("ok") and retry_items:
@@ -1297,9 +1348,11 @@ def compare_candidate_with_xianyu(
             },
             llm_call_meta=step2_llm_meta,
             fallback_error="",
+            browser_aborted=False,
+            debug_browser=debug_browser,
         )
 
-    # 步骤 3：仅对第 2 个 AI 筛出的同款可比商品（默认最多取前 10 个）在单次浏览器会话内批量拉取详情、SKU 价格与运费
+    # 步骤 3：仅对第 2 个 AI 筛出的同款可比商品（默认最多取前 20 个）在单次浏览器会话内批量拉取详情、SKU 价格与运费
     ids_to_fetch = step2_comp_ids[:max_detail_checks] if max_detail_checks > 0 else step2_comp_ids
     logger.info(
         f"📦 [步骤3/批量拉取闲鱼同款详情] 分类=【{cat_name}】 | AI初筛同款={len(step2_comp_ids)}款 -> "
@@ -1313,15 +1366,29 @@ def compare_candidate_with_xianyu(
             debug=debug_browser,
         )
     details_by_id = batch_det_res.get("details_by_id") or {}
+    if not batch_det_res.get("ok"):
+        logger.error(
+            f"❌ [步骤3/批量详情会话异常中断] 分类=【{cat_name}】 | 错误码={batch_det_res.get('error_code')} | "
+            f"目录={batch_det_res.get('user_data_dir')} | 已完成={len(details_by_id)}/{len(ids_to_fetch)} | "
+            f"原因={batch_det_res.get('message')}"
+        )
 
     detailed_items_for_llm: List[Dict[str, Any]] = []
     valid_detailed_ids: Set[str] = set()
+    detail_failed_count = 0
+    first_detail_err_msg = ""
     for idx, iid in enumerate(ids_to_fetch, 1):
         det = details_by_id.get(iid) or {}
         raw_card = raw_card_map.get(iid) or {}
         if not det.get("ok"):
+            detail_failed_count += 1
+            item_err_code = det.get("error_code") or batch_det_res.get("error_code") or "UNKNOWN"
+            item_err_msg = det.get("message") or batch_det_res.get("message") or "批量会话提前中断未拉取"
+            if not first_detail_err_msg:
+                first_detail_err_msg = f"[{item_err_code}] {item_err_msg}"
             logger.warning(
-                f"⚠️ [步骤3/详情拉取失败剔除] ({idx}/{len(ids_to_fetch)}) item_id={iid} | msg={det.get('message')}"
+                f"⚠️ [步骤3/详情拉取失败剔除] ({idx}/{len(ids_to_fetch)}) 分类=【{cat_name}】 | item_id={iid} | "
+                f"错误码={item_err_code} | 原因={item_err_msg}"
             )
             continue
 
@@ -1362,7 +1429,16 @@ def compare_candidate_with_xianyu(
         )
 
     if not detailed_items_for_llm:
-        logger.warning(f"⚠️ [步骤3/同款详情全部拉取失败] 分类=【{cat_name}】 | 初筛IDs={ids_to_fetch}")
+        is_session_abort = not bool(batch_det_res.get("ok", True))
+        logger.error(
+            f"❌ [步骤3/同款详情全部拉取失败] 分类=【{cat_name}】 | 初筛IDs={ids_to_fetch} | "
+            f"会话中断={is_session_abort} | 首条失败原因={first_detail_err_msg}"
+        )
+        fail_reason_text = (
+            f"[批量详情检索异常中断] {first_detail_err_msg}"
+            if is_session_abort
+            else f"初筛同款商品({len(ids_to_fetch)}款)详情拉取均未拿到有效数据（如已下架/售出），首条诊断：{first_detail_err_msg}"
+        )
         return _build_final_record(
             candidate=candidate,
             used_keyword=kw,
@@ -1376,10 +1452,14 @@ def compare_candidate_with_xianyu(
                 "comparable_item_ids": [],
                 "best_xianyu_item_id": "",
                 "llm_winner": "no_comparable",
-                "llm_reason": "初筛同款商品详情拉取均失败，缺少邮费与具体规格信息，不予比价",
+                "llm_reason": fail_reason_text,
             },
             llm_call_meta={},
             fallback_error="all_detail_fetches_failed",
+            batch_det_res=batch_det_res,
+            detail_failed_count=detail_failed_count,
+            browser_aborted=is_session_abort,
+            debug_browser=debug_browser,
         )
 
     # 调用【第 3 个 AI】基于完整详情、SKU 价格与运费进行终审精准比价

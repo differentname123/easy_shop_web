@@ -30,14 +30,24 @@ if str(_CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(_CURRENT_DIR))
 
 try:
-    from openai import OpenAI
+    from openai import DefaultHttpxClient, OpenAI
 except ImportError:
-    OpenAI = None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        OpenAI = None
+    DefaultHttpxClient = None
 
 try:
     import httpx
 except ImportError:
-    httpx = None
+    try:
+        import httpx2 as httpx
+    except ImportError:
+        httpx = None
+
+_INITIAL_OPENAI = OpenAI
+_INITIAL_HTTPX = httpx
 
 try:
     from .antigravity_client import (
@@ -304,6 +314,16 @@ def _resolve_ai_runtime(force_cloud=False, require_keys_on_cloud_block=False):
         raw_providers, local_base_url, proxy_url, local_key_list, all_secrets
     )
     configured_models = raw_models if raw_models not in (None, "", []) else (provider_models or None)
+    if (
+        is_cloud_os
+        and not monkeypatched
+        and require_keys_on_cloud_block
+        and configured_models is None
+    ):
+        raise ValueError(
+            "检测到 Linux 云服务器环境，但当前 config.local.json 中缺少 cloud_ai 配置块"
+            "（config.local.json 不会随 git 上传，请将本地最新的 mobile_web/config.local.json 上传覆盖到服务器）"
+        )
     return {
         "runtime_mode": "linux_cloud" if is_cloud_os else "windows_local",
         "default_base_url": local_base_url,
@@ -507,8 +527,8 @@ _http_filter = _HttpLogsFilter()
 
 
 def _suppress_noisy_http_logs():
-    """屏蔽 httpx / httpcore / openai / urllib3 输出的 HTTP Request: POST ... "HTTP/1.1 200 OK" 噪音日志。"""
-    for noisy_name in ("httpx", "httpx2", "httpcore", "openai", "urllib3"):
+    """屏蔽 httpx / httpx2 / httpcore / openai / urllib3 输出的 HTTP Request 噪音日志。"""
+    for noisy_name in ("httpx", "httpx2", "httpcore", "httpcore2", "openai", "urllib3"):
         lg = logging.getLogger(noisy_name)
         lg.setLevel(logging.WARNING)
         if _http_filter not in lg.filters:
@@ -901,15 +921,20 @@ def _save_model_usage(events):
 
 
 def _create_openai_client(base_url, api_key, proxy_url, timeout):
-    """创建隔离的 OpenAI SDK 客户端；配置 ai_proxy_url 时挂载专属 httpx.Client，不影响全局网络环境。"""
+    """创建隔离的 OpenAI SDK 客户端；配置海外代理时优先使用与当前 openai SDK 版本匹配的 DefaultHttpxClient（兼容 httpx 与 httpx2）。"""
     if OpenAI is None:
         raise RuntimeError("未安装 openai 库，请执行 pip install openai")
     if not api_key:
-        raise ValueError("未配置 API 密钥，请检查配置项 local_api_key 或 local_api_key_list")
+        raise ValueError("未配置 API 密钥，请检查配置项 local_api_key 或 cloud_ai.api_keys")
     if proxy_url:
-        if httpx is None:
-            raise RuntimeError("未安装 httpx 库，无法配置 ai_proxy_url")
-        http_cli = httpx.Client(proxy=proxy_url, timeout=timeout, trust_env=False)
+        if httpx is not _INITIAL_HTTPX and httpx is not None:
+            http_cli = httpx.Client(proxy=proxy_url, timeout=timeout, trust_env=False)
+        elif DefaultHttpxClient is not None and OpenAI is _INITIAL_OPENAI:
+            http_cli = DefaultHttpxClient(proxy=proxy_url, timeout=timeout, trust_env=False)
+        elif httpx is not None:
+            http_cli = httpx.Client(proxy=proxy_url, timeout=timeout, trust_env=False)
+        else:
+            raise RuntimeError("未安装 httpx / httpx2 库，无法配置海外代理 proxy_url")
         try:
             oa_cli = OpenAI(
                 base_url=base_url,
@@ -968,6 +993,7 @@ def generate_content(
     try:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt 必须是非空字符串")
+        metrics["runtime_mode"] = "linux_cloud" if _is_linux_cloud_runtime(force_cloud=force_cloud) else "windows_local"
         runtime = _resolve_ai_runtime(
             force_cloud=force_cloud,
             require_keys_on_cloud_block=(model is None),

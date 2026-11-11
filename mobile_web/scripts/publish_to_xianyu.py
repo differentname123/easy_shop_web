@@ -285,6 +285,14 @@ def clean_browser_cache(user_data_dir: str = DEFAULT_USER_DATA_DIR) -> None:
     logger.info(f"[环境/缓存清理] 目录=<{user_data_dir}> | 清理缓存目录数={deleted_count}")
 
 
+DEFAULT_DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/134.0.0.0 Safari/537.36"
+)
+DEFAULT_HEADLESS_VIEWPORT = {"width": 1440, "height": 900}
+
+
 def launch_persistent_context(
     p,
     user_data_dir: str = DEFAULT_USER_DATA_DIR,
@@ -293,21 +301,26 @@ def launch_persistent_context(
     headless: bool = False,
     offscreen: bool = False,
 ):
-    """启动挂载独立浏览器目录的持久化 Chrome 上下文。"""
+    """启动挂载独立浏览器目录的持久化 Chrome 上下文（无头模式下自动伪装标准桌面 UA 与分辨率，防止 HeadlessChrome 标识被拦截）。"""
     os.makedirs(user_data_dir, exist_ok=True)
     default_args = list(args or ["--disable-blink-features=AutomationControlled"])
-    if offscreen:
-        default_args.append("--window-position=-2000,0")
-    else:
-        default_args.extend(["--start-maximized", "--window-position=0,0"])
 
     kwargs: Dict[str, Any] = {
         "channel": "chrome",
         "user_data_dir": user_data_dir,
         "headless": headless,
         "args": default_args,
-        "no_viewport": True,
     }
+    if headless:
+        kwargs["viewport"] = dict(DEFAULT_HEADLESS_VIEWPORT)
+        kwargs["user_agent"] = DEFAULT_DESKTOP_USER_AGENT
+    else:
+        if offscreen:
+            default_args.append("--window-position=-2000,0")
+        else:
+            default_args.extend(["--start-maximized", "--window-position=0,0"])
+        kwargs["no_viewport"] = True
+
     if hide_automation:
         kwargs["ignore_default_args"] = ["--enable-automation"]
 
@@ -493,6 +506,87 @@ def _collect_page_error_tips(page) -> str:
         return ""
 
 
+def _collect_browser_failure_diag(
+    context: Any,
+    page: Any,
+    auth_tracker: Dict[str, Any],
+    *,
+    headless: bool = True,
+) -> Dict[str, Any]:
+    """在无头/有头浏览器请求未拿到预期数据包时，收集完整现场诊断信息以便日志快速定位原因。"""
+    cur_url = ""
+    page_title = ""
+    has_m_h5_tk = False
+    has_login_frame = False
+    has_punish_frame = False
+    body_hint = ""
+
+    try:
+        cur_url = str(page.url or "")
+    except Exception:
+        pass
+    try:
+        page_title = str(page.title() or "").strip()[:50]
+    except Exception:
+        pass
+    try:
+        cookies = {c["name"]: c["value"] for c in context.cookies() if c.get("name")}
+        has_m_h5_tk = bool(cookies.get("_m_h5_tk"))
+    except Exception:
+        pass
+    try:
+        for f in page.frames:
+            furl = str(f.url or "")
+            if "mini_login" in furl or "login.taobao.com" in furl:
+                has_login_frame = True
+            if ("punish" in furl or "baxia" in furl or "sec.taobao.com" in furl) and "mini_login" not in furl:
+                has_punish_frame = True
+    except Exception:
+        pass
+    try:
+        body_hint = page.evaluate(
+            """() => {
+            const raw = (document.body && document.body.innerText) ? document.body.innerText : '';
+            const clean = raw.replace(/\\s+/g, ' ').trim();
+            const kws = ['卖掉了', '下架', '不存在', '删除', '违规', '被挤爆', '验证', '滑块', '没有找到', '异常', '登录'];
+            for (const kw of kws) {
+                const idx = clean.indexOf(kw);
+                if (idx >= 0) {
+                    return clean.slice(Math.max(0, idx - 12), idx + 36);
+                }
+            }
+            return clean.slice(0, 60);
+        }"""
+        )
+    except Exception:
+        pass
+
+    tips = _collect_page_error_tips(page)
+    return {
+        "mode": "headless" if headless else "headed",
+        "url": cur_url,
+        "title": page_title,
+        "has_m_h5_tk": has_m_h5_tk,
+        "has_login_frame": has_login_frame,
+        "has_punish_frame": has_punish_frame,
+        "page_tips": tips or str(body_hint or "").strip(),
+        "failed_apis": list(auth_tracker.get("failed_apis") or [])[-5:],
+        "risk_rets": list(auth_tracker.get("risk_rets") or []),
+    }
+
+
+def _format_diag_brief(diag: Dict[str, Any]) -> str:
+    """将浏览器失败现场诊断字典格式化为单行高可读摘要，方便日志一眼定位原因。"""
+    tips = str(diag.get("page_tips") or "无明显提示")[:80]
+    apis = diag.get("failed_apis") or []
+    return (
+        f"模式={diag.get('mode')} | 令牌_m_h5_tk={'已获取' if diag.get('has_m_h5_tk') else '缺失'} | "
+        f"滑块框={diag.get('has_punish_frame')} | 登录框={diag.get('has_login_frame')} | "
+        f"URL={diag.get('url') or '-'} | 页面标题={diag.get('title') or '-'} | "
+        f"页面提示=[{tips}] | 失败MTOP={apis if apis else '无'}"
+    )
+
+
 @contextmanager
 def _browser_session_guard(
     user_data_dir: str = DEFAULT_USER_DATA_DIR,
@@ -505,11 +599,13 @@ def _browser_session_guard(
     """
     统一浏览器自动化执行上下文：
     - 自动获取「跨线程 + 跨进程」串行锁（最长等待 `lock_timeout_sec` 秒）；
+    - 默认（`debug=False`）以真无头模式（`headless=True`）静默运行，不弹任何浏览器窗口；`debug=True` 时打开可见窗口；
     - 启动持久化 Chrome 上下文并设置全局最大操作超时（`operation_timeout_sec` 秒），防止页面卡死；
     - 挂载 MTOP 登录态与错误监听器；
     - 退出时确保关闭浏览器并释放串行锁。
     """
     op_timeout_ms = int(max(10.0, float(operation_timeout_sec or DEFAULT_OPERATION_TIMEOUT_SEC)) * 1000)
+    use_headless = not bool(debug)
     with _acquire_serial_browser_lock(
         user_data_dir=user_data_dir,
         task_name=task_name,
@@ -521,8 +617,8 @@ def _browser_session_guard(
                 context = launch_persistent_context(
                     p,
                     user_data_dir=user_data_dir,
-                    headless=False,
-                    offscreen=not debug,
+                    headless=use_headless,
+                    offscreen=False,
                 )
                 context.set_default_timeout(op_timeout_ms)
                 context.set_default_navigation_timeout(op_timeout_ms)
@@ -2179,10 +2275,12 @@ def search_xianyu_items(
             _verify_guest_no_risk_block(active_page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
 
             if success_packet is None:
+                diag = _collect_browser_failure_diag(context, active_page, auth_tracker, headless=not debug)
+                diag_str = _format_diag_brief(diag)
                 elapsed = time.monotonic() - t0
-                logger.warning(
-                    f"⚠️ [免登录搜索/未捕获有效数据包] 目录={tag} | 关键字=【{kw_clean}】 | "
-                    f"已捕获包数={len(search_packets)} | 失败接口={auth_tracker.get('failed_apis')} | 耗时={elapsed:.2f}s"
+                logger.error(
+                    f"❌ [免登录搜索/未捕获有效数据包] 目录={tag} | 关键字=【{kw_clean}】 | "
+                    f"已捕获包数={len(search_packets)} | 耗时={elapsed:.2f}s | 现场诊断=({diag_str})"
                 )
                 return {
                     "ok": False,
@@ -2194,7 +2292,8 @@ def search_xianyu_items(
                     "keyword": kw_clean,
                     "total_count": 0,
                     "items": [],
-                    "message": f"未捕获到关键字【{kw_clean}】的有效闲鱼搜索数据包",
+                    "diagnostics": diag,
+                    "message": f"未捕获到关键字【{kw_clean}】的有效闲鱼搜索数据包 ({diag_str})",
                 }
 
             raw_list = (success_packet.get("data") or {}).get("resultList") or []
@@ -2235,6 +2334,25 @@ def search_xianyu_items(
         return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="search_xianyu_items")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="search_xianyu_items")
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        mode_label = "headless" if not debug else "headed"
+        logger.exception(
+            f"❌ [免登录搜索/浏览器运行异常] 模式={mode_label} | 目录={tag} (<{user_data_dir}>) | "
+            f"关键字=【{kw_clean}】 | 耗时={elapsed:.2f}s | 异常={type(exc).__name__}: {exc}"
+        )
+        return {
+            "ok": False,
+            "is_offline": False,
+            "is_risk_blocked": False,
+            "action": "search_xianyu_items",
+            "error_code": "BROWSER_EXCEPTION",
+            "user_data_dir": user_data_dir,
+            "keyword": kw_clean,
+            "total_count": 0,
+            "items": [],
+            "message": f"浏览器执行搜索异常 ({type(exc).__name__}: {exc})",
+        }
 
 
 def get_xianyu_item_detail(
@@ -2328,10 +2446,12 @@ def get_xianyu_item_detail(
                     _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name="get_xianyu_item_detail")
 
             if success_packet is None:
+                diag = _collect_browser_failure_diag(context, page, auth_tracker, headless=not debug)
+                diag_str = _format_diag_brief(diag)
                 elapsed = time.monotonic() - t0
                 logger.warning(
                     f"⚠️ [免登录详情/未捕获有效数据包] 目录={tag} | 商品ID={item_id} | "
-                    f"已捕获包数={len(detail_packets)} | 失败接口={auth_tracker.get('failed_apis')} | 耗时={elapsed:.2f}s"
+                    f"已捕获包数={len(detail_packets)} | 耗时={elapsed:.2f}s | 现场诊断=({diag_str})"
                 )
                 return {
                     "ok": False,
@@ -2342,7 +2462,8 @@ def get_xianyu_item_detail(
                     "user_data_dir": user_data_dir,
                     "item_id": item_id,
                     "item_url": detail_url,
-                    "message": f"未捕获到商品 ({item_id}) 的有效详情数据包",
+                    "diagnostics": diag,
+                    "message": f"未捕获到商品 ({item_id}) 的有效详情数据包 ({diag_str})",
                 }
 
             parsed_detail = _parse_detail_packet_to_dict(
@@ -2363,6 +2484,24 @@ def get_xianyu_item_detail(
         return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="get_xianyu_item_detail")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="get_xianyu_item_detail")
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        mode_label = "headless" if not debug else "headed"
+        logger.exception(
+            f"❌ [免登录详情/浏览器运行异常] 模式={mode_label} | 目录={tag} (<{user_data_dir}>) | "
+            f"商品ID={item_id} | 耗时={elapsed:.2f}s | 异常={type(exc).__name__}: {exc}"
+        )
+        return {
+            "ok": False,
+            "is_offline": False,
+            "is_risk_blocked": False,
+            "action": "get_xianyu_item_detail",
+            "error_code": "BROWSER_EXCEPTION",
+            "user_data_dir": user_data_dir,
+            "item_id": item_id,
+            "item_url": detail_url,
+            "message": f"浏览器获取详情异常 ({type(exc).__name__}: {exc})",
+        }
 
 
 def _parse_detail_packet_to_dict(
@@ -2529,6 +2668,7 @@ def get_xianyu_item_details_batch(
                 t_item = time.monotonic()
                 detail_url = f"{GOOFISH_HOME_URL}/item?id={item_id}"
                 success_packet: Optional[Dict[str, Any]] = None
+                auth_tracker["failed_apis"].clear()
 
                 for attempt in range(2):
                     detail_packets.clear()
@@ -2569,6 +2709,12 @@ def get_xianyu_item_details_batch(
                         f"SKU数={len(parsed_detail['sku_list'])} | 耗时={time.monotonic() - t_item:.2f}s"
                     )
                 else:
+                    diag = _collect_browser_failure_diag(context, page, auth_tracker, headless=not debug)
+                    diag_str = _format_diag_brief(diag)
+                    logger.warning(
+                        f"⚠️ [免登录批量详情/{idx + 1}/{len(clean_ids)}/失败] 目录={tag} | 商品ID={item_id} | "
+                        f"已捕获包数={len(detail_packets)} | 耗时={time.monotonic() - t_item:.2f}s | 现场诊断=({diag_str})"
+                    )
                     details_by_id[item_id] = {
                         "ok": False,
                         "is_offline": False,
@@ -2578,14 +2724,17 @@ def get_xianyu_item_details_batch(
                         "user_data_dir": user_data_dir,
                         "item_id": item_id,
                         "item_url": detail_url,
-                        "message": f"未捕获到商品 ({item_id}) 的有效详情数据包",
+                        "diagnostics": diag,
+                        "message": f"未捕获到商品 ({item_id}) 的有效详情数据包 ({diag_str})",
                     }
 
                 if idx < len(clean_ids) - 1:
                     page.wait_for_timeout(350)
 
+            ok_cnt = sum(1 for v in details_by_id.values() if v.get("ok"))
+            fail_cnt = len(clean_ids) - ok_cnt
             logger.info(
-                f"[免登录批量详情/完成] 📊 目录={tag} | 成功={sum(1 for v in details_by_id.values() if v.get('ok'))}/{len(clean_ids)} | "
+                f"[免登录批量详情/完成] 📊 目录={tag} | 成功={ok_cnt}/{len(clean_ids)} (失败={fail_cnt}) | "
                 f"总耗时={time.monotonic() - t0:.2f}s"
             )
             return {
@@ -2604,6 +2753,23 @@ def get_xianyu_item_details_batch(
         res = _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="get_xianyu_item_details_batch")
         res["details_by_id"] = details_by_id
         return res
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        mode_label = "headless" if not debug else "headed"
+        logger.exception(
+            f"❌ [免登录批量详情/浏览器运行异常] 模式={mode_label} | 目录={tag} (<{user_data_dir}>) | "
+            f"已完成={len(details_by_id)}/{len(clean_ids)} | 耗时={elapsed:.2f}s | 异常={type(exc).__name__}: {exc}"
+        )
+        return {
+            "ok": False,
+            "is_offline": False,
+            "is_risk_blocked": False,
+            "action": "get_xianyu_item_details_batch",
+            "error_code": "BROWSER_EXCEPTION",
+            "user_data_dir": user_data_dir,
+            "details_by_id": details_by_id,
+            "message": f"批量拉取详情浏览器异常 ({type(exc).__name__}: {exc})",
+        }
 
 
 
