@@ -292,7 +292,7 @@
 
       const myGroupStatusText = item => {
         if (!item) return '';
-        if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
+        if (item.remaining_seconds <= 0) {
           return '⚪ 已到期失效';
         }
         if (item.group_status === 'pending_confirm') {
@@ -303,6 +303,9 @@
         }
         if (item.group_status === 'full' || item.remain_people <= 0) {
           return '🎉 已拼满下架';
+        }
+        if (item.group_status === 'expired') {
+          return '⚪ 已下架（可恢复）';
         }
         return '⚪ 已到期失效';
       };
@@ -926,7 +929,7 @@
 
       const quickMyGroupRelist = async item => {
         if (!item || !item.group_order_id) return;
-        if (item.group_status === 'expired' || item.remaining_seconds <= 0) {
+        if (item.remaining_seconds <= 0) {
           showToast('该拼团已超过24小时有效期失效，无法重新上架');
           refreshMyGroups(false, false);
           return;

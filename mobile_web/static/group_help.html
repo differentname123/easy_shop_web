@@ -177,7 +177,7 @@
                   已满下架
                 </button>
                 <button
-                  v-else-if="item.group_status === 'full' && item.remaining_seconds > 0"
+                  v-else-if="(item.group_status === 'full' || item.group_status === 'expired') && item.remaining_seconds > 0"
                   class="gh-mini-outline-btn"
                   @click="quickMyGroupRelist(item)"
                 >
@@ -340,25 +340,25 @@
           </div>
         </div>
 
-        <!-- 次级操作 A1：当拼团已超过24小时有效期或已标记失效时，不可再上架或下架 -->
+        <!-- 次级操作 A1：当拼团已超过24小时物理有效期时，不可再上架或下架 -->
         <div
           class="gh-cocreate-box"
-          v-if="selectedGroup.remaining_seconds <= 0 || selectedGroup.group_status === 'expired'"
+          v-if="selectedGroup.remaining_seconds <= 0"
         >
           <div class="gh-cocreate-header" style="margin-bottom:0">
             <span class="gh-cocreate-label" style="color:#8c8c8c">
-              ⚪ 该拼团已超过有效期或已失效（拼多多拼团仅24小时有效），无法继续参团或重新上架。
+              ⚪ 该拼团已超过24小时有效期，无法继续参团或重新上架。
             </span>
           </div>
         </div>
 
-        <!-- 次级操作 A2：仍在有效期内但被标记已拼满时，允许误操作恢复 -->
+        <!-- 次级操作 A2：仍在有效期内但被标记已拼满或已失效时，允许误操作恢复 -->
         <div
           class="gh-cocreate-box"
           v-else-if="selectedGroup.group_status !== 'active' || selectedGroup.remain_people <= 0"
         >
           <div class="gh-cocreate-header">
-            <span class="gh-cocreate-label">该拼团已标记拼满下架（仍在有效期内），如实际未满可恢复：</span>
+            <span class="gh-cocreate-label">该拼团已标记下架（仍在24小时有效期内），如实际未满可恢复上架：</span>
           </div>
           <div class="gh-feedback-grid" style="grid-template-columns: repeat(2, 1fr);">
             <button

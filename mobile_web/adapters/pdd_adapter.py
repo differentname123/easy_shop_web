@@ -415,7 +415,7 @@ class PddAdapter(BasePlatformAdapter):
             return {
                 "status": "error",
                 "error_code": "UNRESOLVED_PDD_INPUT",
-                "error_msg": "未能从输入内容中解析出拼多多商品链接或 goods_sign，请粘贴拼多多分享链接或推广短链",
+                "error_msg": "未能识别出拼多多商品链接，请粘贴拼多多分享短链或长链；若只有商品名称请前往「首页」搜索",
             }
 
         # 3. 若已有 goods_sign，优先直查商品详情

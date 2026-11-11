@@ -1936,4 +1936,62 @@ test('desktop icon tags, manifest and add-to-home-screen guide work without logi
   browser3.dispose();
 });
 
+test('concept unification: activeBoomKeyword reactivity, first-screen universal convert, clean order sync query and group_help reversible expiry', async () => {
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
+  const groupHelpJs = fs.readFileSync(path.join(root, 'static', 'js', 'group_help.js'), 'utf8');
+  const appJs = fs.readFileSync(path.join(root, 'static', 'js', 'app.js'), 'utf8');
+
+  // 1. 实时爆品排序栏仅在 activeBoomKeyword 激活时渲染，并提供一键返回全部爆品
+  assert.ok(indexHtml.includes('v-if="activeBoomKeyword"'), 'boom sort bar renders conditionally on activeBoomKeyword');
+  assert.ok(indexHtml.includes('@click="clearBoomSearch"'), 'boom sort bar provides clearBoomSearch back button');
+
+  const h = harness(), feed = h.makeFeeds();
+  assert.equal(feed.activeBoomKeyword.value, '');
+  feed.boomSearchKeyword.value = '牛奶';
+  const searchP = feed.onSearchBoom();
+  assert.equal(feed.activeBoomKeyword.value, '牛奶');
+  await h.finish(0, goodsResponse('milk-1', false));
+  await searchP;
+  const clearP = feed.clearBoomSearch();
+  assert.equal(feed.activeBoomKeyword.value, '');
+  await h.finish(1, goodsResponse('boom-1', false));
+  await clearP;
+
+  // 2. 「我的」页面万能查券卡片位于注册/统计卡片之前，确保首屏直达
+  assert.ok(
+    indexHtml.indexOf('class="universal-convert-card"') < indexHtml.indexOf('class="auth-reg-card"'),
+    'universal-convert-card appears before auth-reg-card on My tab'
+  );
+
+  // 3. 万能查券错误仅在卡片内联展示，不重复触发顶部 Toast；订单同步不携带冗余 force 参数
+  const hAcc = harness({ saved: { easy_shop_token: 'tok_clean' } });
+  const account = hAcc.makeAccount();
+  hAcc.session.saveUser(user('u_clean', 'tok_clean'));
+  account.isLoggedIn.value = true;
+  account.uid.value = 'u_clean';
+  account.universalInput.value = '一段无法识别的纯文本标题';
+  const convP = account.handleUniversalConvert();
+  const toastsBeforeFail = hAcc.toasts.length;
+  await hAcc.finish(0, { detail: '未能识别出拼多多商品链接' }, { status: 400 });
+  await convP;
+  assert.equal(account.universalError.value, '未能识别出拼多多商品链接');
+  assert.equal(hAcc.toasts.length, toastsBeforeFail, 'universalError does not duplicate showToast');
+
+  const orderP = account.syncAndQueryOrders(false);
+  const orderUrl = new URL(hAcc.requests[1].url, 'https://shop.test');
+  assert.equal(orderUrl.searchParams.has('force'), false, 'orders query omits dead force parameter');
+  await hAcc.finish(1, { status: 'success', sync_status: 'idle', data: [] });
+  await orderP;
+
+  // 4. 拼团互助：24h 内被误标 expired 的团允许重新上架，物理到期 (remaining_seconds <= 0) 才彻底锁定
+  assert.ok(
+    groupHelpHtml.includes("(item.group_status === 'full' || item.group_status === 'expired') && item.remaining_seconds > 0"),
+    'group_help.html allows relisting expired groups while remaining_seconds > 0'
+  );
+  assert.ok(groupHelpJs.includes('⚪ 已下架（可恢复）'), 'group_help.js distinguishes reversible crowd-marked expiry');
+  assert.ok(appJs.includes('global.history.replaceState'), 'app.js syncs currentTab to URL via history.replaceState');
+});
+
+
 

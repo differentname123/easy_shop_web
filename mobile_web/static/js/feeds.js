@@ -32,12 +32,13 @@
     const boomPlatforms = ref([{ code: 'all', name: '全部', active: true }]);
     const boomPlatform = ref('all');
     const boomSearchKeyword = ref('');
+    const activeBoomKeyword = ref('');
     const boomSortBy = ref('latest');
     const boomGoodsList = ref([]);
     const boomLoading = ref(false);
     const boomHasMore = ref(true);
     const boomError = ref(false);
-    let activeBoomKeyword = '', boomPage = 1, boomGeneration = 0;
+    let boomPage = 1, boomGeneration = 0;
     const loadPlatforms = async () => {
       if (disposed) return false;
       const generation = ++platformGeneration;
@@ -229,13 +230,14 @@
       channelCache.clear(); homeGoodsList.value = []; boomGoodsList.value = [];
       homeLoading.value = false; boomLoading.value = false; boomError.value = false;
       homeSearchKeyword.value = ''; activeHomeKeyword.value = '';
+      boomSearchKeyword.value = ''; activeBoomKeyword.value = '';
       return initialize(new URLSearchParams(global.location.search));
     };
     const saveBoomState = () => {
       if (disposed) return;
       try {
         global.sessionStorage.setItem(key('boom_return_state', 'all'), JSON.stringify({
-          scope: getScope(), platform: boomPlatform.value, keyword: activeBoomKeyword,
+          scope: getScope(), platform: boomPlatform.value, keyword: activeBoomKeyword.value,
           sortBy: boomSortBy.value, list: [...boomGoodsList.value], page: boomPage,
           hasMore: boomHasMore.value, scrollTop: global.pageYOffset || global.document.documentElement.scrollTop || 0,
         }));
@@ -247,9 +249,9 @@
         const cached = JSON.parse(global.sessionStorage.getItem(key('boom_return_state', 'all')) || 'null');
         if (cached && cached.scope === getScope() && Array.isArray(cached.list) && cached.list.length > 0) {
           boomPlatform.value = cached.platform || 'all';
-          activeBoomKeyword = cached.keyword || '';
-          boomSearchKeyword.value = activeBoomKeyword;
-          boomSortBy.value = activeBoomKeyword ? (cached.sortBy || 'cost_performance') : 'latest';
+          activeBoomKeyword.value = cached.keyword || '';
+          boomSearchKeyword.value = activeBoomKeyword.value;
+          boomSortBy.value = activeBoomKeyword.value ? (cached.sortBy || 'cost_performance') : 'latest';
           boomGoodsList.value = [...cached.list];
           boomPage = cached.page || 1;
           boomHasMore.value = cached.hasMore !== false;
@@ -271,7 +273,7 @@
         boomHasMore.value = true;
         boomError.value = false;
       }
-      const query = { platform: boomPlatform.value, keyword: activeBoomKeyword, sort_by: boomSortBy.value, page: boomPage, page_size: 20 };
+      const query = { platform: boomPlatform.value, keyword: activeBoomKeyword.value, sort_by: boomSortBy.value, page: boomPage, page_size: 20 };
       if (!isPullRefresh) boomLoading.value = true;
       try {
         const { ok, data } = await api.get(`/api/goods/list?${new URLSearchParams(query)}`);
@@ -304,8 +306,8 @@
       return loadBoomGoods(false);
     };
     const onSearchBoom = () => {
-      activeBoomKeyword = boomSearchKeyword.value.trim();
-      boomSortBy.value = activeBoomKeyword ? 'cost_performance' : 'latest';
+      activeBoomKeyword.value = boomSearchKeyword.value.trim();
+      boomSortBy.value = activeBoomKeyword.value ? 'cost_performance' : 'latest';
       global.scrollTo(0, 0);
       return loadBoomGoods(true);
     };
@@ -315,7 +317,7 @@
       boomPlatform.value = code; global.scrollTo(0, 0); return loadBoomGoods(true);
     };
     const switchBoomSort = sort => {
-      if (sort === 'cost_performance' && !activeBoomKeyword) {
+      if (sort === 'cost_performance' && !activeBoomKeyword.value) {
         showToast('请先搜索商品后再按性价比排序');
         return false;
       }
@@ -326,7 +328,7 @@
       activeHomeKeyword, homeGoodsList, homeLoading, homeHasMore, homeError, loadHomeChannels, loadPlatforms,
       loadHomeGoods, refreshHomeGoods, retryLoadHomeGoods, onSearchHome, clearHomeSearch, switchChannel, switchHomePlatform,
       initializeHome, initialize, resetSession, saveSearchState,
-      boomPlatforms, boomPlatform, boomSearchKeyword, boomSortBy, boomGoodsList, boomLoading, boomHasMore, boomError,
+      boomPlatforms, boomPlatform, boomSearchKeyword, activeBoomKeyword, boomSortBy, boomGoodsList, boomLoading, boomHasMore, boomError,
       loadBoomGoods, refreshBoomGoods, retryLoadBoomGoods, saveBoomState, restoreBoomState,
       onSearchBoom, clearBoomSearch, switchBoomPlatform, switchBoomSort,
       dispose: () => { disposed = true; homeGeneration += 1; channelGeneration += 1; platformGeneration += 1; boomGeneration += 1; },

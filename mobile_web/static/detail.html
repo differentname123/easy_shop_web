@@ -361,9 +361,9 @@
 
     <!-- 店铺评分 (shop_ratings) -->
     <div class="shop-ratings-strip" v-if="goods.shop_ratings && (goods.shop_ratings.desc_score || goods.shop_ratings.serv_score || goods.shop_ratings.lgst_score)">
-      <span class="shop-rating-col" v-if="goods.shop_ratings.desc_score">描述相符 <b>{{ goods.shop_ratings.desc_score }}</b></span>
-      <span class="shop-rating-col" v-if="goods.shop_ratings.serv_score">服务态度 <b>{{ goods.shop_ratings.serv_score }}</b></span>
-      <span class="shop-rating-col" v-if="goods.shop_ratings.lgst_score">物流服务 <b>{{ goods.shop_ratings.lgst_score }}</b></span>
+      <span class="shop-rating-col" v-if="goods.shop_ratings.desc_score">描述相符 <b :class="{ 'score-low': String(goods.shop_ratings.desc_score).includes('低'), 'score-mid': String(goods.shop_ratings.desc_score).includes('中') || String(goods.shop_ratings.desc_score).includes('平') }">{{ goods.shop_ratings.desc_score }}</b></span>
+      <span class="shop-rating-col" v-if="goods.shop_ratings.serv_score">服务态度 <b :class="{ 'score-low': String(goods.shop_ratings.serv_score).includes('低'), 'score-mid': String(goods.shop_ratings.serv_score).includes('中') || String(goods.shop_ratings.serv_score).includes('平') }">{{ goods.shop_ratings.serv_score }}</b></span>
+      <span class="shop-rating-col" v-if="goods.shop_ratings.lgst_score">物流服务 <b :class="{ 'score-low': String(goods.shop_ratings.lgst_score).includes('低'), 'score-mid': String(goods.shop_ratings.lgst_score).includes('中') || String(goods.shop_ratings.lgst_score).includes('平') }">{{ goods.shop_ratings.lgst_score }}</b></span>
     </div>
 
     <div class="detail-meta-row" style="margin-bottom:4px;display:flex;justify-content:space-between;color:var(--text-muted);font-size:12px">

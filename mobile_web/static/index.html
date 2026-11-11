@@ -164,7 +164,7 @@
   </div>
 
   <!-- ==================== TAB 2: 爆单推广 (数据库爆品) ==================== -->
-  <div v-show="currentTab === 'boom'" class="tab-page tab-boom">
+  <div v-show="currentTab === 'boom'" class="tab-page tab-boom" :class="{ 'is-searching': Boolean(activeBoomKeyword) }">
     <header class="top-header" :class="{ 'header-hidden': isHeaderHidden }">
       <!-- 爆单搜索栏 -->
       <div class="search-box">
@@ -197,10 +197,11 @@
         </div>
       </div>
 
-      <!-- 排序栏 -->
-      <div class="sort-bar">
+      <!-- 排序栏（搜索同品类商品时展示智能性价比排序与返回入口） -->
+      <div class="sort-bar" v-if="activeBoomKeyword">
         <span class="sort-item" :class="{ active: boomSortBy === 'latest' }" @click="switchBoomSort('latest')">最新上架</span>
         <span class="sort-item" :class="{ active: boomSortBy === 'cost_performance' }" @click="switchBoomSort('cost_performance')">性价比最高</span>
+        <button type="button" class="search-back-btn" @click="clearBoomSearch">返回全部爆品</button>
       </div>
     </header>
 
@@ -335,86 +336,7 @@
       </div>
     </div>
 
-    <!-- 手机号快速登记注册/登录卡片 (未登录时展示) -->
-    <div class="auth-reg-card" v-if="!isLoggedIn">
-      <div class="reg-title">{{ isRegisterMode ? '注册推广账户 (新用户注册)' : '已有账户登录' }}</div>
-      <div class="reg-subtitle">
-        {{ isRegisterMode ? '注册并登录后，可查看本人推广订单与佣金记录' : '输入已登记的手机号和密码，查看本人推广订单与佣金记录' }}
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">手机号</label>
-        <input 
-          type="tel" 
-          maxlength="11" 
-          class="form-input" 
-          placeholder="请输入11位中国大陆手机号" 
-          v-model="formPhone"
-          @keyup.enter="handleRegisterOrLogin"
-        />
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">登录密码</label>
-        <input 
-          type="password" 
-          class="form-input" 
-          placeholder="请输入密码 (至少6位)" 
-          v-model="formPassword"
-          @keyup.enter="handleRegisterOrLogin"
-        />
-      </div>
-
-      <div class="form-group" v-if="isRegisterMode">
-        <label class="form-label">用户昵称 (选填)</label>
-        <input 
-          type="text" 
-          class="form-input" 
-          placeholder="例如: 省钱小能手 (若留空则自动生成)" 
-          v-model="formNickname"
-          @keyup.enter="handleRegisterOrLogin"
-        />
-      </div>
-
-      <div class="form-group" v-if="isRegisterMode">
-        <label class="form-label">邀请码 (选填)</label>
-        <input 
-          type="text" 
-          class="form-input" 
-          placeholder="若有好友邀请码请填写，无则留空" 
-          v-model="formInviteCode"
-          @keyup.enter="handleRegisterOrLogin"
-        />
-      </div>
-
-      <button class="form-btn-submit" @click="handleRegisterOrLogin" :disabled="isSubmittingAuth">
-        {{ isSubmittingAuth ? '提交中...' : (isRegisterMode ? '立即开通并登录' : '立即登录') }}
-      </button>
-
-      <div class="form-toggle-link" @click="isRegisterMode = !isRegisterMode">
-        {{ isRegisterMode ? '已有账号？切换密码登录' : '新用户？注册推广账户' }}
-      </div>
-    </div>
-
-    <!-- 收益统计面板 (已登录展示) -->
-    <div class="stats-card" v-if="isLoggedIn">
-      <div class="stats-grid">
-        <div class="stat-item">
-          <div class="num">¥{{ formatMoney(userOrdersData.total_commission ?? 0) }}</div>
-          <div class="label">订单佣金参考</div>
-        </div>
-        <div class="stat-item">
-          <div class="num">¥{{ formatMoney(userOrdersData.settled_commission ?? 0) }}</div>
-          <div class="label">结算口径佣金</div>
-        </div>
-        <div class="stat-item">
-          <div class="num">¥{{ formatMoney(userOrdersData.refund_commission || 0) }}</div>
-          <div class="label">维权/退款({{ userOrdersData.refund_count || 0 }}笔)</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- 万能转链与口令解析面板 -->
+    <!-- 万能转链与口令解析面板（置于首屏最上方，无论游客或登录推手均可即开即用） -->
     <div class="universal-convert-card">
       <div class="universal-header">
         <div class="universal-title">
@@ -427,7 +349,7 @@
         </button>
       </div>
       <p class="universal-desc">
-        支持粘贴<strong>淘宝</strong>（淘口令/m.tb.cn/e.tb.cn/uland）、<strong>京东</strong>（u.jd.com短链/京口令/京粉链）、<strong>拼多多</strong>（p.pinduoduo.com短链/长链/标题），一键转为您的专属推广链并解析商品详情。
+        支持粘贴<strong>淘宝</strong>（淘口令/m.tb.cn/e.tb.cn/uland）、<strong>京东</strong>（u.jd.com短链/京口令/京粉链）、<strong>拼多多</strong>（p.pinduoduo.com / yangkeduo.com 分享短链与长链），一键转为您的专属推广链并解析商品详情（搜商品名称请前往「首页」搜索）。
       </p>
 
       <div class="universal-plat-tabs" role="tablist" aria-label="转链平台选择">
@@ -540,6 +462,85 @@
           >
             🔍 查看商品详情
           </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 手机号快速登记注册/登录卡片 (未登录时展示) -->
+    <div class="auth-reg-card" v-if="!isLoggedIn">
+      <div class="reg-title">{{ isRegisterMode ? '注册推广账户 (新用户注册)' : '已有账户登录' }}</div>
+      <div class="reg-subtitle">
+        {{ isRegisterMode ? '注册并登录后，可查看本人推广订单与佣金记录' : '输入已登记的手机号和密码，查看本人推广订单与佣金记录' }}
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">手机号</label>
+        <input 
+          type="tel" 
+          maxlength="11" 
+          class="form-input" 
+          placeholder="请输入11位中国大陆手机号" 
+          v-model="formPhone"
+          @keyup.enter="handleRegisterOrLogin"
+        />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">登录密码</label>
+        <input 
+          type="password" 
+          class="form-input" 
+          placeholder="请输入密码 (至少6位)" 
+          v-model="formPassword"
+          @keyup.enter="handleRegisterOrLogin"
+        />
+      </div>
+
+      <div class="form-group" v-if="isRegisterMode">
+        <label class="form-label">用户昵称 (选填)</label>
+        <input 
+          type="text" 
+          class="form-input" 
+          placeholder="例如: 省钱小能手 (若留空则自动生成)" 
+          v-model="formNickname"
+          @keyup.enter="handleRegisterOrLogin"
+        />
+      </div>
+
+      <div class="form-group" v-if="isRegisterMode">
+        <label class="form-label">邀请码 (选填)</label>
+        <input 
+          type="text" 
+          class="form-input" 
+          placeholder="若有好友邀请码请填写，无则留空" 
+          v-model="formInviteCode"
+          @keyup.enter="handleRegisterOrLogin"
+        />
+      </div>
+
+      <button class="form-btn-submit" @click="handleRegisterOrLogin" :disabled="isSubmittingAuth">
+        {{ isSubmittingAuth ? '提交中...' : (isRegisterMode ? '立即开通并登录' : '立即登录') }}
+      </button>
+
+      <div class="form-toggle-link" @click="isRegisterMode = !isRegisterMode">
+        {{ isRegisterMode ? '已有账号？切换密码登录' : '新用户？注册推广账户' }}
+      </div>
+    </div>
+
+    <!-- 收益统计面板 (已登录展示) -->
+    <div class="stats-card" v-if="isLoggedIn">
+      <div class="stats-grid">
+        <div class="stat-item">
+          <div class="num">¥{{ formatMoney(userOrdersData.total_commission ?? 0) }}</div>
+          <div class="label">订单佣金参考</div>
+        </div>
+        <div class="stat-item">
+          <div class="num">¥{{ formatMoney(userOrdersData.settled_commission ?? 0) }}</div>
+          <div class="label">结算口径佣金</div>
+        </div>
+        <div class="stat-item">
+          <div class="num">¥{{ formatMoney(userOrdersData.refund_commission || 0) }}</div>
+          <div class="label">维权/退款({{ userOrdersData.refund_count || 0 }}笔)</div>
         </div>
       </div>
     </div>

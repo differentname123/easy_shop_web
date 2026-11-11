@@ -177,6 +177,11 @@ body {
 }
 
 .tab-page.tab-boom {
+  padding-top: calc(92px + var(--safe-top));
+  transition: padding-top 0.2s ease;
+}
+
+.tab-page.tab-boom.is-searching {
   padding-top: calc(126px + var(--safe-top));
 }
 
@@ -333,9 +338,10 @@ body {
 
 .sort-bar {
   display: flex;
+  align-items: center;
   justify-content: space-around;
   background: #fff;
-  padding: 8px 0;
+  padding: 6px 12px;
   font-size: 12px;
   color: var(--text-sub);
   border-bottom: 1px solid var(--border-light);
@@ -520,6 +526,8 @@ body {
   font-weight: 700;
   color: var(--primary-color);
   margin-right: 1px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .price-unit {
@@ -1435,8 +1443,14 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
   cursor: pointer;
   margin-bottom: 8px;
+}
+
+.login-unlock-banner > span:last-child {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 /* Toast 提示 */
@@ -1512,6 +1526,14 @@ body {
   color: #f5222d;
   font-weight: 600;
   margin-left: 2px;
+}
+
+.shop-rating-col b.score-mid {
+  color: #fa8c16;
+}
+
+.shop-rating-col b.score-low {
+  color: #595959;
 }
 
 .specs-table {

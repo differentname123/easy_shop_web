@@ -387,7 +387,7 @@ def test_24h_auto_expiration():
     res_23h = repo.search_groups(now=base_ts + 23 * 3600)
     assert len(res_23h["items"]) == 1
 
-    # 有效期内若误标已满，可恢复上架但绝不延长原定 expires_at
+    # 有效期内若误标已满或误点已失效，均可恢复上架但绝不延长原定 expires_at
     orig_expires = repo.get_by_group_order_id("3495229659187109999")["expires_at"]
     repo.apply_user_feedback("3495229659187109999", action="mark_full", now=base_ts + 3600)
     restored = repo.apply_user_feedback(
@@ -395,6 +395,15 @@ def test_24h_auto_expiration():
     )
     assert restored["group_status"] == GROUP_STATUS_ACTIVE
     assert restored["expires_at"] == orig_expires
+
+    repo.apply_user_feedback("3495229659187109999", action="mark_expired", now=base_ts + 3800)
+    assert repo.get_by_group_order_id("3495229659187109999")["group_status"] == GROUP_STATUS_EXPIRED
+    restored_from_expired = repo.apply_user_feedback(
+        "3495229659187109999", action="set_remain", remain_people=1, now=base_ts + 3900
+    )
+    assert restored_from_expired["group_status"] == GROUP_STATUS_ACTIVE
+    assert restored_from_expired["remain_people"] == 1
+    assert restored_from_expired["expires_at"] == orig_expires
 
     # 24 小时 + 1 秒后自动过期下线
     expired_now = base_ts + 24 * 3600 + 1

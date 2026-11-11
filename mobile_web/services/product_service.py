@@ -226,7 +226,7 @@ class ProductService:
         if unavailable:
             return unavailable
         raw_kw = (keyword or "").strip()
-        keyword = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
+        keyword = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:500]
         cache_key = (plat, uid or "", keyword, page, page_size)
         cached = SEARCH_CACHE.get(cache_key)
         if cached is not None:

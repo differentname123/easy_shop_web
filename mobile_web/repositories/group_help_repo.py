@@ -385,9 +385,8 @@ class GroupHelpRepository(BaseRepository):
         act = str(action or "").strip()
         expires_at = float(existing.get("expires_at") or 0)
         is_time_expired = expires_at <= current_ts
-        is_marked_expired = existing.get("group_status") == GROUP_STATUS_EXPIRED
 
-        if is_time_expired or is_marked_expired:
+        if is_time_expired:
             if existing.get("group_status") != GROUP_STATUS_EXPIRED:
                 existing = (
                     self.col.find_one_and_update(

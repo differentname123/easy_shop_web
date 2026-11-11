@@ -259,7 +259,13 @@
       watch(currentTab, newTab => {
         isHeaderHidden.value = false; showBackToTop.value = false;
         pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
-        try { global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`); } catch (_) {}
+        try {
+          global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`);
+          const url = new URL(global.location.href);
+          if (newTab === 'home') url.searchParams.delete('tab');
+          else url.searchParams.set('tab', newTab);
+          global.history.replaceState({ tab: newTab, scope: session.scope() }, '', url.toString());
+        } catch (_) {}
         if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0) {
           if (!feeds.restoreBoomState()) feeds.loadBoomGoods(true);
         } else if (newTab === 'user') restoreAccount();

@@ -85,7 +85,7 @@
       }
       orderMessage.value = ''; isSyncingOrders.value = true;
       try {
-        const query = new URLSearchParams({ platform, days, force: (force && pollCount === 0) ? 'true' : 'false' });
+        const query = new URLSearchParams({ platform, days });
         const response = await api.post(`/api/order/sync_and_query?${query}`, undefined, { token: snapshot.token });
         if (disposed || generation !== orderGeneration || !session.isCurrent(snapshot) || platform !== orderPlatform.value || days !== orderDays.value) return;
         if (response.ok && response.data.status === 'success' && response.data.data) {
@@ -225,12 +225,10 @@
         } else {
           const msg = data.error_msg || data.detail || '未能解析或转换该内容，请检查输入格式';
           universalError.value = msg;
-          showToast(msg);
         }
       } catch (_) {
         if (!disposed && generation === universalGeneration) {
           universalError.value = '网络请求异常，请稍后重试';
-          showToast(universalError.value);
         }
       } finally {
         if (generation === universalGeneration) universalLoading.value = false;
