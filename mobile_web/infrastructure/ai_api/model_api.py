@@ -315,22 +315,26 @@ def _resolve_ai_runtime(force_cloud=False, require_keys_on_cloud_block=False):
     }
 
 
-def _pick_api_key(pool_id, keys):
-    """从 Key 池中轮询挑选下一个健康 Key（优先跳过冷却中的 429/鉴权失败 Key）。返回 (api_key, key_label)。"""
+def _pick_api_key(pool_id, keys, model_name=""):
+    """从 Key 池中轮询挑选下一个健康 Key（按模型维度优先跳过冷却中的 429/鉴权失败 Key）。返回 (api_key, key_label)。"""
     if not keys:
         return "", ""
     if len(keys) == 1:
         return keys[0], "Key#1/1"
     now = time.monotonic()
+    cursor_key = f"{pool_id}:{model_name}" if model_name else pool_id
     with _KEY_POOL_LOCK:
-        start = _KEY_POOL_CURSORS.get(pool_id, 0) % len(keys)
+        start = _KEY_POOL_CURSORS.get(cursor_key, 0) % len(keys)
         chosen_idx = None
         earliest_idx = start
         earliest_until = float("inf")
         for offset in range(len(keys)):
             idx = (start + offset) % len(keys)
             k = keys[idx]
-            until = _KEY_COOLDOWN_UNTIL.get(k, 0.0)
+            until = max(
+                _KEY_COOLDOWN_UNTIL.get(("*", k), 0.0),
+                _KEY_COOLDOWN_UNTIL.get((model_name, k), 0.0),
+            )
             if until <= now:
                 chosen_idx = idx
                 break
@@ -339,12 +343,12 @@ def _pick_api_key(pool_id, keys):
                 earliest_idx = idx
         if chosen_idx is None:
             chosen_idx = earliest_idx
-        _KEY_POOL_CURSORS[pool_id] = (chosen_idx + 1) % len(keys)
+        _KEY_POOL_CURSORS[cursor_key] = (chosen_idx + 1) % len(keys)
         return keys[chosen_idx], f"Key#{chosen_idx + 1}/{len(keys)}"
 
 
-def _mark_key_cooldown(api_key, status_code=None, error_text=""):
-    """当某个官方 API Key 触发 429 配额限流或 401/403 权限失败时，短暂标记冷却以便优先切到其他 Key。"""
+def _mark_key_cooldown(api_key, model_name="", status_code=None, error_text=""):
+    """当某个官方 API Key 触发 429 配额限流（按模型隔离）或 401/403 权限失败（全局隔离）时标记冷却。"""
     if not api_key:
         return False
     lower = str(error_text or "").lower()
@@ -352,9 +356,12 @@ def _mark_key_cooldown(api_key, status_code=None, error_text=""):
     is_auth_err = status_code in (401, 403)
     if not (is_rate_limit or is_auth_err):
         return False
-    cooldown = 300.0 if is_auth_err else 60.0
     with _KEY_POOL_LOCK:
-        _KEY_COOLDOWN_UNTIL[api_key] = time.monotonic() + cooldown
+        if is_auth_err:
+            _KEY_COOLDOWN_UNTIL[("*", api_key)] = time.monotonic() + 300.0
+        else:
+            cooldown = 3600.0 if ("per day" in lower or "perday" in lower) else 60.0
+            _KEY_COOLDOWN_UNTIL[(model_name, api_key)] = time.monotonic() + cooldown
     return True
 
 # 示例模型名沿用原需求；请按网关实际支持的模型补充，每个模型名在组内只出现一次。
@@ -1049,10 +1056,12 @@ def generate_content(
                     if stop_on_timeout
                     else float(timeout)
                 )
+                if runtime["runtime_mode"] == "linux_cloud" and has_fallback_model and not is_ag_model:
+                    req_timeout = min(req_timeout, 25.0)
                 used_api_key = ""
                 key_label = ""
                 if not is_ag_model:
-                    used_api_key, key_label = _pick_api_key(route["pool_id"], route_keys)
+                    used_api_key, key_label = _pick_api_key(route["pool_id"], route_keys, model_name=current_model)
                 key_tag = f" | 密钥槽: [{key_label}]" if len(route_keys) > 1 else ""
                 metrics["model_used"] = current_model
                 metrics["attempts"] += 1
@@ -1089,12 +1098,17 @@ def generate_content(
                         active_client = _get_cached_client(
                             route["base_url"], used_api_key, route["proxy_url"]
                         )
-                        raw = active_client.chat.completions.with_raw_response.create(
-                            model=current_model,
-                            messages=messages,
-                            stream=False,
-                            timeout=req_timeout,
-                        )
+                        req_kwargs = {
+                            "model": current_model,
+                            "messages": messages,
+                            "stream": False,
+                            "timeout": req_timeout,
+                        }
+                        if "generativelanguage.googleapis.com" in route["base_url"] and current_model.startswith(
+                            ("gemini-3.8", "gemini-3.7")
+                        ):
+                            req_kwargs["extra_body"] = {"reasoning_effort": "low"}
+                        raw = active_client.chat.completions.with_raw_response.create(**req_kwargs)
                         status_code = raw.status_code
                         response = raw.parse()
                         usage = response.usage.model_dump() if response.usage else None
@@ -1143,10 +1157,19 @@ def generate_content(
                     if budget_exhausted:
                         result["timed_out"] = True
 
+                    if has_fallback_model and (
+                        status_code == 503
+                        or "high demand" in exc_msg_lower
+                        or (is_req_timeout and runtime["runtime_mode"] == "linux_cloud")
+                    ):
+                        skip_same_model = True
+                        step_delay = 0.2
+
                     cooled_key = False
                     if used_api_key:
                         cooled_key = _mark_key_cooldown(
                             used_api_key,
+                            model_name=current_model,
                             status_code=status_code,
                             error_text=f"{type(exc).__name__}: {exc}",
                         )

@@ -606,3 +606,118 @@ def test_jd_client_per_key_pacing_reserves_slots_per_appkey_and_skips_mocks(monk
     real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-1"}})
     assert sleeps == [0.22]  # Immediate second call on k-real-1 waits 0.22s
 
+
+def test_antigravity_client_defaults_to_3_concurrency_per_account_6_across_2(tmp_path, monkeypatch):
+    import os
+    from infrastructure.ai_api import antigravity_client as ag
+
+    monkeypatch.setattr(ag, "GLOBAL_LOCK_DIR", tmp_path / "locks")
+    monkeypatch.setattr(
+        ag,
+        "sync_all_known_accounts_to_sandboxes",
+        lambda overwrite_from_desktop=False: {
+            "guardianriedel689@gmail.com": tmp_path / "sb1",
+            "richard.nowak@usa.com": tmp_path / "sb2",
+        },
+    )
+
+    assert ag.DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT == 3
+    pool = ag.AntigravityPoolClient(
+        account_pool=["guardianriedel689@gmail.com", "richard.nowak@usa.com"]
+    )
+    assert pool.max_concurrency_per_account == 3
+
+    workers = pool.get_eligible_workers()
+    assert len(workers) == 2
+    claimed = []
+    try:
+        for w in workers:
+            assert w._max_concurrency == 3
+            for _ in range(3):
+                fd = w.try_claim_idle_slot()
+                assert fd is not None
+                claimed.append((w, fd))
+            # 4th claim on same sub-account must return None immediately
+            assert w.try_claim_idle_slot() is None
+        assert len(claimed) == 6
+    finally:
+        for w, fd in claimed:
+            w._unlock_fd(fd)
+            os.close(fd)
+            w._concurrency_sem.release()
+
+
+def test_save_batch_anchors_fallback_publish_ts_in_set_on_insert_without_conflict():
+    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
+
+    captured_ops = []
+
+    class _DummyCol:
+        def bulk_write(self, ops, ordered=False):
+            captured_ops.extend(ops)
+            return SimpleNamespace(upserted_count=len(ops), modified_count=0)
+
+    dummy_col = _DummyCol()
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: dummy_col))
+    repo._indexes_ready = True
+
+    res = repo.save_batch(
+        [
+            {
+                "source_site": "haodanku",
+                "source_item_id": "hdk_1",
+                "publish_time": "",
+                "title": "无发布时间线报",
+                "extracted_links": [{"url": "https://u.jd.com/2GR8aBc"}],
+                "has_full_detail": True,
+            },
+            {
+                "source_site": "zhetaoke",
+                "source_item_id": "xb_2",
+                "publish_time": "2026-11-12 06:30:00",
+                "title": "有明确发布时间线报",
+                "extracted_links": [{"url": "https://u.jd.com/3HS9dEf"}],
+                "has_full_detail": True,
+            },
+        ],
+        task_name="unit_test",
+    )
+    assert res["inserted"] == 2
+    op_no_pub, op_with_pub = captured_ops[0]._doc, captured_ops[1]._doc
+
+    # Empty publish_time: publish_ts is only in $setOnInsert (never overwritten on re-poll, no Mongo path conflict)
+    assert "publish_ts" in op_no_pub["$setOnInsert"]
+    assert "publish_ts" not in op_no_pub["$set"]
+
+    # Explicit publish_time: publish_ts is in $set and absent from $setOnInsert
+    assert "publish_ts" in op_with_pub["$set"]
+    assert "publish_ts" not in op_with_pub["$setOnInsert"]
+
+
+def test_run_clean_stage_sweeps_over_7d_by_either_publish_ts_or_first_seen_at():
+    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository, run_clean_stage
+
+    update_queries = []
+    count_queries = []
+
+    class _DummyRawCol:
+        def update_many(self, flt, upd):
+            update_queries.append((flt, upd))
+            return SimpleNamespace(modified_count=2 if len(update_queries) == 1 else 0)
+
+        def count_documents(self, flt):
+            count_queries.append(flt)
+            return 0
+
+    raw_col = _DummyRawCol()
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: raw_col))
+    repo._indexes_ready = True
+
+    out = run_clean_stage(repo, cleaner=SimpleNamespace(), cycle_num=1, clean_limit=10)
+    assert out["expired_over_7d_swept"] == 2
+    sweep_or = update_queries[0][0]["$and"][1]["$or"]
+    assert any("publish_ts" in cond for cond in sweep_or)
+    assert any("first_seen_at" in cond and "$and" not in cond for cond in sweep_or)
+    assert "$nor" in count_queries[0]["$and"][1]
+
+

@@ -51,8 +51,8 @@ def main(argv=None):
         res = generate_content(
             prompt='请仅回复 JSON: {"ok": true}',
             max_retries_per_model=2,
-            timeout=30,
-            stop_on_timeout=True,
+            timeout=20,
+            stop_on_timeout=False,
             force_cloud=bool(args.cloud),
         )
         metrics = res.get("metrics") or {}

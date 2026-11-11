@@ -808,6 +808,8 @@ class DealRawPoolRepository:
                 "ai_clean_status": initial_status,
                 "clean_retry_count": 0,
             }
+            if parsed_pub_ts is None:
+                set_on_insert["publish_ts"] = pub_ts
             if is_expired_over_7d and initial_status == "cleaned_failed":
                 set_on_insert["clean_error_code"] = ERR_EXPIRED_OVER_7_DAYS
                 set_on_insert["clean_error_msg"] = f"爆料发布时间超过 {DEAL_MAX_CLEAN_AGE_DAYS} 天，自动跳过清洗"
@@ -819,7 +821,6 @@ class DealRawPoolRepository:
                 "source_detail_url": source_detail_url,
                 "is_group_stream": is_group_stream,
                 "group_id": group_id,
-                "publish_ts": pub_ts,
                 "fetched_at": rec.get("fetched_at") or "",
                 "platform": rec.get("platform") or "unknown",
                 "candidate_goods_id": rec.get("candidate_goods_id") or "",
@@ -838,6 +839,8 @@ class DealRawPoolRepository:
                 "has_full_detail": has_full_detail,
                 "quality_signals": quality_signals,
             }
+            if parsed_pub_ts is not None:
+                core_fields["publish_ts"] = parsed_pub_ts
 
             if has_full_detail:
                 set_fields.update(core_fields)
@@ -3748,12 +3751,7 @@ def run_clean_stage(
                     {
                         "$or": [
                             {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
-                            {
-                                "$and": [
-                                    {"$or": [{"publish_ts": {"$exists": False}}, {"publish_ts": {"$lte": 0}}, {"publish_ts": None}]},
-                                    {"first_seen_at": {"$lt": cutoff_dt}},
-                                ]
-                            },
+                            {"first_seen_at": {"$lt": cutoff_dt}},
                         ]
                     },
                 ]
@@ -3797,8 +3795,17 @@ def run_clean_stage(
     except Exception as e:
         logger.warning("前置保鲜与重试上限清扫异常: %s", e)
 
+    fresh_guard_clause: Dict[str, Any] = {
+        "$nor": [
+            {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
+            {"first_seen_at": {"$lt": cutoff_dt}},
+        ]
+    }
     active_pending_filter: Dict[str, Any] = {
-        "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
+        "$and": [
+            {"$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]},
+            fresh_guard_clause,
+        ]
     }
     total_pending_initial = raw_col.count_documents(active_pending_filter)
     if total_pending_initial <= 0:
@@ -3827,8 +3834,11 @@ def run_clean_stage(
     docs_by_site: Dict[str, List[Dict[str, Any]]] = {}
     for s_site in sorted_sites:
         site_query = {
-            "source_site": s_site,
-            "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
+            "$and": [
+                {"source_site": s_site},
+                {"$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]},
+                fresh_guard_clause,
+            ]
         }
         docs_by_site[s_site] = list(
             raw_col.find(site_query, {"raw_payload": 0})

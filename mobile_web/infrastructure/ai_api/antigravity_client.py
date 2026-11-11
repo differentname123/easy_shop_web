@@ -9,7 +9,7 @@ Antigravity Official Local Client (Multi-Account Sandbox Pool + High Concurrency
    - 池子中的每个小号都会在 `%LOCALAPPDATA%\\Antigravity\\sandboxes\\<小号邮箱>\\` 下启动各自物理隔离的
      官方 `language_server.exe` 进程（独立进程、独立端口、独立登录态文件、独立设备 UUID）；
    - 桌面端大号（`EXCLUDED_MAIN_ACCOUNTS`）被严格排除在账号池之外，100% 绝不触碰大号；
-   - 每个小号独立享有 `max_concurrency_per_account=2` 的跨进程并发锁与独立错峰锁（6 个小号即支持最高 12 并发）；
+   - 每个小号独立享有 `max_concurrency_per_account=3` 的跨进程并发锁与独立错峰锁（2 个小号即支持最高 6 并发）；
    - 调用方只需指定模型名（如 `antigravity-3.8-flash-high` 或 `antigravity-argon-high`），内部路由器会自动
      识别哪些小号拥有该模型的调用权限与剩余额度，并从当前空闲槽位的小号中【随机选择】一个执行；
    - 每次调用（无论成功或异常重试）均会返回并记录实际使用的小号邮箱与沙箱端口，方便溯源与成功率复盘。
@@ -56,8 +56,10 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 # ==============================================================================
 # 【核心配置 2】小号沙箱白名单账号池（SUB_ACCOUNT_POOL）
 # - 严格采用白名单策略：仅使用下列显式配置的可用小号，不做自动探测扫描；
-# - 每个小号独立限制并发=2（当前 2 个白名单小号总并发 = 2 * 2 = 4）。
+# - 每个小号独立限制并发=3（当前 2 个白名单小号总并发 = 2 * 3 = 6）。
 # ==============================================================================
+DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT: int = 3
+
 SUB_ACCOUNT_POOL: List[str] = [
     "guardianriedel689@gmail.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
     "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
@@ -347,7 +349,7 @@ class AntigravityClient:
         default_model: str = "antigravity-3.8-flash-high",
         timeout: float = 120.0,
         auto_start: bool = True,
-        max_concurrency: int = 2,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT,
         min_stagger_seconds: float = 0.8,
         max_stagger_seconds: float = 1.8,
         sub_account_email: Optional[str] = SUB_ACCOUNT_EMAIL,
@@ -432,7 +434,7 @@ class AntigravityClient:
         slot_acquire_timeout: Optional[float] = None,
     ):
         """
-        获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=2 个跨进程并发槽位）：
+        获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=3 个跨进程并发槽位）：
         - 若由账号池调度器传入了已经非阻塞抢到的 `pre_acquired_fd`，则直接使用；
         - 否则在当前账号的槽位上等待直到空闲（若配置了 slot_acquire_timeout 则超时快速抛出 SlotAcquireTimeoutError）。
         """
@@ -483,7 +485,7 @@ class AntigravityClient:
     def try_claim_idle_slot(self) -> Optional[int]:
         """
         供多账号池调度器调用：非阻塞尝试抢占当前小号的一个空闲并发槽位。
-        若当前小号未满载（并发 < 2），立即返回锁文件 fd；若已满载，立即返回 None。
+        若当前小号未满载（并发 < max_concurrency），立即返回锁文件 fd；若已满载，立即返回 None。
         """
         if not self._concurrency_sem.acquire(blocking=False):
             return None
@@ -1296,7 +1298,7 @@ class AntigravityPoolClient:
     def __init__(
         self,
         account_pool: Optional[List[str]] = None,
-        max_concurrency_per_account: int = 2,
+        max_concurrency_per_account: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT,
         default_model: str = "antigravity-3.8-flash-high",
         timeout: float = 120.0,
     ) -> None:
@@ -1480,7 +1482,7 @@ _default_client: Optional[Any] = None
 
 
 def get_client(
-    max_concurrency: int = 2,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT,
     sub_account_email: Optional[str] = None,
 ) -> Any:
     """
@@ -1511,7 +1513,7 @@ def get_client(
     return _default_client
 
 
-def set_sub_account(email: Optional[str], max_concurrency: int = 2) -> Any:
+def set_sub_account(email: Optional[str], max_concurrency: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT) -> Any:
     """
     - 传入具体邮箱（如 `set_sub_account("guardianriedel689@gmail.com")`）：锁定只使用该小号；
     - 传入 `None` 或 `""`（如 `set_sub_account(None)`）：恢复使用 `SUB_ACCOUNT_POOL` 多小号随机池。
@@ -1523,7 +1525,10 @@ def set_sub_account(email: Optional[str], max_concurrency: int = 2) -> Any:
     return get_client(max_concurrency=max_concurrency, sub_account_email=SUB_ACCOUNT_EMAIL)
 
 
-def set_sub_account_pool(emails: List[str], max_concurrency_per_account: int = 2) -> AntigravityPoolClient:
+def set_sub_account_pool(
+    emails: List[str],
+    max_concurrency_per_account: int = DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT,
+) -> AntigravityPoolClient:
     """动态设置小号账号池列表并启用多小号随机路由池。"""
     global SUB_ACCOUNT_POOL, SUB_ACCOUNT_EMAIL, _default_client
     SUB_ACCOUNT_POOL = [e.strip().lower() for e in emails if e and e.strip()]
@@ -1569,7 +1574,12 @@ if __name__ == "__main__":
     print(f"[1] 桌面端当前登录账号自动快照: {archived_desktop or '未检测到'} (大号保护名单: {sorted(EXCLUDED_MAIN_ACCOUNTS)})")
     pool_client = AntigravityPoolClient()
     rows = pool_client.get_pool_status()
-    print(f"[2] 账号池可用小号数量: {len(rows)} 个 (单号并发上限=2 | Flash 总并发上限={sum(2 for r in rows if r['supports_flash'])}, Argon 总并发上限={sum(2 for r in rows if r['supports_argon'])}):")
+    per_acc = pool_client.max_concurrency_per_account
+    print(
+        f"[2] 账号池可用小号数量: {len(rows)} 个 "
+        f"(单号并发上限={per_acc} | Flash 总并发上限={sum(per_acc for r in rows if r['supports_flash'])}, "
+        f"Argon 总并发上限={sum(per_acc for r in rows if r['supports_argon'])}):"
+    )
     for idx, r in enumerate(rows, 1):
         models_tag = f"Argon={'✅' if r['supports_argon'] else '❌'} | 3.8-Flash={'✅' if r['supports_flash'] else '❌'}"
         print(

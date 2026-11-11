@@ -103,12 +103,12 @@ systemctl status mobile_web.service
       "填入你的第1个官方API_Key",
       "填入你的第2个官方API_Key"
     ],
-    "proxy_url": "http://你的海外服务器IP:代理端口",
+    "proxy_url": "https://账号:密码@proxy.easyeverything.top:443",
     "models": [
+      "gemini-3.8-flash",
       "gemini-3.5-flash-lite",
-      "gemini-3-flash-preview",
-      "gemini-2.5-flash",
-      "gemini-3.1-flash-lite"
+      "gemini-3.7-flash",
+      "gemma-4-31b-it"
     ]
   }
 ```
