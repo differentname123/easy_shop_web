@@ -12,8 +12,8 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261112-1">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261112-1"></script>
+  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261112-2">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261112-2"></script>
 </head>
 <body>
 <div id="group-help-app">
@@ -216,7 +216,7 @@
         <div class="gh-onboard-step">
           <div class="gh-onboard-step-tag">🛒 1. 怎么参团省钱？</div>
           <div class="gh-onboard-step-desc">
-            点下方商品一键直达拼团页 → 参团后返回顺手点<b>「我已参团」</b>
+            点下方商品查看详情 → 点<b>「去拼多多参团」</b>直达进团 → 拼成后顺手点<b>「我已参团」</b>
           </div>
         </div>
         <div class="gh-onboard-step" @click="openHelpGuide(null)" style="cursor:pointer">
@@ -246,7 +246,7 @@
         v-for="item in items"
         :key="item.group_order_id"
         class="gh-card"
-        @click="directJoinGroup(item)"
+        @click="openDetail(item)"
       >
         <div class="gh-thumb-box">
           <img :src="item.poster_url" :alt="item.goods_name" loading="lazy" />
@@ -267,10 +267,7 @@
               <span class="gh-origin-price" v-if="item.original_price && item.original_price > item.group_price">¥{{ item.original_price }}</span>
             </div>
             <span class="gh-sub-meta" v-else>价格见图</span>
-            <div class="gh-card-cta-group">
-              <button class="gh-card-more-btn" @click.stop="openDetail(item)">详情</button>
-              <button class="gh-join-btn" @click.stop="directJoinGroup(item)">去参团</button>
-            </div>
+            <button class="gh-join-btn">去参团</button>
           </div>
         </div>
       </div>
@@ -721,6 +718,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=ux-20261112-1"></script>
+<script src="/static/js/group_help.js?v=ux-20261112-2"></script>
 </body>
 </html>

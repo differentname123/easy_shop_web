@@ -9,9 +9,7 @@
   const UPLOAD_GUIDE_ACK_KEY = 'pdd_gh_upload_guide_ack_v1';
   const JOINED_GROUPS_KEY = 'pdd_gh_joined_gids_v1';
   const RETURN_GROUP_SESSION_KEY = 'pdd_gh_return_group_v1';
-  const AUTO_JUMPED_GID_SESSION_KEY = 'pdd_gh_auto_jumped_gid_v1';
   const RETURN_GROUP_TTL_MS = 10 * 60 * 1000;
-  const AUTO_JUMP_GUARD_TTL_MS = 90 * 1000;
   const APP_WAKE_FALLBACK_MS = 800;
   const EASY_SHOP_TOKEN_KEY = 'easy_shop_token';
   const EASY_SHOP_UID_KEY = 'easy_shop_uid';
@@ -1443,58 +1441,7 @@
         }
       };
 
-      // ==================== 分享直达链接一键自动跳团 + 返回自动展开反馈 + 已拼满留存引导 ====================
-      const isBackForwardNavigation = () => {
-        try {
-          if (global.performance && typeof global.performance.getEntriesByType === 'function') {
-            const navList = global.performance.getEntriesByType('navigation');
-            if (Array.isArray(navList) && navList[0] && navList[0].type === 'back_forward') {
-              return true;
-            }
-          }
-        } catch (_) {}
-        return false;
-      };
-
-      const markAutoJumpGuard = gid => {
-        if (!gid) return;
-        try {
-          if (global.sessionStorage) {
-            global.sessionStorage.setItem(
-              AUTO_JUMPED_GID_SESSION_KEY,
-              JSON.stringify({ gid: String(gid), ts: Date.now() })
-            );
-          }
-        } catch (_) {}
-      };
-
-      const clearAutoJumpGuard = () => {
-        try {
-          if (global.sessionStorage) {
-            global.sessionStorage.removeItem(AUTO_JUMPED_GID_SESSION_KEY);
-          }
-        } catch (_) {}
-      };
-
-      const consumeAutoJumpGuardIfMatch = gid => {
-        if (!gid) return false;
-        try {
-          if (!global.sessionStorage) return false;
-          const raw = global.sessionStorage.getItem(AUTO_JUMPED_GID_SESSION_KEY);
-          if (!raw) return false;
-          const parsed = JSON.parse(raw);
-          if (
-            parsed &&
-            String(parsed.gid) === String(gid) &&
-            Date.now() - Number(parsed.ts || 0) <= AUTO_JUMP_GUARD_TTL_MS
-          ) {
-            global.sessionStorage.removeItem(AUTO_JUMPED_GID_SESSION_KEY);
-            return true;
-          }
-        } catch (_) {}
-        return false;
-      };
-
+      // ==================== 分享直达链接自动展开详情 + 返回自动恢复反馈抽屉 + 已拼满留存引导 ====================
       const refreshSingleGroupSilently = async gid => {
         if (!gid) return;
         try {
@@ -1520,7 +1467,6 @@
 
       const restoreReturnedGroupDetail = async returned => {
         if (!returned || !returned.gid) return;
-        clearAutoJumpGuard();
         if (returned.snapshot && returned.snapshot.group_order_id === returned.gid) {
           openDetail(returned.snapshot);
         }
@@ -1536,14 +1482,14 @@
 
       const openDeepLinkedGroup = async (gid, fromModalHistory = false) => {
         if (!/^[0-9]{10,28}$/.test(gid)) return;
-        const skipAutoJump = Boolean(
-          fromModalHistory || isBackForwardNavigation() || consumeAutoJumpGuardIfMatch(gid)
-        );
-        try {
-          if (global.history && typeof global.history.replaceState === 'function') {
-            global.history.replaceState(null, '', '/group_help');
-          }
-        } catch (_) {}
+        consumeReturnGroup();
+        if (!fromModalHistory) {
+          try {
+            if (global.history && typeof global.history.replaceState === 'function') {
+              global.history.replaceState(null, '', '/group_help');
+            }
+          } catch (_) {}
+        }
         try {
           const resp = await global.fetch(`/api/group_help/detail/${encodeURIComponent(gid)}`);
           const json = await resp.json();
@@ -1555,18 +1501,23 @@
               Number(d.remaining_seconds) > 0 &&
               Number(d.remain_people) > 0
             ) {
-              if (skipAutoJump) {
-                consumeReturnGroup();
+              if (fromModalHistory) {
+                pushedHistoryCount = Math.max(pushedHistoryCount, 1);
+                selectedGroup.value = { ...d };
+                syncGroupPageTitle(selectedGroup.value);
+              } else {
                 openDetail(d);
-                return;
               }
-              markAutoJumpGuard(d.group_order_id || gid);
-              directJoinGroup(d, { userGesture: false });
               return;
             }
           }
-          consumeReturnGroup();
-          clearAutoJumpGuard();
+          if (fromModalHistory) {
+            try {
+              if (global.history && typeof global.history.replaceState === 'function') {
+                global.history.replaceState(null, '', '/group_help');
+              }
+            } catch (_) {}
+          }
           showToast('该拼团刚刚拼满或已结束，快看看大厅其他正在凑人的好价拼团吧！', 3800);
         } catch (_) {}
       };
@@ -1581,7 +1532,6 @@
         clearAppFallbackTimer();
         if (event && event.persisted) {
           consumeReturnGroup();
-          clearAutoJumpGuard();
           if (selectedGroup.value && selectedGroup.value.group_order_id) {
             refreshSingleGroupSilently(selectedGroup.value.group_order_id);
           }

@@ -55,6 +55,8 @@ cd /root/easy_shop_web
 # 1. 拉取最新代码
 git pull origin main
 
+cd /root/easy_shop_web && git pull origin main && systemctl restart mobile_web.service
+
 # 2. 同步安装新增 Python 依赖（走腾讯云镜像源加速，已安装的包会自动秒跳过）
 /root/easy_shop_web/mobile_web/.venv/bin/python -m pip install -i https://mirrors.cloud.tencent.com/pypi/simple -r /root/easy_shop_web/mobile_web/requirements.txt
 
