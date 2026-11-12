@@ -12,8 +12,8 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261111-3">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261111-3"></script>
+  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261112-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261112-1"></script>
 </head>
 <body>
 <div id="group-help-app">
@@ -216,7 +216,7 @@
         <div class="gh-onboard-step">
           <div class="gh-onboard-step-tag">🛒 1. 怎么参团省钱？</div>
           <div class="gh-onboard-step-desc">
-            点下方商品 → 唤醒拼多多或扫码参团 → 拼成后顺手点<b>「我已参团」</b>
+            点下方商品一键直达拼团页 → 参团后返回顺手点<b>「我已参团」</b>
           </div>
         </div>
         <div class="gh-onboard-step" @click="openHelpGuide(null)" style="cursor:pointer">
@@ -246,7 +246,7 @@
         v-for="item in items"
         :key="item.group_order_id"
         class="gh-card"
-        @click="openDetail(item)"
+        @click="directJoinGroup(item)"
       >
         <div class="gh-thumb-box">
           <img :src="item.poster_url" :alt="item.goods_name" loading="lazy" />
@@ -267,7 +267,10 @@
               <span class="gh-origin-price" v-if="item.original_price && item.original_price > item.group_price">¥{{ item.original_price }}</span>
             </div>
             <span class="gh-sub-meta" v-else>价格见图</span>
-            <button class="gh-join-btn">去参团</button>
+            <div class="gh-card-cta-group">
+              <button class="gh-card-more-btn" @click.stop="openDetail(item)">详情</button>
+              <button class="gh-join-btn" @click.stop="directJoinGroup(item)">去参团</button>
+            </div>
           </div>
         </div>
       </div>
@@ -325,7 +328,7 @@
           </div>
         </div>
 
-        <!-- 主操作：唤醒App参团 + 看大图扫码/网页打开 -->
+        <!-- 主操作：一键直达拼团页 + 辅助扫码/分享 -->
         <div class="gh-jump-section">
           <button class="gh-btn-app-jump" @click="jumpToApp(selectedGroup)">
             🚀 去拼多多参团
@@ -334,10 +337,12 @@
             <button class="gh-link-btn" @click="openPosterAndRecord(selectedGroup)">
               📷 看二维码大图扫码
             </button>
-            <span class="gh-link-sep">|</span>
-            <button class="gh-link-btn" @click="jumpToH5(selectedGroup)">
-              🌐 网页打开
-            </button>
+            <template v-if="canWakeNativeApp">
+              <span class="gh-link-sep">|</span>
+              <button class="gh-link-btn" @click="jumpToH5(selectedGroup)">
+                🌐 网页打开
+              </button>
+            </template>
             <template v-if="selectedGroup.group_status === 'active' && selectedGroup.remaining_seconds > 0 && selectedGroup.remain_people > 0">
               <span class="gh-link-sep">|</span>
               <button class="gh-link-btn gh-link-share" @click="shareGroup(selectedGroup)">
@@ -716,6 +721,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=ux-20261111-3"></script>
+<script src="/static/js/group_help.js?v=ux-20261112-1"></script>
 </body>
 </html>

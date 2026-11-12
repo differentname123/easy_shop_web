@@ -1,4 +1,4 @@
-// 拼多多多人团互助独立前端控制器 (零阻塞后台上传 + 本地缓存含失败记录 + 手机返回键防误退 + 跨端扫码自适应)
+// 拼多多多人团互助独立前端控制器 (零阻塞后台上传 + 本地缓存含失败记录 + 一键直达拼团页 + 返回自动展开状态反馈)
 (function (global) {
   'use strict';
   const { createApp, ref, computed, onMounted, onUnmounted } = global.Vue;
@@ -8,6 +8,11 @@
   const ONBOARD_DISMISSED_KEY = 'pdd_gh_onboard_dismissed_v1';
   const UPLOAD_GUIDE_ACK_KEY = 'pdd_gh_upload_guide_ack_v1';
   const JOINED_GROUPS_KEY = 'pdd_gh_joined_gids_v1';
+  const RETURN_GROUP_SESSION_KEY = 'pdd_gh_return_group_v1';
+  const AUTO_JUMPED_GID_SESSION_KEY = 'pdd_gh_auto_jumped_gid_v1';
+  const RETURN_GROUP_TTL_MS = 10 * 60 * 1000;
+  const AUTO_JUMP_GUARD_TTL_MS = 90 * 1000;
+  const APP_WAKE_FALLBACK_MS = 800;
   const EASY_SHOP_TOKEN_KEY = 'easy_shop_token';
   const EASY_SHOP_UID_KEY = 'easy_shop_uid';
   const EASY_SHOP_PHONE_KEY = 'easy_shop_phone';
@@ -667,11 +672,7 @@
 
       const triggerUpload = () => {
         try {
-          const acked = global.localStorage.getItem(UPLOAD_GUIDE_ACK_KEY) === '1';
-          if (!acked && myGroups.value.length === 0) {
-            openHelpGuide(null);
-            return;
-          }
+          global.localStorage.setItem(UPLOAD_GUIDE_ACK_KEY, '1');
         } catch (_) {}
         openFilePickerDirectly();
       };
@@ -918,11 +919,11 @@
         }
       };
 
-      const chooseJoinMatchedGroup = async () => {
+      const chooseJoinMatchedGroup = () => {
         const matched = uploadResultModal.value.matchedGroup;
         const own = uploadResultModal.value.ownGroup;
         closeUploadResultModal();
-        // 用户选择直接去拼已有同款团，将其待确认的重复团设为已结束并从“我的团”清理
+        // 用户选择直接去拼已有同款团，将其待确认的重复团设为已结束并从“我的团”清理，随后一键直达该团
         if (own && own.group_order_id) {
           const ownHeaders = buildAuthHeaders(true);
           const ownBody = buildFeedbackBody(own.group_order_id, 'mark_expired');
@@ -938,7 +939,7 @@
           saveMyGroupsToStorage(myGroups.value);
         }
         if (matched) {
-          openDetail(matched);
+          directJoinGroup(matched);
         }
       };
 
@@ -984,7 +985,78 @@
         }
       };
 
-      // ==================== 参团跳转与计数 (keepalive 防丢失 + 跨端环境自适应) ====================
+      // ==================== 参团一键直达与计数 (keepalive 防丢失 + 微信/手机/电脑全环境直接跳团，绝不弹截图二次阻断) ====================
+      let appFallbackTimer = null;
+
+      const clearAppFallbackTimer = () => {
+        if (appFallbackTimer) {
+          global.clearTimeout(appFallbackTimer);
+          appFallbackTimer = null;
+        }
+      };
+
+      const resolveH5JoinUrl = item => {
+        if (!item) return '';
+        if (item.h5_join_url) return String(item.h5_join_url);
+        if (item.group_order_id) {
+          return `https://mobile.yangkeduo.com/group7.html?group_order_id=${encodeURIComponent(String(item.group_order_id))}`;
+        }
+        return '';
+      };
+
+      const resolveAppWakeUrl = item => {
+        if (!item) return '';
+        if (item.app_wake_url) return String(item.app_wake_url);
+        if (item.group_order_id) {
+          return `pinduoduo://com.xunmeng.pinduoduo/group7.html?group_order_id=${encodeURIComponent(String(item.group_order_id))}`;
+        }
+        return '';
+      };
+
+      const isInAppWebView = () => {
+        const ua = String((global.navigator && global.navigator.userAgent) || '');
+        return /MicroMessenger|QQ\/|Qzone|Weibo|AlipayClient|DingTalk|Feishu|BytedanceWebview/i.test(ua);
+      };
+
+      const isMobileNonWeChat = () => {
+        const ua = String((global.navigator && global.navigator.userAgent) || '');
+        const isMobile = /Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(ua);
+        return isMobile && !isInAppWebView();
+      };
+
+      const canWakeNativeApp = computed(() => isMobileNonWeChat());
+
+      const rememberReturnGroup = item => {
+        if (!item || !item.group_order_id) return;
+        try {
+          if (global.sessionStorage) {
+            global.sessionStorage.setItem(
+              RETURN_GROUP_SESSION_KEY,
+              JSON.stringify({
+                gid: String(item.group_order_id),
+                ts: Date.now(),
+                snapshot: item,
+              })
+            );
+          }
+        } catch (_) {}
+      };
+
+      const consumeReturnGroup = () => {
+        try {
+          if (!global.sessionStorage) return null;
+          const raw = global.sessionStorage.getItem(RETURN_GROUP_SESSION_KEY);
+          if (!raw) return null;
+          global.sessionStorage.removeItem(RETURN_GROUP_SESSION_KEY);
+          const parsed = JSON.parse(raw);
+          if (!parsed || !parsed.gid) return null;
+          if (Date.now() - Number(parsed.ts || 0) > RETURN_GROUP_TTL_MS) return null;
+          return parsed;
+        } catch (_) {
+          return null;
+        }
+      };
+
       const recordClick = async gid => {
         if (!gid) return;
         try {
@@ -1005,29 +1077,78 @@
         } catch (_) {}
       };
 
-      const isMobileNonWeChat = () => {
-        const ua = String((global.navigator && global.navigator.userAgent) || '');
-        const isMobile = /Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(ua);
-        const isBlockedWebView = /MicroMessenger|QQ\/|Weibo|AlipayClient|DingTalk/i.test(ua);
-        return isMobile && !isBlockedWebView;
+      const jumpToGroup = (item, options = {}) => {
+        if (!item) return;
+        const userGesture = options.userGesture !== false;
+        const preferH5Only = Boolean(options.preferH5Only);
+        const h5Url = resolveH5JoinUrl(item);
+        const appUrl = resolveAppWakeUrl(item);
+        if (!h5Url && !appUrl) return;
+
+        clearAppFallbackTimer();
+        recordClick(item.group_order_id);
+
+        const inAppWebView = isInAppWebView();
+        const mobileBrowser = isMobileNonWeChat();
+        const willNavigateCurrentTab = !userGesture || inAppWebView || mobileBrowser;
+        if (willNavigateCurrentTab) {
+          rememberReturnGroup(item);
+        }
+
+        // 1. 手机系统浏览器（非微信等内置 WebView）且由点击触发：优先唤醒拼多多 App，若未安装则在 800ms 后自动兜底直达 H5 参团页（无需二次点击）
+        if (!preferH5Only && userGesture && mobileBrowser && appUrl) {
+          global.location.href = appUrl;
+          if (h5Url) {
+            appFallbackTimer = global.setTimeout(() => {
+              appFallbackTimer = null;
+              if (!(global.document && global.document.hidden)) {
+                global.location.href = h5Url;
+              }
+            }, APP_WAKE_FALLBACK_MS);
+          }
+          return;
+        }
+
+        // 2. 微信内置浏览器（含手机微信与电脑微信）、其他内置 WebView 或分享直达自动跳转：拼多多官方 H5 在微信内原生直通，直接当前页访问拼团链接
+        if (willNavigateCurrentTab || typeof global.open !== 'function') {
+          if (h5Url) {
+            global.location.href = h5Url;
+          }
+          return;
+        }
+
+        // 3. 桌面外部浏览器点击触发：新标签页直接打开拼团链接，当前页保留反馈面板
+        if (h5Url) {
+          global.open(h5Url, '_blank', 'noopener,noreferrer');
+        }
+      };
+
+      const directJoinGroup = (item, options = {}) => {
+        if (!item) return;
+        if (
+          item.group_status !== 'active' ||
+          Number(item.remaining_seconds) <= 0 ||
+          Number(item.remain_people) <= 0
+        ) {
+          openDetail(item);
+          return;
+        }
+        const userGesture = options.userGesture !== false;
+        const willNavigateCurrentTab = !userGesture || isInAppWebView() || isMobileNonWeChat();
+        if (!selectedGroup.value && !willNavigateCurrentTab) {
+          pushModalHistory(item.group_order_id || '');
+        }
+        selectedGroup.value = { ...item };
+        syncGroupPageTitle(selectedGroup.value);
+        jumpToGroup(item, options);
       };
 
       const jumpToApp = item => {
-        if (!item) return;
-        recordClick(item.group_order_id);
-        // 在微信内置浏览器或电脑浏览器中，pinduoduo:// 协议无法直接唤醒 App，直接展示高清二维码海报扫码参团
-        if (!isMobileNonWeChat()) {
-          openFullPoster(item.poster_url);
-          showToast('请长按或使用手机扫描二维码参团', 3000);
-          return;
-        }
-        global.location.href = item.app_wake_url;
+        jumpToGroup(item, { userGesture: true, preferH5Only: false });
       };
 
       const jumpToH5 = item => {
-        if (!item) return;
-        recordClick(item.group_order_id);
-        global.open(item.h5_join_url, '_blank', 'noopener,noreferrer');
+        jumpToGroup(item, { userGesture: true, preferH5Only: true });
       };
 
       // ==================== 10秒内联快捷登录/注册弹窗（与主站账号互通，仅在非团长执行下架操作时唤出） ====================
@@ -1322,9 +1443,102 @@
         }
       };
 
-      // ==================== 分享直达链接自动弹开 & 已拼满留存引导 ====================
-      const openDeepLinkedGroup = async gid => {
+      // ==================== 分享直达链接一键自动跳团 + 返回自动展开反馈 + 已拼满留存引导 ====================
+      const isBackForwardNavigation = () => {
+        try {
+          if (global.performance && typeof global.performance.getEntriesByType === 'function') {
+            const navList = global.performance.getEntriesByType('navigation');
+            if (Array.isArray(navList) && navList[0] && navList[0].type === 'back_forward') {
+              return true;
+            }
+          }
+        } catch (_) {}
+        return false;
+      };
+
+      const markAutoJumpGuard = gid => {
+        if (!gid) return;
+        try {
+          if (global.sessionStorage) {
+            global.sessionStorage.setItem(
+              AUTO_JUMPED_GID_SESSION_KEY,
+              JSON.stringify({ gid: String(gid), ts: Date.now() })
+            );
+          }
+        } catch (_) {}
+      };
+
+      const clearAutoJumpGuard = () => {
+        try {
+          if (global.sessionStorage) {
+            global.sessionStorage.removeItem(AUTO_JUMPED_GID_SESSION_KEY);
+          }
+        } catch (_) {}
+      };
+
+      const consumeAutoJumpGuardIfMatch = gid => {
+        if (!gid) return false;
+        try {
+          if (!global.sessionStorage) return false;
+          const raw = global.sessionStorage.getItem(AUTO_JUMPED_GID_SESSION_KEY);
+          if (!raw) return false;
+          const parsed = JSON.parse(raw);
+          if (
+            parsed &&
+            String(parsed.gid) === String(gid) &&
+            Date.now() - Number(parsed.ts || 0) <= AUTO_JUMP_GUARD_TTL_MS
+          ) {
+            global.sessionStorage.removeItem(AUTO_JUMPED_GID_SESSION_KEY);
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      };
+
+      const refreshSingleGroupSilently = async gid => {
+        if (!gid) return;
+        try {
+          const resp = await global.fetch(`/api/group_help/detail/${encodeURIComponent(gid)}`);
+          if (!resp.ok) return;
+          const json = await resp.json();
+          if (json && json.status === 'success' && json.data) {
+            if (selectedGroup.value && selectedGroup.value.group_order_id === gid) {
+              selectedGroup.value = json.data;
+              syncGroupPageTitle(selectedGroup.value);
+            }
+            const idx = items.value.findIndex(it => it.group_order_id === gid);
+            if (idx !== -1) {
+              if (json.data.group_status === 'active' && Number(json.data.remain_people) > 0) {
+                items.value[idx] = json.data;
+              } else {
+                items.value.splice(idx, 1);
+              }
+            }
+          }
+        } catch (_) {}
+      };
+
+      const restoreReturnedGroupDetail = async returned => {
+        if (!returned || !returned.gid) return;
+        clearAutoJumpGuard();
+        if (returned.snapshot && returned.snapshot.group_order_id === returned.gid) {
+          openDetail(returned.snapshot);
+        }
+        try {
+          const resp = await global.fetch(`/api/group_help/detail/${encodeURIComponent(returned.gid)}`);
+          if (!resp.ok) return;
+          const json = await resp.json();
+          if (json && json.status === 'success' && json.data) {
+            openDetail(json.data);
+          }
+        } catch (_) {}
+      };
+
+      const openDeepLinkedGroup = async (gid, fromModalHistory = false) => {
         if (!/^[0-9]{10,28}$/.test(gid)) return;
+        const skipAutoJump = Boolean(
+          fromModalHistory || isBackForwardNavigation() || consumeAutoJumpGuardIfMatch(gid)
+        );
         try {
           if (global.history && typeof global.history.replaceState === 'function') {
             global.history.replaceState(null, '', '/group_help');
@@ -1341,22 +1555,53 @@
               Number(d.remaining_seconds) > 0 &&
               Number(d.remain_people) > 0
             ) {
-              openDetail(d);
+              if (skipAutoJump) {
+                consumeReturnGroup();
+                openDetail(d);
+                return;
+              }
+              markAutoJumpGuard(d.group_order_id || gid);
+              directJoinGroup(d, { userGesture: false });
               return;
             }
           }
+          consumeReturnGroup();
+          clearAutoJumpGuard();
           showToast('该拼团刚刚拼满或已结束，快看看大厅其他正在凑人的好价拼团吧！', 3800);
         } catch (_) {}
       };
 
+      const onDocumentVisibilityChange = () => {
+        if (global.document && global.document.hidden) {
+          clearAppFallbackTimer();
+        }
+      };
+
+      const onWindowPageShow = event => {
+        clearAppFallbackTimer();
+        if (event && event.persisted) {
+          consumeReturnGroup();
+          clearAutoJumpGuard();
+          if (selectedGroup.value && selectedGroup.value.group_order_id) {
+            refreshSingleGroupSilently(selectedGroup.value.group_order_id);
+          }
+        }
+      };
+
       onMounted(() => {
         global.addEventListener('popstate', onWindowPopState);
+        global.addEventListener('pagehide', clearAppFallbackTimer);
+        global.addEventListener('pageshow', onWindowPageShow);
+        if (global.document && typeof global.document.addEventListener === 'function') {
+          global.document.addEventListener('visibilitychange', onDocumentVisibilityChange);
+        }
         try {
           showOnboardGuide.value = global.localStorage.getItem(ONBOARD_DISMISSED_KEY) !== '1';
         } catch (_) {
           showOnboardGuide.value = true;
         }
         let deepGid = '';
+        let fromModalHistory = false;
         try {
           const params = new URLSearchParams((global.location && global.location.search) || '');
           const inv = String(params.get('invite_code') || '').trim();
@@ -1364,13 +1609,19 @@
             global.localStorage.setItem(EASY_SHOP_PENDING_INVITE_KEY, inv);
           }
           deepGid = String(params.get('gid') || '').trim();
+          fromModalHistory = Boolean(global.history && global.history.state && global.history.state.ghModal);
         } catch (_) {}
         loadSavedAuthToken();
         joinedGroupIds.value = loadJoinedGroupsFromStorage();
         myGroups.value = loadMyGroupsFromStorage();
         fetchGroups(true);
         if (deepGid) {
-          openDeepLinkedGroup(deepGid);
+          openDeepLinkedGroup(deepGid, fromModalHistory);
+        } else {
+          const returned = consumeReturnGroup();
+          if (returned && returned.gid) {
+            restoreReturnedGroupDetail(returned);
+          }
         }
         if (myGroups.value.length > 0) {
           refreshMyGroups(false, false);
@@ -1379,6 +1630,12 @@
 
       onUnmounted(() => {
         global.removeEventListener('popstate', onWindowPopState);
+        global.removeEventListener('pagehide', clearAppFallbackTimer);
+        global.removeEventListener('pageshow', onWindowPageShow);
+        if (global.document && typeof global.document.removeEventListener === 'function') {
+          global.document.removeEventListener('visibilitychange', onDocumentVisibilityChange);
+        }
+        clearAppFallbackTimer();
         if (pollTimer) global.clearInterval(pollTimer);
         if (toastTimer) global.clearTimeout(toastTimer);
       });
@@ -1405,6 +1662,7 @@
         isMyOwnGroup,
         isTakedownBlockedForSelected,
         isJoinedBtnDisabled,
+        canWakeNativeApp,
         helpModal,
         creditWarnModal,
         authModal,
@@ -1445,6 +1703,7 @@
         chooseJoinMatchedGroup,
         choosePublishOwnGroup,
         onMyGroupCardClick,
+        directJoinGroup,
         jumpToApp,
         jumpToH5,
         requestFeedback,

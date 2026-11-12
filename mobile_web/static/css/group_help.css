@@ -290,6 +290,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-top: 6px;
 }
 
@@ -297,6 +298,9 @@ body {
   display: inline-flex;
   align-items: baseline;
   gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .gh-price-val {
@@ -311,12 +315,30 @@ body {
   text-decoration: line-through;
 }
 
+.gh-card-cta-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.gh-card-more-btn {
+  border: 1px solid #dcdfe6;
+  background: #f7f8fa;
+  color: var(--gh-text-sub);
+  border-radius: 99px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
 .gh-join-btn {
   background: var(--gh-primary);
   color: #fff;
   border: none;
   border-radius: 99px;
-  padding: 6px 15px;
+  padding: 6px 14px;
   font-size: 13px;
   font-weight: 700;
   cursor: pointer;

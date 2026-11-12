@@ -2260,6 +2260,11 @@ test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, de
   });
   assert.equal(hActive.page.selectedGroup.value.group_order_id, '3495229659187300088');
   assert.equal(hActive.context.document.title, '【差2人 ¥26.9】维达超韧抽纸24包整箱 - 多人团互助');
+  assert.equal(
+    hActive.context.location.href,
+    'https://mobile.yangkeduo.com/group7.html?group_order_id=3495229659187300088',
+    'active ?gid= share link auto-jumps directly to Pinduoduo group page with 0 extra clicks'
+  );
   await hActive.page.shareGroup(hActive.page.selectedGroup.value);
   assert.ok(hActive.copied.at(-1).includes('https://shop.test/group_help?gid=3495229659187300088&invite_code=INV_MY_SELF'));
   hActive.page.closeDetail();
@@ -2351,3 +2356,129 @@ test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, de
     assert.equal(forbidden.test(jsContent), false, `${jsName} must remain 100% free of WeChat-sensitive words`);
   }
 });
+
+test('group_help 1-click UX: WeChat jumps directly to H5 group without poster popup, restores feedback sheet on return, falls back from App scheme to H5, and opens upload/matched join in 1 click', async () => {
+  const sampleGroup = {
+    group_order_id: '3495229659187300101',
+    goods_name: '蓝月亮深层洁净洗衣液6斤装',
+    group_price: 29.9,
+    poster_url: '/api/group_help/poster/3495229659187300101',
+    h5_join_url: 'https://mobile.yangkeduo.com/group7.html?group_order_id=3495229659187300101&refer_share_id=wx1',
+    app_wake_url: 'pinduoduo://com.xunmeng.pinduoduo/group7.html?group_order_id=3495229659187300101&refer_share_id=wx1',
+    parse_status: 'parsed',
+    group_status: 'active',
+    remain_people: 2,
+    total_people: 3,
+    remaining_seconds: 36000,
+  };
+
+  // 1. 微信内置浏览器（手机微信 / 电脑微信）：点击大厅卡片或「去拼多多参团」直接跳转拼团 H5，绝不弹海报截图！
+  const hWx = harness({ url: 'https://shop.test/group_help' });
+  hWx.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 MicroMessenger/8.0.50 NetType/WIFI';
+  hWx.load('group_help');
+  hWx.mounted[0]();
+  await flush();
+  await hWx.finish(0, {
+    status: 'success',
+    data: { items: [sampleGroup], total: 1, has_more: false, pending_count: 0 },
+  });
+  assert.equal(hWx.page.canWakeNativeApp.value, false, 'WeChat hides duplicate H5 button because primary button directly opens H5');
+
+  hWx.page.directJoinGroup(sampleGroup);
+  assert.equal(hWx.page.fullPosterUrl.value, '', 'WeChat must NEVER pop up poster screenshot on join click');
+  assert.equal(hWx.context.location.href, sampleGroup.h5_join_url);
+  assert.equal(hWx.requests.at(-1).url, '/api/group_help/click/3495229659187300101');
+  assert.equal(hWx.requests.at(-1).options.keepalive, true);
+
+  const savedReturnRaw = hWx.context.sessionStorage.getItem('pdd_gh_return_group_v1');
+  assert.ok(savedReturnRaw, 'stores return group snapshot before navigating away in WeChat');
+
+  // 详情抽屉内点「去拼多多参团」同样直接访问 H5，绝不弹图
+  hWx.context.location.href = 'https://shop.test/group_help';
+  hWx.page.jumpToApp(sampleGroup);
+  assert.equal(hWx.page.fullPosterUrl.value, '');
+  assert.equal(hWx.context.location.href, sampleGroup.h5_join_url);
+
+  // 2. 用户在拼多多参团后按返回回到 /group_help：自动展开刚才参团的商品反馈抽屉（1次点击即可点「我已参团」），且不死循环重跳
+  const hReturn = harness({
+    url: 'https://shop.test/group_help',
+    sessionSaved: { pdd_gh_return_group_v1: savedReturnRaw },
+  });
+  hReturn.context.navigator.userAgent = hWx.context.navigator.userAgent;
+  hReturn.load('group_help');
+  hReturn.mounted[0]();
+  await flush();
+  assert.equal(hReturn.context.location.href, 'https://shop.test/group_help', 'returning to hall must not auto-redirect again');
+  assert.equal(hReturn.page.selectedGroup.value.group_order_id, '3495229659187300101', 'immediately restores group feedback sheet');
+
+  // 若微信后退命中了带 ?gid= 的历史记录，防循环守卫确保只展开详情而不重复自动跳走
+  const hBackGuard = harness({
+    url: 'https://shop.test/group_help?gid=3495229659187300101',
+    sessionSaved: { pdd_gh_auto_jumped_gid_v1: JSON.stringify({ gid: '3495229659187300101', ts: Date.now() }) },
+  });
+  hBackGuard.context.navigator.userAgent = hWx.context.navigator.userAgent;
+  hBackGuard.load('group_help');
+  hBackGuard.mounted[0]();
+  await flush();
+  const detailReqIdx = hBackGuard.requests.findIndex(r => r.url === '/api/group_help/detail/3495229659187300101');
+  await hBackGuard.finish(detailReqIdx, { status: 'success', data: sampleGroup });
+  assert.equal(hBackGuard.context.location.href, 'https://shop.test/group_help?gid=3495229659187300101', 'auto-jump guard blocks infinite back redirect');
+  assert.equal(hBackGuard.page.selectedGroup.value.group_order_id, '3495229659187300101');
+
+  // 3. 手机系统浏览器（非微信）：优先唤醒 pinduoduo:// App，未安装时 800ms 自动降级直达 H5（无需二次点网页打开）；若成功切后台则取消降级
+  const hSafari = harness({ url: 'https://shop.test/group_help' });
+  hSafari.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) Version/17.0 Mobile/15E148 Safari/604.1';
+  hSafari.load('group_help');
+  assert.equal(hSafari.page.canWakeNativeApp.value, true);
+
+  hSafari.page.directJoinGroup(sampleGroup);
+  assert.equal(hSafari.context.location.href, sampleGroup.app_wake_url);
+  const [firstTimerId, fallbackTimerEntry] = [...hSafari.timers.entries()].find(([, t]) => t.delay === 800) || [];
+  assert.ok(fallbackTimerEntry, 'schedules 800ms H5 fallback timer when waking native App');
+  hSafari.timers.delete(firstTimerId);
+  fallbackTimerEntry.callback();
+  assert.equal(hSafari.context.location.href, sampleGroup.h5_join_url, 'falls back to H5 automatically when App is not installed');
+
+  // 若 App 成功拉起导致页面隐藏 (visibilitychange -> document.hidden = true)，立即清除定时器不再跳 H5
+  hSafari.mounted[0]();
+  await flush();
+  hSafari.context.location.href = 'https://shop.test/group_help';
+  hSafari.page.directJoinGroup(sampleGroup);
+  assert.equal(hSafari.context.location.href, sampleGroup.app_wake_url);
+  assert.equal([...hSafari.timers.values()].some(t => t.delay === 800), true);
+  hSafari.context.document.hidden = true;
+  hSafari.fire('visibilitychange');
+  assert.equal([...hSafari.timers.values()].some(t => t.delay === 800), false, 'clears H5 fallback timer once App wakes and hides page');
+
+  // 4. 电脑浏览器 + 首次「传海报发团」1次点击直达相册 + 同款商品弹窗「直接去拼这个团」1次点击直达拼团
+  const hDesktop = harness({ url: 'https://shop.test/group_help' });
+  hDesktop.context.navigator.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36';
+  hDesktop.load('group_help');
+  assert.equal(hDesktop.page.canWakeNativeApp.value, false);
+
+  let filePickerClicks = 0;
+  hDesktop.page.fileInputRef.value = { value: 'dummy', click: () => { filePickerClicks += 1; } };
+  hDesktop.page.triggerUpload();
+  assert.equal(filePickerClicks, 1, 'first-time upload opens file picker in 1 click without modal interception');
+  assert.equal(hDesktop.page.helpModal.value.visible, false);
+
+  hDesktop.page.openUploadResultModal({
+    group_order_id: '3495229659187300199',
+    parse_status: 'parsed',
+    group_status: 'pending_confirm',
+    owner_token: 'own_dup',
+    matched_group: sampleGroup,
+  });
+  assert.equal(hDesktop.page.uploadResultModal.value.visible, true);
+  hDesktop.page.chooseJoinMatchedGroup();
+  assert.equal(hDesktop.page.uploadResultModal.value.visible, false);
+  assert.equal(hDesktop.opened.at(-1), sampleGroup.h5_join_url, 'clicking join matched group directly opens group URL in 1 click');
+
+  // 5. 静态 HTML / CSS 零微信敏感词校验
+  const forbidden = /返利|返现|打钱|提现红包|购物补贴|折合到手|自动存入钱包|随时提现/;
+  const htmlContent = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
+  const cssContent = fs.readFileSync(path.join(root, 'static', 'css', 'group_help.css'), 'utf8');
+  assert.equal(forbidden.test(htmlContent), false, 'group_help.html must remain 100% free of WeChat-sensitive words');
+  assert.equal(forbidden.test(cssContent), false, 'group_help.css must remain 100% free of WeChat-sensitive words');
+});
+
