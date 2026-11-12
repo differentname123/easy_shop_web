@@ -173,7 +173,21 @@ class MemoryCollection:
     def project(doc, projection):
         if projection is None:
             return deepcopy(doc)
-        return {key: deepcopy(value) for key, value in doc.items() if projection.get(key)}
+        result = {}
+        for path, enabled in projection.items():
+            if not enabled:
+                continue
+            found, value = MemoryCollection.get_path(doc, path)
+            if not found:
+                continue
+            parts = path.split(".")
+            target = result
+            for part in parts[:-1]:
+                if not isinstance(target.get(part), dict):
+                    target[part] = {}
+                target = target[part]
+            target[parts[-1]] = deepcopy(value)
+        return result
 
     def find_one(self, query, projection=None):
         with self.lock:
@@ -1374,6 +1388,172 @@ class TestProductRepository(unittest.TestCase):
             "https://img14.360buyimg.com/n1/c1.jpg",
             "https://img14.360buyimg.com/n1/c2.jpg",
         ])
+
+    def test_cost_performance_uses_cleaned_deal_info_within_12h_and_falls_back_when_expired_or_uncleaned(self):
+        # 固定当前时间为 2026-11-12 22:00:00 (北京时间) = 2026-11-12 14:00:00 UTC
+        fixed_now_utc = datetime.datetime(2026, 11, 12, 14, 0, 0, tzinfo=datetime.timezone.utc)
+        fixed_now_ts = fixed_now_utc.timestamp()
+
+        self.col.docs = [
+            # 1. 2 小时内有效爆料 + 已完成线报清洗：按爆料 10000ml / 50元 = 200 ml/元 参与排序（优于外层 4000ml / 49.9元 = 80.16 ml/元）
+            {
+                "platform": "jd", "product_id": "DEAL_FRESH_COMBO", "name": "蓝月亮洗衣液组合爆料",
+                "activity_price": 49.9, "channel_type": 1, "updated_at": fixed_now_utc - datetime.timedelta(minutes=10),
+                "format_status": "success", "format_activity_price": 49.9,
+                "format_info": {
+                    "price": 49.9,
+                    "pricing_basis": {"base_unit": "ml", "total_value": 4000, "structure": [{"unit": "ml", "value": 4000}]},
+                },
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "publish_time": "2026-11-12 20:00:00",
+                    "deal_price": 50.0,
+                    "format_deal_price": 50.0,
+                    "format_status": "success",
+                    "need_reformat": False,
+                    "format_info": {
+                        "sku_id": "DEAL_FRESH_COMBO_deal",
+                        "price": 50.0,
+                        "pricing_basis": {"base_unit": "ml", "total_value": 10000, "structure": [{"unit": "ml", "value": 10000}]},
+                    },
+                },
+            },
+            # 2. 11小时50分内纯线报商品（ISO UTC 时间，无外层 format_info）：按爆料 4000ml / 25元 = 160 ml/元 参与排序
+            {
+                "platform": "jd", "product_id": "DEAL_FRESH_NO_OUTER_FMT", "name": "蓝月亮纯线报好价",
+                "activity_price": 39.9, "updated_at": fixed_now_utc - datetime.timedelta(minutes=20),
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "publish_time": "2026-11-12T02:10:00Z",
+                    "deal_price": 25.0,
+                    "format_deal_price": 25.0,
+                    "format_status": "success",
+                    "need_reformat": False,
+                    "format_info": {
+                        "sku_id": "DEAL_FRESH_NO_OUTER_FMT_deal",
+                        "price": 25.0,
+                        "pricing_basis": {"base_unit": "ml", "total_value": 4000, "structure": [{"unit": "ml", "value": 4000}]},
+                    },
+                },
+            },
+            # 3. 普通官方商品（无线报）：4800ml / 40元 = 120 ml/元
+            {
+                "platform": "jd", "product_id": "OFFICIAL_BASELINE", "name": "蓝月亮官方常规装",
+                "activity_price": 40.0, "channel_type": 1, "updated_at": fixed_now_utc - datetime.timedelta(minutes=30),
+                "format_status": "success", "format_activity_price": 40.0,
+                "format_info": {
+                    "price": 40.0,
+                    "pricing_basis": {"base_unit": "ml", "total_value": 4800, "structure": [{"unit": "ml", "value": 4800}]},
+                },
+            },
+            # 4. 超过 12 小时的爆料（13 小时前发布，即便 updated_at 1 分钟前刚被详情刷新也不复活）：回退外层官方 4000ml / 50元 = 80 ml/元
+            {
+                "platform": "jd", "product_id": "DEAL_EXPIRED_13H_FALLBACK_OUTER", "name": "蓝月亮超时爆料有外层清洗",
+                "activity_price": 50.0, "channel_type": 1, "updated_at": fixed_now_utc - datetime.timedelta(minutes=1),
+                "format_status": "success", "format_activity_price": 50.0,
+                "format_info": {
+                    "price": 50.0,
+                    "pricing_basis": {"base_unit": "ml", "total_value": 4000, "structure": [{"unit": "ml", "value": 4000}]},
+                },
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "publish_time": "2026-11-12 09:00:00",
+                    "deal_price": 50.0,
+                    "format_deal_price": 50.0,
+                    "format_status": "success",
+                    "need_reformat": False,
+                    "format_info": {
+                        "sku_id": "DEAL_EXPIRED_13H_FALLBACK_OUTER_deal",
+                        "price": 50.0,
+                        "pricing_basis": {"base_unit": "ml", "total_value": 20000, "structure": [{"unit": "ml", "value": 20000}]},
+                    },
+                },
+            },
+            # 5. 12 小时内爆料但待重洗（need_reformat=True）：安全回退外层官方 3000ml / 50元 = 60 ml/元
+            {
+                "platform": "jd", "product_id": "DEAL_FRESH_UNCLEANED_FALLBACK_OUTER", "name": "蓝月亮新爆料未清洗",
+                "activity_price": 50.0, "channel_type": 1, "updated_at": fixed_now_utc - datetime.timedelta(minutes=40),
+                "format_status": "success", "format_activity_price": 50.0,
+                "format_info": {
+                    "price": 50.0,
+                    "pricing_basis": {"base_unit": "ml", "total_value": 3000, "structure": [{"unit": "ml", "value": 3000}]},
+                },
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "publish_time": "2026-11-12 21:00:00",
+                    "deal_price": 19.9,
+                    "format_deal_price": 19.9,
+                    "format_status": "success",
+                    "need_reformat": True,
+                    "format_info": {
+                        "sku_id": "DEAL_FRESH_UNCLEANED_FALLBACK_OUTER_deal",
+                        "price": 19.9,
+                        "pricing_basis": {"base_unit": "ml", "total_value": 10000, "structure": [{"unit": "ml", "value": 10000}]},
+                    },
+                },
+            },
+            # 6. 12 小时内爆料但爆料价已变更未重洗（deal_price=35.0 != format_deal_price=29.9）：回退外层官方 2500ml / 50元 = 50 ml/元
+            {
+                "platform": "jd", "product_id": "DEAL_FRESH_PRICE_DRIFT_FALLBACK_OUTER", "name": "蓝月亮爆料改价未重洗",
+                "activity_price": 50.0, "channel_type": 1, "updated_at": fixed_now_utc - datetime.timedelta(minutes=50),
+                "format_status": "success", "format_activity_price": 50.0,
+                "format_info": {
+                    "price": 50.0,
+                    "pricing_basis": {"base_unit": "ml", "total_value": 2500, "structure": [{"unit": "ml", "value": 2500}]},
+                },
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "publish_time": "2026-11-12 21:30:00",
+                    "deal_price": 35.0,
+                    "format_deal_price": 29.9,
+                    "format_status": "success",
+                    "need_reformat": False,
+                    "format_info": {
+                        "sku_id": "DEAL_FRESH_PRICE_DRIFT_FALLBACK_OUTER_deal",
+                        "price": 29.9,
+                        "pricing_basis": {"base_unit": "ml", "total_value": 10000, "structure": [{"unit": "ml", "value": 10000}]},
+                    },
+                },
+            },
+            # 7. 超过 12 小时纯线报商品且无外层 format_info：落入末尾未清洗组兜底
+            {
+                "platform": "jd", "product_id": "DEAL_EXPIRED_NO_OUTER_UNFORMATTED", "name": "蓝月亮超时纯线报",
+                "activity_price": 29.9, "updated_at": fixed_now_utc - datetime.timedelta(minutes=5),
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "publish_time": "2026-11-12 07:00:00",
+                    "deal_price": 19.9,
+                    "format_deal_price": 19.9,
+                    "format_status": "success",
+                    "need_reformat": False,
+                    "format_info": {
+                        "sku_id": "DEAL_EXPIRED_NO_OUTER_UNFORMATTED_deal",
+                        "price": 19.9,
+                        "pricing_basis": {"base_unit": "ml", "total_value": 10000, "structure": [{"unit": "ml", "value": 10000}]},
+                    },
+                },
+            },
+        ]
+
+        with patch("repositories.product_repo.time.time", return_value=fixed_now_ts):
+            ranked = self.repo.rank_boom_products_by_cost_performance(platform="jd", keyword="蓝月亮")
+
+        self.assertEqual(
+            [item["product_id"] for item in ranked],
+            [
+                "DEAL_FRESH_COMBO",
+                "DEAL_FRESH_NO_OUTER_FMT",
+                "OFFICIAL_BASELINE",
+                "DEAL_EXPIRED_13H_FALLBACK_OUTER",
+                "DEAL_FRESH_UNCLEANED_FALLBACK_OUTER",
+                "DEAL_FRESH_PRICE_DRIFT_FALLBACK_OUTER",
+                "DEAL_EXPIRED_NO_OUTER_UNFORMATTED",
+            ],
+        )
+        # 列表摘要卡片外层价格保持官方实时价不变，且不泄漏 deal_info 内部结构
+        top_item = ranked[0]
+        self.assertEqual(top_item["price"], 49.9)
+        self.assertNotIn("deal_info", top_item)
 
 
 if __name__ == "__main__":

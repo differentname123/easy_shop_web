@@ -82,6 +82,8 @@ for _cat, _units in SKU_UNIT_BASE_MAPPING.items():
 class ProductRepository(BaseRepository):
     COLLECTION_NAME = "products"
     _MAX_COST_PERFORMANCE_CANDIDATES = 2000
+    _DEAL_COST_PERFORMANCE_TTL = 12 * 3600
+    _CN_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
     def _init_indexes(self):
         try:
@@ -120,6 +122,13 @@ class ProductRepository(BaseRepository):
         "need_reformat": 1,
         "format_activity_price": 1,
         "format_sku_prices": 1,
+        "deal_info.is_deal_tip": 1,
+        "deal_info.publish_time": 1,
+        "deal_info.deal_price": 1,
+        "deal_info.format_deal_price": 1,
+        "deal_info.format_status": 1,
+        "deal_info.need_reformat": 1,
+        "deal_info.format_info": 1,
     }
     _PLAIN_SKU_PRICE_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 
@@ -497,52 +506,139 @@ class ProductRepository(BaseRepository):
                         if cls._is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
                             raw_sku_list.append((cls._amount_float(sku_price), sku_fmt))
 
-        entries: List[Tuple[float, str, Dict[str, float]]] = []
-        for sku_price, sku_fmt in raw_sku_list:
-            pricing_basis = sku_fmt.get("pricing_basis") or {}
-            raw_structure = pricing_basis.get("structure")
-            raw_base_unit = str(pricing_basis.get("base_unit") or "").strip() or "件"
-            raw_total_val = pricing_basis.get("total_value")
+        return [cls._parse_pricing_basis_entry(sku_price, sku_fmt) for sku_price, sku_fmt in raw_sku_list]
 
-            total_val_float = None
-            if raw_total_val is not None and not isinstance(raw_total_val, bool):
+    @staticmethod
+    def _parse_pricing_basis_entry(
+        sku_price: float,
+        sku_fmt: Dict[str, Any],
+    ) -> Tuple[float, str, Dict[str, float]]:
+        """将单条清洗后的规格 format_info 转换为 (sku_price, raw_base_unit, extracted_units)。"""
+        pricing_basis = sku_fmt.get("pricing_basis") or {}
+        raw_structure = pricing_basis.get("structure")
+        raw_base_unit = str(pricing_basis.get("base_unit") or "").strip() or "件"
+        raw_total_val = pricing_basis.get("total_value")
+
+        total_val_float = None
+        if raw_total_val is not None and not isinstance(raw_total_val, bool):
+            try:
+                tv = float(raw_total_val)
+                if math.isfinite(tv) and tv > 0:
+                    total_val_float = tv
+            except (ValueError, TypeError):
+                total_val_float = None
+
+        extracted_units: Dict[str, float] = {}
+        current_accum = 1.0
+        if isinstance(raw_structure, list) and raw_structure:
+            for struct_item in raw_structure:
+                if not isinstance(struct_item, dict):
+                    continue
+                u = str(struct_item.get("unit") or "").strip()
+                v = struct_item.get("value")
+                val_float = 1.0
+                if v is not None and not isinstance(v, bool):
+                    try:
+                        vf = float(v)
+                        if math.isfinite(vf) and vf > 0:
+                            val_float = vf
+                    except (ValueError, TypeError):
+                        val_float = 1.0
+                current_accum *= val_float
+                if u:
+                    extracted_units[u] = current_accum
+
+        if raw_base_unit:
+            final_val = total_val_float if total_val_float is not None else current_accum
+            extracted_units[raw_base_unit] = final_val
+
+        if not extracted_units:
+            extracted_units["件"] = 1.0
+
+        return (sku_price, raw_base_unit, extracted_units)
+
+    @classmethod
+    def _parse_deal_publish_timestamp(cls, val: Any) -> Optional[float]:
+        """将线报 publish_time（ISO 字符串、北京时间字符串、datetime 或数值时间戳）解析为秒级 Unix 时间戳。"""
+        if val is None or isinstance(val, bool):
+            return None
+        if isinstance(val, datetime.datetime):
+            dt = val.replace(tzinfo=cls._CN_TZ) if val.tzinfo is None else val
+            return dt.timestamp()
+        if isinstance(val, (int, float)):
+            ts = float(val)
+            if not math.isfinite(ts) or ts <= 0:
+                return None
+            return ts / 1000.0 if ts > 1e12 else ts
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                return None
+            if s.endswith(("Z", "z")):
+                s = s[:-1] + "+00:00"
+            if "/" in s[:10]:
+                s = s.replace("/", "-", 2)
+            try:
+                dt = datetime.datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=cls._CN_TZ)
+                return dt.timestamp()
+            except ValueError:
+                pass
+            for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16)):
                 try:
-                    tv = float(raw_total_val)
-                    if math.isfinite(tv) and tv > 0:
-                        total_val_float = tv
-                except (ValueError, TypeError):
-                    total_val_float = None
+                    return datetime.datetime.strptime(s[:width], fmt).replace(tzinfo=cls._CN_TZ).timestamp()
+                except ValueError:
+                    continue
+        return None
 
-            extracted_units: Dict[str, float] = {}
-            current_accum = 1.0
-            if isinstance(raw_structure, list) and raw_structure:
-                for struct_item in raw_structure:
-                    if not isinstance(struct_item, dict):
-                        continue
-                    u = str(struct_item.get("unit") or "").strip()
-                    v = struct_item.get("value")
-                    val_float = 1.0
-                    if v is not None and not isinstance(v, bool):
-                        try:
-                            vf = float(v)
-                            if math.isfinite(vf) and vf > 0:
-                                val_float = vf
-                        except (ValueError, TypeError):
-                            val_float = 1.0
-                    current_accum *= val_float
-                    if u:
-                        extracted_units[u] = current_accum
+    @classmethod
+    def _extract_fresh_deal_unit_entries(
+        cls,
+        doc: Dict[str, Any],
+        *,
+        now_ts: Optional[float] = None,
+    ) -> List[Tuple[float, str, Dict[str, float]]]:
+        """
+        若商品附带 12 小时内发布的有效爆料（is_deal_tip=True）且线报已完成结构化清洗（deal_info.format_info），
+        直接采用爆料清洗结构与爆料到手价计算性价比；否则返回空列表回退外层官方数据。
+        """
+        deal_info = doc.get("deal_info")
+        if not isinstance(deal_info, dict) or deal_info.get("is_deal_tip") is not True:
+            return []
+        if deal_info.get("need_reformat") is True or deal_info.get("format_status") != "success":
+            return []
+        deal_fmt = deal_info.get("format_info")
+        if not isinstance(deal_fmt, dict) or not isinstance(deal_fmt.get("pricing_basis"), dict):
+            return []
 
-            if raw_base_unit:
-                final_val = total_val_float if total_val_float is not None else current_accum
-                extracted_units[raw_base_unit] = final_val
+        pub_ts = cls._parse_deal_publish_timestamp(deal_info.get("publish_time"))
+        cur_ts = float(now_ts) if now_ts is not None else time.time()
+        if pub_ts is None or (cur_ts - pub_ts) > cls._DEAL_COST_PERFORMANCE_TTL or (pub_ts - cur_ts) > 300.0:
+            return []
 
-            if not extracted_units:
-                extracted_units["件"] = 1.0
+        raw_dp = deal_info.get("deal_price")
+        if raw_dp is None or isinstance(raw_dp, bool):
+            return []
+        try:
+            deal_price = cls._amount_float(raw_dp)
+        except (ValueError, TypeError, OverflowError):
+            return []
+        if not math.isfinite(deal_price) or deal_price <= 0:
+            return []
 
-            entries.append((sku_price, raw_base_unit, extracted_units))
+        for snap_val in (deal_info.get("format_deal_price"), deal_fmt.get("price")):
+            if snap_val is not None:
+                if isinstance(snap_val, bool):
+                    return []
+                try:
+                    snap_f = cls._amount_float(snap_val)
+                except (ValueError, TypeError, OverflowError):
+                    return []
+                if not math.isfinite(snap_f) or snap_f <= 0 or abs(round(deal_price, 2) - round(snap_f, 2)) > 0.01:
+                    return []
 
-        return entries
+        return [cls._parse_pricing_basis_entry(deal_price, deal_fmt)]
 
     def rank_boom_products_by_cost_performance(
         self,
@@ -552,10 +648,11 @@ class ProductRepository(BaseRepository):
     ) -> List[Dict[str, Any]]:
         """
         查询爆单库候选商品并按性价比排序：
-        1. 提取各商品合法规格的单位结构，按同类度量衡出现频次统一目标单位（如 kg/斤/克 -> g）；
-        2. 多 SKU 商品取其合法规格中性价比最高的主规格参与排序；
-        3. 按出现最多的单位优先、同单位内性价比从高到低排序，第二多的单位次之，依此类推；
-        4. 尚未完成 format_info 清洗的商品按最新上架顺序排在末尾用作兜底。
+        1. 若商品存在 12 小时内的爆料且已完成线报清洗（deal_info.format_info），优先按爆料清洗数据计算性价比，否则回退外层官方 format_info；
+        2. 提取各商品合法规格的单位结构，按同类度量衡出现频次统一目标单位（如 kg/斤/克 -> g）；
+        3. 多 SKU 商品取其合法规格中性价比最高的主规格参与排序；
+        4. 按出现最多的单位优先、同单位内性价比从高到低排序，第二多的单位次之，依此类推；
+        5. 尚未完成 format_info 清洗的商品按最新上架顺序排在末尾用作兜底。
         """
         filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
         cursor = (
@@ -572,10 +669,14 @@ class ProductRepository(BaseRepository):
         formatted_candidates: List[Tuple[Dict[str, Any], List[Tuple[float, str, Dict[str, float]]]]] = []
         unformatted_items: List[Dict[str, Any]] = []
         category_unit_counts: Dict[str, Dict[str, int]] = {}
+        now_ts = time.time()
 
         for doc in raw_docs:
             summary = self._normalize_doc_summary(doc)
-            sku_entries = self._extract_sku_unit_entries(doc)
+            sku_entries = (
+                self._extract_fresh_deal_unit_entries(doc, now_ts=now_ts)
+                or self._extract_sku_unit_entries(doc)
+            )
             if not sku_entries:
                 unformatted_items.append(summary)
                 continue
