@@ -84,12 +84,14 @@ class FakeMongoDB:
         self.collection = FakeCollection(docs)
         self.indexes = []
         self.last_query = None
+        self.last_limit = None
 
     def create_index(self, collection_name, keys, unique=False):
         self.indexes.append((collection_name, tuple(keys), unique))
 
     def find_many(self, collection_name, query=None, projection=None, sort=None, limit=0):
         self.last_query = query
+        self.last_limit = limit
         items = copy.deepcopy(self.collection.docs)
         if limit and limit > 0:
             items = items[:limit]
@@ -248,6 +250,8 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
     monkeypatch.setattr(gif, "generate_content", _fake_generate_content)
     counts = gif.run_deal_format_round(manager)
 
+    assert fake_db.last_limit == 0
+    assert gif.DEAL_FORMAT_WORKERS == 10
     assert counts["success"] == 1
     assert counts["normal_success"] == 1
     assert counts["failed"] == 1
