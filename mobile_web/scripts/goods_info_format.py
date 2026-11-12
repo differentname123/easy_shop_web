@@ -28,6 +28,8 @@ logger = setup_logger(app_name="goods_format")
 PROMPT_FILE_PATH = MOBILE_WEB_DIR / "prompt" / "商品数据结构化清洗.txt"
 LLM_MAX_RETRIES = 3
 FORMAT_MAX_RETRIES = 3
+LOCKED_RETRY_SENTINEL = 999
+PRICE_COMPARE_ABS_TOL = 1e-4
 FORMAT_WORKERS = 10
 DEAL_FORMAT_WORKERS = 10
 FORMAT_BATCH_SIZE = 20
@@ -40,6 +42,7 @@ COUNT_KEYS = ("success", "failed", "skipped")
 _DEAL_URL_RE = re.compile(r"https?://\S+")
 _DEAL_TOKEN_RE = re.compile(r"[（(]\s*口令\s*[:：][^）)]+[）)]")
 _MULTI_SPACE_RE = re.compile(r"\s+")
+_PLAIN_PRICE_TEXT_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 
 DEAL_SUPPLEMENT_RULES = """
 ---
@@ -252,49 +255,359 @@ class ProductManager:
 def pending_format_query(recent_days=RECENT_DAYS):
     """
     候选商品查询条件：
-    1. 仅限最近一周（recent_days 天）内更新的数据
-    2. 尚未成功格式化，或者标记了 need_reformat: True
-    3. 或者已存在 format_info，但未达到预期 SKU 数量（支持漏洗或分批补洗）
-    4. 或者单规格商品的当前价格与 format_info 清洗价格不一致（支持价格变动重洗）
-    5. 且累计重试次数未超过阈值
+    1. 仅限最近一周（recent_days 天）内更新的数据，且未被人工锁死（format_retry_count < 999）
+    2. 显式标记了 need_reformat: True
+    3. 单规格商品（无 sku_info，或 sku_info 仅含 1 条无规格属性的价格占位项）当前 activity_price 与上次清洗价格不一致
+    4. 多规格/带规格属性商品中任一 SKU 的当前价格文本与上次清洗快照（或历史单值价格）不一致
+    5. 尚未成功格式化，或 format_info 数量少于 sku_info 长度（支持断点补洗），且累计失败重试次数未达阈值
     """
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=recent_days)
+
+    sku_list_expr = {
+        "$cond": [
+            {"$isArray": "$sku_info"},
+            "$sku_info",
+            [],
+        ]
+    }
+    fmt_entries_expr = {
+        "$cond": [
+            {
+                "$and": [
+                    {"$eq": [{"$type": "$format_info"}, "object"]},
+                    {"$eq": [{"$type": "$format_info.pricing_basis"}, "missing"]},
+                ]
+            },
+            {"$objectToArray": "$format_info"},
+            [],
+        ]
+    }
+    sku0_obj_expr = {
+        "$let": {
+            "vars": {"first": {"$arrayElemAt": [sku_list_expr, 0]}},
+            "in": {
+                "$cond": [
+                    {"$eq": [{"$type": "$$first"}, "object"]},
+                    {"$objectToArray": "$$first"},
+                    [],
+                ]
+            },
+        }
+    }
+    specless_single_sku_expr = {
+        "$or": [
+            {"$eq": [{"$size": sku_list_expr}, 0]},
+            {
+                "$and": [
+                    {"$eq": [{"$size": sku_list_expr}, 1]},
+                    {
+                        "$eq": [
+                            {
+                                "$size": {
+                                    "$filter": {
+                                        "input": sku0_obj_expr,
+                                        "as": "kv",
+                                        "cond": {
+                                            "$and": [
+                                                {"$not": [{"$in": ["$$kv.k", ["价格", "截图地址"]]}]},
+                                                {
+                                                    "$ne": [
+                                                        {
+                                                            "$trim": {
+                                                                "input": {
+                                                                    "$convert": {
+                                                                        "input": "$$kv.v",
+                                                                        "to": "string",
+                                                                        "onError": "",
+                                                                        "onNull": "",
+                                                                    }
+                                                                }
+                                                            }
+                                                        },
+                                                        "",
+                                                    ]
+                                                },
+                                            ]
+                                        },
+                                    }
+                                }
+                            },
+                            0,
+                        ]
+                    },
+                ]
+            },
+        ]
+    }
+
+    specless_price_changed_expr = {
+        "$and": [
+            specless_single_sku_expr,
+            {"$isNumber": "$activity_price"},
+            {"$gt": ["$activity_price", 0]},
+            {
+                "$cond": [
+                    {"$isNumber": "$format_activity_price"},
+                    {
+                        "$gt": [
+                            {"$abs": {"$subtract": ["$activity_price", "$format_activity_price"]}},
+                            PRICE_COMPARE_ABS_TOL,
+                        ]
+                    },
+                    {
+                        "$let": {
+                            "vars": {
+                                "entries": fmt_entries_expr,
+                                "exp_id": {
+                                    "$concat": [
+                                        {
+                                            "$convert": {
+                                                "input": "$product_id",
+                                                "to": "string",
+                                                "onError": "",
+                                                "onNull": "",
+                                            }
+                                        },
+                                        {"$cond": [{"$eq": [{"$size": sku_list_expr}, 1]}, "_1", "_0"]},
+                                    ]
+                                },
+                            },
+                            "in": {
+                                "$and": [
+                                    {"$gt": [{"$size": "$$entries"}, 0]},
+                                    {
+                                        "$let": {
+                                            "vars": {"first_entry": {"$arrayElemAt": ["$$entries", 0]}},
+                                            "in": {
+                                                "$or": [
+                                                    {"$ne": [{"$size": "$$entries"}, 1]},
+                                                    {"$ne": ["$$first_entry.k", "$$exp_id"]},
+                                                    {"$not": [{"$isNumber": "$$first_entry.v.price"}]},
+                                                    {
+                                                        "$gt": [
+                                                            {
+                                                                "$abs": {
+                                                                    "$subtract": [
+                                                                        "$activity_price",
+                                                                        "$$first_entry.v.price",
+                                                                    ]
+                                                                }
+                                                            },
+                                                            PRICE_COMPARE_ABS_TOL,
+                                                        ]
+                                                    },
+                                                ]
+                                            },
+                                        }
+                                    },
+                                ]
+                            },
+                        }
+                    },
+                ]
+            },
+        ]
+    }
+
+    fmt_sku_prices_entries_expr = {
+        "$cond": [
+            {"$eq": [{"$type": "$format_sku_prices"}, "object"]},
+            {"$objectToArray": "$format_sku_prices"},
+            [],
+        ]
+    }
+    multi_sku_price_changed_expr = {
+        "$and": [
+            {"$not": [specless_single_sku_expr]},
+            {
+                "$or": [
+                    {"$gt": [{"$size": fmt_entries_expr}, 0]},
+                    {"$gt": [{"$size": fmt_sku_prices_entries_expr}, 0]},
+                ]
+            },
+            {
+                "$let": {
+                    "vars": {
+                        "skus": sku_list_expr,
+                        "fmt_entries": fmt_entries_expr,
+                        "snap_entries": fmt_sku_prices_entries_expr,
+                        "pid_str": {
+                            "$convert": {
+                                "input": "$product_id",
+                                "to": "string",
+                                "onError": "",
+                                "onNull": "",
+                            }
+                        },
+                    },
+                    "in": {
+                        "$anyElementTrue": {
+                            "$map": {
+                                "input": {"$range": [0, {"$size": "$$skus"}]},
+                                "as": "idx",
+                                "in": {
+                                    "$let": {
+                                        "vars": {
+                                            "sku_item": {"$arrayElemAt": ["$$skus", "$$idx"]},
+                                            "sid": {
+                                                "$concat": [
+                                                    "$$pid_str",
+                                                    "_",
+                                                    {"$toString": {"$add": ["$$idx", 1]}},
+                                                ]
+                                            },
+                                        },
+                                        "in": {
+                                            "$let": {
+                                                "vars": {
+                                                    "cur_p_str": {
+                                                        "$trim": {
+                                                            "input": {
+                                                                "$convert": {
+                                                                    "input": {
+                                                                        "$cond": [
+                                                                            {"$eq": [{"$type": "$$sku_item"}, "object"]},
+                                                                            "$$sku_item.价格",
+                                                                            "",
+                                                                        ]
+                                                                    },
+                                                                    "to": "string",
+                                                                    "onError": "",
+                                                                    "onNull": "",
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    "snap_match": {
+                                                        "$filter": {
+                                                            "input": "$$snap_entries",
+                                                            "as": "se",
+                                                            "cond": {"$eq": ["$$se.k", "$$sid"]},
+                                                        }
+                                                    },
+                                                    "fmt_match": {
+                                                        "$filter": {
+                                                            "input": "$$fmt_entries",
+                                                            "as": "fe",
+                                                            "cond": {"$eq": ["$$fe.k", "$$sid"]},
+                                                        }
+                                                    },
+                                                },
+                                                "in": {
+                                                    "$cond": [
+                                                        {"$gt": [{"$size": "$$snap_match"}, 0]},
+                                                        {
+                                                            "$ne": [
+                                                                {"$arrayElemAt": ["$$snap_match.v", 0]},
+                                                                "$$cur_p_str",
+                                                            ]
+                                                        },
+                                                        {
+                                                            "$and": [
+                                                                {"$gt": [{"$size": "$$fmt_match"}, 0]},
+                                                                {
+                                                                    "$regexMatch": {
+                                                                        "input": "$$cur_p_str",
+                                                                        "regex": r"^[￥¥]?\s*\d+(\.\d+)?\s*$",
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "$let": {
+                                                                        "vars": {
+                                                                            "num_p": {
+                                                                                "$convert": {
+                                                                                    "input": {
+                                                                                        "$trim": {
+                                                                                            "input": "$$cur_p_str",
+                                                                                            "chars": "￥¥ \t\r\n",
+                                                                                        }
+                                                                                    },
+                                                                                    "to": "double",
+                                                                                    "onError": -1,
+                                                                                    "onNull": -1,
+                                                                                }
+                                                                            },
+                                                                            "fmt_obj": {"$arrayElemAt": ["$$fmt_match", 0]},
+                                                                        },
+                                                                        "in": {
+                                                                            "$and": [
+                                                                                {"$gt": ["$$num_p", 0]},
+                                                                                {
+                                                                                    "$or": [
+                                                                                        {"$not": [{"$isNumber": "$$fmt_obj.v.price"}]},
+                                                                                        {
+                                                                                            "$gt": [
+                                                                                                {
+                                                                                                    "$abs": {
+                                                                                                        "$subtract": [
+                                                                                                            "$$num_p",
+                                                                                                            "$$fmt_obj.v.price",
+                                                                                                        ]
+                                                                                                    }
+                                                                                                },
+                                                                                                PRICE_COMPARE_ABS_TOL,
+                                                                                            ]
+                                                                                        },
+                                                                                    ]
+                                                                                },
+                                                                            ]
+                                                                        },
+                                                                    }
+                                                                },
+                                                            ]
+                                                        },
+                                                    ]
+                                                },
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        ]
+    }
+
     return {
         "$and": [
             {"updated_at": {"$gte": cutoff_time}},
             {
                 "$or": [
-                    {"format_status": {"$ne": "success"}},
-                    {"need_reformat": True},
-                    # 当存在 sku_info 列表且 format_info 未包含对应数量时允许继续洗
-                    {
-                        "$expr": {
-                            "$gt": [
-                                {"$size": {"$ifNull": ["$sku_info", []]}},
-                                {"$size": {"$objectToArray": {"$ifNull": ["$format_info", {}]}}},
-                            ]
-                        }
-                    },
-                    # 当单规格商品的当前价格与 format_info 清洗价格不一致时重新清洗
-                    {
-                        "$expr": {
-                            "$and": [
-                                {"$eq": [{"$size": {"$ifNull": ["$sku_info", []]}}, 0]},
-                                {
-                                    "$let": {
-                                        "vars": {"entries": {"$objectToArray": {"$ifNull": ["$format_info", {}]}}},
-                                        "in": {"$not": [{"$in": ["$activity_price", "$$entries.v.price"]}]},
-                                    }
-                                },
-                            ]
-                        }
-                    },
+                    {"format_retry_count": {"$exists": False}},
+                    {"format_retry_count": {"$lt": LOCKED_RETRY_SENTINEL}},
                 ]
             },
             {
                 "$or": [
-                    {"format_retry_count": {"$exists": False}},
-                    {"format_retry_count": {"$lt": FORMAT_MAX_RETRIES}},
+                    {"need_reformat": True},
+                    {"$expr": specless_price_changed_expr},
+                    {"$expr": multi_sku_price_changed_expr},
+                    {
+                        "$and": [
+                            {
+                                "$or": [
+                                    {"format_status": {"$ne": "success"}},
+                                    # 当存在 sku_info 列表且 format_info 未包含对应数量时允许继续补洗
+                                    {
+                                        "$expr": {
+                                            "$gt": [
+                                                {"$size": sku_list_expr},
+                                                {"$size": fmt_entries_expr},
+                                            ]
+                                        }
+                                    },
+                                ]
+                            },
+                            {
+                                "$or": [
+                                    {"format_retry_count": {"$exists": False}},
+                                    {"format_retry_count": {"$lt": FORMAT_MAX_RETRIES}},
+                                ]
+                            },
+                        ]
+                    },
                 ]
             },
         ]
@@ -539,12 +852,13 @@ def gen_goods_format_info(sku_task_batch, prompt_text=None, enforce_input_price=
 
     inputs = []
     input_sku_ids = []
-    expected_prices = {} if enforce_input_price else None
+    expected_prices = {}
     for task in sku_task_batch:
         sku_id = task.get("sku_id")
         name = task.get("product_desc")
         sku_desc = task.get("sku_desc", "")
         price = task.get("价格", "")
+        task_expected_price = task.get("expected_price")
 
         if not sku_id or not str(sku_id).strip():
             outcome["error"] = "存在无效的 sku_id"
@@ -556,11 +870,16 @@ def gen_goods_format_info(sku_task_batch, prompt_text=None, enforce_input_price=
         if clean_sku_id in input_sku_ids:
             raise ValueError(f"同一次模型请求不能包含重复的 sku_id: {clean_sku_id}")
 
-        if expected_prices is not None:
+        if enforce_input_price:
             if not _is_positive_number(price):
                 outcome["error"] = f"规格(sku_id={clean_sku_id}) 价格必须是大于0的有限数值"
                 return outcome
             expected_prices[clean_sku_id] = float(price)
+        elif task_expected_price is not None:
+            if not _is_positive_number(task_expected_price):
+                outcome["error"] = f"规格(sku_id={clean_sku_id}) expected_price 必须是大于0的有限数值"
+                return outcome
+            expected_prices[clean_sku_id] = float(task_expected_price)
 
         # 严格按照规范组装大模型入参格式
         inputs.append({
@@ -574,6 +893,7 @@ def gen_goods_format_info(sku_task_batch, prompt_text=None, enforce_input_price=
     if prompt_text is None:
         prompt_text = read_file_to_str(PROMPT_FILE_PATH)
 
+    effective_expected_prices = expected_prices if expected_prices else None
     full_prompt = f"{prompt_text}\n<product_input>\n{json.dumps(inputs, ensure_ascii=False)}\n</product_input>"
     errors, content = [], ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
@@ -595,7 +915,7 @@ def gen_goods_format_info(sku_task_batch, prompt_text=None, enforce_input_price=
             valid, results, item_errors, batch_error = check_format_info(
                 string_to_object(content),
                 input_sku_ids,
-                expected_prices=expected_prices,
+                expected_prices=effective_expected_prices,
             )
             if not valid:
                 raise ValueError(f"{batch_error} | 抽样详情: {str(item_errors)[:200]}")
@@ -622,9 +942,121 @@ def gen_goods_format_info(sku_task_batch, prompt_text=None, enforce_input_price=
     return outcome
 
 
+def _clean_price_number_str(value):
+    """将正数金额格式化为无浮点尾噪的字符串（如 35.4 -> '35.4'，55.0 -> '55'）。"""
+    rounded = round(float(value), 4)
+    if rounded.is_integer():
+        return str(int(rounded))
+    return f"{rounded:.4f}".rstrip("0").rstrip(".")
+
+
+def _extract_sku_desc(item):
+    """提取单个 sku_info 条目的有效规格属性文本（排除 价格、截图地址）。"""
+    if not isinstance(item, dict):
+        return ""
+    desc_parts = [
+        f"{k}：{v}" for k, v in item.items()
+        if k not in ("价格", "截图地址") and str(v or "").strip()
+    ]
+    return " | ".join(desc_parts)
+
+
+def _is_specless_single_sku(sku_info):
+    """
+    判定商品是否属于“无细分规格属性的单品”：
+    1. sku_info 为空 / 非列表；
+    2. 或 sku_info 仅含 1 个元素，且除 '价格'、'截图地址' 外无任何有效规格属性（如 [{'价格': '￥41.4', '截图地址': ''}]）。
+    此类商品的真实当前成交价统一以顶层 activity_price 为准。
+    """
+    if not isinstance(sku_info, list) or len(sku_info) == 0:
+        return True
+    if len(sku_info) == 1:
+        return _extract_sku_desc(sku_info[0]) == ""
+    return False
+
+
+def _parse_plain_sku_price(price_text):
+    """解析形如 '￥41.4' / '41.4' 的纯数值价格文本；若含区间、多档文案或非正数则返回 None。"""
+    match = _PLAIN_PRICE_TEXT_RE.fullmatch(str(price_text or "").strip())
+    if not match:
+        return None
+    val = float(match.group(1))
+    return val if _is_positive_number(val) else None
+
+
+def _detect_product_price_changes(product):
+    """
+    检测商品当前价格是否与上次清洗时认定的价格发生变动，与 pending_format_query 严格对齐。
+    返回: (has_price_mismatch: bool, stale_sku_ids: set[str])
+    """
+    product_id = str(product.get("product_id") or "").strip()
+    if not product_id:
+        return False, set()
+
+    sku_info = product.get("sku_info")
+    raw_fmt = product.get("format_info")
+    existing_fmt = (
+        raw_fmt
+        if isinstance(raw_fmt, dict) and "pricing_basis" not in raw_fmt
+        else {}
+    )
+
+    if _is_specless_single_sku(sku_info):
+        act_price = product.get("activity_price")
+        if not _is_positive_number(act_price):
+            return False, set()
+        act_float = float(act_price)
+        exp_sku_id = (
+            f"{product_id}_1"
+            if isinstance(sku_info, list) and len(sku_info) == 1
+            else f"{product_id}_0"
+        )
+        prev_act = product.get("format_activity_price")
+        if type(prev_act) in (int, float) and math.isfinite(prev_act):
+            if abs(act_float - float(prev_act)) > PRICE_COMPARE_ABS_TOL:
+                return True, {exp_sku_id}
+            return False, set()
+
+        if not existing_fmt:
+            return False, set()
+        first_entry = existing_fmt.get(exp_sku_id)
+        if (
+            len(existing_fmt) != 1
+            or not isinstance(first_entry, dict)
+            or not _is_positive_number(first_entry.get("price"))
+            or abs(act_float - float(first_entry["price"])) > PRICE_COMPARE_ABS_TOL
+        ):
+            return True, {exp_sku_id}
+        return False, set()
+
+    raw_snap = product.get("format_sku_prices")
+    snap_map = raw_snap if isinstance(raw_snap, dict) else {}
+    if not existing_fmt and not snap_map:
+        return False, set()
+
+    stale_sku_ids = set()
+    for idx, item in enumerate(sku_info, start=1):
+        sku_id = f"{product_id}_{idx}"
+        cur_p_str = str(item.get("价格", "")).strip() if isinstance(item, dict) else ""
+        if sku_id in snap_map:
+            if str(snap_map[sku_id]) != cur_p_str:
+                stale_sku_ids.add(sku_id)
+        elif sku_id in existing_fmt:
+            plain_p = _parse_plain_sku_price(cur_p_str)
+            fmt_entry = existing_fmt.get(sku_id)
+            fmt_p = fmt_entry.get("price") if isinstance(fmt_entry, dict) else None
+            if plain_p is not None and (
+                not _is_positive_number(fmt_p)
+                or abs(plain_p - float(fmt_p)) > PRICE_COMPARE_ABS_TOL
+            ):
+                stale_sku_ids.add(sku_id)
+
+    return bool(stale_sku_ids), stale_sku_ids
+
+
 def run_format_round(product_manager):
     """
-    按 SKU 粒度并发生成结构化信息，支持断点补洗与增量写回 format_info.{sku_id}。
+    按 SKU 粒度并发生成结构化信息，支持断点补洗、价格变动自动重洗与增量写回 format_info.{sku_id}。
     """
     started = time.monotonic()
     query_condition = pending_format_query()
@@ -640,6 +1072,8 @@ def run_format_round(product_manager):
             "sku_info": 1,
             "activity_price": 1,
             "format_info": 1,
+            "format_activity_price": 1,
+            "format_sku_prices": 1,
         },
         sort=[("updated_at", -1)],
     )
@@ -662,37 +1096,112 @@ def run_format_round(product_manager):
     state_lock = threading.Lock()
 
     for product in products:
-        product_id = str(product.get("product_id")).strip()
+        product_id = str(product.get("product_id") or "").strip()
         name = str(product.get("name") or "").strip()
         sku_info = product.get("sku_info")
+        is_specless = _is_specless_single_sku(sku_info)
         raw_format_info = product.get("format_info")
         has_invalid_format_info = "format_info" in product and not isinstance(raw_format_info, dict)
-        existing_format_info = raw_format_info if isinstance(raw_format_info, dict) else {}
-
-        has_price_mismatch = (
-            not sku_info
-            and isinstance(existing_format_info.get(f"{product_id}_0"), dict)
-            and existing_format_info[f"{product_id}_0"].get("price") != product.get("activity_price")
+        has_legacy_flat_format = isinstance(raw_format_info, dict) and "pricing_basis" in raw_format_info
+        existing_format_info = (
+            raw_format_info
+            if isinstance(raw_format_info, dict) and not has_legacy_flat_format
+            else {}
         )
-        is_reformat = bool(product.get("need_reformat")) or has_price_mismatch
+        raw_sku_prices = product.get("format_sku_prices")
+        has_invalid_sku_prices = "format_sku_prices" in product and not isinstance(raw_sku_prices, dict)
+        existing_sku_prices = raw_sku_prices.copy() if isinstance(raw_sku_prices, dict) else {}
+
+        has_price_mismatch, stale_sku_ids = _detect_product_price_changes(product)
+        explicit_reformat = bool(product.get("need_reformat"))
+        is_reformat = explicit_reformat or has_price_mismatch
         if is_reformat:
             total_reformat_prods += 1
 
-        # 针对重洗（或旧版单层结构、或 format_info 为 null/非字典）商品，第一次拉取时直接将数据库和内存中的
-        # need_reformat 设为 False、清空旧 format_info、重置 format_retry_count 为 0
-        if is_reformat or "pricing_basis" in existing_format_info or has_invalid_format_info:
-            existing_format_info = {}
+        if not product_id:
+            counts["skipped"] += 1
+            counts["reformat_skipped" if is_reformat else "normal_skipped"] += 1
+            continue
+
+        act_raw = product.get("activity_price")
+        if not name or (is_specless and not _is_positive_number(act_raw)):
+            fail_patch = {
+                "platform": product["platform"],
+                "product_id": product_id,
+                "need_reformat": False,
+                "format_status": "failed",
+                "format_error": "缺少可清洗的商品标题" if not name else "单规格商品缺少大于0的有效 activity_price",
+                "format_retry_count": FORMAT_MAX_RETRIES,
+                "format_updated_at": datetime.now(timezone.utc),
+            }
+            if is_reformat or has_legacy_flat_format or has_invalid_format_info:
+                fail_patch["format_info"] = {}
+            if is_specless:
+                fail_patch["format_activity_price"] = (
+                    float(act_raw)
+                    if type(act_raw) in (int, float) and math.isfinite(act_raw)
+                    else 0.0
+                )
+            product_manager.update(
+                fail_patch,
+                condition={"_id": product["_id"]},
+                upsert=False,
+            )
+            counts["skipped"] += 1
+            counts["reformat_skipped" if is_reformat else "normal_skipped"] += 1
+            continue
+
+        # 针对重洗（或旧版单层结构、或 format_info/format_sku_prices 非字典）商品，拉取时立即落库重置状态与新价格快照，
+        # 既确保重洗拥有全新的重试额度，也防止模型失败时因快照未推进而无限循环重洗。
+        if is_reformat or has_legacy_flat_format or has_invalid_format_info or has_invalid_sku_prices:
+            if explicit_reformat or has_legacy_flat_format or has_invalid_format_info or is_specless:
+                retained_format_info = {}
+            else:
+                valid_sku_keys = {f"{product_id}_{i}" for i in range(1, len(sku_info) + 1)}
+                retained_format_info = {
+                    k: v for k, v in existing_format_info.items()
+                    if k in valid_sku_keys and k not in stale_sku_ids
+                }
+
+            reset_patch = {
+                "platform": product["platform"],
+                "product_id": product_id,
+                "need_reformat": False,
+                "format_status": "success" if retained_format_info else "pending",
+                "format_info": retained_format_info,
+                "format_retry_count": 0,
+            }
+            if is_specless:
+                act_float = float(act_raw)
+                reset_patch["format_activity_price"] = act_float
+                if isinstance(sku_info, list) and len(sku_info) == 1:
+                    shot_path = str(sku_info[0].get("截图地址") or "") if isinstance(sku_info[0], dict) else ""
+                    synced_sku_info = [{"价格": f"￥{_clean_price_number_str(act_float)}", "截图地址": shot_path}]
+                    reset_patch["sku_info"] = synced_sku_info
+                    sku_info = synced_sku_info
+                    product["sku_info"] = synced_sku_info
+            else:
+                if explicit_reformat or has_invalid_sku_prices:
+                    new_sku_prices = {}
+                else:
+                    valid_sku_keys = {f"{product_id}_{i}" for i in range(1, len(sku_info) + 1)}
+                    new_sku_prices = {
+                        k: v for k, v in existing_sku_prices.items()
+                        if k in valid_sku_keys
+                    }
+                for sid in stale_sku_ids:
+                    idx_num = int(sid.rsplit("_", 1)[1]) - 1
+                    if 0 <= idx_num < len(sku_info) and isinstance(sku_info[idx_num], dict):
+                        new_sku_prices[sid] = str(sku_info[idx_num].get("价格", "")).strip()
+                reset_patch["format_sku_prices"] = new_sku_prices
+                existing_sku_prices = new_sku_prices
+                product["format_sku_prices"] = existing_sku_prices
+
+            existing_format_info = retained_format_info
             product["format_info"] = existing_format_info
             product["need_reformat"] = False
             product_manager.update(
-                {
-                    "platform": product["platform"],
-                    "product_id": product_id,
-                    "need_reformat": False,
-                    "format_status": "pending",
-                    "format_info": {},
-                    "format_retry_count": 0,
-                },
+                reset_patch,
                 condition={"_id": product["_id"]},
                 upsert=False,
             )
@@ -700,19 +1209,42 @@ def run_format_round(product_manager):
             product["format_info"] = existing_format_info
 
         product_pending_tasks = []
-        if isinstance(sku_info, list) and len(sku_info) > 0:
+        if is_specless:
+            total_expected = 1
+            has_one_placeholder = isinstance(sku_info, list) and len(sku_info) == 1
+            sku_id = f"{product_id}_1" if has_one_placeholder else f"{product_id}_0"
+            if sku_id not in existing_format_info:
+                act_float = float(act_raw)
+                act_price_str = _clean_price_number_str(act_float)
+                synced_sku_info = None
+                if has_one_placeholder:
+                    shot_path = str(sku_info[0].get("截图地址") or "") if isinstance(sku_info[0], dict) else ""
+                    cur_sku0_p = str(sku_info[0].get("价格") or "").strip() if isinstance(sku_info[0], dict) else ""
+                    target_sku0_p = f"￥{act_price_str}"
+                    if cur_sku0_p != target_sku0_p:
+                        synced_sku_info = [{"价格": target_sku0_p, "截图地址": shot_path}]
+                product_pending_tasks.append({
+                    "sku_id": sku_id,
+                    "product_id": product_id,
+                    "product_desc": name,
+                    "sku_desc": "",
+                    "价格": act_price_str,
+                    "expected_price": act_float,
+                    "sync_specless_sku_info": synced_sku_info,
+                    "record_sku_price_str": None,
+                    "product_ref": product,
+                    "total_expected_skus": 1,
+                    "is_reformat": is_reformat,
+                })
+        else:
             total_expected = len(sku_info)
             for idx, item in enumerate(sku_info, start=1):
                 sku_id = f"{product_id}_{idx}"
                 if sku_id in existing_format_info:
                     continue
 
-                desc_parts = [
-                    f"{k}：{v}" for k, v in item.items()
-                    if k not in ("价格", "截图地址") and str(v).strip()
-                ]
-                sku_desc = " | ".join(desc_parts)
-                price_str = str(item.get("价格", "")).strip()
+                sku_desc = _extract_sku_desc(item)
+                price_str = str(item.get("价格", "")).strip() if isinstance(item, dict) else ""
 
                 product_pending_tasks.append({
                     "sku_id": sku_id,
@@ -720,37 +1252,28 @@ def run_format_round(product_manager):
                     "product_desc": name,
                     "sku_desc": sku_desc,
                     "价格": price_str,
+                    "expected_price": None,
+                    "sync_specless_sku_info": None,
+                    "record_sku_price_str": price_str,
                     "product_ref": product,
                     "total_expected_skus": total_expected,
-                    "is_reformat": is_reformat,
-                })
-        else:
-            total_expected = 1
-            sku_id = f"{product_id}_0"
-            if sku_id not in existing_format_info:
-                act_price = str(product.get("activity_price", "")).strip()
-                product_pending_tasks.append({
-                    "sku_id": sku_id,
-                    "product_id": product_id,
-                    "product_desc": name,
-                    "sku_desc": "",
-                    "价格": act_price,
-                    "product_ref": product,
-                    "total_expected_skus": 1,
                     "is_reformat": is_reformat,
                 })
 
         # 如果该商品下所有规格其实已在上一轮全部生成完毕，直接补标为 success，防止空转
         if not product_pending_tasks and len(existing_format_info) >= total_expected:
+            done_patch = {
+                "platform": product["platform"],
+                "product_id": product_id,
+                "format_status": "success",
+                "need_reformat": False,
+                "format_error": "",
+                "format_updated_at": datetime.now(timezone.utc),
+            }
+            if is_specless:
+                done_patch["format_activity_price"] = float(act_raw)
             product_manager.update(
-                {
-                    "platform": product["platform"],
-                    "product_id": product_id,
-                    "format_status": "success",
-                    "need_reformat": False,
-                    "format_error": "",
-                    "format_updated_at": datetime.now(timezone.utc),
-                },
+                done_patch,
                 condition={"_id": product["_id"]},
                 upsert=False,
             )
@@ -811,7 +1334,14 @@ def run_format_round(product_manager):
                 "format_model": generated["model_used"],
                 "format_updated_at": datetime.now(timezone.utc),
             }
+            if task.get("expected_price") is not None:
+                update_fields["format_activity_price"] = task["expected_price"]
+                if task.get("sync_specless_sku_info") is not None:
+                    update_fields["sku_info"] = task["sync_specless_sku_info"]
+            if task.get("record_sku_price_str") is not None:
+                update_fields[f"format_sku_prices.{sku_id}"] = task["record_sku_price_str"]
 
+            increments_arg = None
             with state_lock:
                 fmt_map = product.setdefault("format_info", {})
                 if is_success:
@@ -822,23 +1352,20 @@ def run_format_round(product_manager):
                     update_fields["need_reformat"] = False
                     if len(fmt_map) >= total_expected_skus:
                         update_fields["format_error"] = ""
-                    inc_val = 0
+                        update_fields["format_retry_count"] = 0
                 else:
                     # 仅当该商品目前没有任何已成功规格时才标为 failed，防止单个异常规格屏蔽整件商品的其它正常规格
-                    if not fmt_map:
-                        update_fields["format_status"] = "failed"
+                    update_fields["format_status"] = "success" if fmt_map else "failed"
                     update_fields["format_error"] = error
                     # 同一商品在本轮最多只累加 1 次重试计数，防止多规格商品在单轮内直接累加满 3 次
                     if doc_id not in round_failed_docs:
                         round_failed_docs.add(doc_id)
-                        inc_val = 1
-                    else:
-                        inc_val = 0
+                        increments_arg = {"format_retry_count": 1}
 
             saved = product_manager.update(
                 update_fields,
                 condition=condition,
-                increments={"format_retry_count": inc_val},
+                increments=increments_arg,
                 upsert=False,
             )
 

@@ -785,4 +785,315 @@ def test_stage2_prompt_hot_reloads_on_mtime_change(monkeypatch, tmp_path):
     assert cleaner._get_stage2_prompt() == "热更新提示词v2"
 
 
+def test_deal_max_clean_age_days_is_2_days():
+    import datetime
+    from mobile_web.scripts.run_deal_pool_scheduler import (
+        DEAL_MAX_CLEAN_AGE_DAYS,
+        DealRawPoolRepository,
+    )
+
+    assert DEAL_MAX_CLEAN_AGE_DAYS == 2
+
+    captured_ops = []
+
+    class _DummyCol:
+        def bulk_write(self, ops, ordered=False):
+            captured_ops.extend(ops)
+            return SimpleNamespace(upserted_count=len(ops), modified_count=0)
+
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: _DummyCol()))
+    repo._indexes_ready = True
+
+    bj_tz = datetime.timezone(datetime.timedelta(hours=8))
+    now_bj = datetime.datetime.now(bj_tz)
+    fresh_20h = (now_bj - datetime.timedelta(hours=20)).strftime("%Y-%m-%d %H:%M:%S")
+    stale_52h = (now_bj - datetime.timedelta(hours=52)).strftime("%Y-%m-%d %H:%M:%S")
+
+    repo.save_batch(
+        [
+            {
+                "source_site": "haodanku",
+                "source_item_id": "fresh_1",
+                "publish_time": fresh_20h,
+                "title": "20小时内线报",
+                "extracted_links": [{"url": "https://u.jd.com/2GR8aBc"}],
+                "has_full_detail": True,
+            },
+            {
+                "source_site": "haodanku",
+                "source_item_id": "stale_1",
+                "publish_time": stale_52h,
+                "title": "52小时前过期线报",
+                "extracted_links": [{"url": "https://u.jd.com/3HS9dEf"}],
+                "has_full_detail": True,
+            },
+        ],
+        task_name="age_test",
+    )
+    assert captured_ops[0]._doc["$setOnInsert"]["clean_status"] == "pending"
+    assert captured_ops[1]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
+
+
+def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_real_deals():
+    from mobile_web.scripts.run_deal_pool_scheduler import (
+        DealRawPoolRepository,
+        _is_pure_jd_coupon_only_record,
+    )
+
+    captured_ops = []
+
+    class _DummyCol:
+        def bulk_write(self, ops, ordered=False):
+            captured_ops.extend(ops)
+            return SimpleNamespace(upserted_count=len(ops), modified_count=0)
+
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: _DummyCol()))
+    repo._indexes_ready = True
+
+    ztk_coupon_1 = {
+        "source_site": "zhetaoke",
+        "source_item_id": "xb_5001",
+        "is_group_stream": True,
+        "title": "速度防身，京东自营生鲜满199减100神券",
+        "tutorial_text": "速度防身领券 https://coupon.m.jd.com/coupons/show.action?key=c3m6c1sbo2a740939106&roleId=123456\n[群聊晒单/教程图片: https://img.zhetaoke.com/pic1.jpg]",
+        "extracted_links": [
+            {"url": "https://coupon.m.jd.com/coupons/show.action?key=c3m6c1sbo2a740939106&roleId=123456", "platform": "jd"}
+        ],
+        "extracted_tokens": [],
+        "has_full_detail": True,
+    }
+    ztk_coupon_login_wrap = {
+        "source_site": "zhetaoke",
+        "source_item_id": "xb_5002",
+        "is_group_stream": True,
+        "title": "PLUS补贴券防身",
+        "tutorial_text": "https://plogin.m.jd.com/cgi-bin/m/tmauth?returnurl=https%3A%2F%2Fcoupon.m.jd.com%2Fcoupons%2Fshow.action%3FlinkKey%3DAAROH_xIpeffAs_-naABEFoe",
+        "extracted_links": [
+            {
+                "url": "https://plogin.m.jd.com/cgi-bin/m/tmauth?returnurl=https://coupon.m.jd.com/coupons/show.action?linkKey=AAROH_xIpeffAs_-naABEFoe",
+                "platform": "jd",
+            }
+        ],
+        "extracted_tokens": [],
+        "has_full_detail": True,
+    }
+    non_group_pure_coupon = {
+        "source_site": "xianbao_fun",
+        "source_item_id": "xbf_5003",
+        "is_group_stream": False,
+        "title": "京东领券防身",
+        "tutorial_text": "先领 https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999",
+        "extracted_links": [{"url": "https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999", "platform": "jd"}],
+        "extracted_tokens": [],
+        "has_full_detail": True,
+    }
+    coupon_plus_product = {
+        "source_site": "zhetaoke",
+        "source_item_id": "xb_5004",
+        "is_group_stream": True,
+        "title": "领券买维达抽纸24包19.9元",
+        "tutorial_text": "先领券 https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999\n再拍主商品 https://u.jd.com/oGtS1YL",
+        "extracted_links": [
+            {"url": "https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999", "platform": "jd"},
+            {"url": "https://u.jd.com/oGtS1YL", "platform": "jd"},
+        ],
+        "extracted_tokens": [],
+        "has_full_detail": True,
+    }
+    coupon_plus_naked_tb_token = {
+        "source_site": "zhetaoke",
+        "source_item_id": "xb_5005",
+        "is_group_stream": True,
+        "title": "领券拍百补商品",
+        "tutorial_text": "领券 https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999\n口令 ￥AbCdEfGh123￥",
+        "extracted_links": [{"url": "https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999", "platform": "jd"}],
+        "extracted_tokens": [],
+        "has_full_detail": True,
+    }
+
+    assert _is_pure_jd_coupon_only_record(ztk_coupon_1) is True
+    assert _is_pure_jd_coupon_only_record(ztk_coupon_login_wrap) is True
+    assert _is_pure_jd_coupon_only_record(coupon_plus_product) is False
+    assert _is_pure_jd_coupon_only_record(coupon_plus_naked_tb_token) is False
+
+    res = repo.save_batch(
+        [ztk_coupon_1, ztk_coupon_login_wrap, non_group_pure_coupon, coupon_plus_product, coupon_plus_naked_tb_token],
+        task_name="coupon_filter_test",
+    )
+    assert res["context_only_saved"] == 2
+    assert res["skipped_no_signal"] == 1
+    assert len(captured_ops) == 4
+    status_by_id = {
+        op._doc["$setOnInsert"]["source_item_id"]: op._doc["$setOnInsert"]["clean_status"]
+        for op in captured_ops
+    }
+    assert status_by_id == {
+        "xb_5001": "context_only",
+        "xb_5002": "context_only",
+        "xb_5004": "pending",
+        "xb_5005": "pending",
+    }
+
+
+def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
+    from mobile_web.scripts.run_deal_pool_scheduler import ERR_AI_TIMEOUT_RETRY
+
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+
+    fake_jd_adapter = MagicMock()
+
+    def _mock_convert(clean_inp):
+        if "coupon.m.jd.com" in clean_inp:
+            return {"status": "failed", "error_code": "UPSTREAM_ERROR", "message": "native coupon"}
+        return {
+            "status": "success",
+            "goods_id": "100888777666",
+            "goods_sign": "https://u.jd.com/my_main_prod",
+            "final_link": "https://u.jd.com/my_main_prod",
+            "url": "https://u.jd.com/my_main_prod",
+            "promotion_token": "￥MyJdToken￥",
+            "product": {
+                "platform": "jd",
+                "product_id": "100888777666",
+                "name": "维达超韧抽纸3层130抽24包",
+                "price": 39.9,
+                "original_price": 49.9,
+                "activity_price": 39.9,
+                "coupon_amount": 0.0,
+                "mall_name": "维达京东自营官方旗舰店",
+                "image": "https://img14.360buyimg.com/n1/jfs/vd.jpg",
+            },
+        }
+
+    fake_jd_adapter.resolve_and_convert_universal.side_effect = _mock_convert
+    cleaner.adapters["jd"] = fake_jd_adapter
+
+    ai1_calls = {"n": 0}
+
+    def _unexpected_stage1(*args, **kwargs):
+        ai1_calls["n"] += 1
+        return {}
+
+    def _fake_stage2(stage2_inputs, total_pending_count=0, quiet_sub_logs=False):
+        return {
+            inp["main_tip_id"]: {
+                "main_tip_id": inp["main_tip_id"],
+                "is_valid_deal": True,
+                "main_link_id": "L2",
+                "coupon_links": [{"link_id": "L1", "coupon_desc": "满39减20券"}],
+                "filler_links": [],
+                "deal_price": 19.9,
+                "tutorial_steps": ["1. 先领券 [#L1]", "2. 再拍维达抽纸 [#L2] 实付19.9元"],
+                "quality_score": 88,
+                "score_breakdown": {"price_advantage": 36, "brand_reputation": 26, "completeness": 26},
+            }
+            for inp in stage2_inputs
+        }
+
+    cleaner.run_ai_stage1_batch = _unexpected_stage1
+    cleaner.run_ai_stage2_batch = _fake_stage2
+
+    neighbor_coupon_doc = {
+        "source_site": "zhetaoke",
+        "source_channel": "zhetaoke_group_1",
+        "source_item_id": "xb_100",
+        "is_group_stream": True,
+        "source_url": "https://zhetaoke.example/msg/xb_100",
+        "title": "维达满39减20神券",
+        "tutorial_text": "先领20元防身券 https://coupon.m.jd.com/coupons/show.action?key=vd20&roleId=111",
+    }
+    main_retry_doc = {
+        "source_site": "zhetaoke",
+        "source_channel": "zhetaoke_group_1",
+        "source_item_id": "xb_101",
+        "is_group_stream": True,
+        "source_url": "https://zhetaoke.example/msg/xb_101",
+        "platform": "jd",
+        "title": "维达抽纸24包19.9元",
+        "tutorial_text": "领楼上券拍维达抽纸19.9元 https://u.jd.com/other_prod",
+        "extracted_links": [{"url": "https://u.jd.com/other_prod", "platform": "jd"}],
+        "extracted_tokens": [],
+        "clean_retry_count": 1,
+        "clean_error_code": ERR_AI_TIMEOUT_RETRY,
+        "ai_stage1_result": {
+            "main_tip_id": "xb_101",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["xb_100", "xb_101"],
+            "combined_raw_text": "先领20元防身券 [#L1]\n领楼上券拍维达抽纸19.9元 [#L2]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {
+                    "link_id": "L1",
+                    "raw_span": "https://coupon.m.jd.com/coupons/show.action?key=vd20&roleId=111",
+                    "clean_input": "https://coupon.m.jd.com/coupons/show.action?key=vd20&roleId=111",
+                    "platform": "jd",
+                    "text_role_hint": "coupon",
+                },
+                {
+                    "link_id": "L2",
+                    "raw_span": "https://u.jd.com/other_prod",
+                    "clean_input": "https://u.jd.com/other_prod",
+                    "platform": "jd",
+                    "text_role_hint": "main_candidate",
+                },
+            ],
+            "_from_fallback": False,
+        },
+    }
+
+    raw_col = MagicMock()
+    raw_col.find.return_value = [neighbor_coupon_doc]
+
+    results = cleaner.clean_batch_records([main_retry_doc], raw_col, shared_active_products={}, quiet_sub_logs=True)
+    assert ai1_calls["n"] == 0  # Reused saved_ai1 without re-calling AI-1!
+    assert results[0]["status"] == "success"
+    raw_col.find.assert_called_once_with(
+        {"source_site": "zhetaoke", "source_item_id": {"$in": ["xb_100"]}},
+        {"raw_payload": 0},
+    )
+    deal_info = results[0]["product_doc"]["deal_info"]
+    assert "先领20元防身券" in deal_info["original_copywriting"]
+    assert "领楼上券拍维达抽纸19.9元" in deal_info["original_copywriting"]
+    assert "https://zhetaoke.example/msg/xb_100" in deal_info["merged_source_urls"]
+    assert "https://zhetaoke.example/msg/xb_101" in deal_info["merged_source_urls"]
+
+
+def test_warmup_anchor_cache_from_db_sorts_by_cleaned_at_desc():
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    sort_calls = []
+    limit_calls = []
+
+    class _FakeCursor:
+        def sort(self, key, direction):
+            sort_calls.append((key, direction))
+            return self
+
+        def limit(self, n):
+            limit_calls.append(n)
+            return [
+                {
+                    "converted_links": [
+                        {
+                            "link_id": "L1",
+                            "clean_input": "https://u.jd.com/cached_anchor_1",
+                            "convert_status": "product",
+                            "platform": "jd",
+                            "goods_id": "100012345678",
+                            "goods_sign": "https://u.jd.com/my_cached_1",
+                            "my_promo_link": "https://u.jd.com/my_cached_1",
+                        }
+                    ]
+                }
+            ]
+
+    raw_col = MagicMock()
+    raw_col.find.return_value = _FakeCursor()
+
+    cleaner.warmup_anchor_cache_from_db(raw_col)
+    assert sort_calls == [("cleaned_at", -1)]
+    assert limit_calls == [3000]
+    assert "jd:https://u.jd.com/cached_anchor_1" in cleaner.anchor_cache
+
+
 

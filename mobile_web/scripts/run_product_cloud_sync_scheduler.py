@@ -85,6 +85,8 @@ FORMAT_FAMILY_FIELDS = frozenset({
     "format_model",
     "format_error",
     "format_retry_count",
+    "format_activity_price",
+    "format_sku_prices",
     "need_reformat",
 })
 

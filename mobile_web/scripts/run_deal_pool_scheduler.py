@@ -129,7 +129,7 @@ PROMPT_STAGE2_PATH = os.path.join(PROMPT_DIR, "爆料阶段2_底牌终审与教�
 
 QUALIFIED_DEAL_MIN_SCORE = 60
 DEAL_INFO_PROTECTION_HOURS = 12.0
-DEAL_MAX_CLEAN_AGE_DAYS = 7
+DEAL_MAX_CLEAN_AGE_DAYS = 2
 MAX_CLEAN_RETRIES = 3
 DEFAULT_CLEAN_WINDOW = 200
 DEFAULT_CLEAN_INTERVAL_SECONDS = 60
@@ -579,6 +579,40 @@ def has_potential_product_signal(record: Dict[str, Any]) -> Tuple[bool, List[str
     return (len(signal_types) > 0), signal_types
 
 
+def _is_pure_jd_coupon_only_record(record: Dict[str, Any]) -> bool:
+    """
+    识别“整条消息仅包含京东官方原生领券链接 (`coupon.m.jd.com`) 且不含任何其他商品链接或口令”的纯防身领券广播：
+    - 群聊流 (`is_group_stream=True`) 中将其存为 `context_only`（不单独发起 AI 清洗，但若同群 ±3 分钟内紧跟真实主商品消息，仍可被无损合并保留优惠券）；
+    - 独立帖流 (`is_group_stream=False`) 中无具体主商品可直接跳过。
+    """
+    if str(record.get("candidate_goods_id") or "").strip():
+        return False
+    tokens = record.get("extracted_tokens") or []
+    if any(str(tk or "").strip() for tk in tokens):
+        return False
+    links = record.get("extracted_links") or []
+    urls = [
+        str(lk.get("url") or lk.get("item_id") or "").strip()
+        for lk in links
+        if isinstance(lk, dict) and str(lk.get("url") or lk.get("item_id") or "").strip()
+    ]
+    if not urls or not all("coupon.m.jd.com" in u.lower() for u in urls):
+        return False
+
+    # 二次保险：剥离已确认的 coupon.m.jd.com 链接与抓取器注入的图片占位符后，确认正文不含其他电商域名或口令符号
+    text_rest = f"{record.get('title') or ''}\n{record.get('tutorial_text') or ''}"
+    for u in urls:
+        text_rest = text_rest.replace(u, " ")
+    text_rest = re.sub(r"\[(?:群聊晒单/教程图片|教程图片):\s*https?://[^\]]+\]", " ", text_rest)
+    text_rest = re.sub(r"https?://\S*coupon\.m\.jd\.com\S*", " ", text_rest, flags=re.I)
+    lower_rest = text_rest.lower()
+    if any(kw in lower_rest for kw in ("http://", "https://", "u.jd.com", "3.cn", "jingfen", "tb.cn", "taobao", "tmall", "uland", "yangkeduo", "pinduoduo")):
+        return False
+    if any(sym in text_rest for sym in ("￥", "¥", "$", "€", "₴", "£", "¢", "口令")):
+        return False
+    return True
+
+
 def evaluate_quality_signals(record: Dict[str, Any]) -> Dict[str, Any]:
     """
     计算单条线报的极简信号结构 (`quality_signals`)，彻底移除复杂正则提取器。
@@ -648,6 +682,7 @@ class DealRawPoolRepository:
             col.create_index([("source_site", 1), ("source_item_id", 1)], unique=True, background=True)
             col.create_index([("first_seen_at", -1)], background=True)
             col.create_index([("last_seen_at", -1)], background=True)
+            col.create_index([("cleaned_at", -1)], background=True)
             col.create_index([("clean_status", 1), ("source_site", 1)], background=True)
             col.create_index(
                 [("clean_status", 1), ("source_site", 1), ("publish_ts", -1), ("last_seen_at", -1)],
@@ -737,7 +772,7 @@ class DealRawPoolRepository:
         1. 强制记录 `source_list_page_url`（列表页/群聊页地址）与 `source_detail_url`（详情页地址），方便人工打开页面核对是否漏抓；
         2. 若为连续群聊流（`is_group_stream=True`，即折淘客采集群）：**100% 消息全量入库**！
            - 含潜在商品信号（链接/口令/货号）的消息标记为 `clean_status='pending'`；
-           - 纯文字教程补充或纯晒单截图消息标记为 `clean_status='context_only'`，供 Stage 2 AI 检索同群前后 ±3 分钟上下文；
+           - 纯文字教程补充、纯晒单截图或纯领券防身广播消息标记为 `clean_status='context_only'`，供 Stage 2 AI 检索同群前后 ±3 分钟上下文；
         3. 若为独立网页/榜单帖（`is_group_stream=False`）：仅对包含潜在商品信号的记录入库并标记为 `clean_status='pending'`。
         """
         if not records:
@@ -773,9 +808,10 @@ class DealRawPoolRepository:
             )
 
             has_signal = bool(quality_signals["has_unique_product_anchor"])
-            if has_full_detail and not has_signal:
+            is_pure_coupon = has_full_detail and _is_pure_jd_coupon_only_record(rec)
+            if has_full_detail and (not has_signal or is_pure_coupon):
                 if is_group_stream:
-                    # 群聊中的纯文字说明或纯晒单截图 100% 留存为 context_only，确保相邻 ±3 分钟聚合零丢失
+                    # 群聊中的纯文字说明、纯晒单截图或纯京东领券广播留存为 context_only，确保相邻 ±3 分钟聚合零丢失且不白跑 AI
                     initial_status = "context_only"
                     context_only_saved += 1
                 else:
@@ -1179,13 +1215,17 @@ class DealPoolCleaner:
             cutoff = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(
                 hours=DEAL_INFO_PROTECTION_HOURS
             )
-            cursor = raw_col.find(
-                {
-                    "cleaned_at": {"$gte": cutoff},
-                    "converted_links.0": {"$exists": True},
-                },
-                {"_id": 0, "converted_links": 1},
-            ).limit(3000)
+            cursor = (
+                raw_col.find(
+                    {
+                        "cleaned_at": {"$gte": cutoff},
+                        "converted_links.0": {"$exists": True},
+                    },
+                    {"_id": 0, "converted_links": 1},
+                )
+                .sort("cleaned_at", -1)
+                .limit(3000)
+            )
             loaded = 0
             with self._cache_lock:
                 for doc in cursor:
@@ -2401,12 +2441,29 @@ class DealPoolCleaner:
             saved_ai1 = doc.get("ai_stage1_result")
             if (
                 doc.get("clean_error_code") in (ERR_ADAPTER_CONVERT_FAILED, ERR_AI_TIMEOUT_RETRY)
-                and not bool(doc.get("is_group_stream") or (site == "zhetaoke" and mid.startswith("xb_")))
                 and isinstance(saved_ai1, dict)
                 and not saved_ai1.get("_from_fallback")
+                and saved_ai1.get("is_standalone_deal") is not False
                 and saved_ai1.get("extracted_targets")
             ):
-                neighbor_maps_by_id[mid] = {mid: doc}
+                reused_map: Dict[str, Dict[str, Any]] = {mid: doc}
+                extra_mids = [
+                    str(tid or "").strip()
+                    for tid in (saved_ai1.get("merged_tip_ids") or [])
+                    if str(tid or "").strip() and str(tid or "").strip() != mid
+                ]
+                if extra_mids and raw_col is not None:
+                    try:
+                        for nd in raw_col.find(
+                            {"source_site": site, "source_item_id": {"$in": extra_mids}},
+                            {"raw_payload": 0},
+                        ):
+                            ntid = str(nd.get("source_item_id") or "").strip()
+                            if ntid:
+                                reused_map[ntid] = nd
+                    except Exception as e:
+                        logger.warning("重试复用 AI-1 结果时补查邻居消息异常 (%s:%s): %s", site, mid, e)
+                neighbor_maps_by_id[mid] = reused_map
                 continue
 
             s1_inp, tip_map = self.build_stage1_task_input(doc, raw_col)
@@ -3859,7 +3916,10 @@ def run_clean_stage(
     }
     total_pending_initial = raw_col.count_documents(active_pending_filter)
     if total_pending_initial <= 0:
-        logger.info("✨ [阶段二~五：双AI+官方转链清洗] 当前初步表 `deal_raw_tips` 无7天内待清洗 (`pending`) 记录，跳过本轮清洗。")
+        logger.info(
+            "✨ [阶段二~五：双AI+官方转链清洗] 当前初步表 `deal_raw_tips` 无%d天内待清洗 (`pending`) 记录，跳过本轮清洗。",
+            DEAL_MAX_CLEAN_AGE_DAYS,
+        )
         return {
             "cycle_num": cycle_num,
             "total_pending_found": 0,
@@ -3918,8 +3978,9 @@ def run_clean_stage(
 
     logger.info(
         "🧼 ================ 开始第 #%d 轮 [扁平单窗口：各平台最新均匀清洗] "
-        "(📦 库内7天内Pending=%d条 | 本轮窗口=%d条 [AI批大小=%d, AI并发=%d, AI超时=%.0fs] | 来源均匀分布=[%s]) ================",
+        "(📦 库内%d天内Pending=%d条 | 本轮窗口=%d条 [AI批大小=%d, AI并发=%d, AI超时=%.0fs] | 来源均匀分布=[%s]) ================",
         cycle_num,
+        DEAL_MAX_CLEAN_AGE_DAYS,
         total_pending_initial,
         total_selected,
         cleaner.ai_batch_size,

@@ -294,3 +294,221 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
     assert len(deal_entries) == 1
     assert deal_entries[0][0] == 60.8
     assert deal_entries[0][2]["ml"] == 8000.0
+
+
+def test_run_format_round_recleans_specless_placeholder_sku_when_activity_price_changes(monkeypatch):
+    """
+    真实回归场景（可乐 663508084573 vs 743329703469）：
+    当商品含无规格属性的 1 元占位 sku_info ([{'价格': '￥41.4', '截图地址': ''}])，且 activity_price
+    后来降为 35.4 时，清洗逻辑必须识别价格变动、以最新 activity_price (35.4) 送洗并同步占位价格，
+    避免继续沿用陈腐价格 41.4 导致性价比排序错误，也避免因重喂旧 sku_info['价格'] 陷入死循环。
+    """
+    cola_18 = {
+        "_id": "oid-cola-18",
+        "platform": "pdd",
+        "product_id": "663508084573",
+        "name": "可口可乐500ml*6瓶+雪碧500ml*6瓶+芬达500ml*6瓶多口味装包邮",
+        "activity_price": 35.4,
+        "price": 43.4,
+        "sku_info": [{"价格": "￥41.4", "截图地址": ""}],
+        "format_status": "success",
+        "format_info": {
+            "663508084573_1": {
+                "sku_id": "663508084573_1",
+                "price": 41.4,
+                "core_entities": [{"name": "碳酸饮料", "score": 10}],
+                "decision_keywords": [{"attribute_name": "单瓶净含量", "attribute_value": "500ml", "score": 9}],
+                "pricing_basis": {
+                    "is_inferred": False,
+                    "structure": [{"value": 18, "unit": "瓶"}, {"value": 500, "unit": "ml"}],
+                    "total_value": 9000,
+                    "base_unit": "ml",
+                    "equivalent_description": None,
+                },
+            }
+        },
+    }
+    cola_24 = {
+        "_id": "oid-cola-24",
+        "platform": "pdd",
+        "product_id": "743329703469",
+        "name": "可口可乐/雪碧/芬达/零度可乐500ml*24瓶汽水碳酸饮料整箱装包邮",
+        "activity_price": 55.2,
+        "price": 65.2,
+        "sku_info": [{"价格": "￥55.2", "截图地址": ""}],
+        "format_status": "success",
+        "format_info": {
+            "743329703469_1": {
+                "sku_id": "743329703469_1",
+                "price": 55.2,
+                "core_entities": [{"name": "碳酸饮料", "score": 10}],
+                "decision_keywords": [{"attribute_name": "单瓶净含量", "attribute_value": "500ml", "score": 9}],
+                "pricing_basis": {
+                    "is_inferred": False,
+                    "structure": [{"value": 24, "unit": "瓶"}, {"value": 500, "unit": "ml"}],
+                    "total_value": 12000,
+                    "base_unit": "ml",
+                    "equivalent_description": None,
+                },
+            }
+        },
+    }
+
+    # 重洗前：18瓶装因陈腐价格 41.4 被触发重洗检测，而 24瓶装价格一致不触发
+    assert gif._detect_product_price_changes(cola_18) == (True, {"663508084573_1"})
+    assert gif._detect_product_price_changes(cola_24) == (False, set())
+
+    captured_prompts: list[str] = []
+
+    def _fake_generate_content(prompt, **kwargs):
+        captured_prompts.append(prompt)
+        # 断言送给模型的价格必须是最新 activity_price (35.4)，绝不能是旧的 ￥41.4
+        assert '"价格": "35.4"' in prompt
+        assert "41.4" not in prompt
+        payload = [{
+            "sku_id": "663508084573_1",
+            "price": 35.4,
+            "core_entities": [{"name": "碳酸饮料", "score": 10}],
+            "decision_keywords": [{"attribute_name": "单瓶净含量", "attribute_value": "500ml", "score": 9}],
+            "pricing_basis": {
+                "is_inferred": False,
+                "structure": [{"value": 18, "unit": "瓶"}, {"value": 500, "unit": "ml"}],
+                "total_value": 9000,
+                "base_unit": "ml",
+                "equivalent_description": None,
+            },
+        }]
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(payload, ensure_ascii=False),
+            "metrics": {"model_used": "mock-goods-model"},
+        }
+
+    monkeypatch.setattr(gif, "generate_content", _fake_generate_content)
+
+    # 第一轮：执行重洗
+    fake_db = FakeMongoDB([cola_18])
+    manager = gif.ProductManager(fake_db)
+    counts = gif.run_format_round(manager)
+
+    assert len(captured_prompts) == 1
+    assert counts["success"] == 1
+    assert counts["reformat_success"] == 1
+    assert cola_18["format_status"] == "success"
+    assert cola_18["format_activity_price"] == 35.4
+    assert cola_18["sku_info"] == [{"价格": "￥35.4", "截图地址": ""}]
+    assert cola_18["format_info"]["663508084573_1"]["price"] == 35.4
+    assert cola_18["format_retry_count"] == 0
+
+    # 第二轮：价格未再变动时，检测结果为 False，即使误查入本轮也不会再次请求模型（防死循环）
+    assert gif._detect_product_price_changes(cola_18) == (False, set())
+    counts_round2 = gif.run_format_round(manager)
+    assert len(captured_prompts) == 1
+    assert counts_round2["success"] == 0
+
+    # 验证下游性价比提取：18瓶装每元 9000/35.4 = 254.237ml，严格高于 24瓶装每元 12000/55.2 = 217.391ml
+    e18 = ProductRepository._extract_sku_unit_entries(cola_18)
+    e24 = ProductRepository._extract_sku_unit_entries(cola_24)
+    assert round(e18[0][2]["ml"] / e18[0][0], 6) > round(e24[0][2]["ml"] / e24[0][0], 6)
+
+
+def test_run_format_round_multi_sku_partial_price_change_and_retry_convergence(monkeypatch):
+    """
+    验证：
+    1. 带真实规格属性的多规格商品：仅价格变动的 SKU 被局部剔除重洗，未变动规格直接保留不重复调模型；
+       带复杂文案（如 '￥19.46多人团价￥21.46'）但未变动的规格不会误触发重洗。
+    2. 单规格商品价格变动重洗若遭遇模型连续失败，快照 format_activity_price 已推进，最多失败 3 轮即收敛停止。
+    3. pending_format_query 顶层保护 format_retry_count < 999 人工锁定记录。
+    """
+    query = gif.pending_format_query()
+    assert {"format_retry_count": {"$lt": gif.LOCKED_RETRY_SENTINEL}} in query["$and"][1]["$or"]
+
+    # 多规格商品：SKU1 原为旧占位残留 3.01，现更新为 ￥47.3；SKU2 保持 ￥23.8 未变
+    doc_multi = {
+        "_id": "oid-multi-1",
+        "platform": "pdd",
+        "product_id": "978550785391",
+        "name": "原生木浆抽纸整箱家用商用餐巾纸",
+        "activity_price": 3.01,
+        "sku_info": [
+            {"款式": "80包【整箱19200张】", "价格": "￥47.3", "截图地址": ""},
+            {"款式": "40包【整箱9600张】", "价格": "￥23.8", "截图地址": ""},
+        ],
+        "format_status": "success",
+        "format_info": {
+            "978550785391_1": _sample_valid_llm_item("978550785391_1", price=3.01, total_value=8000, unit="张"),
+            "978550785391_2": _sample_valid_llm_item("978550785391_2", price=23.8, total_value=8000, unit="张"),
+        },
+    }
+    # 复杂价格文案但已记录快照未变的带规格商品：不应误判价格变动
+    doc_complex_unchanged = {
+        "_id": "oid-complex-1",
+        "platform": "pdd",
+        "product_id": "631582502680",
+        "name": "漫花10提悬挂式抽纸家用12000张",
+        "activity_price": 21.46,
+        "sku_info": [{"款式": "10提12000张送挂钩", "价格": "￥19.46多人团价￥21.46", "截图地址": ""}],
+        "format_status": "success",
+        "format_sku_prices": {"631582502680_1": "￥19.46多人团价￥21.46"},
+        "format_info": {
+            "631582502680_1": _sample_valid_llm_item("631582502680_1", price=19.46, total_value=8000, unit="张"),
+        },
+    }
+    # 单规格空 sku_info 商品：价格从 52.9 降为 49.9，但模拟模型偏离价格导致校验失败
+    doc_empty_sku_fail = {
+        "_id": "oid-empty-fail",
+        "platform": "jd",
+        "product_id": "jd1001",
+        "name": "零度无糖可乐1.25L*12瓶",
+        "activity_price": 49.9,
+        "sku_info": [],
+        "format_status": "success",
+        "format_retry_count": 3,  # 历史旧价格曾满 3 次，新价格仍应获得一次全新重洗周期
+        "format_info": {
+            "jd1001_0": _sample_valid_llm_item("jd1001_0", price=52.9, total_value=8000, unit="ml"),
+        },
+    }
+
+    assert gif._detect_product_price_changes(doc_multi) == (True, {"978550785391_1"})
+    assert gif._detect_product_price_changes(doc_complex_unchanged) == (False, set())
+    assert gif._detect_product_price_changes(doc_empty_sku_fail) == (True, {"jd1001_0"})
+
+    monkeypatch.setattr(gif, "LLM_MAX_RETRIES", 1)
+
+    def _fake_generate(prompt, **kwargs):
+        # 仅 SKU1 被送洗，SKU2 未重复送洗
+        assert "978550785391_1" in prompt
+        assert "978550785391_2" not in prompt
+        # 故意给 jd1001_0 返回错误的旧价格 52.9，触发 expected_price (49.9) 强校验拦截
+        payload = [
+            _sample_valid_llm_item("978550785391_1", price=47.3, total_value=8000, unit="张"),
+            _sample_valid_llm_item("jd1001_0", price=52.9, total_value=8000, unit="ml"),
+        ]
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(payload, ensure_ascii=False),
+            "metrics": {"model_used": "mock-goods-model"},
+        }
+
+    monkeypatch.setattr(gif, "generate_content", _fake_generate)
+
+    fake_db = FakeMongoDB([doc_multi, doc_empty_sku_fail])
+    manager = gif.ProductManager(fake_db)
+    counts = gif.run_format_round(manager)
+
+    assert counts["reformat_success"] == 1
+    assert counts["reformat_failed"] == 1
+
+    # 多规格商品：SKU1 已更新为 47.3 并记录快照，SKU2 完好保留，下一轮不再触发重洗
+    assert doc_multi["format_info"]["978550785391_1"]["price"] == 47.3
+    assert doc_multi["format_info"]["978550785391_2"]["price"] == 23.8
+    assert doc_multi["format_sku_prices"]["978550785391_1"] == "￥47.3"
+    assert gif._detect_product_price_changes(doc_multi) == (False, set())
+
+    # 单规格失败商品：旧陈腐 52.9 已清空，快照已推进到 49.9，retry_count 置为 1 且不会在后续轮次再次误判为新价格重置为 0
+    assert doc_empty_sku_fail["format_status"] == "failed"
+    assert doc_empty_sku_fail["format_info"] == {}
+    assert doc_empty_sku_fail["format_activity_price"] == 49.9
+    assert doc_empty_sku_fail["format_retry_count"] == 1
+    assert gif._detect_product_price_changes(doc_empty_sku_fail) == (False, set())
+
