@@ -1225,7 +1225,156 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(after_refresh["desc"], "官方刷新详情")
         self.assertEqual(after_refresh["deal_tip"]["deal_price"], 24.9)
 
+    def test_cost_performance_treats_stale_price_or_need_reformat_items_as_unformatted(self):
+        now = datetime.datetime(2026, 11, 12, 12, 0, 0)
+        self.col.docs = [
+            # 1. 价格一致的已清洗商品：500g @ 25元 -> 20 g/元，应正常参与性价比排序并位列第一
+            {
+                "platform": "pdd", "product_id": "FRESH_VALID", "name": "立白洗衣液500g",
+                "activity_price": 25.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=10),
+                "format_status": "success", "need_reformat": False, "format_activity_price": 25.0,
+                "format_info": {
+                    "price": 25.0,
+                    "pricing_basis": {"base_unit": "g", "total_value": 500, "structure": [{"unit": "g", "value": 500}]},
+                },
+            },
+            # 2. 单规格商品降价未重洗：format_info.price(41.4) != activity_price(35.4) -> 视为未清洗排到末尾
+            {
+                "platform": "pdd", "product_id": "STALE_SINGLE_DROP", "name": "立白降价未重洗",
+                "activity_price": 35.4, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=1),
+                "format_status": "success",
+                "format_info": {
+                    "price": 41.4,
+                    "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                },
+            },
+            # 3. 单规格商品涨价未重洗：format_info.price(10.0) != activity_price(12.0) -> 视为未清洗排到末尾
+            {
+                "platform": "pdd", "product_id": "STALE_SINGLE_HIKE", "name": "立白涨价未重洗",
+                "activity_price": 12.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=2),
+                "format_status": "success",
+                "format_info": {
+                    "price": 10.0,
+                    "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                },
+            },
+            # 4. 无规格单条 sku_info 降价未重洗：sku="" 且 format_info["..._1"].price(41.4) != activity_price(35.4)
+            {
+                "platform": "pdd", "product_id": "STALE_SPECLESS_SKU", "name": "立白无规格SKU降价未重洗",
+                "activity_price": 35.4, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=3),
+                "format_status": "success",
+                "sku_info": [{"sku": "", "price": 41.4}],
+                "format_info": {
+                    "STALE_SPECLESS_SKU_1": {
+                        "price": 41.4,
+                        "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                    },
+                },
+            },
+            # 5. 已被爬虫标记 need_reformat=True 的商品 -> 视为未清洗排到末尾
+            {
+                "platform": "pdd", "product_id": "NEED_REFORMAT_FLAG", "name": "立白待重洗标记",
+                "activity_price": 20.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=4),
+                "format_status": "success", "need_reformat": True,
+                "format_info": {
+                    "price": 20.0,
+                    "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                },
+            },
+            # 6. 多 SKU 商品（2 个规格）：规格 1 低于活动价被过滤，规格 2 价格已变（sku_info="¥18.0" != format_info.price=25.0），全部失效归入未清洗末尾
+            {
+                "platform": "pdd", "product_id": "STALE_MULTI_SKU", "name": "立白多规格改价未重洗",
+                "activity_price": 18.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=5),
+                "format_status": "success",
+                "sku_info": [
+                    {"sku": "引流小样", "price": "¥9.0"},
+                    {"sku": "补充装", "price": "¥18.0"},
+                ],
+                "format_sku_prices": {"STALE_MULTI_SKU_2": "¥25.0"},
+                "format_info": {
+                    "STALE_MULTI_SKU_1": {
+                        "price": 9.0,
+                        "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                    },
+                    "STALE_MULTI_SKU_2": {
+                        "price": 25.0,
+                        "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                    },
+                },
+            },
+            # 7. 拼多多带具体规格属性的 1-SKU 多档文案（"￥19.46多人团价￥21.46"，清洗快照一致）：合法保留，绝不误杀！(10 g/元 < FRESH_VALID 的 20 g/元，但排在全部未清洗商品之前)
+            {
+                "platform": "pdd", "product_id": "PDD_SINGLE_SPEC_MULTITIER", "name": "立白蓝色2瓶装",
+                "activity_price": 19.46, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=6),
+                "format_status": "success",
+                "sku_info": [{"规格": "蓝色2瓶", "价格": "￥19.46多人团价￥21.46"}],
+                "format_sku_prices": {"PDD_SINGLE_SPEC_MULTITIER_1": "￥19.46多人团价￥21.46"},
+                "format_info": {
+                    "PDD_SINGLE_SPEC_MULTITIER_1": {
+                        "price": 21.46,
+                        "pricing_basis": {"base_unit": "g", "total_value": 214.6, "structure": [{"unit": "g", "value": 214.6}]},
+                    },
+                },
+            },
+        ]
+
+        ranked = self.repo.rank_boom_products_by_cost_performance(platform="pdd", keyword="立白")
+        self.assertEqual(
+            [item["product_id"] for item in ranked],
+            [
+                "FRESH_VALID",
+                "PDD_SINGLE_SPEC_MULTITIER",
+                "STALE_SINGLE_DROP",
+                "STALE_SINGLE_HIKE",
+                "STALE_SPECLESS_SKU",
+                "NEED_REFORMAT_FLAG",
+                "STALE_MULTI_SKU",
+            ],
+        )
+        # 返回的外层展示价格始终是最新 activity_price，且不丢失商品
+        price_by_id = {item["product_id"]: item["price"] for item in ranked}
+        self.assertEqual(price_by_id["STALE_SINGLE_DROP"], 35.4)
+        self.assertEqual(price_by_id["STALE_SINGLE_HIKE"], 12.0)
+
+    def test_protocol_relative_images_normalized_and_empty_carousel_preserves_existing(self):
+        # ProductRepository 入库与读取均补全 // 协议头，且空 carousel_images 更新不会清空库内已有轮播图
+        t1 = datetime.datetime(2026, 11, 12, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        t2 = datetime.datetime(2026, 11, 12, 12, 0, 5, tzinfo=datetime.timezone.utc)
+        self.assertTrue(self.repo.upsert_product_detail({
+            "platform": "jd",
+            "goods_id": "JD-IMG-1",
+            "goods_sign": "JD-IMG-1",
+            "name": "京东测试商品",
+            "price": 19.9,
+            "image_url": "//img14.360buyimg.com/n1/main.jpg",
+            "carousel_images": ["//img14.360buyimg.com/n1/c1.jpg", "//img14.360buyimg.com/n1/c2.jpg"],
+            "detail_updated_at": t1,
+        }))
+        stored_first = self.repo.get_product_detail("JD-IMG-1", platform="jd")
+        self.assertEqual(stored_first["image_url"], "https://img14.360buyimg.com/n1/main.jpg")
+        self.assertEqual(stored_first["carousel_images"], [
+            "https://img14.360buyimg.com/n1/c1.jpg",
+            "https://img14.360buyimg.com/n1/c2.jpg",
+        ])
+
+        # 二次写入空 carousel_images=[] 不覆盖库内已有的真实轮播图
+        self.assertTrue(self.repo.upsert_product_detail({
+            "platform": "jd",
+            "goods_id": "JD-IMG-1",
+            "goods_sign": "JD-IMG-1",
+            "name": "京东测试商品",
+            "price": 17.9,
+            "image_url": "//img14.360buyimg.com/n1/main.jpg",
+            "carousel_images": [],
+            "detail_updated_at": t2,
+        }))
+        stored_second = self.repo.get_product_detail("JD-IMG-1", platform="jd")
+        self.assertEqual(stored_second["price"], 17.9)
+        self.assertEqual(stored_second["carousel_images"], [
+            "https://img14.360buyimg.com/n1/c1.jpg",
+            "https://img14.360buyimg.com/n1/c2.jpg",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()
-

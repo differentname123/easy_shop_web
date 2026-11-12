@@ -2554,3 +2554,204 @@ test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting cop
   assert.ok(detailHtml.includes('class="detail-card-section deal-tip-card" v-if="dealTip"'));
   assert.ok(detailHtml.includes('referrerpolicy="no-referrer"'));
 });
+
+test('detail latest price and off-promotion sync back to Home/Boom outer list cards without polluting subsequent server refreshes', async () => {
+  const dumpSession = storageObj => {
+    const out = {};
+    for (const k of [
+      'easy_shop_home_return_state:guest:pdd',
+      'easy_shop_boom_return_state:guest:all',
+      'easy_shop_bfcache_sync:guest',
+      'current_goods_summary:guest:pdd:id:G_SYNC',
+      'easy_shop_last_active_tab:guest',
+    ]) {
+      const v = storageObj.getItem(k);
+      if (v !== null) out[k] = v;
+    }
+    return out;
+  };
+
+  // 1. 首页与严选好价均加载了旧价格 ¥10.0 的商品 G_SYNC
+  const hApp = harness({ url: 'https://shop.test/' });
+  hApp.load('app');
+  const boot = hApp.mounted[0]();
+  await flush();
+  await hApp.finish(0, { status: 'success', data: platformFixtures });
+  await hApp.finish(1, { status: 'success', data: channelFixtures });
+  await hApp.finish(2, {
+    status: 'success',
+    data: [
+      { goods_id: 'G_SYNC', goods_sign: 'SIGN_SYNC', platform: 'pdd', name: '心相印抽纸', price: 10.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/old.jpg' },
+      { goods_id: 'G_KEEP', goods_sign: 'SIGN_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
+    ],
+    has_more: false,
+  });
+  await boot;
+
+  const boomLoad = hApp.page.loadBoomGoods(true);
+  await hApp.finish(hApp.requests.length - 1, {
+    status: 'success',
+    data: [
+      { goods_id: 'G_SYNC', goods_sign: 'SIGN_SYNC', platform: 'pdd', name: '心相印抽纸', price: 10.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/old.jpg' },
+      { goods_id: 'G_KEEP', goods_sign: 'SIGN_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
+    ],
+    has_more: false,
+  });
+  await boomLoad;
+  hApp.page.saveBoomState();
+
+  // 点击进入详情页
+  hApp.page.openGoodsDetail(hApp.page.homeGoodsList.value[0]);
+  const sharedSession1 = dumpSession(hApp.context.sessionStorage);
+
+  // 2. 详情页拉取到最新真实价格 ¥8.0（含 ¥2.0 优惠券），直接原地更新返回快照并写入一次性 bfcache 同步信标
+  const hDetail = harness({
+    url: 'https://shop.test/detail?goods_id=G_SYNC&goods_sign=SIGN_SYNC&platform=pdd',
+    sessionSaved: sharedSession1,
+  });
+  hDetail.load('detail');
+  const initDetail = hDetail.mounted[0]();
+  await hDetail.finish(0, {
+    status: 'success',
+    data: {
+      goods_id: 'G_SYNC',
+      goods_sign: 'SIGN_SYNC',
+      platform: 'pdd',
+      name: '心相印抽纸',
+      price: 8.0,
+      original_price: 10.0,
+      coupon_amount: 2.0,
+      saved_price: 2.0,
+      has_coupon: true,
+      image_url: 'https://img.test/new8.jpg',
+      carousel_images: ['https://img.test/new8.jpg'],
+    },
+  });
+  await initDetail;
+  assert.equal(hDetail.page.goods.value.price, 8.0);
+
+  const sharedSession2 = dumpSession(hDetail.context.sessionStorage);
+  Object.entries(sharedSession2).forEach(([k, v]) => hApp.context.sessionStorage.setItem(k, v));
+
+  // 3A. 常规历史回退重新挂载读取 sessionStorage 快照：快照已原地更新为 ¥8.0
+  const hReturn = harness({ url: 'https://shop.test/', sessionSaved: sharedSession2 });
+  const returnFeed = hReturn.makeFeeds();
+  returnFeed.initializeHome(new URLSearchParams());
+  assert.equal(returnFeed.homeGoodsList.value[0].price, 8.0);
+  assert.equal(returnFeed.restoreBoomState(), true);
+  assert.equal(returnFeed.boomGoodsList.value[0].price, 8.0);
+
+  // 3B. 浏览器 bfcache 返回触发 pageshow：消费一次性信标同步 ¥8.0，并立即销毁信标
+  hApp.fire('pageshow', { persisted: true });
+  assert.equal(hApp.page.homeGoodsList.value[0].price, 8.0);
+  assert.equal(hApp.page.homeGoodsList.value[0].has_coupon, true);
+  assert.equal(hApp.page.homeGoodsList.value[0].coupon_amount, 2.0);
+  assert.equal(hApp.page.homeGoodsList.value[0].image_url, 'https://img.test/new8.jpg');
+  assert.equal(hApp.page.boomGoodsList.value[0].price, 8.0);
+  assert.equal(hApp.context.sessionStorage.getItem('easy_shop_bfcache_sync:guest'), null, 'one-shot bfcache sync key removed immediately');
+
+  // 3C. 零副作用验证：后续用户下拉刷新列表、券过期恢复为 ¥12.0 时，绝不会被旧的 ¥8.0 客户端状态反向覆盖！
+  const refreshPromise = hApp.page.refreshHomeGoods();
+  await hApp.finish(hApp.requests.length - 1, {
+    status: 'success',
+    data: [
+      { goods_id: 'G_SYNC', goods_sign: 'SIGN_SYNC', platform: 'pdd', name: '心相印抽纸', price: 12.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/new8.jpg' },
+      { goods_id: 'G_KEEP', goods_sign: 'SIGN_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
+    ],
+    has_more: false,
+  });
+  await refreshPromise;
+  assert.equal(hApp.page.homeGoodsList.value[0].price, 12.0, 'fresh server network response is never overwritten by old client patch');
+
+  // 4. 若详情页发现商品已下架 (PRODUCT_OFF_PROMOTION)，返回外层列表后自动剔除下架卡片
+  const hOff = harness({
+    url: 'https://shop.test/detail?goods_id=G_SYNC&goods_sign=SIGN_SYNC&platform=pdd',
+    sessionSaved: sharedSession2,
+  });
+  hOff.load('detail');
+  const initOff = hOff.mounted[0]();
+  await hOff.finish(0, { status: 'error', error_code: 'PRODUCT_OFF_PROMOTION', error_msg: '已下架' }, { status: 404 });
+  await initOff;
+  hApp.context.sessionStorage.setItem('easy_shop_bfcache_sync:guest', hOff.context.sessionStorage.getItem('easy_shop_bfcache_sync:guest'));
+  hApp.fire('pageshow', { persisted: true });
+  assert.deepEqual([...hApp.page.homeGoodsList.value].map(i => i.goods_id), ['G_KEEP']);
+  assert.deepEqual([...hApp.page.boomGoodsList.value].map(i => i.goods_id), ['G_KEEP']);
+});
+
+test('detail broken/missing images never stick across visits: filters 404 slides, exposes retry placeholder, and recovers cleanly on 2nd entry', async () => {
+  const summaryStorageKey = 'current_goods_summary:guest:jd:id:JD_IMG_9';
+  const initialSummary = JSON.stringify({
+    goods_id: 'JD_IMG_9',
+    goods_sign: 'JD_IMG_9',
+    platform: 'jd',
+    platform_name: '京东',
+    name: '京东洗衣液',
+    price: 29.9,
+    image_url: '//img14.360buyimg.com/n1/broken.jpg',
+  });
+
+  // 1. 第一次进入详情：摘要携带协议相对地址 //img... 自动补全为 https://；接口拉取失败且图片加载触发 @error
+  const h1 = harness({
+    url: 'https://shop.test/detail?goods_id=JD_IMG_9&platform=jd',
+    sessionSaved: { [summaryStorageKey]: initialSummary },
+    useRealVue: true,
+  });
+  h1.load('detail');
+  const mount1 = h1.mounted[0]();
+  assert.deepEqual([...h1.page.carouselList.value], ['https://img14.360buyimg.com/n1/broken.jpg']);
+
+  await h1.finish(0, { status: 'error', error_msg: '上游繁忙' }, { status: 502 });
+  await mount1;
+
+  // 图片加载也失败 -> 自动从 carouselList 剔除破图，展示重试占位而非破损图标，并清空摘要缓存里的破图 URL
+  h1.page.onProductImageError('https://img14.360buyimg.com/n1/broken.jpg');
+  assert.deepEqual([...h1.page.carouselList.value], []);
+  assert.equal(h1.page.hasNoAvailableImages.value, true);
+  assert.equal(JSON.parse(h1.context.sessionStorage.getItem(summaryStorageKey)).image_url, '');
+
+  // 2. 用户第二次进入同一商品详情：不会残留破图，直接重新拉取详情恢复真实图片（无需暴露任何公开 refresh 穿透参数）
+  const sessionForVisit2 = {
+    [summaryStorageKey]: h1.context.sessionStorage.getItem(summaryStorageKey),
+  };
+  h1.page.dispose();
+
+  const h2 = harness({
+    url: 'https://shop.test/detail?goods_id=JD_IMG_9&platform=jd',
+    sessionSaved: sessionForVisit2,
+    useRealVue: true,
+  });
+  h2.load('detail');
+  const mount2 = h2.mounted[0]();
+  assert.equal(new URL(h2.requests[0].url, 'https://shop.test').searchParams.get('refresh'), null);
+
+  await h2.finish(0, {
+    status: 'success',
+    data: {
+      goods_id: 'JD_IMG_9',
+      goods_sign: 'JD_IMG_9',
+      platform: 'jd',
+      platform_name: '京东',
+      name: '京东洗衣液',
+      price: 29.9,
+      image_url: '//img14.360buyimg.com/n1/real_main.jpg',
+      carousel_images: ['//img14.360buyimg.com/n1/real_main.jpg', 'https://img14.360buyimg.com/n1/real_2.jpg'],
+    },
+  });
+  await mount2;
+
+  assert.equal(h2.page.hasNoAvailableImages.value, false);
+  assert.deepEqual([...h2.page.carouselList.value], [
+    'https://img14.360buyimg.com/n1/real_main.jpg',
+    'https://img14.360buyimg.com/n1/real_2.jpg',
+  ]);
+  assert.equal(JSON.parse(h2.context.sessionStorage.getItem(summaryStorageKey)).image_url, 'https://img14.360buyimg.com/n1/real_main.jpg');
+  h2.page.dispose();
+
+  // 3. 模板守卫：详情轮播图与外层卡片均绑定破图兜底与 referrerpolicy="no-referrer"
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(detailHtml.includes('@error="onProductImageError(img)"'));
+  assert.ok(detailHtml.includes('v-if="hasNoAvailableImages"'));
+  assert.ok(indexHtml.includes('@error="handleOrderThumbError"'));
+});
+

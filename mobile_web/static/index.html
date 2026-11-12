@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261112-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261112-2">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261112-1"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261112-2"></script>
 </head>
 <body>
 <div id="app">
@@ -88,7 +88,7 @@
         @click="openGoodsDetail(item)"
       >
         <div class="goods-thumb-wrap">
-          <img :src="item.image_url" :alt="item.name" class="goods-thumb" loading="lazy" />
+          <img :src="item.image_url || defaultOrderThumb" :alt="item.name" class="goods-thumb" referrerpolicy="no-referrer" loading="lazy" @error="handleOrderThumbError" />
           <span class="plat-badge" :class="item.platform">{{ item.platform_name || homePlatformName() }}</span>
         </div>
         <div class="goods-body">
@@ -235,7 +235,7 @@
         @click="openGoodsDetail(item)"
       >
         <div class="goods-thumb-wrap">
-          <img :src="item.image_url" :alt="item.name" class="goods-thumb" loading="lazy" />
+          <img :src="item.image_url || defaultOrderThumb" :alt="item.name" class="goods-thumb" referrerpolicy="no-referrer" loading="lazy" @error="handleOrderThumbError" />
           <span class="plat-badge" :class="item.platform">{{ item.platform_name }}</span>
         </div>
         <div class="goods-body">
@@ -416,6 +416,7 @@
         >
           <img
             :src="universalResult.product.image_url || defaultOrderThumb"
+            referrerpolicy="no-referrer"
             @error="handleOrderThumbError"
             class="universal-product-thumb"
             alt="商品主图"
@@ -606,7 +607,7 @@
       <!-- 订单列表明细 -->
       <div class="order-list-wrap" v-if="userOrdersData.order_list && userOrdersData.order_list.length > 0">
         <div class="order-item-card" v-for="ord in userOrdersData.order_list" :key="orderKey(ord)">
-          <img :src="ord.goods_thumbnail_url || defaultOrderThumb" @error="handleOrderThumbError" class="order-item-thumb" alt="商品" />
+          <img :src="ord.goods_thumbnail_url || defaultOrderThumb" referrerpolicy="no-referrer" @error="handleOrderThumbError" class="order-item-thumb" alt="商品" />
           <div class="order-item-info">
             <h4 class="order-item-title">{{ ord.goods_name }}</h4>
             <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">{{ orderTimeLabel(ord) }}：{{ orderTimeText(ord) }}</div>
@@ -869,12 +870,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261112-1"></script>
-<script src="/static/js/session.js?v=ux-20261112-1"></script>
-<script src="/static/js/format.js?v=ux-20261112-1"></script>
-<script src="/static/js/browser.js?v=ux-20261112-1"></script>
-<script src="/static/js/feeds.js?v=ux-20261112-1"></script>
-<script src="/static/js/account.js?v=ux-20261112-1"></script>
-<script src="/static/js/app.js?v=ux-20261112-1"></script>
+<script src="/static/js/api.js?v=ux-20261112-2"></script>
+<script src="/static/js/session.js?v=ux-20261112-2"></script>
+<script src="/static/js/format.js?v=ux-20261112-2"></script>
+<script src="/static/js/browser.js?v=ux-20261112-2"></script>
+<script src="/static/js/feeds.js?v=ux-20261112-2"></script>
+<script src="/static/js/account.js?v=ux-20261112-2"></script>
+<script src="/static/js/app.js?v=ux-20261112-2"></script>
 </body>
 </html>

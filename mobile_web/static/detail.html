@@ -13,8 +13,8 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261112-1">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261112-1"></script>
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261112-2">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261112-2"></script>
   <style>
     /* 专属商品详情大页样式 */
     .detail-nav-bar {
@@ -92,6 +92,29 @@
       width: 100%;
       height: 100%;
       object-fit: cover;
+    }
+    .hero-empty-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: var(--text-muted);
+      font-size: 13px;
+      background: #f5f5f5;
+      z-index: 2;
+    }
+    .hero-empty-retry-btn {
+      border: 1px solid var(--primary-color);
+      background: #fff;
+      color: var(--primary-color);
+      border-radius: 16px;
+      padding: 5px 14px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
     }
     .hero-counter-badge {
       position: absolute;
@@ -576,8 +599,12 @@
         v-for="(img, idx) in carouselList" 
         :key="idx"
       >
-        <img :src="img" :alt="goods?.name || '商品实拍图'" />
+        <img :src="img" referrerpolicy="no-referrer" :alt="goods?.name || '商品实拍图'" @error="onProductImageError(img)" />
       </div>
+    </div>
+    <div class="hero-empty-placeholder" v-if="hasNoAvailableImages">
+      <span>{{ isOffPromotion ? '商品已下架或暂无可用图片' : '商品图片暂未加载成功' }}</span>
+      <button type="button" class="hero-empty-retry-btn" v-if="!isOffPromotion" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
     </div>
     <span class="hero-counter-badge" v-if="carouselList.length > 1">
       {{ currentImgIndex + 1 }} / {{ carouselList.length }}
@@ -718,7 +745,7 @@
     </div>
   </div>
 
-  <div class="detail-card-section retry-card" v-if="detailError && (!goods?.carousel_images || goods.carousel_images.length <= 1)">
+  <div class="detail-card-section retry-card" v-if="detailError && carouselList.length <= 1">
     <div class="retry-card-content">
       <span class="retry-msg">{{ detailErrorMsg || '商品详情暂未完整获取，可重试加载' }}</span>
       <button class="retry-btn-inline" v-if="!isOffPromotion" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
@@ -810,7 +837,7 @@
       <span>商品高清实拍与图文详情</span>
     </div>
     <div v-for="(img, gIdx) in detailGalleryList" :key="'flow_' + gIdx">
-      <img :src="img" class="detail-img-full" loading="lazy" :alt="goods?.name + ' 图' + (gIdx+1)" />
+      <img :src="img" class="detail-img-full" referrerpolicy="no-referrer" loading="lazy" :alt="goods?.name + ' 图' + (gIdx+1)" @error="onProductImageError(img)" />
     </div>
   </div>
 
@@ -921,10 +948,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261112-1"></script>
-<script src="/static/js/session.js?v=ux-20261112-1"></script>
-<script src="/static/js/format.js?v=ux-20261112-1"></script>
-<script src="/static/js/browser.js?v=ux-20261112-1"></script>
-<script src="/static/js/detail.js?v=ux-20261112-1"></script>
+<script src="/static/js/api.js?v=ux-20261112-2"></script>
+<script src="/static/js/session.js?v=ux-20261112-2"></script>
+<script src="/static/js/format.js?v=ux-20261112-2"></script>
+<script src="/static/js/browser.js?v=ux-20261112-2"></script>
+<script src="/static/js/detail.js?v=ux-20261112-2"></script>
 </body>
 </html>

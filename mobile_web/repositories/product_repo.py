@@ -117,7 +117,11 @@ class ProductRepository(BaseRepository):
         "format_info": 1,
         "format_status": 1,
         "sku_info": 1,
+        "need_reformat": 1,
+        "format_activity_price": 1,
+        "format_sku_prices": 1,
     }
+    _PLAIN_SKU_PRICE_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 
     @staticmethod
     def _displayable_content_filter() -> Dict[str, Any]:
@@ -263,7 +267,10 @@ class ProductRepository(BaseRepository):
         for target, aliases in text_fields.items():
             value = next((item[key] for key in aliases if key in item and item[key] is not None and str(item[key]).strip()), None)
             if value is not None:
-                update_set[target] = str(value)
+                text_val = str(value).strip() if target == "image_url" else str(value)
+                if target == "image_url" and text_val.startswith("//"):
+                    text_val = "https:" + text_val
+                update_set[target] = text_val
 
         # 供应商摘要也可带可信物料链接，但不是完整详情，不推进详情来源时钟。
         # 对于京东加密 ID，统一规范化为 https://jingfen.jd.com/detail/{encrypted_id}.html；榜单摘要仅在首次插入时写入，避免覆盖详情页已解析出的长物料链接。
@@ -302,7 +309,22 @@ class ProductRepository(BaseRepository):
                 "unified_tags", "service_guarantees", "shop_ratings", "coupon_info", "search_id",
             ):
                 if key in item and item[key] is not None:
-                    update_set[key] = deepcopy(item[key])
+                    if key == "carousel_images" and isinstance(item[key], list):
+                        cleaned_carousel = []
+                        for img_item in item[key]:
+                            if not isinstance(img_item, str) or not img_item.strip():
+                                continue
+                            u = img_item.strip()
+                            if u.startswith("//"):
+                                u = "https:" + u
+                            if u not in cleaned_carousel:
+                                cleaned_carousel.append(u)
+                        if cleaned_carousel:
+                            update_set["carousel_images"] = cleaned_carousel
+                        else:
+                            insert_set["carousel_images"] = []
+                    else:
+                        update_set[key] = deepcopy(item[key])
         return self._identity_filter(platform, goods_id, goods_sign), {"$set": update_set, "$setOnInsert": insert_set}
 
     def _build_boom_filter_query(
@@ -323,12 +345,48 @@ class ProductRepository(BaseRepository):
             filter_query["name"] = {"$regex": safe_kw, "$options": "i"}
         return filter_query
 
+    @staticmethod
+    def _is_specless_single_sku(sku_info: Any) -> bool:
+        """判定商品是否属于无细分规格属性的单品（成交价统一以顶层 activity_price 为准）。"""
+        if not isinstance(sku_info, list) or len(sku_info) == 0:
+            return True
+        if len(sku_info) == 1:
+            item = sku_info[0]
+            if not isinstance(item, dict):
+                return True
+            return not any(
+                k not in ("价格", "price", "截图地址", "image_url", "img") and str(v or "").strip()
+                for k, v in item.items()
+            )
+        return False
+
     @classmethod
-    def _is_valid_sku_price(cls, price_val: Any, min_limit_price: Optional[float]) -> bool:
+    def _parse_plain_sku_price(cls, price_text: Any) -> Optional[float]:
+        """解析纯数值规格价格（如 '￥41.4' / 41.4）；区间或多档文案返回 None。"""
+        if price_text is None or isinstance(price_text, bool):
+            return None
+        if isinstance(price_text, (int, float, Decimal128)):
+            try:
+                val = cls._amount_float(price_text)
+                return val if math.isfinite(val) and val > 0 else None
+            except (ValueError, TypeError, OverflowError):
+                return None
+        match = cls._PLAIN_SKU_PRICE_RE.fullmatch(str(price_text).strip())
+        if not match:
+            return None
+        try:
+            val = float(match.group(1))
+            return val if math.isfinite(val) and val > 0 else None
+        except (ValueError, OverflowError):
+            return None
+
+    @classmethod
+    def _is_valid_sku_price(cls, price_val: Any, min_limit_price: Optional[float], *, exact_match: bool = False) -> bool:
         """
         校验规格价格有效性：
         1. 必须为大于 0 的有限浮点数/整数/Decimal128；
-        2. 若商品存在全局 activity_price，任何规格价格均不得低于该阈值（排除浮点数精度误差）。
+        2. 单规格商品（exact_match=True）下，若存在外层 activity_price，规格价格必须与外层当前价格一致；
+        3. 多规格模式下，任何规格价格不得低于全局 activity_price。
         """
         if isinstance(price_val, bool) or not isinstance(price_val, (int, float, Decimal128)):
             return False
@@ -339,7 +397,10 @@ class ProductRepository(BaseRepository):
         if not math.isfinite(p_float) or p_float <= 0:
             return False
         if min_limit_price is not None:
-            if round(p_float, 2) < round(float(min_limit_price), 2):
+            if exact_match:
+                if abs(round(p_float, 2) - round(float(min_limit_price), 2)) > 0.01:
+                    return False
+            elif round(p_float, 2) < round(float(min_limit_price), 2):
                 return False
         return True
 
@@ -347,8 +408,10 @@ class ProductRepository(BaseRepository):
     def _extract_sku_unit_entries(cls, doc: Dict[str, Any]) -> List[Tuple[float, str, Dict[str, float]]]:
         """
         从商品的 format_info 中提取所有合法规格的 (sku_price, raw_base_unit, extracted_units)。
-        尚未完成 format_info 清洗或无有效规格的商品返回空列表（归入末尾兜底组）。
+        尚未完成 format_info 清洗、标记 need_reformat 或外层价格已变但尚未重洗的商品返回空列表（归入末尾兜底组）。
         """
+        if doc.get("need_reformat") is True:
+            return []
         if "format_status" in doc and doc.get("format_status") not in (None, "success"):
             return []
         raw_format_info = doc.get("format_info")
@@ -365,28 +428,73 @@ class ProductRepository(BaseRepository):
             except (ValueError, TypeError, OverflowError):
                 min_act_price = None
 
+        sku_info_raw = doc.get("sku_info")
+        is_specless = cls._is_specless_single_sku(sku_info_raw)
+
+        raw_fmt_act = doc.get("format_activity_price")
+        if is_specless and min_act_price is not None and raw_fmt_act is not None and not isinstance(raw_fmt_act, bool):
+            try:
+                fmt_act_f = cls._amount_float(raw_fmt_act)
+            except (ValueError, TypeError, OverflowError):
+                return []
+            if not math.isfinite(fmt_act_f) or fmt_act_f <= 0 or abs(min_act_price - fmt_act_f) > 0.01:
+                return []
+
         raw_sku_list: List[Tuple[float, Dict[str, Any]]] = []
         if "pricing_basis" in raw_format_info and isinstance(raw_format_info.get("pricing_basis"), dict):
             sku_price = raw_format_info.get("price")
-            if cls._is_valid_sku_price(sku_price, min_act_price):
+            if cls._is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
                 raw_sku_list.append((cls._amount_float(sku_price), raw_format_info))
         else:
-            sku_info_list = doc.get("sku_info") if isinstance(doc.get("sku_info"), list) else []
+            sku_info_list = sku_info_raw if isinstance(sku_info_raw, list) else []
             product_id = str(doc.get("product_id") or doc.get("goods_id") or doc.get("goods_sign") or "").strip()
+            stale_sku_ids = set()
+            if not is_specless and sku_info_list and product_id:
+                snap_map = doc.get("format_sku_prices") if isinstance(doc.get("format_sku_prices"), dict) else {}
+                for idx, sku_item in enumerate(sku_info_list, start=1):
+                    if not isinstance(sku_item, dict):
+                        continue
+                    sku_id = f"{product_id}_{idx}"
+                    has_cn_price = "价格" in sku_item and sku_item.get("价格") is not None
+                    cur_p_str = str(sku_item.get("价格") or "").strip() if has_cn_price else ""
+                    if sku_id in snap_map and has_cn_price:
+                        if str(snap_map[sku_id]).strip() != cur_p_str:
+                            stale_sku_ids.add(sku_id)
+                            continue
+                    sku_fmt_entry = raw_format_info.get(sku_id)
+                    if isinstance(sku_fmt_entry, dict):
+                        cur_num = (
+                            cls._parse_plain_sku_price(cur_p_str)
+                            if has_cn_price
+                            else cls._parse_plain_sku_price(sku_item.get("price"))
+                        )
+                        if cur_num is not None:
+                            try:
+                                fmt_p = cls._amount_float(sku_fmt_entry.get("price"))
+                            except (ValueError, TypeError, OverflowError):
+                                fmt_p = None
+                            if fmt_p is None or not math.isfinite(fmt_p) or fmt_p <= 0 or abs(cur_num - fmt_p) > 0.01:
+                                stale_sku_ids.add(sku_id)
+
             if sku_info_list and product_id:
                 for idx in range(1, len(sku_info_list) + 1):
-                    sku_fmt = raw_format_info.get(f"{product_id}_{idx}")
+                    sku_id = f"{product_id}_{idx}"
+                    if sku_id in stale_sku_ids:
+                        continue
+                    sku_fmt = raw_format_info.get(sku_id)
                     if not isinstance(sku_fmt, dict) or not isinstance(sku_fmt.get("pricing_basis"), dict):
                         continue
                     sku_price = sku_fmt.get("price")
-                    if cls._is_valid_sku_price(sku_price, min_act_price):
+                    if cls._is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
                         raw_sku_list.append((cls._amount_float(sku_price), sku_fmt))
 
             if not raw_sku_list:
-                for sku_fmt in raw_format_info.values():
+                for sku_key, sku_fmt in raw_format_info.items():
+                    if sku_key in stale_sku_ids:
+                        continue
                     if isinstance(sku_fmt, dict) and isinstance(sku_fmt.get("pricing_basis"), dict):
                         sku_price = sku_fmt.get("price")
-                        if cls._is_valid_sku_price(sku_price, min_act_price):
+                        if cls._is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
                             raw_sku_list.append((cls._amount_float(sku_price), sku_fmt))
 
         entries: List[Tuple[float, str, Dict[str, float]]] = []
@@ -710,6 +818,10 @@ class ProductRepository(BaseRepository):
             commission_rate = self._amount_float(doc["commission_rate"])
         updated_at_dt = doc.get("updated_at")
         updated_at_str = updated_at_dt.strftime("%Y-%m-%d %H:%M") if hasattr(updated_at_dt, "strftime") else str(updated_at_dt or "")
+        raw_doc_img = doc.get("image_url")
+        clean_doc_img = str(raw_doc_img).strip() if isinstance(raw_doc_img, str) else ""
+        if clean_doc_img.startswith("//"):
+            clean_doc_img = "https:" + clean_doc_img
         return {
             "platform": platform,
             "platform_name": platform_name(platform),
@@ -727,7 +839,7 @@ class ProductRepository(BaseRepository):
             "commission_rate": commission_rate,
             "commission_amount": commission_amount,
             "sales_tip": str(self._first_present(doc, "sales_tip", default="0")),
-            "image_url": doc.get("image_url") or "",
+            "image_url": clean_doc_img,
             "product_url": doc.get("product_url") or "",
             "mall_name": doc.get("mall_name") or "",
             "updated_at": updated_at_str,
@@ -839,6 +951,8 @@ class ProductRepository(BaseRepository):
         if isinstance(raw_imgs, list):
             for img in raw_imgs:
                 u = str(img or "").strip()
+                if u.startswith("//"):
+                    u = "https:" + u
                 if u.startswith(("http://", "https://")) and u not in share_images:
                     share_images.append(u)
 
@@ -870,9 +984,18 @@ class ProductRepository(BaseRepository):
         """返回存储的真实详情；未知商业字段保持空，不捏造优惠券/承诺/评分。"""
         result = self._normalize_doc_summary(doc)
         gallery = doc.get("carousel_images")
-        clean_gallery = [u for u in gallery if isinstance(u, str) and u.startswith("http")] if isinstance(gallery, list) else []
+        clean_gallery: List[str] = []
+        if isinstance(gallery, list):
+            for raw_u in gallery:
+                if not isinstance(raw_u, str):
+                    continue
+                u = raw_u.strip()
+                if u.startswith("//"):
+                    u = "https:" + u
+                if u.startswith(("http://", "https://")):
+                    clean_gallery.append(u)
         main_img = result["image_url"]
-        if not clean_gallery and isinstance(main_img, str) and main_img.startswith("http"):
+        if not clean_gallery and isinstance(main_img, str) and main_img.startswith(("http://", "https://")):
             clean_gallery = [main_img]
         raw_tags = doc.get("detail_tags") or []
         clean_tags: List[str] = []

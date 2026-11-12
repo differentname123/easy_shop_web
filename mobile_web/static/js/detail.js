@@ -53,18 +53,128 @@
       session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; myInviteCode.value = ''; isLoggedIn.value = false;
       generatedCommand.value = ''; closeCommandModal(); closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
     };
-    const carouselList = computed(() => {
+    const brokenProductImages = ref({});
+    const normalizeImg = raw => {
+      const s = typeof raw === 'string' ? raw.trim() : '';
+      if (!s) return '';
+      return s.startsWith('//') ? 'https:' + s : s;
+    };
+    const rawCarouselCandidates = computed(() => {
       if (!goods.value) return [];
-      if (Array.isArray(goods.value.carousel_images) && goods.value.carousel_images.length) return goods.value.carousel_images;
-      return goods.value.image_url ? [goods.value.image_url] : [];
-    });
-    const detailGalleryList = computed(() => {
-      if (!goods.value) return [];
-      const list = Array.isArray(goods.value.carousel_images) && goods.value.carousel_images.length
+      const rawList = Array.isArray(goods.value.carousel_images) && goods.value.carousel_images.length
         ? goods.value.carousel_images
         : (goods.value.image_url ? [goods.value.image_url] : []);
-      return list.length > 1 ? list.slice(1) : list;
+      const seen = new Set();
+      const out = [];
+      for (const item of rawList) {
+        const clean = normalizeImg(item);
+        if (clean && !seen.has(clean)) {
+          seen.add(clean);
+          out.push(clean);
+        }
+      }
+      return out;
     });
+    const carouselList = computed(() => rawCarouselCandidates.value.filter(u => !brokenProductImages.value[u]));
+    const detailGalleryList = computed(() => (carouselList.value.length > 1 ? carouselList.value.slice(1) : carouselList.value));
+    const hasNoAvailableImages = computed(() => !isDeepLoading.value && !isOffPromotion.value && carouselList.value.length === 0);
+    const persistCurrentSummary = item => {
+      if (!item || !requested) return;
+      const summary = {
+        ...shop.goodsIdentity(item),
+        product_id: item.product_id || item.goods_id || item.goods_sign || '',
+        platform_name: item.platform_name || platformName.value,
+        name: item.name || '',
+        price: item.price ?? 0,
+        original_price: item.original_price ?? item.price ?? 0,
+        coupon_amount: item.coupon_amount ?? 0,
+        saved_price: item.saved_price ?? item.coupon_amount ?? 0,
+        has_coupon: Boolean(item.has_coupon),
+        commission_rate: item.commission_rate ?? 0,
+        commission_amount: item.commission_amount ?? 0,
+        sales_tip: item.sales_tip || '0',
+        image_url: carouselList.value[0] || '',
+        mall_name: item.mall_name || '',
+        product_url: item.product_url || '',
+      };
+      try {
+        global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`, JSON.stringify(summary));
+        const actualKey = shop.goodsKey(item);
+        if (actualKey !== shop.goodsKey(requested)) {
+          global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${actualKey}`, JSON.stringify(summary));
+        }
+      } catch (_) {}
+    };
+    const syncOuterSnapshots = (detailItem, offPromotion = false) => {
+      if (!requested) return;
+      const scope = session.scope();
+      const reqId = shop.goodsIdentity(requested);
+      const detId = detailItem ? shop.goodsIdentity(detailItem) : reqId;
+      const plat = detId.platform || reqId.platform;
+      const ids = [...new Set([reqId.goods_id, detId.goods_id].filter(Boolean))];
+      const signs = [...new Set([reqId.goods_sign, detId.goods_sign].filter(Boolean))];
+      if (!plat || (!ids.length && !signs.length)) return;
+      const patch = {};
+      if (!offPromotion && detailItem) {
+        for (const k of ['price', 'original_price', 'coupon_amount', 'saved_price', 'commission_rate', 'commission_amount']) {
+          const n = Number(detailItem[k]);
+          if (detailItem[k] !== undefined && detailItem[k] !== null && Number.isFinite(n)) patch[k] = Number(n.toFixed(2));
+        }
+        if (patch.coupon_amount !== undefined && patch.saved_price === undefined) patch.saved_price = patch.coupon_amount;
+        if (detailItem.has_coupon !== undefined) patch.has_coupon = Boolean(detailItem.has_coupon);
+        else if (patch.coupon_amount !== undefined) patch.has_coupon = patch.coupon_amount > 0;
+        for (const k of ['name', 'sales_tip', 'mall_name', 'product_url']) {
+          if (typeof detailItem[k] === 'string' && detailItem[k].trim()) patch[k] = detailItem[k].trim();
+        }
+        const validImg = carouselList.value[0] || normalizeImg(detailItem.image_url);
+        if (validImg) patch.image_url = validImg;
+      }
+      const matchesItem = item => {
+        if (!item) return false;
+        const cid = shop.goodsIdentity(item);
+        return cid.platform === plat && ((cid.goods_id && ids.includes(cid.goods_id)) || (cid.goods_sign && signs.includes(cid.goods_sign)));
+      };
+      for (const sKey of [
+        `easy_shop_home_return_state:${scope}:${plat}`,
+        `easy_shop_home_search_state:${scope}:${plat}`,
+        `easy_shop_boom_return_state:${scope}:all`,
+      ]) {
+        try {
+          const snap = JSON.parse(global.sessionStorage.getItem(sKey) || 'null');
+          if (snap && Array.isArray(snap.list)) {
+            let changed = false;
+            const nextList = offPromotion
+              ? snap.list.filter(it => { const m = matchesItem(it); if (m) changed = true; return !m; })
+              : snap.list.map(it => { if (!matchesItem(it)) return it; changed = true; return { ...it, ...patch }; });
+            if (changed) global.sessionStorage.setItem(sKey, JSON.stringify({ ...snap, list: nextList }));
+          }
+        } catch (_) {}
+      }
+      try {
+        global.sessionStorage.setItem(`easy_shop_bfcache_sync:${scope}`, JSON.stringify({ plat, ids, signs, offPromotion: Boolean(offPromotion), patch }));
+      } catch (_) {}
+    };
+    const onProductImageError = url => {
+      const clean = normalizeImg(url);
+      if (!url && !clean) return;
+      const nextBroken = { ...brokenProductImages.value };
+      if (url) nextBroken[url] = true;
+      if (clean) nextBroken[clean] = true;
+      brokenProductImages.value = nextBroken;
+      if (currentImgIndex.value >= carouselList.value.length) {
+        currentImgIndex.value = Math.max(0, carouselList.value.length - 1);
+      }
+      if (requested) {
+        try {
+          const sKey = `current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`;
+          const stored = JSON.parse(global.sessionStorage.getItem(sKey) || 'null');
+          if (stored && normalizeImg(stored.image_url) === clean) {
+            stored.image_url = carouselList.value[0] || '';
+            global.sessionStorage.setItem(sKey, JSON.stringify(stored));
+          }
+        } catch (_) {}
+      }
+    };
     const realSpecs = computed(() => !goods.value || !Array.isArray(goods.value.specs) ? [] :
       goods.value.specs.filter(spec => spec && spec.label && spec.value));
     const brokenDealImages = ref({});
@@ -200,22 +310,41 @@
         if (generation !== detailGeneration) return;
         if (ok && data.status === 'success' && data.data) {
           const detail = data.data;
+          const prevBroken = brokenProductImages.value;
+          const prevImages = Array.isArray(goods.value?.carousel_images)
+            ? goods.value.carousel_images.filter(u => { const c = normalizeImg(u); return c && !prevBroken[u] && !prevBroken[c]; })
+            : [];
+          const prevMain = normalizeImg(goods.value?.image_url);
+          const safePrevMain = (prevMain && !prevBroken[prevMain]) ? prevMain : '';
+          brokenProductImages.value = {};
           brokenDealImages.value = {};
+          currentImgIndex.value = 0;
           isCopywritingExpanded.value = false;
+          const nextImageUrl = normalizeImg(detail.image_url)
+            || normalizeImg(Array.isArray(detail.carousel_images) ? detail.carousel_images[0] : '')
+            || safePrevMain;
           goods.value = {
             ...(goods.value || {}), ...detail,
-            carousel_images: (detail.carousel_images && detail.carousel_images.length) ? detail.carousel_images : (goods.value?.carousel_images || []),
+            image_url: nextImageUrl,
+            carousel_images: (Array.isArray(detail.carousel_images) && detail.carousel_images.length) ? detail.carousel_images : prevImages,
             specs: detail.specs || goods.value?.specs,
             service_guarantees: detail.service_guarantees || goods.value?.service_guarantees,
             deal_tip: detail.deal_tip !== undefined ? detail.deal_tip : (goods.value?.deal_tip || null),
           };
           syncDocumentTitle();
+          syncOuterSnapshots(goods.value, false);
+          persistCurrentSummary(goods.value);
+          if (carouselList.value.length === 0 && data.source === 'database_fallback') {
+            detailError.value = true;
+            detailErrorMsg.value = '商品图片暂未加载成功，请点击重新获取';
+          }
         } else {
           if (data?.error_code === 'PRODUCT_OFF_PROMOTION') {
             isOffPromotion.value = true;
             detailErrorMsg.value = data.error_msg || '该商品已取消推广或已下架，请挑选其他好物';
             goods.value = null;
             syncDocumentTitle();
+            syncOuterSnapshots(null, true);
             try { global.sessionStorage.removeItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`); } catch (_) {}
             browser.showToast(detailErrorMsg.value);
           }
@@ -230,6 +359,7 @@
         if (generation === detailGeneration) isDeepLoading.value = false;
       }
     };
+    const retryLoadDeepDetail = () => loadDeepDetail();
     const handleGenerateLink = async (title, failureTip = '生成口令失败，请稍后重试') => {
       if (disposed || !goods.value) return null;
       await restoreIdentity();
@@ -443,14 +573,14 @@
       browser.dispose();
     };
     return {
-      ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
+      ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, hasNoAvailableImages, onProductImageError, realSpecs, isLoggedIn, uid,
       dealTip, dealShareImages, previewImageUrl, isCopywritingExpanded, isLongCopywriting,
       onDealImageError, openImagePreview, closeImagePreview, toggleCopywritingExpand,
       copyDealTutorial, copyDealCopywriting, copyDealAuxItem, openDealAuxItem,
       isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
       onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
-      retryLoadDeepDetail: loadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
+      retryLoadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,
     };
   };

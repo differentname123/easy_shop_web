@@ -25,6 +25,7 @@ from repositories.product_repo import ProductRepository
 from cache import (
     RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
     MATERIAL_CACHE, SIGN_BY_ID_CACHE, evict_product_from_caches, is_product_off_promotion,
+    sync_product_summary_in_caches,
 )
 from config import PRODUCT_DETAIL_TTL, logger
 
@@ -260,8 +261,27 @@ class ProductService:
         return result
 
     @staticmethod
-    def _detail_expires_at(item: dict) -> float:
-        updated = item.get("detail_updated_at")
+    def _is_valid_image_url(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        raw = value.strip()
+        if raw.startswith("//"):
+            raw = "https:" + raw
+        return raw.startswith(("https://", "http://", "/")) and len(raw) > 1
+
+    @classmethod
+    def _has_valid_images(cls, item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if cls._is_valid_image_url(item.get("image_url")):
+            return True
+        gallery = item.get("carousel_images")
+        if isinstance(gallery, list):
+            return any(cls._is_valid_image_url(u) for u in gallery)
+        return False
+
+    @staticmethod
+    def _parse_detail_deadline(updated: Any) -> float:
         if isinstance(updated, bool):
             return 0.0
         if isinstance(updated, datetime):
@@ -282,6 +302,12 @@ class ProductService:
         return timestamp + PRODUCT_DETAIL_TTL
 
     @classmethod
+    def _detail_expires_at(cls, item: dict) -> float:
+        if not cls._has_valid_images(item):
+            return 0.0
+        return cls._parse_detail_deadline(item.get("detail_updated_at"))
+
+    @classmethod
     def _detail_is_fresh(cls, item: dict) -> bool:
         return time.time() < cls._detail_expires_at(item)
 
@@ -291,17 +317,19 @@ class ProductService:
         data.pop("detail_updated_at", None)
         return {"status": "success", "data": data, "source": source}
 
-    @staticmethod
-    def _snapshot_deadline(snapshot):
-        return ProductService._detail_expires_at({"detail_updated_at": snapshot.fetched_at})
+    @classmethod
+    def _snapshot_deadline(cls, snapshot):
+        if not cls._has_valid_images(snapshot.data):
+            return 0.0
+        return cls._parse_detail_deadline(snapshot.fetched_at)
 
-    @staticmethod
-    def _valid_cache_entry(entry):
+    @classmethod
+    def _valid_cache_entry(cls, entry):
         return (isinstance(entry, tuple) and len(entry) == 2
                 and isinstance(entry[0], (int, float)) and not isinstance(entry[0], bool)
                 and math.isfinite(entry[0]) and time.time() < entry[0] <= time.time() + PRODUCT_DETAIL_TTL
                 and isinstance(entry[1], dict) and entry[1].get("status") == "success"
-                and isinstance(entry[1].get("data"), dict))
+                and cls._has_valid_images(entry[1].get("data")))
 
     @staticmethod
     def _cache_detail(platform: str, result: dict, expires_at: float, uid=None, verified_ref=None):
@@ -325,7 +353,7 @@ class ProductService:
         if (isinstance(verified_ref, ProductRef) and verified_ref.platform == ref.platform
                 and ref.goods_id and ref.goods_id == verified_ref.goods_id):
             keys = list(dict.fromkeys(keys + verified_ref.cache_keys(uid)))
-        if not math.isfinite(expires_at) or expires_at <= time.time():
+        if not math.isfinite(expires_at) or expires_at <= time.time() or not ProductService._has_valid_images(item):
             return deepcopy(result)
         entry = (expires_at, deepcopy(result))
         with _DETAIL_CACHE_LOCK:
@@ -409,13 +437,23 @@ class ProductService:
         return self._make_snapshot(item, datetime.fromtimestamp(deadline - PRODUCT_DETAIL_TTL, timezone.utc), platform)
 
     def _commit_snapshot(self, snapshot, uid=None, public=None, stop_event=None):
-        deadline = self._snapshot_deadline(snapshot)
-        if deadline <= time.time():
+        raw_deadline = self._parse_detail_deadline(snapshot.fetched_at)
+        if raw_deadline <= time.time():
             return _LoadedDetail({"status": "error", "error_code": "expired_detail", "error_msg": "详情快照已过期"})
         if stop_event is not None and stop_event.is_set():
             return _LoadedDetail({"status": "error", "error_code": "cancelled"})
         public = deepcopy(public) if public is not None else {"status": "success", "data": deepcopy(snapshot.data)}
         public["data"] = deepcopy(snapshot.data)
+        sync_product_summary_in_caches(snapshot.ref.platform, snapshot.data)
+        if not self._has_valid_images(snapshot.data):
+            upsert_summary = getattr(self.repo, "upsert_home_products", None)
+            if callable(upsert_summary):
+                try:
+                    upsert_summary([snapshot.data])
+                except Exception:
+                    pass
+            return _LoadedDetail(public, snapshot, persisted=False, retryable=False)
+        deadline = raw_deadline
         try:
             written = self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=snapshot.fetched_at)) is True
         except Exception as exc:
@@ -438,6 +476,7 @@ class ProductService:
                 except Exception:
                     break
                 if winner and self._detail_expires_at(winner) >= deadline:
+                    sync_product_summary_in_caches(snapshot.ref.platform, winner)
                     winner_snapshot = self._document_snapshot(winner, snapshot.ref.platform)
                     result = self._database_detail(winner, "database")
                     result = self._cache_detail(snapshot.ref.platform, result, self._detail_expires_at(winner), uid,
@@ -473,7 +512,8 @@ class ProductService:
                 self._flights.pop(key, None)
                 flight["event"].set()
 
-    def _load_official(self, ref, adapter, uid=None, kwargs=None, stop_event=None, refresh_ahead_seconds=0, deal_tip=None):
+    def _load_official(self, ref, adapter, uid=None, kwargs=None, stop_event=None,
+                       refresh_ahead_seconds=0, deal_tip=None):
         kwargs = kwargs or {}
         def load():
             cached = self._cached_detail(ref, uid)

@@ -161,8 +161,7 @@
     };
     const clearHomeSearch = () => { homeSearchKeyword.value = ''; return onSearchHome(); };
     const applySnapshot = cached => {
-      stateScope = getScope();
-      homeGoodsList.value = [...cached.list]; homeOffset = cached.offset ?? 0;
+      stateScope = getScope(); homeGoodsList.value = [...cached.list]; homeOffset = cached.offset ?? 0;
       homeCursor = cached.cursor || ''; homeSearchPage = cached.page || 1;
       homeHasMore.value = cached.hasMore !== false; homeLoading.value = false;
     };
@@ -296,6 +295,46 @@
         return false;
       } finally { if (generation === boomGeneration && scope === getScope() && !isPullRefresh) boomLoading.value = false; }
     };
+    const syncGoodsPatches = () => {
+      if (disposed) return;
+      const syncKey = `easy_shop_bfcache_sync:${getScope()}`;
+      let payload = null;
+      try {
+        payload = JSON.parse(global.sessionStorage.getItem(syncKey) || 'null');
+        if (payload) global.sessionStorage.removeItem(syncKey);
+      } catch (_) {}
+      if (!payload || !payload.plat) return;
+      const ids = Array.isArray(payload.ids) ? payload.ids : [];
+      const signs = Array.isArray(payload.signs) ? payload.signs : [];
+      const applyList = list => {
+        if (!Array.isArray(list) || !list.length) return list;
+        let changed = false;
+        const next = payload.offPromotion
+          ? list.filter(it => {
+              const cid = it ? shop.goodsIdentity(it) : null;
+              const matched = Boolean(cid && cid.platform === payload.plat && ((cid.goods_id && ids.includes(cid.goods_id)) || (cid.goods_sign && signs.includes(cid.goods_sign))));
+              if (matched) changed = true;
+              return !matched;
+            })
+          : list.map(it => {
+              const cid = it ? shop.goodsIdentity(it) : null;
+              if (!cid || cid.platform !== payload.plat || !((cid.goods_id && ids.includes(cid.goods_id)) || (cid.goods_sign && signs.includes(cid.goods_sign)))) return it;
+              changed = true;
+              return { ...it, ...(payload.patch || {}) };
+            });
+        return changed ? next : list;
+      };
+      const nextHome = applyList(homeGoodsList.value);
+      if (nextHome !== homeGoodsList.value) homeGoodsList.value = nextHome;
+      const nextBoom = applyList(boomGoodsList.value);
+      if (nextBoom !== boomGoodsList.value) boomGoodsList.value = nextBoom;
+      for (const [cKey, snap] of channelCache.entries()) {
+        if (snap && Array.isArray(snap.list)) {
+          const nextSnap = applyList(snap.list);
+          if (nextSnap !== snap.list) channelCache.set(cKey, { ...snap, list: nextSnap });
+        }
+      }
+    };
     const refreshBoomGoods = async () => {
       if (disposed) return false;
       return loadBoomGoods(true, true);
@@ -327,7 +366,7 @@
       platforms, platformsError, homePlatform, homePlatformName, homeChannels, currentChannel, homeSearchKeyword,
       activeHomeKeyword, homeGoodsList, homeLoading, homeHasMore, homeError, loadHomeChannels, loadPlatforms,
       loadHomeGoods, refreshHomeGoods, retryLoadHomeGoods, onSearchHome, clearHomeSearch, switchChannel, switchHomePlatform,
-      initializeHome, initialize, resetSession, saveSearchState,
+      initializeHome, initialize, resetSession, saveSearchState, syncGoodsPatches,
       boomPlatforms, boomPlatform, boomSearchKeyword, activeBoomKeyword, boomSortBy, boomGoodsList, boomLoading, boomHasMore, boomError,
       loadBoomGoods, refreshBoomGoods, retryLoadBoomGoods, saveBoomState, restoreBoomState,
       onSearchBoom, clearBoomSearch, switchBoomPlatform, switchBoomSort,

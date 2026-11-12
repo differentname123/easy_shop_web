@@ -22,7 +22,18 @@ except ModuleNotFoundError:
     sys.modules.setdefault("playwright", _pw_mod)
     sys.modules.setdefault("playwright.sync_api", _pw_sync)
 
+import logging
 from mobile_web.scripts import run_xianyu_deal_discovery_scheduler as sched
+
+# 单元测试期间移除生产日志文件 Handler，避免把 Mock 熔断测试日志写入真实业务日志
+sched.logger.handlers = [
+    h for h in sched.logger.handlers if not isinstance(h, logging.FileHandler)
+]
+logging.getLogger("publish_to_xianyu").handlers = [
+    h
+    for h in logging.getLogger("publish_to_xianyu").handlers
+    if not isinstance(h, (logging.FileHandler, sched._ForwardWarningToFileHandler))
+]
 
 
 def _make_sample_deal_doc(
@@ -209,3 +220,179 @@ def test_formatters_distinguish_official_and_deal_tip():
     summary = sched._format_batch_summary_report("disc_test", 12.3, [off_rec, base_rec])
     assert "【正式官价】参评 1" in summary
     assert "【线报爆料】参评 1" in summary
+
+
+def test_guest_auth_tracker_detects_core_search_detail_session_expired_only():
+    from mobile_web.scripts import publish_to_xianyu as pxy
+
+    fake_page = MagicMock()
+    fake_page.frames = []
+    fake_page.url = "https://www.goofish.com/search?q=%E6%8A%BD%E7%BA%B8"
+    tracker = pxy._attach_auth_tracker(fake_page)
+    on_resp = tracker["_on_response_cb"]
+
+    def _emit(url: str, ret_list):
+        resp = MagicMock()
+        resp.url = url
+        resp.json.return_value = {"ret": ret_list, "data": {}}
+        on_resp(resp)
+
+    # 访客首页常规未登录返回（loginuser.get）与热词底纹（pc.search.shade）绝不误判为限流
+    _emit(
+        "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.loginuser.get/1.0/?jsv=2.7.2",
+        ["FAIL_SYS_SESSION_EXPIRED::Session过期"],
+    )
+    _emit(
+        "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search.shade/1.0/?jsv=2.7.2",
+        ["FAIL_SYS_SESSION_EXPIRED::Session过期"],
+    )
+    assert tracker["guest_login_blocked_rets"] == []
+    pxy._verify_guest_no_risk_block(fake_page, tracker, r"W:\temp\xianyu_guest", task_name="unit_test")
+
+    # 一旦核心搜索接口 pc.search/ 返回 Session过期，立即识别为免登录限流拦截并标记 is_risk_blocked=True
+    _emit(
+        "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?jsv=2.7.2",
+        ["FAIL_SYS_SESSION_EXPIRED::Session过期"],
+    )
+    assert len(tracker["guest_login_blocked_rets"]) == 1
+    caught_err = None
+    try:
+        pxy._verify_guest_no_risk_block(fake_page, tracker, r"W:\temp\xianyu_guest", task_name="unit_test")
+    except pxy.XianyuOfflineError as err:
+        caught_err = err
+    assert caught_err is not None
+    assert caught_err.error_code == "RISK_CONTROL_BLOCKED"
+    built = pxy._build_offline_result(
+        r"W:\temp\xianyu_guest",
+        caught_err.reason,
+        error_code=caught_err.error_code,
+        action="search_xianyu_items",
+    )
+    assert built["ok"] is False
+    assert built["is_risk_blocked"] is True
+
+
+def _make_sample_champion(idx: int = 1) -> dict:
+    return {
+        "source_type": sched.SOURCE_TYPE_OFFICIAL,
+        "platform": "pdd",
+        "product_id": f"10000{idx}",
+        "goods_sign": f"sign_{idx}",
+        "channel_type": 1,
+        "category_name": f"测试分类{idx}",
+        "category_item_count": 10,
+        "category_top20_count": 10,
+        "name": f"维达抽纸整箱24包_{idx}",
+        "brand": "维达",
+        "db_activity_price": 19.9,
+        "activity_price": 19.9,
+        "primary_unit": "包",
+        "unit_quantities": {"包": 24.0},
+        "unit_cost_performance": {"包": round(24.0 / 19.9, 6)},
+        "decision_keywords_summary": "品牌:维达",
+        "pricing_basis": {},
+        "search_keyword": f"维达 抽纸 24包 {idx}",
+        "backup_search_keyword": f"维达 抽纸 {idx}",
+        "selection_reason": "测试标品",
+        "llm_keyword_output": {},
+    }
+
+
+def test_compare_candidate_never_retries_backup_keyword_when_primary_search_fails():
+    cand = _make_sample_champion(1)
+    breaker = sched._RoundCircuitBreaker(max_consecutive_fails=2)
+    blocked_res = {
+        "ok": False,
+        "is_offline": True,
+        "is_risk_blocked": True,
+        "error_code": "RISK_CONTROL_BLOCKED",
+        "user_data_dir": r"W:\temp\xianyu_guest",
+        "items": [],
+        "message": "免登录检索被强制要求登录/IP匿名配额限流",
+    }
+    with patch.object(sched, "search_xianyu_items", return_value=blocked_res) as mock_search:
+        rec = sched.compare_candidate_with_xianyu(
+            candidate=cand,
+            guest_user_data_dir=r"W:\temp\xianyu_guest",
+            circuit_breaker=breaker,
+        )
+    # 主搜索报错时绝不换备用词二次重试，且单次风控限流立即触发整轮熔断
+    assert mock_search.call_count == 1
+    assert breaker.is_tripped() is True
+    assert rec["final_winner"] == "browser_error"
+    assert rec["xianyu_audit_trail"]["browser_aborted"] is True
+    assert rec["xianyu_audit_trail"]["is_risk_blocked"] is True
+
+
+def test_pre_round_probe_aborts_before_stage1_ai_and_marks_risk_cooldown():
+    probe_fail = (
+        False,
+        {
+            "ok": False,
+            "is_risk_blocked": True,
+            "error_code": "RISK_CONTROL_BLOCKED",
+            "message": "免登录检索被强制要求登录",
+        },
+    )
+    with patch.object(sched, "probe_xianyu_guest_ready", return_value=probe_fail) as mock_probe, patch.object(
+        sched, "gen_db_object"
+    ) as mock_db, patch.object(sched, "select_verified_category_champions") as mock_stage1:
+        records = sched.run_discovery_cycle(
+            enable_official=True,
+            enable_deal_tip=True,
+            enable_pre_round_probe=True,
+            probe_keyword="抽纸",
+        )
+    assert records == []
+    assert mock_probe.call_count == 1
+    assert mock_db.call_count == 0
+    assert mock_stage1.call_count == 0
+    assert sched._LAST_CYCLE_ABORTED_BY_RISK is True
+
+
+def test_mid_round_circuit_breaker_stops_remaining_champions_without_retry_or_db_write():
+    champs = [_make_sample_champion(1), _make_sample_champion(2), _make_sample_champion(3)]
+    blocked_res = {
+        "ok": False,
+        "is_offline": True,
+        "is_risk_blocked": True,
+        "error_code": "RISK_CONTROL_BLOCKED",
+        "user_data_dir": r"W:\temp\xianyu_guest",
+        "items": [],
+        "message": "免登录检索被强制要求登录",
+    }
+    fake_db = MagicMock()
+    fake_col = MagicMock()
+    fake_col.list_indexes.return_value = []
+    fake_db.get_collection.return_value = fake_col
+
+    with patch.object(sched, "gen_db_object", return_value=fake_db), patch.object(
+        sched, "select_verified_category_champions", return_value=champs
+    ), patch.object(sched, "search_xianyu_items", return_value=blocked_res) as mock_search:
+        records = sched.run_discovery_cycle(
+            enable_official=True,
+            enable_deal_tip=False,
+            enable_pre_round_probe=False,
+            compare_workers=2,
+        )
+
+    # 第 1 个分类在单槽令牌池中触发限流熔断后，排队中的第 2、3 个分类直接跳过，总计仅发起 1 次浏览器搜索，且 0 条脏数据入库
+    assert mock_search.call_count == 1
+    assert len(records) == 1
+    assert fake_col.update_one.call_count == 0
+    assert sched._LAST_CYCLE_ABORTED_BY_RISK is True
+
+
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    test_funcs = [
+        v for k, v in list(globals().items())
+        if k.startswith("test_") and callable(v)
+    ]
+    for fn in test_funcs:
+        fn()
+        print(f"PASSED: {fn.__name__}")
+    print(f"\nALL {len(test_funcs)} TESTS PASSED!")
+
+

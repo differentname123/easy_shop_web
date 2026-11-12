@@ -242,8 +242,10 @@
           });
         }, 300);
       };
-      const refreshAuthorization = () => {
-        if (!global.document.hidden) account.refreshAuthorization();
+      const refreshAuthorization = () => { if (!global.document.hidden) account.refreshAuthorization(); };
+      const handlePageShow = () => {
+        feeds.syncGoodsPatches();
+        refreshAuthorization();
       };
       onMounted(async () => {
         const params = new URLSearchParams(global.location.search);
@@ -275,6 +277,7 @@
             account.syncAndQueryOrders(false);
           }
         })();
+        global.addEventListener('pageshow', handlePageShow);
         global.addEventListener('focus', refreshAuthorization);
         global.document.addEventListener('visibilitychange', refreshAuthorization);
         global.addEventListener('scroll', handleGlobalScroll, { passive: true });
@@ -287,6 +290,7 @@
         await boot;
       });
       onUnmounted(() => {
+        global.removeEventListener('pageshow', handlePageShow);
         global.removeEventListener('focus', refreshAuthorization);
         global.document.removeEventListener('visibilitychange', refreshAuthorization);
         global.removeEventListener('scroll', handleGlobalScroll);

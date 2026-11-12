@@ -80,6 +80,12 @@ _AUTH_CRITICAL_APIS: Tuple[str, ...] = (
     "com.taobao.idle.item.delete",
 )
 
+# 免登录核心数据接口：在访客模式下，一旦搜索或详情接口返回 SESSION_EXPIRED / 请先登录 等错误码，即代表闲鱼已限制当前 IP 的匿名访问配额
+_GUEST_CORE_DATA_APIS: Tuple[str, ...] = (
+    "mtop.taobao.idlemtopsearch.pc.search/",
+    "mtop.taobao.idle.pc.detail/",
+)
+
 _OFFLINE_RET_KEYWORDS: Tuple[str, ...] = (
     "FAIL_SYS_SESSION_EXPIRED",
     "FAIL_SYS_USER_NOT_LOGIN",
@@ -341,6 +347,7 @@ def _attach_auth_tracker(page) -> Dict[str, Any]:
         "display_name": "",
         "expired_rets": [],
         "risk_rets": [],
+        "guest_login_blocked_rets": [],
         "failed_apis": [],
     }
 
@@ -369,6 +376,14 @@ def _attach_auth_tracker(page) -> Dict[str, Any]:
                     tracker["risk_rets"].append(entry)
                 break
 
+        if any(api in url for api in _GUEST_CORE_DATA_APIS):
+            for kw in _OFFLINE_RET_KEYWORDS:
+                if kw in ret_str:
+                    entry = f"{api_short} -> {ret_str}"
+                    if entry not in tracker["guest_login_blocked_rets"]:
+                        tracker["guest_login_blocked_rets"].append(entry)
+                    break
+
         if any(api in url for api in _AUTH_CRITICAL_APIS):
             for kw in _OFFLINE_RET_KEYWORDS:
                 if kw in ret_str:
@@ -386,6 +401,7 @@ def _attach_auth_tracker(page) -> Dict[str, Any]:
                 tracker["display_name"] = str(base["displayName"])
 
     page.on("response", _on_response)
+    tracker["_on_response_cb"] = _on_response
     return tracker
 
 
@@ -630,6 +646,8 @@ def _browser_session_guard(
                 context.set_default_navigation_timeout(op_timeout_ms)
                 page = context.pages[0] if context.pages else context.new_page()
                 auth_tracker = _attach_auth_tracker(page)
+                if hasattr(context, "on") and callable(auth_tracker.get("_on_response_cb")):
+                    context.on("page", lambda new_p: new_p.on("response", auth_tracker["_on_response_cb"]))
                 yield context, page, auth_tracker
             finally:
                 if context:
@@ -1919,14 +1937,19 @@ def _verify_guest_no_risk_block(
     task_name: str = "",
 ) -> None:
     """
-    免登录（访客模式）专用风控检测：
-    不要求账号登录（允许无 `unb` Cookie、允许存在 `mini_login` 弹窗），
-    但一旦检测到触发阿里滑块/限流（`RGV587_ERROR` 或页面出现 `baxia/punish` 滑块验证框），
-    立即打印告警并抛出 `XianyuOfflineError(error_code="RISK_CONTROL_BLOCKED")` 中止操作。
+    免登录（访客模式）专用风控与匿名配额限流检测：
+    不要求账号登录（允许首页无 `unb` Cookie、允许普通登录浮层被关闭），
+    但一旦检测到：
+      1. 触发阿里滑块/限流（`RGV587_ERROR` 或页面出现 `baxia/punish` 滑块验证框）；
+      2. 免登录搜索或详情核心接口（`pc.search` / `pc.detail`）返回 `FAIL_SYS_SESSION_EXPIRED` 等强制登录拦截；
+    立即打印告警并抛出 `XianyuOfflineError(error_code="RISK_CONTROL_BLOCKED")` 中止操作，绝不继续重试妨碍 IP 冷却。
     """
     risk_reasons: List[str] = []
     if auth_tracker.get("risk_rets"):
         risk_reasons.append(f"接口返回风控滑块拦截({auth_tracker['risk_rets'][0]})")
+
+    if auth_tracker.get("guest_login_blocked_rets"):
+        risk_reasons.append(f"免登录检索被强制要求登录/IP匿名配额限流({auth_tracker['guest_login_blocked_rets'][0]})")
 
     punish_frames = [
         f.url
@@ -1941,12 +1964,12 @@ def _verify_guest_no_risk_block(
         reason_str = "；".join(risk_reasons)
         logger.error(
             f"\n{'!' * 76}\n"
-            f"🚨 [风控滑块告警/免登录检索] 检测到闲鱼触发安全验证/滑块限制，已立即中止操作！\n"
+            f"🚨 [风控/免登录限流告警] 检测到闲鱼拦截当前免登录检索，已立即中止操作以静默冷却！\n"
             f"   ├── 触发任务   : {task_name or '免登录检索任务'}\n"
             f"   ├── 浏览器目录 : <{user_data_dir}>\n"
             f"   ├── 当前页面   : {page.url}\n"
-            f"   ├── 风控证据   : {reason_str}\n"
-            f"   └── 恢复方式   : 请暂停检索或调用 open_browser_for_manual_use(r\"{user_data_dir}\") 手动过滑块，或更换新的访客目录！\n"
+            f"   ├── 拦截证据   : {reason_str}\n"
+            f"   └── 恢复方式   : 请保持静默停止自动重试等待 IP 冷却自动恢复，或更换出口公网 IP！\n"
             f"{'!' * 76}"
         )
         raise XianyuOfflineError(
@@ -2273,7 +2296,11 @@ def search_xianyu_items(
                     if "SUCCESS" in ret_str:
                         success_packet = pkt
                         break
-                if success_packet is not None or auth_tracker.get("risk_rets"):
+                if (
+                    success_packet is not None
+                    or auth_tracker.get("risk_rets")
+                    or auth_tracker.get("guest_login_blocked_rets")
+                ):
                     break
                 page.wait_for_timeout(250)
 
@@ -2439,7 +2466,12 @@ def get_xianyu_item_detail(
                         if "FAIL_BIZ_" in ret_str:
                             biz_not_found = True
                             break
-                    if success_packet is not None or biz_not_found or auth_tracker.get("risk_rets"):
+                    if (
+                        success_packet is not None
+                        or biz_not_found
+                        or auth_tracker.get("risk_rets")
+                        or auth_tracker.get("guest_login_blocked_rets")
+                    ):
                         break
                     page.wait_for_timeout(200)
 
@@ -2694,7 +2726,12 @@ def get_xianyu_item_details_batch(
                             if "FAIL_BIZ_" in ret_str:
                                 biz_not_found = True
                                 break
-                        if success_packet is not None or biz_not_found or auth_tracker.get("risk_rets"):
+                        if (
+                            success_packet is not None
+                            or biz_not_found
+                            or auth_tracker.get("risk_rets")
+                            or auth_tracker.get("guest_login_blocked_rets")
+                        ):
                             break
                         page.wait_for_timeout(200)
 
@@ -2743,7 +2780,7 @@ def get_xianyu_item_details_batch(
                     }
 
                 if idx < len(clean_ids) - 1:
-                    page.wait_for_timeout(350)
+                    page.wait_for_timeout(random.randint(600, 1000))
 
             ok_cnt = sum(1 for v in details_by_id.values() if v.get("ok"))
             fail_cnt = len(clean_ids) - ok_cnt

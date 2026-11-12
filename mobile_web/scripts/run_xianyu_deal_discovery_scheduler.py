@@ -41,6 +41,7 @@ import os
 import queue
 import re
 import sys
+import threading
 import time
 import unicodedata
 from collections import defaultdict
@@ -93,16 +94,20 @@ COMPARISON_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼同款比价与性价�
 # 运行控制变量（直接在此处修改变量值即可控制脚本行为）
 # ==============================================================================
 ENABLE_LOOP = True                                 # 是否持续循环运行（True=循环运行，False=仅运行单轮后退出）
-LOOP_INTERVAL_HOURS = 1.0                          # 每轮结束后的等待间隔小时数（1.0 表示每隔 1 小时运行一轮）
+LOOP_INTERVAL_HOURS = 1.0                          # 正常每轮结束后的等待间隔小时数（1.0 表示每隔 1 小时运行一轮）
+RISK_COOLDOWN_HOURS = 2.0                          # 触发闲鱼限流/强制登录熔断后的静默冷却小时数（避免频繁重试妨碍 IP 冷却）
+ENABLE_PRE_ROUND_PROBE = True                      # 每轮 AI 选品前先执行 1 次闲鱼轻量探针，若被限流则直接跳过整轮静默冷却
+PRE_ROUND_PROBE_KEYWORD = "抽纸"                   # 开轮探针使用的常规公共搜索词
+MAX_CONSECUTIVE_BROWSER_FAILS = 2                  # 单轮连续多少次浏览器检索失败即触发整轮熔断，立即停止本轮剩余重试
 ENABLE_OFFICIAL = True                             # 是否开启【正式外层商品】比价（True=开启，False=关闭）
 ENABLE_DEAL_TIP = True                             # 是否开启【线报爆料商品】比价（True=开启，False=关闭）
 SCAN_HOURS_WINDOW = 72                             # 正式外层商品扫描保质期窗口（小时）
 DEAL_SCAN_HOURS_WINDOW = 48                        # 线报爆料商品扫描保质期窗口（小时）
 MAX_CATEGORIES_PER_ROUND = 20                      # 单类商品源每轮探测的有效标品分类数（设为 0 表示不限数量）
 MAX_XIANYU_SEARCH_ITEMS = 20                       # 每次闲鱼搜索抓取的概览商品数
-MAX_DETAIL_CHECKS_PER_CATEGORY = 20                # 每个分类最多拉取多少个初筛同款闲鱼商品详情
+MAX_DETAIL_CHECKS_PER_CATEGORY = 10                # 每个分类最多拉取多少个初筛同款闲鱼商品详情（前10低价款已足够，温和防限流）
 STAGE1_WORKERS = 5                                 # 阶段 1（AI 选标品 + 官方验价）并发线程数
-COMPARE_WORKERS = 3                                # 阶段 2/3（闲鱼比价流水线）并发线程数
+COMPARE_WORKERS = 2                                # 阶段 2/3（闲鱼比价流水线）并发线程数
 DEBUG_BROWSER = False                              # 是否显示浏览器窗口（False=后台无头模式，True=显示窗口）
 GUEST_USER_DATA_DIR = DEFAULT_GUEST_USER_DATA_DIR  # 免登录闲鱼浏览器缓存目录
 
@@ -116,6 +121,8 @@ DEFAULT_MAX_DETAIL_CHECKS = MAX_DETAIL_CHECKS_PER_CATEGORY
 
 # 记录当前进程内按 (source_type, category_name) 因“无标品”被跳过的分类次数，各自独立均匀轮转
 _SESSION_SKIPPED_CAT_COUNTS: Dict[Tuple[str, str], int] = defaultdict(int)
+# 标记最近一轮是否因闲鱼风控/免登录限流熔断而中止，供主循环自动拉长静默冷却时间
+_LAST_CYCLE_ABORTED_BY_RISK: bool = False
 _CN_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 
@@ -1344,6 +1351,83 @@ def _validate_llm_comparison_response(
     return True, "ok", out
 
 
+class _RoundCircuitBreaker:
+    """单轮闲鱼浏览器检索熔断器：遇到风控滑块/强制登录限流立即熔断，或连续检索失败达到阈值时熔断，禁止本轮后续继续盲目重试妨碍冷却。"""
+
+    def __init__(self, max_consecutive_fails: int = MAX_CONSECUTIVE_BROWSER_FAILS):
+        self._lock = threading.Lock()
+        self._max_consecutive_fails = max(1, int(max_consecutive_fails or 2))
+        self._consecutive_fails = 0
+        self._tripped = False
+        self._reason = ""
+
+    def is_tripped(self) -> bool:
+        return self._tripped
+
+    @property
+    def reason(self) -> str:
+        return self._reason
+
+    def record_success(self) -> None:
+        with self._lock:
+            if not self._tripped:
+                self._consecutive_fails = 0
+
+    def record_failure(self, res: Dict[str, Any], context_desc: str = "") -> bool:
+        """记录一次闲鱼浏览器检索失败；若触发熔断返回 True（仅在首次触发时打印醒目熔断横幅）。"""
+        is_risk = bool(res.get("is_risk_blocked") or res.get("is_offline"))
+        err_code = str(res.get("error_code") or "UNKNOWN")
+        msg = str(res.get("message") or "检索异常")
+        newly_tripped = False
+        with self._lock:
+            if self._tripped:
+                return True
+            self._consecutive_fails += 1
+            if is_risk or self._consecutive_fails >= self._max_consecutive_fails:
+                self._tripped = True
+                newly_tripped = True
+                trigger_label = (
+                    "闲鱼限流/强制登录拦截"
+                    if is_risk
+                    else f"连续 {self._consecutive_fails} 次浏览器检索失败"
+                )
+                prefix = f"{context_desc} -> " if context_desc else ""
+                self._reason = f"{prefix}{trigger_label} [{err_code}] {msg}"
+        if newly_tripped:
+            logger.error(
+                f"\n{'!' * 96}\n"
+                f"🛑 [整轮熔断保护已触发] {self._reason}\n"
+                f"   └── 已立即停止本轮后续所有分类的闲鱼检索与重试，进入静默冷却保护，避免继续请求延长风控时间！\n"
+                f"{'!' * 96}"
+            )
+        return self._tripped
+
+
+def probe_xianyu_guest_ready(
+    guest_user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
+    debug_browser: bool = False,
+    probe_keyword: str = PRE_ROUND_PROBE_KEYWORD,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    开轮轻量探针：在调用大模型选拔 40 个标品之前，先执行 1 次最小成本的闲鱼搜索，
+    确认当前 IP 免登录通道正常可用；若仍在限流冷却期则直接中止整轮，做到零无效重试、零 AI 浪费。
+    """
+    kw = str(probe_keyword or "抽纸").strip() or "抽纸"
+    logger.info(f"🩺 [开轮探针检测] 正在执行 1 次轻量闲鱼检索（探针词=【{kw}】），确认免登录通道是否通畅...")
+    res = search_xianyu_items(
+        keyword=kw,
+        max_items=5,
+        user_data_dir=guest_user_data_dir,
+        debug=debug_browser,
+    )
+    if res.get("ok"):
+        logger.info(
+            f"✅ [开轮探针通过] 闲鱼免登录检索正常（返回 {len(res.get('items') or [])} 条），开始本轮标品选拔与比价..."
+        )
+        return True, res
+    return False, res
+
+
 def compare_candidate_with_xianyu(
     candidate: Dict[str, Any],
     guest_user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
@@ -1351,13 +1435,15 @@ def compare_candidate_with_xianyu(
     max_detail_checks: int = DEFAULT_MAX_DETAIL_CHECKS,
     debug_browser: bool = False,
     guest_dir_pool: Optional["queue.Queue[str]"] = None,
+    circuit_breaker: Optional[_RoundCircuitBreaker] = None,
 ) -> Dict[str, Any]:
     """
     完整执行第 2 步与第 3 步：
     1. 搜索闲鱼最多 20 条商品概览（仅在浏览器搜索期间占用访客目录）；
+       - 若主搜索本身报错失败（`ok=False`），绝不再盲目重试备用词，并交由熔断器判定是否整轮熔断；
     2. 调用【第 2 个 AI】筛选出所有与我方标品属于同款可比商品的 `comparable_item_ids`；
-       - 若主搜索词返回结果 < 6 条，或第 2 个 AI 判定同款可比商品为 0 条，自动切换备用词 `backup_search_keyword` 重搜并重新初筛；
-    3. 仅针对第 2 个 AI 筛出的同款商品（最多前 `max_detail_checks` 个），在同一个浏览器会话内调用 `get_xianyu_item_details_batch` 批量获取完整描述 `desc`、多规格 `sku_list` 与真实运费 `transport_fee`（自动清理登录弹窗）；
+       - 仅当主搜索成功（`ok=True`）且返回结果 < 6 条，或第 2 个 AI 判定同款可比商品为 0 条时，才切换备用词 `backup_search_keyword` 扩召回；
+    3. 仅针对第 2 个 AI 筛出的同款商品（最多前 `max_detail_checks` 个），在同一个浏览器会话内调用 `get_xianyu_item_details_batch` 批量获取完整描述 `desc`、多规格 `sku_list` 与真实运费 `transport_fee`；
     4. 调用【第 3 个 AI】基于完整详情、多规格价格和邮费进行终审比价；
     5. 计算单位性价比比值并组装完整入库文档。
     """
@@ -1365,6 +1451,29 @@ def compare_candidate_with_xianyu(
     backup_kw = candidate["backup_search_keyword"]
     my_price = candidate["activity_price"]
     cat_name = candidate["category_name"]
+
+    def _build_breaker_skip_record() -> Dict[str, Any]:
+        reason_txt = circuit_breaker.reason if circuit_breaker else "整轮熔断已触发"
+        rec = _build_final_record(
+            candidate=candidate,
+            used_keyword=kw,
+            search_res={"ok": False, "is_risk_blocked": True, "error_code": "CIRCUIT_BREAKER_SKIPPED", "items": []},
+            coarse_items_for_llm=[],
+            step2_comparable_ids=[],
+            step2_llm_meta={},
+            xianyu_items_for_llm=[],
+            llm_data={},
+            llm_call_meta={},
+            fallback_error=f"[熔断保护跳过] {reason_txt}",
+            browser_aborted=True,
+            debug_browser=debug_browser,
+        )
+        if isinstance(rec.get("xianyu_audit_trail"), dict):
+            rec["xianyu_audit_trail"]["circuit_broken"] = True
+        return rec
+
+    if circuit_breaker is not None and circuit_breaker.is_tripped():
+        return _build_breaker_skip_record()
 
     my_candidate_for_llm = {
         "product_id": candidate["product_id"],
@@ -1379,49 +1488,31 @@ def compare_candidate_with_xianyu(
         "unit_cost_performance": candidate["unit_cost_performance"],
     }
 
-    logger.info(
-        f"🔍 [步骤2/闲鱼搜索] 分类=【{cat_name}】 | 标品=【{candidate['name'][:32]}】 | "
-        f"我方activity_price=¥{my_price} | 我方unit性价比={candidate['unit_cost_performance']} | 搜索词=【{kw}】"
-    )
-
     with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+        if circuit_breaker is not None and circuit_breaker.is_tripped():
+            return _build_breaker_skip_record()
+        logger.info(
+            f"🔍 [步骤2/闲鱼搜索] 分类=【{cat_name}】 | 标品=【{candidate['name'][:32]}】 | "
+            f"我方activity_price=¥{my_price} | 我方unit性价比={candidate['unit_cost_performance']} | 搜索词=【{kw}】"
+        )
         search_res = search_xianyu_items(
             keyword=kw,
             max_items=max_search_items,
             user_data_dir=active_gdir,
             debug=debug_browser,
         )
-    if not search_res.get("ok"):
-        logger.error(
-            f"❌ [步骤2/闲鱼搜索异常失败] 分类=【{cat_name}】 | 搜索词=【{kw}】 | "
-            f"错误码={search_res.get('error_code')} | 目录={search_res.get('user_data_dir')} | 原因={search_res.get('message')}"
-        )
-    raw_items = search_res.get("items") or []
-    used_backup = False
-
-    # 情况 A：若未触发风控滑块且主搜索词返回结果过少（< 6条），直接用备用搜索词扩召回
-    if not search_res.get("is_risk_blocked") and len(raw_items) < 6 and backup_kw and backup_kw != kw:
-        logger.info(f"🔄 [步骤2/搜索词扩召回] 分类=【{cat_name}】 | 主词【{kw}】仅返回 {len(raw_items)} 条，切换备用词【{backup_kw}】重搜...")
-        with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
-            retry_res = search_xianyu_items(
-                keyword=backup_kw,
-                max_items=max_search_items,
-                user_data_dir=active_gdir,
-                debug=debug_browser,
-            )
-        used_backup = True
-        if not retry_res.get("ok"):
+        if not search_res.get("ok"):
             logger.error(
-                f"❌ [步骤2/备用词搜索异常失败] 分类=【{cat_name}】 | 备用词=【{backup_kw}】 | "
-                f"错误码={retry_res.get('error_code')} | 目录={retry_res.get('user_data_dir')} | 原因={retry_res.get('message')}"
+                f"❌ [步骤2/闲鱼搜索异常失败] 分类=【{cat_name}】 | 搜索词=【{kw}】 | "
+                f"错误码={search_res.get('error_code')} | 目录={search_res.get('user_data_dir')} | 原因={search_res.get('message')}"
             )
-            if not search_res.get("ok"):
-                search_res = retry_res
-        elif not search_res.get("ok") or len(retry_res.get("items") or []) > len(raw_items):
-            search_res = retry_res
-            raw_items = retry_res.get("items") or []
-            kw = backup_kw
+            if circuit_breaker is not None:
+                circuit_breaker.record_failure(search_res, context_desc=f"分类【{cat_name}】搜索")
+        else:
+            if circuit_breaker is not None:
+                circuit_breaker.record_success()
 
+    # 主搜索本身报错（如限流/强制登录/浏览器异常）时：绝不再换备用词二次重试，直接中止本分类检索！
     if not search_res.get("ok"):
         err_msg = f"[闲鱼搜索异常:{search_res.get('error_code') or 'UNKNOWN'}] {search_res.get('message') or '未知检索异常'}"
         return _build_final_record(
@@ -1438,6 +1529,51 @@ def compare_candidate_with_xianyu(
             browser_aborted=True,
             debug_browser=debug_browser,
         )
+
+    raw_items = search_res.get("items") or []
+    used_backup = False
+
+    # 情况 A：仅当主搜索成功（ok=True）但正常返回结果过少（< 6条）时，才切换备用搜索词扩召回
+    if len(raw_items) < 6 and backup_kw and backup_kw != kw:
+        with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+            if circuit_breaker is not None and circuit_breaker.is_tripped():
+                return _build_breaker_skip_record()
+            logger.info(f"🔄 [步骤2/搜索词扩召回] 分类=【{cat_name}】 | 主词【{kw}】仅返回 {len(raw_items)} 条，切换备用词【{backup_kw}】重搜...")
+            retry_res = search_xianyu_items(
+                keyword=backup_kw,
+                max_items=max_search_items,
+                user_data_dir=active_gdir,
+                debug=debug_browser,
+            )
+            used_backup = True
+            if not retry_res.get("ok"):
+                logger.error(
+                    f"❌ [步骤2/备用词搜索异常失败] 分类=【{cat_name}】 | 备用词=【{backup_kw}】 | "
+                    f"错误码={retry_res.get('error_code')} | 目录={retry_res.get('user_data_dir')} | 原因={retry_res.get('message')}"
+                )
+                if circuit_breaker is not None and circuit_breaker.record_failure(retry_res, context_desc=f"分类【{cat_name}】备用词搜索"):
+                    err_msg = f"[闲鱼搜索异常:{retry_res.get('error_code') or 'UNKNOWN'}] {retry_res.get('message') or '备用词检索异常'}"
+                    return _build_final_record(
+                        candidate=candidate,
+                        used_keyword=backup_kw,
+                        search_res=retry_res,
+                        coarse_items_for_llm=[],
+                        step2_comparable_ids=[],
+                        step2_llm_meta={},
+                        xianyu_items_for_llm=[],
+                        llm_data={},
+                        llm_call_meta={},
+                        fallback_error=err_msg,
+                        browser_aborted=True,
+                        debug_browser=debug_browser,
+                    )
+            else:
+                if circuit_breaker is not None:
+                    circuit_breaker.record_success()
+                if len(retry_res.get("items") or []) > len(raw_items):
+                    search_res = retry_res
+                    raw_items = retry_res.get("items") or []
+                    kw = backup_kw
 
     if not raw_items:
         logger.info(f"⚪ [步骤2/闲鱼搜索无结果] 分类=【{cat_name}】 | 搜索词=【{kw}】 | 闲鱼返回 0 条商品")
@@ -1467,23 +1603,45 @@ def compare_candidate_with_xianyu(
 
     # 情况 B：若主搜索词返回的全是异品牌推荐（导致第 2 个 AI 初筛同款数为 0），且尚未试过备用搜索词，自动切换备用词重搜 + 重新初筛！
     if not step2_comp_ids and not used_backup and backup_kw and backup_kw != kw:
-        logger.info(
-            f"🔄 [步骤2/初筛0同款触发备用词重搜] 分类=【{cat_name}】 | 主词【{kw}】初筛同款为0，切换备用词【{backup_kw}】重搜..."
-        )
+        retry_res = None
         with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+            if circuit_breaker is not None and circuit_breaker.is_tripped():
+                return _build_breaker_skip_record()
+            logger.info(
+                f"🔄 [步骤2/初筛0同款触发备用词重搜] 分类=【{cat_name}】 | 主词【{kw}】初筛同款为0，切换备用词【{backup_kw}】重搜..."
+            )
             retry_res = search_xianyu_items(
                 keyword=backup_kw,
                 max_items=max_search_items,
                 user_data_dir=active_gdir,
                 debug=debug_browser,
             )
-        if not retry_res.get("ok"):
-            logger.error(
-                f"❌ [步骤2/初筛0同款后备用词重搜异常失败] 分类=【{cat_name}】 | 备用词=【{backup_kw}】 | "
-                f"错误码={retry_res.get('error_code')} | 目录={retry_res.get('user_data_dir')} | 原因={retry_res.get('message')}"
-            )
-        retry_items = retry_res.get("items") or []
-        if retry_res.get("ok") and retry_items:
+            if not retry_res.get("ok"):
+                logger.error(
+                    f"❌ [步骤2/初筛0同款后备用词重搜异常失败] 分类=【{cat_name}】 | 备用词=【{backup_kw}】 | "
+                    f"错误码={retry_res.get('error_code')} | 目录={retry_res.get('user_data_dir')} | 原因={retry_res.get('message')}"
+                )
+                if circuit_breaker is not None and circuit_breaker.record_failure(retry_res, context_desc=f"分类【{cat_name}】初筛后备用词搜索"):
+                    err_msg = f"[闲鱼搜索异常:{retry_res.get('error_code') or 'UNKNOWN'}] {retry_res.get('message') or '备用词检索异常'}"
+                    return _build_final_record(
+                        candidate=candidate,
+                        used_keyword=backup_kw,
+                        search_res=retry_res,
+                        coarse_items_for_llm=[],
+                        step2_comparable_ids=[],
+                        step2_llm_meta={},
+                        xianyu_items_for_llm=[],
+                        llm_data={},
+                        llm_call_meta={},
+                        fallback_error=err_msg,
+                        browser_aborted=True,
+                        debug_browser=debug_browser,
+                    )
+            else:
+                if circuit_breaker is not None:
+                    circuit_breaker.record_success()
+        retry_items = (retry_res or {}).get("items") or []
+        if retry_res and retry_res.get("ok") and retry_items:
             search_res = retry_res
             raw_items = retry_items
             kw = backup_kw
@@ -1519,26 +1677,32 @@ def compare_candidate_with_xianyu(
             debug_browser=debug_browser,
         )
 
-    # 步骤 3：仅对第 2 个 AI 筛出的同款可比商品（默认最多取前 20 个）在单次浏览器会话内批量拉取详情、SKU 价格与运费
+    # 步骤 3：仅对第 2 个 AI 筛出的同款可比商品（默认最多取前 10 个）在单次浏览器会话内批量拉取详情、SKU 价格与运费
     ids_to_fetch = step2_comp_ids[:max_detail_checks] if max_detail_checks > 0 else step2_comp_ids
-    logger.info(
-        f"📦 [步骤3/批量拉取闲鱼同款详情] 分类=【{cat_name}】 | AI初筛同款={len(step2_comp_ids)}款 -> "
-        f"单次浏览器会话批量拉取前 {len(ids_to_fetch)} 款的完整详情、SKU价格与运费..."
-    )
-
     with _borrow_guest_dir(guest_user_data_dir, guest_dir_pool) as active_gdir:
+        if circuit_breaker is not None and circuit_breaker.is_tripped():
+            return _build_breaker_skip_record()
+        logger.info(
+            f"📦 [步骤3/批量拉取闲鱼同款详情] 分类=【{cat_name}】 | AI初筛同款={len(step2_comp_ids)}款 -> "
+            f"单次浏览器会话批量拉取前 {len(ids_to_fetch)} 款的完整详情、SKU价格与运费..."
+        )
         batch_det_res = get_xianyu_item_details_batch(
             item_ids=ids_to_fetch,
             user_data_dir=active_gdir,
             debug=debug_browser,
         )
+        if not batch_det_res.get("ok") or batch_det_res.get("is_risk_blocked"):
+            logger.error(
+                f"❌ [步骤3/批量详情会话异常中断] 分类=【{cat_name}】 | 错误码={batch_det_res.get('error_code')} | "
+                f"目录={batch_det_res.get('user_data_dir')} | 已完成={len(batch_det_res.get('details_by_id') or {})}/{len(ids_to_fetch)} | "
+                f"原因={batch_det_res.get('message')}"
+            )
+            if circuit_breaker is not None:
+                circuit_breaker.record_failure(batch_det_res, context_desc=f"分类【{cat_name}】批量详情")
+        else:
+            if circuit_breaker is not None:
+                circuit_breaker.record_success()
     details_by_id = batch_det_res.get("details_by_id") or {}
-    if not batch_det_res.get("ok"):
-        logger.error(
-            f"❌ [步骤3/批量详情会话异常中断] 分类=【{cat_name}】 | 错误码={batch_det_res.get('error_code')} | "
-            f"目录={batch_det_res.get('user_data_dir')} | 已完成={len(details_by_id)}/{len(ids_to_fetch)} | "
-            f"原因={batch_det_res.get('message')}"
-        )
 
     detailed_items_for_llm: List[Dict[str, Any]] = []
     valid_detailed_ids: Set[str] = set()
@@ -2371,7 +2535,13 @@ def run_discovery_cycle(
     debug_browser: bool = False,
     stage1_workers: int = DEFAULT_STAGE1_WORKERS,
     compare_workers: int = DEFAULT_COMPARE_WORKERS,
+    enable_pre_round_probe: bool = ENABLE_PRE_ROUND_PROBE,
+    probe_keyword: str = PRE_ROUND_PROBE_KEYWORD,
+    max_consecutive_browser_fails: int = MAX_CONSECUTIVE_BROWSER_FAILS,
 ) -> List[Dict[str, Any]]:
+    global _LAST_CYCLE_ABORTED_BY_RISK
+    _LAST_CYCLE_ABORTED_BY_RISK = False
+
     if not enable_official and not enable_deal_tip:
         logger.warning("⚠️ [未启用任何商品源] ENABLE_OFFICIAL 与 ENABLE_DEAL_TIP 均为 False，本轮直接退出。")
         return []
@@ -2397,6 +2567,23 @@ def run_discovery_cycle(
         f"浏览器模式={browser_mode_desc} | 访客主目录=<{guest_user_data_dir}>\n"
         f"{'=' * 96}"
     )
+
+    if enable_pre_round_probe:
+        probe_ok, probe_res = probe_xianyu_guest_ready(
+            guest_user_data_dir=guest_user_data_dir,
+            debug_browser=debug_browser,
+            probe_keyword=probe_keyword,
+        )
+        if not probe_ok:
+            _LAST_CYCLE_ABORTED_BY_RISK = True
+            logger.error(
+                f"\n{'!' * 96}\n"
+                f"🛑 [开轮探针未通过/静默冷却保护] 闲鱼免登录通道当前不可用（错误码={probe_res.get('error_code')} | "
+                f"原因={probe_res.get('message')}）\n"
+                f"   └── 本轮已立即终止，跳过 AI 选品与全部后续闲鱼请求，给当前 IP 留出安静冷却窗口！\n"
+                f"{'!' * 96}"
+            )
+            return []
 
     db = gen_db_object()
     eval_col = db.get_collection(EVAL_COLLECTION_NAME)
@@ -2433,17 +2620,18 @@ def run_discovery_cycle(
         logger.warning("⚠️ [本轮结束] 启用的商品源均未选出满足条件的可比标品候选商品。")
         return []
 
-    # 构建浏览器访客目录池：仅在执行闲鱼初搜/批量详情时借用，AI 思考期间立即归还，实现浏览器与 AI 流水线重叠
+    # 单槽位浏览器目录令牌池：仅在闲鱼初搜/批量详情时借用，AI 思考期间立即归还（既实现浏览器与 AI 重叠，又保证一旦触发限流熔断，排队线程 0 次多余碰撞）
     guest_dir_pool: "queue.Queue[str]" = queue.Queue()
-    num_guest_dirs = min(2, cmp_workers) if cmp_workers > 1 else 1
-    for i in range(num_guest_dirs):
-        gdir = guest_user_data_dir if i == 0 else f"{guest_user_data_dir}_{i + 1}"
-        guest_dir_pool.put(gdir)
+    guest_dir_pool.put(guest_user_data_dir)
+    circuit_breaker = _RoundCircuitBreaker(max_consecutive_fails=max_consecutive_browser_fails)
 
     total_champions = len(champions)
     indexed_records: Dict[int, Dict[str, Any]] = {}
 
-    def _run_single_champion(idx: int, cand: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    def _run_single_champion(idx: int, cand: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+        if circuit_breaker.is_tripped():
+            return idx, None
+
         src_lbl = _source_label(cand.get("source_type"))
         logger.info(
             f"\n>>> ▶️ [开始比价第 {idx}/{total_champions} 个分类标品冠军][{src_lbl}] "
@@ -2457,7 +2645,11 @@ def run_discovery_cycle(
             max_detail_checks=max_detail_checks,
             debug_browser=debug_browser,
             guest_dir_pool=guest_dir_pool,
+            circuit_breaker=circuit_breaker,
         )
+        if (rec.get("xianyu_audit_trail") or {}).get("circuit_broken"):
+            return idx, None
+
         rec["batch_id"] = batch_id
         rec_src_type = _normalize_source_type(rec.get("source_type"))
         rec["source_type"] = rec_src_type
@@ -2487,13 +2679,23 @@ def run_discovery_cycle(
         for fut in concurrent.futures.as_completed(futures):
             try:
                 idx, rec = fut.result()
-                indexed_records[idx] = rec
+                if rec is not None:
+                    indexed_records[idx] = rec
             except Exception as exc:
                 logger.exception(f"❌ [分类比价子任务异常] {exc}")
 
     records = [indexed_records[i] for i in sorted(indexed_records.keys())]
+    skipped_by_breaker = total_champions - len(records)
+    if circuit_breaker.is_tripped():
+        _LAST_CYCLE_ABORTED_BY_RISK = True
+        logger.warning(
+            f"🛑 [熔断跳过汇总] 本轮检测到闲鱼检索熔断，已自动跳过剩余 {skipped_by_breaker}/{total_champions} 个分类标品"
+            f"（均未写入已比价记录库，冷却恢复后将正常参评）。"
+        )
+
     elapsed = time.monotonic() - t0
-    logger.info(_format_batch_summary_report(batch_id, elapsed, records))
+    if records:
+        logger.info(_format_batch_summary_report(batch_id, elapsed, records))
     return records
 
 
@@ -2527,6 +2729,9 @@ def main():
                 debug_browser=DEBUG_BROWSER,
                 stage1_workers=STAGE1_WORKERS,
                 compare_workers=COMPARE_WORKERS,
+                enable_pre_round_probe=ENABLE_PRE_ROUND_PROBE,
+                probe_keyword=PRE_ROUND_PROBE_KEYWORD,
+                max_consecutive_browser_fails=MAX_CONSECUTIVE_BROWSER_FAILS,
             )
         except KeyboardInterrupt:
             logger.info("👋 收到中断信号，任务退出。")
@@ -2535,8 +2740,15 @@ def main():
             logger.exception(f"❌ [探测轮次异常] {exc}")
         if not loop_enabled:
             break
-        logger.info(f"⏳ 本轮执行完毕，等待 {LOOP_INTERVAL_HOURS} 小时后执行下一轮...")
-        time.sleep(max(60.0, LOOP_INTERVAL_HOURS * 3600.0))
+        if _LAST_CYCLE_ABORTED_BY_RISK:
+            sleep_hours = max(float(LOOP_INTERVAL_HOURS or 1.0), float(RISK_COOLDOWN_HOURS or 2.0))
+            logger.warning(
+                f"🛑 本轮触发闲鱼限流/异常熔断保护，进入静默冷却：等待 {sleep_hours} 小时后再执行 1 次轻量探测（期间绝不发起重试）..."
+            )
+        else:
+            sleep_hours = float(LOOP_INTERVAL_HOURS or 1.0)
+            logger.info(f"⏳ 本轮执行完毕，等待 {sleep_hours} 小时后执行下一轮...")
+        time.sleep(max(60.0, sleep_hours * 3600.0))
 
 
 if __name__ == "__main__":
