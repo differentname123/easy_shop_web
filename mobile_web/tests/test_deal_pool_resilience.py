@@ -721,3 +721,68 @@ def test_run_clean_stage_sweeps_over_7d_by_either_publish_ts_or_first_seen_at():
     assert "$nor" in count_queries[0]["$and"][1]
 
 
+def test_format_raw_message_skips_xianbao_synthetic_haodan_weibo_title_but_keeps_real_titles():
+    # 1. xianbao_fun 好单线报 / 微博线报 synthetic title with broken regex price -> skipped when body exists
+    haodan_doc = {
+        "source_site": "xianbao_fun",
+        "source_channel": "category_haodan:好单线报-服饰-淘宝",
+        "source_item_id": "7465539",
+        "title": "乔丹被窝防风防泼水羽绒服 拍1 15元",
+        "tutorial_text": "速 乔丹被窝防风防泼水羽绒服\n弹 下拉叠金币任选拍115元\nhttps://m.tb.cn/h.jQvw5nR",
+    }
+    msg_haodan = DealPoolCleaner._format_raw_message_for_ai1(haodan_doc)
+    assert "【标题】" not in msg_haodan["content"]
+    assert "拍115元" in msg_haodan["content"]
+
+    # 2. Fallback safety: if xianbao_fun detail fetch failed, title is still preserved
+    haodan_err_doc = {
+        "source_site": "xianbao_fun",
+        "source_channel": "haodan_hot:好单线报-服饰-淘宝",
+        "source_item_id": "7465540",
+        "title": "波司登羽绒服 351.45元",
+        "tutorial_text": "预览\n[详情拉取异常: Timeout]",
+    }
+    msg_err = DealPoolCleaner._format_raw_message_for_ai1(haodan_err_doc)
+    assert "【标题】波司登羽绒服 351.45元" in msg_err["content"]
+
+    # 3. xianbao_fun 豆瓣线报 (real user thread title with price only in title) -> MUST keep 【标题】
+    douban_doc = {
+        "source_site": "xianbao_fun",
+        "source_channel": "category_douban:豆瓣线报-买组",
+        "source_item_id": "7460001",
+        "title": "欧莱雅紫熨斗眼霜60ml 145元",
+        "tutorial_text": "[教程图片: https://img3.doubanio.com/view/group_topic/l/public/p1.webp]",
+    }
+    msg_douban = DealPoolCleaner._format_raw_message_for_ai1(douban_doc)
+    assert msg_douban["content"].startswith("【标题】欧莱雅紫熨斗眼霜60ml 145元")
+
+    # 4. haodanku / bacaoo editorial title with price only in title -> MUST keep 【标题】
+    hdk_doc = {
+        "source_site": "haodanku",
+        "source_channel": "wire_report:淘宝实时线报",
+        "source_item_id": "1650001",
+        "title": "💰24.6 | 柏瑞美定妆喷雾100ml",
+        "tutorial_text": "①柏瑞美定妆喷雾 https://uland.taobao.com/item/edetail?id=abc",
+    }
+    msg_hdk = DealPoolCleaner._format_raw_message_for_ai1(hdk_doc)
+    assert msg_hdk["content"].startswith("【标题】💰24.6 | 柏瑞美定妆喷雾100ml")
+
+
+def test_stage2_prompt_hot_reloads_on_mtime_change(monkeypatch, tmp_path):
+    import os
+    import mobile_web.scripts.run_deal_pool_scheduler as sched_mod
+
+    p_file = tmp_path / "stage2_prompt.txt"
+    p_file.write_text("初始提示词v1", encoding="utf-8")
+    monkeypatch.setattr(sched_mod, "PROMPT_STAGE2_PATH", str(p_file))
+
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    assert cleaner._get_stage2_prompt() == "初始提示词v1"
+
+    p_file.write_text("热更新提示词v2", encoding="utf-8")
+    st = os.stat(p_file)
+    os.utime(p_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert cleaner._get_stage2_prompt() == "热更新提示词v2"
+
+
+

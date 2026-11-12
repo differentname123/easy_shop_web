@@ -1113,6 +1113,9 @@ class DealPoolCleaner:
         }
         self.prompt_stage1_template = self._load_prompt_file(PROMPT_STAGE1_PATH)
         self.prompt_stage2_template = self._load_prompt_file(PROMPT_STAGE2_PATH)
+        self._prompt_stage1_mtime = self._get_file_mtime_ns(PROMPT_STAGE1_PATH)
+        self._prompt_stage2_mtime = self._get_file_mtime_ns(PROMPT_STAGE2_PATH)
+        self._prompt_lock = threading.Lock()
 
         # 线程安全的内存级转链结果缓存，避免不同采集群重复刷屏的同一链接/口令重复调用上游接口
         self._cache_lock = threading.Lock()
@@ -1204,6 +1207,13 @@ class DealPoolCleaner:
             logger.warning("预热转链缓存异常: %s", e)
 
     @staticmethod
+    def _get_file_mtime_ns(path: str) -> Optional[int]:
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+
+    @staticmethod
     def _load_prompt_file(path: str) -> str:
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1211,6 +1221,42 @@ class DealPoolCleaner:
         except Exception as e:
             logger.error("读取 AI 提示词文件 [%s] 失败: %s", path, e)
             return ""
+
+    def _get_stage1_prompt(self) -> str:
+        cur_mtime = self._get_file_mtime_ns(PROMPT_STAGE1_PATH)
+        if cur_mtime is not None and cur_mtime != getattr(self, "_prompt_stage1_mtime", None):
+            with self._prompt_lock:
+                if cur_mtime != getattr(self, "_prompt_stage1_mtime", None):
+                    loaded = self._load_prompt_file(PROMPT_STAGE1_PATH)
+                    if loaded:
+                        self.prompt_stage1_template = loaded
+                        self._prompt_stage1_mtime = cur_mtime
+        return self.prompt_stage1_template
+
+    def _get_stage2_prompt(self) -> str:
+        cur_mtime = self._get_file_mtime_ns(PROMPT_STAGE2_PATH)
+        if cur_mtime is not None and cur_mtime != getattr(self, "_prompt_stage2_mtime", None):
+            with self._prompt_lock:
+                if cur_mtime != getattr(self, "_prompt_stage2_mtime", None):
+                    loaded = self._load_prompt_file(PROMPT_STAGE2_PATH)
+                    if loaded:
+                        self.prompt_stage2_template = loaded
+                        self._prompt_stage2_mtime = cur_mtime
+        return self.prompt_stage2_template
+
+    @staticmethod
+    def _is_xianbao_synthetic_title_doc(msg_doc: Dict[str, Any], tut: str) -> bool:
+        """
+        线报酷 (`xianbao_fun`) 旗下的好单线报/微博线报属于无标题群聊/微博流，
+        其列表页 `title` 由源站后端用粗糙正则从正文机械截取并拼接猜测价格（易将红包/口令前缀/连写数字误拼为价格）；
+        当完整正文 `tut` 已存在时，不应把该合成标题前置注入 AI 输入（豆瓣/好单库/拔草哦等真实人工标题源站不受影响）。
+        """
+        if str(msg_doc.get("source_site") or "") != "xianbao_fun":
+            return False
+        if not tut or "[详情拉取异常" in tut:
+            return False
+        ch = str(msg_doc.get("source_channel") or "")
+        return any(k in ch for k in ("好单线报", "微博线报", "haodan", "weibo"))
 
     @staticmethod
     def _extract_doc_images(msg_doc: Dict[str, Any]) -> List[str]:
@@ -1235,7 +1281,7 @@ class DealPoolCleaner:
         title = str(msg_doc.get("title") or "").strip()
         tut = str(msg_doc.get("tutorial_text") or "").strip()
         content = tut if tut else title
-        if title and title not in content:
+        if title and title not in content and not cls._is_xianbao_synthetic_title_doc(msg_doc, tut):
             content = f"【标题】{title}\n{content}".strip()
 
         extra_anchor_lines: List[str] = []
@@ -1504,9 +1550,11 @@ class DealPoolCleaner:
         ]
         total_batches = len(chunks)
 
+        prompt_tpl = self._get_stage1_prompt()
+
         def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             self.stats_ai1_calls += 1
-            return self._call_ai_json_array(self.prompt_stage1_template, chunk, "AI-Stage1")
+            return self._call_ai_json_array(prompt_tpl, chunk, "AI-Stage1")
 
         def _ingest_arr(arr: List[Dict[str, Any]]) -> None:
             for item in arr:
@@ -1946,9 +1994,11 @@ class DealPoolCleaner:
         total_batches = len(chunks)
         t_s4 = time.perf_counter()
 
+        prompt_tpl = self._get_stage2_prompt()
+
         def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             self.stats_ai2_calls += 1
-            return self._call_ai_json_array(self.prompt_stage2_template, chunk, "AI-Stage2")
+            return self._call_ai_json_array(prompt_tpl, chunk, "AI-Stage2")
 
         def _ingest_arr(arr: List[Dict[str, Any]]) -> None:
             for item in arr:
