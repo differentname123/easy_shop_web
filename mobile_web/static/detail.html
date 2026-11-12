@@ -13,8 +13,8 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261111-3">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261111-3"></script>
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261112-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261112-1"></script>
   <style>
     /* 专属商品详情大页样式 */
     .detail-nav-bar {
@@ -299,6 +299,253 @@
       margin-bottom: 4px;
       border-radius: 6px;
     }
+    /* 线报好价卡片样式（仅 dealTip 存在时渲染） */
+    .deal-tip-card {
+      border: 1px solid #ffe1db;
+      background: linear-gradient(180deg, #fff9f8 0%, #ffffff 48px);
+    }
+    .deal-tip-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .deal-tip-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 13px;
+      font-weight: 800;
+      color: var(--primary-color);
+    }
+    .deal-tip-time {
+      font-size: 11px;
+      color: var(--text-muted);
+      background: #f7f8fa;
+      padding: 2px 7px;
+      border-radius: 10px;
+    }
+    .deal-price-box {
+      background: #fff5f3;
+      border: 1px solid #ffdbd4;
+      border-radius: 8px;
+      padding: 9px 11px;
+      margin-bottom: 10px;
+    }
+    .deal-price-row {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .deal-price-lbl {
+      font-size: 11px;
+      font-weight: 600;
+      color: #cf1322;
+    }
+    .deal-price-yen {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--primary-color);
+      margin-left: 2px;
+    }
+    .deal-price-num {
+      font-size: 19px;
+      font-weight: 800;
+      color: var(--primary-color);
+      line-height: 1.1;
+    }
+    .deal-unit-pill {
+      font-size: 11px;
+      font-weight: 700;
+      color: #d46b08;
+      background: #fff7e6;
+      border: 1px solid #ffd591;
+      padding: 1px 6px;
+      border-radius: 4px;
+      align-self: center;
+    }
+    .deal-logic-text {
+      font-size: 12px;
+      color: #593834;
+      line-height: 1.5;
+      margin-top: 5px;
+      word-break: break-word;
+    }
+    .deal-price-box .deal-logic-text:first-child {
+      margin-top: 0;
+    }
+    .deal-aux-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .deal-aux-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: #fafbfc;
+      border: 1px solid #f0f0f0;
+      border-radius: 7px;
+      padding: 7px 9px;
+    }
+    .deal-aux-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      flex: 1;
+    }
+    .deal-aux-tag {
+      flex-shrink: 0;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .deal-aux-tag.coupon {
+      color: #cf1322;
+      background: #fff1f0;
+      border: 1px solid #ffa39e;
+    }
+    .deal-aux-tag.filler {
+      color: #0958d9;
+      background: #e6f4ff;
+      border: 1px solid #91caff;
+    }
+    .deal-aux-title {
+      font-size: 12px;
+      color: var(--text-main);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .deal-aux-actions {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+    .deal-mini-btn {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 12px;
+      cursor: pointer;
+      border: 1px solid #ffd8d2;
+      background: #fff;
+      color: var(--primary-color);
+    }
+    .deal-mini-btn.primary {
+      background: var(--primary-color);
+      border-color: var(--primary-color);
+      color: #fff;
+    }
+    .deal-sub-block {
+      margin-top: 10px;
+    }
+    .deal-sub-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+    .deal-copy-btn {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--primary-color);
+      background: #fff1f0;
+      border: 1px solid #ffccc7;
+      border-radius: 12px;
+      padding: 2px 9px;
+      cursor: pointer;
+    }
+    .deal-steps-box {
+      background: #f9fafb;
+      border-radius: 7px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .deal-step-item {
+      font-size: 12px;
+      color: #333;
+      line-height: 1.55;
+      word-break: break-all;
+    }
+    .deal-copywriting-body {
+      font-size: 12px;
+      color: #444;
+      background: #fafbfc;
+      border-left: 3px solid #ff9c6e;
+      border-radius: 0 6px 6px 0;
+      padding: 8px 10px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .deal-copywriting-body.collapsed {
+      display: -webkit-box;
+      -webkit-line-clamp: 5;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .deal-expand-btn {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 2px 4px;
+      font-size: 11px;
+      color: var(--primary-color);
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .deal-img-strip {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .deal-share-thumb {
+      width: 84px;
+      height: 84px;
+      object-fit: cover;
+      border-radius: 6px;
+      border: 1px solid #eee;
+      flex-shrink: 0;
+      background: #f5f5f5;
+      cursor: pointer;
+    }
+    .deal-tip-footnote {
+      margin-top: 9px;
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.45;
+    }
+    .deal-img-lightbox {
+      position: fixed;
+      inset: 0;
+      z-index: 1200;
+      background: rgba(0, 0, 0, 0.86);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .deal-img-lightbox img {
+      max-width: 100%;
+      max-height: 88vh;
+      object-fit: contain;
+      border-radius: 8px;
+    }
   </style>
 </head>
 <body>
@@ -378,6 +625,89 @@
     <div class="detail-summary-desc" v-if="goods.desc && goods.desc !== goods.name">
       {{ goods.desc }}
     </div>
+  </div>
+
+  <!-- ==================== 线报好价卡片（有线报信息时统一展示，无则完全不渲染） ==================== -->
+  <div class="detail-card-section deal-tip-card" v-if="dealTip">
+    <div class="deal-tip-header">
+      <span class="deal-tip-badge">🔥 线报好价</span>
+      <span class="deal-tip-time" v-if="dealTip.publish_time">{{ dealTip.publish_time }} 爆料</span>
+    </div>
+
+    <div class="deal-price-box" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.unit_deal_price || dealTip.price_logic">
+      <div class="deal-price-row" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.unit_deal_price">
+        <template v-if="dealTip.deal_price !== null && dealTip.deal_price !== undefined">
+          <span class="deal-price-lbl">线报参考价</span>
+          <span class="deal-price-yen">¥</span>
+          <span class="deal-price-num">{{ formatMoney(dealTip.deal_price) }}</span>
+        </template>
+        <span class="deal-unit-pill" v-if="dealTip.unit_deal_price">{{ dealTip.unit_deal_price }}</span>
+      </div>
+      <div class="deal-logic-text" v-if="dealTip.price_logic">💡 怎么买：{{ dealTip.price_logic }}</div>
+    </div>
+
+    <div class="deal-aux-list" v-if="(dealTip.coupon_links && dealTip.coupon_links.length) || (dealTip.filler_links && dealTip.filler_links.length)">
+      <div class="deal-aux-row" v-for="(cItem, cIdx) in (dealTip.coupon_links || [])" :key="'cp_' + cIdx">
+        <div class="deal-aux-left">
+          <span class="deal-aux-tag coupon">领券</span>
+          <span class="deal-aux-title">{{ cItem.label }}</span>
+        </div>
+        <div class="deal-aux-actions">
+          <button class="deal-mini-btn" v-if="cItem.token || cItem.url" @click="copyDealAuxItem(cItem)">{{ cItem.token ? '复制口令' : '复制链接' }}</button>
+          <button class="deal-mini-btn primary" v-if="cItem.url" @click="openDealAuxItem(cItem)">打开 ›</button>
+        </div>
+      </div>
+      <div class="deal-aux-row" v-for="(fItem, fIdx) in (dealTip.filler_links || [])" :key="'fl_' + fIdx">
+        <div class="deal-aux-left">
+          <span class="deal-aux-tag filler">凑单</span>
+          <span class="deal-aux-title">{{ fItem.label }}<template v-if="fItem.official_price"> (¥{{ formatMoney(fItem.official_price) }})</template></span>
+        </div>
+        <div class="deal-aux-actions">
+          <button class="deal-mini-btn" v-if="fItem.token || fItem.url" @click="copyDealAuxItem(fItem)">{{ fItem.token ? '复制口令' : '复制链接' }}</button>
+          <button class="deal-mini-btn primary" v-if="fItem.url" @click="openDealAuxItem(fItem)">打开 ›</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="deal-sub-block" v-if="dealTip.tutorial_steps && dealTip.tutorial_steps.length">
+      <div class="deal-sub-header">
+        <span>📌 购买教程</span>
+        <button class="deal-copy-btn" @click="copyDealTutorial">复制教程</button>
+      </div>
+      <div class="deal-steps-box">
+        <div class="deal-step-item" v-for="(step, sIdx) in dealTip.tutorial_steps" :key="'step_' + sIdx">{{ step }}</div>
+      </div>
+    </div>
+
+    <div class="deal-sub-block" v-if="dealTip.original_copywriting">
+      <div class="deal-sub-header">
+        <span>💬 线报原文</span>
+        <button class="deal-copy-btn" @click="copyDealCopywriting">复制话术</button>
+      </div>
+      <div class="deal-copywriting-body" :class="{ collapsed: isLongCopywriting && !isCopywritingExpanded }">{{ dealTip.original_copywriting }}</div>
+      <button class="deal-expand-btn" v-if="isLongCopywriting" @click="toggleCopywritingExpand">{{ isCopywritingExpanded ? '收起全文 ▲' : '展开全部 ▼' }}</button>
+    </div>
+
+    <div class="deal-sub-block" v-if="dealShareImages.length">
+      <div class="deal-sub-header">
+        <span>📸 实拍与参考图</span>
+      </div>
+      <div class="deal-img-strip">
+        <img
+          v-for="(imgUrl, imgIdx) in dealShareImages"
+          :key="imgUrl + '_' + imgIdx"
+          :src="imgUrl"
+          class="deal-share-thumb"
+          referrerpolicy="no-referrer"
+          loading="lazy"
+          alt="线报参考图"
+          @error="onDealImageError(imgUrl)"
+          @click="openImagePreview(imgUrl)"
+        />
+      </div>
+    </div>
+
+    <div class="deal-tip-footnote">提示：线报优惠有较强时效性，领券或凑单后实际付款金额请以平台结算页为准。</div>
   </div>
 
   <!-- ==================== 深度图文详情加载态与失败重试兜底 ==================== -->
@@ -560,6 +890,11 @@
     </div>
   </div>
 
+  <!-- 线报实拍/订单参考图大图预览 -->
+  <div class="deal-img-lightbox" v-if="previewImageUrl" @click="closeImagePreview">
+    <img :src="previewImageUrl" referrerpolicy="no-referrer" alt="线报参考图预览" />
+  </div>
+
   <!-- ==================== 全局高质感智能加载器与省钱话术轮播 ==================== -->
   <div class="smart-loader-overlay" v-if="smartLoading.visible">
     <div class="smart-loader-card">
@@ -586,10 +921,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261111-3"></script>
-<script src="/static/js/session.js?v=ux-20261111-3"></script>
-<script src="/static/js/format.js?v=ux-20261111-3"></script>
-<script src="/static/js/browser.js?v=ux-20261111-3"></script>
-<script src="/static/js/detail.js?v=ux-20261111-3"></script>
+<script src="/static/js/api.js?v=ux-20261112-1"></script>
+<script src="/static/js/session.js?v=ux-20261112-1"></script>
+<script src="/static/js/format.js?v=ux-20261112-1"></script>
+<script src="/static/js/browser.js?v=ux-20261112-1"></script>
+<script src="/static/js/detail.js?v=ux-20261112-1"></script>
 </body>
 </html>

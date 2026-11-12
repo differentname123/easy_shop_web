@@ -67,13 +67,22 @@ class MemoryCollection:
         self.indexes.append((keys, kwargs))
 
     @staticmethod
+    def get_path(doc, path):
+        current = doc
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return False, None
+            current = current[part]
+        return True, current
+
+    @staticmethod
     def expression(doc, value, variables=None):
         """仅支持可展示价格条件使用的表达式；未知操作立即失败。"""
         variables = variables or {}
         if isinstance(value, str) and value.startswith("$$"):
             return variables[value[2:]]
         if isinstance(value, str) and value.startswith("$"):
-            return doc.get(value[1:])
+            return MemoryCollection.get_path(doc, value[1:])[1]
         if not isinstance(value, dict):
             return value
         op, args = next(iter(value.items()))
@@ -102,11 +111,13 @@ class MemoryCollection:
             return "null" if number is None else "unsupported"
         if op == "$and":
             return all(evaluate(item) for item in args)
+        if op == "$or":
+            return any(evaluate(item) for item in args)
         left, right = (evaluate(item) for item in args)
         if op == "$eq":
-            return left == right
+            return MemoryCollection.equal(left, right)
         if op == "$in":
-            return left in right
+            return any(MemoryCollection.equal(left, candidate) for candidate in right)
         if op == "$gte":
             return left is not None and left >= right
         if op == "$lt":
@@ -123,28 +134,32 @@ class MemoryCollection:
             elif key == "$expr":
                 matched = MemoryCollection.expression(doc, value)
             elif isinstance(value, dict):
+                exists, field_val = MemoryCollection.get_path(doc, key)
                 matched = True
                 for op, operand in value.items():
                     if op == "$regex":
                         flags = re.I if value.get("$options") == "i" else 0
-                        values = doc.get(key) if isinstance(doc.get(key), list) else [doc.get(key)]
+                        values = field_val if isinstance(field_val, list) else [field_val]
                         matched = matched and any(isinstance(item, str) and re.search(operand, item, flags) for item in values)
                     elif op == "$exists":
-                        matched = matched and ((key in doc) == operand)
+                        matched = matched and (exists == operand)
                     elif op == "$eq":
-                        matched = matched and MemoryCollection.equal(doc.get(key), operand)
+                        matched = matched and MemoryCollection.equal(field_val, operand)
                     elif op == "$ne":
-                        matched = matched and not MemoryCollection.equal(doc.get(key), operand)
+                        matched = matched and not MemoryCollection.equal(field_val, operand)
                     elif op != "$options":
                         raise AssertionError(f"unsupported field operator: {op}")
             else:
-                matched = MemoryCollection.equal(doc.get(key), value)
+                _, field_val = MemoryCollection.get_path(doc, key)
+                matched = MemoryCollection.equal(field_val, value)
             if not matched:
                 return False
         return True
 
     @staticmethod
     def equal(left, right):
+        if isinstance(left, bool) != isinstance(right, bool):
+            return False
         # Mongo 日期查询按 UTC 毫秒比较，不能依赖 Python aware/naive 相等。
         if isinstance(left, datetime.datetime) and isinstance(right, datetime.datetime):
             def bson_time(value):
@@ -1119,6 +1134,96 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual([item["product_id"] for item in after_evict["data"]], ["P3", "P2"])
         self.assertEqual(len(self.col.queries), queries_before + 1)
 
+    def test_deal_tip_normalization_and_boom_visibility(self):
+        now = datetime.datetime(2026, 11, 12, 10, 0, 0)
+        deal_doc = {
+            "platform": "taobao",
+            "product_id": "TB-DEAL-1",
+            "goods_id": "TB-DEAL-1",
+            "goods_sign": "SIGN-DEAL-1",
+            "name": "立白大师香氛洗衣液8斤",
+            "activity_price": 49.9,
+            "price": 59.9,
+            "category": "家清",
+            "image_url": "https://img.test/main.jpg",
+            "updated_at": now,
+            "deal_info": {
+                "is_deal_tip": True,
+                "deal_price": 24.9,
+                "unit_deal_price": "3.11元/斤",
+                "price_logic": "领15元商品券+拍凑单品满200减30，主商品实付约24.9元",
+                "publish_time": "2026-11-12T09:04:25Z",
+                "coupon_links": [
+                    {"link_id": "L1", "label": "15元商品券", "url": "https://uland.taobao.com/coupon/1", "token": "1$AAA$://", "platform": "tb"},
+                    {"link_id": "BAD", "label": "空链接", "url": "", "token": ""},
+                ],
+                "filler_links": [
+                    {"link_id": "L2", "label": "凑单棉签", "url": "https://s.click.taobao.com/filler", "token": "2$BBB$://", "platform": "taobao", "official_price": 9.9},
+                ],
+                "tutorial_steps": ["1. 先领15元券 1$AAA$://", "2. 加购主商品与凑单品一起结算"],
+                "original_copywriting": "立白香氛8斤好价！留香超久～\n赶紧锁单！",
+                "user_share_images": [
+                    "https://wx4.sinaimg.cn/mw600/a.jpg",
+                    "https://wx4.sinaimg.cn/mw600/a.jpg",
+                    "ftp://invalid.test/x.jpg",
+                ],
+                "quality_score": 88,
+                "source_site": "smzdm",
+                "source_url": "https://internal.source/1",
+                "my_promotion_link": "https://internal.promo/1",
+            },
+        }
+        plain_doc = {
+            "platform": "pdd",
+            "product_id": "PDD-PLAIN-1",
+            "name": "普通无爆料榜单商品",
+            "activity_price": 12.8,
+            "category": "食品",
+            "channel_type": 5,
+            "updated_at": now - datetime.timedelta(minutes=5),
+        }
+        non_bool_deal_doc = {
+            "platform": "jd",
+            "product_id": "JD-DIRTY-1",
+            "name": "非法布尔值爆料",
+            "activity_price": 19.9,
+            "category": "数码",
+            "deal_info": {"is_deal_tip": 1, "deal_price": 9.9},
+        }
+        self.col.docs = [deal_doc, plain_doc, non_bool_deal_doc]
+
+        # 1. 严选好价列表同时接纳榜单商品与 deal_info.is_deal_tip == True 的线报商品，排除非布尔脏记录，且列表摘要不夹带重字段 deal_tip
+        boom_res = self.repo.query_boom_products()
+        self.assertEqual([item["product_id"] for item in boom_res["data"]], ["TB-DEAL-1", "PDD-PLAIN-1"])
+        self.assertNotIn("deal_tip", boom_res["data"][0])
+        self.assertEqual(sorted(self.repo.get_categories()), ["家清", "食品"])
+
+        # 2. 详情反查返回脱敏后的 deal_tip 白名单，UTC 时间转为北京时间展示，内部源字段绝不外泄
+        detail = self.repo.get_product_detail("TB-DEAL-1", platform="taobao")
+        self.assertIsNotNone(detail["deal_tip"])
+        tip = detail["deal_tip"]
+        self.assertEqual(tip["publish_time"], "2026-11-12 17:04")
+        self.assertEqual(tip["deal_price"], 24.9)
+        self.assertEqual(tip["unit_deal_price"], "3.11元/斤")
+        self.assertEqual(len(tip["coupon_links"]), 1)
+        self.assertEqual(tip["coupon_links"][0]["platform"], "taobao")
+        self.assertEqual(len(tip["filler_links"]), 1)
+        self.assertEqual(tip["filler_links"][0]["official_price"], 9.9)
+        self.assertEqual(tip["share_images"], ["https://wx4.sinaimg.cn/mw600/a.jpg"])
+        for secret_key in ("quality_score", "source_site", "source_url", "my_promotion_link"):
+            self.assertNotIn(secret_key, tip)
+
+        # 3. 普通无爆料商品详情 deal_tip 为 None，且官方详情刷新写入不会破坏库中已有的 deal_info
+        plain_detail = self.repo.get_product_detail("PDD-PLAIN-1", platform="pdd")
+        self.assertIsNone(plain_detail["deal_tip"])
+
+        self.assertTrue(self.repo.upsert_product_detail({
+            "platform": "taobao", "goods_id": "TB-DEAL-1", "goods_sign": "SIGN-DEAL-1",
+            "name": "立白大师香氛洗衣液8斤", "price": 49.9, "desc": "官方刷新详情",
+        }))
+        after_refresh = self.repo.get_product_detail("TB-DEAL-1", platform="taobao")
+        self.assertEqual(after_refresh["desc"], "官方刷新详情")
+        self.assertEqual(after_refresh["deal_tip"]["deal_price"], 24.9)
 
 
 if __name__ == "__main__":

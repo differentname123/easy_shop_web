@@ -67,6 +67,69 @@
     });
     const realSpecs = computed(() => !goods.value || !Array.isArray(goods.value.specs) ? [] :
       goods.value.specs.filter(spec => spec && spec.label && spec.value));
+    const brokenDealImages = ref({});
+    const previewImageUrl = ref('');
+    const isCopywritingExpanded = ref(false);
+    const dealTip = computed(() => {
+      const tip = goods.value?.deal_tip;
+      return tip && typeof tip === 'object' ? tip : null;
+    });
+    const dealShareImages = computed(() => {
+      const list = dealTip.value?.share_images;
+      return Array.isArray(list) ? list.filter(u => typeof u === 'string' && u && !brokenDealImages.value[u]) : [];
+    });
+    const isLongCopywriting = computed(() => {
+      const text = dealTip.value?.original_copywriting || '';
+      return text.length > 140 || text.split('\n').length > 5;
+    });
+    const onDealImageError = url => {
+      if (url) brokenDealImages.value = { ...brokenDealImages.value, [url]: true };
+    };
+    const openImagePreview = url => {
+      if (url) previewImageUrl.value = url;
+    };
+    const closeImagePreview = () => {
+      previewImageUrl.value = '';
+    };
+    const toggleCopywritingExpand = () => {
+      isCopywritingExpanded.value = !isCopywritingExpanded.value;
+    };
+    const copyDealTutorial = () => {
+      const steps = dealTip.value?.tutorial_steps;
+      if (Array.isArray(steps) && steps.length) browser.copyText(steps.join('\n'), '购买教程已复制');
+    };
+    const copyDealCopywriting = () => {
+      const text = dealTip.value?.original_copywriting;
+      if (typeof text === 'string' && text.trim()) browser.copyText(text.trim(), '线报话术已复制');
+    };
+    const copyDealAuxItem = item => {
+      if (!item) return;
+      const token = typeof item.token === 'string' ? item.token.trim() : '';
+      const url = typeof item.url === 'string' ? item.url.trim() : '';
+      const content = token || url;
+      if (content) browser.copyText(content, token ? '口令已复制，请打开对应 App 使用' : '链接已复制');
+    };
+    const openDealAuxItem = item => {
+      if (!item) return;
+      const url = typeof item.url === 'string' ? item.url.trim() : '';
+      const token = typeof item.token === 'string' ? item.token.trim() : '';
+      if (!url && !token) return;
+      const pseudoInfo = { final_link: url, promotion_token: token };
+      if (!url || (browser.shouldBlockDirectJump && browser.shouldBlockDirectJump(pseudoInfo, url))) {
+        const content = token || url;
+        commandModal.value = {
+          visible: true,
+          text: content,
+          token,
+          link: url,
+          wechatGuide: Boolean(url),
+        };
+        browser.copyText(content, url ? `口令已复制，请打开${platformName.value} App 使用` : '口令已复制，请打开对应 App 使用');
+        return;
+      }
+      if (token) browser.copyText(token, '已复制口令，正在打开链接...');
+      browser.jumpToLink(pseudoInfo, url);
+    };
     const onCarouselScroll = () => {
       if (!carouselRef.value) return;
       const width = carouselRef.value.clientWidth || global.innerWidth;
@@ -137,11 +200,14 @@
         if (generation !== detailGeneration) return;
         if (ok && data.status === 'success' && data.data) {
           const detail = data.data;
+          brokenDealImages.value = {};
+          isCopywritingExpanded.value = false;
           goods.value = {
             ...(goods.value || {}), ...detail,
             carousel_images: (detail.carousel_images && detail.carousel_images.length) ? detail.carousel_images : (goods.value?.carousel_images || []),
             specs: detail.specs || goods.value?.specs,
             service_guarantees: detail.service_guarantees || goods.value?.service_guarantees,
+            deal_tip: detail.deal_tip !== undefined ? detail.deal_tip : (goods.value?.deal_tip || null),
           };
           syncDocumentTitle();
         } else {
@@ -367,6 +433,7 @@
     const dispose = () => {
       disposed = true;
       generatedCommand.value = '';
+      closeImagePreview();
       closeCommandModal();
       closeAuthModal();
       global.removeEventListener('focus', refreshAuthorization);
@@ -377,6 +444,9 @@
     };
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, realSpecs, isLoggedIn, uid,
+      dealTip, dealShareImages, previewImageUrl, isCopywritingExpanded, isLongCopywriting,
+      onDealImageError, openImagePreview, closeImagePreview, toggleCopywritingExpand,
+      copyDealTutorial, copyDealCopywriting, copyDealAuxItem, openDealAuxItem,
       isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
       onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,

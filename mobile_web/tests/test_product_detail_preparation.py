@@ -256,3 +256,37 @@ def test_provider_exception_releases_singleflight_for_next_attempt(prepared):
         service.get_goods_detail(platform="fixture", goods_sign="SIGN")
     assert service._flights == {}
     assert service.get_goods_detail(platform="fixture", goods_sign="SIGN")["status"] == "success"
+
+
+def test_deal_tip_survives_official_detail_refresh_and_cache_hits(prepared):
+    service, repo, adapter, _ = prepared
+    sample_tip = {
+        "publish_time": "2026-11-12 17:04",
+        "deal_price": 19.9,
+        "unit_deal_price": "2.48元/斤",
+        "price_logic": "百亿补贴叠加商品券",
+        "coupon_links": [],
+        "filler_links": [],
+        "tutorial_steps": ["1. 直接领券下单"],
+        "original_copywriting": "超值好价！",
+        "share_images": ["https://wx4.sinaimg.cn/mw600/demo.jpg"],
+    }
+    expired = DetailSnapshot(
+        ProductRef("fixture", "123", "SIGN"),
+        dict(data(price=29), deal_tip=sample_tip),
+        datetime.fromtimestamp(NOW - PRODUCT_DETAIL_TTL - 10, timezone.utc),
+    )
+    repo.add(expired)
+    adapter.get_goods_detail.return_value = {"status": "success", "data": data(price=25)}
+
+    refreshed = service.get_goods_detail(platform="fixture", goods_sign="SIGN")
+    assert refreshed["status"] == "success"
+    assert refreshed["data"]["price"] == 25
+    assert refreshed["data"]["deal_tip"] == sample_tip
+    assert repo.reads == 1
+
+    # Subsequent foreground hit comes directly from DETAIL_CACHE with deal_tip intact and zero DB reads
+    cached_hit = service.get_goods_detail(platform="fixture", goods_sign="SIGN")
+    assert cached_hit["data"]["deal_tip"] == sample_tip
+    assert repo.reads == 1
+

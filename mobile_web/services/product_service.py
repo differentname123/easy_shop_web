@@ -473,12 +473,15 @@ class ProductService:
                 self._flights.pop(key, None)
                 flight["event"].set()
 
-    def _load_official(self, ref, adapter, uid=None, kwargs=None, stop_event=None, refresh_ahead_seconds=0):
+    def _load_official(self, ref, adapter, uid=None, kwargs=None, stop_event=None, refresh_ahead_seconds=0, deal_tip=None):
         kwargs = kwargs or {}
         def load():
             cached = self._cached_detail(ref, uid)
             if cached and cached[0] - time.time() > refresh_ahead_seconds:
-                snapshot = self._make_snapshot(cached[1]["data"], datetime.fromtimestamp(cached[0] - PRODUCT_DETAIL_TTL, timezone.utc), ref.platform)
+                cached_data = dict(cached[1]["data"])
+                if isinstance(deal_tip, dict) and deal_tip and not cached_data.get("deal_tip"):
+                    cached_data["deal_tip"] = deepcopy(deal_tip)
+                snapshot = self._make_snapshot(cached_data, datetime.fromtimestamp(cached[0] - PRODUCT_DETAIL_TTL, timezone.utc), ref.platform)
                 return _LoadedDetail(cached[1], snapshot)
             if stop_event is not None and stop_event.is_set():
                 return _LoadedDetail({"status": "error", "error_code": "cancelled"})
@@ -489,8 +492,11 @@ class ProductService:
                 return _LoadedDetail(result, retryable=code in {"NETWORK_ERROR", "TIMEOUT", "RATE_LIMIT", "SERVICE_UNAVAILABLE"})
             if normalize_platform(result["data"].get("platform") or ref.platform) != ref.platform:
                 return _LoadedDetail({"status": "error", "error_msg": "商品返回平台不匹配", "error_code": "product_identity_mismatch"})
+            detail_payload = dict(result["data"])
+            if isinstance(deal_tip, dict) and deal_tip and not detail_payload.get("deal_tip"):
+                detail_payload["deal_tip"] = deepcopy(deal_tip)
             try:
-                snapshot = self._make_snapshot(result["data"], utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), ref.platform)
+                snapshot = self._make_snapshot(detail_payload, utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), ref.platform)
             except ValueError:
                 return _LoadedDetail({"status": "error", "error_code": "invalid_product_detail", "error_msg": "平台商品详情身份无效"})
             return self._commit_snapshot(snapshot, uid, result, stop_event)
@@ -518,7 +524,10 @@ class ProductService:
         if time.time() < deadline:
             result = self._database_detail(item, "database")
             return self._cache_detail(plat, result, deadline, uid)
-        loaded = self._load_official(ref, adapter, uid, kwargs)
+        loaded = self._load_official(
+            ref, adapter, uid, kwargs,
+            deal_tip=item.get("deal_tip") if isinstance(item, dict) else None,
+        )
         if loaded.public.get("status") != "success":
             goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign)
             reason = loaded.public.get("error_msg") or loaded.public.get("error_code") or "未知错误"
@@ -564,13 +573,18 @@ class ProductService:
                 if deadline - time.time() > refresh_ahead_seconds:
                     saved = self._document_snapshot(item, ref.platform)
                     return DetailPrefetchResult("ready", saved, next_check_at=deadline - refresh_ahead_seconds)
+                local_deal_tip = item.get("deal_tip") if isinstance(item, dict) else None
                 cached = self._cached_detail(ref)
                 if cached and cached[0] > deadline and cached[0] - time.time() > refresh_ahead_seconds:
-                    seed = self._make_snapshot(cached[1]["data"], datetime.fromtimestamp(cached[0] - PRODUCT_DETAIL_TTL, timezone.utc), ref.platform)
+                    seed_data = dict(cached[1]["data"])
+                    if isinstance(local_deal_tip, dict) and local_deal_tip and not seed_data.get("deal_tip"):
+                        seed_data["deal_tip"] = deepcopy(local_deal_tip)
+                    seed = self._make_snapshot(seed_data, datetime.fromtimestamp(cached[0] - PRODUCT_DETAIL_TTL, timezone.utc), ref.platform)
                     loaded = self._commit_snapshot(seed, stop_event=stop_event)
                 else:
                     loaded = self._load_official(ref, adapter, stop_event=stop_event,
-                                                 refresh_ahead_seconds=refresh_ahead_seconds)
+                                                 refresh_ahead_seconds=refresh_ahead_seconds,
+                                                 deal_tip=local_deal_tip)
         except Exception as exc:
             logger.warning(
                 "❌ 【详情预取异常】后台预取公开商品详情时发生异常 | 平台[%s] 异常<%s> 排查方向<请检查MongoDB连接或上游详情接口状态>",

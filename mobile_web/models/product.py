@@ -476,6 +476,7 @@ class ProductDetail(ProductSummary):
     shop_ratings: Dict[str, str] = Field(default_factory=dict)
     specs: List[Dict[str, str]] = Field(default_factory=list)
     coupon_info: Dict[str, Any] = Field(default_factory=dict)
+    deal_tip: Optional[Dict[str, Any]] = None
 
     def __init__(self, **data: Any):
         raw_tags = data.get("detail_tags")

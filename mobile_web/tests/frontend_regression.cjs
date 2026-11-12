@@ -2470,3 +2470,87 @@ test('group_help detail-first & 1-click join UX: hall card opens detail, WeChat 
   assert.equal(forbidden.test(htmlContent), false, 'group_help.html must remain 100% free of WeChat-sensitive words');
   assert.equal(forbidden.test(cssContent), false, 'group_help.css must remain 100% free of WeChat-sensitive words');
 });
+
+test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting copy, broken-image hiding, WeChat aux guard, and zero-impact ordinary goods', async () => {
+  // 1. 普通商品（无 deal_tip）：dealTip 为 null，零额外请求，保持原有详情体验
+  const hPlain = harness({ url: 'https://shop.test/detail?goods_id=PLAIN_1&platform=pdd', useRealVue: true });
+  hPlain.load('detail');
+  const initPlain = hPlain.mounted[0]();
+  await hPlain.finish(0, {
+    status: 'success',
+    data: { goods_id: 'PLAIN_1', platform: 'pdd', platform_name: '拼多多', name: '普通纸巾', price: 9.9, deal_tip: null },
+  });
+  await initPlain;
+  assert.equal(hPlain.page.dealTip.value, null);
+  assert.deepEqual([...hPlain.page.dealShareImages.value], []);
+  hPlain.page.dispose();
+
+  // 2. 含线报商品（微信内置浏览器打开淘宝线报商品）：展示线报详情、一键复制教程与话术、损坏外链图自动剔除、凑单链接微信内走口令引导且不发起二次转链
+  const hDeal = harness({ url: 'https://shop.test/detail?goods_sign=TB_DEAL_9&platform=taobao', useRealVue: true });
+  hDeal.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) MicroMessenger/8.0.50';
+  hDeal.load('detail');
+  const initDeal = hDeal.mounted[0]();
+  const sampleTip = {
+    publish_time: '2026-11-12 17:04',
+    deal_price: 24.9,
+    unit_deal_price: '3.11元/斤',
+    price_logic: '领15元券+拍凑单品满减后主商品约24.9元',
+    coupon_links: [{ label: '15元商品券', url: 'https://uland.taobao.com/coupon/edetail?e=1', token: '1$CPN123$://', platform: 'taobao' }],
+    filler_links: [{ label: '凑单棉签', url: 'https://s.click.taobao.com/filler1', token: '2$FIL456$://', platform: 'taobao', official_price: 9.9 }],
+    tutorial_steps: ['1. 先领15元商品券 1$CPN123$://', '2. 加购主商品和凑单棉签一起合并付款'],
+    original_copywriting: '立白大师香氛洗衣液8斤好价！香味高级留香久～\n赶紧锁单！',
+    share_images: ['https://wx4.sinaimg.cn/mw600/ok.jpg', 'https://wx4.sinaimg.cn/mw600/broken.jpg'],
+  };
+  await hDeal.finish(0, {
+    status: 'success',
+    data: {
+      goods_sign: 'TB_DEAL_9',
+      goods_id: 'TB_DEAL_9',
+      platform: 'taobao',
+      platform_name: '淘宝',
+      name: '立白大师香氛洗衣液8斤',
+      price: 49.9,
+      deal_tip: sampleTip,
+    },
+  });
+  await initDeal;
+
+  assert.equal(hDeal.page.dealTip.value.deal_price, 24.9);
+  assert.equal(hDeal.page.dealShareImages.value.length, 2);
+
+  // 外链防盗链/404 破图自动隐藏，不影响其余正常图片及大图预览
+  hDeal.page.onDealImageError('https://wx4.sinaimg.cn/mw600/broken.jpg');
+  assert.deepEqual([...hDeal.page.dealShareImages.value], ['https://wx4.sinaimg.cn/mw600/ok.jpg']);
+  hDeal.page.openImagePreview('https://wx4.sinaimg.cn/mw600/ok.jpg');
+  assert.equal(hDeal.page.previewImageUrl.value, 'https://wx4.sinaimg.cn/mw600/ok.jpg');
+  hDeal.page.closeImagePreview();
+  assert.equal(hDeal.page.previewImageUrl.value, '');
+
+  // 一键复制购买教程与原始线报话术
+  hDeal.page.copyDealTutorial();
+  await flush();
+  assert.equal(hDeal.copied.at(-1), sampleTip.tutorial_steps.join('\n'));
+  hDeal.page.copyDealCopywriting();
+  await flush();
+  assert.equal(hDeal.copied.at(-1), sampleTip.original_copywriting);
+
+  // 微信内点击淘宝凑单链接：拦截白屏直跳，复用口令弹窗并复制默认凑单淘口令，绝不发起任何额外后端转链请求
+  const reqCountBeforeAux = hDeal.requests.length;
+  hDeal.page.openDealAuxItem(sampleTip.filler_links[0]);
+  await flush();
+  assert.equal(hDeal.requests.length, reqCountBeforeAux, 'aux links use default cleaned links/tokens with zero extra API calls');
+  assert.equal(hDeal.page.commandModal.value.visible, true);
+  assert.equal(hDeal.page.commandModal.value.wechatGuide, true);
+  assert.equal(hDeal.copied.at(-1), '2$FIL456$://');
+
+  // 分享好价按钮保持原有精简文案，不拼接长篇线报教程
+  hDeal.page.handleShareDetail();
+  await flush();
+  assert.equal(hDeal.copied.at(-1).includes('合并付款'), false);
+  hDeal.page.dispose();
+
+  // 3. 模板守卫：统一条件渲染且外链图片声明 referrerpolicy="no-referrer"
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  assert.ok(detailHtml.includes('class="detail-card-section deal-tip-card" v-if="dealTip"'));
+  assert.ok(detailHtml.includes('referrerpolicy="no-referrer"'));
+});

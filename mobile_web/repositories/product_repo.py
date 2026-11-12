@@ -150,12 +150,18 @@ class ProductRepository(BaseRepository):
 
     @classmethod
     def _boom_content_filter(cls) -> Dict[str, Any]:
-        """爆单推广与类目聚合仅读取已入库的榜单商品，排除搜索/详情散查及缺少榜单频道标识的记录。"""
+        """爆单推广与类目聚合仅读取已入库的榜单商品或已清洗线报商品，排除搜索/详情散查裸记录。"""
         content_filter = deepcopy(cls._displayable_content_filter())
-        content_filter["channel_type"] = {"$exists": True, "$ne": None}
-        content_filter["$expr"]["$let"]["in"]["$and"].append(
-            {"$in": [{"$type": "$channel_type"}, ["int", "long"]]}
-        )
+        content_filter["$or"] = [
+            {"channel_type": {"$exists": True, "$ne": None}},
+            {"deal_info.is_deal_tip": True},
+        ]
+        content_filter["$expr"]["$let"]["in"]["$and"].append({
+            "$or": [
+                {"$in": [{"$type": "$channel_type"}, ["int", "long"]]},
+                {"$eq": ["$deal_info.is_deal_tip", True]},
+            ]
+        })
         return content_filter
 
     @staticmethod
@@ -727,6 +733,139 @@ class ProductRepository(BaseRepository):
             "updated_at": updated_at_str,
         }
 
+    @classmethod
+    def _extract_deal_tip(cls, doc: Dict[str, Any], fallback_time: str = "") -> Optional[Dict[str, Any]]:
+        """提取公开可展示的线报详情视图，严格过滤内部评分与爬虫源字段；非线报商品返回 None。"""
+        deal_info = doc.get("deal_info")
+        if not isinstance(deal_info, dict) or deal_info.get("is_deal_tip") is not True:
+            return None
+
+        tz_cn = datetime.timezone(datetime.timedelta(hours=8))
+        publish_time = ""
+        raw_pub = deal_info.get("publish_time")
+        if isinstance(raw_pub, datetime.datetime):
+            dt = raw_pub.astimezone(tz_cn) if raw_pub.tzinfo is not None else raw_pub
+            publish_time = dt.strftime("%Y-%m-%d %H:%M")
+        elif isinstance(raw_pub, str) and raw_pub.strip():
+            s = raw_pub.strip()
+            try:
+                dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(tz_cn)
+                publish_time = dt.strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                publish_time = s[:16].replace("T", " ") if len(s) >= 16 else s[:32]
+        if not publish_time:
+            publish_time = str(fallback_time or "").strip()
+
+        deal_price: Optional[float] = None
+        raw_dp = deal_info.get("deal_price")
+        if raw_dp is not None and not isinstance(raw_dp, bool):
+            try:
+                dp_val = cls._amount_float(raw_dp)
+                if math.isfinite(dp_val) and dp_val > 0:
+                    deal_price = round(dp_val, 2)
+            except (TypeError, ValueError, OverflowError):
+                deal_price = None
+
+        unit_deal_price = str(deal_info.get("unit_deal_price") or "").strip()
+        price_logic = str(deal_info.get("price_logic") or "").strip()
+
+        coupon_links: List[Dict[str, Any]] = []
+        raw_coupons = deal_info.get("coupon_links")
+        if isinstance(raw_coupons, list):
+            for entry in raw_coupons:
+                if not isinstance(entry, dict):
+                    continue
+                url = str(entry.get("url") or "").strip()
+                if url and not url.startswith(("http://", "https://")):
+                    url = ""
+                token = str(entry.get("token") or "").strip()
+                if not url and not token:
+                    continue
+                coupon_links.append({
+                    "label": str(entry.get("label") or "优惠券").strip() or "优惠券",
+                    "url": url,
+                    "token": token,
+                    "platform": cls._platform(entry.get("platform")) if entry.get("platform") else "",
+                })
+
+        filler_links: List[Dict[str, Any]] = []
+        raw_fillers = deal_info.get("filler_links")
+        if isinstance(raw_fillers, list):
+            for entry in raw_fillers:
+                if not isinstance(entry, dict):
+                    continue
+                url = str(entry.get("url") or "").strip()
+                if url and not url.startswith(("http://", "https://")):
+                    url = ""
+                token = str(entry.get("token") or "").strip()
+                if not url and not token:
+                    continue
+                f_price: Optional[float] = None
+                raw_fp = entry.get("official_price")
+                if raw_fp is not None and not isinstance(raw_fp, bool):
+                    try:
+                        fp_val = cls._amount_float(raw_fp)
+                        if math.isfinite(fp_val) and fp_val > 0:
+                            f_price = round(fp_val, 2)
+                    except (TypeError, ValueError, OverflowError):
+                        f_price = None
+                filler_links.append({
+                    "label": str(entry.get("label") or entry.get("official_title") or "凑单品").strip() or "凑单品",
+                    "url": url,
+                    "token": token,
+                    "platform": cls._platform(entry.get("platform")) if entry.get("platform") else "",
+                    "official_price": f_price,
+                })
+
+        tutorial_steps: List[str] = []
+        raw_steps = deal_info.get("tutorial_steps")
+        if isinstance(raw_steps, list):
+            for step in raw_steps:
+                text = str(step or "").strip()
+                if text:
+                    tutorial_steps.append(text)
+        if not tutorial_steps and isinstance(deal_info.get("tutorial_text"), str):
+            for line in deal_info["tutorial_text"].splitlines():
+                text = line.strip()
+                if text:
+                    tutorial_steps.append(text)
+
+        original_copywriting = str(deal_info.get("original_copywriting") or "").strip()
+
+        share_images: List[str] = []
+        raw_imgs = deal_info.get("user_share_images")
+        if isinstance(raw_imgs, list):
+            for img in raw_imgs:
+                u = str(img or "").strip()
+                if u.startswith(("http://", "https://")) and u not in share_images:
+                    share_images.append(u)
+
+        if not (
+            deal_price is not None
+            or unit_deal_price
+            or price_logic
+            or coupon_links
+            or filler_links
+            or tutorial_steps
+            or original_copywriting
+            or share_images
+        ):
+            return None
+
+        return {
+            "publish_time": publish_time,
+            "deal_price": deal_price,
+            "unit_deal_price": unit_deal_price,
+            "price_logic": price_logic,
+            "coupon_links": coupon_links,
+            "filler_links": filler_links,
+            "tutorial_steps": tutorial_steps,
+            "original_copywriting": original_copywriting,
+            "share_images": share_images,
+        }
+
     def _normalize_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:
         """返回存储的真实详情；未知商业字段保持空，不捏造优惠券/承诺/评分。"""
         result = self._normalize_doc_summary(doc)
@@ -759,6 +898,7 @@ class ProductRepository(BaseRepository):
             "specs": deepcopy(doc.get("specs") or []),
             "coupon_info": deepcopy(doc.get("coupon_info") or {}),
             "search_id": doc.get("search_id") or "",
+            "deal_tip": self._extract_deal_tip(doc, result["updated_at"]),
             # 不把摘要 updated_at 冒充详情抓取时间；服务层负责过期决策。
             "detail_updated_at": doc.get("detail_updated_at"),
         })
