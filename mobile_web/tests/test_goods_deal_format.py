@@ -84,6 +84,7 @@ class FakeMongoDB:
         self.collection = FakeCollection(docs)
         self.indexes = []
         self.last_query = None
+        self.last_projection = None
         self.last_limit = None
 
     def create_index(self, collection_name, keys, unique=False):
@@ -91,6 +92,7 @@ class FakeMongoDB:
 
     def find_many(self, collection_name, query=None, projection=None, sort=None, limit=0):
         self.last_query = query
+        self.last_projection = projection
         self.last_limit = limit
         items = copy.deepcopy(self.collection.docs)
         if limit and limit > 0:
@@ -136,6 +138,7 @@ def test_build_deal_prompt_text_reuses_base_prompt_without_mutating_file():
 def test_build_deal_product_desc_strips_urls_and_tokens():
     product = {
         "name": "【官方旗舰店】蓝月亮深层洁净洗衣液4kg套装",
+        "activity_price": 49.9,
         "deal_info": {
             "clean_title": "蓝月亮薰衣草洗衣液8斤套装",
             "price_logic": "领满99减30券 + 拍2件立减",
@@ -144,17 +147,22 @@ def test_build_deal_product_desc_strips_urls_and_tokens():
                 "1. 先领券 https://u.jd.com/abc123 （口令：￥88XYZ99￥） "
                 "2. 主商品拍 2 件 https://s.click.taobao.com/xyz (口令: $AAA111$) 实付60.8元起"
             ),
-            "original_copywriting": "群友爆料话术不混入结构化提取描述",
+            "original_copywriting": (
+                "群友爆料 蓝月亮8斤套装\n"
+                "https://m.tb.cn/h.xyz （口令：￥TK999￥） 拍2件实付60.8元"
+            ),
         },
     }
     desc = gif.build_deal_product_desc(product)
     assert "线报主商品：蓝月亮薰衣草洗衣液8斤套装" in desc
     assert "官方标题参考：【官方旗舰店】蓝月亮深层洁净洗衣液4kg套装" in desc
+    assert "官方日常价：49.9元" in desc
     assert "优惠方式：领满99减30券 + 拍2件立减" in desc
     assert "折算参考：折30.4元/套" in desc
+    assert "购买步骤：1. 先领券 2. 主商品拍 2 件 实付60.8元起" in desc
+    assert "原始爆料文案：群友爆料 蓝月亮8斤套装 拍2件实付60.8元" in desc
     assert "https://" not in desc
     assert "口令" not in desc
-    assert "群友爆料" not in desc
 
 
 def test_check_format_info_enforces_expected_deal_price():
@@ -199,6 +207,7 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
             "deal_price": 60.8,
             "price_logic": "拍2件叠券实付60.8元",
             "tutorial_text": "主商品拍2件共到手16斤，实付60.8元起",
+            "original_copywriting": "京东蓝月亮4kg套装 拍2件60.8元",
         },
     }
     doc_reformat_fail = {
@@ -237,6 +246,8 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
 
     def _fake_generate_content(prompt, **kwargs):
         assert "线报场景专属补充约束" in prompt
+        assert "官方日常价：49.9元" in prompt
+        assert "原始爆料文案：京东蓝月亮4kg套装 拍2件60.8元" in prompt
         # 只返回 p100_deal 成功，模拟 p200_deal 缺失失败
         payload = [_sample_valid_llm_item("p100_deal", price=60.8, total_value=8000, unit="ml")]
         return {
@@ -249,6 +260,8 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
     counts = gif.run_deal_format_round(manager)
 
     assert fake_db.last_limit == 0
+    assert fake_db.last_projection["activity_price"] == 1
+    assert fake_db.last_projection["deal_info.original_copywriting"] == 1
     assert gif.DEAL_FORMAT_WORKERS == 10
     assert counts["success"] == 1
     assert counts["normal_success"] == 1

@@ -47,15 +47,15 @@ _PLAIN_PRICE_TEXT_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 DEAL_SUPPLEMENT_RULES = """
 ---
 # 线报场景专属补充约束（最高优先级，若与上文冲突以本节为准）
-当前输入为经核验的【电商好价线报】，每个元素的 `product_desc` 包含“线报主商品标题、官方标题参考及线报购买方案”，`价格` 为已确认的数值型到手价：
-1. **价格直接采信（豁免浮动词归零）**：输入字段 `价格` 已是最终确定的有效成交金额（大于 0 的数字）。即使 `product_desc` 的线报说明中含有“起”、“预估”、“约”、“低至”、“折合”、“返卡/返红包后”或备选方案价格，**`price` 必须直接输出输入字段 `价格` 对应的浮点数，严禁因上述字样返回 0.0**。
-2. **主商品唯一隔离（防凑单/备选污染）**：线报说明中提及的“凑单商品”、“顺手买”、“同场好价备选”及其他辅助凑满减商品均不属于本次交付主体，**严禁混入 `core_entities`、`decision_keywords` 或 `pricing_basis`**；异品类的随单赠品（如买酵母送面粉、买年卡送实物）仅记入 `equivalent_description`，不计入主商品物理总量。
-3. **价格与交付数量的口径严格对齐（核心铁律）**：必须根据线报购买方案核对输入 `价格` 对应的是“多件实付总价”还是“折合单件价”：
-   - **多件总价口径**：若方案表明需拍 N 件或享同品买赠（如“拍2件共60.8元”、“买一送一共发24包实付80.24元”），或虽未直写具体拍下件数（注意：“满3件打9折”仅是活动门槛而非实际拍下数）但同时给出总实付 `价格` 与折算单件价且 `价格 ÷ 单件价 = N`（N≥2 整数，如总实付153元、折算单件25.5元即对应实际拍 6 件），则 `pricing_basis` **必须按最终实际到手的全部主商品总量（N 件或含同品买赠总数）连乘计算**。
-   - **单件折合价口径**：若方案虽要求“拍 N 件/拍 N 盒”，但明确指出输入 `价格` 已经是**折合单件/单盒的到手价**（如“拍3盒装，单盒到手价约59.5元”，输入 `价格` 为 59.5），则 `pricing_basis` **必须严格按 1 个购买单元内含的完整物理规格计算**（若该 1 件商品本身为多袋/多瓶组合装如 `200g4袋`，1 件即为 `4袋×200g=800g`；严禁将单件价与 N 件拍下数错配，也严禁漏算单件套装内含袋数）。
-4. **基础物理规格补全与防营销词误导**：
-   - 优先以“线报主商品标题”与“线报购买方案”为准；仅当线报省略了单件净含量/片数/容量且无冲突时，可继承“官方标题参考”中的单件基础物理规格，**严禁将官方标题中的多件促销门槛词（如 `【3件129】`、`【99选5】`）当作单件发货数量继承**；若标题出现总抽数与包数并列（如“便携纸巾200抽10包”且官方写明“20抽/包、200抽*1提”），须核实 `200抽` 是整提总抽数而非单包抽数，严禁盲目相乘放大。
-   - 同品类多规格组合装（如 `235ml*7瓶 + 950ml*2瓶`）无法用单一连乘表达时，直接求和输出单层总物理量（如 `[{"value": 3545, "unit": "ml"}]`，明细记入 `equivalent_description`），严禁丢弃其中一部分规格。
+当前输入为经核验的【电商好价线报】，`价格` 为已确认的成交到手价；`product_desc` 平铺提供了 `线报主商品`（本次锁定的目标主商品）、`原始爆料文案`（一手爆料原文）、`优惠方式/折算参考/购买步骤`（原文整理摘要，偶有漏抄或偏差）以及 `官方标题参考/官方日常价`（商品链接单件日常基准）：
+1. **价格直接采信**：输入字段 `价格` 已是最终确定的有效成交金额（大于 0 的数字）。无论文本中是否含“起、预估、约、低至、折合、返卡/返红包后”等字样，**`price` 必须直接输出输入字段 `价格` 对应的浮点数，严禁返回 0.0**。
+2. **主商品唯一隔离**：仅提取 `线报主商品` 指向的唯一主体；文本中的凑单品、顺手买、备选方案或同帖顺带提及的其他无关商品严禁混入任何输出字段；异品类的随单赠品仅记入 `equivalent_description`，不计入主商品物理总量。
+3. **价格与交付总量严格对齐**：结合 `原始爆料文案`、购买方案与 `官方日常价`，核实输入 `价格` 这一笔金额实际对应的是“多件实付总价”还是“折合单件价”：
+   - **多件总价口径**：若输入 `价格` 对应拍 N 件或同品买赠的实付总价（注意：“满3件打9折”、“买4免1”等活动门槛标签本身不等于实际拍下件数），`pricing_basis` 按该总价最终实际到手的全部主商品总量计算（若摘要标题中的数量已是拍 N 件后的汇总总数，勿再与 N 重复相乘）。
+   - **单件折合价口径**：若方案虽需拍 N 件凑单，但输入 `价格` 实为折合 1 件的到手单价，则 `pricing_basis` **严格按 1 个购买单元内含的完整物理规格计算**（若 1 件本身为多袋/多瓶组合装如 `200g*4袋`，1 件即为 `4袋×200g=800g`，严禁错乘拍下件数 N，也严禁漏算单件内含规格）。
+4. **真实物理规格核实**：
+   - 对照 `原始爆料文案` 核实该 `价格` 实际对应的主商品确定规格（修正摘要漏抄或误抄的外层规格）；仅当原文未写单件基础净含量/片数且无冲突时，从 `官方标题参考` 补全单件基础规格。**严禁将促销门槛词（如 `【3件129】`、`【99选5】`）或“最多/最高/至高”类不确定上限词计入 `structure`**。
+   - 同品类多规格组合装（如 `235ml*7瓶 + 950ml*2瓶`）无法用单一连乘表达时，直接求和输出单层总物理量（明细记入 `equivalent_description`），严禁丢弃其中一部分规格。
 """.strip()
 
 
@@ -681,36 +681,32 @@ def build_deal_prompt_text(base_prompt_text=None):
     return f"{base_prompt_text.rstrip()}\n\n{DEAL_SUPPLEMENT_RULES}"
 
 
+def _clean_deal_text(value):
+    text = _DEAL_URL_RE.sub("", str(value or ""))
+    text = _DEAL_TOKEN_RE.sub("", text)
+    return _MULTI_SPACE_RE.sub(" ", text).strip()
+
+
 def build_deal_product_desc(product):
-    """组装线报主商品标题、官方标题参考与去链接/口令后的纯文字购买方案。"""
+    """平铺组装线报商品已有文本信息与官方日常价（去链接与口令）。"""
     deal_info = product.get("deal_info") if isinstance(product.get("deal_info"), dict) else {}
-    clean_title = str(deal_info.get("clean_title") or "").strip()
-    official_name = str(product.get("name") or "").strip()
-    main_title = clean_title or official_name
-    if not main_title:
+    clean_title = _clean_deal_text(deal_info.get("clean_title"))
+    official_name = _clean_deal_text(product.get("name"))
+    if not clean_title and not official_name:
         return ""
 
-    parts = [f"线报主商品：{main_title}"]
-    if official_name and official_name != main_title:
-        parts.append(f"官方标题参考：{official_name}")
-
-    scheme_bits = []
-    price_logic = str(deal_info.get("price_logic") or "").strip()
-    unit_dp = str(deal_info.get("unit_deal_price") or "").strip()
-    tutorial = str(deal_info.get("tutorial_text") or "").strip()
-    if price_logic:
-        scheme_bits.append(f"优惠方式：{price_logic}")
-    if unit_dp:
-        scheme_bits.append(f"折算参考：{unit_dp}")
-    if tutorial:
-        t_clean = _DEAL_URL_RE.sub("", tutorial)
-        t_clean = _DEAL_TOKEN_RE.sub("", t_clean)
-        t_clean = _MULTI_SPACE_RE.sub(" ", t_clean).strip()
-        if t_clean:
-            scheme_bits.append(f"购买步骤：{t_clean[:500]}")
-    if scheme_bits:
-        parts.append("线报购买方案：" + "；".join(scheme_bits))
-    return " | ".join(parts)
+    act_p = product.get("activity_price")
+    act_str = f"{float(act_p):.2f}".rstrip("0").rstrip(".") + "元" if _is_positive_number(act_p) else ""
+    fields = [
+        ("线报主商品", clean_title or official_name),
+        ("官方标题参考", official_name),
+        ("官方日常价", act_str),
+        ("优惠方式", _clean_deal_text(deal_info.get("price_logic"))),
+        ("折算参考", _clean_deal_text(deal_info.get("unit_deal_price"))),
+        ("购买步骤", _clean_deal_text(deal_info.get("tutorial_text"))),
+        ("原始爆料文案", _clean_deal_text(deal_info.get("original_copywriting"))),
+    ]
+    return " | ".join(f"{label}：{val}" for label, val in fields if val)
 
 
 def _is_clean_string(value):
@@ -1464,12 +1460,14 @@ def run_deal_format_round(product_manager, limit=DEAL_FORMAT_ROUND_LIMIT):
             "platform": 1,
             "product_id": 1,
             "name": 1,
+            "activity_price": 1,
             "deal_info.is_deal_tip": 1,
             "deal_info.clean_title": 1,
             "deal_info.deal_price": 1,
             "deal_info.unit_deal_price": 1,
             "deal_info.price_logic": 1,
             "deal_info.tutorial_text": 1,
+            "deal_info.original_copywriting": 1,
             "deal_info.need_reformat": 1,
             "deal_info.format_deal_price": 1,
             "deal_info.format_clean_title": 1,
