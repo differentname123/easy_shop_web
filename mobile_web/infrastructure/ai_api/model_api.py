@@ -95,13 +95,31 @@ def get_runtime_file_path(filename, legacy_path=None):
 
 
 def save_json(json_path, data):
-    """原子写入 JSON 文件。"""
+    """多进程/多线程安全原子写入 JSON 文件（独立临时文件名 + Windows os.replace 短暂占用重试）。"""
     path = Path(json_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4, default=str)
-    os.replace(tmp_path, path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4, default=str)
+        last_err = None
+        for attempt in range(4):
+            try:
+                os.replace(tmp_path, path)
+                last_err = None
+                break
+            except PermissionError as exc:
+                last_err = exc
+                if attempt < 3:
+                    time.sleep(0.025 * (attempt + 1) + random.uniform(0.005, 0.02))
+        if last_err is not None:
+            raise last_err
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 class _WindowsSafeTimedRotatingFileHandler(TimedRotatingFileHandler):

@@ -1289,7 +1289,7 @@ def fetch_bacaoo_deals(
                     det_html = rd.text
                     m_h1 = re.search(r"<h1[^>]*>(.*?)</h1>|<title>(.*?)</title>", det_html, re.S | re.I)
                     if m_h1:
-                        raw_t = (m_h1.group(1) or m_h1.group(2) or "").split("_拔草哦")[0]
+                        raw_t = re.split(r"[_|\-]\s*拔草哦", (m_h1.group(1) or m_h1.group(2) or ""))[0]
                         title = re.sub(r"<[^>]+>", "", html_lib.unescape(raw_t)).strip() or title
 
                     m_time = re.search(r'<div[^>]*class=["\'][^"\']*p-time[^"\']*["\'][^>]*>(.*?)</div>', det_html, re.S | re.I)
@@ -1340,7 +1340,7 @@ def fetch_bacaoo_deals(
                                 "type": "bacaoo_subproduct_go",
                                 "platform": sub_plat,
                             }]
-                            sub_tut = f"【{title}】{sub_title} {sub_price_txt}\n直达链接: {target_u}".strip()
+                            sub_tut = f"{sub_title} {sub_price_txt}\n直达链接: {target_u}".strip()
                             sub_rec = build_deal_record(
                                 source_site="bacaoo",
                                 source_channel=f"{channel}_muster",

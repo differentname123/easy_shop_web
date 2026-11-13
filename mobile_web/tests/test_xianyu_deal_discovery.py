@@ -857,6 +857,323 @@ def test_xianyu_items_partial_cache_hit_and_expired_detail_refresh():
     assert audit["step3_detail_failed_count"] == 1
 
 
+def test_save_json_concurrent_unique_tmp_and_permission_retry():
+    """验证 save_json 使用进程+随机唯一临时文件并在 Windows PermissionError 时自动退避重试，不残留 .tmp 文件。"""
+    import concurrent.futures
+    import tempfile
+    from infrastructure.ai_api import model_api
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target = os.path.join(tmpdir, "api_keys_state.json")
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def _flaky_replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(5, "拒绝访问")
+            return real_replace(src, dst)
+
+        with patch.object(model_api.os, "replace", side_effect=_flaky_replace):
+            model_api.save_json(target, {"status": "ok", "count": 3})
+
+        assert calls["n"] == 3
+        with open(target, "r", encoding="utf-8") as f:
+            assert json.load(f) == {"status": "ok", "count": 3}
+        assert [x for x in os.listdir(tmpdir) if x.endswith(".tmp")] == []
+
+        # 多线程高频并发写同一路径不抛 FileNotFoundError / PermissionError
+        def _worker(tid: int):
+            for seq in range(15):
+                model_api.save_json(target, {"tid": tid, "seq": seq})
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            futs = [pool.submit(_worker, i) for i in range(6)]
+            for fut in futs:
+                fut.result()
+
+        with open(target, "r", encoding="utf-8") as f:
+            final_data = json.load(f)
+        assert "tid" in final_data and "seq" in final_data
+        assert [x for x in os.listdir(tmpdir) if x.endswith(".tmp")] == []
+
+
+def test_layer1_source_purification_and_cumulative_unit_dedup():
+    """验证第1层源头净化（幽灵品牌/商用大桶/试用小样/官价低销量剔除）与【共X盒】累计总量防翻倍修复。"""
+    ghost_doc = {
+        "name": "洗衣液大桶40斤酒店洗衣房专用持久留香实惠装",
+        "brand": "宝渍",
+        "sales_tip": "已拼5000+件",
+    }
+    assert sched._is_disqualified_source_candidate(ghost_doc, {}, sched.SOURCE_TYPE_OFFICIAL) is True
+
+    sample_doc = {
+        "name": "蓝月亮洗衣液旅行装试用装小样50g*2袋",
+        "brand": "蓝月亮",
+        "sales_tip": "已拼1万+件",
+    }
+    assert sched._is_disqualified_source_candidate(sample_doc, {}, sched.SOURCE_TYPE_DEAL_TIP) is True
+
+    low_sales_off_doc = {
+        "name": "维达超韧抽纸3层120抽24包整箱",
+        "brand": "维达",
+        "sales_tip": "已拼38件",
+    }
+    assert sched._is_disqualified_source_candidate(low_sales_off_doc, {}, sched.SOURCE_TYPE_OFFICIAL) is True
+
+    good_off_doc = {
+        "name": "维达超韧抽纸3层120抽24包整箱",
+        "brand": "维达",
+        "sales_tip": "已拼1.2万+件",
+    }
+    assert sched._is_disqualified_source_candidate(good_off_doc, {}, sched.SOURCE_TYPE_OFFICIAL) is False
+
+    # 验证「200ml*8盒*4箱共32盒」累计结构不会被二次连乘放大 4 倍（同时覆盖 total_value 25600 错算 + 标题 '共32盒' 双重纠偏）
+    liunainai_sku = {
+        "pricing_basis": {
+            "total_value": 25600,
+            "base_unit": "ml",
+            "structure": [
+                {"value": 4, "unit": "箱"},
+                {"value": 32, "unit": "盒"},
+                {"value": 200, "unit": "ml"},
+            ],
+        },
+        "decision_keywords": [],
+    }
+    base_u, units = sched._extract_raw_units(
+        liunainai_sku, context_text="隔壁刘奶奶水牛奶200ml*8盒*4箱共32盒学生早餐奶"
+    )
+    assert base_u == "ml"
+    assert units["箱"] == 4.0
+    assert units["盒"] == 32.0
+    assert units["ml"] == 6400.0
+
+    # 验证常规非累计每箱单数结构「4箱 * 8盒 * 200ml」依然正常连乘得 32 盒 / 6400ml
+    normal_sku = {
+        "pricing_basis": {
+            "total_value": 6400,
+            "base_unit": "ml",
+            "structure": [
+                {"value": 4, "unit": "箱"},
+                {"value": 8, "unit": "盒"},
+                {"value": 200, "unit": "ml"},
+            ],
+        },
+        "decision_keywords": [],
+    }
+    _, normal_units = sched._extract_raw_units(normal_sku, context_text="纯牛奶200ml*8盒*4箱整箱")
+    assert normal_units["箱"] == 4.0
+    assert normal_units["盒"] == 32.0
+    assert normal_units["ml"] == 6400.0
+
+
+def test_zero_brand_hit_short_circuit_skips_step2_llm_and_backup_search():
+    """验证主搜索返回 >=10 条泛化结果但 0 条包含候选品牌时：立即短路判定无可比，省去备用词搜索与 2 次初筛 AI，并记入零命中品牌集。"""
+    saved_brands = set(sched._SESSION_XIANYU_ZERO_BRANDS)
+    try:
+        sched._SESSION_XIANYU_ZERO_BRANDS.clear()
+        cand = _make_sample_champion(1)
+        cand["brand"] = "五缘湾"
+        cand["name"] = "五缘湾手抓饼原味家庭装20片1800g"
+        cand["search_keyword"] = "五缘湾 手抓饼 20片"
+        cand["backup_search_keyword"] = "五缘湾 手抓饼"
+
+        fuzzy_search_res = {
+            "ok": True,
+            "is_offline": False,
+            "is_risk_blocked": False,
+            "user_data_dir": r"W:\temp\xianyu_xiaohao",
+            "items": [
+                {
+                    "item_id": f"7700{i:02d}",
+                    "title": f"思念安井手抓饼原味家庭装20片_{i}",
+                    "price": 19.9,
+                    "want_cnt": 2,
+                    "is_free_shipping": True,
+                }
+                for i in range(12)
+            ],
+        }
+
+        with patch.object(sched, "search_xianyu_items", return_value=fuzzy_search_res) as mock_search, patch.object(
+            sched, "_filter_comparable_xianyu_items_by_llm"
+        ) as mock_step2_llm, patch.object(sched, "get_xianyu_item_details_batch") as mock_batch_det:
+            rec = sched.compare_candidate_with_xianyu(
+                candidate=cand,
+                search_user_data_dir=r"W:\temp\xianyu_xiaohao",
+                guest_user_data_dir=r"W:\temp\xianyu_guest",
+            )
+
+        assert mock_search.call_count == 1
+        assert mock_step2_llm.call_count == 0
+        assert mock_batch_det.call_count == 0
+        assert rec["final_winner"] == "no_comparable"
+        assert rec["xianyu_audit_trail"]["brand_zero_short_circuit"] is True
+        assert rec["xianyu_audit_trail"]["search_keyword"] == "五缘湾 手抓饼 20片"
+        assert rec["llm_raw_output"]["step3_comparison_llm"]["parsed_json"] is None
+        assert "五缘湾" in sched._SESSION_XIANYU_ZERO_BRANDS
+        assert (
+            sched._is_disqualified_source_candidate(
+                {"name": "五缘湾手抓饼葱香20片", "brand": "五缘湾", "sales_tip": "已拼2000+件"},
+                {},
+                sched.SOURCE_TYPE_OFFICIAL,
+            )
+            is True
+        )
+    finally:
+        sched._SESSION_XIANYU_ZERO_BRANDS.clear()
+        sched._SESSION_XIANYU_ZERO_BRANDS.update(saved_brands)
+
+
+def test_12h_search_keyword_cache_reuses_xianyu_items_without_browser_search():
+    """验证 12h 内同搜索词命中 xianyu_items 概览缓存时：0 次登录小号浏览器搜索请求，直接复用概览列表。"""
+    fake_items_col = _InMemoryXianyuItemsCol()
+    sched._ensure_xianyu_items_indexes(fake_items_col)
+    kw_idx = [
+        (keys, kw)
+        for keys, kw in fake_items_col.indexes
+        if keys == [("last_search_keyword", 1), ("search_updated_at", -1)]
+    ]
+    assert len(kw_idx) == 1
+
+    cand = _make_sample_champion(1)
+    seed_cards = [
+        {
+            "item_id": f"66000{i}",
+            "title": f"维达抽纸整箱24包缓存概览_{i}",
+            "price": 22.0 + i,
+            "want_cnt": 5,
+            "is_free_shipping": True,
+        }
+        for i in range(1, 8)
+    ]
+    saved_cnt = sched._save_xianyu_search_items(fake_items_col, seed_cards, keyword=cand["search_keyword"])
+    assert saved_cnt == 7
+
+    with patch.object(sched, "search_xianyu_items") as mock_search, patch.object(
+        sched, "_filter_comparable_xianyu_items_by_llm", return_value=([], {"model_used": "unit_test"}, "无同规格")
+    ) as mock_step2:
+        rec = sched.compare_candidate_with_xianyu(
+            candidate={**cand, "backup_search_keyword": ""},
+            search_user_data_dir=r"W:\temp\xianyu_xiaohao",
+            guest_user_data_dir=r"W:\temp\xianyu_guest",
+            items_col=fake_items_col,
+            search_cache_hours=12,
+        )
+
+    assert mock_search.call_count == 0
+    assert mock_step2.call_count == 1
+    assert rec["xianyu_audit_trail"]["search_cache_hit"] is True
+    assert rec["xianyu_audit_trail"]["raw_search_count"] == 7
+    assert rec["llm_raw_output"]["step3_comparison_llm"]["parsed_json"] is None
+
+
+def test_jit_interleaved_2_to_1_stops_remaining_stage1_ai_on_circuit_breaker():
+    """验证阶段 1 按需流式选品按 2:1（线报:官价）交替产出，且中途熔断时后续分类 0 次阶段 1 AI 调用。"""
+    deal_cats = [("线报分类A", [("d1", {}, 9.9)]), ("线报分类B", [("d2", {}, 9.9)]), ("线报分类C", [("d3", {}, 9.9)])]
+    off_cats = [("官价分类X", [("o1", {}, 19.9)]), ("官价分类Y", [("o2", {}, 19.9)])]
+
+    def _fake_scan(db, hours_window=72, max_categories=20, source_type=sched.SOURCE_TYPE_OFFICIAL):
+        return list(deal_cats) if source_type == sched.SOURCE_TYPE_DEAL_TIP else list(off_cats)
+
+    step1_calls = []
+
+    def _fake_step1(cat_name, raw_items, src_type):
+        step1_calls.append((src_type, cat_name))
+        champ = _make_sample_champion(len(step1_calls))
+        champ["source_type"] = src_type
+        champ["category_name"] = cat_name
+        return champ
+
+    # 子场景 1：正常完成时严格按 2:1 (线报A -> 线报B -> 官价X -> 线报C -> 官价Y) 顺序流式产出
+    with patch.object(sched, "_scan_sorted_categories_for_source", side_effect=_fake_scan), patch.object(
+        sched, "_evaluate_single_category_step1", side_effect=_fake_step1
+    ):
+        est_total, gen = sched._iter_jit_interleaved_champions(
+            db=MagicMock(),
+            hours_window=72,
+            deal_hours_window=48,
+            enable_official=True,
+            enable_deal_tip=True,
+            max_categories=10,
+            ratio=(2, 1),
+        )
+        assert est_total == 5
+        assert step1_calls == []  # 构造生成器时 0 次 AI 预跑
+        yielded = [c["category_name"] for c in gen]
+        assert yielded == ["线报分类A", "线报分类B", "官价分类X", "线报分类C", "官价分类Y"]
+
+    # 子场景 2：run_discovery_cycle 第 1 个分类触发风控熔断时，后续 4 个分类 0 次阶段 1 AI 调用、0 条脏数据入库
+    step1_calls.clear()
+    fake_db = MagicMock()
+    fake_col = MagicMock()
+    fake_db.get_collection.return_value = fake_col
+    blocked_res = {
+        "ok": False,
+        "is_offline": True,
+        "is_risk_blocked": True,
+        "error_code": "RISK_CONTROL_BLOCKED",
+        "user_data_dir": r"W:\temp\xianyu_xiaohao",
+        "items": [],
+        "message": "搜索触发滑块限流",
+    }
+
+    with patch.object(sched, "gen_db_object", return_value=fake_db), patch.object(
+        sched, "_scan_sorted_categories_for_source", side_effect=_fake_scan
+    ), patch.object(sched, "_evaluate_single_category_step1", side_effect=_fake_step1), patch.object(
+        sched, "search_xianyu_items", return_value=blocked_res
+    ) as mock_search:
+        recs = sched.run_discovery_cycle(
+            enable_deal_tip=True,
+            enable_official=True,
+            max_categories=10,
+            deal_to_official_ratio=(2, 1),
+            enable_pre_round_probe=False,
+        )
+
+    assert len(recs) == 1
+    assert mock_search.call_count == 1
+    assert fake_col.update_one.call_count == 0
+    assert step1_calls == [(sched.SOURCE_TYPE_DEAL_TIP, "线报分类A")]
+    assert sched._LAST_CYCLE_ABORTED_BY_RISK is True
+
+
+def test_ephemeral_h5_session_and_guest_risk_message():
+    """验证 get_xianyu_item_details_batch 默认走纯内存无痕会话，且访客限流提示不误导用户打开人工登录目录。"""
+    from contextlib import contextmanager
+
+    entered = {"ephemeral": 0, "persistent": 0}
+
+    @contextmanager
+    def _fake_ephemeral_guard(**kwargs):
+        entered["ephemeral"] += 1
+        raise pxy.XianyuOfflineError(
+            r"W:\temp\xianyu_guest",
+            "H5详情接口触发风控滑块验证: RGV587_ERROR::SM",
+            error_code="RISK_CONTROL_BLOCKED",
+        )
+        yield  # pragma: no cover
+
+    @contextmanager
+    def _fake_persistent_guard(**kwargs):
+        entered["persistent"] += 1
+        yield MagicMock(), MagicMock(), {"failed_apis": []}  # pragma: no cover
+
+    with patch.object(pxy, "_ephemeral_h5_session_guard", side_effect=_fake_ephemeral_guard), patch.object(
+        pxy, "_browser_session_guard", side_effect=_fake_persistent_guard
+    ):
+        res = pxy.get_xianyu_item_details_batch(["880001", "880002"])
+
+    assert entered["ephemeral"] == 1
+    assert entered["persistent"] == 0
+    assert res["ok"] is False
+    assert res["is_risk_blocked"] is True
+    assert res["is_offline"] is False
+    assert "open_browser_for_manual_use" not in res["message"]
+    assert "纯内存访客会话无需人工打开浏览器目录" in res["message"]
+
+
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")

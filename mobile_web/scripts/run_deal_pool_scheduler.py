@@ -38,13 +38,13 @@
          ② `"coupon_or_activity"`：纯优惠券、活动会场、补贴券链接（保留转链后的领券链接/口令或直达券链，绝不丢弃、绝不盲搜冒充单品）；
          ③ `"failed"`：死链、下架或纯数字无签名 ID。
      - 【Stage 4：AI 阶段二（底牌终审、教程重构与质量评分 `prompt/爆料阶段2_底牌终审与教程评分.txt`）-> 先落盘 `deal_raw_tips`】
-       * 将 `combined_raw_text`、`extracted_images` 与官方转链底牌 `converted_links` 一并交给 AI-2。
+       * 将 `combined_raw_text`、`draft_copywriting` 与官方转链底牌 `converted_links` 一并交给 AI-2（凑单辅助品在 Stage 3 自动跳过转链，仅作凑单动作定位）。
        * AI-2 铁面淘汰“主商品未转出单品仅凑单品存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”、“指鹿为马货不对板 (`PRODUCT_MISMATCH`)”、“虚拟垃圾 (`VIRTUAL_OR_JUNK`)”；
-       * 锁定唯一主商品 `main_link_id`（必须严格为 `convert_status == "product"` 且非凑单品），归位前置优惠券 `coupon_links` 与凑单品 `filler_links`，提取爆料到手价 `deal_price` / 折合单价 `unit_deal_price` / 凑单逻辑 `price_logic`，重构带 `[#L1]` 占位符的 `tutorial_steps` 与 `tutorial_summary`，并给出 0~100 分 `quality_score`。
-       * 代码将 `[#L1]` 精确替换为我方专属推广链接/口令后，**先将完整清洗结果与评分落盘回写至 `deal_raw_tips`**。
+       * 锁定唯一主商品 `main_link_id`（必须严格为 `convert_status == "product"`），归位前置优惠券 `coupon_links`，提取爆料到手价 `deal_price` / 折合单价 `unit_deal_price` / 凑单逻辑 `price_logic`，输出纯文字规范 `tutorial_steps`（绝不夹带链接口令、绝不丢凑单动作）与微整形后的原汁原味文案 `polished_copywriting`，并给出 0~100 分 `quality_score`。
+       * **先将完整清洗结果与评分落盘回写至 `deal_raw_tips`**。
      - 【Stage 5：高分优品晋升入正式商品库 `products`（Schema 严格隔离 + 高分防覆盖保护）】
        * 仅将 `is_valid_deal=True` 且 `quality_score >= 60` 的高分爆料晋升写入正式表 `products`。
-       * **顶层字段与 `deal_info` 严格隔离**：`products` 顶层字段（`name`, `price`, `original_price`, `activity_price`, `coupon_amount`, `image_url`, `mall_name`）**100% 保持官方接口真实原貌**，绝不用爆料价覆盖官方价格！爆料专属的 `deal_price`、`unit_deal_price`、`price_logic`、`coupon_links`、`filler_links`、`tutorial_steps`、`tutorial_text`、`user_share_images`、`quality_score`、`source_list_page_url`、`source_detail_url` 全部收纳于 `deal_info` 子文档中。
+       * **顶层字段与 `deal_info` 严格隔离**：`products` 顶层字段（`name`, `price`, `original_price`, `activity_price`, `coupon_amount`, `image_url`, `mall_name`）**100% 保持官方接口真实原貌**，绝不用爆料价覆盖官方价格！爆料专属的 `deal_price`、`unit_deal_price`、`price_logic`、`coupon_links`、`original_copywriting`、`tutorial_steps`、`tutorial_text`、`user_share_images`、`quality_score`、`source_list_page_url`、`source_detail_url` 全部收纳于 `deal_info` 子文档中。
        * **高分防覆盖保护**：当同一 `(platform, product_id)` 在 12 小时保鲜期内被多条线报命中时，仅当新线报 `quality_score >= 已有 deal_info.quality_score` 时才更新 `deal_info` 教程与价格，彻底杜绝简陋线报覆盖带券带晒单图的精品作业！
 
 一、【全链路可观测性与运维日志体系】
@@ -69,6 +69,7 @@ import signal
 import sys
 import threading
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import zip_longest
@@ -258,10 +259,10 @@ ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
         "绝不丢弃前置领券链接，也绝不对优惠券链接或会场多商品链接做模糊搜索冒充单品。"
     ),
     "principle_04_ai_stage2_audit_and_strict_schema_separation": (
-        "【Stage 4 & Stage 5：Stage 2 AI 底牌终审、评分防覆盖与 Schema 严格隔离】由 Stage 2 AI 结合官方真实商品详情与原始文案进行终审，"
-        "淘汰“主商品未转出单品仅凑单存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”及“货不对板 (`PRODUCT_MISMATCH`)”，生成步骤化教程并打分（0~100 `quality_score`）。"
+        "【Stage 4 & Stage 5：Stage 2 AI 底牌终审、评分防覆盖与极简四要素 Schema 隔离】由 Stage 2 AI 结合官方真实商品详情与原始文案进行终审，"
+        "淘汰“主商品未转出单品仅凑单存活 (`MAIN_PRODUCT_DEAD_ONLY_FILLER`)”及“货不对板 (`PRODUCT_MISMATCH`)”，生成纯文字规范教程、微整形原汁原味文案并打分（0~100 `quality_score`）。"
         "结果先持久化至 `deal_raw_tips`，再将 `quality_score >= 60` 的优品晋升入 `products`：`products` 顶层价格/标题 100% 保持官方原貌，"
-        "爆料价 `deal_price`、优惠券 `coupon_links`、凑单品 `filler_links`、教程与晒单图全部放入 `deal_info`，且高分爆料受保护不被低分简陋线报覆盖。"
+        "爆料价 `deal_price`、优惠券 `coupon_links`、原汁原味文案 `original_copywriting`、纯文字教程 `tutorial_steps` 与晒单图全部放入 `deal_info`（凑单品不转链、动作保留在文字教程中），且高分爆料受保护不被低分简陋线报覆盖。"
     ),
     "principle_05_parallel_producer_consumer_and_early_termination": (
         "【高吞吐架构：拉取/清洗双线程并行 + 转链并发化 + 唯一商品标识提前终止（Early Termination）】"
@@ -1085,12 +1086,28 @@ def detect_candidate_platform(raw_input: str, default_plat: str = "unknown") -> 
     return "unknown"
 
 
+_MATH_ALPHANUM_RE = re.compile(r"[\U0001D400-\U0001D7FF]+")
+
+
 def _normalize_inline_spaces(text: str) -> str:
-    """将不换行空格(\\u00a0)、全角空格(\\u3000)统一为普通空格，并剥离零宽字符，确保 AI-1 raw_span 与原文精确对齐。"""
+    """统一特殊空格、剥离零宽字符，并将倾斜/花体数学字母数字(U+1D400..U+1D7FF，如 𝟖𝟖𝒗𝒊𝒑)还原为标准 ASCII 字符。"""
     if not text:
         return ""
     s = str(text).replace("\u00a0", " ").replace("\u3000", " ")
-    return re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
+    if _MATH_ALPHANUM_RE.search(s):
+        s = _MATH_ALPHANUM_RE.sub(lambda m: unicodedata.normalize("NFKC", m.group(0)), s)
+    return s
+
+
+def _clean_coupon_label(label: str) -> str:
+    """清理优惠券按钮文案中的冗余『领券：/先领』前缀，避免与前端 [领券] 角标重复。"""
+    s = _normalize_inline_spaces(str(label or "")).strip()
+    s = re.sub(r"^(?:先领|点击领取|领取|领券|优惠券)\s*[:：]\s*", "", s).strip()
+    s = re.sub(r"^(?:先领|点击领取)(?=.{2,})", "", s).strip()
+    if not s or s in ("领券", "领", "券"):
+        return "优惠券"
+    return s
 
 
 def rebuild_clean_official_venue_url(raw_input: str) -> Optional[str]:
@@ -2184,27 +2201,50 @@ class DealPoolCleaner:
         }
 
     @staticmethod
-    def _inject_converted_links_into_text(text: str, link_map: Dict[str, Dict[str, Any]]) -> str:
-        """将教程文本中的 `[#L1]`、`[#L2]` 占位符精确替换为我方转链后的专属推广链接/口令，并清除任何未映射的残留占位符。"""
-        out = str(text or "")
-        for lid, cl in sorted(link_map.items(), key=lambda kv: len(kv[0]), reverse=True):
-            placeholder = f"[#{lid}]"
-            if placeholder not in out:
-                continue
-            p_url = str(cl.get("my_promo_link") or "").strip()
-            p_tok = str(cl.get("my_promo_token") or "").strip()
-            if p_url and p_tok and p_url != p_tok:
-                rep = f"{p_url} (口令: {p_tok})"
-            elif p_url:
-                rep = p_url
-            elif p_tok:
-                rep = p_tok
-            else:
-                rep = ""
-            out = out.replace(placeholder, rep)
-        # 清理任何未被映射或失效的残留 [#L...] 占位符，确保展示给用户的教程 100% 干净
+    def _sanitize_clean_tutorial_step(text: str) -> str:
+        """确保购买教程步骤为 100% 纯文字规范指引：剥离偶发残留的 [#L1] 占位符、裸网址与口令壳。"""
+        out = _normalize_inline_spaces(str(text or ""))
         out = re.sub(r"\s*\[#L\d+\]", "", out)
+        out = re.sub(r"[（(]\s*口令\s*[:：][^）)]*[）)]", "", out)
+        out = re.sub(r"(?:#小程序|mp)://\S+", "", out)
+        out = re.sub(r"https?://[^\s\u4e00-\u9fa5\"'<>）)\]]+", "", out)
+        out = re.sub(
+            r"(?<![A-Za-z0-9])(?:u\.jd\.com|3\.cn|m\.tb\.cn|s\.click\.taobao\.com|p\.pinduoduo\.com)/[A-Za-z0-9_.\-?=&/%]+",
+            "",
+            out,
+        )
+        out = re.sub(
+            r"(?i)\d{0,2}[ \t]*[￥¥$€£₴¢!！（(《「/]{1,2}[ \t]*[A-Za-z0-9]{8,16}[ \t]*[￥¥$€£₴¢!！）)》」/]{1,2}(?:[ \t]*:?/{1,2}(?:[ \t]*(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?|[ \t]+(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?",
+            "",
+            out,
+        )
+        out = re.sub(r"[ \t]{2,}", " ", out)
         return out.strip()
+
+    @staticmethod
+    def _sanitize_polished_copywriting(text: str) -> str:
+        """对 AI-2 微整形后的 `polished_copywriting` 执行确定性无链校验，杜绝偶发残留占位符或链接。"""
+        out = _normalize_inline_spaces(str(text or "")).strip()
+        if not out:
+            return ""
+        out = re.sub(r"【来源采集群:\s*(?:【[^】]*】)?[^】]*】\s*", "", out)
+        out = re.sub(r"【折淘客[^】]*】", "", out)
+        out = re.sub(r"【[^】]*拔草哦[^】]*】\s*", "", out)
+        out = re.sub(r"\s*\[#L\d+\]", "", out)
+        out = re.sub(r"(?:#小程序|mp)://\S+", "", out)
+        out = re.sub(r"https?://[^\s\u4e00-\u9fa5\"'<>）)\]]+", "", out)
+        out = re.sub(
+            r"(?<![A-Za-z0-9])(?:u\.jd\.com|3\.cn|m\.tb\.cn|s\.click\.taobao\.com|p\.pinduoduo\.com)/[A-Za-z0-9_.\-?=&/%]+",
+            "",
+            out,
+        )
+        out = re.sub(
+            r"(?i)\d{0,2}[ \t]*[￥¥$€£₴¢!！（(《「/]{1,2}[ \t]*[A-Za-z0-9]{8,16}[ \t]*[￥¥$€£₴¢!！）)》」/]{1,2}(?:[ \t]*:?/{1,2}(?:[ \t]*(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?|[ \t]+(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?",
+            "",
+            out,
+        )
+        kept_lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
+        return "\n".join(kept_lines).strip()
 
     @classmethod
     def _build_clean_original_copywriting(
@@ -2216,10 +2256,9 @@ class DealPoolCleaner:
         strip_spans: Optional[List[str]] = None,
     ) -> str:
         """
-        生成 100% 保留原博主“活人感话术”（原始用词、语气、Emoji、标点与换行排版）的纯净文案 `original_copywriting`：
-        - 仅剔除他人的推广链接、淘口令/京口令、加密商品 ID，以及我方爬虫内部附加的调试标签（如 `【来源采集群:...】`、`[教程图片:...]`）；
-        - 绝不注入我方推广链接/口令（我方推广链接单独存放在 `my_promotion_link` / `coupon_links` / `filler_links` / `tutorial_steps`）；
-        - 绝不篡改、缩写、去重或润色原博主的任何文字内容。
+        生成保留原博主“活人感话术”（原始用词、防屏蔽黑话、语气、Emoji、标点与换行排版）的纯净无链文案初稿：
+        - 仅剔除他人的推广链接、淘口令/京口令、加密商品 ID，以及采集源站拼接头（如 `【来源采集群:...】`、`【...拔草哦...】`）；
+        - 绝不注入我方推广链接/口令（我方推广链接单独存放在 `my_promotion_link` 与 `coupon_links`）。
         """
         ordered_docs: List[Dict[str, Any]] = []
         seen_ids: Set[str] = set()
@@ -2257,9 +2296,10 @@ class DealPoolCleaner:
         if not out:
             return ""
 
-        # 1. 仅剥离我方爬虫脚本内部拼接的伪标签（非原作者撰写内容），必须在剥离裸 URL 之前执行以免留下空括号壳子
+        # 1. 仅剥离爬虫/聚合源站内部拼接的伪标签（非原作者撰写内容），必须在剥离裸 URL 之前执行以免留下空括号壳子
         out = re.sub(r"【来源采集群:\s*(?:【[^】]*】)?[^】]*】\s*", "", out)
         out = re.sub(r"【折淘客[^】]*】", "", out)
+        out = re.sub(r"【[^】]*拔草哦[^】]*】\s*", "", out)
         out = re.sub(r"\[[^\]]*(?:图片|附图|晒单图|外链)\s*[:：]\s*https?://[^\]]*\]", "", out)
         out = re.sub(r"\[(?:群聊晒单/)?教程图片(?:\s*[:：][^\]]*)?\]", "", out)
         out = re.sub(r"\[口令\s*[:：][^\]]*\]", "", out)
@@ -2654,6 +2694,8 @@ class DealPoolCleaner:
             for tgt in (ai1_res.get("extracted_targets") or [])[:8]:
                 if not isinstance(tgt, dict):
                     continue
+                if str(tgt.get("text_role_hint") or "").strip() == "filler_candidate":
+                    continue
                 c_inp = self._strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
                 if not c_inp:
                     continue
@@ -2778,10 +2820,31 @@ class DealPoolCleaner:
 
             conv_list: List[Dict[str, Any]] = []
             attempt_errors: List[Dict[str, str]] = []
+            def_doc_plat = str(doc.get("platform") or "unknown")
             for tgt in targets[:8]:
                 if not isinstance(tgt, dict):
                     continue
-                c_res = self.convert_single_target(tgt, default_plat=str(doc.get("platform") or "unknown"))
+                if str(tgt.get("text_role_hint") or "").strip() == "filler_candidate":
+                    c_inp_f = self._strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
+                    hint_pf = str(tgt.get("platform") or def_doc_plat).strip().lower()
+                    conv_list.append({
+                        "link_id": str(tgt.get("link_id") or ""),
+                        "raw_span": str(tgt.get("raw_span") or ""),
+                        "clean_input": c_inp_f,
+                        "text_role_hint": "filler_candidate",
+                        "platform": detect_candidate_platform(c_inp_f, hint_pf if hint_pf in ("jd", "taobao", "pdd") else def_doc_plat),
+                        "convert_status": "skipped_filler",
+                        "error_code": "SKIPPED_FILLER_NO_CONVERT",
+                        "error_msg": "凑单辅助品按极简规范跳过转链",
+                        "goods_id": "",
+                        "goods_sign": "",
+                        "my_promo_link": "",
+                        "my_promo_token": "",
+                        "official_product": None,
+                        "adapter_res": None,
+                    })
+                    continue
+                c_res = self.convert_single_target(tgt, default_plat=def_doc_plat)
                 conv_list.append(c_res)
                 if c_res["convert_status"] == "failed":
                     attempt_errors.append({
@@ -2794,6 +2857,7 @@ class DealPoolCleaner:
             converted_by_tip_id[mid] = conv_list
             prod_convs = [c for c in conv_list if c["convert_status"] == "product"]
             coupon_convs = [c for c in conv_list if c["convert_status"] == "coupon_or_activity"]
+            has_skipped_filler = any(c.get("convert_status") == "skipped_filler" for c in conv_list)
 
             conv_summary_s3 = [
                 {k: v for k, v in c.items() if k != "adapter_res"}
@@ -2844,7 +2908,10 @@ class DealPoolCleaner:
                         }
                     continue
 
-                if coupon_convs and not attempt_errors:
+                if has_skipped_filler:
+                    primary_err_code = ERR_AI2_MAIN_DEAD_ONLY_FILLER
+                    primary_err_msg = "主商品未存活或仅含凑单辅助品，提前终止拦截"
+                elif coupon_convs and not attempt_errors:
                     primary_err_code = ERR_EMPTY_PRODUCT_IDENTITY
                     primary_err_msg = "仅包含优惠券或活动会场链接，无具体主商品"
                 else:
@@ -2996,6 +3063,7 @@ class DealPoolCleaner:
                     best_mid_by_pid[single_pid] = (r_score, mid)
 
         post_stage3_batch_early_count = 0
+        draft_copy_by_id: Dict[str, str] = {}
         for mid, doc, ai1_res, conv_list, single_pid, _r_score in post_stage3_candidates:
             site = str(doc.get("source_site") or "")
             channel = str(doc.get("source_channel") or "")
@@ -3048,6 +3116,19 @@ class DealPoolCleaner:
                 }
                 continue
 
+            merged_tids_for_copy = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
+            if mid not in merged_tids_for_copy:
+                merged_tids_for_copy.insert(0, mid)
+            tip_map_for_copy = neighbor_maps_by_id.get(mid) or {mid: doc}
+            draft_copywriting = self._build_clean_original_copywriting(
+                merged_tids_for_copy,
+                tip_map_for_copy,
+                ai1_res.get("extracted_targets") or [],
+                doc=doc,
+                strip_spans=ai1_res.get("strip_spans") or [],
+            )
+            draft_copy_by_id[mid] = draft_copywriting
+
             # 构造送往 Stage 4 (AI-2) 的精简底牌数据（隐去 raw_item、推广长链/口令及图片 URL 列表，压缩输入 Token 加速推理）
             ai2_conv_links = [
                 {
@@ -3064,6 +3145,7 @@ class DealPoolCleaner:
                 "source_site": site,
                 "is_group_stream": bool(doc.get("is_group_stream")),
                 "combined_raw_text": str(ai1_res.get("combined_raw_text") or ""),
+                "draft_copywriting": draft_copywriting,
                 "share_image_count": len(ai1_res.get("extracted_images") or []),
                 "converted_links": ai2_conv_links,
             })
@@ -3178,17 +3260,12 @@ class DealPoolCleaner:
             is_valid = bool(ai2_res.get("is_valid_deal"))
             main_lid = str(ai2_res.get("main_link_id") or "").strip()
             main_conv = link_map.get(main_lid)
-            declared_filler_ids = {
-                str(item.get("link_id") or "").strip()
-                for item in (ai2_res.get("filler_links") or [])
-                if isinstance(item, dict)
-            }
-            # 【严格遵循核心铁律】：主商品 main_link_id 必须指向真实存活的官方单品 ("product") 且绝不能位于凑单品列表内；
-            # 若主商品链接无效，严禁在代码中盲目拿 prod_convs[0] 凑单品顶替主商品，必须直接判为无效拦截！
+            # 【严格遵循核心铁律】：主商品 main_link_id 必须指向真实存活的官方单品 ("product") 且绝不能是凑单辅助品；
+            # 若主商品链接无效，严禁在代码中盲目拿凑单品顶替主商品，必须直接判为无效拦截！
             if is_valid and (
                 not main_conv
                 or main_conv.get("convert_status") != "product"
-                or main_lid in declared_filler_ids
+                or main_conv.get("text_role_hint") == "filler_candidate"
             ):
                 is_valid = False
                 if not ai2_res.get("reject_reason"):
@@ -3262,11 +3339,11 @@ class DealPoolCleaner:
                 except Exception:
                     pass
 
-            unit_deal_price = str(ai2_res.get("unit_deal_price") or "").strip() or None
-            price_logic = str(ai2_res.get("price_logic") or "").strip() or None
-            clean_title = str(ai2_res.get("clean_title") or product_card.get("name") or raw_title).strip()
+            unit_deal_price = _normalize_inline_spaces(str(ai2_res.get("unit_deal_price") or "")).strip() or None
+            price_logic = _normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None
+            clean_title = _normalize_inline_spaces(str(ai2_res.get("clean_title") or product_card.get("name") or raw_title)).strip()
 
-            # 组装前置优惠券列表 coupon_links 与凑单商品列表 filler_links（100% 遵循 AI-2 终审结论，严禁盲目追加 AI-2 已剔除的无关外链）
+            # 组装唯一辅助按钮组：前置优惠券列表 coupon_links（有券展示，无券为空列表，不保留任何凑单品链接）
             coupon_links: List[Dict[str, Any]] = []
             seen_cpn_ids: Set[str] = set()
             for item in ai2_res.get("coupon_links") or []:
@@ -3274,53 +3351,39 @@ class DealPoolCleaner:
                     continue
                 lid = str(item.get("link_id") or "").strip()
                 c_obj = link_map.get(lid)
-                if not c_obj or c_obj.get("convert_status") == "failed" or lid == main_lid or lid in seen_cpn_ids:
+                if (
+                    not c_obj
+                    or c_obj.get("convert_status") in ("failed", "skipped_filler")
+                    or lid == main_lid
+                    or lid in seen_cpn_ids
+                ):
+                    continue
+                c_url = str(c_obj.get("my_promo_link") or "").strip()
+                c_tok = str(c_obj.get("my_promo_token") or "").strip()
+                if not c_url and not c_tok:
                     continue
                 seen_cpn_ids.add(lid)
                 coupon_links.append({
                     "link_id": lid,
-                    "label": str(item.get("label") or "先领优惠券").strip(),
-                    "url": c_obj.get("my_promo_link") or "",
-                    "token": c_obj.get("my_promo_token") or "",
+                    "label": _clean_coupon_label(item.get("label") or item.get("coupon_desc") or "优惠券"),
+                    "url": c_url,
+                    "token": c_tok,
                     "platform": c_obj.get("platform") or plat,
                 })
 
-            filler_links: List[Dict[str, Any]] = []
-            seen_flr_ids: Set[str] = set()
-            for item in ai2_res.get("filler_links") or []:
-                if not isinstance(item, dict):
-                    continue
-                lid = str(item.get("link_id") or "").strip()
-                c_obj = link_map.get(lid)
-                if not c_obj or c_obj.get("convert_status") != "product" or lid == main_lid or lid in seen_flr_ids:
-                    continue
-                seen_flr_ids.add(lid)
-                off_p = c_obj.get("official_product") or {}
-                filler_links.append({
-                    "link_id": lid,
-                    "label": str(item.get("label") or f"凑单商品：{off_p.get('title', '')[:20]}").strip(),
-                    "url": c_obj.get("my_promo_link") or "",
-                    "token": c_obj.get("my_promo_token") or "",
-                    "platform": c_obj.get("platform") or plat,
-                    "goods_id": c_obj.get("goods_id") or "",
-                    "official_title": off_p.get("title") or "",
-                    "official_price": off_p.get("price"),
-                })
-
-            # 将 tutorial_steps 中的 [#L1] 占位符替换为我方推广链/口令，并由代码确定性拼接 tutorial_text
-            raw_steps = ai2_res.get("tutorial_steps") if isinstance(ai2_res.get("tutorial_steps"), list) else []
-            tutorial_steps = [
-                self._inject_converted_links_into_text(str(st).strip(), link_map)
-                for st in raw_steps
-                if str(st or "").strip()
-            ]
-            if tutorial_steps:
-                tutorial_text = "\n".join(tutorial_steps)
+            # 生成 100% 纯文字规范购买教程（剥离一切残留占位符、裸网址与口令壳）
+            raw_steps_val = ai2_res.get("tutorial_steps")
+            if isinstance(raw_steps_val, list):
+                raw_step_lines = [str(st or "") for st in raw_steps_val]
+            elif isinstance(raw_steps_val, str) and raw_steps_val.strip():
+                raw_step_lines = raw_steps_val.splitlines()
             else:
-                raw_summary = str(ai2_res.get("tutorial_summary") or "").strip()
-                tutorial_text = self._inject_converted_links_into_text(raw_summary, link_map) if raw_summary else ""
-                if tutorial_text:
-                    tutorial_steps = [ln.strip() for ln in tutorial_text.splitlines() if ln.strip()]
+                raw_step_lines = str(ai2_res.get("tutorial_summary") or "").splitlines()
+            tutorial_steps = [
+                s for s in (self._sanitize_clean_tutorial_step(st) for st in raw_step_lines)
+                if s
+            ]
+            tutorial_text = "\n".join(tutorial_steps)
 
             # 提取用户实付晒单图与教程图（排除与官方商品主图完全相同的 URL，并剥离偶发的 Markdown 链接包裹）
             official_img = str(product_card.get("image_url") or "").strip()
@@ -3346,8 +3409,11 @@ class DealPoolCleaner:
                 if u_det and u_det not in merged_source_urls:
                     merged_source_urls.append(u_det)
 
-            # 生成 100% 保留原博主“活人感话术”（Emoji、标点、情绪词、价格与排版一字不改）且仅纯净剔除别人链接/口令的原始文案
-            original_copywriting = self._build_clean_original_copywriting(
+            # 优先采用 AI-2 微整形断句后的原汁原味文案（经确定性无链消毒），若模型未返回则回退至 Python 去链初稿
+            raw_polished_copy = str(ai2_res.get("polished_copywriting") or "").strip()
+            original_copywriting = (
+                self._sanitize_polished_copywriting(raw_polished_copy) if raw_polished_copy else ""
+            ) or draft_copy_by_id.get(mid) or self._build_clean_original_copywriting(
                 merged_tip_ids,
                 tip_map,
                 ai1_res.get("extracted_targets") or [],
@@ -3366,7 +3432,6 @@ class DealPoolCleaner:
             saved_price = round(max(coupon_amount, max(0.0, original_price - official_activity_price)), 2)
 
             publish_time_str = str(doc.get("publish_time") or doc.get("fetched_at") or "").strip()
-            aux_list = [*coupon_links, *filler_links]
             deal_price_text = f"{deal_price}元" if deal_price is not None else (unit_deal_price or "")
 
             deal_info = {
@@ -3384,8 +3449,6 @@ class DealPoolCleaner:
                 "raw_tip_title": raw_title or str(product_card.get("name") or ""),
                 "original_copywriting": original_copywriting,
                 "coupon_links": coupon_links,
-                "filler_links": filler_links,
-                "auxiliary_links": aux_list,
                 "tutorial_steps": tutorial_steps,
                 "tutorial_text": tutorial_text,
                 "user_share_images": user_share_images,
@@ -3490,7 +3553,7 @@ class DealPoolCleaner:
                 "winning_anchor_type": main_conv.get("text_role_hint") or "main_candidate",
                 "candidate_count": len(conv_list),
                 "tutorial_img_count": len(user_share_images),
-                "aux_link_count": len(aux_list),
+                "coupon_link_count": len(coupon_links),
                 "elapsed_ms": avg_ms,
                 "product_doc": product_doc,
             })
@@ -4210,7 +4273,7 @@ def run_clean_stage(
     with_publish_time = sum(1 for d in success_product_docs if d["deal_info"].get("publish_time"))
     with_tutorial_text = sum(1 for d in success_product_docs if len(d["deal_info"].get("tutorial_text") or "") >= 10)
     with_proof_images = sum(1 for d in success_product_docs if d["deal_info"].get("user_share_images"))
-    with_aux_links = sum(1 for d in success_product_docs if d["deal_info"].get("auxiliary_links"))
+    with_coupon_links = sum(1 for d in success_product_docs if d["deal_info"].get("coupon_links"))
     with_deal_price = sum(1 for d in success_product_docs if d["deal_info"].get("deal_price") is not None)
     avg_quality_score = round(
         sum(int(d["deal_info"].get("quality_score") or 0) for d in success_product_docs) / max(1, resolved_cnt),
@@ -4256,8 +4319,8 @@ def run_clean_stage(
             "retained_tutorial_text_pct": round(with_tutorial_text / max(resolved_cnt, 1) * 100, 1) if resolved_cnt else 0.0,
             "retained_proof_or_guide_images_count": with_proof_images,
             "retained_proof_or_guide_images_pct": round(with_proof_images / max(resolved_cnt, 1) * 100, 1) if resolved_cnt else 0.0,
-            "retained_auxiliary_coupon_or_filler_links_count": with_aux_links,
-            "retained_auxiliary_coupon_or_filler_links_pct": round(with_aux_links / max(resolved_cnt, 1) * 100, 1) if resolved_cnt else 0.0,
+            "retained_coupon_links_count": with_coupon_links,
+            "retained_coupon_links_pct": round(with_coupon_links / max(resolved_cnt, 1) * 100, 1) if resolved_cnt else 0.0,
             "retained_deal_price_count": with_deal_price,
             "retained_deal_price_pct": round(with_deal_price / max(resolved_cnt, 1) * 100, 1) if resolved_cnt else 0.0,
         },
@@ -4343,7 +4406,7 @@ def run_clean_stage(
             f"重构教程={er['retained_tutorial_text_pct']}% | "
             f"爆料价={er['retained_deal_price_pct']}% | "
             f"晒单/步骤图={er['retained_proof_or_guide_images_pct']}%({er['retained_proof_or_guide_images_count']}条) | "
-            f"优惠券/凑单链={er['retained_auxiliary_coupon_or_filler_links_pct']}%({er['retained_auxiliary_coupon_or_filler_links_count']}条)"
+            f"附带优惠券链={er['retained_coupon_links_pct']}%({er['retained_coupon_links_count']}条)"
         ),
         f"│ • 全局拦截分布 : {top_global_errs}",
         "├" + "─" * 98 + "┤",

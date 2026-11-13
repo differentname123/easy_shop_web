@@ -996,40 +996,15 @@ class ProductRepository(BaseRepository):
                 token = str(entry.get("token") or "").strip()
                 if not url and not token:
                     continue
+                raw_lbl = str(entry.get("label") or "").strip()
+                raw_lbl = re.sub(r"^(?:先领|点击领取|领取|领券|优惠券)\s*[:：]\s*", "", raw_lbl).strip()
+                raw_lbl = re.sub(r"^(?:先领|点击领取)(?=.{2,})", "", raw_lbl).strip()
+                lbl = "优惠券" if (not raw_lbl or raw_lbl in ("领券", "领", "券")) else raw_lbl
                 coupon_links.append({
-                    "label": str(entry.get("label") or "优惠券").strip() or "优惠券",
+                    "label": lbl,
                     "url": url,
                     "token": token,
                     "platform": cls._platform(entry.get("platform")) if entry.get("platform") else "",
-                })
-
-        filler_links: List[Dict[str, Any]] = []
-        raw_fillers = deal_info.get("filler_links")
-        if isinstance(raw_fillers, list):
-            for entry in raw_fillers:
-                if not isinstance(entry, dict):
-                    continue
-                url = str(entry.get("url") or "").strip()
-                if url and not url.startswith(("http://", "https://")):
-                    url = ""
-                token = str(entry.get("token") or "").strip()
-                if not url and not token:
-                    continue
-                f_price: Optional[float] = None
-                raw_fp = entry.get("official_price")
-                if raw_fp is not None and not isinstance(raw_fp, bool):
-                    try:
-                        fp_val = cls._amount_float(raw_fp)
-                        if math.isfinite(fp_val) and fp_val > 0:
-                            f_price = round(fp_val, 2)
-                    except (TypeError, ValueError, OverflowError):
-                        f_price = None
-                filler_links.append({
-                    "label": str(entry.get("label") or entry.get("official_title") or "凑单品").strip() or "凑单品",
-                    "url": url,
-                    "token": token,
-                    "platform": cls._platform(entry.get("platform")) if entry.get("platform") else "",
-                    "official_price": f_price,
                 })
 
         tutorial_steps: List[str] = []
@@ -1062,7 +1037,6 @@ class ProductRepository(BaseRepository):
             or unit_deal_price
             or price_logic
             or coupon_links
-            or filler_links
             or tutorial_steps
             or original_copywriting
             or share_images
@@ -1075,7 +1049,6 @@ class ProductRepository(BaseRepository):
             "unit_deal_price": unit_deal_price,
             "price_logic": price_logic,
             "coupon_links": coupon_links,
-            "filler_links": filler_links,
             "tutorial_steps": tutorial_steps,
             "original_copywriting": original_copywriting,
             "share_images": share_images,

@@ -133,7 +133,7 @@ def test_build_deal_prompt_text_reuses_base_prompt_without_mutating_file():
     assert "DEAL_SUPPLEMENT_RULES" not in base_text
 
 
-def test_build_deal_product_desc_strips_urls_tokens_and_isolates_fillers():
+def test_build_deal_product_desc_strips_urls_and_tokens():
     product = {
         "name": "【官方旗舰店】蓝月亮深层洁净洗衣液4kg套装",
         "deal_info": {
@@ -144,8 +144,7 @@ def test_build_deal_product_desc_strips_urls_tokens_and_isolates_fillers():
                 "1. 先领券 https://u.jd.com/abc123 （口令：￥88XYZ99￥） "
                 "2. 主商品拍 2 件 https://s.click.taobao.com/xyz (口令: $AAA111$) 实付60.8元起"
             ),
-            "filler_links": [{"url": "https://u.jd.com/filler", "name": "得力垃圾袋凑单品"}],
-            "original_copywriting": "群友爆料废话与凑单垃圾袋链接",
+            "original_copywriting": "群友爆料话术不混入结构化提取描述",
         },
     }
     desc = gif.build_deal_product_desc(product)
@@ -155,7 +154,6 @@ def test_build_deal_product_desc_strips_urls_tokens_and_isolates_fillers():
     assert "折算参考：折30.4元/套" in desc
     assert "https://" not in desc
     assert "口令" not in desc
-    assert "得力垃圾袋" not in desc
     assert "群友爆料" not in desc
 
 

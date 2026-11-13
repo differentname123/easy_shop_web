@@ -433,11 +433,6 @@
       background: #fff1f0;
       border: 1px solid #ffa39e;
     }
-    .deal-aux-tag.filler {
-      color: #0958d9;
-      background: #e6f4ff;
-      border: 1px solid #91caff;
-    }
     .deal-aux-title {
       font-size: 12px;
       color: var(--text-main);
@@ -673,8 +668,8 @@
       <div class="deal-logic-text" v-if="dealTip.price_logic">💡 怎么买：{{ dealTip.price_logic }}</div>
     </div>
 
-    <div class="deal-aux-list" v-if="(dealTip.coupon_links && dealTip.coupon_links.length) || (dealTip.filler_links && dealTip.filler_links.length)">
-      <div class="deal-aux-row" v-for="(cItem, cIdx) in (dealTip.coupon_links || [])" :key="'cp_' + cIdx">
+    <div class="deal-aux-list" v-if="dealTip.coupon_links && dealTip.coupon_links.length">
+      <div class="deal-aux-row" v-for="(cItem, cIdx) in dealTip.coupon_links" :key="'cp_' + cIdx">
         <div class="deal-aux-left">
           <span class="deal-aux-tag coupon">领券</span>
           <span class="deal-aux-title">{{ cItem.label }}</span>
@@ -682,16 +677,6 @@
         <div class="deal-aux-actions">
           <button class="deal-mini-btn" v-if="cItem.token || cItem.url" @click="copyDealAuxItem(cItem)">{{ cItem.token ? '复制口令' : '复制链接' }}</button>
           <button class="deal-mini-btn primary" v-if="cItem.url" @click="openDealAuxItem(cItem)">打开 ›</button>
-        </div>
-      </div>
-      <div class="deal-aux-row" v-for="(fItem, fIdx) in (dealTip.filler_links || [])" :key="'fl_' + fIdx">
-        <div class="deal-aux-left">
-          <span class="deal-aux-tag filler">凑单</span>
-          <span class="deal-aux-title">{{ fItem.label }}<template v-if="fItem.official_price"> (¥{{ formatMoney(fItem.official_price) }})</template></span>
-        </div>
-        <div class="deal-aux-actions">
-          <button class="deal-mini-btn" v-if="fItem.token || fItem.url" @click="copyDealAuxItem(fItem)">{{ fItem.token ? '复制口令' : '复制链接' }}</button>
-          <button class="deal-mini-btn primary" v-if="fItem.url" @click="openDealAuxItem(fItem)">打开 ›</button>
         </div>
       </div>
     </div>

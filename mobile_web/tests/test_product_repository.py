@@ -1168,13 +1168,10 @@ class TestProductRepository(unittest.TestCase):
                 "price_logic": "领15元商品券+拍凑单品满200减30，主商品实付约24.9元",
                 "publish_time": "2026-11-12T09:04:25Z",
                 "coupon_links": [
-                    {"link_id": "L1", "label": "15元商品券", "url": "https://uland.taobao.com/coupon/1", "token": "1$AAA$://", "platform": "tb"},
+                    {"link_id": "L1", "label": "先领：15元商品券", "url": "https://uland.taobao.com/coupon/1", "token": "1$AAA$://", "platform": "tb"},
                     {"link_id": "BAD", "label": "空链接", "url": "", "token": ""},
                 ],
-                "filler_links": [
-                    {"link_id": "L2", "label": "凑单棉签", "url": "https://s.click.taobao.com/filler", "token": "2$BBB$://", "platform": "taobao", "official_price": 9.9},
-                ],
-                "tutorial_steps": ["1. 先领15元券 1$AAA$://", "2. 加购主商品与凑单品一起结算"],
+                "tutorial_steps": ["1. 先在上方【领券】处领取15元商品券", "2. 加购主商品并自行搭配凑单品满200减30合并结算"],
                 "original_copywriting": "立白香氛8斤好价！留香超久～\n赶紧锁单！",
                 "user_share_images": [
                     "https://wx4.sinaimg.cn/mw600/a.jpg",
@@ -1212,7 +1209,7 @@ class TestProductRepository(unittest.TestCase):
         self.assertNotIn("deal_tip", boom_res["data"][0])
         self.assertEqual(sorted(self.repo.get_categories()), ["家清", "食品"])
 
-        # 2. 详情反查返回脱敏后的 deal_tip 白名单，UTC 时间转为北京时间展示，内部源字段绝不外泄
+        # 2. 详情反查返回脱敏后的极简 deal_tip 白名单，UTC 时间转为北京时间展示，内部源字段与已废弃 filler_links 绝不外泄
         detail = self.repo.get_product_detail("TB-DEAL-1", platform="taobao")
         self.assertIsNotNone(detail["deal_tip"])
         tip = detail["deal_tip"]
@@ -1220,9 +1217,9 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(tip["deal_price"], 24.9)
         self.assertEqual(tip["unit_deal_price"], "3.11元/斤")
         self.assertEqual(len(tip["coupon_links"]), 1)
+        self.assertEqual(tip["coupon_links"][0]["label"], "15元商品券")
         self.assertEqual(tip["coupon_links"][0]["platform"], "taobao")
-        self.assertEqual(len(tip["filler_links"]), 1)
-        self.assertEqual(tip["filler_links"][0]["official_price"], 9.9)
+        self.assertNotIn("filler_links", tip)
         self.assertEqual(tip["share_images"], ["https://wx4.sinaimg.cn/mw600/a.jpg"])
         for secret_key in ("quality_score", "source_site", "source_url", "my_promotion_link"):
             self.assertNotIn(secret_key, tip)

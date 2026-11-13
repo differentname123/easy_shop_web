@@ -266,7 +266,6 @@ def test_deal_tip_survives_official_detail_refresh_and_cache_hits(prepared):
         "unit_deal_price": "2.48元/斤",
         "price_logic": "百亿补贴叠加商品券",
         "coupon_links": [],
-        "filler_links": [],
         "tutorial_steps": ["1. 直接领券下单"],
         "original_copywriting": "超值好价！",
         "share_images": ["https://wx4.sinaimg.cn/mw600/demo.jpg"],

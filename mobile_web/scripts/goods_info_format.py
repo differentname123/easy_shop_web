@@ -682,7 +682,7 @@ def build_deal_prompt_text(base_prompt_text=None):
 
 
 def build_deal_product_desc(product):
-    """组装线报主商品标题、官方标题参考与去链接/口令后的购买方案（严格隔离 filler_links）。"""
+    """组装线报主商品标题、官方标题参考与去链接/口令后的纯文字购买方案。"""
     deal_info = product.get("deal_info") if isinstance(product.get("deal_info"), dict) else {}
     clean_title = str(deal_info.get("clean_title") or "").strip()
     official_name = str(product.get("name") or "").strip()

@@ -140,19 +140,27 @@ def _build_offline_result(
     reason: str,
     action: str = "",
     error_code: str = "ACCOUNT_OFFLINE",
+    is_guest: bool = False,
 ) -> Dict[str, Any]:
-    """统一构造掉线或风控滑块中断返回结构，方便上层通过 `res['is_offline']` 立即停止重试。"""
+    """统一构造掉线或风控滑块中断返回结构，方便上层立即停止重试。"""
     is_risk = error_code == "RISK_CONTROL_BLOCKED"
+    if is_guest:
+        msg = (
+            f"H5免登录详情接口触发闲鱼限流保护 ({reason})，"
+            f"已立即中止本次拉取并进入静默冷却保护（纯内存访客会话无需人工打开浏览器目录）"
+        )
+    else:
+        msg = (
+            f"闲鱼账号{'触发风控滑块验证' if is_risk else '处于未登录或掉线状态'} ({reason})，"
+            f"请暂停自动重试并调用 open_browser_for_manual_use(r'{user_data_dir}') 人工处理"
+        )
     res: Dict[str, Any] = {
         "ok": False,
-        "is_offline": True,
+        "is_offline": False if is_guest else True,
         "is_risk_blocked": is_risk,
         "error_code": error_code,
         "user_data_dir": user_data_dir,
-        "message": (
-            f"闲鱼账号{'触发风控滑块验证' if is_risk else '处于未登录或掉线状态'} ({reason})，"
-            f"请暂停自动重试并调用 open_browser_for_manual_use(r'{user_data_dir}') 人工处理"
-        ),
+        "message": msg,
     }
     if action:
         res["action"] = action
@@ -618,6 +626,69 @@ def _browser_session_guard(
                 if context:
                     try:
                         context.close()
+                    except Exception:
+                        pass
+
+
+@contextmanager
+def _ephemeral_h5_session_guard(
+    lock_key_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
+    *,
+    task_name: str = "ephemeral_h5_task",
+    debug: bool = False,
+    lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+) -> Generator[Tuple[Any, Any, Dict[str, Any]], None, None]:
+    """
+    纯内存无痕移动端 H5 会话上下文（零持久化脏 Cookie 累积）：
+    - 仍通过 `lock_key_dir` 获取跨线程/跨进程串行锁，防止本机多进程并发挤压同一出口 IP；
+    - 使用 `p.chromium.launch(...)` + `browser.new_context(...)` 在内存中动态换取新鲜 `_m_h5_tk`，
+      绝不读写磁盘 `Cookies` 数据库，彻底根除跨轮次 `cna` / `x5secdata` 计数累积触发 `RGV587_ERROR`；
+    - 退出时自动销毁内存上下文与浏览器实例。
+    """
+    op_timeout_ms = int(max(10.0, float(operation_timeout_sec or DEFAULT_OPERATION_TIMEOUT_SEC)) * 1000)
+    use_headless = not bool(debug)
+    launch_args = ["--disable-blink-features=AutomationControlled"]
+    if use_headless:
+        launch_args.append("--headless=new")
+
+    with _acquire_serial_browser_lock(
+        user_data_dir=lock_key_dir,
+        task_name=task_name,
+        lock_timeout_sec=lock_timeout_sec,
+    ):
+        with sync_playwright() as p:
+            browser = None
+            context = None
+            try:
+                browser = p.chromium.launch(
+                    channel="chrome",
+                    headless=use_headless,
+                    args=launch_args,
+                    ignore_default_args=["--enable-automation"],
+                )
+                context = browser.new_context(
+                    viewport=dict(DEFAULT_MOBILE_H5_VIEWPORT),
+                    user_agent=DEFAULT_MOBILE_H5_USER_AGENT,
+                    is_mobile=True,
+                    has_touch=True,
+                )
+                context.set_default_timeout(op_timeout_ms)
+                context.set_default_navigation_timeout(op_timeout_ms)
+                page = context.new_page()
+                auth_tracker = _attach_auth_tracker(page)
+                if hasattr(context, "on") and callable(auth_tracker.get("_on_response_cb")):
+                    context.on("page", lambda new_p: new_p.on("response", auth_tracker["_on_response_cb"]))
+                yield context, page, auth_tracker
+            finally:
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                if browser:
+                    try:
+                        browser.close()
                     except Exception:
                         pass
 
@@ -2368,11 +2439,12 @@ def get_xianyu_item_details_batch(
     user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
     debug: bool = False,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    ephemeral: bool = True,
 ) -> Dict[str, Any]:
     """
-    通过闲鱼移动端 H5 公开分享页在单次浏览器会话内免登录批量获取多个商品详情（描述、多规格 SKU 价格、库存与运费）：
-    - 使用独立的免登录目录 `user_data_dir`（默认 `W:\\temp\\xianyu_guest`），完全不占用搜索小号请求配额；
-    - 自动识别风控拦截并立即熔断停手。
+    通过闲鱼移动端 H5 公开分享页免登录批量获取多个商品详情（描述、多规格 SKU 价格、库存与运费）：
+    - 默认采用纯内存无痕会话（`ephemeral=True`），以 `user_data_dir` 作为串行排队锁标识，绝不持久化累积访客 Cookie；
+    - 完全不占用搜索小号请求配额，自动识别风控拦截并立即熔断停手。
     """
     clean_ids: List[str] = []
     for raw_target in item_ids or []:
@@ -2383,18 +2455,28 @@ def get_xianyu_item_details_batch(
     if not clean_ids:
         return {"ok": True, "is_risk_blocked": False, "details_by_id": {}}
 
-    tag = _dir_tag(user_data_dir)
+    tag = f"ephemeral_h5({ _dir_tag(user_data_dir) })" if ephemeral else _dir_tag(user_data_dir)
     t0 = time.monotonic()
     details_by_id: Dict[str, Dict[str, Any]] = {}
-
-    try:
-        with _browser_session_guard(
+    session_cm = (
+        _ephemeral_h5_session_guard(
+            lock_key_dir=user_data_dir,
+            debug=debug,
+            task_name=f"get_xianyu_item_details_batch:{len(clean_ids)}items",
+            lock_timeout_sec=lock_timeout_sec,
+        )
+        if ephemeral
+        else _browser_session_guard(
             user_data_dir=user_data_dir,
             debug=debug,
             mobile_h5=True,
             task_name=f"get_xianyu_item_details_batch:{len(clean_ids)}items",
             lock_timeout_sec=lock_timeout_sec,
-        ) as (context, page, auth_tracker):
+        )
+    )
+
+    try:
+        with session_cm as (context, page, auth_tracker):
             detail_packets: List[Dict[str, Any]] = []
 
             def _on_response(resp):
@@ -2452,14 +2534,14 @@ def get_xianyu_item_details_batch(
                     )
                     details_by_id[item_id] = parsed_detail
                     logger.info(
-                        f"[H5免登录批量详情/{idx + 1}/{len(clean_ids)}] ✅ 目录={tag} | 商品ID={item_id} | "
+                        f"[H5免登录批量详情/{idx + 1}/{len(clean_ids)}] ✅ 会话={tag} | 商品ID={item_id} | "
                         f"售价=¥{parsed_detail['price']} | 运费=¥{parsed_detail['transport_fee']} | "
                         f"SKU数={len(parsed_detail['sku_list'])} | 耗时={time.monotonic() - t_item:.2f}s"
                     )
                 else:
                     diag_str = _format_failure_diag(context, page, auth_tracker, headless=not debug)
                     logger.warning(
-                        f"⚠️ [H5免登录批量详情/{idx + 1}/{len(clean_ids)}/失败] 目录={tag} | 商品ID={item_id} | "
+                        f"⚠️ [H5免登录批量详情/{idx + 1}/{len(clean_ids)}/失败] 会话={tag} | 商品ID={item_id} | "
                         f"已捕获包数={len(detail_packets)} | 耗时={time.monotonic() - t_item:.2f}s | 诊断=({diag_str})"
                     )
                     details_by_id[item_id] = {
@@ -2475,12 +2557,12 @@ def get_xianyu_item_details_batch(
                     }
 
                 if idx < len(clean_ids) - 1:
-                    page.wait_for_timeout(random.randint(600, 1000))
+                    page.wait_for_timeout(random.randint(2000, 3500))
 
             ok_cnt = sum(1 for v in details_by_id.values() if v.get("ok"))
             fail_cnt = len(clean_ids) - ok_cnt
             logger.info(
-                f"[H5免登录批量详情/完成] 📊 目录={tag} | 成功={ok_cnt}/{len(clean_ids)} (失败={fail_cnt}) | "
+                f"[H5免登录批量详情/完成] 📊 会话={tag} | 成功={ok_cnt}/{len(clean_ids)} (失败={fail_cnt}) | "
                 f"总耗时={time.monotonic() - t0:.2f}s"
             )
             return {
@@ -2492,7 +2574,13 @@ def get_xianyu_item_details_batch(
                 "details_by_id": details_by_id,
             }
     except XianyuOfflineError as e:
-        res = _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="get_xianyu_item_details_batch")
+        res = _build_offline_result(
+            user_data_dir,
+            e.reason,
+            error_code=e.error_code,
+            action="get_xianyu_item_details_batch",
+            is_guest=True,
+        )
         res["details_by_id"] = details_by_id
         return res
     except XianyuLockTimeoutError as e:

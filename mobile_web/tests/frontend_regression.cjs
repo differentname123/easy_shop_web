@@ -2495,9 +2495,8 @@ test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting cop
     deal_price: 24.9,
     unit_deal_price: '3.11元/斤',
     price_logic: '领15元券+拍凑单品满减后主商品约24.9元',
-    coupon_links: [{ label: '15元商品券', url: 'https://uland.taobao.com/coupon/edetail?e=1', token: '1$CPN123$://', platform: 'taobao' }],
-    filler_links: [{ label: '凑单棉签', url: 'https://s.click.taobao.com/filler1', token: '2$FIL456$://', platform: 'taobao', official_price: 9.9 }],
-    tutorial_steps: ['1. 先领15元商品券 1$CPN123$://', '2. 加购主商品和凑单棉签一起合并付款'],
+    coupon_links: [{ label: '15元商品券', url: 'https://uland.taobao.com/quan/detail?sellerId=1&activityId=2', token: '1$CPN123$://', platform: 'taobao' }],
+    tutorial_steps: ['1. 先在上方【领券】处领取15元商品券', '2. 加购主商品并自行搭配凑单品一起合并付款'],
     original_copywriting: '立白大师香氛洗衣液8斤好价！香味高级留香久～\n赶紧锁单！',
     share_images: ['https://wx4.sinaimg.cn/mw600/ok.jpg', 'https://wx4.sinaimg.cn/mw600/broken.jpg'],
   };
@@ -2534,14 +2533,14 @@ test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting cop
   await flush();
   assert.equal(hDeal.copied.at(-1), sampleTip.original_copywriting);
 
-  // 微信内点击淘宝凑单链接：拦截白屏直跳，复用口令弹窗并复制默认凑单淘口令，绝不发起任何额外后端转链请求
+  // 微信内点击淘宝领券链接：拦截白屏直跳，复用口令弹窗并复制领券淘口令，绝不发起任何额外后端转链请求
   const reqCountBeforeAux = hDeal.requests.length;
-  hDeal.page.openDealAuxItem(sampleTip.filler_links[0]);
+  hDeal.page.openDealAuxItem(sampleTip.coupon_links[0]);
   await flush();
   assert.equal(hDeal.requests.length, reqCountBeforeAux, 'aux links use default cleaned links/tokens with zero extra API calls');
   assert.equal(hDeal.page.commandModal.value.visible, true);
   assert.equal(hDeal.page.commandModal.value.wechatGuide, true);
-  assert.equal(hDeal.copied.at(-1), '2$FIL456$://');
+  assert.equal(hDeal.copied.at(-1), '1$CPN123$://');
 
   // 分享好价按钮保持原有精简文案，不拼接长篇线报教程
   hDeal.page.handleShareDetail();

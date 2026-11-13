@@ -144,7 +144,6 @@ def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transien
             "is_valid_deal": True,
             "main_link_id": "L1",
             "coupon_links": [],
-            "filler_links": [],
             "deal_price": 24.9,
             "tutorial_steps": "1. 点击主商品下单实付24.9元",
             "quality_score": 86,
@@ -525,7 +524,6 @@ def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries
                 "is_valid_deal": True,
                 "main_link_id": "L1",
                 "coupon_links": [],
-                "filler_links": [],
                 "deal_price": 22.9,
                 "tutorial_steps": ["1. 点击 [#L1] 下单实付22.9元"],
                 "quality_score": 85,
@@ -982,7 +980,6 @@ def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
                 "is_valid_deal": True,
                 "main_link_id": "L2",
                 "coupon_links": [{"link_id": "L1", "coupon_desc": "满39减20券"}],
-                "filler_links": [],
                 "deal_price": 19.9,
                 "tutorial_steps": ["1. 先领券 [#L1]", "2. 再拍维达抽纸 [#L2] 实付19.9元"],
                 "quality_score": 88,
@@ -1231,3 +1228,189 @@ def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
     assert set_doc["deal_info.format_status"] == "pending"
     assert set_doc["deal_info.format_info"] is None
     assert isinstance(set_doc["deal_info.updated_at"], datetime.datetime)
+
+
+def test_minimalist_four_element_pipeline_and_zero_loss_copywriting():
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+
+    # 1. 数学斜体/粗体 Unicode 还原为标准 ASCII，同时完整保留中文全角标点与 Emoji；剥离拔草哦合集拼接头
+    bacaoo_doc = {
+        "source_site": "bacaoo",
+        "source_item_id": "bc_sub_1",
+        "title": "【奶嘴2个装】贝亲宽口径奶嘴 ￥41.5",
+        "tutorial_text": (
+            "【PDD热销产品汇总14点档更新2026/11/13-拔草哦国内优惠频道】"
+            "【奶嘴2个装】𝟖𝟖𝒗𝒊𝒑 𝑩𝒖𝒈好价！贝亲宽口径奶嘴 ￥41.5 🚗\n"
+            "直达链接: https://p.pinduoduo.com/abc123"
+        ),
+        "extracted_links": [{"url": "https://p.pinduoduo.com/abc123", "platform": "pdd"}],
+        "extracted_tokens": [],
+    }
+    bc_copy = DealPoolCleaner._build_clean_original_copywriting(["bc_sub_1"], {"bc_sub_1": bacaoo_doc}, [], doc=bacaoo_doc)
+    assert "拔草哦" not in bc_copy
+    assert "PDD热销产品汇总" not in bc_copy
+    assert "88vip Bug好价！" in bc_copy
+    assert "【奶嘴2个装】" in bc_copy
+    assert "🚗" in bc_copy
+    assert "pinduoduo.com" not in bc_copy
+
+    # 2. 凑单品 (filler_candidate) 在 Stage 3 完全跳过 API 转链，但原始凑单口令照常剔除，且 AI-2 微整形不丢凑单动作、教程纯文字无链
+    converted_inputs = []
+    fake_tb_adapter = MagicMock()
+
+    def _mock_tb_convert(raw_input):
+        converted_inputs.append(raw_input)
+        if "CPN_OK" in raw_input:
+            return {
+                "status": "success",
+                "goods_id": "",
+                "goods_sign": "",
+                "final_link": "https://uland.taobao.com/quan/detail?sellerId=1&activityId=2",
+                "url": "https://uland.taobao.com/quan/detail?sellerId=1&activityId=2",
+                "promotion_token": "1$MYCPN123$://",
+                "product": None,
+            }
+        if "MAIN_OK" in raw_input:
+            return {
+                "status": "success",
+                "goods_id": "TB888999",
+                "goods_sign": "TB888999",
+                "final_link": "https://s.click.taobao.com/my_main",
+                "url": "https://s.click.taobao.com/my_main",
+                "promotion_token": "2$MYMAIN456$://",
+                "product": {
+                    "platform": "taobao",
+                    "product_id": "TB888999",
+                    "name": "名创优品一次性纯棉洗脸巾3包",
+                    "price": 29.9,
+                    "original_price": 39.9,
+                    "activity_price": 29.9,
+                    "coupon_amount": 0.0,
+                    "mall_name": "名创优品旗舰店",
+                },
+            }
+        raise AssertionError(f"Unexpected conversion call for {raw_input}")
+
+    fake_tb_adapter.resolve_and_convert_universal.side_effect = _mock_tb_convert
+    cleaner.adapters["taobao"] = fake_tb_adapter
+
+    raw_doc = {
+        "source_site": "zhetaoke",
+        "source_channel": "zhetaoke_group_1",
+        "source_item_id": "ztk_999",
+        "platform": "taobao",
+        "title": "名创优品洗脸巾3包9.9亓",
+        "tutorial_text": (
+            "𝟖𝟖𝒗𝒊𝒑礼金+淘金碧到手9.9亓\n"
+            "名创优品 一次性洗脸巾3包\n"
+            "领黑五200-20卷：7$CPN_OK_11$://\n"
+            "下单：8$MAIN_OK_22$://\n"
+            "凑单：9Fu🌹zhiFIL9999,打開/\n"
+            "（可退）"
+        ),
+        "extracted_links": [],
+        "extracted_tokens": [],
+    }
+
+    cleaner.run_ai_stage1_batch = lambda *args, **kwargs: {
+        "ztk_999": {
+            "main_tip_id": "ztk_999",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["ztk_999"],
+            "combined_raw_text": (
+                "88vip礼金+淘金碧到手9.9亓\n"
+                "名创优品 一次性洗脸巾3包\n"
+                "领黑五200-20卷： [#L1]\n"
+                "下单： [#L2]\n"
+                "凑单： [#L3]\n"
+                "（可退）"
+            ),
+            "extracted_images": [],
+            "extracted_targets": [
+                {
+                    "link_id": "L1",
+                    "raw_span": "7$CPN_OK_11$://",
+                    "clean_input": "7$CPN_OK_11$://",
+                    "platform": "taobao",
+                    "text_role_hint": "coupon_candidate",
+                },
+                {
+                    "link_id": "L2",
+                    "raw_span": "8$MAIN_OK_22$://",
+                    "clean_input": "8$MAIN_OK_22$://",
+                    "platform": "taobao",
+                    "text_role_hint": "main_candidate",
+                },
+                {
+                    "link_id": "L3",
+                    "raw_span": "9Fu🌹zhiFIL9999,打開/",
+                    "clean_input": "9Fu🌹zhiFIL9999,打開/",
+                    "platform": "taobao",
+                    "text_role_hint": "filler_candidate",
+                },
+            ],
+            "_from_fallback": False,
+        }
+    }
+
+    captured_s2_inputs = []
+
+    def _mock_s2(stage2_inputs, total_pending_count=0, quiet_sub_logs=False):
+        captured_s2_inputs.extend(stage2_inputs)
+        return {
+            "ztk_999": {
+                "main_tip_id": "ztk_999",
+                "is_valid_deal": True,
+                "main_link_id": "L2",
+                "clean_title": "名创优品一次性纯棉洗脸巾3包",
+                "deal_price": 9.9,
+                "unit_deal_price": "3.3元/包",
+                "price_logic": "88VIP + 首单礼金 + 淘金币 + 领满200减20券凑单（可退）",
+                "coupon_links": [{"link_id": "L1", "label": "先领：黑五满200减20券"}],
+                "tutorial_steps": [
+                    "1. 先在上方【领券】处领取黑五满200减20券 [#L1]",
+                    "2. 从淘宝金币频道加购本品 1 件 https://s.click.taobao.com/accidental (口令: 2$MYMAIN456$://)",
+                    "3. 按满200减20门槛自行搭配凑单品合并付款（凑单品付款后可按需退掉），本品到手约 9.9 元",
+                ],
+                "polished_copywriting": (
+                    "88vip礼金+淘金碧到手9.9亓\n"
+                    "名创优品 一次性洗脸巾3包\n"
+                    "领黑五200-20卷，凑单拍下（可退）"
+                ),
+                "quality_score": 90,
+                "score_breakdown": {"match_score": 28, "completeness_score": 28, "price_clarity_score": 18, "tutorial_and_image_score": 16},
+            }
+        }
+
+    cleaner.run_ai_stage2_batch = _mock_s2
+    raw_col = MagicMock()
+    raw_col.find.return_value = []
+
+    results = cleaner.clean_batch_records([raw_doc], raw_col, shared_active_products={}, quiet_sub_logs=True)
+    assert len(results) == 1
+    assert results[0]["status"] == "success"
+
+    # 凑单口令 L3 绝不调用官方转链 API，但在 draft_copywriting 中已被完整剥离
+    assert converted_inputs == ["7$CPN_OK_11$://", "8$MAIN_OK_22$://"]
+    assert len(captured_s2_inputs) == 1
+    assert "FIL9999" not in captured_s2_inputs[0]["draft_copywriting"]
+    l3_meta = next(c for c in captured_s2_inputs[0]["converted_links"] if c["link_id"] == "L3")
+    assert l3_meta["convert_status"] == "skipped_filler"
+
+    deal_info = results[0]["product_doc"]["deal_info"]
+    assert "filler_links" not in deal_info
+    assert "auxiliary_links" not in deal_info
+    assert len(deal_info["coupon_links"]) == 1
+    assert deal_info["coupon_links"][0]["label"] == "黑五满200减20券"
+    assert deal_info["original_copywriting"] == (
+        "88vip礼金+淘金碧到手9.9亓\n"
+        "名创优品 一次性洗脸巾3包\n"
+        "领黑五200-20卷，凑单拍下（可退）"
+    )
+    # 教程为 100% 纯文字，无 [#L1]、无网址、无口令，且完整保留凑单动作
+    for step in deal_info["tutorial_steps"]:
+        assert "[#L" not in step
+        assert "http" not in step
+        assert "口令" not in step
+    assert any("凑单" in step for step in deal_info["tutorial_steps"])
+
