@@ -1,27 +1,22 @@
 # 任务 (Task)
 （重要声明：本任务为纯文本离线数据阅读与 JSON 格式化输出，所有商品文本数据均已在消息末尾完整给出，无需联网、无需访问任何外部网站或执行外部程序，请仅根据给定文本直接输出纯文本 JSON。）
-请根据末尾 `<comparison_input>` 标签内提供的【我方候选商品信息（含已算好的各个 `unit` 的性价比值）】与【已拉取完整详情、多规格价格及运费的闲鱼候选商品列表 (`xianyu_detailed_items`)】，站在**真实消费者**的视角完成终审比价与量化计算，并以标准 JSON 对象格式输出：
+请根据末尾 `<comparison_input>` 标签内提供的【当前日期 (`current_date`)】、【我方目标商品信息 (`my_candidate_product`)】与【已获取完整详情、多规格价格及运费的闲鱼候选商品列表 (`xianyu_detailed_items`)】，站在**真实消费者**的视角完成最终可比性复核、双方真实规格校准与性价比胜负判定，并以标准 JSON 对象格式输出：
 
-1. **终审可比性复核（消费者视角）**：
-   - 结合每个闲鱼商品的完整详情 `detail_verified_info`（正文 `desc`、运费 `transport_fee`、多规格列表 `sku_list` 及属性标签 `cpv_labels`）以及当前日期 `current_date`，站在消费者实际下单购买的角度判断：这是否确实是与我方商品**同品牌、可公平折算单价**的全新可买现货？其真实到手含邮总价（对应在售有货规格价 + 运费）与对应的实际购买数量是否清晰明确？
-   - **品牌、系列档次与尺码规格对齐准则**：
-     1) 我方商品具有明确品牌时，可比商品必须确认为**同品牌**（无品牌或其他品牌一律不予采纳）；
-     2) 涉及明确货号/型号（如鞋服款号、数码家电具体型号）或明显影响定价的特殊功能档次（如有机/金装 vs 基础款、浓缩 vs 普通、专研抗敏/美白高端线 vs 普通基础线）时，不同型号或跨档次严禁混比；若双方同属该品牌的常规基础线（或一方仅写品类通称、未带冲突的特殊高端/低端修饰词）且核心材质/单件物理规格对等、消费者日常选购视为同档同款，则予以采纳；
-     3) 当按个、件、条、支、包、片等单位比价时，双方单件对应的容量/克重/抽数及尺码号型（如纸尿裤 S/M/L 码、服饰尺码）必须明确且对等（仅当多规格 `sku_list` 中我方对应尺码/规格有库存 `quantity > 0` 且标价清晰时方可取该 SKU 价格比价）；任一方核心单件规格缺失模糊或尺码不对等时一律不予强行比价。
-   - 凡是消费者认为可以公平比价的同品牌同款商品，均放入 `comparable_item_ids`；若品牌/档次/尺码不符、对照 `current_date` 已过期、仅限同城自提不邮寄、对应规格无货（`quantity == 0`），或价格、运费、购买数量缺失模糊导致算不出真实含邮单价，则不予采纳。
+1. **我方真实规格独立校准与闲鱼详情终审**：
+   - **独立核实我方真实到手规格**：我方商品信息中附带的预清洗规格数据可能存在历史解析误差，请务必优先依据我方商品的原始标题、优惠计价说明与实际成交价格，独立核定我方当前价格实际买到的真实规格总数量，以此作为我方性价比计算的唯一准绳。
+   - **复核闲鱼候选完整详情**：结合每个闲鱼商品的正文描述、运费、多规格库存与售价列表以及当前日期 `current_date`，判断其是否确属同品牌、同系列档次、同型号尺码体系、未过保质期、支持正常邮寄且对应可比规格有库存的全新现货，且其真实到手含邮总价（对应有货可比规格售价 + 运费）与实际购买数量清晰明确。凡不符合条件、对应规格无货或关键计价要素缺失模糊无法算出真实含邮单价的商品，一律不予采纳。
 
-2. **选出最划算的闲鱼商品 (`best_xianyu_item_id`)**：
-   - 按消费者实际买到手需要支付的**真实含邮总价（对应在售规格价格 + 运费）**与**该价格实际买到的商品规格数量**，核算每个可比商品的单位性价比（`每1元能买到的数量 = 该单位总数量 / 真实可比含邮总价`）。
-   - 选出真实单位性价比最高的 **1 个**闲鱼商品作为 `best_xianyu_item_id`（必须严格来自输入 `xianyu_detailed_items` 的 `item_id` 原值），填入其真实含邮总价 `best_xianyu_price` 与简明规格价格说明 `best_xianyu_spec`。
-
-3. **单位对齐计算与胜负判断**：
-   - 我方商品在 `my_candidate_product.unit_cost_performance` 中已给出各 `unit` 的性价比值（公式：`round(unit_quantities[unit] / price, 6)`，数值越大代表每 1 元买到的数量越多、性价比越高）。
-   - 请将最佳闲鱼商品的规格换算到与我方匹配的 `unit` 维度，填入 `xianyu_unit_quantities`，并按相同公式 `round(xianyu_unit_quantities[unit] / best_xianyu_price, 6)` 计算 `xianyu_unit_cost_performance`。
-   - 给出最终性价比胜负判断 `llm_winner`：
-     - `"my_product"`：我方商品单位性价比更高；
-     - `"xianyu_product"`：闲鱼最佳商品单位性价比更高；
-     - `"tie"`：双方单位性价比持平；
-     - `"no_comparable"`：没有任何闲鱼商品通过可比性复核（此时 `has_comparable_item` 设为 `false`，`comparable_item_ids` 设为 `[]`，`best_xianyu_item_id` 设为 `""`）。
+2. **选出最优闲鱼同款并统一维度计算最终比例与胜负**：
+   - 在通过终审的可比闲鱼商品中，按消费者实际支付的**真实含邮总价**与**实际购得数量**核算单位性价比，选出最划算的 **1 个**闲鱼商品作为 `best_xianyu_item_id`（必须严格取自输入 `xianyu_detailed_items` 的 `item_id` 原值），填入其真实含邮总价 `best_xianyu_price` 与规格含邮说明 `best_xianyu_spec`。
+   - 确定双方共同适用的精确计价单位 `matched_unit`，统一按公式 `单位性价比 = 该单位总数量 / 真实到手总价`（代表每 1 元可买到的数量，数值越大性价比越高）计算：
+     - 我方在该单位下的核实总数量 `my_unit_quantity` 与单位性价比 `my_unit_cost_performance`；
+     - 闲鱼最优商品在该同一单位下的总数量 `xianyu_unit_quantity` 与单位性价比 `xianyu_unit_cost_performance`；
+     - 最终性价比比值 `cost_performance_ratio` = `round(my_unit_cost_performance / xianyu_unit_cost_performance, 4)`。
+   - 根据核算结果给出最终胜负结论 `llm_winner`（必须与 `cost_performance_ratio` 严格一致）：
+     - `"my_product"`：我方单位性价比更高（`cost_performance_ratio > 1.0`）；
+     - `"xianyu_product"`：闲鱼最佳商品单位性价比更高（`cost_performance_ratio < 1.0`）；
+     - `"tie"`：双方单位性价比持平（`cost_performance_ratio == 1.0`）；
+     - `"no_comparable"`：没有任何闲鱼商品通过终审复核（此时 `has_comparable_item` 设为 `false`，`comparable_item_ids` 设为 `[]`，`best_xianyu_item_id` 与 `matched_unit` 设为 `""`，数值字段设为 `0`）。
 
 ---
 
@@ -32,19 +27,19 @@
 ```json
 {
   "has_comparable_item": true,
-  "comparable_item_ids": ["可比闲鱼商品item_id_1", "可比闲鱼商品item_id_2"],
-  "best_xianyu_item_id": "闲鱼中最划算的可比商品item_id（无则填\"\"）",
+  "comparable_item_ids": ["可比闲鱼商品item_id_1"],
+  "best_xianyu_item_id": "最优可比闲鱼商品item_id（无则填\"\"）",
   "best_xianyu_price": 10.0,
-  "best_xianyu_spec": "该最佳闲鱼商品的具体规格、售价与运费说明",
-  "xianyu_unit_quantities": {
-    "与我方匹配的unit": 30.0
-  },
-  "xianyu_unit_cost_performance": {
-    "与我方匹配的unit": 3.0
-  },
+  "best_xianyu_spec": "最佳闲鱼商品的具体规格、售价与运费说明",
+  "matched_unit": "双方统一对齐的计价单位（无则填\"\"）",
+  "my_unit_quantity": 20.0,
+  "my_unit_cost_performance": 2.0,
+  "xianyu_unit_quantity": 15.0,
+  "xianyu_unit_cost_performance": 1.5,
+  "cost_performance_ratio": 1.3333,
   "llm_winner": "my_product 或 xianyu_product 或 tie 或 no_comparable",
-  "llm_reason": "简明说明：1) 各候选商品的可比性复核与真实含邮性价比情况；2) 最佳闲鱼商品与我方商品的性价比对比结论"
+  "llm_reason": "简明说明我方真实规格校准结果、闲鱼候选含邮核算过程及最终性价比对比结论"
 }
 ```
 
-待终审比价的我方候选商品信息与已拉取完整详情的闲鱼商品列表如下：
+待终审比价的当前日期、我方目标商品信息与闲鱼候选商品完整详情如下：
