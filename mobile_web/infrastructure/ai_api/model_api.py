@@ -429,7 +429,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-aistudio-3.5-flash", "权重": 0, "备注": "来源aistudio_web"},
 
-    {"model_name": "gpt-5.6-terra-max", "权重": 2, "备注": "来源codex 免费"},
+    {"model_name": "gpt-6-codex-luna-max", "权重": 2, "备注": "来源codex 免费"},
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
