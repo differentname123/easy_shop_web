@@ -334,3 +334,39 @@ def test_sync_round_insert_merge_protect_cloud_fields_and_idempotency():
     assert r2["planned_sync_count"] == 0
     assert r2["written_ops"] == 0
     assert cloud_col.bulk_write_calls == writes_before
+
+
+def test_sync_detects_deal_info_updated_at_and_never_propagates_sku_info():
+    now = datetime.datetime(2026, 11, 13, 3, 0, 0, tzinfo=datetime.timezone.utc)
+    base_doc = {
+        "platform": "jd",
+        "product_id": "jd_deal_1",
+        "name": "清风抽纸24包",
+        "price": 39.9,
+        "activity_price": 29.9,
+        "updated_at": now - datetime.timedelta(hours=2),
+        "sku_info": [{"价格": "￥29.9"}],
+        "format_sku_prices": {"jd_deal_1_1": "￥29.9"},
+        "deal_info": {
+            "is_deal_tip": True,
+            "source_item_id": "xb_1",
+            "quality_score": 85,
+            "deal_price": 19.9,
+            "updated_at": now - datetime.timedelta(hours=2),
+            "format_status": "success",
+            "format_updated_at": now - datetime.timedelta(hours=2),
+        },
+    }
+    cloud_fp = sync_mod.extract_sync_fingerprint(base_doc)
+    refreshed_local = copy.deepcopy(base_doc)
+    refreshed_local["deal_info"]["updated_at"] = now
+    local_fp = sync_mod.extract_sync_fingerprint(refreshed_local)
+
+    should_merge, reason = sync_mod.needs_cloud_merge(local_fp, cloud_fp)
+    assert should_merge is True
+    assert reason == "deal_info_changed"
+
+    op = sync_mod.build_product_merge_operation(refreshed_local, cloud_fp)
+    assert "sku_info" not in op._doc["$set"]
+    assert "format_sku_prices" not in op._doc["$set"]
+

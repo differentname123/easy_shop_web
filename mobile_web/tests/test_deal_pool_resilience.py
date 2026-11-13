@@ -1096,4 +1096,138 @@ def test_warmup_anchor_cache_from_db_sorts_by_cleaned_at_desc():
     assert "jd:https://u.jd.com/cached_anchor_1" in cleaner.anchor_cache
 
 
+def test_link_admission_allowlist_and_parameter_allowlist_reconstruction():
+    from mobile_web.scripts.run_deal_pool_scheduler import rebuild_clean_official_venue_url
 
+    # 1. 4 类官方原生公共领券/会场页：仅保留白名单必要 ID 参数，一切外部追踪参数自动清空
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://coupon.m.jd.com/coupons/show.action?key=k123&roleId=r456&zdmcode=bad&utm_source=x&future_track=99"
+        )
+        == "https://coupon.m.jd.com/coupons/show.action?key=k123&roleId=r456"
+    )
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://uland.taobao.com/quan/detail?sellerId=2201&activityId=act88&pid=mm_99_88_77&relationId=123"
+        )
+        == "https://uland.taobao.com/quan/detail?sellerId=2201&activityId=act88"
+    )
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://pages.tmall.com/wow/a/act/tmall/dailygroup/23288/wupr?wh_pid=daily-544479&tkSid=abc&spm=a21"
+        )
+        == "https://pages.tmall.com/wow/a/act/tmall/dailygroup/23288/wupr?wh_pid=daily-544479"
+    )
+    assert (
+        rebuild_clean_official_venue_url("https://pro.m.jd.com/mall/active/2eh7EHb/index.html?union_lens=xxx")
+        == "https://pro.m.jd.com/mall/active/2eh7EHb/index.html"
+    )
+
+    # 2. 任何短链、加密分佣页或缺失必要参数的残缺链接一律返回 None
+    for rejected in (
+        "https://s.click.taobao.com/XNl8wji",
+        "https://m.tb.cn/h.jPi2tHp",
+        "https://u.jd.com/oaDAVcO",
+        "https://3.cn/3b-MaSLj",
+        "https://uland.taobao.com/coupon/edetail?e=encrypted_cps",
+        "https://uland.taobao.com/quan/detail?sellerId=2201",
+    ):
+        assert rebuild_clean_official_venue_url(rejected) is None
+
+    # 3. convert_single_target 契约：成功生成我方新短链则保留 OK_COUPON；转链失败或原样回吐他方短链一律淘汰
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    cleaner.adapters = {
+        "taobao": SimpleNamespace(resolve_and_convert_universal=lambda _x: {"status": "error", "error_msg": "不支持转链"}),
+        "jd": SimpleNamespace(
+            resolve_and_convert_universal=lambda _x: {
+                "status": "success",
+                "final_link": "https://u.jd.com/ogDTQlg",
+                "promotion_token": "！FBxJIEwx！ CA1393",
+            }
+        ),
+    }
+    bad_tb = cleaner.convert_single_target(
+        {"link_id": "L1", "clean_input": "https://s.click.taobao.com/XNl8wji", "platform": "taobao", "text_role_hint": "coupon_candidate"}
+    )
+    assert bad_tb["convert_status"] == "failed"
+    assert bad_tb["my_promo_link"] is None
+
+    own_jd = cleaner.convert_single_target(
+        {"link_id": "L2", "clean_input": "https://u.jd.com/oaDAVcO", "platform": "jd", "text_role_hint": "coupon_candidate"}
+    )
+    assert own_jd["convert_status"] == "coupon_or_activity"
+    assert own_jd["error_code"] == "OK_COUPON"
+    assert own_jd["my_promo_link"] == "https://u.jd.com/ogDTQlg"
+
+
+def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
+    import datetime
+    from mobile_web.scripts.run_deal_pool_scheduler import upsert_cleaned_products_to_formal_table
+
+    # 1. \u00a0 不换行空格归一化后，AI-1 提取的 raw_span 与 strip_spans 100% 命中抠除，正常型号与中文描述完好无损
+    doc = {
+        "source_item_id": "tip_nbsp",
+        "title": "好价牛奶",
+        "tutorial_text": (
+            "不到一块钱一盒的金典纯牛奶，型号 Wacom DTK168 同场好价\n"
+            "38￥\u00a0\u00a0pFTS6WMzTIi￥\n"
+            "7Fu🌹zhiHU7177,打開/\n"
+            "guangdiu.com/go.php?id=30504742"
+        ),
+    }
+    cleaned = DealPoolCleaner._build_clean_original_copywriting(
+        ["tip_nbsp"],
+        {"tip_nbsp": doc},
+        [
+            {"raw_span": "38￥  pFTS6WMzTIi￥", "clean_input": "38￥  pFTS6WMzTIi￥"},
+            {"raw_span": "7Fu🌹zhiHU7177,打開/", "clean_input": "HU7177"},
+        ],
+        doc=doc,
+        strip_spans=["guangdiu.com/go.php?id=30504742"],
+    )
+    assert "pFTS6WMzTIi" not in cleaned
+    assert "HU7177" not in cleaned
+    assert "guangdiu.com" not in cleaned
+    assert "不到一块钱一盒的金典纯牛奶，型号 Wacom DTK168 同场好价" in cleaned
+
+    # 2. 顶层 updated_at 刚被刷新但 deal_info.updated_at 已超 12h 时，允许新线报覆盖并重置 deal_info.format_*
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
+    stored_doc = {
+        "platform": "jd",
+        "product_id": "10001",
+        "updated_at": now - datetime.timedelta(minutes=1),
+        "deal_info": {
+            "is_deal_tip": True,
+            "quality_score": 92,
+            "deal_price": 32.9,
+            "updated_at": now - datetime.timedelta(hours=18),
+            "format_status": "success",
+            "format_info": {"sku_id": "10001_deal", "price": 32.9},
+        },
+    }
+    captured_ops = []
+    formal_col = MagicMock()
+    formal_col.find.return_value = [stored_doc]
+    formal_col.bulk_write.side_effect = lambda ops, ordered=False: (
+        captured_ops.extend(ops) or SimpleNamespace(upserted_count=0, modified_count=1, matched_count=1)
+    )
+
+    res = upsert_cleaned_products_to_formal_table(
+        formal_col,
+        [
+            {
+                "platform": "jd",
+                "product_id": "10001",
+                "name": "可口可乐24罐",
+                "price": 45.9,
+                "deal_info": {"is_deal_tip": True, "quality_score": 80, "deal_price": 26.8},
+            }
+        ],
+    )
+    assert res["protected_high_score"] == 0
+    set_doc = captured_ops[0]._doc["$set"]
+    assert set_doc["deal_info.deal_price"] == 26.8
+    assert set_doc["deal_info.need_reformat"] is True
+    assert set_doc["deal_info.format_status"] == "pending"
+    assert set_doc["deal_info.format_info"] is None
+    assert isinstance(set_doc["deal_info.updated_at"], datetime.datetime)

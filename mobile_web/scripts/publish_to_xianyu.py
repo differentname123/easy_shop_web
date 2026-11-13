@@ -315,7 +315,6 @@ def launch_persistent_context(
     args: Optional[List[str]] = None,
     hide_automation: bool = True,
     headless: bool = False,
-    offscreen: bool = False,
     mobile_h5: bool = False,
 ):
     """启动挂载独立浏览器目录的持久化 Chrome 上下文（支持桌面端 PC 模式与移动端 H5 免登录分享页模式）。"""
@@ -335,16 +334,11 @@ def launch_persistent_context(
         kwargs["user_agent"] = DEFAULT_MOBILE_H5_USER_AGENT
         kwargs["is_mobile"] = True
         kwargs["has_touch"] = True
-        if not headless and offscreen:
-            default_args.append("--window-position=-2000,0")
     elif headless:
         kwargs["viewport"] = dict(DEFAULT_HEADLESS_VIEWPORT)
         kwargs["user_agent"] = DEFAULT_DESKTOP_USER_AGENT
     else:
-        if offscreen:
-            default_args.append("--window-position=-2000,0")
-        else:
-            default_args.extend(["--start-maximized", "--window-position=0,0"])
+        default_args.extend(["--start-maximized", "--window-position=0,0"])
         kwargs["no_viewport"] = True
 
     if hide_automation:
@@ -611,7 +605,6 @@ def _browser_session_guard(
                     p,
                     user_data_dir=user_data_dir,
                     headless=use_headless,
-                    offscreen=False,
                     mobile_h5=mobile_h5,
                 )
                 context.set_default_timeout(op_timeout_ms)
@@ -648,7 +641,7 @@ def open_browser_for_manual_use(
             context = None
             try:
                 context = launch_persistent_context(
-                    p, user_data_dir=user_data_dir, headless=False, offscreen=False
+                    p, user_data_dir=user_data_dir, headless=False
                 )
                 page = context.pages[0] if context.pages else context.new_page()
                 page.bring_to_front()
@@ -1398,7 +1391,7 @@ def _extract_current_chat_detail(page, fallback_time: str = "") -> Dict[str, Any
     """
     提取当前打开的右侧聊天窗口详情：
     1. 提取对方脱敏昵称 `peer_masked_nick` 与唯一用户 ID `peer_user_id`；
-    2. 从 DOM 顶部商品栏兜底提取关联商品 `dom_item_id`、`dom_item_price`、`dom_item_url`；
+    2. 从 DOM 顶部商品栏兜底提取关联商品 `dom_item_id`、`dom_item_price`；
     3. 按视觉从上到下（即时间从早到晚）顺序提取每一条气泡消息，区分 `"peer"`（对方发来）与 `"me"`（我方发出）并关联时间戳。
     """
     detail = page.evaluate(
@@ -1900,7 +1893,7 @@ def reply_message(
 
 
 # ==============================================================================
-# 六、 公开市场比价检索（独立小号登录搜索概览 + 移动端 H5 免登录批量获取商品详情）
+# 七、 公开市场比价检索（独立小号登录搜索概览 + 移动端 H5 免登录批量获取商品详情）
 # ==============================================================================
 def _verify_guest_no_risk_block(
     page,

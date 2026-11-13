@@ -72,6 +72,8 @@ LATEST_SYNC_REPORT_PATH = LOG_DIR / "latest_cloud_sync_report.json"
 NEVER_OVERWRITE_FIELDS = frozenset({
     "_id",
     "created_at",
+    "sku_info",
+    "format_sku_prices",
     "default_promotion",
     "default_promotion_updated_at",
     "default_promotion_expires_at",
@@ -86,7 +88,6 @@ FORMAT_FAMILY_FIELDS = frozenset({
     "format_error",
     "format_retry_count",
     "format_activity_price",
-    "format_sku_prices",
     "need_reformat",
 })
 
@@ -142,6 +143,7 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "deal_info.source_item_id": 1,
     "deal_info.quality_score": 1,
     "deal_info.deal_price": 1,
+    "deal_info.updated_at": 1,
     "deal_info.format_status": 1,
     "deal_info.format_updated_at": 1,
 }
@@ -314,6 +316,7 @@ def build_recent_local_candidates_query(
             {"detail_updated_at": {"$gte": cutoff}},
             {"format_updated_at": {"$gte": cutoff}},
             {"deal_info.format_updated_at": {"$gte": cutoff}},
+            {"deal_info.updated_at": {"$gte": cutoff}},
         ]
     }
     return {"$and": [time_filter, ProductRepository._displayable_content_filter()]}
@@ -348,6 +351,7 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             str(deal_info.get("source_item_id") or ""),
             int(deal_info.get("quality_score") or 0),
             _number_or_none(deal_info.get("deal_price")),
+            to_utc_millis(deal_info.get("updated_at")),
             str(deal_info.get("format_status") or ""),
             to_utc_millis(deal_info.get("format_updated_at")),
         )

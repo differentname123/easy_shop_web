@@ -25,10 +25,11 @@
      3. 非淘/京/拼三大平台的外链（银行活动、美团、饿了么、滴滴、唯品会、抖音、小红书、微信公众号、网盘、B站等）。
    - **多链接/多口令强制独立拆分**：一句话内连续出现多个 URL 或多个口令时，必须拆分为多个独立的 `extracted_targets` 元素，按出现顺序编号 `"L1"`, `"L2"`, `"L3"`...
    - **字段精准定义**：
-     - `raw_span`：该链接或口令在 `content` 中出现的**精确原始子串**（包含口令自带的数字前缀和 `CZ4176/` 等后缀壳，例如 `"1(nGXV6XvBypV) CZ4176/"` 或 `"https://u.jd.com/aaa111"`；**严禁把周围的中文说明词如“先领券”、“拍1件”包含进 `raw_span`**）；
+     - `raw_span`：该链接或口令在 `content` 中出现的**精确原始子串**（包含口令自带的数字前缀、`Fu🌹zhi...打開/` 或 `复制...打开手淘` 等防屏蔽口令外壳及 `CZ4176/` 等后缀壳，例如 `"1(nGXV6XvBypV) CZ4176/"`、`"7Fu🌹zhiHU7177,打開/"` 或 `"https://u.jd.com/aaa111"`；**严禁把周围的教程步骤说明词如“先领券”、“拍1件”包含进 `raw_span`**）；
      - `clean_input`：剥离粘连汉字、HTML 标签及 `[...](...)` / `[口令:...]` 语法壳后的**纯净单个裸 URL 或单个完整口令**（如 `"https://u.jd.com/aaa111"` 或 `"1(nGXV6XvBypV) CZ4176/"`）；
      - `platform`：只能是 `"jd"`、`"taobao"` 或 `"pdd"`；
      - `text_role_hint`：只能是 `"coupon_candidate"`（领券/补贴/红包/礼金/会场）、`"main_candidate"`（主推商品）或 `"filler_candidate"`（凑单品/加购退单品）。
+   - **外部非转链跳转串标记 (`strip_spans`，可选数组)**：若 `content` 中含有未进入 `extracted_targets` 的线报源站跳转链接、外部导购短链或孤立残缺口令壳（如 `"guangdiu.com/go.php?id=123"`），将其精确原始子串放入 `"strip_spans": [...]`（无则省略或输出 `[]`），供下游从展示文案中一并剥离。
 
 ---
 
@@ -64,7 +65,8 @@
         "platform": "jd",
         "text_role_hint": "filler_candidate"
       }
-    ]
+    ],
+    "strip_spans": []
   }
 ]
 ```

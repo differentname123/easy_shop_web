@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-闲鱼高性价比商品探测与比价独立定时任务（精简稳定版 · 双通道物理隔离 + 三步 AI 严选含邮比价）
+r"""
+闲鱼高性价比商品探测与比价独立定时任务（精简稳定版 · 双通道物理隔离 + 闲鱼商品表7天缓存复用 + 三步 AI 严选含邮比价）
 ================================================================================
 核心设计（越简单越稳定）：
   1. 【双独立商品源过滤与分类（仅针对同类型尚未比价过的商品）】：
@@ -10,12 +10,14 @@
   2. 【AI 第 1 步：类内前 20 候选选出 1 个高性价比标品 + 生成搜索词】：
      - 计算各商品 `unit_cost_performance[u] = unit_quantity[u] / activity_price`，取前 20 候选交由第 1 个 AI；
      - 正式商品通过官方接口实时核验 `activity_price`；线报商品直接沿用 48h 内 `deal_price`。
-  3. 【AI 第 2 步：独立小号登录搜索概览 -> AI 初筛同款可比商品 ID】：
-     - 使用独立搜索小号目录（`W:\\temp\\xianyu_xiaohao`）执行关键字搜索（未登录或风控立即停手熔断，0 次无效重试）；
+  3. 【AI 第 2 步：独立小号登录搜索概览 -> 写入 `xianyu_items` -> AI 初筛同款可比商品 ID】：
+     - 使用独立搜索小号目录（`W:\temp\xianyu_xiaohao`）执行关键字搜索（未登录或风控立即停手熔断，0 次无效重试）；
+     - 每次搜索到的闲鱼商品概览按唯一标识 `item_id` 保存/更新到 `xianyu_items` 表（不覆盖已有详情）；
      - 交由第 2 个 AI 筛选同品牌同款/同系列的可比闲鱼商品 `comparable_item_ids`。
-  4. 【AI 第 3 步：移动端 H5 免登录批量拉取详情/多规格/运费 -> AI 终审含邮精准比价】：
-     - 使用免登录访客目录（`W:\\temp\\xianyu_guest`）通过移动端 H5 公开页批量获取完整描述、多规格真实售价与运费（零消耗小号配额）；
-     - 交由第 3 个 AI 基于含邮总价核算性价比，计算单位性价比比值并串行稳定入库。
+  4. 【AI 第 3 步：`xianyu_items` 7天详情缓存优先复用 + H5免登录按需补拉详情 -> AI 终审含邮精准比价】：
+     - 初筛同款先查 `xianyu_items` 表，若 7 天内已存有完整详情则直接复用（0 次详情页请求）；
+     - 仅对缺失或超 7 天过期的商品通过免登录访客目录（`W:\temp\xianyu_guest`）批量获取详情并回写 `xianyu_items`；
+     - 交由第 3 个 AI 基于含邮总价核算性价比，计算单位性价比比值并串行稳定入库 `xianyu_deal_evaluations`。
 ================================================================================
 """
 
@@ -632,8 +634,8 @@ def _evaluate_single_category_step1(
     dim_counts: Dict[str, Dict[str, int]] = {}
     parsed_entries = []
     for doc, sku_fmt, act_price in raw_items:
-        raw_base_unit, extracted_units = _extract_raw_units(sku_fmt)
-        parsed_entries.append((doc, sku_fmt, act_price, raw_base_unit, extracted_units))
+        _, extracted_units = _extract_raw_units(sku_fmt)
+        parsed_entries.append((doc, sku_fmt, act_price, extracted_units))
         for u in extracted_units:
             dim = UNIT_TO_CATEGORY.get(u)
             if dim:
@@ -645,7 +647,7 @@ def _evaluate_single_category_step1(
     cat_candidates: List[Dict[str, Any]] = []
     unit_groups: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
 
-    for idx, (doc, sku_fmt, act_price, raw_base_unit, extracted_units) in enumerate(parsed_entries):
+    for idx, (doc, sku_fmt, act_price, extracted_units) in enumerate(parsed_entries):
         unit_quantities: Dict[str, float] = {}
         for u, val in extracted_units.items():
             unit_quantities[u] = round(float(val), 4)
@@ -657,16 +659,10 @@ def _evaluate_single_category_step1(
                     unit_quantities[tgt_u] = round(conv_val, 4)
 
         unit_cp = _compute_unit_cp(unit_quantities, act_price)
-        dim = UNIT_TO_CATEGORY.get(raw_base_unit)
-        primary_unit = dim_target_unit[dim] if (dim and dim in dim_target_unit) else raw_base_unit
-        if primary_unit not in unit_cp:
-            primary_unit = next(iter(unit_cp.keys()), "件")
-
         cat_candidates.append({
             "doc": doc,
             "sku_fmt": sku_fmt,
             "db_activity_price": round(act_price, 2),
-            "primary_unit": primary_unit,
             "unit_quantities": unit_quantities,
             "unit_cost_performance": unit_cp,
         })
@@ -831,7 +827,6 @@ def select_verified_category_champions(
             "deal_info.price_logic": 1,
             "deal_info.quality_score": 1,
             "deal_info.publish_time": 1,
-            "deal_info.format_updated_at": 1,
         }
         raw_docs = [
             vdoc
@@ -1114,8 +1109,6 @@ def _save_xianyu_search_items(
             "item_id": iid,
             "item_url": item_url,
             "search_card": clean_card,
-            "last_search_title": clean_card["title"],
-            "last_search_price": clean_card["price"],
             "search_updated_at": now_utc,
             "search_updated_at_str": now_str,
             "updated_at": now_utc,
@@ -1133,6 +1126,8 @@ def _save_xianyu_search_items(
                         "created_at": now_utc,
                         "created_at_str": now_str,
                         "has_detail": False,
+                        "title": clean_card["title"],
+                        "price": clean_card["price"],
                     },
                 },
                 upsert=True,
@@ -1248,31 +1243,17 @@ def _save_xianyu_item_details(
         set_fields = {
             "item_id": iid,
             "item_url": item_url,
+            "title": clean_det["title"],
+            "price": clean_det["price"],
+            "transport_fee": clean_det["transport_fee"],
+            "is_free_shipping": clean_det["is_free_shipping"],
+            "has_multi_sku": clean_det["has_multi_sku"],
             "has_detail": True,
             "detail": clean_det,
             "detail_updated_at": now_utc,
             "detail_updated_at_str": now_str,
             "updated_at": now_utc,
             "updated_at_str": now_str,
-            "title": clean_det["title"],
-            "desc": clean_det["desc"],
-            "price": clean_det["price"],
-            "original_price": clean_det["original_price"],
-            "transport_fee": clean_det["transport_fee"],
-            "is_free_shipping": clean_det["is_free_shipping"],
-            "min_price": clean_det["min_price"],
-            "max_price": clean_det["max_price"],
-            "has_multi_sku": clean_det["has_multi_sku"],
-            "sku_list": clean_det["sku_list"],
-            "cpv_labels": clean_det["cpv_labels"],
-            "want_cnt": clean_det["want_cnt"],
-            "browse_cnt": clean_det["browse_cnt"],
-            "quantity": clean_det["quantity"],
-            "images": clean_det["images"],
-            "seller_nick": clean_det["seller_nick"],
-            "seller_city": clean_det["seller_city"],
-            "seller_sold_count": clean_det["seller_sold_count"],
-            "seller_good_rate": clean_det["seller_good_rate"],
         }
         ops.append(
             UpdateOne(
@@ -1739,7 +1720,7 @@ def _build_final_record(
     best_xianyu_product = {
         "item_id": best_xy_id,
         "item_url": f"https://www.goofish.com/item?id={best_xy_id}" if best_xy_id else "",
-        "title": str(llm_data.get("best_xianyu_title") or raw_xy_card.get("title") or ""),
+        "title": str(raw_xy_card.get("title") or ""),
         "display_price": raw_xy_card.get("display_price"),
         "comparable_price": best_xy_price,
         "transport_fee": best_det_info.get("transport_fee"),
@@ -1896,17 +1877,14 @@ def _build_verdict_summary(record: Dict[str, Any]) -> Tuple[str, str, str]:
 
 def _format_champions_summary_table(
     champions: List[Dict[str, Any]],
-    source_type: Optional[str] = None,
+    source_type: str = SOURCE_TYPE_OFFICIAL,
 ) -> str:
     sep = "-" * 136
-    if source_type:
-        src_note = (
-            "【线报爆料 / 48h保质期】直接采用线报 deal_price"
-            if _normalize_source_type(source_type) == SOURCE_TYPE_DEAL_TIP
-            else "【正式官价 / 72h保质期】已通过官方接口实时核验价格"
-        )
-    else:
-        src_note = "包含启用商品源的全部入选标品"
+    src_note = (
+        "【线报爆料 / 48h保质期】直接采用线报 deal_price"
+        if _normalize_source_type(source_type) == SOURCE_TYPE_DEAL_TIP
+        else "【正式官价 / 72h保质期】已通过官方接口实时核验价格"
+    )
     lines = [
         "",
         "=" * 136,

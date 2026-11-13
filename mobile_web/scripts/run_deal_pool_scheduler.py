@@ -74,7 +74,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import zip_longest
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from pymongo import UpdateOne
@@ -1085,28 +1085,72 @@ def detect_candidate_platform(raw_input: str, default_plat: str = "unknown") -> 
     return "unknown"
 
 
+def _normalize_inline_spaces(text: str) -> str:
+    """将不换行空格(\\u00a0)、全角空格(\\u3000)统一为普通空格，并剥离零宽字符，确保 AI-1 raw_span 与原文精确对齐。"""
+    if not text:
+        return ""
+    s = str(text).replace("\u00a0", " ").replace("\u3000", " ")
+    return re.sub(r"[\u200b\u200c\u200d\ufeff]", "", s)
+
+
+def rebuild_clean_official_venue_url(raw_input: str) -> Optional[str]:
+    """
+    【唯一例外辅通道：官方原生公共领券/会场页 · 路径白名单 + 参数白名单重组】
+    仅允许以下 4 类平台原生公共领券/活动页，且仅提取页面打开必需的官方参数重组为纯净 HTTPS URL（其余一切外部参数 100% 丢弃）：
+      1. `coupon.m.jd.com/coupons/show.action` -> 仅保留 `key`, `roleId`, `linkKey`（须含 `linkKey` 或同时含 `key`+`roleId`）
+      2. `uland.taobao.com/quan/detail` -> 仅保留 `sellerId`, `activityId`（两者须同时存在；绝不放行 `/coupon/edetail` 或 `pid`）
+      3. `pages.tmall.com/wow/...` 及 `pages-fast.m.taobao.com/wow/...` -> 仅保留路径与 `wh_pid`
+      4. `pro.m.jd.com/mall/active/...` -> 仅保留路径本身（清空全部 query 参数）
+    其余任何链接（含一切第三方跳转短链、未知域名）一律返回 None。
+    """
+    raw = str(raw_input or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        parts = urlsplit(raw)
+    except Exception:
+        return None
+    host = (parts.hostname or "").strip().lower()
+    path = parts.path or ""
+    if not host or not path:
+        return None
+
+    def _pick_allowed_params(canonical_map: Dict[str, str]) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
+        kept_list: List[Tuple[str, str]] = []
+        found: Dict[str, str] = {}
+        for k, v in parse_qsl(parts.query, keep_blank_values=False):
+            canon = canonical_map.get(k.strip().lower())
+            val = v.strip()
+            if canon and val and canon not in found:
+                found[canon] = val
+                kept_list.append((canon, val))
+        return kept_list, found
+
+    if host == "coupon.m.jd.com" and path == "/coupons/show.action":
+        pairs, found = _pick_allowed_params({"key": "key", "roleid": "roleId", "linkkey": "linkKey"})
+        if not (found.get("linkKey") or (found.get("key") and found.get("roleId"))):
+            return None
+        return urlunsplit(("https", host, path, urlencode(pairs), ""))
+
+    if host == "uland.taobao.com" and path == "/quan/detail":
+        pairs, found = _pick_allowed_params({"sellerid": "sellerId", "activityid": "activityId"})
+        if not (found.get("sellerId") and found.get("activityId")):
+            return None
+        return urlunsplit(("https", host, path, urlencode(pairs), ""))
+
+    if host in ("pages.tmall.com", "pages-fast.m.taobao.com") and path.startswith("/wow/"):
+        pairs, _ = _pick_allowed_params({"wh_pid": "wh_pid"})
+        return urlunsplit(("https", host, path, urlencode(pairs), ""))
+
+    if host == "pro.m.jd.com" and path.startswith("/mall/active/"):
+        return urlunsplit(("https", host, path, "", ""))
+
+    return None
+
+
 def is_direct_coupon_or_venue_url(raw_input: str, role_hint: str = "") -> bool:
-    """判断一个 URL 是否为直接的优惠券领取页或活动会场页（无需转出单品也应保留给用户领券）。"""
-    u = (raw_input or "").strip().lower()
-    if not u.startswith(("http://", "https://")):
-        return False
-    coupon_domains_or_paths = (
-        "coupon.m.jd.com",
-        "pro.m.jd.com",
-        "prodev.m.jd.com",
-        "h5.m.jd.com",
-        "jdcoupon",
-        "uland.taobao.com/quan",
-        "market.m.taobao.com",
-        "pages.tmall.com",
-        "pages-fast.m.taobao.com",
-        "taoquan.taobao.com",
-    )
-    if any(k in u for k in coupon_domains_or_paths):
-        return True
-    if role_hint == "coupon_candidate" and any(k in u for k in ("3.cn/", "u.jd.com/", "m.tb.cn/", "s.click.taobao.com/")):
-        return True
-    return False
+    """判断一个 URL 是否满足官方公共领券/会场白名单准入。"""
+    return rebuild_clean_official_venue_url(raw_input) is not None
 
 
 _ROLE_HINT_NORMALIZE_MAP = {
@@ -1234,13 +1278,37 @@ class DealPoolCleaner:
                             continue
                         c_status = cl.get("convert_status")
                         c_plat = str(cl.get("platform") or "").strip()
-                        c_inp = str(cl.get("clean_input") or "").strip()
-                        if c_plat in ("jd", "taobao", "pdd") and c_inp and c_status in ("product", "coupon_or_activity"):
-                            cl_copy = copy.deepcopy(cl)
-                            for ckey in self._build_anchor_cache_keys(c_plat, c_inp):
-                                if ckey not in self.anchor_cache:
-                                    self.anchor_cache[ckey] = cl_copy
-                                    loaded += 1
+                        c_inp = self._strip_markdown_link_wrapper(str(cl.get("clean_input") or "").strip())
+                        if c_plat not in ("jd", "taobao", "pdd") or not c_inp:
+                            continue
+                        p_link = str(cl.get("my_promo_link") or "").strip()
+                        p_tok = str(cl.get("my_promo_token") or "").strip()
+                        cl_copy = copy.deepcopy(cl)
+                        cl_copy["clean_input"] = c_inp
+                        if c_status == "product":
+                            if not (p_link or p_tok):
+                                continue
+                        elif c_status == "coupon_or_activity":
+                            is_new_link = (
+                                cl.get("error_code") != "OK_DIRECT_COUPON"
+                                and bool(p_link)
+                                and p_link.rstrip("/") != c_inp.rstrip("/")
+                            )
+                            if is_new_link or bool(p_tok):
+                                cl_copy["my_promo_link"] = p_link if is_new_link else None
+                            else:
+                                rebuilt = rebuild_clean_official_venue_url(c_inp)
+                                if not rebuilt:
+                                    continue
+                                cl_copy["error_code"] = "OK_DIRECT_COUPON"
+                                cl_copy["my_promo_link"] = rebuilt
+                                cl_copy["my_promo_token"] = None
+                        else:
+                            continue
+                        for ckey in self._build_anchor_cache_keys(c_plat, c_inp):
+                            if ckey not in self.anchor_cache:
+                                self.anchor_cache[ckey] = cl_copy
+                                loaded += 1
             if loaded > 0:
                 logger.info("🔥 [转链缓存预热] 已从 `deal_raw_tips` 恢复最近 12h 有效转链锚点 %d 个", loaded)
         except Exception as e:
@@ -1318,8 +1386,8 @@ class DealPoolCleaner:
         确保 DOM 属性提取或源站中转解包出的链接/口令（如逛丢 `go.php`、拔草哦 `go.bacaoo.com`、好单库加密ID）
         100% 出现在 `content` 文本中，同时仅传 `image_count` 节省无意义的 URL Token 开销。
         """
-        title = str(msg_doc.get("title") or "").strip()
-        tut = str(msg_doc.get("tutorial_text") or "").strip()
+        title = _normalize_inline_spaces(str(msg_doc.get("title") or "")).strip()
+        tut = _normalize_inline_spaces(str(msg_doc.get("tutorial_text") or "")).strip()
         content = tut if tut else title
         if title and title not in content and not cls._is_xianbao_synthetic_title_doc(msg_doc, tut):
             content = f"【标题】{title}\n{content}".strip()
@@ -1328,12 +1396,12 @@ class DealPoolCleaner:
         for lk in msg_doc.get("extracted_links") or []:
             if not isinstance(lk, dict):
                 continue
-            u = html_lib.unescape(str(lk.get("url") or lk.get("item_id") or "")).strip()
+            u = _normalize_inline_spaces(html_lib.unescape(str(lk.get("url") or lk.get("item_id") or ""))).strip()
             lbl = str(lk.get("label") or "附带链接").strip()
             if u and u not in content:
                 extra_anchor_lines.append(f"{lbl}: {u}")
         for tk in msg_doc.get("extracted_tokens") or []:
-            tk_s = html_lib.unescape(str(tk or "")).strip()
+            tk_s = _normalize_inline_spaces(html_lib.unescape(str(tk or ""))).strip()
             if tk_s and tk_s not in content and not any(tk_s in ln for ln in extra_anchor_lines):
                 extra_anchor_lines.append(f"附带口令/加密ID: {tk_s}")
 
@@ -1669,11 +1737,17 @@ class DealPoolCleaner:
                         continue
                     raw_role = str(tgt.get("text_role_hint") or "main_candidate").strip().lower()
                     tgt["link_id"] = str(tgt.get("link_id") or f"L{idx_t}").strip()
-                    tgt["raw_span"] = str(tgt.get("raw_span") or "").strip()
+                    tgt["raw_span"] = _normalize_inline_spaces(str(tgt.get("raw_span") or "")).strip()
                     tgt["clean_input"] = c_inp
                     tgt["text_role_hint"] = _ROLE_HINT_NORMALIZE_MAP.get(raw_role, "main_candidate")
                     norm_targets.append(tgt)
                 ai1_res["extracted_targets"] = norm_targets
+                raw_strips = ai1_res.get("strip_spans")
+                ai1_res["strip_spans"] = (
+                    [_normalize_inline_spaces(str(x)).strip() for x in raw_strips if str(x or "").strip()]
+                    if isinstance(raw_strips, list)
+                    else []
+                )
                 if not ai1_res.get("merged_tip_ids"):
                     ai1_res["merged_tip_ids"] = [mid]
                 else:
@@ -1796,7 +1870,7 @@ class DealPoolCleaner:
                 promo_link = str(res.get("final_link") or res.get("url") or "").strip()
                 promo_token = str(res.get("promotion_token") or "").strip()
 
-                if goods_id and goods_sign and isinstance(product_card, dict):
+                if goods_id and goods_sign and isinstance(product_card, dict) and (promo_link or promo_token):
                     official_price = float(product_card.get("price") or res.get("price") or 0.0)
                     orig_price = float(product_card.get("original_price") or official_price)
                     act_price = float(product_card.get("activity_price") or official_price)
@@ -1828,8 +1902,9 @@ class DealPoolCleaner:
                             self.anchor_cache[ck] = out
                     return copy.deepcopy(out)
 
-                # 转链成功但无单一商品详情（例如京东/淘宝优惠券短链、活动会场推广链；若详情反查发生暂态报错则不伪装成优惠券，交由重试队列复核）
-                if not res.get("detail_lookup_failed") and (promo_link or promo_token):
+                # 主通道会场/领券转链：必须生成不同于原输入的站长新推广短链，或生成我方专属口令（严禁回退原输入 clean_input）
+                is_new_station_link = bool(promo_link) and promo_link.rstrip("/") != clean_input.rstrip("/")
+                if not res.get("detail_lookup_failed") and (is_new_station_link or bool(promo_token)):
                     out = {
                         "link_id": link_id,
                         "clean_input": clean_input,
@@ -1841,7 +1916,7 @@ class DealPoolCleaner:
                         "error_code": "OK_COUPON",
                         "error_msg": "",
                         "official_product": None,
-                        "my_promo_link": promo_link or (clean_input if clean_input.startswith("http") else None),
+                        "my_promo_link": promo_link if is_new_station_link else None,
                         "my_promo_token": promo_token or None,
                         "adapter_res": res,
                     }
@@ -1850,8 +1925,9 @@ class DealPoolCleaner:
                             self.anchor_cache[ck] = out
                     return copy.deepcopy(out)
 
-            # 若上游未返回单品转链结果，但该链接本身就是可直接打开的官方领券/活动会场链接（如 coupon.m.jd.com），保留为可用优惠券链接
-            if is_direct_coupon_or_venue_url(clean_input, role_hint):
+            # 唯一例外辅通道：仅限 4 类平台原生公共领券/会场页，按参数白名单重组为无追踪纯净 URL（一切未转成功的短链自动拦截）
+            rebuilt_venue_url = rebuild_clean_official_venue_url(clean_input)
+            if rebuilt_venue_url:
                 out = {
                     "link_id": link_id,
                     "clean_input": clean_input,
@@ -1863,7 +1939,7 @@ class DealPoolCleaner:
                     "error_code": "OK_DIRECT_COUPON",
                     "error_msg": "",
                     "official_product": None,
-                    "my_promo_link": clean_input,
+                    "my_promo_link": rebuilt_venue_url,
                     "my_promo_token": None,
                     "adapter_res": res if isinstance(res, dict) else {},
                 }
@@ -2137,6 +2213,7 @@ class DealPoolCleaner:
         tip_map: Dict[str, Dict[str, Any]],
         ai1_targets: List[Dict[str, Any]],
         doc: Optional[Dict[str, Any]] = None,
+        strip_spans: Optional[List[str]] = None,
     ) -> str:
         """
         生成 100% 保留原博主“活人感话术”（原始用词、语气、Emoji、标点与换行排版）的纯净文案 `original_copywriting`：
@@ -2176,7 +2253,7 @@ class DealPoolCleaner:
                 if tk_s:
                     doc_foreign_spans.append(tk_s)
 
-        out = "\n".join(raw_blocks).strip()
+        out = _normalize_inline_spaces("\n".join(raw_blocks)).strip()
         if not out:
             return ""
 
@@ -2214,27 +2291,42 @@ class DealPoolCleaner:
             out,
         )
         out = re.sub(
-            r"(?i)\d?[ \t]*[￥$€£₴¢!！（(《「/]{1,2}[ \t]*[A-Za-z0-9]{8,16}[ \t]*[￥$€£₴¢!！）)》」/]{1,2}(?:[ \t]*:?/{1,2}(?:[ \t]*(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?|[ \t]+(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?",
+            r"(?i)\d{0,2}[ \t]*[￥¥$€£₴¢!！（(《「/]{1,2}[ \t]*[A-Za-z0-9]{8,16}[ \t]*[￥¥$€£₴¢!！）)》」/]{1,2}(?:[ \t]*:?/{1,2}(?:[ \t]*(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?|[ \t]+(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?",
             "",
             out,
         )
         out = re.sub(
-            r"(?i)(?:(?<=\s)|^)\d?[ \t]*(?:[\(（\$￥!！/\-]{1,3}[ \t]*[\)）\$￥!！/\-]{0,3}[ \t]*)?(?::?/{0,2}[ \t]*)?(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*(?=\s|$)",
+            r"(?i)(?:(?<=\s)|^)\d{0,2}[ \t]*(?:[\(（\$￥¥!！/\-]{1,3}[ \t]*[\)）\$￥¥!！/\-]{0,3}[ \t]*)?(?::?/{0,2}[ \t]*)?(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*(?=\s|$)",
             "",
             out,
         )
 
-        # 4. 精确剔除 AI-1 识别出的剩余第三方加密ID/口令原串与预提取锚点（严格保护任何含中文的词句不被误删）
+        # 4. 精确剔除 AI-1 识别出的 raw_span / strip_spans 与预提取锚点（支持防屏蔽短口令外壳，同时保护正常中文描述）
+        def _can_safely_remove_ai_span(s: str) -> bool:
+            if not s or len(s) < 5:
+                return False
+            zh_count = len(re.findall(r"[\u4e00-\u9fff]", s))
+            if zh_count == 0:
+                return True
+            return len(s) <= 60 and zh_count <= 8 and bool(re.search(r"[A-Za-z0-9]{4,}", s))
+
         spans_to_remove: Set[str] = set()
         for t in ai1_targets or []:
             if not isinstance(t, dict):
                 continue
+            raw_sp = _normalize_inline_spaces(str(t.get("raw_span") or "")).strip()
+            if _can_safely_remove_ai_span(raw_sp):
+                spans_to_remove.add(raw_sp)
             for field_name in ("raw_span", "clean_input"):
-                val = cls._strip_markdown_link_wrapper(str(t.get(field_name) or "").strip())
-                if val and len(val) >= 5 and not re.search(r"[\u4e00-\u9fff]", val):
+                val = _normalize_inline_spaces(cls._strip_markdown_link_wrapper(str(t.get(field_name) or "").strip()))
+                if _can_safely_remove_ai_span(val):
                     spans_to_remove.add(val)
+        for sp in strip_spans or []:
+            val = _normalize_inline_spaces(cls._strip_markdown_link_wrapper(str(sp or "").strip()))
+            if _can_safely_remove_ai_span(val):
+                spans_to_remove.add(val)
         for sp in doc_foreign_spans:
-            val = cls._strip_markdown_link_wrapper(sp)
+            val = _normalize_inline_spaces(cls._strip_markdown_link_wrapper(sp))
             if val and len(val) >= 6 and not re.search(r"[\u4e00-\u9fff]", val):
                 spans_to_remove.add(val)
 
@@ -2265,7 +2357,7 @@ class DealPoolCleaner:
             cursor = formal_col.find(
                 {
                     "deal_info.is_deal_tip": True,
-                    "updated_at": {"$gte": cutoff},
+                    "deal_info.updated_at": {"$gte": cutoff},
                 },
                 {
                     "_id": 0,
@@ -3260,6 +3352,7 @@ class DealPoolCleaner:
                 tip_map,
                 ai1_res.get("extracted_targets") or [],
                 doc=doc,
+                strip_spans=ai1_res.get("strip_spans") or [],
             )
 
             source_list_page_url = str(doc.get("source_list_page_url") or doc.get("source_url") or "").strip()
@@ -3450,7 +3543,14 @@ def upsert_cleaned_products_to_formal_table(
         if or_queries:
             for ex_doc in formal_col.find(
                 {"$or": or_queries},
-                {"_id": 0, "platform": 1, "product_id": 1, "updated_at": 1, "deal_info.is_deal_tip": 1, "deal_info.quality_score": 1},
+                {
+                    "_id": 0,
+                    "platform": 1,
+                    "product_id": 1,
+                    "deal_info.is_deal_tip": 1,
+                    "deal_info.quality_score": 1,
+                    "deal_info.updated_at": 1,
+                },
             ):
                 k = (str(ex_doc.get("platform") or ""), str(ex_doc.get("product_id") or ""))
                 existing_map[k] = ex_doc
@@ -3497,17 +3597,29 @@ def upsert_cleaned_products_to_formal_table(
         ex_record = existing_map.get((plat, pid))
         ex_di = (ex_record or {}).get("deal_info") if isinstance((ex_record or {}).get("deal_info"), dict) else {}
         ex_score = int(ex_di.get("quality_score") or 0)
-        ex_updated = _to_naive_utc((ex_record or {}).get("updated_at"))
+        ex_deal_updated = _to_naive_utc(ex_di.get("updated_at"))
         is_fresh_existing = bool(
             ex_di.get("is_deal_tip")
-            and ex_updated is not None
-            and ex_updated >= protection_cutoff
+            and ex_deal_updated is not None
+            and ex_deal_updated >= protection_cutoff
         )
 
         if is_fresh_existing and ex_score > new_score:
             # 触发高分保护：保留已有的高分 deal_info 教程与价格，仅更新顶层官方商品详情并累加跨群共振热度
             protected_high_score += 1
         else:
+            has_numeric_dp = (
+                isinstance(deal_info.get("deal_price"), (int, float))
+                and not isinstance(deal_info.get("deal_price"), bool)
+                and float(deal_info["deal_price"]) > 0
+            )
+            deal_info["updated_at"] = now
+            deal_info["need_reformat"] = has_numeric_dp
+            deal_info["format_status"] = "pending" if has_numeric_dp else "skipped"
+            deal_info["format_info"] = None
+            deal_info["format_deal_price"] = None
+            deal_info["format_retry_count"] = 0
+            deal_info["format_error"] = ""
             for dk, dv in deal_info.items():
                 set_fields[f"deal_info.{dk}"] = dv
 

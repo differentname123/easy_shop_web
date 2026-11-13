@@ -399,7 +399,6 @@ def test_option_b_dual_directory_isolation_in_compare_candidate():
                 "has_comparable_item": True,
                 "comparable_item_ids": ["880001"],
                 "best_xianyu_item_id": "880001",
-                "best_xianyu_title": "维达抽纸整箱24包包邮",
                 "best_xianyu_price": 18.5,
                 "xianyu_unit_quantities": {"包": 24.0},
                 "xianyu_unit_cost_performance": {"包": round(24.0 / 18.5, 6)},
@@ -427,6 +426,7 @@ def test_option_b_dual_directory_isolation_in_compare_candidate():
     assert mock_batch_det.call_count == 1
     assert mock_batch_det.call_args.kwargs["user_data_dir"] == r"W:\temp\xianyu_guest"
     assert rec["final_winner"] == "xianyu_product"
+    assert rec["best_xianyu_product"]["title"] == "维达抽纸整箱24包包邮"
     assert "keyword_llm" not in rec["llm_raw_output"]
     assert "step3_comparison_llm" in rec["llm_raw_output"]
 
@@ -665,7 +665,6 @@ def test_xianyu_items_7day_detail_cache_full_hit_skips_browser_detail_fetch():
                 "has_comparable_item": True,
                 "comparable_item_ids": ["880001"],
                 "best_xianyu_item_id": "880001",
-                "best_xianyu_title": "维达抽纸整箱24包包邮",
                 "best_xianyu_spec": "24包整箱装",
                 "best_xianyu_price": 18.5,
                 "xianyu_unit_quantities": {"包": 24.0},
@@ -817,7 +816,6 @@ def test_xianyu_items_partial_cache_hit_and_expired_detail_refresh():
                 "has_comparable_item": True,
                 "comparable_item_ids": ["9001", "9002", "9003"],
                 "best_xianyu_item_id": "9003",
-                "best_xianyu_title": "新补拉详情商品9003",
                 "best_xianyu_price": 19.0,
                 "xianyu_unit_quantities": {"包": 24.0},
                 "xianyu_unit_cost_performance": {"包": round(24.0 / 19.0, 6)},
