@@ -32,6 +32,8 @@ from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from pymongo import UpdateOne
+
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -62,6 +64,7 @@ from repositories.product_repo import (
 )
 
 EVAL_COLLECTION_NAME = "xianyu_deal_evaluations"
+XIANYU_ITEMS_COLLECTION_NAME = "xianyu_items"
 SOURCE_TYPE_OFFICIAL = "official"
 SOURCE_TYPE_DEAL_TIP = "deal_tip"
 
@@ -89,6 +92,7 @@ DEAL_SCAN_HOURS_WINDOW = 48                             # 线报爆料商品扫�
 MAX_CATEGORIES_PER_ROUND = 20                           # 单类商品源每轮探测的有效标品分类数（0 表示不限）
 MAX_XIANYU_SEARCH_ITEMS = 20                            # 每次闲鱼搜索抓取的概览商品数
 MAX_DETAIL_CHECKS_PER_CATEGORY = 10                     # 每个分类最多通过 H5 免登录拉取多少个初筛同款商品详情
+XIANYU_DETAIL_CACHE_DAYS = 7                            # 闲鱼商品详情数据库缓存有效天数（7天内已有详情直接复用，免重复请求H5）
 STAGE1_WORKERS = 5                                      # 阶段 1（AI 选标品 + 官方验价）并发线程数
 DEBUG_BROWSER = False                                   # 是否显示浏览器窗口（False=后台无头静默，True=显示窗口）
 SEARCH_USER_DATA_DIR = DEFAULT_SEARCH_USER_DATA_DIR     # 【搜索小号独立目录】仅用于步骤2关键字搜索（W:\temp\xianyu_xiaohao）
@@ -1059,6 +1063,242 @@ def _validate_llm_comparison_response(
     return True, "ok", out
 
 
+# ==============================================================================
+# 闲鱼商品表（xianyu_items）持久化与 7 天商品详情缓存复用
+# ==============================================================================
+def _save_xianyu_search_items(
+    items_col: Optional[Any],
+    raw_items: List[Dict[str, Any]],
+    keyword: str = "",
+) -> int:
+    """
+    将闲鱼搜索返回的商品概览数据保存/更新到 xianyu_items 表（按唯一标识 item_id 去重入库）。
+    注意：仅更新搜索概览与更新时间，绝不覆盖该商品已有的完整详情字段（detail / has_detail / detail_updated_at）。
+    """
+    if items_col is None or not raw_items:
+        return 0
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_str = now_utc.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    kw_clean = str(keyword or "").strip()
+
+    dedup_by_id: Dict[str, Dict[str, Any]] = {}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        iid = str(item.get("item_id") or "").strip()
+        if iid and iid not in dedup_by_id:
+            dedup_by_id[iid] = item
+
+    if not dedup_by_id:
+        return 0
+
+    ops: List[UpdateOne] = []
+    for iid, card in dedup_by_id.items():
+        item_url = str(card.get("item_url") or f"https://www.goofish.com/item?id={iid}").strip()
+        clean_card = {
+            "item_id": iid,
+            "item_url": item_url,
+            "title": str(card.get("title") or ""),
+            "price": _num(card.get("price"), 0.0),
+            "raw_price_text": str(card.get("raw_price_text") or ""),
+            "original_price": _num(card.get("original_price"), 0.0),
+            "want_cnt": int(_num(card.get("want_cnt"), 0.0)),
+            "is_free_shipping": bool(card.get("is_free_shipping")),
+            "area": str(card.get("area") or ""),
+            "seller_nick": str(card.get("seller_nick") or ""),
+            "seller_tags": list(card.get("seller_tags") or []),
+            "image_url": str(card.get("image_url") or ""),
+        }
+        set_fields: Dict[str, Any] = {
+            "item_id": iid,
+            "item_url": item_url,
+            "search_card": clean_card,
+            "last_search_title": clean_card["title"],
+            "last_search_price": clean_card["price"],
+            "search_updated_at": now_utc,
+            "search_updated_at_str": now_str,
+            "updated_at": now_utc,
+            "updated_at_str": now_str,
+        }
+        if kw_clean:
+            set_fields["last_search_keyword"] = kw_clean
+
+        ops.append(
+            UpdateOne(
+                {"item_id": iid},
+                {
+                    "$set": set_fields,
+                    "$setOnInsert": {
+                        "created_at": now_utc,
+                        "created_at_str": now_str,
+                        "has_detail": False,
+                    },
+                },
+                upsert=True,
+            )
+        )
+
+    try:
+        items_col.bulk_write(ops, ordered=False)
+        return len(ops)
+    except Exception as exc:
+        logger.warning(f"⚠️ [闲鱼商品表/搜索概览入库异常] count={len(ops)} | 异常={exc}")
+        return 0
+
+
+def _load_cached_xianyu_details(
+    items_col: Optional[Any],
+    item_ids: List[str],
+    cache_days: int = XIANYU_DETAIL_CACHE_DAYS,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    在拉取 H5 详情前先查询 xianyu_items 表：
+    若商品已存有完整详情（has_detail=True）且 detail_updated_at 在有效期内（默认 7 天），直接返回复用，不再打开详情页。
+    """
+    if items_col is None or not item_ids or cache_days <= 0:
+        return {}
+
+    clean_ids = list(dict.fromkeys(str(x).strip() for x in item_ids if str(x).strip()))
+    if not clean_ids:
+        return {}
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cutoff_utc = now_utc - datetime.timedelta(days=float(cache_days))
+    cached_by_id: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        cursor = items_col.find({"item_id": {"$in": clean_ids}, "has_detail": True})
+        for doc in cursor or []:
+            if not isinstance(doc, dict):
+                continue
+            iid = str(doc.get("item_id") or "").strip()
+            if not iid:
+                continue
+            det_utc = _parse_deal_time_utc(doc.get("detail_updated_at"), default_tz=datetime.timezone.utc)
+            if det_utc is None:
+                det_utc = _parse_deal_time_utc(doc.get("detail_updated_at_str"), default_tz=_CN_TZ)
+            if det_utc is None or det_utc < cutoff_utc:
+                continue
+            det = doc.get("detail")
+            if not isinstance(det, dict) or not det.get("ok"):
+                continue
+            det_copy = dict(det)
+            det_copy["ok"] = True
+            det_copy["item_id"] = iid
+            det_copy["_from_db_cache"] = True
+            det_copy["_detail_updated_at_str"] = str(
+                doc.get("detail_updated_at_str") or det_utc.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            )
+            cached_by_id[iid] = det_copy
+    except Exception as exc:
+        logger.warning(f"⚠️ [闲鱼商品表/读取7天缓存详情异常] IDs={clean_ids} | 异常={exc}")
+        return {}
+
+    return cached_by_id
+
+
+def _save_xianyu_item_details(
+    items_col: Optional[Any],
+    details_by_id: Dict[str, Dict[str, Any]],
+) -> int:
+    """
+    将成功拉取的闲鱼商品详情数据（含完整文案、多规格价格、运费等）保存/更新至 xianyu_items 表，
+    记录唯一标识 item_id 与 detail_updated_at，供后续 7 天内直接复用。失败或异常数据不写入详情有效态。
+    """
+    if items_col is None or not details_by_id:
+        return 0
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_str = now_utc.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    ops: List[UpdateOne] = []
+
+    for raw_id, det in details_by_id.items():
+        if not isinstance(det, dict) or not det.get("ok"):
+            continue
+        iid = str(det.get("item_id") or raw_id or "").strip()
+        if not iid:
+            continue
+        item_url = str(det.get("item_url") or f"https://www.goofish.com/item?id={iid}").strip()
+        price_val = _num(det.get("price"), 0.0)
+        clean_det = {
+            "ok": True,
+            "item_id": iid,
+            "item_url": item_url,
+            "title": str(det.get("title") or ""),
+            "desc": str(det.get("desc") or ""),
+            "price": price_val,
+            "original_price": _num(det.get("original_price"), 0.0),
+            "transport_fee": None if det.get("transport_fee") is None else _num(det.get("transport_fee"), 0.0),
+            "is_free_shipping": bool(det.get("is_free_shipping")),
+            "min_price": _num(det.get("min_price"), price_val),
+            "max_price": _num(det.get("max_price"), price_val),
+            "has_multi_sku": bool(det.get("has_multi_sku")),
+            "sku_list": list(det.get("sku_list") or []),
+            "cpv_labels": list(det.get("cpv_labels") or []),
+            "want_cnt": None if det.get("want_cnt") is None else int(_num(det.get("want_cnt"), 0.0)),
+            "browse_cnt": int(_num(det.get("browse_cnt"), 0.0)),
+            "quantity": int(_num(det.get("quantity"), 1.0)),
+            "images": list(det.get("images") or []),
+            "seller_nick": str(det.get("seller_nick") or ""),
+            "seller_city": str(det.get("seller_city") or ""),
+            "seller_sold_count": int(_num(det.get("seller_sold_count"), 0.0)),
+            "seller_good_rate": str(det.get("seller_good_rate") or ""),
+        }
+        set_fields = {
+            "item_id": iid,
+            "item_url": item_url,
+            "has_detail": True,
+            "detail": clean_det,
+            "detail_updated_at": now_utc,
+            "detail_updated_at_str": now_str,
+            "updated_at": now_utc,
+            "updated_at_str": now_str,
+            "title": clean_det["title"],
+            "desc": clean_det["desc"],
+            "price": clean_det["price"],
+            "original_price": clean_det["original_price"],
+            "transport_fee": clean_det["transport_fee"],
+            "is_free_shipping": clean_det["is_free_shipping"],
+            "min_price": clean_det["min_price"],
+            "max_price": clean_det["max_price"],
+            "has_multi_sku": clean_det["has_multi_sku"],
+            "sku_list": clean_det["sku_list"],
+            "cpv_labels": clean_det["cpv_labels"],
+            "want_cnt": clean_det["want_cnt"],
+            "browse_cnt": clean_det["browse_cnt"],
+            "quantity": clean_det["quantity"],
+            "images": clean_det["images"],
+            "seller_nick": clean_det["seller_nick"],
+            "seller_city": clean_det["seller_city"],
+            "seller_sold_count": clean_det["seller_sold_count"],
+            "seller_good_rate": clean_det["seller_good_rate"],
+        }
+        ops.append(
+            UpdateOne(
+                {"item_id": iid},
+                {
+                    "$set": set_fields,
+                    "$setOnInsert": {
+                        "created_at": now_utc,
+                        "created_at_str": now_str,
+                    },
+                },
+                upsert=True,
+            )
+        )
+
+    if not ops:
+        return 0
+
+    try:
+        items_col.bulk_write(ops, ordered=False)
+        return len(ops)
+    except Exception as exc:
+        logger.warning(f"⚠️ [闲鱼商品表/商品详情入库异常] count={len(ops)} | 异常={exc}")
+        return 0
+
+
 def probe_xianyu_search_ready(
     search_user_data_dir: str = SEARCH_USER_DATA_DIR,
     debug_browser: bool = False,
@@ -1088,12 +1328,15 @@ def compare_candidate_with_xianyu(
     max_search_items: int = MAX_XIANYU_SEARCH_ITEMS,
     max_detail_checks: int = MAX_DETAIL_CHECKS_PER_CATEGORY,
     debug_browser: bool = False,
+    items_col: Optional[Any] = None,
+    detail_cache_days: int = XIANYU_DETAIL_CACHE_DAYS,
 ) -> Dict[str, Any]:
     """
-    执行单分类标品闲鱼比价（小号仅搜索 + H5免登录批量拉详情）：
+    执行单分类标品闲鱼比价（小号仅搜索 + xianyu_items 7天详情缓存复用 + H5免登录按需补拉详情）：
     - 搜索报错（掉线/风控/异常）时立即返回 browser_aborted 记录，0 次备用词盲目重试；
+    - 每次搜索成功后自动把闲鱼商品概览写入/更新到 xianyu_items 表；
     - 仅当主搜索成功但条数 < 6 或 AI 初筛 0 同款时，最多切换 1 次备用词扩召回；
-    - 初筛同款走免登录 H5 批量获取详情、多规格售价与运费，再交由第 3 个 AI 终审比价。
+    - 初筛同款先查 xianyu_items 表复用 7 天内已有的完整详情，仅对缺失/过期商品走免登录 H5 批量获取详情并回写数据库，再交由第 3 个 AI 终审比价。
     """
     kw = candidate["search_keyword"]
     backup_kw = candidate["backup_search_keyword"]
@@ -1124,6 +1367,8 @@ def compare_candidate_with_xianyu(
                 f"❌ [步骤2/{label}失败] 分类=【{cat_name}】 | 搜索词=【{target_kw}】 | "
                 f"错误码={res.get('error_code')} | 目录={res.get('user_data_dir')} | 原因={res.get('message')}"
             )
+        elif res.get("items"):
+            _save_xianyu_search_items(items_col, res.get("items") or [], keyword=target_kw)
         return res
 
     def _build_search_aborted_record(failed_kw: str, failed_res: Dict[str, Any]) -> Dict[str, Any]:
@@ -1222,25 +1467,59 @@ def compare_candidate_with_xianyu(
             debug_browser=debug_browser,
         )
 
-    # 步骤 3：在免登录访客目录通过移动端 H5 批量拉取初筛同款商品的完整详情、多规格价格与运费
+    # 步骤 3：先查 xianyu_items 表复用 7 天内已有的完整详情，仅对缺失/过期商品通过 H5 免登录批量补拉详情
     ids_to_fetch = step2_comp_ids[:max_detail_checks] if max_detail_checks > 0 else step2_comp_ids
-    logger.info(
-        f"📦 [步骤3/H5免登录批量拉取详情] 分类=【{cat_name}】 | AI初筛同款={len(step2_comp_ids)}款 -> "
-        f"免登录目录<{guest_user_data_dir}>批量拉取前 {len(ids_to_fetch)} 款详情..."
-    )
-    batch_det_res = get_xianyu_item_details_batch(
+    cached_details_by_id = _load_cached_xianyu_details(
+        items_col=items_col,
         item_ids=ids_to_fetch,
-        user_data_dir=guest_user_data_dir,
-        debug=debug_browser,
+        cache_days=detail_cache_days,
     )
-    if not batch_det_res.get("ok") or batch_det_res.get("is_risk_blocked"):
-        logger.error(
-            f"❌ [步骤3/批量详情会话异常中断] 分类=【{cat_name}】 | 错误码={batch_det_res.get('error_code')} | "
-            f"目录={batch_det_res.get('user_data_dir')} | 已完成={len(batch_det_res.get('details_by_id') or {})}/{len(ids_to_fetch)} | "
-            f"原因={batch_det_res.get('message')}"
-        )
+    missing_ids = [iid for iid in ids_to_fetch if iid not in cached_details_by_id]
+    detail_cache_hit_count = len(cached_details_by_id)
+    detail_live_fetched_count = 0
 
-    details_by_id = batch_det_res.get("details_by_id") or {}
+    if not missing_ids:
+        logger.info(
+            f"⚡ [步骤3/闲鱼详情库缓存全命中] 分类=【{cat_name}】 | 初筛前 {len(ids_to_fetch)} 款同款在 {detail_cache_days} 天内均有完整详情，"
+            f"直接复用数据库详情（0 次 H5 详情页请求）！"
+        )
+        batch_det_res: Dict[str, Any] = {
+            "ok": True,
+            "is_offline": False,
+            "is_risk_blocked": False,
+            "user_data_dir": guest_user_data_dir,
+            "details_by_id": dict(cached_details_by_id),
+        }
+    else:
+        if detail_cache_hit_count > 0:
+            logger.info(
+                f"📦 [步骤3/详情缓存复用+H5按需补拉] 分类=【{cat_name}】 | 待核验={len(ids_to_fetch)}款 "
+                f"(库内{detail_cache_days}天缓存直接复用={detail_cache_hit_count}款，仅需H5补拉={len(missing_ids)}款) -> "
+                f"免登录目录<{guest_user_data_dir}>批量拉取..."
+            )
+        else:
+            logger.info(
+                f"📦 [步骤3/H5免登录批量拉取详情] 分类=【{cat_name}】 | AI初筛同款={len(step2_comp_ids)}款 -> "
+                f"免登录目录<{guest_user_data_dir}>批量拉取前 {len(ids_to_fetch)} 款详情..."
+            )
+        batch_det_res = get_xianyu_item_details_batch(
+            item_ids=missing_ids,
+            user_data_dir=guest_user_data_dir,
+            debug=debug_browser,
+        )
+        live_details_map = batch_det_res.get("details_by_id") or {}
+        detail_live_fetched_count = sum(1 for v in live_details_map.values() if isinstance(v, dict) and v.get("ok"))
+        if detail_live_fetched_count > 0:
+            _save_xianyu_item_details(items_col, live_details_map)
+
+        if not batch_det_res.get("ok") or batch_det_res.get("is_risk_blocked"):
+            logger.error(
+                f"❌ [步骤3/批量详情会话异常中断] 分类=【{cat_name}】 | 错误码={batch_det_res.get('error_code')} | "
+                f"目录={batch_det_res.get('user_data_dir')} | 已完成={len(live_details_map)}/{len(missing_ids)} | "
+                f"原因={batch_det_res.get('message')}"
+            )
+
+    details_by_id = {**cached_details_by_id, **(batch_det_res.get("details_by_id") or {})}
     detailed_items_for_llm: List[Dict[str, Any]] = []
     valid_detailed_ids: Set[str] = set()
     detail_failed_count = 0
@@ -1285,8 +1564,9 @@ def compare_candidate_with_xianyu(
                 "cpv_labels": det.get("cpv_labels") or [],
             },
         })
+        det_src_tag = f"库缓存:{det.get('_detail_updated_at_str', '7天内')}" if det.get("_from_db_cache") else "H5新拉"
         logger.info(
-            f"   ├─ ✅ ({idx}/{len(ids_to_fetch)}) 详情核验就绪 [XY:{iid}] | "
+            f"   ├─ ✅ ({idx}/{len(ids_to_fetch)}) 详情核验就绪 [XY:{iid}][{det_src_tag}] | "
             f"详情价=¥{det.get('price')} (区间:¥{det.get('min_price')}~¥{det.get('max_price')}) | "
             f"运费=¥{det.get('transport_fee')}({'包邮' if det.get('is_free_shipping') else '不包邮'}) | "
             f"多规格={det.get('has_multi_sku')}({len(sku_list_clean)}个SKU) | 标题={(det.get('title') or raw_card.get('title') or '')[:30]}"
@@ -1322,6 +1602,8 @@ def compare_candidate_with_xianyu(
             fallback_error="all_detail_fetches_failed",
             batch_det_res=batch_det_res,
             detail_failed_count=detail_failed_count,
+            detail_cache_hit_count=detail_cache_hit_count,
+            detail_live_fetched_count=detail_live_fetched_count,
             browser_aborted=is_session_abort,
             debug_browser=debug_browser,
         )
@@ -1364,6 +1646,8 @@ def compare_candidate_with_xianyu(
         fallback_error="" if ok else last_error_msg,
         batch_det_res=batch_det_res,
         detail_failed_count=detail_failed_count,
+        detail_cache_hit_count=detail_cache_hit_count,
+        detail_live_fetched_count=detail_live_fetched_count,
         browser_aborted=False,
         debug_browser=debug_browser,
     )
@@ -1382,6 +1666,8 @@ def _build_final_record(
     fallback_error: str = "",
     batch_det_res: Optional[Dict[str, Any]] = None,
     detail_failed_count: int = 0,
+    detail_cache_hit_count: int = 0,
+    detail_live_fetched_count: int = 0,
     browser_aborted: bool = False,
     debug_browser: bool = False,
 ) -> Dict[str, Any]:
@@ -1529,6 +1815,8 @@ def _build_final_record(
             "batch_detail_ok": bool((batch_det_res or {}).get("ok", True)),
             "batch_detail_error_code": str((batch_det_res or {}).get("error_code") or ""),
             "step3_detail_fetched_count": len(xianyu_items_for_llm),
+            "step3_detail_cache_hit_count": int(detail_cache_hit_count),
+            "step3_detail_live_fetched_count": int(detail_live_fetched_count),
             "step3_detail_failed_count": int(detail_failed_count),
             "comparable_item_ids": llm_data.get("comparable_item_ids") or [],
             "xianyu_coarse_items": coarse_items_for_llm,
@@ -1683,8 +1971,14 @@ def _format_single_comparison_card(idx: int, total: int, record: Dict[str, Any])
         xy_desc = "未在闲鱼搜索结果中找到同品牌同规格且邮费清晰的可比商品"
 
     det_ok = audit.get("step3_detail_fetched_count", 0)
+    det_cache = audit.get("step3_detail_cache_hit_count", 0)
     det_fail = audit.get("step3_detail_failed_count", 0)
-    det_stat_str = f"拉取详情{det_ok}款" if det_fail == 0 else f"拉取详情{det_ok}款(失败{det_fail}款)"
+    cache_tag = f"[缓存复用{det_cache}]" if det_cache > 0 else ""
+    det_stat_str = (
+        f"拉取详情{det_ok}款{cache_tag}"
+        if det_fail == 0
+        else f"拉取详情{det_ok}款{cache_tag}(失败{det_fail}款)"
+    )
 
     border_eq = "=" * 140
     border_dash = "-" * 140
@@ -1745,16 +2039,18 @@ def _format_batch_summary_report(batch_id: str, elapsed: float, records: List[Di
     batch_abort_cnt = sum(1 for r in records if not (r.get("xianyu_audit_trail") or {}).get("batch_detail_ok", True))
     item_det_fail_cnt = sum(int((r.get("xianyu_audit_trail") or {}).get("step3_detail_failed_count") or 0) for r in records)
     item_det_ok_cnt = sum(int((r.get("xianyu_audit_trail") or {}).get("step3_detail_fetched_count") or 0) for r in records)
+    item_det_cache_cnt = sum(int((r.get("xianyu_audit_trail") or {}).get("step3_detail_cache_hit_count") or 0) for r in records)
+    item_det_live_cnt = sum(int((r.get("xianyu_audit_trail") or {}).get("step3_detail_live_fetched_count") or 0) for r in records)
 
     if search_err_cnt == 0 and risk_block_cnt == 0 and batch_abort_cnt == 0:
         health_status = (
             f"✅ 浏览器检索健康 (初搜失败=0 | 风控滑块=0 | 会话中断=0 | "
-            f"详情成功拉取={item_det_ok_cnt}个, 单品未捕获={item_det_fail_cnt}个)"
+            f"详情成功={item_det_ok_cnt}个[7天缓存复用={item_det_cache_cnt}/H5新拉={item_det_live_cnt}], 单品未捕获={item_det_fail_cnt}个)"
         )
     else:
         health_status = (
             f"🚨 检测到浏览器检索异常！(初搜失败={search_err_cnt} | 风控滑块={risk_block_cnt} | "
-            f"批量详情中断={batch_abort_cnt} | 详情成功={item_det_ok_cnt}个, 失败={item_det_fail_cnt}个) "
+            f"批量详情中断={batch_abort_cnt} | 详情成功={item_det_ok_cnt}个[缓存复用={item_det_cache_cnt}/H5新拉={item_det_live_cnt}], 失败={item_det_fail_cnt}个) "
             f"-> 请在日志中搜索 ❌ 或 🚨 排查现场诊断！"
         )
 
@@ -1825,6 +2121,15 @@ def _ensure_eval_indexes(eval_col: Any) -> None:
     )
 
 
+def _ensure_xianyu_items_indexes(items_col: Any) -> None:
+    """确保闲鱼商品表 xianyu_items 采用 item_id 唯一索引及 7 天详情有效期查询索引。"""
+    if items_col is None:
+        return
+    items_col.create_index([("item_id", 1)], unique=True, background=True)
+    items_col.create_index([("has_detail", 1), ("detail_updated_at", -1)], background=True)
+    items_col.create_index([("updated_at", -1)], background=True)
+
+
 # ==============================================================================
 # 主流程串行稳定编排与运行入口
 # ==============================================================================
@@ -1836,6 +2141,7 @@ def run_discovery_cycle(
     max_categories: int = MAX_CATEGORIES_PER_ROUND,
     max_search_items: int = MAX_XIANYU_SEARCH_ITEMS,
     max_detail_checks: int = MAX_DETAIL_CHECKS_PER_CATEGORY,
+    detail_cache_days: int = XIANYU_DETAIL_CACHE_DAYS,
     search_user_data_dir: str = SEARCH_USER_DATA_DIR,
     guest_user_data_dir: str = GUEST_USER_DATA_DIR,
     debug_browser: bool = DEBUG_BROWSER,
@@ -1868,11 +2174,12 @@ def run_discovery_cycle(
         f"\n{'=' * 96}\n"
         f"🚀 [闲鱼高性价比商品探测与比价任务/启动] 批次={batch_id} | 启用商品源=[{enabled_desc}] | "
         f"单源探测分类数={max_categories if max_categories > 0 else '全部'} | "
-        f"执行模式=(阶段1选品={s1_workers}线程, 阶段2/3比价=顺序串行, 同款详情上限={detail_cap_desc}) | "
+        f"执行模式=(阶段1选品={s1_workers}线程, 阶段2/3比价=顺序串行, 同款详情上限={detail_cap_desc}, 详情缓存={detail_cache_days}天) | "
         f"浏览器模式={browser_mode_desc} | 搜索小号目录=<{search_user_data_dir}> | H5免登录详情目录=<{guest_user_data_dir}>\n"
         f"{'=' * 96}"
     )
 
+    probe_res: Dict[str, Any] = {}
     if enable_pre_round_probe:
         probe_ok, probe_res = probe_xianyu_search_ready(
             search_user_data_dir=search_user_data_dir,
@@ -1902,6 +2209,10 @@ def run_discovery_cycle(
     db = gen_db_object()
     eval_col = db.get_collection(EVAL_COLLECTION_NAME)
     _ensure_eval_indexes(eval_col)
+    items_col = db.get_collection(XIANYU_ITEMS_COLLECTION_NAME)
+    _ensure_xianyu_items_indexes(items_col)
+    if probe_res.get("ok") and probe_res.get("items"):
+        _save_xianyu_search_items(items_col, probe_res.get("items") or [], keyword=probe_keyword)
 
     champions: List[Dict[str, Any]] = []
     if enable_official:
@@ -1950,6 +2261,8 @@ def run_discovery_cycle(
             max_search_items=max_search_items,
             max_detail_checks=max_detail_checks,
             debug_browser=debug_browser,
+            items_col=items_col,
+            detail_cache_days=detail_cache_days,
         )
         rec["batch_id"] = batch_id
         rec_src_type = _normalize_source_type(rec.get("source_type"))
@@ -1957,6 +2270,7 @@ def run_discovery_cycle(
         records.append(rec)
 
         audit = rec.get("xianyu_audit_trail") or {}
+        is_hard_stop = bool(audit.get("is_risk_blocked") or audit.get("is_account_offline"))
         if audit.get("browser_aborted"):
             consecutive_fails += 1
             logger.warning(
@@ -1965,7 +2279,6 @@ def run_discovery_cycle(
             )
             logger.info(_format_single_comparison_card(idx, total_champions, rec))
 
-            is_hard_stop = bool(audit.get("is_risk_blocked") or audit.get("is_account_offline"))
             if is_hard_stop or consecutive_fails >= max_fails:
                 _LAST_CYCLE_ABORTED_BY_RISK = True
                 remaining = total_champions - idx
@@ -1984,6 +2297,16 @@ def run_discovery_cycle(
                 upsert=True,
             )
             logger.info(_format_single_comparison_card(idx, total_champions, rec))
+            if is_hard_stop:
+                _LAST_CYCLE_ABORTED_BY_RISK = True
+                remaining = total_champions - idx
+                logger.error(
+                    f"\n{'!' * 96}\n"
+                    f"🛑 [详情风控熔断保护已触发] 分类=【{rec['category_name']}】部分详情拉取期间检测到闲鱼风控拦截！\n"
+                    f"   └── 当前已比价结果已保存，立即停止本轮剩余 {remaining}/{total_champions} 个分类检索，进入静默冷却保护！\n"
+                    f"{'!' * 96}"
+                )
+                break
 
     elapsed = time.monotonic() - t0
     if records:

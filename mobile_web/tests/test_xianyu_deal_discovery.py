@@ -567,6 +567,298 @@ def test_havana_silent_sso_cold_start_clears_transient_session_expired():
     assert tracker["expired_rets"] == []
 
 
+class _InMemoryXianyuItemsCol:
+    """模拟 MongoDB xianyu_items 集合的 bulk_write ($set / $setOnInsert) 与 find 查询语义。"""
+
+    def __init__(self, initial_docs=None):
+        self.docs = {}
+        self.indexes = []
+        for d in initial_docs or []:
+            self.docs[str(d["item_id"])] = dict(d)
+
+    def create_index(self, keys, **kwargs):
+        self.indexes.append((keys, kwargs))
+
+    def bulk_write(self, ops, ordered=False):
+        for op in ops:
+            iid = str(op._filter["item_id"])
+            is_insert = iid not in self.docs
+            target = self.docs.setdefault(iid, {})
+            if is_insert and "$setOnInsert" in op._doc:
+                target.update(dict(op._doc["$setOnInsert"]))
+            if "$set" in op._doc:
+                target.update(dict(op._doc["$set"]))
+
+    def find(self, query):
+        id_filter = set((query.get("item_id") or {}).get("$in") or [])
+        req_has_detail = query.get("has_detail")
+        matched = []
+        for iid, doc in self.docs.items():
+            if id_filter and iid not in id_filter:
+                continue
+            if req_has_detail is not None and bool(doc.get("has_detail")) != bool(req_has_detail):
+                continue
+            matched.append(dict(doc))
+        return matched
+
+
+def test_ensure_xianyu_items_indexes():
+    fake_items_col = _InMemoryXianyuItemsCol()
+    sched._ensure_xianyu_items_indexes(fake_items_col)
+    unique_item_idx = [
+        (keys, kw) for keys, kw in fake_items_col.indexes if keys == [("item_id", 1)]
+    ]
+    assert len(unique_item_idx) == 1
+    assert unique_item_idx[0][1].get("unique") is True
+
+
+def test_xianyu_items_7day_detail_cache_full_hit_skips_browser_detail_fetch():
+    """验证 7 天内已有完整详情时：搜索更新概览绝不冲掉旧详情，且步骤 3 完全跳过 H5 浏览器拉取直接复用多规格详情。"""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    two_days_ago = now_utc - datetime.timedelta(days=2)
+    cached_detail = {
+        "ok": True,
+        "item_id": "880001",
+        "item_url": "https://www.goofish.com/item?id=880001",
+        "title": "维达抽纸整箱24包包邮",
+        "desc": "维达超韧抽纸3层120抽多规格整箱包邮",
+        "price": 9.9,
+        "original_price": 29.9,
+        "transport_fee": 0.0,
+        "is_free_shipping": True,
+        "has_multi_sku": True,
+        "min_price": 9.9,
+        "max_price": 18.5,
+        "sku_list": [
+            {"spec_text": "规格: 8包体验装", "price": 9.9, "quantity": 10},
+            {"spec_text": "规格: 24包整箱装", "price": 18.5, "quantity": 25},
+        ],
+        "cpv_labels": [],
+        "want_cnt": 12,
+    }
+    fake_items_col = _InMemoryXianyuItemsCol(
+        [
+            {
+                "item_id": "880001",
+                "has_detail": True,
+                "detail": cached_detail,
+                "detail_updated_at": two_days_ago,
+                "detail_updated_at_str": "2026-11-11 10:00:00",
+            }
+        ]
+    )
+    cand = _make_sample_champion(1)
+    fake_search_res = {
+        "ok": True,
+        "is_offline": False,
+        "is_risk_blocked": False,
+        "user_data_dir": r"W:\temp\xianyu_xiaohao",
+        "items": [
+            {"item_id": f"88000{i}", "title": "维达抽纸整箱24包包邮", "price": 9.9, "want_cnt": 12, "is_free_shipping": True}
+            for i in range(1, 7)
+        ],
+    }
+    fake_step3_llm = {
+        "status": "成功",
+        "content": json.dumps(
+            {
+                "has_comparable_item": True,
+                "comparable_item_ids": ["880001"],
+                "best_xianyu_item_id": "880001",
+                "best_xianyu_title": "维达抽纸整箱24包包邮",
+                "best_xianyu_spec": "24包整箱装",
+                "best_xianyu_price": 18.5,
+                "xianyu_unit_quantities": {"包": 24.0},
+                "xianyu_unit_cost_performance": {"包": round(24.0 / 18.5, 6)},
+                "llm_winner": "xianyu_product",
+                "llm_reason": "复用7天内详情的多规格24包真实价18.5元比价",
+            },
+            ensure_ascii=False,
+        ),
+        "metrics": {"model_used": "unit_test_model"},
+    }
+
+    with patch.object(sched, "search_xianyu_items", return_value=fake_search_res), patch.object(
+        sched, "_filter_comparable_xianyu_items_by_llm", return_value=(["880001"], {}, "ok")
+    ), patch.object(sched, "get_xianyu_item_details_batch") as mock_batch_det, patch.object(
+        sched, "generate_content", return_value=fake_step3_llm
+    ):
+        rec = sched.compare_candidate_with_xianyu(
+            candidate=cand,
+            search_user_data_dir=r"W:\temp\xianyu_xiaohao",
+            guest_user_data_dir=r"W:\temp\xianyu_guest",
+            items_col=fake_items_col,
+            detail_cache_days=7,
+        )
+
+    # 7天内详情全命中 -> 0 次 H5 详情浏览器调用，且搜索入库未覆盖原有详情与多规格 SKU
+    assert mock_batch_det.call_count == 0
+    assert fake_items_col.docs["880001"]["has_detail"] is True
+    assert fake_items_col.docs["880001"]["detail_updated_at"] == two_days_ago
+    assert "search_updated_at" in fake_items_col.docs["880001"]
+    assert fake_items_col.docs["880002"]["has_detail"] is False
+    assert rec["xianyu_audit_trail"]["step3_detail_cache_hit_count"] == 1
+    assert rec["xianyu_audit_trail"]["step3_detail_live_fetched_count"] == 0
+    assert len(rec["best_xianyu_product"]["sku_list"]) == 2
+    assert rec["final_winner"] == "xianyu_product"
+
+
+def test_xianyu_items_partial_cache_hit_and_expired_detail_refresh():
+    """验证混合场景：<7天详情直接复用、>7天过期详情与仅搜索无详情记录走H5补拉并刷新入库、拉取失败记录不污染缓存。"""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    three_days_ago = now_utc - datetime.timedelta(days=3)
+    eight_days_ago = now_utc - datetime.timedelta(days=8)
+
+    fake_items_col = _InMemoryXianyuItemsCol(
+        [
+            {
+                "item_id": "9001",
+                "has_detail": True,
+                "detail_updated_at": three_days_ago,
+                "detail": {
+                    "ok": True,
+                    "item_id": "9001",
+                    "title": "缓存有效商品9001",
+                    "desc": "3天前已拉取详情",
+                    "price": 21.0,
+                    "transport_fee": 0.0,
+                    "is_free_shipping": True,
+                    "has_multi_sku": False,
+                    "min_price": 21.0,
+                    "max_price": 21.0,
+                    "sku_list": [],
+                },
+            },
+            {
+                "item_id": "9002",
+                "has_detail": True,
+                "detail_updated_at": eight_days_ago,
+                "detail": {
+                    "ok": True,
+                    "item_id": "9002",
+                    "title": "已超7天过期商品9002",
+                    "desc": "8天前旧详情",
+                    "price": 25.0,
+                    "transport_fee": 0.0,
+                    "is_free_shipping": True,
+                    "has_multi_sku": False,
+                    "min_price": 25.0,
+                    "max_price": 25.0,
+                    "sku_list": [],
+                },
+            },
+            {
+                "item_id": "9003",
+                "has_detail": False,
+                "search_card": {"item_id": "9003", "title": "仅有搜索概览无详情9003", "price": 19.0},
+            },
+        ]
+    )
+
+    cand = _make_sample_champion(2)
+    fake_search_res = {
+        "ok": True,
+        "is_offline": False,
+        "is_risk_blocked": False,
+        "user_data_dir": r"W:\temp\xianyu_xiaohao",
+        "items": [
+            {"item_id": "9001", "title": "缓存有效商品9001", "price": 21.0, "want_cnt": 3, "is_free_shipping": True},
+            {"item_id": "9002", "title": "已超7天过期商品9002", "price": 20.5, "want_cnt": 4, "is_free_shipping": True},
+            {"item_id": "9003", "title": "仅有搜索概览无详情9003", "price": 19.0, "want_cnt": 6, "is_free_shipping": True},
+            {"item_id": "9004", "title": "拉取详情失败商品9004", "price": 15.0, "want_cnt": 1, "is_free_shipping": True},
+            {"item_id": "9005", "title": "凑够6条商品9005", "price": 29.0, "want_cnt": 1, "is_free_shipping": True},
+            {"item_id": "9006", "title": "凑够6条商品9006", "price": 30.0, "want_cnt": 1, "is_free_shipping": True},
+        ],
+    }
+    fake_live_batch_det = {
+        "ok": True,
+        "is_offline": False,
+        "is_risk_blocked": False,
+        "user_data_dir": r"W:\temp\xianyu_guest",
+        "details_by_id": {
+            "9002": {
+                "ok": True,
+                "item_id": "9002",
+                "title": "已超7天过期商品9002_新详情",
+                "desc": "重新拉取的新详情24包",
+                "price": 20.5,
+                "transport_fee": 0.0,
+                "is_free_shipping": True,
+                "has_multi_sku": False,
+                "min_price": 20.5,
+                "max_price": 20.5,
+                "sku_list": [],
+            },
+            "9003": {
+                "ok": True,
+                "item_id": "9003",
+                "title": "新补拉详情商品9003",
+                "desc": "24包整箱装包邮",
+                "price": 19.0,
+                "transport_fee": 0.0,
+                "is_free_shipping": True,
+                "has_multi_sku": False,
+                "min_price": 19.0,
+                "max_price": 19.0,
+                "sku_list": [],
+            },
+            "9004": {
+                "ok": False,
+                "item_id": "9004",
+                "error_code": "DETAIL_PACKET_EMPTY",
+                "message": "商品已下架",
+            },
+        },
+    }
+    fake_step3_llm = {
+        "status": "成功",
+        "content": json.dumps(
+            {
+                "has_comparable_item": True,
+                "comparable_item_ids": ["9001", "9002", "9003"],
+                "best_xianyu_item_id": "9003",
+                "best_xianyu_title": "新补拉详情商品9003",
+                "best_xianyu_price": 19.0,
+                "xianyu_unit_quantities": {"包": 24.0},
+                "xianyu_unit_cost_performance": {"包": round(24.0 / 19.0, 6)},
+                "llm_winner": "xianyu_product",
+                "llm_reason": "9003含邮19元最优",
+            },
+            ensure_ascii=False,
+        ),
+        "metrics": {"model_used": "unit_test_model"},
+    }
+
+    with patch.object(sched, "search_xianyu_items", return_value=fake_search_res), patch.object(
+        sched, "_filter_comparable_xianyu_items_by_llm", return_value=(["9001", "9002", "9003", "9004"], {}, "ok")
+    ), patch.object(
+        sched, "get_xianyu_item_details_batch", return_value=fake_live_batch_det
+    ) as mock_batch_det, patch.object(sched, "generate_content", return_value=fake_step3_llm):
+        rec = sched.compare_candidate_with_xianyu(
+            candidate=cand,
+            search_user_data_dir=r"W:\temp\xianyu_xiaohao",
+            guest_user_data_dir=r"W:\temp\xianyu_guest",
+            items_col=fake_items_col,
+            detail_cache_days=7,
+        )
+
+    # 9001 命中7天缓存免拉取；仅向 H5 请求缺失/过期的 ["9002", "9003", "9004"]
+    assert mock_batch_det.call_count == 1
+    assert mock_batch_det.call_args.kwargs["item_ids"] == ["9002", "9003", "9004"]
+
+    # 9002 详情与时间戳已刷新；9003 变为 has_detail=True；9004 失败绝不标为 has_detail=True
+    assert fake_items_col.docs["9002"]["detail_updated_at"] > three_days_ago
+    assert fake_items_col.docs["9002"]["price"] == 20.5
+    assert fake_items_col.docs["9003"]["has_detail"] is True
+    assert fake_items_col.docs["9004"]["has_detail"] is False
+
+    audit = rec["xianyu_audit_trail"]
+    assert audit["step3_detail_cache_hit_count"] == 1
+    assert audit["step3_detail_live_fetched_count"] == 2
+    assert audit["step3_detail_fetched_count"] == 3
+    assert audit["step3_detail_failed_count"] == 1
+
+
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
