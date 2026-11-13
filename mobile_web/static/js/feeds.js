@@ -198,7 +198,10 @@
     const initializeHome = params => {
       let keyword = (params.get('keyword') || params.get('q') || read('home_search_keyword') || '').trim();
       if (params.get('tab') && params.get('tab') !== 'home') keyword = '';
-      homeSearchKeyword.value = keyword; activeHomeKeyword.value = keyword;
+      if (keyword || !homeSearchKeyword.value || activeHomeKeyword.value) {
+        homeSearchKeyword.value = keyword;
+      }
+      activeHomeKeyword.value = keyword;
       const cached = read(keyword ? 'home_search_state' : 'home_return_state');
       if (cached && cached.scope === getScope() && cached.platform === homePlatform.value && cached.keyword === keyword && Array.isArray(cached.list)) {
         if (!keyword && homeChannels.value.some(item => item.channel_type === cached.channel)) currentChannel.value = cached.channel;
@@ -247,9 +250,12 @@
       try {
         const cached = JSON.parse(global.sessionStorage.getItem(key('boom_return_state', 'all')) || 'null');
         if (cached && cached.scope === getScope() && Array.isArray(cached.list) && cached.list.length > 0) {
+          const restoredKeyword = cached.keyword || '';
           boomPlatform.value = cached.platform || 'all';
-          activeBoomKeyword.value = cached.keyword || '';
-          boomSearchKeyword.value = activeBoomKeyword.value;
+          activeBoomKeyword.value = restoredKeyword;
+          if (restoredKeyword || !boomSearchKeyword.value) {
+            boomSearchKeyword.value = restoredKeyword;
+          }
           boomSortBy.value = activeBoomKeyword.value ? (cached.sortBy || 'cost_performance') : 'latest';
           boomGoodsList.value = [...cached.list];
           boomPage = cached.page || 1;

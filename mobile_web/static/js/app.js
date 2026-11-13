@@ -59,15 +59,31 @@
       let bottomObserver = null;
       let observerTimer = null;
       let walletRestore = null;
+      const ime = shop.createImeGuard();
+      const homeSearchInputRef = ref(null);
+      const boomSearchInputRef = ref(null);
       feeds = shop.createFeeds({ ref, api, getUid: () => account.isLoggedIn.value ? account.uid.value : '',
         getScope: session.scope, showToast: browser.showToast });
-      const smartSearch = async (sourceTab) => {
+      const resolveImeModelRef = key => {
+        if (key === 'boom') return feeds.boomSearchKeyword;
+        if (key === 'universal') return account.universalInput;
+        if (key === 'nickname') return account.formNickname;
+        return feeds.homeSearchKeyword;
+      };
+      const onImeCompositionStart = (key, event) => ime.onCompositionStart(key, event);
+      const onImeCompositionEnd = (key, event) => ime.onCompositionEnd(key, resolveImeModelRef(key), event);
+      const onImeInput = (key, event) => ime.onInput(key, resolveImeModelRef(key), event);
+      const onImeReset = (key, event, syncValue = false) => ime.onReset(key, resolveImeModelRef(key), event, syncValue);
+      const isUiEvent = ev => Boolean(ev && typeof ev === 'object' && ('target' in ev || 'type' in ev || 'preventDefault' in ev));
+      const smartSearch = async (sourceTab, fromUiEvent = false) => {
         const inputRef = sourceTab === 'boom' ? feeds.boomSearchKeyword : feeds.homeSearchKeyword;
+        const inputEl = sourceTab === 'boom' ? boomSearchInputRef.value : homeSearchInputRef.value;
+        ime.syncElementToRef(sourceTab, inputRef, inputEl, fromUiEvent);
         const raw = String(inputRef.value || '').trim();
         if (raw && typeof shop.extractInternalShareRoute === 'function') {
           const internalRoute = shop.extractInternalShareRoute(raw, global.location ? global.location.origin : '');
           if (internalRoute) {
-            inputRef.value = '';
+            ime.clearElementAndRef(sourceTab, inputRef, inputEl);
             global.location.href = internalRoute;
             return;
           }
@@ -75,12 +91,12 @@
         if (raw && typeof shop.detectLinkOrToken === 'function') {
           const detected = shop.detectLinkOrToken(raw);
           if (detected.isEtbShareWithTitle && detected.keyword) {
-            inputRef.value = '';
+            ime.clearElementAndRef(sourceTab, inputRef, inputEl);
             browser.showToast('已提取分享文案中的商品名称，正在为您搜索好价...');
             return jumpToHomeKeywordSearch(detected.keyword, 'taobao');
           }
           if (detected.isLinkOrToken) {
-            inputRef.value = '';
+            ime.clearElementAndRef(sourceTab, inputRef, inputEl);
             currentTab.value = 'user';
             account.universalPlatform.value = 'auto';
             account.universalInput.value = raw;
@@ -91,8 +107,23 @@
         }
         return sourceTab === 'boom' ? feeds.onSearchBoom() : feeds.onSearchHome();
       };
-      const onSearchHome = () => smartSearch('home');
-      const onSearchBoom = () => smartSearch('boom');
+      const onSearchHome = ev => smartSearch('home', isUiEvent(ev));
+      const onSearchBoom = ev => smartSearch('boom', isUiEvent(ev));
+      const clearHomeSearch = () => {
+        ime.clearElementAndRef('home', feeds.homeSearchKeyword, homeSearchInputRef.value);
+        return feeds.clearHomeSearch();
+      };
+      const clearBoomSearch = () => {
+        ime.clearElementAndRef('boom', feeds.boomSearchKeyword, boomSearchInputRef.value);
+        return feeds.clearBoomSearch();
+      };
+      const onSearchKeydownEnter = (sourceTab, event) => {
+        const inputRef = sourceTab === 'boom' ? feeds.boomSearchKeyword : feeds.homeSearchKeyword;
+        const inputEl = sourceTab === 'boom' ? boomSearchInputRef.value : homeSearchInputRef.value;
+        return ime.onEnterKeydown(sourceTab, inputRef, inputEl, () => smartSearch(sourceTab, false), event);
+      };
+      const onAuthInputEnter = (key, event) =>
+        ime.onEnterKeydown(key, resolveImeModelRef(key), event && event.target, () => account.handleRegisterOrLogin(), event);
       const restoreAccount = () => {
         if (walletRestore) return walletRestore;
         walletRestore = account.fetchUserInfo().then(restored => {
@@ -271,7 +302,7 @@
           account.initializeOrderPlatform(params.get('platform'));
           initialized = true;
           account.resumePendingAuthorization();
-          if (currentTab.value === 'boom' && feeds.boomGoodsList.value.length === 0) {
+          if (currentTab.value === 'boom' && feeds.boomGoodsList.value.length === 0 && !feeds.boomLoading.value && !feeds.activeBoomKeyword.value) {
             if (!feeds.restoreBoomState()) feeds.loadBoomGoods(true);
           } else if (currentTab.value === 'user' && account.isLoggedIn.value) {
             account.syncAndQueryOrders(false);
@@ -322,12 +353,16 @@
           else url.searchParams.set('tab', newTab);
           global.history.replaceState({ tab: newTab, scope: session.scope() }, '', url.toString());
         } catch (_) {}
-        if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0) {
+        if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0 && !feeds.boomLoading.value && !feeds.activeBoomKeyword.value) {
           if (!feeds.restoreBoomState()) feeds.loadBoomGoods(true);
         } else if (newTab === 'user') restoreAccount();
       });
       return {
-        ...browser, ...account, ...feeds, onSearchHome, onSearchBoom,
+        ...browser, ...account, ...feeds,
+        homeSearchInputRef, boomSearchInputRef,
+        onImeCompositionStart, onImeCompositionEnd, onImeInput, onImeReset,
+        onSearchKeydownEnter, onAuthInputEnter,
+        onSearchHome, onSearchBoom, clearHomeSearch, clearBoomSearch,
         currentTab, isHeaderHidden, showBackToTop, scrollToTop,
         pullDistance, pullStatus, isRefreshing, isTransitioning, pullText, executeRefresh,
         formatPhone: shop.formatPhone, formatMoney: shop.formatMoney, formatSales: shop.formatSales,

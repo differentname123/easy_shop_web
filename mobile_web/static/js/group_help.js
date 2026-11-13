@@ -37,6 +37,8 @@
       const fullPosterUrl = ref('');
       const toastMsg = ref('');
       const fileInputRef = ref(null);
+      const searchInputRef = ref(null);
+      let isSearchComposing = false;
       const showOnboardGuide = ref(true);
 
       const authToken = ref('');
@@ -629,7 +631,59 @@
         }
       };
 
-      const onSearch = () => {
+      const syncSearchInputToKeyword = forceFromDom => {
+        const el = searchInputRef.value;
+        if (!el || typeof el.value !== 'string') return;
+        if (forceFromDom) {
+          isSearchComposing = false;
+          el.composing = false;
+          if (keyword.value !== el.value) keyword.value = el.value;
+          return;
+        }
+        if (!String(keyword.value || '').trim() && el.value.trim()) {
+          isSearchComposing = false;
+          el.composing = false;
+          keyword.value = el.value;
+        }
+      };
+
+      const onSearchCompositionStart = event => {
+        isSearchComposing = true;
+        if (event && event.target) event.target.composing = true;
+      };
+
+      const onSearchCompositionEnd = event => {
+        isSearchComposing = false;
+        const el = event && event.target;
+        if (!el) return;
+        el.composing = false;
+        const snapshot = typeof el.value === 'string' ? el.value : '';
+        if (typeof el.value === 'string' && keyword.value !== el.value) {
+          keyword.value = el.value;
+        }
+        const syncDelayed = () => {
+          if (!isSearchComposing && !el.composing && typeof el.value === 'string' && el.value !== snapshot && keyword.value !== el.value) {
+            keyword.value = el.value;
+          }
+        };
+        Promise.resolve().then(syncDelayed);
+        global.setTimeout(syncDelayed, 0);
+      };
+
+      const onSearchImeReset = (event, syncValue = false) => {
+        isSearchComposing = false;
+        const el = event && event.target;
+        if (el) {
+          el.composing = false;
+          if (syncValue && typeof el.value === 'string' && keyword.value !== el.value) {
+            keyword.value = el.value;
+          }
+        }
+      };
+
+      const onSearch = ev => {
+        const fromUi = Boolean(ev && typeof ev === 'object' && ('target' in ev || 'type' in ev || 'preventDefault' in ev));
+        syncSearchInputToKeyword(fromUi);
         activeKeyword.value = keyword.value.trim();
         if (filterMode.value === 'mine') {
           filterMode.value = 'active';
@@ -637,7 +691,35 @@
         fetchGroups(true);
       };
 
-      const onKeywordInput = () => {
+      const onSearchKeydownEnter = event => {
+        const composingNow = Boolean(
+          isSearchComposing ||
+          (event && (event.isComposing || event.keyCode === 229 || event.which === 229))
+        );
+        if (composingNow) return;
+        const targetEl = (event && event.target) || searchInputRef.value;
+        if (targetEl && typeof targetEl.value === 'string') {
+          isSearchComposing = false;
+          targetEl.composing = false;
+          if (keyword.value !== targetEl.value) keyword.value = targetEl.value;
+        }
+        if (event && typeof event.preventDefault === 'function') event.preventDefault();
+        onSearch();
+      };
+
+      const onKeywordInput = event => {
+        if (event && event.isComposing) {
+          isSearchComposing = true;
+          if (event.target) event.target.composing = true;
+          return;
+        }
+        isSearchComposing = false;
+        if (event && event.target) {
+          if (event.target.composing) event.target.composing = false;
+          if (typeof event.target.value === 'string' && keyword.value !== event.target.value) {
+            keyword.value = event.target.value;
+          }
+        }
         if (!keyword.value.trim() && activeKeyword.value) {
           activeKeyword.value = '';
           fetchGroups(true);
@@ -645,6 +727,11 @@
       };
 
       const clearSearch = () => {
+        isSearchComposing = false;
+        if (searchInputRef.value) {
+          searchInputRef.value.composing = false;
+          if (typeof searchInputRef.value.value === 'string') searchInputRef.value.value = '';
+        }
         keyword.value = '';
         activeKeyword.value = '';
         fetchGroups(true);
@@ -1606,6 +1693,7 @@
         fullPosterUrl,
         toastMsg,
         fileInputRef,
+        searchInputRef,
         showOnboardGuide,
         dismissOnboardGuide,
         viewerGuard,
@@ -1630,6 +1718,10 @@
         removeMyGroup,
         quickMyGroupTakedown,
         quickMyGroupRelist,
+        onSearchCompositionStart,
+        onSearchCompositionEnd,
+        onSearchImeReset,
+        onSearchKeydownEnter,
         onSearch,
         onKeywordInput,
         clearSearch,

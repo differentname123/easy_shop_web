@@ -116,6 +116,14 @@ body {
   font-size: 14px;
   color: var(--gh-text-main);
   background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.gh-search-input::-webkit-search-cancel-button,
+.gh-search-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  display: none;
 }
 
 .gh-clear-btn {

@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261112-2">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261113-1">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261112-2"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261113-1"></script>
 </head>
 <body>
 <div id="app">
@@ -27,15 +27,25 @@
         <div class="search-input-wrap">
           <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
           <input 
-            type="text" 
+            ref="homeSearchInputRef"
+            type="search" 
+            enterkeyhint="search"
+            autocomplete="off"
             class="search-input" 
             :placeholder="'搜' + homePlatformName() + '商品，或直接粘贴分享链接/口令...'"
             v-model="homeSearchKeyword"
-            @keyup.enter="onSearchHome"
+            @compositionstart="onImeCompositionStart('home', $event)"
+            @compositionend="onImeCompositionEnd('home', $event)"
+            @input="onImeInput('home', $event)"
+            @focus="onImeReset('home', $event, false)"
+            @blur="onImeReset('home', $event, true)"
+            @change="onImeReset('home', $event, true)"
+            @keydown.esc="onImeReset('home', $event, false)"
+            @keydown.enter="onSearchKeydownEnter('home', $event)"
           />
-          <button v-if="homeSearchKeyword" class="search-clear-btn" @click="clearHomeSearch" title="清空搜索">✕</button>
+          <button v-if="homeSearchKeyword" type="button" class="search-clear-btn" @click="clearHomeSearch" title="清空搜索">✕</button>
         </div>
-        <button class="search-btn" @click="onSearchHome">搜索</button>
+        <button type="button" class="search-btn" @click="onSearchHome($event)">搜索</button>
       </div>
 
       <nav class="platform-bar home-platform-bar" aria-label="推荐平台">
@@ -177,15 +187,25 @@
         <div class="search-input-wrap">
           <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
           <input 
-            type="text" 
+            ref="boomSearchInputRef"
+            type="search" 
+            enterkeyhint="search"
+            autocomplete="off"
             class="search-input" 
             placeholder="在严选好价库中搜高性价比商品..." 
             v-model="boomSearchKeyword"
-            @keyup.enter="onSearchBoom"
+            @compositionstart="onImeCompositionStart('boom', $event)"
+            @compositionend="onImeCompositionEnd('boom', $event)"
+            @input="onImeInput('boom', $event)"
+            @focus="onImeReset('boom', $event, false)"
+            @blur="onImeReset('boom', $event, true)"
+            @change="onImeReset('boom', $event, true)"
+            @keydown.esc="onImeReset('boom', $event, false)"
+            @keydown.enter="onSearchKeydownEnter('boom', $event)"
           />
-          <button v-if="boomSearchKeyword" class="search-clear-btn" @click="clearBoomSearch" title="清空搜索">✕</button>
+          <button v-if="boomSearchKeyword" type="button" class="search-clear-btn" @click="clearBoomSearch" title="清空搜索">✕</button>
         </div>
-        <button class="search-btn" @click="onSearchBoom">搜索</button>
+        <button type="button" class="search-btn" @click="onSearchBoom($event)">搜索</button>
       </div>
 
       <!-- 平台筛选芯片 (第一行) -->
@@ -383,6 +403,12 @@
           class="universal-textarea"
           rows="3"
           v-model="universalInput"
+          @compositionstart="onImeCompositionStart('universal', $event)"
+          @compositionend="onImeCompositionEnd('universal', $event)"
+          @input="onImeInput('universal', $event)"
+          @focus="onImeReset('universal', $event, false)"
+          @blur="onImeReset('universal', $event, true)"
+          @change="onImeReset('universal', $event, true)"
           placeholder="在此粘贴商品分享文案、淘口令、京口令或推广短链 (如 https://m.tb.cn/... 、https://u.jd.com/... 、https://p.pinduoduo.com/...)"
         ></textarea>
       </div>
@@ -529,7 +555,14 @@
           class="form-input" 
           placeholder="例如: 省钱小能手 (若留空则自动生成)" 
           v-model="formNickname"
-          @keyup.enter="handleRegisterOrLogin"
+          @compositionstart="onImeCompositionStart('nickname', $event)"
+          @compositionend="onImeCompositionEnd('nickname', $event)"
+          @input="onImeInput('nickname', $event)"
+          @focus="onImeReset('nickname', $event, false)"
+          @blur="onImeReset('nickname', $event, true)"
+          @change="onImeReset('nickname', $event, true)"
+          @keydown.esc="onImeReset('nickname', $event, false)"
+          @keydown.enter="onAuthInputEnter('nickname', $event)"
         />
       </div>
 
@@ -870,12 +903,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261112-2"></script>
-<script src="/static/js/session.js?v=ux-20261112-2"></script>
-<script src="/static/js/format.js?v=ux-20261112-2"></script>
-<script src="/static/js/browser.js?v=ux-20261112-2"></script>
-<script src="/static/js/feeds.js?v=ux-20261112-2"></script>
-<script src="/static/js/account.js?v=ux-20261112-2"></script>
-<script src="/static/js/app.js?v=ux-20261112-2"></script>
+<script src="/static/js/api.js?v=ux-20261113-1"></script>
+<script src="/static/js/session.js?v=ux-20261113-1"></script>
+<script src="/static/js/format.js?v=ux-20261113-1"></script>
+<script src="/static/js/browser.js?v=ux-20261113-1"></script>
+<script src="/static/js/feeds.js?v=ux-20261113-1"></script>
+<script src="/static/js/account.js?v=ux-20261113-1"></script>
+<script src="/static/js/app.js?v=ux-20261113-1"></script>
 </body>
 </html>

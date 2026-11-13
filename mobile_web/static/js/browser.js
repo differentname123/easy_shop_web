@@ -190,4 +190,94 @@
       triggerAddToDesktop, dismissDesktopBanner, closeDesktopGuide, dispose,
     };
   };
+
+  shop.createImeGuard = function () {
+    const composing = Object.create(null);
+    const isComposing = key => Boolean(composing[key]);
+    const onCompositionStart = (key, event) => {
+      composing[key] = true;
+      if (event && event.target) event.target.composing = true;
+    };
+    const onCompositionEnd = (key, modelRef, event) => {
+      composing[key] = false;
+      const el = event && event.target;
+      if (!el) return;
+      el.composing = false;
+      const snapshot = typeof el.value === 'string' ? el.value : '';
+      if (modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
+        modelRef.value = el.value;
+      }
+      const syncDelayedCommit = () => {
+        if (!composing[key] && !el.composing && typeof el.value === 'string' && el.value !== snapshot && modelRef && modelRef.value !== el.value) {
+          modelRef.value = el.value;
+        }
+      };
+      Promise.resolve().then(syncDelayedCommit);
+      global.setTimeout(syncDelayedCommit, 0);
+    };
+    const onInput = (key, modelRef, event) => {
+      if (event && event.isComposing) {
+        composing[key] = true;
+        if (event.target) event.target.composing = true;
+        return false;
+      }
+      composing[key] = false;
+      const el = event && event.target;
+      if (el) {
+        if (el.composing) el.composing = false;
+        if (modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
+          modelRef.value = el.value;
+        }
+      }
+      return true;
+    };
+    const onReset = (key, modelRef, event, syncValue = false) => {
+      composing[key] = false;
+      const el = event && event.target;
+      if (el) {
+        el.composing = false;
+        if (syncValue && modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
+          modelRef.value = el.value;
+        }
+      }
+    };
+    const syncElementToRef = (key, modelRef, el, forceFromDom = false) => {
+      if (!el || typeof el.value !== 'string' || !modelRef) return;
+      if (forceFromDom) {
+        composing[key] = false;
+        el.composing = false;
+        if (modelRef.value !== el.value) modelRef.value = el.value;
+        return;
+      }
+      if (!String(modelRef.value || '').trim() && el.value.trim()) {
+        composing[key] = false;
+        el.composing = false;
+        modelRef.value = el.value;
+      }
+    };
+    const clearElementAndRef = (key, modelRef, el) => {
+      composing[key] = false;
+      if (el) {
+        el.composing = false;
+        if (typeof el.value === 'string') el.value = '';
+      }
+      if (modelRef) modelRef.value = '';
+    };
+    const onEnterKeydown = (key, modelRef, el, submitFn, event) => {
+      const eventComposing = Boolean(
+        composing[key] ||
+        (event && (event.isComposing || event.keyCode === 229 || event.which === 229))
+      );
+      if (eventComposing) return false;
+      const targetEl = (event && event.target) || el;
+      syncElementToRef(key, modelRef, targetEl, true);
+      if (event && typeof event.preventDefault === 'function') event.preventDefault();
+      if (typeof submitFn === 'function') submitFn();
+      return true;
+    };
+    return {
+      isComposing, onCompositionStart, onCompositionEnd, onInput, onReset,
+      syncElementToRef, clearElementAndRef, onEnterKeydown,
+    };
+  };
 })(globalThis);
