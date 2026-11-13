@@ -387,8 +387,8 @@ def _mark_key_cooldown(api_key, model_name="", status_code=None, error_text=""):
 # 示例模型名沿用原需求；请按网关实际支持的模型补充，每个模型名在组内只出现一次。
 HIGH_MODEL_LIST = [
     # {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
-    {"model_name": "gpt-6.1-sol-max", "权重": 1, "备注": "来源codex 订阅账号"},
-    {"model_name": "antigravity-argon-high", "权重": 0.43, "备注": "来源antigravity 本地客户端 (占组内总权重 30%)"},
+    {"model_name": "gpt-6.1-sol-max", "权重": 90, "备注": "来源codex 订阅账号 (占组内总权重 90%)"},
+    {"model_name": "antigravity-argon-high", "权重": 10, "备注": "来源antigravity 本地客户端 (占组内总权重 10%)"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
 ]
@@ -400,7 +400,7 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
-    {"model_name": "antigravity-3.8-flash-high", "权重": 11.14, "备注": "来源antigravity 本地客户端 (占组内总权重 30%，其余启用项合计=26)"},
+    {"model_name": "antigravity-3.8-flash-high", "权重": 4, "备注": "来源antigravity 本地客户端 (占组内总权重 4%)"},
     # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
 
 
@@ -417,7 +417,7 @@ MEDIUM_MODEL_LIST = [
 
     {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
     # {"model_name": "gpt-6-codex-sol-max", "权重": 5, "备注": "来源codex 付费"},
-    {"model_name": "gpt-6-codex-luna-max", "权重": 10, "备注": "来源codex 付费"},
+    {"model_name": "gpt-6-codex-luna-max", "权重": 20, "备注": "来源codex 付费 (占组内总权重 80%，其余启用项合计=20)"},
 
 ]
 LOW_MODEL_LIST = [
@@ -429,6 +429,7 @@ LOW_MODEL_LIST = [
 
     {"model_name": "gemini-aistudio-3.5-flash", "权重": 0, "备注": "来源aistudio_web"},
 
+    {"model_name": "gpt-5.6-terra-max", "权重": 2, "备注": "来源codex 免费"},
 
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
