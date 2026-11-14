@@ -147,6 +147,10 @@ class MemoryCollection:
                         matched = matched and MemoryCollection.equal(field_val, operand)
                     elif op == "$ne":
                         matched = matched and not MemoryCollection.equal(field_val, operand)
+                    elif op == "$in":
+                        matched = matched and any(MemoryCollection.equal(field_val, cand) for cand in operand)
+                    elif op == "$gt":
+                        matched = matched and isinstance(field_val, (int, float)) and not isinstance(field_val, bool) and field_val > operand
                     elif op != "$options":
                         raise AssertionError(f"unsupported field operator: {op}")
             else:
@@ -668,7 +672,7 @@ class TestProductRepository(unittest.TestCase):
                 "platform", "product_id", "goods_id", "goods_sign", "name", "brand", "category",
                 "activity_price", "price", "original_price", "saved_price", "coupon_amount", "has_coupon",
                 "commission_rate", "commission_amount", "sales_tip", "image_url", "mall_name", "updated_at",
-                "product_url",
+                "product_url", "coupon_url",
             ), 1),
         })
         for field in ("_id", "desc", "carousel_images", "default_promotion", "default_promotion_expires_at"):

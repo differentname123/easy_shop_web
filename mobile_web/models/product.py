@@ -424,6 +424,7 @@ class ProductSummary(BaseModel):
     original_price: float
     coupon_amount: float = 0.0
     has_coupon: bool = False
+    coupon_url: str = ""
     commission_rate: float = 0.0
     commission_amount: float = 0.0
     sales_tip: str = "0"
@@ -433,6 +434,9 @@ class ProductSummary(BaseModel):
     updated_at: Optional[str] = None
 
     def __init__(self, **data: Any):
+        if "coupon_url" in data:
+            raw_cu = data.get("coupon_url")
+            data["coupon_url"] = raw_cu.strip() if isinstance(raw_cu, str) else ""
         if "coupon_amount" in data or "has_coupon" in data:
             try:
                 c_val = round(max(0.0, float(data.get("coupon_amount") or 0.0)), 2)

@@ -17,7 +17,7 @@ from infrastructure.http_utils import (
 )
 from infrastructure.jd_client import (
     JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS, SHANGHAI,
-    canonical_promoter_id, product_url,
+    canonical_promoter_id, jd_coupon_url, product_url,
 )
 from models.product import (
     ProductDetail,
@@ -106,8 +106,10 @@ class JdAdapter(BasePlatformAdapter):
                                             setting("jd_app_key") and setting("jd_app_secret"))}
 
     def can_prefetch_detail(self, ref=None):
-        """禁用后台盲目单品详情轮询，避免无故消耗 ZTK_APPKEY_LIST 配额。"""
-        return False
+        """仅对合法加密 itemId 允许后台单次补券预取（已查过的商品在 ProductService 层直接短路）。"""
+        if ref is None or not isinstance(ref, ProductRef):
+            return False
+        return _is_encrypted_jd_item_id(ref.goods_sign)
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
         sign = _text(goods_sign or goods_id_or_sign or goods_id)
@@ -127,6 +129,7 @@ class JdAdapter(BasePlatformAdapter):
         if price is None or price < 0 or not name:
             raise ValueError("missing or invalid public product content")
         coupon = _money(item.get("coupon_info_money")) or 0.0
+        coupon_link = jd_coupon_url(item.get("coupon_id"))
         image_url = _text(_pick(item.get("pict_url"), item.get("imageUrl")))
         canonical_id = extract_canonical_goods_id(self.platform_code, raw_id, image_url=image_url) or raw_id
         sales_candidates = (
@@ -148,6 +151,8 @@ class JdAdapter(BasePlatformAdapter):
             "sales_tip": sales_tip,
             "mall_name": _text(item.get("shop_title")),
         }
+        if coupon_link:
+            data["coupon_url"] = coupon_link
         summary = ProductSummary(**data).to_dict(exclude_unset=True)
         material = _material_url(item)
         if material:
@@ -287,7 +292,11 @@ class JdAdapter(BasePlatformAdapter):
                     self.default_promoter_id,
                 )
                 if probe.get("status") == "success":
-                    return _error("RATE_LIMIT", "京东详情接口触发临时频控，商品仍在正常推广中")
+                    return _error(
+                        "RATE_LIMIT",
+                        "京东详情接口触发临时频控，商品仍在正常推广中",
+                        probe_short_url=probe.get("short_url") or probe.get("click_url") or "",
+                    )
                 if probe.get("jd_off_promotion") is True:
                     return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
             return result
@@ -295,6 +304,37 @@ class JdAdapter(BasePlatformAdapter):
             return {"status": "success", "data": self._detail(result["data"])}
         except (ValueError, TypeError):
             return _error("PROTOCOL_ERROR", "京东详情字段无效")
+
+    def enrich_detail_resilient(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
+        """优先走单品详情 api_detail.ashx；若遇并发频控 (RATE_LIMIT)，自动复用探针短链经独立配额池 api_quanwang.ashx 精准补齐详情与优惠券。"""
+        ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
+        res = self.get_goods_detail(goods_id_or_sign, goods_id=goods_id, goods_sign=goods_sign)
+        if res.get("status") == "success" or res.get("error_code") != "RATE_LIMIT":
+            return res
+        short_q = _text(res.get("probe_short_url"))
+        if not short_q:
+            return res
+        try:
+            q_res = self.client.search_goods(short_q, page=1, page_size=5, has_coupon=False)
+        except TypeError:
+            q_res = self.client.search_goods(short_q, page=1, page_size=5)
+        rows = q_res.get("data") if q_res.get("status") == "success" else None
+        if not isinstance(rows, list) or len(rows) != 1 or int(q_res.get("total_count") or 1) != 1:
+            return res
+        single = dict(rows[0])
+        returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
+        if is_jd_image_key(ref.goods_id) and returned_img_key and returned_img_key != ref.goods_id:
+            return res
+        target_id = ref.goods_sign or ref.goods_id
+        if target_id and not returned_img_key:
+            single["tao_id"] = target_id
+        try:
+            card = self._detail(single)
+            if ref.goods_id and not card.get("goods_id"):
+                card["goods_id"] = ref.goods_id
+            return {"status": "success", "data": card}
+        except (ValueError, TypeError):
+            return res
 
     def convert_promotion_url(self, goods_id_or_sign="", uid=None, **kwargs):
         unavailable = self._available("promotion")
@@ -309,8 +349,9 @@ class JdAdapter(BasePlatformAdapter):
         target_id = ref.goods_sign or ref.goods_id
         if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
-        # The service strips request kwargs before supplying this private bridge.
+        # The service strips request kwargs before supplying these private bridges.
         material = product_url(kwargs.get("trusted_product_url"))
+        clean_coupon = jd_coupon_url(kwargs.get("trusted_coupon_url"))
         # 【对齐 test_jd_api.py 实证基准】：
         # 加密 itemId 拼接为 https://item.jd.com/{id}.html 无法访问且转链必报 2001104 (商品不在推广中)；
         # 必须使用 https://jingfen.jd.com/detail/{id}.html 格式直接一步转链（若缓存中残留旧版 item.jd.com 拼接格式则自动纠正）。
@@ -322,14 +363,24 @@ class JdAdapter(BasePlatformAdapter):
             if detail.get("status") != "success":
                 return detail
             material = _material_url(detail["data"])
+            if not clean_coupon:
+                clean_coupon = jd_coupon_url(detail["data"].get("coupon_id"))
         if not material:
             return _error("MATERIAL_URL_REQUIRED", "京东物料ID缺少已核验的商品链接")
-        result = self.client.convert_promotion_link(material, promoter)
+
+        def _convert_call(mat_url, coup_url):
+            if coup_url:
+                return self.client.convert_promotion_link(mat_url, promoter, coupon_url=coup_url)
+            return self.client.convert_promotion_link(mat_url, promoter)
+
+        result = _convert_call(material, clean_coupon)
         if result.get("status") != "success" and jingfen_encrypted_url and material == jingfen_encrypted_url:
             # 极端情况下若榜单混淆 itemId 需换取详情页重签名 tao_id，才回退调用一次 api_detail.ashx
             detail = self._fetch_item(ref)
             if detail.get("status") == "success":
                 detail_material = _material_url(detail["data"])
+                if not clean_coupon:
+                    clean_coupon = jd_coupon_url(detail["data"].get("coupon_id"))
                 if detail_material and detail_material != material:
                     material = detail_material
                     try:
@@ -340,19 +391,21 @@ class JdAdapter(BasePlatformAdapter):
                             MATERIAL_CACHE.set(("jd", "id", ref.goods_id), detail_material)
                     except Exception:
                         pass
-                    result = self.client.convert_promotion_link(material, promoter)
+                    result = _convert_call(material, clean_coupon)
             elif result.get("jd_off_promotion") is True:
                 return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
         if result.get("status") != "success":
             if result.get("jd_off_promotion") is True:
                 return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
             return result
+        extra_payload = {"coupon_url": clean_coupon} if clean_coupon else {}
         return self._build_promotion_payload(
             result,
             promoter=promoter,
             goods_id=ref.goods_id,
             goods_sign=ref.goods_sign,
             uid=uid,
+            **extra_payload,
         )
 
     def _build_promotion_payload(

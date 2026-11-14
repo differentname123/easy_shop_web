@@ -202,6 +202,24 @@ class ProductService:
                 item for item in raw_items
                 if not (isinstance(item, dict) and is_product_off_promotion(plat, item.get("goods_id"), item.get("goods_sign")))
             ]
+            if plat == "jd" and items:
+                overlay_fn = getattr(self.repo, "get_known_coupon_overlays", None)
+                if callable(overlay_fn):
+                    try:
+                        zero_keys = []
+                        for it in items:
+                            if not isinstance(it, dict):
+                                continue
+                            has_c = float(it.get("coupon_amount") or 0.0) > 0 and bool(str(it.get("coupon_url") or "").strip())
+                            if not has_c:
+                                for k in (it.get("goods_id"), it.get("goods_sign")):
+                                    if k:
+                                        zero_keys.append(k)
+                        overlays = overlay_fn("jd", zero_keys) if zero_keys else None
+                        if isinstance(overlays, dict) and overlays:
+                            items = [ProductRepository.apply_coupon_overlay(it, overlays) for it in items]
+                    except Exception:
+                        pass
             result["data"] = items
             RECOMMEND_CACHE.set(cache_key, result)
             # Already-verified public snapshots can be read immediately; database
@@ -609,6 +627,14 @@ class ProductService:
                 ref = self._upgrade_ref_sign(ref)
                 item = self._read_detail(ref, strict=True)
                 ref = self._upgrade_ref_sign(ref, item)
+                if (
+                    ref.platform == "jd"
+                    and isinstance(item, dict)
+                    and item.get("detail_updated_at") is not None
+                    and (bool(item.get("coupon_url")) or float(item.get("coupon_amount") or 0.0) <= 0)
+                ):
+                    saved = self._document_snapshot(item, ref.platform)
+                    return DetailPrefetchResult("ready", saved, next_check_at=time.time() + 86400)
                 deadline = self._detail_expires_at(item) if item else 0.0
                 if deadline - time.time() > refresh_ahead_seconds:
                     saved = self._document_snapshot(item, ref.platform)

@@ -111,7 +111,7 @@ class ProductRepository(BaseRepository):
             "platform", "product_id", "goods_id", "goods_sign", "name", "brand",
             "category", "activity_price", "price", "original_price", "saved_price",
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
-            "sales_tip", "image_url", "mall_name", "updated_at", "product_url",
+            "sales_tip", "image_url", "mall_name", "updated_at", "product_url", "coupon_url",
         ), 1),
     }
     _COST_PERFORMANCE_PROJECTION = {
@@ -296,6 +296,10 @@ class ProductRepository(BaseRepository):
                     update_set["product_url"] = clean_url
             else:
                 update_set["product_url"] = clean_url
+
+        coupon_url = item.get("coupon_url")
+        if isinstance(coupon_url, str) and coupon_url.strip():
+            update_set["coupon_url"] = coupon_url.strip()
 
         update_set["updated_at"] = now
         if item.get("source") is not None:
@@ -942,6 +946,7 @@ class ProductRepository(BaseRepository):
             "sales_tip": str(self._first_present(doc, "sales_tip", default="0")),
             "image_url": clean_doc_img,
             "product_url": doc.get("product_url") or "",
+            "coupon_url": str(doc.get("coupon_url") or "").strip(),
             "mall_name": doc.get("mall_name") or "",
             "updated_at": updated_at_str,
         }
@@ -1174,6 +1179,99 @@ class ProductRepository(BaseRepository):
             )
             return ["全部", "食品", "美妆", "百货", "数码", "服饰"]
 
+    def get_known_coupon_overlays(self, platform: str, keys: List[Any]) -> Dict[str, Dict[str, Any]]:
+        """批量读取本地库中已探明的优惠券与券后价快照，防止无券榜单轮询把已知优惠券抹零。"""
+        plat = self._platform(platform)
+        clean_keys = list(dict.fromkeys(
+            str(k).strip() for k in (keys or ())
+            if k is not None and str(k).strip() and str(k).strip() not in ("0", "None")
+        ))
+        if not clean_keys:
+            return {}
+        try:
+            cursor = self.col.find(
+                {
+                    "platform": plat,
+                    "$or": [
+                        {"product_id": {"$in": clean_keys}},
+                        {"goods_sign": {"$in": clean_keys}},
+                    ],
+                },
+                {
+                    "_id": 0,
+                    "product_id": 1,
+                    "goods_id": 1,
+                    "goods_sign": 1,
+                    "activity_price": 1,
+                    "price": 1,
+                    "original_price": 1,
+                    "coupon_amount": 1,
+                    "saved_price": 1,
+                    "coupon_url": 1,
+                },
+            )
+            overlays: Dict[str, Dict[str, Any]] = {}
+            for doc in cursor:
+                if not isinstance(doc, dict):
+                    continue
+                c_url = str(doc.get("coupon_url") or "").strip()
+                c_amt = max(0.0, self._amount_float(self._first_present(doc, "coupon_amount", "saved_price", default=0.0)))
+                if not c_url and c_amt <= 0:
+                    continue
+                act_p = max(0.0, self._amount_float(self._first_present(doc, "activity_price", "price", default=0.0)))
+                orig_p = max(act_p, self._amount_float(self._first_present(doc, "original_price", default=act_p)))
+                if c_amt > 0 and orig_p <= act_p:
+                    orig_p = round(act_p + c_amt, 2)
+                entry = {
+                    "activity_price": round(act_p, 2),
+                    "original_price": round(orig_p, 2),
+                    "coupon_amount": round(c_amt, 2),
+                    "coupon_url": c_url,
+                }
+                for alias in (doc.get("product_id"), doc.get("goods_id"), doc.get("goods_sign")):
+                    ak = str(alias or "").strip()
+                    if ak:
+                        overlays[ak] = entry
+            return overlays
+        except Exception as e:
+            logger.warning(
+                "❌ 【优惠券快照读取降级】批量读取已知优惠券覆盖层失败，将继续常规写入 | 平台[%s] 异常<%s>",
+                plat, format_exc_summary(e),
+            )
+            return {}
+
+    @classmethod
+    def apply_coupon_overlay(cls, item: Dict[str, Any], overlays: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """将已知优惠券与券后价无损叠加到无券榜单摘要字典上（不覆盖入参已有优惠券）。"""
+        if not isinstance(item, dict) or not overlays:
+            return item
+        _, gid, gsign = cls._identity(item)
+        ov = overlays.get(gid) or overlays.get(gsign) or overlays.get(str(item.get("product_id") or "").strip())
+        if not ov:
+            return item
+        out = dict(item)
+        if ov.get("coupon_url") and not str(out.get("coupon_url") or "").strip():
+            out["coupon_url"] = ov["coupon_url"]
+        try:
+            cur_coupon = float(cls._first_present(out, "coupon_amount", "saved_price", "coupon_discount_yuan", default=0.0) or 0.0)
+        except (TypeError, ValueError):
+            cur_coupon = 0.0
+        if cur_coupon <= 0 and ov.get("coupon_amount", 0.0) > 0:
+            c_amt = ov["coupon_amount"]
+            out["coupon_amount"] = c_amt
+            if "saved_price" in out:
+                out["saved_price"] = c_amt
+            out["has_coupon"] = True
+            if ov.get("activity_price", 0.0) > 0:
+                orig_val = max(ov.get("original_price", 0.0), round(ov["activity_price"] + c_amt, 2))
+                if "activity_price" in out:
+                    out["activity_price"] = ov["activity_price"]
+                    out["price"] = orig_val
+                else:
+                    out["price"] = ov["activity_price"]
+                out["original_price"] = orig_val
+        return out
+
     def upsert_home_products(
         self,
         goods_list: List[Dict[str, Any]],
@@ -1186,8 +1284,35 @@ class ProductRepository(BaseRepository):
         if not goods_list or not isinstance(goods_list, list):
             return 0
 
+        effective_list = goods_list
+        if channel_type is not None:
+            jd_zero_keys = []
+            for item in goods_list:
+                if not isinstance(item, dict):
+                    continue
+                plat, gid, gsign = self._identity(item)
+                if plat != "jd":
+                    continue
+                c_val = self._first_present(item, "coupon_amount", "saved_price", "coupon_discount_yuan", default=0.0)
+                try:
+                    has_c = float(c_val or 0.0) > 0 and bool(str(item.get("coupon_url") or "").strip())
+                except (TypeError, ValueError):
+                    has_c = False
+                if not has_c:
+                    if gid:
+                        jd_zero_keys.append(gid)
+                    if gsign and gsign != gid:
+                        jd_zero_keys.append(gsign)
+            if jd_zero_keys:
+                overlays = self.get_known_coupon_overlays("jd", jd_zero_keys)
+                if overlays:
+                    effective_list = [
+                        self.apply_coupon_overlay(it, overlays) if isinstance(it, dict) and self._identity(it)[0] == "jd" else it
+                        for it in goods_list
+                    ]
+
         ops_by_key = {}
-        for item in goods_list:
+        for item in effective_list:
             if not isinstance(item, dict):
                 continue
             mapped = self._build_product_update(item, detail=False, channel_type=channel_type)

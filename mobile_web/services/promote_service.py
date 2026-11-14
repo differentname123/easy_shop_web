@@ -127,6 +127,28 @@ class PromoteService:
             result["command_text"] += f"\n【平台口令】{token.strip()}"
         return result
 
+    def _verified_local_doc(self, ref: ProductRef) -> Optional[dict]:
+        if not ref.key:
+            return None
+        kind = "sign" if ref.goods_sign else "id"
+        item = self.repo.get_product_detail(ref.key, platform=ref.platform, key_type=kind)
+        if not isinstance(item, dict) and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd"):
+            item = self.repo.get_product_detail(ref.goods_id, platform=ref.platform, key_type="id")
+        if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
+            return None
+        if ref.platform != "pdd":
+            gid = str(item.get("goods_id") or item.get("product_id") or "").strip()
+            sign = str(item.get("goods_sign") or gid).strip()
+            actual = ProductRef(ref.platform, gid or sign, sign or gid)
+        else:
+            actual = ProductRef(ref.platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
+        if ref.goods_sign and ref.goods_sign != actual.goods_sign:
+            if not (ref.platform in ("taobao", "jd") and ref.goods_id and ref.goods_id == actual.goods_id):
+                return None
+        elif not ref.goods_sign and ref.goods_id != actual.goods_id:
+            return None
+        return item
+
     def _trusted_material_url(self, ref: ProductRef) -> str:
         if not ref.key:
             return ""
@@ -154,23 +176,8 @@ class PromoteService:
         if isinstance(cached, str) and cached:
             return cached
         try:
-            item = self.repo.get_product_detail(ref.key, platform=ref.platform,
-                                                key_type=kind)
-            if not isinstance(item, dict) and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd"):
-                item = self.repo.get_product_detail(ref.goods_id, platform=ref.platform,
-                                                    key_type="id")
-            if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
-                return ""
-            if ref.platform != "pdd":
-                gid = str(item.get("goods_id") or item.get("product_id") or "").strip()
-                sign = str(item.get("goods_sign") or gid).strip()
-                actual = ProductRef(ref.platform, gid or sign, sign or gid)
-            else:
-                actual = ProductRef(ref.platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
-            if ref.goods_sign and ref.goods_sign != actual.goods_sign:
-                if not (ref.platform in ("taobao", "jd") and ref.goods_id and ref.goods_id == actual.goods_id):
-                    return ""
-            elif not ref.goods_sign and ref.goods_id != actual.goods_id:
+            item = self._verified_local_doc(ref)
+            if not isinstance(item, dict):
                 return ""
             value = item.get("product_url")
             if isinstance(value, str) and value.strip():
@@ -186,6 +193,60 @@ class PromoteService:
                 ref.platform, ref.key, format_exc_summary(exc),
             )
             return ""
+
+    def _cached_or_db_coupon_url(self, ref: ProductRef) -> tuple[str, Optional[dict]]:
+        if ref.platform != "jd" or not ref.key:
+            return "", None
+        from infrastructure.jd_client import jd_coupon_url
+        try:
+            from cache import DETAIL_CACHE
+            for dkey in ref.cache_keys():
+                entry = DETAIL_CACHE.get(dkey)
+                if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
+                    c_url = jd_coupon_url((entry[1].get("data") or {}).get("coupon_url"))
+                    if c_url:
+                        return c_url, entry[1].get("data")
+        except Exception:
+            pass
+        try:
+            doc = self._verified_local_doc(ref)
+            if isinstance(doc, dict):
+                return jd_coupon_url(doc.get("coupon_url")), doc
+        except Exception:
+            pass
+        return "", None
+
+    def _trusted_coupon_url(self, ref: ProductRef, adapter=None) -> str:
+        """统一获取京东官方领券链接：命中本地缓存/数据库直接返回；若从未查过详情，转链前单次补查并落库。"""
+        if ref.platform != "jd" or not ref.key:
+            return ""
+        c_url, doc = self._cached_or_db_coupon_url(ref)
+        if c_url:
+            return c_url
+        from adapters.jd_adapter import _is_encrypted_jd_item_id
+        from infrastructure.jd_client import jd_coupon_url
+        enrich_fn = getattr(adapter, "enrich_detail_resilient", None)
+        target_sign = str((doc or {}).get("goods_sign") or ref.goods_sign or "").strip()
+        needs_once_check = (
+            doc is None
+            or doc.get("detail_updated_at") is None
+            or float(doc.get("coupon_amount") or 0.0) > 0
+        )
+        if not (callable(enrich_fn) and getattr(adapter, "platform_code", None) == "jd"
+                and _is_encrypted_jd_item_id(target_sign) and needs_once_check):
+            return ""
+        try:
+            det = enrich_fn(target_sign, goods_id=ref.goods_id or None, goods_sign=target_sign)
+            if isinstance(det, dict) and det.get("status") == "success" and isinstance(det.get("data"), dict):
+                detail_data = det["data"]
+                self._seed_resolved_product("jd", detail_data, persist_db=True)
+                return jd_coupon_url(detail_data.get("coupon_url"))
+        except Exception as exc:
+            logger.warning(
+                "❌ 【京东转链补券降级】转链前补查商品优惠券异常，将直接按普通商品链接转链 | 商品[%s] 异常<%s>",
+                ref.key, format_exc_summary(exc),
+            )
+        return ""
 
     def _get_link_data(
         self, ref: ProductRef, product_url: str, uid: str, identity: dict, adapter, kwargs: dict,
@@ -216,12 +277,14 @@ class PromoteService:
             PROMOTION_CACHE.pop(cache_key)
 
         ref = self._resolve_product_ref(ref)
+        local_coupon_for_db, _ = self._cached_or_db_coupon_url(ref) if (not uid and ref.platform == "jd") else ("", None)
         if not uid and ref.key:
             cached = self.repo.get_promotion_link_cache(
                 platform=ref.platform, goods_id=ref.goods_id or None,
                 goods_sign=ref.goods_sign or None, goods_key=ref.key,
             )
             if (self._cacheable(cached) and self._public_attribution(cached) and matches_scope(cached)
+                    and (not local_coupon_for_db or cached.get("coupon_url") == local_coupon_for_db)
                     and self._valid_deadline(cached.get("_expires_at"))):
                 expires_at = cached["_expires_at"]
                 data = self._link_data(cached)
@@ -233,13 +296,19 @@ class PromoteService:
         adapter_kwargs = {k: v for k, v in kwargs.items()
                           if k not in ("goods_id", "goods_sign", "identity", "relation_id", "special_id",
                                        "promoter_id", "positionId", "position_id", "trusted_product_url",
-                                       "promotion_scope", "unionId", "union_id")}
+                                       "trusted_coupon_url", "promotion_scope", "unionId", "union_id")}
         if getattr(adapter, "requires_authorized_promotion", False):
             adapter_kwargs["identity"] = identity
         if getattr(adapter, "requires_numeric_promoter_id", False) is True:
             adapter_kwargs["promoter_id"] = identity["promoter_id"]
         if getattr(adapter, "requires_material_url", False) is True:
             adapter_kwargs["trusted_product_url"] = self._trusted_material_url(ref)
+        if ref.platform == "jd":
+            trusted_coupon = self._trusted_coupon_url(ref, adapter)
+            if trusted_coupon:
+                adapter_kwargs["trusted_coupon_url"] = trusted_coupon
+                # 补查到新物料链接时同步刷新，确保二合一转链使用权威物料链
+                adapter_kwargs["trusted_product_url"] = self._trusted_material_url(ref) or adapter_kwargs.get("trusted_product_url", "")
         provider_started = time.perf_counter()
         try:
             result = adapter.convert_promotion_url(
@@ -507,24 +576,29 @@ class PromoteService:
         """
         return detect_platform_signal(raw_text) or "pdd"
 
-    def _seed_resolved_product(self, platform: str, product: Optional[dict], uid: Optional[str] = None) -> None:
-        """将万能转链反查到的商品详情写入 DETAIL_CACHE、MATERIAL_CACHE 与本地商品库，确保点击卡片进详情页秒开。"""
+    def _seed_resolved_product(
+        self, platform: str, product: Optional[dict], uid: Optional[str] = None, *, persist_db: bool = False,
+    ) -> None:
+        """将反查或补查到的商品详情写入 DETAIL_CACHE、MATERIAL_CACHE（按需同步本地库），确保点击卡片进详情页或二次转链秒开。"""
         if not isinstance(product, dict):
             return
         gid = clean_product_id(product.get("goods_id"))
         gsign = str(product.get("goods_sign") or "").strip()
         if not gid and not gsign:
             return
-        snapshot = None
         try:
             from datetime import datetime, timezone
+            from cache import sync_product_summary_in_caches
             from models.product import utc_millis
             from services.product_service import ProductService
-            snapshot = ProductService._make_snapshot(
-                product,
-                utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)),
-                platform,
-            )
+            fetched_at = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
+            snapshot = ProductService._make_snapshot(product, fetched_at, platform)
+            sync_product_summary_in_caches(platform, snapshot.data)
+            if persist_db and callable(getattr(self.repo, "upsert_product_detail", None)):
+                try:
+                    self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=fetched_at))
+                except Exception:
+                    pass
             ProductService._cache_detail(
                 platform,
                 {"status": "success", "data": deepcopy(snapshot.data)},
@@ -650,6 +724,27 @@ class PromoteService:
             product = data.get("product") if isinstance(data.get("product"), dict) else None
             if product:
                 self._seed_resolved_product(plat, product, uid=clean_uid or None)
+                if (
+                    plat == "jd"
+                    and getattr(adapter, "platform_code", None) == "jd"
+                    and product.get("coupon_url")
+                    and product.get("product_url")
+                    and not data.get("coupon_url")
+                    and callable(getattr(adapter, "convert_promotion_url", None))
+                ):
+                    upgraded = adapter.convert_promotion_url(
+                        goods_id_or_sign=product.get("goods_sign") or product.get("goods_id") or "",
+                        uid=effective_uid or None,
+                        goods_id=product.get("goods_id") or None,
+                        goods_sign=product.get("goods_sign") or None,
+                        trusted_product_url=product["product_url"],
+                        trusted_coupon_url=product["coupon_url"],
+                        **adapter_kwargs,
+                    )
+                    if isinstance(upgraded, dict) and upgraded.get("status") == "success":
+                        for k in ("url", "final_link", "mobile_url", "short_url", "click_url", "j_command", "j_short_command", "promotion_token", "coupon_url"):
+                            if upgraded.get(k):
+                                data[k] = upgraded[k]
 
             cmd_kwargs = {
                 "title": data.get("title") or (product or {}).get("name") or "精选高性价比好物",

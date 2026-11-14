@@ -61,11 +61,13 @@ import argparse
 import copy
 import datetime
 import html as html_lib
+import ipaddress
 import json
 import logging
 import os
 import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -480,7 +482,6 @@ _UNSUPPORTED_EXTERNAL_DOMAINS = (
     "vip.com",
     "douyin.com",
     "meituan.com",
-    "yuebai.plus",
     "dpurl.cn",
     "mp.weixin.qq.com",
     "didi.cn",
@@ -1110,15 +1111,15 @@ def _clean_coupon_label(label: str) -> str:
     return s
 
 
-def rebuild_clean_official_venue_url(raw_input: str) -> Optional[str]:
+def rebuild_clean_official_venue_url(raw_input: str, _allow_login_unwrap: bool = True) -> Optional[str]:
     """
     【唯一例外辅通道：官方原生公共领券/会场页 · 路径白名单 + 参数白名单重组】
     仅允许以下 4 类平台原生公共领券/活动页，且仅提取页面打开必需的官方参数重组为纯净 HTTPS URL（其余一切外部参数 100% 丢弃）：
       1. `coupon.m.jd.com/coupons/show.action` -> 仅保留 `key`, `roleId`, `linkKey`（须含 `linkKey` 或同时含 `key`+`roleId`）
       2. `uland.taobao.com/quan/detail` -> 仅保留 `sellerId`, `activityId`（两者须同时存在；绝不放行 `/coupon/edetail` 或 `pid`）
-      3. `pages.tmall.com/wow/...` 及 `pages-fast.m.taobao.com/wow/...` -> 仅保留路径与 `wh_pid`
-      4. `pro.m.jd.com/mall/active/...` -> 仅保留路径本身（清空全部 query 参数）
-    其余任何链接（含一切第三方跳转短链、未知域名）一律返回 None。
+      3. `pages.tmall.com/wow/...` 及 `pages-fast.m.taobao.com/wow/...` -> 严禁阿里妈妈联盟红包（`/lianmeng` 或 `wh_alimama=true`），其余仅保留路径与 `wh_pid`
+      4. `pro.m.jd.com/mall/active/...` 及 `prodev.m.jd.com/mall/active/...` -> 仅保留路径本身（清空全部 query 参数）
+    其余任何链接（含一切第三方跳转短链、加密分佣页、未知域名）一律返回 None。
     """
     raw = str(raw_input or "").strip()
     if not raw.lower().startswith(("http://", "https://")):
@@ -1130,6 +1131,12 @@ def rebuild_clean_official_venue_url(raw_input: str) -> Optional[str]:
     host = (parts.hostname or "").strip().lower()
     path = parts.path or ""
     if not host or not path:
+        return None
+
+    if _allow_login_unwrap and host == "plogin.m.jd.com":
+        for k, v in parse_qsl(parts.query, keep_blank_values=False):
+            if k.strip().lower() == "returnurl" and v.strip():
+                return rebuild_clean_official_venue_url(unquote(v.strip()), _allow_login_unwrap=False)
         return None
 
     def _pick_allowed_params(canonical_map: Dict[str, str]) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:
@@ -1156,10 +1163,16 @@ def rebuild_clean_official_venue_url(raw_input: str) -> Optional[str]:
         return urlunsplit(("https", host, path, urlencode(pairs), ""))
 
     if host in ("pages.tmall.com", "pages-fast.m.taobao.com") and path.startswith("/wow/"):
+        path_segments = [seg for seg in path.lower().split("/") if seg]
+        if "lianmeng" in path_segments:
+            return None
+        for qk, qv in parse_qsl(parts.query, keep_blank_values=True):
+            if qk.strip().lower() in ("wh_alimama", "alimama") and qv.strip().lower() in ("true", "1"):
+                return None
         pairs, _ = _pick_allowed_params({"wh_pid": "wh_pid"})
         return urlunsplit(("https", host, path, urlencode(pairs), ""))
 
-    if host == "pro.m.jd.com" and path.startswith("/mall/active/"):
+    if host in ("pro.m.jd.com", "prodev.m.jd.com") and path.startswith("/mall/active/"):
         return urlunsplit(("https", host, path, "", ""))
 
     return None
@@ -1168,6 +1181,249 @@ def rebuild_clean_official_venue_url(raw_input: str) -> Optional[str]:
 def is_direct_coupon_or_venue_url(raw_input: str, role_hint: str = "") -> bool:
     """判断一个 URL 是否满足官方公共领券/会场白名单准入。"""
     return rebuild_clean_official_venue_url(raw_input) is not None
+
+
+def _precheck_direct_non_cps_venue_url(raw_input: str) -> Optional[str]:
+    """
+    前置免白耗判断：若输入字面已是 100% 无联盟佣金的官方公共领券/活动页（排除可转联盟佣金的京东 `pro*.m.jd.com` 会场），
+    直接返回重组后的纯净官方 URL，省去必败的上游转链 API 调用。
+    """
+    rebuilt = rebuild_clean_official_venue_url(raw_input)
+    if not rebuilt:
+        return None
+    if (urlsplit(rebuilt).hostname or "").strip().lower() in ("pro.m.jd.com", "prodev.m.jd.com"):
+        return None
+    return rebuilt
+
+
+def _is_verified_station_promo_link(clean_input: str, promo_link: str) -> bool:
+    """
+    【通道 1 门禁】：强校验转链产出的 `promo_link` 必须属于官方联盟推广域名，
+    且归一化 `(host, path, query)` 严禁等于原输入（彻底封堵上游接口原样回显或仅将 http 改 https 的伪转链）。
+    """
+    p_raw = str(promo_link or "").strip()
+    if not p_raw.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        p = urlsplit(p_raw)
+    except Exception:
+        return False
+    p_host = (p.hostname or "").strip().lower()
+    p_path = (p.path or "").strip()
+    is_official_cps_host = p_host in (
+        "u.jd.com",
+        "union-click.jd.com",
+        "s.click.taobao.com",
+        "s.click.tmall.com",
+        "p.pinduoduo.com",
+        "mobile.yangkeduo.com",
+    ) or (p_host == "uland.taobao.com" and p_path.startswith(("/coupon/edetail", "/item/edetail")))
+    if not is_official_cps_host:
+        return False
+
+    c_raw = str(clean_input or "").strip()
+    if c_raw.lower().startswith(("http://", "https://")):
+        try:
+            c = urlsplit(c_raw)
+            if (p_host, p_path.rstrip("/"), p.query or "") == (
+                (c.hostname or "").strip().lower(),
+                (c.path or "").rstrip("/"),
+                c.query or "",
+            ):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+_TERMINAL_SINGLE_ITEM_HOSTS = frozenset({
+    "item.jd.com",
+    "item.m.jd.com",
+    "item.yiyaojd.com",
+    "npcitem.jd.hk",
+    "item.taobao.com",
+    "h5.m.taobao.com",
+    "detail.tmall.com",
+    "chaoshi.detail.tmall.com",
+    "detail.tmall.hk",
+    "mobile.yangkeduo.com",
+    "p.pinduoduo.com",
+})
+
+_UNWRAP_HTML_REDIRECT_RE = re.compile(
+    r"(?:real_jump_address|hrl|var\s+url)\s*=\s*['\"]((?:https?:)?//[^'\"]+)['\"]"
+    r"|location\.(?:href|replace|assign)\s*(?:=|\()\s*['\"]((?:https?:)?//[^'\"]+)['\"]"
+    r"|<meta\b(?=[^>]*http-equiv=['\"]?refresh['\"]?)[^>]*content=['\"][^'\"]*?url=['\"]?((?:https?:)?//[^'\"\s>]+)",
+    re.IGNORECASE,
+)
+
+_OFFICIAL_ECOMMERCE_HOST_SUFFIXES = (
+    "jd.com",
+    "jd.hk",
+    "yiyaojd.com",
+    "3.cn",
+    "jingfen.com",
+    "taobao.com",
+    "tmall.com",
+    "tmall.hk",
+    "tb.cn",
+    "tb3.cn",
+    "pinduoduo.com",
+    "yangkeduo.com",
+)
+
+
+def _is_official_ecommerce_http_url(url_str: str) -> bool:
+    """判断 http(s) 链接域名是否归属淘/京/拼官方域名体系（非官方第三方短链无需白调联盟转链 API，直接走安全解包白名单）。"""
+    try:
+        host = (urlsplit(str(url_str or "").strip()).hostname or "").strip().lower().rstrip(".")
+    except Exception:
+        return False
+    if not host:
+        return False
+    return any(host == suf or host.endswith("." + suf) for suf in _OFFICIAL_ECOMMERCE_HOST_SUFFIXES)
+
+
+_UNWRAP_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+)
+
+
+def _is_safe_public_http_url(url_str: str, resolver: Callable[..., Any] = socket.getaddrinfo) -> bool:
+    """SSRF 安全校验：每跳强制校验 http/https 标准端口与全局公网 IP，拒绝回环、内网、链路本地与云元数据地址。"""
+    s = str(url_str or "").strip()
+    if not s or any(ord(ch) < 33 for ch in s):
+        return False
+    try:
+        parts = urlsplit(s)
+        port = parts.port
+    except Exception:
+        return False
+    if parts.scheme.lower() not in ("http", "https") or parts.username is not None or parts.password is not None:
+        return False
+    if port not in (None, 80, 443):
+        return False
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host or host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
+        return False
+    try:
+        ips = [ipaddress.ip_address(host.split("%", 1)[0])]
+    except ValueError:
+        try:
+            infos = resolver(host, port or (443 if parts.scheme.lower() == "https" else 80), 0, socket.SOCK_STREAM)
+            ips = [ipaddress.ip_address(str(info[4][0]).split("%", 1)[0]) for info in (infos or []) if info and len(info) >= 5 and info[4]]
+        except Exception:
+            return False
+    if not ips:
+        return False
+    return all(
+        ip.is_global
+        and not (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+        for ip in ips
+    )
+
+
+def unwrap_to_official_public_venue_url(
+    raw_input: str,
+    max_hops: int = 4,
+    timeout: float = 3.5,
+    http_session: Any = None,
+    resolver: Callable[..., Any] = socket.getaddrinfo,
+) -> Optional[str]:
+    """
+    【通道 2 零域名预设通用安全解包】：
+    当上游官方联盟转链未成功时，不预设任何第三方短链域名规则，安全跟随最多 `max_hops` 跳（301/302、meta refresh、前端明文跳转及手淘 `tu=`），
+    一旦落地页严格命中 `rebuild_clean_official_venue_url` 的 4 类官方公共白名单，立即剥离全部追踪参数重组返回纯净官方 HTTPS URL；否则一律返回 None。
+    """
+    cur = str(raw_input or "").strip()
+    if not cur.lower().startswith(("http://", "https://")) or rebuild_clean_official_venue_url(cur) is not None:
+        return None
+    try:
+        init_host = (urlsplit(cur).hostname or "").strip().lower()
+    except Exception:
+        return None
+    if not init_host or init_host in _TERMINAL_SINGLE_ITEM_HOSTS:
+        return None
+
+    own_session = http_session is None
+    sess = requests.Session() if own_session else http_session
+    req_timeout = (min(2.5, float(timeout)), float(timeout))
+    prev_url: Optional[str] = None
+    try:
+        for _ in range(max(1, int(max_hops))):
+            if not _is_safe_public_http_url(cur, resolver=resolver):
+                return None
+            headers = {"User-Agent": _UNWRAP_MOBILE_UA}
+            if prev_url:
+                headers["Referer"] = prev_url
+            resp = None
+            try:
+                resp = sess.get(cur, allow_redirects=False, timeout=req_timeout, stream=True, headers=headers)
+                nxt = ""
+                if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("Location"):
+                    nxt = str(resp.headers.get("Location") or "").strip()
+                else:
+                    if hasattr(resp, "iter_content"):
+                        buf = bytearray()
+                        for chunk in resp.iter_content(chunk_size=4096):
+                            if chunk:
+                                buf.extend(chunk[: max(0, 16384 - len(buf))])
+                            if len(buf) >= 16384:
+                                break
+                        body = bytes(buf).decode(getattr(resp, "encoding", None) or "utf-8", errors="ignore")
+                    else:
+                        body = str(getattr(resp, "text", "") or "")[:16384]
+                    m = _UNWRAP_HTML_REDIRECT_RE.search(body.replace(r"\/", "/"))
+                    if m:
+                        nxt = next((g for g in m.groups() if g), "")
+            except Exception:
+                return None
+            finally:
+                if resp is not None and hasattr(resp, "close"):
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+
+            if not nxt:
+                break
+            nxt = html_lib.unescape(nxt).strip()
+            if nxt.startswith("//"):
+                nxt = "https:" + nxt
+            elif not nxt.lower().startswith(("http://", "https://")):
+                nxt = urljoin(cur, nxt)
+
+            qs = parse_qs(urlsplit(nxt).query)
+            if qs.get("tu"):
+                cand_tu = unquote(str(qs["tu"][0] or "")).strip()
+                if cand_tu.lower().startswith(("http://", "https://")):
+                    prev_url, cur = nxt, cand_tu
+                else:
+                    prev_url, cur = cur, nxt
+            else:
+                prev_url, cur = cur, nxt
+
+            rebuilt = rebuild_clean_official_venue_url(cur)
+            if rebuilt:
+                return rebuilt
+    finally:
+        if own_session and hasattr(sess, "close"):
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    if cur != str(raw_input or "").strip():
+        return rebuild_clean_official_venue_url(cur)
+    return None
 
 
 _ROLE_HINT_NORMALIZE_MAP = {
@@ -1197,12 +1453,16 @@ class DealPoolCleaner:
         ai_max_workers: int = 12,
         convert_max_workers: int = 10,
         ai_timeout: float = DEFAULT_AI_TIMEOUT_SECONDS,
+        unwrap_http_session: Any = None,
+        unwrap_resolver: Optional[Callable[..., Any]] = None,
     ):
         self.use_ai = True
         self.ai_batch_size = max(1, ai_batch_size)
         self.ai_max_workers = max(1, ai_max_workers)
         self.convert_max_workers = max(1, convert_max_workers)
         self.ai_timeout = max(10.0, float(ai_timeout))
+        self.unwrap_http_session = unwrap_http_session
+        self.unwrap_resolver = unwrap_resolver or socket.getaddrinfo
         self.adapters = {
             "jd": get_adapter("jd"),
             "taobao": get_adapter("taobao"),
@@ -1229,6 +1489,13 @@ class DealPoolCleaner:
         self.stats_early_terminated_pre_ai1 = 0
         self.stats_early_terminated_post_stage3 = 0
         self.last_batch_stage_timings: Dict[str, float] = {}
+
+    def _can_run_live_unwrap(self) -> bool:
+        """生产环境默认开启通用短链安全解包；离线单元测试未显式注入 `unwrap_http_session` 时自动静默跳过真实外网请求。"""
+        if self.unwrap_http_session is not None:
+            return True
+        req_fn = getattr(requests.sessions.Session, "request", None)
+        return getattr(req_fn, "__module__", "").startswith("requests")
 
     def _evict_transient_failed_cache(self) -> None:
         """
@@ -1308,13 +1575,22 @@ class DealPoolCleaner:
                         elif c_status == "coupon_or_activity":
                             is_new_link = (
                                 cl.get("error_code") != "OK_DIRECT_COUPON"
-                                and bool(p_link)
-                                and p_link.rstrip("/") != c_inp.rstrip("/")
+                                and _is_verified_station_promo_link(c_inp, p_link)
                             )
-                            if is_new_link or bool(p_tok):
-                                cl_copy["my_promo_link"] = p_link if is_new_link else None
+                            is_new_tok = (
+                                cl.get("error_code") != "OK_DIRECT_COUPON"
+                                and bool(p_tok)
+                                and p_tok != c_inp
+                            )
+                            if is_new_link or is_new_tok:
+                                rebuilt_promo = rebuild_clean_official_venue_url(p_link) if p_link else None
+                                cl_copy["my_promo_link"] = p_link if is_new_link else rebuilt_promo
+                                cl_copy["my_promo_token"] = p_tok if is_new_tok else None
                             else:
-                                rebuilt = rebuild_clean_official_venue_url(c_inp)
+                                cand_venue = (
+                                    p_link if cl.get("error_code") == "OK_DIRECT_COUPON" and p_link else c_inp
+                                )
+                                rebuilt = rebuild_clean_official_venue_url(cand_venue)
                                 if not rebuilt:
                                     continue
                                 cl_copy["error_code"] = "OK_DIRECT_COUPON"
@@ -1827,8 +2103,49 @@ class DealPoolCleaner:
                 "adapter_res": {},
             }
 
+        # 前置免白耗通道：纯公共无佣金领券/消费券页直接按白名单重组返回，省去必败的上游转链 API 调用
+        pre_direct_url = _precheck_direct_non_cps_venue_url(clean_input)
+        if pre_direct_url:
+            direct_plat = detect_candidate_platform(pre_direct_url, plat if plat in ("jd", "taobao", "pdd") else "unknown")
+            direct_keys = self._build_anchor_cache_keys(direct_plat, clean_input)
+            with self._cache_lock:
+                hit_direct = next((k for k in direct_keys if k in self.anchor_cache), None)
+                if hit_direct is not None and self.anchor_cache[hit_direct].get("convert_status") == "coupon_or_activity":
+                    cached = copy.deepcopy(self.anchor_cache[hit_direct])
+                    cached["link_id"] = link_id
+                    cached["text_role_hint"] = role_hint
+                    self.stats_cache_hits += 1
+                    return cached
+            out = {
+                "link_id": link_id,
+                "clean_input": clean_input,
+                "text_role_hint": role_hint,
+                "convert_status": "coupon_or_activity",
+                "platform": direct_plat,
+                "goods_id": "",
+                "goods_sign": "",
+                "error_code": "OK_DIRECT_COUPON",
+                "error_msg": "",
+                "official_product": None,
+                "my_promo_link": pre_direct_url,
+                "my_promo_token": None,
+                "adapter_res": {},
+            }
+            with self._cache_lock:
+                for ck in direct_keys:
+                    self.anchor_cache[ck] = out
+            return copy.deepcopy(out)
+
         platforms_to_try = [plat] if plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
         last_failed: Optional[Dict[str, Any]] = None
+        pending_failed_cache: List[Tuple[List[str], Dict[str, Any]]] = []
+        had_cache_miss = False
+        any_detail_lookup_failed = False
+
+        is_external_http_shortlink = (
+            clean_input.lower().startswith(("http://", "https://"))
+            and not _is_official_ecommerce_http_url(clean_input)
+        )
 
         for try_plat in platforms_to_try:
             cache_keys = self._build_anchor_cache_keys(try_plat, clean_input)
@@ -1854,9 +2171,32 @@ class DealPoolCleaner:
                         last_failed = cached
                         continue
 
+            if is_external_http_shortlink:
+                had_cache_miss = True
+                out = {
+                    "link_id": link_id,
+                    "clean_input": clean_input,
+                    "text_role_hint": role_hint,
+                    "convert_status": "failed",
+                    "platform": try_plat,
+                    "goods_id": "",
+                    "goods_sign": "",
+                    "error_code": ERR_ADAPTER_CONVERT_FAILED,
+                    "error_msg": "第三方短链未命中官方公共领券白名单",
+                    "official_product": None,
+                    "my_promo_link": None,
+                    "my_promo_token": None,
+                    "adapter_res": {},
+                }
+                for p_tag in platforms_to_try:
+                    pending_failed_cache.append((self._build_anchor_cache_keys(p_tag, clean_input), out))
+                last_failed = out
+                break
+
             adapter = self.adapters.get(try_plat)
             if not adapter:
                 continue
+            had_cache_miss = True
 
             try:
                 res = adapter.resolve_and_convert_universal(clean_input)
@@ -1874,11 +2214,12 @@ class DealPoolCleaner:
                     "my_promo_token": None,
                     "adapter_res": {},
                 }
-                with self._cache_lock:
-                    for ck in cache_keys:
-                        self.anchor_cache[ck] = out
+                pending_failed_cache.append((cache_keys, out))
                 last_failed = out
                 continue
+
+            if isinstance(res, dict) and res.get("detail_lookup_failed"):
+                any_detail_lookup_failed = True
 
             if isinstance(res, dict) and res.get("status") == "success":
                 goods_id = str(res.get("goods_id") or "").strip()
@@ -1919,51 +2260,53 @@ class DealPoolCleaner:
                             self.anchor_cache[ck] = out
                     return copy.deepcopy(out)
 
-                # 主通道会场/领券转链：必须生成不同于原输入的站长新推广短链，或生成我方专属口令（严禁回退原输入 clean_input）
-                is_new_station_link = bool(promo_link) and promo_link.rstrip("/") != clean_input.rstrip("/")
-                if not res.get("detail_lookup_failed") and (is_new_station_link or bool(promo_token)):
-                    out = {
-                        "link_id": link_id,
-                        "clean_input": clean_input,
-                        "text_role_hint": role_hint,
-                        "convert_status": "coupon_or_activity",
-                        "platform": try_plat,
-                        "goods_id": "",
-                        "goods_sign": "",
-                        "error_code": "OK_COUPON",
-                        "error_msg": "",
-                        "official_product": None,
-                        "my_promo_link": promo_link if is_new_station_link else None,
-                        "my_promo_token": promo_token or None,
-                        "adapter_res": res,
-                    }
-                    with self._cache_lock:
-                        for ck in cache_keys:
-                            self.anchor_cache[ck] = out
-                    return copy.deepcopy(out)
-
-            # 唯一例外辅通道：仅限 4 类平台原生公共领券/会场页，按参数白名单重组为无追踪纯净 URL（一切未转成功的短链自动拦截）
-            rebuilt_venue_url = rebuild_clean_official_venue_url(clean_input)
-            if rebuilt_venue_url:
-                out = {
-                    "link_id": link_id,
-                    "clean_input": clean_input,
-                    "text_role_hint": role_hint,
-                    "convert_status": "coupon_or_activity",
-                    "platform": try_plat,
-                    "goods_id": "",
-                    "goods_sign": "",
-                    "error_code": "OK_DIRECT_COUPON",
-                    "error_msg": "",
-                    "official_product": None,
-                    "my_promo_link": rebuilt_venue_url,
-                    "my_promo_token": None,
-                    "adapter_res": res if isinstance(res, dict) else {},
-                }
-                with self._cache_lock:
-                    for ck in cache_keys:
-                        self.anchor_cache[ck] = out
-                return copy.deepcopy(out)
+                # 【通道 1：我方专属联盟新链】：强校验官方联盟推广域且归一化路径/参数严禁等于原输入，或生成不同于原输入的专属口令
+                if not res.get("detail_lookup_failed"):
+                    is_new_station_link = _is_verified_station_promo_link(clean_input, promo_link)
+                    is_new_token = bool(promo_token) and promo_token != clean_input
+                    rebuilt_promo = rebuild_clean_official_venue_url(promo_link) if promo_link else None
+                    if is_new_station_link or is_new_token:
+                        out = {
+                            "link_id": link_id,
+                            "clean_input": clean_input,
+                            "text_role_hint": role_hint,
+                            "convert_status": "coupon_or_activity",
+                            "platform": try_plat,
+                            "goods_id": "",
+                            "goods_sign": "",
+                            "error_code": "OK_COUPON",
+                            "error_msg": "",
+                            "official_product": None,
+                            "my_promo_link": promo_link if is_new_station_link else rebuilt_promo,
+                            "my_promo_token": promo_token if is_new_token else None,
+                            "adapter_res": res,
+                        }
+                        with self._cache_lock:
+                            for ck in cache_keys:
+                                self.anchor_cache[ck] = out
+                        return copy.deepcopy(out)
+                    if rebuilt_promo:
+                        venue_plat = detect_candidate_platform(rebuilt_promo, try_plat)
+                        out = {
+                            "link_id": link_id,
+                            "clean_input": clean_input,
+                            "text_role_hint": role_hint,
+                            "convert_status": "coupon_or_activity",
+                            "platform": venue_plat,
+                            "goods_id": "",
+                            "goods_sign": "",
+                            "error_code": "OK_DIRECT_COUPON",
+                            "error_msg": "",
+                            "official_product": None,
+                            "my_promo_link": rebuilt_promo,
+                            "my_promo_token": None,
+                            "adapter_res": res,
+                        }
+                        with self._cache_lock:
+                            for p_tag in {try_plat, venue_plat}:
+                                for ck in self._build_anchor_cache_keys(p_tag, clean_input):
+                                    self.anchor_cache[ck] = out
+                        return copy.deepcopy(out)
 
             raw_code = str((res or {}).get("error_code") or "")
             raw_msg = (
@@ -1999,10 +2342,50 @@ class DealPoolCleaner:
                 "my_promo_token": None,
                 "adapter_res": res if isinstance(res, dict) else {},
             }
-            with self._cache_lock:
-                for ck in cache_keys:
-                    self.anchor_cache[ck] = out
+            pending_failed_cache.append((cache_keys, out))
             last_failed = out
+
+        # 【通道 2：零域名预设通用安全解包 -> 4 类官方纯净无佣金页重组】（非详情限流场景下统一裁决）
+        if had_cache_miss and not any_detail_lookup_failed:
+            rebuilt_venue_url = rebuild_clean_official_venue_url(clean_input)
+            if not rebuilt_venue_url and self._can_run_live_unwrap():
+                rebuilt_venue_url = unwrap_to_official_public_venue_url(
+                    clean_input,
+                    http_session=self.unwrap_http_session,
+                    resolver=self.unwrap_resolver,
+                )
+            if rebuilt_venue_url:
+                venue_plat = detect_candidate_platform(
+                    rebuilt_venue_url,
+                    plat if plat in ("jd", "taobao", "pdd") else "unknown",
+                )
+                out = {
+                    "link_id": link_id,
+                    "clean_input": clean_input,
+                    "text_role_hint": role_hint,
+                    "convert_status": "coupon_or_activity",
+                    "platform": venue_plat,
+                    "goods_id": "",
+                    "goods_sign": "",
+                    "error_code": "OK_DIRECT_COUPON",
+                    "error_msg": "",
+                    "official_product": None,
+                    "my_promo_link": rebuilt_venue_url,
+                    "my_promo_token": None,
+                    "adapter_res": (last_failed or {}).get("adapter_res") or {},
+                }
+                with self._cache_lock:
+                    for p_tag in set(platforms_to_try) | {venue_plat}:
+                        if p_tag in ("jd", "taobao", "pdd"):
+                            for ck in self._build_anchor_cache_keys(p_tag, clean_input):
+                                self.anchor_cache[ck] = out
+                return copy.deepcopy(out)
+
+        if pending_failed_cache:
+            with self._cache_lock:
+                for cks, failed_out in pending_failed_cache:
+                    for ck in cks:
+                        self.anchor_cache[ck] = failed_out
 
         return copy.deepcopy(last_failed) if last_failed else {
             "link_id": link_id,
@@ -3343,9 +3726,10 @@ class DealPoolCleaner:
             price_logic = _normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None
             clean_title = _normalize_inline_spaces(str(ai2_res.get("clean_title") or product_card.get("name") or raw_title)).strip()
 
-            # 组装唯一辅助按钮组：前置优惠券列表 coupon_links（有券展示，无券为空列表，不保留任何凑单品链接）
+            # 组装唯一辅助按钮组：前置优惠券列表 coupon_links（过滤跨平台广告尾巴、同主商品重复链与淘宝冗余单品 s.click 伪券链）
             coupon_links: List[Dict[str, Any]] = []
             seen_cpn_ids: Set[str] = set()
+            seen_cpn_targets: Set[Tuple[str, str]] = set()
             for item in ai2_res.get("coupon_links") or []:
                 if not isinstance(item, dict):
                     continue
@@ -3358,17 +3742,32 @@ class DealPoolCleaner:
                     or lid in seen_cpn_ids
                 ):
                     continue
+                c_plat = str(c_obj.get("platform") or plat).strip().lower()
+                if plat in ("jd", "taobao", "pdd") and c_plat in ("jd", "taobao", "pdd") and c_plat != plat:
+                    continue
+                if goods_id and str(c_obj.get("goods_id") or "").strip() == goods_id:
+                    continue
                 c_url = str(c_obj.get("my_promo_link") or "").strip()
                 c_tok = str(c_obj.get("my_promo_token") or "").strip()
                 if not c_url and not c_tok:
                     continue
+                if c_url and my_promo_link and c_url == my_promo_link:
+                    continue
+                if plat == "taobao":
+                    c_host = (urlsplit(c_url).hostname or "").strip().lower() if c_url else ""
+                    if c_obj.get("convert_status") == "product" or c_host in ("s.click.taobao.com", "s.click.tmall.com"):
+                        continue
+                dedup_sig = (c_url, c_tok)
+                if dedup_sig in seen_cpn_targets:
+                    continue
                 seen_cpn_ids.add(lid)
+                seen_cpn_targets.add(dedup_sig)
                 coupon_links.append({
                     "link_id": lid,
                     "label": _clean_coupon_label(item.get("label") or item.get("coupon_desc") or "优惠券"),
                     "url": c_url,
                     "token": c_tok,
-                    "platform": c_obj.get("platform") or plat,
+                    "platform": c_plat or plat,
                 })
 
             # 生成 100% 纯文字规范购买教程（剥离一切残留占位符、裸网址与口令壳）

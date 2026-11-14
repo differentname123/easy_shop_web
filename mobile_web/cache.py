@@ -132,7 +132,7 @@ def sync_product_summary_in_caches(platform: str, detail_data: dict) -> None:
     elif "coupon_amount" in patch:
         patch["has_coupon"] = patch["coupon_amount"] > 0
 
-    for str_key in ("name", "sales_tip", "mall_name", "product_url"):
+    for str_key in ("name", "sales_tip", "mall_name", "product_url", "coupon_url"):
         sval = detail_data.get(str_key)
         if isinstance(sval, str) and sval.strip():
             patch[str_key] = sval.strip()
@@ -144,6 +144,14 @@ def sync_product_summary_in_caches(platform: str, detail_data: dict) -> None:
 
     if not patch:
         return
+
+    if "coupon_url" in patch:
+        for pkey in PROMOTION_CACHE.keys():
+            if isinstance(pkey, tuple) and len(pkey) >= 4 and pkey[1] == plat and pkey[3] in targets:
+                entry = PROMOTION_CACHE.get(pkey)
+                cached_data = entry[1] if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict) else {}
+                if cached_data.get("coupon_url") != patch["coupon_url"]:
+                    PROMOTION_CACHE.pop(pkey, None)
 
     def _matches_item(item: object) -> bool:
         if not isinstance(item, dict):

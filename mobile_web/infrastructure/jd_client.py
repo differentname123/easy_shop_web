@@ -52,6 +52,18 @@ def product_url(value):
         return ""
 
 
+def jd_coupon_url(value):
+    """Validate JD official coupon URLs (coupon.m.jd.com / coupon.jd.com) without fetching them."""
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip().split("#", 1)[0].strip()
+    url = product_url(raw)
+    if not url:
+        return ""
+    host = (urlsplit(url).hostname or "").lower()
+    return url if (host in ("coupon.m.jd.com", "coupon.jd.com") or host.endswith(".coupon.jd.com")) else ""
+
+
 def _trusted_signed_url(value):
     if not isinstance(value, str) or "\\" in value or any(ord(c) < 33 for c in value):
         return False
@@ -360,11 +372,12 @@ class JdClient:
         return (self._catalog_page(body["content"], page, size, body) if page is not None else
                 {"status": "success", "data": body["content"]})
 
-    def convert_promotion_link(self, material_url, promoter_id):
+    def convert_promotion_link(self, material_url, promoter_id, coupon_url=None):
         promoter = canonical_promoter_id(promoter_id)
         material = product_url(material_url)
         if not promoter or not material:
             return _error("INVALID_ARGUMENT", "京东转链缺少有效物料URL或数字推广ID")
+        clean_coupon = jd_coupon_url(coupon_url)
 
         def _evaluate(body):
             if body.get("status") == "error":
@@ -384,9 +397,22 @@ class JdClient:
                 return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
             return {"status": "success", "promoter_id": promoter, **data}
 
+        base_params = {"unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter}
+        if clean_coupon:
+            coupon_res = self._execute_with_failover(
+                "open_jing_union_open_promotion_byunionid_get.ashx",
+                {**base_params, "couponUrl": clean_coupon},
+                _evaluate,
+            )
+            if (
+                coupon_res.get("status") == "success"
+                or coupon_res.get("jd_off_promotion") is True
+                or coupon_res.get("error_code") in ("CONFIG_ERROR", "UNSAFE_REDIRECT", "NETWORK_ERROR")
+            ):
+                return coupon_res
         return self._execute_with_failover(
             "open_jing_union_open_promotion_byunionid_get.ashx",
-            {"unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter},
+            base_params,
             _evaluate,
         )
 
