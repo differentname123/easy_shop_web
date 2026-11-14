@@ -117,6 +117,12 @@ class JdAdapter(BasePlatformAdapter):
         return ProductRef(self.platform_code, gid, sign)
 
     def _summary(self, item):
+        """
+        统一商品摘要映射入口（越简单越可靠 · 优惠券极简统一治理原则）：
+          1. 单点统一提取：搜索/详情/转链统一在此提取 `coupon_id -> coupon_url`，不搞多处分散解析；
+          2. 只增不抹低耗：入库层对已知优惠券只增不抹（防无券榜单轮询覆盖），未核验商品全生命周期至多补查一次详情；
+          3. 拒绝冗余清零：严禁为“券领完实时隐藏/清零”增加脆弱轮询，点击转链遇券失效自动无感降级普通推广链，不影响购买与锁佣。
+        """
         raw_id = _item_id(item)
         if not raw_id:
             raise ValueError("missing goods identity")

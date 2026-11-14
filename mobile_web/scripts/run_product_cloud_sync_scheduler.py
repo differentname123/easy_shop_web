@@ -259,7 +259,6 @@ def to_utc_millis(value: Any) -> Optional[int]:
     dt = value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None else value.astimezone(datetime.timezone.utc)
     return int(math.floor(dt.timestamp() * 1000))
 
-
 def _number_or_none(value: Any) -> Optional[float]:
     if isinstance(value, bool) or value is None:
         return None

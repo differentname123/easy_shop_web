@@ -3,9 +3,17 @@
 好价线报与采集群定时拉取 (`deal_raw_tips`) + 双阶段 AI 提纯 & 官方转链核验 + 高分好价入库 (`products`) 一体化守护脚本
 ====================================================================================================================
 零、【第一性原理与核心工程铁律（⚠️ 后续所有开发人员与 AI 迭代优化必须严格遵循，严禁违背）】
-  ★ 最高准则（极简、确定、绝对可靠 —— KISS & Absolute Reliability First）：
-    1. 不要为了一点边角转换率的提升而把系统变得复杂和脆弱！
-       例如：面对纯数字商品 ID（`item.jd.com/{数字}.html`），**严禁采用“提取商品全称去反向模糊搜索再比对”这类链路冗长、极不稳定的方案**。
+  ★ 第一红线（宁少勿脏 · 绝不替他人做嫁衣 —— Zero Foreign Commission / Fail-Closed）：
+    - **严禁任何他人的佣金链接、超级红包、淘礼金、锁佣中间页或未脱敏短链进入数据库**！此准则优先级高于“尽可能多抓优惠券”——**宁可少抓取、少清洗出数据，也绝不放行一条带他人推广归属的链接**。
+    - 一切前置优惠券/活动链接（`deal_info.coupon_links`）必须严守「唯一双门禁」单入口（无第三条路，严禁原样透传 `clean_input`）：
+      ① 【门禁一：我方联盟佣金新链】官方转链成功产出属于本站 PID 的新推广链/口令（强校验官方联盟域名且归一化 `(host, path, query)` 绝不等于原输入）；
+      ② 【门禁二：官方原生公共白名单从零重组】零域名预设通用安全解包后，终点严格命中 4 类官方无佣公共领券/会场路径（`coupon.m.jd.com/coupons/show.action`、`uland.taobao.com/quan/detail`、非联盟红包的 `pages.tmall.com/wow/...`、`pro*.m.jd.com/mall/active/...`），且剥离一切外部追踪参数从零重组纯净 URL。未过双门禁者一律果断丢弃！
+
+  ★ 最高工程准则（越简单越可靠 · 逻辑统一稳定 —— Minimalist, Unified & Reliable）：
+    1. 越简洁越可靠，保持全局逻辑统一收口，严禁过度设计：
+       - **拒绝按域名打碎片补丁**：不预设第三方短链域名名单，统一靠「双门禁」定生死，任外部短链域名如何变换均无需改代码；
+       - **拒绝脆弱冗余的状态维护**：不要为“优惠券领完及时清零或隐藏”编写复杂的轮询探测逻辑——单点统一提取、入库只增不抹（防无券榜单覆盖）、生命周期至多后台补查一次；券若领完，点击转链时自动无感降级为普通推广链，不影响用户下单与本站锁佣；
+       - 不要为了一点边角转换率的提升而把系统变得复杂和脆弱（如严禁对 `item.jd.com/{数字}.html` 采用“提取商品全称去反向模糊搜索再比对”这类长链路不稳定方案）。
     2. 一切都要可靠！任何数据源、子频道、转链方式或降级兜底，只要不可靠、不稳定、需要靠“猜”或“碰运气”，**直接果断放弃该方案的应用**，绝不妥协！
        - 主商品链接若未转出官方单品详情（`convert_status != "product"`），**直接放弃整条线报**，严禁拿存活的凑单品链接顶替主商品；
        - AI-1 或 AI-2 若偶发调用失败或未返回结果，**直接放弃该条记录**，严禁用启发式规则伪造拆解或伪造高分强行入库；
@@ -14,7 +22,7 @@
     3. 代码与 AI 职责边界清晰（告别脆弱正则与启发式补丁，各司其职）：
        - 【确定性代码负责】：多源 HTTP 并发拉取、确定性源站跳板解包（逛丢 `to.php`/`go.php`、拔草哦 `go.bacaoo.com`）、
          源页面地址追溯记录（`source_list_page_url` / `source_detail_url`）、官方转链与商品详情 API 调用
-         （`JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`）、链接占位符精确回填、
+         （`JDAdapter` / `TaobaoAdapter` / `PddAdapter.resolve_and_convert_universal()`）、双门禁安全重组过滤、链接占位符精确回填、
          MongoDB 幂等写入与 `quality_score` 高分保护机制。
        - 【双阶段 AI 负责】：消灭一切脆弱的价格正则、口令截断正则、词表黑名单与启发式规则！
          由 Stage 1 AI 负责群聊同商品附属碎片合并与多链接/口令无损拆解编号；
@@ -241,9 +249,14 @@ EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
 # ==============================================================================
 ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
     "principle_00_kiss_and_absolute_reliability_first": (
-        "【最高准则：极简与绝对可靠（KISS & Absolute Reliability First）】"
-        "1) 不要为了一点边角转换率而把系统变得复杂脆弱（如严禁使用“商品全称反向模糊搜索解析纯数字ID”这种长链路不稳定方案）；"
+        "【最高准则：越简单越可靠（KISS & Minimalist Unified Reliability）】"
+        "1) 整体逻辑必须简洁、统一、单入口收口，不要为了一点边角转换率或过度状态洁癖把系统搞复杂脆弱（如严禁使用“商品全称反向模糊搜索解析纯数字ID”、严禁为优惠券领完编写复杂的实时隐藏/清零轮询）；"
         "2) 一切都要可靠，凡是不可靠、不稳定、需要靠猜或启发式硬凑的方案（如拿存活凑单品顶替主商品、AI 失败时伪造高分入库、回退旧正则价格、抓取全站纯数字ID源）一律直接放弃！"
+    ),
+    "principle_00b_zero_foreign_commission_fail_closed": (
+        "【第一安全红线：宁少勿脏，绝不替他人做嫁衣（Zero Foreign Commission / Fail-Closed）】"
+        "不准出现他人佣金链接的优先级绝对高于拉取更多优惠券——宁可少抓取、少清洗出数据，也绝不允许任何他人的推广短链、超级红包、淘礼金或锁佣中间页进入数据库！"
+        "一切 `coupon_links` 仅允许通过唯一双门禁入库：① 官方联盟成功转出的不同于原输入的本站新链/口令；② 零域名预设通用安全解包后命中 4 类官方原生无佣公共路径且剥离一切外部参数从零重组。未过双门禁者一律丢弃。"
     ),
     "principle_01_source_page_traceability_and_zero_context_loss": (
         "【Stage 1：源页面可追溯与群聊全量留存】每条数据必须记录 `source_list_page_url`（列表页/群聊页地址）与 `source_detail_url`（详情页地址），"
@@ -256,9 +269,9 @@ ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
         "完成全部链接/口令无损拆解编号（`L1, L2...`）与正文 `[#L1]` 占位符替换。"
     ),
     "principle_03_official_api_conversion_for_both_products_and_coupons": (
-        "【Stage 3：官方 API 转链验真且优惠券与主商品同等重要】遍历 Stage 1 AI 拆出的所有编号目标，调用官方 `Adapter.resolve_and_convert_universal()`："
-        "既解析出唯一商品的官方真实详情（`convert_status='product'`），也完整保留优惠券/补贴券/活动会场的转链结果（`convert_status='coupon_or_activity'`），"
-        "绝不丢弃前置领券链接，也绝不对优惠券链接或会场多商品链接做模糊搜索冒充单品。"
+        "【Stage 3：官方 API 转链验真与极简双门禁前置券收口】遍历 Stage 1 AI 拆出的所有编号目标，调用官方 `Adapter.resolve_and_convert_universal()`："
+        "既解析出唯一商品的官方真实详情（`convert_status='product'`），也对前置优惠券/活动会场严格执行「我方联盟新链 OR 通用安全解包白名单重组」双门禁（`convert_status='coupon_or_activity'`），"
+        "无需预设任何第三方短链域名，绝不原样透传外部链接，也绝不对优惠券或会场链接做模糊搜索冒充单品。"
     ),
     "principle_04_ai_stage2_audit_and_strict_schema_separation": (
         "【Stage 4 & Stage 5：Stage 2 AI 底牌终审、评分防覆盖与极简四要素 Schema 隔离】由 Stage 2 AI 结合官方真实商品详情与原始文案进行终审，"
@@ -273,6 +286,11 @@ ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
         "3) 双层确定性提前终止（Early Termination）：当单锚点线报在 Stage 2 前命中 `anchor_cache` 已入库商品，或 Stage 3 转链拿到商品唯一标识 `(platform, goods_id)` "
         "发现该商品已在正式库 `products`（12h 保鲜期内）或同批次已有更优线报正在处理时，立即提前终止并跳过后续 AI 调用（标记 `OK_SKIPPED_ALREADY_CLEANED`），"
         "仅向正式表 `products` 累加跨群/跨站共振热度，大幅节省工作量与 AI 算力！"
+    ),
+    "principle_06_minimalist_append_only_coupon_lifecycle": (
+        "【优惠券极简生命周期治理：单点提取 + 只增不抹 + 失效无感回退】"
+        "单品隐藏券统一在适配器摘要层一次提取，落库采用只增不抹策略（防止无券榜单轮询抹除已知优惠券），未核验商品全生命周期至多低耗补查一次详情；"
+        "不做任何“优惠券领完实时清零/隐藏”的脆弱探测——券能领则二合一自动带券，券领完则转链自动无感回退普通推广链，极简稳定零额外消耗。"
     ),
 }
 
@@ -302,6 +320,11 @@ CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST: Dict[str, str] = {
         "2) 当 AI-2 返回 `deal_price=null` 时，回退读取旧爬虫正则字段 `doc.get('price')`（实测将“80抽湿巾”抠成 80.0 元）；"
         "3) 当 AI-1/AI-2 超时失败时，用 `_fallback_stage1_extract` / `_fallback_stage2_evaluate` 伪造 72 分高分放行入库。"
         "【当前做法】严格执行“不可靠即直接放弃”：主商品非 `product` 直接淘汰，AI 未返回结果直接淘汰，`deal_price=null` 保持为空绝不回退旧正则。"
+    ),
+    "dead_end_05_raw_coupon_fallback_and_per_domain_shortlink_whitelists": (
+        "【曾尝试并彻底移除】1) Stage 5 组装 `coupon_links` 时曾有 `my_promo_link or my_promo_token or clean_input` 兜底，导致折淘客上游将非联盟券 `u.jd.com/XNl8wji` 原样回显时把外部短链漏放入库；"
+        "2) 曾考虑按 `jdpp.vip` / `kurl07.cn` / `yuebai.plus` 等域名维护预设短链白名单，但这会陷入第三方域名不断变换的猫鼠补丁泥潭。"
+        "【当前做法】彻底移除 `or clean_input` 透传，统一采用零域名预设的「双门禁漏斗」（强校验官方联盟新链 `promo != input` + SSRF 防护通用解包后 4 类官方公共白名单参数重组），宁少勿脏，绝不放行任何他人归属链接。"
     ),
     "success_note_01_pdd_four_high_yield_channels_and_bacaoo_unwrap": (
         "【拼多多专项探索：已验证成功并上线】四大高转化拼多多专属源无缝融入五阶段管线：\n"
