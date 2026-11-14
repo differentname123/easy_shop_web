@@ -56,6 +56,40 @@ def _is_encrypted_jd_item_id(value):
     return len(text) >= 25 and "_" in text and all(c.isalnum() or c == "_" for c in text)
 
 
+def _is_official_jd_cipher_id(value):
+    """识别京东联盟标准双段加密 itemId (<前缀>_<密文后缀>，如 IwQNj..._cIOf4YLZawohplFr3g)。"""
+    text = _text(value)
+    if not text or is_jd_image_key(text) or text.count("_") != 1:
+        return False
+    prefix, suffix = text.split("_")
+    return len(prefix) >= 20 and len(suffix) >= 12 and prefix.isalnum() and suffix.isalnum()
+
+
+def _verified_jd_cipher_pair(requested_id, returned_id):
+    """请求与上游返回均为标准京东联盟双段加密 itemId 时，证实由京东联盟解密自同一 SKU（兼容跨 Key 重签名与商家换主图）。"""
+    return _is_official_jd_cipher_id(requested_id) and _is_official_jd_cipher_id(returned_id)
+
+
+def _rank_coupon(purchase, base_price):
+    """从京东榜单 purchasePriceInfo.couponList 提取单件可直接使用的最优官方优惠券 (discount, coupon_url)。"""
+    coupons = purchase.get("couponList") if isinstance(purchase, dict) else None
+    if not isinstance(coupons, list) or base_price is None or base_price <= 0:
+        return 0.0, ""
+    best = (0.0, "")
+    for entry in coupons:
+        if not isinstance(entry, dict) or entry.get("couponStatus") not in (None, 0, "0"):
+            continue
+        remain = _money(entry.get("remainCnt"))
+        if entry.get("remainCnt") not in (None, "") and (remain is None or remain <= 0):
+            continue
+        disc, quota = _money(entry.get("discount")), _money(entry.get("quota"))
+        link = jd_coupon_url(entry.get("link"))
+        if link and disc is not None and quota is not None and 0 < disc < base_price and 0 <= quota <= base_price:
+            if disc > best[0]:
+                best = (disc, link)
+    return best
+
+
 def _material_url(item):
     source = product_url(item.get("item_url"))
     if source:
@@ -119,7 +153,7 @@ class JdAdapter(BasePlatformAdapter):
     def _summary(self, item):
         """
         统一商品摘要映射入口（越简单越可靠 · 优惠券极简统一治理原则）：
-          1. 单点统一提取：搜索/详情/转链统一在此提取 `coupon_id -> coupon_url`，不搞多处分散解析；
+          1. 单点统一提取：搜索/详情 (`coupon_id`) 与榜单 (`purchasePriceInfo.couponList`) 统一在此提取单件可用券；
           2. 只增不抹低耗：入库层对已知优惠券只增不抹（防无券榜单轮询覆盖），未核验商品全生命周期至多补查一次详情；
           3. 拒绝冗余清零：严禁为“券领完实时隐藏/清零”增加脆弱轮询，点击转链遇券失效自动无感降级普通推广链，不影响购买与锁佣。
         """
@@ -136,6 +170,11 @@ class JdAdapter(BasePlatformAdapter):
             raise ValueError("missing or invalid public product content")
         coupon = _money(item.get("coupon_info_money")) or 0.0
         coupon_link = jd_coupon_url(item.get("coupon_id"))
+        if coupon <= 0 and not coupon_link and item.get("quanhou_jiage") in (None, ""):
+            coupon, coupon_link = _rank_coupon(purchase, price)
+            if coupon > 0:
+                original = max(original if original is not None and original >= 0 else price, price)
+                price = round(price - coupon, 2)
         image_url = _text(_pick(item.get("pict_url"), item.get("imageUrl")))
         canonical_id = extract_canonical_goods_id(self.platform_code, raw_id, image_url=image_url) or raw_id
         sales_candidates = (
@@ -268,7 +307,12 @@ class JdAdapter(BasePlatformAdapter):
         if not matches and len(rows) == 1:
             single = dict(rows[0])
             returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
-            img_conflict = bool(is_jd_image_key(ref.goods_id) and returned_img_key and returned_img_key != ref.goods_id)
+            img_conflict = bool(
+                is_jd_image_key(ref.goods_id)
+                and returned_img_key
+                and returned_img_key != ref.goods_id
+                and not _verified_jd_cipher_pair(target_id, _item_id(single))
+            )
             if _material_url(single) and not img_conflict:
                 single["tao_id"] = target_id
                 single["skuId"] = target_id
@@ -328,11 +372,16 @@ class JdAdapter(BasePlatformAdapter):
         if not isinstance(rows, list) or len(rows) != 1 or int(q_res.get("total_count") or 1) != 1:
             return res
         single = dict(rows[0])
-        returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
-        if is_jd_image_key(ref.goods_id) and returned_img_key and returned_img_key != ref.goods_id:
-            return res
         target_id = ref.goods_sign or ref.goods_id
-        if target_id and not returned_img_key:
+        returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
+        if (
+            is_jd_image_key(ref.goods_id)
+            and returned_img_key
+            and returned_img_key != ref.goods_id
+            and not _verified_jd_cipher_pair(target_id, _item_id(single))
+        ):
+            return res
+        if target_id and (not returned_img_key or _is_encrypted_jd_item_id(target_id)):
             single["tao_id"] = target_id
         try:
             card = self._detail(single)

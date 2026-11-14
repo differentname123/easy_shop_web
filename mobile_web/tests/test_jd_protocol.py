@@ -622,6 +622,172 @@ def test_jd_universal_convert_passes_raw_text_directly_and_never_falls_back_to_k
     c_fail.search_goods.assert_not_called()
 
 
+def test_rank_coupon_list_extracts_single_item_usable_coupon_without_side_effects():
+    from cache import clear_all_caches
+    from models.product import ProductRef
+    from repositories.product_repo import ProductRepository
+    from services.promote_service import PromoteService
+    from tests.test_product_repository import MemoryCollection as ProductMemCol
+
+    clear_all_caches()
+    cola_sign = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
+    cola_img = "https://img14.360buyimg.com/pop/jfs/t1/550001/12/3456/78901/6af74ca5F32ceb84f/0083320320631ee4.jpg"
+    cola_coupon = "https://coupon.m.jd.com/coupons/show.action?linkKey=AAROH_xIpeffAs_-naABEFoeyXTPnH86"
+
+    rows = [
+        # 1. 单件可直接使用的官方券（满28减4，原价64 -> 券后60）
+        {
+            "itemId": cola_sign,
+            "skuName": "可口可乐500ml*24瓶整箱",
+            "wlprice": 64.0,
+            "imageUrl": cola_img,
+            "commissionShare": 7.0,
+            "commission": 4.2,
+            "purchasePriceInfo": {
+                "price": 64.0,
+                "purchasePrice": 60.0,
+                "couponList": [{
+                    "discount": 4.0, "quota": 28.0, "link": cola_coupon,
+                    "couponStatus": 0, "remainCnt": 50000,
+                }],
+            },
+        },
+        # 2. 多件凑单 / PLUS 礼金导致 purchasePrice < wlprice 但无可用单品券 -> 严禁虚构低价
+        {
+            "itemId": "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_noCouponPromo12345",
+            "skuName": "凑单促销商品",
+            "wlprice": 29.7,
+            "imageUrl": "https://img.test/no_coupon.jpg",
+            "purchasePriceInfo": {"price": 29.7, "purchasePrice": 19.9, "couponList": []},
+        },
+        # 3. 高门槛满减券（单件20元，券门槛满99减15）+ 已领完券 -> 单件不可用，保持原价
+        {
+            "itemId": "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_highQuotaOnly12345",
+            "skuName": "高门槛券商品",
+            "wlprice": 20.0,
+            "imageUrl": "https://img.test/high_quota.jpg",
+            "purchasePriceInfo": {
+                "price": 20.0,
+                "purchasePrice": 20.0,
+                "couponList": [
+                    {"discount": 15.0, "quota": 99.0, "link": cola_coupon, "couponStatus": 0, "remainCnt": 100},
+                    {"discount": 5.0, "quota": 10.0, "link": cola_coupon, "couponStatus": 0, "remainCnt": 0},
+                ],
+            },
+        },
+        # 4. 多张同品非叠加券（满19减5 + 满20减10，上游虚算7.9）-> 仅取单张最优券 22.9 - 10 = 12.9
+        {
+            "itemId": "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_multiCoupons123456",
+            "skuName": "多券择优商品",
+            "wlprice": 22.9,
+            "imageUrl": "https://img.test/multi.jpg",
+            "purchasePriceInfo": {
+                "price": 22.9,
+                "purchasePrice": 7.9,
+                "couponList": [
+                    {"discount": 5.0, "quota": 19.0, "link": cola_coupon + "1", "couponStatus": 0, "remainCnt": 100},
+                    {"discount": 10.0, "quota": 20.0, "link": cola_coupon + "2", "couponStatus": 0, "remainCnt": 100},
+                ],
+            },
+        },
+    ]
+
+    http = http_for(wrapped(RANK_ROOT, {"code": 200, "data": rows}))
+    jd_adapter = adapter(client(http))
+    res = jd_adapter.get_recommend_goods(channel_type=5, limit=10)
+    assert res["status"] == "success"
+    c0, c1, c2, c3 = res["data"]
+
+    assert c0["price"] == 60.0 and c0["original_price"] == 64.0
+    assert c0["coupon_amount"] == 4.0 and c0["has_coupon"] is True and c0["coupon_url"] == cola_coupon
+
+    assert c1["price"] == 29.7 and c1["coupon_amount"] == 0.0 and c1["has_coupon"] is False and "coupon_url" not in c1
+    assert c2["price"] == 20.0 and c2["coupon_amount"] == 0.0 and c2["has_coupon"] is False and "coupon_url" not in c2
+    assert c3["price"] == 12.9 and c3["original_price"] == 22.9 and c3["coupon_amount"] == 10.0 and c3["coupon_url"] == cola_coupon + "2"
+
+    # 榜单入库已自带官方 coupon_url，后续点击转链直接命中本地券链接，0 次额外详情 API 请求
+    col = ProductMemCol()
+    repo = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda name: col))
+    repo.upsert_home_products([c0], channel_type=5)
+    mock_client = Mock()
+    no_extra_adapter = adapter(mock_client)
+    promo_svc = PromoteService(product_repo=repo)
+    resolved_coupon = promo_svc._trusted_coupon_url(
+        ProductRef("jd", c0["goods_id"], cola_sign), adapter=no_extra_adapter,
+    )
+    assert resolved_coupon == cola_coupon
+    mock_client.get_goods_detail.assert_not_called()
+    clear_all_caches()
 
 
+def test_merchant_main_image_update_preserves_detail_and_coupon_via_verified_cipher_pair():
+    from cache import clear_all_caches
+    from services.product_service import ProductService
 
+    clear_all_caches()
+    old_img_key = "6af2db48Fa28b7d27_0083320320b55f09"
+    old_img_url = f"https://img14.360buyimg.com/pop/jfs/t1/540000/1/100/200/{old_img_key.replace('_', '/')}.jpg"
+    new_img_key = "6af74ca5F32ceb84f_0083320320631ee4"
+    new_img_url = f"https://img14.360buyimg.com/pop/jfs/t1/550000/2/300/400/{new_img_key.replace('_', '/')}.jpg"
+
+    req_sign = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
+    resalted_cipher = "Ip4ZpZqBj5GQZVLMtk0dQZVturRAQ4_3NM1doJsxx4B57H48G"
+    coupon_link = "https://coupon.m.jd.com/coupons/show.action?linkKey=AAROH_xIpeffAs_-naABEFoeyXTPnH86"
+
+    # 1. 商家更换主图且折淘客跨 Key 重加密 tao_id：请求与返回均为标准京东联盟双段密文 ID，正常提取 4 元优惠券
+    c = Mock()
+    c.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [item(
+            resalted_cipher,
+            title="可口可乐500ml*24瓶整箱",
+            size="64",
+            quanhou_jiage="60",
+            coupon_info_money="4",
+            coupon_info="满28元减4元",
+            coupon_id=coupon_link,
+            pict_url=new_img_url,
+            item_url=f"https://jingfen.jd.com/detail/{resalted_cipher}.html",
+        )],
+    }
+    a = adapter(c)
+    repo = Mock()
+    repo.get_product_detail.return_value = {
+        "platform": "jd", "product_id": old_img_key, "goods_id": old_img_key, "goods_sign": req_sign,
+        "name": "可口可乐500ml*24瓶整箱", "price": 64.0, "original_price": 64.0,
+        "coupon_amount": 0.0, "has_coupon": False, "image_url": old_img_url, "detail_updated_at": None,
+    }
+    repo.upsert_product_detail.return_value = True
+    svc = ProductService(product_repo=repo)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("services.product_service.get_adapter", lambda plat: a)
+        detail_res = svc.get_goods_detail(platform="jd", goods_id=old_img_key, goods_sign=req_sign)
+
+    assert detail_res["status"] == "success"
+    assert detail_res.get("source") != "database_fallback"
+    assert detail_res["data"]["price"] == 60.0
+    assert detail_res["data"]["original_price"] == 64.0
+    assert detail_res["data"]["coupon_amount"] == 4.0
+    assert detail_res["data"]["has_coupon"] is True
+    assert detail_res["data"]["coupon_url"] == coupon_link
+    assert detail_res["data"]["goods_id"] == new_img_key
+    assert detail_res["data"]["goods_sign"] == req_sign
+
+    # 2. enrich_detail_resilient 在 301 频控兜底路径下同样兼容商家换主图与跨 Key 重签名
+    c_rl = Mock()
+    c_rl.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
+    c_rl.convert_promotion_link.return_value = {"status": "success", "short_url": "https://u.jd.com/probe_cola"}
+    c_rl.search_goods.return_value = {"status": "success", "total_count": 1, "data": c.get_goods_detail.return_value["data"]}
+    resilient = adapter(c_rl).enrich_detail_resilient(req_sign, goods_id=old_img_key, goods_sign=req_sign)
+    assert resilient["status"] == "success"
+    assert resilient["data"]["price"] == 60.0 and resilient["data"]["coupon_amount"] == 4.0
+    assert resilient["data"]["goods_sign"] == req_sign
+
+    # 3. 防串货红线不变：若上游退化返回非标准加密 ID（如误解析成数字 SKU '6'）且主图冲突，严格拒绝
+    c.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [item("6", skuId="6", pict_url=new_img_url, item_url="https://item.jd.com/6.html")],
+    }
+    mismatch = a.get_goods_detail(req_sign, goods_id=old_img_key, goods_sign=req_sign)
+    assert mismatch["status"] == "error" and mismatch["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
+    clear_all_caches()
