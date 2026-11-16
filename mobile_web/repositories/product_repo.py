@@ -1491,8 +1491,10 @@ class ProductRepository(BaseRepository):
         goods_sign: Optional[str] = None,
         goods_key: Optional[str] = None,
         expires_at: Optional[float] = None,
+        *,
+        only_if_exists: bool = False,
     ) -> bool:
-        """保存官方转链；expires_at 为 UTC Unix 秒时间戳，省略时采用统一 TTL。"""
+        """保存官方转链；expires_at 为 UTC Unix 秒时间戳，省略时采用统一 TTL。only_if_exists=True 时禁止向 products 硬插空记录。"""
         if not data or not isinstance(data, dict):
             return False
 
@@ -1530,11 +1532,16 @@ class ProductRepository(BaseRepository):
         insert_set["created_at"] = now
 
         try:
-            self.col.update_one(
-                filter_spec,
-                {"$set": update_set, "$setOnInsert": insert_set},
-                upsert=True
-            )
+            if only_if_exists:
+                if gid and gsign:
+                    filter_spec = {"platform": platform, "$or": [{"product_id": gid}, {"goods_sign": gsign}]}
+                self.col.update_one(filter_spec, {"$set": update_set}, upsert=False)
+            else:
+                self.col.update_one(
+                    filter_spec,
+                    {"$set": update_set, "$setOnInsert": insert_set},
+                    upsert=True,
+                )
             return True
         except Exception as e:
             logger.warning(
@@ -1542,6 +1549,39 @@ class ProductRepository(BaseRepository):
                 platform, gid or gsign, format_exc_summary(e),
             )
             return False
+
+    def _record_deletion_tombstones(self, platform: str, docs_to_delete: List[Dict[str, Any]]) -> None:
+        """向 deleted_products_log 写入 7 天自动过期的删除墓碑，供云端同步守护进程跨库清理已下架死链。"""
+        if not docs_to_delete or self._db is None or not hasattr(self._db, "get_collection"):
+            return
+        try:
+            tomb_col = self._db.get_collection("deleted_products_log")
+            if not getattr(self, "_tombstone_idx_ready", False):
+                try:
+                    tomb_col.create_index([("platform", 1), ("product_id", 1)], unique=True, background=True)
+                    tomb_col.create_index([("deleted_at", 1)], expireAfterSeconds=7 * 86400, background=True)
+                    self._tombstone_idx_ready = True
+                except Exception:
+                    pass
+            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            for d in docs_to_delete:
+                pid = self._real_goods_id(d.get("product_id") or d.get("goods_id"))
+                if not pid:
+                    continue
+                tomb_col.update_one(
+                    {"platform": platform, "product_id": pid},
+                    {
+                        "$set": {
+                            "platform": platform,
+                            "product_id": pid,
+                            "goods_sign": str(d.get("goods_sign") or "").strip(),
+                            "deleted_at": now_utc,
+                        }
+                    },
+                    upsert=True,
+                )
+        except Exception:
+            pass
 
     def delete_product(
         self,
@@ -1557,9 +1597,17 @@ class ProductRepository(BaseRepository):
             return False
         filter_spec = self._identity_filter(plat, gid, gsign)
         try:
+            matched_docs: List[Dict[str, Any]] = []
+            try:
+                matched_docs = list(self.col.find(filter_spec, {"_id": 0, "product_id": 1, "goods_id": 1, "goods_sign": 1}))
+            except Exception:
+                matched_docs = [{"product_id": gid, "goods_sign": gsign}] if gid else []
             res = self.col.delete_many(filter_spec)
             deleted = int(getattr(res, "deleted_count", 0) or 0)
             if deleted > 0:
+                if not matched_docs and gid:
+                    matched_docs = [{"product_id": gid, "goods_sign": gsign}]
+                self._record_deletion_tombstones(plat, matched_docs)
                 logger.info(
                     "【失效商品清理】已从本地数据库物理移除取消推广/下架商品 | 平台[%s] 商品[%s] 移除条数[%d]",
                     plat, gid or gsign, deleted,

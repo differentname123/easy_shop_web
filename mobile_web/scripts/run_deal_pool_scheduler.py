@@ -80,7 +80,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import zip_longest
 from logging.handlers import RotatingFileHandler
@@ -88,6 +88,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 from pymongo import UpdateOne
 
 # 确保 Windows 终端下正常输出中文与 Emoji
@@ -106,10 +107,13 @@ for _path in (PROJECT_ROOT, WORKSPACE_ROOT, CURRENT_DIR):
 
 from adapters import get_adapter, platform_name
 from infrastructure.ai_api.model_api import generate_content
+from infrastructure.api_governance import api_caller_context, set_process_role
 from infrastructure.mongo import gen_db_object
 from models.product import (
+    detect_platform_signal,
     extract_canonical_goods_id,
     extract_jd_image_key,
+    extract_taobao_token_core,
     is_jd_image_key,
 )
 from mobile_web.scripts.goods_info_format import string_to_object
@@ -140,8 +144,12 @@ PROMPT_STAGE2_PATH = os.path.join(PROMPT_DIR, "爆料阶段2_底牌终审与教�
 
 QUALIFIED_DEAL_MIN_SCORE = 60
 DEAL_INFO_PROTECTION_HOURS = 12.0
+DEAL_FORMAL_EXPIRY_HOURS = 72.0
+DEAL_RAW_TTL_DAYS = 14
 DEAL_MAX_CLEAN_AGE_DAYS = 2
 MAX_CLEAN_RETRIES = 3
+MAX_ANCHOR_CACHE_SIZE = 8000
+MAX_JSONL_FILE_BYTES = 10 * 1024 * 1024
 DEFAULT_CLEAN_WINDOW = 200
 DEFAULT_CLEAN_INTERVAL_SECONDS = 60
 DEFAULT_AI_TIMEOUT_SECONDS = 90.0
@@ -557,14 +565,51 @@ def setup_scheduler_logger() -> logging.Logger:
 logger = setup_scheduler_logger()
 
 
+_JSONL_WRITE_LOCK = threading.Lock()
+
+
+def _append_bounded_jsonl_lines(
+    path: str,
+    lines: List[str],
+    *,
+    max_bytes: int = MAX_JSONL_FILE_BYTES,
+    backup_count: int = 2,
+) -> None:
+    """线程安全且受磁盘容量上限约束地追加 JSONL 记录，超限时自动按 .1 / .2 滚动归档。"""
+    if not lines:
+        return
+    payload = "".join(line if line.endswith("\n") else f"{line}\n" for line in lines)
+    encoded_len = len(payload.encode("utf-8", errors="ignore"))
+    with _JSONL_WRITE_LOCK:
+        try:
+            if max_bytes > 0 and os.path.exists(path):
+                cur_size = os.path.getsize(path)
+                if cur_size + encoded_len > max_bytes:
+                    for idx in range(backup_count, 0, -1):
+                        src = path if idx == 1 else f"{path}.{idx - 1}"
+                        dst = f"{path}.{idx}"
+                        if os.path.exists(src):
+                            try:
+                                if os.path.exists(dst):
+                                    os.remove(dst)
+                                os.replace(src, dst)
+                            except OSError:
+                                pass
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(payload)
+
+
 def append_error_records_jsonl(error_records: List[Dict[str, Any]]):
     """将本轮捕获的所有列表级与详情级错误路径持久化追加写入 logs/deal_pool_errors.jsonl。"""
     if not error_records:
         return
     try:
-        with open(ERROR_LOG_JSONL_PATH, "a", encoding="utf-8") as f:
-            for item in error_records:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        _append_bounded_jsonl_lines(
+            ERROR_LOG_JSONL_PATH,
+            [json.dumps(item, ensure_ascii=False) for item in error_records],
+        )
     except Exception as e:
         logger.error("写入错误路径日志 [%s] 失败: %s", ERROR_LOG_JSONL_PATH, e)
 
@@ -725,6 +770,12 @@ class DealRawPoolRepository:
             )
             col.create_index([("platform", 1), ("quality_signals.quality_tier", 1)], background=True)
             col.create_index([("candidate_goods_id", 1)], background=True)
+            col.create_index(
+                [("first_seen_at", 1)],
+                expireAfterSeconds=int(DEAL_RAW_TTL_DAYS * 86400),
+                name="idx_deal_raw_tips_ttl_14d",
+                background=True,
+            )
 
             # 确保正式 products 表核心索引就绪（与 ProductRepository._init_indexes 保持一致）
             pcol = self.db.get_collection(self.formal_collection_name)
@@ -732,9 +783,104 @@ class DealRawPoolRepository:
             pcol.create_index("goods_sign", background=True)
             pcol.create_index([("updated_at", -1)], background=True)
             pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.quality_score", -1), ("updated_at", -1)], background=True)
+            pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.updated_at", 1)], background=True)
             self._indexes_ready = True
         except Exception as e:
             logger.warning("初始化集合索引时发生异常（稍后自动重试）: %s", e)
+
+    def expire_stale_formal_deals(
+        self,
+        now_utc: Optional[datetime.datetime] = None,
+        max_age_hours: float = DEAL_FORMAL_EXPIRY_HOURS,
+    ) -> int:
+        """将超过保鲜窗口未再被任何新线报刷新的好价商品自动摘除实时好价标 (`deal_info.is_deal_tip = False`)。"""
+        ref_now = now_utc or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        cutoff = ref_now - datetime.timedelta(hours=max(1.0, float(max_age_hours)))
+        try:
+            res = self.formal_col.update_many(
+                {
+                    "deal_info.is_deal_tip": True,
+                    "deal_info.updated_at": {"$lt": cutoff},
+                },
+                {
+                    "$set": {
+                        "deal_info.is_deal_tip": False,
+                        "deal_info.expired_at": ref_now,
+                        "deal_info.updated_at": ref_now,
+                    }
+                },
+            )
+            return int(getattr(res, "modified_count", 0) or 0)
+        except Exception as e:
+            logger.warning("清理超期好价标识 (`deal_info.is_deal_tip`) 异常: %s", e)
+            return 0
+
+    RECOVERY_VERSION_TAG = "20261116_v3"
+
+    def recover_recent_misclassified_tips(self, lookback_hours: float = 48.0) -> Dict[str, int]:
+        """
+        按版本号幂等救援：当新版本调度器启动时，将近 `lookback_hours` 内因旧版频控误判纯券/同帖混带数字ID
+        (`u.jd.com` / `union-click.jd.com` -> `ERR_EMPTY_PRODUCT_IDENTITY` / `ERR_JD_NUMERIC_SKU` / `ERR_AI2_MAIN_DEAD_ONLY_FILLER`)
+        或旧版异形淘口令路由到京东 (`京东.*业务错误`) 的线报释放回 `pending`，按 `recovery_version` 幂等防重复循环。
+        """
+        cutoff = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(
+            hours=max(1.0, float(lookback_hours))
+        )
+        jd_cps_re = r"(?:u\.jd\.com|union-click\.jd\.com)"
+        reset_payload = {
+            "$set": {
+                "clean_status": "pending",
+                "ai_clean_status": "pending",
+                "clean_retry_count": 0,
+                "clean_error_code": "",
+                "clean_error_msg": "",
+                "recovery_version": self.RECOVERY_VERSION_TAG,
+            },
+            "$unset": {
+                "ai_stage1_result": "",
+                "converted_links": "",
+                "ai_stage2_result": "",
+                "next_retry_after_ts": "",
+            },
+        }
+        jd_recovered = 0
+        tb_recovered = 0
+        try:
+            r_jd = self.col.update_many(
+                {
+                    "clean_status": "cleaned_failed",
+                    "clean_error_code": {
+                        "$in": [
+                            ERR_EMPTY_PRODUCT_IDENTITY,
+                            ERR_JD_NUMERIC_SKU,
+                            ERR_AI2_MAIN_DEAD_ONLY_FILLER,
+                        ]
+                    },
+                    "first_seen_at": {"$gte": cutoff},
+                    "recovery_version": {"$ne": self.RECOVERY_VERSION_TAG},
+                    "$or": [
+                        {"tutorial_text": {"$regex": jd_cps_re, "$options": "i"}},
+                        {"source_url": {"$regex": jd_cps_re, "$options": "i"}},
+                        {"extracted_links.url": {"$regex": jd_cps_re, "$options": "i"}},
+                        {"converted_links.clean_input": {"$regex": jd_cps_re, "$options": "i"}},
+                    ],
+                },
+                reset_payload,
+            )
+            jd_recovered = int(getattr(r_jd, "modified_count", 0) or 0)
+            r_tb = self.col.update_many(
+                {
+                    "clean_status": "cleaned_failed",
+                    "first_seen_at": {"$gte": cutoff},
+                    "recovery_version": {"$ne": self.RECOVERY_VERSION_TAG},
+                    "clean_error_msg": {"$regex": "京东.*业务错误"},
+                },
+                reset_payload,
+            )
+            tb_recovered = int(getattr(r_tb, "modified_count", 0) or 0)
+        except Exception as e:
+            logger.warning("按版本幂等救援近期误杀线报异常: %s", e)
+        return {"jd_recovered": jd_recovered, "tb_recovered": tb_recovered}
 
     def reset_raw_collection(self) -> int:
         """
@@ -955,12 +1101,14 @@ class DealRawPoolRepository:
     @staticmethod
     def _append_fallback_jsonl(records: List[Dict[str, Any]], task_name: str):
         try:
-            with open(LOCAL_FALLBACK_JSONL, "a", encoding="utf-8") as f:
-                for rec in records:
-                    row = copy.deepcopy(rec)
-                    row["_fallback_saved_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    row["_task_name"] = task_name
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            rows = []
+            for rec in records:
+                row = copy.deepcopy(rec)
+                row["_fallback_saved_at"] = now_iso
+                row["_task_name"] = task_name
+                rows.append(json.dumps(row, ensure_ascii=False))
+            _append_bounded_jsonl_lines(LOCAL_FALLBACK_JSONL, rows)
         except Exception as ex:
             logger.error("写入本地 JSONL 备份失败: %s", ex)
 
@@ -1108,18 +1256,9 @@ def detect_candidate_platform(raw_input: str, default_plat: str = "unknown") -> 
             return "unsupported_other"
     if any(d in s for d in _UNSUPPORTED_EXTERNAL_DOMAINS):
         return "unsupported_other"
-    if any(k in s for k in ("jd.com", "3.cn", "jingfen")):
-        return "jd"
-    if any(k in s for k in ("taobao.com", "tmall.com", "tb.cn", "tb3.cn", "uland")):
-        return "taobao"
-    if any(k in s for k in ("yangkeduo.com", "pinduoduo.com")):
-        return "pdd"
-    if any(sym in raw_input for sym in ("￥", "¥", "$", "€", "₴", "£", "¢")):
-        return "taobao"
-    if "!" in raw_input or "！" in raw_input:
-        return "jd"
-    if "-" in raw_input and len(raw_input) >= 35 and not raw_input.startswith("http"):
-        return "taobao"
+    sig = detect_platform_signal(raw_input)
+    if sig in ("jd", "taobao", "pdd"):
+        return sig
     if default_plat in ("jd", "taobao", "pdd"):
         return default_plat
     return "unknown"
@@ -1512,10 +1651,12 @@ class DealPoolCleaner:
         self._prompt_stage2_mtime = self._get_file_mtime_ns(PROMPT_STAGE2_PATH)
         self._prompt_lock = threading.Lock()
 
-        # 线程安全的内存级转链结果缓存，避免不同采集群重复刷屏的同一链接/口令重复调用上游接口
+        # 线程安全的有界 LRU 内存级转链结果缓存，避免不同采集群重复刷屏的同一链接/口令重复调用上游接口且杜绝内存无限膨胀
         self._cache_lock = threading.Lock()
         self._cache_warmed_up = False
-        self.anchor_cache: Dict[str, Dict[str, Any]] = {}
+        self.max_anchor_cache_size = MAX_ANCHOR_CACHE_SIZE
+        self.anchor_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._shared_unwrap_session: Optional[requests.Session] = None
         self.stats_cache_hits = 0
         self.stats_ai1_calls = 0
         self.stats_ai1_model_hits = 0
@@ -1527,6 +1668,49 @@ class DealPoolCleaner:
         self.stats_early_terminated_pre_ai1 = 0
         self.stats_early_terminated_post_stage3 = 0
         self.last_batch_stage_timings: Dict[str, float] = {}
+
+    def _set_anchor_cache_locked(self, key: str, value: Dict[str, Any]) -> None:
+        if not key:
+            return
+        if key in self.anchor_cache:
+            self.anchor_cache.move_to_end(key)
+        self.anchor_cache[key] = value
+        while len(self.anchor_cache) > self.max_anchor_cache_size:
+            self.anchor_cache.popitem(last=False)
+
+    def _get_anchor_cache_locked(self, key: str) -> Optional[Dict[str, Any]]:
+        val = self.anchor_cache.get(key)
+        if val is not None:
+            self.anchor_cache.move_to_end(key)
+        return val
+
+    @staticmethod
+    def _slim_adapter_res_for_cache(res: Any, *, keep_product: bool) -> Dict[str, Any]:
+        if not keep_product or not isinstance(res, dict):
+            return {}
+        prod = res.get("product")
+        if not isinstance(prod, dict) or not prod:
+            return {}
+        slim_prod = {k: v for k, v in prod.items() if k != "raw_item"}
+        return {
+            "status": "success",
+            "product": slim_prod,
+            "price": res.get("price"),
+            "coupon_amount": res.get("coupon_amount"),
+            "title": res.get("title"),
+        }
+
+    def _get_unwrap_session(self) -> Any:
+        if self.unwrap_http_session is not None:
+            return self.unwrap_http_session
+        with self._cache_lock:
+            if self._shared_unwrap_session is None:
+                sess = requests.Session()
+                adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32)
+                sess.mount("http://", adapter)
+                sess.mount("https://", adapter)
+                self._shared_unwrap_session = sess
+            return self._shared_unwrap_session
 
     def _can_run_live_unwrap(self) -> bool:
         """生产环境默认开启通用短链安全解包；离线单元测试未显式注入 `unwrap_http_session` 时自动静默跳过真实外网请求。"""
@@ -1554,19 +1738,17 @@ class DealPoolCleaner:
 
     @staticmethod
     def _build_anchor_cache_keys(plat: str, raw_anchor: str) -> List[str]:
-        """生成锚点缓存的主键列表：除完整字符串外，若为淘口令则额外提取 11 位核心字母数字码作为二级索引键。"""
+        """生成锚点缓存的主键列表：除完整字符串外，若为淘口令则额外提取严格 11 位核心字母数字码作为二级索引键。"""
         s = str(raw_anchor or "").strip()
         if not s:
             return []
         keys = [f"{plat}:{s}"]
         if plat == "taobao" and not s.lower().startswith("http"):
-            m = re.search(r"[￥$€£₴¢(（《【「/!！~|]\s*([A-Za-z0-9]{11})\s*[￥$€£₴¢)）》】」/!！~|]", s)
-            if m:
-                tk = m.group(1)
-                if any(c.isalpha() for c in tk) and any(c.isdigit() for c in tk):
-                    tk_key = f"taobao:tk:{tk}"
-                    if tk_key not in keys:
-                        keys.append(tk_key)
+            tk = extract_taobao_token_core(s)
+            if len(tk) == 11:
+                tk_key = f"taobao:tk:{tk}"
+                if tk_key not in keys:
+                    keys.append(tk_key)
         return keys
 
     def warmup_anchor_cache_from_db(self, raw_col) -> None:
@@ -1607,10 +1789,20 @@ class DealPoolCleaner:
                         p_tok = str(cl.get("my_promo_token") or "").strip()
                         cl_copy = copy.deepcopy(cl)
                         cl_copy["clean_input"] = c_inp
+                        cl_copy.pop("adapter_res", None)
                         if c_status == "product":
                             if not (p_link or p_tok):
                                 continue
                         elif c_status == "coupon_or_activity":
+                            # 防护历史限流期间未标记 resolution_kind 的京东短链/联盟跳转链误判 OK_COUPON 污染预热缓存
+                            c_inp_low = c_inp.lower()
+                            if (
+                                c_plat == "jd"
+                                and cl.get("error_code") == "OK_COUPON"
+                                and cl.get("resolution_kind") != "coupon_or_venue"
+                                and ("u.jd.com" in c_inp_low or "union-click.jd.com" in c_inp_low)
+                            ):
+                                continue
                             is_new_link = (
                                 cl.get("error_code") != "OK_DIRECT_COUPON"
                                 and _is_verified_station_promo_link(c_inp, p_link)
@@ -1638,7 +1830,7 @@ class DealPoolCleaner:
                             continue
                         for ckey in self._build_anchor_cache_keys(c_plat, c_inp):
                             if ckey not in self.anchor_cache:
-                                self.anchor_cache[ckey] = cl_copy
+                                self._set_anchor_cache_locked(ckey, cl_copy)
                                 loaded += 1
             if loaded > 0:
                 logger.info("🔥 [转链缓存预热] 已从 `deal_raw_tips` 恢复最近 12h 有效转链锚点 %d 个", loaded)
@@ -1909,10 +2101,17 @@ class DealPoolCleaner:
             "_fallback_reason": fail_reason,
         }
 
-    def _call_ai_json_array(self, prompt_template: str, batch_payload: List[Dict[str, Any]], stage_label: str) -> List[Dict[str, Any]]:
+    def _call_ai_json_array(
+        self,
+        prompt_template: str,
+        batch_payload: List[Dict[str, Any]],
+        stage_label: str,
+        *,
+        _allow_bisect: bool = True,
+    ) -> List[Dict[str, Any]]:
         """
         调用项目统一 AI 接口 `generate_content`（严格限制超时 `self.ai_timeout` 且 `stop_on_timeout=True`、
-        本地槽位忙 5s 快速切换备用模型），一旦超时立即放弃本批次不死磕重试。
+        本地槽位忙 5s 快速切换备用模型）；若多条打包批次发生超时或截断空返回，自动对半切分重试一次防整批连坐。
         """
         if not batch_payload or not prompt_template:
             return []
@@ -1925,6 +2124,7 @@ class DealPoolCleaner:
                 f"==================== 本批次待处理输入 JSON 数据 ====================\n"
                 f"{payload_json}"
             )
+        out_items: List[Dict[str, Any]] = []
         try:
             resp = generate_content(
                 prompt=full_prompt,
@@ -1934,43 +2134,55 @@ class DealPoolCleaner:
                 stop_on_timeout=True,
                 slot_acquire_timeout=5.0,
             )
-            if not resp:
-                return []
             if isinstance(resp, dict):
                 if resp.get("status") != "✅ 成功":
                     detail = "；".join(str(err) for err in (resp.get("error_history") or []))
                     if resp.get("timed_out"):
-                        logger.warning("[%s] 批次达到 AI 超时阈值 (%.0fs)，跳过本批等待下轮重试", stage_label, self.ai_timeout)
-                        return []
-                    raise RuntimeError(detail or str(resp.get("content") or "模型调用失败"))
-                resp_text = str(resp.get("content") or "")
-            else:
+                        logger.warning("[%s] 批次达到 AI 超时阈值 (%.0fs)，尝试切分或留待冷却重试", stage_label, self.ai_timeout)
+                    else:
+                        raise RuntimeError(detail or str(resp.get("content") or "模型调用失败"))
+                else:
+                    resp_text = str(resp.get("content") or "")
+            elif resp:
                 resp_text = str(resp)
+            else:
+                resp_text = ""
+
             cleaned_text = resp_text.strip()
-            if not cleaned_text:
-                return []
-            # 剥离思考模型输出的 <thought>...</thought> 或 <thinking>...</thinking>，防止思维链中的 [#L1] 干扰 JSON 括号定位
-            for close_tag in ("</thought>", "</thinking>"):
-                if close_tag in cleaned_text:
-                    cleaned_text = cleaned_text.split(close_tag)[-1].strip()
-            if "```" in cleaned_text:
-                parts = cleaned_text.split("```")
-                for seg in parts[1::2]:
-                    body = seg.strip()
-                    if body.lower().startswith("json"):
-                        body = body[4:].strip()
-                    if body.startswith("[") or body.startswith("{"):
-                        cleaned_text = body
-                        break
-            parsed = string_to_object(cleaned_text)
-            if isinstance(parsed, list):
-                return [item for item in parsed if isinstance(item, dict)]
-            if isinstance(parsed, dict):
-                return [parsed]
+            if cleaned_text:
+                # 剥离思考模型输出的 <thought>...</thought> 或 <thinking>...</thinking>，防止思维链中的 [#L1] 干扰 JSON 括号定位
+                for close_tag in ("</thought>", "</thinking>"):
+                    if close_tag in cleaned_text:
+                        cleaned_text = cleaned_text.split(close_tag)[-1].strip()
+                if "```" in cleaned_text:
+                    parts = cleaned_text.split("```")
+                    for seg in parts[1::2]:
+                        body = seg.strip()
+                        if body.lower().startswith("json"):
+                            body = body[4:].strip()
+                        if body.startswith("[") or body.startswith("{"):
+                            cleaned_text = body
+                            break
+                parsed = string_to_object(cleaned_text)
+                if isinstance(parsed, list):
+                    out_items = [item for item in parsed if isinstance(item, dict)]
+                elif isinstance(parsed, dict):
+                    out_items = [parsed]
         except Exception as e:
             err_brief = str(e).splitlines()[0][:200]
             logger.warning("[%s] 调用模型组解析 JSON 异常: %s", stage_label, err_brief)
-        return []
+
+        if (
+            not out_items
+            and _allow_bisect
+            and len(batch_payload) >= 3
+            and getattr(generate_content, "__module__", "").endswith("model_api")
+        ):
+            half = len(batch_payload) // 2
+            left_out = self._call_ai_json_array(prompt_template, batch_payload[:half], stage_label, _allow_bisect=False)
+            right_out = self._call_ai_json_array(prompt_template, batch_payload[half:], stage_label, _allow_bisect=False)
+            return left_out + right_out
+        return out_items
 
     def run_ai_stage1_batch(
         self,
@@ -2072,13 +2284,6 @@ class DealPoolCleaner:
                     tgt["clean_input"] = c_inp
                     tgt["text_role_hint"] = _ROLE_HINT_NORMALIZE_MAP.get(raw_role, "main_candidate")
                     norm_targets.append(tgt)
-                ai1_res["extracted_targets"] = norm_targets
-                raw_strips = ai1_res.get("strip_spans")
-                ai1_res["strip_spans"] = (
-                    [_normalize_inline_spaces(str(x)).strip() for x in raw_strips if str(x or "").strip()]
-                    if isinstance(raw_strips, list)
-                    else []
-                )
                 if not ai1_res.get("merged_tip_ids"):
                     ai1_res["merged_tip_ids"] = [mid]
                 else:
@@ -2088,6 +2293,50 @@ class DealPoolCleaner:
                         if str(x or "").strip()
                     ]
                 tip_map = (neighbor_maps_by_id or {}).get(mid) or ({mid: orig_doc} if orig_doc else {})
+                # 确定性补齐：若源站结构化按钮 (extracted_links) 中存在 AI-1 漏提的联盟推广商品链（防止同帖仅提了纯数字 item.jd.com 而漏掉 union-click/u.jd.com），自动补入候选
+                seen_clean_inputs = {t["clean_input"] for t in norm_targets}
+                for m_tid in ai1_res["merged_tip_ids"]:
+                    src_d = tip_map.get(m_tid) or {}
+                    for lk in src_d.get("extracted_links") or []:
+                        if not isinstance(lk, dict) or len(norm_targets) >= 8:
+                            continue
+                        u_cand = self._strip_markdown_link_wrapper(str(lk.get("url") or "").strip())
+                        u_low = u_cand.lower()
+                        if (
+                            not u_cand
+                            or u_cand in seen_clean_inputs
+                            or rebuild_clean_official_venue_url(u_cand) is not None
+                        ):
+                            continue
+                        if any(
+                            dom in u_low
+                            for dom in (
+                                "u.jd.com/",
+                                "union-click.jd.com/",
+                                "jingfen.jd.com/detail/",
+                                "s.click.taobao.com/",
+                                "m.tb.cn/",
+                                "e.tb.cn/",
+                                "p.pinduoduo.com/",
+                                "yangkeduo.com/",
+                            )
+                        ):
+                            seen_clean_inputs.add(u_cand)
+                            next_lid = f"L{len(norm_targets) + 1}"
+                            norm_targets.append({
+                                "link_id": next_lid,
+                                "raw_span": u_cand,
+                                "clean_input": u_cand,
+                                "platform": detect_candidate_platform(u_cand, str(lk.get("platform") or src_d.get("platform") or "unknown")),
+                                "text_role_hint": "main_candidate",
+                            })
+                ai1_res["extracted_targets"] = norm_targets
+                raw_strips = ai1_res.get("strip_spans")
+                ai1_res["strip_spans"] = (
+                    [_normalize_inline_spaces(str(x)).strip() for x in raw_strips if str(x or "").strip()]
+                    if isinstance(raw_strips, list)
+                    else []
+                )
                 assembled_text, assembled_imgs = self._assemble_combined_text_and_images(
                     ai1_res["merged_tip_ids"],
                     norm_targets,
@@ -2148,17 +2397,20 @@ class DealPoolCleaner:
             direct_keys = self._build_anchor_cache_keys(direct_plat, clean_input)
             with self._cache_lock:
                 hit_direct = next((k for k in direct_keys if k in self.anchor_cache), None)
-                if hit_direct is not None and self.anchor_cache[hit_direct].get("convert_status") == "coupon_or_activity":
-                    cached = copy.deepcopy(self.anchor_cache[hit_direct])
-                    cached["link_id"] = link_id
-                    cached["text_role_hint"] = role_hint
-                    self.stats_cache_hits += 1
-                    return cached
+                if hit_direct is not None:
+                    entry = self._get_anchor_cache_locked(hit_direct)
+                    if entry is not None and entry.get("convert_status") == "coupon_or_activity":
+                        cached = copy.deepcopy(entry)
+                        cached["link_id"] = link_id
+                        cached["text_role_hint"] = role_hint
+                        self.stats_cache_hits += 1
+                        return cached
             out = {
                 "link_id": link_id,
                 "clean_input": clean_input,
                 "text_role_hint": role_hint,
                 "convert_status": "coupon_or_activity",
+                "resolution_kind": "coupon_or_venue",
                 "platform": direct_plat,
                 "goods_id": "",
                 "goods_sign": "",
@@ -2171,7 +2423,7 @@ class DealPoolCleaner:
             }
             with self._cache_lock:
                 for ck in direct_keys:
-                    self.anchor_cache[ck] = out
+                    self._set_anchor_cache_locked(ck, out)
             return copy.deepcopy(out)
 
         platforms_to_try = [plat] if plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
@@ -2190,7 +2442,8 @@ class DealPoolCleaner:
             with self._cache_lock:
                 hit_key = next((k for k in cache_keys if k in self.anchor_cache), None)
                 if hit_key is not None:
-                    cached = copy.deepcopy(self.anchor_cache[hit_key])
+                    entry = self._get_anchor_cache_locked(hit_key) or {}
+                    cached = copy.deepcopy(entry)
                     cached["link_id"] = link_id
                     cached["text_role_hint"] = role_hint
                     c_status = cached.get("convert_status")
@@ -2216,6 +2469,7 @@ class DealPoolCleaner:
                     "clean_input": clean_input,
                     "text_role_hint": role_hint,
                     "convert_status": "failed",
+                    "resolution_kind": "error",
                     "platform": try_plat,
                     "goods_id": "",
                     "goods_sign": "",
@@ -2237,13 +2491,15 @@ class DealPoolCleaner:
             had_cache_miss = True
 
             try:
-                res = adapter.resolve_and_convert_universal(clean_input)
+                with api_caller_context("background"):
+                    res = adapter.resolve_and_convert_universal(clean_input)
             except Exception as exc:
                 out = {
                     "link_id": link_id,
                     "clean_input": clean_input,
                     "text_role_hint": role_hint,
                     "convert_status": "failed",
+                    "resolution_kind": "error",
                     "platform": try_plat,
                     "error_code": ERR_ADAPTER_CONVERT_FAILED,
                     "error_msg": f"Adapter({try_plat})调用异常: {exc}",
@@ -2256,7 +2512,14 @@ class DealPoolCleaner:
                 last_failed = out
                 continue
 
-            if isinstance(res, dict) and res.get("detail_lookup_failed"):
+            is_degraded_product = bool(
+                isinstance(res, dict)
+                and (
+                    res.get("detail_lookup_failed")
+                    or res.get("resolution_kind") == "degraded_product"
+                )
+            )
+            if is_degraded_product:
                 any_detail_lookup_failed = True
 
             if isinstance(res, dict) and res.get("status") == "success":
@@ -2271,11 +2534,13 @@ class DealPoolCleaner:
                     orig_price = float(product_card.get("original_price") or official_price)
                     act_price = float(product_card.get("activity_price") or official_price)
                     cpn_amt = float(product_card.get("coupon_amount") or res.get("coupon_amount") or 0.0)
+                    slim_ares = self._slim_adapter_res_for_cache(res, keep_product=True)
                     out = {
                         "link_id": link_id,
                         "clean_input": clean_input,
                         "text_role_hint": role_hint,
                         "convert_status": "product",
+                        "resolution_kind": "product",
                         "platform": try_plat,
                         "goods_id": goods_id,
                         "goods_sign": goods_sign,
@@ -2291,15 +2556,16 @@ class DealPoolCleaner:
                         },
                         "my_promo_link": promo_link or None,
                         "my_promo_token": promo_token or None,
-                        "adapter_res": res,
+                        "adapter_res": slim_ares,
                     }
                     with self._cache_lock:
                         for ck in cache_keys:
-                            self.anchor_cache[ck] = out
+                            self._set_anchor_cache_locked(ck, out)
                     return copy.deepcopy(out)
 
                 # 【通道 1：我方专属联盟新链】：强校验官方联盟推广域且归一化路径/参数严禁等于原输入，或生成不同于原输入的专属口令
-                if not res.get("detail_lookup_failed"):
+                # 严禁将详情反查限流降级的单品 (`degraded_product`) 误归类为纯优惠券 `OK_COUPON`！
+                if not is_degraded_product:
                     is_new_station_link = _is_verified_station_promo_link(clean_input, promo_link)
                     is_new_token = bool(promo_token) and promo_token != clean_input
                     rebuilt_promo = rebuild_clean_official_venue_url(promo_link) if promo_link else None
@@ -2309,6 +2575,7 @@ class DealPoolCleaner:
                             "clean_input": clean_input,
                             "text_role_hint": role_hint,
                             "convert_status": "coupon_or_activity",
+                            "resolution_kind": "coupon_or_venue",
                             "platform": try_plat,
                             "goods_id": "",
                             "goods_sign": "",
@@ -2317,11 +2584,11 @@ class DealPoolCleaner:
                             "official_product": None,
                             "my_promo_link": promo_link if is_new_station_link else rebuilt_promo,
                             "my_promo_token": promo_token if is_new_token else None,
-                            "adapter_res": res,
+                            "adapter_res": {},
                         }
                         with self._cache_lock:
                             for ck in cache_keys:
-                                self.anchor_cache[ck] = out
+                                self._set_anchor_cache_locked(ck, out)
                         return copy.deepcopy(out)
                     if rebuilt_promo:
                         venue_plat = detect_candidate_platform(rebuilt_promo, try_plat)
@@ -2330,6 +2597,7 @@ class DealPoolCleaner:
                             "clean_input": clean_input,
                             "text_role_hint": role_hint,
                             "convert_status": "coupon_or_activity",
+                            "resolution_kind": "coupon_or_venue",
                             "platform": venue_plat,
                             "goods_id": "",
                             "goods_sign": "",
@@ -2338,18 +2606,18 @@ class DealPoolCleaner:
                             "official_product": None,
                             "my_promo_link": rebuilt_promo,
                             "my_promo_token": None,
-                            "adapter_res": res,
+                            "adapter_res": {},
                         }
                         with self._cache_lock:
                             for p_tag in {try_plat, venue_plat}:
                                 for ck in self._build_anchor_cache_keys(p_tag, clean_input):
-                                    self.anchor_cache[ck] = out
+                                    self._set_anchor_cache_locked(ck, out)
                         return copy.deepcopy(out)
 
             raw_code = str((res or {}).get("error_code") or "")
             raw_msg = (
                 "商品详情反查触发临时限流或网络波动"
-                if isinstance(res, dict) and res.get("detail_lookup_failed")
+                if is_degraded_product
                 else str((res or {}).get("error_msg") or "转链未返回有效结果")
             )
             if raw_code == "UNSUPPORTED_TB_NUMERIC_ID" or (try_plat == "taobao" and "不支持数字id" in raw_msg):
@@ -2358,8 +2626,9 @@ class DealPoolCleaner:
                 err_code = ERR_PDD_NUMERIC_ID
             elif raw_code == "UNSUPPORTED_JD_NUMERIC_SKU" or (try_plat == "jd" and "不支持数字id" in raw_msg):
                 err_code = ERR_JD_NUMERIC_SKU
-            elif raw_code == "PRODUCT_OFF_PROMOTION" or any(
-                k in raw_msg for k in ("下架", "不在推广", "取消推广", "不支持该商品")
+            elif not is_degraded_product and (
+                raw_code == "PRODUCT_OFF_PROMOTION"
+                or any(k in raw_msg for k in ("下架", "不在推广", "取消推广", "不支持该商品"))
             ):
                 err_code = ERR_ADAPTER_OFF_PROMOTION
             else:
@@ -2370,6 +2639,7 @@ class DealPoolCleaner:
                 "clean_input": clean_input,
                 "text_role_hint": role_hint,
                 "convert_status": "failed",
+                "resolution_kind": "degraded_product" if is_degraded_product else "error",
                 "platform": try_plat,
                 "goods_id": "",
                 "goods_sign": "",
@@ -2378,7 +2648,7 @@ class DealPoolCleaner:
                 "official_product": None,
                 "my_promo_link": None,
                 "my_promo_token": None,
-                "adapter_res": res if isinstance(res, dict) else {},
+                "adapter_res": {},
             }
             pending_failed_cache.append((cache_keys, out))
             last_failed = out
@@ -2389,7 +2659,7 @@ class DealPoolCleaner:
             if not rebuilt_venue_url and self._can_run_live_unwrap():
                 rebuilt_venue_url = unwrap_to_official_public_venue_url(
                     clean_input,
-                    http_session=self.unwrap_http_session,
+                    http_session=self._get_unwrap_session(),
                     resolver=self.unwrap_resolver,
                 )
             if rebuilt_venue_url:
@@ -2402,6 +2672,7 @@ class DealPoolCleaner:
                     "clean_input": clean_input,
                     "text_role_hint": role_hint,
                     "convert_status": "coupon_or_activity",
+                    "resolution_kind": "coupon_or_venue",
                     "platform": venue_plat,
                     "goods_id": "",
                     "goods_sign": "",
@@ -2410,20 +2681,20 @@ class DealPoolCleaner:
                     "official_product": None,
                     "my_promo_link": rebuilt_venue_url,
                     "my_promo_token": None,
-                    "adapter_res": (last_failed or {}).get("adapter_res") or {},
+                    "adapter_res": {},
                 }
                 with self._cache_lock:
                     for p_tag in set(platforms_to_try) | {venue_plat}:
                         if p_tag in ("jd", "taobao", "pdd"):
                             for ck in self._build_anchor_cache_keys(p_tag, clean_input):
-                                self.anchor_cache[ck] = out
+                                self._set_anchor_cache_locked(ck, out)
                 return copy.deepcopy(out)
 
         if pending_failed_cache:
             with self._cache_lock:
                 for cks, failed_out in pending_failed_cache:
                     for ck in cks:
-                        self.anchor_cache[ck] = failed_out
+                        self._set_anchor_cache_locked(ck, failed_out)
 
         return copy.deepcopy(last_failed) if last_failed else {
             "link_id": link_id,
@@ -4114,6 +4385,7 @@ def upsert_cleaned_products_to_formal_table(
                 and float(deal_info["deal_price"]) > 0
             )
             deal_info["updated_at"] = now
+            deal_info["expired_at"] = None
             deal_info["need_reformat"] = has_numeric_dp
             deal_info["format_status"] = "pending" if has_numeric_dp else "skipped"
             deal_info["format_info"] = None
@@ -4276,6 +4548,7 @@ def _commit_batch_results_to_db(
             )
         elif r["status"] == "retry_pending":
             retry_pending_count += 1
+            r_cnt = int(r.get("retry_count") or 1)
             raw_status_ops.append(
                 UpdateOne(
                     {"source_site": s_site, "source_item_id": s_id},
@@ -4284,7 +4557,8 @@ def _commit_batch_results_to_db(
                             "last_clean_attempt_at": now_utc,
                             "clean_status": "pending",
                             "ai_clean_status": "retry_pending",
-                            "clean_retry_count": int(r.get("retry_count") or 1),
+                            "clean_retry_count": r_cnt,
+                            "next_retry_after_ts": round(time.time() + 180.0 * r_cnt, 1),
                             "clean_error_code": r["error_code"],
                             "clean_error_msg": r["error_msg"],
                             "ai_stage1_result": r.get("ai_stage1_result"),
@@ -4514,10 +4788,16 @@ def run_clean_stage(
     except Exception as e:
         logger.warning("前置保鲜与重试上限清扫异常: %s", e)
 
+    if cycle_num > 0 and cycle_num % 30 == 0:
+        expired_deals = repo.expire_stale_formal_deals(now_utc=now_utc)
+        if expired_deals > 0:
+            logger.info("🧹 [正式库好价保鲜] 已自动摘除超 %.0f 小时未刷新好价标 %d 个", DEAL_FORMAL_EXPIRY_HOURS, expired_deals)
+
     fresh_guard_clause: Dict[str, Any] = {
         "$nor": [
             {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
             {"first_seen_at": {"$lt": cutoff_dt}},
+            {"next_retry_after_ts": {"$gt": round(time.time(), 1)}},
         ]
     }
     active_pending_filter: Dict[str, Any] = {
@@ -4794,11 +5074,15 @@ def run_clean_stage(
     try:
         with open(LATEST_CLEAN_OPS_REPORT_PATH, "w", encoding="utf-8") as f:
             json.dump(clean_report, f, ensure_ascii=False, indent=2)
-        with open(CLEAN_OPS_HISTORY_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(clean_report, ensure_ascii=False) + "\n")
-        with open(CLEAN_FAILED_SAMPLES_JSONL, "a", encoding="utf-8") as f:
-            for item in failed_samples[:200]:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        _append_bounded_jsonl_lines(
+            CLEAN_OPS_HISTORY_JSONL,
+            [json.dumps(clean_report, ensure_ascii=False)],
+        )
+        if failed_samples:
+            _append_bounded_jsonl_lines(
+                CLEAN_FAILED_SAMPLES_JSONL,
+                [json.dumps(item, ensure_ascii=False) for item in failed_samples[:200]],
+            )
         with open(CLEAN_SUCCESS_PREVIEW_JSONL, "w", encoding="utf-8") as f:
             for doc in success_product_docs[:50]:
                 f.write(json.dumps(doc, ensure_ascii=False, default=str) + "\n")
@@ -4988,8 +5272,10 @@ def build_and_log_cycle_ops_report(
     try:
         with open(LATEST_OPS_REPORT_PATH, "w", encoding="utf-8") as f:
             json.dump(ops_report, f, ensure_ascii=False, indent=2)
-        with open(OPS_REPORT_HISTORY_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(ops_report, ensure_ascii=False) + "\n")
+        _append_bounded_jsonl_lines(
+            OPS_REPORT_HISTORY_JSONL,
+            [json.dumps(ops_report, ensure_ascii=False)],
+        )
     except Exception as e:
         logger.warning("保存每轮运维报告文件失败: %s", e)
 
@@ -6223,14 +6509,14 @@ def main():
     parser.add_argument(
         "--ai-batch-size",
         type=int,
-        default=6,
-        help="单次 AI 请求打包处理的线报条数（默认: 6，抑制思考模型长批 90s 尾部超时与输出截断）",
+        default=4,
+        help="单次 AI 请求打包处理的线报条数（默认: 4，抑制思考模型长批 90s 尾部超时与输出截断）",
     )
     parser.add_argument(
         "--ai-workers",
         type=int,
-        default=12,
-        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 12，分波利用本地高速槽位并避免瞬时打满网关）",
+        default=8,
+        help="Stage 2 / Stage 4 AI 并发请求线程数（默认: 8，平滑利用本地高速槽位并避免瞬时打满网关）",
     )
     parser.add_argument(
         "--ai-timeout",
@@ -6280,6 +6566,14 @@ def main():
         help="仅查看最近一轮运维拉取与清洗健康度诊断报告",
     )
     args = parser.parse_args()
+    set_process_role("deal_scheduler")
+    try:
+        from infrastructure.pdd_client import configure_transport
+        from infrastructure.settings import get_settings as _get_app_settings
+        _st = _get_app_settings()
+        configure_transport(dns_mode=_st.pdd_dns_mode, trust_env=_st.pdd_trust_env)
+    except Exception:
+        pass
 
     repo = DealRawPoolRepository(
         collection_name=args.collection,
@@ -6318,6 +6612,18 @@ def main():
     if args.ops_report:
         print_latest_ops_report()
         return
+
+    init_expired = repo.expire_stale_formal_deals()
+    if init_expired > 0:
+        logger.info("🧹 [启动好价保鲜清扫] 自动摘除超 %.0f 小时未刷新好价标 %d 个", DEAL_FORMAL_EXPIRY_HOURS, init_expired)
+
+    recovered = repo.recover_recent_misclassified_tips(lookback_hours=48.0)
+    if recovered["jd_recovered"] or recovered["tb_recovered"]:
+        logger.info(
+            "♻️ [启动误杀线报幂等救援] 已释放近 48h 误杀线报回 pending: 京东短链/联盟链=%d 条, 淘口令误路由=%d 条",
+            recovered["jd_recovered"],
+            recovered["tb_recovered"],
+        )
 
     if args.clean_only:
         run_clean_stage(

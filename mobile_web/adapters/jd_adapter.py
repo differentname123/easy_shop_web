@@ -9,6 +9,10 @@ from datetime import datetime
 
 import requests
 from adapters.base import BasePlatformAdapter
+from infrastructure.api_governance import (
+    execute_provider_chain,
+    stamp_universal_resolution,
+)
 from infrastructure.http_utils import (
     clean_text as _text,
     error_dict as _error,
@@ -561,13 +565,25 @@ class JdAdapter(BasePlatformAdapter):
                     resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
                 elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
                     detail_lookup_failed = True
-            if not product_card:
-                search_q = short or long
-                is_coupon_or_venue_url = any(
-                    kw in (search_q or "").lower()
-                    for kw in ("coupon.m.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "jdcoupon")
+            lower_urls = f"{text} {short} {long}".lower()
+            is_explicit_venue_url = any(
+                kw in lower_urls
+                for kw in ("coupon.m.jd.com", "coupon.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "jdcoupon", "u_act_p=coupon")
+            )
+            verified_coupon_or_venue = bool(
+                not extracted_encrypted_id
+                and (
+                    is_explicit_venue_url
+                    or not j_cmd.strip()
+                    or "促销会场" in j_cmd
                 )
-                if search_q and not is_coupon_or_venue_url:
+            )
+
+            if conv.get("ztk_catalog_throttled"):
+                detail_lookup_failed = True
+            elif not product_card and not verified_coupon_or_venue:
+                search_q = short or long
+                if search_q:
                     try:
                         q_res = self.client.search_goods(search_q, page=1, page_size=5, has_coupon=False)
                     except TypeError:
@@ -579,23 +595,29 @@ class JdAdapter(BasePlatformAdapter):
                         rows = q_res["data"]
                         total_cnt = int(q_res.get("total_count") or len(rows))
                         # 【遵循绝对可靠原则】：仅当转链所得短链 100% 唯一命中单件商品 (len(rows)==1 且 total_cnt==1) 时采纳，
-                        # 严禁因口令含“抢购”字样就从多商品会场列表中盲取首条！
+                        # 严禁从多商品会场列表中盲取首条！
                         if len(rows) == 1 and total_cnt == 1:
                             try:
                                 cand_card = self._detail(rows[0])
-                                if (cand_card.get("price") or 0) > 0:
+                                if (cand_card.get("price") or 0) >= 0:
                                     product_card = cand_card
                                     resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
                             except Exception:
                                 pass
 
-            # 从 jCommand 文案提取商品标题与优惠券金额作为限流兜底
+            # 仅用于前端展示的兜底标题与券面额提取（绝不参与单品 vs 优惠券的门禁裁决）
             fallback_title = "京东精选推广好物"
             fallback_coupon = 0.0
             if j_cmd:
                 t_match = re.search(r"抢购(.+?)(?:[！!]|$)", j_cmd)
+                if not t_match:
+                    t_match = re.search(r"^\s*\d+:/\s*([^！!，,\n]{2,})", j_cmd)
+                if not t_match:
+                    t_match = re.search(r"(?:崠|岽|鯟|埬|D[oōσδ]+ng)\s*([^！!\n]{2,})", j_cmd, re.IGNORECASE)
                 if t_match:
-                    fallback_title = t_match.group(1).strip()
+                    cand_t = t_match.group(1).strip()
+                    if cand_t and "促销会场" not in cand_t:
+                        fallback_title = cand_t
                 c_match = re.search(r"领(\d+(?:\.\d+)?)元优惠券", j_cmd)
                 if c_match:
                     try:
@@ -606,6 +628,9 @@ class JdAdapter(BasePlatformAdapter):
                 b_match = re.search(r"「(.+?)」", text)
                 if b_match:
                     fallback_title = b_match.group(1).strip()
+
+            if product_card is None and not verified_coupon_or_venue:
+                detail_lookup_failed = True
 
             title = (product_card or {}).get("name") or fallback_title
             price = (product_card or {}).get("price")
@@ -629,7 +654,7 @@ class JdAdapter(BasePlatformAdapter):
             if detail_lookup_failed and product_card is None:
                 extra_fields["detail_lookup_failed"] = True
 
-            return self._build_promotion_payload(
+            payload = self._build_promotion_payload(
                 conv,
                 promoter=promoter,
                 goods_id=canonical_id,
@@ -637,9 +662,14 @@ class JdAdapter(BasePlatformAdapter):
                 uid=uid,
                 **extra_fields,
             )
+            return stamp_universal_resolution(payload, verified_coupon_or_venue=verified_coupon_or_venue)
 
-        # 真实网络限速已下沉至 JdClient._get 按单 appkey 预约 0.22s 发包间隔（锁内零网络 RTT 等待），离线单元测试零等待
-        return _do_resolve()
+        extra_providers = [
+            (name, lambda fn=fn: fn(text, promoter=promoter, uid=uid))
+            for name, fn in getattr(self, "extra_universal_providers", ())
+        ]
+        providers = [("ztk_jd_universal", _do_resolve), *extra_providers]
+        return execute_provider_chain("jd", "resolve_universal", providers)
 
     def check_authority(self, uid):
         if not self.active:

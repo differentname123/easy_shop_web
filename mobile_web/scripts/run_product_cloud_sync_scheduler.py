@@ -48,18 +48,21 @@ for _p in (str(MOBILE_WEB_DIR), str(WORKSPACE_ROOT), str(CURRENT_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from infrastructure.api_governance import set_process_role
 from infrastructure.mongo import gen_db_object
 from infrastructure.settings import DEFAULT_CONFIG_FILE
 from models.product import clean_product_id, normalize_platform
 from repositories.product_repo import ProductRepository
 
 COLLECTION_NAME = "products"
+DELETED_TOMBSTONES_COLLECTION = "deleted_products_log"
 DEFAULT_SYNC_WINDOW_DAYS = 3.0
 DEFAULT_SYNC_INTERVAL_SECONDS = 180        # 默认每 3 分钟检查合并一轮
 FULL_SWEEP_EVERY_N_CYCLES = 20             # 守护模式下每 20 轮（约 1 小时）做一次完整 3 天窗口兜底对账
 ROLLING_OVERLAP_SECONDS = 120              # 滚动增量窗口重叠冗余秒数，防止并发写入边界漏扫
 DEFAULT_BATCH_SIZE = 200
 DEFAULT_QUERY_CHUNK_SIZE = 500
+DEFAULT_CLOUD_PULL_MAX_PER_SWEEP = 300
 DEFAULT_CONNECT_TIMEOUT_MS = 10000
 DEFAULT_SOCKET_TIMEOUT_MS = 60000
 PROGRESS_LOG_STEP = 2000
@@ -140,6 +143,7 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
         ]
     },
     "deal_info.is_deal_tip": 1,
+    "deal_info.expired_at": 1,
     "deal_info.source_item_id": 1,
     "deal_info.quality_score": 1,
     "deal_info.deal_price": 1,
@@ -344,6 +348,7 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     deal_info = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
     deal_ready = deal_info.get("is_deal_tip") is True
+    deal_expired = (deal_info.get("is_deal_tip") is False) and (deal_info.get("expired_at") is not None)
     deal_sig = None
     if deal_ready:
         deal_sig = (
@@ -366,6 +371,7 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "fmt_ms": to_utc_millis(doc.get("format_updated_at")) if fmt_ready else None,
         "fmt_sku_count": fmt_count if fmt_ready else 0,
         "deal_ready": deal_ready,
+        "deal_expired": deal_expired,
         "deal_sig": deal_sig,
     }
 
@@ -381,6 +387,7 @@ def needs_cloud_merge(
     - 云端缺 channel_type 而本地有 -> 'fill_channel_type'
     - 本地有已成功的规格清洗 format_info 且云端缺失或更旧 -> 'format_info_changed'
     - 本地有好价线报 deal_info 且云端缺失或内容/规格重洗已变更 -> 'deal_info_changed'
+    - 本地已过期摘标而云端仍挂着实时好价标 -> 'deal_info_expired'
     """
     if cloud_fp is None:
         return True, "insert"
@@ -408,6 +415,8 @@ def needs_cloud_merge(
     if local_fp["deal_ready"]:
         if not cloud_fp["deal_ready"] or local_fp["deal_sig"] != cloud_fp["deal_sig"]:
             return True, "deal_info_changed"
+    elif local_fp.get("deal_expired") and cloud_fp.get("deal_ready"):
+        return True, "deal_info_expired"
 
     return False, "up_to_date"
 
@@ -446,6 +455,7 @@ def build_product_merge_operation(
 
     fmt_ready = local_fp["fmt_ready"]
     deal_ready = local_fp["deal_ready"]
+    deal_expired_sync = bool(local_fp.get("deal_expired") and cloud_fp is not None and cloud_fp.get("deal_ready"))
 
     set_fields: Dict[str, Any] = {}
     for key, value in local_doc.items():
@@ -459,7 +469,7 @@ def build_product_merge_operation(
             if key in ("format_error", "format_retry_count"):
                 continue
         if key == "deal_info":
-            if not deal_ready:
+            if not (deal_ready or deal_expired_sync):
                 continue
         if key == "channel_type":
             if not (isinstance(value, int) and not isinstance(value, bool)):
@@ -532,6 +542,172 @@ def ensure_cloud_products_indexes(cloud_col) -> None:
     cloud_col.create_index([("deal_info.is_deal_tip", 1), ("updated_at", -1)], background=True)
 
 
+def sync_deletion_tombstones_to_cloud(
+    tombstone_col,
+    cloud_col,
+    *,
+    window_days: float = DEFAULT_SYNC_WINDOW_DAYS,
+    since_utc: Optional[datetime.datetime] = None,
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[int, set[Tuple[str, str]]]:
+    """将本地下架删除墓碑 (`deleted_products_log`) 幂等传播到云端 `products`，防止已下架死链残留在云端展示。"""
+    if tombstone_col is None or cloud_col is None:
+        return 0, set()
+    if since_utc is not None:
+        cutoff = since_utc.replace(tzinfo=datetime.timezone.utc) if since_utc.tzinfo is None else since_utc.astimezone(datetime.timezone.utc)
+    else:
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max(0.001, float(window_days)))
+    cutoff_naive = cutoff.replace(tzinfo=None)
+
+    by_plat: Dict[str, List[str]] = defaultdict(list)
+    tombstone_keys: set[Tuple[str, str]] = set()
+    try:
+        cursor = tombstone_col.find(
+            {"$or": [{"deleted_at": {"$gte": cutoff}}, {"deleted_at": {"$gte": cutoff_naive}}]},
+            {"_id": 0, "platform": 1, "product_id": 1},
+        )
+        for doc in cursor:
+            plat = normalize_platform(doc.get("platform") or "")
+            pid = clean_product_id(doc.get("product_id"))
+            if plat and pid and (plat, pid) not in tombstone_keys:
+                tombstone_keys.add((plat, pid))
+                by_plat[plat].append(pid)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("⚠️ 读取本地下架删除墓碑表失败: %s", exc)
+        return 0, tombstone_keys
+
+    deleted_cloud = 0
+    if by_plat and not dry_run and callable(getattr(cloud_col, "delete_many", None)):
+        for plat, pids in by_plat.items():
+            for pid_chunk in _chunked(pids, DEFAULT_QUERY_CHUNK_SIZE):
+                res = cloud_col.delete_many({"platform": plat, "product_id": {"$in": pid_chunk}})
+                deleted_cloud += int(getattr(res, "deleted_count", 0) or 0)
+        if deleted_cloud > 0 and logger is not None:
+            logger.info("🗑️ [下架墓碑同步] 已从云端 `products` 同步清理本地已下架商品 %d 条", deleted_cloud)
+    return deleted_cloud, tombstone_keys
+
+
+def pull_cloud_only_unformatted_products(
+    local_col,
+    cloud_col,
+    *,
+    window_days: float = DEFAULT_SYNC_WINDOW_DAYS,
+    max_pull: int = DEFAULT_CLOUD_PULL_MAX_PER_SWEEP,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    exclude_keys: Optional[set[Tuple[str, str]]] = None,
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> int:
+    """
+    全量对账轮次反向拉取「云端独有且尚未执行规格结构化清洗 (`format_status == None`)」的新近有效商品到本地库：
+    由本地 `goods_info_format.py` 完成 AI 规格清洗后，下一轮自动将 `format_info` 合并回云端，补齐云端推荐流商品规格闭环。
+    """
+    if local_col is None or cloud_col is None or max_pull <= 0:
+        return 0
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max(0.001, float(window_days)))
+    cloud_query = {
+        "$and": [
+            {"updated_at": {"$gte": cutoff}},
+            {"$or": [{"format_status": None}, {"format_status": {"$exists": False}}]},
+            ProductRepository._displayable_content_filter(),
+        ]
+    }
+    try:
+        raw_cursor = cloud_col.find(cloud_query)
+        if not isinstance(raw_cursor, (list, tuple)):
+            if hasattr(raw_cursor, "sort"):
+                raw_cursor = raw_cursor.sort([("updated_at", -1)])
+            if hasattr(raw_cursor, "limit"):
+                raw_cursor = raw_cursor.limit(int(max_pull))
+        cloud_docs = list(raw_cursor)[: int(max_pull)]
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("⚠️ 查询云端待补洗规格商品异常: %s", exc)
+        return 0
+
+    if not cloud_docs:
+        return 0
+
+    excluded = exclude_keys or set()
+    cand_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    pids_by_plat: Dict[str, List[str]] = defaultdict(list)
+    for c_doc in cloud_docs:
+        if not is_valid_syncable_product(c_doc):
+            continue
+        plat = normalize_platform(c_doc.get("platform") or "")
+        pid = clean_product_id(c_doc.get("product_id") or c_doc.get("goods_id"))
+        if not plat or not pid or (plat, pid) in excluded or (plat, pid) in cand_by_key:
+            continue
+        cand_by_key[(plat, pid)] = c_doc
+        pids_by_plat[plat].append(pid)
+
+    if not cand_by_key:
+        return 0
+
+    existing_local_keys: set[Tuple[str, str]] = set()
+    for plat, pids in pids_by_plat.items():
+        for pid_chunk in _chunked(pids, DEFAULT_QUERY_CHUNK_SIZE):
+            for l_doc in local_col.find(
+                {"platform": plat, "product_id": {"$in": pid_chunk}},
+                {"_id": 0, "platform": 1, "product_id": 1},
+            ):
+                lp = normalize_platform(l_doc.get("platform") or "")
+                lpid = clean_product_id(l_doc.get("product_id"))
+                if lp and lpid:
+                    existing_local_keys.add((lp, lpid))
+
+    missing_keys = [k for k in cand_by_key.keys() if k not in existing_local_keys]
+    if not missing_keys or dry_run:
+        return len(missing_keys) if dry_run else 0
+
+    pulled_upserted = 0
+    now_naive = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    ops: List[UpdateOne] = []
+    for key in missing_keys:
+        plat, pid = key
+        src_doc = cand_by_key[key]
+        clean_insert: Dict[str, Any] = {}
+        for k, v in src_doc.items():
+            if k in NEVER_OVERWRITE_FIELDS or v is None:
+                continue
+            if isinstance(v, datetime.datetime) and v.tzinfo is not None:
+                clean_insert[k] = v.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            else:
+                clean_insert[k] = copy.deepcopy(v)
+        clean_insert["platform"] = plat
+        clean_insert["product_id"] = pid
+        if not clean_insert.get("goods_id"):
+            clean_insert["goods_id"] = pid
+        raw_created = src_doc.get("created_at")
+        if isinstance(raw_created, datetime.datetime):
+            clean_insert["created_at"] = (
+                raw_created.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                if raw_created.tzinfo is not None
+                else raw_created
+            )
+        else:
+            clean_insert["created_at"] = clean_insert.get("updated_at") or now_naive
+        ops.append(UpdateOne({"platform": plat, "product_id": pid}, {"$setOnInsert": clean_insert}, upsert=True))
+        if len(ops) >= max(1, int(batch_size)):
+            res = local_col.bulk_write(ops, ordered=False)
+            pulled_upserted += int(res.upserted_count or 0)
+            ops.clear()
+
+    if ops:
+        res = local_col.bulk_write(ops, ordered=False)
+        pulled_upserted += int(res.upserted_count or 0)
+        ops.clear()
+
+    if pulled_upserted > 0 and logger is not None:
+        logger.info(
+            "📥 [云端推荐流回拉补洗] 已将 %d 条云端独有未清洗商品回拉至本地 `products` 交由 `goods_info_format` 补齐规格",
+            pulled_upserted,
+        )
+    return pulled_upserted
+
+
 def run_sync_round(
     local_col,
     cloud_col,
@@ -541,11 +717,33 @@ def run_sync_round(
     batch_size: int = DEFAULT_BATCH_SIZE,
     dry_run: bool = False,
     logger: Optional[logging.Logger] = None,
+    tombstone_col=None,
+    pull_cloud_unformatted: bool = False,
 ) -> Dict[str, Any]:
     """
-    执行单轮「本地商品库 -> 云端商品库」检查合并同步。
+    执行单轮「本地商品库 <-> 云端商品库」检查合并同步。
     """
     t0 = time.perf_counter()
+    cloud_deleted_tombstones, tombstone_keys = sync_deletion_tombstones_to_cloud(
+        tombstone_col,
+        cloud_col,
+        window_days=window_days,
+        since_utc=since_utc,
+        dry_run=dry_run,
+        logger=logger,
+    )
+    pulled_cloud_only = 0
+    if pull_cloud_unformatted:
+        pulled_cloud_only = pull_cloud_only_unformatted_products(
+            local_col,
+            cloud_col,
+            window_days=window_days,
+            batch_size=batch_size,
+            exclude_keys=tombstone_keys,
+            dry_run=dry_run,
+            logger=logger,
+        )
+
     query = build_recent_local_candidates_query(window_days=window_days, since_utc=since_utc)
 
     # 1. 先拉取本地窗口内候选商品的超轻量指纹
@@ -647,6 +845,8 @@ def run_sync_round(
         "cloud_upserted_new": upserted_total,
         "cloud_matched_existing": matched_total,
         "cloud_modified_existing": modified_total,
+        "cloud_deleted_tombstones": cloud_deleted_tombstones,
+        "local_pulled_cloud_unformatted": pulled_cloud_only,
         "elapsed_seconds": elapsed_s,
     }
 
@@ -654,7 +854,7 @@ def run_sync_round(
         mode_tag = "[DRY-RUN 演练]" if dry_run else "[正式合并]"
         logger.info(
             "%s %s | 本地候选=%d条 | 已一致跳过=%d条 | 待同步=%d条 %s | "
-            "云端新增=%d条 合并更新=%d条 | 耗时=%.2fs",
+            "云端新增=%d条 合并更新=%d条 下架清理=%d条 回拉待洗=%d条 | 耗时=%.2fs",
             mode_tag,
             scope_desc,
             total_candidates,
@@ -663,6 +863,8 @@ def run_sync_round(
             json.dumps(dict(reason_counter), ensure_ascii=False),
             upserted_total,
             modified_total,
+            cloud_deleted_tombstones,
+            pulled_cloud_only,
             elapsed_s,
         )
 
@@ -681,6 +883,7 @@ def _save_latest_report(report: Dict[str, Any]) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    set_process_role("cloud_sync_scheduler")
     parser = argparse.ArgumentParser(
         description="本地商品库 -> 云端商品库 (`crawler_data.products`) 定时检查合并同步守护脚本"
     )
@@ -781,6 +984,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     cloud_indexes_ready = False
 
                 local_col = local_db.get_collection(COLLECTION_NAME)
+                tombstone_col = local_db.get_collection(DELETED_TOMBSTONES_COLLECTION)
                 cloud_col = cloud_client[cloud_db_name][COLLECTION_NAME]
 
                 if not cloud_indexes_ready and not args.dry_run:
@@ -795,6 +999,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     batch_size=args.batch_size,
                     dry_run=args.dry_run,
                     logger=logger,
+                    tombstone_col=tombstone_col,
+                    pull_cloud_unformatted=is_full_sweep,
                 )
                 report["cycle_num"] = cycle_num
                 _save_latest_report(report)

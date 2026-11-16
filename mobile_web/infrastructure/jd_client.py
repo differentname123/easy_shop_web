@@ -7,6 +7,11 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
 import requests
+from infrastructure.api_governance import (
+    GLOBAL_UPSTREAM_HEALTH,
+    get_caller_context,
+    is_real_requests_session,
+)
 from infrastructure.http_utils import (
     SHANGHAI,
     error_dict as _error,
@@ -189,12 +194,18 @@ class JdClient:
     _DETAIL_KEY_DISPATCH_INTERVAL_SEC = 0.85
     _MAX_KEY_PACE_WAIT_SEC = 2.0
     _MAX_DETAIL_KEY_PACE_WAIT_SEC = 3.0
+    _MAX_BG_PACE_WAIT_SEC = 12.0
+    _SHARED_CATALOG_QUOTA_ENDPOINTS = (
+        "api_detail.ashx",
+        "api_quanwang.ashx",
+        "open_gaoyongzhuanlian_tkl_piliang.ashx",
+    )
 
     class _KeyPaceBacklogError(RuntimeError):
         pass
 
     def _pace_real_http_by_key(self, kwargs, *, url=""):
-        """仅在真实未被打桩的 requests.Session 下按单 appkey 预约发包时间槽；api_detail 单独按上游较严窗口节流。"""
+        """仅在真实未被打桩的 requests.Session 下按单 appkey 预约发包时间槽；详情/搜索/批量解析共享折淘客 1000 限流池统一节流。"""
         if type(self.http) is not requests.Session:
             return
         get_fn = getattr(self.http, "get", None)
@@ -204,16 +215,21 @@ class JdClient:
         appkey = str(params.get("appkey") or "") if isinstance(params, dict) else ""
         if not appkey:
             return
-        is_detail = "api_detail.ashx" in str(url or "")
+        url_str = str(url or "")
+        is_catalog_pool = any(ep in url_str for ep in self._SHARED_CATALOG_QUOTA_ENDPOINTS)
         interval = float(
-            self._DETAIL_KEY_DISPATCH_INTERVAL_SEC if is_detail else self._MIN_KEY_DISPATCH_INTERVAL_SEC
+            self._DETAIL_KEY_DISPATCH_INTERVAL_SEC if is_catalog_pool else self._MIN_KEY_DISPATCH_INTERVAL_SEC
         )
         if interval <= 0:
             return
-        max_wait = float(
-            self._MAX_DETAIL_KEY_PACE_WAIT_SEC if is_detail else self._MAX_KEY_PACE_WAIT_SEC
-        )
-        slot_key = (appkey, "detail") if is_detail else appkey
+        is_bg = get_caller_context() == "background"
+        if is_bg:
+            max_wait = float(self._MAX_BG_PACE_WAIT_SEC)
+        else:
+            max_wait = float(
+                self._MAX_DETAIL_KEY_PACE_WAIT_SEC if is_catalog_pool else self._MAX_KEY_PACE_WAIT_SEC
+            )
+        slot_key = (appkey, "detail") if is_catalog_pool else appkey
         with JdClient._KEY_PACE_LOCK:
             now = time.monotonic()
             scheduled = max(now, JdClient._KEY_NEXT_ALLOWED_TS.get(slot_key, 0.0))
@@ -224,24 +240,48 @@ class JdClient:
         if wait_s > 0:
             time.sleep(wait_s)
 
+    @staticmethod
+    def _endpoint_op_name(url: str) -> str:
+        raw = str(url or "").split("?", 1)[0].rstrip("/")
+        tail = raw.rsplit("/", 1)[-1] or "http_get"
+        return tail[:-5] if tail.endswith(".ashx") else tail
+
     def _get(self, url, **kwargs):
+        is_real = is_real_requests_session(self.http)
+        op_name = self._endpoint_op_name(url)
+        t0 = time.perf_counter()
         try:
             self._pace_real_http_by_key(kwargs, url=url)
             response = self.http.get(url, timeout=self.timeout, allow_redirects=False, **kwargs)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
             if 300 <= response.status_code < 400:
+                GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="error", latency_ms=dt_ms, error_code="UNSAFE_REDIRECT", allow_persist=is_real)
                 return _error("UNSAFE_REDIRECT", "京东接口重定向被拒绝")
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, dict):
+                GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
                 return _error("PROTOCOL_ERROR", "京东响应不是对象")
             if body.get("status") == "error" or "error" in body or "error_response" in body:
+                GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="error", latency_ms=dt_ms, error_code="UPSTREAM_ERROR", allow_persist=is_real)
                 return _error("UPSTREAM_ERROR", "京东接口返回业务错误")
+            st_str = str(body.get("status") or "")
+            if st_str in ("300", "301"):
+                GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="degraded", latency_ms=dt_ms, error_code=f"ZTK_{st_str}", error_msg=str(body.get("content") or "")[:80], allow_persist=is_real)
+            else:
+                GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
             return body
         except JdClient._KeyPaceBacklogError:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="rate_limit", latency_ms=dt_ms, error_code="QUOTA_PACE_BACKLOG", allow_persist=is_real)
             return _error("UPSTREAM_ERROR", "京东接口请求过于频繁，请稍后重试")
         except ValueError:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
             return _error("PROTOCOL_ERROR", "京东响应不是有效JSON")
-        except Exception:
+        except Exception as exc:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="error", latency_ms=dt_ms, error_code=type(exc).__name__, allow_persist=is_real)
             # Request exceptions and supplier messages may contain keys/signed URLs.
             return _error("NETWORK_ERROR", "京东接口通信失败")
 
@@ -488,10 +528,27 @@ class JdClient:
             or primary_res.get("jd_off_promotion") is True
         ):
             return primary_res
-        if primary_res.get("status") == "success" and "jingfen.jd.com/detail/" in material:
-            return primary_res
+
+        primary_ok = primary_res.get("status") == "success"
+        if primary_ok:
+            lower_mat = material.lower()
+            j_cmd_primary = str(primary_res.get("j_command") or "").strip()
+            is_known_jingfen_or_venue = (
+                "jingfen.jd.com/detail/" in lower_mat
+                or any(
+                    kw in lower_mat
+                    for kw in ("coupon.m.jd.com", "coupon.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "u_act_p=coupon")
+                )
+                or not j_cmd_primary
+                or "促销会场" in j_cmd_primary
+            )
+            if is_known_jingfen_or_venue:
+                return primary_res
+
+        piliang_empty_tao_id_hits = 0
 
         def _evaluate_piliang(body):
+            nonlocal piliang_empty_tao_id_hits
             if body.get("status") == "error":
                 return body
             if str(body.get("status")) != "200":
@@ -499,6 +556,11 @@ class JdClient:
             p_tao_id = str(body.get("tao_id") or "").strip()
             p_res_url = product_url(body.get("result_url"))
             p_res_tkl = str(body.get("result_tkl") or "").strip()
+            # 当 primary_res 已成功获取短链时，调用 piliang 的唯一目的是拿加密 tao_id 与商品详情；
+            # 若单 Key 因频控返回空 tao_id，触发多 Key 轮询切换至健康 Key
+            if primary_ok and not p_tao_id:
+                piliang_empty_tao_id_hits += 1
+                return _error("UPSTREAM_ERROR", "京东批量转链未返回商品ID")
             if not (p_tao_id or p_res_url):
                 return _error("UPSTREAM_ERROR", "京东批量文案转链未解析出商品")
             raw_item = None
@@ -518,12 +580,17 @@ class JdClient:
                 "raw_item": raw_item,
             }
 
+        piliang_tkl = (
+            (primary_res.get("short_url") or material)
+            if (primary_ok and "://" not in material)
+            else material
+        )
         piliang_res = self._execute_with_failover(
             "open_gaoyongzhuanlian_tkl_piliang.ashx",
-            {"unionId": self.union_id, "positionId": promoter, "tkl": material, "signurl": 5},
+            {"unionId": self.union_id, "positionId": promoter, "tkl": piliang_tkl, "signurl": 5},
             _evaluate_piliang,
         )
-        if primary_res.get("status") == "success":
+        if primary_ok:
             if piliang_res.get("status") == "success":
                 if piliang_res.get("tao_id"):
                     primary_res["tao_id"] = piliang_res["tao_id"]
@@ -533,6 +600,8 @@ class JdClient:
                     primary_res["j_command"] = piliang_res["j_command"]
                 if not primary_res.get("j_short_command") and piliang_res.get("j_short_command"):
                     primary_res["j_short_command"] = piliang_res["j_short_command"]
+            elif piliang_empty_tao_id_hits >= max(1, len(self.appkey_list)):
+                primary_res["ztk_catalog_throttled"] = True
             return primary_res
 
         if piliang_res.get("status") != "success":

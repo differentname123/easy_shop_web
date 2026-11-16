@@ -17,6 +17,7 @@ r"""
 """
 
 import datetime
+import gc
 import json
 import logging
 import math
@@ -45,11 +46,13 @@ for _p in (PROJECT_ROOT, WORKSPACE_ROOT, CURRENT_DIR):
 
 from adapters import get_adapter, normalize_platform
 from infrastructure.ai_api.model_api import generate_content
+from infrastructure.api_governance import api_caller_context, set_process_role
 from infrastructure.mongo import gen_db_object
 from mobile_web.scripts.goods_info_format import read_file_to_str, string_to_object
 from mobile_web.scripts.publish_to_xianyu import (
     DEFAULT_GUEST_USER_DATA_DIR,
     DEFAULT_SEARCH_USER_DATA_DIR,
+    XianyuRoundBrowserPool,
     get_xianyu_item_details_batch,
     search_xianyu_items,
 )
@@ -83,9 +86,10 @@ ENABLE_OFFICIAL = True                                  # 是否开启【正式�
 ENABLE_DEAL_TIP = True                                  # 是否开启【线报爆料商品】比价
 SCAN_HOURS_WINDOW = 72                                  # 正式官方商品时效性窗口（小时）
 DEAL_SCAN_HOURS_WINDOW = 48                             # 线报爆料商品时效性窗口（小时）
-MAX_CATEGORIES_PER_ROUND = 20                           # 每个数据源每轮选取的商品类别上限（官方20 + 线报20）
+MAX_CATEGORIES_PER_ROUND = 10                           # 每个数据源每轮选取的商品类别上限（官方10 + 线报10，降低每小时冷请求密度）
 MAX_XIANYU_SEARCH_ITEMS = 20                            # 每次闲鱼搜索抓取的概览商品数
 MAX_DETAIL_CHECKS_PER_CATEGORY = 2                      # 每个商品最多保留前 2 个可比闲鱼商品补充详情
+MAX_LIVE_H5_DETAILS_PER_ROUND = 18                      # 单轮无痕 H5 实时新拉详情软上限（库内7天缓存命中不占额度）
 XIANYU_DETAIL_CACHE_DAYS = 7                            # 闲鱼商品详情数据库缓存有效天数（7天内免重复拉取）
 DEBUG_BROWSER = False                                   # 是否显示浏览器窗口（False=后台无头静默）
 SEARCH_USER_DATA_DIR = DEFAULT_SEARCH_USER_DATA_DIR     # 【搜索小号目录】仅用于步骤2关键字搜索（W:\temp\xianyu_xiaohao）
@@ -481,11 +485,12 @@ def _verify_live_activity_price(platform: str, product_id: str, goods_sign: str,
     """调用官方 Adapter 验证正式商品实时价格（下架淘汰返回 None，网络波动沿用入库价）。"""
     try:
         adapter = get_adapter(platform)
-        res = adapter.get_goods_detail(
-            goods_id_or_sign=goods_sign or product_id,
-            goods_id=product_id,
-            goods_sign=goods_sign or None,
-        )
+        with api_caller_context("background"):
+            res = adapter.get_goods_detail(
+                goods_id_or_sign=goods_sign or product_id,
+                goods_id=product_id,
+                goods_sign=goods_sign or None,
+            )
         if isinstance(res, dict):
             if str(res.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION":
                 logger.warning(f"🚫 [官方验价淘汰] [{platform.upper()}:{product_id}] 商品已下架或取消推广，跳过该候选")
@@ -667,7 +672,7 @@ def select_round_candidates_for_source(
     """
     src_type = _normalize_source_type(source_type)
     src_label = _source_label(src_type)
-    repo = ProductRepository()
+    repo = ProductRepository(db_instance=db)
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     cutoff_utc = now_utc - datetime.timedelta(hours=hours_window)
     cutoff_dt = cutoff_utc.replace(tzinfo=None)
@@ -1279,6 +1284,7 @@ def compare_candidate_with_xianyu(
     debug_browser: bool = False,
     items_col: Optional[Any] = None,
     detail_cache_days: int = XIANYU_DETAIL_CACHE_DAYS,
+    browser_pool: Optional[XianyuRoundBrowserPool] = None,
 ) -> Dict[str, Any]:
     """对单个候选商品一次性串行跑完：资格审查与搜词 -> 闲鱼搜索 -> 同款初筛 -> 前2款详情补齐 -> 大模型终审比价。"""
     cand = dict(candidate)
@@ -1340,12 +1346,15 @@ def compare_candidate_with_xianyu(
     if cand.get("deal_unit_price_text"):
         my_candidate_for_llm["unit_deal_price"] = cand["deal_unit_price_text"]
 
+    pool_kw = {"browser_pool": browser_pool} if browser_pool is not None else {}
+
     def _run_search(target_kw: str, label: str) -> Dict[str, Any]:
         res = search_xianyu_items(
             keyword=target_kw,
             max_items=max_search_items,
             user_data_dir=search_user_data_dir,
             debug=debug_browser,
+            **pool_kw,
         )
         if not res.get("ok"):
             logger.error(
@@ -1492,6 +1501,7 @@ def compare_candidate_with_xianyu(
             item_ids=missing_ids,
             user_data_dir=guest_user_data_dir,
             debug=debug_browser,
+            **pool_kw,
         )
         live_details_map = batch_det_res.get("details_by_id") or {}
         detail_live_fetched_count = sum(1 for v in live_details_map.values() if isinstance(v, dict) and v.get("ok"))
@@ -2139,124 +2149,155 @@ def run_discovery_cycle(
     )
 
     db = gen_db_object()
-    eval_col = db.get_collection(EVAL_COLLECTION_NAME)
-    _ensure_eval_indexes(eval_col)
-    items_col = db.get_collection(XIANYU_ITEMS_COLLECTION_NAME)
-    _ensure_xianyu_items_indexes(items_col)
+    try:
+        eval_col = db.get_collection(EVAL_COLLECTION_NAME)
+        _ensure_eval_indexes(eval_col)
+        items_col = db.get_collection(XIANYU_ITEMS_COLLECTION_NAME)
+        _ensure_xianyu_items_indexes(items_col)
 
-    official_candidates = (
-        select_round_candidates_for_source(
-            db=db,
-            hours_window=hours_window,
-            max_categories=max_categories,
-            source_type=SOURCE_TYPE_OFFICIAL,
-        )
-        if enable_official
-        else []
-    )
-    deal_candidates = (
-        select_round_candidates_for_source(
-            db=db,
-            hours_window=deal_hours_window,
-            max_categories=max_categories,
-            source_type=SOURCE_TYPE_DEAL_TIP,
-        )
-        if enable_deal_tip
-        else []
-    )
-    candidates = interleave_candidates_one_to_one(official_candidates, deal_candidates)
-    if not candidates:
-        logger.warning("⚠️ [本轮结束] 启用的商品源均无满足时效与价格条件的未比价候选商品。")
-        return []
-
-    total_candidates = len(candidates)
-    records: List[Dict[str, Any]] = []
-    consecutive_fails = 0
-
-    for idx, cand in enumerate(candidates, 1):
-        src_lbl = _source_label(cand.get("source_type"))
-        logger.info(
-            f"\n>>> ▶️ [开始处理第 {idx}/{total_candidates} 个候选商品][{src_lbl}] "
-            f"分类=【{cand['category_name']}】(库内{cand.get('category_item_count', '-')}款) | "
-            f"候选商品=【{cand['name'][:40]}】(¥{cand['activity_price']:.2f})"
-        )
-        rec = compare_candidate_with_xianyu(
-            candidate=cand,
-            search_user_data_dir=search_user_data_dir,
-            guest_user_data_dir=guest_user_data_dir,
-            max_search_items=max_search_items,
-            max_detail_checks=max_detail_checks,
-            debug_browser=debug_browser,
-            items_col=items_col,
-            detail_cache_days=detail_cache_days,
-        )
-        rec["batch_id"] = batch_id
-        rec_src_type = _normalize_source_type(rec.get("source_type"))
-        rec["source_type"] = rec_src_type
-        records.append(rec)
-
-        audit = rec.get("xianyu_audit_trail") or {}
-        is_hard_stop = bool(audit.get("is_risk_blocked") or audit.get("is_account_offline"))
-        if audit.get("browser_aborted"):
-            consecutive_fails += 1
-            logger.warning(
-                f"⚠️ [跳过入库][{src_lbl}] 分类=【{rec['category_name']}】 | 商品=[{rec['platform'].upper()}:{rec['product_id']}] "
-                f"因闲鱼浏览器检索异常中断，暂不写入比价记录库，保留后续轮次重试机会"
+        official_candidates = (
+            select_round_candidates_for_source(
+                db=db,
+                hours_window=hours_window,
+                max_categories=max_categories,
+                source_type=SOURCE_TYPE_OFFICIAL,
             )
-            logger.info(_format_single_comparison_card(idx, total_candidates, rec))
-
-            if is_hard_stop or consecutive_fails >= max_fails:
-                _LAST_CYCLE_ABORTED_BY_RISK = True
-                remaining = total_candidates - idx
-                logger.error(
-                    f"\n{'!' * 96}\n"
-                    f"🛑 [整轮熔断保护已触发] 分类=【{rec['category_name']}】检测到风控/掉线或连续失败({consecutive_fails}次)！\n"
-                    f"   └── 已立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品的后续处理，进入静默冷却保护！\n"
-                    f"{'!' * 96}"
-                )
-                break
-        elif audit.get("llm_aborted"):
-            logger.warning(
-                f"⚠️ [跳过入库][{src_lbl}] 分类=【{rec['category_name']}】 | 商品=[{rec['platform'].upper()}:{rec['product_id']}] "
-                f"因大模型网关调用或输出校验异常，暂不写入比价记录库，保留后续轮次重试机会"
+            if enable_official
+            else []
+        )
+        deal_candidates = (
+            select_round_candidates_for_source(
+                db=db,
+                hours_window=deal_hours_window,
+                max_categories=max_categories,
+                source_type=SOURCE_TYPE_DEAL_TIP,
             )
-            logger.info(_format_single_comparison_card(idx, total_candidates, rec))
-            if is_hard_stop:
-                _LAST_CYCLE_ABORTED_BY_RISK = True
-                remaining = total_candidates - idx
-                logger.error(
-                    f"\n{'!' * 96}\n"
-                    f"🛑 [详情风控熔断保护已触发] 分类=【{rec['category_name']}】详情拉取期间检测到闲鱼风控拦截！\n"
-                    f"   └── 立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品处理，进入静默冷却保护！\n"
-                    f"{'!' * 96}"
-                )
-                break
-        else:
-            consecutive_fails = 0
-            eval_col.update_one(
-                {"platform": rec["platform"], "product_id": rec["product_id"], "source_type": rec_src_type},
-                {"$set": rec},
-                upsert=True,
-            )
-            logger.info(_format_single_comparison_card(idx, total_candidates, rec))
-            if is_hard_stop:
-                _LAST_CYCLE_ABORTED_BY_RISK = True
-                remaining = total_candidates - idx
-                logger.error(
-                    f"\n{'!' * 96}\n"
-                    f"🛑 [详情风控熔断保护已触发] 分类=【{rec['category_name']}】详情拉取期间检测到闲鱼风控拦截！\n"
-                    f"   └── 当前已比价结果已保存，立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品处理，进入静默冷却保护！\n"
-                    f"{'!' * 96}"
-                )
-                break
+            if enable_deal_tip
+            else []
+        )
+        candidates = interleave_candidates_one_to_one(official_candidates, deal_candidates)
+        if not candidates:
+            logger.warning("⚠️ [本轮结束] 启用的商品源均无满足时效与价格条件的未比价候选商品。")
+            return []
 
-    elapsed = time.monotonic() - t0
-    if records:
-        logger.info(_format_batch_summary_report(batch_id, elapsed, records))
-    return records
+        total_candidates = len(candidates)
+        records: List[Dict[str, Any]] = []
+        consecutive_fails = 0
+        round_live_h5_fetched = 0
+
+        with XianyuRoundBrowserPool() as browser_pool:
+            for idx, cand in enumerate(candidates, 1):
+                src_lbl = _source_label(cand.get("source_type"))
+                logger.info(
+                    f"\n>>> ▶️ [开始处理第 {idx}/{total_candidates} 个候选商品][{src_lbl}] "
+                    f"分类=【{cand['category_name']}】(库内{cand.get('category_item_count', '-')}款) | "
+                    f"候选商品=【{cand['name'][:40]}】(¥{cand['activity_price']:.2f})"
+                )
+                rec = compare_candidate_with_xianyu(
+                    candidate=cand,
+                    search_user_data_dir=search_user_data_dir,
+                    guest_user_data_dir=guest_user_data_dir,
+                    max_search_items=max_search_items,
+                    max_detail_checks=max_detail_checks,
+                    debug_browser=debug_browser,
+                    items_col=items_col,
+                    detail_cache_days=detail_cache_days,
+                    browser_pool=browser_pool,
+                )
+                rec["batch_id"] = batch_id
+                rec_src_type = _normalize_source_type(rec.get("source_type"))
+                rec["source_type"] = rec_src_type
+                records.append(rec)
+
+                audit = rec.get("xianyu_audit_trail") or {}
+                round_live_h5_fetched += int(audit.get("step3_detail_live_fetched_count") or 0)
+                is_hard_stop = bool(audit.get("is_risk_blocked") or audit.get("is_account_offline"))
+                if audit.get("browser_aborted"):
+                    consecutive_fails += 1
+                    logger.warning(
+                        f"⚠️ [跳过入库][{src_lbl}] 分类=【{rec['category_name']}】 | 商品=[{rec['platform'].upper()}:{rec['product_id']}] "
+                        f"因闲鱼浏览器检索异常中断，暂不写入比价记录库，保留后续轮次重试机会"
+                    )
+                    logger.info(_format_single_comparison_card(idx, total_candidates, rec))
+
+                    if is_hard_stop or consecutive_fails >= max_fails:
+                        _LAST_CYCLE_ABORTED_BY_RISK = True
+                        remaining = total_candidates - idx
+                        logger.error(
+                            f"\n{'!' * 96}\n"
+                            f"🛑 [整轮熔断保护已触发] 分类=【{rec['category_name']}】检测到风控/掉线或连续失败({consecutive_fails}次)！\n"
+                            f"   └── 已立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品的后续处理，进入静默冷却保护！\n"
+                            f"{'!' * 96}"
+                        )
+                        break
+                elif audit.get("llm_aborted"):
+                    logger.warning(
+                        f"⚠️ [跳过入库][{src_lbl}] 分类=【{rec['category_name']}】 | 商品=[{rec['platform'].upper()}:{rec['product_id']}] "
+                        f"因大模型网关调用或输出校验异常，暂不写入比价记录库，保留后续轮次重试机会"
+                    )
+                    logger.info(_format_single_comparison_card(idx, total_candidates, rec))
+                    if is_hard_stop:
+                        _LAST_CYCLE_ABORTED_BY_RISK = True
+                        remaining = total_candidates - idx
+                        logger.error(
+                            f"\n{'!' * 96}\n"
+                            f"🛑 [详情风控熔断保护已触发] 分类=【{rec['category_name']}】详情拉取期间检测到闲鱼风控拦截！\n"
+                            f"   └── 立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品处理，进入静默冷却保护！\n"
+                            f"{'!' * 96}"
+                        )
+                        break
+                else:
+                    consecutive_fails = 0
+                    eval_col.update_one(
+                        {"platform": rec["platform"], "product_id": rec["product_id"], "source_type": rec_src_type},
+                        {"$set": rec},
+                        upsert=True,
+                    )
+                    logger.info(_format_single_comparison_card(idx, total_candidates, rec))
+                    if is_hard_stop:
+                        _LAST_CYCLE_ABORTED_BY_RISK = True
+                        remaining = total_candidates - idx
+                        logger.error(
+                            f"\n{'!' * 96}\n"
+                            f"🛑 [详情风控熔断保护已触发] 分类=【{rec['category_name']}】详情拉取期间检测到闲鱼风控拦截！\n"
+                            f"   └── 当前已比价结果已保存，立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品处理，进入静默冷却保护！\n"
+                            f"{'!' * 96}"
+                        )
+                        break
+
+                if (
+                    MAX_LIVE_H5_DETAILS_PER_ROUND > 0
+                    and round_live_h5_fetched >= MAX_LIVE_H5_DETAILS_PER_ROUND
+                    and idx < total_candidates
+                ):
+                    logger.info(
+                        f"🛡️ [单轮H5配额温和收尾] 本轮已实时新拉 {round_live_h5_fetched} 款闲鱼H5详情（达温和预算 {MAX_LIVE_H5_DETAILS_PER_ROUND} 款），"
+                        f"主动收尾保护出口IP，剩余 {total_candidates - idx} 个候选留待下一轮继续。"
+                    )
+                    break
+
+        elapsed = time.monotonic() - t0
+        if records:
+            logger.info(_format_batch_summary_report(batch_id, elapsed, records))
+        return records
+    finally:
+        if callable(getattr(db, "close", None)):
+            try:
+                db.close()
+            except Exception:
+                pass
+        gc.collect()
 
 
 def main() -> None:
+    set_process_role("xianyu_scheduler")
+    try:
+        from infrastructure.pdd_client import configure_transport
+        from infrastructure.settings import get_settings as _get_app_settings
+        _st = _get_app_settings()
+        configure_transport(dns_mode=_st.pdd_dns_mode, trust_env=_st.pdd_trust_env)
+    except Exception:
+        pass
     while True:
         try:
             run_discovery_cycle()

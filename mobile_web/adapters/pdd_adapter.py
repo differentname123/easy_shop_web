@@ -4,10 +4,17 @@ import re
 from typing import Dict, Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 from adapters.base import BasePlatformAdapter
+from infrastructure.api_governance import (
+    execute_provider_chain,
+    is_real_requests_session,
+    stamp_universal_resolution,
+    track_provider_call,
+)
 from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id, extract_search_keyword
 from config import PDD_CLIENT_ID, PDD_CLIENT_SECRET, PDD_PID, logger, settings
 from infrastructure.pdd_client import (
+    _PDD_SESSION,
     call_pdd_api,
     clean_goods_item,
     check_member_authority,
@@ -513,7 +520,15 @@ class PddAdapter(BasePlatformAdapter):
         conv_res["price"] = price
         conv_res["coupon_amount"] = coupon
         conv_res["product"] = product_detail
-        return conv_res
+        out = stamp_universal_resolution(conv_res, single_item_evidence=True)
+        track_provider_call(
+            "pdd",
+            "pdd_router_universal",
+            "resolve_universal",
+            lambda: out,
+            allow_persist=is_real_requests_session(_PDD_SESSION),
+        )
+        return out
 
 
     def check_authority(self, uid) -> Dict[str, Any]:

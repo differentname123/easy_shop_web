@@ -16,9 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, set_process_role
 from infrastructure.logging_utils import configure_logging, format_exc_summary
 from infrastructure.pdd_client import configure_transport
 from services.detail_prefetch import DetailPrefetcher
+from services.order_service import OrderSyncWorker
 
 from config import logger, settings
 from adapters import get_adapter, get_all_platforms, PlatformUnavailableError
@@ -26,7 +28,7 @@ from api.home import router as home_router
 from api.goods import router as goods_router
 from api.user import router as user_router
 from api.promote import router as promote_router
-from api.order import router as order_router
+from api.order import router as order_router, order_service
 from api.group_help import router as group_help_router, group_help_worker
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -35,6 +37,7 @@ GROUP_HELP_ENABLED = True  # 多人团互助独立模块总开关，置为 False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    set_process_role("web")
     configure_logging(settings)
     configure_transport(dns_mode=settings.pdd_dns_mode, trust_env=settings.pdd_trust_env)
 
@@ -48,8 +51,10 @@ async def lifespan(app: FastAPI):
             start_writes()
     prefetcher = None
     warmup_thread = None
+    order_sync_worker = None
     warmup_stop = threading.Event()
     app.state.detail_prefetcher = None
+    app.state.order_sync_worker = None
 
     def warm_connections():
         # 预取关闭时保留旧的首榜预热，但线程及其摘要写入必须随 lifespan 回收。
@@ -98,11 +103,18 @@ async def lifespan(app: FastAPI):
         elif settings.warmup_enabled:
             warmup_thread = threading.Thread(target=warm_connections, name="platform-warmup", daemon=False)
             warmup_thread.start()
-        if GROUP_HELP_ENABLED and (settings.detail_prefetch_enabled or settings.warmup_enabled):
-            group_help_worker.start()
+        if settings.detail_prefetch_enabled or settings.warmup_enabled:
+            if GROUP_HELP_ENABLED:
+                group_help_worker.start()
+            order_sync_worker = OrderSyncWorker(order_service)
+            app.state.order_sync_worker = order_sync_worker
+            order_sync_worker.start()
         yield
     finally:
         warmup_stop.set()
+        if order_sync_worker is not None:
+            await asyncio.to_thread(order_sync_worker.stop)
+            app.state.order_sync_worker = None
         if GROUP_HELP_ENABLED:
             await asyncio.to_thread(group_help_worker.stop)
         if prefetcher is not None:
@@ -160,7 +172,7 @@ def create_app() -> FastAPI:
         req_path = _request_path(request)
         path_only = request.url.path
         is_noisy_asset = path_only.startswith("/static/") or path_only in (
-            "/favicon.ico", "/apple-touch-icon.png", "/manifest.json", "/health",
+            "/favicon.ico", "/apple-touch-icon.png", "/manifest.json", "/health", "/api/system/upstream-health",
         )
         try:
             response = await call_next(request)
@@ -244,6 +256,10 @@ def create_app() -> FastAPI:
     @application.get("/health")
     def health_check():
         return {"status": "ok", "service": "mobile_web_service"}
+
+    @application.get("/api/system/upstream-health")
+    def upstream_health_check():
+        return GLOBAL_UPSTREAM_HEALTH.get_combined_health_report()
 
     return application
 

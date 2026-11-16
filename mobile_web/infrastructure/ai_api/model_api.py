@@ -166,21 +166,53 @@ def save_json(json_path, data):
 
 
 class _WindowsSafeTimedRotatingFileHandler(TimedRotatingFileHandler):
-    """Windows 多进程/多线程安全按天轮转 Handler：避免跨进程占用导致午夜 0 点反复抛出 WinError 32。"""
+    """按天日志轮转 Handler：配合按守护进程隔离独立日志文件，彻底消除跨进程抢锁与每行关流开销。"""
 
     def doRollover(self):
+        if self.stream:
+            try:
+                self.stream.close()
+            except OSError:
+                pass
+            self.stream = None
+        current_time = int(time.time())
+        t = self.rolloverAt - self.interval
+        time_tuple = time.gmtime(t) if self.utc else time.localtime(t)
+        dfn = self.rotation_filename(self.baseFilename + "." + time.strftime(self.suffix, time_tuple))
         try:
-            super().doRollover()
+            if not os.path.exists(dfn) and os.path.exists(self.baseFilename) and os.path.getsize(self.baseFilename) > 0:
+                self.rotate(self.baseFilename, dfn)
+            if self.backupCount > 0:
+                for s in self.getFilesToDelete():
+                    try:
+                        os.remove(s)
+                    except OSError:
+                        pass
         except OSError:
-            # Windows 下若另一进程（如 goods_info_format 与 scheduler 并行）正持有日志文件句柄，
-            # os.rename 会抛 PermissionError (WinError 32)；此时重新打开流并推进下次轮转时间，避免后续每次写日志无限报错刷屏
-            if not self.delay and self.stream is None:
+            pass
+        if not self.delay:
+            try:
                 self.stream = self._open()
-            current_time = int(time.time())
-            new_rollover_at = self.computeRollover(current_time)
-            while new_rollover_at <= current_time:
-                new_rollover_at += self.interval
-            self.rolloverAt = new_rollover_at
+            except OSError:
+                self.stream = None
+        new_rollover_at = self.computeRollover(current_time)
+        while new_rollover_at <= current_time:
+            new_rollover_at += self.interval
+        self.rolloverAt = new_rollover_at
+
+
+def _resolve_process_log_stem(app_name: str) -> str:
+    """按入口脚本自动隔离后台任务 AI 日志文件（如 model_api_deal_pool.log），从根源避免 Windows 多进程句柄冲突。"""
+    if app_name != "model_api":
+        return app_name
+    entry = os.path.splitext(os.path.basename(str(sys.argv[0] or "")))[0].lower()
+    if "deal_pool" in entry:
+        return "model_api_deal_pool"
+    if "xianyu" in entry:
+        return "model_api_xianyu"
+    if "goods_info_format" in entry:
+        return "model_api_goods_format"
+    return app_name
 
 
 def setup_logger(app_name="model_api"):
@@ -206,8 +238,9 @@ def setup_logger(app_name="model_api"):
             try:
                 log_dir = _APP_DIR / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
+                log_stem = _resolve_process_log_stem(app_name)
                 file_handler = _WindowsSafeTimedRotatingFileHandler(
-                    filename=str(log_dir / f"{app_name}.log"),
+                    filename=str(log_dir / f"{log_stem}.log"),
                     when="midnight",
                     interval=1,
                     backupCount=30,

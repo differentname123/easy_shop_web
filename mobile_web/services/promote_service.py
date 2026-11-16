@@ -65,6 +65,18 @@ class PromoteService:
                     "❌ 【转链身份解析降级】读取商品身份缓存时发生异常，已降级使用原始参数继续转链 | 平台[%s] Sign[%s] 异常<%s> 排查方向<请检查MongoDB连接或products集合状态>",
                     ref.platform, ref.goods_sign, format_exc_summary(exc),
                 )
+            # 若内存 DETAIL_CACHE 已持有经服务端验证的同平台商品详情，直接补齐权威 goods_id
+            try:
+                from cache import DETAIL_CACHE
+                for dkey in ref.cache_keys():
+                    entry = DETAIL_CACHE.get(dkey)
+                    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
+                        cached_data = entry[1].get("data") or {}
+                        cached_gid = clean_product_id(cached_data.get("goods_id") or cached_data.get("product_id"))
+                        if cached_gid:
+                            return ProductRef(ref.platform, cached_gid, ref.goods_sign)
+            except Exception:
+                pass
             if ref.platform in ("taobao", "jd"):
                 sign = ref.goods_sign or ref.goods_id
                 gid = ref.goods_id or extract_canonical_goods_id(ref.platform, sign)
@@ -351,9 +363,11 @@ class PromoteService:
         if self._cacheable(data):
             PROMOTION_CACHE.set(cache_key, (expires_at, deepcopy(data)))
             if not uid and ref.key:
+                extra_repo_kw = {"only_if_exists": True} if isinstance(self.repo, ProductRepository) else {}
                 self.repo.save_promotion_link_cache(
                     platform=ref.platform, data=deepcopy(data), goods_id=ref.goods_id or None,
                     goods_sign=ref.goods_sign or None, goods_key=ref.key, expires_at=expires_at,
+                    **extra_repo_kw,
                 )
         return data
 

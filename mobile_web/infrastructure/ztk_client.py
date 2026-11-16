@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """折淘客渠道订单与高佣转链协议（支持 ZTK_APPKEY_LIST 自动轮询切换，与 scripts/test_tb_api.py 对齐）。"""
+import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlsplit
 import requests
+from infrastructure.api_governance import (
+    GLOBAL_QUOTA_PACER,
+    GLOBAL_UPSTREAM_HEALTH,
+    QuotaPaceBacklogError,
+    is_real_requests_session,
+)
 from infrastructure.http_utils import (
     SHANGHAI,
     error_dict as _error,
@@ -165,35 +172,85 @@ class ZtkClient:
 
         def _query_once(current_key):
             params = {"appkey": current_key, "sid": self._sid_for_key(current_key), **base_params}
+            real_http = is_real_requests_session(self.http)
+            t0 = time.perf_counter()
+
+            def _record_order_metric(outcome, code="", msg=""):
+                if real_http:
+                    GLOBAL_UPSTREAM_HEALTH.record_call(
+                        platform="taobao",
+                        provider="ztk_tb",
+                        operation="open_dingdanchaxun2",
+                        outcome=outcome,
+                        latency_ms=(time.perf_counter() - t0) * 1000.0,
+                        error_code=code,
+                        error_msg=msg,
+                        allow_persist=True,
+                    )
+
+            try:
+                GLOBAL_QUOTA_PACER.pace(
+                    "ztk_tb_order",
+                    current_key,
+                    0.32,
+                    http_session=self.http,
+                    foreground_max_wait=10.0,
+                    background_max_wait=60.0,
+                )
+            except QuotaPaceBacklogError:
+                _record_order_metric("rate_limit", "QUOTA_PACE_BACKLOG", "淘宝订单接口请求过于频繁")
+                return _error("UPSTREAM_ERROR", "淘宝订单接口请求过于频繁，请稍后重试")
+
             try:
                 body = self._get_response(ZTK_ORDER_URL, params=params)
+                if (
+                    real_http
+                    and isinstance(body, dict)
+                    and not any(root in body for root in ORDER_RESPONSE_ROOTS)
+                    and "status" in body
+                    and str(body.get("status")) not in ("0", "1", "200", "success", "error")
+                ):
+                    time.sleep(0.85)
+                    body = self._get_response(ZTK_ORDER_URL, params=params)
                 if isinstance(body, dict) and body.get("status") == "error":
+                    _record_order_metric("error", body.get("error_code", ""), body.get("error_msg", ""))
                     return body
                 signed_url = body if isinstance(body, str) else None
                 if isinstance(body, dict) and not any(root in body for root in ORDER_RESPONSE_ROOTS):
                     # Recognize only explicit URL envelopes, never recursively chase arbitrary fields.
                     if body.get("error_response") or body.get("error"):
+                        _record_order_metric("error", "UPSTREAM_ERROR", "折淘客订单返回业务错误")
                         return _error("UPSTREAM_ERROR", "折淘客订单返回业务错误")
                     if "code" in body and str(body["code"]) not in ("0", "1", "200"):
+                        _record_order_metric("error", "UPSTREAM_ERROR", "折淘客订单返回业务错误")
                         return _error("UPSTREAM_ERROR", "折淘客订单返回业务错误")
+                    if "status" in body and str(body["status"]) not in ("0", "1", "200", "success"):
+                        _record_order_metric("rate_limit", f"ZTK_STATUS_{body.get('status')}", "折淘客订单接口繁忙或触发限流")
+                        return _error("UPSTREAM_ERROR", "折淘客订单接口繁忙或触发限流，请稍后自动续传")
                     candidate = body.get("url")
                     if candidate is None and isinstance(body.get("data"), str):
                         candidate = body["data"]
                     signed_url = candidate
                 if signed_url is not None:
                     if not _trusted_signed_url(signed_url):
+                        _record_order_metric("error", "UNTRUSTED_GATEWAY", "拒绝非受信HTTPS官方TOP签名地址")
                         return _error("UNTRUSTED_GATEWAY", "拒绝非受信HTTPS官方TOP签名地址")
                     body = self._get_response(signed_url)
                     if isinstance(body, dict) and body.get("status") == "error":
+                        _record_order_metric("error", body.get("error_code", ""), body.get("error_msg", ""))
                         return body
                 parsed = parse_order_response(body)
             except Exception:
                 # Never log exceptions or request URLs: both carry keys/signatures.
+                _record_order_metric("error", "NETWORK_ERROR", "折淘客订单通信失败")
                 return _error("NETWORK_ERROR", "折淘客订单通信失败")
             if parsed.get("status") != "success":
+                _record_order_metric("error", parsed.get("error_code", ""), parsed.get("error_msg", ""))
                 return parsed
             if parsed["has_more"] and page >= 100:
+                _record_order_metric("error", "PAGINATION_LIMIT", "订单超过上游100页上限")
                 return _error("PAGINATION_LIMIT", "订单超过上游100页上限，需要缩小时间窗")
+            _record_order_metric("success")
             parsed["next_cursor"] = {"page_no": page + 1, "position_index": parsed["position_index"]} if parsed["has_more"] else None
             return parsed
 
@@ -219,6 +276,17 @@ class ZtkClient:
             }
             if relation_id:
                 params["relation_id"] = relation_id
+            try:
+                GLOBAL_QUOTA_PACER.pace(
+                    "ztk_tb_channel",
+                    current_key,
+                    0.25,
+                    http_session=self.http,
+                    foreground_max_wait=3.0,
+                    background_max_wait=12.0,
+                )
+            except QuotaPaceBacklogError:
+                return _error("UPSTREAM_ERROR", "淘宝转链请求过于频繁，请稍后重试")
             try:
                 body = self._get_response(ZTK_CHANNEL_URL, params=params)
                 if isinstance(body, dict) and body.get("status") == "error":

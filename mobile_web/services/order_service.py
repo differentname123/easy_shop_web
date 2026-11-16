@@ -5,6 +5,7 @@ import time
 import threading
 from typing import Dict, Any, Optional
 from adapters import get_adapter, require_adapter
+from infrastructure.api_governance import api_caller_context
 from infrastructure.logging_utils import format_exc_summary
 from models.product import normalize_platform
 from models.order import normalize_order_fields
@@ -125,11 +126,12 @@ class OrderService:
             for batch_idx in range(max_batches):
                 for _ in range(ORDER_SYNC_MAX_PAGES):
                     pending = state["pending"]
-                    response = adapter.fetch_increment_orders(
-                        start_time=pending["start_time"], end_time=pending["end_time"],
-                        page=pending["page"], page_size=_PAGE_SIZE,
-                        cursor=deepcopy(pending.get("cursor")),
-                    )
+                    with api_caller_context("background"):
+                        response = adapter.fetch_increment_orders(
+                            start_time=pending["start_time"], end_time=pending["end_time"],
+                            page=pending["page"], page_size=_PAGE_SIZE,
+                            cursor=deepcopy(pending.get("cursor")),
+                        )
                     if not isinstance(response, dict) or response.get("status") != "success":
                         error = response.get("error_msg", "平台订单查询失败") if isinstance(response, dict) else "平台订单响应无效"
                         break
@@ -289,3 +291,83 @@ class OrderService:
             "synced_count": state.get("synced_count", 0),
         })
         return {"status": "success", "data": result}
+
+    def run_scheduled_sync_round(self, stop_event: Optional[threading.Event] = None) -> Dict[str, str]:
+        """由后台守护线程周期性调用：在单线程内串行推进各已启用平台的增量订单检查点，防止无人查单超 23h 漏单。"""
+        from adapters import get_all_platforms
+        outcomes: Dict[str, str] = {}
+        for p_info in get_all_platforms():
+            if stop_event is not None and stop_event.is_set():
+                break
+            if not p_info.get("active"):
+                continue
+            caps = p_info.get("capabilities") or {}
+            if caps.get("orders") is False:
+                continue
+            plat = normalize_platform(p_info.get("code") or "")
+            if not plat:
+                continue
+            now = time.time()
+            if now - _LAST_SYNC_ATTEMPT.get(plat, 0.0) < ORDER_SYNC_INTERVAL:
+                outcomes[plat] = "skipped_cooldown"
+                continue
+            lock = _platform_lock(plat)
+            if not lock.acquire(blocking=False):
+                outcomes[plat] = "skipped_busy"
+                continue
+            _LAST_SYNC_ATTEMPT[plat] = now
+            _SYNC_STATE[plat] = {"status": "running", "error": "", "synced_count": 0}
+            # _sync_platform_orders_bg 内部 finally 会负责释放 _platform_lock(plat)
+            self._sync_platform_orders_bg(plat, int(now), True)
+            outcomes[plat] = (_SYNC_STATE.get(plat) or {}).get("status", "done")
+        return outcomes
+
+
+class OrderSyncWorker:
+    """常驻轻量后台订单同步守护线程（默认启动延迟 45s，每 15 分钟巡检一次三平台增量订单水位）。"""
+
+    def __init__(
+        self,
+        service: OrderService,
+        *,
+        interval_seconds: float = 900.0,
+        initial_delay_seconds: float = 45.0,
+    ) -> None:
+        self.service = service
+        self.interval_seconds = max(60.0, float(interval_seconds))
+        self.initial_delay_seconds = max(0.0, float(initial_delay_seconds))
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="order-sync-worker",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "【订单定时同步】后台增量拉单守护线程已启动 (首轮延迟 %.0fs, 巡检周期 %.0fs)",
+            self.initial_delay_seconds,
+            self.interval_seconds,
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        self._thread = None
+
+    def _run_loop(self) -> None:
+        if self.initial_delay_seconds > 0 and self._stop_event.wait(timeout=self.initial_delay_seconds):
+            return
+        while not self._stop_event.is_set():
+            try:
+                self.service.run_scheduled_sync_round(stop_event=self._stop_event)
+            except Exception as exc:
+                logger.warning("【订单定时同步】本轮后台拉单巡检异常 | 异常<%s>", format_exc_summary(exc))
+            if self._stop_event.wait(timeout=self.interval_seconds):
+                break

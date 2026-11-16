@@ -19,6 +19,7 @@ from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger("mobile_web")
 
+_REAL_STDLIB_GETADDRINFO = socket.getaddrinfo
 _ORIG_GETADDRINFO = socket.getaddrinfo
 _PDD_FALLBACK_IPS = ("101.226.73.254", "58.217.134.20", "101.226.73.255", "58.217.134.19")
 _GATEWAY_FALLBACK_IPS = {
@@ -30,14 +31,65 @@ _GATEWAY_FALLBACK_IPS = {
     "v2.api.haodanku.com": ("139.200.130.76", "113.125.206.117", "139.200.130.199"),
 }
 _PDD_DNS_CACHE = {}
+_PDD_DNS_REFRESHING = set()
 _PDD_DNS_LOCK = threading.Lock()
 _PDD_TRANSPORT_LOCK = threading.Lock()
 _PDD_DNS_ENABLED = False
 _PDD_DNS_INSTALLED = False
+_DNS_REAL_RESOLVE_TIMEOUT_SEC = 1.5
+_DNS_PROACTIVE_REFRESH_WINDOW_SEC = 90.0
 
 
 def _is_windows():
     return sys.platform == "win32"
+
+
+def _resolve_with_bounded_timeout(resolver, host, port, family, type_, proto, flags):
+    """对真实 C 级系统 DNS 解析施加 1.5s 超时保护防 12s 卡死；单元测试 Mock 直接同步调用保持 100% 确定性。"""
+    if resolver is not _REAL_STDLIB_GETADDRINFO:
+        return resolver(host, port, family, type_, proto, flags)
+    box = [None, None]
+    done = threading.Event()
+
+    def _worker():
+        try:
+            box[0] = resolver(host, port, family, type_, proto, flags)
+        except Exception as exc:
+            box[1] = exc
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_worker, name=f"dns-{host}", daemon=True)
+    t.start()
+    if not done.wait(timeout=_DNS_REAL_RESOLVE_TIMEOUT_SEC):
+        raise socket.gaierror(f"DNS resolve timed out (>{_DNS_REAL_RESOLVE_TIMEOUT_SEC}s) for {host}")
+    if box[1] is not None:
+        raise box[1]
+    return box[0]
+
+
+def _schedule_proactive_dns_refresh(host, port, type_, proto, flags):
+    resolver = _ORIG_GETADDRINFO
+    if resolver is not _REAL_STDLIB_GETADDRINFO:
+        return
+    with _PDD_DNS_LOCK:
+        if host in _PDD_DNS_REFRESHING:
+            return
+        _PDD_DNS_REFRESHING.add(host)
+
+    def _bg_refresh():
+        try:
+            res = _resolve_with_bounded_timeout(resolver, host, port, socket.AF_INET, type_, proto, flags)
+            if res:
+                with _PDD_DNS_LOCK:
+                    _PDD_DNS_CACHE[host] = (time.time() + 600, res)
+        except Exception:
+            pass
+        finally:
+            with _PDD_DNS_LOCK:
+                _PDD_DNS_REFRESHING.discard(host)
+
+    threading.Thread(target=_bg_refresh, name=f"dns-pre-{host}", daemon=True).start()
 
 
 def _pdd_cached_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -45,13 +97,15 @@ def _pdd_cached_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         now = time.time()
         entry = _PDD_DNS_CACHE.get(host)
         if entry and now < entry[0]:
+            if (entry[0] - now) <= _DNS_PROACTIVE_REFRESH_WINDOW_SEC:
+                _schedule_proactive_dns_refresh(host, port, type, proto, flags)
             return [(f, t, p, c, (addr[0], port or addr[1])) for f, t, p, c, addr in entry[1]]
         with _PDD_DNS_LOCK:
             entry = _PDD_DNS_CACHE.get(host)
             if entry and now < entry[0]:
                 return [(f, t, p, c, (addr[0], port or addr[1])) for f, t, p, c, addr in entry[1]]
             try:
-                res = _ORIG_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+                res = _resolve_with_bounded_timeout(_ORIG_GETADDRINFO, host, port, socket.AF_INET, type, proto, flags)
                 _PDD_DNS_CACHE[host] = (now + 600, res)
                 return res
             except Exception as exc:

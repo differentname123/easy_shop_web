@@ -17,6 +17,52 @@ def normalize_platform(platform: Optional[str], default: str = "pdd") -> str:
     return "taobao" if code == "tb" else code
 
 
+_TB_CURRENCY_OR_EMOJI_CHARS = r"￥¥$€₴£¢💲🗝🔑🔐"
+_TB_WRAP_CHARS = _TB_CURRENCY_OR_EMOJI_CHARS + r"()（）/【】「」《》~|💰👉📲📦🎁"
+_SHARE_CODE_PAT = r"(?:CZ|CA|AC|ZH|MF|HU|TG|AA|SY|YD|TK)\s*\d{2,6}"
+_SHARE_CODE_RE = re.compile(rf"\b{_SHARE_CODE_PAT}\b", re.IGNORECASE)
+_TB_UNIFIED_TOKEN_RE = re.compile(
+    rf"([{_TB_WRAP_CHARS}])\s*(?:{_SHARE_CODE_PAT}\s+)?([A-Za-z0-9]{{8,15}})\s*(?:{_SHARE_CODE_PAT}\s*)?([{_TB_WRAP_CHARS}])",
+    re.IGNORECASE,
+)
+_COMMON_MODEL_WORD_RE = re.compile(
+    r"(?:iphone|ipad|airpod|macbook|watch|mate|nova|pura|xiaomi|redmi|galaxy|vivo|oppo|honor|huawei|thinkpad|surface|rtx|gtx|ryzen)",
+    re.IGNORECASE,
+)
+_JCMD_TOKEN_RE = re.compile(r"[！!][A-Za-z0-9]{10,20}[！!]")
+_BARE_ENCRYPTED_ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
+_SUPPORTED_ECOMMERCE_DOMAINS = (
+    "jd.com", "jingfen.com", "3.cn", "jingxi.com",
+    "tb.cn", "tb3.cn", "taobao.com", "tmall.com", "alimama.com",
+    "pinduoduo.com", "yangkeduo.com",
+)
+
+
+def extract_taobao_token_core(raw_text: Any) -> str:
+    """
+    淘口令唯一真源提取器：
+    - 先剥离 http(s) URL 防止误匹配 URL 路径段；
+    - 货币/钥匙符号包裹（如 `￥...￥`、`🗝...💲`）允许 8~15 位字母数字混合码；
+    - 普通括号/斜杠/书名号包裹（如 `(...)`、`/.../`、`【...】`）严格要求标准 11 位字母数字混合码，
+      且无分享前缀码时排除 `(iPhone16Pro)` 等常见数码型号词，兼顾高召回与搜索框零误判。
+    """
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+    no_urls = re.sub(r"https?://\S+", " ", text)
+    has_share_code = bool(_SHARE_CODE_RE.search(no_urls) or re.search(r"\b\d{1,2}:/", no_urls))
+    for m in _TB_UNIFIED_TOKEN_RE.finditer(no_urls):
+        left_ch, tok, right_ch = m.group(1), m.group(2), m.group(3)
+        if not (any(c.isalpha() for c in tok) and any(c.isdigit() for c in tok)):
+            continue
+        is_strong_delim = (left_ch in _TB_CURRENCY_OR_EMOJI_CHARS) or (right_ch in _TB_CURRENCY_OR_EMOJI_CHARS)
+        if is_strong_delim:
+            return tok
+        if len(tok) == 11 and (has_share_code or not _COMMON_MODEL_WORD_RE.search(tok)):
+            return tok
+    return ""
+
+
 def extract_search_keyword(raw_text: Any, max_length: int = 60) -> str:
     """
     跨平台统一分享文案清洗与搜索关键词提取器：
@@ -30,12 +76,17 @@ def extract_search_keyword(raw_text: Any, max_length: int = 60) -> str:
     bracket_match = re.search(r"「([^」]{2,})」", text)
     if bracket_match:
         candidate = bracket_match.group(1).strip()
-        if candidate and not candidate.startswith(("http://", "https://")):
+        if (
+            candidate
+            and not candidate.startswith(("http://", "https://"))
+            and not re.fullmatch(rf"(?:{_SHARE_CODE_PAT}\s+)?[A-Za-z0-9]{{6,22}}", candidate, re.IGNORECASE)
+        ):
             return candidate[:max_length].strip()
 
     cleaned = re.sub(r"https?://\S+", " ", text)
-    cleaned = re.sub(r"[￥¥$€₴£¢()（）/!！$%&*][A-Za-z0-9]{6,22}[￥¥$€₴£¢()（）/!！$%&*]", " ", cleaned)
-    cleaned = re.sub(r"\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{2,6}\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = _TB_UNIFIED_TOKEN_RE.sub(" ", cleaned)
+    cleaned = _JCMD_TOKEN_RE.sub(" ", cleaned)
+    cleaned = _SHARE_CODE_RE.sub(" ", cleaned)
     cleaned = re.sub(
         r"【(?:淘宝|天猫|京东|京东自营|拼多多|多多进宝|百亿补贴|好物推荐|好物分享|好物精选|手淘分享|券后特惠|特惠参考价|抢购口令|平台口令)[^】]*】",
         " ",
@@ -67,13 +118,13 @@ def detect_platform_signal(raw_text: Any) -> Optional[str]:
     # 1. 显式域名特征识别
     if any(
         d in lower
-        for d in ("u.jd.com", "jingfen.jd.com", "union-click.jd.com", "item.jd.com", "m.jd.com", "3.cn", "jingxi.com", "jd.com")
+        for d in ("u.jd.com", "jingfen.jd.com", "jingfen.com", "union-click.jd.com", "item.jd.com", "m.jd.com", "3.cn", "jingxi.com", "jd.com")
     ):
         return "jd"
     if any(
         d in lower
         for d in (
-            "m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn", "s.click.taobao.com",
+            "m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn", "tb3.cn", "s.click.taobao.com",
             "uland.taobao.com", "item.taobao.com", "detail.tmall.com", "taobao.com", "tmall.com", "alimama.com",
         )
     ):
@@ -81,14 +132,12 @@ def detect_platform_signal(raw_text: Any) -> Optional[str]:
     if any(d in lower for d in ("p.pinduoduo.com", "yangkeduo.com", "pinduoduo.com", "goods_sign=")):
         return "pdd"
 
-    # 2. 口令与文案特征识别
-    if re.search(r"[！!][A-Za-z0-9]{10,20}[！!]", text) or any(
-        k in text for k in ("京东", "猄", "崠", "崬", "京口令", "Doōδng")
+    # 2. 口令与文案特征识别（统一复用 extract_taobao_token_core 单一真源）
+    if _JCMD_TOKEN_RE.search(text) or any(
+        k in text for k in ("京东", "猄", "崠", "崬", "京口令", "Doōδng", "Doσσng", "Dσσδng")
     ):
         return "jd"
-    if re.search(r"[￥¥$€₴£¢()（）][A-Za-z0-9]{8,15}[￥¥$€₴£¢()（）]", text) or any(
-        k in text for k in ("淘口令", "手淘", "淘宝", "天猫", "阿里妈妈")
-    ):
+    if extract_taobao_token_core(text) or any(k in text for k in ("淘口令", "手淘", "淘宝", "天猫", "阿里妈妈")):
         return "taobao"
     if any(k in text for k in ("拼多多", "多多进宝", "百亿补贴")) or re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
         return "pdd"
@@ -100,17 +149,6 @@ def detect_platform_signal(raw_text: Any) -> Optional[str]:
         return "jd"
 
     return None
-
-
-_SUPPORTED_ECOMMERCE_DOMAINS = (
-    "jd.com", "3.cn", "jingxi.com",
-    "tb.cn", "taobao.com", "tmall.com", "alimama.com",
-    "pinduoduo.com", "yangkeduo.com",
-)
-_TPWD_TOKEN_RE = re.compile(r"[￥¥$€₴£¢()（）/!！$%&*][A-Za-z0-9]{8,22}[￥¥$€₴£¢()（）/!！$%&*]")
-_JCMD_TOKEN_RE = re.compile(r"[！!][A-Za-z0-9]{10,20}[！!]")
-_SHARE_CODE_RE = re.compile(r"\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{3,6}\b", re.IGNORECASE)
-_BARE_ENCRYPTED_ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
 
 
 def classify_user_input(raw_text: Any) -> Dict[str, Any]:
@@ -145,7 +183,7 @@ def classify_user_input(raw_text: Any) -> Dict[str, Any]:
     has_token_signal = bool(
         has_supported_domain
         or "goods_sign=" in lower
-        or _TPWD_TOKEN_RE.search(text)
+        or extract_taobao_token_core(text)
         or _JCMD_TOKEN_RE.search(text)
         or _SHARE_CODE_RE.search(text)
         or is_bare_encrypted_id

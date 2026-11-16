@@ -25,7 +25,8 @@ r"""
 =========================================================================================
 """
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import gc
 import json
 import logging
 import os
@@ -591,6 +592,28 @@ def _format_failure_diag(context: Any, page: Any, auth_tracker: Dict[str, Any], 
     )
 
 
+def _detach_listener_safely(emitter: Any, event: str, callback: Any) -> None:
+    if emitter is None or not callable(callback):
+        return
+    remove_fn = getattr(emitter, "remove_listener", None)
+    if callable(remove_fn):
+        try:
+            remove_fn(event, callback)
+        except Exception:
+            pass
+
+
+def _detach_tracker_from_context(context: Any, auth_tracker: Optional[Dict[str, Any]], on_page_cb: Any = None) -> None:
+    if context is None:
+        return
+    if callable(on_page_cb):
+        _detach_listener_safely(context, "page", on_page_cb)
+    resp_cb = (auth_tracker or {}).get("_on_response_cb")
+    if callable(resp_cb):
+        for p_item in list(getattr(context, "pages", None) or []):
+            _detach_listener_safely(p_item, "response", resp_cb)
+
+
 @contextmanager
 def _browser_session_guard(
     user_data_dir: str = DEFAULT_USER_DATA_DIR,
@@ -607,7 +630,7 @@ def _browser_session_guard(
     - 默认（`debug=False`）以真无头模式（`headless=True`）静默运行，不弹任何浏览器窗口；`debug=True` 时打开可见窗口；
     - 启动持久化 Chrome 上下文并设置全局最大操作超时（`operation_timeout_sec` 秒），防止页面卡死；
     - 挂载 MTOP 登录态与错误监听器；
-    - 退出时确保关闭浏览器并释放串行锁。
+    - 退出时确保卸载监听器、关闭浏览器并释放串行锁。
     """
     op_timeout_ms = int(max(10.0, float(operation_timeout_sec or DEFAULT_OPERATION_TIMEOUT_SEC)) * 1000)
     use_headless = not bool(debug)
@@ -618,6 +641,8 @@ def _browser_session_guard(
     ):
         with sync_playwright() as p:
             context = None
+            auth_tracker: Optional[Dict[str, Any]] = None
+            on_page_cb = None
             try:
                 context = launch_persistent_context(
                     p,
@@ -630,14 +655,19 @@ def _browser_session_guard(
                 page = context.pages[0] if context.pages else context.new_page()
                 auth_tracker = _attach_auth_tracker(page)
                 if hasattr(context, "on") and callable(auth_tracker.get("_on_response_cb")):
-                    context.on("page", lambda new_p: new_p.on("response", auth_tracker["_on_response_cb"]))
+                    def _on_new_page(new_p):
+                        new_p.on("response", auth_tracker["_on_response_cb"])
+                    on_page_cb = _on_new_page
+                    context.on("page", on_page_cb)
                 yield context, page, auth_tracker
             finally:
+                _detach_tracker_from_context(context, auth_tracker, on_page_cb)
                 if context:
                     try:
                         context.close()
                     except Exception:
                         pass
+        gc.collect()
 
 
 @contextmanager
@@ -654,7 +684,7 @@ def _ephemeral_h5_session_guard(
     - 仍通过 `lock_key_dir` 获取跨线程/跨进程串行锁，防止本机多进程并发挤压同一出口 IP；
     - 使用 `p.chromium.launch(...)` + `browser.new_context(...)` 在内存中动态换取新鲜 `_m_h5_tk`，
       绝不读写磁盘 `Cookies` 数据库，彻底根除跨轮次 `cna` / `x5secdata` 计数累积触发 `RGV587_ERROR`；
-    - 退出时自动销毁内存上下文与浏览器实例。
+    - 退出时自动卸载监听器并销毁内存上下文与浏览器实例。
     """
     op_timeout_ms = int(max(10.0, float(operation_timeout_sec or DEFAULT_OPERATION_TIMEOUT_SEC)) * 1000)
     use_headless = not bool(debug)
@@ -670,6 +700,8 @@ def _ephemeral_h5_session_guard(
         with sync_playwright() as p:
             browser = None
             context = None
+            auth_tracker: Optional[Dict[str, Any]] = None
+            on_page_cb = None
             try:
                 browser = p.chromium.launch(
                     channel="chrome",
@@ -688,9 +720,13 @@ def _ephemeral_h5_session_guard(
                 page = context.new_page()
                 auth_tracker = _attach_auth_tracker(page)
                 if hasattr(context, "on") and callable(auth_tracker.get("_on_response_cb")):
-                    context.on("page", lambda new_p: new_p.on("response", auth_tracker["_on_response_cb"]))
+                    def _on_new_page(new_p):
+                        new_p.on("response", auth_tracker["_on_response_cb"])
+                    on_page_cb = _on_new_page
+                    context.on("page", on_page_cb)
                 yield context, page, auth_tracker
             finally:
+                _detach_tracker_from_context(context, auth_tracker, on_page_cb)
                 if context:
                     try:
                         context.close()
@@ -701,6 +737,278 @@ def _ephemeral_h5_session_guard(
                         browser.close()
                     except Exception:
                         pass
+        gc.collect()
+
+
+class XianyuRoundBrowserPool:
+    """
+    单轮任务级惰性浏览器会话复用池：
+    - 惰性初始化：若本轮无真实搜索/详情请求（如单元测试 Mock 或全部命中缓存），零进程开销；
+    - 搜索上下文单轮复用：复用同一个已登录 `xianyu_xiaohao` 持久化上下文，避免每搜 1 个词就冷启动 Chrome；
+    - 无痕 H5 详情会话自然复用 + 定时轮换：同一内存 H5 会话先在首页自然预热一次 `_m_h5_tk`，
+      最多连续查看 `max_h5_items_per_context`（默认 10）件商品后自动轮换全新内存上下文，兼顾人类访问轨迹与防累积风控；
+    - 退出时强制卸载所有监听器、关闭全部上下文与 Playwright 进程并执行 GC，彻底根除句柄累积。
+    """
+
+    def __init__(
+        self,
+        *,
+        max_h5_items_per_context: int = 10,
+        search_min_interval_sec: float = 2.8,
+        h5_detail_min_interval_sec: float = 4.2,
+        operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    ) -> None:
+        self.max_h5_items_per_context = max(2, int(max_h5_items_per_context))
+        self.search_min_interval_sec = max(0.5, float(search_min_interval_sec))
+        self.h5_detail_min_interval_sec = max(0.5, float(h5_detail_min_interval_sec))
+        self.operation_timeout_sec = max(10.0, float(operation_timeout_sec or DEFAULT_OPERATION_TIMEOUT_SEC))
+
+        self._pw_cm: Any = None
+        self._pw: Any = None
+        self._lock_stack = ExitStack()
+        self._held_locks: set[str] = set()
+
+        self._search_dir: str = ""
+        self._search_ctx: Any = None
+        self._search_page: Any = None
+        self._search_tracker: Optional[Dict[str, Any]] = None
+        self._search_on_page_cb: Any = None
+        self._last_search_ts: float = 0.0
+
+        self._h5_browser: Any = None
+        self._h5_ctx: Any = None
+        self._h5_page: Any = None
+        self._h5_tracker: Optional[Dict[str, Any]] = None
+        self._h5_on_page_cb: Any = None
+        self._h5_items_served: int = 0
+        self._last_h5_ts: float = 0.0
+
+    def __enter__(self) -> "XianyuRoundBrowserPool":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def _ensure_playwright(self) -> Any:
+        if self._pw is None:
+            self._pw_cm = sync_playwright()
+            self._pw = self._pw_cm.__enter__()
+        return self._pw
+
+    def _ensure_dir_lock(self, user_data_dir: str, task_name: str, lock_timeout_sec: float) -> None:
+        norm_key = os.path.normcase(os.path.abspath(user_data_dir))
+        if norm_key not in self._held_locks:
+            self._lock_stack.enter_context(
+                _acquire_serial_browser_lock(
+                    user_data_dir=user_data_dir,
+                    task_name=task_name,
+                    lock_timeout_sec=lock_timeout_sec,
+                )
+            )
+            self._held_locks.add(norm_key)
+
+    def _close_h5_context_only(self) -> None:
+        _detach_tracker_from_context(self._h5_ctx, self._h5_tracker, self._h5_on_page_cb)
+        if self._h5_ctx is not None:
+            try:
+                self._h5_ctx.close()
+            except Exception:
+                pass
+        self._h5_ctx = None
+        self._h5_page = None
+        self._h5_tracker = None
+        self._h5_on_page_cb = None
+        self._h5_items_served = 0
+
+    def _close_search_context_only(self) -> None:
+        _detach_tracker_from_context(self._search_ctx, self._search_tracker, self._search_on_page_cb)
+        if self._search_ctx is not None:
+            try:
+                self._search_ctx.close()
+            except Exception:
+                pass
+        self._search_ctx = None
+        self._search_page = None
+        self._search_tracker = None
+        self._search_on_page_cb = None
+        self._search_dir = ""
+
+    @contextmanager
+    def acquire_search_session(
+        self,
+        user_data_dir: str = DEFAULT_SEARCH_USER_DATA_DIR,
+        *,
+        debug: bool = False,
+        lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+        task_name: str = "round_search",
+    ) -> Generator[Tuple[Any, Any, Dict[str, Any]], None, None]:
+        self._ensure_dir_lock(user_data_dir, task_name, lock_timeout_sec)
+        p = self._ensure_playwright()
+        op_timeout_ms = int(self.operation_timeout_sec * 1000)
+        use_headless = not bool(debug)
+
+        if self._search_ctx is not None and self._search_dir != user_data_dir:
+            self._close_search_context_only()
+
+        if self._search_ctx is None:
+            ctx = launch_persistent_context(
+                p,
+                user_data_dir=user_data_dir,
+                headless=use_headless,
+                mobile_h5=False,
+            )
+            ctx.set_default_timeout(op_timeout_ms)
+            ctx.set_default_navigation_timeout(op_timeout_ms)
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            tracker = _attach_auth_tracker(page)
+
+            def _on_new_page(new_p):
+                new_p.on("response", tracker["_on_response_cb"])
+
+            if hasattr(ctx, "on"):
+                ctx.on("page", _on_new_page)
+            self._search_ctx = ctx
+            self._search_page = page
+            self._search_tracker = tracker
+            self._search_on_page_cb = _on_new_page
+            self._search_dir = user_data_dir
+        else:
+            gap = (self._last_search_ts + self.search_min_interval_sec + random.uniform(0.0, 1.4)) - time.monotonic()
+            if gap > 0:
+                time.sleep(gap)
+            # 清理上一轮搜索可能打开的多余新标签页，防止 Page 句柄堆积
+            pages = list(self._search_ctx.pages or [])
+            while len(pages) > 1:
+                extra_p = pages.pop()
+                if extra_p is not self._search_page:
+                    _detach_listener_safely(extra_p, "response", (self._search_tracker or {}).get("_on_response_cb"))
+                    try:
+                        extra_p.close()
+                    except Exception:
+                        pass
+            if self._search_tracker is not None:
+                self._search_tracker["failed_apis"].clear()
+
+        try:
+            yield self._search_ctx, self._search_page, self._search_tracker
+        except Exception:
+            self._close_search_context_only()
+            raise
+        finally:
+            self._last_search_ts = time.monotonic()
+
+    @contextmanager
+    def acquire_h5_detail_session(
+        self,
+        lock_key_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
+        *,
+        debug: bool = False,
+        lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+        task_name: str = "round_h5_detail",
+        item_count: int = 1,
+    ) -> Generator[Tuple[Any, Any, Dict[str, Any]], None, None]:
+        self._ensure_dir_lock(lock_key_dir, task_name, lock_timeout_sec)
+        p = self._ensure_playwright()
+        op_timeout_ms = int(self.operation_timeout_sec * 1000)
+        use_headless = not bool(debug)
+
+        if self._h5_browser is not None:
+            try:
+                if hasattr(self._h5_browser, "is_connected") and not self._h5_browser.is_connected():
+                    self._close_h5_context_only()
+                    self._h5_browser = None
+            except Exception:
+                self._close_h5_context_only()
+                self._h5_browser = None
+
+        if self._h5_browser is None:
+            launch_args = ["--disable-blink-features=AutomationControlled"]
+            if use_headless:
+                launch_args.append("--headless=new")
+            self._h5_browser = p.chromium.launch(
+                channel="chrome",
+                headless=use_headless,
+                args=launch_args,
+                ignore_default_args=["--enable-automation"],
+            )
+
+        if self._h5_ctx is not None and self._h5_items_served >= self.max_h5_items_per_context:
+            self._close_h5_context_only()
+
+        if self._h5_ctx is None:
+            ctx = self._h5_browser.new_context(
+                viewport=dict(DEFAULT_MOBILE_H5_VIEWPORT),
+                user_agent=DEFAULT_MOBILE_H5_USER_AGENT,
+                is_mobile=True,
+                has_touch=True,
+            )
+            ctx.set_default_timeout(op_timeout_ms)
+            ctx.set_default_navigation_timeout(op_timeout_ms)
+            page = ctx.new_page()
+            tracker = _attach_auth_tracker(page)
+
+            def _on_new_page(new_p):
+                new_p.on("response", tracker["_on_response_cb"])
+
+            if hasattr(ctx, "on"):
+                ctx.on("page", _on_new_page)
+            # 先访问一次 H5 首页自然换取 _m_h5_tk 令牌，避免冷启动裸访详情页触发 RGV587_ERROR
+            try:
+                page.goto(GOOFISH_H5_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+                for _ in range(10):
+                    cookies = {c["name"]: c["value"] for c in ctx.cookies() if c.get("name")}
+                    if cookies.get("_m_h5_tk"):
+                        break
+                    page.wait_for_timeout(200)
+                page.wait_for_timeout(random.randint(500, 900))
+            except Exception:
+                pass
+            tracker["failed_apis"].clear()
+            tracker["risk_rets"].clear()
+            tracker["guest_login_blocked_rets"].clear()
+            self._h5_ctx = ctx
+            self._h5_page = page
+            self._h5_tracker = tracker
+            self._h5_on_page_cb = _on_new_page
+            self._h5_items_served = 0
+        else:
+            gap = (self._last_h5_ts + self.h5_detail_min_interval_sec + random.uniform(0.0, 2.0)) - time.monotonic()
+            if gap > 0:
+                time.sleep(gap)
+            if self._h5_tracker is not None:
+                self._h5_tracker["failed_apis"].clear()
+
+        try:
+            yield self._h5_ctx, self._h5_page, self._h5_tracker
+        except Exception:
+            self._close_h5_context_only()
+            raise
+        finally:
+            self._h5_items_served += max(1, int(item_count))
+            self._last_h5_ts = time.monotonic()
+
+    def close(self) -> None:
+        self._close_h5_context_only()
+        if self._h5_browser is not None:
+            try:
+                self._h5_browser.close()
+            except Exception:
+                pass
+            self._h5_browser = None
+        self._close_search_context_only()
+        if self._pw_cm is not None:
+            try:
+                self._pw_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._pw_cm = None
+            self._pw = None
+        try:
+            self._lock_stack.close()
+        except Exception:
+            pass
+        self._held_locks.clear()
+        gc.collect()
 
 
 def open_browser_for_manual_use(
@@ -2193,11 +2501,13 @@ def search_xianyu_items(
     user_data_dir: str = DEFAULT_SEARCH_USER_DATA_DIR,
     debug: bool = False,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    browser_pool: Optional[XianyuRoundBrowserPool] = None,
 ) -> Dict[str, Any]:
     """
     使用已登录的独立闲鱼目录（默认搜索小号 `W:\\temp\\xianyu_xiaohao`）搜索关键字商品概览：
     - 搜索前后强校验在线与风控状态，若未扫码登录、掉线或触发滑块立即返回 `ACCOUNT_OFFLINE` / `RISK_CONTROL_BLOCKED`，绝不盲目重试；
-    - 拦截解析 `mtop.taobao.idlemtopsearch.pc.search` 返回的商品列表。
+    - 拦截解析 `mtop.taobao.idlemtopsearch.pc.search` 返回的商品列表；
+    - 可选传入 `browser_pool` 单轮复用持久化搜索上下文，结束时自动卸载局部监听器避免句柄泄漏。
     """
     kw_clean = str(keyword or "").strip()
     if not kw_clean:
@@ -2207,124 +2517,146 @@ def search_xianyu_items(
     tag = _dir_tag(user_data_dir)
     t0 = time.monotonic()
 
-    try:
-        with _browser_session_guard(
+    session_cm = (
+        browser_pool.acquire_search_session(
+            user_data_dir=user_data_dir,
+            debug=debug,
+            lock_timeout_sec=lock_timeout_sec,
+            task_name=f"search_xianyu_items:{kw_clean[:20]}",
+        )
+        if browser_pool is not None
+        else _browser_session_guard(
             user_data_dir=user_data_dir,
             debug=debug,
             task_name=f"search_xianyu_items:{kw_clean[:20]}",
             lock_timeout_sec=lock_timeout_sec,
-        ) as (context, page, auth_tracker):
+        )
+    )
+
+    try:
+        with session_cm as (context, page, auth_tracker):
             search_packets: List[Dict[str, Any]] = []
+            bound_pages: List[Any] = []
+
+            def _on_search_response(resp):
+                if "mtop.taobao.idlemtopsearch.pc.search/" in resp.url:
+                    try:
+                        body = resp.json()
+                        if isinstance(body, dict):
+                            search_packets.append(body)
+                    except Exception:
+                        pass
 
             def _bind_search_listener(target_page) -> None:
-                def _on_response(resp):
-                    if "mtop.taobao.idlemtopsearch.pc.search/" in resp.url:
-                        try:
-                            body = resp.json()
-                            if isinstance(body, dict):
-                                search_packets.append(body)
-                        except Exception:
-                            pass
-
-                target_page.on("response", _on_response)
+                if target_page not in bound_pages:
+                    bound_pages.append(target_page)
+                    target_page.on("response", _on_search_response)
 
             _bind_search_listener(page)
-            context.on("page", _bind_search_listener)
+            if hasattr(context, "on"):
+                context.on("page", _bind_search_listener)
 
-            page.goto(GOOFISH_HOME_URL, wait_until="domcontentloaded", timeout=30000)
-            for _ in range(15):
-                cookies = {c["name"]: c["value"] for c in context.cookies() if c.get("name")}
-                if cookies.get("_m_h5_tk"):
-                    break
-                page.wait_for_timeout(200)
-            page.wait_for_timeout(800)
-            _verify_account_online(context, page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
+            try:
+                cur_url = str(getattr(page, "url", "") or "")
+                if "goofish.com" not in cur_url:
+                    page.goto(GOOFISH_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+                    for _ in range(15):
+                        cookies = {c["name"]: c["value"] for c in context.cookies() if c.get("name")}
+                        if cookies.get("_m_h5_tk"):
+                            break
+                        page.wait_for_timeout(200)
+                    page.wait_for_timeout(800)
+                _verify_account_online(context, page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
 
-            search_packets.clear()
-            search_input = page.locator("input[class*='search-input'], input[type='text']").first
-            triggered = False
-            if search_input.count() > 0:
-                try:
-                    search_input.click(timeout=3000)
-                    search_input.fill(kw_clean, timeout=3000)
-                    page.wait_for_timeout(150)
-                    if search_input.input_value().strip() == kw_clean:
-                        search_btn = page.locator("button[class*='search-icon'], button:has-text('搜索')").first
-                        if search_btn.count() > 0:
-                            search_btn.click(timeout=3000)
-                        else:
-                            search_input.press("Enter", timeout=3000)
-                        triggered = True
-                except Exception:
-                    triggered = False
+                search_packets.clear()
+                search_input = page.locator("input[class*='search-input'], input[type='text']").first
+                triggered = False
+                if search_input.count() > 0:
+                    try:
+                        search_input.click(timeout=3000)
+                        search_input.fill(kw_clean, timeout=3000)
+                        page.wait_for_timeout(150)
+                        if search_input.input_value().strip() == kw_clean:
+                            search_btn = page.locator("button[class*='search-icon'], button:has-text('搜索')").first
+                            if search_btn.count() > 0:
+                                search_btn.click(timeout=3000)
+                            else:
+                                search_input.press("Enter", timeout=3000)
+                            triggered = True
+                    except Exception:
+                        triggered = False
 
-            if not triggered:
-                page.goto(f"{GOOFISH_HOME_URL}/search?q={quote(kw_clean)}", wait_until="domcontentloaded", timeout=30000)
+                if not triggered:
+                    page.goto(f"{GOOFISH_HOME_URL}/search?q={quote(kw_clean)}", wait_until="domcontentloaded", timeout=30000)
 
-            success_packet: Optional[Dict[str, Any]] = None
-            for _ in range(32):
-                for pkt in reversed(search_packets):
-                    ret_str = " | ".join(str(x) for x in (pkt.get("ret") or []))
-                    if "SUCCESS" in ret_str:
-                        success_packet = pkt
+                success_packet: Optional[Dict[str, Any]] = None
+                for _ in range(32):
+                    for pkt in reversed(search_packets):
+                        ret_str = " | ".join(str(x) for x in (pkt.get("ret") or []))
+                        if "SUCCESS" in ret_str:
+                            success_packet = pkt
+                            break
+                    if success_packet is not None or auth_tracker.get("risk_rets") or auth_tracker.get("expired_rets"):
                         break
-                if success_packet is not None or auth_tracker.get("risk_rets") or auth_tracker.get("expired_rets"):
-                    break
-                page.wait_for_timeout(250)
+                    page.wait_for_timeout(250)
 
-            active_page = context.pages[-1] if context.pages else page
-            _verify_account_online(context, active_page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
+                active_page = context.pages[-1] if context.pages else page
+                _verify_account_online(context, active_page, auth_tracker, user_data_dir, task_name="search_xianyu_items")
 
-            if success_packet is None:
-                diag_str = _format_failure_diag(context, active_page, auth_tracker, headless=not debug)
+                if success_packet is None:
+                    diag_str = _format_failure_diag(context, active_page, auth_tracker, headless=not debug)
+                    elapsed = time.monotonic() - t0
+                    logger.error(
+                        f"❌ [闲鱼搜索/未捕获有效数据包] 目录={tag} | 关键字=【{kw_clean}】 | "
+                        f"已捕获包数={len(search_packets)} | 耗时={elapsed:.2f}s | 诊断=({diag_str})"
+                    )
+                    return {
+                        "ok": False,
+                        "is_offline": False,
+                        "is_risk_blocked": False,
+                        "action": "search_xianyu_items",
+                        "error_code": "SEARCH_PACKET_EMPTY",
+                        "user_data_dir": user_data_dir,
+                        "keyword": kw_clean,
+                        "total_count": 0,
+                        "items": [],
+                        "message": f"未捕获到关键字【{kw_clean}】的有效闲鱼搜索数据包 ({diag_str})",
+                    }
+
+                raw_list = (success_packet.get("data") or {}).get("resultList") or []
+                parsed_items: List[Dict[str, Any]] = []
+                for wrap in raw_list:
+                    item_obj = _parse_search_result_item(wrap)
+                    if item_obj is not None:
+                        parsed_items.append(item_obj)
+                        if len(parsed_items) >= limit:
+                            break
+
+                prices = sorted(x["price"] for x in parsed_items if x["price"] > 0)
+                min_p = prices[0] if prices else 0.0
+                max_p = prices[-1] if prices else 0.0
+                med_p = prices[len(prices) // 2] if prices else 0.0
                 elapsed = time.monotonic() - t0
-                logger.error(
-                    f"❌ [闲鱼搜索/未捕获有效数据包] 目录={tag} | 关键字=【{kw_clean}】 | "
-                    f"已捕获包数={len(search_packets)} | 耗时={elapsed:.2f}s | 诊断=({diag_str})"
+
+                logger.info(
+                    f"[闲鱼搜索/完成] ✅ 目录={tag} | 关键字=【{kw_clean}】 | 返回商品数={len(parsed_items)} | "
+                    f"价格区间=¥{min_p}~¥{max_p} (中位价=¥{med_p}) | 耗时={elapsed:.2f}s"
                 )
                 return {
-                    "ok": False,
+                    "ok": True,
                     "is_offline": False,
                     "is_risk_blocked": False,
                     "action": "search_xianyu_items",
-                    "error_code": "SEARCH_PACKET_EMPTY",
                     "user_data_dir": user_data_dir,
                     "keyword": kw_clean,
-                    "total_count": 0,
-                    "items": [],
-                    "message": f"未捕获到关键字【{kw_clean}】的有效闲鱼搜索数据包 ({diag_str})",
+                    "total_count": len(parsed_items),
+                    "price_summary": {"min_price": min_p, "median_price": med_p, "max_price": max_p},
+                    "items": parsed_items,
                 }
-
-            raw_list = (success_packet.get("data") or {}).get("resultList") or []
-            parsed_items: List[Dict[str, Any]] = []
-            for wrap in raw_list:
-                item_obj = _parse_search_result_item(wrap)
-                if item_obj is not None:
-                    parsed_items.append(item_obj)
-                    if len(parsed_items) >= limit:
-                        break
-
-            prices = sorted(x["price"] for x in parsed_items if x["price"] > 0)
-            min_p = prices[0] if prices else 0.0
-            max_p = prices[-1] if prices else 0.0
-            med_p = prices[len(prices) // 2] if prices else 0.0
-            elapsed = time.monotonic() - t0
-
-            logger.info(
-                f"[闲鱼搜索/完成] ✅ 目录={tag} | 关键字=【{kw_clean}】 | 返回商品数={len(parsed_items)} | "
-                f"价格区间=¥{min_p}~¥{max_p} (中位价=¥{med_p}) | 耗时={elapsed:.2f}s"
-            )
-            return {
-                "ok": True,
-                "is_offline": False,
-                "is_risk_blocked": False,
-                "action": "search_xianyu_items",
-                "user_data_dir": user_data_dir,
-                "keyword": kw_clean,
-                "total_count": len(parsed_items),
-                "price_summary": {"min_price": min_p, "median_price": med_p, "max_price": max_p},
-                "items": parsed_items,
-            }
+            finally:
+                _detach_listener_safely(context, "page", _bind_search_listener)
+                for bp in bound_pages:
+                    _detach_listener_safely(bp, "response", _on_search_response)
     except XianyuOfflineError as e:
         return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="search_xianyu_items")
     except XianyuLockTimeoutError as e:
@@ -2450,11 +2782,13 @@ def get_xianyu_item_details_batch(
     debug: bool = False,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
     ephemeral: bool = True,
+    browser_pool: Optional[XianyuRoundBrowserPool] = None,
 ) -> Dict[str, Any]:
     """
     通过闲鱼移动端 H5 公开分享页免登录批量获取多个商品详情（描述、多规格 SKU 价格、库存与运费）：
     - 默认采用纯内存无痕会话（`ephemeral=True`），以 `user_data_dir` 作为串行排队锁标识，绝不持久化累积访客 Cookie；
-    - 完全不占用搜索小号请求配额，自动识别风控拦截并立即熔断停手。
+    - 完全不占用搜索小号请求配额，自动识别风控拦截并立即熔断停手；
+    - 可选传入 `browser_pool` 单轮复用 H5 `_m_h5_tk` 会话（每 10 件自动轮换），根除频繁冷启动换令牌导致的 `RGV587_ERROR`。
     """
     clean_ids: List[str] = []
     for raw_target in item_ids or []:
@@ -2468,22 +2802,29 @@ def get_xianyu_item_details_batch(
     tag = f"ephemeral_h5({ _dir_tag(user_data_dir) })" if ephemeral else _dir_tag(user_data_dir)
     t0 = time.monotonic()
     details_by_id: Dict[str, Dict[str, Any]] = {}
-    session_cm = (
-        _ephemeral_h5_session_guard(
+    if browser_pool is not None and ephemeral:
+        session_cm = browser_pool.acquire_h5_detail_session(
+            lock_key_dir=user_data_dir,
+            debug=debug,
+            lock_timeout_sec=lock_timeout_sec,
+            task_name=f"get_xianyu_item_details_batch:{len(clean_ids)}items",
+            item_count=len(clean_ids),
+        )
+    elif ephemeral:
+        session_cm = _ephemeral_h5_session_guard(
             lock_key_dir=user_data_dir,
             debug=debug,
             task_name=f"get_xianyu_item_details_batch:{len(clean_ids)}items",
             lock_timeout_sec=lock_timeout_sec,
         )
-        if ephemeral
-        else _browser_session_guard(
+    else:
+        session_cm = _browser_session_guard(
             user_data_dir=user_data_dir,
             debug=debug,
             mobile_h5=True,
             task_name=f"get_xianyu_item_details_batch:{len(clean_ids)}items",
             lock_timeout_sec=lock_timeout_sec,
         )
-    )
 
     try:
         with session_cm as (context, page, auth_tracker):
@@ -2499,90 +2840,92 @@ def get_xianyu_item_details_batch(
                         pass
 
             page.on("response", _on_response)
+            try:
+                for idx, item_id in enumerate(clean_ids):
+                    t_item = time.monotonic()
+                    pc_detail_url = f"{GOOFISH_HOME_URL}/item?id={item_id}"
+                    h5_detail_url = f"{GOOFISH_H5_HOME_URL}/item?id={item_id}"
+                    success_packet: Optional[Dict[str, Any]] = None
+                    biz_not_found = False
+                    auth_tracker["failed_apis"].clear()
 
-            for idx, item_id in enumerate(clean_ids):
-                t_item = time.monotonic()
-                pc_detail_url = f"{GOOFISH_HOME_URL}/item?id={item_id}"
-                h5_detail_url = f"{GOOFISH_H5_HOME_URL}/item?id={item_id}"
-                success_packet: Optional[Dict[str, Any]] = None
-                biz_not_found = False
-                auth_tracker["failed_apis"].clear()
+                    for attempt in range(2):
+                        detail_packets.clear()
+                        page.goto(h5_detail_url, wait_until="domcontentloaded", timeout=30000)
+                        for _ in range(28):
+                            for pkt in reversed(detail_packets):
+                                ret_str = " | ".join(str(x) for x in (pkt.get("ret") or []))
+                                if "SUCCESS" in ret_str and isinstance((pkt.get("data") or {}).get("itemDO"), dict):
+                                    success_packet = pkt
+                                    break
+                                if "FAIL_BIZ_" in ret_str or "ITEM_NOT_FOUND" in ret_str:
+                                    biz_not_found = True
+                                    break
+                            if (
+                                success_packet is not None
+                                or biz_not_found
+                                or auth_tracker.get("risk_rets")
+                                or auth_tracker.get("guest_login_blocked_rets")
+                            ):
+                                break
+                            page.wait_for_timeout(200)
 
-                for attempt in range(2):
-                    detail_packets.clear()
-                    page.goto(h5_detail_url, wait_until="domcontentloaded", timeout=30000)
-                    for _ in range(28):
-                        for pkt in reversed(detail_packets):
-                            ret_str = " | ".join(str(x) for x in (pkt.get("ret") or []))
-                            if "SUCCESS" in ret_str and isinstance((pkt.get("data") or {}).get("itemDO"), dict):
-                                success_packet = pkt
-                                break
-                            if "FAIL_BIZ_" in ret_str or "ITEM_NOT_FOUND" in ret_str:
-                                biz_not_found = True
-                                break
-                        if (
-                            success_packet is not None
-                            or biz_not_found
-                            or auth_tracker.get("risk_rets")
-                            or auth_tracker.get("guest_login_blocked_rets")
-                        ):
+                        _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name=f"batch_detail:{item_id}")
+                        if success_packet is not None or biz_not_found:
                             break
-                        page.wait_for_timeout(200)
+                        if attempt == 0:
+                            page.wait_for_timeout(900)
 
-                    _verify_guest_no_risk_block(page, auth_tracker, user_data_dir, task_name=f"batch_detail:{item_id}")
-                    if success_packet is not None or biz_not_found:
-                        break
-                    if attempt == 0:
-                        page.wait_for_timeout(800)
+                    if success_packet is not None:
+                        parsed_detail = _parse_detail_packet_to_dict(
+                            success_packet=success_packet,
+                            item_id=item_id,
+                            detail_url=pc_detail_url,
+                            user_data_dir=user_data_dir,
+                        )
+                        details_by_id[item_id] = parsed_detail
+                        logger.info(
+                            f"[H5免登录批量详情/{idx + 1}/{len(clean_ids)}] ✅ 会话={tag} | 商品ID={item_id} | "
+                            f"售价=¥{parsed_detail['price']} | 运费=¥{parsed_detail['transport_fee']} | "
+                            f"SKU数={len(parsed_detail['sku_list'])} | 耗时={time.monotonic() - t_item:.2f}s"
+                        )
+                    else:
+                        diag_str = _format_failure_diag(context, page, auth_tracker, headless=not debug)
+                        logger.warning(
+                            f"⚠️ [H5免登录批量详情/{idx + 1}/{len(clean_ids)}/失败] 会话={tag} | 商品ID={item_id} | "
+                            f"已捕获包数={len(detail_packets)} | 耗时={time.monotonic() - t_item:.2f}s | 诊断=({diag_str})"
+                        )
+                        details_by_id[item_id] = {
+                            "ok": False,
+                            "is_offline": False,
+                            "is_risk_blocked": False,
+                            "action": "get_xianyu_item_detail",
+                            "error_code": "DETAIL_PACKET_EMPTY",
+                            "user_data_dir": user_data_dir,
+                            "item_id": item_id,
+                            "item_url": pc_detail_url,
+                            "message": f"未捕获到商品 ({item_id}) 的有效详情数据包 ({diag_str})",
+                        }
 
-                if success_packet is not None:
-                    parsed_detail = _parse_detail_packet_to_dict(
-                        success_packet=success_packet,
-                        item_id=item_id,
-                        detail_url=pc_detail_url,
-                        user_data_dir=user_data_dir,
-                    )
-                    details_by_id[item_id] = parsed_detail
-                    logger.info(
-                        f"[H5免登录批量详情/{idx + 1}/{len(clean_ids)}] ✅ 会话={tag} | 商品ID={item_id} | "
-                        f"售价=¥{parsed_detail['price']} | 运费=¥{parsed_detail['transport_fee']} | "
-                        f"SKU数={len(parsed_detail['sku_list'])} | 耗时={time.monotonic() - t_item:.2f}s"
-                    )
-                else:
-                    diag_str = _format_failure_diag(context, page, auth_tracker, headless=not debug)
-                    logger.warning(
-                        f"⚠️ [H5免登录批量详情/{idx + 1}/{len(clean_ids)}/失败] 会话={tag} | 商品ID={item_id} | "
-                        f"已捕获包数={len(detail_packets)} | 耗时={time.monotonic() - t_item:.2f}s | 诊断=({diag_str})"
-                    )
-                    details_by_id[item_id] = {
-                        "ok": False,
-                        "is_offline": False,
-                        "is_risk_blocked": False,
-                        "action": "get_xianyu_item_detail",
-                        "error_code": "DETAIL_PACKET_EMPTY",
-                        "user_data_dir": user_data_dir,
-                        "item_id": item_id,
-                        "item_url": pc_detail_url,
-                        "message": f"未捕获到商品 ({item_id}) 的有效详情数据包 ({diag_str})",
-                    }
+                    if idx < len(clean_ids) - 1:
+                        page.wait_for_timeout(random.randint(3600, 5800))
 
-                if idx < len(clean_ids) - 1:
-                    page.wait_for_timeout(random.randint(2000, 3500))
-
-            ok_cnt = sum(1 for v in details_by_id.values() if v.get("ok"))
-            fail_cnt = len(clean_ids) - ok_cnt
-            logger.info(
-                f"[H5免登录批量详情/完成] 📊 会话={tag} | 成功={ok_cnt}/{len(clean_ids)} (失败={fail_cnt}) | "
-                f"总耗时={time.monotonic() - t0:.2f}s"
-            )
-            return {
-                "ok": True,
-                "is_offline": False,
-                "is_risk_blocked": False,
-                "action": "get_xianyu_item_details_batch",
-                "user_data_dir": user_data_dir,
-                "details_by_id": details_by_id,
-            }
+                ok_cnt = sum(1 for v in details_by_id.values() if v.get("ok"))
+                fail_cnt = len(clean_ids) - ok_cnt
+                logger.info(
+                    f"[H5免登录批量详情/完成] 📊 会话={tag} | 成功={ok_cnt}/{len(clean_ids)} (失败={fail_cnt}) | "
+                    f"总耗时={time.monotonic() - t0:.2f}s"
+                )
+                return {
+                    "ok": True,
+                    "is_offline": False,
+                    "is_risk_blocked": False,
+                    "action": "get_xianyu_item_details_batch",
+                    "user_data_dir": user_data_dir,
+                    "details_by_id": details_by_id,
+                }
+            finally:
+                _detach_listener_safely(page, "response", _on_response)
     except XianyuOfflineError as e:
         res = _build_offline_result(
             user_data_dir,
