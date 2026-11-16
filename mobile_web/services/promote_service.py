@@ -18,12 +18,21 @@ from models.product import (
     detect_platform_signal,
     extract_canonical_goods_id,
     is_jd_image_key,
-    normalize_jd_material_url,
     normalize_platform,
 )
 from models.user import normalize_promoter_id
 from repositories.product_repo import ProductRepository
-from cache import PROMOTION_CACHE, MATERIAL_CACHE, SIGN_BY_ID_CACHE, evict_product_from_caches
+from cache import (
+    DETAIL_CACHE,
+    MATERIAL_CACHE,
+    PROMOTION_CACHE,
+    SIGN_BY_ID_CACHE,
+    cache_product_detail,
+    evict_product_from_caches,
+    make_detail_snapshot,
+    snapshot_detail_deadline,
+    sync_product_summary_in_caches,
+)
 from config import PROMOTION_LINK_TTL, logger
 
 _UID_PATTERN = re.compile(r"^u_[0-9a-f]{8}$")
@@ -161,20 +170,31 @@ class PromoteService:
             return None
         return item
 
-    def _trusted_material_url(self, ref: ProductRef) -> str:
+    @staticmethod
+    def _resolve_capability_adapter(platform: str, adapter=None):
+        if adapter is not None:
+            return adapter
+        try:
+            return get_adapter(platform)
+        except Exception:
+            return None
+
+    def _trusted_material_url(self, ref: ProductRef, adapter=None) -> str:
         if not ref.key:
             return ""
+        adp = self._resolve_capability_adapter(ref.platform, adapter)
+        auth_fn = getattr(adp, "is_authoritative_material_url", None) if adp is not None else None
+        norm_fn = getattr(adp, "normalize_material_url", None) if adp is not None else None
         kind = "sign" if ref.goods_sign else "id"
         cache_key = (ref.platform, kind, ref.key)
         cached = MATERIAL_CACHE.get(cache_key)
         if not (isinstance(cached, str) and cached) and ref.goods_id:
             cached = MATERIAL_CACHE.get((ref.platform, "id", ref.goods_id))
         if isinstance(cached, str) and cached:
-            if ref.platform != "jd" or "jingfen.jd.com" in cached:
+            if not callable(auth_fn) or auth_fn(cached) is True:
                 return cached
-        # 若 DETAIL_CACHE 中已有详情页最新拉取的权威快照（如 jingfen.jd.com），优先采用并刷新 MATERIAL_CACHE
+        # 若 DETAIL_CACHE 中已有详情页最新拉取的权威快照，优先采用并刷新 MATERIAL_CACHE
         try:
-            from cache import DETAIL_CACHE
             for dkey in ref.cache_keys():
                 entry = DETAIL_CACHE.get(dkey)
                 if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
@@ -194,8 +214,10 @@ class PromoteService:
             value = item.get("product_url")
             if isinstance(value, str) and value.strip():
                 clean_val = value.strip()
-                if ref.platform == "jd":
-                    clean_val = normalize_jd_material_url(clean_val)
+                if callable(norm_fn):
+                    norm_val = norm_fn(clean_val)
+                    if isinstance(norm_val, str) and norm_val.strip():
+                        clean_val = norm_val.strip()
                 MATERIAL_CACHE.set(cache_key, clean_val)
                 return clean_val
             return ""
@@ -206,57 +228,66 @@ class PromoteService:
             )
             return ""
 
-    def _cached_or_db_coupon_url(self, ref: ProductRef) -> tuple[str, Optional[dict]]:
-        if ref.platform != "jd" or not ref.key:
+    def _cached_or_db_coupon_url(self, ref: ProductRef, adapter=None) -> tuple[str, Optional[dict]]:
+        if not ref.key:
             return "", None
-        from infrastructure.jd_client import jd_coupon_url
+        adp = self._resolve_capability_adapter(ref.platform, adapter)
+        if adp is None or getattr(adp, "supports_coupon_enrichment", False) is not True:
+            return "", None
+        extract_fn = getattr(adp, "extract_trusted_coupon_url", None)
+        if not callable(extract_fn):
+            return "", None
         try:
-            from cache import DETAIL_CACHE
             for dkey in ref.cache_keys():
                 entry = DETAIL_CACHE.get(dkey)
                 if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
-                    c_url = jd_coupon_url((entry[1].get("data") or {}).get("coupon_url"))
-                    if c_url:
+                    c_url = extract_fn(entry[1].get("data") or {})
+                    if isinstance(c_url, str) and c_url:
                         return c_url, entry[1].get("data")
         except Exception:
             pass
         try:
             doc = self._verified_local_doc(ref)
             if isinstance(doc, dict):
-                return jd_coupon_url(doc.get("coupon_url")), doc
+                c_url = extract_fn(doc)
+                return (c_url if isinstance(c_url, str) else ""), doc
         except Exception:
             pass
         return "", None
 
     def _trusted_coupon_url(self, ref: ProductRef, adapter=None) -> str:
-        """统一获取京东官方领券链接：命中本地缓存/数据库直接返回；若从未查过详情，转链前单次补查并落库。"""
-        if ref.platform != "jd" or not ref.key:
+        """统一获取平台官方领券链接：命中本地缓存/数据库直接返回；若从未查过详情，转链前单次补查并落库。"""
+        if not ref.key:
             return ""
-        c_url, doc = self._cached_or_db_coupon_url(ref)
+        adp = self._resolve_capability_adapter(ref.platform, adapter)
+        if adp is None or getattr(adp, "supports_coupon_enrichment", False) is not True:
+            return ""
+        c_url, doc = self._cached_or_db_coupon_url(ref, adapter=adp)
         if c_url:
             return c_url
-        from adapters.jd_adapter import _is_encrypted_jd_item_id
-        from infrastructure.jd_client import jd_coupon_url
-        enrich_fn = getattr(adapter, "enrich_detail_resilient", None)
+        should_fn = getattr(adp, "should_enrich_promotion_coupon", None)
+        extract_fn = getattr(adp, "extract_trusted_coupon_url", None)
+        detail_fn = getattr(adp, "get_goods_detail", None)
         target_sign = str((doc or {}).get("goods_sign") or ref.goods_sign or "").strip()
-        needs_once_check = (
-            doc is None
-            or doc.get("detail_updated_at") is None
-            or float(doc.get("coupon_amount") or 0.0) > 0
-        )
-        if not (callable(enrich_fn) and getattr(adapter, "platform_code", None) == "jd"
-                and _is_encrypted_jd_item_id(target_sign) and needs_once_check):
+        if not (
+            target_sign
+            and callable(should_fn)
+            and callable(extract_fn)
+            and callable(detail_fn)
+            and should_fn(ref, doc) is True
+        ):
             return ""
         try:
-            det = enrich_fn(target_sign, goods_id=ref.goods_id or None, goods_sign=target_sign)
+            det = detail_fn(target_sign, goods_id=ref.goods_id or None, goods_sign=target_sign)
             if isinstance(det, dict) and det.get("status") == "success" and isinstance(det.get("data"), dict):
                 detail_data = det["data"]
-                self._seed_resolved_product("jd", detail_data, persist_db=True)
-                return jd_coupon_url(detail_data.get("coupon_url"))
+                self._seed_resolved_product(ref.platform, detail_data, persist_db=True)
+                extracted = extract_fn(detail_data)
+                return extracted if isinstance(extracted, str) else ""
         except Exception as exc:
             logger.warning(
-                "❌ 【京东转链补券降级】转链前补查商品优惠券未成功，将直接按普通商品链接转链 | 商品[%s] 异常<%s>",
-                ref.key, format_exc_summary(exc),
+                "❌ 【转链补券降级】转链前补查商品优惠券未成功，将直接按普通商品链接转链 | 平台[%s] 商品[%s] 异常<%s>",
+                ref.platform, ref.key, format_exc_summary(exc),
             )
         return ""
 
@@ -289,7 +320,12 @@ class PromoteService:
             PROMOTION_CACHE.pop(cache_key)
 
         ref = self._resolve_product_ref(ref)
-        local_coupon_for_db, _ = self._cached_or_db_coupon_url(ref) if (not uid and ref.platform == "jd") else ("", None)
+        supports_coupon = getattr(adapter, "supports_coupon_enrichment", False) is True
+        local_coupon_for_db, _ = (
+            self._cached_or_db_coupon_url(ref, adapter=adapter)
+            if (not uid and supports_coupon)
+            else ("", None)
+        )
         if not uid and ref.key:
             cached = self.repo.get_promotion_link_cache(
                 platform=ref.platform, goods_id=ref.goods_id or None,
@@ -314,13 +350,16 @@ class PromoteService:
         if getattr(adapter, "requires_numeric_promoter_id", False) is True:
             adapter_kwargs["promoter_id"] = identity["promoter_id"]
         if getattr(adapter, "requires_material_url", False) is True:
-            adapter_kwargs["trusted_product_url"] = self._trusted_material_url(ref)
-        if ref.platform == "jd":
+            adapter_kwargs["trusted_product_url"] = self._trusted_material_url(ref, adapter=adapter)
+        if supports_coupon:
             trusted_coupon = self._trusted_coupon_url(ref, adapter)
             if trusted_coupon:
                 adapter_kwargs["trusted_coupon_url"] = trusted_coupon
                 # 补查到新物料链接时同步刷新，确保二合一转链使用权威物料链
-                adapter_kwargs["trusted_product_url"] = self._trusted_material_url(ref) or adapter_kwargs.get("trusted_product_url", "")
+                adapter_kwargs["trusted_product_url"] = (
+                    self._trusted_material_url(ref, adapter=adapter)
+                    or adapter_kwargs.get("trusted_product_url", "")
+                )
         provider_started = time.perf_counter()
         try:
             result = adapter.convert_promotion_url(
@@ -640,21 +679,19 @@ class PromoteService:
             return
         try:
             from datetime import datetime, timezone
-            from cache import sync_product_summary_in_caches
             from models.product import utc_millis
-            from services.product_service import ProductService
             fetched_at = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
-            snapshot = ProductService._make_snapshot(product, fetched_at, platform)
+            snapshot = make_detail_snapshot(product, fetched_at, platform)
             sync_product_summary_in_caches(platform, snapshot.data)
             if persist_db and callable(getattr(self.repo, "upsert_product_detail", None)):
                 try:
                     self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=fetched_at))
                 except Exception:
                     pass
-            ProductService._cache_detail(
+            cache_product_detail(
                 platform,
                 {"status": "success", "data": deepcopy(snapshot.data)},
-                ProductService._snapshot_deadline(snapshot),
+                snapshot_detail_deadline(snapshot),
                 uid=uid,
             )
         except Exception:
@@ -785,12 +822,10 @@ class PromoteService:
             product = data.get("product") if isinstance(data.get("product"), dict) else None
             if product:
                 self._seed_resolved_product(plat, product, uid=clean_uid or None)
+                upgrade_fn = getattr(adapter, "needs_coupon_upgrade", None)
                 if (
-                    plat == "jd"
-                    and getattr(adapter, "platform_code", None) == "jd"
-                    and product.get("coupon_url")
-                    and product.get("product_url")
-                    and not data.get("coupon_url")
+                    callable(upgrade_fn)
+                    and upgrade_fn(data, product) is True
                     and callable(getattr(adapter, "convert_promotion_url", None))
                 ):
                     upgraded = adapter.convert_promotion_url(

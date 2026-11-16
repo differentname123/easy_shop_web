@@ -296,6 +296,20 @@ def execute_with_key_failover(
     return last_result or error_dict("UPSTREAM_ERROR", "请求失败")
 
 
+_PROVIDER_LEAK_KEYWORDS = [
+    "折淘客", "ztk", "appkey", "sid", "40009", "goods_id", "api_", "gateway", "网关拒绝",
+    "大淘客", "dataoke", "订单侠", "dingdanxia", "京推推", "jingtuitui", "好单库", "haodanku",
+]
+
+
+def register_sensitive_provider_keywords(*keywords: str) -> None:
+    """登记新增第三方供应商关键词，防止内部网关报错文案透传给终端用户。"""
+    for kw in keywords:
+        clean = clean_text(kw).lower()
+        if clean and clean not in _PROVIDER_LEAK_KEYWORDS:
+            _PROVIDER_LEAK_KEYWORDS.append(clean)
+
+
 def sanitize_user_error_message(error_code: Any, raw_msg: Any, platform_name: str = "") -> str:
     """将上游网关或第三方中转原始报错统一清洗为面向普通用户的友好提示。"""
     code = clean_text(error_code).upper()
@@ -315,6 +329,6 @@ def sanitize_user_error_message(error_code: Any, raw_msg: Any, platform_name: st
         return f"您的{plat}推广渠道尚未完成授权或已失效，请在「我的」页面下方完成渠道授权后再试"
     if code == "INVALID_TKL" or "error tkl" in lower or "商品id解析错误" in lower:
         return f"未能识别该{plat}口令或链接，请确认粘贴的是完整的商品分享口令/短链，或在「首页」搜索商品名称"
-    if any(k in lower for k in ("折淘客", "ztk", "appkey", "sid", "40009", "goods_id", "api_", "gateway", "网关拒绝")):
+    if any(k in lower for k in _PROVIDER_LEAK_KEYWORDS):
         return f"暂未能解析该{plat}链接，请确认商品仍在售且分享链接完整有效，或在「首页」搜索同款商品"
     return msg or f"暂未能解析该{plat}链接，请检查链接或口令是否完整有效"

@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """京东/折京客薄协议边界；支持多 ZTK_APPKEY_LIST 自动轮询与故障切换，与 scripts/test_jd_api.py 严格对齐。"""
 import json
-import threading
 import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
 import requests
 from infrastructure.api_governance import (
+    GLOBAL_QUOTA_PACER,
     GLOBAL_UPSTREAM_HEALTH,
-    get_caller_context,
+    QuotaPaceBacklogError,
     is_real_requests_session,
 )
 from infrastructure.http_utils import (
@@ -188,8 +188,6 @@ class JdClient:
             self.http = sess
         self.timeout = timeout
 
-    _KEY_PACE_LOCK = threading.Lock()
-    _KEY_NEXT_ALLOWED_TS = {}
     _MIN_KEY_DISPATCH_INTERVAL_SEC = 0.22
     _DETAIL_KEY_DISPATCH_INTERVAL_SEC = 0.85
     _MAX_KEY_PACE_WAIT_SEC = 2.0
@@ -201,44 +199,22 @@ class JdClient:
         "open_gaoyongzhuanlian_tkl_piliang.ashx",
     )
 
-    class _KeyPaceBacklogError(RuntimeError):
-        pass
-
     def _pace_real_http_by_key(self, kwargs, *, url=""):
-        """仅在真实未被打桩的 requests.Session 下按单 appkey 预约发包时间槽；详情/搜索/批量解析共享折淘客 1000 限流池统一节流。"""
-        if type(self.http) is not requests.Session:
-            return
-        get_fn = getattr(self.http, "get", None)
-        if not getattr(get_fn, "__module__", "").startswith("requests"):
-            return
+        """委托 GLOBAL_QUOTA_PACER 按单 appkey 预约发包时间槽；详情/搜索/批量解析共享折淘客 1000 限流池统一节流。"""
         params = kwargs.get("params")
         appkey = str(params.get("appkey") or "") if isinstance(params, dict) else ""
         if not appkey:
-            return
+            return 0.0
         url_str = str(url or "")
         is_catalog_pool = any(ep in url_str for ep in self._SHARED_CATALOG_QUOTA_ENDPOINTS)
-        interval = float(
-            self._DETAIL_KEY_DISPATCH_INTERVAL_SEC if is_catalog_pool else self._MIN_KEY_DISPATCH_INTERVAL_SEC
+        return GLOBAL_QUOTA_PACER.pace(
+            "ztk_jd_catalog" if is_catalog_pool else "ztk_jd_general",
+            appkey,
+            self._DETAIL_KEY_DISPATCH_INTERVAL_SEC if is_catalog_pool else self._MIN_KEY_DISPATCH_INTERVAL_SEC,
+            http_session=self.http,
+            foreground_max_wait=self._MAX_DETAIL_KEY_PACE_WAIT_SEC if is_catalog_pool else self._MAX_KEY_PACE_WAIT_SEC,
+            background_max_wait=self._MAX_BG_PACE_WAIT_SEC,
         )
-        if interval <= 0:
-            return
-        is_bg = get_caller_context() == "background"
-        if is_bg:
-            max_wait = float(self._MAX_BG_PACE_WAIT_SEC)
-        else:
-            max_wait = float(
-                self._MAX_DETAIL_KEY_PACE_WAIT_SEC if is_catalog_pool else self._MAX_KEY_PACE_WAIT_SEC
-            )
-        slot_key = (appkey, "detail") if is_catalog_pool else appkey
-        with JdClient._KEY_PACE_LOCK:
-            now = time.monotonic()
-            scheduled = max(now, JdClient._KEY_NEXT_ALLOWED_TS.get(slot_key, 0.0))
-            wait_s = scheduled - now
-            if max_wait > 0 and wait_s > max_wait:
-                raise JdClient._KeyPaceBacklogError("key pace backlog exceeded")
-            JdClient._KEY_NEXT_ALLOWED_TS[slot_key] = scheduled + interval
-        if wait_s > 0:
-            time.sleep(wait_s)
 
     @staticmethod
     def _endpoint_op_name(url: str) -> str:
@@ -273,7 +249,7 @@ class JdClient:
             else:
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
             return body
-        except JdClient._KeyPaceBacklogError:
+        except QuotaPaceBacklogError:
             dt_ms = (time.perf_counter() - t0) * 1000.0
             GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="rate_limit", latency_ms=dt_ms, error_code="QUOTA_PACE_BACKLOG", allow_persist=is_real)
             return _error("UPSTREAM_ERROR", "京东接口请求过于频繁，请稍后重试")

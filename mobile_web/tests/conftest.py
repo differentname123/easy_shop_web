@@ -31,6 +31,7 @@ def offline_resources_and_registry(tmp_path):
 
     api_gov._HEALTH_DIR = tmp_path / "runtime_health"
     api_gov.GLOBAL_UPSTREAM_HEALTH.reset()
+    api_gov.GLOBAL_QUOTA_PACER.reset()
     model_api_mod = sys.modules.get("infrastructure.ai_api.model_api")
     orig_model_usage_path = getattr(model_api_mod, "MODEL_USAGE_JSON_PATH", None) if model_api_mod is not None else None
     if model_api_mod is not None:
@@ -47,14 +48,9 @@ def offline_resources_and_registry(tmp_path):
         api_gov._HEALTH_DIR = orig_health_dir
         api_gov._PROCESS_ROLE = orig_process_role
         api_gov.GLOBAL_UPSTREAM_HEALTH.reset()
+        api_gov.GLOBAL_QUOTA_PACER.reset()
         if model_api_mod is not None and orig_model_usage_path is not None:
             model_api_mod.MODEL_USAGE_JSON_PATH = orig_model_usage_path
-        jd_client_mod = sys.modules.get("infrastructure.jd_client")
-        if jd_client_mod is not None:
-            jd_cls = getattr(jd_client_mod, "JdClient", None)
-            if jd_cls is not None:
-                with jd_cls._KEY_PACE_LOCK:
-                    jd_cls._KEY_NEXT_ALLOWED_TS.clear()
         order_service_mod = sys.modules.get("services.order_service")
         if order_service_mod is not None:
             order_service_mod._LAST_SYNC_TIMESTAMP.clear()

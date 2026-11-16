@@ -322,7 +322,8 @@ def extract_jd_image_key(image_url: Any) -> str:
             return ""
         parts = [p for p in path.split("/") if p]
         if len(parts) >= 2:
-            stem = re.sub(r"\.(?:jpg|jpeg|png|webp|gif|avif)+$", "", parts[-1], flags=re.IGNORECASE)
+            raw_last = parts[-1].split("!", 1)[0]
+            stem = re.sub(r"(?:\.(?:jpg|jpeg|png|webp|gif|avif|dpg))+$", "", raw_last, flags=re.IGNORECASE)
             parent = parts[-2]
             if (
                 len(parent) >= 8

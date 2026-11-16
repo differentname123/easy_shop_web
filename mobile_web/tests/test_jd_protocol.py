@@ -503,7 +503,7 @@ def test_jd_detail_301_rate_limit_vs_off_promotion_arbitration_and_eviction():
             "jCommand": "口令", "jShortCommand": "短口令"}}, field="result", string=True),
     )
     a_alive = adapter(client(http_rate_limited))
-    res_alive = a_alive.get_goods_detail(off_promo_id)
+    res_alive = a_alive.get_goods_detail(off_promo_id, allow_fallback=False)
     assert res_alive["status"] == "error"
     assert res_alive["error_code"] == "RATE_LIMIT"
 
@@ -799,12 +799,12 @@ def test_merchant_main_image_update_preserves_detail_and_coupon_via_verified_cip
     assert detail_res["data"]["goods_id"] == new_img_key
     assert detail_res["data"]["goods_sign"] == req_sign
 
-    # 2. enrich_detail_resilient 在 301 频控兜底路径下同样兼容商家换主图与跨 Key 重签名
+    # 2. get_goods_detail 在 301 频控兜底路径下同样兼容商家换主图与跨 Key 重签名
     c_rl = Mock()
     c_rl.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
     c_rl.convert_promotion_link.return_value = {"status": "success", "short_url": "https://u.jd.com/probe_cola"}
     c_rl.search_goods.return_value = {"status": "success", "total_count": 1, "data": c.get_goods_detail.return_value["data"]}
-    resilient = adapter(c_rl).enrich_detail_resilient(req_sign, goods_id=old_img_key, goods_sign=req_sign)
+    resilient = adapter(c_rl).get_goods_detail(req_sign, goods_id=old_img_key, goods_sign=req_sign)
     assert resilient["status"] == "success"
     assert resilient["data"]["price"] == 60.0 and resilient["data"]["coupon_amount"] == 4.0
     assert resilient["data"]["goods_sign"] == req_sign
@@ -851,16 +851,18 @@ def test_jd_search_goods_rescues_single_key_301_rate_limit_and_converges_on_genu
 
 def test_jd_client_per_key_pacing_reserves_slots_per_appkey_and_skips_mocks(monkeypatch):
     import requests
+    from infrastructure.api_governance import GLOBAL_QUOTA_PACER
 
     sleeps = []
-    monkeypatch.setattr("infrastructure.jd_client.time.monotonic", lambda: 1000.0)
-    monkeypatch.setattr("infrastructure.jd_client.time.sleep", lambda s: sleeps.append(round(s, 3)))
-    monkeypatch.setattr(JdClient, "_KEY_NEXT_ALLOWED_TS", {})
+    monkeypatch.setattr("infrastructure.api_governance.time.monotonic", lambda: 1000.0)
+    monkeypatch.setattr("infrastructure.api_governance.time.sleep", lambda s: sleeps.append(round(s, 3)))
+    monkeypatch.setattr("infrastructure.api_governance.is_real_requests_session", lambda s: isinstance(s, requests.Session))
+    monkeypatch.setattr(GLOBAL_QUOTA_PACER, "_next_allowed_ts", {})
 
     # 1. Mocked http_session incurs zero pacing sleep
     mock_cli = JdClient(appkey_list=["k-mock"], union_id="2035679405", http_session=SimpleNamespace(get=lambda *a, **kw: None))
     mock_cli._pace_real_http_by_key({"params": {"appkey": "k-mock"}})
-    assert sleeps == [] and JdClient._KEY_NEXT_ALLOWED_TS == {}
+    assert sleeps == [] and GLOBAL_QUOTA_PACER._next_allowed_ts == {}
 
     # 2. Real requests.Session spaces same-key calls by 0.22s while allowing distinct keys immediately
     real_cli = JdClient(appkey_list=["k-real-1", "k-real-2"], union_id="2035679405", http_session=requests.Session())
@@ -872,15 +874,19 @@ def test_jd_client_per_key_pacing_reserves_slots_per_appkey_and_skips_mocks(monk
 
 
 def test_jd_client_pace_backlog_fast_fails_instead_of_blocking(monkeypatch):
+    import requests
+    from infrastructure.api_governance import GLOBAL_QUOTA_PACER
+
     cli = JdClient(appkey_list=["busy_key"], union_id="100001")
-    monkeypatch.setattr(JdClient, "_KEY_NEXT_ALLOWED_TS", {"busy_key": 1000.0})
-    monkeypatch.setattr("infrastructure.jd_client.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr("infrastructure.api_governance.is_real_requests_session", lambda s: isinstance(s, requests.Session))
+    monkeypatch.setattr(GLOBAL_QUOTA_PACER, "_next_allowed_ts", {("ztk_jd_general", "busy_key"): 1000.0})
+    monkeypatch.setattr("infrastructure.api_governance.time.monotonic", lambda: 100.0)
 
     res = cli._get("https://api.zhetaoke.com:10001/api/open_jing_union_open_goods_jingfen_query.ashx", params={"appkey": "busy_key"})
     assert res["status"] == "error" and res["error_code"] == "UPSTREAM_ERROR"
 
 
-def test_jd_detail_rate_limit_fallback_uses_resilient_enrich_and_never_logs_red_cross(monkeypatch, caplog):
+def test_jd_detail_rate_limit_fallback_uses_unified_detail_and_never_logs_red_cross(monkeypatch, caplog):
     import logging
     from cache import clear_all_caches
     from models.product import ProductRef
@@ -899,11 +905,9 @@ def test_jd_detail_rate_limit_fallback_uses_resilient_enrich_and_never_logs_red_
         def resolve_product_ref(self, raw="", goods_id=None, goods_sign=None):
             return ProductRef("jd", goods_id or gid, goods_sign or enc_sign)
 
-        def enrich_detail_resilient(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
+        def get_goods_detail(self, goods_id_or_sign="", goods_id=None, goods_sign=None, uid=None, **kwargs):
+            assert kwargs.get("allow_fallback", True) is True
             return {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "京东详情接口触发临时频控"}
-
-        def get_goods_detail(self, **kwargs):
-            raise AssertionError("foreground JD detail should prefer enrich_detail_resilient")
 
     repo = Mock()
     repo.get_product_detail.return_value = {

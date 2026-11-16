@@ -48,6 +48,9 @@ NON_FALLBACK_DETERMINISTIC_ERRORS = frozenset({
     "PRODUCT_OFF_PROMOTION",
     "AUTH_REQUIRED",
     "IDENTITY_MISMATCH",
+    "AMBIGUOUS_IDENTITY",
+    "INVALID_IDENTITY",
+    "INCOMPLETE_IDENTITY",
     "INVALID_ARGUMENT",
     "INVALID_PROMOTER_ID",
     "INVALID_PDD_URL",
@@ -507,6 +510,18 @@ def track_provider_call(
     return res
 
 
+def rotate_providers(
+    providers: Sequence[Tuple[str, Callable[[], Dict[str, Any]]]],
+    start_index: int = 0,
+) -> List[Tuple[str, Callable[[], Dict[str, Any]]]]:
+    """按起始游标旋转供应商列表，兼顾轮询负载均衡与单次故障自动顺延。"""
+    items = list(providers)
+    if len(items) <= 1:
+        return items
+    offset = int(start_index) % len(items)
+    return items[offset:] + items[:offset]
+
+
 def execute_provider_chain(
     platform: str,
     operation: str,
@@ -518,7 +533,7 @@ def execute_provider_chain(
     执行有序多 API 供应商降级链：
     - 若某供应商返回完整成功（非 `degraded_product`），立即返回；
     - 若某供应商返回确定性业务结果（如 `PRODUCT_OFF_PROMOTION`、未授权、非法参数），立即短路返回，不浪费后续供应商配额；
-    - 若某供应商触发限流、网络异常或仅拿到 `degraded_product`，顺延尝试下一供应商；
+    - 若某供应商触发限流、网络异常、未捕获异常或仅拿到 `degraded_product`，顺延尝试下一供应商；
     - 若后续供应商均失败，但此前已有 `degraded_product`（带可用推广链接），保底返回该 `degraded_product`。
     """
     best_degraded: Optional[Dict[str, Any]] = None
@@ -529,7 +544,16 @@ def execute_provider_chain(
     }
 
     for prov_name, prov_fn in providers:
-        res = track_provider_call(platform, prov_name, operation, prov_fn, allow_persist=allow_persist)
+        try:
+            res = track_provider_call(platform, prov_name, operation, prov_fn, allow_persist=allow_persist)
+        except Exception as exc:
+            last_result = {
+                "status": "error",
+                "error_code": "PROVIDER_EXCEPTION",
+                "error_msg": f"{prov_name} 执行异常: {type(exc).__name__}",
+                "_provider": prov_name,
+            }
+            continue
         if not isinstance(res, dict):
             continue
         res.setdefault("_provider", prov_name)

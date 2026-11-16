@@ -3,14 +3,14 @@
 import hashlib
 import math
 import re
-import threading
 import time
 from datetime import datetime
+from typing import Optional
 
 import requests
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
-    execute_provider_chain,
+    is_real_requests_session,
     stamp_universal_resolution,
 )
 from infrastructure.http_utils import (
@@ -30,8 +30,8 @@ from models.product import (
     clean_product_id,
     extract_canonical_goods_id,
     extract_jd_image_key,
-    extract_search_keyword,
     is_jd_image_key,
+    normalize_jd_material_url,
 )
 
 
@@ -118,12 +118,12 @@ class JdAdapter(BasePlatformAdapter):
     requires_authorized_promotion = False
     requires_numeric_promoter_id = True
     requires_material_url = True
+    supports_coupon_enrichment = True
+    preserves_known_coupons_across_rank = True
     order_window_seconds = ORDER_WINDOW_SECONDS
-    _universal_rate_lock = threading.Lock()
-    _last_universal_finish_ts = 0.0
-    _UNIVERSAL_PACE_SECONDS = 0.35
 
     def __init__(self, settings=None, client=None, **overrides):
+        self._ensure_provider_state()
         if settings is None:
             from config import settings
         def setting(name, default=""):
@@ -137,17 +137,76 @@ class JdAdapter(BasePlatformAdapter):
             raw_appkeys, union_id, setting("jd_app_key"), setting("jd_app_secret"),
             setting("jd_api_base", DEFAULT_API_BASE))
         has_appkey = bool(getattr(self.client, "appkey_list", None) or setting("ztk_appkey") or setting("ztk_appkey_list"))
-        catalog = bool(client is not None or has_appkey and canonical_promoter_id(union_id))
-        self.capabilities = {"recommend": catalog, "search": catalog, "detail": catalog,
-                             "promotion": bool(catalog and self.default_promoter_id), "authorization": False,
-                             "orders": bool(client is not None or has_appkey and
-                                            setting("jd_app_key") and setting("jd_app_secret"))}
+        self._has_ztk_catalog = bool(client is not None or has_appkey and canonical_promoter_id(union_id))
+        self._has_ztk_orders = bool(
+            client is not None or has_appkey and setting("jd_app_key") and setting("jd_app_secret")
+        )
+        self._refresh_capabilities()
+
+    def _refresh_capabilities(self) -> None:
+        cat = getattr(self, "_has_ztk_catalog", False)
+        orders_ok = getattr(self, "_has_ztk_orders", False)
+        self.capabilities = {
+            "recommend": bool(cat or self._has_extra_providers("recommend")),
+            "search": bool(cat or self._has_extra_providers("search")),
+            "detail": bool(cat or self._has_extra_providers("detail")),
+            "promotion": bool((cat and self.default_promoter_id) or self._has_extra_providers("promotion")),
+            "authorization": False,
+            "orders": bool(orders_ok or self._has_extra_providers("orders")),
+        }
+
+    def _is_real_http(self) -> bool:
+        return is_real_requests_session(getattr(self.client, "http", None))
 
     def can_prefetch_detail(self, ref=None):
-        """仅对合法加密 itemId 允许后台单次补券预取（已查过的商品在 ProductService 层直接短路）。"""
+        """允许合法加密 itemId 与纯数字 SKU（存在非折淘客详情供应商时）走后台详情预取，严禁传主图哈希。"""
         if ref is None or not isinstance(ref, ProductRef):
             return False
-        return _is_encrypted_jd_item_id(ref.goods_sign)
+        sign = ref.goods_sign
+        if _is_encrypted_jd_item_id(sign):
+            return True
+        if sign and sign.isdigit() and self._has_extra_providers("detail"):
+            return True
+        return False
+
+    def normalize_material_url(self, url: str) -> str:
+        return normalize_jd_material_url(url)
+
+    def is_authoritative_material_url(self, url: str) -> bool:
+        return "jingfen.jd.com" in str(url or "")
+
+    def extract_trusted_coupon_url(self, doc: Optional[dict]) -> str:
+        return jd_coupon_url((doc or {}).get("coupon_url"))
+
+    def should_enrich_promotion_coupon(self, ref: ProductRef, local_doc: Optional[dict]) -> bool:
+        if (
+            local_doc is not None
+            and local_doc.get("detail_updated_at") is not None
+            and float(local_doc.get("coupon_amount") or 0.0) <= 0
+        ):
+            return False
+        target_sign = str((local_doc or {}).get("goods_sign") or ref.goods_sign or "").strip()
+        return bool(
+            _is_encrypted_jd_item_id(target_sign)
+            or (target_sign.isdigit() and self._has_extra_providers("detail"))
+        )
+
+    def needs_coupon_upgrade(self, universal_result: dict, product: Optional[dict]) -> bool:
+        return bool(
+            isinstance(product, dict)
+            and product.get("coupon_url")
+            and product.get("product_url")
+            and not universal_result.get("coupon_url")
+        )
+
+    def skip_prefetch_if_detail_checked(self, ref: ProductRef, item: Optional[dict]) -> Optional[float]:
+        if (
+            isinstance(item, dict)
+            and item.get("detail_updated_at") is not None
+            and (bool(item.get("coupon_url")) or float(item.get("coupon_amount") or 0.0) <= 0)
+        ):
+            return 86400.0
+        return None
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
         sign = _text(goods_sign or goods_id_or_sign or goods_id)
@@ -258,42 +317,65 @@ class JdAdapter(BasePlatformAdapter):
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东榜单频道或分页无效", data=[])
-        page, skip = offset // limit + 1, offset % limit
-        items, total, more = [], None, False
-        # Offset can straddle two upstream pages. Never publish a partial failed page.
-        while len(items) < limit:
-            result = self.client.get_rank_goods({5: 1, 1: 3}[channel], page=page, page_size=limit)
-            if result.get("status") != "success":
-                return {**result, "data": []}
-            rows = result.get("data")
-            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                return _error("PROTOCOL_ERROR", "京东榜单商品列表无效", data=[])
-            selected = rows[skip:skip + limit - len(items)]
-            try:
-                items.extend(self._summary(item) for item in selected)
-            except (ValueError, TypeError):
-                return _error("PROTOCOL_ERROR", "京东榜单商品身份或字段无效", data=[])
-            total = result.get("total_count")
-            more = skip + len(selected) < len(rows) or bool(result.get("has_more"))
-            if len(items) >= limit or not more or not rows:
-                break
-            skip, page = 0, page + 1
-        # Rank summaries never claim full DetailSnapshots, even with a detail_sink.
-        return {"status": "success", "data": items, "total_count": total,
-                "offset": offset, "next_offset": offset + len(items), "has_more": more, "next_cursor": None}
+
+        def _recommend_via_ztk():
+            page, skip = offset // limit + 1, offset % limit
+            items, total, more = [], None, False
+            # Offset can straddle two upstream pages. Never publish a partial failed page.
+            while len(items) < limit:
+                result = self.client.get_rank_goods({5: 1, 1: 3}[channel], page=page, page_size=limit)
+                if result.get("status") != "success":
+                    return {**result, "data": []}
+                rows = result.get("data")
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    return _error("PROTOCOL_ERROR", "京东榜单商品列表无效", data=[])
+                selected = rows[skip:skip + limit - len(items)]
+                try:
+                    items.extend(self._summary(item) for item in selected)
+                except (ValueError, TypeError):
+                    return _error("PROTOCOL_ERROR", "京东榜单商品身份或字段无效", data=[])
+                total = result.get("total_count")
+                more = skip + len(selected) < len(rows) or bool(result.get("has_more"))
+                if len(items) >= limit or not more or not rows:
+                    break
+                skip, page = 0, page + 1
+            # Rank summaries never claim full DetailSnapshots, even with a detail_sink.
+            return {"status": "success", "data": items, "total_count": total,
+                    "offset": offset, "next_offset": offset + len(items), "has_more": more, "next_cursor": None}
+
+        base = [("ztk_jd_rank", _recommend_via_ztk)] if self._has_ztk_catalog else []
+        providers = self._compose_providers(
+            "recommend", base, channel_type=channel, offset=offset, limit=limit,
+            uid=uid, detail_sink=detail_sink, **kwargs,
+        )
+        res = self._execute_capability("recommend", providers, allow_persist=self._is_real_http())
+        if res.get("status") != "success" and "data" not in res:
+            res["data"] = []
+        return res
 
     def search_goods(self, keyword, page=1, page_size=20, uid=None, **kwargs):
         unavailable = self._available("search")
         if unavailable:
             return {**unavailable, "data": []}
-        result = self.client.search_goods(keyword, page=page, page_size=page_size)
-        if result.get("status") != "success":
-            return result
-        try:
-            data = [self._summary(item) for item in result["data"]]
-        except (ValueError, TypeError, KeyError):
-            return _error("PROTOCOL_ERROR", "京东搜索商品身份或字段无效", data=[])
-        return {**result, "data": data}
+
+        def _search_via_ztk():
+            result = self.client.search_goods(keyword, page=page, page_size=page_size)
+            if result.get("status") != "success":
+                return result
+            try:
+                data = [self._summary(item) for item in result["data"]]
+            except (ValueError, TypeError, KeyError):
+                return _error("PROTOCOL_ERROR", "京东搜索商品身份或字段无效", data=[])
+            return {**result, "data": data}
+
+        base = [("ztk_jd_quanwang", _search_via_ztk)] if self._has_ztk_catalog else []
+        providers = self._compose_providers(
+            "search", base, keyword=keyword, page=page, page_size=page_size, uid=uid, **kwargs,
+        )
+        res = self._execute_capability("search", providers, allow_persist=self._is_real_http())
+        if res.get("status") != "success" and "data" not in res:
+            res["data"] = []
+        return res
 
     def _fetch_item(self, ref):
         target_id = ref.goods_sign or ref.goods_id
@@ -330,70 +412,103 @@ class JdAdapter(BasePlatformAdapter):
         if unavailable:
             return unavailable
         ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
-        result = self._fetch_item(ref)
-        if result.get("status") != "success":
-            target_id = ref.goods_sign or ref.goods_id
-            if (result.get("ztk_ambiguous_301") is True
-                    and _is_encrypted_jd_item_id(target_id)
-                    and self.default_promoter_id):
-                # 【交叉探针裁决】：折淘客 api_detail.ashx 返回 {'status': 301, 'content': '对应宝贝已下架'} 存在二义性：
-                # 既可能是折淘客触发单品频控，也可能是商品真正取消了京东联盟推广。
-                # 通过官方转链接口探测 https://jingfen.jd.com/detail/{id}.html 即可精确裁决：
-                # - 若转链成功 (code=200)：说明商品仍在推广，301 纯属详情接口限流 -> 返回 RATE_LIMIT 以便上层启用本地缓存兜底；
-                # - 若京东联盟返回 2001104 (商品不在推广中)：确认已取消推广 -> 返回 PRODUCT_OFF_PROMOTION 触发全链路驱逐。
-                probe = self.client.convert_promotion_link(
-                    f"https://jingfen.jd.com/detail/{target_id}.html",
-                    self.default_promoter_id,
-                )
-                if probe.get("status") == "success":
-                    return _error(
-                        "RATE_LIMIT",
-                        "京东详情接口触发临时频控，商品仍在正常推广中",
-                        probe_short_url=probe.get("short_url") or probe.get("click_url") or "",
-                    )
-                if probe.get("jd_off_promotion") is True:
-                    return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
-            return result
-        try:
-            return {"status": "success", "data": self._detail(result["data"])}
-        except (ValueError, TypeError):
-            return _error("PROTOCOL_ERROR", "京东详情字段无效")
-
-    def enrich_detail_resilient(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
-        """优先走单品详情 api_detail.ashx；若遇并发频控 (RATE_LIMIT)，自动复用探针短链经独立配额池 api_quanwang.ashx 精准补齐详情与优惠券。"""
-        ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
-        res = self.get_goods_detail(goods_id_or_sign, goods_id=goods_id, goods_sign=goods_sign)
-        if res.get("status") == "success" or res.get("error_code") != "RATE_LIMIT":
-            return res
-        short_q = _text(res.get("probe_short_url"))
-        if not short_q:
-            return res
-        try:
-            q_res = self.client.search_goods(short_q, page=1, page_size=5, has_coupon=False)
-        except TypeError:
-            q_res = self.client.search_goods(short_q, page=1, page_size=5)
-        rows = q_res.get("data") if q_res.get("status") == "success" else None
-        if not isinstance(rows, list) or len(rows) != 1 or int(q_res.get("total_count") or 1) != 1:
-            return res
-        single = dict(rows[0])
         target_id = ref.goods_sign or ref.goods_id
-        returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
+        if not target_id or "://" in target_id or target_id.startswith("//"):
+            return _error("INVALID_ARGUMENT", "京东需要商品ID而非未经核验的请求URL")
+        if is_jd_image_key(target_id):
+            return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU，不能直接使用主图哈希 ID")
+
+        allow_fallback = bool(kwargs.get("allow_fallback", True))
+        probe_state = {"short_url": "", "rate_limit_res": None}
+
+        def _detail_via_ztk():
+            result = self._fetch_item(ref)
+            if result.get("status") != "success":
+                if (result.get("ztk_ambiguous_301") is True
+                        and _is_encrypted_jd_item_id(target_id)
+                        and self.default_promoter_id):
+                    # 【交叉探针裁决】：折淘客 api_detail.ashx 返回 {'status': 301, 'content': '对应宝贝已下架'} 存在二义性：
+                    # 既可能是折淘客触发单品频控，也可能是商品真正取消了京东联盟推广。
+                    # 通过官方转链接口探测 https://jingfen.jd.com/detail/{id}.html 即可精确裁决：
+                    # - 若转链成功 (code=200)：说明商品仍在推广，301 纯属详情接口限流 -> 返回 RATE_LIMIT 以便备用源/缓存兜底；
+                    # - 若京东联盟返回 2001104 (商品不在推广中)：确认已取消推广 -> 返回 PRODUCT_OFF_PROMOTION 触发全链路驱逐。
+                    probe = self.client.convert_promotion_link(
+                        f"https://jingfen.jd.com/detail/{target_id}.html",
+                        self.default_promoter_id,
+                    )
+                    if probe.get("status") == "success":
+                        short_url = probe.get("short_url") or probe.get("click_url") or ""
+                        rl_res = _error(
+                            "RATE_LIMIT",
+                            "京东详情接口触发临时频控，商品仍在正常推广中",
+                            probe_short_url=short_url,
+                        )
+                        probe_state["short_url"] = _text(short_url)
+                        probe_state["rate_limit_res"] = rl_res
+                        return rl_res
+                    if probe.get("jd_off_promotion") is True:
+                        return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
+                return result
+            try:
+                return {"status": "success", "data": self._detail(result["data"])}
+            except (ValueError, TypeError):
+                return _error("PROTOCOL_ERROR", "京东详情字段无效")
+
+        def _detail_via_ztk_probe():
+            short_q = probe_state.get("short_url") or ""
+            rate_limit_res = probe_state.get("rate_limit_res")
+            if not short_q:
+                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
+            try:
+                q_res = self.client.search_goods(short_q, page=1, page_size=5, has_coupon=False)
+            except TypeError:
+                q_res = self.client.search_goods(short_q, page=1, page_size=5)
+            rows = q_res.get("data") if q_res.get("status") == "success" else None
+            if not isinstance(rows, list) or len(rows) != 1 or int(q_res.get("total_count") or 1) != 1:
+                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
+            single = dict(rows[0])
+            returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
+            if (
+                is_jd_image_key(ref.goods_id)
+                and returned_img_key
+                and returned_img_key != ref.goods_id
+                and not _verified_jd_cipher_pair(target_id, _item_id(single))
+            ):
+                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
+            if target_id and (not returned_img_key or _is_encrypted_jd_item_id(target_id)):
+                single["tao_id"] = target_id
+            try:
+                card = self._detail(single)
+                if ref.goods_id and not card.get("goods_id"):
+                    card["goods_id"] = ref.goods_id
+                return {"status": "success", "data": card}
+            except (ValueError, TypeError):
+                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
+
+        base = [("ztk_jd_detail", _detail_via_ztk)] if self._has_ztk_catalog else []
+        providers = self._compose_providers(
+            "detail",
+            base,
+            goods_id_or_sign=goods_id_or_sign,
+            uid=uid,
+            goods_id=ref.goods_id or goods_id,
+            goods_sign=ref.goods_sign or goods_sign,
+            **kwargs,
+        )
+        res = self._execute_capability("detail", providers, allow_persist=self._is_real_http())
         if (
-            is_jd_image_key(ref.goods_id)
-            and returned_img_key
-            and returned_img_key != ref.goods_id
-            and not _verified_jd_cipher_pair(target_id, _item_id(single))
+            allow_fallback
+            and self._has_ztk_catalog
+            and res.get("status") != "success"
+            and res.get("error_code") == "RATE_LIMIT"
+            and probe_state.get("short_url")
         ):
-            return res
-        if target_id and (not returned_img_key or _is_encrypted_jd_item_id(target_id)):
-            single["tao_id"] = target_id
-        try:
-            card = self._detail(single)
-            if ref.goods_id and not card.get("goods_id"):
-                card["goods_id"] = ref.goods_id
-            return {"status": "success", "data": card}
-        except (ValueError, TypeError):
-            return res
+            return self._execute_capability(
+                "detail",
+                [("ztk_jd_quanwang_probe", _detail_via_ztk_probe)],
+                allow_persist=self._is_real_http(),
+            )
+        return res
 
     def convert_promotion_url(self, goods_id_or_sign="", uid=None, **kwargs):
         unavailable = self._available("promotion")
@@ -408,64 +523,80 @@ class JdAdapter(BasePlatformAdapter):
         target_id = ref.goods_sign or ref.goods_id
         if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
-        # The service strips request kwargs before supplying these private bridges.
-        material = product_url(kwargs.get("trusted_product_url"))
-        clean_coupon = jd_coupon_url(kwargs.get("trusted_coupon_url"))
-        # 【对齐 test_jd_api.py 实证基准】：
-        # 加密 itemId 拼接为 https://item.jd.com/{id}.html 无法访问且转链必报 2001104 (商品不在推广中)；
-        # 必须使用 https://jingfen.jd.com/detail/{id}.html 格式直接一步转链（若缓存中残留旧版 item.jd.com 拼接格式则自动纠正）。
-        jingfen_encrypted_url = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else ""
-        if jingfen_encrypted_url and (not material or material == f"https://item.jd.com/{target_id}.html"):
-            material = jingfen_encrypted_url
-        if not material:
-            detail = self._fetch_item(ref)
-            if detail.get("status") != "success":
-                return detail
-            material = _material_url(detail["data"])
-            if not clean_coupon:
-                clean_coupon = jd_coupon_url(detail["data"].get("coupon_id"))
-        if not material:
-            return _error("MATERIAL_URL_REQUIRED", "京东物料ID缺少已核验的商品链接")
 
-        def _convert_call(mat_url, coup_url):
-            if coup_url:
-                return self.client.convert_promotion_link(mat_url, promoter, coupon_url=coup_url)
-            return self.client.convert_promotion_link(mat_url, promoter)
-
-        result = _convert_call(material, clean_coupon)
-        if result.get("status") != "success" and jingfen_encrypted_url and material == jingfen_encrypted_url:
-            # 极端情况下若榜单混淆 itemId 需换取详情页重签名 tao_id，才回退调用一次 api_detail.ashx
-            detail = self._fetch_item(ref)
-            if detail.get("status") == "success":
-                detail_material = _material_url(detail["data"])
+        def _promote_via_ztk():
+            # The service strips request kwargs before supplying these private bridges.
+            material = product_url(kwargs.get("trusted_product_url"))
+            clean_coupon = jd_coupon_url(kwargs.get("trusted_coupon_url"))
+            # 【对齐 test_jd_api.py 实证基准】：
+            # 加密 itemId 拼接为 https://item.jd.com/{id}.html 无法访问且转链必报 2001104 (商品不在推广中)；
+            # 必须使用 https://jingfen.jd.com/detail/{id}.html 格式直接一步转链（若缓存中残留旧版 item.jd.com 拼接格式则自动纠正）。
+            jingfen_encrypted_url = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else ""
+            if jingfen_encrypted_url and (not material or material == f"https://item.jd.com/{target_id}.html"):
+                material = jingfen_encrypted_url
+            if not material:
+                detail = self._fetch_item(ref)
+                if detail.get("status") != "success":
+                    return detail
+                material = _material_url(detail["data"])
                 if not clean_coupon:
                     clean_coupon = jd_coupon_url(detail["data"].get("coupon_id"))
-                if detail_material and detail_material != material:
-                    material = detail_material
-                    try:
-                        from cache import MATERIAL_CACHE
-                        if ref.goods_sign:
-                            MATERIAL_CACHE.set(("jd", "sign", ref.goods_sign), detail_material)
-                        if ref.goods_id:
-                            MATERIAL_CACHE.set(("jd", "id", ref.goods_id), detail_material)
-                    except Exception:
-                        pass
-                    result = _convert_call(material, clean_coupon)
-            elif result.get("jd_off_promotion") is True:
-                return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
-        if result.get("status") != "success":
-            if result.get("jd_off_promotion") is True:
-                return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
-            return result
-        extra_payload = {"coupon_url": clean_coupon} if clean_coupon else {}
-        return self._build_promotion_payload(
-            result,
-            promoter=promoter,
+            if not material:
+                return _error("MATERIAL_URL_REQUIRED", "京东物料ID缺少已核验的商品链接")
+
+            def _convert_call(mat_url, coup_url):
+                if coup_url:
+                    return self.client.convert_promotion_link(mat_url, promoter, coupon_url=coup_url)
+                return self.client.convert_promotion_link(mat_url, promoter)
+
+            result = _convert_call(material, clean_coupon)
+            if result.get("status") != "success" and jingfen_encrypted_url and material == jingfen_encrypted_url:
+                # 极端情况下若榜单混淆 itemId 需换取详情页重签名 tao_id，才回退调用一次 api_detail.ashx
+                detail = self._fetch_item(ref)
+                if detail.get("status") == "success":
+                    detail_material = _material_url(detail["data"])
+                    if not clean_coupon:
+                        clean_coupon = jd_coupon_url(detail["data"].get("coupon_id"))
+                    if detail_material and detail_material != material:
+                        material = detail_material
+                        try:
+                            from cache import MATERIAL_CACHE
+                            if ref.goods_sign:
+                                MATERIAL_CACHE.set(("jd", "sign", ref.goods_sign), detail_material)
+                            if ref.goods_id:
+                                MATERIAL_CACHE.set(("jd", "id", ref.goods_id), detail_material)
+                        except Exception:
+                            pass
+                        result = _convert_call(material, clean_coupon)
+                elif result.get("jd_off_promotion") is True:
+                    return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
+            if result.get("status") != "success":
+                if result.get("jd_off_promotion") is True:
+                    return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
+                return result
+            extra_payload = {"coupon_url": clean_coupon} if clean_coupon else {}
+            return self._build_promotion_payload(
+                result,
+                promoter=promoter,
+                goods_id=ref.goods_id,
+                goods_sign=ref.goods_sign,
+                uid=uid,
+                **extra_payload,
+            )
+
+        base = [("ztk_jd_byunionid", _promote_via_ztk)] if self._has_ztk_catalog else []
+        promo_kw = {k: v for k, v in kwargs.items() if k not in ("goods_id", "goods_sign", "promoter_id")}
+        providers = self._compose_providers(
+            "promotion",
+            base,
+            goods_id_or_sign=goods_id_or_sign,
+            uid=uid,
             goods_id=ref.goods_id,
             goods_sign=ref.goods_sign,
-            uid=uid,
-            **extra_payload,
+            promoter_id=promoter,
+            **promo_kw,
         )
+        return self._execute_capability("promotion", providers, allow_persist=self._is_real_http())
 
     def _build_promotion_payload(
         self,
@@ -513,9 +644,10 @@ class JdAdapter(BasePlatformAdapter):
         2. 明确拦截纯数字 item.jd.com/{数字}.html 或纯数字 SKU，严禁在转链失败时提取文本标题调用 `search_goods` 模糊搜索取首条商品顶替；
         3. 转链成功后，通过 api_detail.ashx（加密ID）或 api_quanwang.ashx（转链所得 u.jd.com 短链，youquan=0）精准反查商品详情。
         """
-        unavailable = self._available("promotion")
-        if unavailable:
-            return unavailable
+        if not self.active:
+            return _error("platform_unavailable", f"{self.platform_name}暂未启用")
+        if not (self.capabilities.get("promotion") or self._has_extra_providers("universal")):
+            return _error("CONFIG_ERROR", f"{self.platform_name}该功能缺少必要配置")
         promoter = canonical_promoter_id(kwargs.get("promoter_id") or self.default_promoter_id)
         if not promoter:
             return _error("INVALID_PROMOTER_ID", "京东转链需要服务端数字推广ID")
@@ -664,12 +796,17 @@ class JdAdapter(BasePlatformAdapter):
             )
             return stamp_universal_resolution(payload, verified_coupon_or_venue=verified_coupon_or_venue)
 
-        extra_providers = [
-            (name, lambda fn=fn: fn(text, promoter=promoter, uid=uid))
-            for name, fn in getattr(self, "extra_universal_providers", ())
-        ]
-        providers = [("ztk_jd_universal", _do_resolve), *extra_providers]
-        return execute_provider_chain("jd", "resolve_universal", providers)
+        base = [("ztk_jd_universal", _do_resolve)] if self._has_ztk_catalog else []
+        univ_kw = {k: v for k, v in kwargs.items() if k != "promoter_id"}
+        providers = self._compose_providers(
+            "universal", base, raw_text=text, uid=uid, promoter_id=promoter, **univ_kw,
+        )
+        return self._execute_capability(
+            "universal",
+            providers,
+            allow_persist=self._is_real_http(),
+            metric_operation="resolve_universal",
+        )
 
     def check_authority(self, uid):
         if not self.active:
@@ -681,8 +818,19 @@ class JdAdapter(BasePlatformAdapter):
 
     def fetch_increment_orders(self, start_time, end_time, page=1, page_size=50, **kwargs):
         unavailable = self._available("orders")
-        result = unavailable or self.client.query_orders(start_time, end_time, page=page,
-                                                         page_size=page_size, cursor=kwargs.get("cursor"))
+        if unavailable:
+            return {**unavailable, "order_list": [], "has_more": False, "next_cursor": None}
+
+        def _orders_via_ztk():
+            return self.client.query_orders(
+                start_time, end_time, page=page, page_size=page_size, cursor=kwargs.get("cursor"),
+            )
+
+        base = [("ztk_jd_orders", _orders_via_ztk)] if self._has_ztk_orders else []
+        providers = self._compose_providers(
+            "orders", base, start_time=start_time, end_time=end_time, page=page, page_size=page_size, **kwargs,
+        )
+        result = self._execute_capability("orders", providers, allow_persist=self._is_real_http())
         if result.get("status") != "success":
             return {**result, "order_list": [], "has_more": False, "next_cursor": None}
         return result

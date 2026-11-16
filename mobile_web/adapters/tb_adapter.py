@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """淘宝平台边界：官方商品、第三方ID榜单、核验身份与渠道订单映射。"""
-import math
 import json
 import re
 from datetime import datetime, timezone
@@ -8,7 +7,6 @@ from urllib.parse import urlencode, urlsplit
 
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
-    execute_provider_chain,
     is_real_requests_session,
     stamp_universal_resolution,
 )
@@ -27,9 +25,8 @@ from models.product import (
     ProductDetail,
     clean_product_id,
     extract_canonical_goods_id,
-    extract_search_keyword,
 )
-from infrastructure.tb_client import TaobaoClient
+from infrastructure.tb_client import TaobaoClient, _TB_SESSION
 from infrastructure.hdk_client import HdkClient
 from infrastructure.ztk_client import ZtkClient, ORDER_WINDOW_SECONDS
 
@@ -42,6 +39,7 @@ class TaobaoAdapter(BasePlatformAdapter):
     order_window_seconds = ORDER_WINDOW_SECONDS
 
     def __init__(self, settings=None, official_client=None, hdk_client=None, ztk_client=None, **overrides):
+        self._ensure_provider_state()
         if settings is None:
             from config import settings
         def setting(name, default=""):
@@ -69,18 +67,48 @@ class TaobaoAdapter(BasePlatformAdapter):
             pid_prefix = getattr(self.official, "pid_prefix", "") or "mm_328750149_3161250458"
         channel_adzone = _text(setting("tb_channel_adzone_id")) or adzone or "116343300219"
         self.channel_pid = _text(setting("tb_channel_pid")) or f"{pid_prefix}_{channel_adzone}"
-        official_ok = bool(official_client is not None or key and secret)
-        search_ok = bool(official_client is not None or official_ok and adzone)
+        self._official_ok = bool(official_client is not None or key and secret)
+        self._search_ok = bool(official_client is not None or self._official_ok and adzone)
         has_hdk_key = bool(getattr(self.hdk, "appkey_list", None) or setting("hdk_api_key") or hdk_keys)
+        self._hdk_ok = bool(hdk_client is not None or has_hdk_key)
         has_ztk_key = bool(getattr(self.ztk, "appkey_list", None) or setting("ztk_appkey") or ztk_keys)
         has_ztk_sid = bool(getattr(self.ztk, "sid_list", None) or setting("ztk_sid") or ztk_sids)
         has_ztk_channel = bool(has_ztk_key and has_ztk_sid)
+        self._ztk_channel_ok = bool(ztk_client is not None or has_ztk_channel)
+        self._official_auth_ok = bool(
+            official_client is not None or self._official_ok and (setting("tb_session") or has_ztk_channel)
+        )
+        self._orders_ok = bool(ztk_client is not None or has_ztk_channel)
+        self._refresh_capabilities()
+
+    def _refresh_capabilities(self) -> None:
         self.capabilities = {
-            "recommend": bool(official_ok and (hdk_client is not None or has_hdk_key)),
-            "search": search_ok, "detail": official_ok, "promotion": search_ok,
-            "authorization": bool(official_client is not None or official_ok and (setting("tb_session") or has_ztk_channel)),
-            "orders": bool(ztk_client is not None or has_ztk_channel),
+            "recommend": bool((self._official_ok and self._hdk_ok) or self._has_extra_providers("recommend")),
+            "search": bool(self._search_ok or self._has_extra_providers("search")),
+            "detail": bool(self._official_ok or self._has_extra_providers("detail")),
+            "promotion": bool(
+                self._search_ok
+                or (self._ztk_channel_ready() and bool(self.channel_pid))
+                or self._has_extra_providers("promotion")
+            ),
+            "authorization": bool(
+                self._official_auth_ok
+                or self._ztk_channel_ok
+                or self._has_extra_providers("check_authority")
+                or self._has_extra_providers("generate_authority_url")
+            ),
+            "orders": bool(self._orders_ok or self._has_extra_providers("orders")),
         }
+
+    def _is_real_http(self) -> bool:
+        ztk_http = getattr(self.ztk, "http", None)
+        off_http = getattr(self.official, "http_session", None) or _TB_SESSION
+        hdk_http = getattr(self.hdk, "http", None)
+        return (
+            is_real_requests_session(ztk_http)
+            or is_real_requests_session(off_http)
+            or is_real_requests_session(hdk_http)
+        )
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
         sign = _text(goods_sign or goods_id_or_sign or goods_id)
@@ -161,14 +189,31 @@ class TaobaoAdapter(BasePlatformAdapter):
         return ProductDetail(**data).to_dict(exclude_unset=True)
 
     def search_goods(self, keyword, page=1, page_size=20, uid=None, **kwargs):
-        # Catalog content is always public/site-wide, not personalized promotion content.
-        res = self.official.search_goods(keyword, page=page, page_size=page_size)
-        if res.get("status") != "success":
-            return res
-        return {**{key: value for key, value in res.items() if key not in ("data", "raw")},
-                "data": [self._summary(item) for item in res.get("data", [])]}
+        unavailable = self._available("search")
+        if unavailable:
+            return {**unavailable, "data": []}
+
+        def _search_via_official():
+            # Catalog content is always public/site-wide, not personalized promotion content.
+            res = self.official.search_goods(keyword, page=page, page_size=page_size)
+            if res.get("status") != "success":
+                return res
+            return {**{key: value for key, value in res.items() if key not in ("data", "raw")},
+                    "data": [self._summary(item) for item in res.get("data", [])]}
+
+        base = [("tb_official_search", _search_via_official)] if self._search_ok else []
+        providers = self._compose_providers(
+            "search", base, keyword=keyword, page=page, page_size=page_size, uid=uid, **kwargs,
+        )
+        res = self._execute_capability("search", providers, allow_persist=self._is_real_http())
+        if res.get("status") != "success" and "data" not in res:
+            res["data"] = []
+        return res
 
     def get_recommend_goods(self, channel_type=5, offset=0, limit=20, uid=None, detail_sink=None, **kwargs):
+        unavailable = self._available("recommend")
+        if unavailable:
+            return {**unavailable, "data": []}
         try:
             channel, offset, limit = int(channel_type), int(offset), int(limit)
             if channel not in (5, 1) or offset < 0 or not 1 <= limit <= 100:
@@ -184,85 +229,98 @@ class TaobaoAdapter(BasePlatformAdapter):
                 source_cursor, consumed = cursor.get("source"), offset
         except (ValueError, TypeError):
             return _error("INVALID_ARGUMENT", "淘宝榜单频道、偏移量或游标无效", data=[])
-        # Legacy offset-only callers can replay source pages; normal callers pass cursor.
-        while consumed < offset:
-            prior = self.hdk.get_ranked_ids(sale_type, limit=min(100, offset - consumed), cursor=source_cursor)
-            if prior.get("status") != "success":
-                return prior
-            count = prior.get("source_count", len(prior.get("item_ids", [])))
-            if count < 1 or not prior.get("has_more"):
-                return {"status": "success", "data": [], "offset": offset, "next_offset": consumed + count,
-                        "next_cursor": None, "has_more": False, "total_count": prior.get("total_count")}
-            consumed += count
-            source_cursor = prior.get("next_cursor")
-        source = self.hdk.get_ranked_ids(sale_type, limit=limit, cursor=source_cursor)
-        if source.get("status") != "success":
-            return source
-        ids = [_text(i) for i in source.get("item_ids", [])]
-        unique_ids = list(dict.fromkeys(i for i in ids if i))
-        by_id, source_by_sign = {}, {}
-        for start in range(0, len(unique_ids), 20):
-            batch_ids = unique_ids[start:start + 20]
-            response = self.official.get_goods_details(batch_ids)
-            # Fix source time at EACH response, not when the page is published or queued.
-            fetched_at = datetime.now(timezone.utc) if detail_sink is not None else None
-            if response.get("status") != "success":
-                return response  # A failed official batch must not advance the source cursor.
-            batch_items = response.get("data", [])
-            if not isinstance(batch_items, list):
-                return _error("PROTOCOL_ERROR", "淘宝官方详情列表无效", data=[])
-            for item in batch_items:
-                if not isinstance(item, dict):
-                    return _error("PROTOCOL_ERROR", "淘宝官方详情商品无效", data=[])
-                echoed, sign = _text(item.get("input_item_iid")), _text(item.get("goods_sign"))
-                # Map only against THIS official request, never position/title or
-                # an arbitrary opaque echo that merely looks like an original ID.
-                source_id = echoed if echoed else sign
-                if not sign or source_id not in batch_ids:
-                    return _error("PRODUCT_IDENTITY_MISMATCH", "官方榜单详情未证实本批商品身份", data=[])
-                if ((source_id in by_id and by_id[source_id][0]["goods_sign"] != sign)
-                        or (sign in source_by_sign and source_by_sign[sign] != source_id)):
-                    return _error("PRODUCT_IDENTITY_MISMATCH", "官方榜单详情商品身份存在冲突", data=[])
-                verified = dict(item)
-                verified["goods_sign"] = sign
-                verified["goods_id"] = extract_canonical_goods_id(self.platform_code, sign) or sign
-                by_id[source_id] = (verified, fetched_at)
-                source_by_sign[sign] = source_id
-        items, seen = [], set()
-        seeds = [] if detail_sink is not None else None
-        for source_id in ids:
-            matched = by_id.get(source_id)
-            if matched and matched[0]["goods_id"] not in seen:
-                item, fetched_at = matched
-                seen.add(item["goods_id"])
-                items.append(self._summary(item))
-                if seeds is not None:
-                    seeds.append((item, fetched_at))
-        try:
-            count = int(source.get("source_count", len(ids)))
-            if count < len(ids):
-                raise ValueError
-        except (ValueError, TypeError):
-            return _error("PAGINATION_ERROR", "淘宝榜单来源数量无效", data=[])
-        next_offset = offset + count
-        has_more = source.get("has_more", False)
-        if (not isinstance(has_more, bool) or has_more and
-                (next_offset <= offset or not source.get("next_cursor")
-                 or source.get("next_cursor") == source_cursor)):
-            return _error("PAGINATION_ERROR", "淘宝榜单缺少前进游标", data=[])
-        result = {"status": "success", "data": items, "offset": offset, "limit": limit,
-                  "next_offset": next_offset, "has_more": has_more, "total_count": source.get("total_count"),
-                  "next_cursor": {"channel_type": channel, "offset": next_offset,
-                                  "source": source["next_cursor"]} if has_more else None}
-        if seeds is not None:
-            # No partial page is published on a later batch/identity/paging error.
-            # The sink only collects memory; persistence belongs to the service.
-            snapshots = [DetailSnapshot(
-                ref=ProductRef(self.platform_code, item["goods_id"], item["goods_sign"]),
-                data=self._detail(item), fetched_at=fetched_at) for item, fetched_at in seeds]
-            for snapshot in snapshots:
-                detail_sink(snapshot)
-        return result
+
+        def _recommend_via_hdk_official():
+            cur_source, cur_consumed = source_cursor, consumed
+            # Legacy offset-only callers can replay source pages; normal callers pass cursor.
+            while cur_consumed < offset:
+                prior = self.hdk.get_ranked_ids(sale_type, limit=min(100, offset - cur_consumed), cursor=cur_source)
+                if prior.get("status") != "success":
+                    return prior
+                count = prior.get("source_count", len(prior.get("item_ids", [])))
+                if count < 1 or not prior.get("has_more"):
+                    return {"status": "success", "data": [], "offset": offset, "next_offset": cur_consumed + count,
+                            "next_cursor": None, "has_more": False, "total_count": prior.get("total_count")}
+                cur_consumed += count
+                cur_source = prior.get("next_cursor")
+            source = self.hdk.get_ranked_ids(sale_type, limit=limit, cursor=cur_source)
+            if source.get("status") != "success":
+                return source
+            ids = [_text(i) for i in source.get("item_ids", [])]
+            unique_ids = list(dict.fromkeys(i for i in ids if i))
+            by_id, source_by_sign = {}, {}
+            for start in range(0, len(unique_ids), 20):
+                batch_ids = unique_ids[start:start + 20]
+                response = self.official.get_goods_details(batch_ids)
+                # Fix source time at EACH response, not when the page is published or queued.
+                fetched_at = datetime.now(timezone.utc) if detail_sink is not None else None
+                if response.get("status") != "success":
+                    return response  # A failed official batch must not advance the source cursor.
+                batch_items = response.get("data", [])
+                if not isinstance(batch_items, list):
+                    return _error("PROTOCOL_ERROR", "淘宝官方详情列表无效", data=[])
+                for item in batch_items:
+                    if not isinstance(item, dict):
+                        return _error("PROTOCOL_ERROR", "淘宝官方详情商品无效", data=[])
+                    echoed, sign = _text(item.get("input_item_iid")), _text(item.get("goods_sign"))
+                    # Map only against THIS official request, never position/title or
+                    # an arbitrary opaque echo that merely looks like an original ID.
+                    source_id = echoed if echoed else sign
+                    if not sign or source_id not in batch_ids:
+                        return _error("PRODUCT_IDENTITY_MISMATCH", "官方榜单详情未证实本批商品身份", data=[])
+                    if ((source_id in by_id and by_id[source_id][0]["goods_sign"] != sign)
+                            or (sign in source_by_sign and source_by_sign[sign] != source_id)):
+                        return _error("PRODUCT_IDENTITY_MISMATCH", "官方榜单详情商品身份存在冲突", data=[])
+                    verified = dict(item)
+                    verified["goods_sign"] = sign
+                    verified["goods_id"] = extract_canonical_goods_id(self.platform_code, sign) or sign
+                    by_id[source_id] = (verified, fetched_at)
+                    source_by_sign[sign] = source_id
+            items, seen = [], set()
+            seeds = [] if detail_sink is not None else None
+            for source_id in ids:
+                matched = by_id.get(source_id)
+                if matched and matched[0]["goods_id"] not in seen:
+                    item, fetched_at = matched
+                    seen.add(item["goods_id"])
+                    items.append(self._summary(item))
+                    if seeds is not None:
+                        seeds.append((item, fetched_at))
+            try:
+                count = int(source.get("source_count", len(ids)))
+                if count < len(ids):
+                    raise ValueError
+            except (ValueError, TypeError):
+                return _error("PAGINATION_ERROR", "淘宝榜单来源数量无效", data=[])
+            next_offset = offset + count
+            has_more = source.get("has_more", False)
+            if (not isinstance(has_more, bool) or has_more and
+                    (next_offset <= offset or not source.get("next_cursor")
+                     or source.get("next_cursor") == cur_source)):
+                return _error("PAGINATION_ERROR", "淘宝榜单缺少前进游标", data=[])
+            result = {"status": "success", "data": items, "offset": offset, "limit": limit,
+                      "next_offset": next_offset, "has_more": has_more, "total_count": source.get("total_count"),
+                      "next_cursor": {"channel_type": channel, "offset": next_offset,
+                                      "source": source["next_cursor"]} if has_more else None}
+            if seeds is not None:
+                # No partial page is published on a later batch/identity/paging error.
+                # The sink only collects memory; persistence belongs to the service.
+                snapshots = [DetailSnapshot(
+                    ref=ProductRef(self.platform_code, item["goods_id"], item["goods_sign"]),
+                    data=self._detail(item), fetched_at=fetched_at) for item, fetched_at in seeds]
+                for snapshot in snapshots:
+                    detail_sink(snapshot)
+            return result
+
+        base = [("hdk_plus_tb_official_recommend", _recommend_via_hdk_official)] if (self._official_ok and self._hdk_ok) else []
+        providers = self._compose_providers(
+            "recommend", base, channel_type=channel, offset=offset, limit=limit,
+            uid=uid, detail_sink=detail_sink, **kwargs,
+        )
+        res = self._execute_capability("recommend", providers, allow_persist=self._is_real_http())
+        if res.get("status") != "success" and "data" not in res:
+            res["data"] = []
+        return res
 
     def _official_detail(self, ref):
         if not ref.key:
@@ -287,10 +345,30 @@ class TaobaoAdapter(BasePlatformAdapter):
         return {"status": "success", "data": item}
 
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):
-        res = self._official_detail(self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign))
-        if res.get("status") != "success":
-            return res
-        return {"status": "success", "data": self._detail(res["data"])}
+        unavailable = self._available("detail")
+        if unavailable:
+            return unavailable
+        ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
+        if not ref.key:
+            return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
+
+        def _detail_via_official():
+            res = self._official_detail(ref)
+            if res.get("status") != "success":
+                return res
+            return {"status": "success", "data": self._detail(res["data"])}
+
+        base = [("tb_official_detail", _detail_via_official)] if self._official_ok else []
+        providers = self._compose_providers(
+            "detail",
+            base,
+            goods_id_or_sign=goods_id_or_sign,
+            uid=uid,
+            goods_id=ref.goods_id or goods_id,
+            goods_sign=ref.goods_sign or goods_sign,
+            **kwargs,
+        )
+        return self._execute_capability("detail", providers, allow_persist=self._is_real_http())
 
     def _is_unauthorized_error(self, err) -> bool:
         """识别淘宝/折淘客网关抛出的渠道未授权或 relationId 无效错误。"""
@@ -306,6 +384,9 @@ class TaobaoAdapter(BasePlatformAdapter):
                     or re.search(r"(?:用户|推手|渠道).{0,12}(?:未授权|未备案|失效|无效)", msg))
 
     def convert_promotion_url(self, goods_id_or_sign, uid=None, **kwargs):
+        unavailable = self._available("promotion", need_auth=False, is_fallback=False)
+        if unavailable:
+            return unavailable
         identity = kwargs.get("identity") or {}
         relation_id = _text(identity.get("relation_id")) if isinstance(identity, dict) else ""
         if uid and (not relation_id or relation_id == "0"):
@@ -313,24 +394,13 @@ class TaobaoAdapter(BasePlatformAdapter):
         if uid and identity.get("external_id") is not None and _text(identity["external_id"]) != _text(uid):
             return _error("IDENTITY_MISMATCH", "淘宝推广身份与站内用户不一致", need_auth=True, is_fallback=False)
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
-        detail = self._official_detail(ref)
-        if detail.get("status") != "success":
-            return detail
-        item = detail["data"]
-        raw = item.get("raw_item") or {}
-        # Do not search a title: product URL search may require extra API permission;
-        # when denied, surface the official error rather than promote a different item.
-        official_target = self._official_product_url((raw.get("item_basic_info") or {}).get("item_url"))
-        target = official_target
-        if not target:
-            fallback_id = ref.goods_id if str(ref.goods_id).isdigit() else (ref.goods_sign or ref.goods_id or item["goods_sign"])
-            if str(fallback_id).isdigit():
-                target = "https://item.taobao.com/item.htm?" + urlencode({"id": fallback_id})
-            else:
-                target = "https://uland.taobao.com/item/edetail?" + urlencode({"id": fallback_id})
-        # 途径 B: 推手渠道推广 -> 调用折淘客高佣渠道转链
-        if uid and relation_id:
-            ztk_res = self.ztk.convert_channel_url(target, relation_id, self.channel_pid)
+
+        def _ztk_channel_convert(target, rel, goods_id_val, goods_sign_val, title_hint, *, allow_public=False):
+            ztk_res = (
+                self.ztk.convert_channel_url(target, rel, self.channel_pid, allow_public=True)
+                if allow_public
+                else self.ztk.convert_channel_url(target, rel, self.channel_pid)
+            )
             if not isinstance(ztk_res, dict) or ztk_res.get("status") != "success":
                 err = ztk_res.get("error_msg") if isinstance(ztk_res, dict) else "折淘客渠道转链失败"
                 is_unauth = self._is_unauthorized_error(ztk_res)
@@ -340,18 +410,22 @@ class TaobaoAdapter(BasePlatformAdapter):
             if not link or not str(link).startswith(("https://", "http://")):
                 return _error("PROMOTION_UNAVAILABLE", "折淘客未返回有效渠道推广链接")
             password = ztk_res.get("tpwd") or ""
-            if not password:
-                token = self.official.create_tpwd(link, text=item.get("goods_name") or "精选好物")
+            if not password and self._official_ok:
+                token = self.official.create_tpwd(link, text=title_hint or "精选好物")
                 password = token.get("password_simple") or token.get("model") or ""
             if not password:
                 return _error("PROTOCOL_ERROR", "渠道转链未生成有效淘口令")
             short_url = _text(ztk_res.get("short_url"))
+            is_channel = bool(uid and rel)
             result = {
                 "status": "success", "url": link, "final_link": short_url or link, "mobile_url": link, "short_url": short_url,
                 "we_app_info": {}, "promotion_token": password, "token_type": "tpwd",
-                "attribution_status": "verified", "relation_id": relation_id, "need_auth": False,
-                "is_fallback": False, "goods_id": item.get("goods_id", ""),
-                "goods_sign": item.get("goods_sign", ""), "link_type": "折淘客渠道淘口令",
+                "attribution_status": "verified" if is_channel else "anonymous",
+                "relation_id": rel if is_channel else "",
+                "need_auth": False,
+                "is_fallback": False, "goods_id": goods_id_val,
+                "goods_sign": goods_sign_val,
+                "link_type": "折淘客渠道淘口令" if is_channel else "折淘客高佣淘口令",
             }
             expires = _timestamp(ztk_res.get("expires_at"))
             if expires:
@@ -359,46 +433,103 @@ class TaobaoAdapter(BasePlatformAdapter):
             result["cacheable"] = bool(expires)
             return result
 
-        # 途径 A: 站长/自营/无渠道普通推广 -> 调用官方 TOP 物料升级接口
-        res = self.official.search_goods(target, page=1, page_size=20)
-        if res.get("status") != "success":
-            return res
-        expected = ProductRef(self.platform_code, item.get("goods_id", ""), item["goods_sign"])
-        candidates = res.get("data") or []
-        matches = [candidate for candidate in candidates if self._matches(candidate, expected)
-                   and (not ref.goods_id or not candidate.get("goods_id")
-                        or extract_canonical_goods_id(self.platform_code, candidate["goods_id"]) == ref.goods_id)]
-        # Real TOP responses re-encrypt IDs even for the same exact product URL.
-        # Only the official detail URL's single precise result can bridge that
-        # change, with seller/title/image corroboration; never take a keyword's
-        # first item or resolve an ambiguous/mismatching response by position.
-        if (not matches and official_target and len(candidates) == 1
-                and self._same_official_product(item, candidates[0])
-                and (not ref.goods_id or not candidates[0].get("goods_id")
-                     or extract_canonical_goods_id(self.platform_code, candidates[0]["goods_id"]) == ref.goods_id)):
-            matches = candidates
-        if len(matches) != 1:
-            return _error("PRODUCT_IDENTITY_MISMATCH", "精准生链响应与请求商品不一致")
-        promoted = matches[0]
-        link = promoted.get("coupon_share_url") or promoted.get("click_url")
-        if not link or not str(link).startswith(("https://", "http://")):
-            return _error("PROMOTION_UNAVAILABLE", "官方未返回可用的券二合一推广链接")
-        token = self.official.create_tpwd(link, text=item.get("goods_name") or "精选好物")
-        if token.get("status") != "success":
-            return token
-        password = token.get("password_simple") or token.get("model")
-        if not password:
-            return _error("PROTOCOL_ERROR", "官方未返回真实淘口令")
-        result = {"status": "success", "url": link, "final_link": link, "mobile_url": link, "short_url": "",
-                  "we_app_info": {}, "promotion_token": password, "token_type": "tpwd",
-                  "attribution_status": "anonymous", "need_auth": False,
-                  "is_fallback": False, "goods_id": item.get("goods_id", ""),
-                  "goods_sign": item.get("goods_sign", ""), "link_type": "淘宝官方淘口令"}
-        expires = _timestamp(token.get("expires_at") or (token.get("raw") or {}).get("expires_at"))
-        if expires:
-            result["expires_at"] = expires
-        result["cacheable"] = bool(expires)
-        return result
+        def _promote_via_official_or_ztk():
+            detail = self._official_detail(ref)
+            if detail.get("status") != "success":
+                return detail
+            item = detail["data"]
+            raw = item.get("raw_item") or {}
+            # Do not search a title: product URL search may require extra API permission;
+            # when denied, surface the official error rather than promote a different item.
+            official_target = self._official_product_url((raw.get("item_basic_info") or {}).get("item_url"))
+            target = official_target
+            if not target:
+                fallback_id = ref.goods_id if str(ref.goods_id).isdigit() else (ref.goods_sign or ref.goods_id or item["goods_sign"])
+                if str(fallback_id).isdigit():
+                    target = "https://item.taobao.com/item.htm?" + urlencode({"id": fallback_id})
+                else:
+                    target = "https://uland.taobao.com/item/edetail?" + urlencode({"id": fallback_id})
+            # 途径 B: 推手渠道推广 -> 调用折淘客高佣渠道转链
+            if uid and relation_id:
+                return _ztk_channel_convert(
+                    target, relation_id, item.get("goods_id", ""), item.get("goods_sign", ""), item.get("goods_name"),
+                )
+            # 途径 A: 站长/自营/无渠道普通推广 -> 若无官方搜索权限但配置了 ZTK 通道，可走 ZTK 公共高佣转链
+            if not self._search_ok and self._ztk_channel_ready() and self.channel_pid:
+                return _ztk_channel_convert(
+                    target, "", item.get("goods_id", ""), item.get("goods_sign", ""), item.get("goods_name"),
+                    allow_public=True,
+                )
+            # 调用官方 TOP 物料升级接口
+            res = self.official.search_goods(target, page=1, page_size=20)
+            if res.get("status") != "success":
+                return res
+            expected = ProductRef(self.platform_code, item.get("goods_id", ""), item["goods_sign"])
+            candidates = res.get("data") or []
+            matches = [candidate for candidate in candidates if self._matches(candidate, expected)
+                       and (not ref.goods_id or not candidate.get("goods_id")
+                            or extract_canonical_goods_id(self.platform_code, candidate["goods_id"]) == ref.goods_id)]
+            # Real TOP responses re-encrypt IDs even for the same exact product URL.
+            # Only the official detail URL's single precise result can bridge that
+            # change, with seller/title/image corroboration; never take a keyword's
+            # first item or resolve an ambiguous/mismatching response by position.
+            if (not matches and official_target and len(candidates) == 1
+                    and self._same_official_product(item, candidates[0])
+                    and (not ref.goods_id or not candidates[0].get("goods_id")
+                         or extract_canonical_goods_id(self.platform_code, candidates[0]["goods_id"]) == ref.goods_id)):
+                matches = candidates
+            if len(matches) != 1:
+                return _error("PRODUCT_IDENTITY_MISMATCH", "精准生链响应与请求商品不一致")
+            promoted = matches[0]
+            link = promoted.get("coupon_share_url") or promoted.get("click_url")
+            if not link or not str(link).startswith(("https://", "http://")):
+                return _error("PROMOTION_UNAVAILABLE", "官方未返回可用的券二合一推广链接")
+            token = self.official.create_tpwd(link, text=item.get("goods_name") or "精选好物")
+            if token.get("status") != "success":
+                return token
+            password = token.get("password_simple") or token.get("model")
+            if not password:
+                return _error("PROTOCOL_ERROR", "官方未返回真实淘口令")
+            result = {"status": "success", "url": link, "final_link": link, "mobile_url": link, "short_url": "",
+                      "we_app_info": {}, "promotion_token": password, "token_type": "tpwd",
+                      "attribution_status": "anonymous", "need_auth": False,
+                      "is_fallback": False, "goods_id": item.get("goods_id", ""),
+                      "goods_sign": item.get("goods_sign", ""), "link_type": "淘宝官方淘口令"}
+            expires = _timestamp(token.get("expires_at") or (token.get("raw") or {}).get("expires_at"))
+            if expires:
+                result["expires_at"] = expires
+            result["cacheable"] = bool(expires)
+            return result
+
+        def _promote_via_ztk_only():
+            target_id = ref.goods_id if str(ref.goods_id).isdigit() else (ref.goods_sign or ref.goods_id)
+            if not target_id:
+                return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
+            target = (
+                f"https://item.taobao.com/item.htm?{urlencode({'id': target_id})}"
+                if str(target_id).isdigit()
+                else f"https://uland.taobao.com/item/edetail?{urlencode({'id': target_id})}"
+            )
+            rel = relation_id if (uid and relation_id) else ""
+            return _ztk_channel_convert(
+                target, rel, ref.goods_id, ref.goods_sign or ref.goods_id,
+                _text(kwargs.get("title") or kwargs.get("name")), allow_public=(not rel),
+            )
+
+        base = []
+        if self._official_ok:
+            base.append(("tb_official_promote", _promote_via_official_or_ztk))
+        elif self._ztk_channel_ready() and self.channel_pid:
+            base.append(("ztk_tb_promote", _promote_via_ztk_only))
+
+        providers = self._compose_providers(
+            "promotion",
+            base,
+            goods_id_or_sign=goods_id_or_sign,
+            uid=uid,
+            **kwargs,
+        )
+        return self._execute_capability("promotion", providers, allow_persist=self._is_real_http())
 
     def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):
         """
@@ -429,20 +560,6 @@ class TaobaoAdapter(BasePlatformAdapter):
             )
         is_bare_id = bool(re.match(r"^[A-Za-z0-9_-]{8,}$", text)) and not text.startswith(("http://", "https://"))
         tkl_input = f"https://uland.taobao.com/item/edetail?id={text}" if is_bare_id else text
-
-        if not self._ztk_channel_ready() or not self.channel_pid:
-            if is_bare_id:
-                conv = self.convert_promotion_url(text, uid=uid, identity=identity)
-                if conv.get("status") != "success":
-                    return stamp_universal_resolution(conv, single_item_evidence=True)
-                det = self.get_goods_detail(text)
-                if det.get("status") == "success":
-                    conv["product"] = det["data"]
-                else:
-                    conv["detail_lookup_failed"] = True
-                return stamp_universal_resolution(conv, single_item_evidence=True)
-            return _error("CONFIG_ERROR", "淘宝折淘客万能转链未配置完整 (需 ZTK_APPKEY / ZTK_SID / TB_CHANNEL_PID)")
-
         rel_arg = relation_id if (uid and relation_id) else ""
 
         def _do_ztk_resolve():
@@ -548,17 +665,33 @@ class TaobaoAdapter(BasePlatformAdapter):
                 verified_coupon_or_venue=(not is_explicit_single_item),
             )
 
-        extra_providers = [
-            (name, lambda fn=fn: fn(text, uid=uid, identity=identity))
-            for name, fn in getattr(self, "extra_universal_providers", ())
-        ]
-        ztk_http = getattr(self.ztk, "http", None)
-        allow_persist = is_real_requests_session(ztk_http)
-        return execute_provider_chain(
-            "taobao",
-            "resolve_universal",
-            [("ztk_tb_universal", _do_ztk_resolve), *extra_providers],
-            allow_persist=allow_persist,
+        def _do_bare_id_resolve():
+            conv = self.convert_promotion_url(text, uid=uid, identity=identity)
+            if conv.get("status") != "success":
+                return stamp_universal_resolution(conv, single_item_evidence=True)
+            det = self.get_goods_detail(text)
+            if det.get("status") == "success":
+                conv["product"] = det["data"]
+            else:
+                conv["detail_lookup_failed"] = True
+            return stamp_universal_resolution(conv, single_item_evidence=True)
+
+        if self._ztk_channel_ready() and self.channel_pid:
+            base = [("ztk_tb_universal", _do_ztk_resolve)]
+        elif is_bare_id and self._official_ok:
+            base = [("tb_official_universal", _do_bare_id_resolve)]
+        else:
+            base = []
+
+        if not base and not self._has_extra_providers("universal"):
+            return _error("CONFIG_ERROR", "淘宝折淘客万能转链未配置完整 (需 ZTK_APPKEY / ZTK_SID / TB_CHANNEL_PID)")
+
+        providers = self._compose_providers("universal", base, raw_text=text, uid=uid, **kwargs)
+        return self._execute_capability(
+            "universal",
+            providers,
+            allow_persist=self._is_real_http(),
+            metric_operation="resolve_universal",
         )
 
     def _ztk_channel_ready(self) -> bool:
@@ -567,60 +700,106 @@ class TaobaoAdapter(BasePlatformAdapter):
         return bool(isinstance(appkeys, (tuple, list)) and appkeys and isinstance(sid, str) and sid.strip())
 
     def check_authority(self, uid):
-        current_sess = getattr(self.official, "session_key", None)
-        if getattr(self, "_last_invalid_session", None) and current_sess and current_sess == self._last_invalid_session:
+        unavailable = self._available("authorization", is_authorized=False)
+        if unavailable:
+            return unavailable
+
+        def _auth_via_official():
+            current_sess = getattr(self.official, "session_key", None)
+            if getattr(self, "_last_invalid_session", None) and current_sess and current_sess == self._last_invalid_session:
+                if hasattr(self.official, "try_refresh_session") and callable(self.official.try_refresh_session):
+                    try:
+                        self.official.try_refresh_session()
+                    except Exception:
+                        pass
+                current_sess = getattr(self.official, "session_key", None)
+                if current_sess == self._last_invalid_session:
+                    return _error("SESSION_EXPIRED", "淘宝渠道授权服务正在刷新凭证，请稍后再试")
+
+            res = self.official.check_authority(uid)
+            if isinstance(res, dict) and res.get("status") == "success":
+                self._last_invalid_session = None
+                return res
+            err_code = str((res or {}).get("error_code") or "")
+            if err_code in ("IDENTITY_MISMATCH", "AMBIGUOUS_IDENTITY", "INVALID_IDENTITY", "INCOMPLETE_IDENTITY"):
+                return res
+            is_invalid_sess = isinstance(res, dict) and (
+                "invalid-sessionkey" in str(res.get("error_msg", "")).lower() or err_code == "27"
+            )
             if hasattr(self.official, "try_refresh_session") and callable(self.official.try_refresh_session):
                 try:
-                    self.official.try_refresh_session()
+                    if self.official.try_refresh_session():
+                        retry_res = self.official.check_authority(uid)
+                        if isinstance(retry_res, dict) and retry_res.get("status") == "success":
+                            self._last_invalid_session = None
+                            return retry_res
                 except Exception:
                     pass
-            current_sess = getattr(self.official, "session_key", None)
-            if current_sess == self._last_invalid_session and self._ztk_channel_ready() and hasattr(self.ztk, "check_publisher_relation"):
-                ztk_res = self.ztk.check_publisher_relation(uid)
-                if isinstance(ztk_res, dict) and ztk_res.get("status") == "success":
-                    return ztk_res
+            if is_invalid_sess and isinstance(getattr(self.official, "session_key", None), str):
+                self._last_invalid_session = self.official.session_key
+            if is_invalid_sess:
+                return _error("SESSION_EXPIRED", "淘宝渠道授权服务正在刷新凭证，请稍后再试")
+            return res
 
-        res = self.official.check_authority(uid)
-        if isinstance(res, dict) and res.get("status") == "success":
-            self._last_invalid_session = None
-            return res
-        err_code = str((res or {}).get("error_code") or "")
-        if err_code in ("IDENTITY_MISMATCH", "AMBIGUOUS_IDENTITY", "INVALID_IDENTITY", "INCOMPLETE_IDENTITY"):
-            return res
-        is_invalid_sess = isinstance(res, dict) and ("invalid-sessionkey" in str(res.get("error_msg", "")).lower() or err_code == "27")
-        if hasattr(self.official, "try_refresh_session") and callable(self.official.try_refresh_session):
-            try:
-                if self.official.try_refresh_session():
-                    retry_res = self.official.check_authority(uid)
-                    if isinstance(retry_res, dict) and retry_res.get("status") == "success":
-                        self._last_invalid_session = None
-                        return retry_res
-            except Exception:
-                pass
-        if is_invalid_sess and isinstance(getattr(self.official, "session_key", None), str):
-            self._last_invalid_session = self.official.session_key
+        def _auth_via_ztk():
+            return self.ztk.check_publisher_relation(uid)
+
+        base = []
+        if self._official_auth_ok and hasattr(self.official, "check_authority"):
+            base.append(("tb_official_auth", _auth_via_official))
         if self._ztk_channel_ready() and hasattr(self.ztk, "check_publisher_relation"):
-            ztk_res = self.ztk.check_publisher_relation(uid)
-            if isinstance(ztk_res, dict) and ztk_res.get("status") == "success":
-                return ztk_res
-        if is_invalid_sess:
-            return _error("SESSION_EXPIRED", "淘宝渠道授权服务正在刷新凭证，请稍后再试")
-        return res
+            base.append(("ztk_tb_auth", _auth_via_ztk))
+
+        providers = self._compose_providers("check_authority", base, uid=uid)
+        return self._execute_capability("check_authority", providers, allow_persist=self._is_real_http())
 
     def generate_authority_url(self, uid, **kwargs):
-        if self._ztk_channel_ready() and not getattr(self.official, "inviter_code", "") and hasattr(self.ztk, "generate_authority_url"):
-            ztk_res = self.ztk.generate_authority_url(uid)
-            if isinstance(ztk_res, dict) and ztk_res.get("status") == "success":
-                return ztk_res
-        res = self.official.generate_authority_url(uid)
-        if isinstance(res, dict) and res.get("status") == "success":
-            return res
-        if self._ztk_channel_ready() and hasattr(self.ztk, "generate_authority_url"):
-            return self.ztk.generate_authority_url(uid, inviter_code=getattr(self.official, "inviter_code", ""))
-        return res
+        unavailable = self._available("authorization", is_authorized=False)
+        if unavailable:
+            return unavailable
+
+        def _official_auth_url():
+            return self.official.generate_authority_url(uid, **kwargs) if kwargs else self.official.generate_authority_url(uid)
+
+        def _ztk_auth_url(with_inviter: bool = False):
+            inv = getattr(self.official, "inviter_code", "") if with_inviter else ""
+            if inv:
+                return self.ztk.generate_authority_url(uid, inviter_code=inv)
+            return self.ztk.generate_authority_url(uid)
+
+        ztk_ready = self._ztk_channel_ready() and hasattr(self.ztk, "generate_authority_url")
+        off_ready = self._official_auth_ok and hasattr(self.official, "generate_authority_url")
+        ztk_first = ztk_ready and not getattr(self.official, "inviter_code", "")
+
+        base = []
+        if ztk_first:
+            base.append(("ztk_tb_auth_url", lambda: _ztk_auth_url(False)))
+            if off_ready:
+                base.append(("tb_official_auth_url", _official_auth_url))
+        else:
+            if off_ready:
+                base.append(("tb_official_auth_url", _official_auth_url))
+            if ztk_ready:
+                base.append(("ztk_tb_auth_url", lambda: _ztk_auth_url(True)))
+
+        providers = self._compose_providers("generate_authority_url", base, uid=uid, **kwargs)
+        return self._execute_capability("generate_authority_url", providers, allow_persist=self._is_real_http())
 
     def fetch_increment_orders(self, start_time, end_time, page=1, page_size=50, **kwargs):
-        result = self.ztk.query_orders(start_time, end_time, page=page, page_size=page_size, cursor=kwargs.get("cursor"))
+        unavailable = self._available("orders")
+        if unavailable:
+            return {**unavailable, "order_list": [], "has_more": False, "next_cursor": None}
+
+        def _orders_via_ztk():
+            return self.ztk.query_orders(
+                start_time, end_time, page=page, page_size=page_size, cursor=kwargs.get("cursor"),
+            )
+
+        base = [("ztk_tb_orders", _orders_via_ztk)] if self._orders_ok else []
+        providers = self._compose_providers(
+            "orders", base, start_time=start_time, end_time=end_time, page=page, page_size=page_size, **kwargs,
+        )
+        result = self._execute_capability("orders", providers, allow_persist=self._is_real_http())
         if result.get("status") != "success":
             return {**result, "order_list": [], "has_more": False, "next_cursor": None}
         return result

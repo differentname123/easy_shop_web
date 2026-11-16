@@ -2,7 +2,7 @@
 """
 存量京东榜单/有券商品一次性低耗补券回填脚本：
 - 默认优先扫描存量从未拉取过详情的京东实时榜单商品 (channel_type in [1, 5], detail_updated_at is None)，
-  通过 JdAdapter.enrich_detail_resilient 单次补齐官方隐藏优惠券链接 (coupon_url) 与券后价；
+  通过 JdAdapter.get_goods_detail 单次补齐官方隐藏优惠券链接 (coupon_url) 与券后价；
 - 遇并发线报调度器折淘客 60s 峰值窗口限流时，自动退避重试，遇明确下架 (PRODUCT_OFF_PROMOTION) 自动清理；
 - 已查过的商品写入 detail_updated_at，幂等可中断续跑，不会重复消耗配额。
 
@@ -131,7 +131,7 @@ def main(argv=None) -> int:
         for delay in BACKOFF_SCHEDULE:
             if delay > 0:
                 time.sleep(delay)
-            res = adapter.enrich_detail_resilient(sign, goods_id=gid or None, goods_sign=sign)
+            res = adapter.get_goods_detail(sign, goods_id=gid or None, goods_sign=sign)
             if res.get("error_code") != "RATE_LIMIT":
                 break
 

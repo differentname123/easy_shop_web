@@ -5,10 +5,8 @@ from typing import Dict, Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
-    execute_provider_chain,
     is_real_requests_session,
     stamp_universal_resolution,
-    track_provider_call,
 )
 from infrastructure.logging_utils import format_exc_summary
 from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id, extract_search_keyword
@@ -34,10 +32,34 @@ class PddAdapter(BasePlatformAdapter):
     recommendation_limit = 400
 
     def __init__(self, client_id=PDD_CLIENT_ID, client_secret=PDD_CLIENT_SECRET, pid=PDD_PID, enabled=None):
+        self._ensure_provider_state()
         self.active = settings.pdd_enabled if enabled is None else bool(enabled)
         self.client_id = client_id
         self.client_secret = client_secret
         self.pid = pid
+        self._refresh_capabilities()
+
+    def _has_official_creds(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+    def _refresh_capabilities(self) -> None:
+        cred_ok = self._has_official_creds()
+        pid_ok = bool(cred_ok and self.pid)
+        self.capabilities = {
+            "recommend": bool(pid_ok or self._has_extra_providers("recommend")),
+            "search": bool(pid_ok or self._has_extra_providers("search")),
+            "detail": bool(pid_ok or self._has_extra_providers("detail")),
+            "promotion": bool(pid_ok or self._has_extra_providers("promotion")),
+            "authorization": bool(
+                pid_ok
+                or self._has_extra_providers("check_authority")
+                or self._has_extra_providers("generate_authority_url")
+            ),
+            "orders": bool(cred_ok or self._has_extra_providers("orders")),
+        }
+
+    def _is_real_http(self) -> bool:
+        return is_real_requests_session(_PDD_SESSION)
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None) -> ProductRef:
         raw = str(goods_id_or_sign or "").strip()
@@ -130,126 +152,173 @@ class PddAdapter(BasePlatformAdapter):
 
     def get_recommend_goods(self, channel_type=5, offset=0, limit=20, uid=None, detail_sink=None, **kwargs) -> Dict[str, Any]:
         """400 条推荐上限是拼多多规则；内部 detail_sink 不转发到供应商。"""
+        unavailable = self._available("recommend")
+        if unavailable:
+            return {**unavailable, "data": []}
         if channel_type not in {channel["channel_type"] for channel in self.channels}:
             return {"status": "error", "error_code": "invalid_channel", "error_msg": "不支持的榜单", "data": []}
         if offset >= self.recommendation_limit:
             return {"status": "success", "total_count": self.recommendation_limit, "offset": offset,
                     "limit": limit, "has_more": False, "data": []}
         request_limit = min(limit, self.recommendation_limit - offset)
-        try:
-            cursor = kwargs.pop("cursor", None)
-            if cursor and "list_id" not in kwargs:
-                if isinstance(cursor, dict) and cursor.get("list_id"):
-                    kwargs["list_id"] = str(cursor["list_id"]).strip()
-                elif isinstance(cursor, str) and cursor.strip():
-                    kwargs["list_id"] = cursor.strip()
-            params = {
-                "channel_type": channel_type, "offset": offset, "limit": request_limit,
-                "pid": self.pid, "custom_parameters": make_custom_parameters(uid=uid) if uid else None,
-                **kwargs,
-            }
-            res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.recommend.get", params)
-            response = res.get("goods_basic_detail_response", {})
-            raw_items = response.get("list", [])
-            items = [self._normalize_goods_summary(clean_goods_item(item, source_type=f"pdd_recommend_{channel_type}"))
-                     for item in raw_items if item]
-            total = response.get("total")
-            has_total = isinstance(total, int) and not isinstance(total, bool) and total > 0
-            effective_limit = min(self.recommendation_limit, total) if has_total else self.recommendation_limit
-            has_more = (
-                bool(raw_items) and offset + request_limit < effective_limit
-                if has_total
-                else len(raw_items) >= request_limit and offset + request_limit < self.recommendation_limit
-            )
-            next_offset = offset + request_limit if (has_total and raw_items) else offset + len(raw_items)
-            list_id = response.get("list_id", "") or kwargs.get("list_id", "")
-            return {
-                "status": "success", "total_count": total if total is not None else len(items),
-                "offset": offset, "limit": limit, "next_offset": next_offset,
-                "list_id": list_id,
-                "next_cursor": list_id if (has_more and list_id) else None,
-                "has_more": has_more,
-                "data": items,
-            }
-        except Exception as exc:
-            logger.debug(
-                "【拼多多接口异常】拉取推荐商品流异常，交由上层服务处理 | 频道[%s] 偏移[%s] 异常<%s>",
-                channel_type, offset, format_exc_summary(exc),
-            )
-            return {"status": "error", "error_msg": str(exc), "data": []}
+
+        def _recommend_via_pdd():
+            call_kw = dict(kwargs)
+            try:
+                cursor = call_kw.pop("cursor", None)
+                if cursor and "list_id" not in call_kw:
+                    if isinstance(cursor, dict) and cursor.get("list_id"):
+                        call_kw["list_id"] = str(cursor["list_id"]).strip()
+                    elif isinstance(cursor, str) and cursor.strip():
+                        call_kw["list_id"] = cursor.strip()
+                params = {
+                    "channel_type": channel_type, "offset": offset, "limit": request_limit,
+                    "pid": self.pid, "custom_parameters": make_custom_parameters(uid=uid) if uid else None,
+                    **call_kw,
+                }
+                res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.recommend.get", params)
+                response = res.get("goods_basic_detail_response", {})
+                raw_items = response.get("list", [])
+                items = [self._normalize_goods_summary(clean_goods_item(item, source_type=f"pdd_recommend_{channel_type}"))
+                         for item in raw_items if item]
+                total = response.get("total")
+                has_total = isinstance(total, int) and not isinstance(total, bool) and total > 0
+                effective_limit = min(self.recommendation_limit, total) if has_total else self.recommendation_limit
+                has_more = (
+                    bool(raw_items) and offset + request_limit < effective_limit
+                    if has_total
+                    else len(raw_items) >= request_limit and offset + request_limit < self.recommendation_limit
+                )
+                next_offset = offset + request_limit if (has_total and raw_items) else offset + len(raw_items)
+                list_id = response.get("list_id", "") or call_kw.get("list_id", "")
+                return {
+                    "status": "success", "total_count": total if total is not None else len(items),
+                    "offset": offset, "limit": limit, "next_offset": next_offset,
+                    "list_id": list_id,
+                    "next_cursor": list_id if (has_more and list_id) else None,
+                    "has_more": has_more,
+                    "data": items,
+                }
+            except Exception as exc:
+                logger.debug(
+                    "【拼多多接口异常】拉取推荐商品流异常，交由上层服务处理 | 频道[%s] 偏移[%s] 异常<%s>",
+                    channel_type, offset, format_exc_summary(exc),
+                )
+                return {"status": "error", "error_msg": str(exc), "data": []}
+
+        base = [("pdd_official_recommend", _recommend_via_pdd)] if (self._has_official_creds() and self.pid) else []
+        providers = self._compose_providers(
+            "recommend", base, channel_type=channel_type, offset=offset, limit=limit,
+            uid=uid, detail_sink=detail_sink, **kwargs,
+        )
+        res = self._execute_capability("recommend", providers, allow_persist=self._is_real_http())
+        if res.get("status") != "success" and "data" not in res:
+            res["data"] = []
+        return res
 
     def search_goods(self, keyword, page=1, page_size=20, uid=None, **kwargs) -> Dict[str, Any]:
-        try:
-            size = max(1, min(100, int(page_size or 20)))
-            gateway_size = size
-            params = {"keyword": keyword, "pid": self.pid, "page": page, "page_size": gateway_size,
-                      "custom_parameters": make_custom_parameters(uid=uid) if uid else None, **kwargs}
+        unavailable = self._available("search")
+        if unavailable:
+            return {**unavailable, "data": []}
+
+        def _search_via_pdd():
             try:
-                res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
-            except Exception as first_exc:
-                # 【对齐 test_pdd_api.py 实证基准】：
-                # 若当前登录用户尚未完成拼多多推手备案 (触发 60001 未传入已经授权备案过的相关参数)，
-                # 公共商品搜索自动回退为不传 custom_parameters（站长已备案 PID 级）重试，避免阻断用户搜索。
-                if size < 10 and ("pageSize" in str(first_exc) or "3000000" in str(first_exc)):
-                    gateway_size = 10
-                    params["page_size"] = 10
-                    try:
-                        res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
-                    except Exception as retry_exc:
-                        if uid and self._is_unauthorized_error(retry_exc):
-                            params["custom_parameters"] = None
-                            res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
-                        else:
-                            raise
-                elif uid and self._is_unauthorized_error(first_exc):
-                    params["custom_parameters"] = None
+                size = max(1, min(100, int(page_size or 20)))
+                gateway_size = size
+                params = {"keyword": keyword, "pid": self.pid, "page": page, "page_size": gateway_size,
+                          "custom_parameters": make_custom_parameters(uid=uid) if uid else None, **kwargs}
+                try:
                     res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
-                else:
-                    raise
-            response = res.get("goods_search_response", {})
-            raw_items = response.get("goods_list", [])
-            items = [self._normalize_goods_summary(clean_goods_item(item, source_type="pdd_search"))
-                     for item in raw_items if item]
-            total = response.get("total_count")
-            has_more = page * size < total if total is not None else (len(items) > size if gateway_size > size else len(raw_items) >= gateway_size)
-            items = items[:size]
-            return {
-                "status": "success", "total_count": total if total is not None else len(items),
-                "page": page, "page_size": size, "list_id": response.get("list_id", ""),
-                "has_more": has_more,
-                "data": items,
-            }
-        except Exception as exc:
-            logger.debug(
-                "【拼多多接口异常】搜索联盟商品异常，交由上层服务处理 | 关键词[%s] 页码[%s] 异常<%s>",
-                keyword, page, format_exc_summary(exc),
-            )
-            return {"status": "error", "error_msg": str(exc), "data": []}
+                except Exception as first_exc:
+                    # 【对齐 test_pdd_api.py 实证基准】：
+                    # 若当前登录用户尚未完成拼多多推手备案 (触发 60001 未传入已经授权备案过的相关参数)，
+                    # 公共商品搜索自动回退为不传 custom_parameters（站长已备案 PID 级）重试，避免阻断用户搜索。
+                    if size < 10 and ("pageSize" in str(first_exc) or "3000000" in str(first_exc)):
+                        gateway_size = 10
+                        params["page_size"] = 10
+                        try:
+                            res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+                        except Exception as retry_exc:
+                            if uid and self._is_unauthorized_error(retry_exc):
+                                params["custom_parameters"] = None
+                                res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+                            else:
+                                raise
+                    elif uid and self._is_unauthorized_error(first_exc):
+                        params["custom_parameters"] = None
+                        res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
+                    else:
+                        raise
+                response = res.get("goods_search_response", {})
+                raw_items = response.get("goods_list", [])
+                items = [self._normalize_goods_summary(clean_goods_item(item, source_type="pdd_search"))
+                         for item in raw_items if item]
+                total = response.get("total_count")
+                has_more = page * size < total if total is not None else (len(items) > size if gateway_size > size else len(raw_items) >= gateway_size)
+                items = items[:size]
+                return {
+                    "status": "success", "total_count": total if total is not None else len(items),
+                    "page": page, "page_size": size, "list_id": response.get("list_id", ""),
+                    "has_more": has_more,
+                    "data": items,
+                }
+            except Exception as exc:
+                logger.debug(
+                    "【拼多多接口异常】搜索联盟商品异常，交由上层服务处理 | 关键词[%s] 页码[%s] 异常<%s>",
+                    keyword, page, format_exc_summary(exc),
+                )
+                return {"status": "error", "error_msg": str(exc), "data": []}
+
+        base = [("pdd_official_search", _search_via_pdd)] if (self._has_official_creds() and self.pid) else []
+        providers = self._compose_providers(
+            "search", base, keyword=keyword, page=page, page_size=page_size, uid=uid, **kwargs,
+        )
+        res = self._execute_capability("search", providers, allow_persist=self._is_real_http())
+        if res.get("status") != "success" and "data" not in res:
+            res["data"] = []
+        return res
 
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs) -> Dict[str, Any]:
-        try:
-            ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
-            res = pdd_get_detail(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
-                                 goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs)
-            if res.get("status") != "success" or not res.get("data"):
-                return {
-                    "status": "error",
-                    "error_code": str(res.get("error_code") or "UPSTREAM_ERROR"),
-                    "error_msg": res.get("error_msg", "未查询到官方商品详情"),
-                }
-            item = self._normalize_goods(res["data"])
-            if ref.goods_sign and not item.get("goods_sign"):
-                item["goods_sign"] = ref.goods_sign
-            if not ref.goods_sign and ref.goods_id and item.get("goods_id") not in ("", ref.goods_id):
-                return {"status": "error", "error_msg": "商品 ID 反查结果不匹配", "error_code": "product_identity_mismatch"}
-            return {"status": "success", "data": item}
-        except Exception as exc:
-            logger.debug(
-                "【拼多多接口异常】查询商品详情异常，交由上层服务处理 | 商品[%s] 异常<%s>",
-                goods_id_or_sign or goods_id or goods_sign, format_exc_summary(exc),
-            )
-            err_code = str(getattr(exc, "error_code", "") or "").strip() or "INTERNAL_ERROR"
-            return {"status": "error", "error_code": err_code, "error_msg": str(exc)}
+        unavailable = self._available("detail")
+        if unavailable:
+            return unavailable
+        ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
+
+        def _detail_via_pdd():
+            try:
+                res = pdd_get_detail(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
+                                     goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs)
+                if res.get("status") != "success" or not res.get("data"):
+                    return {
+                        "status": "error",
+                        "error_code": str(res.get("error_code") or "UPSTREAM_ERROR"),
+                        "error_msg": res.get("error_msg", "未查询到官方商品详情"),
+                    }
+                item = self._normalize_goods(res["data"])
+                if ref.goods_sign and not item.get("goods_sign"):
+                    item["goods_sign"] = ref.goods_sign
+                if not ref.goods_sign and ref.goods_id and item.get("goods_id") not in ("", ref.goods_id):
+                    return {"status": "error", "error_msg": "商品 ID 反查结果不匹配", "error_code": "product_identity_mismatch"}
+                return {"status": "success", "data": item}
+            except Exception as exc:
+                logger.debug(
+                    "【拼多多接口异常】查询商品详情异常，交由上层服务处理 | 商品[%s] 异常<%s>",
+                    goods_id_or_sign or goods_id or goods_sign, format_exc_summary(exc),
+                )
+                err_code = str(getattr(exc, "error_code", "") or "").strip() or "INTERNAL_ERROR"
+                return {"status": "error", "error_code": err_code, "error_msg": str(exc)}
+
+        base = [("pdd_official_detail", _detail_via_pdd)] if (self._has_official_creds() and self.pid) else []
+        providers = self._compose_providers(
+            "detail",
+            base,
+            goods_id_or_sign=goods_id_or_sign,
+            uid=uid,
+            goods_id=ref.goods_id or goods_id,
+            goods_sign=ref.goods_sign or goods_sign,
+            **kwargs,
+        )
+        return self._execute_capability("detail", providers, allow_persist=self._is_real_http())
 
     def _resolve_goods_id(self, goods_id_or_sign: str, kwargs: dict) -> tuple:
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
@@ -349,6 +418,9 @@ class PddAdapter(BasePlatformAdapter):
         return result
 
     def convert_promotion_url(self, goods_id_or_sign, uid=None, **kwargs) -> Dict[str, Any]:
+        unavailable = self._available("promotion", need_auth=False, is_fallback=False)
+        if unavailable:
+            return unavailable
         goods_id, goods_sign = self._resolve_goods_id(goods_id_or_sign, kwargs)
         title = kwargs.get("title") or kwargs.get("name") or kwargs.get("goods_name") or "精选高性价比好物"
         price = kwargs.get("price")
@@ -378,24 +450,40 @@ class PddAdapter(BasePlatformAdapter):
 
         clean_uid = uid.strip() if isinstance(uid, str) and uid.strip() else None
 
-        # 仅使用编排层给出的有效 UID；个人失败不在 adapter 内匿名重试，避免污染个人缓存。
-        link, raw, link_type, is_unauthorized = self._attempt_promotions(
-            target, source_url, uid=clean_uid, **options
-        )
-        if link:
-            return self._promotion_result(link, raw, title, price, coupon, link_type)
-        if clean_uid:
-            result = {
-                "status": "error", "need_auth": is_unauthorized,
-                "error_code": "AUTH_REQUIRED" if is_unauthorized else "PERSONAL_PROMOTION_UNAVAILABLE",
-                "error_msg": "拼多多渠道授权未完成或已失效" if is_unauthorized else "暂未能生成拼多多个人推广链接",
-            }
-            if is_unauthorized:
-                result["auth_platform"] = "pdd"
-                result["auth_msg"] = "请到我的页重新校验拼多多渠道授权备案"
-            return result
+        def _promote_via_pdd():
+            # 仅使用编排层给出的有效 UID；个人失败不在 adapter 内匿名重试，避免污染个人缓存。
+            link, raw, link_type, is_unauthorized = self._attempt_promotions(
+                target, source_url, uid=clean_uid, **options
+            )
+            if link:
+                return self._promotion_result(link, raw, title, price, coupon, link_type)
+            if clean_uid:
+                result = {
+                    "status": "error", "need_auth": is_unauthorized,
+                    "error_code": "AUTH_REQUIRED" if is_unauthorized else "PERSONAL_PROMOTION_UNAVAILABLE",
+                    "error_msg": "拼多多渠道授权未完成或已失效" if is_unauthorized else "暂未能生成拼多多个人推广链接",
+                }
+                if is_unauthorized:
+                    result["auth_platform"] = "pdd"
+                    result["auth_msg"] = "请到我的页重新校验拼多多渠道授权备案"
+                return result
+            return {"status": "error", "error_code": "PROMOTION_FAILED", "error_msg": "暂未能生成拼多多推广链接"}
 
-        # 匿名接口全部不可用才使用原始商品直链；此保底不可缓存。
+        base = [("pdd_official_promote", _promote_via_pdd)] if (self._has_official_creds() and self.pid) else []
+        providers = self._compose_providers(
+            "promotion",
+            base,
+            goods_id_or_sign=goods_id_or_sign,
+            uid=clean_uid,
+            **kwargs,
+        )
+        res = self._execute_capability("promotion", providers, allow_persist=self._is_real_http())
+        if res.get("status") == "success":
+            return res
+        if clean_uid or res.get("error_code") in ("INVALID_ARGUMENT", "invalid_product_url", "platform_unavailable", "CONFIG_ERROR", "AUTH_REQUIRED"):
+            return res
+
+        # 匿名多供应商链均未返回推广链接时才使用原始商品直链；此保底不可缓存。
         final_direct_url = source_url or ("https://mobile.yangkeduo.com/goods.html?" + urlencode({"goods_sign": goods_sign}))
         return self._promotion_result(
             final_direct_url, {}, title, price, coupon, "商品直连保底", is_fallback=True,
@@ -416,7 +504,6 @@ class PddAdapter(BasePlatformAdapter):
         extracted_sign = ""
         extracted_id = ""
         extracted_url = ""
-        product_detail = None
 
         # 1. 直接匹配 goods_sign 参数或裸加密 goods_sign
         sign_param_match = re.search(r"goods_sign=([A-Za-z0-9_-]{20,})", text)
@@ -444,128 +531,166 @@ class PddAdapter(BasePlatformAdapter):
                 "error_msg": "未能识别出拼多多商品链接，请粘贴拼多多分享短链或长链；若只有商品名称请前往「首页」搜索",
             }
 
-        # 3. 若已有 goods_sign，优先直查商品详情
-        if extracted_sign:
-            det_res = self.get_goods_detail(goods_sign=extracted_sign, uid=None)
-            if det_res.get("status") == "success" and isinstance(det_res.get("data"), dict):
-                product_detail = det_res["data"]
-                extracted_id = product_detail.get("goods_id") or extracted_id
+        def _do_pdd_universal():
+            sign_val = extracted_sign
+            id_val = extracted_id
+            product_detail = None
 
-        # 4. 若尚未拿到详情且存在拼多多链接，直接将链接透传给 search_goods 精准解析唯一单品
-        if not product_detail and extracted_url:
-            search_res = self.search_goods(extracted_url, page=1, page_size=10, uid=None)
-            if search_res.get("status") != "success":
-                err_msg = str(search_res.get("error_msg") or "")
-                if "40009" in err_msg or "原始链接" in err_msg:
-                    return {
-                        "status": "error",
-                        "error_code": "UNSUPPORTED_PDD_ID_ONLY_URL",
-                        "error_msg": "拼多多官方接口 (40009) 已禁止仅含纯数字 goods_id 的非原始链接查询，请粘贴拼多多 App 分享链接或推广短链",
-                    }
-                return {
-                    "status": "error",
-                    "error_code": "UNRESOLVED_PDD_INPUT",
-                    "error_msg": "未能解析该拼多多链接，请确认链接有效且商品在推广中",
-                }
-
-            hits = search_res.get("data") or []
-            if len(hits) != 1 or int(search_res.get("total_count") or 0) != 1:
-                return {
-                    "status": "error",
-                    "error_code": "UNRESOLVED_PDD_INPUT",
-                    "error_msg": "该链接未能唯一定位到具体拼多多商品，请确认粘贴的是单品分享链接",
-                }
-
-            first_hit = hits[0]
-            extracted_sign = first_hit.get("goods_sign") or extracted_sign
-            extracted_id = first_hit.get("goods_id") or extracted_id
-            product_detail = first_hit
-            if extracted_sign:
-                det_res = self.get_goods_detail(goods_sign=extracted_sign, goods_id=extracted_id or None, uid=None)
+            # 3. 若已有 goods_sign，优先直查商品详情
+            if sign_val:
+                det_res = self.get_goods_detail(goods_sign=sign_val, uid=None)
                 if det_res.get("status") == "success" and isinstance(det_res.get("data"), dict):
                     product_detail = det_res["data"]
-                    extracted_id = product_detail.get("goods_id") or extracted_id
+                    id_val = product_detail.get("goods_id") or id_val
 
-        if not product_detail or not extracted_sign:
-            return {
-                "status": "error",
-                "error_code": "UNRESOLVED_PDD_INPUT",
-                "error_msg": "未能获取到对应的拼多多商品详情，商品可能已下架或取消推广",
-            }
+            # 4. 若尚未拿到详情且存在拼多多链接，直接将链接透传给 search_goods 精准解析唯一单品
+            if not product_detail and extracted_url:
+                search_res = self.search_goods(extracted_url, page=1, page_size=10, uid=None)
+                if search_res.get("status") != "success":
+                    err_msg = str(search_res.get("error_msg") or "")
+                    if "40009" in err_msg or "原始链接" in err_msg:
+                        return {
+                            "status": "error",
+                            "error_code": "UNSUPPORTED_PDD_ID_ONLY_URL",
+                            "error_msg": "拼多多官方接口 (40009) 已禁止仅含纯数字 goods_id 的非原始链接查询，请粘贴拼多多 App 分享链接或推广短链",
+                        }
+                    return {
+                        "status": "error",
+                        "error_code": "UNRESOLVED_PDD_INPUT",
+                        "error_msg": "未能解析该拼多多链接，请确认链接有效且商品在推广中",
+                    }
 
-        title = product_detail.get("name") or "拼多多精选好物"
-        price = product_detail.get("price")
-        coupon = product_detail.get("coupon_amount")
+                hits = search_res.get("data") or []
+                if len(hits) != 1 or int(search_res.get("total_count") or 0) != 1:
+                    return {
+                        "status": "error",
+                        "error_code": "UNRESOLVED_PDD_INPUT",
+                        "error_msg": "该链接未能唯一定位到具体拼多多商品，请确认粘贴的是单品分享链接",
+                    }
 
-        # 5. 执行三层智能生链（支持推手归因 uid）
-        conv_res = self.convert_promotion_url(
-            goods_id_or_sign=extracted_sign or extracted_id,
-            uid=uid,
-            goods_id=extracted_id or None,
-            goods_sign=extracted_sign or None,
-            product_url=extracted_url or None,
-            title=title,
-            price=price,
-            coupon_amount=coupon,
-        )
-        if conv_res.get("status") != "success":
+                first_hit = hits[0]
+                sign_val = first_hit.get("goods_sign") or sign_val
+                id_val = first_hit.get("goods_id") or id_val
+                product_detail = first_hit
+                if sign_val:
+                    det_res = self.get_goods_detail(goods_sign=sign_val, goods_id=id_val or None, uid=None)
+                    if det_res.get("status") == "success" and isinstance(det_res.get("data"), dict):
+                        product_detail = det_res["data"]
+                        id_val = product_detail.get("goods_id") or id_val
+
+            if not product_detail or not sign_val:
+                return {
+                    "status": "error",
+                    "error_code": "UNRESOLVED_PDD_INPUT",
+                    "error_msg": "未能获取到对应的拼多多商品详情，商品可能已下架或取消推广",
+                }
+
+            title = product_detail.get("name") or "拼多多精选好物"
+            price = product_detail.get("price")
+            coupon = product_detail.get("coupon_amount")
+
+            # 5. 执行三层智能生链（支持推手归因 uid）
+            conv_res = self.convert_promotion_url(
+                goods_id_or_sign=sign_val or id_val,
+                uid=uid,
+                goods_id=id_val or None,
+                goods_sign=sign_val or None,
+                product_url=extracted_url or None,
+                title=title,
+                price=price,
+                coupon_amount=coupon,
+            )
+            if conv_res.get("status") != "success":
+                conv_res["product"] = product_detail
+                return conv_res
+            if conv_res.get("is_fallback"):
+                return {
+                    "status": "error",
+                    "error_code": "PROMOTION_FAILED",
+                    "error_msg": "该拼多多商品暂不支持生成推广链接",
+                    "product": product_detail,
+                }
+
+            conv_res["goods_id"] = id_val
+            conv_res["goods_sign"] = sign_val
+            conv_res["title"] = title
+            conv_res["price"] = price
+            conv_res["coupon_amount"] = coupon
             conv_res["product"] = product_detail
-            return conv_res
-        if conv_res.get("is_fallback"):
-            return {
-                "status": "error",
-                "error_code": "PROMOTION_FAILED",
-                "error_msg": "该拼多多商品暂不支持生成推广链接",
-                "product": product_detail,
-            }
+            return stamp_universal_resolution(conv_res, single_item_evidence=True)
 
-        conv_res["goods_id"] = extracted_id
-        conv_res["goods_sign"] = extracted_sign
-        conv_res["title"] = title
-        conv_res["price"] = price
-        conv_res["coupon_amount"] = coupon
-        conv_res["product"] = product_detail
-        out = stamp_universal_resolution(conv_res, single_item_evidence=True)
-        track_provider_call(
-            "pdd",
-            "pdd_router_universal",
-            "resolve_universal",
-            lambda: out,
-            allow_persist=is_real_requests_session(_PDD_SESSION),
+        base = [("pdd_router_universal", _do_pdd_universal)] if (self._has_official_creds() and self.pid) else []
+        providers = self._compose_providers("universal", base, raw_text=text, uid=uid, **kwargs)
+        return self._execute_capability(
+            "universal",
+            providers,
+            allow_persist=self._is_real_http(),
+            metric_operation="resolve_universal",
         )
-        return out
-
 
     def check_authority(self, uid) -> Dict[str, Any]:
-        try:
-            return check_member_authority(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid, uid=uid)
-        except Exception as exc:
-            logger.debug("【拼多多接口异常】核验备案状态异常，交由上层服务处理 | 用户[%s] 异常<%s>", uid, format_exc_summary(exc))
-            return {"status": "error", "is_authorized": False, "bind": 0, "error_msg": str(exc)}
+        unavailable = self._available("authorization", is_authorized=False)
+        if unavailable:
+            return unavailable
+
+        def _check_via_pdd():
+            try:
+                return check_member_authority(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid, uid=uid)
+            except Exception as exc:
+                logger.debug("【拼多多接口异常】核验备案状态异常，交由上层服务处理 | 用户[%s] 异常<%s>", uid, format_exc_summary(exc))
+                return {"status": "error", "is_authorized": False, "bind": 0, "error_msg": str(exc)}
+
+        base = [("pdd_official_auth", _check_via_pdd)] if (self._has_official_creds() and self.pid) else []
+        providers = self._compose_providers("check_authority", base, uid=uid)
+        return self._execute_capability("check_authority", providers, allow_persist=self._is_real_http())
 
     def generate_authority_url(self, uid, **kwargs) -> Dict[str, Any]:
-        try:
-            res = pdd_gen_auth_url(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid, uid=uid, **kwargs)
-            info = res.get("url_info") or {}
-            link = info.get("mobile_short_url") or info.get("mobile_url") or info.get("short_url") or info.get("url")
-            if res.get("status") == "success" and link:
-                return {"status": "success", "auth_url": link, "short_url": link, "we_app_info": info.get("we_app_info", {})}
-            return {"status": "error", "error_msg": res.get("error_msg", "生成授权链接失败")}
-        except Exception as exc:
-            logger.debug("【拼多多接口异常】生成备案引导链接异常，交由上层服务处理 | 用户[%s] 异常<%s>", uid, format_exc_summary(exc))
-            return {"status": "error", "error_msg": str(exc)}
+        unavailable = self._available("authorization", is_authorized=False)
+        if unavailable:
+            return unavailable
+
+        def _gen_via_pdd():
+            try:
+                res = pdd_gen_auth_url(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid, uid=uid, **kwargs)
+                info = res.get("url_info") or {}
+                link = info.get("mobile_short_url") or info.get("mobile_url") or info.get("short_url") or info.get("url")
+                if res.get("status") == "success" and link:
+                    return {"status": "success", "auth_url": link, "short_url": link, "we_app_info": info.get("we_app_info", {})}
+                return {"status": "error", "error_msg": res.get("error_msg", "生成授权链接失败")}
+            except Exception as exc:
+                logger.debug("【拼多多接口异常】生成备案引导链接异常，交由上层服务处理 | 用户[%s] 异常<%s>", uid, format_exc_summary(exc))
+                return {"status": "error", "error_msg": str(exc)}
+
+        base = [("pdd_official_auth_url", _gen_via_pdd)] if (self._has_official_creds() and self.pid) else []
+        providers = self._compose_providers("generate_authority_url", base, uid=uid, **kwargs)
+        return self._execute_capability("generate_authority_url", providers, allow_persist=self._is_real_http())
 
     def fetch_increment_orders(self, start_time, end_time, page=1, page_size=50, **kwargs) -> Dict[str, Any]:
-        try:
-            res = query_increment_orders(client_id=self.client_id, client_secret=self.client_secret,
-                                         start_time=start_time, end_time=end_time, page=page, page_size=page_size, **kwargs)
-            if not isinstance(res, dict) or res.get("status") != "success":
-                message = res.get("error_msg", "增量订单查询失败") if isinstance(res, dict) else "增量订单响应无效"
-                return {"status": "error", "error_msg": message, "order_list": [], "total_count": 0}
-            orders = [self.normalize_order(order) for order in res.get("order_list", [])]
-            total = res.get("total_count", len(orders))
-            return {"status": "success", "order_list": orders, "total_count": total,
-                    "has_more": page * page_size < total}
-        except Exception as exc:
-            logger.debug("【拼多多接口异常】拉取增量订单异常，交由上层服务处理 | 页码[%s] 异常<%s>", page, format_exc_summary(exc))
-            return {"status": "error", "error_msg": str(exc), "order_list": [], "total_count": 0}
+        unavailable = self._available("orders")
+        if unavailable:
+            return {**unavailable, "order_list": [], "total_count": 0}
+
+        def _orders_via_pdd():
+            try:
+                res = query_increment_orders(client_id=self.client_id, client_secret=self.client_secret,
+                                             start_time=start_time, end_time=end_time, page=page, page_size=page_size, **kwargs)
+                if not isinstance(res, dict) or res.get("status") != "success":
+                    message = res.get("error_msg", "增量订单查询失败") if isinstance(res, dict) else "增量订单响应无效"
+                    return {"status": "error", "error_msg": message, "order_list": [], "total_count": 0}
+                orders = [self.normalize_order(order) for order in res.get("order_list", [])]
+                total = res.get("total_count", len(orders))
+                return {"status": "success", "order_list": orders, "total_count": total,
+                        "has_more": page * page_size < total}
+            except Exception as exc:
+                logger.debug("【拼多多接口异常】拉取增量订单异常，交由上层服务处理 | 页码[%s] 异常<%s>", page, format_exc_summary(exc))
+                return {"status": "error", "error_msg": str(exc), "order_list": [], "total_count": 0}
+
+        base = [("pdd_official_orders", _orders_via_pdd)] if self._has_official_creds() else []
+        providers = self._compose_providers(
+            "orders", base, start_time=start_time, end_time=end_time, page=page, page_size=page_size, **kwargs,
+        )
+        result = self._execute_capability("orders", providers, allow_persist=self._is_real_http())
+        if result.get("status") != "success":
+            result.setdefault("order_list", [])
+            result.setdefault("total_count", 0)
+        return result

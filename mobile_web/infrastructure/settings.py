@@ -204,19 +204,29 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
         raise SettingsError("local_mongo_user 与 local_mongo_password 必须同时配置或同时留空")
 
     if require_credentials:
-        required = []
+        def _missing_for_profiles(profiles):
+            for fields in profiles:
+                if all(value.strip() for _, value in fields):
+                    return []
+            # 没有任何方案完整就绪时，优先报告“已配置部分字段的方案”或默认主方案缺失项
+            best = max(profiles, key=lambda fields: sum(1 for _, v in fields if v.strip()))
+            return [key for key, value in best if not value.strip()]
+
+        missing = []
         if pdd_enabled:
-            required.extend((("myself_pdd_client_id", pdd_client_id),
-                             ("myself_pdd_client_secret", pdd_client_secret), ("myself_pdd_pid", pdd_pid)))
+            missing.extend(_missing_for_profiles([
+                (("myself_pdd_client_id", pdd_client_id), ("myself_pdd_client_secret", pdd_client_secret), ("myself_pdd_pid", pdd_pid)),
+            ]))
         if taobao_enabled:
-            required.extend((("myself_taobao_app_key", tb_app_key),
-                             ("myself_taobao_app_secret", tb_app_secret),
-                             ("taobao_adzone_id / myself_taobao_pid", tb_adzone_id)))
+            missing.extend(_missing_for_profiles([
+                (("myself_taobao_app_key", tb_app_key), ("myself_taobao_app_secret", tb_app_secret), ("taobao_adzone_id / myself_taobao_pid", tb_adzone_id)),
+                (("zhetaoke_appkey", ztk_appkey), ("zhetaoke_sid", ztk_sid), ("myself_taobao_pid / taobao_adzone_id", tb_adzone_id or tb_pid)),
+            ]))
         if jd_enabled:
             # Catalog credentials do not imply promotion/order credentials are available.
-            required.extend((("zhetaoke_appkey", ztk_appkey), ("myself_jd_union_id", jd_union_id),
-                             ("jd_api_base", jd_api_base)))
-        missing = [key for key, value in required if not value.strip()]
+            missing.extend(_missing_for_profiles([
+                (("zhetaoke_appkey", ztk_appkey), ("myself_jd_union_id", jd_union_id), ("jd_api_base", jd_api_base)),
+            ]))
         if missing:
             raise SettingsError("缺少必需配置：" + ", ".join(missing))
         if not pdd_enabled and not taobao_enabled and not jd_enabled:

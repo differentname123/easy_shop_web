@@ -3,8 +3,11 @@
 多平台联盟抽象适配器基类
 定义统一的导购商品查询、搜索、推广生链、推手授权备案协议。
 """
+import threading
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from infrastructure.api_governance import execute_provider_chain, rotate_providers
 from models.product import ProductRef
 
 
@@ -43,10 +46,103 @@ class BasePlatformAdapter(ABC):
     requires_authorized_promotion: bool = False
     requires_numeric_promoter_id: bool = False
     requires_material_url: bool = False
+    supports_coupon_enrichment: bool = False
+    preserves_known_coupons_across_rank: bool = False
     default_promoter_id: str = ""
     promotion_scope: str = ""
     order_window_seconds: int = 23 * 3600
     capabilities = None
+
+    def _ensure_provider_state(self) -> None:
+        if not hasattr(self, "_provider_lock"):
+            self._provider_lock = threading.Lock()
+        if not hasattr(self, "_extra_providers"):
+            self._extra_providers: Dict[str, List[Tuple[str, Callable[..., Dict[str, Any]], bool]]] = {}
+        if not hasattr(self, "_provider_strategies"):
+            self._provider_strategies: Dict[str, str] = {}
+        if not hasattr(self, "_rr_cursors"):
+            self._rr_cursors: Dict[str, int] = {}
+
+    def register_provider(
+        self,
+        operation: str,
+        name: str,
+        fn: Callable[..., Dict[str, Any]],
+        *,
+        prepend: bool = False,
+        strategy: Optional[str] = None,
+    ) -> None:
+        """
+        向指定平台能力挂载额外的第三方供应商实现（与对应 Adapter 公开方法同签名）：
+        - `operation`: 'recommend' | 'search' | 'detail' | 'promotion' | 'universal' | 'check_authority' | 'generate_authority_url' | 'orders'
+        - `prepend=True` 可将其设为首选主通道，原内置供应商自动退居备用；
+        - `strategy`: 可选 'failover'（默认主备降级）或 'round_robin'（轮询分摊 + 单次故障顺延）。
+        """
+        self._ensure_provider_state()
+        op = str(operation or "").strip().lower()
+        with self._provider_lock:
+            entries = self._extra_providers.setdefault(op, [])
+            entries[:] = [item for item in entries if item[0] != name]
+            entries.append((name, fn, bool(prepend)))
+            if strategy in ("failover", "round_robin"):
+                self._provider_strategies[op] = strategy
+        refresh = getattr(self, "_refresh_capabilities", None)
+        if callable(refresh):
+            refresh()
+
+    def set_provider_strategy(self, operation: str, strategy: str = "failover") -> None:
+        """切换某项能力的多供应商调度策略：'failover' 或 'round_robin'。"""
+        if strategy not in ("failover", "round_robin"):
+            raise ValueError("strategy must be 'failover' or 'round_robin'")
+        self._ensure_provider_state()
+        op = str(operation or "").strip().lower()
+        with self._provider_lock:
+            self._provider_strategies[op] = strategy
+
+    def _has_extra_providers(self, operation: str) -> bool:
+        self._ensure_provider_state()
+        return bool(self._extra_providers.get(str(operation or "").strip().lower()))
+
+    def _compose_providers(
+        self,
+        operation: str,
+        base_providers: Sequence[Tuple[str, Callable[[], Dict[str, Any]]]],
+        **call_kwargs: Any,
+    ) -> List[Tuple[str, Callable[[], Dict[str, Any]]]]:
+        """将内置供应商与动态注册的第三方供应商拼装为标准化零参调用链。"""
+        self._ensure_provider_state()
+        op = str(operation or "").strip().lower()
+        with self._provider_lock:
+            extras = list(self._extra_providers.get(op, ()))
+        front = [(name, (lambda f=fn, kw=call_kwargs: f(**kw))) for name, fn, prepend in extras if prepend]
+        back = [(name, (lambda f=fn, kw=call_kwargs: f(**kw))) for name, fn, prepend in extras if not prepend]
+        return [*front, *base_providers, *back]
+
+    def _execute_capability(
+        self,
+        operation: str,
+        providers: Sequence[Tuple[str, Callable[[], Dict[str, Any]]]],
+        *,
+        strategy: Optional[str] = None,
+        allow_persist: bool = True,
+        metric_operation: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """统一执行某能力的多供应商链（支持主备降级与轮询分流，复用全局健康与配额治理）。"""
+        self._ensure_provider_state()
+        op = str(operation or "").strip().lower()
+        with self._provider_lock:
+            eff_strategy = strategy or self._provider_strategies.get(op, "failover")
+            ordered = list(providers)
+            if eff_strategy == "round_robin" and len(ordered) > 1:
+                idx = self._rr_cursors.get(op, 0)
+                self._rr_cursors[op] = (idx + 1) % len(ordered)
+                ordered = rotate_providers(ordered, idx)
+        return execute_provider_chain(
+            self.platform_code or "unknown",
+            metric_operation or op,
+            ordered,
+            allow_persist=allow_persist,
+        )
 
     def _available(self, capability: str, message: str = "", **extra: Any) -> Optional[Dict[str, Any]]:
         """统一的平台启用与子能力配置守卫。"""
@@ -76,6 +172,30 @@ class BasePlatformAdapter(ABC):
         """后台公开详情的资格判断；不改变前台按需查询能力。"""
         return bool(ref.key)
 
+    def normalize_material_url(self, url: str) -> str:
+        """平台物料链接规范化（默认原样透传）。"""
+        return str(url or "").strip()
+
+    def is_authoritative_material_url(self, url: str) -> bool:
+        """判断缓存中的物料链接是否为平台权威链接（防止低优先级摘要覆写）。"""
+        return bool(str(url or "").strip())
+
+    def extract_trusted_coupon_url(self, doc: Optional[dict]) -> str:
+        """从本地摘要/详情记录中提取经平台校验的官方优惠券链接。"""
+        return ""
+
+    def should_enrich_promotion_coupon(self, ref: ProductRef, local_doc: Optional[dict]) -> bool:
+        """判断点击转链前是否需要单次补查详情优惠券。"""
+        return False
+
+    def needs_coupon_upgrade(self, universal_result: dict, product: Optional[dict]) -> bool:
+        """判断万能转链后是否需要叠加优惠券进行二合一升级转链。"""
+        return False
+
+    def skip_prefetch_if_detail_checked(self, ref: ProductRef, item: Optional[dict]) -> Optional[float]:
+        """若平台对已拉取过详情的商品无需重复刷新，返回冷却秒数，否则返回 None。"""
+        return None
+
     def warmup(self) -> None:
         """可选的启动预热，不要求通用入口了解任何平台 SDK。"""
 
@@ -85,6 +205,14 @@ class BasePlatformAdapter(ABC):
 
     def build_command_text(self, title, final_link, price=None, coupon=None) -> str:
         return build_command_text(title, final_link, price, coupon, self.platform_name)
+
+    def resolve_and_convert_universal(self, raw_text: str, uid: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """万能转链与商品详情反查统一接口（默认提示平台暂不支持）。"""
+        return self._universal_error(
+            "unsupported",
+            f"{self.platform_name or '该平台'}暂不支持万能转链",
+            error_code="UNSUPPORTED_OPERATION",
+        )
 
     def _universal_error(
         self,
@@ -256,6 +384,7 @@ class UnavailablePlatformAdapter(BasePlatformAdapter):
     search_goods = _unavailable
     get_goods_detail = _unavailable
     convert_promotion_url = _unavailable
+    resolve_and_convert_universal = _unavailable
     check_authority = _unavailable
     generate_authority_url = _unavailable
     fetch_increment_orders = _unavailable

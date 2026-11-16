@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """商品应用服务：平台调度、详情来源时间及前后台共用的商品解析。"""
-import math
 import json
 import time
 import threading
@@ -15,16 +14,25 @@ from models.product import (
     DetailSnapshot,
     DetailPrefetchResult,
     classify_user_input,
-    extract_canonical_goods_id,
     extract_search_keyword,
     is_jd_image_key,
-    resolve_item_identity,
     utc_millis,
 )
 from repositories.product_repo import ProductRepository
 from cache import (
     RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
-    MATERIAL_CACHE, SIGN_BY_ID_CACHE, evict_product_from_caches, is_product_off_promotion,
+    MATERIAL_CACHE, SIGN_BY_ID_CACHE,
+    _DETAIL_CACHE_LOCK,
+    cache_product_detail,
+    evict_product_from_caches,
+    get_cached_product_detail,
+    has_valid_product_images,
+    is_product_off_promotion,
+    is_valid_detail_cache_entry,
+    is_valid_image_url,
+    make_detail_snapshot,
+    parse_detail_deadline,
+    snapshot_detail_deadline,
     sync_product_summary_in_caches,
 )
 from config import PRODUCT_DETAIL_TTL, logger
@@ -34,7 +42,6 @@ _DETAIL_CACHE = DETAIL_CACHE
 _SEARCH_CACHE = SEARCH_CACHE
 _CATEGORY_CACHE = CATEGORY_CACHE
 _BOOM_SORT_CACHE = BOOM_SORT_CACHE
-_DETAIL_CACHE_LOCK = threading.RLock()
 
 
 @dataclass
@@ -135,9 +142,10 @@ class ProductService:
                     ref.platform, ref.key, format_exc_summary(exc),
                 )
 
-    def _offer_products(self, items, channel_type=None, snapshots=()):
+    def _offer_products(self, items, channel_type=None, snapshots=(), adapter=None):
         # 转链所需公开映射先发布，不能被可丢弃的后台摘要写入或预取开关阻断；同时过滤已在防复活黑名单中的下架商品。
         valid_items = []
+        adapter_cache = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -150,13 +158,30 @@ class ProductService:
             url = item.get("product_url")
             if ref.key and isinstance(url, str) and url.strip():
                 clean_url = url.strip()
+                adp = adapter if (adapter is not None and getattr(adapter, "platform_code", ref.platform) == ref.platform) else adapter_cache.get(ref.platform)
+                if adp is None and ref.platform not in adapter_cache:
+                    try:
+                        adp = get_adapter(ref.platform)
+                    except Exception:
+                        adp = None
+                    adapter_cache[ref.platform] = adp
+                auth_fn = None
+                if adp is not None and getattr(adp, "requires_material_url", False) is True:
+                    candidate_fn = getattr(adp, "is_authoritative_material_url", None)
+                    if callable(candidate_fn):
+                        auth_fn = candidate_fn
                 for kind, val in (("sign", ref.goods_sign), ("id", ref.goods_id)):
                     if not val:
                         continue
                     cache_key = (ref.platform, kind, val)
                     existing_url = MATERIAL_CACHE.get(cache_key)
-                    # 防止榜单合成的 item.jd.com/{encrypted_id}.html 覆盖详情页已解析出的权威 jingfen.jd.com 推广链接
-                    if isinstance(existing_url, str) and "jingfen.jd.com" in existing_url and "jingfen.jd.com" not in clean_url:
+                    # 防止榜单低优先级摘要链接覆盖详情页已解析出的权威推广物料链接
+                    if (
+                        isinstance(existing_url, str)
+                        and auth_fn is not None
+                        and auth_fn(existing_url) is True
+                        and auth_fn(clean_url) is not True
+                    ):
                         continue
                     MATERIAL_CACHE.set(cache_key, clean_url)
         if self.prefetcher is not None:
@@ -185,7 +210,7 @@ class ProductService:
         if not force_refresh:
             cached = RECOMMEND_CACHE.get(cache_key)
             if cached is not None:
-                self._offer_products(cached.get("data") or [])
+                self._offer_products(cached.get("data") or [], adapter=adapter)
                 return cached
         snapshots = []
         def collect(snapshot):
@@ -202,7 +227,7 @@ class ProductService:
                 item for item in raw_items
                 if not (isinstance(item, dict) and is_product_off_promotion(plat, item.get("goods_id"), item.get("goods_sign")))
             ]
-            if plat == "jd" and items:
+            if getattr(adapter, "preserves_known_coupons_across_rank", False) is True and items:
                 overlay_fn = getattr(self.repo, "get_known_coupon_overlays", None)
                 if callable(overlay_fn):
                     try:
@@ -215,7 +240,7 @@ class ProductService:
                                 for k in (it.get("goods_id"), it.get("goods_sign")):
                                     if k:
                                         zero_keys.append(k)
-                        overlays = overlay_fn("jd", zero_keys) if zero_keys else None
+                        overlays = overlay_fn(plat, zero_keys) if zero_keys else None
                         if isinstance(overlays, dict) and overlays:
                             items = [ProductRepository.apply_coupon_overlay(it, overlays) for it in items]
                     except Exception:
@@ -230,7 +255,7 @@ class ProductService:
                 deadline = self._snapshot_deadline(snapshot)
                 if deadline > time.time():
                     self._cache_detail(plat, {"status": "success", "data": snapshot.data}, deadline)
-            self._offer_products(items, channel_type=channel_type, snapshots=tuple(snapshots))
+            self._offer_products(items, channel_type=channel_type, snapshots=tuple(snapshots), adapter=adapter)
         else:
             logger.warning(
                 "%s 【商品推荐失败】拉取平台首页推荐商品流失败 | 平台[%s] 频道[%s] 偏移[%s] 数量[%s] 失败原因<%s> 排查方向<请检查上游联盟接口配额、网络连接或应用密钥配置>",
@@ -254,7 +279,7 @@ class ProductService:
         cache_key = (plat, uid or "", keyword, page, page_size)
         cached = SEARCH_CACHE.get(cache_key)
         if cached is not None:
-            self._offer_products(cached.get("data") or [])
+            self._offer_products(cached.get("data") or [], adapter=adapter)
             return cached
         result = adapter.search_goods(keyword=keyword, page=page, page_size=page_size, uid=uid)
         if result.get("status") == "success":
@@ -270,7 +295,7 @@ class ProductService:
                 materials = [item for item in items if item.get("product_url")]
                 if materials:
                     self._save_summary_in_background(materials, None)
-            self._offer_products(items)
+            self._offer_products(items, adapter=adapter)
         else:
             logger.warning(
                 "%s 【商品搜索失败】按关键词检索平台联盟商品失败 | 平台[%s] 关键词[%s] 页码[%s] 失败原因<%s> 排查方向<请检查上游搜索接口配额、关键词合法性或网关连通性>",
@@ -280,52 +305,19 @@ class ProductService:
             )
         return result
 
-    @staticmethod
-    def _is_valid_image_url(value: Any) -> bool:
-        if not isinstance(value, str):
-            return False
-        raw = value.strip()
-        if raw.startswith("//"):
-            raw = "https:" + raw
-        return raw.startswith(("https://", "http://", "/")) and len(raw) > 1
-
-    @classmethod
-    def _has_valid_images(cls, item: Any) -> bool:
-        if not isinstance(item, dict):
-            return False
-        if cls._is_valid_image_url(item.get("image_url")):
-            return True
-        gallery = item.get("carousel_images")
-        if isinstance(gallery, list):
-            return any(cls._is_valid_image_url(u) for u in gallery)
-        return False
-
-    @staticmethod
-    def _parse_detail_deadline(updated: Any) -> float:
-        if isinstance(updated, bool):
-            return 0.0
-        if isinstance(updated, datetime):
-            updated = updated.replace(tzinfo=timezone.utc) if updated.tzinfo is None else updated
-            timestamp = updated.timestamp()
-        elif isinstance(updated, (int, float)):
-            timestamp = float(updated)
-        elif isinstance(updated, str):
-            try:
-                parsed = datetime.fromisoformat(updated)
-                timestamp = (parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)).timestamp()
-            except ValueError:
-                return 0.0
-        else:
-            return 0.0
-        if not math.isfinite(timestamp) or timestamp > time.time():
-            return 0.0
-        return timestamp + PRODUCT_DETAIL_TTL
+    _is_valid_image_url = staticmethod(is_valid_image_url)
+    _has_valid_images = staticmethod(has_valid_product_images)
+    _parse_detail_deadline = staticmethod(parse_detail_deadline)
+    _snapshot_deadline = staticmethod(snapshot_detail_deadline)
+    _valid_cache_entry = staticmethod(is_valid_detail_cache_entry)
+    _cache_detail = staticmethod(cache_product_detail)
+    _cached_detail = staticmethod(get_cached_product_detail)
 
     @classmethod
     def _detail_expires_at(cls, item: dict) -> float:
-        if not cls._has_valid_images(item):
+        if not has_valid_product_images(item):
             return 0.0
-        return cls._parse_detail_deadline(item.get("detail_updated_at"))
+        return parse_detail_deadline(item.get("detail_updated_at"))
 
     @classmethod
     def _detail_is_fresh(cls, item: dict) -> bool:
@@ -336,72 +328,6 @@ class ProductService:
         data = deepcopy(item)
         data.pop("detail_updated_at", None)
         return {"status": "success", "data": data, "source": source}
-
-    @classmethod
-    def _snapshot_deadline(cls, snapshot):
-        if not cls._has_valid_images(snapshot.data):
-            return 0.0
-        return cls._parse_detail_deadline(snapshot.fetched_at)
-
-    @classmethod
-    def _valid_cache_entry(cls, entry):
-        return (isinstance(entry, tuple) and len(entry) == 2
-                and isinstance(entry[0], (int, float)) and not isinstance(entry[0], bool)
-                and math.isfinite(entry[0]) and time.time() < entry[0] <= time.time() + PRODUCT_DETAIL_TTL
-                and isinstance(entry[1], dict) and entry[1].get("status") == "success"
-                and cls._has_valid_images(entry[1].get("data")))
-
-    @staticmethod
-    def _cache_detail(platform: str, result: dict, expires_at: float, uid=None, verified_ref=None):
-        item = result.get("data") or {}
-        ref = ProductRef(platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
-        if ref.goods_id and ref.goods_sign and ref.goods_id != ref.goods_sign:
-            SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), ref.goods_sign)
-        url = item.get("product_url")
-        if isinstance(url, str) and url.strip():
-            clean_url = url.strip()
-            if ref.goods_sign:
-                MATERIAL_CACHE.set((ref.platform, "sign", ref.goods_sign), clean_url)
-            if ref.goods_id:
-                MATERIAL_CACHE.set((ref.platform, "id", ref.goods_id), clean_url)
-            if isinstance(verified_ref, ProductRef) and verified_ref.platform == ref.platform:
-                if verified_ref.goods_sign:
-                    MATERIAL_CACHE.set((verified_ref.platform, "sign", verified_ref.goods_sign), clean_url)
-                if verified_ref.goods_id:
-                    MATERIAL_CACHE.set((verified_ref.platform, "id", verified_ref.goods_id), clean_url)
-        keys = ref.cache_keys(uid)
-        if (isinstance(verified_ref, ProductRef) and verified_ref.platform == ref.platform
-                and ref.goods_id and ref.goods_id == verified_ref.goods_id):
-            keys = list(dict.fromkeys(keys + verified_ref.cache_keys(uid)))
-        if not math.isfinite(expires_at) or expires_at <= time.time() or not ProductService._has_valid_images(item):
-            return deepcopy(result)
-        entry = (expires_at, deepcopy(result))
-        with _DETAIL_CACHE_LOCK:
-            # A newer trusted alias wins for the whole snapshot, not just one key.
-            for key in keys:
-                current = DETAIL_CACHE.get(key)
-                if ProductService._valid_cache_entry(current) and current[0] > entry[0]:
-                    entry = current
-            for key in keys:
-                DETAIL_CACHE.set(key, (entry[0], deepcopy(entry[1])))
-        return deepcopy(entry[1])
-
-    @staticmethod
-    def _cached_detail(ref, uid=None):
-        primary = ProductRef(ref.platform, "" if ref.goods_sign else ref.goods_id, ref.goods_sign)
-        keys = list(primary.cache_keys(uid))
-        if ref.platform in ("taobao", "jd") and ref.goods_id and ref.goods_sign == ref.goods_id:
-            id_key = ("detail", ref.platform, uid or "", "id", ref.goods_id)
-            if id_key not in keys:
-                keys.append(id_key)
-        with _DETAIL_CACHE_LOCK:
-            for key in keys:
-                cached = DETAIL_CACHE.get(key)
-                if ProductService._valid_cache_entry(cached):
-                    return cached[0], deepcopy(cached[1])
-                if cached is not None:
-                    DETAIL_CACHE.pop(key)
-        return None
 
     def _read_detail(self, ref, strict=False):
         options = {"strict": True} if strict else {}
@@ -442,13 +368,7 @@ class ProductService:
             return ProductRef(ref.platform, ref.goods_id, cached_sign.strip())
         return ref
 
-    @staticmethod
-    def _make_snapshot(data, fetched_at, platform):
-        data = dict(data)
-        actual_platform, gid, sign = resolve_item_identity(data, default_platform=platform)
-        ref = ProductRef(actual_platform, gid, sign)
-        data.update(platform=actual_platform, goods_id=ref.goods_id, goods_sign=ref.goods_sign)
-        return DetailSnapshot(ref, data, fetched_at)
+    _make_snapshot = staticmethod(make_detail_snapshot)
 
     def _document_snapshot(self, item, platform):
         deadline = self._detail_expires_at(item)
@@ -545,17 +465,16 @@ class ProductService:
                 return _LoadedDetail(cached[1], snapshot)
             if stop_event is not None and stop_event.is_set():
                 return _LoadedDetail({"status": "error", "error_code": "cancelled"})
-            if (
-                stop_event is None
-                and getattr(adapter, "platform_code", None) == "jd"
-                and hasattr(type(adapter), "enrich_detail_resilient")
-            ):
-                result = adapter.enrich_detail_resilient(
-                    ref.key, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None
-                )
-            else:
-                result = adapter.get_goods_detail(goods_id_or_sign=ref.key, goods_id=ref.goods_id or None,
-                                                  goods_sign=ref.goods_sign or None, uid=uid, **kwargs)
+            detail_kwargs = dict(kwargs)
+            if stop_event is not None:
+                detail_kwargs.setdefault("allow_fallback", False)
+            result = adapter.get_goods_detail(
+                goods_id_or_sign=ref.key,
+                goods_id=ref.goods_id or None,
+                goods_sign=ref.goods_sign or None,
+                uid=uid,
+                **detail_kwargs,
+            )
             if result.get("status") != "success" or not result.get("data"):
                 code = str(result.get("error_code") or "").upper()
                 return _LoadedDetail(result, retryable=code in {"NETWORK_ERROR", "TIMEOUT", "RATE_LIMIT", "SERVICE_UNAVAILABLE"})
@@ -647,14 +566,12 @@ class ProductService:
                 ref = self._upgrade_ref_sign(ref)
                 item = self._read_detail(ref, strict=True)
                 ref = self._upgrade_ref_sign(ref, item)
-                if (
-                    ref.platform == "jd"
-                    and isinstance(item, dict)
-                    and item.get("detail_updated_at") is not None
-                    and (bool(item.get("coupon_url")) or float(item.get("coupon_amount") or 0.0) <= 0)
-                ):
-                    saved = self._document_snapshot(item, ref.platform)
-                    return DetailPrefetchResult("ready", saved, next_check_at=time.time() + 86400)
+                skip_fn = getattr(adapter, "skip_prefetch_if_detail_checked", None)
+                if callable(skip_fn):
+                    cooldown_sec = skip_fn(ref, item)
+                    if isinstance(cooldown_sec, (int, float)) and not isinstance(cooldown_sec, bool) and cooldown_sec > 0:
+                        saved = self._document_snapshot(item, ref.platform)
+                        return DetailPrefetchResult("ready", saved, next_check_at=time.time() + cooldown_sec)
                 deadline = self._detail_expires_at(item) if item else 0.0
                 if deadline - time.time() > refresh_ahead_seconds:
                     saved = self._document_snapshot(item, ref.platform)

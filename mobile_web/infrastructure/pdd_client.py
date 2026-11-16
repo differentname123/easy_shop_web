@@ -181,10 +181,27 @@ def configure_transport(dns_mode="auto", trust_env=None):
                 _PDD_DNS_INSTALLED = False
 
 
-def warmup():
+def register_gateway_fallback_ips(host: str, ips) -> None:
+    """为新增第三方联盟网关域名登记备用 IPv4，复用 Windows DNS 防卡死兜底。"""
+    clean_host = str(host or "").strip().lower()
+    clean_ips = tuple(str(ip).strip() for ip in (ips or ()) if str(ip).strip())
+    if not clean_host or not clean_ips:
+        return
+    with _PDD_TRANSPORT_LOCK:
+        _GATEWAY_FALLBACK_IPS[clean_host] = clean_ips
+        if _PDD_DNS_ENABLED:
+            now_ts = time.time()
+            with _PDD_DNS_LOCK:
+                _PDD_DNS_CACHE[clean_host] = (
+                    now_ts + 600,
+                    [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443)) for ip in clean_ips],
+                )
+
+
+def warmup(http_session=None):
     """Best-effort connection-pool warmup, invoked explicitly at startup."""
     try:
-        _PDD_SESSION.head("https://gw-api.pinduoduo.com", timeout=3.0)
+        (http_session or _PDD_SESSION).head("https://gw-api.pinduoduo.com", timeout=3.0)
     except Exception as exc:
         logger.debug("【连接池预热】拼多多网关连接池预热未完成，首次请求时将自动重连 | 异常<%s>", type(exc).__name__)
 
@@ -225,7 +242,7 @@ class PddApiError(RuntimeError):
         self.sub_code = str(sub_code or "").strip()
 
 
-def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeout=(2.5, 4.0)):
+def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeout=(2.5, 4.0), http_session=None):
     """
     拼多多网关核心请求与 MD5 自动签名引擎 (使用连接池加速)
     """
@@ -262,7 +279,8 @@ def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeo
 
     # 4. 发起 HTTP POST 请求 (连接池复用)
     try:
-        response = _PDD_SESSION.post(
+        session = http_session if http_session is not None else _PDD_SESSION
+        response = session.post(
             url,
             json=params,
             headers={"Content-Type": "application/json;charset=utf-8"},
@@ -627,3 +645,51 @@ def query_increment_orders(client_id, client_secret, start_time, end_time, page=
         }
     except Exception as e:
         return {"status": "error", "error_msg": f"增量订单查询失败: {str(e)}", "order_list": []}
+
+
+class PddClient:
+    """拼多多官方多多进宝客户端封装，统一面向对象与 Session 注入风格；保留模块函数兼容。"""
+
+    def __init__(self, client_id: str, client_secret: str, pid: str = "", http_session=None):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.pid = pid
+        self.http_session = http_session
+
+    def call_api(self, api_type: str, business_params=None, timeout=(2.5, 4.0)):
+        if self.http_session is not None:
+            return call_pdd_api(
+                self.client_id, self.client_secret, api_type, business_params,
+                timeout=timeout, http_session=self.http_session,
+            )
+        return call_pdd_api(self.client_id, self.client_secret, api_type, business_params, timeout=timeout)
+
+    def warmup(self):
+        return warmup(http_session=self.http_session)
+
+    def get_goods_detail(self, goods_sign=None, goods_id=None, uid=None, **kwargs):
+        return get_goods_detail(
+            self.client_id, self.client_secret, pid=self.pid,
+            goods_sign=goods_sign, goods_id=goods_id, uid=uid, **kwargs,
+        )
+
+    def generate_smart_promotion_url(self, goods_sign, cash_gift_id=None, uid=None, **kwargs):
+        return generate_smart_promotion_url(
+            self.client_id, self.client_secret, self.pid, goods_sign,
+            cash_gift_id=cash_gift_id, uid=uid, **kwargs,
+        )
+
+    def convert_pdd_url(self, source_url, uid=None, **kwargs):
+        return convert_pdd_url(self.client_id, self.client_secret, self.pid, source_url, uid=uid, **kwargs)
+
+    def check_authority(self, uid):
+        return check_member_authority(self.client_id, self.client_secret, self.pid, uid)
+
+    def generate_authority_url(self, uid=None, **kwargs):
+        return generate_authority_url(self.client_id, self.client_secret, self.pid, uid=uid, **kwargs)
+
+    def query_orders(self, start_time, end_time, page=1, page_size=50, **kwargs):
+        return query_increment_orders(
+            self.client_id, self.client_secret, start_time=start_time, end_time=end_time,
+            page=page, page_size=page_size, **kwargs,
+        )
