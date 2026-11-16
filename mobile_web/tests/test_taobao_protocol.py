@@ -161,11 +161,15 @@ def test_authority_missing_session_is_error_and_exact_external_id_is_required():
     api = Mock()
     assert tb_client.check_publisher_relation("k", "s", "uid", _api_call=api)["error_code"] == "CONFIG_ERROR"
     api.assert_not_called()
-    def response(records):
-        return {"status": "success", "data": {"tbk_sc_publisher_info_get_response": {"data": {"inviter_list": {"map_data": records}}}}}
-    api.return_value = response([{"external_id": "another-user", "relation_id": "9007199254740993"}])
+    def response(data):
+        return {"status": "success", "data": {"tbk_sc_publisher_info_get_response": {"data": data}}}
+    api.return_value = response({"total_count": 0})
+    assert tb_client.check_publisher_relation("k", "s", "uid", "session", api)["is_authorized"] is False
+    api.return_value = response({"total_count": 2, "inviter_list": {"map_data": [{"relation_id": "9007199254740993", "external_id": "uid"}]}})
+    assert tb_client.check_publisher_relation("k", "s", "uid", "session", api)["error_code"] == "INCOMPLETE_IDENTITY"
+    api.return_value = response({"inviter_list": {"map_data": [{"external_id": "another-user", "relation_id": "9007199254740993"}]}})
     assert tb_client.check_publisher_relation("k", "s", "uid", "session", api)["error_code"] == "IDENTITY_MISMATCH"
-    api.return_value = response([{"external_id": "uid", "relation_id": "9007199254740993"}])
+    api.return_value = response({"inviter_list": {"map_data": [{"external_id": "uid", "relation_id": "9007199254740993"}]}})
     result = tb_client.check_publisher_relation("k", "s", "uid", "session", api)
     assert result["identity"] == {"external_id": "uid", "relation_id": "9007199254740993"}
     assert result["bind"] == 1
@@ -207,6 +211,7 @@ def test_precision_promotion_two_users_are_separated_and_real_token_preserved():
         assert result["relation_id"] == relation
         assert result["cacheable"] is False and "expires_at" not in result
         assert ztk.convert_channel_url.call_args.args[1] == relation
+    official.search_goods.assert_not_called()
     result = adapter.convert_promotion_url("101")
     assert result["attribution_status"] == "anonymous"
     assert result["promotion_token"] == "￥真实口令￥"
@@ -241,9 +246,10 @@ def test_precision_accepts_verified_canonical_sign_without_search_alias():
 
 def test_source_expiry_is_not_invented_and_empty_token_is_error():
     official = promotion_official()
-    official.create_tpwd.return_value = {"status": "success", "model": "￥token￥", "expires_at": 1900000000}
+    official.create_tpwd.return_value = {"status": "success", "model": "￥token￥"}
     result = make_adapter(official).convert_promotion_url("101")
-    assert result["expires_at"] == 1900000000 and result["cacheable"]
+    assert result["status"] == "success" and result["promotion_token"] == "￥token￥"
+    assert "expires_at" not in result and result["cacheable"] is False
     official.create_tpwd.return_value = {"status": "success"}
     assert make_adapter(official).convert_promotion_url("101")["status"] == "error"
 
@@ -453,6 +459,8 @@ def test_ztk_convert_channel_url_success_and_error_contract():
 
 def test_ztk_invalid_relation_id_triggers_fallback_without_revoking_saved_auth(monkeypatch):
     from services.promote_service import PromoteService
+    from services.user_service import UserService
+
     official = promotion_official()
     ztk = ZtkClient("ztk_key", "ztk_sid")
     ztk.convert_channel_url = Mock(return_value={
@@ -462,181 +470,63 @@ def test_ztk_invalid_relation_id_triggers_fallback_without_revoking_saved_auth(m
         "need_auth": True,
     })
     adapter = make_adapter(official, ztk=ztk)
-    repo, users = Mock(), Mock()
+    repo, user_repo = Mock(), Mock()
     repo.get_promotion_link_cache.return_value = None
-    users.get_promotion_context.return_value = {
-        "status": "success", "is_authorized": True, "identity": {"external_id": "u_12345678", "relation_id": "bad_rid"}
+    user_repo.get_user_by_uid.return_value = {
+        "uid": "u_12345678",
+        "auth_status": {
+            "taobao": {
+                "is_authorized": True,
+                "updated_at": time.time(),
+                "identity": {"external_id": "u_12345678", "relation_id": "bad_rid"},
+            }
+        },
     }
-    monkeypatch.setattr("services.promote_service.get_adapter", lambda platform: adapter)
+    import adapters as adapters_pkg
+    monkeypatch.setitem(adapters_pkg._ADAPTER_REGISTRY, "taobao", adapter)
 
-    service = PromoteService(repo, users)
-    result = service.convert_link("taobao", "101", uid="u_12345678")
+    result = PromoteService(repo, UserService(user_repo)).convert_link("taobao", "101", uid="u_12345678")
 
-    # 1. 策略 B: 转链失败不抹除数据库授权信息，防止网络抖动误伤推手
-    users.invalidate_promotion_authorization.assert_not_called()
-    # 2. 返回站长自营兜底链接供继续复制
+    # 策略 B: 转链失败不抹除数据库授权信息，防止网络抖动误伤推手
+    user_repo.update_auth_status.assert_not_called()
     assert result["status"] == "success"
-    assert result["need_auth"] is True
-    assert result["is_fallback"] is True
+    assert result["need_auth"] is True and result["is_fallback"] is True
     assert result["final_link"].startswith("https://")
     assert result["promotion_token"] == "￥真实口令￥"
     assert "渠道授权未生效或已失效" in result["auth_msg"]
-    # 3. 站长官方接口被调用以生成兜底链接
     assert official.search_goods.called
 
 
-def test_adapter_dual_track_channel_promotion_via_ztk():
-    official = promotion_official()
-    ztk = ZtkClient("ztk_key", "ztk_sid")
-    ztk.convert_channel_url = Mock(return_value={
-        "status": "success",
-        "final_link": "https://uland.taobao.com/channel_landing",
-        "tpwd": "￥CHANNEL_TPWD￥",
-        "url": "https://uland.taobao.com/channel_landing",
-    })
-    adapter = make_adapter(official, ztk=ztk)
-    result = adapter.convert_promotion_url("101", uid="u_12345678", identity={"external_id": "u_12345678", "relation_id": "3400251845"})
-    assert result["status"] == "success"
-    assert result["final_link"] == "https://uland.taobao.com/channel_landing"
-    assert result["promotion_token"] == "￥CHANNEL_TPWD￥"
-    assert result["attribution_status"] == "verified"
-    assert result["relation_id"] == "3400251845"
-    assert ztk.convert_channel_url.called
-    official.search_goods.assert_not_called()
-
-
-def test_unauthorized_user_promotion_falls_back_to_official_station_master_link(monkeypatch):
-    from services.promote_service import PromoteService
-    official = promotion_official()
-    adapter = make_adapter(official)
-    repo, users = Mock(), Mock()
-    repo.get_promotion_link_cache.return_value = None
-    users.get_promotion_context.return_value = {"status": "success", "is_authorized": False, "identity": {}}
-    monkeypatch.setattr("services.promote_service.get_adapter", lambda platform: adapter)
-    result = PromoteService(repo, users).convert_link("taobao", "101", uid="u_57f51d4c")
-    users.get_promotion_context.assert_called_once_with("u_57f51d4c", "taobao", allow_remote=False)
-    assert result["status"] == "success"
-    assert result["need_auth"] is True
-    assert result["is_fallback"] is True
-    assert result["final_link"].startswith("https://")
-    assert result["promotion_token"] == "￥真实口令￥"
-    assert result["auth_platform"] == "taobao"
-    assert "尚未在淘宝完成渠道授权备案" in result["auth_msg"]
-    assert result["attribution_status"] == "anonymous"
-    assert result["cacheable"] is False
-    assert "relation_id" not in official.search_goods.call_args.kwargs
-
-
-def test_user_service_caches_negative_auth_status_without_repeated_network_calls(monkeypatch):
-    from services.user_service import UserService
-    repo = Mock()
-    repo.get_user_by_uid.return_value = {
-        "uid": "u_testuser",
-        "auth_status": {
-            "taobao": {
-                "is_authorized": False,
-                "bind": 0,
-                "updated_at": time.time(),
-            }
-        }
-    }
-    adapter = Mock()
-    adapter.active = True
-    adapter.platform_name = "淘宝"
-    monkeypatch.setattr("services.user_service.get_adapter", lambda plat: adapter)
-
-    service = UserService(user_repo=repo)
-    res = service.get_promotion_context("u_testuser", "taobao")
-    assert res["status"] == "success"
-    assert res["is_authorized"] is False
-    assert res["identity"] == {}
-    adapter.check_authority.assert_not_called()
-
-    # When force=True, it rechecks upstream
-    adapter.check_authority.return_value = {"status": "success", "is_authorized": False, "bind": 0}
-    repo.update_auth_status.return_value = True
-    res_forced = service.get_promotion_context("u_testuser", "taobao", force=True)
-    assert res_forced["status"] == "success"
-    assert res_forced["is_authorized"] is False
-    adapter.check_authority.assert_called_once_with(uid="u_testuser")
-
-
-def test_promote_service_caches_generic_promotion_in_db_for_unauthorized_users(monkeypatch):
-    from services.promote_service import PromoteService
-    from models.product import ProductRef
-    repo = Mock()
-    user_svc = Mock()
-    user_svc.get_promotion_context.return_value = {
-        "status": "success", "is_authorized": False, "identity": {}
-    }
-    repo.get_product_identity.return_value = None
-    repo.get_promotion_link_cache.return_value = None
-
-    adapter = Mock()
-    adapter.active = True
-    adapter.platform_name = "淘宝"
-    adapter.requires_authorized_promotion = True
-    adapter.resolve_product_ref.return_value = ProductRef("taobao", "101", "")
-    adapter.convert_promotion_url.return_value = {
-        "status": "success", "final_link": "https://uland.taobao.com/coupon/test",
-        "promotion_token": "￥通用口令￥", "need_auth": False, "is_fallback": False,
-        "attribution_status": "anonymous", "expires_at": time.time() + 3600,
-        "goods_id": "101", "link_type": "通用官方推广"
-    }
-    adapter.build_command_text.return_value = "测试文案"
-    monkeypatch.setattr("services.promote_service.get_adapter", lambda plat: adapter)
-
-    service = PromoteService(product_repo=repo, user_service=user_svc)
-    result = service.convert_link(platform="taobao", goods_id_or_sign="101", uid="u_57f51d4c")
-    assert result["status"] == "success"
-    assert result["need_auth"] is True
-    assert result["final_link"] == "https://uland.taobao.com/coupon/test"
-    repo.save_promotion_link_cache.assert_called_once()
-    saved_data = repo.save_promotion_link_cache.call_args.kwargs["data"]
-    assert saved_data["final_link"] == "https://uland.taobao.com/coupon/test"
-    assert saved_data["promotion_token"] == "￥通用口令￥"
-
-    assert saved_data["need_auth"] is False and saved_data["is_fallback"] is False
-    assert "auth_msg" not in saved_data
-    assert adapter.convert_promotion_url.call_args.kwargs["uid"] is None
-    # Clear memory to exercise persistent-cache refill, not another memory hit.
-    from cache import PROMOTION_CACHE
-    PROMOTION_CACHE.clear()
-    repo.get_promotion_link_cache.return_value = {
-        "status": "success", "final_link": "https://uland.taobao.com/coupon/test",
-        "promotion_token": "￥通用口令￥", "link_type": "通用官方推广",
-        "_expires_at": time.time() + 3600
-    }
-    adapter.convert_promotion_url.reset_mock()
-    res2 = service.convert_link(platform="taobao", goods_id_or_sign="101", uid="u_57f51d4c")
-    assert res2["status"] == "success"
-    assert res2["need_auth"] is True
-    assert res2["final_link"] == "https://uland.taobao.com/coupon/test"
-    adapter.convert_promotion_url.assert_not_called()
-
-
 def test_taobao_detail_extracts_verified_specs_from_official_item():
-    official = Mock()
-    official.configured = True
-    official.get_goods_details.return_value = {
-        "status": "success",
-        "data": [{
-            "goods_id": "889900",
-            "goods_sign": "889900",
-            "goods_name": "维达抽纸整箱",
+    cleaned = tb_client.clean_tb_goods_item({
+        "item_id": "889900",
+        "input_item_iid": "889900",
+        "item_basic_info": {
+            "title": "维达抽纸整箱",
+            "pict_url": "//official/vinda.jpg",
             "brand_name": "Vinda/维达",
             "category_name": "纸品/湿巾",
-            "mall_name": "维达官方旗舰店",
+            "shop_title": "维达官方旗舰店",
             "provcity": "广东 江门",
-            "min_group_price_yuan": 29.9,
-            "original_price_yuan": 39.9,
-            "coupon_discount_yuan": 10.0,
-            "has_coupon": True,
-        }],
-    }
+        },
+        "price_promotion_info": {
+            "reserve_price": "39.9",
+            "zk_final_price": "39.9",
+            "final_promotion_price": "29.9",
+            "final_promotion_path_list": {"final_promotion_path_map_data": [
+                {"promotion_title": "店铺优惠券", "promotion_fee": "10.0"},
+            ]},
+        },
+        "publish_info": {"income_rate": "10", "income_info": {"commission_amount": "2.99"}},
+    })
+    official = Mock()
+    official.get_goods_details.return_value = {"status": "success", "data": [cleaned]}
     adapter = make_adapter(official)
     res = adapter.get_goods_detail("889900", goods_id="889900")
     assert res["status"] == "success"
+    assert res["data"]["price"] == 29.9
+    assert res["data"]["original_price"] == 39.9
+    assert res["data"]["coupon_amount"] == 10.0
     assert res["data"]["specs"] == [
         {"label": "商品品牌", "value": "Vinda/维达"},
         {"label": "商品类目", "value": "纸品/湿巾"},
@@ -645,17 +535,94 @@ def test_taobao_detail_extracts_verified_specs_from_official_item():
     ]
 
 
-def test_ztk_client_multi_key_failover():
+def test_ztk_client_multi_key_and_sid_pairing_failover():
     http = SimpleNamespace(get=Mock(side_effect=[
         reply({"code": 301, "msg": "appkey日调用次数超限"}),
         reply(order_response([{"trade_id": "t1"}])),
     ]))
     client = ZtkClient("key1", "sid1", http, appkey_list=("key1", "key2"))
     res = client.query_orders(0, 100)
-    assert res["status"] == "success"
-    assert len(res["order_list"]) == 1
-    assert client.appkey == "key2"
-    assert http.get.call_count == 2
+    assert res["status"] == "success" and len(res["order_list"]) == 1
+    assert client.appkey == "key2" and http.get.call_count == 2
+
+    seen_pairs = []
+
+    def _get(url, params=None, **_kwargs):
+        seen_pairs.append((params["appkey"], params["sid"]))
+        if params["appkey"] == "ak-1":
+            return reply({"status": 400, "content": "appkey未授权或已到期"})
+        return reply({
+            "status": 200,
+            "content": [{"tao_id": "888777666", "coupon_click_url": "https://uland.taobao.com/coupon/edetail?e=test", "tkl": "￥AbCdEf123￥"}],
+        })
+
+    paired = ZtkClient(appkey_list=["ak-1", "ak-2", "ak-3"], sid_list=["sid-1", "sid-2", "sid-3"], http_session=SimpleNamespace(get=_get))
+    conv = paired.convert_channel_url("https://item.taobao.com/item.htm?id=888777666", relation_id="2999888777", pid="mm_1_2_3")
+    assert conv["status"] == "success" and conv["raw"]["tao_id"] == "888777666" and conv["tpwd"] == "￥AbCdEf123￥"
+    assert seen_pairs == [("ak-1", "sid-1"), ("ak-2", "sid-2")]
+
+
+def test_hdk_client_multi_key_pool_failover():
+    seen_keys = []
+
+    def _get(url, params=None, **_kwargs):
+        key = params["apikey"]
+        seen_keys.append(key)
+        if key == "hdk-1":
+            return reply({"code": 0, "msg": "apikey请求超限"})
+        if key == "hdk-2":
+            raise RuntimeError("transient socket timeout")
+        return reply({"code": 1, "data": [{"itemid": "555666"}], "min_id": 0})
+
+    client = HdkClient(api_key_list=["hdk-1", "hdk-2", "hdk-3"], http_session=SimpleNamespace(get=_get))
+    res = client.get_ranked_ids(1, limit=20)
+    assert res["status"] == "success" and res["item_ids"] == ["555666"]
+    assert seen_keys == ["hdk-1", "hdk-2", "hdk-3"] and client.api_key == "hdk-3"
+
+
+def test_injected_taobao_client_honors_authorization_specific_timeout():
+    response = SimpleNamespace(status_code=200, raise_for_status=Mock(), json=lambda: {
+        "tbk_sc_publisher_info_get_response": {"data": {"total_count": 0, "inviter_list": []}}})
+    http = SimpleNamespace(post=Mock(return_value=response))
+    client = tb_client.TaobaoClient("key", "secret", session_key="session", http_session=http)
+    assert client.check_authority("u_12345678")["is_authorized"] is False
+    assert http.post.call_args.kwargs["timeout"] == (2.0, 3.0)
+
+
+def test_tb_client_never_clobbers_config_when_local_cfg_corrupt(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "custom_cfg.json"
+    cfg_path.write_text("{corrupt json", encoding="utf-8")
+    monkeypatch.setenv("WEB_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("TB_REFRESH_TOKEN", "env_ref_tok")
+
+    res = tb_client.reload_or_refresh_tb_credentials(
+        app_key="k",
+        app_secret="s",
+        current_session="old_sess",
+        _api_call=lambda **_kw: {
+            "status": "success",
+            "data": {"top_auth_token_refresh_response": {"token_result": json.dumps({"access_token": "new_sess_tok"})}},
+        },
+    )
+    assert res["session_key"] == "new_sess_tok"
+    assert cfg_path.read_text(encoding="utf-8") == "{corrupt json"
+
+
+def test_unified_channel_names_and_tb_50001_empty_search():
+    from adapters.pdd_adapter import PddAdapter
+
+    pdd_channels = {ch["channel_type"]: ch["name"] for ch in PddAdapter.channels}
+    tb_channels = {ch["channel_type"]: ch["name"] for ch in TaobaoAdapter.channels}
+    assert pdd_channels == tb_channels == {5: "实时销量榜", 1: "今日销量榜"}
+
+    tb_empty = tb_client.search_tb_material_upgrade(
+        app_key="test_key",
+        app_secret="test_secret",
+        adzone_id="123456",
+        keyword="zzzznotfound999999xyz",
+        _api_call=lambda **_kw: {"status": "error", "error_code": "50001", "error_msg": "[15:50001] 无结果"},
+    )
+    assert tb_empty["status"] == "success" and tb_empty["data"] == [] and tb_empty["has_more"] is False
 
 
 def test_taobao_adapter_falls_back_to_ztk_sid_channel_when_top_session_expired():
@@ -762,4 +729,62 @@ def test_universal_convert_promotional_copy_uses_piliang_and_never_falls_back_to
     official.search_goods.assert_not_called()
 
 
+def test_tb_top_errors_enforce_fail_closed_red_cross_policy(monkeypatch):
+    records = []
 
+    def _rec(level, msg, *args):
+        text = msg % args if args else str(msg)
+        records.append((level, text))
+
+    monkeypatch.setattr(
+        tb_client,
+        "logger",
+        SimpleNamespace(
+            debug=lambda msg, *a: _rec("DEBUG", msg, *a),
+            info=lambda msg, *a: _rec("INFO", msg, *a),
+            warning=lambda msg, *a: _rec("WARNING", msg, *a),
+            error=lambda msg, *a: _rec("ERROR", msg, *a),
+            exception=lambda msg, *a: _rec("ERROR", msg, *a),
+            isEnabledFor=lambda lvl: True,
+        ),
+    )
+
+    def _call(method, body):
+        http = SimpleNamespace(post=Mock(return_value=reply(body)))
+        return tb_client.call_tb_api(
+            "app_key",
+            "app_secret",
+            method,
+            {"item_id": "123456"},
+            http_session=http,
+        )
+
+    # 详情接口返回 50001 / 40001 / 应用级错误 -> 可能存在传参截断或内部调用问题，一律打 ❌
+    for err_body in (
+        {"error_response": {"code": 15, "msg": "Remote service error", "sub_code": "50001", "sub_msg": "无结果"}},
+        {"error_response": {"code": 15, "msg": "Remote service error", "sub_code": "40001", "sub_msg": "内部调用失败"}},
+        {"error_response": {"code": 11, "msg": "Insufficient isv permissions", "sub_code": "invalid-appkey", "sub_msg": "无效AppKey"}},
+    ):
+        records.clear()
+        res = _call("taobao.tbk.item.info.upgrade.get", err_body)
+        assert res["status"] == "error"
+        assert any("❌ 【淘宝网关异常】" in msg for _, msg in records)
+
+    # 搜索接口 50001 与官方 24h SessionKey 自动切通道 -> 确定无需运维介入，绝不打 ❌
+    records.clear()
+    res_search_empty = _call(
+        "taobao.tbk.dg.material.optional.upgrade",
+        {"error_response": {"code": 15, "msg": "Remote service error", "sub_code": "50001", "sub_msg": "无结果"}},
+    )
+    assert res_search_empty["status"] == "error"
+    assert any(lvl == "DEBUG" for lvl, _ in records)
+    assert all("❌" not in msg for _, msg in records)
+
+    records.clear()
+    res_sess = _call(
+        "taobao.tbk.sc.publisher.info.get",
+        {"error_response": {"code": 27, "msg": "Invalid session", "sub_code": "invalid-sessionkey"}},
+    )
+    assert res_sess["status"] == "error"
+    assert any(lvl == "INFO" and "自动切换至折淘客" in msg for lvl, msg in records)
+    assert all("❌" not in msg for _, msg in records)

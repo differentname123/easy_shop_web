@@ -9,6 +9,7 @@ import datetime
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import pytest
 
 _MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ for _p in (str(_REPO_ROOT), str(_MOBILE_WEB_DIR)):
         sys.path.insert(0, _p)
 
 from mobile_web.scripts import run_product_cloud_sync_scheduler as sync_mod
+from tests.test_product_repository import MemoryCollection as ProductMemoryCollection
 
 
 class _FakeBulkWriteResult:
@@ -29,7 +31,7 @@ class _FakeBulkWriteResult:
 
 
 class _FakeSyncCollection:
-    """支持投影与 UpdateOne(upsert=True) 的离线内存集合，用于严格验证双库合并与幂等性。"""
+    """支持真实 Mongo 过滤、投影与 UpdateOne(upsert=True) 的离线内存集合。"""
 
     def __init__(self, initial_docs: list[dict] | None = None):
         self.docs: list[dict] = [copy.deepcopy(d) for d in (initial_docs or [])]
@@ -58,29 +60,12 @@ class _FakeSyncCollection:
 
     def find(self, query: dict | None = None, projection: dict | None = None):
         q = query or {}
-        results = []
-        for doc in self.docs:
-            if "platform" in q and doc.get("platform") != q["platform"]:
-                continue
-            if "product_id" in q and isinstance(q["product_id"], dict) and "$in" in q["product_id"]:
-                if doc.get("product_id") not in q["product_id"]["$in"]:
-                    continue
-            # 模拟可展示商品过滤（排除无名称或无有效价格的身份裸记录）
-            if "$and" in q:
-                if not sync_mod.is_valid_syncable_product(doc):
-                    continue
-                cutoff = q["$and"][0]["$or"][0]["updated_at"]["$gte"]
-                cutoff_ms = sync_mod.to_utc_millis(cutoff)
-                ts_candidates = [
-                    sync_mod.to_utc_millis(doc.get("updated_at")),
-                    sync_mod.to_utc_millis(doc.get("detail_updated_at")),
-                    sync_mod.to_utc_millis(doc.get("format_updated_at")),
-                    sync_mod.to_utc_millis((doc.get("deal_info") or {}).get("format_updated_at")),
-                ]
-                if not any(ms is not None and ms >= cutoff_ms for ms in ts_candidates):
-                    continue
-            results.append(self._project(doc, projection))
-        return results
+        return [self._project(doc, projection) for doc in self.docs if ProductMemoryCollection.matches(doc, q)]
+
+    def delete_many(self, filt: dict):
+        before = len(self.docs)
+        self.docs = [d for d in self.docs if not ProductMemoryCollection.matches(d, filt)]
+        return SimpleNamespace(deleted_count=before - len(self.docs))
 
     def bulk_write(self, operations, ordered: bool = False):
         self.bulk_write_calls += 1
@@ -369,4 +354,101 @@ def test_sync_detects_deal_info_updated_at_and_never_propagates_sku_info():
     op = sync_mod.build_product_merge_operation(refreshed_local, cloud_fp)
     assert "sku_info" not in op._doc["$set"]
     assert "format_sku_prices" not in op._doc["$set"]
+
+
+def test_cloud_sync_tombstones_deal_expiry_and_cloud_only_pullback():
+    from unittest.mock import MagicMock
+
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    t_old = now - datetime.timedelta(hours=80)
+
+    # 1) 本地已超 72h 摘除好价标 (is_deal_tip=False + expired_at)，云端仍为 is_deal_tip=True -> 自动同步摘标
+    local_expired_deal = {
+        "platform": "jd",
+        "product_id": "jd_stale_deal_1",
+        "name": "过期好价纸巾",
+        "price": 29.9,
+        "activity_price": 29.9,
+        "updated_at": t_old,
+        "deal_info": {
+            "is_deal_tip": False,
+            "expired_at": now,
+            "updated_at": now,
+            "deal_price": 9.9,
+        },
+    }
+    cloud_active_deal = {
+        "platform": "jd",
+        "product_id": "jd_stale_deal_1",
+        "name": "过期好价纸巾",
+        "price": 29.9,
+        "activity_price": 29.9,
+        "updated_at": t_old,
+        "deal_info": {
+            "is_deal_tip": True,
+            "updated_at": t_old,
+            "deal_price": 9.9,
+        },
+    }
+    l_fp = sync_mod.extract_sync_fingerprint(local_expired_deal)
+    c_fp = sync_mod.extract_sync_fingerprint(cloud_active_deal)
+    should_sync, reason = sync_mod.needs_cloud_merge(l_fp, c_fp)
+    assert should_sync is True and reason == "deal_info_expired"
+    op = sync_mod.build_product_merge_operation(local_expired_deal, c_fp)
+    assert op._doc["$set"]["deal_info"]["is_deal_tip"] is False
+
+    # 2) 墓碑跨云端删除 + 云端独有未清洗推荐流商品回拉到本地（自动排除已墓碑删除商品，走真实 Query 过滤）
+    tombstone_col = MagicMock()
+    tombstone_col.find.return_value = [{"platform": "pdd", "product_id": "dead_off_promo_1", "deleted_at": now}]
+
+    local_col = _FakeSyncCollection([])
+    cloud_col = _FakeSyncCollection(
+        [
+            {
+                "_id": "c_dead",
+                "platform": "pdd",
+                "product_id": "dead_off_promo_1",
+                "name": "已下架死链商品",
+                "price": 19.9,
+                "activity_price": 19.9,
+                "updated_at": now,
+            },
+            {
+                "_id": "c_stream_unfmt",
+                "platform": "pdd",
+                "product_id": "cloud_stream_new_1",
+                "goods_sign": "E9_STREAM_1",
+                "name": "云端推荐流新商品待规格清洗",
+                "price": 15.8,
+                "activity_price": 15.8,
+                "image_url": "https://img.pddpic.com/s1.jpg",
+                "updated_at": now,
+                "default_promotion": {"final_link": "https://p.pinduoduo.com/cloud_only"},
+            },
+            {
+                "_id": "c_already_fmt",
+                "platform": "pdd",
+                "product_id": "cloud_already_formatted",
+                "name": "云端已清洗商品不应被回拉",
+                "price": 25.0,
+                "activity_price": 25.0,
+                "updated_at": now,
+                "format_status": "success",
+            },
+        ]
+    )
+
+    rep = sync_mod.run_sync_round(
+        local_col,
+        cloud_col,
+        window_days=3.0,
+        tombstone_col=tombstone_col,
+        pull_cloud_unformatted=True,
+    )
+    assert rep["cloud_deleted_tombstones"] == 1
+    assert rep["local_pulled_cloud_unformatted"] == 1
+    assert all(d["product_id"] != "dead_off_promo_1" for d in cloud_col.docs)
+    assert len(local_col.docs) == 1
+    assert local_col.docs[0]["product_id"] == "cloud_stream_new_1"
+    assert "default_promotion" not in local_col.docs[0]
 

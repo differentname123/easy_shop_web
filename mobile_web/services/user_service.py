@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from config import AUTH_STATUS_TTL, AUTH_NEGATIVE_STATUS_TTL
-from infrastructure.logging_utils import format_exc_summary
+from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import normalize_platform
 from models.user import normalize_promoter_id
 from repositories.user_repo import UserRepository
@@ -200,13 +200,15 @@ class UserService:
             response = adapter.check_authority(uid=uid)
             remote_ms = (time.perf_counter() - started) * 1000
             if not isinstance(response, dict) or response.get("status") != "success":
+                err_code = response.get("error_code", "authorization_failed") if isinstance(response, dict) else "authorization_failed"
                 err_msg = response.get("error_msg", "平台授权状态查询失败，请稍后重试") if isinstance(response, dict) else "平台授权状态响应无效"
                 logger.warning(
-                    "❌ 【渠道授权核验失败】调用平台接口核验推手渠道备案状态失败 | 平台[%s] 用户[%s] 耗时[%.1fms] 失败原因<%s> 排查方向<请检查平台联盟授权接口连通性、PID配置或应用密钥>",
+                    "%s 【渠道授权核验失败】调用平台接口核验推手渠道备案状态失败 | 平台[%s] 用户[%s] 耗时[%.1fms] 失败原因<%s> 排查方向<请检查平台联盟授权接口连通性、PID配置或应用密钥>",
+                    severity_icon(error_code=err_code),
                     plat, uid, remote_ms, err_msg,
                 )
                 return {"status": "error", "platform": plat,
-                        "error_code": response.get("error_code", "authorization_failed") if isinstance(response, dict) else "authorization_failed",
+                        "error_code": err_code,
                         "error_msg": err_msg}
             if not isinstance(response.get("is_authorized"), bool):
                 logger.warning(
@@ -232,8 +234,8 @@ class UserService:
             bind = response.get("bind", 0)
             if not self.repo.update_auth_status(uid=uid, platform=plat, is_authorized=authorized, bind=bind,
                                                 extra={"identity": identity}):
-                logger.error(
-                    "❌ 【渠道授权保存失败】将核验后的渠道授权状态写入数据库未命中用户记录 | 平台[%s] 用户[%s] 授权结果[%s] 排查方向<请检查users集合中该uid是否存在>",
+                logger.warning(
+                    "⚠️ 【渠道授权保存跳过】将核验后的渠道授权状态写入数据库未命中用户记录 | 平台[%s] 用户[%s] 授权结果[%s]",
                     plat, uid, "已授权" if authorized else "未授权",
                 )
                 return {"status": "error", "platform": plat, "error_msg": "保存授权状态失败，请稍后重试"}
@@ -303,9 +305,11 @@ class UserService:
         try:
             url_result = adapter.generate_authority_url(uid=uid)
             if not isinstance(url_result, dict) or url_result.get("status") != "success":
+                err_code = url_result.get("error_code") if isinstance(url_result, dict) else None
                 message = url_result.get("error_msg") if isinstance(url_result, dict) else None
                 logger.warning(
-                    "❌ 【渠道授权链接生成失败】调用平台接口生成备案授权引导链接失败 | 平台[%s] 用户[%s] 失败原因<%s> 排查方向<请检查平台联盟PID/AppKey配置或上游授权接口状态>",
+                    "%s 【渠道授权链接生成失败】调用平台接口生成备案授权引导链接失败 | 平台[%s] 用户[%s] 失败原因<%s> 排查方向<请检查平台联盟PID/AppKey配置或上游授权接口状态>",
+                    severity_icon(error_code=err_code),
                     plat, uid, message or "上游返回失败",
                 )
                 return {"status": "error", "platform": plat, "error_msg": message or "生成授权链接失败，请稍后重试"}

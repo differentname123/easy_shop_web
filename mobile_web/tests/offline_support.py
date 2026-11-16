@@ -50,15 +50,8 @@ def install_offline_environment():
     replacements = (
         patch.dict(os.environ, {
             "WEB_CONFIG_FILE": str(config_path),
-            "WEB_AUTH_SECRET": _CONFIG["web_auth_secret"],
-            "PDD_CLIENT_ID": _CONFIG["myself_pdd_client_id"],
-            "PDD_CLIENT_SECRET": _CONFIG["myself_pdd_client_secret"],
-            "PDD_PID": _CONFIG["myself_pdd_pid"],
-            "MONGO_HOST": "localhost", "MONGO_PORT": "27017",
-            "MONGO_USER": "", "MONGO_PASSWORD": "", "MONGO_DB_NAME": "mobile_web_offline",
-            "MONGO_AUTH_SOURCE": "admin", "WEB_HOST": "127.0.0.1", "WEB_PORT": "8000",
-            "WEB_LOG_DIR": "-", "WEB_LOG_LEVEL": "INFO", "WEB_WARMUP_ENABLED": "1",
-            "PDD_DNS_MODE": "off", "PDD_TRUST_ENV": "0",
+            "WEB_LOG_DIR": "-",
+            "MODEL_USAGE_JSON_PATH": str(Path(directory.name) / "model_usage.json"),
         }),
         patch("pymongo.MongoClient", new=_deny("MongoClient")),
         patch("requests.sessions.Session.request", new=_deny("platform HTTP")),

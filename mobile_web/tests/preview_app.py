@@ -76,6 +76,7 @@ class MemoryProducts:
                  and (not keyword or keyword in item["name"])]
         return catalog_result(items, page, page_size)
 
+    def get_known_coupon_overlays(self, platform, keys): return {}
     def get_categories(self, **kwargs): return ["日用"]
 
     def _promotion_key(self, platform, goods_id=None, goods_sign=None, goods_key=None):
@@ -93,7 +94,7 @@ class MemoryProducts:
         self.cache_calls["hits"] += 1
         return {**deepcopy(saved), "from_cache": True}
 
-    def save_promotion_link_cache(self, platform, data, goods_id=None, goods_sign=None, goods_key=None, expires_at=None):
+    def save_promotion_link_cache(self, platform, data, goods_id=None, goods_sign=None, goods_key=None, expires_at=None, **_kwargs):
         if not expires_at or expires_at <= time.time():
             return False
         self.cache_calls["writes"] += 1
@@ -107,8 +108,10 @@ class MemoryUsers:
         self.profiles = {}
         self.authorized = set()
 
-    def register_or_login(self, phone, password, nickname=None, invite_code=None):
+    def register_or_login(self, phone, password, nickname=None, invite_code=None, mode="auto"):
         uid = "u_12345678" if phone.endswith("0000") else "u_87654321"
+        if mode == "login" and uid not in self.profiles:
+            raise ValueError("该手机号尚未注册，请切换到【注册】模式")
         self.profiles.setdefault(uid, {
             "uid": uid, "phone": phone, "nickname": nickname or "离线测试用户",
             "avatar": "", "invite_code": "SMOKE01", "balance": 0, "total_rebate": 0, "pending_rebate": 0,
@@ -117,6 +120,14 @@ class MemoryUsers:
         return deepcopy(self.profiles[uid])
 
     def get_user_by_uid(self, uid): return deepcopy(self.profiles.get(uid))
+
+    def get_group_help_guard(self, uid):
+        profile = self.profiles.get(uid)
+        if not profile:
+            return None
+        return {"logged_in": True, "uid": uid, "phone": profile.get("phone", ""), "can_takedown": True, "strikes": 0, "reason": ""}
+
+    def inc_false_group_takedown(self, uid): return 1
 
     def ensure_promoter_id(self, uid, reserved_ids=()):
         profile = self.profiles.get(uid)
@@ -202,7 +213,18 @@ class MemorySync:
     def save_state(self, platform, state): self.states[platform] = deepcopy(state); return True
 
 
-products, users, orders, sync = MemoryProducts(), MemoryUsers(), MemoryOrders(), MemorySync()
+class MemoryGroupHelp:
+    def search_groups(self, keyword="", filter_mode="active", offset=0, limit=20, now=None):
+        return {"items": [], "total": 0, "has_more": False, "pending_count": 0}
+
+    def get_by_group_order_id(self, group_order_id): return None
+    def increment_click(self, group_order_id, now=None): return None
+    def apply_user_feedback(self, **kwargs): return None
+    def pop_last_takedown_uid(self, group_order_id, exclude_uid=""): return ""
+    def expire_outdated_groups(self, now=None): return 0
+
+
+products, users, orders, sync, group_helps = MemoryProducts(), MemoryUsers(), MemoryOrders(), MemorySync(), MemoryGroupHelp()
 
 
 class PreviewAdapter(BasePlatformAdapter):
@@ -261,6 +283,17 @@ class PreviewAdapter(BasePlatformAdapter):
                 "promotion_token": "￥OFFLINE_JD_TEST_ONLY￥" if self.platform_code == "jd" else
                                    "￥OFFLINE_TEST_ONLY￥" if self.platform_code == "taobao" else ""}
 
+    def resolve_and_convert_universal(self, raw_text, uid=None, identity=None, promoter_id=None, **_kwargs):
+        item = next((p for p in PRODUCTS if p["platform"] == self.platform_code), None)
+        if not item:
+            return {"status": "error", "error_msg": "离线预览暂无匹配商品"}
+        conv = self.convert_promotion_url(
+            item["goods_sign"] or item["product_id"], uid=uid, identity=identity, promoter_id=promoter_id, trusted_product_url=item["product_url"],
+        )
+        if conv.get("status") != "success":
+            return conv
+        return {**conv, "goods_id": item["goods_id"], "goods_sign": item["goods_sign"], "product": deepcopy(item)}
+
     def check_authority(self, uid):
         self.calls["authority_checks"] += 1
         if not self.requires_authorized_promotion:
@@ -285,7 +318,7 @@ for platform, adapter in preview_adapters.items():
     register_adapter(platform, adapter)
 
 from main import create_app
-from api import home, goods, promote, user, order
+from api import home, goods, promote, user, order, group_help
 
 for service in (home.product_service, goods.product_service, promote.promote_service): service.repo = products
 user.user_service.repo = users
@@ -294,6 +327,8 @@ promote.promote_service.user_service = user.user_service
 order.order_service.repo = orders
 order.order_service.sync_repo = sync
 order.order_service.user_repo = users
+group_help.group_help_service.repo = group_helps
+group_help.group_help_service.user_repo = users
 app = create_app()
 
 

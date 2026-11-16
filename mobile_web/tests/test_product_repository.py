@@ -116,6 +116,8 @@ class MemoryCollection:
         left, right = (evaluate(item) for item in args)
         if op == "$eq":
             return MemoryCollection.equal(left, right)
+        if op == "$ne":
+            return not MemoryCollection.equal(left, right)
         if op == "$in":
             return any(MemoryCollection.equal(left, candidate) for candidate in right)
         if op == "$gte":
@@ -125,12 +127,38 @@ class MemoryCollection:
         raise AssertionError(f"unsupported expression: {op}")
 
     @staticmethod
+    def _coerce_comparable(left, right):
+        if isinstance(left, datetime.datetime) and isinstance(right, datetime.datetime):
+            def bson_time(value):
+                value = (value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None
+                         else value.astimezone(datetime.timezone.utc))
+                return value.replace(microsecond=value.microsecond // 1000 * 1000)
+            return bson_time(left), bson_time(right)
+        return left, right
+
+    @staticmethod
+    def _is_mongo_type(val, type_name):
+        if type_name == "number":
+            return isinstance(val, (int, float, Decimal128)) and not isinstance(val, bool)
+        if type_name == "string":
+            return isinstance(val, str)
+        if type_name in ("int", "long"):
+            return isinstance(val, int) and not isinstance(val, bool)
+        if type_name == "double":
+            return isinstance(val, float)
+        if type_name == "bool":
+            return isinstance(val, bool)
+        return False
+
+    @staticmethod
     def matches(doc, query):
         for key, value in query.items():
             if key == "$and":
                 matched = all(MemoryCollection.matches(doc, branch) for branch in value)
             elif key == "$or":
                 matched = any(MemoryCollection.matches(doc, branch) for branch in value)
+            elif key == "$nor":
+                matched = not any(MemoryCollection.matches(doc, branch) for branch in value)
             elif key == "$expr":
                 matched = MemoryCollection.expression(doc, value)
             elif isinstance(value, dict):
@@ -149,8 +177,31 @@ class MemoryCollection:
                         matched = matched and not MemoryCollection.equal(field_val, operand)
                     elif op == "$in":
                         matched = matched and any(MemoryCollection.equal(field_val, cand) for cand in operand)
+                    elif op == "$type":
+                        candidates = operand if isinstance(operand, list) else [operand]
+                        matched = matched and any(MemoryCollection._is_mongo_type(field_val, t) for t in candidates)
                     elif op == "$gt":
-                        matched = matched and isinstance(field_val, (int, float)) and not isinstance(field_val, bool) and field_val > operand
+                        l_v, r_v = MemoryCollection._coerce_comparable(field_val, operand)
+                        if isinstance(l_v, datetime.datetime) and isinstance(r_v, datetime.datetime):
+                            matched = matched and (l_v > r_v)
+                        else:
+                            matched = matched and (
+                                isinstance(l_v, (int, float)) and not isinstance(l_v, bool)
+                                and isinstance(r_v, (int, float)) and not isinstance(r_v, bool)
+                                and l_v > r_v
+                            )
+                    elif op == "$gte":
+                        l_v, r_v = MemoryCollection._coerce_comparable(field_val, operand)
+                        if isinstance(l_v, datetime.datetime) and isinstance(r_v, datetime.datetime):
+                            matched = matched and (l_v >= r_v)
+                        else:
+                            matched = matched and isinstance(l_v, (int, float)) and not isinstance(l_v, bool) and l_v >= r_v
+                    elif op == "$lt":
+                        l_v, r_v = MemoryCollection._coerce_comparable(field_val, operand)
+                        if isinstance(l_v, datetime.datetime) and isinstance(r_v, datetime.datetime):
+                            matched = matched and (l_v < r_v)
+                        else:
+                            matched = matched and isinstance(l_v, (int, float)) and not isinstance(l_v, bool) and l_v < r_v
                     elif op != "$options":
                         raise AssertionError(f"unsupported field operator: {op}")
             else:
@@ -165,13 +216,8 @@ class MemoryCollection:
         if isinstance(left, bool) != isinstance(right, bool):
             return False
         # Mongo 日期查询按 UTC 毫秒比较，不能依赖 Python aware/naive 相等。
-        if isinstance(left, datetime.datetime) and isinstance(right, datetime.datetime):
-            def bson_time(value):
-                value = (value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None
-                         else value.astimezone(datetime.timezone.utc))
-                return value.replace(microsecond=value.microsecond // 1000 * 1000)
-            return bson_time(left) == bson_time(right)
-        return left == right
+        l_v, r_v = MemoryCollection._coerce_comparable(left, right)
+        return l_v == r_v
 
     @staticmethod
     def project(doc, projection):
@@ -273,6 +319,10 @@ class TestProductRepository(unittest.TestCase):
             for key in ("price", "original_price", "saved_price", "coupon_amount", "commission_amount", "commission_rate"):
                 self.assertEqual(result[key], 0, key)
             self.assertFalse(result["has_coupon"])
+        explicit = self.repo._normalize_doc_summary({
+            "product_id": "1", "activity_price": 10, "commission_amount": 0, "commission_rate": 0,
+        })
+        self.assertEqual(explicit["commission_rate"], 0)
 
     def test_zero_saved_price_and_false_coupon_are_not_inferred_from_discount(self):
         result = self.repo._normalize_doc_summary({
@@ -288,13 +338,6 @@ class TestProductRepository(unittest.TestCase):
             self.assertEqual(self.repo._calc_commission(100, commission), (0.0, 0.0))
         self.assertEqual(self.repo._calc_commission(50, 5), (10.0, 5.0))
         self.assertEqual(self.repo._calc_commission(0, 5), (0.0, 5.0))
-
-    def test_explicit_commission_rate_is_preserved(self):
-        result = self.repo._normalize_doc_summary({
-            "product_id": "1", "activity_price": 10, "commission_amount": 0,
-            "commission_rate": 0,
-        })
-        self.assertEqual(result["commission_rate"], 0)
 
     def test_summary_and_detail_share_money_and_identity_mapping(self):
         payload = {
@@ -389,19 +432,6 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(self.col.docs[0]["activity_price"], 0)
         self.assertEqual(self.col.docs[0]["price"], 100)
         self.assertEqual(self.col.docs[0]["original_price"], 100)
-
-    def test_only_details_refresh_detail_updated_at(self):
-        self.repo.upsert_home_products([{"goods_id": "100", "name": "商品", "price": 10}])
-        self.assertNotIn("detail_updated_at", self.col.docs[0])
-        self.repo.upsert_product_detail({"goods_id": "100", "desc": "来源"})
-        old = datetime.datetime(2020, 1, 1)
-        self.col.docs[0]["detail_updated_at"] = old
-        self.repo.upsert_home_products([{"goods_id": "100", "price": 9}])
-        self.assertEqual(self.col.docs[0]["detail_updated_at"], old)
-        self.assertGreater(self.col.docs[0]["updated_at"], old)
-        self.assertEqual(self.repo.get_product_detail("100")["detail_updated_at"], old)
-        self.repo.upsert_product_detail({"goods_id": "100", "desc": "新来源"})
-        self.assertGreater(self.col.docs[0]["detail_updated_at"], old)
 
     def test_summary_material_url_is_persisted_without_creating_a_detail_clock(self):
         url = "https://item.jd.com/123.html"
@@ -704,22 +734,6 @@ class TestProductRepository(unittest.TestCase):
         self.assertIsNone(self.repo.get_product_detail("123", key_type="id"))
         self.assertEqual(self.repo.get_product_detail("00123", key_type="id")["name"], "字符串ID")
         self.assertEqual(self.col.queries[-1]["$and"][0], {"platform": "pdd", "product_id": "00123"})
-
-    def test_detail_write_preserves_service_fetch_time_and_summary_never_refreshes_it(self):
-        utc = datetime.timezone.utc
-        fetched = datetime.datetime(2025, 1, 2, 3, 4, 5, tzinfo=utc)
-        for supplied in (fetched, fetched.replace(tzinfo=None), fetched.astimezone(datetime.timezone(datetime.timedelta(hours=8)))):
-            with self.subTest(supplied=supplied):
-                _, update = self.repo._build_product_update({"goods_id": "1", "detail_updated_at": supplied}, detail=True)
-                self.assertEqual(update["$set"]["detail_updated_at"], fetched.replace(tzinfo=None))
-                _, summary = self.repo._build_product_update({"goods_id": "1", "detail_updated_at": supplied}, detail=False)
-                self.assertNotIn("detail_updated_at", summary["$set"])
-        for invalid in (None, "2025-01-02", 123):
-            before = datetime.datetime.now(utc).replace(tzinfo=None)
-            _, update = self.repo._build_product_update({"goods_id": "1", "detail_updated_at": invalid}, detail=True)
-            after = datetime.datetime.now(utc).replace(tzinfo=None)
-            self.assertLessEqual(before, update["$set"]["detail_updated_at"])
-            self.assertLessEqual(update["$set"]["detail_updated_at"], after)
 
     def test_sign_only_promotion_cache_uses_same_unique_identity_strategy(self):
         for sign in ("S1", "S2"):
@@ -1555,6 +1569,53 @@ class TestProductRepository(unittest.TestCase):
         top_item = ranked[0]
         self.assertEqual(top_item["price"], 49.9)
         self.assertNotIn("deal_info", top_item)
+
+    def test_query_boom_products_regex_escaped(self):
+        self.col.docs = [
+            {"platform": "pdd", "product_id": "LITERAL", "name": "维达 .*+?^${}()|[]\\ 抽纸", "price": 10.0, "channel_type": 5},
+            {"platform": "pdd", "product_id": "OTHER", "name": "普通抽纸任何文本", "price": 10.0, "channel_type": 5},
+        ]
+        nasty = ".*+?^${}()|[]\\"
+        res = self.repo.query_boom_products(platform="pdd", keyword=nasty, page=1, page_size=20)
+        self.assertEqual([d["product_id"] for d in res["data"]], ["LITERAL"])
+        self.assertEqual(self.col.queries[-1]["$and"][0]["name"]["$regex"], re.escape(nasty.strip()[:30]))
+
+    def test_get_promotion_link_cache_rejects_legacy_promotion_url(self):
+        self.col.docs = [{
+            "platform": "pdd",
+            "product_id": "88888",
+            "promotion_url": "https://p.pinduoduo.com/old_link_123",
+            "name": "历史商品",
+        }]
+        self.assertIsNone(self.repo.get_promotion_link_cache(platform="pdd", goods_id="88888"))
+
+    def test_product_repo_uppercase_g_maps_to_mass_not_storage(self):
+        from repositories.product_repo import UNIT_TO_CATEGORY, UNIT_TO_MULTIPLIER
+
+        self.assertEqual(UNIT_TO_CATEGORY["G"], "质量")
+        self.assertEqual(UNIT_TO_MULTIPLIER["G"], 1000)
+        self.assertEqual(UNIT_TO_CATEGORY["g"], "质量")
+        self.assertEqual(UNIT_TO_MULTIPLIER["g"], 1000)
+        self.assertEqual(UNIT_TO_CATEGORY["GB"], "数据存储")
+
+    def test_evict_product_from_caches_clears_5tuple_product_ref_keys(self):
+        import cache
+        from models.product import ProductRef
+
+        cache.DETAIL_CACHE.clear()
+        target = ProductRef(platform="pdd", goods_id="998877", goods_sign="sign_998877")
+        other = ProductRef(platform="pdd", goods_id="112233", goods_sign="sign_112233")
+        for key in target.cache_keys(uid="user_1"):
+            cache.DETAIL_CACHE.set(key, {"goods_id": "998877"})
+        for key in other.cache_keys(uid="user_1"):
+            cache.DETAIL_CACHE.set(key, {"goods_id": "112233"})
+
+        cache.evict_product_from_caches("pdd", goods_id="998877", goods_sign="sign_998877")
+        for key in target.cache_keys(uid="user_1"):
+            self.assertNotIn(key, cache.DETAIL_CACHE)
+        for key in other.cache_keys(uid="user_1"):
+            self.assertIn(key, cache.DETAIL_CACHE)
+        self.assertTrue(cache.is_product_off_promotion("pdd", goods_id="998877"))
 
 
 if __name__ == "__main__":

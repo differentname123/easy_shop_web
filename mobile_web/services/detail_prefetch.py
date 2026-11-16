@@ -98,7 +98,11 @@ class DetailPrefetcher:
         self._admitted = 0
         self._seed_cycles = 0
         self._completed = dict.fromkeys(_COMPLETION_STATUSES, 0)
-        self._batch_failures = {}
+        self._batch_detail_total = 0
+        self._batch_detail_errors = {}
+        self._batch_detail_reasons = {}
+        self._batch_persist_errors = {}
+        self._batch_off_promotion = 0
 
     def stats(self):
         """返回脱离内部状态的只读统计快照；不暴露任何商品或用户身份。"""
@@ -256,16 +260,17 @@ class DetailPrefetcher:
                     )
                 except Exception as exc:
                     logger.warning(
-                        "❌ 【详情预取告警】执行平台首屏推荐预取时发生异常 | 平台[%s] 频道[%s] 异常<%s> 排查方向<请检查上游推荐接口或网络连接状态>",
+                        "❌ 【详情预取告警】执行平台首屏推荐预取时发生异常，下轮将自动重试 | 平台[%s] 频道[%s] 异常<%s>",
                         platform["code"], channel.get("channel_type"), format_exc_summary(exc),
                     )
 
     def _execute_detail(self, task):
         snapshot = task.snapshot
         result = None
+        last_exc_summary = ""
         for attempt in range(MAX_ATTEMPTS):
             if self._stop_event.is_set():
-                return "stopped"
+                return "stopped", "", ""
             try:
                 result = self.service.prefetch_product_detail(
                     snapshot.ref if snapshot is not None else task.ref,
@@ -273,10 +278,11 @@ class DetailPrefetcher:
                     stop_event=self._stop_event,
                 )
             except Exception as exc:
+                last_exc_summary = format_exc_summary(exc)
                 # 只有共享入口明确标识的暂时错误才重试。
                 logger.warning(
-                    "❌ 【详情预取异常】执行商品详情预取任务时发生异常 | 平台[%s] 异常<%s> 排查方向<请检查上游详情接口或数据库状态>",
-                    task.ref.platform, format_exc_summary(exc),
+                    "❌ 【详情预取单品异常】执行后台商品详情预取任务时发生异常，不影响在线服务 | 平台[%s] 异常<%s>",
+                    task.ref.platform, last_exc_summary,
                 )
                 break
             if result.snapshot is not None:
@@ -289,7 +295,7 @@ class DetailPrefetcher:
                     if snapshot is None or _newer_snapshot(replacement.snapshot, snapshot):
                         break
             if self._stop_event.wait(self._retry_backoff):
-                return "stopped"
+                return "stopped", "", ""
         now = self._wall_clock()
         next_check = getattr(result, "next_check_at", 0)
         if getattr(result, "status", None) == "ready" and isinstance(next_check, (int, float)) and math.isfinite(next_check):
@@ -304,19 +310,25 @@ class DetailPrefetcher:
             while len(self._cooldowns) > COOLDOWN_CAPACITY:
                 self._cooldowns.popitem(last=False)
         status = getattr(result, "status", "error")
-        return status if status in _COMPLETION_STATUSES else "error"
+        status = status if status in _COMPLETION_STATUSES else "error"
+        err_code = str(getattr(result, "error_code", "") or "").strip()
+        err_msg = str(getattr(result, "error_msg", "") or "").strip()
+        if last_exc_summary:
+            err_code = err_code or "INTERNAL_ERROR"
+            err_msg = err_msg or last_exc_summary
+        return status, err_code, err_msg
 
     def _execute(self, task):
         if isinstance(task, _SummaryTask):
             try:
                 self.service.repo.upsert_home_products(task.items, channel_type=task.channel_type)
-                return "summary_ready"
+                return "summary_ready", "", ""
             except Exception as exc:
                 logger.warning(
                     "❌ 【详情预取告警】预取队列批量写入推荐商品摘要失败，不影响在线结果 | 频道[%s] 异常<%s> 排查方向<请检查MongoDB写入连接状态>",
                     task.channel_type, format_exc_summary(exc),
                 )
-                return "summary_error"
+                return "summary_error", "PERSIST_FAILED", format_exc_summary(exc)
         return self._execute_detail(task)
 
     def _run(self):
@@ -344,29 +356,70 @@ class DetailPrefetcher:
                         continue
                     _, task = self._pending.popitem(last=False)
                     self._inflight = task
-                status = "stopped"
+                status, err_code, err_msg = ("stopped", "", "")
                 try:
                     if not self._stop_event.is_set():
-                        status = self._execute(task)
+                        status, err_code, err_msg = self._execute(task)
                 finally:
-                    batch_failures = None
+                    batch_detail_total = 0
+                    batch_detail_errors = None
+                    batch_detail_reasons = None
+                    batch_persist_errors = None
+                    batch_off_promotion = 0
                     with self._condition:
                         self._completed[status] += 1
-                        if isinstance(task, _DetailTask) and status in ("error", "persist_failed"):
+                        if isinstance(task, _DetailTask):
+                            self._batch_detail_total += 1
                             plat = task.ref.platform or "unknown"
-                            self._batch_failures[plat] = self._batch_failures.get(plat, 0) + 1
+                            if status == "persist_failed":
+                                self._batch_persist_errors[plat] = self._batch_persist_errors.get(plat, 0) + 1
+                            elif status == "skipped" and err_code.upper() == "PRODUCT_OFF_PROMOTION":
+                                self._batch_off_promotion += 1
+                            elif status == "error":
+                                tag = f"{plat}[{err_code or 'UNKNOWN'}]"
+                                self._batch_detail_errors[tag] = self._batch_detail_errors.get(tag, 0) + 1
+                                if err_msg and tag not in self._batch_detail_reasons:
+                                    self._batch_detail_reasons[tag] = err_msg[:120]
                         self._inflight = None
                         batch_finished = not self._pending
-                        if batch_finished and self._batch_failures:
-                            batch_failures = dict(self._batch_failures)
-                            self._batch_failures.clear()
+                        if batch_finished:
+                            batch_detail_total = self._batch_detail_total
+                            self._batch_detail_total = 0
+                            batch_off_promotion = self._batch_off_promotion
+                            self._batch_off_promotion = 0
+                            if self._batch_persist_errors:
+                                batch_persist_errors = dict(self._batch_persist_errors)
+                                self._batch_persist_errors.clear()
+                            if self._batch_detail_errors:
+                                batch_detail_errors = dict(self._batch_detail_errors)
+                                self._batch_detail_errors.clear()
+                            if self._batch_detail_reasons:
+                                batch_detail_reasons = dict(self._batch_detail_reasons)
+                                self._batch_detail_reasons.clear()
                         self._condition.notify_all()
                 if batch_finished:
-                    if batch_failures:
-                        dist = ", ".join(f"{plat}:{cnt}条" for plat, cnt in sorted(batch_failures.items()))
+                    if batch_persist_errors:
+                        dist = ", ".join(f"{plat}:{cnt}条" for plat, cnt in sorted(batch_persist_errors.items()))
                         logger.warning(
-                            "❌ 【详情预取告警】本批次后台预取存在失败任务 | 失败分布[%s] 排查方向<请检查对应平台上游详情接口配额(如折淘客/联盟网关限流)或数据库连接状态>",
+                            "❌ 【详情预取告警】本批次后台预取存在数据库落盘失败任务 | 入库失败分布[%s] 排查方向<请检查MongoDB写入连接状态或磁盘空间>",
                             dist,
+                        )
+                    if batch_detail_errors:
+                        err_total = sum(batch_detail_errors.values())
+                        dist = ", ".join(f"{tag}:{cnt}条" for tag, cnt in sorted(batch_detail_errors.items()))
+                        detail_hint = "; ".join(f"{tag}={reason}" for tag, reason in sorted((batch_detail_reasons or {}).items()))
+                        logger.warning(
+                            "❌ 【详情预取告警】本批次后台预取存在失败任务 | 失败[%d/%d条] 分布[%s]%s 排查方向<请检查上游接口错误码、入参ID/Sign或网络状态>",
+                            err_total,
+                            batch_detail_total,
+                            dist,
+                            f" | 原因<{detail_hint}>" if detail_hint else "",
+                        )
+                    elif batch_off_promotion > 0:
+                        logger.info(
+                            "【详情预取】本批次已自动清理已确认下架/退推商品 [%d/%d条]",
+                            batch_off_promotion,
+                            batch_detail_total,
                         )
                     self._log_stats("idle")
         finally:
@@ -374,6 +427,10 @@ class DetailPrefetcher:
                 self._accepting = False
                 self._pending.clear()
                 self._inflight = None
-                self._batch_failures.clear()
+                self._batch_detail_total = 0
+                self._batch_detail_errors.clear()
+                self._batch_detail_reasons.clear()
+                self._batch_persist_errors.clear()
+                self._batch_off_promotion = 0
                 self._condition.notify_all()
             self._log_stats("stopped")

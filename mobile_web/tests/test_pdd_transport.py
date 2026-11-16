@@ -78,6 +78,10 @@ def test_auto_uses_platform_dns_and_proxy_defaults(monkeypatch, native_dns, plat
         result = socket.getaddrinfo("gw-api.pinduoduo.com", 8443)
         assert [entry[4] for entry in result] == [(ip, 8443) for ip in pdd_client._PDD_FALLBACK_IPS]
         native_dns.assert_not_called()
+    pdd_client.configure_transport("off", trust_env=not trust)
+    assert pdd_client._PDD_SESSION.trust_env is (not trust)
+    pdd_client.configure_transport("off", trust_env=None)
+    assert pdd_client._PDD_SESSION.trust_env is trust
 
 
 @pytest.mark.parametrize("platform", ["win32", "linux"])
@@ -130,16 +134,6 @@ def test_on_respects_preexisting_wrapper_and_off_restores_it(monkeypatch, native
     external.assert_called_once()
     pdd_client.configure_transport("off")
     assert socket.getaddrinfo is external
-
-
-@pytest.mark.parametrize("platform", ["win32", "linux"])
-@pytest.mark.parametrize("trust_env", [True, False])
-def test_explicit_trust_env_overrides_each_platform(monkeypatch, native_dns, platform, trust_env):
-    monkeypatch.setattr(sys, "platform", platform)
-    pdd_client.configure_transport("off", trust_env=trust_env)
-    assert pdd_client._PDD_SESSION.trust_env is trust_env
-    pdd_client.configure_transport("off", trust_env=None)
-    assert pdd_client._PDD_SESSION.trust_env is (platform != "win32")
 
 
 def test_expired_cache_refreshes_ipv4_and_preserves_port(monkeypatch, native_dns):

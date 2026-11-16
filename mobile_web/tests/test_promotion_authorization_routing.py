@@ -11,7 +11,6 @@ from adapters.base import UnavailablePlatformAdapter
 from auth import create_access_token
 from cache import PROMOTION_CACHE
 from config import AUTH_STATUS_TTL, AUTH_NEGATIVE_STATUS_TTL
-from infrastructure.tb_client import TaobaoClient
 from services.promote_service import PromoteService
 from services.user_service import UserService
 
@@ -220,7 +219,7 @@ def test_failed_explicit_check_never_overwrites_authorization(routing, response)
 
 
 @pytest.mark.parametrize("code,need_auth", [("AUTH_REQUIRED", True), ("PERSONAL_PROMOTION_UNAVAILABLE", False)])
-def test_runtime_personal_failure_reuses_public_db_and_only_explicit_denial_revokes(routing, code, need_auth):
+def test_runtime_personal_failure_reuses_public_db_and_never_revokes_authorization(routing, code, need_auth):
     routing.profiles[UID]["auth_status"]["pdd"] = authorized()
     routing.saved["pdd"] = public_link(_expires_at=time.time() + 300)
     adapter = routing.adapters["pdd"]
@@ -230,12 +229,13 @@ def test_runtime_personal_failure_reuses_public_db_and_only_explicit_denial_revo
     assert result["status"] == "success" and result["final_link"] == "https://example.com/public"
     assert result["attribution_status"] == "anonymous" and result["is_fallback"]
     assert bool(result.get("need_auth")) is need_auth
+    if need_auth:
+        assert "渠道授权未生效或已失效" in result["auth_msg"]
     adapter.convert_promotion_url.assert_called_once()
     # 策略 B: 转链失败不抹除数据库授权信息，防止网络抖动误伤推手
     routing.user_repo.update_auth_status.assert_not_called()
     assert routing.profiles[UID]["auth_status"]["pdd"]["is_authorized"] is True
     if need_auth:
-        # 下次转链依然乐观重试渠道生链
         routing.service.convert_link("pdd", "123", uid=UID)
         assert adapter.convert_promotion_url.call_count == 2
 
@@ -313,25 +313,67 @@ def test_explicit_authority_check_can_repair_a_corrupt_saved_identity(routing):
     routing.adapters["taobao"].generate_authority_url.assert_not_called()
 
 
-def test_runtime_failure_always_yields_station_master_fallback_without_touching_db(routing):
-    routing.profiles[UID]["auth_status"]["taobao"] = authorized()
-    routing.saved["taobao"] = public_link(_expires_at=time.time() + 300)
-    adapter = routing.adapters["taobao"]
-    adapter.convert_promotion_url.side_effect = None
-    adapter.convert_promotion_url.return_value = {"status": "error", "error_code": "AUTH_REQUIRED", "need_auth": True}
-    result = routing.service.convert_link("taobao", "123", uid=UID)
-    assert result["status"] == "success"
-    assert result["is_fallback"] is True
-    assert result["need_auth"] is True
-    assert "渠道授权未生效或已失效" in result["auth_msg"]
-    adapter.convert_promotion_url.assert_called_once()
-    routing.user_repo.update_auth_status.assert_not_called()
+def test_universal_convert_http_route_and_keyword_or_ambiguous_interceptions(monkeypatch):
+    from unittest.mock import MagicMock
+    from infrastructure.http_utils import sanitize_user_error_message
+    from models.product import ProductRef
+    from main import app
 
+    sanitized = sanitize_user_error_message("UPSTREAM_ERROR", "折淘客ZTK请求失败: errorCode=40009 relationId sid invalid", "淘宝")
+    for leak in ("折淘客", "ZTK", "40009", "relationId"):
+        assert leak not in sanitized
 
-def test_injected_taobao_client_honors_authorization_specific_timeout():
-    response = SimpleNamespace(status_code=200, raise_for_status=Mock(), json=lambda: {
-        "tbk_sc_publisher_info_get_response": {"data": {"total_count": 0, "inviter_list": []}}})
-    http = SimpleNamespace(post=Mock(return_value=response))
-    client = TaobaoClient("key", "secret", session_key="session", http_session=http)
-    assert client.check_authority(UID)["is_authorized"] is False
-    assert http.post.call_args.kwargs["timeout"] == (2.0, 3.0)
+    client = TestClient(app)
+    ambiguous = client.post("/api/promote/universal", json={"text": "农夫山泉饮用天然水550ml*24瓶整箱装", "platform": "auto"})
+    assert ambiguous.status_code == 200
+    assert ambiguous.json()["error_code"] == "AMBIGUOUS_PLATFORM_TEXT"
+
+    svc = PromoteService(product_repo=MagicMock(), user_service=MagicMock())
+    intercepted = svc.universal_convert(raw_text="维达抽纸整箱", platform="taobao")
+    assert intercepted["status"] == "error"
+    assert intercepted["error_code"] == "KEYWORD_NOT_LINK"
+    assert intercepted["suggested_keyword"] == "维达抽纸整箱"
+    assert intercepted["suggested_platform"] == "taobao"
+
+    mock_adapter = MagicMock()
+    mock_adapter.active = True
+    mock_adapter.platform_code = "taobao"
+    mock_adapter.platform_name = "淘宝"
+    mock_adapter.capabilities = {"detail": True, "promotion": True}
+    mock_adapter.requires_authorized_promotion = True
+    mock_adapter.requires_numeric_promoter_id = False
+    mock_adapter.resolve_product_ref.side_effect = lambda raw="", gid=None, gsign=None: ProductRef("taobao", gid or raw, gsign or raw)
+    mock_adapter.build_command_text.return_value = "【淘宝精选】好丽友派\n￥JBnB61RqEqX￥ https://s.click.taobao.com/abc"
+    mock_adapter.resolve_and_convert_universal.return_value = {
+        "status": "success",
+        "url": "https://uland.taobao.com/coupon/edetail?e=xxx",
+        "final_link": "https://s.click.taobao.com/abc",
+        "short_url": "https://s.click.taobao.com/abc",
+        "promotion_token": "￥JBnB61RqEqX￥",
+        "token_type": "tpwd",
+        "attribution_status": "anonymous",
+        "need_auth": False,
+        "is_fallback": False,
+        "goods_id": "TB_ENC_ID_999",
+        "goods_sign": "TB_ENC_ID_999",
+        "title": "好丽友巧克力派",
+        "price": 8.5,
+        "coupon_amount": 3.0,
+        "product": {
+            "platform": "taobao", "platform_name": "淘宝",
+            "goods_id": "TB_ENC_ID_999", "goods_sign": "TB_ENC_ID_999",
+            "name": "好丽友巧克力派", "image_url": "https://img.alicdn.com/1.jpg",
+            "price": 8.5, "original_price": 11.5, "coupon_amount": 3.0, "has_coupon": True,
+        },
+    }
+    monkeypatch.setattr("services.promote_service.get_adapter", lambda _p: mock_adapter)
+    monkeypatch.setattr("services.product_service.get_adapter", lambda _p: mock_adapter)
+    resp = client.post(
+        "/api/promote/universal",
+        json={"text": "67￥JBnB61RqEqX￥ https://m.tb.cn/h.xxx 好丽友巧克力派", "platform": "auto"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success" and body["platform"] == "taobao"
+    assert body["promotion_token"] == "￥JBnB61RqEqX￥"
+    assert body["product"]["goods_id"] == "TB_ENC_ID_999"

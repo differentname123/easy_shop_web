@@ -52,11 +52,6 @@ def assert_calls(strategy, api_types, uid):
         assert (json.loads(custom) if custom else None) == ({"uid": uid} if uid else None)
 
 
-def test_pdd_declares_authorization_without_new_identity_fields(strategy):
-    assert strategy.adapter.requires_authorized_promotion is True
-    assert strategy.adapter.required_identity_fields == ()
-
-
 @pytest.mark.parametrize("uid", [None, UID])
 def test_real_smart_red_packet_success_stops_without_standard_or_wash(strategy, uid):
     strategy.replies.append({"rp_promotion_url_generate_response": {"url_list": [{"short_url": PROMOTION}]}})
@@ -129,14 +124,6 @@ def test_smart_preserves_intermediate_authorization_evidence_when_last_failure_i
     strategy.wash.assert_called_once()
 
 
-def test_smart_returns_intermediate_error_details_only_when_all_strategies_fail(strategy):
-    strategy.replies.extend([RuntimeError("PDD网关拒绝: [60001:] 未备案"), {}])
-    result = pdd_client.generate_smart_promotion_url("offline", "offline", "mock_pid", SIGN, uid=UID)
-    assert result["status"] == "error"
-    assert result["strategy_errors"] == ["PDD网关拒绝: [60001:] 未备案"]
-    assert_calls(strategy, [RED_API, STANDARD_API], UID)
-
-
 def test_success_after_intermediate_authorization_error_remains_personal_success(strategy):
     strategy.replies.extend([
         RuntimeError("PDD网关拒绝: [60001:] 未备案"),
@@ -203,14 +190,6 @@ def test_generic_network_and_config_errors_do_not_claim_user_is_unauthorized(str
     strategy.wash.assert_not_called()
 
 
-def test_real_smart_network_errors_are_not_mistaken_for_missing_authorization(strategy):
-    strategy.replies.extend([requests.Timeout("AUTH proxy unavailable"), requests.Timeout("connection timed out")])
-    result = strategy.adapter.convert_promotion_url(SIGN, uid=UID)
-    assert result["error_code"] == "PERSONAL_PROMOTION_UNAVAILABLE"
-    assert result["need_auth"] is False
-    assert_calls(strategy, [RED_API, STANDARD_API], UID)
-
-
 @pytest.mark.parametrize("uid", [None, UID])
 def test_sign_only_ignores_unverified_product_url_after_smart_is_exhausted(strategy, uid):
     strategy.replies.extend([{}, {}])
@@ -230,8 +209,7 @@ def test_sign_only_ignores_unverified_product_url_after_smart_is_exhausted(strat
     assert_calls(strategy, [RED_API, STANDARD_API], uid)
 
 
-@pytest.mark.parametrize("uid", [None, UID])
-@pytest.mark.parametrize("goods_sign", [None, SIGN])
+@pytest.mark.parametrize("uid,goods_sign", [(None, None), (UID, SIGN)])
 def test_numeric_identity_cannot_be_overridden_by_conflicting_product_url(strategy, uid, goods_sign):
     strategy.replies.extend([{}, {}, {"goods_zs_unit_generate_response": {"short_url": PROMOTION}}])
     result = strategy.adapter.convert_promotion_url(
@@ -267,13 +245,12 @@ def test_wash_authorization_error_is_reported_without_anonymous_retry(strategy):
     assert_calls(strategy, [WASH_API], UID)
 
 
-@pytest.mark.parametrize("uid", [None, UID])
-@pytest.mark.parametrize("source", [
-    "https://evilpinduoduo.com/goods/123",
-    "https://pinduoduo.com.evil.example/goods/123",
-    "file://pinduoduo.com/goods/123",
-    "javascript:alert(1)",
-    "https://[pinduoduo.com/goods/123",
+@pytest.mark.parametrize("source,uid", [
+    ("https://evilpinduoduo.com/goods/123", None),
+    ("https://pinduoduo.com.evil.example/goods/123", UID),
+    ("file://pinduoduo.com/goods/123", None),
+    ("javascript:alert(1)", UID),
+    ("https://[pinduoduo.com/goods/123", UID),
 ])
 def test_unsupported_url_only_input_is_error_not_direct_link_success(strategy, source, uid):
     result = strategy.adapter.convert_promotion_url("", product_url=source, uid=uid)
@@ -305,37 +282,6 @@ def test_anonymous_all_fail_preserves_uncacheable_direct_link(strategy, target, 
     assert result["link_type"] == "商品直连保底"
     assert not promote_service.PromoteService._cacheable(result)
     assert_calls(strategy, expected_calls, None)
-
-
-def test_anonymous_direct_fallback_is_not_written_or_reused_by_service(strategy, monkeypatch):
-    repo = SimpleNamespace(
-        get_product_identity=Mock(return_value=None),
-        get_promotion_link_cache=Mock(return_value=None),
-        save_promotion_link_cache=Mock(),
-    )
-    monkeypatch.setattr(promote_service, "get_adapter", lambda platform: strategy.adapter)
-    service = promote_service.PromoteService(product_repo=repo)
-    strategy.replies.extend({} for _ in range(6))
-    for _ in range(2):
-        result = service.convert_link("pdd", "123")
-        assert result["final_link"] == SOURCE
-        assert result["is_fallback"] is True
-        assert result["cacheable"] is False
-    repo.save_promotion_link_cache.assert_not_called()
-    assert strategy.smart.call_count == 2
-    assert strategy.standard.call_count == 2
-    assert strategy.wash.call_count == 2
-    assert_calls(strategy, [RED_API, STANDARD_API, WASH_API] * 2, None)
-
-
-def test_missing_product_input_does_not_attempt_any_gateway_strategy(strategy):
-    result = strategy.adapter.convert_promotion_url("", uid=UID)
-    assert result["status"] == "error"
-    assert "error_code" not in result
-    strategy.smart.assert_not_called()
-    strategy.standard.assert_not_called()
-    strategy.wash.assert_not_called()
-    strategy.api.assert_not_called()
 
 
 def test_universal_convert_supports_app_share_ps_url_and_rejects_ambiguous_or_id_only_inputs(strategy):

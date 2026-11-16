@@ -569,3 +569,5 @@ class DetailPrefetchResult:
     snapshot: Optional[DetailSnapshot] = None
     retryable: bool = False
     next_check_at: float = 0.0
+    error_code: str = ""
+    error_msg: str = ""

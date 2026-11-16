@@ -53,7 +53,8 @@ def test_disabled_and_empty_optional_configuration_is_safe_and_never_calls_http(
     assert a.active is False and a.default_promoter_id == ""
     assert not any(a.capabilities.values())
     for result in (a.get_recommend_goods(), a.search_goods("商品"), a.get_goods_detail("sku"),
-                   a.convert_promotion_url("sku"), a.fetch_increment_orders(0, 100)):
+                   a.convert_promotion_url("sku"), a.check_authority("u_1234abcd"),
+                   a.generate_authority_url("u_1234abcd"), a.fetch_increment_orders(0, 100)):
         assert result["error_code"] == "platform_unavailable"
     a = JdAdapter(settings=SimpleNamespace(jd_enabled=True, ztk_appkey="key", jd_union_id="100"))
     assert a.active and a.capabilities["search"] and a.capabilities["detail"]
@@ -84,15 +85,24 @@ def test_rank_script_roots_fields_zero_values_and_channel_mapping(string, channe
     assert call.kwargs["allow_redirects"] is False and call.kwargs["timeout"] == (3.0, 12.0)
 
 
+def _rank_row(item_id):
+    return {
+        "itemId": item_id,
+        "skuName": f"榜单商品-{item_id}",
+        "wlprice": "20.50",
+        "imageUrl": "https://img.test/rank.jpg",
+    }
+
+
 def test_rank_non_aligned_offset_spans_pages_without_losing_order_or_publishing_details():
     c = Mock()
     c.get_rank_goods.side_effect = [
-        {"status": "success", "data": [item(str(i)) for i in range(4, 7)], "has_more": True},
-        {"status": "success", "data": [item(str(i)) for i in range(7, 10)], "has_more": True},
+        {"status": "success", "data": [_rank_row(f"rank_{i}_encrypted") for i in range(4, 7)], "has_more": True},
+        {"status": "success", "data": [_rank_row(f"rank_{i}_encrypted") for i in range(7, 10)], "has_more": True},
     ]
     sink = Mock()
     result = adapter(c).get_recommend_goods(offset=5, limit=3, detail_sink=sink)
-    assert [g["goods_id"] for g in result["data"]] == ["6", "7", "8"]
+    assert [g["goods_id"] for g in result["data"]] == ["rank_6_encrypted", "rank_7_encrypted", "rank_8_encrypted"]
     assert result["next_offset"] == 8 and result["has_more"]
     assert [call.kwargs["page"] for call in c.get_rank_goods.call_args_list] == [2, 3]
     sink.assert_not_called()
@@ -102,7 +112,7 @@ def test_rank_non_aligned_offset_spans_pages_without_losing_order_or_publishing_
 def test_failed_second_rank_page_does_not_return_partial_success():
     c = Mock()
     c.get_rank_goods.side_effect = [
-        {"status": "success", "data": [item(str(i)) for i in range(4, 7)], "has_more": True},
+        {"status": "success", "data": [_rank_row(f"rank_{i}_encrypted") for i in range(4, 7)], "has_more": True},
         {"status": "error", "error_code": "NETWORK_ERROR"},
     ]
     result = adapter(c).get_recommend_goods(offset=5, limit=3)
@@ -181,7 +191,8 @@ def test_promotion_script_parameters_commands_and_server_identity_only(string):
                       "positionId": "88", "materialId": "https://jingfen.jd.com/detail/verified.html"}
 
 
-def test_material_url_bridge_uses_supplier_detail_not_request_url_and_never_invents_opaque_sku():
+def test_material_url_bridge_uses_supplier_detail_not_request_url_and_rejects_numeric_sku():
+    encrypted_tao_id = "2JQkZkZ2nGOIkKHE8K75IkKfe6mXtQ_3SD7M7MGcugkXyuI4w"
     c = Mock()
     c.get_goods_detail.return_value = {"status": "success", "data": [item(item_url="")]}
     a = adapter(c)
@@ -189,13 +200,17 @@ def test_material_url_bridge_uses_supplier_detail_not_request_url_and_never_inve
                                      url="https://item.jd.com/999.html")
     assert result["error_code"] == "MATERIAL_URL_REQUIRED"
     c.convert_promotion_link.assert_not_called()
-    # Even numeric itemId alone is not an explicit SKU assertion from the supplier.
+    # 纯数字 itemId 不足以构成可信商品链接
     c.get_goods_detail.return_value = {"status": "success", "data": [item("123", item_url="")]}
     assert a.convert_promotion_url("123", promoter_id="88")["error_code"] == "MATERIAL_URL_REQUIRED"
-    c.get_goods_detail.return_value = {"status": "success", "data": [item(item_url="", skuId="00123")]}
+    # 加密 tao_id / itemId 可兜底拼出标准京粉物料链接
+    c.get_goods_detail.return_value = {"status": "success", "data": [item(encrypted_tao_id, item_url="")]}
     c.convert_promotion_link.return_value = {"status": "success", "short_url": "https://u.jd.com/1"}
-    assert a.convert_promotion_url("opaque-material", promoter_id="88")["status"] == "success"
-    assert c.convert_promotion_link.call_args.args == ("https://item.jd.com/123.html", "88")
+    assert a.convert_promotion_url(encrypted_tao_id, promoter_id="88")["status"] == "success"
+    assert c.convert_promotion_link.call_args.args == (f"https://jingfen.jd.com/detail/{encrypted_tao_id}.html", "88")
+    # 真实上游对纯数字 item.jd.com/123.html 返回 301 不支持数字 id 转链时精确映射 UNSUPPORTED_JD_NUMERIC_SKU
+    numeric_http = http_for({"status": 301, "content": "很抱歉！不支持数字id转链！"})
+    assert client(numeric_http).convert_universal_material("https://item.jd.com/123.html", "88")["error_code"] == "UNSUPPORTED_JD_NUMERIC_SKU"
     # Real item_url is available in raw detail even though the example's DTO omits it.
     c.get_goods_detail.return_value = {"status": "success", "data": [item()]}
     assert a.convert_promotion_url("opaque-material", promoter_id="88")["status"] == "success"
@@ -382,28 +397,36 @@ def test_numeric_scope_config_fingerprint_and_failure_has_no_owner_fallback():
 
 
 def test_appkey_list_failover_rescues_rate_limited_key_and_updates_active_cursor():
-    # 当 Key 1 触发折淘客 301 频控限制时，自动切换到 Key 2 重试成功，并将健康游标切换到 Key 2
+    # 当 Key 1 触发折淘客 301 频控限制时，自动切换到 Key 2 重试成功，并将 Key 1 冷却隔离 60s（哪怕轮询游标绕回索引 0 也跳过）
     http = http_for(
         {"status": 301, "content": "对应宝贝已下架"},
         {"status": 200, "content": [item("opaque-material")]},
         {"status": 200, "content": [item("second-item")]},
+        {"status": 200, "content": [item("third-item")]},
     )
     c = JdClient(["key-1", "key-2"], "10001", "test-jd-key", "test-jd-secret", http_session=http)
     assert c.appkey_list == ("key-1", "key-2")
 
-    # 第一次请求：Key 1 返回 301 失败 -> 自动切换 Key 2 成功
+    # 第一次请求（游标 0）：Key 1 返回 301 失败 -> 自动切换 Key 2 成功，且 Key 1（索引 0）进入冷却隔离
     res1 = c.get_goods_detail("opaque-material")
     assert res1["status"] == "success"
     assert http.get.call_count == 2
     assert http.get.call_args_list[0].kwargs["params"]["appkey"] == "key-1"
     assert http.get.call_args_list[1].kwargs["params"]["appkey"] == "key-2"
     assert c.appkey == "key-2"
+    assert 0 in c._key_cooldown_until
 
-    # 第二次请求：直接从已记忆的健康 Key 2 发起，1 次即成功，不再浪费在已限流的 Key 1 上
+    # 第二次请求（游标 1）：直接走 Key 2 成功
     res2 = c.search_goods("蓝牙耳机")
     assert res2["status"] == "success"
     assert http.get.call_count == 3
     assert http.get.call_args_list[2].kwargs["params"]["appkey"] == "key-2"
+
+    # 第三次请求（轮询游标已绕回索引 0）：因 Key 1 仍在 60s 冷却期内，仍跳过 Key 1 直接使用健康的 Key 2
+    res3 = c.search_goods("无线耳机")
+    assert res3["status"] == "success"
+    assert http.get.call_count == 4
+    assert http.get.call_args_list[3].kwargs["params"]["appkey"] == "key-2"
 
 
 def test_appkey_list_never_retries_on_unsafe_redirect_or_untrusted_gateway():
@@ -411,6 +434,12 @@ def test_appkey_list_never_retries_on_unsafe_redirect_or_untrusted_gateway():
     c = JdClient(["key-1", "key-2"], "10001", "test-jd-key", "test-jd-secret", http_session=http)
     assert c.search_goods("蓝牙耳机")["error_code"] == "UNSAFE_REDIRECT"
     assert http.get.call_count == 1
+
+    evil_signed = "https://evil.test/routerjson?method=" + ORDER_METHOD
+    order_http = SimpleNamespace(get=Mock(side_effect=[reply({"status": 200, "content": evil_signed}), reply({"status": 200, "content": SIGNED})]))
+    c2 = JdClient(["key-1", "key-2"], "10001", "test-jd-key", "test-jd-secret", http_session=order_http)
+    assert c2.query_orders(0, 100)["error_code"] == "UNTRUSTED_GATEWAY"
+    assert order_http.get.call_count == 1
 
 
 def test_rank_encrypted_item_id_converts_directly_with_jingfen_url_without_detail_call():
@@ -593,10 +622,6 @@ def test_jd_universal_convert_passes_raw_text_directly_and_never_falls_back_to_k
                 }),
             },
         },
-        {
-            "status": 200,
-            "content": [item("wAQEbTBpySSwDZcuvK0xwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC", title="可口可乐330ml*24")],
-        },
     )
     a = adapter(client(s))
     mixed_text = "★京东超级补贴★ 可口可乐330ml*24 售价：49.2元[下单链接：https://u.jd.com/oldshort]返2元红包！"
@@ -605,6 +630,7 @@ def test_jd_universal_convert_passes_raw_text_directly_and_never_falls_back_to_k
     assert res["short_url"] == "https://u.jd.com/newshort"
     assert res["promotion_token"] == "！ABCD1234EFGH！ CA1234"
     assert res["product"]["name"] == "可口可乐330ml*24"
+    assert s.get.call_count == 3
     assert s.get.call_args_list[0].args[0].endswith("/open_jing_union_open_promotion_byunionid_get.ashx")
     assert s.get.call_args_list[1].args[0].endswith("/open_gaoyongzhuanlian_tkl_piliang.ashx")
     assert s.get.call_args_list[2].args[0].endswith("/open_jing_union_open_promotion_byunionid_get.ashx")
@@ -791,3 +817,106 @@ def test_merchant_main_image_update_preserves_detail_and_coupon_via_verified_cip
     mismatch = a.get_goods_detail(req_sign, goods_id=old_img_key, goods_sign=req_sign)
     assert mismatch["status"] == "error" and mismatch["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
     clear_all_caches()
+
+
+def test_jd_search_goods_rescues_single_key_301_rate_limit_and_converges_on_genuine_empty():
+    # Case 1: Key 1 returns 301 "无符合条件的数据" due to 1000-call throttle, Key 2 returns real data
+    called_keys = []
+
+    def _get_rate_limited(url, params=None, **_kwargs):
+        k = params["appkey"]
+        called_keys.append(k)
+        if k == "jd-k1":
+            return reply({"status": 301, "content": "无符合条件的数据"})
+        return reply({"status": 200, "content": [{"tao_id": "100999", "tao_title": "京东好价抽纸", "quanhou_jiage": "19.9"}]})
+
+    jd1 = JdClient(union_id="10001", appkey_list=["jd-k1", "jd-k2", "jd-k3", "jd-k4"], http_session=SimpleNamespace(get=_get_rate_limited))
+    res1 = jd1.search_goods("维达抽纸", page=1, page_size=20)
+    assert res1["status"] == "success" and len(res1["data"]) == 1
+    assert called_keys == ["jd-k1", "jd-k2"]
+    assert 0 in jd1._key_cooldown_until
+
+    # Case 2: Genuine empty search across 4 keys stops after 2 keys confirm 301 (does not waste k3/k4)
+    empty_keys = []
+
+    def _get_truly_empty(url, params=None, **_kwargs):
+        empty_keys.append(params["appkey"])
+        return reply({"status": 301, "content": "无符合条件的数据"})
+
+    jd2 = JdClient(union_id="10001", appkey_list=["jd-k1", "jd-k2", "jd-k3", "jd-k4"], http_session=SimpleNamespace(get=_get_truly_empty))
+    res2 = jd2.search_goods("不存在的冷门词xyz", page=1, page_size=20)
+    assert res2 == {"status": "success", "data": [], "has_more": False, "total_count": 0}
+    assert empty_keys == ["jd-k1", "jd-k2"]
+
+
+def test_jd_client_per_key_pacing_reserves_slots_per_appkey_and_skips_mocks(monkeypatch):
+    import requests
+
+    sleeps = []
+    monkeypatch.setattr("infrastructure.jd_client.time.monotonic", lambda: 1000.0)
+    monkeypatch.setattr("infrastructure.jd_client.time.sleep", lambda s: sleeps.append(round(s, 3)))
+    monkeypatch.setattr(JdClient, "_KEY_NEXT_ALLOWED_TS", {})
+
+    # 1. Mocked http_session incurs zero pacing sleep
+    mock_cli = JdClient(appkey_list=["k-mock"], union_id="2035679405", http_session=SimpleNamespace(get=lambda *a, **kw: None))
+    mock_cli._pace_real_http_by_key({"params": {"appkey": "k-mock"}})
+    assert sleeps == [] and JdClient._KEY_NEXT_ALLOWED_TS == {}
+
+    # 2. Real requests.Session spaces same-key calls by 0.22s while allowing distinct keys immediately
+    real_cli = JdClient(appkey_list=["k-real-1", "k-real-2"], union_id="2035679405", http_session=requests.Session())
+    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-1"}})
+    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-2"}})
+    assert sleeps == []
+    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-1"}})
+    assert sleeps == [0.22]
+
+
+def test_jd_client_pace_backlog_fast_fails_instead_of_blocking(monkeypatch):
+    cli = JdClient(appkey_list=["busy_key"], union_id="100001")
+    monkeypatch.setattr(JdClient, "_KEY_NEXT_ALLOWED_TS", {"busy_key": 1000.0})
+    monkeypatch.setattr("infrastructure.jd_client.time.monotonic", lambda: 100.0)
+
+    res = cli._get("https://api.zhetaoke.com:10001/api/open_jing_union_open_goods_jingfen_query.ashx", params={"appkey": "busy_key"})
+    assert res["status"] == "error" and res["error_code"] == "UPSTREAM_ERROR"
+
+
+def test_jd_detail_rate_limit_fallback_uses_resilient_enrich_and_never_logs_red_cross(monkeypatch, caplog):
+    import logging
+    from cache import clear_all_caches
+    from models.product import ProductRef
+    from services import product_service as prod_mod
+
+    clear_all_caches()
+    enc_sign = "MHQuhO536DtWOykdGM94WOykdGM94Q_3RTWqX1JrEJSAPxknW"
+    gid = "6ad1ed9fFa252fa1e_093532032071e8dc"
+
+    class FakeJdDetailAdapter:
+        active = True
+        platform_code = "jd"
+        platform_name = "京东"
+        capabilities = {"detail": True}
+
+        def resolve_product_ref(self, raw="", goods_id=None, goods_sign=None):
+            return ProductRef("jd", goods_id or gid, goods_sign or enc_sign)
+
+        def enrich_detail_resilient(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
+            return {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "京东详情接口触发临时频控"}
+
+        def get_goods_detail(self, **kwargs):
+            raise AssertionError("foreground JD detail should prefer enrich_detail_resilient")
+
+    repo = Mock()
+    repo.get_product_detail.return_value = {
+        "platform": "jd", "goods_id": gid, "goods_sign": enc_sign, "name": "小草先生纯黑芝麻油500ml",
+        "price": 9.99, "original_price": 9.99,
+        "image_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/4/6ad1ed9fFa252fa1e/093532032071e8dc.png",
+    }
+    monkeypatch.setattr(prod_mod, "get_adapter", lambda plat: FakeJdDetailAdapter())
+    svc = prod_mod.ProductService(product_repo=repo)
+
+    with caplog.at_level(logging.INFO):
+        res = svc.get_goods_detail(platform="jd", goods_id=gid, goods_sign=enc_sign)
+    assert res["status"] == "success" and res["source"] == "database_fallback"
+    assert all("❌" not in rec.getMessage() for rec in caplog.records)
+    clear_all_caches()
+

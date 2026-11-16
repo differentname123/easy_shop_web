@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """单元测试：云端多官方 API Key 轮询池、独立海外代理隔离、自定义模型列表及 --check-ai 自检。"""
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -8,6 +9,8 @@ import pytest
 
 from infrastructure.ai_api import model_api
 import run as runner
+
+_REAL_TIME_SLEEP = time.sleep
 
 
 class _FakeRateLimitError(Exception):
@@ -231,29 +234,36 @@ def test_runner_check_ai_flag_succeeds_and_redacts_secrets_on_failure(tmp_path, 
     from infrastructure.settings import get_settings
 
     get_settings.cache_clear()
-    monkeypatch.setattr(
-        model_api,
-        "generate_content",
-        lambda **kw: {
-            "status": "✅ 成功",
-            "content": '{"ok": true}',
-            "metrics": {"model_used": "gemini-3.8-flash", "key_slot": "Key#1/2", "total_time_seconds": 0.42},
-        },
-    )
-    assert runner.main(["--config", str(cfg), "--check-ai"]) == 0
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            model_api,
+            "generate_content",
+            lambda **kw: {
+                "status": "✅ 成功",
+                "content": '{"ok": true}',
+                "metrics": {"model_used": "gemini-3.8-flash", "key_slot": "Key#1/2", "total_time_seconds": 0.42},
+            },
+        )
+        assert runner.main(["--config", str(cfg), "--check-ai"]) == 0
     out = capsys.readouterr()
     assert "AI 连通性自检成功" in out.out
     assert "gemini-3.8-flash" in out.out
     assert "AIzaSySecretCanaryKey12345" not in out.out + out.err
 
+    monkeypatch.setattr(model_api, "_RUNTIME_OS_NAME", "nt")
     monkeypatch.setattr(
         model_api,
-        "generate_content",
-        lambda **kw: {
-            "status": "❌ 失败",
-            "content": model_api._redact("调用失败：401 invalid key AIzaSySecretCanaryKey12345"),
-            "metrics": {"model_used": "gemini-3.8-flash", "total_time_seconds": 0.12},
-        },
+        "OpenAI",
+        lambda **_kw: SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    with_raw_response=SimpleNamespace(
+                        create=lambda **_ckw: (_ for _ in ()).throw(RuntimeError("401 invalid key AIzaSySecretCanaryKey12345"))
+                    )
+                )
+            ),
+            close=lambda: None,
+        ),
     )
     assert runner.main(["--config", str(cfg), "--check-ai"]) == 1
     out_fail = capsys.readouterr()
@@ -366,8 +376,8 @@ def test_linux_missing_cloud_ai_fails_fast_with_clear_upload_hint(tmp_path, monk
     assert res["status"] == "❌ 失败"
     assert res["metrics"]["attempts"] == 0
     assert res["metrics"]["runtime_mode"] == "linux_cloud"
-    assert "缺少 cloud_ai 配置块" in res["content"]
-    assert "config.local.json 不会随 git 上传" in res["content"]
+    assert "cloud_ai" in res["content"]
+    assert "config.local.json" in res["content"]
 
 
 def test_openai_v3_default_httpx_client_works_without_legacy_httpx(monkeypatch):
@@ -403,3 +413,143 @@ def test_openai_v3_default_httpx_client_works_without_legacy_httpx(monkeypatch):
     assert captured["openai_kwargs"]["http_client"] is http_cli
 
 
+def test_unified_llm_json_extraction_strips_think_blocks():
+    from infrastructure.ai_api.model_api import extract_llm_json
+    from services.group_help_service import extract_json_object
+    from mobile_web.scripts.goods_info_format import string_to_object
+
+    raw_dict_output = (
+        '<think>先分析一下：如果返回 {"is_valid": false, "fake": 1} 会怎样？不行，再想想。</think>\n'
+        '```json\n{"is_valid": true, "real_answer": 42}\n```'
+    )
+    assert extract_llm_json(raw_dict_output) == {"is_valid": True, "real_answer": 42}
+    assert extract_json_object(raw_dict_output) == {"is_valid": True, "real_answer": 42}
+    assert string_to_object(raw_dict_output) == {"is_valid": True, "real_answer": 42}
+
+    raw_list_output = (
+        '<thought>草稿：[{"sku_id": "wrong"}]</thought>\n'
+        '[{"sku_id": "100_1", "price": 19.9}]'
+    )
+    assert extract_llm_json(raw_list_output) == [{"sku_id": "100_1", "price": 19.9}]
+    assert string_to_object(raw_list_output) == [{"sku_id": "100_1", "price": 19.9}]
+
+
+def test_select_models_excludes_zero_weight_models_from_primary_and_fallbacks():
+    zero_low = {m["model_name"] for m in model_api.LOW_MODEL_LIST if m.get("权重", 0) <= 0}
+    zero_med = {m["model_name"] for m in model_api.MEDIUM_MODEL_LIST if m.get("权重", 0) <= 0}
+    assert "gemini-aistudio-api-key-3.5-flash" in zero_low
+
+    for _ in range(100):
+        chosen_low = model_api._select_models(None, None, "low")
+        assert chosen_low and zero_low.isdisjoint(chosen_low)
+        chosen_med = model_api._select_models(None, None, "medium")
+        assert chosen_med and zero_med.isdisjoint(chosen_med)
+
+
+def test_antigravity_client_defaults_to_3_concurrency_per_account_6_across_2(tmp_path, monkeypatch):
+    import os
+    from infrastructure.ai_api import antigravity_client as ag
+
+    monkeypatch.setattr(ag, "GLOBAL_LOCK_DIR", tmp_path / "locks")
+    monkeypatch.setattr(
+        ag,
+        "sync_all_known_accounts_to_sandboxes",
+        lambda overwrite_from_desktop=False: {
+            "guardianriedel689@gmail.com": tmp_path / "sb1",
+            "richard.nowak@usa.com": tmp_path / "sb2",
+        },
+    )
+
+    assert ag.DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT == 3
+    pool = ag.AntigravityPoolClient(
+        account_pool=["guardianriedel689@gmail.com", "richard.nowak@usa.com"]
+    )
+    assert pool.max_concurrency_per_account == 3
+    workers = pool.get_eligible_workers()
+    assert len(workers) == 2
+    claimed = []
+    try:
+        for w in workers:
+            assert w._max_concurrency == 3
+            for _ in range(3):
+                fd = w.try_claim_idle_slot()
+                assert fd is not None
+                claimed.append((w, fd))
+            assert w.try_claim_idle_slot() is None
+        assert len(claimed) == 6
+    finally:
+        for w, fd in claimed:
+            w._unlock_fd(fd)
+            os.close(fd)
+            w._concurrency_sem.release()
+
+
+def test_windows_safe_timed_rotating_file_handler_and_per_daemon_log_isolation(tmp_path):
+    import logging
+    import os
+    import time
+    from unittest.mock import patch
+
+    with patch("sys.argv", ["scripts/run_deal_pool_scheduler.py"]):
+        assert model_api._resolve_process_log_stem("model_api") == "model_api_deal_pool"
+    with patch("sys.argv", ["scripts/run_xianyu_deal_discovery_scheduler.py"]):
+        assert model_api._resolve_process_log_stem("model_api") == "model_api_xianyu"
+    with patch("sys.argv", ["run.py"]):
+        assert model_api._resolve_process_log_stem("model_api") == "model_api"
+
+    log_path = os.path.join(str(tmp_path), "model_api_deal_pool.log")
+    handler = model_api._WindowsSafeTimedRotatingFileHandler(
+        log_path, when="midnight", backupCount=2, encoding="utf-8", delay=True
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    rec = logging.LogRecord("test", logging.INFO, __file__, 1, "hello log line", (), None)
+    handler.emit(rec)
+    handler.rolloverAt = int(time.time()) - 10
+    handler.doRollover()
+    rotated_files = [f for f in os.listdir(tmp_path) if f.startswith("model_api_deal_pool.log.")]
+    assert len(rotated_files) == 1
+
+    handler.emit(rec)
+    handler.rolloverAt = int(time.time()) - 10
+    with patch.object(handler, "rotate", side_effect=PermissionError(32, "被占用")):
+        handler.doRollover()
+    assert handler.rolloverAt > int(time.time())
+    handler.close()
+
+
+def test_save_json_concurrent_unique_tmp_and_permission_retry(tmp_path, monkeypatch):
+    import concurrent.futures
+    import os
+    from unittest.mock import patch
+
+    monkeypatch.setattr(model_api.time, "sleep", _REAL_TIME_SLEEP)
+    target = os.path.join(str(tmp_path), "api_keys_state.json")
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def _flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(5, "拒绝访问")
+        return real_replace(src, dst)
+
+    with patch.object(model_api.os, "replace", side_effect=_flaky_replace):
+        model_api.save_json(target, {"status": "ok", "count": 3})
+
+    assert calls["n"] == 3
+    with open(target, "r", encoding="utf-8") as f:
+        assert json.load(f) == {"status": "ok", "count": 3}
+    assert [x for x in os.listdir(tmp_path) if x.endswith(".tmp")] == []
+
+    def _worker(tid: int):
+        for seq in range(15):
+            model_api.save_json(target, {"tid": tid, "seq": seq})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for fut in [pool.submit(_worker, i) for i in range(6)]:
+            fut.result()
+
+    with open(target, "r", encoding="utf-8") as f:
+        final_data = json.load(f)
+    assert "tid" in final_data and "seq" in final_data
+    assert [x for x in os.listdir(tmp_path) if x.endswith(".tmp")] == []

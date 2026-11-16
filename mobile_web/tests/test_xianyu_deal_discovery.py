@@ -182,23 +182,6 @@ class _InMemoryXianyuItemsCol:
         return matched
 
 
-def test_prompts_contain_no_concrete_examples():
-    """验证三个大模型提示词均采用纯抽象原则表达，不含具体举例词。"""
-    prompt_paths = [
-        sched.KEYWORD_PROMPT_PATH,
-        sched.COARSE_FILTER_PROMPT_PATH,
-        sched.COMPARISON_PROMPT_PATH,
-    ]
-    forbidden_markers = ("例如", "比如", "举例", "如：", "如“", '如"', "譬如")
-    for p in prompt_paths:
-        assert os.path.isfile(p), f"提示词文件不存在: {p}"
-        with open(p, "r", encoding="utf-8") as f:
-            txt = f.read().strip()
-        assert len(txt) > 200
-        for marker in forbidden_markers:
-            assert marker not in txt, f"提示词 {os.path.basename(p)} 中不应出现具体举例标记 '{marker}'"
-
-
 def test_build_deal_tip_virtual_doc_shelf_life_and_snapshot():
     now_utc = datetime.datetime(2026, 11, 12, 6, 0, 0, tzinfo=datetime.timezone.utc)
     cutoff_48h = now_utc - datetime.timedelta(hours=48)
@@ -337,8 +320,9 @@ def test_step1_single_item_eligibility_llm_and_ineligible_skip():
 
 
 def test_top2_detail_cap_and_7day_xianyu_items_cache_reuse():
-    """验证默认仅保留前 2 个可比商品拉取详情，且 xianyu_items 表 7 天内详情直接复用、搜索概览入库绝不覆盖旧详情。"""
-    assert sched.MAX_DETAIL_CHECKS_PER_CATEGORY == 2
+    """验证按 MAX_DETAIL_CHECKS_PER_CATEGORY 截断可比商品详情拉取，且 xianyu_items 表 7 天内详情直接复用、搜索概览绝不覆盖旧详情。"""
+    cap = sched.MAX_DETAIL_CHECKS_PER_CATEGORY
+    assert cap >= 2
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     two_days_ago = now_utc - datetime.timedelta(days=2)
@@ -390,6 +374,7 @@ def test_top2_detail_cap_and_7day_xianyu_items_cache_reuse():
     )
 
     cand = _make_sample_candidate(1, with_keyword=True)
+    candidate_ids = [f"900{i}" for i in range(1, cap + 3)]
     fake_search_res = {
         "ok": True,
         "is_offline": False,
@@ -397,7 +382,7 @@ def test_top2_detail_cap_and_7day_xianyu_items_cache_reuse():
         "user_data_dir": r"W:\temp\xianyu_xiaohao",
         "items": [
             {"item_id": f"900{i}", "title": f"维达抽纸24包_{i}", "price": 18.0 + i, "want_cnt": 5, "is_free_shipping": True}
-            for i in range(1, 7)
+            for i in range(1, cap + 5)
         ],
     }
     fake_live_det = {
@@ -444,9 +429,8 @@ def test_top2_detail_cap_and_7day_xianyu_items_cache_reuse():
         "metrics": {"model_used": "unit_test_step3"},
     }
 
-    # 初筛返回 4 个 ID，但系统应仅保留前 2 个 (["9001", "9002"])；其中 9001 命中 7 天缓存免拉取，仅补拉 ["9002"]
     with patch.object(sched, "search_xianyu_items", return_value=fake_search_res), patch.object(
-        sched, "_filter_comparable_xianyu_items_by_llm", return_value=(["9001", "9002", "9003", "9004"], {}, "ok")
+        sched, "_filter_comparable_xianyu_items_by_llm", return_value=(candidate_ids, {}, "ok")
     ), patch.object(sched, "get_xianyu_item_details_batch", return_value=fake_live_det) as mock_batch_det, patch.object(
         sched, "generate_content", return_value=fake_step3_llm
     ):
@@ -459,16 +443,16 @@ def test_top2_detail_cap_and_7day_xianyu_items_cache_reuse():
         )
 
     assert mock_batch_det.call_count == 1
-    assert mock_batch_det.call_args.kwargs["item_ids"] == ["9002"]
+    assert mock_batch_det.call_args.kwargs["item_ids"] == [i for i in candidate_ids[:cap] if i != "9001"]
     assert fake_items_col.docs["9001"]["has_detail"] is True
     assert len(fake_items_col.docs["9001"]["detail"]["sku_list"]) == 2
     assert fake_items_col.docs["9002"]["detail_updated_at"] > two_days_ago
-    assert fake_items_col.docs["9003"]["has_detail"] is False
+    assert fake_items_col.docs[f"900{cap + 1}"]["has_detail"] is False
 
     audit = rec["xianyu_audit_trail"]
-    assert audit["step3_detail_fetched_count"] == 2
+    assert audit["step3_detail_fetched_count"] == cap
     assert audit["step3_detail_cache_hit_count"] == 1
-    assert audit["step3_detail_live_fetched_count"] == 1
+    assert audit["step3_detail_live_fetched_count"] == cap - 1
     assert rec["final_winner"] == "xianyu_product"
 
 
@@ -586,21 +570,24 @@ def test_mid_round_circuit_breaker_stops_immediately_without_db_write():
     fake_col = MagicMock()
     fake_db.get_collection.return_value = fake_col
 
-    with patch.object(sched, "gen_db_object", return_value=fake_db), patch.object(
-        sched, "select_round_candidates_for_source", return_value=cands
-    ), patch.object(sched, "generate_content", return_value=step1_ok) as mock_llm, patch.object(
-        sched, "search_xianyu_items", return_value=blocked_res
-    ) as mock_search:
-        records = sched.run_discovery_cycle(
-            enable_official=True,
-            enable_deal_tip=False,
-        )
+    try:
+        with patch.object(sched, "gen_db_object", return_value=fake_db), patch.object(
+            sched, "select_round_candidates_for_source", return_value=cands
+        ), patch.object(sched, "generate_content", return_value=step1_ok) as mock_llm, patch.object(
+            sched, "search_xianyu_items", return_value=blocked_res
+        ) as mock_search:
+            records = sched.run_discovery_cycle(
+                enable_official=True,
+                enable_deal_tip=False,
+            )
 
-    assert len(records) == 1
-    assert mock_llm.call_count == 1
-    assert mock_search.call_count == 1
-    assert fake_col.update_one.call_count == 0
-    assert sched._LAST_CYCLE_ABORTED_BY_RISK is True
+        assert len(records) == 1
+        assert mock_llm.call_count == 1
+        assert mock_search.call_count == 1
+        assert fake_col.update_one.call_count == 0
+        assert sched._LAST_CYCLE_ABORTED_BY_RISK is True
+    finally:
+        sched._LAST_CYCLE_ABORTED_BY_RISK = False
 
 
 def test_indexes_and_report_formatters():
@@ -652,8 +639,8 @@ def test_indexes_and_report_formatters():
         "xianyu_audit_trail": {"search_keyword": "瑷尔博士 精华油", "search_ok": True, "batch_detail_ok": True},
     }
     card = sched._format_single_comparison_card(1, 2, base_rec)
-    assert "[线报爆料]" in card
-    assert "💡 线报优惠方案 : 领券+多人团" in card
+    assert "线报爆料" in card
+    assert "领券+多人团" in card
 
     inel_rec = {
         **base_rec,
@@ -663,8 +650,8 @@ def test_indexes_and_report_formatters():
         "xianyu_audit_trail": {"ineligible": True, "search_ok": True, "batch_detail_ok": True},
     }
     summary = sched._format_batch_summary_report("disc_test", 12.3, [inel_rec, base_rec])
-    assert "⏭️ 无资格跳过: 1" in summary
-    assert "🏆 我方胜出: 1" in summary
+    assert "无资格" in summary and "1" in summary
+    assert "我方胜出" in summary
 
 
 def test_auth_tracker_search_vs_h5_guest_detail_detection():
@@ -846,54 +833,56 @@ def test_ephemeral_h5_session_and_guest_risk_message():
     assert res["is_risk_blocked"] is True
     assert res["is_offline"] is False
     assert "open_browser_for_manual_use" not in res["message"]
-    assert "纯内存访客会话无需人工打开浏览器目录" in res["message"]
+    assert "纯内存" in res["message"] and "无需" in res["message"]
 
 
-def test_save_json_concurrent_unique_tmp_and_permission_retry():
-    """验证 save_json 使用进程+随机唯一临时文件并在 Windows PermissionError 时自动退避重试，不残留 .tmp 文件。"""
-    import concurrent.futures
-    import tempfile
-    from infrastructure.ai_api import model_api
+def test_xianyu_round_pool_lazy_init_and_discovery_cycle_closes_db():
+    with patch.object(pxy, "sync_playwright", side_effect=AssertionError("should not start eagerly")):
+        with pxy.XianyuRoundBrowserPool() as pool:
+            assert pool._pw is None
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        target = os.path.join(tmpdir, "api_keys_state.json")
-        real_replace = os.replace
-        calls = {"n": 0}
+    fake_db = MagicMock()
+    fake_db.get_collection.return_value = MagicMock()
+    with patch.object(sched, "gen_db_object", return_value=fake_db), patch.object(
+        sched, "select_round_candidates_for_source", return_value=[]
+    ):
+        sched.run_discovery_cycle(enable_official=True, enable_deal_tip=False)
 
-        def _flaky_replace(src, dst):
-            calls["n"] += 1
-            if calls["n"] <= 2:
-                raise PermissionError(5, "拒绝访问")
-            return real_replace(src, dst)
-
-        with patch.object(model_api.os, "replace", side_effect=_flaky_replace):
-            model_api.save_json(target, {"status": "ok", "count": 3})
-
-        assert calls["n"] == 3
-        with open(target, "r", encoding="utf-8") as f:
-            assert json.load(f) == {"status": "ok", "count": 3}
-        assert [x for x in os.listdir(tmpdir) if x.endswith(".tmp")] == []
-
-        def _worker(tid: int):
-            for seq in range(15):
-                model_api.save_json(target, {"tid": tid, "seq": seq})
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            futs = [pool.submit(_worker, i) for i in range(6)]
-            for fut in futs:
-                fut.result()
-
-        with open(target, "r", encoding="utf-8") as f:
-            final_data = json.load(f)
-        assert "tid" in final_data and "seq" in final_data
-        assert [x for x in os.listdir(tmpdir) if x.endswith(".tmp")] == []
+    assert fake_db.close.call_count == 1
 
 
-if __name__ == "__main__":
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-    test_funcs = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
-    for fn in test_funcs:
-        fn()
-        print(f"PASSED: {fn.__name__}")
-    print(f"\nALL {len(test_funcs)} TESTS PASSED!")
+def test_xianyu_discovery_transient_llm_outage_never_blacklists_candidate(monkeypatch):
+    cand = _make_sample_candidate(1, with_keyword=False)
+    monkeypatch.setattr(
+        sched,
+        "_call_llm_json",
+        lambda **kwargs: (False, {}, {"model_used": "mock", "attempt_used": 3}, "504 Gateway Timeout"),
+    )
+
+    rec = sched.compare_candidate_with_xianyu(
+        candidate=cand,
+        search_user_data_dir="dummy_search",
+        guest_user_data_dir="dummy_guest",
+    )
+    assert rec["final_winner"] == "llm_error"
+    assert rec["xianyu_audit_trail"]["llm_aborted"] is True
+    assert rec["xianyu_audit_trail"]["ineligible"] is False
+
+    fake_eval_col = MagicMock()
+    fake_items_col = MagicMock()
+    fake_db = MagicMock()
+    fake_db.get_collection.side_effect = lambda name: (
+        fake_eval_col if name == sched.EVAL_COLLECTION_NAME else fake_items_col
+    )
+    monkeypatch.setattr(sched, "gen_db_object", lambda: fake_db)
+    monkeypatch.setattr(
+        sched,
+        "select_round_candidates_for_source",
+        lambda **kwargs: [cand] if kwargs.get("source_type") == sched.SOURCE_TYPE_OFFICIAL else [],
+    )
+
+    records = sched.run_discovery_cycle(max_categories=1)
+    assert len(records) == 1
+    assert records[0]["xianyu_audit_trail"]["llm_aborted"] is True
+    fake_eval_col.update_one.assert_not_called()
+

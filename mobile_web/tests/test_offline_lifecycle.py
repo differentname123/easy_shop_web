@@ -239,7 +239,7 @@ def test_structured_logging_denoising_and_aggregation(monkeypatch):
 
     with TestClient(app) as client:
         assert client.get("/health").status_code == 200
-        assert client.get("/static/css/home.css").status_code in (200, 404)
+        assert client.get("/static/css/style.css").status_code == 200
         assert client.get("/").status_code == 200
         assert client.get("/nonexistent-route").status_code == 404
 
@@ -266,13 +266,29 @@ def test_structured_logging_denoising_and_aggregation(monkeypatch):
         platform_name="拼多多",
         requires_authorized_promotion=False,
         resolve_product_ref=lambda gid, goods_id=None, goods_sign=None: ProductRef("pdd", str(gid), goods_sign or ""),
-        convert_promotion_url=lambda *a, **k: {"status": "error", "error_msg": "商品已下架或不支持推广"},
+        convert_promotion_url=lambda *a, **k: {
+            "status": "error",
+            "error_code": "PRODUCT_OFF_PROMOTION",
+            "error_msg": "商品已下架或不支持推广",
+        },
     )
     monkeypatch.setattr("services.promote_service.get_adapter", lambda plat: adapter)
-    res = PromoteService(product_repo=repo, user_service=user_svc).convert_link("pdd", "1001", uid="u_12345678")
+    svc = PromoteService(product_repo=repo, user_service=user_svc)
+    res = svc.convert_link("pdd", "1001", uid="u_12345678")
     assert res["status"] == "error"
     assert promo_info == [], "转链失败时不应打印碎片化的前置 INFO 日志"
     assert len(promo_warn) == 1
-    assert promo_warn[0].startswith("❌ 【推广转链失败】")
+    assert promo_warn[0].startswith("⚠️ 【推广转链失败】")
     assert "平台[pdd]" in promo_warn[0] and "商品[1001]" in promo_warn[0] and "排查方向<" in promo_warn[0]
+
+    for err_payload in (
+        {"status": "error", "error_msg": "未知上游异常"},
+        {"status": "error", "error_code": "CONFIG_ERROR", "error_msg": "缺少联盟配置"},
+    ):
+        promo_warn.clear()
+        adapter.convert_promotion_url = lambda *a, payload=err_payload, **k: dict(payload)
+        res_ops = svc.convert_link("pdd", "1001", uid="u_12345678")
+        assert res_ops["status"] == "error"
+        assert len(promo_warn) == 1
+        assert promo_warn[0].startswith("❌ 【推广转链失败】")
 

@@ -163,23 +163,21 @@ def test_twenty_minute_windows_cover_only_initial_recent_23h_and_resume(setup_se
     assert module._LAST_SYNC_TIMESTAMP["future_shop"] == target
 
 
-def test_pdd_legacy_short_page_without_has_more_or_cursor_still_completes(setup_service):
-    adapter = Adapter(lambda **kw: {"status": "success", "order_list": [{"order_sn": str(i)} for i in range(3)]})
-    service, adapter, sync, repo, _ = setup_service(adapter)
+def test_pdd_legacy_pages_without_cursor(setup_service):
+    short_adapter = Adapter(lambda **kw: {"status": "success", "order_list": [{"order_sn": str(i)} for i in range(3)]})
+    service, short_adapter, sync, repo, _ = setup_service(short_adapter)
     run(service)
-    assert len(adapter.calls) == 1
+    assert len(short_adapter.calls) == 1
     assert sync.states["future_shop"]["pending"] is None
     assert len(repo.docs) == 3
 
-
-def test_pdd_legacy_full_page_uses_next_page_without_cursor(setup_service):
-    adapter = Adapter(lambda **kw: {"status": "success", "order_list": (
+    full_adapter = Adapter(lambda **kw: {"status": "success", "order_list": (
         [{"order_sn": str(i)} for i in range(50)] if kw["page"] == 1 else [])})
-    service, adapter, sync, _, _ = setup_service(adapter)
-    run(service)
-    assert [call["page"] for call in adapter.calls] == [1, 2]
-    assert all(call["cursor"] is None for call in adapter.calls)
-    assert sync.states["future_shop"]["last_success_end"] == 200000
+    service2, full_adapter, sync2, _, _ = setup_service(full_adapter)
+    run(service2)
+    assert [call["page"] for call in full_adapter.calls] == [1, 2]
+    assert all(call["cursor"] is None for call in full_adapter.calls)
+    assert sync2.states["future_shop"]["last_success_end"] == 200000
 
 
 @pytest.mark.parametrize("failure", ["upstream", "write", "short_write", "normalize", "bad_list", "empty_more"])
@@ -647,8 +645,9 @@ def test_invalid_is_not_refund_and_commission_bases_remain_explicit():
         return dict(platform="future_shop", promoter_uid="owner", order_sn=sn,
                     order_pay_time=100, goods_id="sku", promotion_amount_yuan=amount, **fields)
     docs = [
-        order("invalid", 100, is_invalid=True, is_refund=False, is_settled=True),
-        order("refund", 7, is_invalid=True, is_refund=True, is_settled=False),
+        order("invalid", 100, is_invalid=True, is_refund=False, is_settled=True, order_status="returned"),
+        order("refund", 7, is_invalid=True, is_refund=True, is_settled=False, order_status="returned"),
+        order("unsettled-4", 5, is_invalid=False, is_refund=False, is_settled=False, order_status=4),
         order("payment", 10, is_settled=False, estimated_commission_yuan=10,
               settled_commission_yuan=None, commission_basis="payment_estimate"),
         order("settled", 8, is_settled=True, estimated_commission_yuan=10,
@@ -658,12 +657,13 @@ def test_invalid_is_not_refund_and_commission_bases_remain_explicit():
         order("legacy", 2, is_settled=True),  # 旧文档缺 is_invalid，默认有效。
     ]
     result = repository(MemoryCollection(docs)).query_user_orders("future_shop", "owner")
-    assert result["total_count"] == 6
-    assert result["total_commission"] == 20
+    assert result["total_count"] == 7
+    assert result["total_commission"] == 25
     assert result["settled_commission"] == 10
     assert result["refund_count"] == 1 and result["refund_commission"] == 7
     by_sn = {doc["order_sn"]: doc for doc in result["order_list"]}
     assert by_sn["invalid"]["is_invalid"] and not by_sn["invalid"]["is_refund"]
+    assert not by_sn["unsettled-4"]["is_refund"]
     assert not by_sn["legacy"]["is_invalid"]
     assert by_sn["missing-settlement"]["promotion_amount_yuan"] == 0
     assert by_sn["missing-settlement"]["estimated_commission_yuan"] == 15
@@ -686,3 +686,88 @@ def test_aggregation_keeps_full_stats_and_maximum_100_details():
     assert len(result["order_list"]) == 100
     assert result["order_list"][0]["order_sn"] == "134"
     assert not any("$limit" in stage for stage in col.pipeline[1]["$facet"]["stats"])
+
+
+def test_repository_errors_are_not_legal_empty_stats():
+    col = MagicMock()
+    col.aggregate.side_effect = RuntimeError("offline")
+    col.bulk_write.side_effect = RuntimeError("offline")
+    repo = repository(col)
+    with pytest.raises(RuntimeError):
+        repo.query_user_orders("future_shop", "u_a")
+    with pytest.raises(RuntimeError):
+        repo.upsert_orders([{"order_sn": "a"}], "future_shop")
+    with pytest.raises(ValueError):
+        repo.upsert_orders([{}], "future_shop")
+
+
+def test_identity_lookup_failure_does_not_advance_checkpoint(setup_service):
+    sync = MemorySyncRepository({"future_shop": pending(success=90)})
+    before = deepcopy(sync.states)
+    orders = MemoryOrders()
+    users = MemoryUserRepository()
+    users.get_uid_by_promoter_id = MagicMock(side_effect=RuntimeError("identity storage offline"))
+    adapter = Adapter(lambda **kw: {"status": "success", "has_more": False,
+                                    "order_list": [{"order_sn": "row", "promoter_id": "123"}]})
+    service, _, sync, orders, _ = setup_service(adapter, repo=orders, sync=sync, users=users)
+    run(service)
+    assert sync.states == before and not orders.pages
+    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 90
+    assert module._SYNC_STATE["future_shop"]["status"] == "error"
+
+
+@pytest.mark.parametrize("source_time", [100, None])
+def test_source_guards_protect_neutral_fields_and_canonical_promoter_evidence(source_time):
+    col = MemoryCollection()
+    repo = repository(col)
+    latest = {"order_sn": "row", "order_modify_at": 200, "order_time": 1000,
+              "order_time_basis": "created", "order_amount_basis": "commissionable",
+              "order_amount_yuan": 0, "promotion_amount_yuan": 0,
+              "is_settled": True, "is_refund": False, "promoter_id": "123",
+              "promoter_uid": "owner", "attribution_status": "matched"}
+    repo.upsert_orders([latest], "jd")
+    stale = dict(latest, order_modify_at=source_time, order_time=9999, order_time_basis="paid",
+                 order_amount_basis="paid", order_amount_yuan=100, promotion_amount_yuan=999,
+                 is_settled=False, is_refund=True, promoter_id="999", promoter_uid="attacker")
+    assert repo.upsert_orders([stale], "jd") == 1
+    for key, value in latest.items():
+        assert col.docs[0][key] == value
+    fresh = dict(stale, order_modify_at=300)
+    repo.upsert_orders([fresh], "jd")
+    assert col.docs[0]["is_refund"] is True and col.docs[0]["order_time"] == 9999
+    assert col.docs[0]["promoter_id"] == "123" and col.docs[0]["promoter_uid"] == "owner"
+    assert col.docs[0]["attribution_status"] == "matched"
+
+
+def test_unknown_promoter_evidence_survives_empty_page_and_normal_sync_replay():
+    col = MemoryCollection()
+    repo = repository(col)
+    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 100,
+                         "promoter_id": "123", "promoter_uid": "", "attribution_status": "unmatched"}], "jd")
+    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 200,
+                         "promoter_id": "", "promoter_uid": "", "attribution_status": "unmatched"}], "jd")
+    assert col.docs[0]["promoter_id"] == "123"
+    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 200,
+                         "promoter_id": "123", "promoter_uid": "new-owner", "attribution_status": "matched"}], "jd")
+    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 300,
+                         "promoter_id": "999", "promoter_uid": "other-owner"}], "jd")
+    assert col.docs[0]["promoter_id"] == "123" and col.docs[0]["promoter_uid"] == "new-owner"
+
+
+def test_order_sync_worker_runs_periodically_and_stops_cleanly():
+    order_svc = MagicMock()
+    called_evt = threading.Event()
+
+    def _fake_round(stop_event=None):
+        called_evt.set()
+        return {"pdd": "done"}
+
+    order_svc.run_scheduled_sync_round.side_effect = _fake_round
+    worker = module.OrderSyncWorker(order_svc, interval_seconds=60.0, initial_delay_seconds=0.01)
+    worker.start()
+    try:
+        assert called_evt.wait(timeout=2.0) is True
+    finally:
+        worker.stop()
+    assert worker._thread is None
+    assert order_svc.run_scheduled_sync_round.call_count >= 1

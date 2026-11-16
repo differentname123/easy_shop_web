@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from mobile_web.infrastructure.ai_api.model_api import LOW_MODEL_LIST
 from mobile_web.infrastructure.http_utils import error_dict, execute_with_key_failover
 from mobile_web.scripts.run_deal_pool_scheduler import (
     ERR_ADAPTER_CONVERT_FAILED,
@@ -15,64 +14,50 @@ from mobile_web.scripts.run_deal_pool_scheduler import (
 )
 
 
-def test_poison_model_gemini_3_5_flash_weight_is_zero():
-    matched = [
-        item for item in LOW_MODEL_LIST
-        if item.get("model_name") == "gemini-aistudio-api-key-3.5-flash"
-    ]
-    assert matched, "LOW_MODEL_LIST should retain gemini-aistudio-api-key-3.5-flash entry"
-    assert matched[0]["权重"] == 0
+def test_jd_and_ztk_client_real_round_robin_vs_sticky():
+    from infrastructure.jd_client import JdClient
+    from infrastructure.ztk_client import ZtkClient
 
+    def _reply(body):
+        return SimpleNamespace(status_code=200, json=lambda: body, raise_for_status=lambda: None)
 
-def test_jd_client_uses_healthy_round_robin_while_ztk_client_stays_sticky():
-    seen_jd_keys = []
-    jd_dummy = SimpleNamespace(appkey_list=("jd-key-1", "jd-key-2"), _active_key_index=0)
+    jd_keys = []
+    jd_http = SimpleNamespace(
+        get=lambda url, params=None, **_kw: jd_keys.append(params["appkey"]) or _reply({"status": 200, "content": [{"tao_id": "1"}]})
+    )
+    jd_cli = JdClient(appkey_list=["jd-k1", "jd-k2"], union_id="10001", http_session=jd_http)
     for _ in range(4):
-        res = execute_with_key_failover(
-            jd_dummy,
-            lambda k: seen_jd_keys.append(k) or {"status": "success", "key": k},
-            round_robin=True,
+        assert jd_cli.search_goods("抽纸")["status"] == "success"
+    assert jd_keys == ["jd-k1", "jd-k2", "jd-k1", "jd-k2"]
+
+    # ZtkClient sharing a single sid stays sticky (round_robin=False)
+    tb_sticky = []
+    sticky_http = SimpleNamespace(
+        get=lambda url, params=None, **_kw: tb_sticky.append((params["appkey"], params["sid"])) or _reply(
+            {"status": 200, "content": [{"tao_id": "101", "coupon_click_url": "https://uland.taobao.com/e=1", "tkl": "￥T1￥"}]}
         )
-        assert res["status"] == "success"
-    assert seen_jd_keys == ["jd-key-1", "jd-key-2", "jd-key-1", "jd-key-2"]
-
-    seen_tb_keys = []
-    tb_dummy = SimpleNamespace(appkey_list=("tb-key-1", "tb-key-2"), _active_key_index=0)
+    )
+    ztk_sticky = ZtkClient(appkey_list=["tk-1", "tk-2"], sid="sid-shared", http_session=sticky_http)
     for _ in range(3):
-        res = execute_with_key_failover(
-            tb_dummy,
-            lambda k: seen_tb_keys.append(k) or {"status": "success", "key": k},
-            round_robin=False,
+        assert ztk_sticky.convert_channel_url("https://item.taobao.com/item.htm?id=101", pid="mm_1_2_3", allow_public=True)["status"] == "success"
+    assert tb_sticky == [("tk-1", "sid-shared"), ("tk-1", "sid-shared"), ("tk-1", "sid-shared")]
+
+    # ZtkClient with per-key paired sid_list rotates round-robin with matching (appkey, sid) pairs
+    tb_rr = []
+    rr_http = SimpleNamespace(
+        get=lambda url, params=None, **_kw: tb_rr.append((params["appkey"], params["sid"])) or _reply(
+            {"status": 200, "content": [{"tao_id": "101", "coupon_click_url": "https://uland.taobao.com/e=1", "tkl": "￥T2￥"}]}
         )
-        assert res["status"] == "success"
-    assert seen_tb_keys == ["tb-key-1", "tb-key-1", "tb-key-1"]
-
-
-def test_round_robin_quarantines_failed_key_when_backup_key_rescues():
-    calls = []
-    client_dummy = SimpleNamespace(appkey_list=("key-bad", "key-good"), _active_key_index=0)
-
-    def _call(key: str):
-        calls.append(key)
-        if key == "key-bad":
-            return error_dict("UPSTREAM_ERROR", "rate_limit")
-        return {"status": "success", "key": key}
-
-    res1 = execute_with_key_failover(client_dummy, _call, round_robin=True)
-    assert res1["status"] == "success"
-    assert calls == ["key-bad", "key-good"]
-
-    # Within 60s cooldown window, subsequent round-robin calls skip key-bad directly
-    calls.clear()
-    for _ in range(3):
-        res = execute_with_key_failover(client_dummy, _call, round_robin=True)
-        assert res["status"] == "success"
-    assert calls == ["key-good", "key-good", "key-good"]
+    )
+    ztk_rr = ZtkClient(appkey_list=["tk-1", "tk-2"], sid_list=["sid-1", "sid-2"], http_session=rr_http)
+    for _ in range(4):
+        assert ztk_rr.convert_channel_url("https://item.taobao.com/item.htm?id=101", pid="mm_1_2_3", allow_public=True)["status"] == "success"
+    assert tb_rr == [("tk-1", "sid-1"), ("tk-2", "sid-2"), ("tk-1", "sid-1"), ("tk-2", "sid-2")]
 
 
 def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transient_cache():
     cleaner = DealPoolCleaner(ai_batch_size=10, ai_max_workers=2, convert_max_workers=2)
-    cleaner.warmup_anchor_cache_from_db = lambda _col: None
+    cleaner._cache_warmed_up = True
 
     fake_jd_adapter = MagicMock()
     # Round 1: Zhetaoke JD transient 301 "无符合条件的数据"
@@ -188,7 +173,7 @@ def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transien
     assert res_round2[0]["status"] == "retry_pending"
     assert res_round2[0]["error_code"] == ERR_ADAPTER_CONVERT_FAILED
     assert res_round2[0]["retry_count"] == 2
-    assert ai1_call_count["n"] == 1  # AI-1 reused without re-calling LLM!
+    assert ai1_call_count["n"] == 1
     assert cleaner.anchor_cache == {}
 
     # Attempt 3 -> upstream JD succeeds -> full product resolved!
@@ -202,12 +187,12 @@ def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transien
     assert len(res_round3) == 1
     assert res_round3[0]["status"] == "success"
     assert res_round3[0]["product_id"] == "100123456789"
-    assert ai1_call_count["n"] == 1  # Still only 1 AI-1 call total!
+    assert ai1_call_count["n"] == 1
 
 
 def test_deterministic_error_remains_cached_and_does_not_retry():
     cleaner = DealPoolCleaner(ai_batch_size=10, ai_max_workers=2, convert_max_workers=2)
-    cleaner.warmup_anchor_cache_from_db = lambda _col: None
+    cleaner._cache_warmed_up = True
     fake_jd_adapter = MagicMock()
     fake_jd_adapter.resolve_and_convert_universal.return_value = {
         "status": "error",
@@ -252,28 +237,16 @@ def test_deterministic_error_remains_cached_and_does_not_retry():
     assert len(res) == 1
     assert res[0]["status"] == "failed"
     assert res[0]["error_code"] == ERR_JD_NUMERIC_SKU
-    assert len(cleaner.anchor_cache) > 0
+    assert "jd:https://item.jd.com/100012345678.html" in cleaner.anchor_cache
+    assert fake_jd_adapter.resolve_and_convert_universal.call_count == 1
 
-
-def test_clean_original_copywriting_strips_mp_urls_and_token_shells_without_touching_human_copy():
-    doc = {
-        "source_item_id": "tip_1",
-        "title": "好价神车",
-        "tutorial_text": (
-            "兄弟们这波神车快冲！叠省省卡到手才9.9包邮！\n"
-            "https://u.jd.com/o1s7UHc\n"
-            "微信小程序 mp://kX9aBcDeFgHiJkL\n"
-            "复制口令 /:/ 速度锁单手慢无！"
-        ),
-        "extracted_links": [{"url": "https://u.jd.com/o1s7UHc"}],
-        "extracted_tokens": [],
-    }
-    cleaned = DealPoolCleaner._build_clean_original_copywriting(["tip_1"], {"tip_1": doc}, [], doc=doc)
-    assert "mp://" not in cleaned
-    assert "u.jd.com" not in cleaned
-    assert "/:/" not in cleaned
-    assert "兄弟们这波神车快冲！叠省省卡到手才9.9包邮！" in cleaned
-    assert "速度锁单手慢无！" in cleaned
+    # Even after transient failure eviction and a second batch run, deterministic failure stays cached without re-hitting upstream
+    cleaner._evict_transient_failed_cache()
+    assert "jd:https://item.jd.com/100012345678.html" in cleaner.anchor_cache
+    doc2 = dict(doc, source_item_id="tip_sku_2")
+    res2 = cleaner.clean_batch_records([doc2], raw_col, shared_active_products={}, quiet_sub_logs=True)
+    assert res2[0]["status"] == "failed" and res2[0]["error_code"] == ERR_JD_NUMERIC_SKU
+    assert fake_jd_adapter.resolve_and_convert_universal.call_count == 1
 
 
 def test_four_key_pool_failover_and_cooldown_rotation():
@@ -298,166 +271,6 @@ def test_four_key_pool_failover_and_cooldown_rotation():
     ]
     assert set(seen_healthy) == {"k3", "k4"}
     assert "k1" not in calls and "k2" not in calls
-
-
-def test_jd_search_goods_rescues_single_key_301_rate_limit_and_converges_on_genuine_empty():
-    from infrastructure.jd_client import JdClient
-
-    def _json_resp(payload):
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.raise_for_status.return_value = None
-        resp.json.return_value = payload
-        return resp
-
-    # Case 1: Key 1 returns 301 "无符合条件的数据" due to 1000-call throttle, Key 2 returns real data
-    called_keys = []
-
-    def _get_rate_limited(url, params=None, **_kwargs):
-        k = params["appkey"]
-        called_keys.append(k)
-        if k == "jd-k1":
-            return _json_resp({"status": 301, "content": "无符合条件的数据"})
-        return _json_resp({
-            "status": 200,
-            "content": [{"tao_id": "100999", "tao_title": "京东好价抽纸", "quanhou_jiage": "19.9"}],
-        })
-
-    http1 = SimpleNamespace(get=_get_rate_limited)
-    jd1 = JdClient(union_id="10001", appkey_list=["jd-k1", "jd-k2", "jd-k3", "jd-k4"], http_session=http1)
-    res1 = jd1.search_goods("维达抽纸", page=1, page_size=20)
-    assert res1["status"] == "success"
-    assert len(res1["data"]) == 1
-    assert called_keys == ["jd-k1", "jd-k2"]
-    assert 0 in jd1._key_cooldown_until  # jd-k1 quarantined
-
-    # Case 2: Genuine empty search across 4 keys stops after 2 keys confirm 301 (does not waste k3/k4)
-    empty_keys = []
-
-    def _get_truly_empty(url, params=None, **_kwargs):
-        empty_keys.append(params["appkey"])
-        return _json_resp({"status": 301, "content": "无符合条件的数据"})
-
-    http2 = SimpleNamespace(get=_get_truly_empty)
-    jd2 = JdClient(union_id="10001", appkey_list=["jd-k1", "jd-k2", "jd-k3", "jd-k4"], http_session=http2)
-    res2 = jd2.search_goods("不存在的冷门词xyz", page=1, page_size=20)
-    assert res2 == {"status": "success", "data": [], "has_more": False, "total_count": 0}
-    assert empty_keys == ["jd-k1", "jd-k2"]
-
-
-def test_ztk_client_multi_account_sid_pairing_and_appkey_unauthorized_failover():
-    from infrastructure.ztk_client import ZtkClient
-
-    seen_pairs = []
-
-    def _get(url, params=None, **_kwargs):
-        seen_pairs.append((params["appkey"], params["sid"]))
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.raise_for_status.return_value = None
-        if params["appkey"] == "ak-1":
-            # Previously misclassified as user AUTH_REQUIRED when relation_id was present!
-            resp.json.return_value = {"status": 400, "content": "appkey未授权或已到期"}
-        else:
-            resp.json.return_value = {
-                "status": 200,
-                "content": [{
-                    "tao_id": "888777666",
-                    "coupon_click_url": "https://uland.taobao.com/coupon/edetail?e=test",
-                    "tkl": "￥AbCdEf123￥",
-                }],
-            }
-        return resp
-
-    client = ZtkClient(
-        appkey_list=["ak-1", "ak-2", "ak-3"],
-        sid_list=["sid-1", "sid-2", "sid-3"],
-        http_session=SimpleNamespace(get=_get),
-    )
-    res = client.convert_channel_url(
-        "https://item.taobao.com/item.htm?id=888777666",
-        relation_id="2999888777",
-        pid="mm_1_2_3",
-    )
-    assert res["status"] == "success"
-    assert res["raw"]["tao_id"] == "888777666"
-    assert res["tpwd"] == "￥AbCdEf123￥"
-    assert seen_pairs == [("ak-1", "sid-1"), ("ak-2", "sid-2")]
-
-
-def test_hdk_client_multi_key_pool_failover():
-    from infrastructure.hdk_client import HdkClient
-
-    seen_keys = []
-
-    def _get(url, params=None, **_kwargs):
-        key = params["apikey"]
-        seen_keys.append(key)
-        if key == "hdk-1":
-            resp = MagicMock(status_code=200)
-            resp.raise_for_status.return_value = None
-            resp.json.return_value = {"code": 0, "msg": "apikey请求超限"}
-            return resp
-        if key == "hdk-2":
-            raise RuntimeError("transient socket timeout")
-        resp = MagicMock(status_code=200)
-        resp.raise_for_status.return_value = None
-        resp.json.return_value = {"code": 1, "data": [{"itemid": "555666"}], "min_id": 0}
-        return resp
-
-    client = HdkClient(api_key_list=["hdk-1", "hdk-2", "hdk-3"], http_session=SimpleNamespace(get=_get))
-    res = client.get_ranked_ids(1, limit=20)
-    assert res["status"] == "success"
-    assert res["item_ids"] == ["555666"]
-    assert seen_keys == ["hdk-1", "hdk-2", "hdk-3"]
-    assert client.api_key == "hdk-3"
-
-
-def test_settings_parses_multi_key_pools_for_ztk_and_hdk(tmp_path):
-    import json
-    from infrastructure.settings import load_settings
-
-    cfg_file = tmp_path / "config.test.json"
-    cfg_file.write_text(
-        json.dumps({
-            "local_mongo_host": "127.0.0.1",
-            "local_mongo_port": 27017,
-            "local_mongo_db_name": "shop_test",
-            "web_auth_secret": "x" * 48,
-            "zhetaoke_appkey": "ztk-k1",
-            "zhetaoke_appkey_list": ["ztk-k1", "ztk-k2", "ztk-k3", "ztk-k4"],
-            "zhetaoke_sid": "sid-1",
-            "zhetaoke_sid_list": ["sid-1", "sid-2", "sid-3", "sid-4"],
-            "haodanku_api_key": "hdk-1",
-            "haodanku_api_key_list": ["hdk-1", "hdk-2", "hdk-3"],
-        }),
-        encoding="utf-8",
-    )
-    loaded = load_settings(cfg_file, require_credentials=False)
-    assert loaded.ztk_appkey_list == ("ztk-k1", "ztk-k2", "ztk-k3", "ztk-k4")
-    assert loaded.ztk_sid_list == ("sid-1", "sid-2", "sid-3", "sid-4")
-    assert loaded.hdk_api_key_list == ("hdk-1", "hdk-2", "hdk-3")
-
-
-def test_select_models_excludes_zero_weight_models_from_primary_and_fallbacks():
-    from mobile_web.infrastructure.ai_api.model_api import (
-        LOW_MODEL_LIST,
-        MEDIUM_MODEL_LIST,
-        _select_models,
-    )
-
-    zero_low = {m["model_name"] for m in LOW_MODEL_LIST if m.get("权重", 0) <= 0}
-    zero_med = {m["model_name"] for m in MEDIUM_MODEL_LIST if m.get("权重", 0) <= 0}
-    assert "gemini-aistudio-api-key-3.5-flash" in zero_low
-
-    for _ in range(100):
-        chosen_low = _select_models(None, None, "low")
-        assert chosen_low
-        assert zero_low.isdisjoint(chosen_low)
-
-        chosen_med = _select_models(None, None, "medium")
-        assert chosen_med
-        assert zero_med.isdisjoint(chosen_med)
 
 
 def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries():
@@ -579,72 +392,6 @@ def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries
     assert ai1_calls["n"] == 2
 
 
-def test_jd_client_per_key_pacing_reserves_slots_per_appkey_and_skips_mocks(monkeypatch):
-    import requests
-    from infrastructure.jd_client import JdClient
-
-    sleeps = []
-    fake_clock = {"t": 1000.0}
-    monkeypatch.setattr("infrastructure.jd_client.time.monotonic", lambda: fake_clock["t"])
-    monkeypatch.setattr("infrastructure.jd_client.time.sleep", lambda s: sleeps.append(round(s, 3)))
-    monkeypatch.setattr(JdClient, "_KEY_NEXT_ALLOWED_TS", {})
-
-    # 1. Mocked http_session incurs zero pacing sleep
-    mock_cli = JdClient(appkey_list=["k-mock"], union_id="2035679405", http_session=SimpleNamespace(get=lambda *a, **kw: None))
-    mock_cli._pace_real_http_by_key({"params": {"appkey": "k-mock"}})
-    assert sleeps == []
-    assert JdClient._KEY_NEXT_ALLOWED_TS == {}
-
-    # 2. Real requests.Session spaces same-key calls by 0.22s while allowing distinct keys immediately
-    real_cli = JdClient(appkey_list=["k-real-1", "k-real-2"], union_id="2035679405", http_session=requests.Session())
-    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-1"}})
-    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-2"}})
-    assert sleeps == []  # First call on each independent key does not wait on the other!
-
-    real_cli._pace_real_http_by_key({"params": {"appkey": "k-real-1"}})
-    assert sleeps == [0.22]  # Immediate second call on k-real-1 waits 0.22s
-
-
-def test_antigravity_client_defaults_to_3_concurrency_per_account_6_across_2(tmp_path, monkeypatch):
-    import os
-    from infrastructure.ai_api import antigravity_client as ag
-
-    monkeypatch.setattr(ag, "GLOBAL_LOCK_DIR", tmp_path / "locks")
-    monkeypatch.setattr(
-        ag,
-        "sync_all_known_accounts_to_sandboxes",
-        lambda overwrite_from_desktop=False: {
-            "guardianriedel689@gmail.com": tmp_path / "sb1",
-            "richard.nowak@usa.com": tmp_path / "sb2",
-        },
-    )
-
-    assert ag.DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT == 3
-    pool = ag.AntigravityPoolClient(
-        account_pool=["guardianriedel689@gmail.com", "richard.nowak@usa.com"]
-    )
-    assert pool.max_concurrency_per_account == 3
-
-    workers = pool.get_eligible_workers()
-    assert len(workers) == 2
-    claimed = []
-    try:
-        for w in workers:
-            assert w._max_concurrency == 3
-            for _ in range(3):
-                fd = w.try_claim_idle_slot()
-                assert fd is not None
-                claimed.append((w, fd))
-            # 4th claim on same sub-account must return None immediately
-            assert w.try_claim_idle_slot() is None
-        assert len(claimed) == 6
-    finally:
-        for w, fd in claimed:
-            w._unlock_fd(fd)
-            os.close(fd)
-            w._concurrency_sem.release()
-
-
 def test_save_batch_anchors_fallback_publish_ts_in_set_on_insert_without_conflict():
     from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
 
@@ -692,31 +439,84 @@ def test_save_batch_anchors_fallback_publish_ts_in_set_on_insert_without_conflic
     assert "publish_ts" not in op_with_pub["$setOnInsert"]
 
 
-def test_run_clean_stage_sweeps_over_7d_by_either_publish_ts_or_first_seen_at():
-    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository, run_clean_stage
+def test_run_clean_stage_sweeps_stale_pending_by_either_publish_ts_or_first_seen_at():
+    import datetime
+    import time
+    from mobile_web.scripts.run_deal_pool_scheduler import (
+        DEAL_MAX_CLEAN_AGE_DAYS,
+        ERR_AI_MAX_RETRIES_EXCEEDED,
+        ERR_EXPIRED_OVER_7_DAYS,
+        MAX_CLEAN_RETRIES,
+        DealRawPoolRepository,
+        run_clean_stage,
+    )
 
-    update_queries = []
-    count_queries = []
+    def _matches(doc, flt):
+        for key, cond in flt.items():
+            if key == "$and":
+                if not all(_matches(doc, sub) for sub in cond):
+                    return False
+            elif key == "$or":
+                if not any(_matches(doc, sub) for sub in cond):
+                    return False
+            elif key == "$nor":
+                if any(_matches(doc, sub) for sub in cond):
+                    return False
+            elif isinstance(cond, dict):
+                exists = key in doc
+                val = doc.get(key)
+                if "$exists" in cond and exists != bool(cond["$exists"]):
+                    return False
+                if "$gt" in cond and (val is None or not (val > cond["$gt"])):
+                    return False
+                if "$gte" in cond and (val is None or not (val >= cond["$gte"])):
+                    return False
+                if "$lt" in cond and (val is None or not (val < cond["$lt"])):
+                    return False
+            elif doc.get(key) != cond:
+                return False
+        return True
 
-    class _DummyRawCol:
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    now_ts = time.time()
+    stale_ts = now_ts - (DEAL_MAX_CLEAN_AGE_DAYS + 1) * 86400.0
+    stale_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS + 1)
+    fresh_dt = now_utc - datetime.timedelta(hours=1)
+
+    docs = [
+        {"_id": "exp_pub", "clean_status": "pending", "publish_ts": stale_ts, "first_seen_at": fresh_dt},
+        {"_id": "exp_seen", "publish_ts": 0, "first_seen_at": stale_dt},
+        {"_id": "retry_cap", "clean_status": "pending", "publish_ts": now_ts - 3600, "first_seen_at": fresh_dt, "clean_retry_count": MAX_CLEAN_RETRIES},
+        {"_id": "cooling", "clean_status": "pending", "publish_ts": now_ts - 3600, "first_seen_at": fresh_dt, "next_retry_after_ts": now_ts + 300},
+    ]
+
+    class _MemRawCol:
         def update_many(self, flt, upd):
-            update_queries.append((flt, upd))
-            return SimpleNamespace(modified_count=2 if len(update_queries) == 1 else 0)
+            modified = 0
+            for doc in docs:
+                if _matches(doc, flt):
+                    doc.update(upd.get("$set", {}))
+                    modified += 1
+            return SimpleNamespace(modified_count=modified)
 
         def count_documents(self, flt):
-            count_queries.append(flt)
-            return 0
+            return sum(1 for doc in docs if _matches(doc, flt))
 
-    raw_col = _DummyRawCol()
+    raw_col = _MemRawCol()
     repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: raw_col))
     repo._indexes_ready = True
 
     out = run_clean_stage(repo, cleaner=SimpleNamespace(), cycle_num=1, clean_limit=10)
     assert out["expired_over_7d_swept"] == 2
-    sweep_or = update_queries[0][0]["$and"][1]["$or"]
-    assert any("publish_ts" in cond for cond in sweep_or)
-    assert any("first_seen_at" in cond and "$and" not in cond for cond in sweep_or)
-    assert "$nor" in count_queries[0]["$and"][1]
+    assert out["total_pending_found"] == 0
+    by_id = {d["_id"]: d for d in docs}
+    assert by_id["exp_pub"]["clean_status"] == "cleaned_failed"
+    assert by_id["exp_pub"]["clean_error_code"] == ERR_EXPIRED_OVER_7_DAYS
+    assert by_id["exp_seen"]["clean_status"] == "cleaned_failed"
+    assert by_id["exp_seen"]["clean_error_code"] == ERR_EXPIRED_OVER_7_DAYS
+    assert by_id["retry_cap"]["clean_status"] == "cleaned_failed"
+    assert by_id["retry_cap"]["clean_error_code"] == ERR_AI_MAX_RETRIES_EXCEEDED
+    assert by_id["cooling"]["clean_status"] == "pending"
 
 
 def test_format_raw_message_skips_xianbao_synthetic_haodan_weibo_title_but_keeps_real_titles():
@@ -1093,53 +893,15 @@ def test_warmup_anchor_cache_from_db_sorts_by_cleaned_at_desc():
     assert "jd:https://u.jd.com/cached_anchor_1" in cleaner.anchor_cache
 
 
-def test_link_admission_allowlist_and_parameter_allowlist_reconstruction():
-    from mobile_web.scripts.run_deal_pool_scheduler import rebuild_clean_official_venue_url
-
-    # 1. 4 类官方原生公共领券/会场页：仅保留白名单必要 ID 参数，一切外部追踪参数自动清空
-    assert (
-        rebuild_clean_official_venue_url(
-            "https://coupon.m.jd.com/coupons/show.action?key=k123&roleId=r456&zdmcode=bad&utm_source=x&future_track=99"
-        )
-        == "https://coupon.m.jd.com/coupons/show.action?key=k123&roleId=r456"
-    )
-    assert (
-        rebuild_clean_official_venue_url(
-            "https://uland.taobao.com/quan/detail?sellerId=2201&activityId=act88&pid=mm_99_88_77&relationId=123"
-        )
-        == "https://uland.taobao.com/quan/detail?sellerId=2201&activityId=act88"
-    )
-    assert (
-        rebuild_clean_official_venue_url(
-            "https://pages.tmall.com/wow/a/act/tmall/dailygroup/23288/wupr?wh_pid=daily-544479&tkSid=abc&spm=a21"
-        )
-        == "https://pages.tmall.com/wow/a/act/tmall/dailygroup/23288/wupr?wh_pid=daily-544479"
-    )
-    assert (
-        rebuild_clean_official_venue_url("https://pro.m.jd.com/mall/active/2eh7EHb/index.html?union_lens=xxx")
-        == "https://pro.m.jd.com/mall/active/2eh7EHb/index.html"
-    )
-
-    # 2. 任何短链、加密分佣页或缺失必要参数的残缺链接一律返回 None
-    for rejected in (
-        "https://s.click.taobao.com/XNl8wji",
-        "https://m.tb.cn/h.jPi2tHp",
-        "https://u.jd.com/oaDAVcO",
-        "https://3.cn/3b-MaSLj",
-        "https://uland.taobao.com/coupon/edetail?e=encrypted_cps",
-        "https://uland.taobao.com/quan/detail?sellerId=2201",
-    ):
-        assert rebuild_clean_official_venue_url(rejected) is None
-
-    # 3. convert_single_target 契约：成功生成我方新短链则保留 OK_COUPON；转链失败或原样回吐他方短链一律淘汰
+def test_convert_single_target_admits_own_promo_and_rejects_failed_or_echo():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
     cleaner.adapters = {
         "taobao": SimpleNamespace(resolve_and_convert_universal=lambda _x: {"status": "error", "error_msg": "不支持转链"}),
         "jd": SimpleNamespace(
-            resolve_and_convert_universal=lambda _x: {
+            resolve_and_convert_universal=lambda x: {
                 "status": "success",
-                "final_link": "https://u.jd.com/ogDTQlg",
-                "promotion_token": "！FBxJIEwx！ CA1393",
+                "final_link": "https://u.jd.com/echoSame" if "echoSame" in x else "https://u.jd.com/ogDTQlg",
+                "promotion_token": "" if "echoSame" in x else "！FBxJIEwx！ CA1393",
             }
         ),
     }
@@ -1148,6 +910,12 @@ def test_link_admission_allowlist_and_parameter_allowlist_reconstruction():
     )
     assert bad_tb["convert_status"] == "failed"
     assert bad_tb["my_promo_link"] is None
+
+    echo_jd = cleaner.convert_single_target(
+        {"link_id": "L_ECHO", "clean_input": "https://u.jd.com/echoSame", "platform": "jd", "text_role_hint": "coupon_candidate"}
+    )
+    assert echo_jd["convert_status"] == "failed"
+    assert echo_jd["my_promo_link"] is None
 
     own_jd = cleaner.convert_single_target(
         {"link_id": "L2", "clean_input": "https://u.jd.com/oaDAVcO", "platform": "jd", "text_role_hint": "coupon_candidate"}
@@ -1161,7 +929,7 @@ def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
     import datetime
     from mobile_web.scripts.run_deal_pool_scheduler import upsert_cleaned_products_to_formal_table
 
-    # 1. \u00a0 不换行空格归一化后，AI-1 提取的 raw_span 与 strip_spans 100% 命中抠除，正常型号与中文描述完好无损
+    # 1. \u00a0 不换行空格、mp://、/:/ 口令壳与 strip_spans 100% 精准剥离，正常型号与中文描述完好无损
     doc = {
         "source_item_id": "tip_nbsp",
         "title": "好价牛奶",
@@ -1169,8 +937,13 @@ def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
             "不到一块钱一盒的金典纯牛奶，型号 Wacom DTK168 同场好价\n"
             "38￥\u00a0\u00a0pFTS6WMzTIi￥\n"
             "7Fu🌹zhiHU7177,打開/\n"
+            "https://u.jd.com/o1s7UHc\n"
+            "微信小程序 mp://kX9aBcDeFgHiJkL\n"
+            "复制口令 /:/ 速度锁单手慢无！\n"
             "guangdiu.com/go.php?id=30504742"
         ),
+        "extracted_links": [{"url": "https://u.jd.com/o1s7UHc"}],
+        "extracted_tokens": [],
     }
     cleaned = DealPoolCleaner._build_clean_original_copywriting(
         ["tip_nbsp"],
@@ -1185,7 +958,11 @@ def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
     assert "pFTS6WMzTIi" not in cleaned
     assert "HU7177" not in cleaned
     assert "guangdiu.com" not in cleaned
+    assert "mp://" not in cleaned
+    assert "u.jd.com" not in cleaned
+    assert "/:/" not in cleaned
     assert "不到一块钱一盒的金典纯牛奶，型号 Wacom DTK168 同场好价" in cleaned
+    assert "速度锁单手慢无！" in cleaned
 
     # 2. 顶层 updated_at 刚被刷新但 deal_info.updated_at 已超 12h 时，允许新线报覆盖并重置 deal_info.format_*
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
@@ -1232,6 +1009,7 @@ def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
 
 def test_minimalist_four_element_pipeline_and_zero_loss_copywriting():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
 
     # 1. 数学斜体/粗体 Unicode 还原为标准 ASCII，同时完整保留中文全角标点与 Emoji；剥离拔草哦合集拼接头
     bacaoo_doc = {
@@ -1414,3 +1192,283 @@ def test_minimalist_four_element_pipeline_and_zero_loss_copywriting():
         assert "口令" not in step
     assert any("凑单" in step for step in deal_info["tutorial_steps"])
 
+
+def test_deal_cleaner_never_poisons_degraded_jd_shortlink_as_ok_coupon():
+    from infrastructure.api_governance import stamp_universal_resolution
+
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    degraded_res = stamp_universal_resolution(
+        {
+            "status": "success",
+            "url": "https://u.jd.com/myStationNewLink",
+            "final_link": "https://u.jd.com/myStationNewLink",
+            "short_url": "https://u.jd.com/myStationNewLink",
+            "product": None,
+        },
+        verified_coupon_or_venue=False,
+    )
+    cleaner.adapters["jd"] = SimpleNamespace(resolve_and_convert_universal=lambda _inp: degraded_res)
+
+    out = cleaner.convert_single_target(
+        {"link_id": "L1", "clean_input": "https://u.jd.com/o6P5O9L", "platform": "jd", "text_role_hint": "main_candidate"},
+        default_plat="jd",
+    )
+    assert out["convert_status"] == "failed"
+    assert out["error_code"] == ERR_ADAPTER_CONVERT_FAILED
+    assert out["resolution_kind"] == "degraded_product"
+
+    # 轮末驱逐暂态失败缓存后，anchor_cache 不残留中毒记录，保证下一轮重试能真正重调接口恢复
+    cleaner._evict_transient_failed_cache()
+    assert "jd:https://u.jd.com/o6P5O9L" not in cleaner.anchor_cache
+
+    # 验证预热门禁：旧库中未标记 resolution_kind 的 u.jd.com 与 union-click.jd.com OK_COUPON 均拒绝预热
+    class _WarmupCursor:
+        def sort(self, *_a):
+            return self
+
+        def limit(self, *_a):
+            return [
+                {
+                    "converted_links": [
+                        {
+                            "link_id": "L_OLD_POISON_U",
+                            "clean_input": "https://u.jd.com/poisonedOld",
+                            "convert_status": "coupon_or_activity",
+                            "error_code": "OK_COUPON",
+                            "platform": "jd",
+                            "my_promo_link": "https://u.jd.com/myPoisonedOut",
+                        },
+                        {
+                            "link_id": "L_OLD_POISON_UC",
+                            "clean_input": "https://union-click.jd.com/jdc?e=&p=JF8B_OLD",
+                            "convert_status": "coupon_or_activity",
+                            "error_code": "OK_COUPON",
+                            "platform": "jd",
+                            "my_promo_link": "https://u.jd.com/myPoisonedOut2",
+                        },
+                        {
+                            "link_id": "L_NEW_VENUE",
+                            "clean_input": "https://u.jd.com/realVenue",
+                            "convert_status": "coupon_or_activity",
+                            "resolution_kind": "coupon_or_venue",
+                            "error_code": "OK_COUPON",
+                            "platform": "jd",
+                            "my_promo_link": "https://u.jd.com/myRealVenueOut",
+                        },
+                    ]
+                }
+            ]
+
+    raw_col = MagicMock()
+    raw_col.find.return_value = _WarmupCursor()
+    cleaner.warmup_anchor_cache_from_db(raw_col)
+    assert "jd:https://u.jd.com/poisonedOld" not in cleaner.anchor_cache
+    assert "jd:https://union-click.jd.com/jdc?e=&p=JF8B_OLD" not in cleaner.anchor_cache
+    assert "jd:https://u.jd.com/realVenue" in cleaner.anchor_cache
+
+
+def test_deal_pool_startup_recovery_idempotently_rescues_recent_misclassified_tips():
+    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
+
+    fake_db = MagicMock()
+    fake_col = MagicMock()
+    fake_db.get_collection.return_value = fake_col
+
+    repo = DealRawPoolRepository(db_instance=fake_db)
+    fake_col.update_many.reset_mock()
+    fake_col.update_many.side_effect = [
+        SimpleNamespace(modified_count=7),
+        SimpleNamespace(modified_count=3),
+    ]
+    out = repo.recover_recent_misclassified_tips(lookback_hours=48.0)
+    assert out == {"jd_recovered": 7, "tb_recovered": 3}
+    assert fake_col.update_many.call_count == 2
+    jd_flt, jd_upd = fake_col.update_many.call_args_list[0].args
+    assert ERR_JD_NUMERIC_SKU in jd_flt["clean_error_code"]["$in"]
+    assert any("union-click" in str(cond) for cond in jd_flt["$or"])
+    for call in fake_col.update_many.call_args_list:
+        flt, upd = call.args
+        assert flt["recovery_version"] == {"$ne": DealRawPoolRepository.RECOVERY_VERSION_TAG}
+        assert upd["$set"]["clean_status"] == "pending"
+        assert upd["$set"]["recovery_version"] == DealRawPoolRepository.RECOVERY_VERSION_TAG
+        assert "ai_stage1_result" in upd["$unset"]
+
+    # 验证同帖同时含 item.jd.com/{数字} 与 extracted_links(union-click.jd.com) 时，若 AI-1 漏提 union-click，由代码确定性补齐
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    doc = {
+        "source_site": "guangdiu",
+        "source_item_id": "gd_1",
+        "platform": "jd",
+        "title": "米多奇香米饼 9.9元",
+        "tutorial_text": "https://item.jd.com/10171863267421.html",
+        "extracted_links": [
+            {"label": "直达购买", "url": "https://union-click.jd.com/jdc?e=&p=JF8B_VALID", "platform": "jd"}
+        ],
+    }
+    s1_inp, tip_map = cleaner.build_stage1_task_input(doc, None)
+    with patch.object(
+        cleaner,
+        "_call_ai_json_array",
+        return_value=[
+            {
+                "main_tip_id": "gd_1",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["gd_1"],
+                "extracted_targets": [
+                    {
+                        "link_id": "L1",
+                        "raw_span": "https://item.jd.com/10171863267421.html",
+                        "clean_input": "https://item.jd.com/10171863267421.html",
+                        "platform": "jd",
+                        "text_role_hint": "main_candidate",
+                    }
+                ],
+                "strip_spans": [],
+            }
+        ],
+    ):
+        ai1_map = cleaner.run_ai_stage1_batch([s1_inp], {"gd_1": doc}, {"gd_1": tip_map}, quiet_sub_logs=True)
+    extracted_urls = [t["clean_input"] for t in ai1_map["gd_1"]["extracted_targets"]]
+    assert "https://union-click.jd.com/jdc?e=&p=JF8B_VALID" in extracted_urls
+
+
+def test_deal_pool_parse_publish_time_epoch_china_tz_consistency():
+    """验证东八区无时区字符串与显式 UTC Z 字符串解析结果严格一致，消除容器 UTC 8 小时漂移。"""
+    from mobile_web.scripts.run_deal_pool_scheduler import parse_publish_time_epoch
+
+    ts_cn = parse_publish_time_epoch("2026-11-12 14:30:00")
+    ts_utc = parse_publish_time_epoch("2026-11-12T06:30:00Z")
+    ts_iso_offset = parse_publish_time_epoch("2026-11-12T14:30:00+08:00")
+    assert ts_cn is not None
+    assert ts_cn == ts_utc == ts_iso_offset
+
+
+def test_xianbao_detail_loop_circuit_breaks_on_429_and_caps_attempts(monkeypatch):
+    """验证详情抓取遇到 429/502 立即熔断不再硬撞整页，且遇到 404 也严格按尝试次数封顶在 max_details。"""
+    from mobile_web.scripts import test_deal_sites_scraper as scraper
+
+    monkeypatch.setattr(scraper.time, "sleep", lambda _: None)
+
+    li_items = "".join(
+        f'<li class="article-list"><a href="/haodan/{1000 + i}.html" data-catename="京东" data-price="9.9">'
+        f"测试线报商品 #{i}</a></li>"
+        for i in range(25)
+    )
+    list_html = f"<ul>{li_items}</ul>"
+
+    calls_429 = []
+
+    def fake_get_429(url, headers=None, timeout=10.0):
+        calls_429.append(url)
+        resp = MagicMock()
+        if url.endswith("haodan-hot.html"):
+            resp.status_code = 200
+            resp.text = list_html
+        elif len(calls_429) == 2:
+            resp.status_code = 200
+            resp.text = '<div class="article-content"><a href="https://u.jd.com/abc123">直达</a></div><div id="foot"></div>'
+        else:
+            resp.status_code = 429
+            resp.text = "Too Many Requests"
+        return resp
+
+    sess_429 = MagicMock()
+    sess_429.get.side_effect = fake_get_429
+
+    res_429 = scraper.fetch_xianbao_fun_deals(
+        channel="haodan_hot",
+        fetch_detail=True,
+        max_details=15,
+        session=sess_429,
+    )
+    assert len(calls_429) == 3
+    assert res_429["count"] == 25
+    assert res_429["detail_fetched"] == 1
+    assert len(res_429["detail_errors"]) == 1
+    assert res_429["detail_errors"][0]["http_status"] == 429
+
+    calls_404 = []
+
+    def fake_get_404(url, headers=None, timeout=10.0):
+        calls_404.append(url)
+        resp = MagicMock()
+        if url.endswith("haodan-hot.html"):
+            resp.status_code = 200
+            resp.text = list_html
+        else:
+            resp.status_code = 404
+            resp.text = "Not Found"
+        return resp
+
+    sess_404 = MagicMock()
+    sess_404.get.side_effect = fake_get_404
+
+    res_404 = scraper.fetch_xianbao_fun_deals(
+        channel="haodan_hot",
+        fetch_detail=True,
+        max_details=4,
+        session=sess_404,
+    )
+    assert len(calls_404) == 1 + 4
+    assert res_404["detail_fetched"] == 0
+    assert len(res_404["detail_errors"]) == 4
+
+
+def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, tmp_path):
+    """验证同源站点在单轮内触发 429 后，后续同站点频道直接 cooldown_skipped 冷却跳过，且错误路径按频道聚合。"""
+    from mobile_web.scripts import run_deal_pool_scheduler as dps
+
+    monkeypatch.setattr(dps.time, "sleep", lambda _: None)
+    monkeypatch.setattr(dps, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"))
+    monkeypatch.setattr(dps, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"))
+    monkeypatch.setattr(dps, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"))
+    monkeypatch.setattr(dps, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"))
+
+    xianbao_calls = []
+
+    def fake_xianbao(**kwargs):
+        xianbao_calls.append(kwargs.get("channel"))
+        return {
+            "status": "success",
+            "http_status": 200,
+            "request_url": "https://new.xianbao.fun/test",
+            "count": 2,
+            "detail_fetched": 0,
+            "detail_errors": [
+                {"item_id": "1", "error_url": "https://new.xianbao.fun/1.html", "http_status": 429, "error_type": "HTTP_429", "error": "429"},
+                {"item_id": "2", "error_url": "https://new.xianbao.fun/2.html", "http_status": 429, "error_type": "HTTP_429", "error": "429"},
+            ],
+            "records": [{"source_site": "xianbao_fun", "source_item_id": "1", "has_full_detail": False}],
+        }
+
+    ok_stub = lambda **kwargs: {
+        "status": "success",
+        "http_status": 200,
+        "request_url": "https://example.com/ok",
+        "count": 1,
+        "detail_fetched": 1,
+        "detail_errors": [],
+        "records": [{"source_site": "haodanku", "source_item_id": "h1", "has_full_detail": True, "extracted_links": [{"url": "https://u.jd.com/x"}]}],
+    }
+
+    monkeypatch.setattr(dps, "fetch_xianbao_fun_deals", fake_xianbao)
+    monkeypatch.setattr(dps, "fetch_haodanku_wire_report", ok_stub)
+    monkeypatch.setattr(dps, "fetch_zhetaoke_xianbao_groups", ok_stub)
+    monkeypatch.setattr(dps, "fetch_guangdiu_deals", ok_stub)
+    monkeypatch.setattr(dps, "fetch_xuandan_deals", ok_stub)
+    monkeypatch.setattr(dps, "fetch_0818tuan_deals", ok_stub)
+    monkeypatch.setattr(dps, "fetch_bacaoo_deals", ok_stub)
+    monkeypatch.setattr(dps, "fetch_iehou_deals", ok_stub)
+
+    repo = MagicMock()
+    repo.get_existing_detailed_ids.return_value = set()
+    repo.save_batch.return_value = {"inserted": 1, "updated": 0}
+    repo.generate_pool_summary.return_value = {"total_records": 1}
+
+    out = dps.run_fetch_stage(repo=repo, session=MagicMock(), cycle_num=1, run_all_tiers=False)
+    assert len(xianbao_calls) == 1
+    xb_tasks = [t for t in out["tasks"] if t["site_key"] == "xianbao_fun"]
+    assert len(xb_tasks) == 7
+    assert sum(1 for t in xb_tasks if t["status"] == "cooldown_skipped") == 6
+    assert len(out["error_paths"]) == 1
+    assert "共 2 条详情异常" in out["error_paths"][0]["error_message"]

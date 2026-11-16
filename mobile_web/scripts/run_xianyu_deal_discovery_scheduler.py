@@ -68,7 +68,8 @@ SOURCE_TYPE_OFFICIAL = "official"
 SOURCE_TYPE_DEAL_TIP = "deal_tip"
 
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+if os.environ.get("WEB_LOG_DIR", "").strip() != "-":
+    os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "xianyu_deal_discovery.log")
 PROMPT_DIR = os.path.join(PROJECT_ROOT, "prompt")
 KEYWORD_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼搜索关键字生成.txt")
@@ -150,14 +151,14 @@ def _setup_logger() -> logging.Logger:
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     lg.addHandler(sh)
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
-    fh.setFormatter(fmt)
-    lg.addHandler(fh)
+    if os.environ.get("WEB_LOG_DIR", "").strip() != "-":
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        fh.setFormatter(fmt)
+        lg.addHandler(fh)
+        xy_lg = logging.getLogger("publish_to_xianyu")
+        if not any(isinstance(h, _ForwardWarningToFileHandler) for h in xy_lg.handlers):
+            xy_lg.addHandler(_ForwardWarningToFileHandler(fh))
     lg.propagate = False
-
-    xy_lg = logging.getLogger("publish_to_xianyu")
-    if not any(isinstance(h, _ForwardWarningToFileHandler) for h in xy_lg.handlers):
-        xy_lg.addHandler(_ForwardWarningToFileHandler(fh))
     return lg
 
 

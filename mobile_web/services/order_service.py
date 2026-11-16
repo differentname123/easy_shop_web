@@ -6,7 +6,7 @@ import threading
 from typing import Dict, Any, Optional
 from adapters import get_adapter, require_adapter
 from infrastructure.api_governance import api_caller_context
-from infrastructure.logging_utils import format_exc_summary
+from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import normalize_platform
 from models.order import normalize_order_fields
 from models.user import normalize_promoter_id
@@ -92,6 +92,7 @@ class OrderService:
         advanced = False
         complete = False
         error = ""
+        error_code = ""
         try:
             adapter = get_adapter(platform)
             window_seconds = int(getattr(adapter, "order_window_seconds", _INITIAL_LOOKBACK_SECONDS))
@@ -133,6 +134,7 @@ class OrderService:
                             cursor=deepcopy(pending.get("cursor")),
                         )
                     if not isinstance(response, dict) or response.get("status") != "success":
+                        error_code = str(response.get("error_code") or "") if isinstance(response, dict) else ""
                         error = response.get("error_msg", "平台订单查询失败") if isinstance(response, dict) else "平台订单响应无效"
                         break
                     orders = response.get("order_list")
@@ -204,7 +206,8 @@ class OrderService:
                            "synced_count": processed}
                 if error:
                     logger.warning(
-                        "❌ 【订单同步中断】拉取或写入增量订单时未完整完成 | 平台[%s] 状态[%s] 已处理页数[%d] 已入库[%d笔] 耗时[%.1fms] 中断原因<%s> 排查方向<请检查上游联盟订单接口状态、密钥配额或稍后自动续传>",
+                        "%s 【订单同步中断】拉取或写入增量订单时未完整完成 | 平台[%s] 状态[%s] 已处理页数[%d] 已入库[%d笔] 耗时[%.1fms] 中断原因<%s> 排查方向<请检查上游联盟订单接口状态、密钥配额或稍后自动续传>",
+                        severity_icon(error_code=error_code),
                         platform, summary["status"], pages_fetched, processed, elapsed_ms, summary["error"],
                     )
                 else:

@@ -766,7 +766,7 @@ class XianyuRoundBrowserPool:
         self._pw_cm: Any = None
         self._pw: Any = None
         self._lock_stack = ExitStack()
-        self._held_locks: set[str] = set()
+        self._global_lock_held: bool = False
 
         self._search_dir: str = ""
         self._search_ctx: Any = None
@@ -796,8 +796,7 @@ class XianyuRoundBrowserPool:
         return self._pw
 
     def _ensure_dir_lock(self, user_data_dir: str, task_name: str, lock_timeout_sec: float) -> None:
-        norm_key = os.path.normcase(os.path.abspath(user_data_dir))
-        if norm_key not in self._held_locks:
+        if not self._global_lock_held:
             self._lock_stack.enter_context(
                 _acquire_serial_browser_lock(
                     user_data_dir=user_data_dir,
@@ -805,7 +804,7 @@ class XianyuRoundBrowserPool:
                     lock_timeout_sec=lock_timeout_sec,
                 )
             )
-            self._held_locks.add(norm_key)
+            self._global_lock_held = True
 
     def _close_h5_context_only(self) -> None:
         _detach_tracker_from_context(self._h5_ctx, self._h5_tracker, self._h5_on_page_cb)
@@ -1007,7 +1006,7 @@ class XianyuRoundBrowserPool:
             self._lock_stack.close()
         except Exception:
             pass
-        self._held_locks.clear()
+        self._global_lock_held = False
         gc.collect()
 
 

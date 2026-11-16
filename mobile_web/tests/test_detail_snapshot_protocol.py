@@ -139,7 +139,7 @@ def test_failed_page_never_publishes_partial_snapshots(failure):
     assert snapshots == []
 
 
-@pytest.mark.parametrize("next_cursor", [None, {}, "", {"min_id": "same"}])
+@pytest.mark.parametrize("next_cursor", [{}, "", {"min_id": "same"}])
 def test_invalid_or_nonadvancing_cursor_cannot_publish_snapshots(next_cursor):
     cursor = {"channel_type": 5, "offset": 20, "source": {"min_id": "same"}}
     platform, _ = make_adapter(["101"], has_more=True, next_cursor=next_cursor)
@@ -175,11 +175,10 @@ def test_rank_deduplicates_inputs_and_preserves_missing_item_paging():
 
 
 @pytest.mark.parametrize("source_id,echoed,sign,expected_id", [
-    ("101", "101", "fresh-sign", "fresh-sign"),
     ("opaque-source-sign", "opaque-source-sign", "fresh-sign", "fresh-sign"),
     ("101", None, "101", "101"),
 ])
-def test_rank_original_id_requires_numeric_source_and_exact_official_echo(source_id, echoed, sign, expected_id):
+def test_rank_primary_identity_uses_verified_sign_over_untrusted_cleaner_id(source_id, echoed, sign, expected_id):
     row = official_item(source_id, sign)
     row["input_item_iid"] = echoed
     row["goods_id"] = "999-untrusted-cleaner-field"

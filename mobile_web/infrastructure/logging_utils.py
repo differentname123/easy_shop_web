@@ -31,6 +31,30 @@ def format_exc_summary(exc: BaseException, *, include_message: bool = True, max_
     return f"{exc_type}: {clean_msg}"
 
 
+PROVEN_NON_OPS_ERROR_CODES = frozenset({
+    "PRODUCT_OFF_PROMOTION",
+    "AUTH_REQUIRED",
+    "UNSUPPORTED_TB_NUMERIC_ID",
+    "UNSUPPORTED_JD_NUMERIC_SKU",
+    "UNSUPPORTED_PDD_ID_ONLY_URL",
+    "AMBIGUOUS_PLATFORM_TEXT",
+    "KEYWORD_NOT_LINK",
+    "UNSUPPORTED_URL_DOMAIN",
+    "COUPON_NOT_FOUND",
+    "INVALID_USER_INPUT",
+})
+
+
+def is_non_ops_error_code(error_code: object) -> bool:
+    """Fail-Closed：仅已实证确定非运维/代码故障的业务拒单码返回 True。"""
+    return str(error_code or "").strip().upper() in PROVEN_NON_OPS_ERROR_CODES
+
+
+def severity_icon(*, error_code: object = None, non_ops_ok: bool = False) -> str:
+    """统一日志红叉准入开关：默认一律打 ❌，仅确定完全不是问题的状态才降级为 ⚠️。"""
+    return "⚠️" if (non_ops_ok or is_non_ops_error_code(error_code)) else "❌"
+
+
 def configure_console_encoding():
     """Windows 的重定向输出也使用 UTF-8，避免云端/本地终端日志乱码。"""
     for stream in (sys.stdout, sys.stderr):

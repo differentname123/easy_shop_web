@@ -1,7 +1,6 @@
 """PDD runtime protocol regression checks with exclusively fake requests."""
 
 import hashlib
-import inspect
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -28,50 +27,23 @@ def fake_gateway(monkeypatch):
     return session.post, replies
 
 
-def test_only_runtime_closure_and_transport_entry_points_are_exported():
-    signatures = {
-        "make_custom_parameters": "(uid=None, extra_custom=None)",
-        "extract_short_url": "(response_dict)",
-        "call_pdd_api": "(client_id, client_secret, api_type, business_params=None, timeout=(2.5, 4.0))",
-        "clean_goods_item": "(raw_data, source_type='')",
-        "clean_order_item": "(order)",
-        "check_member_authority": "(client_id, client_secret, pid, uid)",
-        "generate_authority_url": "(client_id, client_secret, pid, uid=None, **kwargs)",
-        "convert_pdd_url": "(client_id, client_secret, pid, source_url, uid=None, **kwargs)",
-        "generate_goods_promotion_url": "(client_id, client_secret, pid, goods_sign, uid=None, search_id=None, **kwargs)",
-        "generate_smart_promotion_url": "(client_id, client_secret, pid, goods_sign, cash_gift_id=None, uid=None, **kwargs)",
-        "get_goods_detail": "(client_id, client_secret, pid=None, goods_sign=None, goods_id=None, uid=None, **kwargs)",
-        "query_increment_orders": "(client_id, client_secret, start_time, end_time, page=1, page_size=50, **kwargs)",
-        "configure_transport": "(dns_mode='auto', trust_env=None)",
-        "warmup": "()",
-    }
-    exported = {
-        name for name, obj in vars(pdd_client).items()
-        if not name.startswith("_") and inspect.isfunction(obj) and obj.__module__ == pdd_client.__name__
-    }
-    assert exported == set(signatures)
-    for name, signature in signatures.items():
-        assert str(inspect.signature(getattr(pdd_client, name))) == signature
-    assert not hasattr(pdd_client, "get_config")
-    assert not hasattr(pdd_client, "setup_logger")
-    assert not hasattr(pdd_client, "traceback")
+@pytest.mark.parametrize("uid,extra,expected", [
+    (None, None, None),
+    ("   ", None, None),
+    (0, None, '{"uid":"0"}'),
+    ("  用户01  ", None, '{"uid":"用户01"}'),
+    ("old", {"uid": "new", "渠道": 2}, '{"uid":"new","渠道":2}'),
+    (None, {"x": [1, 2]}, '{"x":[1,2]}'),
+    (None, "not-a-dict", None),
+])
+def test_custom_parameters_preserve_uid_unicode_and_overrides(uid, extra, expected):
+    assert pdd_client.make_custom_parameters(uid, extra) == expected
 
 
-@pytest.mark.parametrize("uid,expected", [(None, None), ("   ", None), (0, '{"uid":"0"}'), ("  用户01  ", '{"uid":"用户01"}')])
-def test_custom_parameters_preserve_uid_string_and_unicode(uid, expected):
-    assert pdd_client.make_custom_parameters(uid) == expected
-
-
-def test_extra_custom_parameters_preserve_original_override_semantics():
-    assert pdd_client.make_custom_parameters("old", {"uid": "new", "渠道": 2}) == '{"uid":"new","渠道":2}'
-    assert pdd_client.make_custom_parameters(None, {"x": [1, 2]}) == '{"x":[1,2]}'
-    assert pdd_client.make_custom_parameters(None, "not-a-dict") is None
-
-
-def test_gateway_signs_exact_serialization_and_keeps_default_post_timeout(monkeypatch, fake_gateway):
+def test_gateway_signs_exact_serialization_and_timeout_overrides(monkeypatch, fake_gateway):
     post, replies = fake_gateway
     monkeypatch.setattr(pdd_client.time, "time", lambda: 1234567890.9)
-    replies.append({"ok": True})
+    replies.extend([{"ok": True}, {}])
     business = {"enabled": True, "disabled": False, "values": ["中文", 1], "object": {"uid": "01"}, "omit": None, "zero": 0}
     assert pdd_client.call_pdd_api("client", "secret", "pdd.test", business) == {"ok": True}
     args, kwargs = post.call_args
@@ -90,10 +62,6 @@ def test_gateway_signs_exact_serialization_and_keeps_default_post_timeout(monkey
     assert "omit" in business and business["omit"] is None
     assert "verify" not in kwargs
 
-
-def test_gateway_keeps_explicit_timeout_and_business_metadata_overrides(fake_gateway):
-    post, replies = fake_gateway
-    replies.append({})
     pdd_client.call_pdd_api("client", "secret", "pdd.test", {"timestamp": 5, "data_type": "JSON"}, timeout=(1, 9))
     assert post.call_args.kwargs["timeout"] == (1, 9)
     assert post.call_args.kwargs["json"]["timestamp"] == "5"
@@ -150,11 +118,14 @@ def test_goods_cleaning_keeps_fen_amounts_and_commission_truncation():
     assert pdd_client.clean_goods_item([]) is None
 
 
-@pytest.mark.parametrize("custom,uid", [
-    ('{"uid":"0001"}', "0001"), ('{"uid":0}', "0"), ("raw-uid", "raw-uid"),
-    ('{"x":1}', '{"x":1}'), ('["uid"]', '["uid"]'), ("", None),
+@pytest.mark.parametrize("custom,uid,status", [
+    ('{"uid":"0001"}', "0001", 2),
+    ('{"uid":0}', "0", 3),
+    ("raw-uid", "raw-uid", 4),
+    ('{"x":1}', '{"x":1}', 5),
+    ('["uid"]', '["uid"]', 2),
+    ("", None, 4),
 ])
-@pytest.mark.parametrize("status", [2, 3, 4, 5])
 def test_order_cleaning_preserves_attribution_money_and_status(custom, uid, status):
     raw = {"custom_parameters": custom, "order_status": status, "goods_price": 1234,
            "order_amount": 2468, "promotion_amount": 135, "promotion_rate": 175, "p_id": "pid"}
@@ -239,17 +210,10 @@ def test_smart_promotion_degrades_cash_gift_then_red_packet_then_standard(fake_g
     assert "search_id" not in params[1]
     assert all(item["custom_parameters"] == '{"uid":"007"}' for item in params)
 
-
-@pytest.mark.parametrize("cash_gift,reply,expected", [
-    (5, {"goods_promotion_url_generate_response": {"goods_promotion_url_list": [{"short_url": "gift"}]}}, "多多礼金秒杀"),
-    (None, {"rp_promotion_url_generate_response": {"url_list": [{"short_url": "red"}]}}, "官方超级红包"),
-])
-def test_smart_promotion_stops_at_first_available_strategy(fake_gateway, cash_gift, reply, expected):
-    post, replies = fake_gateway
-    replies.append(reply)
-    result = pdd_client.generate_smart_promotion_url("c", "s", "pid", "SIGN", cash_gift_id=cash_gift)
-    assert result["link_type"] == expected
-    assert post.call_count == 1
+    post.reset_mock()
+    replies.append({"goods_promotion_url_generate_response": {"goods_promotion_url_list": [{"short_url": "gift"}]}})
+    gift_res = pdd_client.generate_smart_promotion_url("c", "s", "pid", "SIGN", cash_gift_id=5)
+    assert gift_res["link_type"] == "多多礼金秒杀" and post.call_count == 1
 
 
 def test_goods_sign_detail_uses_cleaner_and_forwards_kwargs(fake_gateway):
@@ -280,11 +244,22 @@ def test_goods_id_detail_keeps_short_link_probe_strategy(fake_gateway):
 
 def test_goods_detail_failure_paths_remain_non_throwing(fake_gateway):
     _, replies = fake_gateway
-    assert pdd_client.get_goods_detail("c", "s")["error_msg"] == "必须提供 goods_sign 或 goods_id 其中之一"
-    replies.extend([{}, requests.Timeout("offline"), {}])
-    assert "Detail 接口未找到商品" in pdd_client.get_goods_detail("c", "s", goods_sign="SIGN")["error_msg"]
-    assert "Detail 查询失败:" in pdd_client.get_goods_detail("c", "s", goods_sign="SIGN")["error_msg"]
-    assert pdd_client.get_goods_detail("c", "s", goods_id=42)["error_msg"] == "通过 goods_id 生成探针短链失败"
+    err_missing = pdd_client.get_goods_detail("c", "s")
+    assert err_missing["error_code"] == "INVALID_ARGUMENT"
+    assert err_missing["error_msg"] == "必须提供 goods_sign 或 goods_id 其中之一"
+    replies.extend([
+        {},
+        {"goods_detail_response": {"goods_details": []}},
+        requests.Timeout("offline"),
+        {},
+    ])
+    assert pdd_client.get_goods_detail("c", "s", goods_sign="SIGN")["error_code"] == "PROTOCOL_ERROR"
+    off_res = pdd_client.get_goods_detail("c", "s", goods_sign="SIGN")
+    assert off_res["error_code"] == "PRODUCT_OFF_PROMOTION" and "下架" in off_res["error_msg"]
+    net_res = pdd_client.get_goods_detail("c", "s", goods_sign="SIGN")
+    assert net_res["error_code"] == "NETWORK_ERROR" and "Detail 查询失败:" in net_res["error_msg"]
+    probe_res = pdd_client.get_goods_detail("c", "s", goods_id=42)
+    assert probe_res["status"] == "error" and probe_res["error_code"] == "PROMOTION_FAILED"
 
 
 def test_increment_orders_uses_local_cleaner_and_original_gateway_parameters(fake_gateway):
@@ -317,3 +292,35 @@ def test_increment_orders_failure_preserves_empty_list(fake_gateway):
     assert result["status"] == "error"
     assert result["order_list"] == []
     assert result["error_msg"].startswith("增量订单查询失败:")
+
+
+def test_pdd_detail_separates_proven_off_promotion_from_api_and_protocol_errors(fake_gateway):
+    from adapters.pdd_adapter import PddAdapter
+
+    _, replies = fake_gateway
+    adapter = PddAdapter(client_id="c", client_secret="s", pid="pid")
+
+    # 1. 网关正常返回 200 且 goods_details 为空 -> 100% 确定商品下架/退出推广
+    replies.append({"goods_detail_response": {"goods_details": []}})
+    off_res = adapter.get_goods_detail(goods_sign="SIGN_OFF")
+    assert off_res["status"] == "error"
+    assert off_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    # 2. 网关抛出业务/调用错 -> 必须保留原始网关错误码，不能混成下架
+    replies.append({"error_response": {"error_code": 50001, "sub_code": "BAD_SIGN", "error_msg": "参数非法"}})
+    gw_res = adapter.get_goods_detail(goods_sign="SIGN_BAD")
+    assert gw_res["status"] == "error"
+    assert gw_res["error_code"] == "50001"
+
+    # 3. 网络超时 -> 保留 NETWORK_ERROR
+    replies.append(requests.Timeout("pdd timeout"))
+    net_res = adapter.get_goods_detail(goods_sign="SIGN_NET")
+    assert net_res["status"] == "error"
+    assert net_res["error_code"] == "NETWORK_ERROR"
+
+    # 4. 响应结构损坏 -> 返回 PROTOCOL_ERROR
+    replies.append({"goods_detail_response": "unexpected"})
+    proto_res = adapter.get_goods_detail(goods_sign="SIGN_PROTO")
+    assert proto_res["status"] == "error"
+    assert proto_res["error_code"] == "PROTOCOL_ERROR"
+

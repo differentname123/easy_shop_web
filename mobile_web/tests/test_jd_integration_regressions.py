@@ -76,17 +76,18 @@ def test_jd_display_time_roundtrips_shanghai_not_timezone_less_utc(source):
 
 
 def test_unified_jd_coupon_extraction_rank_preservation_and_depleted_fallback():
-    from cache import clear_all_caches
+    from datetime import datetime, timedelta, timezone
     from infrastructure.jd_client import DEFAULT_API_BASE, JdClient, PROMOTION_ROOT
     from repositories.product_repo import ProductRepository
     from tests.test_product_repository import MemoryCollection as ProductMemCol
 
-    clear_all_caches()
     enc_sign = "Wl4yEImIlQsfIguVL32ZfIguVL32Z4_3QWdizpmh42cklzdJw"
     jd_img = "https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg"
     coupon_link = "http://coupon.m.jd.com/coupons/show.action?key=c123&roleId=999"
+    t1 = datetime.now(timezone.utc) - timedelta(seconds=10)
+    t2 = t1 + timedelta(seconds=5)
 
-    # 1. _summary 统一提取 coupon_id -> coupon_url，入库后即使后续详情券额为0也不抹除已有 coupon_url，且无券榜单轮询不覆盖优惠券与券后价
+    # 1. _detail 统一提取 coupon_id -> coupon_url，无券榜单轮询不覆盖优惠券与券后价
     col = ProductMemCol()
     repo = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda name: col))
 
@@ -101,6 +102,7 @@ def test_unified_jd_coupon_extraction_rank_preservation_and_depleted_fallback():
         "pict_url": jd_img,
         "item_url": f"https://jingfen.jd.com/detail/{enc_sign}.html",
     })
+    detail_card["detail_updated_at"] = t1
     assert detail_card["coupon_url"] == coupon_link
     assert detail_card["price"] == 44.9 and detail_card["coupon_amount"] == 8.0
     assert repo.upsert_product_detail(detail_card) is True
@@ -121,6 +123,12 @@ def test_unified_jd_coupon_extraction_rank_preservation_and_depleted_fallback():
     assert saved["coupon_amount"] == 8.0 and saved["has_coupon"] is True
     assert saved["price"] == 44.9 and saved["original_price"] == 52.9
     assert saved["sales_tip"] == "5000"
+
+    # 后续若详情无新 coupon_url 写入，库内历史 coupon_url 字段仍不被空串抹除
+    zero_detail = dict(detail_card, coupon_amount=0.0, has_coupon=False, coupon_url="", detail_updated_at=t2)
+    assert repo.upsert_product_detail(zero_detail) is True
+    after_zero = repo.get_product_detail(enc_sign, platform="jd", key_type="sign")
+    assert after_zero["coupon_url"] == coupon_link
 
     # 2. 二合一领券转链：优先带 couponUrl；若券已领完自动无损回退普通推广链
     replies = [
@@ -150,15 +158,12 @@ def test_unified_jd_coupon_extraction_rank_preservation_and_depleted_fallback():
         assert http.get.call_args_list[0].args == (DEFAULT_API_BASE + "/open_jing_union_open_promotion_byunionid_get.ashx",)
         assert http.get.call_args_list[0].kwargs["params"]["couponUrl"] == coupon_link
         assert "couponUrl" not in http.get.call_args_list[1].kwargs["params"]
-    clear_all_caches()
 
 
 def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circuits():
-    from cache import clear_all_caches
     from repositories.product_repo import ProductRepository
     from tests.test_product_repository import MemoryCollection as ProductMemCol
 
-    clear_all_caches()
     enc_sign = "H942Tfk1n9iTlRHE8K75IkKfe6mXtQ_3Mqe07A69i2lWGNpGd"
     jd_img = "https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg"
     coupon_link = "https://coupon.m.jd.com/coupons/show.action?key=k888&roleId=777"
@@ -167,7 +172,6 @@ def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circ
     repo = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda name: col))
 
     mock_client = Mock()
-    # 模拟 api_detail.ashx 遇 301 限流 -> 交叉探针转链存活 -> 自动走 api_quanwang.ashx 短链兜底拿到隐藏券
     mock_client.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
     mock_client.convert_promotion_link.side_effect = [
         {"status": "success", "short_url": "https://u.jd.com/probe1"},
@@ -202,11 +206,9 @@ def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circ
         assert res["final_link"] == "https://u.jd.com/two_in_one"
         assert mock_client.convert_promotion_link.call_args_list[-1].kwargs == {"coupon_url": coupon_link}
 
-        # 落库后已具备 detail_updated_at 与 coupon_url，后台预取直接短路不消耗上游配额
         prod_svc = ProductService(product_repo=repo)
         mock_client.get_goods_detail.reset_mock()
         pf = prod_svc.prefetch_product_detail(ProductRef("jd", "6ae3f40fF84b3cfef_0083320320005d73", enc_sign))
         assert pf.status == "ready"
         mock_client.get_goods_detail.assert_not_called()
-    clear_all_caches()
 

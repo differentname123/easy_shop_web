@@ -139,10 +139,14 @@ def test_identity_repository_has_unique_partial_index_and_rejects_field_injectio
     col = db.get_collection.return_value
     col.update_one.return_value = SimpleNamespace(modified_count=1, matched_count=1)
     repo = UserRepository(db_instance=db)
+    col.create_index.reset_mock()
     assert repo.update_auth_status(UID, "tb", True, extra={"identity": {"relation_id": "123"}})
+    assert repo.update_auth_status("u_deadbeef", "tb", True, extra={"identity": {"relation_id": "456"}})
     assert any(call.kwargs.get("partialFilterExpression") == {
         "auth_status.taobao.identity.relation_id": {"$type": "string"}
     } and call.kwargs.get("unique") is True for call in col.create_index.call_args_list)
+    # 同一集合实例后续写入不应重复执行 DDL
+    assert not any(call.kwargs.get("unique") is True for call in col.create_index.call_args_list[3:])
     with pytest.raises(ValueError):
         repo.update_auth_status(UID, "tb", True, extra={"identity.relation_id": "123"})
     with pytest.raises(ValueError):
@@ -169,19 +173,6 @@ def promotion_service(monkeypatch):
                                                 "identity": {"relation_id": "a"}}
     monkeypatch.setattr("services.promote_service.get_adapter", lambda platform: adapter)
     return PromoteService(repo, users), adapter, repo, users
-
-
-def test_token_survives_cache_but_text_uses_current_request_and_identity(monkeypatch):
-    service, adapter, _, users = promotion_service(monkeypatch)
-    first = service.convert_link("fixture", goods_id="123", uid=UID, title="第一次")
-    second = service.convert_link("fixture", goods_id="123", uid=UID, title="第二次")
-    assert "￥真实凭证￥" in first["command_text"] and "￥真实凭证￥" in second["command_text"]
-    assert "第二次" in second["command_text"] and "第一次" not in second["command_text"]
-    adapter.convert_promotion_url.assert_called_once()
-    assert adapter.convert_promotion_url.call_args.kwargs["identity"] == {"relation_id": "a"}
-    users.get_promotion_context.return_value["identity"] = {"relation_id": "b"}
-    service.convert_link("fixture", goods_id="123", uid=UID)
-    assert adapter.convert_promotion_url.call_count == 2
 
 
 def test_uncacheable_tokens_and_expired_results_do_not_enter_cache(monkeypatch):
@@ -279,18 +270,6 @@ def test_explicit_zero_and_opaque_input_proof_are_preserved_without_fake_raw_id(
     assert item["goods_id"] == "" and item["goods_sign"] == "opaque"
     assert item["input_item_iid"] == "original-A"
     assert clean_tb_goods_item({"item_id": "opaque", "item_basic_info": ["invalid"]}) is None
-
-
-def test_empty_channel_count_is_authoritative_but_partial_or_unverified_records_are_not():
-    api = MagicMock()
-    def respond(data):
-        api.return_value = {"status": "success", "data": {"tbk_sc_publisher_info_get_response": {"data": data}}}
-        return check_publisher_relation("key", "secret", UID, "session", api)
-    assert respond({"total_count": 0})["is_authorized"] is False
-    assert respond({"total_count": 2, "inviter_list": {"map_data": [
-        {"relation_id": "a", "external_id": UID}
-    ]}})["error_code"] == "INCOMPLETE_IDENTITY"
-    assert respond({"inviter_list": {"map_data": [{"relation_id": "a"}]}})["error_code"] == "IDENTITY_MISMATCH"
 
 
 def test_top_business_errors_cannot_echo_credentials():

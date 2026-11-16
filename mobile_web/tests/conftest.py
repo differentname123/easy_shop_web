@@ -7,6 +7,9 @@ install_offline_environment()
 import pytest
 
 
+import sys
+
+
 @pytest.fixture(scope="session", autouse=True)
 def offline_import_and_shutdown():
     assert_no_blocked_calls()
@@ -15,15 +18,53 @@ def offline_import_and_shutdown():
 
 
 @pytest.fixture(autouse=True)
-def offline_resources_and_registry():
+def offline_resources_and_registry(tmp_path):
     import adapters
     from cache import clear_all_caches
+    import infrastructure.api_governance as api_gov
 
     registry = dict(adapters._ADAPTER_REGISTRY)
+    orig_health_dir = api_gov._HEALTH_DIR
+    orig_process_role = api_gov._PROCESS_ROLE
+    had_playwright = "playwright" in sys.modules
+    orig_playwright = sys.modules.get("playwright")
+
+    api_gov._HEALTH_DIR = tmp_path / "runtime_health"
+    api_gov.GLOBAL_UPSTREAM_HEALTH.reset()
+    model_api_mod = sys.modules.get("infrastructure.ai_api.model_api")
+    orig_model_usage_path = getattr(model_api_mod, "MODEL_USAGE_JSON_PATH", None) if model_api_mod is not None else None
+    if model_api_mod is not None:
+        model_api_mod.MODEL_USAGE_JSON_PATH = tmp_path / "model_usage.json"
+
     start = len(BLOCKED_CALLS)
     clear_all_caches()
-    yield
-    adapters._ADAPTER_REGISTRY.clear()
-    adapters._ADAPTER_REGISTRY.update(registry)
-    clear_all_caches()
-    assert BLOCKED_CALLS[start:] == [], "测试尝试访问真实资源，即使业务代码捕获了异常也不算通过"
+    try:
+        yield
+    finally:
+        adapters._ADAPTER_REGISTRY.clear()
+        adapters._ADAPTER_REGISTRY.update(registry)
+        clear_all_caches()
+        api_gov._HEALTH_DIR = orig_health_dir
+        api_gov._PROCESS_ROLE = orig_process_role
+        api_gov.GLOBAL_UPSTREAM_HEALTH.reset()
+        if model_api_mod is not None and orig_model_usage_path is not None:
+            model_api_mod.MODEL_USAGE_JSON_PATH = orig_model_usage_path
+        jd_client_mod = sys.modules.get("infrastructure.jd_client")
+        if jd_client_mod is not None:
+            jd_cls = getattr(jd_client_mod, "JdClient", None)
+            if jd_cls is not None:
+                with jd_cls._KEY_PACE_LOCK:
+                    jd_cls._KEY_NEXT_ALLOWED_TS.clear()
+        order_service_mod = sys.modules.get("services.order_service")
+        if order_service_mod is not None:
+            order_service_mod._LAST_SYNC_TIMESTAMP.clear()
+            order_service_mod._LAST_SYNC_ATTEMPT.clear()
+            order_service_mod._SYNC_STATE.clear()
+        if not had_playwright:
+            for mod_name in list(sys.modules):
+                if mod_name == "playwright" or mod_name.startswith("playwright."):
+                    sys.modules.pop(mod_name, None)
+        else:
+            sys.modules["playwright"] = orig_playwright
+        assert BLOCKED_CALLS[start:] == [], "测试尝试访问真实资源，即使业务代码捕获了异常也不算通过"
+

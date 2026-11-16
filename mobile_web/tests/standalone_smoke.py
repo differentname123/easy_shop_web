@@ -197,8 +197,11 @@ def run_worker(app_dir, forbidden_root):
                     self.assertEqual(status, 200)
                     self.assertEqual(json.loads(body), {"status": "ok", "service": "mobile_web_service"})
                     for route, filename in (("/", "index.html"), ("/detail", "detail.html"),
+                                            ("/group_help", "group_help.html"),
                                             ("/static/css/style.css", "css/style.css"),
-                                            ("/static/js/detail.js", "js/detail.js")):
+                                            ("/static/css/group_help.css", "css/group_help.css"),
+                                            ("/static/js/detail.js", "js/detail.js"),
+                                            ("/static/js/group_help.js", "js/group_help.js")):
                         status, body = await asgi_get(self.main.app, route)
                         self.assertEqual(status, 200, route)
                         self.assertEqual(body, (app_dir / "static" / filename).read_bytes(), route)
@@ -207,7 +210,8 @@ def run_worker(app_dir, forbidden_root):
             loop.run_until_complete(exercise())
             for module_name, service_name in (("api.home", "product_service"), ("api.goods", "product_service"),
                                               ("api.user", "user_service"), ("api.order", "order_service"),
-                                              ("api.promote", "promote_service")):
+                                              ("api.promote", "promote_service"),
+                                              ("api.group_help", "group_help_service")):
                 service = getattr(importlib.import_module(module_name), service_name)
                 self.assertIsNone(service.repo._db, "health/static startup must not construct a Mongo client")
             self.assertFalse(list(app_dir.rglob("*.log")))
@@ -216,12 +220,12 @@ def run_worker(app_dir, forbidden_root):
             path = app_dir.parent / "bad smoke config.json"
             path.write_text(json.dumps({"local_mongo_port": "secret-port-canary", "web_auth_secret": SMOKE_SECRET}), encoding="utf-8")
             with self.assertRaises(self.settings.SettingsError) as error:
-                self.settings.load_settings(path, environ={}, require_credentials=False)
+                self.settings.load_settings(path, require_credentials=False)
             self.assertNotIn("secret-port-canary", str(error.exception))
             self.assertNotIn(SMOKE_SECRET, str(error.exception))
             path.write_text('{"password": "json-secret-canary",', encoding="utf-8")
             with self.assertRaises(self.settings.SettingsError) as error:
-                self.settings.load_settings(path, environ={})
+                self.settings.load_settings(path)
             self.assertNotIn("json-secret-canary", str(error.exception))
 
         def test_04_logging_is_idempotent_and_utf8(self):

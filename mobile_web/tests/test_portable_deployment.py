@@ -37,8 +37,8 @@ def private_config(tmp_path):
     return path
 
 
-def test_legacy_json_configuration_and_frozen_settings(private_config):
-    settings = load_settings(private_config, environ={})
+def test_json_configuration_and_frozen_settings(private_config):
+    settings = load_settings(private_config)
     assert settings.pdd_client_id == PRIVATE["myself_pdd_client_id"]
     assert settings.pdd_client_secret == PRIVATE["myself_pdd_client_secret"]
     assert settings.pdd_pid == PRIVATE["myself_pdd_pid"]
@@ -57,27 +57,11 @@ def test_legacy_json_configuration_and_frozen_settings(private_config):
 
 
 def test_settings_repr_hides_private_secrets(private_config):
-    settings = load_settings(private_config, environ={})
+    settings = load_settings(private_config)
     rendered = repr(settings)
     for field in ("myself_pdd_client_secret", "local_mongo_password", "web_auth_secret"):
         assert PRIVATE[field] not in rendered
     assert "json-mongo.invalid" in rendered
-
-
-def test_json_pure_configuration(private_config):
-    settings = load_settings(private_config)
-    assert settings.pdd_client_id == PRIVATE["myself_pdd_client_id"]
-    assert settings.pdd_client_secret == PRIVATE["myself_pdd_client_secret"]
-    assert settings.pdd_pid == PRIVATE["myself_pdd_pid"]
-    assert settings.mongo_host == PRIVATE["local_mongo_host"]
-    assert settings.mongo_port == PRIVATE["local_mongo_port"]
-    assert settings.mongo_user == PRIVATE["local_mongo_user"]
-    assert settings.mongo_password == PRIVATE["local_mongo_password"]
-    assert settings.mongo_db_name == PRIVATE["local_mongo_db_name"]
-    assert settings.mongo_auth_source == PRIVATE["mongo_auth_source"]
-    assert settings.auth_secret == PRIVATE["web_auth_secret"]
-    assert settings.web_host == PRIVATE["web_host"]
-    assert settings.web_port == PRIVATE["web_port"]
 
 
 @pytest.mark.parametrize("field,key", [

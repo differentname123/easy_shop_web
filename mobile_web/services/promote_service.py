@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional
 from adapters import get_adapter, PlatformUnavailableError
 from adapters.base import build_command_text
 from infrastructure.http_utils import sanitize_user_error_message
-from infrastructure.logging_utils import format_exc_summary
+from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import (
     ProductRef,
     classify_user_input,
@@ -62,7 +62,7 @@ class PromoteService:
                     return ProductRef(ref.platform, goods_id, doc_sign)
             except Exception as exc:
                 logger.warning(
-                    "❌ 【转链身份解析降级】读取商品身份缓存时发生异常，已降级使用原始参数继续转链 | 平台[%s] Sign[%s] 异常<%s> 排查方向<请检查MongoDB连接或products集合状态>",
+                    "❌ 【转链身份解析降级】读取商品身份缓存未成功，已降级使用原始参数继续转链 | 平台[%s] Sign[%s] 异常<%s>",
                     ref.platform, ref.goods_sign, format_exc_summary(exc),
                 )
             # 若内存 DETAIL_CACHE 已持有经服务端验证的同平台商品详情，直接补齐权威 goods_id
@@ -201,7 +201,7 @@ class PromoteService:
             return ""
         except Exception as exc:
             logger.warning(
-                "❌ 【转链物料读取降级】从本地数据库读取商品可信物料链接失败，将尝试直接调用上游转链 | 平台[%s] 商品[%s] 异常<%s> 排查方向<请检查MongoDB连接状态>",
+                "❌ 【转链物料读取降级】从本地数据库读取商品可信物料链接未成功，将尝试直接调用上游转链 | 平台[%s] 商品[%s] 异常<%s>",
                 ref.platform, ref.key, format_exc_summary(exc),
             )
             return ""
@@ -255,7 +255,7 @@ class PromoteService:
                 return jd_coupon_url(detail_data.get("coupon_url"))
         except Exception as exc:
             logger.warning(
-                "❌ 【京东转链补券降级】转链前补查商品优惠券异常，将直接按普通商品链接转链 | 商品[%s] 异常<%s>",
+                "❌ 【京东转链补券降级】转链前补查商品优惠券未成功，将直接按普通商品链接转链 | 商品[%s] 异常<%s>",
                 ref.key, format_exc_summary(exc),
             )
         return ""
@@ -467,7 +467,8 @@ class PromoteService:
                     except Exception:
                         pass
             logger.warning(
-                "❌ 【推广转链失败】正在生成商品推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、物料链接有效性或上游联盟转链网关状态>",
+                "%s 【推广转链失败】正在生成商品推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、物料链接有效性或上游联盟转链网关状态>",
+                severity_icon(error_code=data.get("error_code")),
                 plat, goods_tag, user_tag, "personal" if (effective_uid and not personal_fallback) else "public",
                 source, auth_ms, provider_ms, total_ms,
                 data.get("error_msg") or data.get("error_code") or "未知错误",
@@ -835,7 +836,8 @@ class PromoteService:
         total_ms = (time.perf_counter() - total_started) * 1000
         raw_err_msg = last_error.get("error_msg") or last_error.get("error_code") or "未知错误"
         logger.warning(
-            "❌ 【万能转链失败】平台[%s] 用户[%s] 总耗时[%.1fms] 失败原因<%s>",
+            "%s 【万能转链失败】平台[%s] 用户[%s] 总耗时[%.1fms] 失败原因<%s>",
+            severity_icon(error_code=last_error.get("error_code")),
             detected_plat,
             clean_uid or "匿名",
             total_ms,

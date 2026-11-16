@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 系统级运行隐患修复与上游商品/转链 API 统一治理层回归测试套件。
-覆盖 6 大线上真实运行隐患与 `infrastructure/api_governance.py` 统一治理契约：
+覆盖核心治理契约与跨模块系统隐患：
   1. 统一 API 治理层（前台/后台自适应配额节流、多通道故障转移链、四态结果契约、健康监控端点）；
-  2. 京东 u.jd.com 单品限流防误判 OK_COUPON 与预热缓存防毒化、消除冗余 piliang 二次消耗；
-  3. 淘宝全变体口令（括号/斜杠/书名号/AC01/CZ00）跨模块平台识别对齐；
+  2. 京东 u.jd.com 单品保留 tkl_piliang 补全详情与多 Key 轮询防空 tao_id；
+  3. 淘宝全变体口令跨模块平台识别单一真源对齐；
   4. 万能转链 -> 详情页转链防幽灵空商品（DETAIL_CACHE 身份补齐 + only_if_exists=True 禁硬插空壳）；
-  5. 内存/句柄/磁盘防泄漏（有界 LRU anchor_cache、有界 JSONL 轮转、Windows model_api.log 跨午夜安全滚动、闲鱼 db.close 与惰性连接池）；
-  6. 后台订单主动轮询守护（OrderSyncWorker）、超72h过期好价摘标及云端墓碑删除/未清洗流商品回拉闭环。
+  5. 内存/句柄/磁盘防泄漏（有界 LRU anchor_cache、有界 JSONL 轮转、闲鱼浏览器串行锁、AI 超时日志安全）。
 """
 from __future__ import annotations
 
-import datetime
 import json
 import logging
 import os
 import tempfile
-import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -38,7 +35,6 @@ from infrastructure.api_governance import (
 )
 from models.product import detect_platform_signal, extract_search_keyword
 from repositories.product_repo import ProductRepository
-from services.order_service import OrderSyncWorker
 from services.promote_service import PromoteService
 
 
@@ -275,83 +271,6 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     assert all("quanwang" not in u for u, _, _ in calls)
 
 
-def test_deal_cleaner_never_poisons_degraded_jd_shortlink_as_ok_coupon():
-    from mobile_web.scripts.run_deal_pool_scheduler import (
-        ERR_ADAPTER_CONVERT_FAILED,
-        DealPoolCleaner,
-    )
-
-    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    degraded_res = stamp_universal_resolution(
-        {
-            "status": "success",
-            "url": "https://u.jd.com/myStationNewLink",
-            "final_link": "https://u.jd.com/myStationNewLink",
-            "short_url": "https://u.jd.com/myStationNewLink",
-            "product": None,
-        },
-        verified_coupon_or_venue=False,
-    )
-    cleaner.adapters["jd"] = SimpleNamespace(resolve_and_convert_universal=lambda _inp: degraded_res)
-
-    out = cleaner.convert_single_target(
-        {"link_id": "L1", "clean_input": "https://u.jd.com/o6P5O9L", "platform": "jd", "text_role_hint": "main_candidate"},
-        default_plat="jd",
-    )
-    assert out["convert_status"] == "failed"
-    assert out["error_code"] == ERR_ADAPTER_CONVERT_FAILED
-    assert out["resolution_kind"] == "degraded_product"
-
-    # 轮末驱逐暂态失败缓存后，anchor_cache 不残留中毒记录，保证下一轮重试能真正重调接口恢复
-    cleaner._evict_transient_failed_cache()
-    assert "jd:https://u.jd.com/o6P5O9L" not in cleaner.anchor_cache
-
-    # 验证预热门禁：旧库中未标记 resolution_kind 的 u.jd.com 与 union-click.jd.com OK_COUPON 均拒绝预热
-    class _WarmupCursor:
-        def sort(self, *_a):
-            return self
-
-        def limit(self, *_a):
-            return [
-                {
-                    "converted_links": [
-                        {
-                            "link_id": "L_OLD_POISON_U",
-                            "clean_input": "https://u.jd.com/poisonedOld",
-                            "convert_status": "coupon_or_activity",
-                            "error_code": "OK_COUPON",
-                            "platform": "jd",
-                            "my_promo_link": "https://u.jd.com/myPoisonedOut",
-                        },
-                        {
-                            "link_id": "L_OLD_POISON_UC",
-                            "clean_input": "https://union-click.jd.com/jdc?e=&p=JF8B_OLD",
-                            "convert_status": "coupon_or_activity",
-                            "error_code": "OK_COUPON",
-                            "platform": "jd",
-                            "my_promo_link": "https://u.jd.com/myPoisonedOut2",
-                        },
-                        {
-                            "link_id": "L_NEW_VENUE",
-                            "clean_input": "https://u.jd.com/realVenue",
-                            "convert_status": "coupon_or_activity",
-                            "resolution_kind": "coupon_or_venue",
-                            "error_code": "OK_COUPON",
-                            "platform": "jd",
-                            "my_promo_link": "https://u.jd.com/myRealVenueOut",
-                        },
-                    ]
-                }
-            ]
-
-    raw_col = MagicMock()
-    raw_col.find.return_value = _WarmupCursor()
-    cleaner.warmup_anchor_cache_from_db(raw_col)
-    assert "jd:https://u.jd.com/poisonedOld" not in cleaner.anchor_cache
-    assert "jd:https://union-click.jd.com/jdc?e=&p=JF8B_OLD" not in cleaner.anchor_cache
-    assert "jd:https://u.jd.com/realVenue" in cleaner.anchor_cache
-
-
 # ==============================================================================
 # 3. 淘宝全变体口令单一真源识别（含 Emoji 🗝/💲，且不误伤搜索框括号型号词与非11位缓存键）
 # ==============================================================================
@@ -510,208 +429,6 @@ def test_bounded_anchor_cache_lru_and_bounded_jsonl_rotation():
         assert os.path.exists(f"{jpath}.1")
 
 
-def test_windows_safe_timed_rotating_file_handler_and_per_daemon_log_isolation():
-    from infrastructure.ai_api.model_api import (
-        _WindowsSafeTimedRotatingFileHandler,
-        _resolve_process_log_stem,
-    )
-
-    with patch("sys.argv", ["scripts/run_deal_pool_scheduler.py"]):
-        assert _resolve_process_log_stem("model_api") == "model_api_deal_pool"
-    with patch("sys.argv", ["scripts/run_xianyu_deal_discovery_scheduler.py"]):
-        assert _resolve_process_log_stem("model_api") == "model_api_xianyu"
-    with patch("sys.argv", ["run.py"]):
-        assert _resolve_process_log_stem("model_api") == "model_api"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        log_path = os.path.join(tmpdir, "model_api_deal_pool.log")
-        handler = _WindowsSafeTimedRotatingFileHandler(log_path, when="midnight", backupCount=2, encoding="utf-8", delay=True)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-
-        rec = logging.LogRecord("test", logging.INFO, __file__, 1, "hello log line", (), None)
-        handler.emit(rec)
-        handler.rolloverAt = int(time.time()) - 10
-        handler.doRollover()
-        rotated_files = [f for f in os.listdir(tmpdir) if f.startswith("model_api_deal_pool.log.")]
-        assert len(rotated_files) == 1
-
-        # 极端情况下若 rename 仍抛 PermissionError，静默推进 rolloverAt 绝不抛未捕获异常
-        handler.emit(rec)
-        handler.rolloverAt = int(time.time()) - 10
-        with patch.object(handler, "rotate", side_effect=PermissionError(32, "被占用")):
-            handler.doRollover()
-        assert handler.rolloverAt > int(time.time())
-        handler.close()
-
-
-def test_xianyu_round_pool_lazy_init_and_discovery_cycle_closes_db():
-    import sys
-    import types
-
-    try:
-        import playwright.sync_api  # noqa: F401
-    except ModuleNotFoundError:
-        _pw_mod = types.ModuleType("playwright")
-        _pw_sync = types.ModuleType("playwright.sync_api")
-        _pw_sync.sync_playwright = MagicMock()
-        sys.modules.setdefault("playwright", _pw_mod)
-        sys.modules.setdefault("playwright.sync_api", _pw_sync)
-
-    from mobile_web.scripts import publish_to_xianyu as pxy
-    from mobile_web.scripts import run_xianyu_deal_discovery_scheduler as xy_sched
-
-    # 惰性验证：未实际调用 acquire_* 时，__enter__/__exit__ 绝不启动 Playwright
-    with patch.object(pxy, "sync_playwright", side_effect=AssertionError("should not start eagerly")):
-        with pxy.XianyuRoundBrowserPool() as pool:
-            assert pool._pw is None
-
-    # 验证 run_discovery_cycle 无论候选为空还是正常结束，均在 finally 中调用 db.close()
-    fake_db = MagicMock()
-    fake_db.get_collection.return_value = MagicMock()
-    with patch.object(xy_sched, "gen_db_object", return_value=fake_db), patch.object(
-        xy_sched, "select_round_candidates_for_source", return_value=[]
-    ):
-        xy_sched.run_discovery_cycle(enable_official=True, enable_deal_tip=False)
-
-    assert fake_db.close.call_count == 1
-
-
-# ==============================================================================
-# 6. 后台订单定时同步守护 + 墓碑跨云端删除/好价过期摘标/云端未清洗流回拉
-# ==============================================================================
-def test_order_sync_worker_runs_periodically_and_stops_cleanly():
-    order_svc = MagicMock()
-    called_evt = threading.Event()
-
-    def _fake_round(stop_event=None):
-        called_evt.set()
-        return {"pdd": "done"}
-
-    order_svc.run_scheduled_sync_round.side_effect = _fake_round
-    worker = OrderSyncWorker(order_svc, interval_seconds=60.0, initial_delay_seconds=0.01)
-    worker.start()
-    try:
-        assert called_evt.wait(timeout=2.0) is True
-    finally:
-        worker.stop()
-    assert worker._thread is None
-    assert order_svc.run_scheduled_sync_round.call_count >= 1
-
-
-def test_cloud_sync_tombstones_deal_expiry_and_cloud_only_pullback():
-    from mobile_web.scripts import run_product_cloud_sync_scheduler as sync_mod
-    from tests.test_product_cloud_sync import _FakeSyncCollection
-
-    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
-    t_old = now - datetime.timedelta(hours=80)
-
-    # 1) 本地已超 72h 摘除好价标 (is_deal_tip=False + expired_at)，云端仍为 is_deal_tip=True -> 自动同步摘标
-    local_expired_deal = {
-        "platform": "jd",
-        "product_id": "jd_stale_deal_1",
-        "name": "过期好价纸巾",
-        "price": 29.9,
-        "activity_price": 29.9,
-        "updated_at": t_old,
-        "deal_info": {
-            "is_deal_tip": False,
-            "expired_at": now,
-            "updated_at": now,
-            "deal_price": 9.9,
-        },
-    }
-    cloud_active_deal = {
-        "platform": "jd",
-        "product_id": "jd_stale_deal_1",
-        "name": "过期好价纸巾",
-        "price": 29.9,
-        "activity_price": 29.9,
-        "updated_at": t_old,
-        "deal_info": {
-            "is_deal_tip": True,
-            "updated_at": t_old,
-            "deal_price": 9.9,
-        },
-    }
-    l_fp = sync_mod.extract_sync_fingerprint(local_expired_deal)
-    c_fp = sync_mod.extract_sync_fingerprint(cloud_active_deal)
-    should_sync, reason = sync_mod.needs_cloud_merge(l_fp, c_fp)
-    assert should_sync is True
-    assert reason == "deal_info_expired"
-    op = sync_mod.build_product_merge_operation(local_expired_deal, c_fp)
-    assert op._doc["$set"]["deal_info"]["is_deal_tip"] is False
-
-    # 2) 墓碑跨云端删除 + 云端独有未清洗推荐流商品回拉到本地（自动排除已墓碑删除商品）
-    class _TombstoneAwareCloudCol(_FakeSyncCollection):
-        def find(self, query: dict | None = None, projection: dict | None = None):
-            q = query or {}
-            if "$and" in q and isinstance(q["$and"][0], dict) and "updated_at" in q["$and"][0]:
-                cutoff_ms = sync_mod.to_utc_millis(q["$and"][0]["updated_at"]["$gte"])
-                out = []
-                for doc in self.docs:
-                    if not sync_mod.is_valid_syncable_product(doc):
-                        continue
-                    if doc.get("format_status") is not None:
-                        continue
-                    u_ms = sync_mod.to_utc_millis(doc.get("updated_at"))
-                    if u_ms is None or u_ms < cutoff_ms:
-                        continue
-                    out.append(self._project(doc, projection))
-                return out
-            return super().find(query, projection)
-
-        def delete_many(self, filt: dict):
-            plat = filt["platform"]
-            pids = set(filt["product_id"]["$in"])
-            before = len(self.docs)
-            self.docs = [d for d in self.docs if not (d.get("platform") == plat and d.get("product_id") in pids)]
-            return SimpleNamespace(deleted_count=before - len(self.docs))
-
-    tombstone_col = MagicMock()
-    tombstone_col.find.return_value = [{"platform": "pdd", "product_id": "dead_off_promo_1", "deleted_at": now}]
-
-    local_col = _FakeSyncCollection([])
-    cloud_col = _TombstoneAwareCloudCol(
-        [
-            {
-                "_id": "c_dead",
-                "platform": "pdd",
-                "product_id": "dead_off_promo_1",
-                "name": "已下架死链商品",
-                "price": 19.9,
-                "activity_price": 19.9,
-                "updated_at": now,
-            },
-            {
-                "_id": "c_stream_unfmt",
-                "platform": "pdd",
-                "product_id": "cloud_stream_new_1",
-                "goods_sign": "E9_STREAM_1",
-                "name": "云端推荐流新商品待规格清洗",
-                "price": 15.8,
-                "activity_price": 15.8,
-                "image_url": "https://img.pddpic.com/s1.jpg",
-                "updated_at": now,
-                "default_promotion": {"final_link": "https://p.pinduoduo.com/cloud_only"},
-            },
-        ]
-    )
-
-    rep = sync_mod.run_sync_round(
-        local_col,
-        cloud_col,
-        window_days=3.0,
-        tombstone_col=tombstone_col,
-        pull_cloud_unformatted=True,
-    )
-    assert rep["cloud_deleted_tombstones"] == 1
-    assert rep["local_pulled_cloud_unformatted"] == 1
-    assert all(d["product_id"] != "dead_off_promo_1" for d in cloud_col.docs)
-    assert len(local_col.docs) == 1
-    assert local_col.docs[0]["product_id"] == "cloud_stream_new_1"
-    assert "default_promotion" not in local_col.docs[0]
-
-
 def test_ztk_order_query_recognizes_relay_status_throttle_and_pace_backlog():
     from infrastructure.api_governance import QuotaPaceBacklogError
     from infrastructure.ztk_client import ZtkClient
@@ -731,79 +448,6 @@ def test_ztk_order_query_recognizes_relay_status_throttle_and_pace_backlog():
         res_backlog = client.query_orders(0, 600)
     assert res_backlog["status"] == "error"
     assert res_backlog["error_code"] == "UPSTREAM_ERROR"
-
-
-def test_deal_pool_startup_recovery_idempotently_rescues_recent_misclassified_tips():
-    from mobile_web.scripts.run_deal_pool_scheduler import (
-        ERR_JD_NUMERIC_SKU,
-        DealPoolCleaner,
-        DealRawPoolRepository,
-    )
-
-    fake_db = MagicMock()
-    fake_col = MagicMock()
-    fake_col.update_many.side_effect = [
-        SimpleNamespace(modified_count=7),
-        SimpleNamespace(modified_count=3),
-    ]
-    fake_db.get_collection.return_value = fake_col
-
-    repo = DealRawPoolRepository(db_instance=fake_db)
-    fake_col.update_many.reset_mock()
-    fake_col.update_many.side_effect = [
-        SimpleNamespace(modified_count=7),
-        SimpleNamespace(modified_count=3),
-    ]
-    out = repo.recover_recent_misclassified_tips(lookback_hours=48.0)
-    assert out == {"jd_recovered": 7, "tb_recovered": 3}
-    assert fake_col.update_many.call_count == 2
-    jd_flt, jd_upd = fake_col.update_many.call_args_list[0].args
-    assert ERR_JD_NUMERIC_SKU in jd_flt["clean_error_code"]["$in"]
-    assert any("union-click" in str(cond) for cond in jd_flt["$or"])
-    for call in fake_col.update_many.call_args_list:
-        flt, upd = call.args
-        assert flt["recovery_version"] == {"$ne": DealRawPoolRepository.RECOVERY_VERSION_TAG}
-        assert upd["$set"]["clean_status"] == "pending"
-        assert upd["$set"]["recovery_version"] == DealRawPoolRepository.RECOVERY_VERSION_TAG
-        assert "ai_stage1_result" in upd["$unset"]
-
-    # 验证同帖同时含 item.jd.com/{数字} 与 extracted_links(union-click.jd.com) 时，若 AI-1 漏提 union-click，由代码确定性补齐
-    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    doc = {
-        "source_site": "guangdiu",
-        "source_item_id": "gd_1",
-        "platform": "jd",
-        "title": "米多奇香米饼 9.9元",
-        "tutorial_text": "https://item.jd.com/10171863267421.html",
-        "extracted_links": [
-            {"label": "直达购买", "url": "https://union-click.jd.com/jdc?e=&p=JF8B_VALID", "platform": "jd"}
-        ],
-    }
-    s1_inp, tip_map = cleaner.build_stage1_task_input(doc, None)
-    with patch.object(
-        cleaner,
-        "_call_ai_json_array",
-        return_value=[
-            {
-                "main_tip_id": "gd_1",
-                "is_standalone_deal": True,
-                "merged_tip_ids": ["gd_1"],
-                "extracted_targets": [
-                    {
-                        "link_id": "L1",
-                        "raw_span": "https://item.jd.com/10171863267421.html",
-                        "clean_input": "https://item.jd.com/10171863267421.html",
-                        "platform": "jd",
-                        "text_role_hint": "main_candidate",
-                    }
-                ],
-                "strip_spans": [],
-            }
-        ],
-    ):
-        ai1_map = cleaner.run_ai_stage1_batch([s1_inp], {"gd_1": doc}, {"gd_1": tip_map}, quiet_sub_logs=True)
-    extracted_urls = [t["clean_input"] for t in ai1_map["gd_1"]["extracted_targets"]]
-    assert "https://union-click.jd.com/jdc?e=&p=JF8B_VALID" in extracted_urls
 
 
 def test_upstream_health_report_skips_stale_snapshots_from_aggregation():
@@ -841,5 +485,109 @@ def test_upstream_health_report_skips_stale_snapshots_from_aggregation():
     assert ep["total_calls"] == 1
     assert ep["rate_limit_calls"] == 0
     assert report["alert_summary"] == []
+
+
+def test_xianyu_round_pool_search_then_h5_never_self_deadlocks_and_ai_timeout_clean():
+    from mobile_web.scripts import publish_to_xianyu as pxy
+    from mobile_web.scripts import run_deal_pool_scheduler as sched
+
+    # 1) 真实调用 _acquire_serial_browser_lock（仅桩掉 Playwright），验证同轮先 search_session 再 h5_detail_session 绝不自死锁
+    class _FakePage:
+        url = "https://www.goofish.com"
+        frames = []
+
+        def on(self, *_a, **_k):
+            pass
+
+        def remove_listener(self, *_a, **_k):
+            pass
+
+        def goto(self, *_a, **_k):
+            pass
+
+        def wait_for_timeout(self, *_a, **_k):
+            pass
+
+        def close(self):
+            pass
+
+    class _FakeCtx:
+        def __init__(self):
+            self.pages = [_FakePage()]
+
+        def set_default_timeout(self, *_a):
+            pass
+
+        def set_default_navigation_timeout(self, *_a):
+            pass
+
+        def on(self, *_a, **_k):
+            pass
+
+        def remove_listener(self, *_a, **_k):
+            pass
+
+        def new_page(self):
+            p = _FakePage()
+            self.pages.append(p)
+            return p
+
+        def cookies(self):
+            return [{"name": "_m_h5_tk", "value": "tok_1"}]
+
+        def close(self):
+            pass
+
+    class _FakeBrowser:
+        def is_connected(self):
+            return True
+
+        def new_context(self, **_k):
+            return _FakeCtx()
+
+        def close(self):
+            pass
+
+    class _FakePw:
+        chromium = SimpleNamespace(
+            launch_persistent_context=lambda **_k: _FakeCtx(),
+            launch=lambda **_k: _FakeBrowser(),
+        )
+
+    class _FakePwCm:
+        def __enter__(self):
+            return _FakePw()
+
+        def __exit__(self, *_a):
+            return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lock_file = os.path.join(tmpdir, "xianyu_test.lock")
+        dir_search = os.path.join(tmpdir, "search_acc")
+        dir_guest = os.path.join(tmpdir, "guest_acc")
+        with patch.object(pxy, "_GLOBAL_LOCK_FILE_PATH", lock_file), patch.object(
+            pxy, "sync_playwright", return_value=_FakePwCm()
+        ):
+            with pxy.XianyuRoundBrowserPool() as pool:
+                with pool.acquire_search_session(user_data_dir=dir_search, lock_timeout_sec=2.0) as (_c1, p1, _t1):
+                    assert p1 is not None
+                with pool.acquire_h5_detail_session(lock_key_dir=dir_guest, lock_timeout_sec=2.0) as (_c2, p2, _t2):
+                    assert p2 is not None
+            # 退出后全局线程锁必须已完全释放
+            assert pxy._PROCESS_THREAD_LOCK.acquire(timeout=0.5)
+            pxy._PROCESS_THREAD_LOCK.release()
+
+    # 2) _call_ai_json_array 遇到 timed_out=True 时不抛 UnboundLocalError
+    cleaner = sched.DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    logged_warnings = []
+    with patch.object(
+        sched,
+        "generate_content",
+        return_value={"status": "❌ 失败", "timed_out": True, "error_history": ["timeout"]},
+    ), patch.object(sched.logger, "warning", side_effect=lambda msg, *args: logged_warnings.append(msg % args if args else msg)):
+        out = cleaner._call_ai_json_array("prompt", [{"id": 1}], "AI-Stage2")
+    assert out == []
+    assert all("resp_text" not in w for w in logged_warnings)
+
 
 

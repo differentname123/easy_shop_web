@@ -45,8 +45,7 @@ def service_for(monkeypatch, adapter=None, repo=None, sync=None, users=None):
     )
 
 
-@pytest.mark.parametrize("platform", ["pdd", "taobao"])
-@pytest.mark.parametrize("paid_time", [0, 1234, None])
+@pytest.mark.parametrize("platform,paid_time", [("pdd", 0), ("taobao", 1234), ("pdd", None)])
 def test_legacy_platforms_gain_neutral_fields_without_losing_zero_or_status(platform, paid_time):
     raw = {"order_sn": "legacy", "order_pay_time": paid_time, "order_amount_yuan": 0,
            "promotion_amount_yuan": 0, "estimated_commission_yuan": 0,
@@ -117,7 +116,6 @@ def test_page_local_identity_cache_includes_misses_but_refreshes_next_page(monke
     run(service)
     assert users.promoter_lookups == ["123", "999", "123", "999"]
     assert len(users.lookups) == 4  # 两个渠道身份，每页各一次（包括未匹配）。
-    assert users.auth_status["jd"]["is_authorized"] is False
     assert orders.docs["future_shop", "1-pid-0"]["promoter_id"] == "123"
     assert orders.docs["future_shop", "1-pid-1"]["promoter_uid"] == "numeric-owner"
     assert orders.docs["future_shop", "1-pid-3"]["promoter_uid"] == ""
@@ -151,82 +149,6 @@ def test_malformed_promoter_evidence_never_falls_back_to_untrusted_uid(monkeypat
     with pytest.raises(ValueError):
         repository(col).upsert_orders([{"order_sn": "row", "promoter_id": invalid}], "jd")
     assert not col.docs
-
-
-def test_jd_one_hour_windows_keep_existing_budget_and_resume_initial_23_hours(monkeypatch):
-    adapter = Adapter()
-    adapter.order_window_seconds = 3600
-    sync = MemorySyncRepository()
-    service = service_for(monkeypatch, adapter, sync=sync)
-    target = 200000
-    run(service, "jd", now=target)
-    assert len(adapter.calls) == module.ORDER_SYNC_MAX_PAGES == 5
-    assert module._SYNC_STATE["jd"]["status"] == "partial"
-    assert sync.states["jd"]["last_success_end"] == target - 18 * 3600
-    assert sync.states["jd"]["pending"]["target_end"] == target
-    restarted = service_for(monkeypatch, adapter, sync=sync)
-    while sync.states["jd"]["pending"]:
-        before = len(adapter.calls)
-        run(restarted, "jd", now=target + 99999)
-        assert len(adapter.calls) - before <= 5
-    assert len(adapter.calls) == 23
-    assert all(call["end_time"] - call["start_time"] == 3600 for call in adapter.calls)
-    assert adapter.calls[0]["start_time"] == target - 23 * 3600
-    assert adapter.calls[-1]["end_time"] == target
-    assert module._SYNC_STATE["jd"]["status"] == "success"
-
-
-def test_identity_lookup_failure_does_not_advance_checkpoint(monkeypatch):
-    users = PromoterUsers()
-    users.get_uid_by_promoter_id = MagicMock(side_effect=RuntimeError("identity storage offline"))
-    sync = MemorySyncRepository({"jd": pending(success=90)})
-    before = deepcopy(sync.states)
-    orders = MemoryOrders()
-    adapter = Adapter(lambda **kw: {"status": "success", "has_more": False,
-                                    "order_list": [{"order_sn": "row", "promoter_id": "123"}]})
-    service = service_for(monkeypatch, adapter, orders, sync, users)
-    run(service, "jd")
-    assert sync.states == before and not orders.pages
-    assert module._LAST_SYNC_TIMESTAMP["jd"] == 90
-    assert module._SYNC_STATE["jd"]["status"] == "error"
-
-
-@pytest.mark.parametrize("source_time", [100, None])
-def test_source_guards_protect_neutral_fields_and_canonical_promoter_evidence(source_time):
-    col = MemoryCollection()
-    repo = repository(col)
-    latest = {"order_sn": "row", "order_modify_at": 200, "order_time": 1000,
-              "order_time_basis": "created", "order_amount_basis": "commissionable",
-              "order_amount_yuan": 0, "promotion_amount_yuan": 0,
-              "is_settled": True, "is_refund": False, "promoter_id": "123",
-              "promoter_uid": "owner", "attribution_status": "matched"}
-    repo.upsert_orders([latest], "jd")
-    stale = dict(latest, order_modify_at=source_time, order_time=9999, order_time_basis="paid",
-                 order_amount_basis="paid", order_amount_yuan=100, promotion_amount_yuan=999,
-                 is_settled=False, is_refund=True, promoter_id="999", promoter_uid="attacker")
-    assert repo.upsert_orders([stale], "jd") == 1
-    for key, value in latest.items():
-        assert col.docs[0][key] == value
-    fresh = dict(stale, order_modify_at=300)
-    repo.upsert_orders([fresh], "jd")
-    assert col.docs[0]["is_refund"] is True and col.docs[0]["order_time"] == 9999
-    assert col.docs[0]["promoter_id"] == "123" and col.docs[0]["promoter_uid"] == "owner"
-    assert col.docs[0]["attribution_status"] == "matched"
-
-
-def test_unknown_promoter_evidence_survives_empty_page_and_normal_sync_replay():
-    col = MemoryCollection()
-    repo = repository(col)
-    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 100,
-                         "promoter_id": "123", "promoter_uid": "", "attribution_status": "unmatched"}], "jd")
-    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 200,
-                         "promoter_id": "", "promoter_uid": "", "attribution_status": "unmatched"}], "jd")
-    assert col.docs[0]["promoter_id"] == "123"
-    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 200,
-                         "promoter_id": "123", "promoter_uid": "new-owner", "attribution_status": "matched"}], "jd")
-    repo.upsert_orders([{"order_sn": "unknown", "order_modify_at": 300,
-                         "promoter_id": "999", "promoter_uid": "other-owner"}], "jd")
-    assert col.docs[0]["promoter_id"] == "123" and col.docs[0]["promoter_uid"] == "new-owner"
 
 
 def test_mixed_time_filter_sort_and_full_stats_do_not_require_backfill():

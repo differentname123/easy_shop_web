@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from adapters import get_adapter, normalize_platform
-from infrastructure.logging_utils import format_exc_summary
+from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import (
     ProductRef,
     DetailSnapshot,
@@ -233,7 +233,8 @@ class ProductService:
             self._offer_products(items, channel_type=channel_type, snapshots=tuple(snapshots))
         else:
             logger.warning(
-                "❌ 【商品推荐失败】拉取平台首页推荐商品流失败 | 平台[%s] 频道[%s] 偏移[%s] 数量[%s] 失败原因<%s> 排查方向<请检查上游联盟接口配额、网络连接或应用密钥配置>",
+                "%s 【商品推荐失败】拉取平台首页推荐商品流失败 | 平台[%s] 频道[%s] 偏移[%s] 数量[%s] 失败原因<%s> 排查方向<请检查上游联盟接口配额、网络连接或应用密钥配置>",
+                severity_icon(error_code=result.get("error_code")),
                 plat, channel_type, offset, limit,
                 result.get("error_msg") or result.get("error_code") or "未知错误",
             )
@@ -272,7 +273,8 @@ class ProductService:
             self._offer_products(items)
         else:
             logger.warning(
-                "❌ 【商品搜索失败】按关键词检索平台联盟商品失败 | 平台[%s] 关键词[%s] 页码[%s] 失败原因<%s> 排查方向<请检查上游搜索接口配额、关键词合法性或网关连通性>",
+                "%s 【商品搜索失败】按关键词检索平台联盟商品失败 | 平台[%s] 关键词[%s] 页码[%s] 失败原因<%s> 排查方向<请检查上游搜索接口配额、关键词合法性或网关连通性>",
+                severity_icon(error_code=result.get("error_code")),
                 plat, keyword, page,
                 result.get("error_msg") or result.get("error_code") or "未知错误",
             )
@@ -601,8 +603,8 @@ class ProductService:
             err_code = str(loaded.public.get("error_code") or "").upper()
             if err_code == "PRODUCT_OFF_PROMOTION":
                 self.evict_off_promotion_product(ref)
-                logger.warning(
-                    "❌ 【商品已下架/取消推广】上游确认商品已停止推广，已自动从缓存与本地库清理 | 平台[%s] 商品[%s] 原因<%s>",
+                logger.info(
+                    "【商品已下架/取消推广】上游确认商品已停止推广，已自动从缓存与本地库清理 | 平台[%s] 商品[%s] 原因<%s>",
                     plat, goods_tag, reason,
                 )
                 return loaded.public
@@ -614,20 +616,22 @@ class ProductService:
                     )
                 else:
                     logger.warning(
-                        "⚠️ 【商品详情降级】实时拉取上游商品详情未成功，已降级返回本地历史缓存 | 平台[%s] 商品[%s] 上游原因<%s>",
-                        plat, goods_tag, reason,
+                        "%s 【商品详情降级】实时拉取上游商品详情未成功，已降级返回本地历史缓存 | 平台[%s] 商品[%s] 上游原因<%s>",
+                        severity_icon(error_code=err_code), plat, goods_tag, reason,
                     )
                 return self._database_detail(item, "database_fallback")
             logger.warning(
-                "❌ 【商品详情失败】拉取商品详情失败且本地无可用缓存 | 平台[%s] 商品[%s] 失败原因<%s> 排查方向<请检查商品ID/Sign是否有效、商品是否已下架或上游接口状态>",
-                plat, goods_tag, reason,
+                "%s 【商品详情失败】拉取商品详情失败且本地无可用缓存 | 平台[%s] 商品[%s] 失败原因<%s> 排查方向<请检查商品ID/Sign是否有效、商品是否已下架或上游接口状态>",
+                severity_icon(error_code=err_code), plat, goods_tag, reason,
             )
         return loaded.public
 
     def prefetch_product_detail(self, ref, snapshot=None, refresh_ahead_seconds=330, stop_event=None):
-        """只准备公开详情；内部结果明确区分已入库、仅内存及失败。"""
+        """只准备公开详情；内部结果明确区分已入库、确定下架与需告警失败。"""
         if stop_event is not None and stop_event.is_set():
             return DetailPrefetchResult("skipped")
+        if is_product_off_promotion(ref.platform, ref.goods_id, ref.goods_sign):
+            return DetailPrefetchResult("skipped", error_code="PRODUCT_OFF_PROMOTION")
         try:
             adapter = get_adapter(ref.platform)
             if self._capability_error(adapter, "detail"):
@@ -637,7 +641,7 @@ class ProductService:
                 return DetailPrefetchResult("skipped")
             if snapshot is not None:
                 if not isinstance(snapshot, DetailSnapshot) or snapshot.ref != ref:
-                    return DetailPrefetchResult("error")
+                    return DetailPrefetchResult("error", error_code="INVALID_SNAPSHOT", error_msg="预取快照与商品身份不匹配")
                 loaded = self._commit_snapshot(snapshot, stop_event=stop_event)
             else:
                 ref = self._upgrade_ref_sign(ref)
@@ -668,11 +672,12 @@ class ProductService:
                                                  refresh_ahead_seconds=refresh_ahead_seconds,
                                                  deal_tip=local_deal_tip)
         except Exception as exc:
+            exc_summary = format_exc_summary(exc)
             logger.warning(
-                "❌ 【详情预取异常】后台预取公开商品详情时发生异常 | 平台[%s] 异常<%s> 排查方向<请检查MongoDB连接或上游详情接口状态>",
-                ref.platform, format_exc_summary(exc),
+                "❌ 【详情预取单品异常】后台预取公开商品详情时发生异常，下轮将自动重试 | 平台[%s] 异常<%s>",
+                ref.platform, exc_summary,
             )
-            return DetailPrefetchResult("error", snapshot, retryable=True)
+            return DetailPrefetchResult("error", snapshot, retryable=True, error_code="INTERNAL_ERROR", error_msg=exc_summary)
         if loaded.snapshot and self._snapshot_deadline(loaded.snapshot) <= time.time():
             return DetailPrefetchResult("skipped")
         if loaded.persisted and loaded.snapshot:
@@ -680,7 +685,22 @@ class ProductService:
                                         next_check_at=self._snapshot_deadline(loaded.snapshot) - refresh_ahead_seconds)
         if loaded.public.get("status") == "success" and loaded.snapshot:
             return DetailPrefetchResult("persist_failed", loaded.snapshot, retryable=True)
-        return DetailPrefetchResult("error", loaded.snapshot, retryable=loaded.retryable)
+        err_code = str(loaded.public.get("error_code") or "").strip()
+        err_msg = str(loaded.public.get("error_msg") or "").strip()
+        if err_code.upper() == "PRODUCT_OFF_PROMOTION":
+            self.evict_off_promotion_product(ref)
+            logger.info(
+                "【详情预取下架清理】上游确认商品已停止推广，已自动从缓存与本地库清理 | 平台[%s] 商品[%s]",
+                ref.platform, ref.goods_id or ref.goods_sign,
+            )
+            return DetailPrefetchResult("skipped", error_code="PRODUCT_OFF_PROMOTION", next_check_at=time.time() + 3600)
+        return DetailPrefetchResult(
+            "error",
+            loaded.snapshot,
+            retryable=loaded.retryable,
+            error_code=err_code or "UPSTREAM_ERROR",
+            error_msg=err_msg,
+        )
 
     def get_boom_products(self, platform="all", category=None, keyword=None, sort_by=None,
                           page=1, page_size=20) -> Dict[str, Any]:

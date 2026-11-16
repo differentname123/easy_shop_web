@@ -301,9 +301,9 @@ def test_detail_commit_syncs_list_caches_and_invalidates_boom_sort_on_price_chan
         "coupon_amount": 0.0, "has_coupon": False, "sales_tip": "100",
         "image_url": "https://image.test/old.jpg",
     }
-    RECOMMEND_CACHE.set(("fixture", 5, 0, 20, ""), {"status": "success", "data": [deepcopy(stale_item)], "has_more": False})
-    SEARCH_CACHE.set(("fixture", "抽纸", 1, 20, ""), {"status": "success", "data": [deepcopy(stale_item)], "has_more": False})
-    BOOM_SORT_CACHE.set(("fixture", "抽纸", None, None), [deepcopy(stale_item)])
+    RECOMMEND_CACHE.set(("fixture", "", 5, 0, 20, ""), {"status": "success", "data": [deepcopy(stale_item)], "has_more": False})
+    SEARCH_CACHE.set(("fixture", "", "抽纸", 1, 20), {"status": "success", "data": [deepcopy(stale_item)], "has_more": False})
+    BOOM_SORT_CACHE.set(("fixture", "", "抽纸", "cost_performance"), [deepcopy(stale_item)])
 
     # 1. Price changes from 10.0 -> 8.0: RECOMMEND_CACHE & SEARCH_CACHE update in-place; BOOM_SORT_CACHE invalidates
     fresh_detail = dict(
@@ -318,20 +318,20 @@ def test_detail_commit_syncs_list_caches_and_invalidates_boom_sort_on_price_chan
     res = service.get_goods_detail(platform="fixture", goods_id="123", goods_sign="SIGN")
     assert res["status"] == "success" and res["data"]["price"] == 8.0
 
-    rec_item = RECOMMEND_CACHE.get(("fixture", 5, 0, 20, ""))["data"][0]
-    search_item = SEARCH_CACHE.get(("fixture", "抽纸", 1, 20, ""))["data"][0]
+    rec_item = RECOMMEND_CACHE.get(("fixture", "", 5, 0, 20, ""))["data"][0]
+    search_item = SEARCH_CACHE.get(("fixture", "", "抽纸", 1, 20))["data"][0]
     assert rec_item["price"] == 8.0 and rec_item["has_coupon"] is True and rec_item["coupon_amount"] == 2.0
     assert search_item["price"] == 8.0 and search_item["image_url"] == "https://image.test/new.jpg"
-    assert ("fixture", "抽纸", None, None) not in BOOM_SORT_CACHE
+    assert ("fixture", "", "抽纸", "cost_performance") not in BOOM_SORT_CACHE
 
     # 2. Price stays 8.0 while sales_tip updates: BOOM_SORT_CACHE updates in-place without invalidation
     clock.now = NOW + PRODUCT_DETAIL_TTL + 5
-    BOOM_SORT_CACHE.set(("fixture", "抽纸", None, None), [deepcopy(rec_item)])
+    BOOM_SORT_CACHE.set(("fixture", "", "抽纸", "cost_performance"), [deepcopy(rec_item)])
     same_price_detail = dict(fresh_detail, sales_tip="1万+")
     adapter.get_goods_detail.return_value = {"status": "success", "data": same_price_detail}
     service.get_goods_detail(platform="fixture", goods_id="123", goods_sign="SIGN")
-    assert ("fixture", "抽纸", None, None) in BOOM_SORT_CACHE
-    assert BOOM_SORT_CACHE.get(("fixture", "抽纸", None, None))[0]["sales_tip"] == "1万+"
+    assert ("fixture", "", "抽纸", "cost_performance") in BOOM_SORT_CACHE
+    assert BOOM_SORT_CACHE.get(("fixture", "", "抽纸", "cost_performance"))[0]["sales_tip"] == "1万+"
 
 
 def test_imageless_detail_never_poisons_cache_or_ttl_and_recovers_on_second_visit(prepared):
@@ -381,3 +381,30 @@ def test_imageless_detail_never_poisons_cache_or_ttl_and_recovers_on_second_visi
     assert adapter.get_goods_detail.call_count == 2
     assert repo.writes == 1
     assert len(DETAIL_CACHE.keys()) > 0
+
+
+def test_prefetch_product_detail_separates_off_promotion_eviction_from_call_errors(prepared):
+    service, repo, adapter, _ = prepared
+    repo.delete_product = Mock(return_value=1)
+
+    adapter.get_goods_detail.return_value = {
+        "status": "error",
+        "error_code": "40001",
+        "error_msg": "[15:40001] 内部调用失败",
+    }
+    err_res = service.prefetch_product_detail(ProductRef("fixture", "2001", "SIGN_ERR"))
+    assert err_res.status == "error"
+    assert err_res.error_code == "40001"
+    assert "[15:40001]" in err_res.error_msg
+    repo.delete_product.assert_not_called()
+
+    adapter.get_goods_detail.return_value = {
+        "status": "error",
+        "error_code": "PRODUCT_OFF_PROMOTION",
+        "error_msg": "商品已下架或无推广计划",
+    }
+    off_res = service.prefetch_product_detail(ProductRef("fixture", "2002", "SIGN_OFF"))
+    assert off_res.status == "skipped"
+    assert off_res.error_code == "PRODUCT_OFF_PROMOTION"
+    repo.delete_product.assert_called_once_with("fixture", goods_id="2002", goods_sign="SIGN_OFF")
+

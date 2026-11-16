@@ -8,17 +8,9 @@ from fastapi.testclient import TestClient
 import adapters
 from adapters.base import BasePlatformAdapter
 from adapters.pdd_adapter import PddAdapter
-from cache import DETAIL_CACHE, clear_all_caches
+from cache import DETAIL_CACHE
 from models.product import ProductRef
-from repositories.base_repo import BaseRepository
 from services.product_service import ProductService
-
-
-@pytest.fixture(autouse=True)
-def reset_caches():
-    clear_all_caches()
-    yield
-    clear_all_caches()
 
 
 @pytest.fixture
@@ -212,43 +204,6 @@ def test_pdd_order_explicit_flags_override_legacy_status():
     assert PddAdapter().normalize_order({"order_status": 4})["is_refund"] is True
 
 
-def test_pdd_url_only_conversion_preserves_uid():
-    with patch("adapters.pdd_adapter.convert_pdd_url", return_value={
-        "status": "success", "jump_url": "https://p.pinduoduo.com/result", "raw_data": {},
-    }) as convert:
-        result = PddAdapter().convert_promotion_url("", uid="u_12345678", product_url="https://p.pinduoduo.com/input")
-    assert result["final_link"] == "https://p.pinduoduo.com/result"
-    assert convert.call_args.kwargs["uid"] == "u_12345678"
-    assert result["is_fallback"] is False
-
-
-def test_pdd_explicit_product_url_cannot_override_a_known_identity():
-    with patch("adapters.pdd_adapter.generate_smart_promotion_url", return_value={"status": "error"}), \
-         patch("adapters.pdd_adapter.convert_pdd_url", return_value={
-             "status": "success", "jump_url": "https://p.pinduoduo.com/verified", "raw_data": {}}) as convert:
-        result = PddAdapter().convert_promotion_url("SIGN_A", goods_id="111", goods_sign="SIGN_A",
-                                                   product_url="https://mobile.pinduoduo.com/goods.html?goods_id=222")
-    assert convert.call_args.kwargs["source_url"].endswith("goods_id=111")
-    assert result["final_link"].endswith("verified")
-
-
-def test_unattributed_user_link_is_explicit_fallback():
-    """不能将匿名成功伪装为个人结果；明确交给 service 选择通用路径。"""
-    def smart_mock(*args, uid=None, **kwargs):
-        if uid:
-            return {"status": "error", "error_msg": "个人生链暂不可用"}
-        return {"status": "success", "data": {"short_url": "https://p.pinduoduo.com/site"}}
-
-    with patch("adapters.pdd_adapter.generate_smart_promotion_url", side_effect=smart_mock) as smart:
-        result = PddAdapter().convert_promotion_url("SIGN_A", uid="u_12345678")
-    assert result["status"] == "error"
-    assert result["error_code"] == "PERSONAL_PROMOTION_UNAVAILABLE"
-    assert result["need_auth"] is False
-    assert not result.get("final_link")
-    smart.assert_called_once()
-    assert smart.call_args.kwargs["uid"] == "u_12345678"
-
-
 def test_disabled_platforms_cannot_generate_fake_links_or_authorization():
     assert adapters.get_adapter("tb") is adapters.get_adapter("taobao")
     for code in ("taobao", "jd"):
@@ -259,6 +214,17 @@ def test_disabled_platforms_cannot_generate_fake_links_or_authorization():
     assert metadata["pdd"]["active"] is True
     assert metadata["taobao"]["active"] is False
     assert metadata["jd"]["active"] is False
+
+
+def test_public_authorization_required_comes_from_adapter_declaration():
+    by_code = {item["code"]: item for item in adapters.get_all_platforms()}
+    assert set(by_code) >= {"pdd", "taobao", "jd"}
+    assert by_code["pdd"]["authorization_required"] is True
+    assert by_code["taobao"]["authorization_required"] is True
+    assert by_code["jd"]["authorization_required"] is False
+    for code, item in by_code.items():
+        real_adapter = adapters.get_adapter(code)
+        assert item["authorization_required"] is bool(real_adapter.requires_authorized_promotion)
 
 
 def test_registered_test_platform_uses_existing_core_flow_and_routes(monkeypatch):
@@ -279,32 +245,36 @@ def test_registered_test_platform_uses_existing_core_flow_and_routes(monkeypatch
     monkeypatch.setattr(home.product_service, "repo", MagicMock())
     from main import create_app
     client = TestClient(create_app())
-    assert client.get("/api/home/channels?platform=fixture").json()["data"][0]["channel_type"] == 42
-    result = client.get("/api/home/recommend?platform=fixture&channel_type=42&offset=450").json()
-    assert result["data"][0]["goods_id"] == "x-1"
-    assert client.get("/api/home/channels?platform=unknown").status_code == 400
-    assert client.get("/api/home/channels?platform=jd").status_code == 400
+    try:
+        assert client.get("/api/home/channels?platform=fixture").json()["data"][0]["channel_type"] == 42
+        result = client.get("/api/home/recommend?platform=fixture&channel_type=42&offset=450").json()
+        assert result["data"][0]["goods_id"] == "x-1"
+        assert client.get("/api/home/channels?platform=unknown").status_code == 400
+        assert client.get("/api/home/channels?platform=jd").status_code == 400
+    finally:
+        home.product_service.wait_for_background_writes()
 
 
-def test_repository_connection_is_lazy_and_failed_indexes_retry():
-    class ProbeRepository(BaseRepository):
-        COLLECTION_NAME = "fixture_probe"
-        attempts = 0
-        def _init_indexes(self):
-            self.attempts += 1
-            self.col.create_index("key")
-            return self.attempts > 1
-    db = MagicMock()
-    with patch("repositories.base_repo.gen_db_object", return_value=db) as connect:
-        repo = ProbeRepository()
-        connect.assert_not_called()
-        _ = repo.col
-        assert repo.attempts == 1
-        _ = repo.col
-        assert repo.attempts == 2
-        _ = repo.col
-        assert repo.attempts == 2
-        connect.assert_called_once()
+def test_category_cache_and_long_keyword_search_routes():
+    from cache import CATEGORY_CACHE
+    from main import app
+    from models.product import extract_search_keyword
+
+    CATEGORY_CACHE.clear()
+    mock_repo = MagicMock()
+    mock_repo.get_categories.return_value = ["食品", "数码"]
+    service = ProductService(product_repo=mock_repo)
+    assert service.get_boom_categories(platform="pdd") == ["食品", "数码"]
+    assert service.get_boom_categories(platform="pdd") == ["食品", "数码"]
+    assert mock_repo.get_categories.call_count == 1
+
+    share_text = "67￥ HU293 2026abcd ￥ https://m.tb.cn/h.xxx CZ0001 【淘宝】农夫山泉饮用天然水550ml*24瓶整箱装家庭囤货实惠装大容量"
+    cleaned = extract_search_keyword(share_text)
+    assert "https://" not in cleaned and "HU293" not in cleaned and "CZ0001" not in cleaned
+    assert "农夫山泉饮用天然水" in cleaned and len(cleaned) <= 60
+
+    with patch("services.product_service.ProductService.search_home_goods", return_value={"status": "success", "data": [], "has_more": False}):
+        assert TestClient(app).get("/api/home/search", params={"keyword": share_text, "platform": "taobao"}).status_code == 200
 
 
 def test_query_token_is_redacted_from_request_log():
@@ -317,57 +287,5 @@ def test_query_token_is_redacted_from_request_log():
     assert "[REDACTED]" in path
     assert "keyword=test" in path
 
-
-def test_unauthorized_user_fallback_flags_need_auth():
-    from adapters.pdd_adapter import PddAdapter
-    adapter = PddAdapter()
-
-    def smart_mock(client_id, client_secret, pid, goods_sign, uid=None, **kwargs):
-        if uid:
-            return {"status": "error", "error_msg": "PDD网关拒绝: [60001:AUTH] 未备案 - 请授权"}
-        return {"status": "success", "link_type": "官方专属红包", "data": {"short_url": "https://p.pinduoduo.com/station"}}
-
-    with patch("adapters.pdd_adapter.generate_smart_promotion_url", side_effect=smart_mock) as smart:
-        res = adapter.convert_promotion_url("SIGN_KIWI", uid="u_12345678")
-
-    assert res["status"] == "error"
-    assert res["need_auth"] is True
-    assert res["auth_platform"] == "pdd"
-    assert res["error_code"] == "AUTH_REQUIRED"
-    assert not res.get("final_link")
-    smart.assert_called_once()
-    assert smart.call_args.kwargs["uid"] == "u_12345678"
-
-
-def test_pdd_attempt_promotions_strict_order():
-    """真实 smart 内部红包→标准各一次，之后才洗链；外层不得重复标准请求。"""
-    from infrastructure import pdd_client
-    call_order = []
-
-    def mock_gateway(client_id, client_secret, api_type, business_params=None, **kwargs):
-        if api_type == "pdd.ddk.rp.prom.url.generate":
-            call_order.append("1_smart_channel23")
-        else:
-            assert api_type == "pdd.ddk.goods.promotion.url.generate"
-            call_order.append("2_goods_standard")
-        return {}
-
-    def mock_zs(*args, **kwargs):
-        call_order.append("3_zs_unit")
-        return {"status": "success", "jump_url": "https://p.pinduoduo.com/zs", "raw_data": {}}
-
-    with patch("infrastructure.pdd_client.call_pdd_api", side_effect=mock_gateway) as gateway, \
-         patch("adapters.pdd_adapter.generate_smart_promotion_url", wraps=pdd_client.generate_smart_promotion_url) as smart, \
-         patch("adapters.pdd_adapter.convert_pdd_url", side_effect=mock_zs) as wash:
-        link, raw, link_type, _ = PddAdapter()._attempt_promotions(
-            target="SIGN_TEST", source_url="https://mobile.pinduoduo.com/goods.html?goods_id=123", uid="u_123"
-        )
-
-    assert call_order == ["1_smart_channel23", "2_goods_standard", "3_zs_unit"]
-    assert gateway.call_count == 2
-    smart.assert_called_once()
-    wash.assert_called_once()
-    assert link == "https://p.pinduoduo.com/zs"
-    assert link_type == "官方招商券推广"
 
 

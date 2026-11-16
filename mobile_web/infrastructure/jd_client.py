@@ -268,6 +268,8 @@ class JdClient:
             st_str = str(body.get("status") or "")
             if st_str in ("300", "301"):
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="degraded", latency_ms=dt_ms, error_code=f"ZTK_{st_str}", error_msg=str(body.get("content") or "")[:80], allow_persist=is_real)
+            elif op_name == "open_gaoyongzhuanlian_tkl_piliang" and not str(body.get("tao_id") or "").strip():
+                GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="degraded", latency_ms=dt_ms, error_code="ZTK_EMPTY_TAO_ID", error_msg="status=200 with empty tao_id", allow_persist=is_real)
             else:
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
             return body

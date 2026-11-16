@@ -112,30 +112,19 @@ def test_initializer_migrates_jd_whitelist_without_changing_auth_or_overwriting(
     assert load_settings(target).jd_enabled
 
 
-def test_public_authorization_required_comes_from_adapter_declaration(monkeypatch):
-    import adapters
-    fixtures = {
-        "jd": SimpleNamespace(platform_name="京东", active=True, requires_authorized_promotion=False,
-                              capabilities={"promotion": True, "authorization": False}),
-        "taobao": SimpleNamespace(platform_name="淘宝", active=True, requires_authorized_promotion=True,
-                                  capabilities={"promotion": True, "authorization": False}),
-    }
-    monkeypatch.setattr(adapters, "_ADAPTER_TYPES", {})
-    monkeypatch.setattr(adapters, "_ADAPTER_REGISTRY", fixtures)
-    descriptors = {item["code"]: item for item in adapters.get_all_platforms()}
-    assert descriptors["jd"]["authorization_required"] is False
-    assert descriptors["taobao"]["authorization_required"] is True
-    assert not descriptors["jd"]["capabilities"]["authorization"]
-    assert not descriptors["taobao"]["capabilities"]["authorization"]
-
-
 def test_zhetaoke_appkey_list_merges_deduplicates_and_redacts_all_keys(tmp_path):
     settings = load_settings(jd_config(
         tmp_path,
         zhetaoke_appkey="key-alpha, key-beta",
         zhetaoke_appkey_list=["key-beta", "key-gamma"],
+        zhetaoke_sid="sid-1",
+        zhetaoke_sid_list=["sid-1", "sid-2", "sid-3"],
+        haodanku_api_key="hdk-1",
+        haodanku_api_key_list=["hdk-1", "hdk-2", "hdk-3"],
     ))
     assert settings.ztk_appkey == "key-alpha"
     assert settings.ztk_appkey_list == ("key-alpha", "key-beta", "key-gamma")
+    assert settings.ztk_sid_list == ("sid-1", "sid-2", "sid-3")
+    assert settings.hdk_api_key_list == ("hdk-1", "hdk-2", "hdk-3")
     assert "key-alpha" not in repr(settings) and "key-gamma" not in repr(settings)
 

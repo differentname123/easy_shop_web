@@ -232,7 +232,11 @@ class PddAdapter(BasePlatformAdapter):
             res = pdd_get_detail(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
                                  goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs)
             if res.get("status") != "success" or not res.get("data"):
-                return {"status": "error", "error_msg": res.get("error_msg", "未查询到官方商品详情")}
+                return {
+                    "status": "error",
+                    "error_code": str(res.get("error_code") or "UPSTREAM_ERROR"),
+                    "error_msg": res.get("error_msg", "未查询到官方商品详情"),
+                }
             item = self._normalize_goods(res["data"])
             if ref.goods_sign and not item.get("goods_sign"):
                 item["goods_sign"] = ref.goods_sign
@@ -244,7 +248,8 @@ class PddAdapter(BasePlatformAdapter):
                 "【拼多多接口异常】查询商品详情异常，交由上层服务处理 | 商品[%s] 异常<%s>",
                 goods_id_or_sign or goods_id or goods_sign, format_exc_summary(exc),
             )
-            return {"status": "error", "error_msg": str(exc)}
+            err_code = str(getattr(exc, "error_code", "") or "").strip() or "INTERNAL_ERROR"
+            return {"status": "error", "error_code": err_code, "error_msg": str(exc)}
 
     def _resolve_goods_id(self, goods_id_or_sign: str, kwargs: dict) -> tuple:
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))

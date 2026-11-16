@@ -304,13 +304,13 @@ def test_numeric_context_reserves_default_and_never_reads_platform_authorization
     assert "is_authorized" not in result and "auth_url" not in result
 
 
-@pytest.mark.parametrize("failure", [ValueError("missing account"), RuntimeError("index failure")])
+@pytest.mark.parametrize("failure", [ValueError("missing account"), RuntimeError("secret index failure")])
 def test_numeric_context_failure_never_falls_back_to_default_identity(failure):
     repo = SimpleNamespace(ensure_promoter_id=Mock(side_effect=failure))
     orders = Mock()
     result = UserService(repo, order_repo=orders).get_numeric_promotion_context(UID_A, "jd", DEFAULT_ID)
     assert result["status"] == "error" and result["error_code"] == "promoter_identity_unavailable"
-    assert "promoter_id" not in result and "uid" not in result
+    assert "promoter_id" not in result and "uid" not in result and "secret" not in str(result)
     repo.ensure_promoter_id.assert_called_once_with(UID_A, reserved_ids=(DEFAULT_ID,))
     assert orders.mock_calls == []
 

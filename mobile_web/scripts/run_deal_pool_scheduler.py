@@ -551,14 +551,15 @@ def setup_scheduler_logger() -> logging.Logger:
     console_handler.setFormatter(fmt)
     sched_logger.addHandler(console_handler)
 
-    file_handler = RotatingFileHandler(
-        LOG_FILE_PATH,
-        maxBytes=15 * 1024 * 1024,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(fmt)
-    sched_logger.addHandler(file_handler)
+    if os.environ.get("WEB_LOG_DIR", "").strip() != "-":
+        file_handler = RotatingFileHandler(
+            LOG_FILE_PATH,
+            maxBytes=15 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        sched_logger.addHandler(file_handler)
     return sched_logger
 
 
@@ -2134,6 +2135,7 @@ class DealPoolCleaner:
                 stop_on_timeout=True,
                 slot_acquire_timeout=5.0,
             )
+            resp_text = ""
             if isinstance(resp, dict):
                 if resp.get("status") != "✅ 成功":
                     detail = "；".join(str(err) for err in (resp.get("error_history") or []))
@@ -2145,8 +2147,6 @@ class DealPoolCleaner:
                     resp_text = str(resp.get("content") or "")
             elif resp:
                 resp_text = str(resp)
-            else:
-                resp_text = ""
 
             cleaned_text = resp_text.strip()
             if cleaned_text:

@@ -53,15 +53,17 @@ def test_search_detail_and_precise_promotion_keep_sign_primary_across_real_encry
     assert card["goods_sign"] == detail["data"]["goods_sign"] == "search-input-id"
     official.search_goods.return_value = {"status": "success", "data": [item("new-promotion-search-id")]}
     promotion = platform.convert_promotion_url(card["goods_sign"])
-    assert promotion["status"] == "success"
+    assert promotion["status"] == "success" and promotion["promotion_token"] == "￥OFFLINE_TOKEN￥"
     assert promotion["goods_sign"] == card["goods_sign"] and promotion["goods_id"] == "search-input-id"
-    assert official.search_goods.call_args.args[0] == detail["data"]["product_url"]
+    assert official.search_goods.call_args.args[0] == "https://uland.taobao.com/item/edetail?id=new-detail-id"
+    assert not promotion["cacheable"]
 
 
 def test_reencrypted_detail_still_hits_shared_detail_cache(monkeypatch):
     platform, official = adapter()
     repo = MagicMock()
     repo.get_product_detail.return_value = None
+    repo.upsert_product_detail.return_value = True
     monkeypatch.setattr("services.product_service.get_adapter", lambda code: platform)
     products = ProductService(repo)
     first = products.get_goods_detail(platform="taobao", goods_sign="search-input-id")
@@ -76,15 +78,6 @@ def test_verified_sign_does_not_turn_unverified_auxiliary_id_into_an_alias():
     assert result["status"] == "success"
     assert result["data"]["goods_sign"] == "search-input-id" and result["data"]["goods_id"] == "search-input-id"
     official.get_goods_details.assert_called_once_with(["search-input-id"])
-
-
-def test_precise_official_url_query_can_return_a_freshly_encrypted_id():
-    platform, official = adapter()
-    result = platform.convert_promotion_url("search-input-id", goods_sign="search-input-id")
-    assert result["status"] == "success" and result["promotion_token"] == "￥OFFLINE_TOKEN￥"
-    assert result["goods_sign"] == "search-input-id"
-    assert official.search_goods.call_args.args[0] == "https://uland.taobao.com/item/edetail?id=new-detail-id"
-    assert not result["cacheable"]
 
 
 @pytest.mark.parametrize("field,replacement", [("seller_id", "other-seller"), ("goods_name", "不同商品"),

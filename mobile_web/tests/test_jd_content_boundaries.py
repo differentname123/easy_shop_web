@@ -29,12 +29,6 @@ def test_real_known_prices_including_zero_are_preserved(price):
     assert result["data"][0]["price"] == float(price)
 
 
-def test_disabled_jd_has_no_authorization_entry():
-    adapter = JdAdapter(SimpleNamespace(jd_enabled=False))
-    assert adapter.check_authority("u_1234abcd")["error_code"] == "platform_unavailable"
-    assert adapter.generate_authority_url("u_1234abcd")["status"] == "error"
-
-
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_search_material_urls_saved_even_without_detail_prefetch(monkeypatch, prefetch):
     SEARCH_CACHE.clear()

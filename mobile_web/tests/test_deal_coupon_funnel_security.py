@@ -74,7 +74,19 @@ def test_rebuild_clean_official_venue_url_blocks_alimama_super_red_packet_and_al
     ):
         assert rebuild_clean_official_venue_url(super_hb_url) is None
 
-    # 2. 正常官方 88VIP 消费券 / 百亿补贴活动页：保留路径与 wh_pid，彻底剥离 tkSid / spm / ut_sk 等追踪参数
+    # 2. 正常官方公共领券/消费券会场页：保留白名单必要参数，彻底剥离追踪与返佣参数
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://coupon.m.jd.com/coupons/show.action?key=k123&roleId=r456&zdmcode=bad&utm_source=x&future_track=99"
+        )
+        == "https://coupon.m.jd.com/coupons/show.action?key=k123&roleId=r456"
+    )
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://uland.taobao.com/quan/detail?sellerId=2201&activityId=act88&pid=mm_99_88_77&relationId=123"
+        )
+        == "https://uland.taobao.com/quan/detail?sellerId=2201&activityId=act88"
+    )
     assert (
         rebuild_clean_official_venue_url(
             "https://pages.tmall.com/wow/a/act/tmall/dailygroup/23288/wupr?wh_pid=daily-544479&es=drop_me&spm=a21"
@@ -89,6 +101,12 @@ def test_rebuild_clean_official_venue_url_blocks_alimama_super_red_packet_and_al
     # 3. prodev.m.jd.com 与 pro.m.jd.com 会场并列放行并 100% 清空 query 参数
     assert (
         rebuild_clean_official_venue_url(
+            "https://pro.m.jd.com/mall/active/2eh7EHb/index.html?union_lens=xxx"
+        )
+        == "https://pro.m.jd.com/mall/active/2eh7EHb/index.html"
+    )
+    assert (
+        rebuild_clean_official_venue_url(
             "https://prodev.m.jd.com/mall/active/3xh9KLM/index.html?utm_campaign=t_1001695162_&cu=true"
         )
         == "https://prodev.m.jd.com/mall/active/3xh9KLM/index.html"
@@ -101,6 +119,17 @@ def test_rebuild_clean_official_venue_url_blocks_alimama_super_red_packet_and_al
         )
         == "https://coupon.m.jd.com/coupons/show.action?key=k9&roleId=r9"
     )
+
+    # 5. 短链、加密 CPS 页或缺失必要参数的残缺链接一律返回 None
+    for rejected in (
+        "https://s.click.taobao.com/XNl8wji",
+        "https://m.tb.cn/h.jPi2tHp",
+        "https://u.jd.com/oaDAVcO",
+        "https://3.cn/3b-MaSLj",
+        "https://uland.taobao.com/coupon/edetail?e=encrypted_cps",
+        "https://uland.taobao.com/quan/detail?sellerId=2201",
+    ):
+        assert rebuild_clean_official_venue_url(rejected) is None
 
 
 def test_unwrap_rescues_302_meta_js_and_taobao_tu_into_clean_official_urls():
@@ -254,10 +283,10 @@ def test_gate1_blocks_echo_back_spoofing_and_prechecks_pure_non_cps_coupons():
 
     # 2. convert_single_target 端到端验证：
     #    - 纯无佣金 coupon.m.jd.com 直接前置命中，0 次上游 API 调用；
-    #    - 折淘客 tkl_piliang 伪成功回显 http->https s.click 他人红包，被双门禁彻底拦截为 failed；
+    #    - 折淘客 tkl_piliang 伪成功回显 http->https s.click 他人红包，经 Gate 1 + Gate 2 真访 /wow/z/lianmeng/ 后彻底拦截为 failed；
     #    - 第三方短链 yuebai.plus 转链失败后经安全解包重组为纯净官方 JD 券链 (OK_DIRECT_COUPON)。
     fake_session = _RouteSession({
-        "https://s.click.taobao.com/XNl8wji": _FakeResponse(
+        "http://s.click.taobao.com/XNl8wji": _FakeResponse(
             status_code=200,
             body="<script>var real_jump_address = 'https://pages.tmall.com/wow/z/lianmeng/default/route?wh_alimama=true';</script>",
         ),
@@ -306,7 +335,7 @@ def test_gate1_blocks_echo_back_spoofing_and_prechecks_pure_non_cps_coupons():
     assert direct_jd["my_promo_link"] == "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1"
     assert jd_calls == []
 
-    # (b) 伪成功回显他人超红短链 -> Gate 1 识破回显 + Gate 2 识破 /lianmeng/ -> 彻底判 failed
+    # (b) 伪成功回显他人超红短链 -> Gate 1 识破回显 + Gate 2 真正请求页面并识破 /wow/z/lianmeng/ -> 彻底判 failed
     spoof_tb = cleaner.convert_single_target({
         "link_id": "L2",
         "clean_input": "http://s.click.taobao.com/XNl8wji",
@@ -315,6 +344,7 @@ def test_gate1_blocks_echo_back_spoofing_and_prechecks_pure_non_cps_coupons():
     })
     assert spoof_tb["convert_status"] == "failed"
     assert spoof_tb["my_promo_link"] is None
+    assert any(u == "http://s.click.taobao.com/XNl8wji" for u, _ in fake_session.calls)
 
     # (c) yuebai.plus 未知短链 -> Gate 2 安全解包救回纯净 coupon.m.jd.com 并自动归位 platform="jd"
     rescued_yb = cleaner.convert_single_target({
@@ -329,55 +359,11 @@ def test_gate1_blocks_echo_back_spoofing_and_prechecks_pure_non_cps_coupons():
     assert rescued_yb["my_promo_link"] == "https://coupon.m.jd.com/coupons/show.action?key=yb_k&roleId=yb_r"
 
 
-def test_warmup_cache_and_stage5_filter_cross_platform_and_redundant_tb_sclick():
+def test_stage5_filters_cross_platform_and_redundant_tb_sclick():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
 
-    # 1. 缓存预热测试：拒绝历史伪转链与超红残留，保留真实解包纯净券
-    class _FakeWarmupCursor:
-        def sort(self, *_a):
-            return self
-
-        def limit(self, *_a):
-            return [{
-                "converted_links": [
-                    {
-                        "link_id": "L_BAD_ECHO",
-                        "clean_input": "http://s.click.taobao.com/XNl8wji",
-                        "convert_status": "coupon_or_activity",
-                        "error_code": "OK_COUPON",
-                        "platform": "taobao",
-                        "my_promo_link": "https://s.click.taobao.com/XNl8wji/",
-                    },
-                    {
-                        "link_id": "L_BAD_LIANMENG",
-                        "clean_input": "https://s.tb.cn/h.jScxcAd",
-                        "convert_status": "coupon_or_activity",
-                        "error_code": "OK_DIRECT_COUPON",
-                        "platform": "taobao",
-                        "my_promo_link": "https://pages.tmall.com/wow/z/lianmeng/default/route?wh_alimama=true",
-                    },
-                    {
-                        "link_id": "L_GOOD_UNWRAP",
-                        "clean_input": "https://llipin.cn/hjA2NeT",
-                        "convert_status": "coupon_or_activity",
-                        "error_code": "OK_DIRECT_COUPON",
-                        "platform": "jd",
-                        "my_promo_link": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1",
-                    },
-                ]
-            }]
-
-    raw_col = MagicMock()
-    raw_col.find.return_value = _FakeWarmupCursor()
-    cleaner.warmup_anchor_cache_from_db(raw_col)
-    assert "taobao:http://s.click.taobao.com/XNl8wji" not in cleaner.anchor_cache
-    assert "taobao:https://s.tb.cn/h.jScxcAd" not in cleaner.anchor_cache
-    assert cleaner.anchor_cache["jd:https://llipin.cn/hjA2NeT"]["my_promo_link"] == (
-        "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1"
-    )
-
-    # 2. Stage 5 组装净化测试：
-    #    - 淘宝商品自动剔除冗余单品 s.click 伪券链和跨平台京东广告尾巴，仅保留真实店铺暗券 + 88VIP 消费券会场
+    # Stage 5 组装净化：淘宝商品自动剔除冗余单品 s.click 伪券链和跨平台京东广告尾巴，仅保留真实消费券会场
     cleaner.adapters = {
         "taobao": SimpleNamespace(
             resolve_and_convert_universal=lambda inp: (

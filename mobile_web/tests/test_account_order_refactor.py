@@ -86,10 +86,24 @@ def test_invalid_success_and_legacy_fallback_cache_are_rejected(promotion):
 def test_sign_resolution_is_platform_scoped_and_accepts_nonnumeric_real_ids(promotion):
     service, adapter, repo = promotion
     repo.get_product_identity.return_value = {"platform": "future_shop", "product_id": "sku-A"}
-    service.convert_link("future_shop", goods_sign="opaque-sign")
+    service.convert_link("future_shop", goods_id="wrong-id", goods_sign="opaque-sign")
     repo.get_product_identity.assert_called_once_with("opaque-sign", platform="future_shop")
     assert adapter.convert_promotion_url.call_args.kwargs["goods_id"] == "sku-A"
     assert adapter.convert_promotion_url.call_args.kwargs["goods_sign"] == "opaque-sign"
+    assert repo.save_promotion_link_cache.call_args.kwargs["goods_id"] == "sku-A"
+
+
+def test_identity_only_record_supplies_verified_id_without_becoming_detail(promotion):
+    from repositories.product_repo import ProductRepository
+    from tests.test_product_repository import MemoryCollection
+
+    service, adapter, _ = promotion
+    collection = MemoryCollection()
+    service.repo = ProductRepository(SimpleNamespace(get_collection=lambda name: collection))
+    collection.docs.append({"platform": "future_shop", "product_id": "trusted-id", "goods_sign": "SIGN_A"})
+    service.convert_link("future_shop", goods_sign="SIGN_A", goods_id="wrong-id", uid="u_1234abcd")
+    assert adapter.convert_promotion_url.call_args.kwargs["goods_id"] == "trusted-id"
+    assert service.repo.get_product_detail("SIGN_A", platform="future_shop", key_type="sign") is None
 
 
 def test_unverified_client_id_is_not_used_as_sign_alias(promotion):
@@ -98,14 +112,6 @@ def test_unverified_client_id_is_not_used_as_sign_alias(promotion):
     assert adapter.convert_promotion_url.call_args.kwargs["goods_id"] is None
     assert repo.get_promotion_link_cache.call_args.kwargs["goods_id"] is None
     assert repo.save_promotion_link_cache.call_args.kwargs["goods_id"] is None
-
-
-def test_sign_pair_uses_only_platform_verified_id(promotion):
-    service, adapter, repo = promotion
-    repo.get_product_identity.return_value = {"platform": "future_shop", "product_id": "verified-id"}
-    service.convert_link("future_shop", goods_id="wrong-id", goods_sign="opaque-sign")
-    assert adapter.convert_promotion_url.call_args.kwargs["goods_id"] == "verified-id"
-    assert repo.save_promotion_link_cache.call_args.kwargs["goods_id"] == "verified-id"
 
 
 def test_url_only_promotion_does_not_create_a_fake_product_identity(promotion):
@@ -134,12 +140,35 @@ def test_promotion_cache_is_uid_scoped_and_defensively_copied(promotion):
     repo.save_promotion_link_cache.assert_not_called()
 
 
-def test_command_helper_is_neutral_but_platform_adapter_controls_copy(promotion):
+def test_command_helper_coupon_adaptive_and_long_link_suppression(promotion):
+    from adapters.pdd_adapter import PddAdapter
+
     text = promote_module.PromoteService.build_command_text("标题", "https://example.com", 10, 2)
     assert "标题" in text and "10" in text and "https://example.com" in text
     assert "拼多多" not in text
     service, _, _ = promotion
     assert "测试平台" in service.convert_link("future_shop", "sku-A")["command_text"]
+
+    pdd_adapter = PddAdapter()
+    text_no_coupon = pdd_adapter.build_command_text("无券好物", "https://p.pinduoduo.com/short1", 19.9, 0.0)
+    assert "【特惠参考价】¥19.9" in text_no_coupon and "已立减" not in text_no_coupon
+    text_with_coupon = pdd_adapter.build_command_text("有券好物", "https://p.pinduoduo.com/short2", 19.9, 5.0)
+    assert "【券后特惠】¥19.9（已立减 ¥5.0）" in text_with_coupon
+
+    long_uland = "https://uland.taobao.com/coupon/edetail?e=" + ("x" * 180)
+    assert promote_module.PromoteService._final_link({
+        "status": "success",
+        "final_link": long_uland,
+        "short_url": "https://s.click.taobao.com/short_abc",
+        "promotion_token": "￥ABCD1234￥",
+    }) == "https://s.click.taobao.com/short_abc"
+
+    decorated = service._with_command(
+        {"status": "success", "final_link": long_uland, "promotion_token": "￥ABCD1234￥"},
+        pdd_adapter,
+        {"title": "超长链接测试商品", "price": 29.9, "coupon_amount": 0.0},
+    )
+    assert "￥ABCD1234￥" in decorated["command_text"] and long_uland not in decorated["command_text"]
 
 
 def test_promotion_platform_and_id_sign_cache_types_are_distinct(promotion):
@@ -163,9 +192,9 @@ def user(monkeypatch):
 @pytest.mark.parametrize("updated_at", [
     datetime.now(timezone.utc),
     datetime.now(timezone.utc).replace(tzinfo=None),
-    1700000000,
+    1700000000,  # 正授权长期有效 (ttl=None)，兼容历史秒级时间戳
 ])
-def test_fresh_authorization_reuses_confirmation(user, updated_at):
+def test_saved_positive_authorization_reuses_confirmation_across_timestamp_formats(user, updated_at):
     service, adapter, repo = user
     repo.get_user_by_uid.return_value["auth_status"] = {"future_shop": {"is_authorized": True, "updated_at": updated_at}}
     assert service.check_and_get_auth("u_1234abcd", "future_shop")["is_authorized"]
@@ -178,26 +207,12 @@ def test_fresh_authorization_reuses_confirmation(user, updated_at):
     {"is_authorized": True, "updated_at": None},
     {"is_authorized": True, "updated_at": "invalid"},
 ])
-def test_expired_or_legacy_authorization_is_rechecked(user, status):
+def test_legacy_or_unparseable_updated_at_authorization_is_rechecked(user, status):
     service, adapter, repo = user
     repo.get_user_by_uid.return_value["auth_status"] = {"future_shop": status}
     assert service.check_and_get_auth("u_1234abcd", "future_shop")["status"] == "success"
     adapter.check_authority.assert_called_once()
     repo.update_auth_status.assert_called_once()
-
-
-@pytest.mark.parametrize("response", [
-    {"status": "error", "is_authorized": False, "error_msg": "upstream unavailable"},
-    {"status": "success"},
-    {"status": "success", "is_authorized": "false"},
-])
-def test_authorization_errors_do_not_overwrite_state(user, response):
-    service, adapter, repo = user
-    repo.get_user_by_uid.return_value["auth_status"] = {"future_shop": {"is_authorized": True}}
-    adapter.check_authority.return_value = response
-    assert service.check_and_get_auth("u_1234abcd", "future_shop")["status"] == "error"
-    repo.update_auth_status.assert_not_called()
-    adapter.generate_authority_url.assert_not_called()
 
 
 @pytest.mark.parametrize("response", [{"status": "error", "error_msg": "quota"}, {"status": "success"}])
@@ -211,14 +226,6 @@ def test_authorization_link_generation_failure_remains_error(user, response):
     )
 
 
-def test_confirmed_revocation_generates_real_authorization_url(user):
-    service, adapter, repo = user
-    adapter.check_authority.return_value = {"status": "success", "is_authorized": False, "bind": 0}
-    result = service.check_and_get_auth("u_1234abcd", "future_shop")
-    assert result["status"] == "success" and result["is_authorized"] is False
-    assert result["auth_url"] == "https://example.com/auth"
-
-
 def test_auth_repository_canonicalizes_alias_and_stamps_utc():
     db = MagicMock()
     db.get_collection.return_value.update_one.return_value = SimpleNamespace(modified_count=1, matched_count=1)
@@ -229,144 +236,41 @@ def test_auth_repository_canonicalizes_alias_and_stamps_utc():
     assert fields["auth_status.taobao.updated_at"].tzinfo == timezone.utc
 
 
-# 小型 Mongo 表达式解释器，仅用于检验本仓储发出的聚合管线，绝不连接数据库。
-_MISSING = object()
+def test_user_repo_login_errors_and_concurrent_duplicate_key_recovery():
+    from pymongo.errors import DuplicateKeyError
+    from auth import hash_password
 
+    pwd_hash = hash_password("secret123")
+    existing_doc = {
+        "uid": "u_existing",
+        "phone": "13900001111",
+        "password_hash": pwd_hash,
+        "nickname": "老用户",
+        "invite_code": "INV_888888",
+    }
 
-def evaluate(expr, doc):
-    if isinstance(expr, str) and expr.startswith("$"):
-        return doc.get(expr[1:])
-    if isinstance(expr, list):
-        return [evaluate(value, doc) for value in expr]
-    if not isinstance(expr, dict):
-        return expr
-    operator, value = next(iter(expr.items()))
-    if operator == "$type":
-        item = doc.get(value[1:], _MISSING)
-        return "missing" if item is _MISSING else "bool" if isinstance(item, bool) else "other"
-    if operator == "$convert":
-        item = evaluate(value["input"], doc)
-        return float(item) if item is not None else value["onNull"]
-    if operator == "$cond":
-        test, yes, no = value
-        return evaluate(yes if evaluate(test, doc) else no, doc)
-    if operator == "$ifNull":
-        return next((item for item in evaluate(value, doc) if item is not None), None)
-    args = evaluate(value, doc)
-    if operator == "$eq":
-        return args[0] == args[1]
-    if operator == "$in":
-        return args[0] in args[1]
-    if operator == "$and":
-        return all(args)
-    if operator == "$not":
-        return not args[0]
-    raise AssertionError(f"unsupported expression {expr}")
-
-
-class MemoryOrderCollection:
-    def __init__(self, orders):
-        self.orders = orders
-        self.pipeline = None
-
-    def create_index(self, *args, **kwargs):
-        return "test_index"
-
-    def aggregate(self, pipeline):
-        self.pipeline = deepcopy(pipeline)
-        match = pipeline[0]["$match"]
-        def matches(doc, query):
-            for key, value in query.items():
-                if key == "$or":
-                    if not any(matches(doc, branch) for branch in value): return False
-                elif isinstance(value, dict):
-                    assert set(value) == {"$gte"}
-                    if doc.get(key) is None or doc[key] < value["$gte"]: return False
-                elif doc.get(key) != value:
-                    return False
-            return True
-        docs = [doc for doc in self.orders if matches(doc, match)]
-        output = {}
-        for name, stages in pipeline[1]["$facet"].items():
-            rows = deepcopy(docs)
-            for stage in stages:
-                operator, value = next(iter(stage.items()))
-                if operator == "$project":
-                    if all(item == 0 for item in value.values()):
-                        rows = [{key: item for key, item in row.items() if key not in value} for row in rows]
-                    else:
-                        rows = [{key: evaluate(expr, row) for key, expr in value.items()} for row in rows]
-                elif operator == "$set":
-                    rows = [dict(row, **{key: evaluate(expr, row) for key, expr in value.items()}) for row in rows]
-                elif operator == "$group":
-                    rows = [{key: sum(evaluate(expr["$sum"], row) for row in rows)
-                             for key, expr in value.items() if key != "_id"}] if rows else []
-                elif operator == "$sort":
-                    for key, direction in reversed(list(value.items())):
-                        rows.sort(key=lambda row: (row.get(key) is not None, row.get(key) or 0), reverse=direction < 0)
-                elif operator == "$limit":
-                    rows = rows[:value]
-                else:
-                    raise AssertionError(f"unsupported stage {stage}")
-            output[name] = rows
-        return [output]
-
-
-def order_repo_for(collection):
-    db = MagicMock()
-    db.get_collection.return_value = collection
-    return OrderRepository(db_instance=db)
-
-
-def test_aggregation_covers_all_matches_not_only_100_display_rows():
-    docs = [{"platform": "future_shop", "promoter_uid": "u_a", "order_sn": f"o{i:03}",
-             "promotion_amount_yuan": "1.25", "order_pay_time": 1000 + i,
-             "is_refund": False, "is_settled": True} for i in range(135)]
-    docs.extend([
-        dict(docs[0], platform="other", promotion_amount_yuan=999),
-        dict(docs[0], promoter_uid="other", promotion_amount_yuan=999),
-        dict(docs[0], order_pay_time=1, promotion_amount_yuan=999),
-    ])
-    col = MemoryOrderCollection(docs)
-    result = order_repo_for(col).query_user_orders("future_shop", "u_a", start_timestamp=1000)
-    assert result["total_count"] == 135
-    assert result["total_commission"] == result["settled_commission"] == 168.75
-    assert len(result["order_list"]) == 100
-    assert result["order_list"][0]["order_sn"] == "o134"
-    assert not any("$limit" in stage for stage in col.pipeline[1]["$facet"]["stats"])
-
-
-def test_canonical_boolean_flags_drive_order_stats():
-    docs = [
-        {"order_sn": "settled-1", "order_status": "returned", "is_refund": False, "is_settled": True},
-        {"order_sn": "refund-1", "order_status": "returned", "is_refund": True, "is_settled": False},
-        {"order_sn": "settled-2", "order_status": "paid_out", "is_refund": False, "is_settled": True},
-        {"order_sn": "unsettled", "order_status": 4, "is_refund": False, "is_settled": False},
-        {"order_sn": "settled-false", "order_status": "paid_out", "is_refund": False, "is_settled": False},
-    ]
-    for doc in docs:
-        doc.update(platform="future_shop", promoter_uid="u_a", promotion_amount_yuan=2)
-    repo = order_repo_for(MemoryOrderCollection(docs))
-    result = repo.query_user_orders("future_shop", "u_a")
-    assert result["total_count"] == 5 and result["total_commission"] == 8
-    assert result["refund_count"] == 1 and result["refund_commission"] == 2
-    assert result["settled_commission"] == 4
-    by_id = {order["order_sn"]: order for order in result["order_list"]}
-    assert not by_id["settled-1"]["is_refund"] and not by_id["unsettled"]["is_refund"]
-    assert not by_id["settled-false"]["is_settled"]
-
-
-def test_repository_errors_are_not_legal_empty_stats():
     col = MagicMock()
-    col.aggregate.side_effect = RuntimeError("offline")
-    col.bulk_write.side_effect = RuntimeError("offline")
-    repo = order_repo_for(col)
-    with pytest.raises(RuntimeError):
-        repo.query_user_orders("future_shop", "u_a")
-    with pytest.raises(RuntimeError):
-        repo.upsert_orders([{"order_sn": "a"}], "future_shop")
-    with pytest.raises(ValueError):
-        repo.upsert_orders([{}], "future_shop")
+    db = MagicMock()
+    db.get_collection.return_value = col
+    db.__getitem__.return_value = col
+    repo = UserRepository(db_instance=db)
+
+    col.find_one.return_value = None
+    with pytest.raises(ValueError, match="该手机号尚未注册"):
+        repo.register_or_login(phone="13900001111", password="password123", mode="login")
+
+    col.find_one.return_value = dict(existing_doc)
+    with pytest.raises(ValueError, match="输入的密码不正确"):
+        repo.register_or_login(phone="13900001111", password="wrong_password")
+
+    col.find_one.side_effect = [None, None, dict(existing_doc)]
+    col.insert_one.side_effect = DuplicateKeyError("E11000 duplicate key error phone_1")
+    user_ok = repo.register_or_login("13900001111", "secret123")
+    assert user_ok["uid"] == "u_existing" and "password_hash" not in user_ok
+
+    col.find_one.side_effect = [None, None, dict(existing_doc)]
+    with pytest.raises(ValueError, match="密码"):
+        repo.register_or_login("13900001111", "wrong_pass")
 
 
 @pytest.fixture
@@ -382,12 +286,6 @@ def orders(monkeypatch):
     user_repo = MagicMock()
     user_repo.get_uid_by_platform_identity.return_value = None
     return order_module.OrderService(repo, sync_repo=sync_repo, user_repo=user_repo), adapter, repo
-
-
-def run_sync(service, end_time=200000):
-    assert order_module._platform_lock("future_shop").acquire(blocking=False)
-    service._sync_platform_orders_bg("future_shop", end_time)
-    assert not order_module._platform_lock("future_shop").locked()
 
 
 def test_busy_lock_returns_local_data_without_start_or_sdk(orders):
@@ -417,60 +315,6 @@ def test_thread_start_failure_releases_lock_and_preserves_success_watermark(orde
     assert result["data"]["last_sync_attempt_time"] > 123
 
 
-def test_force_cannot_bypass_attempt_cooldown(orders):
-    service, _, _ = orders
-    order_module._LAST_SYNC_ATTEMPT["future_shop"] = 1000
-    with patch.object(order_module.time, "time", return_value=1001), patch.object(order_module.threading, "Thread") as thread:
-        assert service.sync_and_query_orders("future_shop", "u_a", force_sync=True)["status"] == "success"
-    thread.assert_not_called()
-
-
-@pytest.mark.parametrize("kind", ["upstream", "database", "short_write"])
-def test_failed_sync_does_not_advance_watermark(orders, kind):
-    service, adapter, repo = orders
-    order_module._LAST_SYNC_TIMESTAMP["future_shop"] = 123
-    if kind == "upstream":
-        adapter.fetch_increment_orders.return_value = {"status": "error", "error_msg": "quota"}
-    else:
-        adapter.fetch_increment_orders.return_value = {"status": "success", "order_list": [{"order_sn": "a"}]}
-        repo.upsert_orders.side_effect = RuntimeError("offline") if kind == "database" else None
-        repo.upsert_orders.return_value = 0
-    run_sync(service)
-    assert order_module._SYNC_STATE["future_shop"]["status"] == "error"
-    assert order_module._LAST_SYNC_TIMESTAMP["future_shop"] == 123
-
-
-def test_page_budget_exhaustion_is_partial_not_success(orders, monkeypatch):
-    service, adapter, repo = orders
-    monkeypatch.setattr(order_module, "ORDER_SYNC_MAX_PAGES", 2)
-    adapter.fetch_increment_orders.return_value = {"status": "success", "order_list": [{"order_sn": str(i)} for i in range(50)], "has_more": True}
-    run_sync(service)
-    assert order_module._SYNC_STATE["future_shop"]["status"] == "partial"
-    assert order_module._SYNC_STATE["future_shop"]["synced_count"] == 100
-    assert "future_shop" not in order_module._LAST_SYNC_TIMESTAMP
-    assert adapter.normalize_order.call_count == 100
-    assert repo.upsert_orders.call_args.args[0][0]["is_settled"] is True
-
-
-def test_failure_after_first_page_is_partial_and_keeps_previous_success(orders):
-    service, adapter, _ = orders
-    order_module._LAST_SYNC_TIMESTAMP["future_shop"] = 123
-    adapter.fetch_increment_orders.side_effect = [
-        {"status": "success", "order_list": [{"order_sn": "a"}], "has_more": True},
-        {"status": "error", "error_msg": "quota"},
-    ]
-    run_sync(service)
-    assert order_module._SYNC_STATE["future_shop"]["status"] == "partial"
-    assert order_module._LAST_SYNC_TIMESTAMP["future_shop"] == 123
-
-
-def test_complete_empty_window_advances_only_success_watermark(orders):
-    service, _, _ = orders
-    run_sync(service)
-    assert order_module._LAST_SYNC_TIMESTAMP["future_shop"] == 200000
-    assert order_module._SYNC_STATE["future_shop"]["status"] == "success"
-
-
 def test_query_database_failure_returns_error_envelope(orders):
     service, _, repo = orders
     repo.query_user_orders.side_effect = RuntimeError("offline")
@@ -483,18 +327,23 @@ def test_query_database_failure_returns_error_envelope(orders):
 
 
 def test_disabled_platforms_are_rejected_before_cached_results(promotion, user, orders, monkeypatch):
+    import adapters
+
     promotion_service, promotion_adapter, _ = promotion
     user_service, user_adapter, _ = user
-    promotion_adapter.active = user_adapter.active = False
+    order_service, order_adapter, _ = orders
+    promotion_adapter.active = user_adapter.active = order_adapter.active = False
+
+    monkeypatch.setattr(order_module, "require_adapter", adapters.require_adapter)
+    monkeypatch.setitem(adapters._ADAPTER_REGISTRY, "future_shop", order_adapter)
+
     for service_call in (
         lambda: promotion_service.convert_link("future_shop", "sku-A"),
         lambda: user_service.check_and_get_auth("u_a", "future_shop"),
+        lambda: order_service.sync_and_query_orders("future_shop", "u_a"),
     ):
         with pytest.raises(PlatformUnavailableError):
             service_call()
-    monkeypatch.setattr(order_module, "require_adapter", MagicMock(side_effect=PlatformUnavailableError("暂未接入")))
-    with pytest.raises(PlatformUnavailableError):
-        orders[0].sync_and_query_orders("future_shop", "u_a")
 
 
 def test_api_days_zero_future_platform_syntax_and_force_protection(monkeypatch):

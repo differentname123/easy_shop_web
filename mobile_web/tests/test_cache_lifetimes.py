@@ -174,13 +174,3 @@ def test_identity_only_product_is_not_detail_fallback_but_can_be_completed(catal
     assert service.get_goods_detail(goods_sign="SIGN_A")["data"]["price"] == 10
     assert len(collection.docs) == 1
     assert service.repo.get_product_detail("SIGN_A", key_type="sign")["name"] == "商品"
-
-
-def test_identity_only_record_can_still_supply_verified_promotion_id(promotion):
-    service, adapter, _ = promotion
-    collection = MemoryCollection()
-    service.repo = ProductRepository(SimpleNamespace(get_collection=lambda name: collection))
-    collection.docs.append({"platform": "future_shop", "product_id": "trusted-id", "goods_sign": "SIGN_A"})
-    service.convert_link("future_shop", goods_sign="SIGN_A", goods_id="wrong-id", uid="u_1234abcd")
-    assert adapter.convert_promotion_url.call_args.kwargs["goods_id"] == "trusted-id"
-    assert service.repo.get_product_detail("SIGN_A", platform="future_shop", key_type="sign") is None

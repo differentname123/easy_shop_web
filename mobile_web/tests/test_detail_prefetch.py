@@ -85,6 +85,90 @@ def blocked_service():
     return MemoryService(handler), entered, release
 
 
+def test_batch_logging_distinguishes_proven_off_promotion_from_real_errors(monkeypatch):
+    from services import detail_prefetch as detail_prefetch_mod
+
+    records = []
+    rec_lock = threading.Lock()
+
+    def _rec(level, msg, *args):
+        text = msg % args if args else str(msg)
+        with rec_lock:
+            records.append((level, text))
+
+    monkeypatch.setattr(
+        detail_prefetch_mod,
+        "logger",
+        SimpleNamespace(
+            debug=lambda msg, *a: _rec("DEBUG", msg, *a),
+            info=lambda msg, *a: _rec("INFO", msg, *a),
+            warning=lambda msg, *a: _rec("WARNING", msg, *a),
+            error=lambda msg, *a: _rec("ERROR", msg, *a),
+            exception=lambda msg, *a: _rec("ERROR", msg, *a),
+            isEnabledFor=lambda lvl: True,
+        ),
+    )
+
+    # (a) 确定性商品下架（skipped + PRODUCT_OFF_PROMOTION）：零 ❌，只记普通下架清理 INFO
+    records.clear()
+    svc_off = MemoryService(
+        lambda ref, **k: DetailPrefetchResult(
+            "skipped" if ref.goods_id == "1" else "ready",
+            next_check_at=2000,
+            error_code="PRODUCT_OFF_PROMOTION" if ref.goods_id == "1" else "",
+        )
+    )
+    worker = DetailPrefetcher(svc_off, wall_clock=Clock())
+    worker.start()
+    try:
+        assert worker.offer_products([product(str(i)) for i in range(1, 7)]) == 6
+        idle(worker)
+    finally:
+        worker.stop()
+    msgs_a = [msg for _, msg in records]
+    assert all("❌" not in m for m in msgs_a)
+    assert any("【详情预取】本批次已自动清理已确认下架/退推商品 [1/6条]" in m for m in msgs_a)
+
+    # (b) 哪怕只有 1 条接口/调用失败（如 40001）：Fail-Closed 必须立刻打 ❌ 并携带具体错误码与原因
+    records.clear()
+    svc_single_err = MemoryService(
+        lambda ref, **k: DetailPrefetchResult(
+            "error" if ref.goods_id == "1" else "ready",
+            next_check_at=2000,
+            error_code="40001" if ref.goods_id == "1" else "",
+            error_msg="[15:40001] 内部调用失败" if ref.goods_id == "1" else "",
+        )
+    )
+    worker = DetailPrefetcher(svc_single_err, wall_clock=Clock())
+    worker.start()
+    try:
+        assert worker.offer_products([product(str(i), platform="taobao") for i in range(1, 7)]) == 6
+        idle(worker)
+    finally:
+        worker.stop()
+    msgs_b = [msg for _, msg in records]
+    assert any(
+        "❌ 【详情预取告警】本批次后台预取存在失败任务" in m
+        and "taobao[40001]:1条" in m
+        and "[15:40001] 内部调用失败" in m
+        for m in msgs_b
+    )
+
+    # (c) 出现数据库落盘失败：必须打 ❌ 告警
+    records.clear()
+    captured = snapshot("123", "READY", 995, platform="pdd")
+    svc_persist = MemoryService(lambda ref, **k: DetailPrefetchResult("persist_failed", snapshot=captured, retryable=True))
+    worker = DetailPrefetcher(svc_persist, wall_clock=Clock(), retry_backoff_seconds=0)
+    worker.start()
+    try:
+        assert worker.offer_products([product("123", sign="READY")]) == 1
+        idle(worker)
+    finally:
+        worker.stop()
+    msgs_c = [msg for _, msg in records]
+    assert any("❌ 【详情预取告警】本批次后台预取存在数据库落盘失败任务" in m for m in msgs_c)
+
+
 def test_constants_and_explicit_lifecycle_never_start_threads_in_constructor():
     assert (WORKER_COUNT, QUEUE_CAPACITY, PAGE_LIMIT, DEFAULT_INTERVAL_SECONDS) == (1, 128, 20, 300)
     service = MemoryService()

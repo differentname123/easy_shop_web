@@ -216,6 +216,15 @@ def extract_short_url(response_dict):
         or response_dict.get("url")
     )
 
+class PddApiError(RuntimeError):
+    """保留拼多多网关或网络错误码的 RuntimeError 子类。"""
+
+    def __init__(self, message: str, *, error_code: str = "", sub_code: str = ""):
+        super().__init__(message)
+        self.error_code = str(error_code or "").strip()
+        self.sub_code = str(sub_code or "").strip()
+
+
 def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeout=(2.5, 4.0)):
     """
     拼多多网关核心请求与 MD5 自动签名引擎 (使用连接池加速)
@@ -262,7 +271,7 @@ def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeo
         response.raise_for_status()
         result = response.json()
     except Exception as e:
-        raise RuntimeError(f"拼多多网络请求层崩溃: {str(e)}")
+        raise PddApiError(f"拼多多网络请求层崩溃: {str(e)}", error_code="NETWORK_ERROR")
 
     # 5. 网关级与业务级错误校验拦截
     if "error_response" in result:
@@ -272,7 +281,11 @@ def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeo
         error_code = err_resp.get("error_code", "")
         sub_code = err_resp.get("sub_code", "")
         full_error = f"[{error_code}:{sub_code}] {error_msg} - {sub_msg}".strip(" -:")
-        raise RuntimeError(f"PDD网关拒绝: {full_error}")
+        raise PddApiError(
+            f"PDD网关拒绝: {full_error}",
+            error_code=str(error_code or ""),
+            sub_code=str(sub_code or ""),
+        )
 
     return result
 
@@ -436,9 +449,10 @@ def convert_pdd_url(client_id, client_secret, pid, source_url, uid=None, **kwarg
         jump_url = extract_short_url(data)
         if jump_url:
             return {"status": "success", "jump_url": jump_url, "raw_data": data}
-        return {"status": "error", "error_msg": "接口返回正常但未包含可用的跳转链接"}
+        return {"status": "error", "error_code": "PROMOTION_FAILED", "error_msg": "接口返回正常但未包含可用的跳转链接"}
     except Exception as e:
-        return {"status": "error", "error_msg": f"转链失败: {str(e)}"}
+        err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
+        return {"status": "error", "error_code": err_code, "error_msg": f"转链失败: {str(e)}"}
 
 def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=None, search_id=None, **kwargs):
     """
@@ -522,7 +536,7 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
     - 仅有 goods_id 时，自动执行 “转短链 -> 关键词截胡搜索” 的双跨策略。
     """
     if not goods_sign and not goods_id:
-        return {"status": "error", "error_msg": "必须提供 goods_sign 或 goods_id 其中之一"}
+        return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "必须提供 goods_sign 或 goods_id 其中之一"}
 
     custom_params = make_custom_parameters(uid=uid)
 
@@ -543,13 +557,19 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
                     res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params)
                 else:
                     raise
-            goods_list = res.get("goods_detail_response", {}).get("goods_details", [])
+            detail_resp = res.get("goods_detail_response")
+            if not isinstance(detail_resp, dict):
+                return {"status": "error", "error_code": "PROTOCOL_ERROR", "error_msg": "Detail 接口响应缺少 goods_detail_response"}
+            goods_list = detail_resp.get("goods_details", [])
+            if not isinstance(goods_list, list):
+                return {"status": "error", "error_code": "PROTOCOL_ERROR", "error_msg": "Detail 接口 goods_details 字段无效"}
             if goods_list:
                 cleaned = clean_goods_item(goods_list[0], source_type="detail_api")
                 return {"status": "success", "data": cleaned}
-            return {"status": "error", "error_msg": "Detail 接口未找到商品，可能已下架或无推广计划"}
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
         except Exception as e:
-            return {"status": "error", "error_msg": f"Detail 查询失败: {str(e)}"}
+            err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
+            return {"status": "error", "error_code": err_code, "error_msg": f"Detail 查询失败: {str(e)}"}
 
     # 路径 B：goods_id 降级策略（通过短链反查）
     try:
@@ -557,7 +577,11 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
         zs_res = convert_pdd_url(client_id, client_secret, pid=pid, source_url=source_url, uid=uid)
         short_url = zs_res.get("jump_url")
         if not short_url:
-            return {"status": "error", "error_msg": "通过 goods_id 生成探针短链失败"}
+            return {
+                "status": "error",
+                "error_code": str(zs_res.get("error_code") or "UPSTREAM_ERROR"),
+                "error_msg": zs_res.get("error_msg") or "通过 goods_id 生成探针短链失败",
+            }
 
         search_res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.search", {
             "keyword": short_url,
@@ -570,9 +594,10 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
         if goods_list:
             cleaned = clean_goods_item(goods_list[0], source_type="search_api_probe")
             return {"status": "success", "data": cleaned}
-        return {"status": "error", "error_msg": "探针短链搜索未命中，商品可能不可推广"}
+        return {"status": "error", "error_code": "PROMOTION_FAILED", "error_msg": "探针短链搜索未命中，商品可能不可推广"}
     except Exception as e:
-        return {"status": "error", "error_msg": f"goods_id 反查中断: {str(e)}"}
+        err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
+        return {"status": "error", "error_code": err_code, "error_msg": f"goods_id 反查中断: {str(e)}"}
 
 def query_increment_orders(client_id, client_secret, start_time, end_time, page=1, page_size=50, **kwargs):
     """

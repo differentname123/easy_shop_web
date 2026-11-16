@@ -123,14 +123,15 @@ def call_tb_api(
         for credential in (app_key, app_secret, session_key):
             if credential:
                 error_detail = error_detail.replace(str(credential), "[REDACTED]")
-        if str(sub_code) == "invalid-sessionkey" or str(code) == "27":
+        sub_code_str = str(sub_code or "").strip()
+        if sub_code_str == "invalid-sessionkey" or str(code) == "27":
             logger.info(
                 "【淘宝凭证切换】官方24h SessionKey已过期，将自动切换至折淘客90天长效SID通道 | 接口[%s] 状态[%s]",
                 method,
                 sub_code or code,
             )
-        elif str(sub_code) == "50001" and method == "taobao.tbk.dg.material.optional.upgrade":
-            logger.debug("【淘宝搜索无结果】接口[%s] 返回空结果 [50001]", method)
+        elif sub_code_str == "50001" and method == "taobao.tbk.dg.material.optional.upgrade":
+            logger.debug("【淘宝接口无结果】接口[%s] 返回空结果 [50001]", method)
         else:
             logger.warning(
                 "❌ 【淘宝网关异常】淘宝开放平台返回业务错误 | 接口[%s] 错误码[%s] | 详情<%s> | 排查方向<请检查TOP应用权限、SessionKey有效期或请求参数>",

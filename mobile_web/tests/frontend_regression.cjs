@@ -2923,7 +2923,8 @@ test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux
     const urls = [...html.matchAll(/(?:src|href)="(\/static\/(?:js|css)\/[^"]+)"/g)].map(m => new URL(m[1], 'https://offline.test'));
     for (const u of urls) versions.add(u.searchParams.get('v'));
   }
-  assert.deepEqual([...versions], ['ux-20261114-2']);
+  assert.equal(versions.size, 1, `expected uniform asset version across all pages, got: ${[...versions].join(', ')}`);
+  assert.ok([...versions][0], 'asset version query parameter must be non-empty');
 
   const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');

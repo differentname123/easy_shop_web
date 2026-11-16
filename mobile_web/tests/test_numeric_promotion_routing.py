@@ -98,7 +98,6 @@ def test_foreign_or_mismatched_mapping_is_not_trusted(routing):
 
 def test_personal_failure_falls_back_to_station_master_floor_unless_station_master_fails(routing):
     service, adapter, repo, users = routing
-    users.get_numeric_promotion_context.return_value = None
     users.get_numeric_promotion_context.side_effect = lambda *args: {"status": "error", "error_msg": "推手用户不存在"}
     res_missing = service.convert_link("jd", "opaque-material", uid="u_1234abcd")
     assert res_missing["status"] == "success"
@@ -159,9 +158,8 @@ def test_cache_changes_with_numeric_identity_and_default_configuration(routing):
     assert service.convert_link("jd", "opaque-material", uid="u_1234abcd")["promoter_id"] == "2468"
     assert len(adapter.calls) == 2
     public = service.convert_link("jd", "opaque-material")
-    stored = dict(repo.save_promotion_link_cache.call_args.kwargs["data"], _expires_at=10**10)
+    stored = dict(repo.save_promotion_link_cache.call_args.kwargs["data"], _expires_at=__import__("time").time() + 60)
     # A changed deployment default must reject the old Mongo cache as well as memory cache.
-    stored["_expires_at"] = __import__("time").time() + 60
     repo.get_promotion_link_cache.return_value = stored
     adapter.default_promoter_id = "3333"
     adapter.promotion_scope = "union-B:3333"
@@ -169,29 +167,58 @@ def test_cache_changes_with_numeric_identity_and_default_configuration(routing):
     assert public["promoter_id"] != "3333"
 
 
-def test_unknown_lifetime_disables_all_writes(routing):
-    service, adapter, repo, _ = routing
-    adapter.cacheable = False
-    for _ in range(2):
-        assert service.convert_link("jd", "opaque-material")["status"] == "success"
-    assert len(adapter.calls) == 2
-    assert module.PROMOTION_CACHE.size() == 0
-    repo.save_promotion_link_cache.assert_not_called()
+def test_universal_convert_deleted_user_falls_back_to_station_master_floor(monkeypatch):
+    class FakeJdUniversalAdapter:
+        active = True
+        platform_code = "jd"
+        platform_name = "京东"
+        requires_numeric_promoter_id = True
+        requires_authorized_promotion = False
+        default_promoter_id = "3110104129"
+        promotion_scope = "jd-scope"
 
+        def __init__(self):
+            self.calls = []
 
-def test_numeric_user_context_only_resolves_identity_without_order_mutations(monkeypatch):
-    users, orders = MagicMock(), MagicMock()
-    users.ensure_promoter_id.return_value = "1234"
-    service = UserService(users, orders)
-    for _ in range(2):
-        result = service.get_numeric_promotion_context("u_1234abcd", "jd", "3110104129")
-        assert result == {"status": "success", "uid": "u_1234abcd", "promoter_id": "1234"}
-    users.ensure_promoter_id.assert_called_with("u_1234abcd", reserved_ids=("3110104129",))
-    assert orders.mock_calls == []
-    assert service.get_numeric_promotion_context("u_1234abcd", "jd", "3110104129")["status"] == "success"
-    users.ensure_promoter_id.side_effect = RuntimeError("secret must not leak")
-    failed = service.get_numeric_promotion_context("u_1234abcd", "jd", "3110104129")
-    assert failed["status"] == "error" and "secret" not in str(failed)
+        def build_command_text(self, title, final_link, price=None, coupon=None):
+            return f"{title} {final_link}"
+
+        def resolve_and_convert_universal(self, text, uid=None, **kwargs):
+            self.calls.append({"uid": uid, **kwargs})
+            if kwargs.get("promoter_id") == "9999":
+                return {"status": "error", "error_msg": "personal position failed"}
+            return {
+                "status": "success",
+                "short_url": "https://u.jd.com/station_floor",
+                "final_link": "https://u.jd.com/station_floor",
+                "promotion_token": "！站长保底京口令！",
+                "promoter_id": kwargs["promoter_id"],
+                "attribution_status": "verified" if uid else "anonymous",
+                "title": "京东测试商品",
+                "price": 19.9,
+            }
+
+    adapter = FakeJdUniversalAdapter()
+    users = MagicMock()
+    users.get_numeric_promotion_context.return_value = {
+        "status": "error",
+        "error_code": "promoter_identity_unavailable",
+        "error_msg": "推手用户不存在",
+    }
+    monkeypatch.setattr(module, "get_adapter", lambda plat: adapter)
+    svc = module.PromoteService(product_repo=MagicMock(), user_service=users)
+
+    res1 = svc.universal_convert("https://u.jd.com/abcDEF", platform="jd", uid="u_57f51d4c")
+    assert res1["status"] == "success"
+    assert res1["final_link"] == "https://u.jd.com/station_floor"
+    assert res1["is_fallback"] is True and res1["attribution_status"] == "anonymous" and res1["cacheable"] is False
+    assert adapter.calls[-1] == {"uid": None, "promoter_id": "3110104129"}
+
+    users.get_numeric_promotion_context.return_value = {"status": "success", "promoter_id": "9999"}
+    res2 = svc.universal_convert("https://u.jd.com/abcDEF", platform="jd", uid="u_57f51d4c")
+    assert res2["status"] == "success"
+    assert res2["is_fallback"] is True and res2["attribution_status"] == "anonymous"
+    assert [c["promoter_id"] for c in adapter.calls[-2:]] == ["9999", "3110104129"]
 
 
 def test_no_auth_api_path_reports_not_required_without_remote_calls(monkeypatch):

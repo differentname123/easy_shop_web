@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sys
+from unittest.mock import MagicMock
 
 _MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _MOBILE_WEB_DIR.parent
@@ -17,6 +19,7 @@ for _p in (str(_REPO_ROOT), str(_MOBILE_WEB_DIR)):
 
 from repositories.product_repo import ProductRepository
 from mobile_web.scripts import goods_info_format as gif
+from tests.test_product_repository import MemoryCollection as ProductMemoryCollection
 
 
 def _set_dot_path(doc: dict, dot_path: str, value):
@@ -27,15 +30,6 @@ def _set_dot_path(doc: dict, dot_path: str, value):
             cur[part] = {}
         cur = cur[part]
     cur[parts[-1]] = copy.deepcopy(value)
-
-
-def _get_dot_path(doc: dict, dot_path: str, default=None):
-    cur = doc
-    for part in dot_path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return default
-        cur = cur[part]
-    return cur
 
 
 class FakeBulkResult:
@@ -50,14 +44,6 @@ class FakeCollection:
     def __init__(self, docs: list[dict]):
         self.docs = docs
 
-    def _matches(self, doc: dict, query: dict) -> bool:
-        if "$and" in query:
-            return all(self._matches(doc, sub) for sub in query["$and"])
-        for k, v in query.items():
-            if _get_dot_path(doc, k) != v:
-                return False
-        return True
-
     def bulk_write(self, operations, ordered=False):
         matched = 0
         modified = 0
@@ -65,14 +51,14 @@ class FakeCollection:
             filt = op._filter
             upd = op._doc
             for doc in self.docs:
-                if self._matches(doc, filt):
+                if ProductMemoryCollection.matches(doc, filt):
                     matched += 1
                     before = copy.deepcopy(doc)
                     for k, v in upd.get("$set", {}).items():
                         _set_dot_path(doc, k, v)
                     for k, v in upd.get("$inc", {}).items():
-                        cur_val = _get_dot_path(doc, k, 0) or 0
-                        _set_dot_path(doc, k, cur_val + v)
+                        _, cur_val = ProductMemoryCollection.get_path(doc, k)
+                        _set_dot_path(doc, k, (cur_val or 0) + v)
                     if doc != before:
                         modified += 1
                     break
@@ -94,7 +80,15 @@ class FakeMongoDB:
         self.last_query = query
         self.last_projection = projection
         self.last_limit = limit
-        items = copy.deepcopy(self.collection.docs)
+        q = query or {}
+        items = [doc for doc in self.collection.docs if ProductMemoryCollection.matches(doc, q)]
+        if sort:
+            for key, direction in reversed(sort):
+                items.sort(
+                    key=lambda d: (ProductMemoryCollection.get_path(d, key)[1] is not None, ProductMemoryCollection.get_path(d, key)[1]),
+                    reverse=direction < 0,
+                )
+        items = [ProductMemoryCollection.project(doc, projection) for doc in items]
         if limit and limit > 0:
             items = items[:limit]
         return items
@@ -125,14 +119,6 @@ def _sample_valid_llm_item(sku_id: str, price: float, total_value: float = 8000,
             "equivalent_description": None,
         },
     }
-
-
-def test_build_deal_prompt_text_reuses_base_prompt_without_mutating_file():
-    prompt_text = gif.build_deal_prompt_text()
-    base_text = gif.read_file_to_str(gif.PROMPT_FILE_PATH)
-    assert prompt_text.startswith(base_text.rstrip())
-    assert "线报场景专属补充约束" in prompt_text
-    assert "DEAL_SUPPLEMENT_RULES" not in base_text
 
 
 def test_build_deal_product_desc_strips_urls_and_tokens():
@@ -190,6 +176,7 @@ def test_check_format_info_enforces_expected_deal_price():
 
 
 def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecycle(monkeypatch):
+    now_utc = datetime.now(timezone.utc)
     official_format_snapshot = {
         "p100_0": _sample_valid_llm_item("p100_0", price=49.9, total_value=4000, unit="ml")
     }
@@ -199,6 +186,7 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
         "product_id": "p100",
         "name": "蓝月亮深层洁净洗衣液4kg",
         "activity_price": 49.9,
+        "updated_at": now_utc,
         "format_status": "success",
         "format_info": copy.deepcopy(official_format_snapshot),
         "deal_info": {
@@ -216,6 +204,7 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
         "product_id": "p200",
         "name": "维达抽纸24包整箱",
         "activity_price": 39.9,
+        "updated_at": now_utc,
         "format_status": "success",
         "format_info": {"p200_0": _sample_valid_llm_item("p200_0", price=39.9, total_value=2400, unit="抽")},
         "deal_info": {
@@ -234,14 +223,23 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
         "platform": "pdd",
         "product_id": "p300",
         "name": "",
+        "updated_at": now_utc,
         "deal_info": {
             "is_deal_tip": True,
             "clean_title": "",
             "deal_price": 9.9,
         },
     }
+    doc_stale_old = {
+        "_id": "oid-old",
+        "platform": "pdd",
+        "product_id": "p400",
+        "name": "超窗口旧线报",
+        "updated_at": now_utc - timedelta(days=gif.RECENT_DAYS + 3),
+        "deal_info": {"is_deal_tip": True, "clean_title": "超窗旧商品", "deal_price": 9.9},
+    }
 
-    fake_db = FakeMongoDB([doc_normal, doc_reformat_fail, doc_empty_title])
+    fake_db = FakeMongoDB([doc_normal, doc_reformat_fail, doc_empty_title, doc_stale_old])
     manager = gif.ProductManager(fake_db)
 
     def _fake_generate_content(prompt, **kwargs):
@@ -314,6 +312,7 @@ def test_run_format_round_recleans_specless_placeholder_sku_when_activity_price_
     后来降为 35.4 时，清洗逻辑必须识别价格变动、以最新 activity_price (35.4) 送洗并同步占位价格，
     避免继续沿用陈腐价格 41.4 导致性价比排序错误，也避免因重喂旧 sku_info['价格'] 陷入死循环。
     """
+    now_utc = datetime.now(timezone.utc)
     cola_18 = {
         "_id": "oid-cola-18",
         "platform": "pdd",
@@ -321,6 +320,7 @@ def test_run_format_round_recleans_specless_placeholder_sku_when_activity_price_
         "name": "可口可乐500ml*6瓶+雪碧500ml*6瓶+芬达500ml*6瓶多口味装包邮",
         "activity_price": 35.4,
         "price": 43.4,
+        "updated_at": now_utc,
         "sku_info": [{"价格": "￥41.4", "截图地址": ""}],
         "format_status": "success",
         "format_info": {
@@ -346,6 +346,7 @@ def test_run_format_round_recleans_specless_placeholder_sku_when_activity_price_
         "name": "可口可乐/雪碧/芬达/零度可乐500ml*24瓶汽水碳酸饮料整箱装包邮",
         "activity_price": 55.2,
         "price": 65.2,
+        "updated_at": now_utc,
         "sku_info": [{"价格": "￥55.2", "截图地址": ""}],
         "format_status": "success",
         "format_info": {
@@ -397,8 +398,8 @@ def test_run_format_round_recleans_specless_placeholder_sku_when_activity_price_
 
     monkeypatch.setattr(gif, "generate_content", _fake_generate_content)
 
-    # 第一轮：执行重洗
-    fake_db = FakeMongoDB([cola_18])
+    # 第一轮：执行重洗（cola_24 价格未变，同轮被跳过且零写入）
+    fake_db = FakeMongoDB([cola_18, cola_24])
     manager = gif.ProductManager(fake_db)
     counts = gif.run_format_round(manager)
 
@@ -431,8 +432,10 @@ def test_run_format_round_multi_sku_partial_price_change_and_retry_convergence(m
     2. 单规格商品价格变动重洗若遭遇模型连续失败，快照 format_activity_price 已推进，最多失败 3 轮即收敛停止。
     3. pending_format_query 顶层保护 format_retry_count < 999 人工锁定记录。
     """
+    now_utc = datetime.now(timezone.utc)
     query = gif.pending_format_query()
-    assert {"format_retry_count": {"$lt": gif.LOCKED_RETRY_SENTINEL}} in query["$and"][1]["$or"]
+    assert ProductMemoryCollection.matches({"updated_at": now_utc}, query) is True
+    assert ProductMemoryCollection.matches({"updated_at": now_utc, "format_retry_count": gif.LOCKED_RETRY_SENTINEL}, query) is False
 
     # 多规格商品：SKU1 原为旧占位残留 3.01，现更新为 ￥47.3；SKU2 保持 ￥23.8 未变
     doc_multi = {
@@ -441,6 +444,7 @@ def test_run_format_round_multi_sku_partial_price_change_and_retry_convergence(m
         "product_id": "978550785391",
         "name": "原生木浆抽纸整箱家用商用餐巾纸",
         "activity_price": 3.01,
+        "updated_at": now_utc,
         "sku_info": [
             {"款式": "80包【整箱19200张】", "价格": "￥47.3", "截图地址": ""},
             {"款式": "40包【整箱9600张】", "价格": "￥23.8", "截图地址": ""},
@@ -458,6 +462,7 @@ def test_run_format_round_multi_sku_partial_price_change_and_retry_convergence(m
         "product_id": "631582502680",
         "name": "漫花10提悬挂式抽纸家用12000张",
         "activity_price": 21.46,
+        "updated_at": now_utc,
         "sku_info": [{"款式": "10提12000张送挂钩", "价格": "￥19.46多人团价￥21.46", "截图地址": ""}],
         "format_status": "success",
         "format_sku_prices": {"631582502680_1": "￥19.46多人团价￥21.46"},
@@ -472,6 +477,7 @@ def test_run_format_round_multi_sku_partial_price_change_and_retry_convergence(m
         "product_id": "jd1001",
         "name": "零度无糖可乐1.25L*12瓶",
         "activity_price": 49.9,
+        "updated_at": now_utc,
         "sku_info": [],
         "format_status": "success",
         "format_retry_count": 3,  # 历史旧价格曾满 3 次，新价格仍应获得一次全新重洗周期
@@ -503,7 +509,7 @@ def test_run_format_round_multi_sku_partial_price_change_and_retry_convergence(m
 
     monkeypatch.setattr(gif, "generate_content", _fake_generate)
 
-    fake_db = FakeMongoDB([doc_multi, doc_empty_sku_fail])
+    fake_db = FakeMongoDB([doc_multi, doc_complex_unchanged, doc_empty_sku_fail])
     manager = gif.ProductManager(fake_db)
     counts = gif.run_format_round(manager)
 
@@ -522,4 +528,23 @@ def test_run_format_round_multi_sku_partial_price_change_and_retry_convergence(m
     assert doc_empty_sku_fail["format_activity_price"] == 49.9
     assert doc_empty_sku_fail["format_retry_count"] == 1
     assert gif._detect_product_price_changes(doc_empty_sku_fail) == (False, set())
+
+
+def test_run_format_round_skips_unchanged_success_with_zero_writes():
+    unchanged_doc = {
+        "_id": "oid_done",
+        "platform": "pdd",
+        "product_id": "100",
+        "name": "维达抽纸24包",
+        "activity_price": 19.9,
+        "sku_info": [{"款式": "24包", "价格": "￥19.9"}],
+        "format_status": "success",
+        "format_sku_prices": {"100_1": "￥19.9"},
+        "format_info": {"100_1": _sample_valid_llm_item("100_1", price=19.9, total_value=24, unit="包")},
+    }
+    mgr = MagicMock()
+    mgr.query.return_value = [unchanged_doc]
+    counts = gif.run_format_round(mgr)
+    assert counts["success"] == 0 and counts["skipped"] == 0
+    mgr.update.assert_not_called()
 
