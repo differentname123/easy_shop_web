@@ -47,6 +47,8 @@ def copy_production_tree(source, destination):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
     shutil.copytree(source / "static", destination / "static")
+    if (source / "prompt").is_dir():
+        shutil.copytree(source / "prompt", destination / "prompt")
     for name in ("requirements.txt", "constraints.txt", "config.example.json"):
         if (source / name).is_file():
             shutil.copy2(source / name, destination / name)

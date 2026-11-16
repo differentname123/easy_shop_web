@@ -453,28 +453,43 @@ def generate_tb_authority_url(app_key, app_secret, uid, session_key=None, invite
     return {"status": "success", "auth_url": url, "short_url": "", "we_app_info": {}}
 
 
+_TB_CFG_WRITE_LOCK = __import__("threading").Lock()
+
+
 def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_session: str = "", _api_call=None) -> Dict[str, str]:
     """
     当检测到 taobao_session 缺失或触发 27:invalid-sessionkey 时：
     1. 检查项目根目录下的 config.local.json 是否已更新了新的 taobao_session 或 zhetaoke_sid（支持热重载免重启）；
-    2. 若配置了 taobao_refresh_token，尝试调用淘宝开放平台 taobao.top.auth.token.refresh 自动刷新并持久化。
+    2. 若配置了 taobao_refresh_token，尝试调用淘宝开放平台 taobao.top.auth.token.refresh 自动刷新并原子持久化。
     """
     import os
+    import uuid
     from pathlib import Path
 
     result = {"session_key": _text(current_session), "ztk_sid": ""}
-    config_path = Path(__file__).resolve().parents[1] / "config.local.json"
-    if not config_path.is_file():
-        config_path = Path(__file__).resolve().parents[2] / "config.local.json"
-    local_cfg = {}
+    app_dir = Path(__file__).resolve().parents[1]
+    cfg_env = os.environ.get("WEB_CONFIG_FILE", "").strip()
+    if cfg_env:
+        config_path = Path(cfg_env).expanduser()
+        if not config_path.is_absolute():
+            config_path = (app_dir / config_path).resolve()
+    else:
+        config_path = app_dir / "config.local.json"
+        if not config_path.is_file():
+            config_path = app_dir.parent / "config.local.json"
+
+    local_cfg = None
     if config_path.is_file():
         try:
-            local_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            loaded = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                local_cfg = loaded
         except Exception:
-            local_cfg = {}
+            local_cfg = None
 
-    file_session = _text(local_cfg.get("taobao_session") or local_cfg.get("TB_SESSION"))
-    file_sid = _text(local_cfg.get("zhetaoke_sid") or local_cfg.get("ZTK_SID"))
+    cfg_view = local_cfg or {}
+    file_session = _text(cfg_view.get("taobao_session") or cfg_view.get("TB_SESSION"))
+    file_sid = _text(cfg_view.get("zhetaoke_sid") or cfg_view.get("ZTK_SID"))
     if file_sid:
         result["ztk_sid"] = file_sid
     if file_session and file_session != _text(current_session):
@@ -483,8 +498,8 @@ def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_sess
 
     refresh_token = _text(
         os.environ.get("TB_REFRESH_TOKEN")
-        or local_cfg.get("taobao_refresh_token")
-        or local_cfg.get("TB_REFRESH_TOKEN")
+        or cfg_view.get("taobao_refresh_token")
+        or cfg_view.get("TB_REFRESH_TOKEN")
     )
     if refresh_token and app_key and app_secret:
         res = (_api_call or call_tb_api)(
@@ -505,14 +520,24 @@ def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_sess
                 new_refresh = _text(token_result.get("refresh_token"))
                 if new_session:
                     result["session_key"] = new_session
-                    if config_path.is_file() and isinstance(local_cfg, dict):
-                        try:
-                            local_cfg["taobao_session"] = new_session
-                            if new_refresh:
-                                local_cfg["taobao_refresh_token"] = new_refresh
-                            config_path.write_text(json.dumps(local_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                        except Exception:
-                            pass
+                    # 仅当原始配置文件已被成功解析为非空字典时才原子写回，彻底杜绝 BOM/并发截断导致配置文件被覆写为空字典
+                    if config_path.is_file() and isinstance(local_cfg, dict) and local_cfg:
+                        with _TB_CFG_WRITE_LOCK:
+                            tmp_path = config_path.with_name(f".{config_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+                            try:
+                                latest_raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
+                                target_cfg = latest_raw if isinstance(latest_raw, dict) and latest_raw else dict(local_cfg)
+                                target_cfg["taobao_session"] = new_session
+                                if new_refresh:
+                                    target_cfg["taobao_refresh_token"] = new_refresh
+                                tmp_path.write_text(json.dumps(target_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                                os.replace(tmp_path, config_path)
+                            except Exception:
+                                try:
+                                    if tmp_path.exists():
+                                        tmp_path.unlink()
+                                except OSError:
+                                    pass
     return result
 
 

@@ -199,8 +199,12 @@ def test_upstream_authorization_error_cannot_use_previous_promotion_cache(monkey
     service, adapter, _, users = promotion_service(monkeypatch)
     service.convert_link("fixture", goods_id="123", uid=UID)
     users.get_promotion_context.return_value = {"status": "error", "error_code": "SESSION_EXPIRED"}
-    assert service.convert_link("fixture", goods_id="123", uid=UID)["error_code"] == "SESSION_EXPIRED"
-    adapter.convert_promotion_url.assert_called_once()
+    res = service.convert_link("fixture", goods_id="123", uid=UID)
+    assert res["status"] == "success"
+    assert res["is_fallback"] is True and res["attribution_status"] == "anonymous" and res["cacheable"] is False
+    assert adapter.convert_promotion_url.call_count == 2
+    assert adapter.convert_promotion_url.call_args.kwargs["uid"] is None
+    assert adapter.convert_promotion_url.call_args.kwargs["identity"] == {}
 
 
 def test_personal_conversion_requires_token_and_rejects_forged_uid(monkeypatch):

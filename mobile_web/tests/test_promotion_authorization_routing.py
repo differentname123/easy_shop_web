@@ -176,11 +176,13 @@ def test_revoked_or_expired_authorization_does_not_reuse_warm_personal_link(rout
 
 
 @pytest.mark.parametrize("identity", [{"external_id": OTHER_UID, "relation_id": "x"}, "invalid"])
-def test_corrupt_or_mismatched_saved_identity_is_error_not_generic(routing, identity):
+def test_corrupt_or_mismatched_saved_identity_falls_back_to_station_master_without_leaking_identity(routing, identity):
     routing.profiles[UID]["auth_status"]["taobao"] = authorized() | {"identity": identity}
-    assert routing.service.convert_link("taobao", "123", uid=UID)["status"] == "error"
-    routing.adapters["taobao"].convert_promotion_url.assert_not_called()
-    routing.products.get_promotion_link_cache.assert_not_called()
+    res = routing.service.convert_link("taobao", "123", uid=UID)
+    assert res["status"] == "success" and res["final_link"] == "https://example.com/public"
+    assert res["is_fallback"] is True and res["attribution_status"] == "anonymous" and res["cacheable"] is False
+    assert routing.adapters["taobao"].convert_promotion_url.call_args.kwargs["uid"] is None
+    assert routing.adapters["taobao"].convert_promotion_url.call_args.kwargs["identity"] == {}
 
 
 def test_negative_cache_force_and_check_only_have_distinct_responsibilities(routing):
@@ -238,15 +240,22 @@ def test_runtime_personal_failure_reuses_public_db_and_only_explicit_denial_revo
         assert adapter.convert_promotion_url.call_count == 2
 
 
-def test_identity_mismatch_failure_does_not_fall_back(routing):
+def test_identity_mismatch_or_missing_user_falls_back_to_station_master_link(routing):
     routing.profiles[UID]["auth_status"]["taobao"] = authorized()
+    routing.saved["taobao"] = public_link(_expires_at=time.time() + 300)
     adapter = routing.adapters["taobao"]
     adapter.convert_promotion_url.side_effect = None
     adapter.convert_promotion_url.return_value = {"status": "error", "error_code": "IDENTITY_MISMATCH", "need_auth": True}
-    assert routing.service.convert_link("taobao", "123", uid=UID)["error_code"] == "IDENTITY_MISMATCH"
+    res = routing.service.convert_link("taobao", "123", uid=UID)
+    assert res["status"] == "success" and res["final_link"] == "https://example.com/public"
+    assert res["is_fallback"] is True and res["attribution_status"] == "anonymous"
     adapter.convert_promotion_url.assert_called_once()
-    routing.products.get_promotion_link_cache.assert_not_called()
     routing.user_repo.update_auth_status.assert_not_called()
+
+    # 用户被删库（推手用户不存在）时同样由站长公共推广链保底，绝不丢单
+    res_deleted = routing.service.convert_link("taobao", "123", uid="u_deadbeef")
+    assert res_deleted["status"] == "success" and res_deleted["final_link"] == "https://example.com/public"
+    assert res_deleted["is_fallback"] is True and res_deleted["attribution_status"] == "anonymous"
 
 
 @pytest.mark.parametrize("extra", [{"cacheable": False}, {"is_fallback": True}])

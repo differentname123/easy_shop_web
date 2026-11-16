@@ -32,7 +32,7 @@ LOCKED_RETRY_SENTINEL = 999
 PRICE_COMPARE_ABS_TOL = 1e-4
 FORMAT_WORKERS = 10
 DEAL_FORMAT_WORKERS = 10
-FORMAT_BATCH_SIZE = 20
+FORMAT_BATCH_SIZE = 10
 DEAL_FORMAT_ROUND_LIMIT = 0
 ROUND_INTERVAL_SECONDS = 60
 RECENT_DAYS = 7
@@ -43,6 +43,7 @@ _DEAL_URL_RE = re.compile(r"https?://\S+")
 _DEAL_TOKEN_RE = re.compile(r"[（(]\s*口令\s*[:：][^）)]+[）)]")
 _MULTI_SPACE_RE = re.compile(r"\s+")
 _PLAIN_PRICE_TEXT_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
+_THINK_BLOCK_RE = re.compile(r"<(?:think|thought)\b[^>]*>[\s\S]*?</(?:think|thought)>", re.IGNORECASE)
 
 DEAL_SUPPLEMENT_RULES = """
 ---
@@ -77,12 +78,18 @@ def string_to_object(input_str: str):
     从字符串中提取并解析出 Python 列表或字典对象，专为处理 LLM 输出设计。
 
     核心增强：
-    1. 智能提取：自动忽略 Markdown 标记（如 ```json）和首尾废话。
+    1. 智能提取：自动忽略 <think> 思考块、Markdown 标记（如 ```json）和首尾废话。
     2. 安全清洗（String-Aware）：在移除注释和尾随逗号时，严格保护字符串内部的内容（如 URL、带 // 的规格名）。
     3. 双引擎解析：结合 json.loads 的高性能与 ast.literal_eval 的宽容度。
     """
     if not isinstance(input_str, str):
         raise TypeError(f"输入必须是字符串，但收到了 {type(input_str).__name__}。")
+
+    # 先剥离推理模型的 <think>...</think> / <thought>...</thought> 思考链，防止内部花括号污染边界查找
+    if "<think" in input_str.lower() or "<thought" in input_str.lower():
+        stripped = _THINK_BLOCK_RE.sub("", input_str).strip()
+        if stripped:
+            input_str = stripped
 
     def _create_error_message(reason: str) -> str:
         preview = (input_str[:500] + "...") if len(input_str) > 500 else input_str
@@ -159,6 +166,7 @@ class ProductManager:
             raise ValueError("必须提供有效的 MongoBase 实例")
         self._db = db_instance
         self._db.create_index(self.COLLECTION_NAME, [("platform", 1), ("product_id", 1)], unique=True)
+        self._db.create_index(self.COLLECTION_NAME, [("updated_at", -1)])
         self._db.create_index(self.COLLECTION_NAME, [("platform", 1), ("updated_at", -1)])
         self._db.create_index(self.COLLECTION_NAME, [("deal_info.is_deal_tip", 1), ("updated_at", -1)])
 
@@ -254,322 +262,12 @@ class ProductManager:
 
 def pending_format_query(recent_days=RECENT_DAYS):
     """
-    候选商品查询条件：
-    1. 仅限最近一周（recent_days 天）内更新的数据，且未被人工锁死（format_retry_count < 999）
-    2. 显式标记了 need_reformat: True
-    3. 单规格商品（无 sku_info，或 sku_info 仅含 1 条无规格属性的价格占位项）当前 activity_price 与上次清洗价格不一致
-    4. 多规格/带规格属性商品中任一 SKU 的当前价格文本与上次清洗快照（或历史单值价格）不一致
-    5. 尚未成功格式化，或 format_info 数量少于 sku_info 长度（支持断点补洗），且累计失败重试次数未达阈值
+    候选商品索引查询条件（单一真源原则：MongoDB 仅走 updated_at 索引拉取近期未人工锁死商品，
+    价格变更、断点补洗与失败重试上限统一在 Python `run_format_round` 中单点判定，消除 360 行脆弱 $expr 双重维护）：
+    1. 仅限最近一周（recent_days 天）内更新的数据
+    2. 未被人工锁死（format_retry_count 不存在或 < LOCKED_RETRY_SENTINEL）
     """
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=recent_days)
-
-    sku_list_expr = {
-        "$cond": [
-            {"$isArray": "$sku_info"},
-            "$sku_info",
-            [],
-        ]
-    }
-    fmt_entries_expr = {
-        "$cond": [
-            {
-                "$and": [
-                    {"$eq": [{"$type": "$format_info"}, "object"]},
-                    {"$eq": [{"$type": "$format_info.pricing_basis"}, "missing"]},
-                ]
-            },
-            {"$objectToArray": "$format_info"},
-            [],
-        ]
-    }
-    sku0_obj_expr = {
-        "$let": {
-            "vars": {"first": {"$arrayElemAt": [sku_list_expr, 0]}},
-            "in": {
-                "$cond": [
-                    {"$eq": [{"$type": "$$first"}, "object"]},
-                    {"$objectToArray": "$$first"},
-                    [],
-                ]
-            },
-        }
-    }
-    specless_single_sku_expr = {
-        "$or": [
-            {"$eq": [{"$size": sku_list_expr}, 0]},
-            {
-                "$and": [
-                    {"$eq": [{"$size": sku_list_expr}, 1]},
-                    {
-                        "$eq": [
-                            {
-                                "$size": {
-                                    "$filter": {
-                                        "input": sku0_obj_expr,
-                                        "as": "kv",
-                                        "cond": {
-                                            "$and": [
-                                                {"$not": [{"$in": ["$$kv.k", ["价格", "截图地址"]]}]},
-                                                {
-                                                    "$ne": [
-                                                        {
-                                                            "$trim": {
-                                                                "input": {
-                                                                    "$convert": {
-                                                                        "input": "$$kv.v",
-                                                                        "to": "string",
-                                                                        "onError": "",
-                                                                        "onNull": "",
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        "",
-                                                    ]
-                                                },
-                                            ]
-                                        },
-                                    }
-                                }
-                            },
-                            0,
-                        ]
-                    },
-                ]
-            },
-        ]
-    }
-
-    specless_price_changed_expr = {
-        "$and": [
-            specless_single_sku_expr,
-            {"$isNumber": "$activity_price"},
-            {"$gt": ["$activity_price", 0]},
-            {
-                "$cond": [
-                    {"$isNumber": "$format_activity_price"},
-                    {
-                        "$gt": [
-                            {"$abs": {"$subtract": ["$activity_price", "$format_activity_price"]}},
-                            PRICE_COMPARE_ABS_TOL,
-                        ]
-                    },
-                    {
-                        "$let": {
-                            "vars": {
-                                "entries": fmt_entries_expr,
-                                "exp_id": {
-                                    "$concat": [
-                                        {
-                                            "$convert": {
-                                                "input": "$product_id",
-                                                "to": "string",
-                                                "onError": "",
-                                                "onNull": "",
-                                            }
-                                        },
-                                        {"$cond": [{"$eq": [{"$size": sku_list_expr}, 1]}, "_1", "_0"]},
-                                    ]
-                                },
-                            },
-                            "in": {
-                                "$and": [
-                                    {"$gt": [{"$size": "$$entries"}, 0]},
-                                    {
-                                        "$let": {
-                                            "vars": {"first_entry": {"$arrayElemAt": ["$$entries", 0]}},
-                                            "in": {
-                                                "$or": [
-                                                    {"$ne": [{"$size": "$$entries"}, 1]},
-                                                    {"$ne": ["$$first_entry.k", "$$exp_id"]},
-                                                    {"$not": [{"$isNumber": "$$first_entry.v.price"}]},
-                                                    {
-                                                        "$gt": [
-                                                            {
-                                                                "$abs": {
-                                                                    "$subtract": [
-                                                                        "$activity_price",
-                                                                        "$$first_entry.v.price",
-                                                                    ]
-                                                                }
-                                                            },
-                                                            PRICE_COMPARE_ABS_TOL,
-                                                        ]
-                                                    },
-                                                ]
-                                            },
-                                        }
-                                    },
-                                ]
-                            },
-                        }
-                    },
-                ]
-            },
-        ]
-    }
-
-    fmt_sku_prices_entries_expr = {
-        "$cond": [
-            {"$eq": [{"$type": "$format_sku_prices"}, "object"]},
-            {"$objectToArray": "$format_sku_prices"},
-            [],
-        ]
-    }
-    multi_sku_price_changed_expr = {
-        "$and": [
-            {"$not": [specless_single_sku_expr]},
-            {
-                "$or": [
-                    {"$gt": [{"$size": fmt_entries_expr}, 0]},
-                    {"$gt": [{"$size": fmt_sku_prices_entries_expr}, 0]},
-                ]
-            },
-            {
-                "$let": {
-                    "vars": {
-                        "skus": sku_list_expr,
-                        "fmt_entries": fmt_entries_expr,
-                        "snap_entries": fmt_sku_prices_entries_expr,
-                        "pid_str": {
-                            "$convert": {
-                                "input": "$product_id",
-                                "to": "string",
-                                "onError": "",
-                                "onNull": "",
-                            }
-                        },
-                    },
-                    "in": {
-                        "$anyElementTrue": {
-                            "$map": {
-                                "input": {"$range": [0, {"$size": "$$skus"}]},
-                                "as": "idx",
-                                "in": {
-                                    "$let": {
-                                        "vars": {
-                                            "sku_item": {"$arrayElemAt": ["$$skus", "$$idx"]},
-                                            "sid": {
-                                                "$concat": [
-                                                    "$$pid_str",
-                                                    "_",
-                                                    {"$toString": {"$add": ["$$idx", 1]}},
-                                                ]
-                                            },
-                                        },
-                                        "in": {
-                                            "$let": {
-                                                "vars": {
-                                                    "cur_p_str": {
-                                                        "$trim": {
-                                                            "input": {
-                                                                "$convert": {
-                                                                    "input": {
-                                                                        "$cond": [
-                                                                            {"$eq": [{"$type": "$$sku_item"}, "object"]},
-                                                                            "$$sku_item.价格",
-                                                                            "",
-                                                                        ]
-                                                                    },
-                                                                    "to": "string",
-                                                                    "onError": "",
-                                                                    "onNull": "",
-                                                                }
-                                                            }
-                                                        }
-                                                    },
-                                                    "snap_match": {
-                                                        "$filter": {
-                                                            "input": "$$snap_entries",
-                                                            "as": "se",
-                                                            "cond": {"$eq": ["$$se.k", "$$sid"]},
-                                                        }
-                                                    },
-                                                    "fmt_match": {
-                                                        "$filter": {
-                                                            "input": "$$fmt_entries",
-                                                            "as": "fe",
-                                                            "cond": {"$eq": ["$$fe.k", "$$sid"]},
-                                                        }
-                                                    },
-                                                },
-                                                "in": {
-                                                    "$cond": [
-                                                        {"$gt": [{"$size": "$$snap_match"}, 0]},
-                                                        {
-                                                            "$ne": [
-                                                                {"$arrayElemAt": ["$$snap_match.v", 0]},
-                                                                "$$cur_p_str",
-                                                            ]
-                                                        },
-                                                        {
-                                                            "$and": [
-                                                                {"$gt": [{"$size": "$$fmt_match"}, 0]},
-                                                                {
-                                                                    "$regexMatch": {
-                                                                        "input": "$$cur_p_str",
-                                                                        "regex": r"^[￥¥]?\s*\d+(\.\d+)?\s*$",
-                                                                    }
-                                                                },
-                                                                {
-                                                                    "$let": {
-                                                                        "vars": {
-                                                                            "num_p": {
-                                                                                "$convert": {
-                                                                                    "input": {
-                                                                                        "$trim": {
-                                                                                            "input": "$$cur_p_str",
-                                                                                            "chars": "￥¥ \t\r\n",
-                                                                                        }
-                                                                                    },
-                                                                                    "to": "double",
-                                                                                    "onError": -1,
-                                                                                    "onNull": -1,
-                                                                                }
-                                                                            },
-                                                                            "fmt_obj": {"$arrayElemAt": ["$$fmt_match", 0]},
-                                                                        },
-                                                                        "in": {
-                                                                            "$and": [
-                                                                                {"$gt": ["$$num_p", 0]},
-                                                                                {
-                                                                                    "$or": [
-                                                                                        {"$not": [{"$isNumber": "$$fmt_obj.v.price"}]},
-                                                                                        {
-                                                                                            "$gt": [
-                                                                                                {
-                                                                                                    "$abs": {
-                                                                                                        "$subtract": [
-                                                                                                            "$$num_p",
-                                                                                                            "$$fmt_obj.v.price",
-                                                                                                        ]
-                                                                                                    }
-                                                                                                },
-                                                                                                PRICE_COMPARE_ABS_TOL,
-                                                                                            ]
-                                                                                        },
-                                                                                    ]
-                                                                                },
-                                                                            ]
-                                                                        },
-                                                                    }
-                                                                },
-                                                            ]
-                                                        },
-                                                    ]
-                                                },
-                                            }
-                                        },
-                                    }
-                                },
-                            }
-                        }
-                    },
-                }
-            },
-        ]
-    }
-
     return {
         "$and": [
             {"updated_at": {"$gte": cutoff_time}},
@@ -577,37 +275,6 @@ def pending_format_query(recent_days=RECENT_DAYS):
                 "$or": [
                     {"format_retry_count": {"$exists": False}},
                     {"format_retry_count": {"$lt": LOCKED_RETRY_SENTINEL}},
-                ]
-            },
-            {
-                "$or": [
-                    {"need_reformat": True},
-                    {"$expr": specless_price_changed_expr},
-                    {"$expr": multi_sku_price_changed_expr},
-                    {
-                        "$and": [
-                            {
-                                "$or": [
-                                    {"format_status": {"$ne": "success"}},
-                                    # 当存在 sku_info 列表且 format_info 未包含对应数量时允许继续补洗
-                                    {
-                                        "$expr": {
-                                            "$gt": [
-                                                {"$size": sku_list_expr},
-                                                {"$size": fmt_entries_expr},
-                                            ]
-                                        }
-                                    },
-                                ]
-                            },
-                            {
-                                "$or": [
-                                    {"format_retry_count": {"$exists": False}},
-                                    {"format_retry_count": {"$lt": FORMAT_MAX_RETRIES}},
-                                ]
-                            },
-                        ]
-                    },
                 ]
             },
         ]
@@ -788,8 +455,13 @@ def _check_single_item(format_info, index):
     total_value = pricing["total_value"]
     if not _is_positive_number(total_value):
         return False, f"{prefix} pricing_basis.total_value 必须是 (0, BSON_MAX_INT64] 范围内的有限数值"
+    if not _is_positive_number(total):
+        return False, f"{prefix} pricing_basis.structure 各层乘积越界或非法"
     if not math.isclose(total_value, total, rel_tol=1e-5):
-        return False, f"{prefix} pricing_basis.total_value ({total_value}) 必须等于各层 value 的乘积 ({total})"
+        if math.isclose(total_value, total, rel_tol=1e-2):
+            pricing["total_value"] = round(total, 6)
+        else:
+            return False, f"{prefix} pricing_basis.total_value ({total_value}) 必须等于各层 value 的乘积 ({total})"
     if not _is_clean_string(pricing["base_unit"]) or pricing["base_unit"] != structure[-1]["unit"]:
         return False, f"{prefix} pricing_basis.base_unit 必须与最后一层 unit 一致"
     return True, ""
@@ -1068,6 +740,8 @@ def run_format_round(product_manager):
             "sku_info": 1,
             "activity_price": 1,
             "format_info": 1,
+            "format_status": 1,
+            "format_retry_count": 1,
             "format_activity_price": 1,
             "format_sku_prices": 1,
         },
@@ -1092,6 +766,10 @@ def run_format_round(product_manager):
     state_lock = threading.Lock()
 
     for product in products:
+        retry_cnt = product.get("format_retry_count")
+        if type(retry_cnt) in (int, float) and retry_cnt >= LOCKED_RETRY_SENTINEL:
+            continue
+
         product_id = str(product.get("product_id") or "").strip()
         name = str(product.get("name") or "").strip()
         sku_info = product.get("sku_info")
@@ -1111,6 +789,21 @@ def run_format_round(product_manager):
         has_price_mismatch, stale_sku_ids = _detect_product_price_changes(product)
         explicit_reformat = bool(product.get("need_reformat"))
         is_reformat = explicit_reformat or has_price_mismatch
+
+        if not is_reformat and not has_legacy_flat_format and not has_invalid_format_info and not has_invalid_sku_prices:
+            if type(retry_cnt) in (int, float) and retry_cnt >= FORMAT_MAX_RETRIES:
+                continue
+            if product_id and product.get("format_status") == "success":
+                if is_specless:
+                    exp_key = f"{product_id}_1" if (isinstance(sku_info, list) and len(sku_info) == 1) else f"{product_id}_0"
+                    is_complete = exp_key in existing_format_info
+                else:
+                    is_complete = isinstance(sku_info, list) and all(
+                        f"{product_id}_{idx}" in existing_format_info for idx in range(1, len(sku_info) + 1)
+                    )
+                if is_complete:
+                    continue
+
         if is_reformat:
             total_reformat_prods += 1
 

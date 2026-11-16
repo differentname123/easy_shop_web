@@ -63,21 +63,64 @@ except ImportError:
     )
 
 
+_CONFIG_CACHE_LOCK = threading.Lock()
+_CONFIG_FILE_CACHE = {"key": None, "data": None}
+_THINK_BLOCK_RE = re.compile(r"<(?:think|thought)\b[^>]*>[\s\S]*?</(?:think|thought)>", flags=re.IGNORECASE)
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", flags=re.IGNORECASE)
+
+
 def get_config(key, default=""):
-    """从 mobile_web/config.local.json（或 WEB_CONFIG_FILE）读取配置项。"""
+    """从 mobile_web/config.local.json（或 WEB_CONFIG_FILE）读取配置项，按文件 mtime+size 内存缓存避免高频磁盘读取。"""
     cfg_env = os.environ.get("WEB_CONFIG_FILE")
     cfg_path = Path(cfg_env).expanduser() if cfg_env else (_APP_DIR / "config.local.json")
     if not cfg_path.is_absolute():
         cfg_path = (_APP_DIR / cfg_path).resolve()
-    if cfg_path.is_file():
+    try:
+        st = cfg_path.stat()
+    except OSError:
+        return default
+    cache_sig = (str(cfg_path), st.st_mtime_ns, st.st_size)
+    with _CONFIG_CACHE_LOCK:
+        if _CONFIG_FILE_CACHE["key"] == cache_sig:
+            data = _CONFIG_FILE_CACHE["data"]
+        else:
+            data = None
+    if data is None:
         try:
             with cfg_path.open("r", encoding="utf-8-sig") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and key in data:
-                return data[key]
+                loaded = json.load(f)
+            data = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return default
+        with _CONFIG_CACHE_LOCK:
+            _CONFIG_FILE_CACHE["key"] = cache_sig
+            _CONFIG_FILE_CACHE["data"] = data
+    return data[key] if isinstance(data, dict) and key in data else default
+
+
+def extract_llm_json(raw_text: str):
+    """统一剥离模型推理块 (<think>/<thought>) 与 Markdown 代码围栏，并用 JSONDecoder 稳健提取首个合法 JSON 对象或数组。"""
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ValueError("模型返回内容为空")
+    cleaned = _THINK_BLOCK_RE.sub("", raw_text).strip()
+    candidates = [m.group(1).strip() for m in _FENCED_JSON_RE.finditer(cleaned) if m.group(1).strip()]
+    candidates.append(cleaned)
+    decoder = json.JSONDecoder()
+    for text in candidates:
+        try:
+            return json.loads(text)
         except Exception:
             pass
-    return default
+        for idx, ch in enumerate(text):
+            if ch not in "{[":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(text, idx)
+                if isinstance(obj, (dict, list)):
+                    return obj
+            except Exception:
+                continue
+    raise ValueError("无法从模型输出中解析合法 JSON 数据")
 
 
 def get_runtime_file_path(filename, legacy_path=None):

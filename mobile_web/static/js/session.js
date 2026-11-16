@@ -12,36 +12,44 @@
     const pendingInviteKey = 'easy_shop_pending_invite';
     let generation = 0;
     let pendingRestore = null;
-    const token = () => storage.getItem(keys.token) || '';
-    const myInviteCode = () => {
-      try { return storage.getItem(keys.myInvite) || ''; } catch (_) { return ''; }
+    const fallbackMap = new Map();
+    const safeGet = key => {
+      try { return storage ? storage.getItem(key) : (fallbackMap.get(key) ?? null); }
+      catch (_) { return fallbackMap.get(key) ?? null; }
     };
+    const safeSet = (key, val) => {
+      const str = String(val ?? '');
+      fallbackMap.set(key, str);
+      try { if (storage) storage.setItem(key, str); } catch (_) {}
+    };
+    const safeRemove = key => {
+      fallbackMap.delete(key);
+      try { if (storage) storage.removeItem(key); } catch (_) {}
+    };
+    const token = () => safeGet(keys.token) || '';
+    const myInviteCode = () => safeGet(keys.myInvite) || '';
     const savePendingInvite = code => {
       const clean = String(code || '').trim().slice(0, 32);
       if (!/^[A-Za-z0-9_-]{3,32}$/.test(clean)) return;
-      try { storage.setItem(pendingInviteKey, clean); } catch (_) {}
+      safeSet(pendingInviteKey, clean);
     };
-    const pendingInvite = () => {
-      try { return storage.getItem(pendingInviteKey) || ''; } catch (_) { return ''; }
-    };
-    const clearPendingInvite = () => {
-      try { storage.removeItem(pendingInviteKey); } catch (_) {}
-    };
+    const pendingInvite = () => safeGet(pendingInviteKey) || '';
+    const clearPendingInvite = () => safeRemove(pendingInviteKey);
     const capture = () => ({ generation, token: token() });
     const isCurrent = snapshot => snapshot.generation === generation && snapshot.token === token();
     const clear = () => {
       generation += 1;
-      Object.values(keys).forEach(key => storage.removeItem(key));
+      Object.values(keys).forEach(key => safeRemove(key));
       forgetPendingAuthorization();
       pendingRestore = null;
     };
     const saveUser = user => {
       if (user.auth_token && user.auth_token !== token()) forgetPendingAuthorization();
       generation += 1;
-      storage.setItem(keys.uid, user.uid || '');
-      storage.setItem(keys.phone, user.phone || '');
-      if (user.invite_code) storage.setItem(keys.myInvite, user.invite_code);
-      if (user.auth_token) storage.setItem(keys.token, user.auth_token);
+      safeSet(keys.uid, user.uid || '');
+      safeSet(keys.phone, user.phone || '');
+      if (user.invite_code) safeSet(keys.myInvite, user.invite_code);
+      if (user.auth_token) safeSet(keys.token, user.auth_token);
       pendingRestore = null;
       return capture();
     };
@@ -56,7 +64,7 @@
           const session = saveUser(response.data.user);
           return { user: response.data.user, session };
         }
-        if (response.status === 401 || response.ok) {
+        if (response.status === 401 || response.status === 404 || response.ok) {
           clear();
           return { invalid: true };
         }

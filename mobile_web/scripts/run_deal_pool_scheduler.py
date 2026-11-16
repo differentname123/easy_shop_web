@@ -1063,22 +1063,37 @@ def _to_naive_utc(dt: Any) -> Optional[datetime.datetime]:
     return dt
 
 
+_CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
 def parse_publish_time_epoch(pub_str: Any) -> Optional[float]:
-    """将常见发布时间字符串解析为 Unix 时间戳（秒），用于同群 ±3 分钟（±180s）上下文聚合。"""
+    """将常见发布时间字符串解析为 Unix 时间戳（秒），统一按东八区或显式时区解析，防止 UTC 容器环境偏移 8 小时。"""
     s = str(pub_str or "").strip()
     if not s:
         return None
+    if s.endswith(("Z", "z")):
+        try:
+            dt = datetime.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+            return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        except Exception:
+            pass
+    try:
+        iso_dt = datetime.datetime.fromisoformat(s)
+        if iso_dt.tzinfo is None:
+            iso_dt = iso_dt.replace(tzinfo=_CHINA_TZ)
+        return iso_dt.timestamp()
+    except Exception:
+        pass
     for fmt in (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d %H:%M",
-        "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%dT%H:%M:%S",
     ):
         try:
             dt = datetime.datetime.strptime(s[:19], fmt)
-            return dt.timestamp()
+            return dt.replace(tzinfo=_CHINA_TZ).timestamp()
         except Exception:
             continue
     return None
@@ -4552,6 +4567,7 @@ def run_clean_stage(
             .sort([("publish_ts", -1), ("last_seen_at", -1)])
             .limit(eff_limit)
         )
+        docs_by_site[s_site].sort(key=lambda d: int(d.get("clean_retry_count") or 0))
 
     selected_docs: List[Dict[str, Any]] = []
     selected_keys: Set[Tuple[str, str]] = set()
@@ -4864,7 +4880,7 @@ def build_and_log_cycle_ops_report(
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     ok_tasks = [t for t in task_reports if t["status"] == "success"]
-    warn_tasks = [t for t in task_reports if t["status"] == "empty_warning"]
+    warn_tasks = [t for t in task_reports if t["status"] in ("empty_warning", "cooldown_skipped")]
     fail_tasks = [t for t in task_reports if t["status"] == "error"]
 
     total_fetched = sum(t.get("fetched", 0) for t in task_reports)
@@ -4897,7 +4913,7 @@ def build_and_log_cycle_ops_report(
         st["tasks_total"] += 1
         if t["status"] == "success":
             st["tasks_ok"] += 1
-        elif t["status"] == "empty_warning":
+        elif t["status"] in ("empty_warning", "cooldown_skipped"):
             st["tasks_warn"] += 1
         else:
             st["tasks_fail"] += 1
@@ -5720,6 +5736,9 @@ def run_fetch_stage(
         cur_pending_cnt,
     )
 
+    rate_limited_sites: Set[str] = set()
+    _rate_limit_codes = {403, 429, 502, 503, 504}
+
     for task_idx, (task_name, site_key, freq_tier, default_url, fn, pause_sec) in enumerate(tasks, 1):
         rem_tasks = total_tasks - task_idx
         t0 = time.perf_counter()
@@ -5727,6 +5746,33 @@ def run_fetch_stage(
             task_name,
             {"consecutive_failures": 0, "total_runs": 0, "total_errors": 0, "last_error_url": ""},
         )
+
+        if site_key in rate_limited_sites:
+            logger.info(
+                "  ⏸️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 同源站点本轮已触发限流保护，跳过本频道等待下轮冷却",
+                task_idx,
+                total_tasks,
+                rem_tasks,
+                task_name,
+            )
+            task_reports.append({
+                "task_name": task_name,
+                "site_key": site_key,
+                "tier": freq_tier,
+                "request_url": default_url,
+                "http_status": 429,
+                "status": "cooldown_skipped",
+                "fetched": 0,
+                "detail_fetched": 0,
+                "detail_error_count": 0,
+                "inserted": 0,
+                "updated": 0,
+                "unique_anchor_count": 0,
+                "consecutive_failures": ch_state["consecutive_failures"],
+                "elapsed_ms": 0.0,
+            })
+            continue
+
         ch_state["total_runs"] += 1
 
         try:
@@ -5735,6 +5781,11 @@ def run_fetch_stage(
             http_status = res.get("http_status")
             records = res.get("records") or []
             detail_errors = res.get("detail_errors") or []
+
+            if http_status in _rate_limit_codes or any(
+                d.get("http_status") in _rate_limit_codes for d in detail_errors
+            ):
+                rate_limited_sites.add(site_key)
 
             for r in records:
                 if r.get("has_full_detail") and r.get("source_item_id"):
@@ -5767,7 +5818,17 @@ def run_fetch_stage(
                 if evaluate_quality_signals(r)["has_unique_product_anchor"]
             )
 
-            for d_err in detail_errors:
+            if detail_errors:
+                first_err = detail_errors[0]
+                first_url = str(first_err.get("error_url") or first_err.get("detail_url") or req_url)
+                first_type = str(first_err.get("error_type") or "DetailFetchError")
+                first_msg = str(first_err.get("error") or "")
+                if len(detail_errors) == 1:
+                    summary_msg = first_msg
+                else:
+                    type_counts = Counter(str(d.get("error_type") or "DetailFetchError") for d in detail_errors)
+                    type_summary = ", ".join(f"{k}:{v}" for k, v in type_counts.items())
+                    summary_msg = f"本频道共 {len(detail_errors)} 条详情异常 ({type_summary})，首条: {first_msg}"
                 err_item = {
                     "occurred_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "cycle_num": cycle_num,
@@ -5775,27 +5836,28 @@ def run_fetch_stage(
                     "task_name": task_name,
                     "stage": "detail_fetch",
                     "severity": "warning",
-                    "error_url": str(d_err.get("error_url") or req_url),
-                    "item_id": str(d_err.get("item_id") or ""),
-                    "http_status": d_err.get("http_status"),
-                    "error_type": str(d_err.get("error_type") or "DetailFetchError"),
-                    "error_message": str(d_err.get("error") or ""),
+                    "error_url": first_url,
+                    "item_id": str(first_err.get("item_id") or ""),
+                    "http_status": first_err.get("http_status"),
+                    "error_type": first_type,
+                    "error_message": summary_msg,
                     "consecutive_failures": 1,
                     "ops_advice": get_ops_troubleshooting_advice(
                         site_key=site_key,
-                        http_status=d_err.get("http_status"),
-                        error_type=str(d_err.get("error_type") or "DetailFetchError"),
+                        http_status=first_err.get("http_status"),
+                        error_type=first_type,
                         fetched_count=cnt,
                         consecutive_failures=1,
                     ),
                 }
                 cycle_error_paths.append(err_item)
                 logger.warning(
-                    "  ⚠️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 详情页子路径异常 | URL=%s | 类型=%s | 详情=%s",
+                    "  ⚠️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 详情页异常汇总 (共%d条) | 首条URL=%s | 类型=%s | 详情=%s",
                     task_idx,
                     total_tasks,
                     rem_tasks,
                     task_name,
+                    len(detail_errors),
                     err_item["error_url"],
                     err_item["error_type"],
                     err_item["error_message"],

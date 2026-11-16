@@ -293,8 +293,12 @@
           isLoggedIn.value = false;
           if (result.missing) session.clear();
           identitySnapshot = session.capture();
+          if (result.unavailable) identityRestore = null;
         }
-      }).catch(error => global.console.warn('获取用户信息失败:', error));
+      }).catch(error => {
+        identityRestore = null;
+        global.console.warn('获取用户信息失败:', error);
+      });
       return identityRestore;
     };
     const loadDeepDetail = async () => {

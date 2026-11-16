@@ -265,9 +265,9 @@ def _parse_single_time_value(val: Any) -> Optional[int]:
     matched_unit = False
     for pat, mult in (
         (r"(\d+(?:\.\d+)?)\s*(?:天|日)", 86400.0),
-        (r"(\d+(?:\.\d+)?)\s*(?:小时|时|hr|h)(?!\w)", 3600.0),
-        (r"(\d+(?:\.\d+)?)\s*(?:分钟|分|min|m)(?!\w)", 60.0),
-        (r"(\d+(?:\.\d+)?)\s*(?:秒钟|秒|sec|s)(?!\w)", 1.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:小时|时|hr|h)(?![a-zA-Z])", 3600.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:分钟|分|min|m)(?![a-zA-Z])", 60.0),
+        (r"(\d+(?:\.\d+)?)\s*(?:秒钟|秒|sec|s)(?![a-zA-Z])", 1.0),
     ):
         m_u = re.search(pat, s, flags=re.IGNORECASE)
         if m_u:

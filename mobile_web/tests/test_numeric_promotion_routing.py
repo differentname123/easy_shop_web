@@ -96,26 +96,58 @@ def test_foreign_or_mismatched_mapping_is_not_trusted(routing):
     assert adapter.calls[-1]["trusted_product_url"] == ""
 
 
-def test_no_personal_failure_can_fall_back_to_default(routing):
-    service, adapter, _, users = routing
+def test_personal_failure_falls_back_to_station_master_floor_unless_station_master_fails(routing):
+    service, adapter, repo, users = routing
     users.get_numeric_promotion_context.return_value = None
-    users.get_numeric_promotion_context.side_effect = lambda *args: {"status": "error", "error_msg": "db failed"}
-    assert service.convert_link("jd", "opaque-material", uid="u_1234abcd")["status"] == "error"
-    assert adapter.calls == []
+    users.get_numeric_promotion_context.side_effect = lambda *args: {"status": "error", "error_msg": "推手用户不存在"}
+    res_missing = service.convert_link("jd", "opaque-material", uid="u_1234abcd")
+    assert res_missing["status"] == "success"
+    assert res_missing["promoter_id"] == "3110104129"
+    assert res_missing["is_fallback"] is True and res_missing["attribution_status"] == "anonymous"
+    assert res_missing["cacheable"] is False
+    assert len(adapter.calls) == 1 and adapter.calls[0]["promoter_id"] == "3110104129" and adapter.calls[0]["uid"] is None
+
+    # 个人推广位上游失败、但站长推广位可用时，自动以站长推广位保底（绝不白白丢单）
+    module.PROMOTION_CACHE.clear()
+    repo.get_promotion_link_cache.return_value = None
     users.get_numeric_promotion_context.side_effect = lambda *args: {"status": "success", "promoter_id": "1234"}
+    orig_convert = adapter.convert_promotion_url
+    adapter.convert_promotion_url = lambda **kw: (
+        {"status": "error", "error_msg": "personal position rejected"}
+        if kw.get("promoter_id") == "1234"
+        else orig_convert(**kw)
+    )
+    res_fb = service.convert_link("jd", "opaque-material", uid="u_1234abcd")
+    assert res_fb["status"] == "success" and res_fb["promoter_id"] == "3110104129"
+    assert res_fb["is_fallback"] is True and res_fb["attribution_status"] == "anonymous"
+    adapter.convert_promotion_url = orig_convert
+
+    # 当上游连站长推广位也无法转链时，才真正返回错误
+    module.PROMOTION_CACHE.clear()
+    repo.get_promotion_link_cache.return_value = None
     adapter.failure = True
     assert service.convert_link("jd", "opaque-material", uid="u_1234abcd")["status"] == "error"
-    assert len(adapter.calls) == 1 and adapter.calls[0]["uid"] == "u_1234abcd"
 
 
-def test_invalid_identity_and_wrong_result_fail_closed(routing):
+def test_invalid_personal_identity_falls_back_while_broken_default_or_wrong_result_fails_closed(routing):
     service, adapter, _, users = routing
-    assert service.convert_link("jd", "opaque-material", uid="bad-uid")["status"] == "error"
+    bad_uid_res = service.convert_link("jd", "opaque-material", uid="bad-uid")
+    assert bad_uid_res["status"] == "success" and bad_uid_res["promoter_id"] == "3110104129"
+    assert bad_uid_res["is_fallback"] is True and bad_uid_res["attribution_status"] == "anonymous"
+
+    module.PROMOTION_CACHE.clear()
     users.get_numeric_promotion_context.side_effect = lambda *args: {"status": "success", "promoter_id": "u_bad"}
-    assert service.convert_link("jd", "opaque-material", uid="u_1234abcd")["status"] == "error"
-    assert adapter.calls == []
+    bad_pid_res = service.convert_link("jd", "opaque-material", uid="u_1234abcd")
+    assert bad_pid_res["status"] == "success" and bad_pid_res["promoter_id"] == "3110104129"
+    assert bad_pid_res["is_fallback"] is True
+
+    # 站长自身默认推广位未配置/非法，或平台返回伪造身份时仍严格拦截
+    module.PROMOTION_CACHE.clear()
     adapter.wrong_identity = True
     assert service.convert_link("jd", "opaque-material")["error_code"] == "invalid_promotion_identity"
+    adapter.wrong_identity = False
+    adapter.default_promoter_id = "bad_default"
+    assert service.convert_link("jd", "opaque-material", uid="u_1234abcd")["error_code"] == "invalid_promoter_id"
 
 
 def test_cache_changes_with_numeric_identity_and_default_configuration(routing):

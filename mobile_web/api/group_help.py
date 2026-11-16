@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """拼多多多人团互助独立路由模块：上传二维码图片、搜索列表、详情查询、跳转计数与用户共创状态反馈。"""
+import asyncio
 import base64
 from typing import Optional, Tuple
 from fastapi import APIRouter, Path, Query, Request
@@ -15,6 +16,13 @@ from services.group_help_service import GroupHelpService, GroupHelpWorker
 router = APIRouter(prefix="/api/group_help", tags=["拼多多多人团互助"])
 group_help_service = GroupHelpService()
 group_help_worker = GroupHelpWorker(group_help_service, interval_seconds=8.0)
+
+_UPLOAD_SEMAPHORE = asyncio.Semaphore(4)
+_MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024  # 15MB (兼容 10MB 原图的 Base64/FormData 封装开销)
+
+
+class _PayloadTooLargeError(ValueError):
+    pass
 
 
 def _extract_viewer_auth(request: Request) -> Tuple[Optional[str], bool]:
@@ -36,9 +44,25 @@ def _extract_viewer_auth(request: Request) -> Tuple[Optional[str], bool]:
 
 async def _extract_upload_payload(request: Request) -> Tuple[bytes, str]:
     """兼容 JSON(image_base64 + 可选 owner_token)、multipart/form-data(file) 与原始二进制流三种上传方式。"""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > _MAX_REQUEST_BODY_BYTES:
+                raise _PayloadTooLargeError("上传请求体积过大，请上传 10MB 以内的图片")
+        except ValueError as exc:
+            if isinstance(exc, _PayloadTooLargeError):
+                raise
+
     content_type = (request.headers.get("content-type") or "").lower()
     if "application/json" in content_type:
-        body = await request.json()
+        raw_body = await request.body()
+        if len(raw_body) > _MAX_REQUEST_BODY_BYTES:
+            raise _PayloadTooLargeError("上传请求体积过大，请上传 10MB 以内的图片")
+        try:
+            import json
+            body = json.loads(raw_body)
+        except Exception as exc:
+            raise ValueError("JSON 请求体格式不正确") from exc
         if not isinstance(body, dict):
             raise ValueError("JSON 请求体格式不正确")
         b64_str = str(body.get("image_base64") or body.get("image") or "").strip()
@@ -58,11 +82,16 @@ async def _extract_upload_payload(request: Request) -> Tuple[bytes, str]:
         if upload is None or not hasattr(upload, "read"):
             raise ValueError("请在表单 file 字段中上传二维码分享图片")
         owner_token = str(form.get("owner_token") or "").strip()[:64]
-        return await upload.read(), owner_token
+        data = await upload.read(_MAX_REQUEST_BODY_BYTES + 1)
+        if len(data) > _MAX_REQUEST_BODY_BYTES:
+            raise _PayloadTooLargeError("上传请求体积过大，请上传 10MB 以内的图片")
+        return data, owner_token
 
     raw = await request.body()
     if not raw:
         raise ValueError("未检测到上传的图片内容")
+    if len(raw) > _MAX_REQUEST_BODY_BYTES:
+        raise _PayloadTooLargeError("上传请求体积过大，请上传 10MB 以内的图片")
     return raw, ""
 
 
@@ -70,13 +99,26 @@ async def _extract_upload_payload(request: Request) -> Tuple[bytes, str]:
 async def upload_group_poster(request: Request):
     """
     上传拼多多多人团二维码分享图片：
-    立即同步解码二维码 -> 免登录核验 307 重定向提取 group_order_id -> 签发团长口令并写入待解析队列。
+    立即在受控工作线程解码二维码 -> 免登录核验 307 重定向提取 group_order_id -> 签发团长口令并写入待解析队列。
     """
     try:
         uid, _ = _extract_viewer_auth(request)
         image_bytes, owner_token = await _extract_upload_payload(request)
-        return group_help_service.submit_poster_image(
-            image_bytes, owner_token=owner_token, viewer_uid=uid
+        async with _UPLOAD_SEMAPHORE:
+            return await asyncio.to_thread(
+                group_help_service.submit_poster_image,
+                image_bytes,
+                owner_token=owner_token,
+                viewer_uid=uid,
+            )
+    except _PayloadTooLargeError as exc:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "status": "error",
+                "error_code": "payload_too_large",
+                "error_msg": str(exc),
+            },
         )
     except ValueError as exc:
         return JSONResponse(

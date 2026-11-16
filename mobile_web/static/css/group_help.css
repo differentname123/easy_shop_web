@@ -17,6 +17,10 @@
   -webkit-tap-highlight-color: transparent;
 }
 
+[v-cloak] {
+  display: none !important;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", "Microsoft YaHei", sans-serif;
   background-color: var(--gh-bg);

@@ -11,7 +11,15 @@
         method, headers, signal,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
-      const data = await response.json();
+      let data;
+      try {
+        data = await response.json();
+      } catch (_) {
+        data = {
+          status: 'error',
+          error_msg: response.status === 413 ? '上传内容过大，请压缩后重试' : '服务繁忙，请稍后重试',
+        };
+      }
       return { ok: response.ok, status: response.status, data };
     };
     return {

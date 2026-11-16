@@ -179,7 +179,7 @@ class OrderRepository(BaseRepository):
             {"$facet": {
                 "stats": [
                     {"$project": {
-                        "commission": {"$convert": {"input": "$promotion_amount_yuan", "to": "double", "onNull": 0}},
+                        "commission": {"$convert": {"input": "$promotion_amount_yuan", "to": "double", "onNull": 0, "onError": 0}},
                         "refund": refund, "settled": settled, "invalid": invalid,
                     }},
                     {"$group": {

@@ -27,6 +27,10 @@
   -webkit-tap-highlight-color: transparent;
 }
 
+[v-cloak] {
+  display: none !important;
+}
+
 html {
   width: 100%;
   min-height: 100%;

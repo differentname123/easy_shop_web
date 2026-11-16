@@ -864,6 +864,7 @@ def evaluate_candidate_eligibility_and_keywords(
     )
     if not ok:
         fail_reason = f"AI资格审查校验失败: {last_err}"
+        meta["llm_failed"] = True
         meta["parsed_json"] = {"is_eligible": False, "reason": fail_reason}
         return False, "", "", fail_reason, meta
 
@@ -972,6 +973,7 @@ def _filter_comparable_xianyu_items_by_llm(
         id_hint_msg=f"请务必确保 `comparable_item_ids` 中的每个 ID 均严格取自给定的闲鱼列表 ID 集合：{sorted(valid_xianyu_ids)}，并严格输出合法 JSON！",
     )
     if not ok:
+        llm_meta["llm_failed"] = True
         return [], llm_meta, f"AI同款初筛校验失败: {last_err}"
 
     comp_ids = clean_dict.get("comparable_item_ids") or []
@@ -1290,6 +1292,7 @@ def compare_candidate_with_xianyu(
         cand["selection_reason"] = elig_reason
         cand["llm_keyword_output"] = step1_meta
         if not is_elig:
+            step1_llm_failed = bool(step1_meta.get("llm_failed"))
             return _build_final_record(
                 candidate=cand,
                 used_keyword="",
@@ -1302,13 +1305,14 @@ def compare_candidate_with_xianyu(
                     "has_comparable_item": False,
                     "comparable_item_ids": [],
                     "best_xianyu_item_id": "",
-                    "llm_winner": "ineligible",
-                    "llm_reason": f"[不具备比价资格] {elig_reason}",
+                    "llm_winner": "llm_error" if step1_llm_failed else "ineligible",
+                    "llm_reason": elig_reason if step1_llm_failed else f"[不具备比价资格] {elig_reason}",
                 },
                 llm_call_meta={},
                 browser_aborted=False,
                 debug_browser=debug_browser,
-                ineligible=True,
+                ineligible=not step1_llm_failed,
+                llm_aborted=step1_llm_failed,
             )
 
     kw = str(cand["search_keyword"]).strip()
@@ -1413,7 +1417,7 @@ def compare_candidate_with_xianyu(
         my_candidate_for_llm, coarse_items_for_llm, valid_coarse_ids
     )
 
-    if not step2_comp_ids and not used_backup and backup_kw and backup_kw != kw:
+    if not step2_comp_ids and not step2_llm_meta.get("llm_failed") and not used_backup and backup_kw and backup_kw != kw:
         logger.info(f"🔄 [步骤2/初筛0同款触发备用词重搜] 分类=【{cat_name}】 | 主词【{kw}】初筛同款为0，切换备用词【{backup_kw}】重搜...")
         retry_res = _run_search(backup_kw, "初筛后备用词搜索")
         if not retry_res.get("ok"):
@@ -1427,6 +1431,7 @@ def compare_candidate_with_xianyu(
             )
 
     if not step2_comp_ids:
+        step2_llm_failed = bool(step2_llm_meta.get("llm_failed"))
         logger.info(f"⚪ [步骤2/初筛无同款可比商品] 分类=【{cat_name}】 | 搜索词=【{kw}】 | 原因={step2_reason}")
         return _build_final_record(
             candidate=cand,
@@ -1440,12 +1445,13 @@ def compare_candidate_with_xianyu(
                 "has_comparable_item": False,
                 "comparable_item_ids": [],
                 "best_xianyu_item_id": "",
-                "llm_winner": "no_comparable",
-                "llm_reason": f"[AI初筛无同款可比商品] {step2_reason}",
+                "llm_winner": "llm_error" if step2_llm_failed else "no_comparable",
+                "llm_reason": step2_reason if step2_llm_failed else f"[AI初筛无同款可比商品] {step2_reason}",
             },
             llm_call_meta={},
             browser_aborted=False,
             debug_browser=debug_browser,
+            llm_aborted=step2_llm_failed,
         )
 
     # 仅保留前 max_detail_checks（默认前 2 个）可比商品补充详情：7天内库里有详情直接复用，缺失才拉取
@@ -1635,6 +1641,7 @@ def compare_candidate_with_xianyu(
         detail_live_fetched_count=detail_live_fetched_count,
         browser_aborted=False,
         debug_browser=debug_browser,
+        llm_aborted=not ok,
     )
 
 
@@ -1656,12 +1663,14 @@ def _build_final_record(
     browser_aborted: bool = False,
     debug_browser: bool = False,
     ineligible: bool = False,
+    llm_aborted: bool = False,
 ) -> Dict[str, Any]:
     """直接以第 3 次大模型最终判定的性价比比例与胜负结果构建入库文档（避免受预清洗误差干扰）。"""
     has_comp = bool(llm_data.get("has_comparable_item"))
     best_xy_id = str(llm_data.get("best_xianyu_item_id") or "").strip()
     best_xy_price = round(_num(llm_data.get("best_xianyu_price"), 0.0), 2)
-    llm_winner = str(llm_data.get("llm_winner") or ("ineligible" if ineligible else "no_comparable")).strip()
+    default_winner = "llm_error" if llm_aborted else ("ineligible" if ineligible else "no_comparable")
+    llm_winner = str(llm_data.get("llm_winner") or default_winner).strip()
     llm_reason = str(llm_data.get("llm_reason") or fallback_error or "未找到可比商品").strip()
 
     matched_u = str(llm_data.get("matched_unit") or "").strip() or None
@@ -1694,6 +1703,11 @@ def _build_final_record(
     if browser_aborted:
         comparison_basis = "browser_error"
         final_winner = "browser_error"
+        cp_ratio = None
+        matched_u = None
+    elif llm_aborted:
+        comparison_basis = "llm_error"
+        final_winner = "llm_error"
         cp_ratio = None
         matched_u = None
     elif ineligible:
@@ -1785,6 +1799,7 @@ def _build_final_record(
         "xianyu_audit_trail": {
             "browser_mode": "headless" if not debug_browser else "headed",
             "browser_aborted": bool(browser_aborted),
+            "llm_aborted": bool(llm_aborted),
             "ineligible": bool(ineligible),
             "is_risk_blocked": bool(search_res.get("is_risk_blocked") or (batch_det_res or {}).get("is_risk_blocked")),
             "is_account_offline": bool(
@@ -1830,6 +1845,13 @@ def _build_verdict_summary(record: Dict[str, Any]) -> Tuple[str, str, str]:
             "🚨 检索异常",
             "ERR",
             f"闲鱼浏览器检索异常中断：{cr.get('llm_reason') or '请搜索上方 ❌ 错误日志定位原因'}",
+        )
+
+    if audit.get("llm_aborted") or final_winner == "llm_error":
+        return (
+            "⚠️ AI异常跳过",
+            "ERR",
+            f"大模型网关调用或校验异常中断（暂不落库，保留重试）：{cr.get('llm_reason') or '-'}",
         )
 
     if audit.get("ineligible") or final_winner == "ineligible":
@@ -1898,6 +1920,9 @@ def _format_single_comparison_card(idx: int, total: int, record: Dict[str, Any])
     elif audit.get("browser_aborted"):
         xy_plat_id, xy_price, xy_qty, xy_cp = "XY :检索异常中断", "-", "-", "-"
         xy_desc = cr.get("llm_reason") or "闲鱼无头浏览器检索异常中断"
+    elif audit.get("llm_aborted"):
+        xy_plat_id, xy_price, xy_qty, xy_cp = "XY :AI异常中断", "-", "-", "-"
+        xy_desc = cr.get("llm_reason") or "大模型调用或输出校验异常中断，保留下轮重试"
     elif audit.get("ineligible"):
         xy_plat_id, xy_price, xy_qty, xy_cp = "XY :未发起检索", "-", "-", "-"
         xy_desc = cr.get("llm_reason") or "AI判定当前商品不具备比价资格，未消耗闲鱼配额"
@@ -1954,12 +1979,18 @@ def _format_batch_summary_report(batch_id: str, elapsed: float, records: List[Di
         l = sum(1 for r in sub_recs if r.get("final_winner") == "xianyu_product")
         t = sum(1 for r in sub_recs if r.get("final_winner") == "tie")
         inel = sum(1 for r in sub_recs if r.get("final_winner") == "ineligible")
-        e = sum(1 for r in sub_recs if (r.get("xianyu_audit_trail") or {}).get("browser_aborted"))
+        e = sum(
+            1
+            for r in sub_recs
+            if (r.get("xianyu_audit_trail") or {}).get("browser_aborted")
+            or (r.get("xianyu_audit_trail") or {}).get("llm_aborted")
+        )
         n = sum(
             1
             for r in sub_recs
             if r.get("final_winner") not in ("my_product", "xianyu_product", "tie", "ineligible")
             and not (r.get("xianyu_audit_trail") or {}).get("browser_aborted")
+            and not (r.get("xianyu_audit_trail") or {}).get("llm_aborted")
         )
         return w, l, t, n, inel, e
 
@@ -2181,6 +2212,22 @@ def run_discovery_cycle(
                     f"\n{'!' * 96}\n"
                     f"🛑 [整轮熔断保护已触发] 分类=【{rec['category_name']}】检测到风控/掉线或连续失败({consecutive_fails}次)！\n"
                     f"   └── 已立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品的后续处理，进入静默冷却保护！\n"
+                    f"{'!' * 96}"
+                )
+                break
+        elif audit.get("llm_aborted"):
+            logger.warning(
+                f"⚠️ [跳过入库][{src_lbl}] 分类=【{rec['category_name']}】 | 商品=[{rec['platform'].upper()}:{rec['product_id']}] "
+                f"因大模型网关调用或输出校验异常，暂不写入比价记录库，保留后续轮次重试机会"
+            )
+            logger.info(_format_single_comparison_card(idx, total_candidates, rec))
+            if is_hard_stop:
+                _LAST_CYCLE_ABORTED_BY_RISK = True
+                remaining = total_candidates - idx
+                logger.error(
+                    f"\n{'!' * 96}\n"
+                    f"🛑 [详情风控熔断保护已触发] 分类=【{rec['category_name']}】详情拉取期间检测到闲鱼风控拦截！\n"
+                    f"   └── 立即停止本轮剩余 {remaining}/{total_candidates} 个候选商品处理，进入静默冷却保护！\n"
                     f"{'!' * 96}"
                 )
                 break

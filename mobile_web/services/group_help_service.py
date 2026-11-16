@@ -16,7 +16,11 @@ import numpy as np
 import requests
 from PIL import Image
 
+Image.MAX_IMAGE_PIXELS = 25_000_000
+
+from cache_utils import ThreadSafeTTLCache
 from config import logger
+from infrastructure.ai_api.model_api import extract_llm_json
 from infrastructure.logging_utils import format_exc_summary
 from models.group_help import (
     MAX_TAKEDOWNS_PER_WINDOW,
@@ -38,6 +42,7 @@ _APP_DIR = Path(__file__).resolve().parent.parent
 _POSTER_DIR = _APP_DIR / "runtime" / "group_posters"
 _PROMPT_FILE = _APP_DIR / "prompt" / "多人团海报识别.txt"
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
+_POSTER_RETENTION_SECONDS = 7 * 86400  # 本地海报保留 7 天，自动清理超期历史文件
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
@@ -52,7 +57,7 @@ def decode_qr_from_image_bytes(image_bytes: bytes) -> str:
     """
     对整张图片进行全局二维码识别（不假设二维码固定在某角落）：
     1. 先对全图做直接识别与二值化识别；
-    2. 若二维码在整图中占比过小，使用覆盖全图 100% 区域的均匀重叠滑动窗口（上/中/下 × 左/中/右）扫描全图。
+    2. 若二维码在整图中占比过小，按 4 个重叠象限 + 中心区域（共最多 6 个区域）覆盖全图。
     """
     if not image_bytes:
         return ""
@@ -69,21 +74,22 @@ def decode_qr_from_image_bytes(image_bytes: bytes) -> str:
 
     detector = cv2.QRCodeDetector()
 
-    # 1. 全图优先，随后按均匀重叠网格覆盖全图所有区域（上/中/下、左/中/右一视同仁，不绑定特定角落）
     regions = [gray_full]
     if h >= 200 and w >= 200:
-        for y0, y1 in ((0.0, 0.6), (0.2, 0.8), (0.4, 1.0)):
-            band = gray_full[int(h * y0) : int(h * y1), :]
-            regions.append(band)
-            for x0, x1 in ((0.0, 0.65), (0.2, 0.8), (0.35, 1.0)):
-                regions.append(band[:, int(w * x0) : int(w * x1)])
+        regions.extend([
+            gray_full[int(h * 0.4) :, int(w * 0.35) :],                 # 右下（最常见）
+            gray_full[int(h * 0.4) :, : int(w * 0.65)],                 # 左下
+            gray_full[: int(h * 0.6), : int(w * 0.65)],                 # 左上
+            gray_full[: int(h * 0.6), int(w * 0.35) :],                 # 右上
+            gray_full[int(h * 0.2) : int(h * 0.8), int(w * 0.2) : int(w * 0.8)],  # 中心
+        ])
 
     for reg in regions:
         if reg.size == 0:
             continue
         rh, rw = reg.shape[:2]
         scales = [reg]
-        if max(rh, rw) < 1000:
+        if max(rh, rw) < 600:
             scales.append(
                 cv2.resize(reg, (int(rw * 1.5), int(rh * 1.5)), interpolation=cv2.INTER_CUBIC)
             )
@@ -140,25 +146,12 @@ def resolve_pdd_qr_link(qr_url: str, http_get: Optional[Callable] = None) -> Dic
 
 
 def extract_json_object(raw_text: str) -> Dict[str, Any]:
-    """从大模型输出文本中稳健提取 JSON 字典。"""
+    """从大模型输出文本中稳健提取 JSON 字典（支持自动剥离 <think> 思考标签与代码块）。"""
     if not isinstance(raw_text, str) or not raw_text.strip():
         raise ValueError("模型返回内容为空")
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        obj = json.loads(cleaned)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        obj = json.loads(cleaned[start : end + 1])
-        if isinstance(obj, dict):
-            return obj
+    obj = extract_llm_json(raw_text)
+    if isinstance(obj, dict):
+        return obj
     raise ValueError("无法从模型输出中解析合法 JSON 对象")
 
 
@@ -184,7 +177,8 @@ class GroupHelpService:
         self._http_get = http_get
         self._ai_generator = ai_generator
         self._wake_callback: Optional[Callable[[], None]] = None
-        self._takedown_ts: Dict[str, list] = {}
+        self._takedown_ts = ThreadSafeTTLCache(maxsize=4096, ttl=TAKEDOWN_RATE_WINDOW_SECONDS)
+        self._last_poster_cleanup_ts: float = 0.0
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
         self._wake_callback = callback
@@ -427,13 +421,32 @@ class GroupHelpService:
             logger.warning("【多人团识图异常】团单[%s] 解析发生异常 | 异常<%s>", gid, format_exc_summary(exc))
             return False
 
+    def _cleanup_old_poster_files(self, now: Optional[float] = None) -> int:
+        current_ts = float(now if now is not None else time.time())
+        if current_ts - self._last_poster_cleanup_ts < 3600.0:
+            return 0
+        self._last_poster_cleanup_ts = current_ts
+        if not self.poster_dir.is_dir():
+            return 0
+        cutoff = current_ts - _POSTER_RETENTION_SECONDS
+        removed = 0
+        for p in self.poster_dir.glob("*.jpg"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                pass
+        return removed
+
     def process_pending_batch(self, batch_size: int = 2) -> Dict[str, int]:
-        """定时任务单次执行入口：先清理超24h过期团，再批量解析待识别图片。"""
+        """定时任务单次执行入口：先清理超24h过期团与超7天旧海报，再批量解析待识别图片。"""
         expired_count = 0
         parsed_count = 0
         failed_count = 0
         try:
             expired_count = self.repo.expire_outdated_groups()
+            self._cleanup_old_poster_files()
         except Exception as exc:
             logger.warning("【多人团定时任务】自动下线过期团异常 | 异常<%s>", format_exc_summary(exc))
 
@@ -600,9 +613,9 @@ class GroupHelpService:
                         guard["reason"], error_code="takedown_banned", status_code=403
                     )
                 cutoff = now - TAKEDOWN_RATE_WINDOW_SECONDS
-                recent_ts = [t for t in self._takedown_ts.get(verified_uid, []) if t >= cutoff]
+                recent_ts = [t for t in (self._takedown_ts.get(verified_uid) or []) if t >= cutoff]
                 if len(recent_ts) >= MAX_TAKEDOWNS_PER_WINDOW:
-                    self._takedown_ts[verified_uid] = recent_ts
+                    self._takedown_ts.set(verified_uid, recent_ts)
                     raise GroupHelpPermissionError(
                         "您短时间内下架他人拼团过于频繁，请稍后再试",
                         error_code="takedown_rate_limited",
@@ -617,7 +630,7 @@ class GroupHelpService:
                 is_owner=is_owner,
             )
             if not is_owner and verified_uid and updated:
-                self._takedown_ts[verified_uid] = recent_ts + [now]
+                self._takedown_ts.set(verified_uid, recent_ts + [now])
             return (
                 {
                     "data": format_group_doc(updated, now=now),

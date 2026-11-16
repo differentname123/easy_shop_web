@@ -12,11 +12,11 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261113-1">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261113-1"></script>
+  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261114-2">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261114-2"></script>
 </head>
 <body>
-<div id="group-help-app">
+<div id="group-help-app" v-cloak>
 
   <!-- 隐藏的二维码图片上传控件 -->
   <input
@@ -726,6 +726,6 @@
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
 </div>
-<script src="/static/js/group_help.js?v=ux-20261113-1"></script>
+<script src="/static/js/group_help.js?v=ux-20261114-2"></script>
 </body>
 </html>

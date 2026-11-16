@@ -38,6 +38,10 @@ class GroupHelpRepository(BaseRepository):
         )
         col.create_index([("goods_name", ASCENDING)], name="idx_goods_name")
         col.create_index([("keywords", ASCENDING)], name="idx_keywords")
+        col.create_index(
+            [("group_status", ASCENDING), ("expires_at", ASCENDING)],
+            name="idx_status_expires",
+        )
         return True
 
     def get_by_group_order_id(self, group_order_id: str) -> Optional[Dict[str, Any]]:
@@ -411,6 +415,28 @@ class GroupHelpRepository(BaseRepository):
         was_active = existing.get("group_status") == GROUP_STATUS_ACTIVE and prev_rem > 0
         update_fields: Dict[str, Any] = {"updated_at": current_ts}
 
+        clean_op_uid = str(operator_uid or "").strip()
+
+        if act == "joined_one" and prev_rem >= 2:
+            updated = self.col.find_one_and_update(
+                {"group_order_id": gid, "remain_people": {"$gte": 2}},
+                {
+                    "$set": {"updated_at": current_ts},
+                    "$inc": {"remain_people": -1, "feedback_count": 1},
+                },
+                projection={"_id": 0},
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated is not None:
+                return updated
+            existing = self.get_by_group_order_id(gid)
+            if not existing:
+                return None
+            prev_rem = int(existing.get("remain_people") if existing.get("remain_people") is not None else 1)
+            if prev_rem < 2 and not is_owner and not clean_op_uid:
+                return existing
+            was_active = existing.get("group_status") == GROUP_STATUS_ACTIVE and prev_rem > 0
+
         if act == "mark_full":
             update_fields["group_status"] = GROUP_STATUS_FULL
             update_fields["remain_people"] = 0
@@ -442,7 +468,6 @@ class GroupHelpRepository(BaseRepository):
 
         target_status = update_fields.get("group_status", existing.get("group_status"))
         now_offline = target_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED)
-        clean_op_uid = str(operator_uid or "").strip()
 
         if was_active and now_offline:
             update_fields["last_takedown_uid"] = "" if is_owner else clean_op_uid

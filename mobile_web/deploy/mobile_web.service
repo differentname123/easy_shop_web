@@ -24,8 +24,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-# File logging is disabled above. To enable it, create a writable runtime/logs
-# directory, set WEB_LOG_DIR, and allow ONLY that directory with ReadWritePaths.
+ReadWritePaths=-/opt/mobile_web/runtime -/opt/mobile_web/logs
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mobile_web

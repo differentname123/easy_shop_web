@@ -141,6 +141,7 @@ _TOKEN_RE = re.compile(
     r"|\b[A-Za-z0-9]{25,35}_[A-Za-z0-9]{15,22}\b)"
 )
 _RAW_URL_RE = re.compile(r"https?://[^\s<>\"'\]）】]+", re.IGNORECASE)
+_RATE_LIMIT_STATUSES = (403, 429, 502, 503, 504)
 
 
 # ==============================================================================
@@ -716,6 +717,8 @@ def fetch_xianbao_fun_deals(
     records: List[Dict[str, Any]] = []
     detail_errors: List[Dict[str, Any]] = []
     detail_fetched = 0
+    detail_attempted = 0
+    detail_circuit_broken = False
     skip_set = skip_detail_ids or set()
 
     for li_html in li_blocks:
@@ -754,7 +757,10 @@ def fetch_xianbao_fun_deals(
         has_full_detail = False
         extra_hot_metrics: Dict[str, Any] = {"comments": comments_cnt}
 
-        if fetch_detail and detail_fetched < max_details and item_id not in skip_set:
+        if fetch_detail and not detail_circuit_broken and detail_attempted < max_details and item_id not in skip_set:
+            if detail_attempted > 0:
+                time.sleep(0.15)
+            detail_attempted += 1
             try:
                 rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
                 if rd.status_code == 200:
@@ -803,9 +809,12 @@ def fetch_xianbao_fun_deals(
                             meta_prefix = f"【商城:{catename} | 品牌:{extra_hot_metrics.get('brand', '')} | 分类:{extra_hot_metrics.get('category', '')}】"
                             tutorial_text = f"{meta_prefix}\n{tutorial_text}".strip()
                 else:
+                    if rd.status_code in _RATE_LIMIT_STATUSES:
+                        detail_circuit_broken = True
                     detail_errors.append({
                         "item_id": item_id,
                         "detail_url": detail_url,
+                        "error_url": detail_url,
                         "stage": "detail_fetch",
                         "http_status": rd.status_code,
                         "error_type": f"HTTP_{rd.status_code}",
@@ -815,6 +824,7 @@ def fetch_xianbao_fun_deals(
                 detail_errors.append({
                     "item_id": item_id,
                     "detail_url": detail_url,
+                    "error_url": detail_url,
                     "stage": "detail_fetch",
                     "http_status": None,
                     "error_type": type(e).__name__,
@@ -886,6 +896,8 @@ def fetch_0818tuan_deals(
     detail_errors: List[Dict[str, Any]] = []
     seen_ids: set = set()
     detail_fetched = 0
+    detail_attempted = 0
+    detail_circuit_broken = False
     skip_set = skip_detail_ids or set()
 
     for full_a, rel_href, item_id in anchors:
@@ -910,7 +922,10 @@ def fetch_0818tuan_deals(
         raw_payload: Any = full_a
         has_full_detail = False
 
-        if fetch_detail and detail_fetched < max_details and item_id not in skip_set:
+        if fetch_detail and not detail_circuit_broken and detail_attempted < max_details and item_id not in skip_set:
+            if detail_attempted > 0:
+                time.sleep(0.1)
+            detail_attempted += 1
             try:
                 rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
                 rd.encoding = "utf-8"
@@ -944,9 +959,12 @@ def fetch_0818tuan_deals(
                         )
                         tutorial_text = html_to_tutorial_text(clean_xb, base_url=detail_url)
                 else:
+                    if rd.status_code in _RATE_LIMIT_STATUSES:
+                        detail_circuit_broken = True
                     detail_errors.append({
                         "item_id": item_id,
                         "detail_url": detail_url,
+                        "error_url": detail_url,
                         "stage": "detail_fetch",
                         "http_status": rd.status_code,
                         "error_type": f"HTTP_{rd.status_code}",
@@ -956,6 +974,7 @@ def fetch_0818tuan_deals(
                 detail_errors.append({
                     "item_id": item_id,
                     "detail_url": detail_url,
+                    "error_url": detail_url,
                     "stage": "detail_fetch",
                     "http_status": None,
                     "error_type": type(e).__name__,
@@ -1238,6 +1257,8 @@ def fetch_bacaoo_deals(
     records: List[Dict[str, Any]] = []
     detail_errors: List[Dict[str, Any]] = []
     detail_fetched = 0
+    detail_attempted = 0
+    detail_circuit_broken = False
     skip_set = skip_detail_ids or set()
 
     def _unwrap_bacaoo_go(post_data: Dict[str, str], referer_url: str) -> str:
@@ -1279,7 +1300,10 @@ def fetch_bacaoo_deals(
         if pid not in skip_set and sum(1 for s in skip_set if s.startswith(f"{pid}_sub_")) >= 48:
             skip_set.add(pid)
 
-        if fetch_detail and detail_fetched < max_details and pid not in skip_set:
+        if fetch_detail and not detail_circuit_broken and detail_attempted < max_details and pid not in skip_set:
+            if detail_attempted > 0:
+                time.sleep(0.1)
+            detail_attempted += 1
             try:
                 rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
                 rd.encoding = "utf-8"
@@ -1394,9 +1418,12 @@ def fetch_bacaoo_deals(
                             })
                             tutorial_text = f"{tutorial_text}\n直达链接: {direct_u}".strip()
                 else:
+                    if rd.status_code in _RATE_LIMIT_STATUSES:
+                        detail_circuit_broken = True
                     detail_errors.append({
                         "item_id": pid,
                         "detail_url": detail_url,
+                        "error_url": detail_url,
                         "stage": "detail_fetch",
                         "http_status": rd.status_code,
                         "error_type": f"HTTP_{rd.status_code}",
@@ -1406,6 +1433,7 @@ def fetch_bacaoo_deals(
                 detail_errors.append({
                     "item_id": pid,
                     "detail_url": detail_url,
+                    "error_url": detail_url,
                     "stage": "detail_fetch",
                     "http_status": None,
                     "error_type": type(e).__name__,
@@ -1472,6 +1500,8 @@ def fetch_iehou_deals(
     detail_errors: List[Dict[str, Any]] = []
     seen_ids: set = set()
     detail_fetched = 0
+    detail_attempted = 0
+    detail_circuit_broken = False
     skip_set = skip_detail_ids or set()
 
     for rel_href, item_id, raw_title in items:
@@ -1489,7 +1519,10 @@ def fetch_iehou_deals(
         raw_payload: Any = ""
         has_full_detail = False
 
-        if fetch_detail and detail_fetched < max_details and item_id not in skip_set:
+        if fetch_detail and not detail_circuit_broken and detail_attempted < max_details and item_id not in skip_set:
+            if detail_attempted > 0:
+                time.sleep(0.1)
+            detail_attempted += 1
             try:
                 rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
                 if rd.status_code == 200:
@@ -1509,9 +1542,12 @@ def fetch_iehou_deals(
                         )
                         tutorial_text = html_to_tutorial_text(msg_html, base_url=detail_url)
                 else:
+                    if rd.status_code in _RATE_LIMIT_STATUSES:
+                        detail_circuit_broken = True
                     detail_errors.append({
                         "item_id": item_id,
                         "detail_url": detail_url,
+                        "error_url": detail_url,
                         "stage": "detail_fetch",
                         "http_status": rd.status_code,
                         "error_type": f"HTTP_{rd.status_code}",
@@ -1521,6 +1557,7 @@ def fetch_iehou_deals(
                 detail_errors.append({
                     "item_id": item_id,
                     "detail_url": detail_url,
+                    "error_url": detail_url,
                     "stage": "detail_fetch",
                     "http_status": None,
                     "error_type": type(e).__name__,
@@ -2060,6 +2097,8 @@ def fetch_guangdiu_deals(
     records: List[Dict[str, Any]] = []
     seen_ids: set = set()
     detail_fetched = 0
+    detail_attempted = 0
+    detail_circuit_broken = False
     detail_errors: List[Dict[str, Any]] = []
     skip_set = skip_detail_ids or set()
 
@@ -2117,7 +2156,10 @@ def fetch_guangdiu_deals(
         raw_payload: Any = blk
         has_full_detail = False
 
-        if fetch_detail and detail_fetched < max_details and item_id not in skip_set:
+        if fetch_detail and not detail_circuit_broken and detail_attempted < max_details and item_id not in skip_set:
+            if detail_attempted > 0:
+                time.sleep(0.1)
+            detail_attempted += 1
             try:
                 rd = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
                 rd.encoding = "utf-8"
@@ -2178,6 +2220,8 @@ def fetch_guangdiu_deals(
                                         "platform": detect_platform_signal(f"{go_target} {mall_name}") or "unknown",
                                     })
                         else:
+                            if r_go.status_code in _RATE_LIMIT_STATUSES:
+                                detail_circuit_broken = True
                             detail_errors.append({
                                 "item_id": item_id,
                                 "error_url": go_url,
@@ -2199,11 +2243,14 @@ def fetch_guangdiu_deals(
                     )
                     tutorial_text = f"【{mall_name or '逛丢好价'}】{title}\n{dabs_text}\n{go_urls_str}".strip()
                 else:
+                    if rd.status_code in _RATE_LIMIT_STATUSES:
+                        detail_circuit_broken = True
                     detail_errors.append({
                         "item_id": item_id,
                         "error_url": detail_url,
                         "http_status": rd.status_code,
                         "error_type": f"HTTP_{rd.status_code}",
+                        "error": f"详情页返回非200状态码: {rd.status_code}",
                     })
             except Exception as e:
                 detail_errors.append({

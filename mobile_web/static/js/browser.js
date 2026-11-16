@@ -75,13 +75,30 @@
         }, 220);
       }, 1300);
     };
+    const isSafeWebJumpUrl = rawUrl => {
+      const s = String(rawUrl || '').trim();
+      if (!s) return false;
+      if (s.startsWith('/') && !s.startsWith('//')) return true;
+      return /^https?:\/\//i.test(s);
+    };
+    const isSafeSchemaUrl = rawUrl => {
+      const s = String(rawUrl || '').trim();
+      if (!s || /^(?:javascript|data|vbscript|file|blob):/i.test(s)) return false;
+      return /^[a-z][a-z0-9+.-]*:\/\//i.test(s);
+    };
     const jumpToLink = (linkInfo, fallbackUrl = '', canNavigate = () => true) => {
-      const target = linkInfo.final_link || fallbackUrl;
+      const rawTarget = (linkInfo && linkInfo.final_link) || fallbackUrl;
+      const target = isSafeWebJumpUrl(rawTarget) ? rawTarget : '';
+      const schemaUrl = linkInfo && isSafeSchemaUrl(linkInfo.schema_url) ? linkInfo.schema_url : '';
       global.setTimeout(() => {
         if (!canNavigate()) return;
-        if (linkInfo.schema_url && global.navigator.userAgent.toLowerCase().includes('mobile')) {
-          global.location.href = linkInfo.schema_url;
-          global.setTimeout(() => { if (target && canNavigate()) global.location.href = target; }, 800);
+        if (schemaUrl && global.navigator.userAgent.toLowerCase().includes('mobile')) {
+          global.location.href = schemaUrl;
+          global.setTimeout(() => {
+            if (target && canNavigate() && !(global.document && global.document.hidden)) {
+              global.location.href = target;
+            }
+          }, 800);
         } else if (target) {
           global.location.href = target;
         }

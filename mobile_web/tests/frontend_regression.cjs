@@ -2869,7 +2869,7 @@ test('Chinese IME composition + Enter never wipes or drops Chinese search keywor
   h.page.dispose();
 });
 
-test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux-20261113-1 asset versions', async () => {
+test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux-20261114-2 asset versions', async () => {
   // 1. 多人团互助搜索框：中文组词按回车不抢跑，上屏后按回车精准携带中文关键词
   const hGh = harness({ url: 'https://shop.test/group_help' });
   hGh.load('group_help');
@@ -2923,7 +2923,7 @@ test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux
     const urls = [...html.matchAll(/(?:src|href)="(\/static\/(?:js|css)\/[^"]+)"/g)].map(m => new URL(m[1], 'https://offline.test'));
     for (const u of urls) versions.add(u.searchParams.get('v'));
   }
-  assert.deepEqual([...versions], ['ux-20261113-1']);
+  assert.deepEqual([...versions], ['ux-20261114-2']);
 
   const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
@@ -2934,5 +2934,104 @@ test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux
   assert.ok(indexHtml.includes('@keydown.enter="onSearchKeydownEnter(\'boom\', $event)"'));
   assert.ok(groupHelpHtml.includes('@keydown.enter="onSearchKeydownEnter($event)"'));
 });
+
+test('stability guards: Private Mode storage fallback, HTML 413/502 error handling, safe jump URLs, detail identity retry, and local-only group_help polling', async () => {
+  // 1. session.js: throwing localStorage (iOS Private Mode / WebView quota) falls back to memory cleanly
+  const hPriv = harness();
+  hPriv.context.localStorage = {
+    getItem() { throw new Error('QuotaExceededError'); },
+    setItem() { throw new Error('QuotaExceededError'); },
+    removeItem() { throw new Error('QuotaExceededError'); },
+  };
+  const privSession = hPriv.context.EasyShop.createSessionStore(hPriv.context.localStorage);
+  privSession.saveUser({ ...user('U-PRIV', 'tok-priv'), invite_code: 'INV_999' });
+  assert.equal(privSession.token(), 'tok-priv');
+  assert.equal(privSession.myInviteCode(), 'INV_999');
+  assert.notEqual(privSession.scope(), 'guest');
+  privSession.clear();
+  assert.equal(privSession.token(), '');
+  assert.equal(privSession.scope(), 'guest');
+
+  // 2. api.js: non-JSON gateway response (413/502 HTML) resolves cleanly instead of throwing SyntaxError
+  const hApi = harness();
+  const req413 = hApi.api.post('/api/group_help/upload', { test: 1 });
+  hApi.requests[0].resolve({
+    ok: false,
+    status: 413,
+    json: async () => { throw new SyntaxError('Unexpected token < in JSON'); },
+  });
+  await flush();
+  const res413 = await req413;
+  assert.equal(res413.ok, false);
+  assert.equal(res413.status, 413);
+  assert.ok(res413.data.error_msg.includes('上传内容过大'));
+
+  // 3. browser.js: unsafe javascript:/data: schemes blocked; hidden tab after app wake skips H5 fallback redirect
+  const hJump = harness({ url: 'https://shop.test/detail' });
+  const browser = hJump.context.EasyShop.createBrowserTools({ ref: hJump.context.Vue.ref });
+  browser.jumpToLink({ schema_url: 'javascript:alert(1)', final_link: 'javascript:alert(2)' }, 'data:text/html,hi');
+  const unsafeTimer = [...hJump.timers.values()].find(t => t.delay === 400);
+  if (unsafeTimer) unsafeTimer.callback();
+  assert.equal(hJump.context.location.href, 'https://shop.test/detail');
+
+  hJump.timers.clear();
+  browser.jumpToLink({ schema_url: 'pinduoduo://com.xunmeng.pinduoduo/item', final_link: 'https://mobile.yangkeduo.com/goods.html?goods_id=1' });
+  const launchTimer = [...hJump.timers.values()].find(t => t.delay === 400);
+  assert.ok(launchTimer, '400ms launch timer scheduled');
+  launchTimer.callback();
+  assert.equal(hJump.context.location.href, 'pinduoduo://com.xunmeng.pinduoduo/item');
+  const fallbackTimer = [...hJump.timers.values()].find(t => t.delay === 800);
+  assert.ok(fallbackTimer, '800ms H5 fallback timer scheduled');
+  hJump.context.document.hidden = true;
+  fallbackTimer.callback();
+  assert.equal(hJump.context.location.href, 'pinduoduo://com.xunmeng.pinduoduo/item', 'hidden tab does not redirect away after app wake');
+
+  // 4. detail.js: transient /api/user/info network failure resets identityRestore so subsequent buy click retries and succeeds
+  const hDet = harness({ url: 'https://shop.test/detail?goods_id=G1', saved: { easy_shop_token: 'token-A' } });
+  hDet.load('detail');
+  const initDet = hDet.mounted[0]();
+  hDet.requests[0].reject(new Error('network blip'));
+  await hDet.finish(1, { status: 'success', data: { goods_id: 'G1', platform: 'pdd', product_url: 'https://mobile.yangkeduo.com/goods.html?goods_id=G1' } });
+  await initDet;
+  assert.equal(hDet.page.isLoggedIn.value, false);
+
+  const buyRetry = hDet.page.handleJumpToBuy();
+  await flush();
+  assert.ok(hDet.requests[2].url.includes('/api/user/info'), 'subsequent action retries /api/user/info');
+  await hDet.finish(2, { status: 'success', user: user('A', 'token-A') });
+  await flush();
+  assert.equal(hDet.page.isLoggedIn.value, true);
+  await hDet.finish(3, { status: 'success', final_link: 'https://mobile.yangkeduo.com/goods.html?goods_id=G1' });
+  await buyRetry;
+
+  // 5. group_help.js: global pending_count > 0 does NOT cause idle visitors to poll when hasLocalPending() is false
+  const hIdle = harness({ url: 'https://shop.test/group_help' });
+  const intervals = [];
+  hIdle.context.setInterval = (cb, ms) => { const id = intervals.length + 1; intervals.push({ id, cb, ms, active: true }); return id; };
+  hIdle.context.clearInterval = id => { const item = intervals.find(x => x.id === id); if (item) item.active = false; };
+  hIdle.load('group_help');
+  hIdle.mounted[0]();
+  await flush();
+  await hIdle.finish(0, { status: 'success', data: { items: [], total: 0, has_more: false, pending_count: 5 } });
+  const activePollTimers = intervals.filter(x => x.ms === 3500 && x.active);
+  assert.equal(activePollTimers.length, 0, 'idle visitor without local pending uploads never polls /api/group_help/list every 3.5s');
+
+  // 6. session.js: /api/user/info HTTP 404 (deleted user after DB reset) clears zombie token so /api/promote/convert runs cleanly as guest
+  const hDead = harness({ url: 'https://shop.test/detail?goods_id=G2', saved: { easy_shop_token: 'zombie-token' } });
+  hDead.load('detail');
+  const initDead = hDead.mounted[0]();
+  await hDead.finish(0, { detail: '用户不存在' }, { status: 404 });
+  await hDead.finish(1, { status: 'success', data: { goods_id: 'G2', platform: 'jd', product_url: 'https://jingfen.jd.com/detail/G2.html' } });
+  await initDead;
+  assert.equal(hDead.session.token(), '', '404 user not found purges zombie token from localStorage');
+  const buyClean = hDead.page.handleJumpToBuy();
+  await flush();
+  const convertReq = hDead.requests.find(r => r.url === '/api/promote/convert');
+  assert.ok(convertReq, 'convert request dispatched directly without re-querying /api/user/info');
+  assert.equal(convertReq.options.headers.Authorization, undefined, 'zombie Authorization header is NOT sent');
+  await hDead.finish(hDead.requests.indexOf(convertReq), { status: 'success', final_link: 'https://u.jd.com/clean123' });
+  await buyClean;
+});
+
 
 

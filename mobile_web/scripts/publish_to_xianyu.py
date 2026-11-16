@@ -28,7 +28,6 @@ r"""
 from contextlib import contextmanager
 import json
 import logging
-import msvcrt
 import os
 import random
 import re
@@ -37,6 +36,11 @@ import sys
 import tempfile
 import threading
 import time
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
@@ -229,7 +233,10 @@ def _acquire_serial_browser_lock(
         while True:
             try:
                 lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                if os.name == "nt":
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 file_locked = True
                 break
             except OSError:
@@ -260,7 +267,10 @@ def _acquire_serial_browser_lock(
         if file_locked and lock_file is not None:
             try:
                 lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                if os.name == "nt":
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             except Exception:
                 pass
         if lock_file is not None:

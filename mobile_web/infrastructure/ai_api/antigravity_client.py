@@ -451,24 +451,21 @@ class AntigravityClient:
                 self._concurrency_sem.release()
             return
 
+        effective_timeout = float(slot_acquire_timeout) if slot_acquire_timeout is not None else 120.0
         wait_started = time.perf_counter()
-        if slot_acquire_timeout is not None:
-            acquired = self._concurrency_sem.acquire(timeout=max(0.01, float(slot_acquire_timeout)))
-            if not acquired:
-                raise SlotAcquireTimeoutError(
-                    f"等待 Antigravity 本地并发槽位超过 {float(slot_acquire_timeout):.1f}s，立即切换其他模型"
-                )
-        else:
-            self._concurrency_sem.acquire()
+        if not self._concurrency_sem.acquire(timeout=max(0.01, effective_timeout)):
+            raise SlotAcquireTimeoutError(
+                f"等待 Antigravity 本地并发槽位超过 {effective_timeout:.1f}s，立即切换其他模型"
+            )
 
         locked_fd: Optional[int] = None
         try:
             while locked_fd is None:
                 locked_fd = self._try_acquire_os_slot_fd()
                 if locked_fd is None:
-                    if slot_acquire_timeout is not None and (time.perf_counter() - wait_started) >= float(slot_acquire_timeout):
+                    if (time.perf_counter() - wait_started) >= effective_timeout:
                         raise SlotAcquireTimeoutError(
-                            f"等待 Antigravity 本地文件锁槽位超过 {float(slot_acquire_timeout):.1f}s，立即切换其他模型"
+                            f"等待 Antigravity 本地文件锁槽位超过 {effective_timeout:.1f}s，立即切换其他模型"
                         )
                     time.sleep(random.uniform(0.08, 0.16))
             self._wait_for_stagger_slot()
@@ -747,69 +744,85 @@ class AntigravityClient:
             log_path.parent.mkdir(parents=True, exist_ok=True)
 
         log_file = open(log_path, "w", encoding="utf-8")
+        try:
+            args = [
+                str(DEFAULT_LS_BIN),
+                "--standalone",
+                "--override_ide_name", "antigravity",
+                "--subclient_type", "hub",
+                "--override_ide_version", ide_version,
+                "--override_user_agent_name", "antigravity",
+                "--https_server_port", "0",
+                "--csrf_token", csrf_token,
+                "--app_data_dir", "antigravity",
+                "--api_server_url", "https://generativelanguage.googleapis.com",
+                "--cloud_code_endpoint", "https://daily-cloudcode-pa.googleapis.com",
+            ]
+            if sandbox_dir is not None:
+                args.extend(["--gemini_dir", str(sandbox_dir / ".gemini")])
 
-        args = [
-            str(DEFAULT_LS_BIN),
-            "--standalone",
-            "--override_ide_name", "antigravity",
-            "--subclient_type", "hub",
-            "--override_ide_version", ide_version,
-            "--override_user_agent_name", "antigravity",
-            "--https_server_port", "0",
-            "--csrf_token", csrf_token,
-            "--app_data_dir", "antigravity",
-            "--api_server_url", "https://generativelanguage.googleapis.com",
-            "--cloud_code_endpoint", "https://daily-cloudcode-pa.googleapis.com",
-        ]
-        if sandbox_dir is not None:
-            args.extend(["--gemini_dir", str(sandbox_dir / ".gemini")])
-
-        proc = subprocess.Popen(
-            args,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            env=env,
-            close_fds=True,
-            **self._hidden_subprocess_kwargs(),
-        )
-
-        http_port: Optional[int] = None
-        deadline = time.time() + 18.0
-        while time.time() < deadline:
+            proc = subprocess.Popen(
+                args,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                close_fds=True,
+                **self._hidden_subprocess_kwargs(),
+            )
+        finally:
             try:
-                content = log_path.read_text(encoding="utf-8", errors="ignore")
-                if not http_port:
-                    m = re.search(r"Language server listening on random port at (\d+) for HTTP\b", content)
-                    if m:
-                        http_port = int(m.group(1))
-                if http_port and (
-                    "Auth succeeded" in content
-                    or "initialized server successfully" in content
-                    or "Token refreshed successfully" in content
-                ):
-                    break
+                log_file.close()
             except OSError:
                 pass
-            time.sleep(0.25)
 
-        if not http_port:
-            raise RuntimeError(f"后台静默启动官方 language_server.exe 超时，请检查日志: {log_path}")
+        try:
+            http_port: Optional[int] = None
+            deadline = time.time() + 18.0
+            while time.time() < deadline:
+                if proc.poll() is not None and not http_port:
+                    break
+                try:
+                    content = log_path.read_text(encoding="utf-8", errors="ignore")
+                    if not http_port:
+                        m = re.search(r"Language server listening on random port at (\d+) for HTTP\b", content)
+                        if m:
+                            http_port = int(m.group(1))
+                    if http_port and (
+                        "Auth succeeded" in content
+                        or "initialized server successfully" in content
+                        or "Token refreshed successfully" in content
+                    ):
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.25)
 
-        return self._verify_and_bind_connection(
-            port=http_port,
-            csrf_token=csrf_token,
-            pid=proc.pid,
-            wait_seconds=12.0,
-            sandbox_dir=sandbox_dir,
-        )
+            if not http_port:
+                raise RuntimeError(f"后台静默启动官方 language_server.exe 超时，请检查日志: {log_path}")
+
+            return self._verify_and_bind_connection(
+                port=http_port,
+                csrf_token=csrf_token,
+                pid=proc.pid,
+                wait_seconds=12.0,
+                sandbox_dir=sandbox_dir,
+            )
+        except BaseException:
+            try:
+                proc.kill()
+                proc.wait(timeout=3.0)
+            except Exception:
+                pass
+            raise
 
     @contextlib.contextmanager
-    def _acquire_discovery_file_lock(self):
+    def _acquire_discovery_file_lock(self, timeout_sec: float = 30.0):
         """跨进程服务发现/启动互斥锁：防止多个 Python 进程同时启动时重复拉起多个沙箱 language_server.exe。"""
         GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
         lock_file = GLOBAL_LOCK_DIR / f"ag_discovery_{self._lock_key}.lock"
         fd: Optional[int] = None
+        deadline = time.monotonic() + max(1.0, float(timeout_sec))
         while fd is None:
             candidate_fd: Optional[int] = None
             try:
@@ -829,6 +842,8 @@ class AntigravityClient:
                         os.close(candidate_fd)
                     except OSError:
                         pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"获取 Antigravity 服务发现文件锁超时 ({timeout_sec}s): {lock_file}")
             time.sleep(random.uniform(0.05, 0.15))
         try:
             yield
@@ -932,6 +947,7 @@ class AntigravityClient:
             pacing_lock_file = GLOBAL_LOCK_DIR / f"ag_pacing_{self._lock_key}.lock"
             pacing_state_file = GLOBAL_LOCK_DIR / f"ag_pacing_{self._lock_key}.state"
             fd: Optional[int] = None
+            lock_deadline = time.monotonic() + 15.0
             while fd is None:
                 candidate_fd: Optional[int] = None
                 try:
@@ -951,6 +967,8 @@ class AntigravityClient:
                             os.close(candidate_fd)
                         except OSError:
                             pass
+                if time.monotonic() >= lock_deadline:
+                    break
                 time.sleep(random.uniform(0.03, 0.08))
 
             try:
@@ -971,16 +989,18 @@ class AntigravityClient:
 
                 dispatch_ts = time.time()
                 self._last_dispatch_ts = dispatch_ts
-                try:
-                    pacing_state_file.write_text(f"{dispatch_ts:.6f}", encoding="utf-8")
-                except OSError:
-                    pass
+                if fd is not None:
+                    try:
+                        pacing_state_file.write_text(f"{dispatch_ts:.6f}", encoding="utf-8")
+                    except OSError:
+                        pass
             finally:
-                self._unlock_fd(fd)
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                if fd is not None:
+                    self._unlock_fd(fd)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def _post_rpc(
         self,
@@ -1364,6 +1384,11 @@ class AntigravityPoolClient:
 
         chosen_worker: Optional[AntigravityClient] = None
         claimed_fd: Optional[int] = None
+        effective_slot_timeout = (
+            float(slot_acquire_timeout)
+            if slot_acquire_timeout is not None
+            else max(float(timeout or 120.0), 120.0)
+        )
         wait_started = time.perf_counter()
 
         while chosen_worker is None:
@@ -1380,9 +1405,9 @@ class AntigravityPoolClient:
                     break
 
             if chosen_worker is None:
-                if slot_acquire_timeout is not None and (time.perf_counter() - wait_started) >= float(slot_acquire_timeout):
+                if (time.perf_counter() - wait_started) >= effective_slot_timeout:
                     raise SlotAcquireTimeoutError(
-                        f"等待 Antigravity 本地空闲槽位超过 {float(slot_acquire_timeout):.1f}s，立即切换其他模型"
+                        f"等待 Antigravity 本地空闲槽位超过 {effective_slot_timeout:.1f}s，立即切换其他模型"
                     )
                 time.sleep(random.uniform(0.08, 0.16))
 

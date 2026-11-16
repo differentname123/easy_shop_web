@@ -117,18 +117,18 @@ class UserService:
         return {"status": "success", "user": user_data}
 
     def get_numeric_promotion_context(self, uid: str, platform: str, default_promoter_id) -> Dict[str, Any]:
-        """数字推广身份与渠道备案无关，已分配身份失败时不能变成站长身份。"""
+        """读取或分配推手专属数字推广位ID；若推手账号异常则返回错误，由上层转链服务统一降级站长推广位保底。"""
         plat = normalize_platform(platform)
         try:
             default_id = normalize_promoter_id(default_promoter_id)
             promoter_id = self.repo.ensure_promoter_id(uid, reserved_ids=(default_id,))
         except Exception as exc:
             logger.warning(
-                "❌ 【推广身份分配失败】为用户分配或读取数字推广位ID时发生异常 | 平台[%s] 用户[%s] 异常<%s> 排查方向<请检查MongoDB连接状态、promoter_id唯一索引或默认推广位配置>",
+                "⚠️ 【推广身份读取异常】为用户分配或读取数字推广位ID未成功 | 平台[%s] 用户[%s] 原因<%s>",
                 plat, uid, format_exc_summary(exc),
             )
             return {"status": "error", "error_code": "promoter_identity_unavailable",
-                    "error_msg": "无法确认本人推广身份，请稍后重试；未使用站长推广位代替"}
+                    "error_msg": "无法确认本人推广身份，请稍后重试"}
         return {"status": "success", "uid": uid, "promoter_id": promoter_id}
 
     @staticmethod

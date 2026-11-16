@@ -589,40 +589,26 @@
         myGroups.value.some(it => it.parse_status === 'pending' && it.group_order_id);
 
       const managePendingPoll = () => {
-        const shouldPoll = hasLocalPending() || pendingCount.value > 0;
+        const isHidden = Boolean(global.document && global.document.hidden);
+        const shouldPoll = !isHidden && hasLocalPending();
         if (shouldPoll && !pollTimer) {
           pollTimer = global.setInterval(async () => {
+            if (global.document && global.document.hidden) {
+              global.clearInterval(pollTimer);
+              pollTimer = null;
+              return;
+            }
             if (hasLocalPending()) {
               await refreshMyGroups(false, true);
             }
-            if (filterMode.value !== 'mine' && pendingCount.value > 0) {
-              try {
-                const apiFilter = filterMode.value === 'almost' ? 'almost' : 'active';
-                const params = new URLSearchParams({
-                  keyword: activeKeyword.value,
-                  filter_mode: apiFilter,
-                  offset: '0',
-                  limit: String(Math.max(20, items.value.length)),
-                });
-                const resp = await global.fetch(`/api/group_help/list?${params}`, {
-                  headers: buildAuthHeaders(false),
-                });
-                const json = await resp.json();
-                if (json.status === 'success' && json.data) {
-                  items.value = json.data.items || [];
-                  total.value = Number(json.data.total || 0);
-                  hasMore.value = Boolean(json.data.has_more);
-                  pendingCount.value = Number(json.data.pending_count || 0);
-                  if (json.data.viewer_guard) {
-                    applyViewerGuard(json.data.viewer_guard);
-                  }
-                  syncSelectedGroup();
-                }
-              } catch (_) {}
-            }
-            if (!hasLocalPending() && pendingCount.value <= 0 && pollTimer) {
-              global.clearInterval(pollTimer);
-              pollTimer = null;
+            if (!hasLocalPending()) {
+              if (pollTimer) {
+                global.clearInterval(pollTimer);
+                pollTimer = null;
+              }
+              if (filterMode.value !== 'mine') {
+                fetchGroups(true);
+              }
             }
           }, 3500);
         } else if (!shouldPoll && pollTimer) {
@@ -841,8 +827,11 @@
               headers: buildAuthHeaders(true),
               body: JSON.stringify({ image_base64: uploadDataUrl }),
             });
-            const json = await resp.json();
-            if (resp.ok && json.status === 'success' && json.data) {
+            let json = null;
+            try {
+              json = await resp.json();
+            } catch (_) {}
+            if (resp.ok && json && json.status === 'success' && json.data) {
               const ownerPatch = json.owner_token ? { owner_token: String(json.owner_token) } : {};
               upsertMyGroup(
                 {
@@ -863,7 +852,8 @@
               }
             } else {
               const errMsg =
-                (json && json.error_msg) || '未在图片中识别到有效的拼多多多人团二维码';
+                (json && json.error_msg) ||
+                (resp.status === 413 ? '上传图片过大，请控制在 10MB 以内' : '未在图片中识别到有效的拼多多多人团二维码');
               upsertMyGroup(
                 {
                   ...initialRecord,
@@ -1613,6 +1603,7 @@
         if (global.document && global.document.hidden) {
           clearAppFallbackTimer();
         }
+        managePendingPoll();
       };
 
       const onWindowPageShow = event => {

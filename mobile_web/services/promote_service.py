@@ -357,6 +357,31 @@ class PromoteService:
                 )
         return data
 
+    _NON_FALLBACK_PRODUCT_ERRORS = frozenset({
+        "PRODUCT_OFF_PROMOTION",
+        "UNSUPPORTED_JD_NUMERIC_SKU",
+        "UNSUPPORTED_PDD_ID_ONLY_URL",
+        "MATERIAL_URL_REQUIRED",
+        "INVALID_ARGUMENT",
+        "CONFIG_ERROR",
+        "CAPABILITY_UNAVAILABLE",
+        "PLATFORM_UNAVAILABLE",
+    })
+
+    @staticmethod
+    def _public_promotion_identity(adapter: Any):
+        """解析站长公共保底推广身份；仅当站长自身默认推广位配置缺失/非法时返回错误。"""
+        if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+            try:
+                return {"promoter_id": normalize_promoter_id(getattr(adapter, "default_promoter_id", ""))}, None
+            except ValueError:
+                return {}, {
+                    "status": "error",
+                    "error_code": "invalid_promoter_id",
+                    "error_msg": "平台推广身份尚未正确配置",
+                }
+        return {}, None
+
     def convert_link(
         self,
         platform: str = "pdd",
@@ -374,11 +399,7 @@ class PromoteService:
         if isinstance(capabilities, dict) and capabilities.get("promotion") is False:
             return {"status": "error", "error_code": "capability_unavailable",
                     "error_msg": f"{adapter.platform_name}推广转链尚未配置"}
-        clean_uid = uid.strip() if isinstance(uid, str) else ""
-        if clean_uid and not _UID_PATTERN.fullmatch(clean_uid):
-            if getattr(adapter, "requires_numeric_promoter_id", False) is True:
-                return {"status": "error", "error_code": "invalid_promoter_uid", "error_msg": "无效的登录推广身份"}
-            clean_uid = ""
+        raw_uid = uid.strip() if isinstance(uid, str) else ""
         resolved = adapter.resolve_product_ref(
             goods_id_or_sign, goods_id=kwargs.get("goods_id"), goods_sign=kwargs.get("goods_sign")
         )
@@ -388,37 +409,36 @@ class PromoteService:
             return {"status": "error", "error_msg": "缺少有效商品标识或链接"}
 
         goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign) or "url"
-        user_tag = clean_uid or "匿名"
-        err_resp, effective_uid, identity, context, need_auth, auth_ms = self._resolve_user_promotion_context(
-            plat, adapter, clean_uid, goods_tag=goods_tag, total_started=total_started, log_errors=True
+        user_tag = raw_uid or "匿名"
+        err_resp, effective_uid, identity, public_identity, context, need_auth, personal_fallback, auth_ms = (
+            self._resolve_user_promotion_context(
+                plat, adapter, raw_uid, goods_tag=goods_tag, total_started=total_started, log_errors=True
+            )
         )
         if err_resp is not None:
             return err_resp
 
         trace: Dict[str, Any] = {}
         data = self._get_link_data(ref, product_url, effective_uid, identity, adapter, kwargs, trace=trace)
-        personal_fallback = False
-        if (effective_uid and getattr(adapter, "requires_authorized_promotion", False)
-                and data.get("status") == "error"):
-            code = data.get("error_code")
-            if code == "AUTH_REQUIRED" and data.get("need_auth") is True:
-                # 策略 B: 乐观重试/无损兜底。不在转链失败时物理注销数据库中的授权信息，防止网络抖动误伤推手；仅在本次转链降级为通用链接并提示
-                context = {"authorization_status": "unauthorized"}
-                need_auth = True
-            elif code != "PERSONAL_PROMOTION_UNAVAILABLE":
-                total_ms = (time.perf_counter() - total_started) * 1000
-                logger.warning(
-                    "❌ 【推广转链失败】正在生成个人专属推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[personal] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、PID/RelationId配置或上游联盟转链接口状态>",
-                    plat, goods_tag, user_tag, trace.get("source", "provider"), auth_ms,
-                    trace.get("provider_ms", 0.0), total_ms,
-                    data.get("error_msg") or code or "未知错误",
+        has_personal_mode = bool(
+            getattr(adapter, "requires_authorized_promotion", False)
+            or getattr(adapter, "requires_numeric_promoter_id", False) is True
+        )
+        if effective_uid and has_personal_mode and data.get("status") != "success":
+            code = str(data.get("error_code") or "")
+            if code.upper() not in self._NON_FALLBACK_PRODUCT_ERRORS:
+                if code == "AUTH_REQUIRED" and data.get("need_auth") is True:
+                    # 策略 B: 乐观重试/无损兜底。不在转链失败时物理注销数据库中的授权信息，防止网络抖动误伤推手
+                    context = {"authorization_status": "unauthorized"}
+                    need_auth = True
+                personal_fallback = True
+                fallback_trace: Dict[str, Any] = {}
+                fallback_data = self._get_link_data(
+                    ref, product_url, "", public_identity, adapter, kwargs, trace=fallback_trace
                 )
-                return data
-            personal_fallback = True
-            fallback_trace: Dict[str, Any] = {}
-            data = self._get_link_data(ref, product_url, "", {}, adapter, kwargs, trace=fallback_trace)
-            trace["source"] = fallback_trace.get("source", trace.get("source", "provider"))
-            trace["provider_ms"] = float(trace.get("provider_ms", 0.0)) + float(fallback_trace.get("provider_ms", 0.0))
+                trace["source"] = fallback_trace.get("source", trace.get("source", "provider"))
+                trace["provider_ms"] = float(trace.get("provider_ms", 0.0)) + float(fallback_trace.get("provider_ms", 0.0))
+                data = fallback_data
 
         total_ms = (time.perf_counter() - total_started) * 1000
         source = trace.get("source", "provider")
@@ -434,7 +454,7 @@ class PromoteService:
                         pass
             logger.warning(
                 "❌ 【推广转链失败】正在生成商品推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、物料链接有效性或上游联盟转链网关状态>",
-                plat, goods_tag, user_tag, "personal" if effective_uid else "public",
+                plat, goods_tag, user_tag, "personal" if (effective_uid and not personal_fallback) else "public",
                 source, auth_ms, provider_ms, total_ms,
                 data.get("error_msg") or data.get("error_code") or "未知错误",
             )
@@ -472,68 +492,84 @@ class PromoteService:
         self,
         plat: str,
         adapter: Any,
-        clean_uid: str,
+        raw_uid: str,
         *,
         goods_tag: str = "url",
         total_started: float = 0.0,
         log_errors: bool = False,
     ):
-        """统一解析推手推广位身份（数字 position_id 制或渠道授权备案制）。"""
-        user_tag = clean_uid or "匿名"
-        identity: Dict[str, Any] = {}
+        """统一解析推手推广位身份；当个人身份缺失/失效时统一降级至站长推广位保底（绝不白白丢单）。"""
+        user_tag = raw_uid or "匿名"
+        public_identity, config_err = self._public_promotion_identity(adapter)
+        if config_err is not None:
+            if log_errors:
+                logger.warning(
+                    "❌ 【推广转链失败】平台默认推广位ID格式无效 | 平台[%s] 商品[%s] 用户[%s] 排查方向<请检查配置中默认推广位ID(如JD_DEFAULT_POSITION_ID)是否为纯数字>",
+                    plat, goods_tag, user_tag,
+                )
+            return config_err, "", {}, {}, {}, False, False, 0.0
+
+        if not raw_uid:
+            return None, "", dict(public_identity), dict(public_identity), {}, False, False, 0.0
+
+        if not _UID_PATTERN.fullmatch(raw_uid):
+            return None, "", dict(public_identity), dict(public_identity), {}, False, True, 0.0
+
+        clean_uid = raw_uid
+        identity: Dict[str, Any] = dict(public_identity)
         context: Dict[str, Any] = {}
         effective_uid = clean_uid
         need_auth = False
+        personal_fallback = False
         auth_ms = 0.0
 
         if getattr(adapter, "requires_numeric_promoter_id", False) is True:
             auth_started = time.perf_counter()
-            if clean_uid:
-                context = self._ensure_user_service().get_numeric_promotion_context(
-                    clean_uid, plat, getattr(adapter, "default_promoter_id", "")
-                )
-                auth_ms = (time.perf_counter() - auth_started) * 1000
-                if context.get("status") != "success":
-                    if log_errors:
-                        logger.warning(
-                            "❌ 【推广转链失败】获取推手数字推广位身份时失败 | 平台[%s] 商品[%s] 用户[%s] 耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户账号状态或默认推广位配置>",
-                            plat, goods_tag, user_tag, (time.perf_counter() - total_started) * 1000,
-                            context.get("error_msg") or context.get("error_code") or "推广身份异常",
-                        )
-                    return context, effective_uid, identity, context, need_auth, auth_ms
-                numeric_id = context.get("promoter_id")
+            context = self._ensure_user_service().get_numeric_promotion_context(
+                clean_uid, plat, public_identity["promoter_id"]
+            )
+            auth_ms = (time.perf_counter() - auth_started) * 1000
+            personal_id = ""
+            if context.get("status") == "success":
+                try:
+                    personal_id = normalize_promoter_id(context.get("promoter_id"))
+                except ValueError:
+                    personal_id = ""
+            if personal_id:
+                identity = {"promoter_id": personal_id}
             else:
-                numeric_id = getattr(adapter, "default_promoter_id", "")
-            try:
-                identity = {"promoter_id": normalize_promoter_id(numeric_id)}
-            except ValueError:
                 if log_errors:
                     logger.warning(
-                        "❌ 【推广转链失败】平台数字推广位ID格式无效 | 平台[%s] 商品[%s] 用户[%s] 排查方向<请检查环境变量中默认推广位ID(如JD_DEFAULT_POSITION_ID)是否为纯数字>",
+                        "⚠️ 【推广身份降级保底】获取推手数字推广位未成功，已自动切换站长推广位保底 | 平台[%s] 商品[%s] 用户[%s] 原因<%s>",
                         plat, goods_tag, user_tag,
+                        context.get("error_msg") or context.get("error_code") or "推广位格式无效",
                     )
-                err = {"status": "error", "error_code": "invalid_promoter_id", "error_msg": "平台推广身份尚未正确配置"}
-                return err, effective_uid, identity, context, need_auth, auth_ms
+                effective_uid = ""
+                identity = dict(public_identity)
+                personal_fallback = True
 
-        if clean_uid and getattr(adapter, "requires_authorized_promotion", False):
+        elif getattr(adapter, "requires_authorized_promotion", False):
             auth_started = time.perf_counter()
             context = self._ensure_user_service().get_promotion_context(clean_uid, plat, allow_remote=False)
             auth_ms = (time.perf_counter() - auth_started) * 1000
             if context.get("status") != "success":
                 if log_errors:
                     logger.warning(
-                        "❌ 【推广转链失败】读取推手平台渠道授权状态时失败 | 平台[%s] 商品[%s] 用户[%s] 授权耗时[%.1fms] 失败原因<%s> 排查方向<请检查用户中心数据库或授权状态配置>",
-                        plat, goods_tag, user_tag, auth_ms,
-                        context.get("error_msg") or context.get("error_code") or "授权上下文读取失败",
+                        "⚠️ 【推广身份降级保底】读取推手渠道授权状态未成功，已自动切换站长推广位保底 | 平台[%s] 商品[%s] 用户[%s] 原因<%s>",
+                        plat, goods_tag, user_tag,
+                        context.get("error_msg") or context.get("error_code") or "授权上下文异常",
                     )
-                return context, effective_uid, identity, context, need_auth, auth_ms
-            if context.get("is_authorized") is True:
+                effective_uid = ""
+                identity = dict(public_identity)
+                personal_fallback = True
+            elif context.get("is_authorized") is True:
                 identity = context.get("identity") or {}
             else:
                 effective_uid = ""
+                identity = dict(public_identity)
                 need_auth = True
 
-        return None, effective_uid, identity, context, need_auth, auth_ms
+        return None, effective_uid, identity, dict(public_identity), context, need_auth, personal_fallback, auth_ms
 
     @staticmethod
     def _decorate_auth_fallback(
@@ -546,7 +582,7 @@ class PromoteService:
         personal_fallback: bool,
         hint_location: str = "我的页",
     ) -> None:
-        """统一装配未备案/降级通用链的前端提示元数据。"""
+        """统一装配未备案/降级通用链的前端提示元数据（明确标记不计本人佣金且禁止跨用户缓存）。"""
         if need_auth:
             authorization_status = context.get("authorization_status", "unauthorized")
             if personal_fallback:
@@ -560,6 +596,7 @@ class PromoteService:
             result.update(
                 need_auth=True,
                 is_fallback=True,
+                cacheable=False,
                 attribution_status="anonymous",
                 auth_platform=plat,
                 auth_platform_name=adapter.platform_name,
@@ -567,7 +604,7 @@ class PromoteService:
                 auth_msg=f"{message}；当前为通用链接，无法计入本人推广佣金。",
             )
         elif personal_fallback:
-            result.update(is_fallback=True, attribution_status="anonymous")
+            result.update(is_fallback=True, cacheable=False, attribution_status="anonymous")
 
     @staticmethod
     def detect_platform_from_text(raw_text: str) -> str:
@@ -658,9 +695,8 @@ class PromoteService:
                 "suggested_platform": detected_plat,
             }
 
-        clean_uid = uid.strip() if isinstance(uid, str) else ""
-        if clean_uid and not _UID_PATTERN.fullmatch(clean_uid):
-            clean_uid = ""
+        raw_uid = uid.strip() if isinstance(uid, str) else ""
+        clean_uid = raw_uid if _UID_PATTERN.fullmatch(raw_uid) else ""
 
         # 第一性原理：确定性单平台路由，禁止在某平台转链失败后盲目跨平台回退到其他平台全文检索造成张冠李戴
         candidate_platforms = [detected_plat]
@@ -680,35 +716,45 @@ class PromoteService:
             if not callable(resolve_fn):
                 continue
 
-            err_resp, effective_uid, identity, context, need_auth, _ = self._resolve_user_promotion_context(
-                plat, adapter, clean_uid, total_started=total_started, log_errors=False
+            err_resp, effective_uid, identity, public_identity, context, need_auth, personal_fallback, _ = (
+                self._resolve_user_promotion_context(
+                    plat, adapter, raw_uid, total_started=total_started, log_errors=False
+                )
             )
             if err_resp is not None:
                 return err_resp
 
-            adapter_kwargs: Dict[str, Any] = {}
-            if getattr(adapter, "requires_authorized_promotion", False):
-                adapter_kwargs["identity"] = identity
-            if getattr(adapter, "requires_numeric_promoter_id", False) is True:
-                adapter_kwargs["promoter_id"] = identity["promoter_id"]
+            def _build_adapter_kwargs(ident: Dict[str, Any]) -> Dict[str, Any]:
+                kw: Dict[str, Any] = {}
+                if getattr(adapter, "requires_authorized_promotion", False):
+                    kw["identity"] = ident
+                if getattr(adapter, "requires_numeric_promoter_id", False) is True:
+                    kw["promoter_id"] = ident["promoter_id"]
+                return kw
 
-            data = resolve_fn(text, uid=effective_uid or None, **adapter_kwargs)
-            personal_fallback = False
+            adapter_kwargs = _build_adapter_kwargs(identity)
+            public_kwargs = _build_adapter_kwargs(public_identity)
+            active_uid = effective_uid or None
+
+            data = resolve_fn(text, uid=active_uid, **adapter_kwargs)
+            has_personal_mode = bool(
+                getattr(adapter, "requires_authorized_promotion", False)
+                or getattr(adapter, "requires_numeric_promoter_id", False) is True
+            )
             if (
                 effective_uid
-                and getattr(adapter, "requires_authorized_promotion", False)
-                and isinstance(data, dict)
-                and data.get("status") == "error"
+                and has_personal_mode
+                and (not isinstance(data, dict) or data.get("status") != "success")
             ):
-                code = data.get("error_code")
-                if code == "AUTH_REQUIRED" and data.get("need_auth") is True:
-                    context = {"authorization_status": "unauthorized"}
-                    need_auth = True
+                code = str(data.get("error_code") or "") if isinstance(data, dict) else ""
+                if code.upper() not in self._NON_FALLBACK_PRODUCT_ERRORS:
+                    if code == "AUTH_REQUIRED" and isinstance(data, dict) and data.get("need_auth") is True:
+                        context = {"authorization_status": "unauthorized"}
+                        need_auth = True
                     personal_fallback = True
-                elif code == "PERSONAL_PROMOTION_UNAVAILABLE":
-                    personal_fallback = True
-                if personal_fallback:
-                    data = resolve_fn(text, uid=None, identity={})
+                    active_uid = None
+                    adapter_kwargs = public_kwargs
+                    data = resolve_fn(text, uid=None, **public_kwargs)
 
             if not isinstance(data, dict) or data.get("status") != "success":
                 last_error = dict(data) if isinstance(data, dict) else dict(last_error)
@@ -734,7 +780,7 @@ class PromoteService:
                 ):
                     upgraded = adapter.convert_promotion_url(
                         goods_id_or_sign=product.get("goods_sign") or product.get("goods_id") or "",
-                        uid=effective_uid or None,
+                        uid=active_uid,
                         goods_id=product.get("goods_id") or None,
                         goods_sign=product.get("goods_sign") or None,
                         trusted_product_url=product["product_url"],

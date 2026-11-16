@@ -543,8 +543,17 @@ class ProductService:
                 return _LoadedDetail(cached[1], snapshot)
             if stop_event is not None and stop_event.is_set():
                 return _LoadedDetail({"status": "error", "error_code": "cancelled"})
-            result = adapter.get_goods_detail(goods_id_or_sign=ref.key, goods_id=ref.goods_id or None,
-                                              goods_sign=ref.goods_sign or None, uid=uid, **kwargs)
+            if (
+                stop_event is None
+                and getattr(adapter, "platform_code", None) == "jd"
+                and hasattr(type(adapter), "enrich_detail_resilient")
+            ):
+                result = adapter.enrich_detail_resilient(
+                    ref.key, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None
+                )
+            else:
+                result = adapter.get_goods_detail(goods_id_or_sign=ref.key, goods_id=ref.goods_id or None,
+                                                  goods_sign=ref.goods_sign or None, uid=uid, **kwargs)
             if result.get("status") != "success" or not result.get("data"):
                 code = str(result.get("error_code") or "").upper()
                 return _LoadedDetail(result, retryable=code in {"NETWORK_ERROR", "TIMEOUT", "RATE_LIMIT", "SERVICE_UNAVAILABLE"})
@@ -589,7 +598,8 @@ class ProductService:
         if loaded.public.get("status") != "success":
             goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign)
             reason = loaded.public.get("error_msg") or loaded.public.get("error_code") or "未知错误"
-            if str(loaded.public.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION":
+            err_code = str(loaded.public.get("error_code") or "").upper()
+            if err_code == "PRODUCT_OFF_PROMOTION":
                 self.evict_off_promotion_product(ref)
                 logger.warning(
                     "❌ 【商品已下架/取消推广】上游确认商品已停止推广，已自动从缓存与本地库清理 | 平台[%s] 商品[%s] 原因<%s>",
@@ -597,10 +607,16 @@ class ProductService:
                 )
                 return loaded.public
             if item:
-                logger.warning(
-                    "❌ 【商品详情降级】实时拉取上游商品详情失败，已降级返回本地历史缓存 | 平台[%s] 商品[%s] 上游原因<%s> 排查方向<请检查上游详情接口状态或商品是否已下架>",
-                    plat, goods_tag, reason,
-                )
+                if err_code == "RATE_LIMIT":
+                    logger.info(
+                        "【商品详情缓存兜底】上游详情接口触发瞬时频控，已无缝返回本地缓存 | 平台[%s] 商品[%s]",
+                        plat, goods_tag,
+                    )
+                else:
+                    logger.warning(
+                        "⚠️ 【商品详情降级】实时拉取上游商品详情未成功，已降级返回本地历史缓存 | 平台[%s] 商品[%s] 上游原因<%s>",
+                        plat, goods_tag, reason,
+                    )
                 return self._database_detail(item, "database_fallback")
             logger.warning(
                 "❌ 【商品详情失败】拉取商品详情失败且本地无可用缓存 | 平台[%s] 商品[%s] 失败原因<%s> 排查方向<请检查商品ID/Sign是否有效、商品是否已下架或上游接口状态>",

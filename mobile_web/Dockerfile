@@ -23,6 +23,9 @@ COPY --chown=mobileweb:mobileweb repositories/ ./repositories/
 COPY --chown=mobileweb:mobileweb services/ ./services/
 COPY --chown=mobileweb:mobileweb scripts/ ./scripts/
 COPY --chown=mobileweb:mobileweb static/ ./static/
+COPY --chown=mobileweb:mobileweb prompt/ ./prompt/
+RUN mkdir -p /opt/mobile_web/runtime/group_posters /opt/mobile_web/logs/runtime \
+    && chown -R mobileweb:mobileweb /opt/mobile_web/runtime /opt/mobile_web/logs
 USER mobileweb:mobileweb
 
 # Optional test image: docker build --target test -t mobile-web:test .

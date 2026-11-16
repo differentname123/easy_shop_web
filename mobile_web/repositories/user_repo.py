@@ -59,17 +59,24 @@ class UserRepository(BaseRepository):
 
     def _ensure_identity_index(self, path: str) -> None:
         col = self.col
-        cache_key = (id(col), path)
-        if cache_key in self._ensured_identity_indexes:
+        ensured = getattr(self._db, "_ensured_identity_indexes", None)
+        if not isinstance(ensured, set):
+            ensured = set()
+            try:
+                self._db._ensured_identity_indexes = ensured
+            except Exception:
+                ensured = self._ensured_identity_indexes
+        cache_key = (self.COLLECTION_NAME, path)
+        if cache_key in ensured:
             return
         with self._promoter_index_lock:
-            if cache_key not in self._ensured_identity_indexes:
+            if cache_key not in ensured:
                 col.create_index(
                     [(path, 1)],
                     unique=True,
                     partialFilterExpression={path: {"$type": "string"}},
                 )
-                self._ensured_identity_indexes.add(cache_key)
+                ensured.add(cache_key)
 
     @staticmethod
     def _unassigned_promoter(uid):
@@ -225,7 +232,23 @@ class UserRepository(BaseRepository):
             "meta": {}
         }
 
-        self.col.insert_one(user_doc)
+        try:
+            self.col.insert_one(user_doc)
+        except DuplicateKeyError:
+            raced = self.get_user_by_phone(phone)
+            if raced:
+                if not verify_password(password, raced.get("password_hash")):
+                    raise ValueError("手机号已注册，输入的密码不正确")
+                self.col.update_one({"phone": phone}, {"$set": {"last_login_at": now, "last_active_at": now}})
+                raced["last_login_at"] = now
+                raced["last_active_at"] = now
+                raced.pop("password_hash", None)
+                return raced
+            user_doc.pop("_id", None)
+            user_doc["uid"] = self.generate_uid()
+            user_doc["invite_code"] = self.generate_unique_invite_code()
+            self.col.insert_one(user_doc)
+
         user_doc.pop("_id", None)
         user_doc.pop("password_hash", None)
         user_doc["_is_new_user"] = True

@@ -142,7 +142,7 @@ def create_app() -> FastAPI:
         version="2.0.0",
         lifespan=lifespan,
     )
-    application.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    application.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                                allow_methods=["*"], allow_headers=["*"])
     application.add_middleware(GZipMiddleware, minimum_size=500)
 
