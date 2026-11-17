@@ -11,6 +11,7 @@ from itertools import islice
 from typing import Optional
 
 from adapters import get_adapter, get_all_platforms
+from cache import is_product_off_promotion
 from config import logger
 from infrastructure.logging_utils import format_exc_summary
 from models.product import DetailSnapshot, ProductRef
@@ -20,6 +21,7 @@ WORKER_COUNT = 1
 QUEUE_CAPACITY = 128
 PAGE_LIMIT = 20
 DEFAULT_INTERVAL_SECONDS = 300
+DEFAULT_MAX_RANK_LIMIT = 400
 MAX_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.25
 FAILURE_COOLDOWN_SECONDS = 60
@@ -78,10 +80,13 @@ class DetailPrefetcher:
     def __init__(self, service, *, seed_enabled=False,
                  interval_seconds=DEFAULT_INTERVAL_SECONDS, queue_capacity=QUEUE_CAPACITY,
                  clock=None, wall_clock=None, retry_backoff_seconds=RETRY_BACKOFF_SECONDS,
-                 platform_provider=None, adapter_provider=None):
+                 platform_provider=None, adapter_provider=None,
+                 deep_seed_enabled=True, max_rank_limit=DEFAULT_MAX_RANK_LIMIT):
         self.service = service
         self.seed_enabled = seed_enabled
         self.interval_seconds = interval_seconds
+        self.deep_seed_enabled = deep_seed_enabled
+        self.max_rank_limit = max_rank_limit
         self._capacity = queue_capacity
         self._clock = clock or time.monotonic
         self._wall_clock = wall_clock or time.time
@@ -242,8 +247,10 @@ class DetailPrefetcher:
                 continue
             if self._stop_event.is_set():
                 return
+            adapter = None
             try:
-                channels = self._adapter(platform["code"]).channels[:2]
+                adapter = self._adapter(platform["code"])
+                channels = adapter.channels[:2]
             except Exception as exc:
                 logger.warning(
                     "❌ 【详情预取告警】获取平台预取频道配置失败，已跳过该平台本轮预取 | 平台[%s] 异常<%s> 排查方向<请检查平台适配器注册或配置状态>",
@@ -253,17 +260,78 @@ class DetailPrefetcher:
             for channel in channels:
                 if self._stop_event.is_set():
                     return
+                ch_type = channel.get("channel_type")
+                first_res = None
                 try:
                     # 不 force 缓存、不翻页、不携带用户作用域；service 自己交付候选和 ready 快照。
-                    self.service.get_home_recommendations(
-                        platform=platform["code"], channel_type=channel["channel_type"],
+                    first_res = self.service.get_home_recommendations(
+                        platform=platform["code"], channel_type=ch_type,
                         offset=0, limit=PAGE_LIMIT, uid=None, cursor=None,
                     )
                 except Exception as exc:
                     logger.warning(
                         "❌ 【详情预取告警】执行平台首屏推荐预取时发生异常，下轮将自动重试 | 平台[%s] 频道[%s] 异常<%s>",
-                        platform["code"], channel.get("channel_type"), format_exc_summary(exc),
+                        platform["code"], ch_type, format_exc_summary(exc),
                     )
+                    continue
+
+                if not self.deep_seed_enabled or adapter is None:
+                    continue
+                get_recommend = getattr(adapter, "get_recommend_goods", None)
+                if not callable(get_recommend) or not isinstance(first_res, dict) or first_res.get("status") != "success":
+                    continue
+
+                has_more = bool(first_res.get("has_more"))
+                next_offset = first_res.get("next_offset") or PAGE_LIMIT
+                cursor = first_res.get("next_cursor")
+                max_limit = getattr(adapter, "recommendation_limit", None) or self.max_rank_limit
+
+                # 后续页：仅拉取榜单商品摘要并直接入库，绝不投递单品详情预取任务，保障外部接口配额与队列安全
+                while has_more and next_offset < max_limit:
+                    if self._stop_event.is_set():
+                        return
+                    paging = {"cursor": cursor} if cursor else {}
+                    try:
+                        page_res = get_recommend(
+                            channel_type=ch_type, offset=next_offset, limit=PAGE_LIMIT,
+                            uid=None, detail_sink=None, **paging,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "❌ 【榜单摘要续拉异常】平台[%s] 频道[%s] 偏移[%s] 拉取摘要失败 | 异常<%s>",
+                            platform["code"], ch_type, next_offset, format_exc_summary(exc),
+                        )
+                        break
+
+                    if not isinstance(page_res, dict) or page_res.get("status") != "success":
+                        break
+                    raw_items = page_res.get("data") or []
+                    if not isinstance(raw_items, list) or not raw_items:
+                        break
+
+                    valid_items = [
+                        it for it in raw_items
+                        if isinstance(it, dict) and not is_product_off_promotion(
+                            platform["code"], it.get("goods_id"), it.get("goods_sign")
+                        )
+                    ]
+                    if valid_items:
+                        try:
+                            self.service.repo.upsert_home_products(valid_items, channel_type=ch_type)
+                        except Exception as exc:
+                            logger.warning(
+                                "❌ 【榜单摘要入库异常】平台[%s] 频道[%s] 批量入库失败 | 数量[%d] 异常<%s>",
+                                platform["code"], ch_type, len(valid_items), format_exc_summary(exc),
+                            )
+
+                    has_more = bool(page_res.get("has_more"))
+                    new_offset = page_res.get("next_offset")
+                    if not isinstance(new_offset, int) or new_offset <= next_offset:
+                        new_offset = next_offset + len(raw_items)
+                    if new_offset <= next_offset:
+                        break
+                    next_offset = new_offset
+                    cursor = page_res.get("next_cursor")
 
     def _execute_detail(self, task):
         snapshot = task.snapshot

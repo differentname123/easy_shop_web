@@ -570,3 +570,103 @@ def test_passive_mode_does_not_touch_platforms_and_still_handles_real_candidates
         assert service.calls[0][1]["refresh_ahead_seconds"] == 330
     finally:
         worker.stop()
+
+
+def test_seed_pulls_full_rank_summaries_without_fetching_extra_details():
+    """验证榜单续页仅批量入库摘要，首屏详情预热正常，后续页绝不增加详情 API 调用。"""
+    written_batches = []
+    detail_calls = []
+
+    class MockAdapter:
+        platform_code = "pdd"
+        channels = ({"channel_type": 5, "name": "实时榜"},)
+        recommendation_limit = 400
+
+        def __init__(self):
+            self.recommend_calls = []
+
+        def warmup(self):
+            pass
+
+        def get_recommend_goods(self, channel_type=5, offset=0, limit=20, uid=None, detail_sink=None, **kwargs):
+            self.recommend_calls.append({
+                "channel_type": channel_type, "offset": offset, "limit": limit,
+                "detail_sink": detail_sink, "kwargs": kwargs,
+            })
+            if offset == 0:
+                return {
+                    "status": "success",
+                    "data": [{"platform": "pdd", "goods_id": f"page1_item_{i}", "goods_sign": f"s1_{i}", "name": f"首屏品{i}"} for i in range(20)],
+                    "has_more": True,
+                    "next_offset": 20,
+                    "next_cursor": "cursor_page2",
+                }
+            elif offset == 20:
+                return {
+                    "status": "success",
+                    "data": [{"platform": "pdd", "goods_id": f"page2_item_{i}", "goods_sign": f"s2_{i}", "name": f"续页品{i}"} for i in range(20)],
+                    "has_more": False,
+                    "next_offset": 40,
+                    "next_cursor": None,
+                }
+            return {"status": "success", "data": [], "has_more": False}
+
+    adapter = MockAdapter()
+
+    class MockService:
+        def __init__(self):
+            self.prefetcher = None
+            self.repo = SimpleNamespace(
+                upsert_home_products=lambda items, channel_type: written_batches.append((channel_type, [it["goods_id"] for it in items]))
+            )
+
+        def get_home_recommendations(self, platform="pdd", channel_type=5, offset=0, limit=20, uid=None, cursor=None):
+            # 模拟首屏行为：调用 adapter 并将首屏交付给 prefetcher
+            res = adapter.get_recommend_goods(channel_type=channel_type, offset=offset, limit=limit, uid=uid)
+            items = res.get("data") or []
+            if self.prefetcher:
+                self.prefetcher.offer_products(items, channel_type=channel_type)
+            return res
+
+        def prefetch_product_detail(self, ref, **kwargs):
+            detail_calls.append(ref.goods_id)
+            return DetailPrefetchResult("ready", next_check_at=2000)
+
+    service = MockService()
+    descriptors = [{"code": "pdd", "active": True, "capabilities": {"recommend": True, "detail": True}}]
+    worker = DetailPrefetcher(
+        service, seed_enabled=False,
+        platform_provider=lambda: descriptors,
+        adapter_provider=lambda code: adapter,
+        deep_seed_enabled=True,
+    )
+    service.prefetcher = worker
+    worker.start()
+
+    try:
+        # 手动触发一次 seed
+        worker._seed()
+        idle(worker)
+
+        # 1. 验证适配器被调用的参数
+        assert len(adapter.recommend_calls) == 2
+        # 首屏由 get_home_recommendations 触发
+        assert adapter.recommend_calls[0]["offset"] == 0
+        # 续页由 _seed 后续页循环触发，且 detail_sink 必须为 None
+        assert adapter.recommend_calls[1]["offset"] == 20
+        assert adapter.recommend_calls[1]["detail_sink"] is None
+        assert adapter.recommend_calls[1]["kwargs"].get("cursor") == "cursor_page2"
+
+        # 2. 验证两页商品均成功批量写入 MongoDB
+        written_gids = [gid for _, gids in written_batches for gid in gids]
+        assert len(written_gids) == 40
+        assert "page1_item_0" in written_gids
+        assert "page2_item_19" in written_gids
+
+        # 3. 核心约束验证：只有首屏商品（page1）被调用了单品详情预取，续页商品（page2）绝对不增加详情请求！
+        assert len(detail_calls) == 20
+        assert all(gid.startswith("page1_item_") for gid in detail_calls)
+        assert not any(gid.startswith("page2_item_") for gid in detail_calls)
+    finally:
+        worker.stop()
+
