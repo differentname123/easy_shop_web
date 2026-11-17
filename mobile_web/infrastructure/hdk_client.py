@@ -182,7 +182,7 @@ class HdkClient:
                 return _error("AUTH_REQUIRED", msg or "好单库尚未绑定京东推客账号", sub_msg=payload.get("sub_msg"))
             if "下架" in msg or "不在推广" in msg:
                 return _error("PRODUCT_OFF_PROMOTION", msg or "该商品不在推广中或已下架")
-            return _error("UPSTREAM_ERROR", msg or f"好单库返回错误码 {code}", code=code, sub_msg=payload.get("sub_msg"))
+            return _error("UPSTREAM_ERROR", msg or f"好单库返回错误码 {code}", upstream_code=code, sub_msg=payload.get("sub_msg"))
 
         if self.appkey_list:
             res = execute_with_key_failover(self, _do_single_request, round_robin=True)

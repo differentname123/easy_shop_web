@@ -84,7 +84,7 @@ from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import zip_longest
 from logging.handlers import RotatingFileHandler
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -153,6 +153,16 @@ MAX_JSONL_FILE_BYTES = 10 * 1024 * 1024
 DEFAULT_CLEAN_WINDOW = 200
 DEFAULT_CLEAN_INTERVAL_SECONDS = 60
 DEFAULT_AI_TIMEOUT_SECONDS = 90.0
+
+# 阶段化独立流水线常量 (Stage Pipeline Constants)
+CLEAN_STAGE_NEED_AI1 = "need_ai1"
+CLEAN_STAGE_NEED_CONVERT = "need_convert"
+CLEAN_STAGE_NEED_AI2 = "need_ai2"
+CLEAN_STAGE_DONE = "done"
+
+DEFAULT_STAGE_POLL_INTERVAL_SECONDS = 3
+DEFAULT_STAGE_LEASE_SECONDS_AI = 300
+DEFAULT_STAGE_LEASE_SECONDS_CONVERT = 180
 
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -772,6 +782,14 @@ class DealRawPoolRepository:
             col.create_index([("platform", 1), ("quality_signals.quality_tier", 1)], background=True)
             col.create_index([("candidate_goods_id", 1)], background=True)
             col.create_index(
+                [("clean_status", 1), ("clean_stage", 1), ("stage_lease_until_ts", 1), ("publish_ts", -1)],
+                background=True,
+            )
+            col.create_index(
+                [("stage_lease_until_ts", 1), ("stage_lease_owner", 1)],
+                background=True,
+            )
+            col.create_index(
                 [("first_seen_at", 1)],
                 expireAfterSeconds=int(DEAL_RAW_TTL_DAYS * 86400),
                 name="idx_deal_raw_tips_ttl_14d",
@@ -831,6 +849,7 @@ class DealRawPoolRepository:
         reset_payload = {
             "$set": {
                 "clean_status": "pending",
+                "clean_stage": CLEAN_STAGE_NEED_AI1,
                 "ai_clean_status": "pending",
                 "clean_retry_count": 0,
                 "clean_error_code": "",
@@ -840,8 +859,11 @@ class DealRawPoolRepository:
             "$unset": {
                 "ai_stage1_result": "",
                 "converted_links": "",
+                "stage3_converted_links": "",
                 "ai_stage2_result": "",
                 "next_retry_after_ts": "",
+                "stage_lease_owner": "",
+                "stage_lease_until_ts": "",
             },
         }
         jd_recovered = 0
@@ -1013,6 +1035,7 @@ class DealRawPoolRepository:
                 "source_item_id": item_id,
                 "first_seen_at": now,
                 "clean_status": initial_status,
+                "clean_stage": CLEAN_STAGE_NEED_AI1 if initial_status == "pending" else CLEAN_STAGE_DONE,
                 "ai_clean_status": initial_status,
                 "clean_retry_count": 0,
             }
@@ -1113,6 +1136,178 @@ class DealRawPoolRepository:
         except Exception as ex:
             logger.error("写入本地 JSONL 备份失败: %s", ex)
 
+    def migrate_pending_to_stage_machine(self) -> Dict[str, int]:
+        """
+        全量幂等迁移历史数据至阶段状态机：
+        - `clean_status == 'pending'` 且缺失 `clean_stage` 的历史数据补充 `clean_stage='need_ai1'`；
+        - 非 `pending` 状态的记录统一补充 `clean_stage='done'`；
+        - 清理遗留无效租约字段。
+        """
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        res_pending = self.col.update_many(
+            {"clean_status": "pending", "clean_stage": {"$exists": False}},
+            {"$set": {"clean_stage": CLEAN_STAGE_NEED_AI1}},
+        )
+        res_done = self.col.update_many(
+            {"clean_status": {"$ne": "pending"}, "clean_stage": {"$exists": False}},
+            {"$set": {"clean_stage": CLEAN_STAGE_DONE}},
+        )
+        res_leases = self.col.update_many(
+            {"clean_status": {"$ne": "pending"}, "stage_lease_owner": {"$exists": True}},
+            {"$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""}},
+        )
+        migrated_pending = int(getattr(res_pending, "modified_count", 0) or 0)
+        migrated_done = int(getattr(res_done, "modified_count", 0) or 0)
+        cleared_leases = int(getattr(res_leases, "modified_count", 0) or 0)
+        if migrated_pending > 0 or migrated_done > 0:
+            logger.info(
+                "🚀 [状态机版本迁移] 幂等补齐阶段标记: pending->need_ai1=%d条, non-pending->done=%d条, 清理租约=%d条",
+                migrated_pending,
+                migrated_done,
+                cleared_leases,
+            )
+        return {
+            "migrated_pending": migrated_pending,
+            "migrated_done": migrated_done,
+            "cleared_leases": cleared_leases,
+        }
+
+    def _select_fair_candidate_ids(
+        self,
+        base_query: Dict[str, Any],
+        limit: int,
+    ) -> List[Any]:
+        """按站点倒序各取候选记录，公平轮询抽取最多 `limit` 个待认领 _id。"""
+        if limit <= 0:
+            return []
+        sites = [
+            str(s or "").strip()
+            for s in self.col.distinct("source_site", base_query)
+            if str(s or "").strip()
+        ]
+        sorted_sites = sorted(set(sites))
+        if not sorted_sites:
+            cursor = (
+                self.col.find(base_query, {"_id": 1})
+                .sort([("publish_ts", -1), ("last_seen_at", -1)])
+                .limit(limit)
+            )
+            return [doc["_id"] for doc in cursor]
+
+        per_site_candidates: Dict[str, List[Any]] = {}
+        for s_site in sorted_sites:
+            q = {"$and": [{"source_site": s_site}, base_query]}
+            docs = list(
+                self.col.find(q, {"_id": 1, "clean_retry_count": 1})
+                .sort([("publish_ts", -1), ("last_seen_at", -1)])
+                .limit(limit)
+            )
+            docs.sort(key=lambda d: int(d.get("clean_retry_count") or 0))
+            per_site_candidates[s_site] = [d["_id"] for d in docs]
+
+        chosen_ids: List[Any] = []
+        chosen_set = set()
+        queues = [per_site_candidates[s] for s in sorted_sites if per_site_candidates.get(s)]
+        for group in zip_longest(*queues):
+            for doc_id in group:
+                if doc_id is not None and doc_id not in chosen_set:
+                    chosen_set.add(doc_id)
+                    chosen_ids.append(doc_id)
+                    if len(chosen_ids) >= limit:
+                        return chosen_ids
+        return chosen_ids
+
+    def claim_stage_docs(
+        self,
+        stage: str,
+        limit: int,
+        lease_seconds: int = 300,
+        worker_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        原子认领指定阶段的待处理记录（租约认领机制）：
+        1. 过滤保鲜期内、非重试冷却中且当前无活跃租约的候选记录；
+        2. 来源站点公平抽样出候选 ID 列表；
+        3. 原子 update_many 加上本 Worker 的 lease_owner 与 lease_until_ts；
+        4. 查询并返回真正认领成功的完整文档列表（排除 raw_payload）。
+        """
+        if limit <= 0:
+            return []
+        now_ts = time.time()
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        cutoff_ts = now_ts - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
+        cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
+
+        base_query: Dict[str, Any] = {
+            "clean_status": "pending",
+            "clean_stage": stage,
+            "$nor": [
+                {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
+                {"first_seen_at": {"$lt": cutoff_dt}},
+                {"next_retry_after_ts": {"$gt": round(now_ts, 1)}},
+            ],
+            "$or": [
+                {"stage_lease_until_ts": {"$exists": False}},
+                {"stage_lease_until_ts": {"$lt": round(now_ts, 1)}},
+            ],
+        }
+
+        cand_ids = self._select_fair_candidate_ids(base_query, limit)
+        if not cand_ids:
+            return []
+
+        w_tag = str(worker_id or "w")
+        claim_token = f"{w_tag}_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+        lease_until = round(now_ts + max(10, lease_seconds), 1)
+
+        claim_filter = {
+            "_id": {"$in": cand_ids},
+            "clean_status": "pending",
+            "clean_stage": stage,
+            "$or": [
+                {"stage_lease_until_ts": {"$exists": False}},
+                {"stage_lease_until_ts": {"$lt": round(now_ts, 1)}},
+            ],
+        }
+
+        try:
+            upd_res = self.col.update_many(
+                claim_filter,
+                {
+                    "$set": {
+                        "stage_lease_owner": claim_token,
+                        "stage_lease_until_ts": lease_until,
+                    }
+                },
+            )
+            claimed_cnt = int(getattr(upd_res, "modified_count", 0) or 0)
+            if claimed_cnt <= 0:
+                return []
+            claimed_docs = list(
+                self.col.find({"stage_lease_owner": claim_token}, {"raw_payload": 0})
+            )
+            return claimed_docs
+        except Exception as e:
+            logger.warning("认领阶段 [%s] 任务发生异常: %s", stage, e)
+            return []
+
+    def reclaim_expired_leases(self, now_ts: Optional[float] = None) -> int:
+        """显式清扫已过期的租约，将 stage_lease_owner 与 stage_lease_until_ts 移除。"""
+        if now_ts is None:
+            now_ts = time.time()
+        try:
+            res = self.col.update_many(
+                {
+                    "clean_status": "pending",
+                    "stage_lease_until_ts": {"$exists": True, "$lt": round(now_ts, 1)},
+                },
+                {"$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""}},
+            )
+            return int(getattr(res, "modified_count", 0) or 0)
+        except Exception as e:
+            logger.warning("清扫过期租约异常: %s", e)
+            return 0
+
     def generate_pool_summary(self) -> Dict[str, Any]:
         """生成初步表 `deal_raw_tips` + 正式表 `products` 线报商品的全局统计分析报告。"""
         col = self.col
@@ -1175,8 +1370,15 @@ class DealRawPoolRepository:
             ])
         )
 
+        pending_by_stage = {
+            CLEAN_STAGE_NEED_AI1: col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI1}),
+            CLEAN_STAGE_NEED_CONVERT: col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_CONVERT}),
+            CLEAN_STAGE_NEED_AI2: col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI2}),
+        }
+
         return {
             "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pending_by_stage": pending_by_stage,
             "raw_collection": self.collection_name,
             "formal_collection": self.formal_collection_name,
             "total_records": total_docs,
@@ -3073,12 +3275,13 @@ class DealPoolCleaner:
         kept_lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
         return "\n".join(kept_lines).strip()
 
-    @staticmethod
-    def _load_active_formal_products(formal_col) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        """
-        从正式表 `products` 查询 12 小时保鲜期内已清洗入库的所有好价商品唯一标识 `(platform, product_id)`，
-        用于双层提前终止（Early Termination）：凡是唯一标识已在正式库清洗过的商品，无需重复调用 AI-2 终审！
-        """
+    @classmethod
+    def _lookup_active_formal_products(
+        cls,
+        formal_col,
+        pid_keys: Optional[Iterable[Tuple[str, str]]] = None,
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """按指定的 (platform, product_id) 精确查询 12h 内活跃已清洗商品；若 pid_keys 为 None 则全量查询。"""
         active_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         if formal_col is None:
             return active_map
@@ -3086,11 +3289,22 @@ class DealPoolCleaner:
             cutoff = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(
                 hours=DEAL_INFO_PROTECTION_HOURS
             )
+            base_q: Dict[str, Any] = {
+                "deal_info.is_deal_tip": True,
+                "deal_info.updated_at": {"$gte": cutoff},
+            }
+            if pid_keys is not None:
+                keys_list = [(str(p or "").strip(), str(i or "").strip()) for p, i in pid_keys if p and i]
+                if not keys_list:
+                    return active_map
+                if len(keys_list) == 1:
+                    base_q["platform"] = keys_list[0][0]
+                    base_q["product_id"] = keys_list[0][1]
+                else:
+                    base_q["$or"] = [{"platform": p, "product_id": pid} for p, pid in keys_list]
+
             cursor = formal_col.find(
-                {
-                    "deal_info.is_deal_tip": True,
-                    "deal_info.updated_at": {"$gte": cutoff},
-                },
+                base_q,
                 {
                     "_id": 0,
                     "platform": 1,
@@ -3120,7 +3334,36 @@ class DealPoolCleaner:
             logger.warning("查询正式表已清洗活跃商品集合异常: %s", e)
         return active_map
 
-    def clean_batch_records(
+    @classmethod
+    def _load_active_formal_products(cls, formal_col) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """全量查询 12h 内活跃商品（兼容老调用）。"""
+        return cls._lookup_active_formal_products(formal_col, pid_keys=None)
+
+    @staticmethod
+    def _load_neighbor_docs(
+        raw_col, site: str, merged_tip_ids: List[str], current_doc: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """根据 merged_tip_ids 组装对应的完整文档映射，供文案去链清洗使用。"""
+        tip_map: Dict[str, Dict[str, Any]] = {}
+        if current_doc:
+            mid = str(current_doc.get("source_item_id") or "")
+            if mid:
+                tip_map[mid] = current_doc
+        needed = [tid for tid in merged_tip_ids if tid and tid not in tip_map]
+        if needed and raw_col is not None:
+            try:
+                for nd in raw_col.find(
+                    {"source_site": site, "source_item_id": {"$in": needed}},
+                    {"raw_payload": 0},
+                ):
+                    ntid = str(nd.get("source_item_id") or "").strip()
+                    if ntid:
+                        tip_map[ntid] = nd
+            except Exception as e:
+                logger.warning("补查邻居消息文档异常 (%s: %s): %s", site, needed, e)
+        return tip_map
+
+    def process_ai1_unit(
         self,
         selected_docs: List[Dict[str, Any]],
         raw_col,
@@ -3129,16 +3372,20 @@ class DealPoolCleaner:
         shared_active_products: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
         shared_lock: Optional[threading.Lock] = None,
         quiet_sub_logs: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Dict[str, Dict[str, Any]]]]:
         """
-        对一批 `pending` 记录完整执行：
-        - Tier 1 前置缓存提前终止 -> Stage 2 (AI-1 批量并发拆解) -> Stage 3 (官方 API 多线程并发转链) ->
-        - Tier 2 唯一商品标识 (`platform`, `goods_id`) 提前终止 -> Stage 4 (AI-2 批量并发终审与评分)。
+        阶段一/AI-1拆解单元（Stage 2 AI-1）：
+        - Tier 1 缓存早停；
+        - 复用已成功 AI-1 结果或调用 run_ai_stage1_batch；
+        - 邻居碎片吸收判定 (merged_into_parent)；
+        - AI-1 超时重试 (retry_pending) 或 无锚点拦截 (failed)；
+        - 胜出有效记录输出 stage_outcome='advance_to_convert'。
+        返回: (outcomes, elapsed_seconds, neighbor_maps_by_id)
         """
         if not selected_docs:
-            return []
+            return [], 0.0, {}
 
-        t_batch_start = time.perf_counter()
+        t_ai1_start = time.perf_counter()
         self.warmup_anchor_cache_from_db(raw_col)
         active_formal_products = (
             shared_active_products
@@ -3157,7 +3404,7 @@ class DealPoolCleaner:
         docs_by_tip_id: Dict[str, Dict[str, Any]] = {}
         neighbor_maps_by_id: Dict[str, Dict[str, Dict[str, Any]]] = {}
         stage1_inputs: List[Dict[str, Any]] = []
-        pre_stage2_outcomes: Dict[str, Dict[str, Any]] = {}
+        outcomes_by_id: Dict[str, Dict[str, Any]] = {}
         pre_ai1_early_count = 0
 
         for doc in selected_docs:
@@ -3169,11 +3416,7 @@ class DealPoolCleaner:
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
 
-            # 【Tier 1 前置提前终止（Before AI-1）】：
-            # 当该记录所含全部链接/口令 100% 均已命中 `anchor_cache`（即无任何未知新链接），
-            # 且其中所有单品 (`"product"`) 锚点指向同一个唯一商品标识 `(platform, goods_id)`（排除多商品/主次混淆可能），
-            # 同时该唯一商品已在正式库 `products` 12h 保鲜期内清洗入库，
-            # 则直接提前终止（跳过 AI-1、Stage 3 与 AI-2），仅累加跨站/跨群共振热度！
+            # Tier 1 前置提前终止（Before AI-1）
             raw_anchors: List[str] = []
             for lk in doc.get("extracted_links") or []:
                 if isinstance(lk, dict):
@@ -3230,8 +3473,9 @@ class DealPoolCleaner:
                 ex_info = matched_ex_info
                 self.stats_early_terminated_pre_ai1 += 1
                 pre_ai1_early_count += 1
-                pre_stage2_outcomes[mid] = {
+                outcomes_by_id[mid] = {
                     "status": "early_terminated",
+                    "stage_outcome": "early_terminated",
                     "early_stage": "pre_ai1",
                     "error_code": OK_SKIPPED_ALREADY_CLEANED,
                     "error_msg": f"前置锚点缓存命中已入库唯一商品({c_plat}:{c_gid})，提前终止跳过AI-1/转链/AI-2并累加共振",
@@ -3300,8 +3544,6 @@ class DealPoolCleaner:
                 pre_ai1_early_count,
             )
 
-        # ---------------- Stage 2: 调用 AI-1 合并群上下文并无损拆解全部链接/口令 ----------------
-        t_ai1_start = time.perf_counter()
         ai1_hits_before = self.stats_ai1_model_hits
         ai1_fb_before = self.stats_ai1_fallbacks
         if not quiet_sub_logs:
@@ -3326,7 +3568,7 @@ class DealPoolCleaner:
         )
         for doc in selected_docs:
             mid = str(doc.get("source_item_id") or "")
-            if mid and mid not in ai1_results and mid not in pre_stage2_outcomes:
+            if mid and mid not in ai1_results and mid not in outcomes_by_id:
                 saved_ai1 = doc.get("ai_stage1_result")
                 if isinstance(saved_ai1, dict) and not saved_ai1.get("_from_fallback") and saved_ai1.get("extracted_targets"):
                     ai1_results[mid] = copy.deepcopy(saved_ai1)
@@ -3339,12 +3581,7 @@ class DealPoolCleaner:
                 self.stats_ai1_fallbacks - ai1_fb_before,
             )
 
-        # ---------------- Stage 3: 官方 Adapter 多线程并发转链核验（区分单品、优惠券与死链） ----------------
-        converted_by_tip_id: Dict[str, List[Dict[str, Any]]] = {}
-        stage2_inputs: List[Dict[str, Any]] = []
-
-        # 若同批次中某条消息已被相邻主线报吸收进 merged_tip_ids，直接标记为 merged_into_parent 避免重复转链。
-        # 注意：按提取目标数与合并碎片数从多到少排序，且已被吸收的子碎片或已作为父节点吸收他人的主线报不可被反向吸收（防止 A 吸收 B、B 又吸收 A 导致双方同归于尽）
+        # 邻居碎片吸收判定
         absorbed_by_neighbor: Dict[str, str] = {}
         active_parent_ids: Set[str] = set()
         sorted_ai1_items = sorted(
@@ -3371,15 +3608,155 @@ class DealPoolCleaner:
                     absorbed_by_neighbor[m_tid_str] = mid
                     active_parent_ids.add(mid)
 
-        # 收集本批次所有需要转链的去重目标 (plat_hint, clean_input)，并发执行官方 Adapter 转链
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            if not mid or mid in outcomes_by_id:
+                continue
+            site = str(doc.get("source_site") or "")
+            channel = str(doc.get("source_channel") or "")
+            raw_title = str(doc.get("title") or "").strip()
+            ai1_res = ai1_results.get(mid) or {}
+
+            if mid in absorbed_by_neighbor or ai1_res.get("is_standalone_deal") is False:
+                parent_id = absorbed_by_neighbor.get(mid) or ""
+                outcomes_by_id[mid] = {
+                    "status": "merged_into_parent",
+                    "stage_outcome": "merged_into_parent",
+                    "error_code": ERR_MERGED_INTO_NEIGHBOR,
+                    "error_msg": f"群聊连续碎片已合并入相邻主线报 {parent_id}".strip(),
+                    "merged_into_tip_id": parent_id,
+                    "source_site": site,
+                    "source_channel": channel,
+                    "source_item_id": mid,
+                    "title": raw_title,
+                    "ai_stage1_result": ai1_res,
+                    "converted_links": [],
+                    "ai_stage2_result": None,
+                    "quality_score": 0,
+                    "candidate_count": 0,
+                    "attempt_errors": [],
+                }
+                continue
+
+            if ai1_res.get("_from_fallback"):
+                new_retries = int(doc.get("clean_retry_count") or 0) + 1
+                self.stats_ai_retries_scheduled += 1
+                if new_retries < MAX_CLEAN_RETRIES:
+                    outcomes_by_id[mid] = {
+                        "status": "retry_pending",
+                        "stage_outcome": "retry_pending",
+                        "clean_stage": CLEAN_STAGE_NEED_AI1,
+                        "error_code": ERR_AI_TIMEOUT_RETRY,
+                        "error_msg": f"AI-1 超时或未返回有效拆解，跳过本轮并累加重试 ({new_retries}/{MAX_CLEAN_RETRIES})",
+                        "retry_count": new_retries,
+                        "source_site": site,
+                        "source_channel": channel,
+                        "source_item_id": mid,
+                        "title": raw_title,
+                        "ai_stage1_result": ai1_res,
+                        "converted_links": [],
+                        "ai_stage2_result": None,
+                        "quality_score": 0,
+                        "candidate_count": 0,
+                        "attempt_errors": [],
+                    }
+                else:
+                    outcomes_by_id[mid] = {
+                        "status": "failed",
+                        "stage_outcome": "failed",
+                        "error_code": ERR_AI_MAX_RETRIES_EXCEEDED,
+                        "error_msg": f"AI-1 连续 {new_retries} 次超时或未返回结果，达最大重试上限({MAX_CLEAN_RETRIES}次)，永久放弃",
+                        "retry_count": new_retries,
+                        "source_site": site,
+                        "source_channel": channel,
+                        "source_item_id": mid,
+                        "title": raw_title,
+                        "ai_stage1_result": ai1_res,
+                        "converted_links": [],
+                        "ai_stage2_result": None,
+                        "quality_score": 0,
+                        "candidate_count": 0,
+                        "attempt_errors": [],
+                    }
+                continue
+
+            targets = ai1_res.get("extracted_targets") or []
+            if not targets:
+                outcomes_by_id[mid] = {
+                    "status": "failed",
+                    "stage_outcome": "failed",
+                    "error_code": ERR_NO_ANCHOR,
+                    "error_msg": "Stage 1 AI 未在爆料文本中识别出任何淘/京/拼链接或口令",
+                    "source_site": site,
+                    "source_channel": channel,
+                    "source_item_id": mid,
+                    "title": raw_title,
+                    "ai_stage1_result": ai1_res,
+                    "converted_links": [],
+                    "ai_stage2_result": None,
+                    "quality_score": 0,
+                    "candidate_count": 0,
+                    "attempt_errors": [],
+                }
+                continue
+
+            # 成功完成 AI-1 拆解，推进至转链阶段
+            outcomes_by_id[mid] = {
+                "status": "in_progress",
+                "stage_outcome": "advance_to_convert",
+                "source_site": site,
+                "source_channel": channel,
+                "source_item_id": mid,
+                "title": raw_title,
+                "ai_stage1_result": ai1_res,
+                "candidate_count": len(targets),
+            }
+
+        out_list = [outcomes_by_id[str(d.get("source_item_id") or "")] for d in selected_docs if str(d.get("source_item_id") or "") in outcomes_by_id]
+        return out_list, t_ai1_elapsed, neighbor_maps_by_id
+
+    def process_convert_unit(
+        self,
+        selected_docs: List[Dict[str, Any]],
+        formal_col=None,
+        total_pending_count: int = 0,
+        shared_active_products: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+        shared_lock: Optional[threading.Lock] = None,
+        quiet_sub_logs: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], float]:
+        """
+        阶段二/转链核验单元（Stage 3 官方 Adapter 并发转链）：
+        - 收集 extracted_targets 并发执行官方转链；
+        - 单品与凑单品存活校验；
+        - Tier 2 转链后已入库商品缓存早停 (post_stage3_db)；
+        - 同批次相同主商品去重早停 (post_stage3_batch)；
+        - 暂态错误重试 (retry_pending) 或 转链失败 (failed)；
+        - 胜出有效记录输出 stage_outcome='advance_to_ai2'。
+        返回: (outcomes, elapsed_seconds)
+        """
+        if not selected_docs:
+            return [], 0.0
+
         t_stage3_start = time.perf_counter()
+        active_formal_products = (
+            shared_active_products
+            if shared_active_products is not None
+            else self._load_active_formal_products(formal_col)
+        )
+
+        def _get_active_prod(pid_key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+            if shared_lock is not None:
+                with shared_lock:
+                    v = active_formal_products.get(pid_key)
+                    return copy.deepcopy(v) if v is not None else None
+            v = active_formal_products.get(pid_key)
+            return copy.deepcopy(v) if v is not None else None
+
+        # 收集去重目标
         total_target_mentions = 0
         unique_target_map: Dict[Tuple[str, str], Tuple[Dict[str, Any], str]] = {}
         for doc in selected_docs:
-            mid = str(doc.get("source_item_id") or "")
-            if mid in pre_stage2_outcomes or mid in absorbed_by_neighbor:
-                continue
-            ai1_res = ai1_results.get(mid) or {}
+            ai1_res = doc.get("ai_stage1_result") or {}
             if ai1_res.get("_from_fallback") or ai1_res.get("is_standalone_deal") is False:
                 continue
             def_plat = str(doc.get("platform") or "unknown")
@@ -3419,96 +3796,17 @@ class DealPoolCleaner:
                 self.stats_cache_hits,
             )
 
-        # 第一遍扫描 Stage 3 结果：处理合并碎片、AI-1超时重试、无锚点、死链、纯凑单存活，以及【已在正式库 `products` 的唯一商品提前终止】
+        outcomes_by_id: Dict[str, Dict[str, Any]] = {}
         post_stage3_candidates: List[Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Optional[Tuple[str, str]], float]] = []
         post_stage3_db_early_count = 0
 
         for doc in selected_docs:
             mid = str(doc.get("source_item_id") or "")
-            if mid in pre_stage2_outcomes:
-                continue
             site = str(doc.get("source_site") or "")
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
-            ai1_res = ai1_results.get(mid) or {}
-
-            if mid in absorbed_by_neighbor or ai1_res.get("is_standalone_deal") is False:
-                parent_id = absorbed_by_neighbor.get(mid) or ""
-                pre_stage2_outcomes[mid] = {
-                    "status": "merged_into_parent",
-                    "error_code": ERR_MERGED_INTO_NEIGHBOR,
-                    "error_msg": f"群聊连续碎片已合并入相邻主线报 {parent_id}".strip(),
-                    "merged_into_tip_id": parent_id,
-                    "source_site": site,
-                    "source_channel": channel,
-                    "source_item_id": mid,
-                    "title": raw_title,
-                    "ai_stage1_result": ai1_res,
-                    "converted_links": [],
-                    "ai_stage2_result": None,
-                    "quality_score": 0,
-                    "candidate_count": 0,
-                    "attempt_errors": [],
-                }
-                continue
-
-            if ai1_res.get("_from_fallback"):
-                new_retries = int(doc.get("clean_retry_count") or 0) + 1
-                self.stats_ai_retries_scheduled += 1
-                if new_retries < MAX_CLEAN_RETRIES:
-                    pre_stage2_outcomes[mid] = {
-                        "status": "retry_pending",
-                        "error_code": ERR_AI_TIMEOUT_RETRY,
-                        "error_msg": f"AI-1 超时或未返回有效拆解，跳过本轮并累加重试 ({new_retries}/{MAX_CLEAN_RETRIES})",
-                        "retry_count": new_retries,
-                        "source_site": site,
-                        "source_channel": channel,
-                        "source_item_id": mid,
-                        "title": raw_title,
-                        "ai_stage1_result": ai1_res,
-                        "converted_links": [],
-                        "ai_stage2_result": None,
-                        "quality_score": 0,
-                        "candidate_count": 0,
-                        "attempt_errors": [],
-                    }
-                else:
-                    pre_stage2_outcomes[mid] = {
-                        "status": "failed",
-                        "error_code": ERR_AI_MAX_RETRIES_EXCEEDED,
-                        "error_msg": f"AI-1 连续 {new_retries} 次超时或未返回结果，达最大重试上限({MAX_CLEAN_RETRIES}次)，永久放弃",
-                        "retry_count": new_retries,
-                        "source_site": site,
-                        "source_channel": channel,
-                        "source_item_id": mid,
-                        "title": raw_title,
-                        "ai_stage1_result": ai1_res,
-                        "converted_links": [],
-                        "ai_stage2_result": None,
-                        "quality_score": 0,
-                        "candidate_count": 0,
-                        "attempt_errors": [],
-                    }
-                continue
-
+            ai1_res = doc.get("ai_stage1_result") or {}
             targets = ai1_res.get("extracted_targets") or []
-            if not targets:
-                pre_stage2_outcomes[mid] = {
-                    "status": "failed",
-                    "error_code": ERR_NO_ANCHOR,
-                    "error_msg": "Stage 1 AI 未在爆料文本中识别出任何淘/京/拼链接或口令",
-                    "source_site": site,
-                    "source_channel": channel,
-                    "source_item_id": mid,
-                    "title": raw_title,
-                    "ai_stage1_result": ai1_res,
-                    "converted_links": [],
-                    "ai_stage2_result": None,
-                    "quality_score": 0,
-                    "candidate_count": 0,
-                    "attempt_errors": [],
-                }
-                continue
 
             conv_list: List[Dict[str, Any]] = []
             attempt_errors: List[Dict[str, str]] = []
@@ -3546,11 +3844,9 @@ class DealPoolCleaner:
                         "error_msg": c_res["error_msg"],
                     })
 
-            converted_by_tip_id[mid] = conv_list
             prod_convs = [c for c in conv_list if c["convert_status"] == "product"]
             coupon_convs = [c for c in conv_list if c["convert_status"] == "coupon_or_activity"]
             has_skipped_filler = any(c.get("convert_status") == "skipped_filler" for c in conv_list)
-
             conv_summary_s3 = [
                 {k: v for k, v in c.items() if k != "adapter_res"}
                 for c in conv_list
@@ -3565,8 +3861,10 @@ class DealPoolCleaner:
                     new_retries = int(doc.get("clean_retry_count") or 0) + 1
                     self.stats_ai_retries_scheduled += 1
                     if new_retries < MAX_CLEAN_RETRIES:
-                        pre_stage2_outcomes[mid] = {
+                        outcomes_by_id[mid] = {
                             "status": "retry_pending",
+                            "stage_outcome": "retry_pending",
+                            "clean_stage": CLEAN_STAGE_NEED_CONVERT,
                             "error_code": ERR_ADAPTER_CONVERT_FAILED,
                             "error_msg": f"官方转链或反查暂态失败，保留待下轮重试 ({new_retries}/{MAX_CLEAN_RETRIES}): {transient_err['error_msg']}",
                             "retry_count": new_retries,
@@ -3582,8 +3880,9 @@ class DealPoolCleaner:
                             "attempt_errors": attempt_errors,
                         }
                     else:
-                        pre_stage2_outcomes[mid] = {
+                        outcomes_by_id[mid] = {
                             "status": "failed",
+                            "stage_outcome": "failed",
                             "error_code": ERR_ADAPTER_CONVERT_FAILED,
                             "error_msg": f"官方转链连续 {new_retries} 轮失败，达最大重试上限({MAX_CLEAN_RETRIES}次)放弃: {transient_err['error_msg']}",
                             "retry_count": new_retries,
@@ -3609,8 +3908,9 @@ class DealPoolCleaner:
                 else:
                     primary_err_code = attempt_errors[0]["error_code"] if attempt_errors else ERR_ADAPTER_CONVERT_FAILED
                     primary_err_msg = attempt_errors[0]["error_msg"] if attempt_errors else "所有候选链接均转链失败"
-                pre_stage2_outcomes[mid] = {
+                outcomes_by_id[mid] = {
                     "status": "failed",
+                    "stage_outcome": "failed",
                     "error_code": primary_err_code,
                     "error_msg": primary_err_msg,
                     "source_site": site,
@@ -3626,7 +3926,6 @@ class DealPoolCleaner:
                 }
                 continue
 
-            # 若存活的单品链接 100% 是凑单品 (filler_candidate) 而主商品死链，先排查主商品是否属于暂态 API 报错
             main_prod_convs = [c for c in prod_convs if c.get("text_role_hint") != "filler_candidate"]
             if not main_prod_convs:
                 transient_main_err = next(
@@ -3643,8 +3942,10 @@ class DealPoolCleaner:
                     new_retries = int(doc.get("clean_retry_count") or 0) + 1
                     self.stats_ai_retries_scheduled += 1
                     if new_retries < MAX_CLEAN_RETRIES:
-                        pre_stage2_outcomes[mid] = {
+                        outcomes_by_id[mid] = {
                             "status": "retry_pending",
+                            "stage_outcome": "retry_pending",
+                            "clean_stage": CLEAN_STAGE_NEED_CONVERT,
                             "error_code": ERR_ADAPTER_CONVERT_FAILED,
                             "error_msg": f"主商品官方转链暂态失败，保留待下轮重试 ({new_retries}/{MAX_CLEAN_RETRIES}): {transient_main_err['error_msg']}",
                             "retry_count": new_retries,
@@ -3661,8 +3962,9 @@ class DealPoolCleaner:
                         }
                         continue
 
-                pre_stage2_outcomes[mid] = {
+                outcomes_by_id[mid] = {
                     "status": "failed",
+                    "stage_outcome": "failed",
                     "error_code": ERR_AI2_MAIN_DEAD_ONLY_FILLER,
                     "error_msg": "主商品链接转链失败，仅凑单品链接存活，提前终止拦截",
                     "source_site": site,
@@ -3678,7 +3980,6 @@ class DealPoolCleaner:
                 }
                 continue
 
-            # 识别主候选商品的唯一标识 (platform, goods_id)
             unique_main_pids = {
                 (str(c.get("platform") or ""), str(c.get("goods_id") or ""))
                 for c in main_prod_convs
@@ -3688,9 +3989,7 @@ class DealPoolCleaner:
                 next(iter(unique_main_pids)) if len(unique_main_pids) == 1 else None
             )
 
-            # 【Tier 2 提前终止（Post-Stage 3 -> 正式库 `products` 已存在该唯一商品）】：
-            # 当转链已经拿到主商品的唯一标识 `(platform, goods_id)` 且该商品在 12h 保鲜期内已在 `products` 中清洗过，
-            # 立即提前跳过 Stage 4 (AI-2)，直接累加跨站/跨群共振热度！
+            # Tier 2 提前终止（已入库商品）
             ex_info_s3 = _get_active_prod(single_main_pid) if single_main_pid is not None else None
             if single_main_pid is not None and ex_info_s3 is not None:
                 c_plat, c_gid = single_main_pid
@@ -3703,8 +4002,9 @@ class DealPoolCleaner:
                     merged_tids.insert(0, mid)
                 self.stats_early_terminated_post_stage3 += 1
                 post_stage3_db_early_count += 1
-                pre_stage2_outcomes[mid] = {
+                outcomes_by_id[mid] = {
                     "status": "early_terminated",
+                    "stage_outcome": "early_terminated",
                     "early_stage": "post_stage3_db",
                     "error_code": OK_SKIPPED_ALREADY_CLEANED,
                     "error_msg": f"转链唯一商品({c_plat}:{c_gid})已在正式库清洗完毕(12h内)，提前终止跳过AI-2并累加共振",
@@ -3742,11 +4042,9 @@ class DealPoolCleaner:
             )
             post_stage3_candidates.append((mid, doc, ai1_res, conv_list, single_main_pid, richness_score))
 
-        # 本轮 Stage 3 结果消费完毕后，立即驱逐暂态失败缓存项，确保下轮 retry_pending 能真实重新请求上游接口
         self._evict_transient_failed_cache()
 
-        # 第二遍扫描 Stage 3 结果：【同批次内相同唯一商品 `(platform, goods_id)` 去重提前终止】
-        # 若同批次有多条线报转链出同一个新 `(platform, goods_id)`，仅选信息最丰富的一条送入 Stage 4 (AI-2)，其余同批重复线报提前终止并累加共振！
+        # 第二遍扫描 Stage 3 结果：同批次内相同唯一商品去重
         best_mid_by_pid: Dict[Tuple[str, str], Tuple[float, str]] = {}
         for mid, _doc, _ai1_res, _conv_list, single_pid, r_score in post_stage3_candidates:
             if single_pid is not None:
@@ -3755,7 +4053,6 @@ class DealPoolCleaner:
                     best_mid_by_pid[single_pid] = (r_score, mid)
 
         post_stage3_batch_early_count = 0
-        draft_copy_by_id: Dict[str, str] = {}
         for mid, doc, ai1_res, conv_list, single_pid, _r_score in post_stage3_candidates:
             site = str(doc.get("source_site") or "")
             channel = str(doc.get("source_channel") or "")
@@ -3773,8 +4070,9 @@ class DealPoolCleaner:
                     merged_tids.insert(0, mid)
                 self.stats_early_terminated_post_stage3 += 1
                 post_stage3_batch_early_count += 1
-                pre_stage2_outcomes[mid] = {
+                outcomes_by_id[mid] = {
                     "status": "early_terminated",
+                    "stage_outcome": "early_terminated",
                     "early_stage": "post_stage3_batch",
                     "error_code": OK_SKIPPED_ALREADY_CLEANED,
                     "error_msg": f"同批次已有更优线报({winner_mid})命中同一唯一商品({c_plat}:{c_gid})，提前终止跳过AI-2并累加共振",
@@ -3808,10 +4106,71 @@ class DealPoolCleaner:
                 }
                 continue
 
+            conv_summary_s3 = [
+                {k: v for k, v in c.items() if k != "adapter_res"}
+                for c in conv_list
+            ]
+            outcomes_by_id[mid] = {
+                "status": "in_progress",
+                "stage_outcome": "advance_to_ai2",
+                "source_site": site,
+                "source_channel": channel,
+                "source_item_id": mid,
+                "title": raw_title,
+                "ai_stage1_result": ai1_res,
+                "converted_links": conv_summary_s3,
+                "full_conv_list": conv_list,
+                "candidate_count": len(conv_list),
+            }
+
+        if (post_stage3_db_early_count > 0 or post_stage3_batch_early_count > 0) and not quiet_sub_logs:
+            logger.info(
+                "⚡ [Stage 3 唯一商品标识早停] 转链后命中唯一商品 `(platform, goods_id)` 提前终止=%d条 "
+                "(已在正式库=%d条, 同批去重=%d条) -> 直接跳过 Stage 4 (AI-2)！",
+                post_stage3_db_early_count + post_stage3_batch_early_count,
+                post_stage3_db_early_count,
+                post_stage3_batch_early_count,
+            )
+
+        out_list = [outcomes_by_id[str(d.get("source_item_id") or "")] for d in selected_docs if str(d.get("source_item_id") or "") in outcomes_by_id]
+        return out_list, t_stage3_elapsed
+
+    def process_ai2_unit(
+        self,
+        selected_docs: List[Dict[str, Any]],
+        raw_col=None,
+        formal_col=None,
+        total_pending_count: int = 0,
+        neighbor_maps_by_id: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+        quiet_sub_logs: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], float]:
+        """
+        阶段三/AI-2终审单元（Stage 4 AI-2）：
+        - 组装文案与精简底牌数据；
+        - 并发调用 run_ai_stage2_batch 进行终审与质量评分；
+        - 组装最终 product_doc、deal_info 及 coupon_links；
+        - 评分 >= 60 输出 status='success'，低分输出 status='low_score'。
+        返回: (outcomes, elapsed_seconds)
+        """
+        if not selected_docs:
+            return [], 0.0
+
+        t_ai2_start = time.perf_counter()
+        draft_copy_by_id: Dict[str, str] = {}
+        stage2_inputs: List[Dict[str, Any]] = []
+
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            site = str(doc.get("source_site") or "")
+            ai1_res = doc.get("ai_stage1_result") or {}
+            conv_list = doc.get("full_conv_list") or doc.get("converted_links") or doc.get("stage3_converted_links") or []
+
             merged_tids_for_copy = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
             if mid not in merged_tids_for_copy:
                 merged_tids_for_copy.insert(0, mid)
-            tip_map_for_copy = neighbor_maps_by_id.get(mid) or {mid: doc}
+            tip_map_for_copy = (neighbor_maps_by_id.get(mid) if neighbor_maps_by_id else None) or self._load_neighbor_docs(
+                raw_col, site, merged_tids_for_copy, current_doc=doc
+            )
             draft_copywriting = self._build_clean_original_copywriting(
                 merged_tids_for_copy,
                 tip_map_for_copy,
@@ -3821,14 +4180,13 @@ class DealPoolCleaner:
             )
             draft_copy_by_id[mid] = draft_copywriting
 
-            # 构造送往 Stage 4 (AI-2) 的精简底牌数据（隐去 raw_item、推广长链/口令及图片 URL 列表，压缩输入 Token 加速推理）
             ai2_conv_links = [
                 {
                     "link_id": c["link_id"],
-                    "text_role_hint": c["text_role_hint"],
+                    "text_role_hint": c.get("text_role_hint") or "main_candidate",
                     "convert_status": c["convert_status"],
                     "platform": c["platform"],
-                    "official_product": c["official_product"],
+                    "official_product": c.get("official_product"),
                 }
                 for c in conv_list
             ]
@@ -3842,17 +4200,6 @@ class DealPoolCleaner:
                 "converted_links": ai2_conv_links,
             })
 
-        if (post_stage3_db_early_count > 0 or post_stage3_batch_early_count > 0) and not quiet_sub_logs:
-            logger.info(
-                "⚡ [Stage 3 唯一商品标识早停] 转链后命中唯一商品 `(platform, goods_id)` 提前终止=%d条 "
-                "(已在正式库=%d条, 同批去重=%d条) -> 直接跳过 Stage 4 (AI-2)！",
-                post_stage3_db_early_count + post_stage3_batch_early_count,
-                post_stage3_db_early_count,
-                post_stage3_batch_early_count,
-            )
-
-        # ---------------- Stage 4: 调用 AI-2 进行底牌终审、教程重构与 0~100 质量评分 ----------------
-        t_ai2_start = time.perf_counter()
         ai2_hits_before = self.stats_ai2_model_hits
         ai2_fb_before = self.stats_ai2_fallbacks
         if not quiet_sub_logs:
@@ -3871,28 +4218,15 @@ class DealPoolCleaner:
         )
         t_ai2_elapsed = round(time.perf_counter() - t_ai2_start, 2)
         s2_input_map = {item["main_tip_id"]: item for item in stage2_inputs}
-        self.last_batch_stage_timings = {
-            "stage2_ai1_seconds": t_ai1_elapsed,
-            "stage3_convert_seconds": t_stage3_elapsed,
-            "stage4_ai2_seconds": t_ai2_elapsed,
-        }
 
-        avg_ms = round((time.perf_counter() - t_batch_start) * 1000.0 / max(1, len(selected_docs)), 1)
-        final_results: List[Dict[str, Any]] = []
-
+        outcomes_by_id: Dict[str, Dict[str, Any]] = {}
         for doc in selected_docs:
             mid = str(doc.get("source_item_id") or "")
-            if mid in pre_stage2_outcomes:
-                out = pre_stage2_outcomes[mid]
-                out["elapsed_ms"] = avg_ms
-                final_results.append(out)
-                continue
-
             site = str(doc.get("source_site") or "")
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
-            ai1_res = ai1_results.get(mid) or {}
-            conv_list = converted_by_tip_id.get(mid) or []
+            ai1_res = doc.get("ai_stage1_result") or {}
+            conv_list = doc.get("full_conv_list") or doc.get("converted_links") or doc.get("stage3_converted_links") or []
             s2_inp = s2_input_map.get(mid) or {}
             ai2_res = ai2_results.get(mid)
             if not isinstance(ai2_res, dict) or "is_valid_deal" not in ai2_res:
@@ -3910,8 +4244,10 @@ class DealPoolCleaner:
                 new_retries = int(doc.get("clean_retry_count") or 0) + 1
                 self.stats_ai_retries_scheduled += 1
                 if new_retries < MAX_CLEAN_RETRIES:
-                    final_results.append({
+                    outcomes_by_id[mid] = {
                         "status": "retry_pending",
+                        "stage_outcome": "retry_pending",
+                        "clean_stage": CLEAN_STAGE_NEED_AI2,
                         "error_code": ERR_AI_TIMEOUT_RETRY,
                         "error_msg": f"AI-2 超时或未返回有效终审，跳过本轮并累加重试 ({new_retries}/{MAX_CLEAN_RETRIES})",
                         "retry_count": new_retries,
@@ -3925,11 +4261,11 @@ class DealPoolCleaner:
                         "quality_score": 0,
                         "candidate_count": len(conv_list),
                         "attempt_errors": [],
-                        "elapsed_ms": avg_ms,
-                    })
+                    }
                 else:
-                    final_results.append({
+                    outcomes_by_id[mid] = {
                         "status": "failed",
+                        "stage_outcome": "failed",
                         "error_code": ERR_AI_MAX_RETRIES_EXCEEDED,
                         "error_msg": f"AI-2 连续 {new_retries} 次超时或未返回结果，达最大重试上限({MAX_CLEAN_RETRIES}次)，永久放弃",
                         "retry_count": new_retries,
@@ -3943,17 +4279,13 @@ class DealPoolCleaner:
                         "quality_score": 0,
                         "candidate_count": len(conv_list),
                         "attempt_errors": [],
-                        "elapsed_ms": avg_ms,
-                    })
+                    }
                 continue
 
             link_map = {c["link_id"]: c for c in conv_list}
-
             is_valid = bool(ai2_res.get("is_valid_deal"))
             main_lid = str(ai2_res.get("main_link_id") or "").strip()
             main_conv = link_map.get(main_lid)
-            # 【严格遵循核心铁律】：主商品 main_link_id 必须指向真实存活的官方单品 ("product") 且绝不能是凑单辅助品；
-            # 若主商品链接无效，严禁在代码中盲目拿凑单品顶替主商品，必须直接判为无效拦截！
             if is_valid and (
                 not main_conv
                 or main_conv.get("convert_status") != "product"
@@ -3973,8 +4305,9 @@ class DealPoolCleaner:
                     err_code = ERR_AI2_VIRTUAL_OR_JUNK
                 else:
                     err_code = ERR_ADAPTER_CONVERT_FAILED
-                final_results.append({
+                outcomes_by_id[mid] = {
                     "status": "failed",
+                    "stage_outcome": "failed",
                     "error_code": err_code,
                     "error_msg": f"AI-2 终审拦截 ({rej})",
                     "source_site": site,
@@ -3987,8 +4320,7 @@ class DealPoolCleaner:
                     "quality_score": 0,
                     "candidate_count": len(conv_list),
                     "attempt_errors": [],
-                    "elapsed_ms": avg_ms,
-                })
+                }
                 continue
 
             try:
@@ -3998,7 +4330,6 @@ class DealPoolCleaner:
             quality_score = max(0, min(100, quality_score))
             score_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
 
-            # 组装主商品官方真实详情与爆料专属 deal_info（严格隔离顶层官方价格与爆料价！）
             plat = str(main_conv.get("platform") or "")
             goods_id = str(main_conv.get("goods_id") or "")
             goods_sign = str(main_conv.get("goods_sign") or "")
@@ -4018,7 +4349,6 @@ class DealPoolCleaner:
             my_promo_link = str(main_conv.get("my_promo_link") or "")
             my_promo_token = str(main_conv.get("my_promo_token") or "")
 
-            # 提取并校验 deal_price（仅信任 AI-2 语义核验后的 deal_price，严禁回退使用旧爬虫正则提取的 doc.get("price")！）
             raw_deal_p = ai2_res.get("deal_price")
             deal_price: Optional[float] = None
             if isinstance(raw_deal_p, (int, float)) and 0 < float(raw_deal_p) < 100000:
@@ -4035,7 +4365,6 @@ class DealPoolCleaner:
             price_logic = _normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None
             clean_title = _normalize_inline_spaces(str(ai2_res.get("clean_title") or product_card.get("name") or raw_title)).strip()
 
-            # 组装唯一辅助按钮组：前置优惠券列表 coupon_links（过滤跨平台广告尾巴、同主商品重复链与淘宝冗余单品 s.click 伪券链）
             coupon_links: List[Dict[str, Any]] = []
             seen_cpn_ids: Set[str] = set()
             seen_cpn_targets: Set[Tuple[str, str]] = set()
@@ -4079,7 +4408,6 @@ class DealPoolCleaner:
                     "platform": c_plat or plat,
                 })
 
-            # 生成 100% 纯文字规范购买教程（剥离一切残留占位符、裸网址与口令壳）
             raw_steps_val = ai2_res.get("tutorial_steps")
             if isinstance(raw_steps_val, list):
                 raw_step_lines = [str(st or "") for st in raw_steps_val]
@@ -4091,9 +4419,8 @@ class DealPoolCleaner:
                 s for s in (self._sanitize_clean_tutorial_step(st) for st in raw_step_lines)
                 if s
             ]
-            tutorial_text = "\n".join(tutorial_steps)
+            tutorial_text = "\\n".join(tutorial_steps)
 
-            # 提取用户实付晒单图与教程图（排除与官方商品主图完全相同的 URL，并剥离偶发的 Markdown 链接包裹）
             official_img = str(product_card.get("image_url") or "").strip()
             extracted_imgs = [
                 self._strip_markdown_link_wrapper(str(u).strip())
@@ -4105,11 +4432,12 @@ class DealPoolCleaner:
                 if img_u and img_u != official_img and img_u not in user_share_images:
                     user_share_images.append(img_u)
 
-            # 汇总合并的群消息 ID 与源页面 URL 列表（满足用户核对源页面的需求）
             merged_tip_ids = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
             if mid not in merged_tip_ids:
                 merged_tip_ids.insert(0, mid)
-            tip_map = neighbor_maps_by_id.get(mid) or {mid: doc}
+            tip_map = (neighbor_maps_by_id.get(mid) if neighbor_maps_by_id else None) or self._load_neighbor_docs(
+                raw_col, site, merged_tip_ids, current_doc=doc
+            )
             merged_source_urls: List[str] = []
             for m_tid in merged_tip_ids:
                 nd = tip_map.get(m_tid) or {}
@@ -4117,7 +4445,6 @@ class DealPoolCleaner:
                 if u_det and u_det not in merged_source_urls:
                     merged_source_urls.append(u_det)
 
-            # 优先采用 AI-2 微整形断句后的原汁原味文案（经确定性无链消毒），若模型未返回则回退至 Python 去链初稿
             raw_polished_copy = str(ai2_res.get("polished_copywriting") or "").strip()
             original_copywriting = (
                 self._sanitize_polished_copywriting(raw_polished_copy) if raw_polished_copy else ""
@@ -4132,7 +4459,6 @@ class DealPoolCleaner:
             source_list_page_url = str(doc.get("source_list_page_url") or doc.get("source_url") or "").strip()
             source_detail_url = str(doc.get("source_detail_url") or doc.get("source_url") or source_list_page_url).strip()
 
-            # 严格保持顶层价格 100% 为官方 API 真实价格，绝不用爆料价覆盖！
             official_price = float(product_card.get("price") or adapter_res.get("price") or 0.0)
             original_price = float(product_card.get("original_price") or official_price)
             official_activity_price = float(product_card.get("activity_price") or official_price)
@@ -4209,8 +4535,9 @@ class DealPoolCleaner:
             }
 
             if quality_score < QUALIFIED_DEAL_MIN_SCORE:
-                final_results.append({
+                outcomes_by_id[mid] = {
                     "status": "low_score",
+                    "stage_outcome": "low_score",
                     "error_code": ERR_LOW_QUALITY_SCORE,
                     "error_msg": f"综合评分 {quality_score} < {QUALIFIED_DEAL_MIN_SCORE} 分，仅留存初步表不入正式表",
                     "source_site": site,
@@ -4232,12 +4559,12 @@ class DealPoolCleaner:
                     "ai_stage2_result": ai2_res,
                     "candidate_count": len(conv_list),
                     "attempt_errors": [],
-                    "elapsed_ms": avg_ms,
-                })
+                }
                 continue
 
-            final_results.append({
+            outcomes_by_id[mid] = {
                 "status": "success",
+                "stage_outcome": "success",
                 "error_code": "OK",
                 "error_msg": "",
                 "source_site": site,
@@ -4262,15 +4589,7 @@ class DealPoolCleaner:
                 "candidate_count": len(conv_list),
                 "tutorial_img_count": len(user_share_images),
                 "coupon_link_count": len(coupon_links),
-                "elapsed_ms": avg_ms,
                 "product_doc": product_doc,
-            })
-
-        if final_results:
-            final_results[0]["_stage_timings"] = {
-                "stage2_ai1_seconds": t_ai1_elapsed,
-                "stage3_convert_seconds": t_stage3_elapsed,
-                "stage4_ai2_seconds": t_ai2_elapsed,
             }
 
         if stage2_inputs and not quiet_sub_logs:
@@ -4279,6 +4598,113 @@ class DealPoolCleaner:
                 self.stats_ai2_model_hits - ai2_hits_before,
                 self.stats_ai2_fallbacks - ai2_fb_before,
             )
+
+        out_list = [outcomes_by_id[str(d.get("source_item_id") or "")] for d in selected_docs if str(d.get("source_item_id") or "") in outcomes_by_id]
+        return out_list, t_ai2_elapsed
+
+    def clean_batch_records(
+        self,
+        selected_docs: List[Dict[str, Any]],
+        raw_col,
+        formal_col=None,
+        total_pending_count: int = 0,
+        shared_active_products: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+        shared_lock: Optional[threading.Lock] = None,
+        quiet_sub_logs: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        对一批记录完整执行：
+        Stage 2 (AI-1) -> Stage 3 (官方转链) -> Stage 4 (AI-2) 顺序驱动（内部由各阶段单元函数纯净执行）。
+        """
+        if not selected_docs:
+            return []
+
+        t_batch_start = time.perf_counter()
+        final_by_mid: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Stage 2 (AI-1 拆解)
+        ai1_outcomes, t_ai1_elapsed, neighbor_maps = self.process_ai1_unit(
+            selected_docs,
+            raw_col,
+            formal_col=formal_col,
+            total_pending_count=total_pending_count,
+            shared_active_products=shared_active_products,
+            shared_lock=shared_lock,
+            quiet_sub_logs=quiet_sub_logs,
+        )
+        ai1_map = {str(r.get("source_item_id") or ""): r for r in ai1_outcomes}
+
+        adv_to_convert: List[Dict[str, Any]] = []
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            out = ai1_map.get(mid)
+            if not out:
+                continue
+            if out.get("stage_outcome") == "advance_to_convert":
+                d_copy = copy.deepcopy(doc)
+                d_copy["ai_stage1_result"] = out.get("ai_stage1_result")
+                adv_to_convert.append(d_copy)
+            else:
+                final_by_mid[mid] = out
+
+        # 2. Stage 3 (官方转链)
+        t_stage3_elapsed = 0.0
+        adv_to_ai2: List[Dict[str, Any]] = []
+        if adv_to_convert:
+            conv_outcomes, t_stage3_elapsed = self.process_convert_unit(
+                adv_to_convert,
+                formal_col=formal_col,
+                total_pending_count=total_pending_count,
+                shared_active_products=shared_active_products,
+                shared_lock=shared_lock,
+                quiet_sub_logs=quiet_sub_logs,
+            )
+            conv_map = {str(r.get("source_item_id") or ""): r for r in conv_outcomes}
+            for doc in adv_to_convert:
+                mid = str(doc.get("source_item_id") or "")
+                out = conv_map.get(mid)
+                if not out:
+                    continue
+                if out.get("stage_outcome") == "advance_to_ai2":
+                    d_copy = copy.deepcopy(doc)
+                    d_copy["converted_links"] = out.get("converted_links") or []
+                    d_copy["full_conv_list"] = out.get("full_conv_list") or []
+                    adv_to_ai2.append(d_copy)
+                else:
+                    final_by_mid[mid] = out
+
+        # 3. Stage 4 (AI-2 终审)
+        t_ai2_elapsed = 0.0
+        if adv_to_ai2:
+            ai2_outcomes, t_ai2_elapsed = self.process_ai2_unit(
+                adv_to_ai2,
+                raw_col=raw_col,
+                formal_col=formal_col,
+                total_pending_count=total_pending_count,
+                neighbor_maps_by_id=neighbor_maps,
+                quiet_sub_logs=quiet_sub_logs,
+            )
+            for out in ai2_outcomes:
+                mid = str(out.get("source_item_id") or "")
+                final_by_mid[mid] = out
+
+        self.last_batch_stage_timings = {
+            "stage2_ai1_seconds": t_ai1_elapsed,
+            "stage3_convert_seconds": t_stage3_elapsed,
+            "stage4_ai2_seconds": t_ai2_elapsed,
+        }
+
+        avg_ms = round((time.perf_counter() - t_batch_start) * 1000.0 / max(1, len(selected_docs)), 1)
+        final_results: List[Dict[str, Any]] = []
+        for doc in selected_docs:
+            mid = str(doc.get("source_item_id") or "")
+            if mid in final_by_mid:
+                item = final_by_mid[mid]
+                item["elapsed_ms"] = avg_ms
+                final_results.append(item)
+
+        if final_results:
+            final_results[0]["_stage_timings"] = self.last_batch_stage_timings
 
         return final_results
 
@@ -4435,8 +4861,10 @@ def _commit_batch_results_to_db(
     shared_lock: Optional[threading.Lock] = None,
 ) -> Dict[str, Any]:
     """
-    将本轮清洗窗口的结果统一写回初步表 `deal_raw_tips` 与正式表 `products`，
-    并处理超时跳过重试（`retry_pending`，保持 `pending` 并累加 `clean_retry_count`）与超过最大重试次数拦截。
+    将本轮清洗窗口或阶段工作单元的结果统一写回初步表 `deal_raw_tips` 与正式表 `products`：
+    - 支持阶段流转：advance_to_convert (stage=need_convert) 与 advance_to_ai2 (stage=need_ai2)；
+    - 终态记录统一标记 clean_stage=done 并剥离租约与临时中间字段；
+    - 超时跳过重试 (retry_pending) 保持当前 clean_stage、解除租约并累加 clean_retry_count。
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     raw_status_ops = []
@@ -4458,7 +4886,46 @@ def _commit_batch_results_to_db(
         if r.get("original_copywriting"):
             common_ai_fields["original_copywriting"] = r["original_copywriting"]
 
-        if r["status"] == "success":
+        stage_outcome = r.get("stage_outcome")
+
+        # 1. 阶段中间状态推进：由 AI-1 推进至 转链
+        if stage_outcome == "advance_to_convert":
+            raw_status_ops.append(
+                UpdateOne(
+                    {"source_site": s_site, "source_item_id": s_id},
+                    {
+                        "$set": {
+                            "clean_stage": CLEAN_STAGE_NEED_CONVERT,
+                            "ai_stage1_result": r.get("ai_stage1_result"),
+                            "stage1_cleaned_at": now_utc,
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                        },
+                    },
+                )
+            )
+        # 2. 阶段中间状态推进：由 转链 推进至 AI-2
+        elif stage_outcome == "advance_to_ai2":
+            raw_status_ops.append(
+                UpdateOne(
+                    {"source_site": s_site, "source_item_id": s_id},
+                    {
+                        "$set": {
+                            "clean_stage": CLEAN_STAGE_NEED_AI2,
+                            "converted_links": r.get("converted_links") or [],
+                            "stage3_converted_links": r.get("converted_links") or [],
+                            "stage2_converted_at": now_utc,
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                        },
+                    },
+                )
+            )
+        elif r["status"] == "success":
             batch_success_product_docs.append(r["product_doc"])
             raw_status_ops.append(
                 UpdateOne(
@@ -4467,6 +4934,7 @@ def _commit_batch_results_to_db(
                         "$set": {
                             **common_ai_fields,
                             "clean_status": "cleaned_success",
+                            "clean_stage": CLEAN_STAGE_DONE,
                             "ai_clean_status": "cleaned_success",
                             "clean_error_code": "OK",
                             "clean_error_msg": "",
@@ -4475,7 +4943,12 @@ def _commit_batch_results_to_db(
                             "resolved_goods_sign": r["goods_sign"],
                             "resolved_official_title": r["official_title"],
                             "merged_tip_ids": r.get("merged_tip_ids") or [s_id],
-                        }
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                            "stage3_converted_links": "",
+                        },
                     },
                 )
             )
@@ -4487,10 +4960,16 @@ def _commit_batch_results_to_db(
                             {
                                 "$set": {
                                     "clean_status": "merged_into_parent",
+                                    "clean_stage": CLEAN_STAGE_DONE,
                                     "ai_clean_status": "merged_into_parent",
                                     "merged_into_tip_id": s_id,
                                     "cleaned_at": now_utc,
-                                }
+                                },
+                                "$unset": {
+                                    "stage_lease_owner": "",
+                                    "stage_lease_until_ts": "",
+                                    "stage3_converted_links": "",
+                                },
                             },
                         )
                     )
@@ -4503,6 +4982,7 @@ def _commit_batch_results_to_db(
                         "$set": {
                             **common_ai_fields,
                             "clean_status": "cleaned_success",
+                            "clean_stage": CLEAN_STAGE_DONE,
                             "ai_clean_status": "cleaned_early_terminated",
                             "clean_error_code": OK_SKIPPED_ALREADY_CLEANED,
                             "clean_error_msg": r["error_msg"],
@@ -4511,7 +4991,12 @@ def _commit_batch_results_to_db(
                             "resolved_goods_sign": r.get("goods_sign") or "",
                             "resolved_official_title": r.get("official_title") or "",
                             "merged_tip_ids": r.get("merged_tip_ids") or [s_id],
-                        }
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                            "stage3_converted_links": "",
+                        },
                     },
                 )
             )
@@ -4523,10 +5008,16 @@ def _commit_batch_results_to_db(
                             {
                                 "$set": {
                                     "clean_status": "merged_into_parent",
+                                    "clean_stage": CLEAN_STAGE_DONE,
                                     "ai_clean_status": "merged_into_parent",
                                     "merged_into_tip_id": s_id,
                                     "cleaned_at": now_utc,
-                                }
+                                },
+                                "$unset": {
+                                    "stage_lease_owner": "",
+                                    "stage_lease_until_ts": "",
+                                    "stage3_converted_links": "",
+                                },
                             },
                         )
                     )
@@ -4538,33 +5029,46 @@ def _commit_batch_results_to_db(
                         "$set": {
                             **common_ai_fields,
                             "clean_status": "merged_into_parent",
+                            "clean_stage": CLEAN_STAGE_DONE,
                             "ai_clean_status": "merged_into_parent",
                             "merged_into_tip_id": r.get("merged_into_tip_id") or "",
                             "clean_error_code": r["error_code"],
                             "clean_error_msg": r["error_msg"],
-                        }
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                            "stage3_converted_links": "",
+                        },
                     },
                 )
             )
         elif r["status"] == "retry_pending":
             retry_pending_count += 1
             r_cnt = int(r.get("retry_count") or 1)
+            retry_set = {
+                "last_clean_attempt_at": now_utc,
+                "clean_status": "pending",
+                "ai_clean_status": "retry_pending",
+                "clean_retry_count": r_cnt,
+                "next_retry_after_ts": round(time.time() + 180.0 * r_cnt, 1),
+                "clean_error_code": r["error_code"],
+                "clean_error_msg": r["error_msg"],
+                "ai_stage1_result": r.get("ai_stage1_result"),
+                "converted_links": r.get("converted_links") or [],
+                "ai_stage2_result": r.get("ai_stage2_result"),
+            }
+            if r.get("clean_stage"):
+                retry_set["clean_stage"] = r["clean_stage"]
             raw_status_ops.append(
                 UpdateOne(
                     {"source_site": s_site, "source_item_id": s_id},
                     {
-                        "$set": {
-                            "last_clean_attempt_at": now_utc,
-                            "clean_status": "pending",
-                            "ai_clean_status": "retry_pending",
-                            "clean_retry_count": r_cnt,
-                            "next_retry_after_ts": round(time.time() + 180.0 * r_cnt, 1),
-                            "clean_error_code": r["error_code"],
-                            "clean_error_msg": r["error_msg"],
-                            "ai_stage1_result": r.get("ai_stage1_result"),
-                            "converted_links": r.get("converted_links") or [],
-                            "ai_stage2_result": r.get("ai_stage2_result"),
-                        }
+                        "$set": retry_set,
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                        },
                     },
                 )
             )
@@ -4576,6 +5080,7 @@ def _commit_batch_results_to_db(
                         "$set": {
                             **common_ai_fields,
                             "clean_status": "cleaned_low_score",
+                            "clean_stage": CLEAN_STAGE_DONE,
                             "ai_clean_status": "cleaned_low_score",
                             "clean_error_code": r["error_code"],
                             "clean_error_msg": r["error_msg"],
@@ -4583,7 +5088,12 @@ def _commit_batch_results_to_db(
                             "resolved_product_id": r.get("product_id"),
                             "resolved_goods_sign": r.get("goods_sign"),
                             "resolved_official_title": r.get("official_title"),
-                        }
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                            "stage3_converted_links": "",
+                        },
                     },
                 )
             )
@@ -4591,6 +5101,7 @@ def _commit_batch_results_to_db(
             fail_set: Dict[str, Any] = {
                 **common_ai_fields,
                 "clean_status": "cleaned_failed",
+                "clean_stage": CLEAN_STAGE_DONE,
                 "ai_clean_status": "cleaned_failed",
                 "clean_error_code": r["error_code"],
                 "clean_error_msg": r["error_msg"],
@@ -4601,7 +5112,14 @@ def _commit_batch_results_to_db(
             raw_status_ops.append(
                 UpdateOne(
                     {"source_site": s_site, "source_item_id": s_id},
-                    {"$set": fail_set},
+                    {
+                        "$set": fail_set,
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                            "stage3_converted_links": "",
+                        },
+                    },
                 )
             )
             batch_failed_samples.append({
@@ -4712,7 +5230,6 @@ def _commit_batch_results_to_db(
         "failed_samples": batch_failed_samples,
         "retry_pending_count": retry_pending_count,
     }
-
 
 def run_clean_stage(
     repo: DealRawPoolRepository,
@@ -6465,9 +6982,385 @@ def print_latest_ops_report():
     print("=" * 98 + "\n")
 
 
+class StageWorker(threading.Thread):
+    """阶段工作线程：各阶段独立认领符合自身状态的记录并即时推进至下一阶段。"""
+    def __init__(
+        self,
+        name: str,
+        stage: str,
+        repo: DealRawPoolRepository,
+        cleaner: DealPoolCleaner,
+        batch_size: int,
+        lease_seconds: int = 300,
+        poll_interval: float = DEFAULT_STAGE_POLL_INTERVAL_SECONDS,
+        stop_event: Optional[threading.Event] = None,
+        ai_semaphore: Optional[threading.BoundedSemaphore] = None,
+        upstream_event: Optional[threading.Event] = None,
+        downstream_event: Optional[threading.Event] = None,
+        shared_active_products: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+        shared_lock: Optional[threading.Lock] = None,
+        quiet_sub_logs: bool = False,
+    ):
+        super().__init__(name=name, daemon=True)
+        self.stage = stage
+        self.repo = repo
+        self.cleaner = cleaner
+        self.batch_size = max(1, batch_size)
+        self.lease_seconds = max(10, lease_seconds)
+        self.poll_interval = max(0.5, float(poll_interval))
+        self.stop_event = stop_event or threading.Event()
+        self.ai_semaphore = ai_semaphore
+        self.upstream_event = upstream_event
+        self.downstream_event = downstream_event
+        self.shared_active_products = shared_active_products
+        self.shared_lock = shared_lock
+        self.quiet_sub_logs = quiet_sub_logs
+        self.worker_id = f"{name}_{os.getpid()}_{threading.get_ident()}"
+        self.total_processed = 0
+        self.total_advanced = 0
+
+    def _compute_safe_lease(self, limit: int) -> int:
+        """根据认领批量动态自适应计算安全租约，确保大批次处理期间不被维护线程误回收。"""
+        if limit <= 0:
+            return self.lease_seconds
+        if self.stage in (CLEAN_STAGE_NEED_AI1, CLEAN_STAGE_NEED_AI2):
+            ai_chunk_size = max(1, getattr(self.cleaner, "ai_batch_size", 4))
+            ai_workers = max(1, getattr(self.cleaner, "ai_max_workers", 8))
+            ai_timeout = float(getattr(self.cleaner, "ai_timeout", 90.0))
+            rounds = (limit + (ai_chunk_size * ai_workers) - 1) // (ai_chunk_size * ai_workers)
+            est_sec = int((rounds + 2) * ai_timeout * 1.5)
+            return max(self.lease_seconds, est_sec)
+        elif self.stage == CLEAN_STAGE_NEED_CONVERT:
+            conv_workers = max(1, getattr(self.cleaner, "convert_max_workers", 10))
+            est_sec = int((limit / conv_workers) * 2.0) + 120
+            return max(self.lease_seconds, est_sec)
+        return self.lease_seconds
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                safe_lease = self._compute_safe_lease(self.batch_size)
+                claimed = self.repo.claim_stage_docs(
+                    self.stage,
+                    limit=self.batch_size,
+                    lease_seconds=safe_lease,
+                    worker_id=self.worker_id,
+                )
+                if not claimed:
+                    if self.upstream_event is not None:
+                        self.upstream_event.wait(timeout=self.poll_interval)
+                        self.upstream_event.clear()
+                    else:
+                        time.sleep(self.poll_interval)
+                    continue
+
+                if self.stage == CLEAN_STAGE_NEED_AI1:
+                    if self.ai_semaphore is not None:
+                        with self.ai_semaphore:
+                            outcomes, elapsed, _ = self.cleaner.process_ai1_unit(
+                                claimed,
+                                self.repo.col,
+                                formal_col=self.repo.formal_col,
+                                total_pending_count=len(claimed),
+                                shared_active_products=self.shared_active_products,
+                                shared_lock=self.shared_lock,
+                                quiet_sub_logs=self.quiet_sub_logs,
+                            )
+                    else:
+                        outcomes, elapsed, _ = self.cleaner.process_ai1_unit(
+                            claimed,
+                            self.repo.col,
+                            formal_col=self.repo.formal_col,
+                            total_pending_count=len(claimed),
+                            shared_active_products=self.shared_active_products,
+                            shared_lock=self.shared_lock,
+                            quiet_sub_logs=self.quiet_sub_logs,
+                        )
+                elif self.stage == CLEAN_STAGE_NEED_CONVERT:
+                    outcomes, elapsed = self.cleaner.process_convert_unit(
+                        claimed,
+                        formal_col=self.repo.formal_col,
+                        total_pending_count=len(claimed),
+                        shared_active_products=self.shared_active_products,
+                        shared_lock=self.shared_lock,
+                        quiet_sub_logs=self.quiet_sub_logs,
+                    )
+                elif self.stage == CLEAN_STAGE_NEED_AI2:
+                    if self.ai_semaphore is not None:
+                        with self.ai_semaphore:
+                            outcomes, elapsed = self.cleaner.process_ai2_unit(
+                                claimed,
+                                raw_col=self.repo.col,
+                                formal_col=self.repo.formal_col,
+                                total_pending_count=len(claimed),
+                                quiet_sub_logs=self.quiet_sub_logs,
+                            )
+                    else:
+                        outcomes, elapsed = self.cleaner.process_ai2_unit(
+                            claimed,
+                            raw_col=self.repo.col,
+                            formal_col=self.repo.formal_col,
+                            total_pending_count=len(claimed),
+                            quiet_sub_logs=self.quiet_sub_logs,
+                        )
+                else:
+                    logger.warning("[%s] 未知阶段标记: %s", self.name, self.stage)
+                    time.sleep(self.poll_interval)
+                    continue
+
+                if outcomes:
+                    _commit_batch_results_to_db(
+                        outcomes,
+                        self.repo.col,
+                        self.repo.formal_col,
+                        cycle_num=0,
+                        shared_active_products=self.shared_active_products,
+                        shared_lock=self.shared_lock,
+                    )
+                    self.total_processed += len(outcomes)
+                    adv_count = sum(1 for o in outcomes if o.get("stage_outcome") in ("advance_to_convert", "advance_to_ai2", "success"))
+                    self.total_advanced += adv_count
+                    if self.downstream_event is not None and adv_count > 0:
+                        self.downstream_event.set()
+
+            except Exception as e:
+                logger.exception("🚨 [%s] 阶段工作线程处理异常，稍后继续: %s", self.name, e)
+                time.sleep(self.poll_interval)
+
+
+class MaintenanceWorker(threading.Thread):
+    """后台清扫维护线程：租约防死锁清扫、陈旧数据出队、重试上限归档与好价保鲜。"""
+    def __init__(
+        self,
+        repo: DealRawPoolRepository,
+        poll_interval: float = 30.0,
+        stop_event: Optional[threading.Event] = None,
+    ):
+        super().__init__(name="DealMaintenanceWorker", daemon=True)
+        self.repo = repo
+        self.poll_interval = max(5.0, poll_interval)
+        self.stop_event = stop_event or threading.Event()
+
+    def run(self) -> None:
+        tick = 0
+        while not self.stop_event.is_set():
+            tick += 1
+            try:
+                # 1. 租约清扫：释放超时未完成的租约回队
+                reclaimed = self.repo.reclaim_expired_leases()
+                if reclaimed > 0:
+                    logger.info("🧹 [维护清扫] 成功释放超时未完成租约 %d 条回队", reclaimed)
+
+                # 2. 保鲜清扫：将超过保鲜期的旧未清洗记录标为 cleaned_failed
+                now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+                cutoff_ts = time.time() - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
+                cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
+                self.repo.col.update_many(
+                    {
+                        "clean_status": "pending",
+                        "$or": [
+                            {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
+                            {"first_seen_at": {"$lt": cutoff_dt}},
+                        ],
+                    },
+                    {
+                        "$set": {
+                            "clean_status": "cleaned_failed",
+                            "clean_stage": CLEAN_STAGE_DONE,
+                            "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
+                            "clean_error_msg": f"超过 {DEAL_MAX_CLEAN_AGE_DAYS} 天保鲜期，自动清扫",
+                            "cleaned_at": now_utc,
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                        },
+                    },
+                )
+
+                # 3. 超限重试清扫：重试达到上限的标记为 cleaned_failed
+                self.repo.col.update_many(
+                    {
+                        "clean_status": "pending",
+                        "clean_retry_count": {"$gte": MAX_CLEAN_RETRIES},
+                    },
+                    {
+                        "$set": {
+                            "clean_status": "cleaned_failed",
+                            "clean_stage": CLEAN_STAGE_DONE,
+                            "clean_error_code": ERR_AI_MAX_RETRIES_EXCEEDED,
+                            "clean_error_msg": f"已达最大重试上限({MAX_CLEAN_RETRIES}次)，自动放弃",
+                            "cleaned_at": now_utc,
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                        },
+                    },
+                )
+
+                # 4. 每 30 轮（约 15 分钟）执行一次正式库好价保鲜摘标
+                if tick % 30 == 0:
+                    exp_cnt = self.repo.expire_stale_formal_deals(now_utc=now_utc)
+                    if exp_cnt > 0:
+                        logger.info("🧹 [正式库好价保鲜] 自动摘除超 %.0f 小时未刷新好价标 %d 个", DEAL_FORMAL_EXPIRY_HOURS, exp_cnt)
+
+                # 5. 更新状态快照
+                summary = self.repo.generate_pool_summary()
+                with open(STATS_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, ensure_ascii=False, indent=2)
+
+            except Exception as e:
+                logger.warning("维护线程执行异常: %s", e)
+
+            self.stop_event.wait(timeout=self.poll_interval)
+
+
+def run_stage_pipeline_drain(
+    repo: DealRawPoolRepository,
+    cleaner: DealPoolCleaner,
+    clean_limit: int = 0,
+    timeout_seconds: float = 3600.0,
+) -> Dict[str, Any]:
+    """
+    排空运行模式（供 `--clean-only` 或 `--once` 使用）：
+    启动 AI-1、转链与 AI-2 三个独立工作线程并发流水线作业，
+    直至库内所有阶段待处理记录全部排空或达到目标上限后优雅结束。
+    """
+    t_start = time.perf_counter()
+    repo.migrate_pending_to_stage_machine()
+    cleaner.warmup_anchor_cache_from_db(repo.col)
+    shared_active_products = cleaner._load_active_formal_products(repo.formal_col)
+    shared_lock = threading.Lock()
+    ai_semaphore = threading.BoundedSemaphore(cleaner.ai_max_workers)
+
+    stop_event = threading.Event()
+    ai1_done_event = threading.Event()
+    convert_done_event = threading.Event()
+
+    # Stage 1: AI-1 拆解（按批次优先处理最新鲜线报，默认以并发能力打满平摊长尾）
+    ai1_batch = max(64, cleaner.ai_batch_size * cleaner.ai_max_workers * 2)
+    if clean_limit > 0:
+        ai1_batch = max(cleaner.ai_batch_size, clean_limit)
+
+    # Stage 2 & 3: 官方转链与 AI-2 终审（上游满足条件的有效记录 100% 全量认领排空，彻底取消人工狭隘卡口）
+    convert_batch = 5000
+    ai2_batch = 2000
+
+    worker_ai1 = StageWorker(
+        name="StageWorker-AI1",
+        stage=CLEAN_STAGE_NEED_AI1,
+        repo=repo,
+        cleaner=cleaner,
+        batch_size=ai1_batch,
+        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
+        poll_interval=1.0,
+        stop_event=stop_event,
+        ai_semaphore=ai_semaphore,
+        upstream_event=None,
+        downstream_event=ai1_done_event,
+        shared_active_products=shared_active_products,
+        shared_lock=shared_lock,
+    )
+    worker_convert = StageWorker(
+        name="StageWorker-Convert",
+        stage=CLEAN_STAGE_NEED_CONVERT,
+        repo=repo,
+        cleaner=cleaner,
+        batch_size=convert_batch,
+        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
+        poll_interval=1.0,
+        stop_event=stop_event,
+        ai_semaphore=None,
+        upstream_event=ai1_done_event,
+        downstream_event=convert_done_event,
+        shared_active_products=shared_active_products,
+        shared_lock=shared_lock,
+    )
+    worker_ai2 = StageWorker(
+        name="StageWorker-AI2",
+        stage=CLEAN_STAGE_NEED_AI2,
+        repo=repo,
+        cleaner=cleaner,
+        batch_size=ai2_batch,
+        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
+        poll_interval=1.0,
+        stop_event=stop_event,
+        ai_semaphore=ai_semaphore,
+        upstream_event=convert_done_event,
+        downstream_event=None,
+        shared_active_products=shared_active_products,
+        shared_lock=shared_lock,
+    )
+    worker_maint = MaintenanceWorker(repo=repo, poll_interval=15.0, stop_event=stop_event)
+
+    logger.info(
+        "🚀 [阶段化流水线启动] AI-1 (批=%d, 并发=%d) | 转链 (批=%d, 并发=%d) | AI-2 (批=%d, 并发=%d) | 排空模式运行中...",
+        ai1_batch,
+        cleaner.ai_max_workers,
+        convert_batch,
+        cleaner.convert_max_workers,
+        ai2_batch,
+        cleaner.ai_max_workers,
+    )
+
+    worker_ai1.start()
+    worker_convert.start()
+    worker_ai2.start()
+    worker_maint.start()
+
+    idle_count = 0
+    try:
+        while time.perf_counter() - t_start < timeout_seconds:
+            # 统计三个阶段的待处理记录数
+            p_ai1 = repo.col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI1})
+            p_conv = repo.col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_CONVERT})
+            p_ai2 = repo.col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI2})
+            total_pending = p_ai1 + p_conv + p_ai2
+
+            total_done = worker_ai2.total_processed
+
+            if clean_limit > 0 and total_done >= clean_limit:
+                logger.info("🏁 已达到目标处理上限 (--clean-limit=%d)，通知各阶段 Worker 结束。", clean_limit)
+                break
+
+            if total_pending == 0:
+                idle_count += 1
+                if idle_count >= 2:
+                    logger.info("✨ 所有阶段队列均已排空 (pending=0)，流水线处理完毕。")
+                    break
+            else:
+                idle_count = 0
+
+            time.sleep(2.0)
+    finally:
+        stop_event.set()
+        ai1_done_event.set()
+        convert_done_event.set()
+        worker_ai1.join(timeout=3.0)
+        worker_convert.join(timeout=3.0)
+        worker_ai2.join(timeout=3.0)
+        worker_maint.join(timeout=2.0)
+
+    elapsed_s = round(time.perf_counter() - t_start, 2)
+    logger.info(
+        "🏁 [阶段化流水线排空完成] 耗时=%.2fs | AI-1处理=%d条, 转链处理=%d条, AI-2终审=%d条",
+        elapsed_s,
+        worker_ai1.total_processed,
+        worker_convert.total_processed,
+        worker_ai2.total_processed,
+    )
+    return {
+        "elapsed_s": elapsed_s,
+        "ai1_processed": worker_ai1.total_processed,
+        "convert_processed": worker_convert.total_processed,
+        "ai2_processed": worker_ai2.total_processed,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="好价线报与采集群定时拉取 (`deal_raw_tips`) + 唯一商品清洗入正式表 (`products`) 一体化守护脚本"
+        description="好价线报与采集群定时拉取 (`deal_raw_tips`) + 阶段化流水线清洗入正式表 (`products`) 一体化守护脚本"
     )
     parser.add_argument(
         "--collection",
@@ -6549,7 +7442,7 @@ def main():
     parser.add_argument(
         "--serial",
         action="store_true",
-        help="强制使用串行模式（先拉取后清洗）；默认在持续守护模式下启用【拉取线程 + 清洗线程】双线程并行",
+        help="强制使用串行单窗口模式（先拉取后清洗）；默认启用【阶段化独立流水线并行守护】",
     )
     parser.add_argument(
         "--all-channels",
@@ -6629,6 +7522,9 @@ def main():
         print_latest_ops_report()
         return
 
+    # 启动前统一迁移历史数据至阶段状态机
+    repo.migrate_pending_to_stage_machine()
+
     init_expired = repo.expire_stale_formal_deals()
     if init_expired > 0:
         logger.info("🧹 [启动好价保鲜清扫] 自动摘除超 %.0f 小时未刷新好价标 %d 个", DEAL_FORMAL_EXPIRY_HOURS, init_expired)
@@ -6641,13 +7537,21 @@ def main():
             recovered["tb_recovered"],
         )
 
+    # 1. 仅清洗模式 (--clean-only)
     if args.clean_only:
-        run_clean_stage(
-            repo=repo,
-            cleaner=cleaner,
-            cycle_num=1,
-            clean_limit=args.clean_limit,
-        )
+        if args.serial:
+            run_clean_stage(
+                repo=repo,
+                cleaner=cleaner,
+                cycle_num=1,
+                clean_limit=args.clean_limit,
+            )
+        else:
+            run_stage_pipeline_drain(
+                repo=repo,
+                cleaner=cleaner,
+                clean_limit=args.clean_limit,
+            )
         print_stats_report(repo)
         return
 
@@ -6656,7 +7560,7 @@ def main():
 
     def _handle_sig(signum, frame):
         nonlocal stop_requested
-        logger.info("收到停止信号 (%s)，正在通知拉取与清洗线程优雅退出...", signum)
+        logger.info("收到停止信号 (%s)，正在通知各工作线程优雅退出...", signum)
         stop_requested = True
         new_fetch_event.set()
 
@@ -6666,17 +7570,29 @@ def main():
 
     channel_health_tracker: Dict[str, Dict[str, Any]] = {}
 
+    # 2. 单次闭环模式 (--once)
     if args.once or args.max_cycles == 1:
         with requests.Session() as session:
-            run_single_cycle(
+            run_fetch_stage(
                 repo=repo,
-                cleaner=cleaner,
                 session=session,
                 cycle_num=1,
                 max_new_details_per_channel=args.max_new_details,
                 run_all_tiers=args.all_channels,
-                clean_limit=args.clean_limit,
                 channel_health_tracker=channel_health_tracker,
+            )
+        if args.serial:
+            run_clean_stage(
+                repo=repo,
+                cleaner=cleaner,
+                cycle_num=1,
+                clean_limit=args.clean_limit,
+            )
+        else:
+            run_stage_pipeline_drain(
+                repo=repo,
+                cleaner=cleaner,
+                clean_limit=args.clean_limit,
             )
         print_stats_report(repo)
         return
@@ -6684,6 +7600,7 @@ def main():
     start_wall = time.time()
     deadline_wall = (start_wall + args.duration_hours * 3600.0) if args.duration_hours > 0 else None
 
+    # 3. 兼容串行守护模式 (--serial)
     if args.serial:
         logger.info(
             "🚀 好价线报【串行模式：拉取 -> 清洗】守护已启动 | 初步表=[%s] -> 正式表=[%s] | "
@@ -6731,24 +7648,29 @@ def main():
         return
 
     # ==========================================================================
-    # 默认高吞吐模式：【Producer 多源定时拉取线程】与【Consumer 各平台最新均匀清洗线程】双线程并行
+    # 4. 默认高吞吐模式：【Producer定时拉取 + 阶段化流水线独立并发并行守护】
     # ==========================================================================
     logger.info(
-        "🚀 好价线报【双线程并行守护：Producer定时拉取 + Consumer各平台最新均匀清洗】已启动 | 初步表=[%s] -> 正式表=[%s] | "
-        "拉取间隔=%ds | 清洗间隔=%ds | 清洗窗口=%d/轮 | AI批次=%d(x%d线程, 超时=%.0fs) | 转链并发=%d线程 | 主日志=[%s]",
+        "🚀 好价线报【阶段化独立流水线并行守护】已启动 | 初步表=[%s] -> 正式表=[%s] | "
+        "拉取间隔=%ds | AI-1(批=%d, 并发=%d) | 转链(并发=%d) | AI-2(批=%d, 并发=%d) | 主日志=[%s]",
         args.collection,
         args.formal_collection,
         args.interval,
-        args.clean_interval,
-        args.clean_limit,
         args.ai_batch_size,
         args.ai_workers,
-        args.ai_timeout,
         args.convert_workers,
+        args.ai_batch_size,
+        args.ai_workers,
         LOG_FILE_PATH,
     )
 
-    shared_state: Dict[str, Any] = {"latest_clean_report": {}}
+    cleaner.warmup_anchor_cache_from_db(repo.col)
+    shared_active_products = cleaner._load_active_formal_products(repo.formal_col)
+    shared_lock = threading.Lock()
+    ai_semaphore = threading.BoundedSemaphore(cleaner.ai_max_workers)
+
+    ai1_done_event = threading.Event()
+    convert_done_event = threading.Event()
 
     def _producer_fetch_worker() -> None:
         nonlocal stop_requested
@@ -6764,7 +7686,6 @@ def main():
                         max_new_details_per_channel=args.max_new_details,
                         run_all_tiers=args.all_channels or (fetch_cycle % 2 == 0),
                         channel_health_tracker=channel_health_tracker,
-                        latest_clean_report=shared_state.get("latest_clean_report"),
                     )
                     if fetch_res.get("total_inserted", 0) > 0:
                         new_fetch_event.set()
@@ -6772,20 +7693,20 @@ def main():
                 logger.exception("🚨 [拉取线程/Producer] 第 #%d 轮拉取异常，将在下一轮自动恢复: %s", fetch_cycle, fetch_exc)
 
             if args.max_cycles > 0 and fetch_cycle >= args.max_cycles:
-                logger.info("🏁 [拉取线程/Producer] 已完成设定最大拉取轮数 (--max-cycles=%d)，通知清洗线程收尾退出。", args.max_cycles)
+                logger.info("🏁 [拉取线程/Producer] 已完成设定最大拉取轮数 (--max-cycles=%d)，通知清洗各阶段收尾退出。", args.max_cycles)
                 stop_requested = True
                 new_fetch_event.set()
                 break
 
             if deadline_wall is not None and time.time() >= deadline_wall:
-                logger.info("🏁 [拉取线程/Producer] 已达到设定运行时长 (--duration-hours=%.2f)，通知清洗线程收尾退出。", args.duration_hours)
+                logger.info("🏁 [拉取线程/Producer] 已达到设定运行时长 (--duration-hours=%.2f)，通知清洗各阶段收尾退出。", args.duration_hours)
                 stop_requested = True
                 new_fetch_event.set()
                 break
 
             sleep_target = max(10, int(args.interval))
             logger.info(
-                "⏳ [拉取线程/Producer] 第 #%d 轮拉取完毕，休眠 %d 秒后进入第 #%d 轮拉取（清洗线程在后台并行运转中）...",
+                "⏳ [拉取线程/Producer] 第 #%d 轮拉取完毕，休眠 %d 秒后进入第 #%d 轮拉取（各清洗流水线在后台并行运转中）...",
                 fetch_cycle,
                 sleep_target,
                 fetch_cycle + 1,
@@ -6797,87 +7718,95 @@ def main():
                     break
                 time.sleep(1)
 
-    def _consumer_clean_worker() -> None:
-        nonlocal stop_requested
-        clean_cycle = 0
-        was_idle = False
-        # 启动后先等 3 秒，让第一轮拉取率先启动连接
-        time.sleep(3)
-        while not stop_requested:
-            if deadline_wall is not None and time.time() >= deadline_wall:
-                stop_requested = True
-                break
-            try:
-                pending_cnt = repo.col.count_documents(
-                    {"$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]}
-                )
-            except Exception as e:
-                logger.warning("[清洗线程/Consumer] 查询 pending 数量异常: %s", e)
-                pending_cnt = 0
+    # Stage 1: AI-1 拆解（按批次优先处理最新鲜线报，默认以并发能力打满平摊长尾）
+    ai1_batch = max(64, cleaner.ai_batch_size * cleaner.ai_max_workers * 2)
+    if getattr(args, "clean_limit", 0) > 0:
+        ai1_batch = max(cleaner.ai_batch_size, args.clean_limit)
 
-            if pending_cnt <= 0:
-                if not was_idle:
-                    logger.info("✨ [清洗线程/Consumer] 当前初步表 `pending=0` 已全部清空，等待拉取线程注入新线报...")
-                    was_idle = True
-                new_fetch_event.wait(timeout=15.0)
-                new_fetch_event.clear()
-                continue
+    # Stage 2 & 3: 官方转链与 AI-2 终审（上游满足条件的有效记录 100% 全量认领排空，彻底取消人工狭隘卡口）
+    convert_batch = 5000
+    ai2_batch = 2000
 
-            was_idle = False
-            new_fetch_event.clear()
-            clean_cycle += 1
-            t_round_start = time.perf_counter()
-            try:
-                c_rep = run_clean_stage(
-                    repo=repo,
-                    cleaner=cleaner,
-                    cycle_num=clean_cycle,
-                    clean_limit=args.clean_limit,
-                )
-                shared_state["latest_clean_report"] = c_rep
-                summary = repo.generate_pool_summary()
-                with open(STATS_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
-                    json.dump(summary, f, ensure_ascii=False, indent=2)
-            except Exception as clean_exc:
-                logger.exception("🚨 [清洗线程/Consumer] 第 #%d 批清洗发生异常，10秒后自动继续: %s", clean_cycle, clean_exc)
-                time.sleep(10)
-                continue
-
-            round_elapsed = time.perf_counter() - t_round_start
-            clean_sleep = max(3, int(round(args.clean_interval - round_elapsed)))
-            logger.info(
-                "⏳ [清洗线程/Consumer] 第 #%d 轮清洗完毕 (本轮耗时=%.1fs, 目标周期=%ds)，等待 %d 秒后进入第 #%d 轮各平台最新均匀清洗...",
-                clean_cycle,
-                round_elapsed,
-                int(args.clean_interval),
-                clean_sleep,
-                clean_cycle + 1,
-            )
-            for _ in range(clean_sleep):
-                if stop_requested or (deadline_wall is not None and time.time() >= deadline_wall):
-                    break
-                time.sleep(1)
-
+    worker_ai1 = StageWorker(
+        name="StageWorker-AI1",
+        stage=CLEAN_STAGE_NEED_AI1,
+        repo=repo,
+        cleaner=cleaner,
+        batch_size=ai1_batch,
+        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
+        poll_interval=2.0,
+        stop_event=threading.Event(),
+        ai_semaphore=ai_semaphore,
+        upstream_event=new_fetch_event,
+        downstream_event=ai1_done_event,
+        shared_active_products=shared_active_products,
+        shared_lock=shared_lock,
+    )
+    worker_convert = StageWorker(
+        name="StageWorker-Convert",
+        stage=CLEAN_STAGE_NEED_CONVERT,
+        repo=repo,
+        cleaner=cleaner,
+        batch_size=convert_batch,
+        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
+        poll_interval=1.5,
+        stop_event=threading.Event(),
+        ai_semaphore=None,
+        upstream_event=ai1_done_event,
+        downstream_event=convert_done_event,
+        shared_active_products=shared_active_products,
+        shared_lock=shared_lock,
+    )
+    worker_ai2 = StageWorker(
+        name="StageWorker-AI2",
+        stage=CLEAN_STAGE_NEED_AI2,
+        repo=repo,
+        cleaner=cleaner,
+        batch_size=ai2_batch,
+        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
+        poll_interval=2.0,
+        stop_event=threading.Event(),
+        ai_semaphore=ai_semaphore,
+        upstream_event=convert_done_event,
+        downstream_event=None,
+        shared_active_products=shared_active_products,
+        shared_lock=shared_lock,
+    )
+    worker_maint = MaintenanceWorker(repo=repo, poll_interval=30.0, stop_event=threading.Event())
     producer_thread = threading.Thread(target=_producer_fetch_worker, name="DealProducerFetch", daemon=True)
-    consumer_thread = threading.Thread(target=_consumer_clean_worker, name="DealConsumerClean", daemon=True)
 
     producer_thread.start()
-    consumer_thread.start()
+    worker_ai1.start()
+    worker_convert.start()
+    worker_ai2.start()
+    worker_maint.start()
 
     try:
-        while producer_thread.is_alive() or consumer_thread.is_alive():
+        while producer_thread.is_alive() or worker_ai1.is_alive() or worker_convert.is_alive() or worker_ai2.is_alive():
             producer_thread.join(timeout=1.0)
-            consumer_thread.join(timeout=1.0)
-            if stop_requested and not producer_thread.is_alive():
-                # 等待当前正在执行的清洗批次优雅收尾
-                consumer_thread.join(timeout=5.0)
+            worker_ai1.join(timeout=0.5)
+            worker_convert.join(timeout=0.5)
+            worker_ai2.join(timeout=0.5)
+            if stop_requested:
+                worker_ai1.stop_event.set()
+                worker_convert.stop_event.set()
+                worker_ai2.stop_event.set()
+                worker_maint.stop_event.set()
+                ai1_done_event.set()
+                convert_done_event.set()
+                new_fetch_event.set()
                 break
     except KeyboardInterrupt:
         stop_requested = True
+        worker_ai1.stop_event.set()
+        worker_convert.stop_event.set()
+        worker_ai2.stop_event.set()
+        worker_maint.stop_event.set()
+        ai1_done_event.set()
+        convert_done_event.set()
         new_fetch_event.set()
 
     print_stats_report(repo)
-
 
 if __name__ == "__main__":
     main()
