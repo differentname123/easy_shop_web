@@ -4,8 +4,10 @@
 2. 京东平台：高配额全网搜索、详情反查及专属转链支持。
 """
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 import requests
 
 from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, is_real_requests_session
@@ -278,11 +280,77 @@ class HdkClient:
         *,
         union_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """尝试反查短链商品。注意：好单库官方当前不提供 u.jd.com 解包接口，避免向搜索接口盲传 URL。"""
+        """
+        轻量解包京东 u.jd.com 推广短链，判定是活动会场页还是单品商品：
+        1. 跟随一次内部 302/hrl 跳转拿到落地真实 URL；
+        2. 若落地为活动/会场/券包（pro.m.jd.com、jingfen 活动包、coupon.m.jd.com）：
+           返回 is_venue=True，上游转链后直接作为 coupon_or_venue 成功流转，避免无谓反查单品详情；
+        3. 若落地为单品页（item.m.jd.com / item.jd.com / skuId）：
+           提取出确定性的数字 sku_id 并返回，供详情反查与精准卡片绑定。
+        """
         url = clean_text(short_url)
         if not url:
             return _error("INVALID_ARGUMENT", "短链不能为空")
-        return _error("NOT_SUPPORTED", "好单库当前不支持短链反查，请使用折淘客短链反查能力")
+        if not url.lower().startswith(("http://", "https://")):
+            return _error("INVALID_ARGUMENT", "短链格式无效")
+
+        if "u.jd.com" not in url.lower():
+            return _error("NOT_SUPPORTED", "仅支持 u.jd.com 短链解包")
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+            )
+        }
+        dest_url = ""
+        try:
+            timeout = (2.0, 3.5)
+            resp = self.http.get(url, headers=headers, timeout=timeout)
+            if getattr(resp, "status_code", 0) == 200:
+                m = re.search(r"var\s+hrl\s*=\s*['\"]([^'\"]+)['\"]", getattr(resp, "text", "") or "")
+                if m:
+                    hrl = m.group(1).strip()
+                    r2 = self.http.get(hrl, headers=headers, allow_redirects=True, timeout=timeout)
+                    dest_url = str(getattr(r2, "url", "") or "").strip()
+                elif getattr(resp, "url", "") and resp.url != url:
+                    dest_url = str(resp.url).strip()
+            elif getattr(resp, "status_code", 0) in (301, 302, 303, 307, 308) and getattr(resp, "headers", None):
+                dest_url = str(resp.headers.get("Location") or "").strip()
+        except Exception as e:
+            logger.debug("[HDK短链解包] 访问异常: url=%s, err=%s", url, e)
+            return _error("UPSTREAM_ERROR", f"京东短链解包失败: {e}")
+
+        if not dest_url:
+            return _error("NOT_FOUND", "未能解包该京东短链落地页")
+
+        parts = urlsplit(dest_url)
+        host = (parts.hostname or "").lower()
+        path = parts.path or ""
+
+        # 判定是否属于官方活动/会场/券包
+        is_venue = False
+        if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active/" in path:
+            is_venue = True
+        elif host == "jingfen.jd.com" and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url):
+            is_venue = True
+        elif host == "coupon.m.jd.com":
+            is_venue = True
+
+        # 判定是否包含明确单品 SKU
+        sku_id = ""
+        sku_m = re.search(r"/(?:product|item)/(\d+)\.html", path, re.IGNORECASE) or re.search(r"[?&]sku(?:Id)?=(\d+)", parts.query)
+        if sku_m:
+            sku_id = sku_m.group(1)
+
+        return {
+            "status": "success",
+            "data": {
+                "dest_url": dest_url,
+                "is_venue": is_venue,
+                "sku_id": sku_id,
+            },
+        }
 
     def convert_promotion_link(
         self,
@@ -293,7 +361,7 @@ class HdkClient:
         sub_union_id: Optional[str] = None,
         coupon_url: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """京东高佣转链生成专属推广短链 (接口 id=48: v3/get_jditems_link)。"""
+        """京东高佣转链生成专属推广短链 (接口 id=48: v3/get_jditems_link)。原生支持物料 ID、jingfen.jd.com 链接以及 u.jd.com 短链。"""
         mat = clean_text(material_id)
         if not mat:
             return _error("INVALID_ARGUMENT", "缺少物料ID或商品链接")

@@ -163,8 +163,9 @@ class ProductRepository(BaseRepository):
 
     @classmethod
     def _boom_content_filter(cls) -> Dict[str, Any]:
-        """爆单推广与类目聚合仅读取已入库的榜单商品或已清洗线报商品，排除搜索/详情散查裸记录。"""
+        """爆单推广与类目聚合仅读取已入库的榜单商品或已清洗线报商品，排除搜索/详情散查裸记录与已软下架商品。"""
         content_filter = deepcopy(cls._displayable_content_filter())
+        content_filter["is_off_promotion"] = {"$ne": True}
         content_filter["$or"] = [
             {"channel_type": {"$exists": True, "$ne": None}},
             {"deal_info.is_deal_tip": True},
@@ -302,6 +303,12 @@ class ProductRepository(BaseRepository):
             update_set["coupon_url"] = coupon_url.strip()
 
         update_set["updated_at"] = now
+        update_set["is_off_promotion"] = False
+        try:
+            from cache import clear_product_off_promotion
+            clear_product_off_promotion(platform, goods_id, goods_sign)
+        except Exception:
+            pass
         if item.get("source") is not None:
             update_set["source"] = item["source"]
         elif not detail:
@@ -1103,6 +1110,8 @@ class ProductRepository(BaseRepository):
             "deal_tip": self._extract_deal_tip(doc, result["updated_at"]),
             # 不把摘要 updated_at 冒充详情抓取时间；服务层负责过期决策。
             "detail_updated_at": doc.get("detail_updated_at"),
+            "is_off_promotion": doc.get("is_off_promotion", False),
+            "off_promotion_at": doc.get("off_promotion_at"),
         })
         return result
 
@@ -1446,10 +1455,11 @@ class ProductRepository(BaseRepository):
         platform = self._platform(platform)
         gid, gsign = self._promotion_identity(goods_id, goods_sign, goods_key)
 
+        filter_spec = {"platform": platform, "is_off_promotion": {"$ne": True}}
         if gid:
-            filter_spec = {"platform": platform, "product_id": gid}
+            filter_spec["product_id"] = gid
         elif gsign:
-            filter_spec = {"platform": platform, "goods_sign": gsign}
+            filter_spec["goods_sign"] = gsign
         else:
             return None
 
@@ -1589,7 +1599,7 @@ class ProductRepository(BaseRepository):
         goods_id: Optional[str] = None,
         goods_sign: Optional[str] = None,
     ) -> bool:
-        """物理删除已确认取消推广或下架的商品记录，避免首页/爆单库或详情降级继续展示失效商品。"""
+        """软下架已确认取消推广或下架的商品记录，避免首页/爆单库或详情降级继续展示失效商品。"""
         plat = self._platform(platform)
         gid = self._real_goods_id(goods_id)
         gsign = str(goods_sign or "").strip()
@@ -1602,20 +1612,26 @@ class ProductRepository(BaseRepository):
                 matched_docs = list(self.col.find(filter_spec, {"_id": 0, "product_id": 1, "goods_id": 1, "goods_sign": 1}))
             except Exception:
                 matched_docs = [{"product_id": gid, "goods_sign": gsign}] if gid else []
-            res = self.col.delete_many(filter_spec)
-            deleted = int(getattr(res, "deleted_count", 0) or 0)
-            if deleted > 0:
-                if not matched_docs and gid:
-                    matched_docs = [{"product_id": gid, "goods_sign": gsign}]
+            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            res = self.col.update_many(
+                filter_spec,
+                {
+                    "$set": {"is_off_promotion": True, "off_promotion_at": now_utc},
+                    "$unset": {"default_promotion": "", "default_promotion_expires_at": ""},
+                },
+            )
+            modified = int(getattr(res, "modified_count", 0) or 0)
+            if matched_docs and gid:
                 self._record_deletion_tombstones(plat, matched_docs)
+            if modified > 0:
                 logger.info(
-                    "【失效商品清理】已从本地数据库物理移除取消推广/下架商品 | 平台[%s] 商品[%s] 移除条数[%d]",
-                    plat, gid or gsign, deleted,
+                    "【失效商品软下架】已将取消推广/下架商品标记软隔离 | 平台[%s] 商品[%s] 影响条数[%d]",
+                    plat, gid or gsign, modified,
                 )
-            return deleted > 0
+            return modified > 0 or len(matched_docs) > 0
         except Exception as e:
             logger.warning(
-                "❌ 【失效商品清理异常】从products集合删除下架商品失败 | 平台[%s] 商品[%s] 异常<%s>",
+                "❌ 【失效商品清理异常】从products集合软下架商品失败 | 平台[%s] 商品[%s] 异常<%s>",
                 plat, gid or gsign, format_exc_summary(e),
             )
             return False

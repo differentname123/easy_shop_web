@@ -496,6 +496,10 @@ def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=
             return {"status": "success", "data": url_list[0]}
         return {"status": "error", "error_msg": "未能生成推广链接"}
     except Exception as e:
+        sub_code = str(getattr(e, "sub_code", "") or "").strip()
+        msg = str(e)
+        if sub_code in ("40001", "40002") or any(k in msg for k in ("商品非多多客商品", "商品已下架", "商品不存在")):
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
         return {"status": "error", "error_msg": f"生成商品推广链接异常: {str(e)}"}
 
 def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash_gift_id=None, uid=None, **kwargs):
@@ -586,6 +590,10 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
                 return {"status": "success", "data": cleaned}
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
         except Exception as e:
+            sub_code = str(getattr(e, "sub_code", "") or "").strip()
+            msg = str(e)
+            if sub_code in ("40001", "40002") or any(k in msg for k in ("商品非多多客商品", "商品已下架", "商品不存在")):
+                return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
             err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
             return {"status": "error", "error_code": err_code, "error_msg": f"Detail 查询失败: {str(e)}"}
 

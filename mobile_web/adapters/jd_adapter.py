@@ -295,7 +295,16 @@ class JdAdapter(BasePlatformAdapter):
                 return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU")
             res = client.get_goods_detail(target_id)
             if res.get("status") != "success":
-                return res
+                code = str(res.get("error_code") or "").upper()
+                if code == "PRODUCT_OFF_PROMOTION" or res.get("not_found") is True or code == "NOT_FOUND":
+                    time.sleep(0.15)
+                    retry_res = client.get_goods_detail(target_id)
+                    if retry_res.get("status") == "success" and retry_res.get("data"):
+                        res = retry_res
+                    else:
+                        return _error("PRODUCT_OFF_PROMOTION", "该京东商品已下架或已停止推广")
+                else:
+                    return res
             raw_item = res.get("data") or {}
             try:
                 return {"status": "success", "data": self._normalize_hdk_detail(raw_item, ref)}
@@ -315,7 +324,7 @@ class JdAdapter(BasePlatformAdapter):
             sub_id = kwargs.get("sub_union_id")
             res = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=sub_id, coupon_url=coupon)
             if res.get("status") != "success":
-                logger.warning("[JD转链-好单库主力] 转链失败(%s: %s)，准备降级至备用通道: target_id=%s", res.get("error_code"), res.get("error_msg"), target_id)
+                logger.debug("[JD转链-好单库主力] 转链未成功(%s: %s)，顺延至备用通道: target_id=%s", res.get("error_code"), res.get("error_msg"), target_id)
                 return res
             logger.info("[JD转链-好单库主力] 转链成功: short_url=%s, target_id=%s", res.get("short_url"), target_id)
             extra = {"coupon_url": coupon} if coupon else {}
@@ -344,36 +353,49 @@ class JdAdapter(BasePlatformAdapter):
                 target_id = text
 
             short_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9_-]+", text)
+            is_confirmed_venue = False
             if short_match and not target_id:
                 res = client.resolve_short_url(short_match.group(0))
                 if res.get("status") == "success" and isinstance(res.get("data"), dict):
-                    try:
-                        card = self._normalize_hdk_detail(res["data"])
-                        target_id = card.get("goods_sign") or card.get("goods_id")
-                    except Exception:
-                        pass
+                    data = res["data"]
+                    if data.get("is_venue"):
+                        is_confirmed_venue = True
+                    elif data.get("sku_id"):
+                        target_id = str(data["sku_id"]).strip()
+                    if data.get("goodsname") or data.get("name"):
+                        try:
+                            card = self._normalize_hdk_detail(data)
+                            target_id = card.get("goods_sign") or card.get("goods_id")
+                        except Exception:
+                            pass
 
             if target_id and not card:
                 det = self.get_goods_detail(target_id)
                 if det.get("status") == "success" and isinstance(det.get("data"), dict):
                     card = det["data"]
 
-            if not target_id and not card:
+            material_url = ""
+            if target_id:
+                material_url = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else target_id
+            elif short_match:
+                material_url = short_match.group(0)
+
+            if not material_url and not target_id and not card and not is_confirmed_venue:
                 return _error("NOT_FOUND", "未能识别该京东链接或商品")
 
-            mat = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else (short_match.group(0) if short_match else target_id)
+            mat = material_url or (short_match.group(0) if short_match else target_id)
             conv = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=kwargs.get("sub_union_id"), coupon_url=(card or {}).get("coupon_url"))
             if conv.get("status") != "success":
-                logger.warning("[JD万能转链-好单库] 转链失败(%s)，准备降级至备用通道: target_id=%s", conv.get("error_msg"), target_id)
+                logger.debug("[JD万能转链-好单库] 转链未成功(%s)，顺延至备用通道: mat=%s", conv.get("error_msg"), mat[:60])
                 return conv
-            logger.info("[JD万能解析-好单库主力] 解析与转链成功: target_id=%s, final_link=%s", target_id, conv.get("final_link"))
+            logger.info("[JD万能解析-好单库主力] 原生解析与转链成功: target_id=%s, final_link=%s", target_id or mat, conv.get("final_link"))
             short = conv.get("short_url") or ""
             long = conv.get("click_url") or ""
-            title = (card or {}).get("name") or "京东精选好物"
+            title = (card or {}).get("name") or ("京东精选活动会场" if is_confirmed_venue else "京东精选好物")
             price = (card or {}).get("price")
             coupon = (card or {}).get("coupon_amount", 0.0)
-            canonical_id = (card or {}).get("goods_id") or extract_canonical_goods_id(self.platform_code, target_id) or target_id
-            sign_id = (card or {}).get("goods_sign") or target_id
+            canonical_id = (card or {}).get("goods_id") or (extract_canonical_goods_id(self.platform_code, target_id) if target_id else "") or target_id or ""
+            sign_id = (card or {}).get("goods_sign") or target_id or ""
             payload = {
                 "status": "success",
                 "final_link": short or long,
@@ -391,9 +413,15 @@ class JdAdapter(BasePlatformAdapter):
                 "need_auth": False,
                 "link_type": "京东推广链接",
             }
+            if is_confirmed_venue:
+                payload["convert_status"] = "coupon_or_activity"
+                payload["resolution_kind"] = "coupon_or_venue"
+                payload["detail_lookup_failed"] = False
+                return stamp_universal_resolution(payload, verified_coupon_or_venue=True)
+
             if card is None:
                 payload["detail_lookup_failed"] = True
-            return stamp_universal_resolution(payload)
+            return stamp_universal_resolution(payload, single_item_evidence=bool(target_id))
         return _universal
 
     def _make_hdk_orders(self, client: HdkClient):
@@ -737,6 +765,9 @@ class JdAdapter(BasePlatformAdapter):
         if not promoter:
             return _error("INVALID_PROMOTER_ID", "京东转链需要服务端数字推广ID")
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
+        from cache import is_product_off_promotion
+        if is_product_off_promotion("jd", ref.goods_id, ref.goods_sign):
+            return _error("PRODUCT_OFF_PROMOTION", "该京东商品已下架或已停止推广")
         target_id = ref.goods_sign or ref.goods_id
         if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")

@@ -149,7 +149,7 @@ class PromoteService:
         return result
 
     def _verified_local_doc(self, ref: ProductRef) -> Optional[dict]:
-        if not ref.key:
+        if not ref.key or not hasattr(self.repo, "get_product_detail"):
             return None
         kind = "sign" if ref.goods_sign else "id"
         item = self.repo.get_product_detail(ref.key, platform=ref.platform, key_type=kind)

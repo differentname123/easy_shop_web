@@ -513,6 +513,9 @@ class ProductService:
             return cached[1]
         item = self._read_detail(ref)
         ref = self._upgrade_ref_sign(ref, item)
+        if isinstance(item, dict) and item.get("is_off_promotion") is True:
+            evict_product_from_caches(plat, ref.goods_id, ref.goods_sign)
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}
         deadline = self._detail_expires_at(item) if item else 0.0
         if time.time() < deadline:
             result = self._database_detail(item, "database")
@@ -532,7 +535,7 @@ class ProductService:
                     plat, goods_tag, reason,
                 )
                 return loaded.public
-            if item:
+            if item and item.get("is_off_promotion") is not True:
                 if err_code == "RATE_LIMIT":
                     logger.info(
                         "【商品详情缓存兜底】上游详情接口触发瞬时频控，已无缝返回本地缓存 | 平台[%s] 商品[%s]",

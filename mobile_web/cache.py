@@ -48,6 +48,16 @@ def is_product_off_promotion(platform: str, goods_id: str = "", goods_sign: str 
     return False
 
 
+def clear_product_off_promotion(platform: str, goods_id: str = "", goods_sign: str = "") -> None:
+    """当重新抓取到商品最新在售数据时，将其从防复活黑名单中移出以实现自愈复活。"""
+    plat = str(platform or "").strip().lower()
+    targets = {str(x).strip() for x in (goods_id, goods_sign) if str(x or "").strip()}
+    if not plat or not targets:
+        return
+    for t in targets:
+        OFF_PROMOTION_CACHE.pop((plat, t), None)
+
+
 def evict_product_from_caches(platform: str, goods_id: str = "", goods_sign: str = "") -> None:
     """当上游明确裁决商品已取消推广或下架时，从全内存缓存域驱逐并登记防复活黑名单。"""
     plat = str(platform or "").strip().lower()

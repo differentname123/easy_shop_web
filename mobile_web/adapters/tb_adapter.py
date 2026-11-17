@@ -409,10 +409,33 @@ class TaobaoAdapter(BasePlatformAdapter):
             return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
         res = self.official.get_goods_details([ref.key])
         if res.get("status") != "success":
-            return res
+            code = str(res.get("error_code") or "")
+            msg = str(res.get("error_msg") or "")
+            if code in ("isv.item-not-exist", "isv.item-offline", "isv.item-delete", "PRODUCT_OFF_PROMOTION", "50001") or "无结果" in msg:
+                import time
+                time.sleep(0.15)
+                retry_res = self.official.get_goods_details([ref.key])
+                if retry_res.get("status") == "success":
+                    res = retry_res
+                else:
+                    return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
+            else:
+                return res
         items = [item for item in res.get("data", []) if self._matches(item, ref)]
         if not items:
-            return _error("PRODUCT_IDENTITY_MISMATCH", "官方商品详情未证实请求商品身份")
+            raw_data = res.get("data")
+            if isinstance(raw_data, list) and len(raw_data) == 0:
+                import time
+                time.sleep(0.15)
+                retry_res = self.official.get_goods_details([ref.key])
+                if retry_res.get("status") == "success" and isinstance(retry_res.get("data"), list) and len(retry_res.get("data")) > 0:
+                    retry_items = [item for item in retry_res["data"] if self._matches(item, ref)]
+                    if retry_items:
+                        items = retry_items
+                if not items:
+                    return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
+            if not items:
+                return _error("PRODUCT_IDENTITY_MISMATCH", "官方商品详情未证实请求商品身份")
         item = dict(items[0])
         echoed = _text(item.get("input_item_iid"))
         if echoed and not echoed.isdigit():
@@ -476,6 +499,9 @@ class TaobaoAdapter(BasePlatformAdapter):
         if uid and identity.get("external_id") is not None and _text(identity["external_id"]) != _text(uid):
             return _error("IDENTITY_MISMATCH", "淘宝推广身份与站内用户不一致", need_auth=True, is_fallback=False)
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
+        from cache import is_product_off_promotion
+        if is_product_off_promotion("taobao", ref.goods_id, ref.goods_sign):
+            return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
 
         def _ztk_channel_convert(target, rel, goods_id_val, goods_sign_val, title_hint, *, allow_public=False):
             ztk_res = (

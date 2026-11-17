@@ -600,3 +600,105 @@ def test_tb_adapter_promotion_prefers_hdk_and_fails_over_to_ztk():
     assert res_degraded["_provider"] == "tb_official_promote"
     assert res_degraded["promotion_token"] == "￥淘口令ZTK￥"
 
+
+def test_jd_adapter_universal_direct_short_link_native_hdk():
+    """验证当输入为纯 u.jd.com 短链且无商品卡片时，HDK 原生直接转链成功而不提早降级。"""
+    hdk_mock = Mock()
+    hdk_mock.resolve_short_url.return_value = {
+        "status": "error",
+        "error_code": "NOT_SUPPORTED",
+        "error_msg": "好单库当前不支持短链反查",
+    }
+    hdk_mock.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/direct_hdk_short",
+        "click_url": "https://union-click.jd.com/direct_hdk_long",
+        "final_link": "https://u.jd.com/direct_hdk_short",
+        "promoter_id": "2035679405",
+    }
+    ztk_client = Mock()
+    ztk_client.convert_universal_material.return_value = {
+        "status": "error",
+        "error_code": "RATE_LIMIT",
+        "error_msg": "折淘客频控限流",
+    }
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+    res = adapter.resolve_and_convert_universal("https://u.jd.com/o1W3Z7o")
+
+    assert res["status"] == "success"
+    assert res["_provider"] == "hdk_jd_universal"
+    assert res["final_link"] == "https://u.jd.com/direct_hdk_short"
+    assert res["short_url"] == "https://u.jd.com/direct_hdk_short"
+    assert res["detail_lookup_failed"] is True
+    assert res["resolution_kind"] == "degraded_product"
+    assert ztk_client.convert_universal_material.call_count == 1
+
+
+def test_jd_adapter_universal_venue_shortlink_resolves_cleanly():
+    """验证当输入 u.jd.com 短链落地为官方活动/会场时，正向实证为 coupon_or_venue，无需单品卡片且绝不降级。"""
+    hdk_mock = Mock()
+    hdk_mock.resolve_short_url.return_value = {
+        "status": "success",
+        "data": {
+            "dest_url": "https://pro.m.jd.com/mall/active/4Gks5dMEpjonE5XYzAG1jG2mMM9R/index.html",
+            "is_venue": True,
+            "sku_id": "",
+        },
+    }
+    hdk_mock.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/my_venue_short",
+        "click_url": "https://union-click.jd.com/my_venue_long",
+        "final_link": "https://u.jd.com/my_venue_short",
+        "promoter_id": "2035679405",
+    }
+    ztk_client = Mock()
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+    res = adapter.resolve_and_convert_universal("https://u.jd.com/oOW5kMj")
+
+    assert res["status"] == "success"
+    assert res["_provider"] == "hdk_jd_universal"
+    assert res["resolution_kind"] == "coupon_or_venue"
+    assert res["convert_status"] == "coupon_or_activity"
+    assert res["detail_lookup_failed"] is False
+    assert res["final_link"] == "https://u.jd.com/my_venue_short"
+    # 会场直接正向实证成功，绝不调用折淘客去无谓反查单品详情！
+    assert ztk_client.convert_universal_material.call_count == 0
+
+
+def test_hdk_client_resolve_short_url_mocked():
+    """验证 HdkClient.resolve_short_url 的轻量解包逻辑与会场/单品判断。"""
+    from infrastructure.hdk_client import HdkClient
+
+    # 1. 模拟落地为大促会场
+    sess_mock = Mock()
+    resp1 = Mock(status_code=200, text="<script>var hrl='https://u.jd.com/jda?e=123';</script>", url="https://u.jd.com/oOW5kMj")
+    resp2 = Mock(status_code=200, url="https://pro.m.jd.com/mall/active/4Gks5dMEpjonE5XYzAG1jG2mMM9R/index.html?unionActId=31255")
+    sess_mock.get.side_effect = [resp1, resp2]
+
+    client = HdkClient(api_key="test_key", http_session=sess_mock)
+    res = client.resolve_short_url("https://u.jd.com/oOW5kMj")
+    assert res["status"] == "success"
+    assert res["data"]["is_venue"] is True
+    assert res["data"]["sku_id"] == ""
+
+    # 2. 模拟落地为单品
+    resp3 = Mock(status_code=200, text="<script>var hrl='https://u.jd.com/jda?e=456';</script>", url="https://u.jd.com/oDZwpf0")
+    resp4 = Mock(status_code=200, url="https://item.m.jd.com/product/10190980164446.html?rid=19054")
+    sess_mock.get.side_effect = [resp3, resp4]
+
+    res_item = client.resolve_short_url("https://u.jd.com/oDZwpf0")
+    assert res_item["status"] == "success"
+    assert res_item["data"]["is_venue"] is False
+    assert res_item["data"]["sku_id"] == "10190980164446"
+
+
+

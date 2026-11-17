@@ -232,6 +232,9 @@ def setup_logger(app_name="model_api"):
             datefmt="%Y-%m-%d %H:%M:%S",
         )
         console_handler = logging.StreamHandler()
+        console_level_name = os.environ.get("MODEL_API_CONSOLE_LOG_LEVEL", "WARNING").strip().upper()
+        console_level = getattr(logging, console_level_name, logging.WARNING)
+        console_handler.setLevel(console_level)
         console_handler.setFormatter(fmt)
         named_logger.addHandler(console_handler)
         if os.environ.get("WEB_LOG_DIR", "").strip() != "-":

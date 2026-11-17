@@ -289,11 +289,26 @@ class PddAdapter(BasePlatformAdapter):
                 res = pdd_get_detail(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
                                      goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs)
                 if res.get("status") != "success" or not res.get("data"):
-                    return {
-                        "status": "error",
-                        "error_code": str(res.get("error_code") or "UPSTREAM_ERROR"),
-                        "error_msg": res.get("error_msg", "未查询到官方商品详情"),
-                    }
+                    code = str(res.get("error_code") or "UPSTREAM_ERROR")
+                    if code == "PRODUCT_OFF_PROMOTION":
+                        import time
+                        time.sleep(0.15)
+                        retry_res = pdd_get_detail(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
+                                                   goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs)
+                        if retry_res.get("status") == "success" and retry_res.get("data"):
+                            res = retry_res
+                        else:
+                            return {
+                                "status": "error",
+                                "error_code": "PRODUCT_OFF_PROMOTION",
+                                "error_msg": res.get("error_msg", "该拼多多商品已下架或无推广计划"),
+                            }
+                    else:
+                        return {
+                            "status": "error",
+                            "error_code": code,
+                            "error_msg": res.get("error_msg", "未查询到官方商品详情"),
+                        }
                 item = self._normalize_goods(res["data"])
                 if ref.goods_sign and not item.get("goods_sign"):
                     item["goods_sign"] = ref.goods_sign
@@ -422,6 +437,9 @@ class PddAdapter(BasePlatformAdapter):
         if unavailable:
             return unavailable
         goods_id, goods_sign = self._resolve_goods_id(goods_id_or_sign, kwargs)
+        from cache import is_product_off_promotion
+        if is_product_off_promotion("pdd", goods_id, goods_sign):
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该拼多多商品已下架或无推广计划"}
         title = kwargs.get("title") or kwargs.get("name") or kwargs.get("goods_name") or "精选高性价比好物"
         price = kwargs.get("price")
         coupon = kwargs.get("coupon_amount") if kwargs.get("coupon_amount") is not None else kwargs.get("coupon")
