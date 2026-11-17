@@ -2869,7 +2869,7 @@ test('Chinese IME composition + Enter never wipes or drops Chinese search keywor
   h.page.dispose();
 });
 
-test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux-20261114-2 asset versions', async () => {
+test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux-20261118-1 asset versions', async () => {
   // 1. 多人团互助搜索框：中文组词按回车不抢跑，上屏后按回车精准携带中文关键词
   const hGh = harness({ url: 'https://shop.test/group_help' });
   hGh.load('group_help');
@@ -3112,6 +3112,60 @@ test('simplified search routing, goHome reset, single detail retry, honest degra
   assert.ok(detailHtml.includes('v-if="!isOffPromotion && !detailError"'));
   assert.ok(indexHtml.includes("universalResult.resolution_kind === 'degraded_product'"));
   assert.ok(indexHtml.includes('universal-degraded-tip'));
+});
+
+test('mobile search IME resilience: native form submit support, zero el.composing tampering, and stable cross-platform typing', async () => {
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
+
+  // 1. 标准语义化移动端搜索表单：使用 <form action="javascript:void(0);"> 包裹，软键盘“搜索”按键 100% 触发且不刷新
+  assert.ok(indexHtml.includes('<form action="javascript:void(0);" class="search-box" @submit.prevent="onSearchHome($event)">'));
+  assert.ok(indexHtml.includes('<form action="javascript:void(0);" class="search-box" @submit.prevent="onSearchBoom($event)">'));
+  assert.ok(groupHelpHtml.includes('<form action="javascript:void(0);" class="gh-search-row" v-if="filterMode !== \'mine\'" @submit.prevent="onSearch($event)">'));
+
+  // 2. 彻底移除破坏 Vue 3 原生 vModelText 的多余监听器，将文字输入与选词上屏 100% 交由浏览器和 Vue 3 处理
+  assert.equal(indexHtml.includes('@compositionstart="onImeCompositionStart(\'home\''), false);
+  assert.equal(indexHtml.includes('@input="onImeInput(\'home\''), false);
+  assert.equal(indexHtml.includes('@compositionstart="onImeCompositionStart(\'boom\''), false);
+  assert.equal(indexHtml.includes('@compositionstart="onImeCompositionStart(\'universal\''), false);
+  assert.equal(indexHtml.includes('@compositionstart="onImeCompositionStart(\'nickname\''), false);
+
+  // 3. 运行态验证：虚拟键盘 Enter 在非合成期（如 Android 键盘 keyCode=229 且无合成标志）正常触发搜索，绝不被误判为 composing 丢弃
+  const h = harness({ url: 'https://shop.test/' });
+  h.load('app');
+  const boot = h.mounted[0]();
+  await flush();
+  await h.finish(0, { status: 'success', data: platformFixtures });
+  await h.finish(1, { status: 'success', data: channelFixtures });
+  await h.finish(2, goodsResponse('INIT-IME'));
+  await boot;
+
+  let blurred = false;
+  const mockHomeEl = {
+    value: '充电宝',
+    composing: false,
+    blur() { blurred = true; },
+  };
+  h.page.homeSearchInputRef.value = mockHomeEl;
+  h.page.homeSearchKeyword.value = '充电宝';
+
+  const reqCountBefore = h.requests.length;
+  // 模拟 Android 软键盘点击搜索键（keyCode 229 但不在合成态）
+  let prevented = false;
+  h.page.onSearchKeydownEnter('home', {
+    target: mockHomeEl,
+    isComposing: false,
+    keyCode: 229,
+    which: 229,
+    preventDefault() { prevented = true; },
+  });
+
+  assert.equal(prevented, true, 'Android soft keyboard search key triggers submit prevention');
+  assert.equal(h.requests.length, reqCountBefore + 1, 'triggers keyword search immediately');
+  assert.equal(blurred, true, 'blurs input to smoothly dismiss mobile virtual keyboard');
+  const searchUrl = new URL(h.requests.at(-1).url, 'https://shop.test');
+  assert.equal(searchUrl.searchParams.get('keyword'), '充电宝');
+  h.page.dispose();
 });
 
 

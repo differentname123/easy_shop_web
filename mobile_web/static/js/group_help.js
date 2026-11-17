@@ -642,13 +642,13 @@
         isSearchComposing = false;
         const el = event && event.target;
         if (!el) return;
-        el.composing = false;
+        if (el.composing) el.composing = false;
         const snapshot = typeof el.value === 'string' ? el.value : '';
         if (typeof el.value === 'string' && keyword.value !== el.value) {
           keyword.value = el.value;
         }
         const syncDelayed = () => {
-          if (!isSearchComposing && !el.composing && typeof el.value === 'string' && el.value !== snapshot && keyword.value !== el.value) {
+          if (!isSearchComposing && (!el || !el.composing) && typeof el.value === 'string' && el.value !== snapshot && keyword.value !== el.value) {
             keyword.value = el.value;
           }
         };
@@ -660,7 +660,7 @@
         isSearchComposing = false;
         const el = event && event.target;
         if (el) {
-          el.composing = false;
+          if (el.composing) el.composing = false;
           if (syncValue && typeof el.value === 'string' && keyword.value !== el.value) {
             keyword.value = el.value;
           }
@@ -670,6 +670,9 @@
       const onSearch = ev => {
         const fromUi = Boolean(ev && typeof ev === 'object' && ('target' in ev || 'type' in ev || 'preventDefault' in ev));
         syncSearchInputToKeyword(fromUi);
+        if (searchInputRef.value && typeof searchInputRef.value.blur === 'function') {
+          try { searchInputRef.value.blur(); } catch (_) {}
+        }
         activeKeyword.value = keyword.value.trim();
         if (filterMode.value === 'mine') {
           filterMode.value = 'active';
@@ -680,7 +683,7 @@
       const onSearchKeydownEnter = event => {
         const composingNow = Boolean(
           isSearchComposing ||
-          (event && (event.isComposing || event.keyCode === 229 || event.which === 229))
+          (event && (event.isComposing || ((event.keyCode === 229 || event.which === 229) && (isSearchComposing || (event.target && event.target.composing)))))
         );
         if (composingNow) return;
         const targetEl = (event && event.target) || searchInputRef.value;

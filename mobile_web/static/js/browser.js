@@ -219,13 +219,13 @@
       composing[key] = false;
       const el = event && event.target;
       if (!el) return;
-      el.composing = false;
+      if (el.composing) el.composing = false;
       const snapshot = typeof el.value === 'string' ? el.value : '';
       if (modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
         modelRef.value = el.value;
       }
       const syncDelayedCommit = () => {
-        if (!composing[key] && !el.composing && typeof el.value === 'string' && el.value !== snapshot && modelRef && modelRef.value !== el.value) {
+        if (!composing[key] && (!el || !el.composing) && typeof el.value === 'string' && el.value !== snapshot && modelRef && modelRef.value !== el.value) {
           modelRef.value = el.value;
         }
       };
@@ -233,18 +233,17 @@
       global.setTimeout(syncDelayedCommit, 0);
     };
     const onInput = (key, modelRef, event) => {
+      const el = event && event.target;
+      if (!el) return true;
       if (event && event.isComposing) {
         composing[key] = true;
-        if (event.target) event.target.composing = true;
+        el.composing = true;
         return false;
       }
-      composing[key] = false;
-      const el = event && event.target;
-      if (el) {
-        if (el.composing) el.composing = false;
-        if (modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
-          modelRef.value = el.value;
-        }
+      if (composing[key]) return false;
+      if (el.composing) el.composing = false;
+      if (modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
+        modelRef.value = el.value;
       }
       return true;
     };
@@ -252,7 +251,7 @@
       composing[key] = false;
       const el = event && event.target;
       if (el) {
-        el.composing = false;
+        if (el.composing) el.composing = false;
         if (syncValue && modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
           modelRef.value = el.value;
         }
@@ -262,20 +261,20 @@
       if (!el || typeof el.value !== 'string' || !modelRef) return;
       if (forceFromDom) {
         composing[key] = false;
-        el.composing = false;
+        if (el.composing) el.composing = false;
         if (modelRef.value !== el.value) modelRef.value = el.value;
         return;
       }
       if (!String(modelRef.value || '').trim() && el.value.trim()) {
         composing[key] = false;
-        el.composing = false;
+        if (el.composing) el.composing = false;
         modelRef.value = el.value;
       }
     };
     const clearElementAndRef = (key, modelRef, el) => {
       composing[key] = false;
       if (el) {
-        el.composing = false;
+        if (el.composing) el.composing = false;
         if (typeof el.value === 'string') el.value = '';
       }
       if (modelRef) modelRef.value = '';
@@ -283,7 +282,7 @@
     const onEnterKeydown = (key, modelRef, el, submitFn, event) => {
       const eventComposing = Boolean(
         composing[key] ||
-        (event && (event.isComposing || event.keyCode === 229 || event.which === 229))
+        (event && (event.isComposing || ((event.keyCode === 229 || event.which === 229) && (composing[key] || (event.target && event.target.composing)))))
       );
       if (eventComposing) return false;
       const targetEl = (event && event.target) || el;

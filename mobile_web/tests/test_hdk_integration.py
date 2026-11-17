@@ -700,5 +700,72 @@ def test_hdk_client_resolve_short_url_mocked():
     assert res_item["data"]["is_venue"] is False
     assert res_item["data"]["sku_id"] == "10190980164446"
 
+    # 3. 模拟通天塔单品模板（携带加密 sku 参数，严禁判为会场）
+    resp5 = Mock(status_code=200, text="<script>var hrl='https://u.jd.com/jda?e=789';</script>", url="https://u.jd.com/ogAwTxc")
+    resp6 = Mock(status_code=200, url="https://pro.m.jd.com/mall/active/2eh7EHbxrCQQ/index.html?sku=eu8kjNqEBGUN1MbOYF&rid=19054")
+    sess_mock.get.side_effect = [resp5, resp6]
+
+    res_babel = client.resolve_short_url("https://u.jd.com/ogAwTxc")
+    assert res_babel["status"] == "success"
+    assert res_babel["data"]["is_venue"] is False
+    assert res_babel["data"]["sku_id"] == "eu8kjNqEBGUN1MbOYF"
+
+    # 4. 模拟防刷 returnurl 落地单品
+    resp7 = Mock(status_code=200, text="<script>var hrl='https://u.jd.com/jda?e=999';</script>", url="https://u.jd.com/o6At3T3")
+    resp8 = Mock(status_code=200, url="https://cfe.m.jd.com/privatedomain/risk_handler/?returnurl=https%3A%2F%2Fitem.m.jd.com%2Fproduct%2F100160514423.html")
+    sess_mock.get.side_effect = [resp7, resp8]
+
+    res_cfe = client.resolve_short_url("https://u.jd.com/o6At3T3")
+    assert res_cfe["status"] == "success"
+    assert res_cfe["data"]["is_venue"] is False
+    assert res_cfe["data"]["sku_id"] == "100160514423"
+
+
+def test_jd_adapter_babel_product_resolves_to_single_item():
+    """验证通天塔单品落地页（携带加密 sku）在适配器中能够成功反查商品详情并标记为 single_item，绝不误杀为会场。"""
+    hdk_mock = Mock()
+    hdk_mock.resolve_short_url.return_value = {
+        "status": "success",
+        "data": {
+            "dest_url": "https://pro.m.jd.com/mall/active/2eh7EHbxrCQQ/index.html?sku=eu8kjNqEBGUN1MbOYF&rid=19054",
+            "is_venue": False,
+            "sku_id": "eu8kjNqEBGUN1MbOYF",
+        },
+    }
+    hdk_mock.get_goods_detail.return_value = {
+        "status": "success",
+        "data": {
+            "skuid": "100249470124",
+            "itemid": "eu8kjNqEBGUN1MbOYF",
+            "goodsname": "格力高百奇大礼包316g",
+            "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/glico.jpg",
+            "itemprice": "29.90",
+            "itemendprice": "22.90",
+            "couponmoney": "7.00",
+        },
+    }
+    hdk_mock.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/my_promo_short",
+        "click_url": "https://union-click.jd.com/my_promo_long",
+        "final_link": "https://u.jd.com/my_promo_short",
+        "promoter_id": "2035679405",
+    }
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        hdk_client=hdk_mock,
+    )
+    res = adapter.resolve_and_convert_universal("https://u.jd.com/ogAwTxc")
+
+    assert res["status"] == "success"
+    assert res["resolution_kind"] == "product"
+    assert res["goods_id"] == "100249470124"
+    assert res["goods_sign"] == "100249470124"
+    assert res["title"] == "格力高百奇大礼包316g"
+    assert res["price"] == 22.9
+    assert res["final_link"] == "https://u.jd.com/my_promo_short"
+    assert res.get("convert_status") is None  # 不是会场，单品正常流转！
+
+
 
 

@@ -358,10 +358,10 @@ class JdAdapter(BasePlatformAdapter):
                 res = client.resolve_short_url(short_match.group(0))
                 if res.get("status") == "success" and isinstance(res.get("data"), dict):
                     data = res["data"]
-                    if data.get("is_venue"):
-                        is_confirmed_venue = True
-                    elif data.get("sku_id"):
+                    if data.get("sku_id"):
                         target_id = str(data["sku_id"]).strip()
+                    elif data.get("is_venue"):
+                        is_confirmed_venue = True
                     if data.get("goodsname") or data.get("name"):
                         try:
                             card = self._normalize_hdk_detail(data)

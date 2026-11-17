@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 import requests
 
 from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, is_real_requests_session
@@ -327,21 +327,42 @@ class HdkClient:
         parts = urlsplit(dest_url)
         host = (parts.hostname or "").lower()
         path = parts.path or ""
+        qs = parse_qs(parts.query)
+
+        # 判定是否包含明确单品 SKU 或 goods_sign（通天塔单品页常携带 sku 或 mainSku）
+        sku_id = ""
+        sku_param = qs.get("sku", [""])[0].strip()
+        main_sku_param = qs.get("mainSku", [""])[0].strip()
+        skuid_param = qs.get("skuId", [""])[0].strip()
+        if sku_param:
+            sku_id = sku_param
+        elif main_sku_param:
+            sku_id = main_sku_param
+        elif skuid_param:
+            sku_id = skuid_param
+
+        if not sku_id:
+            path_m = re.search(r"/(?:product|item)/(\d+)\.html", path, re.IGNORECASE)
+            if path_m:
+                sku_id = path_m.group(1)
+
+        if not sku_id and "returnurl" in qs:
+            ret_url = unquote(qs["returnurl"][0])
+            ret_parts = urlsplit(ret_url)
+            ret_m = re.search(r"/(?:product|item)/(\d+)\.html", ret_parts.path, re.IGNORECASE) or re.search(r"[?&]sku(?:Id)?=([A-Za-z0-9_]+)", ret_parts.query)
+            if ret_m:
+                sku_id = ret_m.group(1)
 
         # 判定是否属于官方活动/会场/券包
+        # 铁律：只有在毫无任何单品 SKU/goods_sign 实证的前提下，才允许判定为纯会场！
         is_venue = False
-        if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active/" in path:
-            is_venue = True
-        elif host == "jingfen.jd.com" and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url):
-            is_venue = True
-        elif host == "coupon.m.jd.com":
-            is_venue = True
-
-        # 判定是否包含明确单品 SKU
-        sku_id = ""
-        sku_m = re.search(r"/(?:product|item)/(\d+)\.html", path, re.IGNORECASE) or re.search(r"[?&]sku(?:Id)?=(\d+)", parts.query)
-        if sku_m:
-            sku_id = sku_m.group(1)
+        if not sku_id:
+            if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active/" in path:
+                is_venue = True
+            elif host == "jingfen.jd.com" and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url):
+                is_venue = True
+            elif host == "coupon.m.jd.com":
+                is_venue = True
 
         return {
             "status": "success",

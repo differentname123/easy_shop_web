@@ -79,6 +79,9 @@
         const inputRef = sourceTab === 'boom' ? feeds.boomSearchKeyword : feeds.homeSearchKeyword;
         const inputEl = sourceTab === 'boom' ? boomSearchInputRef.value : homeSearchInputRef.value;
         ime.syncElementToRef(sourceTab, inputRef, inputEl, fromUiEvent);
+        if (inputEl && typeof inputEl.blur === 'function') {
+          try { inputEl.blur(); } catch (_) {}
+        }
         const raw = String(inputRef.value || '').trim();
         if (raw && typeof shop.extractInternalShareRoute === 'function') {
           const internalRoute = shop.extractInternalShareRoute(raw, global.location ? global.location.origin : '');
