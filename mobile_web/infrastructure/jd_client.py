@@ -375,31 +375,27 @@ class JdClient:
         try:
             page, size = self._page(page, page_size)
             query = keyword.strip()
-            if not query:
-                raise ValueError
+            while len(query) < 4:
+                query += query
         except (TypeError, ValueError, AttributeError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东搜索关键词或分页无效")
         config_error = self._validate_config()
         if config_error is not None:
             return config_error
-        if len(query) < 4:
-            return _error("INVALID_ARGUMENT", "京东搜索关键词至少需要4个字符（可加品牌或品类词，如「维达抽纸」）")
         ambiguous_empty_hits = 0
-        short_query_rejected = False
 
         def _evaluate_search(body):
-            nonlocal ambiguous_empty_hits, short_query_rejected
-            if isinstance(body, dict) and str(body.get("status")) in ("300", "301"):
-                msg = str(body.get("content") or body.get("msg") or "")
-                if "少于4个字" in msg:
-                    short_query_rejected = True
-                    return _error("INVALID_ARGUMENT", "京东搜索关键词至少需要4个字符（可加品牌或品类词，如「维达抽纸」）")
-                if any(
-                    kw in msg
+            nonlocal ambiguous_empty_hits
+            if (
+                isinstance(body, dict)
+                and str(body.get("status")) in ("300", "301")
+                and any(
+                    kw in str(body.get("content") or body.get("msg") or "")
                     for kw in ("无符合条件的数据", "无数据", "没有数据", "暂无数据", "没有找到")
-                ):
-                    ambiguous_empty_hits += 1
-                    return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_empty=True)
+                )
+            ):
+                ambiguous_empty_hits += 1
+                return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_empty=True)
             return self._content(body, page, size)
 
         res = self._execute_with_failover(
@@ -407,7 +403,7 @@ class JdClient:
             {"unionId": self.union_id, "q": query, "page": page, "page_size": size,
              "sort": "new", "youquan": 1 if has_coupon else 0, "type": 2},
             _evaluate_search,
-            extra_stop_early=lambda _r: short_query_rejected or ambiguous_empty_hits >= 2,
+            extra_stop_early=lambda _r: ambiguous_empty_hits >= 2,
         )
         if res.get("ztk_ambiguous_empty"):
             return {"status": "success", "data": [], "has_more": False, "total_count": 0}

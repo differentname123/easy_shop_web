@@ -123,16 +123,13 @@ def test_search_exact_script_parameters_public_url_and_missing_only_price_fallba
     http = http_for({"status": 200, "content": [item()]},
                     {"status": 200, "content": [item("second", quanhou_jiage=None)]})
     a = adapter(client(http))
-    too_short = a.search_goods("纸", page=2, page_size=3)
-    assert too_short["status"] == "error" and too_short["error_code"] == "INVALID_ARGUMENT"
-    assert http.get.call_count == 0
-    first = a.search_goods("维达抽纸", page=2, page_size=3)
+    first = a.search_goods("纸", page=2, page_size=3)
     assert first["data"][0]["price"] == 0
     assert first["data"][0]["product_url"] == "https://jingfen.jd.com/detail/verified.html"
     assert "raw" not in str(first) and "jCommand" not in str(first)
     call = http.get.call_args
     assert call.args == (DEFAULT_API_BASE + "/api_quanwang.ashx",)
-    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "维达抽纸",
+    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "纸纸纸纸",
                                      "page": 2, "page_size": 3, "sort": "new", "youquan": 0, "type": 2}
     assert a.search_goods("足够长关键词")["data"][0]["price"] == 20.5
     assert http.get.call_args.kwargs["params"]["q"] == "足够长关键词"

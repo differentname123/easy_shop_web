@@ -96,13 +96,17 @@ def test_invalid_or_future_detail_source_time_is_not_fresh(catalog, clock, times
     adapter.get_goods_detail.assert_called_once()
 
 
-def test_detail_cache_remains_uid_scoped(catalog):
+def test_detail_cache_is_shared_across_users(catalog):
     service, _, adapter = catalog
     adapter.get_goods_detail.side_effect = [detail(price=20), detail(price=9)]
+    # 用户 A 查询商品详情，触发首次拉取
     assert service.get_goods_detail(goods_id="123", uid="u_1234abcd")["data"]["price"] == 20
-    assert service.get_goods_detail(goods_id="123", uid="u_abcd1234")["data"]["price"] == 9
+    # 用户 B 查询同款商品详情，直接命中跨用户公共热缓存，不重复请求上游 API
+    assert service.get_goods_detail(goods_id="123", uid="u_abcd1234")["data"]["price"] == 20
+    # 通过商品 Sign 访问同款，同样命中公共热缓存
     assert service.get_goods_detail(goods_sign="SIGN_A", uid="u_1234abcd")["data"]["price"] == 20
-    assert adapter.get_goods_detail.call_count == 2
+    # 验证上游接口仅调用 1 次，公共展示类数据跨用户完全共享
+    assert adapter.get_goods_detail.call_count == 1
 
 
 def test_sign_promotion_hot_hit_skips_identity_and_renders_current_copy(promotion):
@@ -174,3 +178,37 @@ def test_identity_only_product_is_not_detail_fallback_but_can_be_completed(catal
     assert service.get_goods_detail(goods_sign="SIGN_A")["data"]["price"] == 10
     assert len(collection.docs) == 1
     assert service.repo.get_product_detail("SIGN_A", key_type="sign")["name"] == "商品"
+
+
+def test_detail_singleflight_collapses_concurrent_requests_across_different_uids(catalog):
+    import threading
+    import time
+    service, _, adapter = catalog
+
+    barrier = threading.Barrier(5)
+    call_records = []
+
+    def slow_detail(*args, **kwargs):
+        call_records.append(kwargs.get("uid"))
+        time.sleep(0.05)
+        return detail(price=88.0)
+
+    adapter.get_goods_detail.side_effect = slow_detail
+
+    results = []
+    def worker(user_id):
+        barrier.wait()
+        res = service.get_goods_detail(goods_id="sku_concurrent_99", uid=user_id)
+        results.append(res)
+
+    threads = [threading.Thread(target=worker, args=(f"user_{i}",)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 5 个不同用户的瞬间并发请求必须全部成功拿到详情
+    assert len(results) == 5
+    assert all(r["status"] == "success" and r["data"]["price"] == 88.0 for r in results)
+    # 防并发击穿 Singleflight 必须将 5 个不同用户的请求聚合成单次上游请求
+    assert adapter.get_goods_detail.call_count == 1

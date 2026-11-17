@@ -127,15 +127,16 @@ def test_invalid_provider_platform_is_not_persisted(catalog):
     repo.upsert_product_detail.assert_not_called()
 
 
-def test_catalog_cache_does_not_share_uid_specific_results(catalog):
+def test_catalog_cache_is_shared_across_users(catalog):
     service, _, adapter = catalog
     adapter.get_recommend_goods.return_value = {"status": "success", "data": []}
     adapter.search_goods.return_value = {"status": "success", "data": []}
     for uid in ("u_a", "u_b", "u_a"):
         service.get_home_recommendations(uid=uid)
         service.search_home_goods("ABC", uid=uid)
-    assert adapter.get_recommend_goods.call_count == 2
-    assert adapter.search_goods.call_count == 2
+    # 公开榜单与关键词搜索结果跨用户共享，3 次调用仅向上游请求 1 次
+    assert adapter.get_recommend_goods.call_count == 1
+    assert adapter.search_goods.call_count == 1
     assert adapter.search_goods.call_args.kwargs["keyword"] == "ABC"
 
 

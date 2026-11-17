@@ -206,7 +206,8 @@ class ProductService:
         if isinstance(channels, (tuple, list)) and channels and channel_type not in {channel["channel_type"] for channel in channels}:
             return {"status": "error", "error_code": "invalid_channel", "error_msg": "不支持的榜单", "data": []}
         cursor_key = json.dumps(cursor, sort_keys=True, separators=(",", ":")) if isinstance(cursor, (dict, list)) else cursor or ""
-        cache_key = (plat, uid or "", channel_type, offset, limit, cursor_key)
+        # 公开推荐榜单不按用户作用域隔离，所有用户共享同一份内存缓存以节约上游配额
+        cache_key = (plat, "", channel_type, offset, limit, cursor_key)
         if not force_refresh:
             cached = RECOMMEND_CACHE.get(cache_key)
             if cached is not None:
@@ -276,7 +277,8 @@ class ProductService:
         if classified["kind"] == "unsupported_url" or (classified["has_link_or_token"] and not classified["keyword"]):
             return {"status": "success", "total_count": 0, "page": page, "page_size": page_size, "has_more": False, "data": []}
         keyword = classified["keyword"] or raw_kw[:60]
-        cache_key = (plat, uid or "", keyword, page, page_size)
+        # 公开关键词检索结果不按用户隔离，跨用户共享以避免同词重复消耗上游额度
+        cache_key = (plat, "", keyword, page, page_size)
         cached = SEARCH_CACHE.get(cache_key)
         if cached is not None:
             self._offer_products(cached.get("data") or [], adapter=adapter)
@@ -419,14 +421,15 @@ class ProductService:
                     sync_product_summary_in_caches(snapshot.ref.platform, winner)
                     winner_snapshot = self._document_snapshot(winner, snapshot.ref.platform)
                     result = self._database_detail(winner, "database")
-                    result = self._cache_detail(snapshot.ref.platform, result, self._detail_expires_at(winner), uid,
+                    result = self._cache_detail(snapshot.ref.platform, result, self._detail_expires_at(winner), None,
                                                 verified_ref=snapshot.ref)
                     return _LoadedDetail(result, winner_snapshot, persisted=True)
-        public = self._cache_detail(snapshot.ref.platform, public, deadline, uid)
+        public = self._cache_detail(snapshot.ref.platform, public, deadline, None)
         return _LoadedDetail(public, snapshot, persisted=written, retryable=not written)
 
     def _singleflight(self, ref, uid, kwargs, load, stop_event=None):
-        key = (ref.platform, uid or "", "sign" if ref.goods_sign else "id", ref.key,
+        # 防并发击穿锁按平台与商品唯一标识聚合，同一瞬间多用户访问同款商品仅发起单次上游请求
+        key = (ref.platform, "", "sign" if ref.goods_sign else "id", ref.key,
                ref.goods_id if ref.goods_sign else "", json.dumps(kwargs, sort_keys=True, default=str))
         with self._flight_lock:
             flight = self._flights.get(key)
@@ -456,7 +459,8 @@ class ProductService:
                        refresh_ahead_seconds=0, deal_tip=None):
         kwargs = kwargs or {}
         def load():
-            cached = self._cached_detail(ref, uid)
+            # 公开商品详情直接查公共缓存，不再受当前调用方 uid 隔离
+            cached = self._cached_detail(ref)
             if cached and cached[0] - time.time() > refresh_ahead_seconds:
                 cached_data = dict(cached[1]["data"])
                 if isinstance(deal_tip, dict) and deal_tip and not cached_data.get("deal_tip"):
@@ -487,7 +491,7 @@ class ProductService:
                 snapshot = self._make_snapshot(detail_payload, utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), ref.platform)
             except ValueError:
                 return _LoadedDetail({"status": "error", "error_code": "invalid_product_detail", "error_msg": "平台商品详情身份无效"})
-            return self._commit_snapshot(snapshot, uid, result, stop_event)
+            return self._commit_snapshot(snapshot, None, result, stop_event)
         return self._singleflight(ref, uid, kwargs, load, stop_event)
 
     def get_goods_detail(self, platform="pdd", goods_id_or_sign="", goods_id=None,
@@ -503,7 +507,8 @@ class ProductService:
         ref = self._upgrade_ref_sign(ref)
         if is_product_off_promotion(plat, ref.goods_id, ref.goods_sign):
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}
-        cached = self._cached_detail(ref, uid)
+        # 公开商品详情优先命中全局共享内存缓存
+        cached = self._cached_detail(ref)
         if cached:
             return cached[1]
         item = self._read_detail(ref)
@@ -511,7 +516,7 @@ class ProductService:
         deadline = self._detail_expires_at(item) if item else 0.0
         if time.time() < deadline:
             result = self._database_detail(item, "database")
-            return self._cache_detail(plat, result, deadline, uid)
+            return self._cache_detail(plat, result, deadline)
         loaded = self._load_official(
             ref, adapter, uid, kwargs,
             deal_tip=item.get("deal_tip") if isinstance(item, dict) else None,
