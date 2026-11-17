@@ -278,17 +278,11 @@ class HdkClient:
         *,
         union_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """直接反查 u.jd.com 短链商品完整信息 (原生支持短链反查)。"""
+        """尝试反查短链商品。注意：好单库官方当前不提供 u.jd.com 解包接口，避免向搜索接口盲传 URL。"""
         url = clean_text(short_url)
         if not url:
             return _error("INVALID_ARGUMENT", "短链不能为空")
-        search_res = self.search_goods(url, page=1, page_size=5, union_id=union_id)
-        if search_res.get("status") != "success":
-            return search_res
-        rows = search_res.get("data") or []
-        if not rows:
-            return _error("NOT_FOUND", "好单库未查到该短链商品")
-        return {"status": "success", "data": rows[0]}
+        return _error("NOT_SUPPORTED", "好单库当前不支持短链反查，请使用折淘客短链反查能力")
 
     def convert_promotion_link(
         self,

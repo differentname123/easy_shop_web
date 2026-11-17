@@ -7214,14 +7214,14 @@ class MaintenanceWorker(threading.Thread):
                     p_stages = summary.get("pending_by_stage") or {}
                     logger.info(
                         "📈 [全库阶段心跳看板] 总线报=%d条 | 成功清洗=%d条, 失败淘汰=%d条 | ⏳ 待清洗总Pending=%d条 (AI-1待拆=%d, 待转链=%d, 待终审=%d) | 📦 正式库好价=%d件",
-                        summary.get("total_raw_tips", 0),
-                        summary.get("cleaned_success", 0),
-                        summary.get("cleaned_failed", 0),
+                        summary.get("total_records", 0),
+                        summary.get("cleaned_success_records", 0),
+                        summary.get("cleaned_failed_records", 0),
                         summary.get("pending_clean_records", 0),
                         p_stages.get("need_ai1", 0),
                         p_stages.get("need_convert", 0),
                         p_stages.get("need_ai2", 0),
-                        summary.get("formal_deal_pool_products", 0),
+                        summary.get("formal_deal_products_count", 0),
                     )
 
             except Exception as e:

@@ -335,10 +335,16 @@ class JdAdapter(BasePlatformAdapter):
             if not text:
                 return _error("INVALID_ARGUMENT", "请输入京东链接或商品信息")
             promoter = canonical_promoter_id(promoter_id or self.default_promoter_id)
-            short_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9_-]+", text)
             card = None
             target_id = ""
-            if short_match:
+            jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
+            if jf_match:
+                target_id = jf_match.group(1)
+            elif _is_encrypted_jd_item_id(text):
+                target_id = text
+
+            short_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9_-]+", text)
+            if short_match and not target_id:
                 res = client.resolve_short_url(short_match.group(0))
                 if res.get("status") == "success" and isinstance(res.get("data"), dict):
                     try:
@@ -346,18 +352,13 @@ class JdAdapter(BasePlatformAdapter):
                         target_id = card.get("goods_sign") or card.get("goods_id")
                     except Exception:
                         pass
-            if not card:
-                jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
-                if jf_match:
-                    target_id = jf_match.group(1)
-                elif _is_encrypted_jd_item_id(text):
-                    target_id = text
-                if target_id:
-                    det = self.get_goods_detail(target_id)
-                    if det.get("status") == "success" and isinstance(det.get("data"), dict):
-                        card = det["data"]
+
+            if target_id and not card:
+                det = self.get_goods_detail(target_id)
+                if det.get("status") == "success" and isinstance(det.get("data"), dict):
+                    card = det["data"]
+
             if not target_id and not card:
-                logger.warning("[JD万能解析-好单库] 未能解析到有效目标ID，准备降级至备用通道: input=%s", text[:60])
                 return _error("NOT_FOUND", "未能识别该京东链接或商品")
 
             mat = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else (short_match.group(0) if short_match else target_id)
