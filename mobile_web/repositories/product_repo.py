@@ -1064,6 +1064,7 @@ class ProductRepository(BaseRepository):
             "tutorial_steps": tutorial_steps,
             "original_copywriting": original_copywriting,
             "share_images": share_images,
+            "tips_timeline": deal_info.get("tips_timeline") or [],
         }
 
     def _normalize_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:

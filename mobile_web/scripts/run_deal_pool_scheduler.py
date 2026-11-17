@@ -1872,6 +1872,7 @@ class DealPoolCleaner:
         self.stats_ai_retries_scheduled = 0
         self.stats_early_terminated_pre_ai1 = 0
         self.stats_early_terminated_post_stage3 = 0
+        self.stats_deal_upgrades_post_stage3 = 0
         self.last_batch_stage_timings: Dict[str, float] = {}
 
     def _set_anchor_cache_locked(self, key: str, value: Dict[str, Any]) -> None:
@@ -2302,6 +2303,8 @@ class DealPoolCleaner:
             "combined_raw_text": msg["content"].strip(),
             "extracted_images": self._extract_doc_images(doc),
             "extracted_targets": [],
+            "deal_price": None,
+            "tutorial_score": 50,
             "_from_fallback": True,
             "_fallback_reason": fail_reason,
         }
@@ -2477,6 +2480,25 @@ class DealPoolCleaner:
             else:
                 self.stats_ai1_model_hits += 1
                 ai1_res["_from_fallback"] = False
+
+                raw_ts = ai1_res.get("tutorial_score")
+                if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool) and 0 <= raw_ts <= 100:
+                    ai1_res["tutorial_score"] = int(raw_ts)
+                else:
+                    ai1_res["tutorial_score"] = 50
+
+                raw_dp = ai1_res.get("deal_price")
+                if isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and 0.1 <= raw_dp <= 100000:
+                    ai1_res["deal_price"] = round(float(raw_dp), 2)
+                elif isinstance(raw_dp, str):
+                    try:
+                        val = float(re.sub(r"[^\d.]", "", raw_dp))
+                        ai1_res["deal_price"] = round(val, 2) if 0.1 <= val <= 100000 else None
+                    except Exception:
+                        ai1_res["deal_price"] = None
+                else:
+                    ai1_res["deal_price"] = None
+
                 norm_targets: List[Dict[str, Any]] = []
                 for idx_t, tgt in enumerate(ai1_res.get("extracted_targets") or [], 1):
                     if not isinstance(tgt, dict):
@@ -3309,6 +3331,72 @@ class DealPoolCleaner:
         return "\n".join(kept_lines).strip()
 
     @classmethod
+    def _should_upgrade_existing_deal(
+        cls,
+        ex_info: Dict[str, Any],
+        ai1_res: Dict[str, Any],
+        doc: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        判断新线报是否值得对库内已存在的同款商品执行【择优升级】：
+        纯基于 AI-1 产出的标准化数值比对，不含任何脆弱正则与手工关键词猜测：
+        1. 价格突破升级：新线报提取到预估到手价且比库内现有 deal_price 明显更低 (>= 5% 折扣)；
+        2. 教程更优升级：新线报 tutorial_score 明显超越库内现有水平 (新分 >= 75 且 新分 >= 旧分 + 15)；
+        若均不满足，则判定无需重复清洗，返回 (False, "")。
+        """
+        new_dp = ai1_res.get("deal_price")
+        ex_dp = ex_info.get("deal_price")
+        new_score = int(ai1_res.get("tutorial_score") or 0)
+        ex_score = int(ex_info.get("tutorial_score") or ex_info.get("quality_score") or 75)
+
+        # 维度一：价格突破升级（新到手价明显更优）
+        if (
+            isinstance(new_dp, (int, float))
+            and isinstance(ex_dp, (int, float))
+            and float(ex_dp) > 0
+            and float(new_dp) > 0
+            and float(new_dp) < float(ex_dp) * 0.95
+        ):
+            return True, f"新线报预估价({float(new_dp):.2f}元)显著低于库内旧价格({float(ex_dp):.2f}元)，触发价格择优升级"
+
+        # 维度二：教程质量更优升级
+        if new_score >= 75 and new_score >= ex_score + 15:
+            return True, f"新线报教程实操分({new_score})显著超越库内现有水平({ex_score})，触发教程补全升级"
+
+        return False, ""
+
+    @classmethod
+    def _make_timeline_entry(
+        cls,
+        doc: Dict[str, Any],
+        ai1_res: Optional[Dict[str, Any]] = None,
+        clean_copy: str = "",
+    ) -> Dict[str, Any]:
+        """构造一条结构化、有界限的线报时间线记录（用于 products.deal_info.tips_timeline 时序展示）。"""
+        mid = str(doc.get("source_item_id") or "")
+        site = str(doc.get("source_site") or "")
+        channel = str(doc.get("source_channel") or "")
+        pub_time = str(doc.get("publish_time") or "")
+        pub_ts = doc.get("publish_ts")
+        if not isinstance(pub_ts, (int, float)):
+            pub_ts = parse_publish_time_epoch(pub_time) or 0.0
+        title = str(doc.get("title") or "").strip()
+        dp = (ai1_res.get("deal_price") if isinstance(ai1_res, dict) else None)
+        ts = (ai1_res.get("tutorial_score") if isinstance(ai1_res, dict) else 50)
+        copywriting = clean_copy or (str(ai1_res.get("combined_raw_text") or "") if isinstance(ai1_res, dict) else "") or title
+        return {
+            "tip_id": mid,
+            "source_site": site,
+            "source_channel": channel,
+            "publish_time": pub_time,
+            "publish_ts": float(pub_ts),
+            "title": title,
+            "copywriting": cls._sanitize_polished_copywriting(copywriting)[:300],
+            "deal_price": dp,
+            "tutorial_score": int(ts) if ts is not None else 50,
+        }
+
+    @classmethod
     def _lookup_active_formal_products(
         cls,
         formal_col,
@@ -3347,6 +3435,8 @@ class DealPoolCleaner:
                     "price": 1,
                     "deal_info.quality_score": 1,
                     "deal_info.deal_price": 1,
+                    "deal_info.tutorial_steps": 1,
+                    "deal_info.tutorial_score": 1,
                 },
             )
             for d in cursor:
@@ -3354,6 +3444,8 @@ class DealPoolCleaner:
                 pid = str(d.get("product_id") or "").strip()
                 if plat and pid:
                     di = d.get("deal_info") if isinstance(d.get("deal_info"), dict) else {}
+                    t_steps = di.get("tutorial_steps")
+                    t_cnt = len(t_steps) if isinstance(t_steps, list) else (1 if t_steps else 0)
                     active_map[(plat, pid)] = {
                         "platform": plat,
                         "product_id": pid,
@@ -3362,6 +3454,8 @@ class DealPoolCleaner:
                         "official_price": d.get("price"),
                         "deal_price": di.get("deal_price"),
                         "quality_score": int(di.get("quality_score") or 75),
+                        "tutorial_steps_count": t_cnt,
+                        "tutorial_score": int(di.get("tutorial_score") or di.get("quality_score") or 75),
                     }
         except Exception as e:
             logger.warning("查询正式表已清洗活跃商品集合异常: %s", e)
@@ -3535,6 +3629,8 @@ class DealPoolCleaner:
                         "seen_count": max(1, int(doc.get("seen_count") or 1)),
                         "source_site": site,
                         "seen_channels": doc.get("seen_channels") or ([channel] if channel else []),
+                        "copywriting": self._sanitize_polished_copywriting(str(doc.get("tutorial_text") or raw_title)),
+                        "timeline_entry": self._make_timeline_entry(doc, clean_copy=self._sanitize_polished_copywriting(str(doc.get("tutorial_text") or raw_title))),
                     },
                 }
                 continue
@@ -4022,9 +4118,23 @@ class DealPoolCleaner:
                 next(iter(unique_main_pids)) if len(unique_main_pids) == 1 else None
             )
 
-            # Tier 2 提前终止（已入库商品）
+            # Tier 2 提前终止或择优升级（已入库商品）
             ex_info_s3 = _get_active_prod(single_main_pid) if single_main_pid is not None else None
+            should_upgrade = False
+            upgrade_reason = ""
             if single_main_pid is not None and ex_info_s3 is not None:
+                should_upgrade, upgrade_reason = self._should_upgrade_existing_deal(ex_info_s3, ai1_res, doc)
+                if should_upgrade:
+                    self.stats_deal_upgrades_post_stage3 += 1
+                    if not quiet_sub_logs:
+                        logger.info(
+                            "✨ [Stage 3 择优升级] 命中已入库商品(%s:%s)但满足升级条件: %s -> 推进至 AI-2 终审更新！",
+                            single_main_pid[0],
+                            single_main_pid[1],
+                            upgrade_reason,
+                        )
+
+            if single_main_pid is not None and ex_info_s3 is not None and not should_upgrade:
                 c_plat, c_gid = single_main_pid
                 primary_conv = main_prod_convs[0]
                 c_gsign = str(primary_conv.get("goods_sign") or "")
@@ -4035,6 +4145,8 @@ class DealPoolCleaner:
                     merged_tids.insert(0, mid)
                 self.stats_early_terminated_post_stage3 += 1
                 post_stage3_db_early_count += 1
+                clean_copy = self._sanitize_polished_copywriting(str(ai1_res.get("combined_raw_text") or raw_title))
+                timeline_item = self._make_timeline_entry(doc, ai1_res=ai1_res, clean_copy=clean_copy)
                 outcomes_by_id[mid] = {
                     "status": "early_terminated",
                     "stage_outcome": "early_terminated",
@@ -4064,14 +4176,18 @@ class DealPoolCleaner:
                         "seen_count": max(1, int(doc.get("seen_count") or 1)),
                         "source_site": site,
                         "seen_channels": doc.get("seen_channels") or ([channel] if channel else []),
+                        "copywriting": clean_copy,
+                        "timeline_entry": timeline_item,
                     },
                 }
                 continue
 
+            new_score = int(ai1_res.get("tutorial_score") or 50)
             richness_score = (
                 len(conv_list) * 10.0
                 + len(ai1_res.get("extracted_images") or []) * 5.0
-                + min(len(str(ai1_res.get("combined_raw_text") or "")), 500) / 50.0
+                + new_score * 0.3
+                + (25.0 if should_upgrade else 0.0)
             )
             post_stage3_candidates.append((mid, doc, ai1_res, conv_list, single_main_pid, richness_score))
 
@@ -4103,6 +4219,8 @@ class DealPoolCleaner:
                     merged_tids.insert(0, mid)
                 self.stats_early_terminated_post_stage3 += 1
                 post_stage3_batch_early_count += 1
+                clean_copy_batch = self._sanitize_polished_copywriting(str(ai1_res.get("combined_raw_text") or raw_title))
+                timeline_item_batch = self._make_timeline_entry(doc, ai1_res=ai1_res, clean_copy=clean_copy_batch)
                 outcomes_by_id[mid] = {
                     "status": "early_terminated",
                     "stage_outcome": "early_terminated",
@@ -4135,6 +4253,8 @@ class DealPoolCleaner:
                         "seen_count": max(1, int(doc.get("seen_count") or 1)),
                         "source_site": site,
                         "seen_channels": doc.get("seen_channels") or ([channel] if channel else []),
+                        "copywriting": clean_copy_batch,
+                        "timeline_entry": timeline_item_batch,
                     },
                 }
                 continue
@@ -4805,6 +4925,7 @@ def upsert_cleaned_products_to_formal_table(
                     "product_id": 1,
                     "deal_info.is_deal_tip": 1,
                     "deal_info.quality_score": 1,
+                    "deal_info.deal_price": 1,
                     "deal_info.updated_at": 1,
                 },
             ):
@@ -4860,7 +4981,23 @@ def upsert_cleaned_products_to_formal_table(
             and ex_deal_updated >= protection_cutoff
         )
 
-        if is_fresh_existing and ex_score > new_score:
+        new_dp = (
+            float(deal_info["deal_price"])
+            if isinstance(deal_info.get("deal_price"), (int, float))
+            and not isinstance(deal_info.get("deal_price"), bool)
+            and float(deal_info["deal_price"]) > 0
+            else None
+        )
+        ex_dp = (
+            float(ex_di["deal_price"])
+            if isinstance(ex_di.get("deal_price"), (int, float))
+            and not isinstance(ex_di.get("deal_price"), bool)
+            and float(ex_di["deal_price"]) > 0
+            else None
+        )
+        price_improved = bool(new_dp is not None and ex_dp is not None and new_dp < ex_dp * 0.98)
+
+        if is_fresh_existing and ex_score > new_score and not price_improved:
             # 触发高分保护：保留已有的高分 deal_info 教程与价格，仅更新顶层官方商品详情并累加跨群共振热度
             protected_high_score += 1
         else:
@@ -4880,6 +5017,27 @@ def upsert_cleaned_products_to_formal_table(
             for dk, dv in deal_info.items():
                 set_fields[f"deal_info.{dk}"] = dv
 
+        # 收集本批次中关于该商品的所有有效线报时间线条目
+        batch_timeline_entries: List[Dict[str, Any]] = []
+        seen_tids: Set[str] = set()
+        for d in docs_for_item:
+            di = d.get("deal_info") or {}
+            mid = str(di.get("source_item_id") or d.get("product_id") or "")
+            if mid and mid not in seen_tids:
+                seen_tids.add(mid)
+                pub_t = str(di.get("publish_time") or "")
+                batch_timeline_entries.append({
+                    "tip_id": mid,
+                    "source_site": str(di.get("source_site") or ""),
+                    "source_channel": str(di.get("source_channel") or ""),
+                    "publish_time": pub_t,
+                    "publish_ts": parse_publish_time_epoch(pub_t) or 0.0,
+                    "title": str(di.get("raw_tip_title") or d.get("name") or ""),
+                    "copywriting": str(di.get("original_copywriting") or "")[:300],
+                    "deal_price": di.get("deal_price"),
+                    "tutorial_score": int(di.get("tutorial_score") or di.get("quality_score") or 75),
+                })
+
         update_spec: Dict[str, Any] = {
             "$set": set_fields,
             "$setOnInsert": {
@@ -4891,6 +5049,14 @@ def upsert_cleaned_products_to_formal_table(
                 "deal_info.tip_hit_count": len(docs_for_item),
             },
         }
+        if batch_timeline_entries:
+            update_spec["$push"] = {
+                "deal_info.tips_timeline": {
+                    "$each": batch_timeline_entries,
+                    "$sort": {"publish_ts": -1},
+                    "$slice": 20,
+                }
+            }
         add_to_set: Dict[str, Any] = {}
         if all_sites:
             add_to_set["deal_info.resonance_sites"] = {"$each": all_sites}
@@ -5217,7 +5383,10 @@ def _commit_batch_results_to_db(
                         di = pdoc.get("deal_info") if isinstance(pdoc.get("deal_info"), dict) else {}
                         new_q = int(di.get("quality_score") or 75)
                         prev_entry = shared_active_products.get((plat, pid))
-                        if prev_entry is None or new_q >= int(prev_entry.get("quality_score") or 0):
+                        new_dp = float(di["deal_price"]) if isinstance(di.get("deal_price"), (int, float)) and not isinstance(di.get("deal_price"), bool) and float(di["deal_price"]) > 0 else None
+                        ex_dp = float(prev_entry["deal_price"]) if prev_entry and isinstance(prev_entry.get("deal_price"), (int, float)) and not isinstance(prev_entry.get("deal_price"), bool) and float(prev_entry["deal_price"]) > 0 else None
+                        improved = bool(new_dp is not None and ex_dp is not None and new_dp < ex_dp * 0.98)
+                        if prev_entry is None or new_q >= int(prev_entry.get("quality_score") or 0) or improved:
                             shared_active_products[(plat, pid)] = {
                                 "platform": plat,
                                 "product_id": pid,
@@ -5226,6 +5395,8 @@ def _commit_batch_results_to_db(
                                 "official_price": pdoc.get("price"),
                                 "deal_price": di.get("deal_price"),
                                 "quality_score": new_q,
+                                "tutorial_steps_count": len(di.get("tutorial_steps") or []) if isinstance(di.get("tutorial_steps"), list) else (1 if di.get("tutorial_steps") else 0),
+                                "tutorial_score": int(di.get("tutorial_score") or di.get("quality_score") or new_q),
                             }
 
             if shared_lock is not None:
@@ -5246,7 +5417,7 @@ def _commit_batch_results_to_db(
                 continue
             bucket = grouped_res.setdefault(
                 (plat, pid),
-                {"seen_inc": 0, "hit_inc": 0, "sites": set(), "channels": set()},
+                {"seen_inc": 0, "hit_inc": 0, "sites": set(), "channels": set(), "copies": [], "timeline": []},
             )
             bucket["seen_inc"] += max(1, int(ru.get("seen_count") or 1))
             bucket["hit_inc"] += 1
@@ -5257,6 +5428,13 @@ def _commit_batch_results_to_db(
                 ch_s = str(ch or "").strip()
                 if ch_s:
                     bucket["channels"].add(ch_s)
+            c_txt = str(ru.get("copywriting") or "").strip()
+            if c_txt and len(c_txt) >= 15 and c_txt not in bucket["copies"] and len(bucket["copies"]) < 3:
+                bucket["copies"].append(c_txt[:300])
+            tl_entry = ru.get("timeline_entry")
+            if isinstance(tl_entry, dict) and tl_entry.get("tip_id"):
+                if not any(e.get("tip_id") == tl_entry["tip_id"] for e in bucket["timeline"]):
+                    bucket["timeline"].append(tl_entry)
 
         early_ops = []
         for (plat, pid), b in grouped_res.items():
@@ -5271,8 +5449,18 @@ def _commit_batch_results_to_db(
                 add_set["deal_info.resonance_sites"] = {"$each": sorted(b["sites"])}
             if b["channels"]:
                 add_set["deal_info.resonance_channels"] = {"$each": sorted(b["channels"])}
+            if b.get("copies"):
+                add_set["deal_info.supplementary_copies"] = {"$each": b["copies"]}
             if add_set:
                 upd_doc["$addToSet"] = add_set
+            if b.get("timeline"):
+                upd_doc["$push"] = {
+                    "deal_info.tips_timeline": {
+                        "$each": b["timeline"],
+                        "$sort": {"publish_ts": -1},
+                        "$slice": 20,
+                    }
+                }
             early_ops.append(UpdateOne({"platform": plat, "product_id": pid}, upd_doc, upsert=False))
         if early_ops:
             try:
@@ -5635,6 +5823,7 @@ def run_clean_stage(
             "anchor_cache_hits": cleaner.stats_cache_hits,
             "early_terminated_pre_ai1": cleaner.stats_early_terminated_pre_ai1,
             "early_terminated_post_stage3": cleaner.stats_early_terminated_post_stage3,
+            "deal_upgrades_post_stage3": cleaner.stats_deal_upgrades_post_stage3,
             "ai_stage1_calls": cleaner.stats_ai1_calls,
             "ai_stage1_model_hits": cleaner.stats_ai1_model_hits,
             "ai_stage1_fallbacks": cleaner.stats_ai1_fallbacks,
@@ -5697,7 +5886,7 @@ def run_clean_stage(
         (
             f"│ • 引擎与AI指标 : 总耗={batch_elapsed_s}s (AI1={em['stage2_ai1_seconds']}s / 并发转链={em['stage3_convert_seconds']}s / AI2={em['stage4_ai2_seconds']}s) | "
             f"AI-1(直出={cleaner.stats_ai1_model_hits}) | AI-2(直出={cleaner.stats_ai2_model_hits}) | "
-            f"早停累计={cleaner.stats_early_terminated_pre_ai1 + cleaner.stats_early_terminated_post_stage3} | 缓存命中={cleaner.stats_cache_hits}"
+            f"早停累计={cleaner.stats_early_terminated_pre_ai1 + cleaner.stats_early_terminated_post_stage3} | 择优升级={cleaner.stats_deal_upgrades_post_stage3} | 缓存命中={cleaner.stats_cache_hits}"
         ),
         (
             f"│ • 专有信息保留 : 爆料时间={er['retained_publish_time_pct']}% | "

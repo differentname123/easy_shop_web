@@ -1472,3 +1472,187 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
     assert sum(1 for t in xb_tasks if t["status"] == "cooldown_skipped") == len(xb_tasks) - 1
     assert len(out["error_paths"]) == 1
     assert "共 2 条详情异常" in out["error_paths"][0]["error_message"]
+
+
+def test_deal_ai1_scoring_and_timeline_upgrade_conditions():
+    from mobile_web.scripts.run_deal_pool_scheduler import DealPoolCleaner
+
+    # 1. 结构化时间线条目生成
+    raw_doc = {
+        "source_item_id": "tip_998",
+        "source_site": "zhetaoke",
+        "source_channel": "群3",
+        "publish_time": "2026-11-18 01:20:00",
+        "publish_ts": 1794936000.0,
+        "title": "爆料抽纸 9.9包邮",
+        "tutorial_text": "拍1件领券立减到手9.9元",
+    }
+    ai1_res = {
+        "deal_price": 9.9,
+        "tutorial_score": 85,
+        "combined_raw_text": "拍1件领券立减到手9.9元",
+    }
+    entry = DealPoolCleaner._make_timeline_entry(raw_doc, ai1_res=ai1_res)
+    assert entry["tip_id"] == "tip_998"
+    assert entry["source_site"] == "zhetaoke"
+    assert entry["publish_ts"] == 1794936000.0
+    assert entry["deal_price"] == 9.9
+    assert entry["tutorial_score"] == 85
+    assert "9.9元" in entry["copywriting"]
+
+    # 2. 教程更优升级（库内商品教程分仅 60，新线报 AI-1 评出 85 分高质量教程）
+    ex_poor = {
+        "platform": "tb",
+        "product_id": "111",
+        "tutorial_score": 60,
+        "quality_score": 60,
+        "deal_price": 9.9,
+    }
+    should_up, reason = DealPoolCleaner._should_upgrade_existing_deal(ex_poor, ai1_res, raw_doc)
+    assert should_up is True
+    assert "教程补全升级" in reason
+
+    # 3. 价格突破升级（库内商品虽有 90 分教程，但新线报价格从 50.0 破低到 38.0）
+    ex_high_score = {
+        "platform": "jd",
+        "product_id": "222",
+        "tutorial_score": 90,
+        "quality_score": 90,
+        "deal_price": 50.0,
+    }
+    ai1_cheap = {
+        "deal_price": 38.0,
+        "tutorial_score": 80,
+    }
+    should_up2, reason2 = DealPoolCleaner._should_upgrade_existing_deal(ex_high_score, ai1_cheap, raw_doc)
+    assert should_up2 is True
+    assert "价格择优升级" in reason2
+
+    # 4. 普通重复（库内教程完整，且价格相同、新分未显著超越 -> 安全早停，仅记录时间线）
+    ai1_dup = {
+        "deal_price": 50.0,
+        "tutorial_score": 75,
+    }
+    should_up3, _ = DealPoolCleaner._should_upgrade_existing_deal(ex_high_score, ai1_dup, raw_doc)
+    assert should_up3 is False
+
+
+def test_upsert_cleaned_products_honors_lower_price_improvement():
+    import datetime
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from mobile_web.scripts.run_deal_pool_scheduler import upsert_cleaned_products_to_formal_table
+
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
+    stored_doc = {
+        "platform": "jd",
+        "product_id": "10099",
+        "name": "某品牌耳机",
+        "price": 299.0,
+        "updated_at": now - datetime.timedelta(hours=1),
+        "deal_info": {
+            "is_deal_tip": True,
+            "quality_score": 95,
+            "deal_price": 199.0,
+            "updated_at": now - datetime.timedelta(hours=1),
+        },
+    }
+    captured_ops = []
+    formal_col = MagicMock()
+    formal_col.find.return_value = [stored_doc]
+    formal_col.bulk_write.side_effect = lambda ops, ordered=False: (
+        captured_ops.extend(ops) or SimpleNamespace(upserted_count=0, modified_count=1, matched_count=1)
+    )
+
+    # 新线报质量分 88 (低于库内 95)，但价格从 199 破低到 149 (降低超 2%) -> 必须放行更新 deal_price 而不被高分拦截！
+    res = upsert_cleaned_products_to_formal_table(
+        formal_col,
+        [
+            {
+                "platform": "jd",
+                "product_id": "10099",
+                "name": "某品牌耳机",
+                "price": 299.0,
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "quality_score": 88,
+                    "deal_price": 149.0,
+                    "tutorial_steps": ["1. 领券", "2. 下单"],
+                },
+            }
+        ],
+    )
+    assert res["protected_high_score"] == 0
+    assert len(captured_ops) == 1
+    set_fields = captured_ops[0]._doc["$set"]
+    assert set_fields["deal_info.deal_price"] == 149.0
+    assert set_fields["deal_info.tutorial_steps"] == ["1. 领券", "2. 下单"]
+    assert "$push" in captured_ops[0]._doc
+    assert "deal_info.tips_timeline" in captured_ops[0]._doc["$push"]
+    tl_pushed = captured_ops[0]._doc["$push"]["deal_info.tips_timeline"]["$each"]
+    assert len(tl_pushed) == 1
+    assert tl_pushed[0]["deal_price"] == 149.0
+
+
+def test_commit_batch_results_records_supplementary_copies():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from mobile_web.scripts.run_deal_pool_scheduler import _commit_batch_results_to_db
+
+    raw_col = MagicMock()
+    raw_col.bulk_write.return_value = SimpleNamespace(modified_count=1)
+    formal_col = MagicMock()
+    captured_formal_ops = []
+    formal_col.bulk_write.side_effect = lambda ops, ordered=False: (
+        captured_formal_ops.extend(ops) or SimpleNamespace(upserted_count=0, modified_count=1)
+    )
+
+    early_results = [
+        {
+            "status": "early_terminated",
+            "source_site": "xianbao_fun",
+            "source_item_id": "xb_dup_1",
+            "platform": "tb",
+            "product_id": "67890",
+            "error_msg": "已入库早停",
+            "resonance_update": {
+                "platform": "tb",
+                "product_id": "67890",
+                "seen_count": 1,
+                "source_site": "xianbao_fun",
+                "seen_channels": ["ch1"],
+                "copywriting": "群友最新实操作业：拍2件叠加88vip再减5元，凑单某某可退！",
+                "timeline_entry": {
+                    "tip_id": "xb_dup_1",
+                    "source_site": "xianbao_fun",
+                    "source_channel": "ch1",
+                    "publish_time": "2026-11-18 01:25:00",
+                    "publish_ts": 1794936300.0,
+                    "title": "群友爆料作业",
+                    "copywriting": "群友最新实操作业：拍2件叠加88vip再减5元",
+                    "deal_price": 45.0,
+                    "tutorial_score": 80,
+                },
+            },
+        }
+    ]
+
+    commit_res = _commit_batch_results_to_db(
+        early_results,
+        raw_col=raw_col,
+        formal_col=formal_col,
+        cycle_num=1,
+    )
+    assert len(captured_formal_ops) == 1
+    upd_op = captured_formal_ops[0]._doc
+    assert "$addToSet" in upd_op
+    assert "deal_info.supplementary_copies" in upd_op["$addToSet"]
+    copies = upd_op["$addToSet"]["deal_info.supplementary_copies"]["$each"]
+    assert len(copies) == 1
+    assert "群友最新实操作业" in copies[0]
+    assert "$push" in upd_op
+    assert "deal_info.tips_timeline" in upd_op["$push"]
+    tl_ops = upd_op["$push"]["deal_info.tips_timeline"]["$each"]
+    assert len(tl_ops) == 1
+    assert tl_ops[0]["tip_id"] == "xb_dup_1"
+    assert tl_ops[0]["deal_price"] == 45.0
