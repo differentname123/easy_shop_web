@@ -289,7 +289,7 @@ def execute_with_key_failover(
         if last_result is not None and callable(should_ignore_error) and should_ignore_error(result, last_result):
             continue
         last_result = result
-        if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR"):
+        if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR", "RATE_LIMIT"):
             return result
         if callable(should_stop_early) and should_stop_early(result):
             return result

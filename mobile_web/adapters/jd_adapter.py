@@ -13,9 +13,13 @@ from infrastructure.api_governance import (
     is_real_requests_session,
     stamp_universal_resolution,
 )
+from infrastructure.hdk_client import HdkClient
 from infrastructure.http_utils import (
+    clean_int,
+    clean_money,
     clean_text as _text,
     error_dict as _error,
+    normalize_http_url,
     parse_finite_money as _money,
     parse_shanghai_timestamp as _timestamp,
 )
@@ -141,7 +145,242 @@ class JdAdapter(BasePlatformAdapter):
         self._has_ztk_orders = bool(
             client is not None or has_appkey and setting("jd_app_key") and setting("jd_app_secret")
         )
+        hdk_key = setting("hdk_api_key", "")
+        self.hdk = overrides.get("hdk_client") or (HdkClient(hdk_key, union_id=union_id) if hdk_key else None)
+        if self.hdk:
+            self.attach_hdk(self.hdk)
         self._refresh_capabilities()
+
+    def attach_hdk(self, hdk_client: HdkClient) -> None:
+        """挂载好单库 (HDK) 为京东高配额能力提供者：搜索/详情为主力，转链/万能为兜底。"""
+        self.hdk = hdk_client
+        self.register_provider("search", "hdk_jd_search", self._make_hdk_search(hdk_client), prepend=True)
+        self.register_provider("detail", "hdk_jd_detail", self._make_hdk_detail(hdk_client), prepend=True)
+        self.register_provider("promotion", "hdk_jd_promotion", self._make_hdk_promotion(hdk_client), prepend=False)
+        self.register_provider("universal", "hdk_jd_universal", self._make_hdk_universal(hdk_client), prepend=False)
+
+    def _normalize_hdk_summary(self, item: dict) -> dict:
+        raw_sign = _text(item.get("skuid") or item.get("itemid"))
+        if not raw_sign:
+            raise ValueError("missing goods identity")
+        image_url = normalize_http_url(item.get("itempic") or item.get("white_image"))
+        canonical_id = extract_canonical_goods_id(self.platform_code, raw_sign, image_url=image_url) or raw_sign
+        price = clean_money(item.get("itemendprice") or item.get("itemprice"), 0.0)
+        original = clean_money(item.get("itemprice") or price, price)
+        if original is not None and price is not None and original < price:
+            original = price
+        coupon_amt = clean_money(item.get("couponmoney"), 0.0) or 0.0
+        coupon_url = jd_coupon_url(item.get("couponurl"))
+        name = _text(item.get("goodsname"))
+        if not name:
+            raise ValueError("missing goods title")
+        rate = clean_money(item.get("commission"), 0.0) or 0.0
+        rate_percent = round(rate * 100, 2) if 0 < rate <= 1.0 else rate
+        comm_amount = round(price * (rate_percent / 100.0), 2) if price else 0.0
+        sales = _text(item.get("itemsale") or item.get("comments") or "0")
+        mall = _text(item.get("shopname")) or "京东店铺"
+        brand = _text(item.get("brand_name")) or "品牌甄选"
+        cat_info = item.get("category_info") if isinstance(item.get("category_info"), dict) else {}
+        cat = _text(cat_info.get("cid3Name") or cat_info.get("cid1Name")) or "精选好物"
+
+        data = {
+            "platform": self.platform_code,
+            "platform_name": self.platform_name,
+            "goods_id": canonical_id,
+            "goods_sign": raw_sign,
+            "name": name,
+            "image_url": image_url,
+            "product_url": f"https://jingfen.jd.com/detail/{raw_sign}.html",
+            "price": price,
+            "original_price": original if original is not None else price,
+            "coupon_amount": coupon_amt,
+            "has_coupon": coupon_amt > 0 and bool(coupon_url),
+            "commission_rate": rate_percent,
+            "commission_amount": comm_amount,
+            "sales_tip": sales,
+            "mall_name": mall,
+            "brand": brand,
+            "category": cat,
+        }
+        if coupon_url:
+            data["coupon_url"] = coupon_url
+        return ProductSummary(**data).to_dict(exclude_unset=True)
+
+    def _normalize_hdk_detail(self, item: dict, ref: Optional[ProductRef] = None) -> dict:
+        summary_data = self._normalize_hdk_summary(item)
+        raw_images = _text(item.get("jd_image"))
+        carousel = [
+            normalize_http_url(img)
+            for img in (raw_images.split(",") if raw_images else [])
+            if normalize_http_url(img)
+        ]
+        if summary_data.get("image_url") and summary_data["image_url"] not in carousel:
+            carousel.insert(0, summary_data["image_url"])
+
+        specs = []
+        if summary_data.get("brand"):
+            specs.append({"label": "商品品牌", "value": summary_data["brand"]})
+        if summary_data.get("category"):
+            specs.append({"label": "商品类目", "value": summary_data["category"]})
+        if summary_data.get("mall_name"):
+            specs.append({"label": "店铺名称", "value": summary_data["mall_name"]})
+
+        shop_info = item.get("shop_info") if isinstance(item.get("shop_info"), dict) else {}
+        ratings = {}
+        for source, target in (("userEvaluateScore", "desc_score"), ("logisticsLvyueScore", "lgst_score"), ("afterServiceScore", "serv_score")):
+            s_val = _text(shop_info.get(source))
+            if s_val and s_val not in ("0", "0.0"):
+                ratings[target] = s_val
+
+        tags = []
+        if summary_data.get("coupon_amount", 0) > 0:
+            tags.append(f"{summary_data['coupon_amount']:g}元优惠券")
+        for tag in item.get("sku_tag_list") or []:
+            if isinstance(tag, dict) and tag.get("name"):
+                t_name = _text(tag["name"])
+                if t_name and t_name not in tags:
+                    tags.append(t_name)
+
+        detail_payload = {
+            **summary_data,
+            "carousel_images": carousel,
+            "detail_tags": tags,
+            "specs": specs,
+            "shop_ratings": ratings,
+            "coupon_info": {
+                "coupon_amount": summary_data.get("coupon_amount", 0.0),
+                "coupon_url": summary_data.get("coupon_url", ""),
+                "quota": clean_money(item.get("quota"), 0.0),
+                "coupon_start_time": clean_int(item.get("couponstarttime")),
+                "coupon_end_time": clean_int(item.get("couponendtime")),
+            },
+        }
+        return ProductDetail(**detail_payload).to_dict(exclude_unset=True)
+
+    def _make_hdk_search(self, client: HdkClient):
+        def _search(keyword="", page=1, page_size=20, uid=None, **kwargs):
+            res = client.search_goods(keyword, page=page, page_size=page_size)
+            if res.get("status") != "success":
+                return res
+            items = res.get("data") or []
+            summaries = []
+            for it in items:
+                try:
+                    summaries.append(self._normalize_hdk_summary(it))
+                except Exception:
+                    continue
+            return {
+                "status": "success",
+                "data": summaries,
+                "total_count": res.get("total_count", len(summaries)),
+                "page": page,
+                "page_size": page_size,
+                "has_more": bool(res.get("has_more")) if "has_more" in res else len(summaries) >= page_size,
+            }
+        return _search
+
+    def _make_hdk_detail(self, client: HdkClient):
+        def _detail(goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):
+            ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
+            target_id = ref.goods_sign or ref.goods_id
+            if not target_id or is_jd_image_key(target_id):
+                return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU")
+            res = client.get_goods_detail(target_id)
+            if res.get("status") != "success":
+                return res
+            raw_item = res.get("data") or {}
+            try:
+                return {"status": "success", "data": self._normalize_hdk_detail(raw_item, ref)}
+            except Exception as exc:
+                return _error("PROTOCOL_ERROR", f"好单库详情解析失败: {exc}")
+        return _detail
+
+    def _make_hdk_promotion(self, client: HdkClient):
+        def _promote(goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, promoter_id=None, **kwargs):
+            ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
+            target_id = ref.goods_sign or ref.goods_id
+            if not target_id:
+                return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
+            promoter = canonical_promoter_id(promoter_id or self.default_promoter_id)
+            mat = kwargs.get("trusted_product_url") or (f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else target_id)
+            coupon = jd_coupon_url(kwargs.get("trusted_coupon_url"))
+            sub_id = kwargs.get("sub_union_id")
+            res = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=sub_id, coupon_url=coupon)
+            if res.get("status") != "success":
+                return res
+            extra = {"coupon_url": coupon} if coupon else {}
+            return self._build_promotion_payload(
+                res,
+                promoter=promoter,
+                goods_id=ref.goods_id,
+                goods_sign=ref.goods_sign,
+                uid=uid,
+                **extra,
+            )
+        return _promote
+
+    def _make_hdk_universal(self, client: HdkClient):
+        def _universal(raw_text="", uid=None, promoter_id=None, **kwargs):
+            text = _text(raw_text)
+            if not text:
+                return _error("INVALID_ARGUMENT", "请输入京东链接或商品信息")
+            promoter = canonical_promoter_id(promoter_id or self.default_promoter_id)
+            short_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9_-]+", text)
+            card = None
+            target_id = ""
+            if short_match:
+                res = client.resolve_short_url(short_match.group(0))
+                if res.get("status") == "success" and isinstance(res.get("data"), dict):
+                    try:
+                        card = self._normalize_hdk_detail(res["data"])
+                        target_id = card.get("goods_sign") or card.get("goods_id")
+                    except Exception:
+                        pass
+            if not card:
+                jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
+                if jf_match:
+                    target_id = jf_match.group(1)
+                elif _is_encrypted_jd_item_id(text):
+                    target_id = text
+                if target_id:
+                    det = self.get_goods_detail(target_id)
+                    if det.get("status") == "success" and isinstance(det.get("data"), dict):
+                        card = det["data"]
+            if not target_id and not card:
+                return _error("NOT_FOUND", "未能识别该京东链接或商品")
+
+            mat = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else (short_match.group(0) if short_match else target_id)
+            conv = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=kwargs.get("sub_union_id"), coupon_url=(card or {}).get("coupon_url"))
+            if conv.get("status") != "success":
+                return conv
+            short = conv.get("short_url") or ""
+            long = conv.get("click_url") or ""
+            title = (card or {}).get("name") or "京东精选好物"
+            price = (card or {}).get("price")
+            coupon = (card or {}).get("coupon_amount", 0.0)
+            canonical_id = (card or {}).get("goods_id") or extract_canonical_goods_id(self.platform_code, target_id) or target_id
+            sign_id = (card or {}).get("goods_sign") or target_id
+            payload = {
+                "status": "success",
+                "final_link": short or long,
+                "short_url": short,
+                "click_url": long,
+                "url": long or short,
+                "title": title,
+                "price": price,
+                "coupon_amount": coupon,
+                "product": card,
+                "promoter_id": promoter,
+                "goods_id": canonical_id,
+                "goods_sign": sign_id,
+                "attribution_status": "verified" if uid else "anonymous",
+                "need_auth": False,
+                "link_type": "京东推广链接",
+            }
+            if card is None:
+                payload["detail_lookup_failed"] = True
+            return stamp_universal_resolution(payload)
+        return _universal
 
     def _refresh_capabilities(self) -> None:
         cat = getattr(self, "_has_ztk_catalog", False)
