@@ -633,11 +633,21 @@ class TaobaoAdapter(BasePlatformAdapter):
                 }
                 product_card = ProductDetail(**detail_payload).to_dict(exclude_unset=True)
 
-            lower_in = text.lower()
-            is_explicit_single_item = bool(
-                tao_id
-                or is_bare_id
-                or any(k in lower_in for k in ("item.taobao.com", "detail.tmall.com", "uland.taobao.com/item/edetail"))
+            lower_urls = f"{text} {link} {short_url}".lower()
+            verified_coupon_or_venue = bool(
+                not tao_id
+                and not is_bare_id
+                and any(
+                    kw in lower_urls
+                    for kw in (
+                        "pages.tmall.com/wow/",
+                        "pages-fast.m.taobao.com/wow/",
+                        "uland.taobao.com/quan",
+                        "mo.m.taobao.com",
+                    )
+                )
+                and "/wow/z/lianmeng/" not in lower_urls
+                and "wh_alimama=" not in lower_urls
             )
             payload = {
                 "status": "success",
@@ -662,7 +672,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             }
             return stamp_universal_resolution(
                 payload,
-                verified_coupon_or_venue=(not is_explicit_single_item),
+                verified_coupon_or_venue=verified_coupon_or_venue,
             )
 
         def _do_bare_id_resolve():

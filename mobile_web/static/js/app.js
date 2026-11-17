@@ -101,7 +101,7 @@
             account.universalPlatform.value = 'auto';
             account.universalInput.value = raw;
             scrollToTop();
-            browser.showToast('已识别分享链接/口令，正在为您解析专属通道...');
+            browser.showToast('已识别分享链接，正在为您解析专属通道...');
             return account.handleUniversalConvert();
           }
         }
@@ -287,6 +287,7 @@
         if (account.formInviteCode.value) account.isRegisterMode.value = true;
         if (['home', 'boom', 'user'].includes(params.get('tab'))) {
           currentTab.value = params.get('tab');
+          try { global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`); } catch (_) {}
         } else {
           try {
             const savedTab = global.sessionStorage.getItem(`easy_shop_last_active_tab:${session.scope()}`);

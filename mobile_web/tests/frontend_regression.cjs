@@ -3034,5 +3034,86 @@ test('stability guards: Private Mode storage fallback, HTML 413/502 error handli
   await buyClean;
 });
 
+test('simplified search routing, goHome reset, single detail retry, honest degraded conversion & sync cooldown toast', async () => {
+  const hFmt = harness();
+  hFmt.load('app');
+  const { detectLinkOrToken } = hFmt.context.EasyShop;
+  for (const kw of ['(iPhone15Pro)', '!RTX4060Ti!', 'CZ1234', '/2025新款/', 'jd.com', 'AbCdEfGhIjKlMnOpQrStUvWxYz12']) {
+    assert.equal(detectLinkOrToken(kw).isLinkOrToken, false, `keyword ${kw} never false-positives as token`);
+  }
+  assert.equal(detectLinkOrToken('https://u.jd.com/abc123').isLinkOrToken, true);
+  assert.equal(detectLinkOrToken('https://u.jd.com/abc123').platform, 'jd');
+  assert.equal(detectLinkOrToken('【淘宝】https://e.tb.cn/h.123 「纸巾抽纸」').isEtbShareWithTitle, true);
+
+  // goHome reset=1 clears stale saved boom tab & old home search keyword
+  const hDet = harness({ url: 'https://shop.test/detail?goods_id=G1&platform=pdd' });
+  hDet.load('detail');
+  hDet.page.goHome();
+  assert.equal(hDet.context.location.href, '/?tab=home&reset=1');
+
+  const hApp = harness({
+    url: 'https://shop.test/?tab=home&reset=1',
+    sessionSaved: {
+      'easy_shop_last_active_tab:guest': 'boom',
+      'easy_shop_home_search_keyword:guest:pdd': JSON.stringify('旧搜索词'),
+    },
+  });
+  hApp.load('app');
+  const boot = hApp.mounted[0]();
+  await flush();
+  await hApp.finish(0, { status: 'success', data: platformFixtures });
+  await hApp.finish(1, { status: 'success', data: channelFixtures });
+  await hApp.finish(2, goodsResponse('FRESH-HOME', false));
+  await boot;
+  assert.equal(hApp.page.currentTab.value, 'home');
+  assert.equal(hApp.page.homeSearchKeyword.value, '');
+  assert.ok(hApp.requests[2].url.startsWith('/api/home/recommend?'));
+
+  // JD INVALID_ARGUMENT guidance renders clean message without fake homeError retry
+  hApp.page.homeSearchKeyword.value = '纸巾';
+  const shortSearch = hApp.page.onSearchHome();
+  await hApp.finish(hApp.requests.length - 1, {
+    status: 'error',
+    error_code: 'INVALID_ARGUMENT',
+    error_msg: '京东搜索关键词至少需要4个字符（可加品牌或品类词，如「维达抽纸」）',
+  });
+  await shortSearch;
+  assert.equal(hApp.page.homeError.value, false);
+  assert.equal(hApp.page.homeHasMore.value, false);
+  assert.ok(hApp.page.homeEmptyMessage.value.includes('4个字符'));
+
+  // Degraded universal conversion shows honest toast instead of success toast
+  hApp.page.universalInput.value = 'https://u.jd.com/deg1';
+  const degP = hApp.page.handleUniversalConvert();
+  await hApp.finish(hApp.requests.length - 1, {
+    status: 'success',
+    resolution_kind: 'degraded_product',
+    detail_lookup_failed: true,
+    final_link: 'https://u.jd.com/deg1',
+  });
+  await degP;
+  assert.ok(hApp.page.toastMessage.value.includes('限流'));
+
+  // Order sync within 180s cooldown surfaces countdown toast
+  hApp.page.isLoggedIn.value = true;
+  hApp.page.uid.value = 'u_1';
+  hApp.session.saveUser(user('u_1', 'tok_1'));
+  const syncP = hApp.page.syncAndQueryOrders(true);
+  await hApp.finish(hApp.requests.length - 1, {
+    status: 'success',
+    data: { orders: [], sync_status: 'success', sync_cooldown_remaining: 118 },
+  });
+  await syncP;
+  assert.equal(hApp.page.toastMessage.value, '已刷新本地订单，118秒后可再次向平台同步');
+
+  // HTML templates preserve single detail retry guard & degraded banner
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(detailHtml.includes('v-if="!isOffPromotion && !detailError"'));
+  assert.ok(indexHtml.includes("universalResult.resolution_kind === 'degraded_product'"));
+  assert.ok(indexHtml.includes('universal-degraded-tip'));
+});
+
+
 
 

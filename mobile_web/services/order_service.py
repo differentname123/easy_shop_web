@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """本地订单查询与有界、可续传的同步编排；平台差异只由适配器声明。"""
 from copy import deepcopy
+import math
 import time
 import threading
 from typing import Dict, Any, Optional
@@ -271,6 +272,13 @@ class OrderService:
             return {"status": "error", "error_code": "capability_unavailable", "platform": plat,
                     "error_msg": f"{adapter.platform_name}订单查询尚未配置，不能同步订单"}
         now = time.time()
+        last_attempt_before = float(_LAST_SYNC_ATTEMPT.get(plat, 0.0) or 0.0)
+        elapsed_before = now - last_attempt_before
+        sync_cooldown_remaining = (
+            max(1, int(math.ceil(ORDER_SYNC_INTERVAL - elapsed_before)))
+            if (last_attempt_before > 0 and 0 <= elapsed_before < ORDER_SYNC_INTERVAL)
+            else 0
+        )
         self._try_start_sync(plat, now)
         start_ts = int(now - days * 86400) if days else None
         try:
@@ -289,6 +297,7 @@ class OrderService:
             "platform": plat, "uid": clean_uid, "query_days": days,
             "last_sync_time": int(_LAST_SYNC_TIMESTAMP.get(plat, 0)),
             "last_sync_attempt_time": int(_LAST_SYNC_ATTEMPT.get(plat, 0)),
+            "sync_cooldown_remaining": sync_cooldown_remaining,
             "sync_status": state.get("status", "idle"),
             "sync_error": state.get("error", ""),
             "synced_count": state.get("synced_count", 0),

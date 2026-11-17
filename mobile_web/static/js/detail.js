@@ -245,7 +245,7 @@
       const width = carouselRef.value.clientWidth || global.innerWidth;
       currentImgIndex.value = Math.round(carouselRef.value.scrollLeft / width);
     };
-    const goHome = () => { global.location.href = '/'; };
+    const goHome = () => { global.location.href = '/?tab=home&reset=1'; };
     const goToRegister = () => {
       const inv = session.pendingInvite ? session.pendingInvite() : '';
       global.location.href = inv ? `/?${new URLSearchParams({ tab: 'user', invite_code: inv })}` : '/?tab=user';

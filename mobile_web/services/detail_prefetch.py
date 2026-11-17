@@ -23,6 +23,7 @@ DEFAULT_INTERVAL_SECONDS = 300
 MAX_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.25
 FAILURE_COOLDOWN_SECONDS = 60
+RATE_LIMIT_COOLDOWN_SECONDS = 600
 COOLDOWN_CAPACITY = QUEUE_CAPACITY * 2
 _COMPLETION_STATUSES = ("ready", "persist_failed", "error", "skipped", "superseded", "stopped",
                         "summary_ready", "summary_error")
@@ -298,8 +299,19 @@ class DetailPrefetcher:
                 return "stopped", "", ""
         now = self._wall_clock()
         next_check = getattr(result, "next_check_at", 0)
-        if getattr(result, "status", None) == "ready" and isinstance(next_check, (int, float)) and math.isfinite(next_check):
+        err_code = str(getattr(result, "error_code", "") or "").strip()
+        err_msg = str(getattr(result, "error_msg", "") or "").strip()
+        err_upper = err_code.upper()
+        status = getattr(result, "status", "error")
+        if (
+            (status == "ready" or err_upper == "PRODUCT_OFF_PROMOTION")
+            and isinstance(next_check, (int, float))
+            and not isinstance(next_check, bool)
+            and math.isfinite(next_check)
+        ):
             until = max(now, next_check)
+        elif err_upper in ("RATE_LIMIT", "QUOTA_EXCEEDED", "429"):
+            until = now + RATE_LIMIT_COOLDOWN_SECONDS
         else:
             until = now + FAILURE_COOLDOWN_SECONDS
         with self._condition:
@@ -309,10 +321,7 @@ class DetailPrefetcher:
                 self._cooldowns.move_to_end(key)
             while len(self._cooldowns) > COOLDOWN_CAPACITY:
                 self._cooldowns.popitem(last=False)
-        status = getattr(result, "status", "error")
         status = status if status in _COMPLETION_STATUSES else "error"
-        err_code = str(getattr(result, "error_code", "") or "").strip()
-        err_msg = str(getattr(result, "error_msg", "") or "").strip()
         if last_exc_summary:
             err_code = err_code or "INTERNAL_ERROR"
             err_msg = err_msg or last_exc_summary

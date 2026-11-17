@@ -123,16 +123,23 @@ def test_search_exact_script_parameters_public_url_and_missing_only_price_fallba
     http = http_for({"status": 200, "content": [item()]},
                     {"status": 200, "content": [item("second", quanhou_jiage=None)]})
     a = adapter(client(http))
-    first = a.search_goods("纸", page=2, page_size=3)
+    too_short = a.search_goods("纸", page=2, page_size=3)
+    assert too_short["status"] == "error" and too_short["error_code"] == "INVALID_ARGUMENT"
+    assert http.get.call_count == 0
+    first = a.search_goods("维达抽纸", page=2, page_size=3)
     assert first["data"][0]["price"] == 0
     assert first["data"][0]["product_url"] == "https://jingfen.jd.com/detail/verified.html"
     assert "raw" not in str(first) and "jCommand" not in str(first)
     call = http.get.call_args
     assert call.args == (DEFAULT_API_BASE + "/api_quanwang.ashx",)
-    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "纸纸纸纸",
-                                     "page": 2, "page_size": 3, "sort": "new", "youquan": 1, "type": 2}
+    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "维达抽纸",
+                                     "page": 2, "page_size": 3, "sort": "new", "youquan": 0, "type": 2}
     assert a.search_goods("足够长关键词")["data"][0]["price"] == 20.5
     assert http.get.call_args.kwargs["params"]["q"] == "足够长关键词"
+    assert http.get.call_args.kwargs["params"]["youquan"] == 0
+    http_cpn = http_for({"status": 200, "content": [item()]})
+    assert client(http_cpn).search_goods("足够长关键词", has_coupon=True)["status"] == "success"
+    assert http_cpn.get.call_args.kwargs["params"]["youquan"] == 1
 
 
 @pytest.mark.parametrize("images,expected", [("a|b||a", ["a", "b"]), (["a", "b", None, "a"], ["a", "b"]), (None, [])])
@@ -326,7 +333,7 @@ def test_unknown_catalog_and_relay_envelopes_do_not_disclose_messages(body):
     for method in ("get_rank_goods", "get_goods_detail", "search_goods", "query_orders"):
         http = http_for(body)
         c = client(http)
-        args = {"get_rank_goods": (), "get_goods_detail": ("opaque",), "search_goods": ("商品",), "query_orders": (0, 100)}[method]
+        args = {"get_rank_goods": (), "get_goods_detail": ("opaque",), "search_goods": ("京东商品",), "query_orders": (0, 100)}[method]
         result = getattr(c, method)(*args)
         assert result["status"] == "error" and "private" not in str(result)
 
@@ -376,12 +383,12 @@ def test_supplier_material_url_requires_official_host_and_safe_components(value)
 def test_client_config_base_and_pagination_errors_are_offline():
     http = http_for()
     for base in ("https://user:pass@relay.test/api", "https://relay.test/api?secret=private", "https://relay.test/unknown", ""):
-        assert JdClient("k", "100", api_base=base, http_session=http).search_goods("商品")["error_code"] == "CONFIG_ERROR"
+        assert JdClient("k", "100", api_base=base, http_session=http).search_goods("京东商品")["error_code"] == "CONFIG_ERROR"
     for args in ((1.5, 20), (True, 20), (1, 2.5), (1, 0)):
         assert client(http).get_rank_goods(page=args[0], page_size=args[1])["error_code"] == "INVALID_ARGUMENT"
     http.get.assert_not_called()
     http = http_for({"status": 200, "content": [], "hasMore": True})
-    assert client(http).search_goods("商品")["error_code"] == "PAGINATION_ERROR"
+    assert client(http).search_goods("京东商品")["error_code"] == "PAGINATION_ERROR"
 
 
 def test_numeric_scope_config_fingerprint_and_failure_has_no_owner_fallback():
@@ -799,15 +806,13 @@ def test_merchant_main_image_update_preserves_detail_and_coupon_via_verified_cip
     assert detail_res["data"]["goods_id"] == new_img_key
     assert detail_res["data"]["goods_sign"] == req_sign
 
-    # 2. get_goods_detail 在 301 频控兜底路径下同样兼容商家换主图与跨 Key 重签名
+    # 2. get_goods_detail 遇 301 频控且转链探针成功时直接裁决为 RATE_LIMIT，不再额外撞 api_quanwang 消耗 1000 配额
     c_rl = Mock()
     c_rl.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
     c_rl.convert_promotion_link.return_value = {"status": "success", "short_url": "https://u.jd.com/probe_cola"}
-    c_rl.search_goods.return_value = {"status": "success", "total_count": 1, "data": c.get_goods_detail.return_value["data"]}
     resilient = adapter(c_rl).get_goods_detail(req_sign, goods_id=old_img_key, goods_sign=req_sign)
-    assert resilient["status"] == "success"
-    assert resilient["data"]["price"] == 60.0 and resilient["data"]["coupon_amount"] == 4.0
-    assert resilient["data"]["goods_sign"] == req_sign
+    assert resilient["status"] == "error" and resilient["error_code"] == "RATE_LIMIT"
+    c_rl.search_goods.assert_not_called()
 
     # 3. 防串货红线不变：若上游退化返回非标准加密 ID（如误解析成数字 SKU '6'）且主图冲突，严格拒绝
     c.get_goods_detail.return_value = {

@@ -70,11 +70,7 @@ class UserService:
             }
             if mode:
                 repo_kwargs["mode"] = mode
-            try:
-                user = self.repo.register_or_login(**repo_kwargs)
-            except TypeError:
-                repo_kwargs.pop("mode", None)
-                user = self.repo.register_or_login(**repo_kwargs)
+            user = self.repo.register_or_login(**repo_kwargs)
             auth_token = create_access_token(user["uid"])
             user_data = dict(user)
             is_new_user = bool(user_data.pop("_is_new_user", False))

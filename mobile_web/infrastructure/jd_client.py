@@ -69,6 +69,23 @@ def jd_coupon_url(value):
     return url if (host in ("coupon.m.jd.com", "coupon.jd.com") or host.endswith(".coupon.jd.com")) else ""
 
 
+JD_OFFICIAL_VENUE_URL_MARKERS = (
+    "coupon.m.jd.com",
+    "coupon.jd.com",
+    "pro.m.jd.com",
+    "prodev.m.jd.com",
+    "h5.m.jd.com",
+    "jdcoupon",
+    "u_act_p=coupon",
+)
+
+
+def is_jd_official_venue_url(text: str) -> bool:
+    """判断文本/URL是否命中京东官方公开领券/活动会场域名白名单。"""
+    lower = str(text or "").lower()
+    return any(marker in lower for marker in JD_OFFICIAL_VENUE_URL_MARKERS)
+
+
 def _trusted_signed_url(value):
     if not isinstance(value, str) or "\\" in value or any(ord(c) < 33 for c in value):
         return False
@@ -354,33 +371,35 @@ class JdClient:
             return _error("PAGINATION_ERROR", "京东商品页长与分页声明不一致")
         return {"status": "success", "data": rows, "has_more": more, "total_count": total}
 
-    def search_goods(self, keyword, page=1, page_size=20, *, has_coupon=True):
+    def search_goods(self, keyword, page=1, page_size=20, *, has_coupon=False):
         try:
             page, size = self._page(page, page_size)
             query = keyword.strip()
             if not query:
                 raise ValueError
-            # 【重要协议约束】折淘客全网搜索接口 (api_quanwang.ashx) 强制要求搜索词 q 的长度至少为 4 个字符；
-            # 若少于 4 个字符（例如“纸巾”、“可乐”），折淘客上游会直接报错拒绝响应。
-            # 因此此处必须对不足 4 个字符的关键词进行倍增补齐（如“纸巾” -> “纸巾纸巾”），切勿删除！
-            while len(query) < 4:
-                query += query
         except (TypeError, ValueError, AttributeError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东搜索关键词或分页无效")
+        config_error = self._validate_config()
+        if config_error is not None:
+            return config_error
+        if len(query) < 4:
+            return _error("INVALID_ARGUMENT", "京东搜索关键词至少需要4个字符（可加品牌或品类词，如「维达抽纸」）")
         ambiguous_empty_hits = 0
+        short_query_rejected = False
 
         def _evaluate_search(body):
-            nonlocal ambiguous_empty_hits
-            if (
-                isinstance(body, dict)
-                and str(body.get("status")) in ("300", "301")
-                and any(
-                    kw in str(body.get("content") or body.get("msg") or "")
+            nonlocal ambiguous_empty_hits, short_query_rejected
+            if isinstance(body, dict) and str(body.get("status")) in ("300", "301"):
+                msg = str(body.get("content") or body.get("msg") or "")
+                if "少于4个字" in msg:
+                    short_query_rejected = True
+                    return _error("INVALID_ARGUMENT", "京东搜索关键词至少需要4个字符（可加品牌或品类词，如「维达抽纸」）")
+                if any(
+                    kw in msg
                     for kw in ("无符合条件的数据", "无数据", "没有数据", "暂无数据", "没有找到")
-                )
-            ):
-                ambiguous_empty_hits += 1
-                return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_empty=True)
+                ):
+                    ambiguous_empty_hits += 1
+                    return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_empty=True)
             return self._content(body, page, size)
 
         res = self._execute_with_failover(
@@ -388,7 +407,7 @@ class JdClient:
             {"unionId": self.union_id, "q": query, "page": page, "page_size": size,
              "sort": "new", "youquan": 1 if has_coupon else 0, "type": 2},
             _evaluate_search,
-            extra_stop_early=lambda _r: ambiguous_empty_hits >= 2,
+            extra_stop_early=lambda _r: short_query_rejected or ambiguous_empty_hits >= 2,
         )
         if res.get("ztk_ambiguous_empty"):
             return {"status": "success", "data": [], "has_more": False, "total_count": 0}
@@ -513,12 +532,8 @@ class JdClient:
             j_cmd_primary = str(primary_res.get("j_command") or "").strip()
             is_known_jingfen_or_venue = (
                 "jingfen.jd.com/detail/" in lower_mat
-                or any(
-                    kw in lower_mat
-                    for kw in ("coupon.m.jd.com", "coupon.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "u_act_p=coupon")
-                )
+                or is_jd_official_venue_url(lower_mat)
                 or not j_cmd_primary
-                or "促销会场" in j_cmd_primary
             )
             if is_known_jingfen_or_venue:
                 return primary_res

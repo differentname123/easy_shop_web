@@ -91,9 +91,14 @@
         if (response.ok && response.data.status === 'success' && response.data.data) {
           userOrdersData.value = response.data.data;
           if (force && pollCount === 0) {
-            const messages = { running: '已刷新本地订单，后台同步进行中', success: '订单已刷新',
-              partial: '订单已刷新，后台同步尚未完成', error: '订单已刷新，后台同步失败，请稍后重试' };
-            showToast(messages[response.data.data.sync_status] || '已刷新本地订单');
+            const cooldown = Number(response.data.data.sync_cooldown_remaining || 0);
+            if (response.data.data.sync_status !== 'running' && cooldown > 0) {
+              showToast(`已刷新本地订单，${cooldown}秒后可再次向平台同步`);
+            } else {
+              const messages = { running: '已刷新本地订单，后台同步进行中', success: '订单已刷新',
+                partial: '订单已刷新，后台同步尚未完成', error: '订单已刷新，后台同步失败，请稍后重试' };
+              showToast(messages[response.data.data.sync_status] || '已刷新本地订单');
+            }
           } else if (force && pollCount > 0 && response.data.data.sync_status === 'success') {
             showToast('后台订单同步已完成');
           }
@@ -226,6 +231,10 @@
           universalResult.value = data;
           if (data.need_auth && data.auth_msg) {
             showToast(data.auth_msg);
+          } else if (data.resolution_kind === 'degraded_product') {
+            showToast('已生成下单通道，商品卡片因上游限流暂未返回，可稍后重试详情');
+          } else if (data.resolution_kind === 'coupon_or_venue') {
+            showToast('已识别为领券/会场链接并生成专属通道');
           } else {
             showToast('转链与商品解析成功！');
           }

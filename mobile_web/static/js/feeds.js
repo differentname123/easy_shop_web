@@ -14,6 +14,7 @@
     const homeLoading = ref(false);
     const homeHasMore = ref(true);
     const homeError = ref(false);
+    const homeEmptyMessage = ref('');
     let homeOffset = 0, homeCursor = '', homeSearchPage = 1;
     let homeGeneration = 0, channelGeneration = 0, platformGeneration = 0;
     let disposed = false, stateScope = getScope();
@@ -108,7 +109,7 @@
       if (isReset) {
         homeOffset = 0; homeCursor = ''; homeSearchPage = 1;
         if (!isPullRefresh) homeGoodsList.value = [];
-        homeHasMore.value = true; homeError.value = false;
+        homeHasMore.value = true; homeError.value = false; homeEmptyMessage.value = '';
       }
       const query = {
         platform: homePlatform.value, keyword: activeHomeKeyword.value, channel: currentChannel.value,
@@ -124,9 +125,17 @@
         if (!current(generation, scope)) return false;
         const data = response.data;
         if (!response.ok || data.status !== 'success' || !Array.isArray(data.data)) {
+          if (data && data.error_code === 'INVALID_ARGUMENT') {
+            homeError.value = false;
+            homeHasMore.value = false;
+            homeEmptyMessage.value = data.error_msg || '搜索关键词格式有误，请调整后重试';
+            showToast(homeEmptyMessage.value);
+            return false;
+          }
           homeError.value = true; showToast('商品加载中断，点击重试'); return false;
         }
         homeError.value = false;
+        homeEmptyMessage.value = '';
         homeGoodsList.value = shop.mergeGoods(isReset ? [] : homeGoodsList.value, data.data);
         const suppliedOffset = typeof data.next_offset === 'number' && Number.isFinite(data.next_offset) && data.next_offset >= 0;
         homeOffset = suppliedOffset ? data.next_offset : query.offset + data.data.length;
@@ -163,14 +172,14 @@
     const applySnapshot = cached => {
       stateScope = getScope(); homeGoodsList.value = [...cached.list]; homeOffset = cached.offset ?? 0;
       homeCursor = cached.cursor || ''; homeSearchPage = cached.page || 1;
-      homeHasMore.value = cached.hasMore !== false; homeLoading.value = false;
+      homeHasMore.value = cached.hasMore !== false; homeLoading.value = false; homeEmptyMessage.value = '';
     };
     const switchChannel = type => {
       if (disposed) return;
       if (homeChannels.value.length && !homeChannels.value.some(item => item.channel_type === type)) return;
       if (stateScope === getScope() && !activeHomeKeyword.value && (!homeLoading.value || homeGoodsList.value.length)) channelCache.set(cacheKey(), snapshotList());
       homeGeneration += 1; currentChannel.value = type;
-      homeSearchKeyword.value = ''; activeHomeKeyword.value = ''; homeError.value = false;
+      homeSearchKeyword.value = ''; activeHomeKeyword.value = ''; homeError.value = false; homeEmptyMessage.value = '';
       syncHomeSearchToUrl(''); global.scrollTo(0, 0);
       const cached = channelCache.get(cacheKey(type));
       if (cached) { applySnapshot(cached); return; }
@@ -184,7 +193,7 @@
       homeGeneration += 1; channelGeneration += 1;
       homePlatform.value = code; currentChannel.value = 5;
       homeSearchKeyword.value = preservedKeyword; activeHomeKeyword.value = preservedKeyword; homeGoodsList.value = [];
-      homeLoading.value = true; homeError.value = false; homeHasMore.value = true;
+      homeLoading.value = true; homeError.value = false; homeHasMore.value = true; homeEmptyMessage.value = '';
       homeOffset = 0; homeCursor = ''; homeSearchPage = 1;
       syncHomeSearchToUrl(preservedKeyword); global.scrollTo(0, 0);
       const generation = homeGeneration, scope = getScope();
@@ -196,8 +205,21 @@
       } else if (current(generation, scope)) homeLoading.value = false;
     };
     const initializeHome = params => {
-      let keyword = (params.get('keyword') || params.get('q') || read('home_search_keyword') || '').trim();
+      const isExplicitReset = params.get('reset') === '1';
+      let keyword = isExplicitReset ? '' : (params.get('keyword') || params.get('q') || read('home_search_keyword') || '').trim();
       if (params.get('tab') && params.get('tab') !== 'home') keyword = '';
+      if (isExplicitReset) {
+        try {
+          global.sessionStorage.removeItem(key('home_search_keyword'));
+          global.sessionStorage.removeItem(key('home_search_state'));
+          const url = new URL(global.location.href);
+          url.searchParams.delete('reset');
+          url.searchParams.delete('tab');
+          url.searchParams.delete('keyword');
+          url.searchParams.delete('q');
+          global.history.replaceState({ tab: 'home', scope: getScope() }, '', url.toString());
+        } catch (_) {}
+      }
       if (keyword || !homeSearchKeyword.value || activeHomeKeyword.value) {
         homeSearchKeyword.value = keyword;
       }
@@ -370,7 +392,7 @@
     };
     return {
       platforms, platformsError, homePlatform, homePlatformName, homeChannels, currentChannel, homeSearchKeyword,
-      activeHomeKeyword, homeGoodsList, homeLoading, homeHasMore, homeError, loadHomeChannels, loadPlatforms,
+      activeHomeKeyword, homeGoodsList, homeLoading, homeHasMore, homeError, homeEmptyMessage, loadHomeChannels, loadPlatforms,
       loadHomeGoods, refreshHomeGoods, retryLoadHomeGoods, onSearchHome, clearHomeSearch, switchChannel, switchHomePlatform,
       initializeHome, initialize, resetSession, saveSearchState, syncGoodsPatches,
       boomPlatforms, boomPlatform, boomSearchKeyword, activeBoomKeyword, boomSortBy, boomGoodsList, boomLoading, boomHasMore, boomError,

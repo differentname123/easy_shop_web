@@ -599,7 +599,7 @@
     </div>
     <div class="hero-empty-placeholder" v-if="hasNoAvailableImages">
       <span>{{ isOffPromotion ? '商品已下架或暂无可用图片' : '商品图片暂未加载成功' }}</span>
-      <button type="button" class="hero-empty-retry-btn" v-if="!isOffPromotion" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
+      <button type="button" class="hero-empty-retry-btn" v-if="!isOffPromotion && !detailError" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
     </div>
     <span class="hero-counter-badge" v-if="carouselList.length > 1">
       {{ currentImgIndex + 1 }} / {{ carouselList.length }}

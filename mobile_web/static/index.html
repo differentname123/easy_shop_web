@@ -32,7 +32,7 @@
             enterkeyhint="search"
             autocomplete="off"
             class="search-input" 
-            :placeholder="'搜' + homePlatformName() + '商品，或直接粘贴分享链接/口令...'"
+            :placeholder="'搜' + homePlatformName() + '商品，或粘贴商品分享链接...'"
             v-model="homeSearchKeyword"
             @compositionstart="onImeCompositionStart('home', $event)"
             @compositionend="onImeCompositionEnd('home', $event)"
@@ -172,7 +172,7 @@
     </div>
 
     <div v-if="!homeLoading && homeError" class="empty-wrap" @click="retryLoadHomeGoods">{{ platformsError ? '平台信息暂不可用，请刷新页面重试' : '加载失败，点击重试' }}</div>
-    <div v-if="!homeLoading && !homeError && !homeHasMore && homeGoodsList.length === 0" class="empty-wrap">暂无符合条件的商品，换个关键词或切换上方平台试试</div>
+    <div v-if="!homeLoading && !homeError && !homeHasMore && homeGoodsList.length === 0" class="empty-wrap">{{ homeEmptyMessage || '暂无符合条件的商品，换个关键词或切换上方平台试试' }}</div>
     <div v-if="!homeLoading && !homeError && homeHasMore" class="loading-wrap continue-load-wrap" :class="{ 'is-subtle': homeGoodsList.length > 0 }" @click="loadHomeGoods(false)">
       <button type="button" class="continue-load-btn">下滑自动加载 · 点击加载下一页</button>
     </div>
@@ -482,8 +482,14 @@
             </div>
           </div>
         </div>
+        <div v-else-if="universalResult.resolution_kind === 'degraded_product'" class="universal-degraded-tip">
+          <span class="universal-degraded-text">⚠️ 已生成专属下单通道（商品卡片因上游限流暂未完整返回，不影响下方领券购买）</span>
+          <button type="button" class="universal-retry-btn" @click="handleUniversalConvert" :disabled="universalLoading">
+            {{ universalLoading ? '正在重试...' : '🔄 重试查询详情' }}
+          </button>
+        </div>
         <div v-else class="universal-no-preview-tip">
-          ✓ 已生成专属下单通道（该短链未返回图文卡片，可直接复制下方口令或点击领券购买）
+          ✓ 已生成专属下单通道（{{ universalResult.resolution_kind === 'coupon_or_venue' ? '领券/活动会场链接' : '该短链未返回图文卡片' }}，可直接复制下方口令或点击领券购买）
         </div>
 
         <!-- 转链口令/链接输出框 -->

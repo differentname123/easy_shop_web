@@ -21,7 +21,7 @@ from infrastructure.http_utils import (
 )
 from infrastructure.jd_client import (
     JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS, SHANGHAI,
-    canonical_promoter_id, jd_coupon_url, product_url,
+    canonical_promoter_id, is_jd_official_venue_url, jd_coupon_url, product_url,
 )
 from models.product import (
     ProductDetail,
@@ -159,15 +159,13 @@ class JdAdapter(BasePlatformAdapter):
         return is_real_requests_session(getattr(self.client, "http", None))
 
     def can_prefetch_detail(self, ref=None):
-        """允许合法加密 itemId 与纯数字 SKU（存在非折淘客详情供应商时）走后台详情预取，严禁传主图哈希。"""
+        """JD 折淘客共用小时级千次配额：榜单/搜索绝不后台盲刷 api_detail，仅允许外挂独立详情源后台预取。"""
         if ref is None or not isinstance(ref, ProductRef):
             return False
+        if not self._has_extra_providers("detail"):
+            return False
         sign = ref.goods_sign
-        if _is_encrypted_jd_item_id(sign):
-            return True
-        if sign and sign.isdigit() and self._has_extra_providers("detail"):
-            return True
-        return False
+        return bool(_is_encrypted_jd_item_id(sign) or (sign and sign.isdigit()))
 
     def normalize_material_url(self, url: str) -> str:
         return normalize_jd_material_url(url)
@@ -418,9 +416,6 @@ class JdAdapter(BasePlatformAdapter):
         if is_jd_image_key(target_id):
             return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU，不能直接使用主图哈希 ID")
 
-        allow_fallback = bool(kwargs.get("allow_fallback", True))
-        probe_state = {"short_url": "", "rate_limit_res": None}
-
         def _detail_via_ztk():
             result = self._fetch_item(ref)
             if result.get("status") != "success":
@@ -438,14 +433,11 @@ class JdAdapter(BasePlatformAdapter):
                     )
                     if probe.get("status") == "success":
                         short_url = probe.get("short_url") or probe.get("click_url") or ""
-                        rl_res = _error(
+                        return _error(
                             "RATE_LIMIT",
                             "京东详情接口触发临时频控，商品仍在正常推广中",
                             probe_short_url=short_url,
                         )
-                        probe_state["short_url"] = _text(short_url)
-                        probe_state["rate_limit_res"] = rl_res
-                        return rl_res
                     if probe.get("jd_off_promotion") is True:
                         return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
                 return result
@@ -453,37 +445,6 @@ class JdAdapter(BasePlatformAdapter):
                 return {"status": "success", "data": self._detail(result["data"])}
             except (ValueError, TypeError):
                 return _error("PROTOCOL_ERROR", "京东详情字段无效")
-
-        def _detail_via_ztk_probe():
-            short_q = probe_state.get("short_url") or ""
-            rate_limit_res = probe_state.get("rate_limit_res")
-            if not short_q:
-                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
-            try:
-                q_res = self.client.search_goods(short_q, page=1, page_size=5, has_coupon=False)
-            except TypeError:
-                q_res = self.client.search_goods(short_q, page=1, page_size=5)
-            rows = q_res.get("data") if q_res.get("status") == "success" else None
-            if not isinstance(rows, list) or len(rows) != 1 or int(q_res.get("total_count") or 1) != 1:
-                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
-            single = dict(rows[0])
-            returned_img_key = extract_jd_image_key(_pick(single.get("pict_url"), single.get("imageUrl")))
-            if (
-                is_jd_image_key(ref.goods_id)
-                and returned_img_key
-                and returned_img_key != ref.goods_id
-                and not _verified_jd_cipher_pair(target_id, _item_id(single))
-            ):
-                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
-            if target_id and (not returned_img_key or _is_encrypted_jd_item_id(target_id)):
-                single["tao_id"] = target_id
-            try:
-                card = self._detail(single)
-                if ref.goods_id and not card.get("goods_id"):
-                    card["goods_id"] = ref.goods_id
-                return {"status": "success", "data": card}
-            except (ValueError, TypeError):
-                return rate_limit_res or _error("RATE_LIMIT", "京东详情接口触发临时频控")
 
         base = [("ztk_jd_detail", _detail_via_ztk)] if self._has_ztk_catalog else []
         providers = self._compose_providers(
@@ -495,20 +456,7 @@ class JdAdapter(BasePlatformAdapter):
             goods_sign=ref.goods_sign or goods_sign,
             **kwargs,
         )
-        res = self._execute_capability("detail", providers, allow_persist=self._is_real_http())
-        if (
-            allow_fallback
-            and self._has_ztk_catalog
-            and res.get("status") != "success"
-            and res.get("error_code") == "RATE_LIMIT"
-            and probe_state.get("short_url")
-        ):
-            return self._execute_capability(
-                "detail",
-                [("ztk_jd_quanwang_probe", _detail_via_ztk_probe)],
-                allow_persist=self._is_real_http(),
-            )
-        return res
+        return self._execute_capability("detail", providers, allow_persist=self._is_real_http())
 
     def convert_promotion_url(self, goods_id_or_sign="", uid=None, **kwargs):
         unavailable = self._available("promotion")
@@ -698,77 +646,25 @@ class JdAdapter(BasePlatformAdapter):
                 elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
                     detail_lookup_failed = True
             lower_urls = f"{text} {short} {long}".lower()
-            is_explicit_venue_url = any(
-                kw in lower_urls
-                for kw in ("coupon.m.jd.com", "coupon.jd.com", "pro.m.jd.com", "prodev.m.jd.com", "h5.m.jd.com", "jdcoupon", "u_act_p=coupon")
-            )
+            is_explicit_venue_url = is_jd_official_venue_url(lower_urls)
             verified_coupon_or_venue = bool(
                 not extracted_encrypted_id
-                and (
-                    is_explicit_venue_url
-                    or not j_cmd.strip()
-                    or "促销会场" in j_cmd
-                )
+                and (is_explicit_venue_url or not j_cmd.strip())
             )
 
-            if conv.get("ztk_catalog_throttled"):
+            if conv.get("ztk_catalog_throttled") or (product_card is None and not verified_coupon_or_venue):
                 detail_lookup_failed = True
-            elif not product_card and not verified_coupon_or_venue:
-                search_q = short or long
-                if search_q:
-                    try:
-                        q_res = self.client.search_goods(search_q, page=1, page_size=5, has_coupon=False)
-                    except TypeError:
-                        q_res = self.client.search_goods(search_q, page=1, page_size=5)
-                    if q_res.get("status") != "success":
-                        if q_res.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
-                            detail_lookup_failed = True
-                    elif isinstance(q_res.get("data"), list) and q_res["data"]:
-                        rows = q_res["data"]
-                        total_cnt = int(q_res.get("total_count") or len(rows))
-                        # 【遵循绝对可靠原则】：仅当转链所得短链 100% 唯一命中单件商品 (len(rows)==1 且 total_cnt==1) 时采纳，
-                        # 严禁从多商品会场列表中盲取首条！
-                        if len(rows) == 1 and total_cnt == 1:
-                            try:
-                                cand_card = self._detail(rows[0])
-                                if (cand_card.get("price") or 0) >= 0:
-                                    product_card = cand_card
-                                    resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or ""
-                            except Exception:
-                                pass
 
-            # 仅用于前端展示的兜底标题与券面额提取（绝不参与单品 vs 优惠券的门禁裁决）
             fallback_title = "京东精选推广好物"
-            fallback_coupon = 0.0
-            if j_cmd:
-                t_match = re.search(r"抢购(.+?)(?:[！!]|$)", j_cmd)
-                if not t_match:
-                    t_match = re.search(r"^\s*\d+:/\s*([^！!，,\n]{2,})", j_cmd)
-                if not t_match:
-                    t_match = re.search(r"(?:崠|岽|鯟|埬|D[oōσδ]+ng)\s*([^！!\n]{2,})", j_cmd, re.IGNORECASE)
-                if t_match:
-                    cand_t = t_match.group(1).strip()
-                    if cand_t and "促销会场" not in cand_t:
-                        fallback_title = cand_t
-                c_match = re.search(r"领(\d+(?:\.\d+)?)元优惠券", j_cmd)
-                if c_match:
-                    try:
-                        fallback_coupon = round(float(c_match.group(1)), 2)
-                    except Exception:
-                        pass
-            if fallback_title == "京东精选推广好物":
-                b_match = re.search(r"「(.+?)」", text)
-                if b_match:
-                    fallback_title = b_match.group(1).strip()
-
-            if product_card is None and not verified_coupon_or_venue:
-                detail_lookup_failed = True
+            b_match = re.search(r"「([^」]{2,})」", text)
+            if b_match:
+                fallback_title = b_match.group(1).strip()
 
             title = (product_card or {}).get("name") or fallback_title
             price = (product_card or {}).get("price")
             coupon_amount = (product_card or {}).get("coupon_amount")
             if coupon_amount is None:
-                coupon_amount = fallback_coupon
+                coupon_amount = 0.0
 
             canonical_id = (
                 (product_card or {}).get("goods_id")

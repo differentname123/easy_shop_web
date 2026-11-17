@@ -161,9 +161,11 @@ def test_unified_jd_coupon_extraction_rank_preservation_and_depleted_fallback():
 
 
 def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circuits():
+    from cache import clear_all_caches
     from repositories.product_repo import ProductRepository
     from tests.test_product_repository import MemoryCollection as ProductMemCol
 
+    clear_all_caches()
     enc_sign = "H942Tfk1n9iTlRHE8K75IkKfe6mXtQ_3Mqe07A69i2lWGNpGd"
     jd_img = "https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg"
     coupon_link = "https://coupon.m.jd.com/coupons/show.action?key=k888&roleId=777"
@@ -172,14 +174,8 @@ def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circ
     repo = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda name: col))
 
     mock_client = Mock()
-    mock_client.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
-    mock_client.convert_promotion_link.side_effect = [
-        {"status": "success", "short_url": "https://u.jd.com/probe1"},
-        {"status": "success", "promoter_id": "88", "short_url": "https://u.jd.com/two_in_one", "click_url": "", "j_command": "领券口令", "j_short_command": "领券口令"},
-    ]
-    mock_client.search_goods.return_value = {
+    mock_client.get_goods_detail.return_value = {
         "status": "success",
-        "total_count": 1,
         "data": [{
             "tao_id": enc_sign,
             "title": "芬达橙味500ml*24瓶",
@@ -190,6 +186,10 @@ def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circ
             "pict_url": jd_img,
             "item_url": f"https://jingfen.jd.com/detail/{enc_sign}.html",
         }],
+    }
+    mock_client.convert_promotion_link.return_value = {
+        "status": "success", "promoter_id": "88", "short_url": "https://u.jd.com/two_in_one",
+        "click_url": "", "j_command": "领券口令", "j_short_command": "领券口令",
     }
 
     jd_adapter = JdAdapter(SimpleNamespace(jd_enabled=True, jd_position_id="88"), client=mock_client)
@@ -205,10 +205,34 @@ def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circ
         assert res["status"] == "success"
         assert res["final_link"] == "https://u.jd.com/two_in_one"
         assert mock_client.convert_promotion_link.call_args_list[-1].kwargs == {"coupon_url": coupon_link}
+        mock_client.search_goods.assert_not_called()
 
         prod_svc = ProductService(product_repo=repo)
         mock_client.get_goods_detail.reset_mock()
         pf = prod_svc.prefetch_product_detail(ProductRef("jd", "6ae3f40fF84b3cfef_0083320320005d73", enc_sign))
-        assert pf.status == "ready"
+        assert pf.status in ("ready", "skipped")
         mock_client.get_goods_detail.assert_not_called()
+
+    # 详情触发 301 频控时：不调用 api_quanwang 撞库浪费配额，直接无损降级普通转链
+    clear_all_caches()
+    col_rl = ProductMemCol()
+    repo_rl = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda name: col_rl))
+    rl_client = Mock()
+    rl_client.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
+    rl_client.convert_promotion_link.side_effect = [
+        {"status": "success", "short_url": "https://u.jd.com/probe1"},
+        {"status": "success", "promoter_id": "88", "short_url": "https://u.jd.com/plain_ok", "click_url": "", "j_command": "口令", "j_short_command": "口令"},
+    ]
+    rl_adapter = JdAdapter(SimpleNamespace(jd_enabled=True, jd_position_id="88"), client=rl_client)
+    repo_rl.upsert_home_products([rl_adapter._summary({
+        "itemId": enc_sign, "skuName": "芬达橙味500ml*24瓶", "wlprice": "49.90", "imageUrl": jd_img,
+    })], channel_type=5)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("services.promote_service.get_adapter", lambda plat: rl_adapter)
+        rl_res = PromoteService(product_repo=repo_rl).convert_link("jd", enc_sign)
+        assert rl_res["status"] == "success"
+        assert rl_res["final_link"] == "https://u.jd.com/plain_ok"
+        rl_client.get_goods_detail.assert_called_once()
+        rl_client.search_goods.assert_not_called()
+    clear_all_caches()
 

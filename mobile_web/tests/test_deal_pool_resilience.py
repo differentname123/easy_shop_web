@@ -27,7 +27,7 @@ def test_jd_and_ztk_client_real_round_robin_vs_sticky():
     )
     jd_cli = JdClient(appkey_list=["jd-k1", "jd-k2"], union_id="10001", http_session=jd_http)
     for _ in range(4):
-        assert jd_cli.search_goods("抽纸")["status"] == "success"
+        assert jd_cli.search_goods("维达抽纸")["status"] == "success"
     assert jd_keys == ["jd-k1", "jd-k2", "jd-k1", "jd-k2"]
 
     # ZtkClient sharing a single sid stays sticky (round_robin=False)

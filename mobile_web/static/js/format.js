@@ -113,22 +113,18 @@
       return { isLinkOrToken: false, isUnsupportedUrl: false, isEtbShareWithTitle: true, platform: 'taobao', keyword: bracketTitle };
     }
     const hasHttp = /https?:\/\//i.test(lower);
+    if (!hasHttp) {
+      return { isLinkOrToken: false, isUnsupportedUrl: false, isEtbShareWithTitle: false, platform: '', keyword: bracketTitle };
+    }
     const hasSupportedDomain = SUPPORTED_LINK_DOMAINS.some(d => lower.includes(d));
-    if (hasHttp && !hasSupportedDomain) {
+    if (!hasSupportedDomain) {
       return { isLinkOrToken: true, isUnsupportedUrl: true, isEtbShareWithTitle: false, platform: '', keyword: bracketTitle };
     }
-    const isBareEncryptedId = text.length >= 25 && !/^\d+$/.test(text) && /^[A-Za-z0-9_-]{25,}$/.test(text);
-    const hasToken = hasSupportedDomain ||
-      lower.includes('goods_sign=') ||
-      /[￥¥$€₴£¢()（）/!！$%&*][A-Za-z0-9]{8,22}[￥¥$€₴£¢()（）/!！$%&*]/.test(text) ||
-      /[！!][A-Za-z0-9]{10,20}[！!]/.test(text) ||
-      /\b(?:CZ|CA|ZH|MF|HU|TG)\s*\d{3,6}\b/i.test(text) ||
-      isBareEncryptedId;
     let platform = '';
-    if (['jd.com', '3.cn', 'jingxi.com'].some(d => lower.includes(d)) || /[！!][A-Za-z0-9]{10,20}[！!]/.test(text)) platform = 'jd';
-    else if (['tb.cn', 'taobao.com', 'tmall.com', 'alimama.com'].some(d => lower.includes(d)) || /[￥¥$€₴£¢()（）][A-Za-z0-9]{8,15}[￥¥$€₴£¢()（）]/.test(text)) platform = 'taobao';
-    else if (['pinduoduo.com', 'yangkeduo.com', 'goods_sign='].some(d => lower.includes(d)) || /^[EYc][A-Za-z0-9_-]{25,}$/.test(text)) platform = 'pdd';
-    return { isLinkOrToken: hasToken, isUnsupportedUrl: false, isEtbShareWithTitle: false, platform, keyword: bracketTitle };
+    if (['jd.com', '3.cn', 'jingxi.com'].some(d => lower.includes(d))) platform = 'jd';
+    else if (['tb.cn', 'taobao.com', 'tmall.com', 'alimama.com'].some(d => lower.includes(d))) platform = 'taobao';
+    else if (['pinduoduo.com', 'yangkeduo.com'].some(d => lower.includes(d))) platform = 'pdd';
+    return { isLinkOrToken: true, isUnsupportedUrl: false, isEtbShareWithTitle: false, platform, keyword: bracketTitle };
   };
   shop.extractInternalShareRoute = (rawText, currentOrigin = '') => {
     const text = String(rawText || '').trim();

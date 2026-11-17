@@ -189,7 +189,7 @@ class ProductRepository(BaseRepository):
 
     @classmethod
     def _identity(cls, item: Dict[str, Any]) -> Tuple[str, str, str]:
-        return resolve_item_identity(item, allow_jd_sign_desalt=True)
+        return resolve_item_identity(item)
 
     @staticmethod
     def _identity_filter(platform: str, goods_id: str, goods_sign: str) -> Dict[str, Any]:

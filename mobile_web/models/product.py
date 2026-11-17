@@ -185,11 +185,15 @@ def classify_user_input(raw_text: Any) -> Dict[str, Any]:
         or "goods_sign=" in lower
         or extract_taobao_token_core(text)
         or _JCMD_TOKEN_RE.search(text)
-        or _SHARE_CODE_RE.search(text)
         or is_bare_encrypted_id
     )
     platform = detect_platform_signal(text)
-    keyword = "" if is_bare_encrypted_id else extract_search_keyword(text, max_length=60)
+    if is_bare_encrypted_id:
+        keyword = ""
+    elif has_token_signal:
+        keyword = extract_search_keyword(text, max_length=60)
+    else:
+        keyword = text[:60].strip()
 
     return {
         "kind": "link_or_token" if has_token_signal else "keyword",
@@ -208,10 +212,7 @@ def clean_product_id(value: Any) -> str:
     return "" if text in ("", "0", "0.0", "None") else text
 
 
-import hashlib
-
 _JD_IMAGE_KEY_RE = re.compile(r"^[0-9a-fA-F]{14,22}_[0-9a-fA-F]{12,20}$")
-_JD_JFS_HASH_RE = re.compile(r"^jfs/[0-9a-f]{16}$")
 _JD_ITEM_OR_JINGFEN_URL_RE = re.compile(
     r"^https?://(?:jingfen\.jd\.com/detail|item\.jd\.com)/([^/?#.]+)\.html$",
     re.IGNORECASE,
@@ -225,39 +226,6 @@ def is_jd_image_key(value: Any) -> bool:
     return bool(text and _JD_IMAGE_KEY_RE.match(text))
 
 
-def is_jd_jfs_hash_id(value: Any) -> bool:
-    """判断字符串是否为京东主图 CDN 提取的 jfs/<16位sha1> 静态唯一标识。"""
-    text = clean_product_id(value)
-    return bool(text and _JD_JFS_HASH_RE.match(text))
-
-
-def extract_jd_jfs_hash_id(image_url: Any, *fallback_urls: Any) -> str:
-    """从京东官方 CDN 主图 URL (360buyimg.com/jfs/...) 提取跨通道恒定的 16 位十六进制哈希作为稳定 goods_id。"""
-    for candidate in (image_url, *fallback_urls):
-        if isinstance(candidate, (list, tuple)):
-            for sub in candidate:
-                res = extract_jd_jfs_hash_id(sub)
-                if res:
-                    return res
-            continue
-        raw = str(candidate or "").strip()
-        if raw.startswith("//"):
-            raw = "https:" + raw
-        if not raw.startswith(("http://", "https://")):
-            continue
-        parsed = urlsplit(raw)
-        host = (parsed.netloc or "").lower()
-        path = parsed.path or ""
-        if "360buyimg.com" not in host and "/jfs/" not in path:
-            continue
-        idx = path.find("/jfs/")
-        stable_key = (path[idx:].lower() if idx >= 0 else path.lower()).strip("/")
-        if len(stable_key) >= 12:
-            digest = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:16]
-            return f"jfs/{digest}"
-    return ""
-
-
 def extract_jd_encrypted_id_from_url(url: Any) -> str:
     """从京东 jingfen.jd.com/detail/{id}.html 或加密版 item.jd.com/{id}.html 中提取加密 itemId。"""
     raw = str(url or "").strip()
@@ -267,7 +235,7 @@ def extract_jd_encrypted_id_from_url(url: Any) -> str:
     if not match:
         return ""
     token = clean_product_id(match.group(1))
-    if not token or token.isdigit() or is_jd_jfs_hash_id(token):
+    if not token or token.isdigit():
         return ""
     return token
 
@@ -284,15 +252,13 @@ def normalize_jd_material_url(raw_url: Any, candidate_id: Any = "") -> str:
     if url and not url.startswith(("http://", "https://")):
         url = ""
     cid = clean_product_id(candidate_id)
-    if is_jd_jfs_hash_id(cid):
-        cid = ""
 
     if url:
         m_item = _JD_ITEM_URL_RE.match(url)
         if m_item:
             token = clean_product_id(m_item.group(1))
             if token and not token.isdigit():
-                target = cid or ("" if is_jd_jfs_hash_id(token) else token)
+                target = cid or token
                 return f"https://jingfen.jd.com/detail/{target}.html" if target else ""
         return url
 
@@ -342,7 +308,6 @@ def extract_canonical_goods_id(
     raw_id_or_sign: Any = "",
     *,
     image_url: Any = "",
-    allow_jd_sign_desalt: bool = False,
 ) -> str:
     """
     第一性原理商品唯一主键 (goods_id / product_id) 规范化提取器：
@@ -350,11 +315,8 @@ def extract_canonical_goods_id(
     1. 淘宝 (taobao)：
        TOP 27939 权限包与折淘客返回的加密 item_id 固定为 '<动态请求盐值前缀>-<稳定商品密文后缀>'
        （如 '0AqROdBH7t8b9oJzGJT5n6C2t6-0v7DKOgI5JqnZd4Nhxd'）。
-       每次请求 '-' 前缀都会变化，但 '-' 后的商品密文后缀（如 '0v7DKOgI5JqnZd4Nhxd'）在榜单、搜索、详情、转链间 100% 恒定唯一。
     2. 京东 (jd)：
-       - 优先从京东主图 URL (360buyimg.com/jfs/...) 提取 '<目录哈希>_<文件哈希>' 作为跨通道恒定唯一标识；
-       - 当仅提供 50 位京东加密 itemId 且开启 allow_jd_sign_desalt 时，剥离中间随时间变化的 6 位动态盐值，
-         提取 '<14位前缀>_<下划线后18位后缀>' 作为稳定标识。
+       优先从京东主图 URL (360buyimg.com/jfs/...) 提取 '<目录哈希>_<文件哈希>' 作为跨通道恒定唯一标识。
     3. 拼多多 (pdd)：
        保持原生数字 goods_id 不变。
     """
@@ -374,10 +336,6 @@ def extract_canonical_goods_id(
         img_key = extract_jd_image_key(image_url)
         if img_key:
             return img_key
-        if allow_jd_sign_desalt and "_" in raw and len(raw) >= 35:
-            prefix, suffix = raw.split("_", 1)
-            if len(prefix) >= 14 and len(suffix) >= 12:
-                return f"{prefix[:14]}_{suffix}"
         return raw
     return raw
 
@@ -385,8 +343,6 @@ def extract_canonical_goods_id(
 def resolve_item_identity(
     item: Dict[str, Any],
     default_platform: Optional[str] = "pdd",
-    *,
-    allow_jd_sign_desalt: bool = False,
 ) -> tuple[str, str, str]:
     """从商品字典中统一提取规范化三元组 (platform, goods_id, goods_sign)。"""
     platform = normalize_platform(item.get("platform") or default_platform)
@@ -411,7 +367,6 @@ def resolve_item_identity(
                 platform,
                 raw_id_candidate,
                 image_url=img_url,
-                allow_jd_sign_desalt=allow_jd_sign_desalt,
             )
             or raw_id_candidate
         )
@@ -498,13 +453,6 @@ class ProductSummary(BaseModel):
             except (TypeError, ValueError):
                 pass
         super().__init__(**data)
-
-    def model_dump(self, **kwargs) -> Dict[str, Any]:
-        """兼顾 Pydantic v1 (.dict) 与 v2 (.model_dump)"""
-        dump_fn = getattr(super(), "model_dump", None)
-        if callable(dump_fn):
-            return dump_fn(**kwargs)
-        return self.dict(exclude_unset=kwargs.get("exclude_unset", False))
 
     def to_dict(self, **kwargs) -> Dict[str, Any]:
         return self.model_dump(**kwargs)

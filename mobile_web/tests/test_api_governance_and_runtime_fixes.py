@@ -267,7 +267,7 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     assert res_deg["status"] == "success"
     assert res_deg["resolution_kind"] == "degraded_product"
     assert res_deg.get("detail_lookup_failed") is True
-    assert "越峰花茉莉飘雪花茶" in res_deg["title"]
+    assert res_deg["title"] == "京东精选推广好物"
     assert all("quanwang" not in u for u, _, _ in calls)
 
 
@@ -588,6 +588,80 @@ def test_xianyu_round_pool_search_then_h5_never_self_deadlocks_and_ai_timeout_cl
         out = cleaner._call_ai_json_array("prompt", [{"id": 1}], "AI-Stage2")
     assert out == []
     assert all("resp_text" not in w for w in logged_warnings)
+
+
+def test_simplified_robustness_fail_closed_taobao_share_code_prefetch_and_order_cooldown():
+    from adapters.jd_adapter import JdAdapter
+    from adapters.tb_adapter import TaobaoAdapter
+    from infrastructure.jd_client import JdClient
+    from infrastructure.ztk_client import ZtkClient
+    from models.product import ProductRef, classify_user_input
+    from services.detail_prefetch import DetailPrefetcher, RATE_LIMIT_COOLDOWN_SECONDS
+    from services.order_service import OrderService, _LAST_SYNC_ATTEMPT, _SYNC_STATE
+    from tests.test_detail_prefetch import Clock, MemoryService, idle, product
+
+    # 1. Standalone share-code / hardware model keywords are NOT classified as links/tokens
+    for kw in ("CZ1234", "(iPhone15Pro)", "!RTX4060!"):
+        c = classify_user_input(kw)
+        assert c["kind"] == "keyword"
+        assert c["has_link_or_token"] is False
+        assert c["keyword"] == kw
+
+    # 2. TaobaoAdapter Fail-Closed: empty tao_id on m.tb.cn shortlink -> degraded_product (NEVER coupon_or_venue);
+    #    empty tao_id on explicit official pages.tmall.com/wow/ venue -> coupon_or_venue
+    tb_http = SimpleNamespace(get=lambda url, **kw: SimpleNamespace(
+        status_code=200,
+        raise_for_status=lambda: None,
+        json=lambda: {
+            "status": 200,
+            "content": [{
+                "tao_id": "",
+                "title": "",
+                "shorturl": "https://s.click.taobao.com/tbShort1",
+                "coupon_click_url": "https://uland.taobao.com/coupon/edetail?e=test",
+                "tkl": "￥tbTok123456￥",
+            }],
+        },
+    ))
+    ztk = ZtkClient("tk1", "sid1", http_session=tb_http, appkey_list=("tk1",))
+    tb = TaobaoAdapter(official_client=MagicMock(), hdk_client=MagicMock(), ztk_client=ztk, tb_channel_pid="mm_1_2_3", taobao_enabled=True)
+    deg = tb.resolve_and_convert_universal("https://m.tb.cn/h.throttleCase")
+    assert deg["status"] == "success" and deg["resolution_kind"] == "degraded_product"
+    assert deg.get("detail_lookup_failed") is True
+    venue = tb.resolve_and_convert_universal("https://pages.tmall.com/wow/a/act/tmall/dailygroup/23288/wupr?wh_pid=daily-544479")
+    assert venue["status"] == "success" and venue["resolution_kind"] == "coupon_or_venue"
+
+    # 3. JD ZTK items opt out of blind background prefetch, and DetailPrefetcher backs off 600s on RATE_LIMIT
+    jd = JdAdapter(client=JdClient(appkey_list=("jk1",), union_id="10001", http_session=MagicMock()), jd_enabled=True, jd_position_id="10001")
+    assert jd.can_prefetch_detail(ProductRef("jd", "img_1", "ENC_1234567890123456789012345678901234567890")) is False
+
+    clock = Clock()
+    svc_rl = MemoryService(lambda ref, **kw: __import__("models.product", fromlist=["DetailPrefetchResult"]).DetailPrefetchResult("error", error_code="RATE_LIMIT"))
+    worker = DetailPrefetcher(svc_rl, wall_clock=clock, retry_backoff_seconds=0)
+    worker.start()
+    try:
+        assert worker.offer_products([product("rl_1")]) == 1
+        idle(worker)
+        clock.value += RATE_LIMIT_COOLDOWN_SECONDS - 1
+        assert worker.offer_products([product("rl_1")]) == 0
+        clock.value += 1
+        assert worker.offer_products([product("rl_1")]) == 1
+        idle(worker)
+    finally:
+        worker.stop()
+
+    # 4. OrderService surfaces real cooldown seconds remaining while keeping 180s interval locked
+    _LAST_SYNC_ATTEMPT["pdd"] = time.time() - 40
+    _SYNC_STATE["pdd"] = {"status": "success", "error": "", "synced_count": 1}
+    o_repo = MagicMock()
+    o_repo.query_user_orders.return_value = {"status": "success", "orders": [], "summary": {}}
+    osvc = OrderService(order_repo=o_repo)
+    with patch("services.order_service.require_adapter", return_value=SimpleNamespace(active=True, platform_name="拼多多", capabilities={"orders": True})), \
+         patch("services.order_service.get_adapter", return_value=SimpleNamespace(active=True, platform_name="拼多多", capabilities={"orders": True})):
+        ores = osvc.sync_and_query_orders("pdd", "u_cool_test", force_sync=True)
+    assert ores["status"] == "success"
+    assert 130 <= ores["data"]["sync_cooldown_remaining"] <= 145
+
 
 
 
