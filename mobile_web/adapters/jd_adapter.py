@@ -146,7 +146,11 @@ class JdAdapter(BasePlatformAdapter):
             client is not None or has_appkey and setting("jd_app_key") and setting("jd_app_secret")
         )
         hdk_key = setting("hdk_api_key", "")
-        self.hdk = overrides.get("hdk_client") or (HdkClient(hdk_key, union_id=union_id) if hdk_key else None)
+        hdk_keys = setting("hdk_api_key_list", ())
+        has_hdk = bool(hdk_key or hdk_keys or overrides.get("hdk_client"))
+        self.hdk = overrides.get("hdk_client") or (
+            HdkClient(hdk_key, api_key_list=hdk_keys, union_id=union_id) if has_hdk else None
+        )
         if self.hdk:
             self.attach_hdk(self.hdk)
         self._refresh_capabilities()

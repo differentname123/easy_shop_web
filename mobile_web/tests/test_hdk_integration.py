@@ -150,6 +150,36 @@ def test_hdk_multi_key_failover():
     assert client.api_key == "key_2"
 
 
+def test_jd_adapter_hdk_multi_key_round_robin():
+    """验证 JdAdapter 读取 hdk_api_key_list 并进行多 Key 轮询负载均衡。"""
+    settings = SimpleNamespace(
+        jd_enabled=True,
+        jd_union_id="2035679405",
+        jd_position_id="88",
+        ztk_appkey="ztk_test",
+        hdk_api_key="hdk_k1",
+        hdk_api_key_list=("hdk_k1", "hdk_k2", "hdk_k3"),
+    )
+    adapter = JdAdapter(settings=settings)
+    assert adapter.hdk is not None
+    assert adapter.hdk.appkey_list == ("hdk_k1", "hdk_k2", "hdk_k3")
+
+    call_keys = []
+
+    def _mock_get(url, params=None, **kw):
+        k = params.get("apikey")
+        call_keys.append(k)
+        return _mock_response(200, {"code": 200, "data": [{"skuid": "1", "goodsname": "纸巾"}]})
+
+    adapter.hdk.http.get = _mock_get
+
+    # 连续调用 3 次 search，多 key 均匀轮询分摊配额 (Round Robin)
+    adapter.search_goods("纸巾")
+    adapter.search_goods("纸巾")
+    adapter.search_goods("纸巾")
+    assert call_keys == ["hdk_k1", "hdk_k2", "hdk_k3"]
+
+
 # ----------------------------------------------------------------------
 # 2. 契约一致性验证：HDK 归一化输出与 ZTK 归一化输出具备相同核心字段
 # ----------------------------------------------------------------------
