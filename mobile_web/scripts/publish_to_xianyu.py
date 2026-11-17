@@ -47,7 +47,10 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
 import requests
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):

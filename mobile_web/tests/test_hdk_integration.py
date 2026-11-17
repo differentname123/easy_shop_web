@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from adapters.jd_adapter import JdAdapter
+from adapters.tb_adapter import TaobaoAdapter
 from infrastructure.hdk_client import HdkClient
 from infrastructure.jd_client import JdClient
 from models.product import ProductDetail, ProductRef, ProductSummary, extract_canonical_goods_id, extract_jd_image_key
@@ -327,21 +328,16 @@ def test_jd_adapter_detail_fails_over_to_ztk_on_hdk_rate_limit():
     ztk_client.get_goods_detail.assert_called_once()
 
 
-def test_jd_adapter_promotion_fails_over_to_hdk_on_ztk_error():
-    """转链以 ZTK 为主（产出京口令），若 ZTK 发生临时异常，无缝降级到 HDK 转链保底生链。"""
+def test_jd_adapter_promotion_prefers_hdk_as_primary():
+    """转链以 HDK 为主力首选，成功时直接返回，不消耗 ZTK 额度。"""
     ztk_client = Mock()
     ztk_client.appkey_list = ("ztk_key",)
-    ztk_client.convert_promotion_link.return_value = {
-        "status": "error",
-        "error_code": "RATE_LIMIT",
-        "error_msg": "ZTK转链限流",
-    }
     hdk_mock = Mock()
     hdk_mock.convert_promotion_link.return_value = {
         "status": "success",
-        "short_url": "https://u.jd.com/hdk_backup",
-        "click_url": "https://union-click.jd.com/hdk_backup",
-        "final_link": "https://u.jd.com/hdk_backup",
+        "short_url": "https://u.jd.com/hdk_primary",
+        "click_url": "https://union-click.jd.com/hdk_primary",
+        "final_link": "https://u.jd.com/hdk_primary",
         "promoter_id": "88",
     }
     adapter = JdAdapter(
@@ -357,8 +353,45 @@ def test_jd_adapter_promotion_fails_over_to_hdk_on_ztk_error():
 
     assert res["status"] == "success"
     assert res["_provider"] == "hdk_jd_promotion"
-    assert res["final_link"] == "https://u.jd.com/hdk_backup"
-    assert res["short_url"] == "https://u.jd.com/hdk_backup"
+    assert res["final_link"] == "https://u.jd.com/hdk_primary"
+    assert res["short_url"] == "https://u.jd.com/hdk_primary"
+    # ZTK 未被调用
+    ztk_client.convert_promotion_link.assert_not_called()
+
+
+def test_jd_adapter_promotion_fails_over_to_ztk_on_hdk_error():
+    """HDK 主力转链遇到限流时，自动无缝降级到 ZTK 转链保底生链。"""
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+    ztk_client.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/ztk_backup",
+        "click_url": "https://union-click.jd.com/ztk_backup",
+        "j_command": "京口令abc",
+    }
+    hdk_mock = Mock()
+    hdk_mock.convert_promotion_link.return_value = {
+        "status": "error",
+        "error_code": "RATE_LIMIT",
+        "error_msg": "好单库转链限流",
+    }
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+    res = adapter.convert_promotion_url(
+        "enc_item_id_12345678901234567890",
+        promoter_id="88",
+        trusted_product_url="https://jingfen.jd.com/detail/enc_item_id_12345678901234567890.html",
+    )
+
+    assert res["status"] == "success"
+    assert res["_provider"] == "ztk_jd_byunionid"
+    assert res["final_link"] == "https://u.jd.com/ztk_backup"
+    assert res["promotion_token"] == "京口令abc"
+    hdk_mock.convert_promotion_link.assert_called_once()
+    ztk_client.convert_promotion_link.assert_called_once()
 
 
 def test_jd_adapter_universal_resolve_via_hdk():
@@ -435,4 +468,135 @@ def test_hdk_agents_md_rule3_compliance():
     assert res["error_code"] == "INVALID_ARGUMENT"
     assert "不能直接使用主图哈希 ID" in res["error_msg"]
     hdk_mock.get_goods_detail.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# 4. JD 订单同步与 TB 平台好单库主力扩展测试
+# ----------------------------------------------------------------------
+
+def test_jd_adapter_orders_prefers_hdk_and_fails_over_to_ztk():
+    """验证 JD 订单同步首选好单库，且能够无缝归一化；好单库失败时顺延至折淘客。"""
+    hdk_mock = Mock()
+    hdk_mock.query_jd_orders.return_value = {
+        "status": "success",
+        "order_list": [
+            {
+                "id": "trade_hdk_123",
+                "orderId": "parent_hdk_123",
+                "skuId": "10001",
+                "skuName": "好单库京东商品",
+                "skuNum": 2,
+                "estimateCosPrice": 99.0,
+                "estimateFee": 9.9,
+                "actualFee": 9.9,
+                "validCode": 18,
+                "orderTime": 1700000000,
+                "modifyTime": 1700000100,
+                "finishTime": 1700000200,
+                "positionId": "88",
+                "subUnionId": "sub_1",
+                "commissionRate": 10.0,
+            }
+        ],
+        "total_count": 1,
+        "page": 1,
+        "has_more": False,
+        "next_cursor": None,
+    }
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", jd_app_key="k", jd_app_secret="s"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+    res = adapter.fetch_increment_orders(1700000000, 1700000200, page=1)
+
+    assert res["status"] == "success"
+    assert res["_provider"] == "hdk_jd_orders"
+    assert len(res["order_list"]) == 1
+    # 验证字段被 normalize_order 正确映射
+    norm = adapter.normalize_order(res["order_list"][0])
+    assert norm["order_sn"] == "trade_hdk_123"
+    assert norm["goods_name"] == "好单库京东商品"
+    assert norm["is_settled"] is True
+    assert norm["promotion_amount_yuan"] == 9.9
+    ztk_client.query_orders.assert_not_called()
+
+    # 模拟好单库报错，验证顺延至折淘客
+    hdk_mock.query_jd_orders.return_value = {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "限流"}
+    ztk_client.query_orders.return_value = {
+        "status": "success",
+        "order_list": [{"id": "ztk_row_1", "orderId": "p1", "skuId": "2", "skuName": "ZTK商品", "validCode": 16, "estimateFee": 5.0, "orderTime": 1700000000, "modifyTime": 1700000000}],
+        "has_more": False,
+        "next_cursor": None,
+    }
+    res_fallback = adapter.fetch_increment_orders(1700000000, 1700000200, page=1)
+    assert res_fallback["status"] == "success"
+    assert res_fallback["_provider"] == "ztk_jd_orders"
+    assert res_fallback["order_list"][0]["id"] == "ztk_row_1"
+
+
+def test_tb_adapter_promotion_prefers_hdk_and_fails_over_to_ztk():
+    """验证淘宝转链：配置了 tb_name 且好单库成功时首选好单库；未配置或未授权时自动平滑降级至折淘客。"""
+    hdk_mock = Mock()
+    hdk_mock.appkey_list = ("hdk_key",)
+    hdk_mock.convert_tb_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://s.click.taobao.com/hdk_tb",
+        "click_url": "https://s.click.taobao.com/hdk_tb",
+        "final_link": "https://s.click.taobao.com/hdk_tb",
+        "tpwd": "￥淘口令HDK￥",
+        "taoword": "￥淘口令HDK￥",
+    }
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+    ztk_client.sid = "192646"
+
+    settings = SimpleNamespace(
+        taobao_enabled=True,
+        tb_app_key="test_app_key",
+        tb_app_secret="test_secret",
+        tb_pid="mm_1_2_3",
+        tb_channel_pid="mm_1_2_3",
+        hdk_api_key="hdk_k",
+        hdk_tb_name="已授权淘宝账号",
+        ztk_appkey="ztk_k",
+        ztk_sid="192646",
+    )
+    official_client = Mock()
+    official_client.get_goods_details.return_value = {
+        "status": "success",
+        "data": [{"goods_id": "673231015690", "goods_sign": "sign_1", "goods_name": "淘宝精选商品"}],
+    }
+    tb_adapter = TaobaoAdapter(
+        settings=settings,
+        official_client=official_client,
+        hdk_client=hdk_mock,
+        ztk_client=ztk_client,
+    )
+    res = tb_adapter.convert_promotion_url("673231015690", identity={"relation_id": "12345"}, uid="user_1")
+
+    assert res["status"] == "success"
+    assert res["_provider"] == "hdk_tb_promotion"
+    assert res["promotion_token"] == "￥淘口令HDK￥"
+    assert res["final_link"] == "https://s.click.taobao.com/hdk_tb"
+    assert res["relation_id"] == "12345"
+
+    # 模拟好单库提示未授权，验证平滑降级到折淘客
+    hdk_mock.convert_tb_promotion_link.return_value = {
+        "status": "error",
+        "error_code": "AUTH_REQUIRED",
+        "error_msg": "您淘宝未授权，请到好单库推广中心-授权管理-进行页面授权！",
+    }
+    ztk_client.convert_channel_url.return_value = {
+        "status": "success",
+        "url": "https://s.click.taobao.com/ztk_tb",
+        "short_url": "https://s.click.taobao.com/ztk_tb",
+        "tpwd": "￥淘口令ZTK￥",
+    }
+    res_degraded = tb_adapter.convert_promotion_url("673231015690", identity={"relation_id": "12345"}, uid="user_1")
+    assert res_degraded["status"] == "success"
+    assert res_degraded["_provider"] == "tb_official_promote"
+    assert res_degraded["promotion_token"] == "￥淘口令ZTK￥"
 

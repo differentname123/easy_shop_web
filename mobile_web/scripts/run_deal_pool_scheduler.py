@@ -2342,7 +2342,7 @@ class DealPoolCleaner:
                 if resp.get("status") != "✅ 成功":
                     detail = "；".join(str(err) for err in (resp.get("error_history") or []))
                     if resp.get("timed_out"):
-                        logger.warning("[%s] 批次达到 AI 超时阈值 (%.0fs)，尝试切分或留待冷却重试", stage_label, self.ai_timeout)
+                        logger.debug("[%s] 批次达到 AI 超时阈值 (%.0fs)，留待下一轮或切分重试", stage_label, self.ai_timeout)
                     else:
                         raise RuntimeError(detail or str(resp.get("content") or "模型调用失败"))
                 else:
@@ -2372,7 +2372,7 @@ class DealPoolCleaner:
                     out_items = [parsed]
         except Exception as e:
             err_brief = str(e).splitlines()[0][:200]
-            logger.warning("[%s] 调用模型组解析 JSON 异常: %s", stage_label, err_brief)
+            logger.debug("[%s] 调用模型组解析 JSON 偶发异常 (留待重试): %s", stage_label, err_brief)
 
         if (
             not out_items
@@ -2426,15 +2426,7 @@ class DealPoolCleaner:
                 try:
                     _ingest_arr(_worker(chunks[0]))
                 except Exception as e:
-                    logger.warning("[AI-Stage1] 批次执行异常: %s", str(e).splitlines()[0][:200])
-                if not quiet_sub_logs:
-                    logger.info(
-                        "  📊 [阶段2-AI拆解 进度 01/01批 (100%%)] 已拆解=%3d/%3d条 (本轮还剩  0条) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
-                        total_items,
-                        total_items,
-                        time.perf_counter() - t_s1,
-                        max(0, total_pending_count - total_items),
-                    )
+                    logger.debug("[AI-Stage1] 批次偶发执行异常 (留待重试): %s", str(e).splitlines()[0][:200])
             else:
                 done_batches = 0
                 done_items = 0
@@ -2447,18 +2439,16 @@ class DealPoolCleaner:
                         try:
                             _ingest_arr(fut.result())
                         except Exception as e:
-                            logger.warning("[AI-Stage1] 并发批次执行异常: %s", str(e).splitlines()[0][:200])
+                            logger.debug("[AI-Stage1] 并发批次偶发执行异常 (留待重试): %s", str(e).splitlines()[0][:200])
                         if not quiet_sub_logs:
-                            logger.info(
-                                "  📊 [阶段2-AI拆解 进度 %02d/%02d批 (%3d%%)] 已拆解=%3d/%3d条 (本轮还剩%3d条) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
+                            logger.debug(
+                                "  📊 [阶段2-AI拆解 子进度 %02d/%02d批 (%3d%%)] 本批已处理=%3d/%3d条 | 已耗时=%.1fs",
                                 done_batches,
                                 total_batches,
                                 int(done_batches * 100 / max(1, total_batches)),
                                 done_items,
                                 total_items,
-                                max(0, total_items - done_items),
                                 time.perf_counter() - t_s1,
-                                max(0, total_pending_count - done_items),
                             )
 
         # 若 AI-1 超时/未返回某条记录，标记 _from_fallback=True 走重试计数；若正常返回，由代码确定性组装文本与图片
@@ -2940,15 +2930,13 @@ class DealPoolCleaner:
                 done_cnt += 1
                 cur_done = done_cnt
             if not quiet_sub_logs and (cur_done % step == 0 or cur_done == total_targets):
-                logger.info(
-                    "  📊 [阶段3-官方转链 进度 %3d/%3d个 (%3d%%)] 已核验=%3d个 (还剩%3d个) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
+                logger.debug(
+                    "  📊 [阶段3-官方转链 子进度 %3d/%3d个 (%3d%%)] 本批已核验=%3d个 | 已耗时=%.1fs",
                     cur_done,
                     total_targets,
                     int(cur_done * 100 / max(1, total_targets)),
                     cur_done,
-                    max(0, total_targets - cur_done),
                     time.perf_counter() - t_s3,
-                    total_pending_count,
                 )
 
         def _conv_worker(item: Tuple[Dict[str, Any], str]) -> None:
@@ -2956,7 +2944,7 @@ class DealPoolCleaner:
             try:
                 self.convert_single_target(tgt, default_plat=def_plat)
             except Exception as e:
-                logger.warning("[Stage3-并发转链] 单目标转链异常: %s", str(e)[:160])
+                logger.debug("[Stage3-并发转链] 单目标转链偶发异常: %s", str(e)[:160])
             finally:
                 _record_done()
 
@@ -3040,15 +3028,7 @@ class DealPoolCleaner:
             try:
                 _ingest_arr(_worker(chunks[0]))
             except Exception as e:
-                logger.warning("[AI-Stage2] 批次执行异常: %s", str(e).splitlines()[0][:200])
-            if not quiet_sub_logs:
-                logger.info(
-                    "  📊 [阶段4-AI终审 进度 01/01批 (100%%)] 已终审=%3d/%3d条 (本轮还剩  0条) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
-                    total_items,
-                    total_items,
-                    time.perf_counter() - t_s4,
-                    total_pending_count,
-                )
+                logger.debug("[AI-Stage2] 批次偶发执行异常 (留待重试): %s", str(e).splitlines()[0][:200])
         else:
             done_batches = 0
             done_items = 0
@@ -3061,18 +3041,16 @@ class DealPoolCleaner:
                     try:
                         _ingest_arr(fut.result())
                     except Exception as e:
-                        logger.warning("[AI-Stage2] 并发批次执行异常: %s", str(e).splitlines()[0][:200])
+                        logger.debug("[AI-Stage2] 并发批次偶发执行异常 (留待重试): %s", str(e).splitlines()[0][:200])
                     if not quiet_sub_logs:
-                        logger.info(
-                            "  📊 [阶段4-AI终审 进度 %02d/%02d批 (%3d%%)] 已终审=%3d/%3d条 (本轮还剩%3d条) | 已耗时=%.1fs | 📦 库内待清洗存货=%d条",
+                        logger.debug(
+                            "  📊 [阶段4-AI终审 子进度 %02d/%02d批 (%3d%%)] 本批已终审=%3d/%3d条 | 已耗时=%.1fs",
                             done_batches,
                             total_batches,
                             int(done_batches * 100 / max(1, total_batches)),
                             done_items,
                             total_items,
-                            max(0, total_items - done_items),
                             time.perf_counter() - t_s4,
-                            total_pending_count,
                         )
 
         return results_by_id
@@ -3547,13 +3525,13 @@ class DealPoolCleaner:
         ai1_hits_before = self.stats_ai1_model_hits
         ai1_fb_before = self.stats_ai1_fallbacks
         if not quiet_sub_logs:
+            n_chunks = (len(stage1_inputs) + self.ai_batch_size - 1) // self.ai_batch_size if stage1_inputs else 0
             logger.info(
-                "🤖 [阶段2-AI拆解 启动] 正在并发拆解 %d 条线报 (每批=%d条, 共%d批, 并发=%d线程) | 📦 库内总存货Pending=%d条...",
+                "🤖 [AI-1 拆解启动] 本批认领=%d条 (每组=%d条, 共%d组, 并发=%d线程) | 阶段: need_ai1 -> need_convert",
                 len(stage1_inputs),
                 self.ai_batch_size,
-                (len(stage1_inputs) + self.ai_batch_size - 1) // self.ai_batch_size if stage1_inputs else 0,
-                self.ai_max_workers,
-                total_pending_count,
+                n_chunks,
+                min(self.ai_max_workers, n_chunks) if n_chunks else 1,
             )
         ai1_results = (
             self.run_ai_stage1_batch(
@@ -3573,13 +3551,6 @@ class DealPoolCleaner:
                 if isinstance(saved_ai1, dict) and not saved_ai1.get("_from_fallback") and saved_ai1.get("extracted_targets"):
                     ai1_results[mid] = copy.deepcopy(saved_ai1)
         t_ai1_elapsed = round(time.perf_counter() - t_ai1_start, 2)
-        if not quiet_sub_logs:
-            logger.info(
-                "🤖 [阶段2-AI拆解 完成] 耗时=%.2fs | 本批模型直出=%d条, 超时/未出待重试=%d条",
-                t_ai1_elapsed,
-                self.stats_ai1_model_hits - ai1_hits_before,
-                self.stats_ai1_fallbacks - ai1_fb_before,
-            )
 
         # 邻居碎片吸收判定
         absorbed_by_neighbor: Dict[str, str] = {}
@@ -3713,6 +3684,19 @@ class DealPoolCleaner:
             }
 
         out_list = [outcomes_by_id[str(d.get("source_item_id") or "")] for d in selected_docs if str(d.get("source_item_id") or "") in outcomes_by_id]
+        if not quiet_sub_logs:
+            adv_cnt = sum(1 for o in out_list if o.get("stage_outcome") == "advance_to_convert")
+            retry_cnt = sum(1 for o in out_list if o.get("status") == "retry_pending")
+            fail_cnt = sum(1 for o in out_list if o.get("stage_outcome") == "failed")
+            logger.info(
+                "🤖 [AI-1 拆解完成] 耗时=%.1fs | 本批认领=%d条 (直出=%d条, 留待重试=%d条) -> 推进待转链=%d条 (淘汰纯券/无链=%d条)",
+                t_ai1_elapsed,
+                len(selected_docs),
+                self.stats_ai1_model_hits - ai1_hits_before,
+                retry_cnt,
+                adv_cnt,
+                fail_cnt,
+            )
         return out_list, t_ai1_elapsed, neighbor_maps_by_id
 
     def process_convert_unit(
@@ -3777,11 +3761,11 @@ class DealPoolCleaner:
 
         if not quiet_sub_logs:
             logger.info(
-                "🔗 [阶段3-官方转链 启动] 正在并发核验 %d 个独立链接/口令 (总引用=%d次, 并发=%d线程) | 📦 库内总存货Pending=%d条...",
+                "🔗 [官方转链启动] 本批全量认领=%d条 (并发核验=%d个独立链接/口令, 引用=%d次, 并发=%d线程) | 阶段: need_convert -> need_ai2",
+                len(selected_docs),
                 len(unique_target_map),
                 total_target_mentions,
                 self.convert_max_workers,
-                total_pending_count,
             )
         self.run_stage3_concurrent_conversions(
             list(unique_target_map.values()),
@@ -3789,12 +3773,6 @@ class DealPoolCleaner:
             quiet_sub_logs=quiet_sub_logs,
         )
         t_stage3_elapsed = round(time.perf_counter() - t_stage3_start, 2)
-        if not quiet_sub_logs:
-            logger.info(
-                "🔗 [阶段3-官方转链 完成] 耗时=%.2fs | 累计缓存命中=%d次",
-                t_stage3_elapsed,
-                self.stats_cache_hits,
-            )
 
         outcomes_by_id: Dict[str, Dict[str, Any]] = {}
         post_stage3_candidates: List[Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Optional[Tuple[str, str]], float]] = []
@@ -4133,6 +4111,21 @@ class DealPoolCleaner:
             )
 
         out_list = [outcomes_by_id[str(d.get("source_item_id") or "")] for d in selected_docs if str(d.get("source_item_id") or "") in outcomes_by_id]
+        if not quiet_sub_logs:
+            adv_ai2_cnt = sum(1 for o in out_list if o.get("stage_outcome") == "advance_to_ai2")
+            early_cnt = sum(1 for o in out_list if o.get("stage_outcome") == "early_terminated")
+            retry_cnt = sum(1 for o in out_list if o.get("status") == "retry_pending")
+            fail_cnt = sum(1 for o in out_list if o.get("stage_outcome") == "failed")
+            logger.info(
+                "🔗 [官方转链完成] 耗时=%.1fs | 本批认领=%d条 (推进待终审=%d条, 库内/同批早停吸收=%d条, 留待重试=%d条, 失败淘汰=%d条) | 累计缓存命中=%d次",
+                t_stage3_elapsed,
+                len(selected_docs),
+                adv_ai2_cnt,
+                early_cnt,
+                retry_cnt,
+                fail_cnt,
+                self.stats_cache_hits,
+            )
         return out_list, t_stage3_elapsed
 
     def process_ai2_unit(
@@ -4203,13 +4196,13 @@ class DealPoolCleaner:
         ai2_hits_before = self.stats_ai2_model_hits
         ai2_fb_before = self.stats_ai2_fallbacks
         if not quiet_sub_logs:
+            n_chunks = (len(stage2_inputs) + self.ai_batch_size - 1) // self.ai_batch_size if stage2_inputs else 0
             logger.info(
-                "🧠 [阶段4-AI终审 启动] 正在并发终审 %d 条新唯一商品线报 (每批=%d条, 共%d批, 并发=%d线程) | 📦 库内总存货Pending=%d条...",
+                "🧠 [AI-2 终审启动] 本批认领=%d款新唯一商品 (每组=%d条, 共%d组, 并发=%d线程) | 阶段: need_ai2 -> 正式库",
                 len(stage2_inputs),
                 self.ai_batch_size,
-                (len(stage2_inputs) + self.ai_batch_size - 1) // self.ai_batch_size if stage2_inputs else 0,
-                self.ai_max_workers,
-                total_pending_count,
+                n_chunks,
+                min(self.ai_max_workers, n_chunks) if n_chunks else 1,
             )
         ai2_results = self.run_ai_stage2_batch(
             stage2_inputs,
@@ -4592,14 +4585,21 @@ class DealPoolCleaner:
                 "product_doc": product_doc,
             }
 
-        if stage2_inputs and not quiet_sub_logs:
-            logger.info(
-                "🧠 [Stage 4 / AI-2 完成] 本批模型直出=%d条, 保底兜底=%d条",
-                self.stats_ai2_model_hits - ai2_hits_before,
-                self.stats_ai2_fallbacks - ai2_fb_before,
-            )
-
         out_list = [outcomes_by_id[str(d.get("source_item_id") or "")] for d in selected_docs if str(d.get("source_item_id") or "") in outcomes_by_id]
+        if not quiet_sub_logs:
+            succ_cnt = sum(1 for o in out_list if o.get("status") == "success")
+            low_cnt = sum(1 for o in out_list if o.get("status") == "cleaned_low_score")
+            retry_cnt = sum(1 for o in out_list if o.get("status") == "retry_pending")
+            fail_cnt = sum(1 for o in out_list if o.get("status") in ("failed", "cleaned_failed"))
+            logger.info(
+                "🧠 [AI-2 终审完成] 耗时=%.1fs | 本批认领=%d款新商品 (正式库好价入库=%d件, 低分存档=%d件, 留待重试=%d件, 淘汰=%d件)",
+                t_ai2_elapsed,
+                len(selected_docs),
+                succ_cnt,
+                low_cnt,
+                retry_cnt,
+                fail_cnt,
+            )
         return out_list, t_ai2_elapsed
 
     def clean_batch_records(
@@ -7205,10 +7205,24 @@ class MaintenanceWorker(threading.Thread):
                     if exp_cnt > 0:
                         logger.info("🧹 [正式库好价保鲜] 自动摘除超 %.0f 小时未刷新好价标 %d 个", DEAL_FORMAL_EXPIRY_HOURS, exp_cnt)
 
-                # 5. 更新状态快照
+                # 5. 更新状态快照与心跳看板
                 summary = self.repo.generate_pool_summary()
                 with open(STATS_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
                     json.dump(summary, f, ensure_ascii=False, indent=2)
+
+                if tick % 10 == 0:
+                    p_stages = summary.get("pending_by_stage") or {}
+                    logger.info(
+                        "📈 [全库阶段心跳看板] 总线报=%d条 | 成功清洗=%d条, 失败淘汰=%d条 | ⏳ 待清洗总Pending=%d条 (AI-1待拆=%d, 待转链=%d, 待终审=%d) | 📦 正式库好价=%d件",
+                        summary.get("total_raw_tips", 0),
+                        summary.get("cleaned_success", 0),
+                        summary.get("cleaned_failed", 0),
+                        summary.get("pending_clean_records", 0),
+                        p_stages.get("need_ai1", 0),
+                        p_stages.get("need_convert", 0),
+                        p_stages.get("need_ai2", 0),
+                        summary.get("formal_deal_pool_products", 0),
+                    )
 
             except Exception as e:
                 logger.warning("维护线程执行异常: %s", e)

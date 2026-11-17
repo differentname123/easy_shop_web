@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """淘宝平台边界：官方商品、第三方ID榜单、核验身份与渠道订单映射。"""
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit
+
+logger = logging.getLogger(__name__)
 
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
@@ -79,7 +82,86 @@ class TaobaoAdapter(BasePlatformAdapter):
             official_client is not None or self._official_ok and (setting("tb_session") or has_ztk_channel)
         )
         self._orders_ok = bool(ztk_client is not None or has_ztk_channel)
+        self.tb_name = _text(setting("hdk_tb_name") or setting("tb_name") or setting("tb_account_name"))
+        if self._hdk_ok and self.hdk:
+            self.attach_hdk(self.hdk)
         self._refresh_capabilities()
+
+    def attach_hdk(self, hdk_client: HdkClient) -> None:
+        """挂载好单库 (HDK) 为淘宝高配额能力提供者：转链与订单能力设为主力/首选，未授权时自动无缝降级至折淘客。"""
+        self.hdk = hdk_client
+        self.register_provider("promotion", "hdk_tb_promotion", self._make_hdk_promotion(hdk_client), prepend=True)
+        self.register_provider("orders", "hdk_tb_orders", self._make_hdk_orders(hdk_client), prepend=True)
+
+    def _make_hdk_promotion(self, client: HdkClient):
+        def _promote(goods_id_or_sign="", uid=None, **kwargs):
+            ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
+            target_id = ref.goods_id if str(ref.goods_id).isdigit() else (ref.goods_sign or ref.goods_id)
+            if not target_id:
+                return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
+            if not getattr(self, "tb_name", ""):
+                # 好单库 ratesurl 必填已在好单库授权的 tb_name，未配置时直接顺延给折淘客
+                logger.info("[TB转链-好单库] 未配置 hdk_tb_name，自动顺延至折淘客通道: target_id=%s", target_id)
+                return _error("UPSTREAM_PROVIDER_UNAUTHORIZED", "未配置好单库已授权淘宝账号(hdk_tb_name)")
+            pid = self.channel_pid or getattr(self.official, "pid", "")
+            if not pid:
+                return _error("CONFIG_ERROR", "缺少淘宝 PID 配置")
+            identity = kwargs.get("identity") or {}
+            relation_id = _text(identity.get("relation_id")) if isinstance(identity, dict) else ""
+            title = _text(kwargs.get("title") or kwargs.get("name") or "精选好物")
+            res = client.convert_tb_promotion_link(
+                target_id,
+                pid=pid,
+                tb_name=self.tb_name,
+                title=title,
+                relation_id=relation_id or None,
+            )
+            if res.get("status") != "success":
+                err_code = res.get("error_code")
+                if err_code in ("AUTH_REQUIRED", "PROVIDER_UNAUTHORIZED") or "未授权" in str(res.get("error_msg")):
+                    logger.warning("[TB转链-好单库] 好单库淘宝推客未授权，平滑降级至折淘客通道: %s", res.get("error_msg"))
+                    return _error("UPSTREAM_PROVIDER_UNAUTHORIZED", res.get("error_msg") or "好单库推客未授权")
+                logger.warning("[TB转链-好单库] 转链失败(%s: %s)，准备降级至备用通道", err_code, res.get("error_msg"))
+                return res
+            logger.info("[TB转链-好单库主力] 转链成功: target_id=%s, tpwd=%s", target_id, res.get("tpwd"))
+            link = res.get("final_link") or res.get("url")
+            short_url = res.get("short_url") or link
+            password = res.get("tpwd") or res.get("taoword") or ""
+            is_channel = bool(uid and relation_id)
+            return {
+                "status": "success",
+                "url": link,
+                "final_link": short_url or link,
+                "mobile_url": link,
+                "short_url": short_url,
+                "we_app_info": {},
+                "promotion_token": password,
+                "token_type": "tpwd" if password else "",
+                "attribution_status": "verified" if is_channel else "anonymous",
+                "relation_id": relation_id if is_channel else "",
+                "need_auth": False,
+                "is_fallback": False,
+                "goods_id": ref.goods_id,
+                "goods_sign": ref.goods_sign or ref.goods_id,
+                "link_type": "好单库渠道淘口令" if is_channel else "好单库高佣淘口令",
+            }
+        return _promote
+
+    def _make_hdk_orders(self, client: HdkClient):
+        def _orders(start_time, end_time, page=1, page_size=50, **kwargs):
+            try:
+                s_ts = int(start_time.timestamp()) if hasattr(start_time, "timestamp") else int(start_time)
+                e_ts = int(end_time.timestamp()) if hasattr(end_time, "timestamp") else int(end_time)
+            except Exception:
+                return _error("INVALID_ARGUMENT", "淘宝订单时间范围无效")
+            cursor = kwargs.get("cursor")
+            res = client.query_tb_orders(s_ts, e_ts, page=page, page_size=page_size, cursor=cursor)
+            if res.get("status") != "success":
+                logger.warning("[TB订单同步-好单库主力] 拉取失败(%s: %s)，顺延至折淘客通道", res.get("error_code"), res.get("error_msg"))
+                return res
+            logger.info("[TB订单同步-好单库主力] 拉取成功: 订单数=%d, has_more=%s", len(res.get("order_list") or []), res.get("has_more"))
+            return res
+        return _orders
 
     def _refresh_capabilities(self) -> None:
         self.capabilities = {

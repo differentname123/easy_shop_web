@@ -4,9 +4,11 @@
 2. 京东平台：高配额全网搜索、详情反查及专属转链支持。
 """
 import logging
+import time
 from typing import Any, Dict, List, Optional
 import requests
 
+from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, is_real_requests_session
 from infrastructure.http_utils import (
     clean_money,
     clean_text,
@@ -143,8 +145,11 @@ class HdkClient:
         if not self.appkey_list and not self.api_key:
             return _error("CONFIG_ERROR", "好单库缺少 API Key 配置")
         url = f"{self.api_base}/{path.lstrip('/')}"
+        is_real = is_real_requests_session(self.http)
+        plat = "jd" if ("jd" in path.lower() or "jing" in path.lower()) else "tb"
 
         def _do_single_request(current_key: str) -> Dict[str, Any]:
+            t0 = time.monotonic()
             clean_p = {k: v for k, v in (params or {}).items() if v is not None}
             clean_d = {k: v for k, v in (data or {}).items() if v is not None}
             if method.upper() == "POST":
@@ -160,28 +165,41 @@ class HdkClient:
                     resp.raise_for_status()
                 payload = resp.json() if callable(getattr(resp, "json", None)) else {}
             except requests.exceptions.Timeout:
+                dt_ms = (time.monotonic() - t0) * 1000.0
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="TIMEOUT", allow_persist=is_real)
                 return _error("TIMEOUT", "好单库接口请求超时")
             except requests.exceptions.RequestException as exc:
+                dt_ms = (time.monotonic() - t0) * 1000.0
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="NETWORK_ERROR", allow_persist=is_real)
                 return _error("NETWORK_ERROR", f"好单库网络请求失败: {exc}")
             except Exception as exc:
+                dt_ms = (time.monotonic() - t0) * 1000.0
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
                 return _error("PROTOCOL_ERROR", f"好单库响应解析失败: {exc}")
 
+            dt_ms = (time.monotonic() - t0) * 1000.0
             if not isinstance(payload, dict):
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
                 return _error("PROTOCOL_ERROR", "好单库返回非 JSON 字典")
 
             code = payload.get("code")
             msg = clean_text(payload.get("msg") or payload.get("sub_msg") or "")
 
             if code in (200, 1, "200", "1"):
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
                 return {"status": "success", "data": payload.get("data"), "raw": payload}
 
             err_msg_lower = msg.lower()
             if any(kw in msg for kw in HDK_RATE_LIMIT_KEYWORDS) or "429" in err_msg_lower:
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="rate_limit", latency_ms=dt_ms, error_code="RATE_LIMIT", error_msg=msg[:80], allow_persist=is_real)
                 return _error("RATE_LIMIT", msg or "好单库接口调用频次超限", sub_msg=payload.get("sub_msg"))
             if "未授权" in msg or "授权" in msg or "绑定" in msg:
-                return _error("AUTH_REQUIRED", msg or "好单库尚未绑定京东推客账号", sub_msg=payload.get("sub_msg"))
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="AUTH_REQUIRED", error_msg=msg[:80], allow_persist=is_real)
+                return _error("AUTH_REQUIRED", msg or "好单库尚未绑定推客账号", sub_msg=payload.get("sub_msg"))
             if "下架" in msg or "不在推广" in msg:
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="PRODUCT_OFF_PROMOTION", error_msg=msg[:80], allow_persist=is_real)
                 return _error("PRODUCT_OFF_PROMOTION", msg or "该商品不在推广中或已下架")
+            GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code=f"HDK_{code}", error_msg=msg[:80], allow_persist=is_real)
             return _error("UPSTREAM_ERROR", msg or f"好单库返回错误码 {code}", upstream_code=code, sub_msg=payload.get("sub_msg"))
 
         if self.appkey_list:
@@ -317,3 +335,170 @@ class HdkClient:
             "final_link": short or click,
             "promoter_id": promoter_id or uid,
         }
+
+    def query_jd_orders(
+        self,
+        start_time: int,
+        end_time: int,
+        page: int = 1,
+        page_size: int = 50,
+        date_type: int = 1,
+        state: int = 0,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """拉取京东联盟订单明细 (接口 id=239: v3/unify_jd_order_list)。"""
+        cur_page = cursor or page or 1
+        size = min(100, max(1, int(page_size or 50)))
+        params = {
+            "min_id": cur_page,
+            "back": size,
+            "start_date": int(start_time),
+            "end_date": int(end_time),
+            "date_type": int(date_type),
+            "state": int(state),
+        }
+        res = self._request("GET", "unify_jd_order_list", params=params)
+        if res.get("status") != "success":
+            return res
+        raw_items = res.get("data")
+        rows = raw_items if isinstance(raw_items, list) else []
+        mapped_orders = [_map_hdk_jd_order_to_row(row) for row in rows if isinstance(row, dict)]
+        raw_payload = res.get("raw") or {}
+        next_min_id = raw_payload.get("min_id")
+        has_more = bool(next_min_id and str(next_min_id) != "0" and str(next_min_id) != str(cur_page) and len(rows) >= size)
+        return {
+            "status": "success",
+            "order_list": mapped_orders,
+            "total_count": len(mapped_orders),
+            "page": int(cur_page) if str(cur_page).isdigit() else 1,
+            "has_more": has_more,
+            "next_cursor": str(next_min_id) if has_more else None,
+        }
+
+    def convert_tb_promotion_link(
+        self,
+        item_id: str,
+        pid: str,
+        tb_name: str,
+        title: str = "",
+        relation_id: Optional[str] = None,
+        special_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """淘宝高佣商品转链 (接口 id=1: v3/ratesurl)。"""
+        iid = clean_text(item_id)
+        if not iid:
+            return _error("INVALID_ARGUMENT", "缺少淘宝商品ID")
+        p = clean_text(pid)
+        if not p:
+            return _error("CONFIG_ERROR", "缺少淘宝 PID 配置")
+        name = clean_text(tb_name)
+        if not name:
+            return _error("PROVIDER_UNAUTHORIZED", "缺少好单库已授权淘宝账号昵称 (tb_name)")
+        payload = {
+            "itemid": iid,
+            "pid": p,
+            "tb_name": name,
+            "title": clean_text(title) or "精选好物",
+            "get_taoword": 1,
+        }
+        if relation_id:
+            payload["relation_id"] = clean_text(relation_id)
+        if special_id:
+            payload["special_id"] = clean_text(special_id)
+
+        res = self._request("POST", "ratesurl", data=payload)
+        if res.get("status") != "success":
+            return res
+        data = res.get("data")
+        if not isinstance(data, dict):
+            return _error("PROTOCOL_ERROR", "好单库淘宝转链返回数据异常")
+        click_url = clean_text(data.get("coupon_click_url") or data.get("item_url"))
+        short_url = clean_text(data.get("coupon_click_url") or data.get("item_url"))
+        taoword = clean_text(data.get("taoword") or data.get("new_model"))
+        if not click_url and not taoword:
+            return _error("PROTOCOL_ERROR", "好单库未返回有效淘宝推广链接或口令")
+        return {
+            "status": "success",
+            "final_link": short_url or click_url,
+            "url": click_url or short_url,
+            "short_url": short_url,
+            "click_url": click_url,
+            "tpwd": taoword,
+            "taoword": taoword,
+            "raw": data,
+        }
+
+    def query_tb_orders(
+        self,
+        start_time: int,
+        end_time: int,
+        page: int = 1,
+        page_size: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """淘宝订单拉取 (接口: v3/tb_live_order_list)。"""
+        cur_page = cursor or page or 1
+        size = min(100, max(1, int(page_size or 50)))
+        params = {
+            "min_id": cur_page,
+            "back": size,
+            "start_date": int(start_time),
+            "end_date": int(end_time),
+        }
+        res = self._request("GET", "tb_live_order_list", params=params)
+        if res.get("status") != "success":
+            return res
+        raw_items = res.get("data")
+        rows = raw_items if isinstance(raw_items, list) else []
+        mapped = []
+        for r in rows:
+            if isinstance(r, dict):
+                mapped.append({
+                    "trade_id": clean_text(r.get("trade_id") or r.get("order_sn")),
+                    "trade_parent_id": clean_text(r.get("trade_parent_id")),
+                    "item_id": clean_text(r.get("item_id")),
+                    "item_title": clean_text(r.get("item_title")),
+                    "item_num": r.get("item_num", 1),
+                    "alipay_total_price": clean_money(r.get("pay_price"), 0.0),
+                    "pub_share_pre_fee": clean_money(r.get("predict_money"), 0.0),
+                    "pub_share_fee": clean_money(r.get("actual_money"), 0.0),
+                    "tk_status": r.get("order_status", 12),
+                    "tk_create_time": r.get("create_time"),
+                    "tk_paid_time": r.get("paid_time"),
+                    "tk_earning_time": r.get("earning_time"),
+                    "relation_id": clean_text(r.get("relation_id")),
+                })
+        raw_payload = res.get("raw") or {}
+        next_min_id = raw_payload.get("min_id")
+        has_more = bool(next_min_id and str(next_min_id) != "0" and str(next_min_id) != str(cur_page) and len(rows) >= size)
+        return {
+            "status": "success",
+            "order_list": mapped,
+            "total_count": len(mapped),
+            "page": int(cur_page) if str(cur_page).isdigit() else 1,
+            "has_more": has_more,
+            "next_cursor": str(next_min_id) if has_more else None,
+        }
+
+
+def _map_hdk_jd_order_to_row(row: dict) -> dict:
+    status_map = {1: 16, 2: 18, 3: 28, 4: 17}
+    st = row.get("order_status")
+    valid_code = status_map.get(int(st) if str(st).isdigit() else 0, row.get("validCode") or 16)
+    return {
+        "id": clean_text(row.get("trade_id") or row.get("id")),
+        "orderId": clean_text(row.get("trade_parent_id") or row.get("orderId")),
+        "skuId": clean_text(row.get("item_id") or row.get("skuId")),
+        "skuName": clean_text(row.get("item_title") or row.get("skuName")),
+        "skuNum": row.get("item_num") or row.get("skuNum") or 1,
+        "estimateCosPrice": clean_money(row.get("pay_price") or row.get("estimateCosPrice"), 0.0),
+        "estimateFee": clean_money(row.get("predict_money") or row.get("estimateFee"), 0.0),
+        "actualFee": clean_money(row.get("actual_money") or row.get("actualFee"), 0.0),
+        "validCode": valid_code,
+        "orderTime": row.get("create_time") or row.get("orderTime"),
+        "modifyTime": row.get("update_time") or row.get("create_time") or row.get("modifyTime"),
+        "finishTime": row.get("earning_time") or row.get("finishTime"),
+        "positionId": clean_text(row.get("channel_code") or row.get("positionId")),
+        "subUnionId": clean_text(row.get("sub_union_id") or row.get("subUnionId")),
+        "commissionRate": clean_money(row.get("commission_rate") or row.get("commissionRate"), 0.0),
+    }

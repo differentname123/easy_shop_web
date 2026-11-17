@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """京东字段/分页适配；无授权、用户仓储或个人转站长兜底。"""
 import hashlib
+import logging
 import math
 import re
 import time
@@ -8,6 +9,8 @@ from datetime import datetime
 from typing import Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
     is_real_requests_session,
@@ -156,12 +159,13 @@ class JdAdapter(BasePlatformAdapter):
         self._refresh_capabilities()
 
     def attach_hdk(self, hdk_client: HdkClient) -> None:
-        """挂载好单库 (HDK) 为京东高配额能力提供者：搜索/详情为主力，转链/万能为兜底。"""
+        """挂载好单库 (HDK) 为京东全能力主力提供者：搜索/详情/转链/万能/订单均设为主力，折淘客全面作为平滑兜底。"""
         self.hdk = hdk_client
         self.register_provider("search", "hdk_jd_search", self._make_hdk_search(hdk_client), prepend=True)
         self.register_provider("detail", "hdk_jd_detail", self._make_hdk_detail(hdk_client), prepend=True)
-        self.register_provider("promotion", "hdk_jd_promotion", self._make_hdk_promotion(hdk_client), prepend=False)
-        self.register_provider("universal", "hdk_jd_universal", self._make_hdk_universal(hdk_client), prepend=False)
+        self.register_provider("promotion", "hdk_jd_promotion", self._make_hdk_promotion(hdk_client), prepend=True)
+        self.register_provider("universal", "hdk_jd_universal", self._make_hdk_universal(hdk_client), prepend=True)
+        self.register_provider("orders", "hdk_jd_orders", self._make_hdk_orders(hdk_client), prepend=True)
 
     def _normalize_hdk_summary(self, item: dict) -> dict:
         raw_sign = _text(item.get("skuid") or item.get("itemid"))
@@ -311,7 +315,9 @@ class JdAdapter(BasePlatformAdapter):
             sub_id = kwargs.get("sub_union_id")
             res = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=sub_id, coupon_url=coupon)
             if res.get("status") != "success":
+                logger.warning("[JD转链-好单库主力] 转链失败(%s: %s)，准备降级至备用通道: target_id=%s", res.get("error_code"), res.get("error_msg"), target_id)
                 return res
+            logger.info("[JD转链-好单库主力] 转链成功: short_url=%s, target_id=%s", res.get("short_url"), target_id)
             extra = {"coupon_url": coupon} if coupon else {}
             return self._build_promotion_payload(
                 res,
@@ -351,12 +357,15 @@ class JdAdapter(BasePlatformAdapter):
                     if det.get("status") == "success" and isinstance(det.get("data"), dict):
                         card = det["data"]
             if not target_id and not card:
+                logger.warning("[JD万能解析-好单库] 未能解析到有效目标ID，准备降级至备用通道: input=%s", text[:60])
                 return _error("NOT_FOUND", "未能识别该京东链接或商品")
 
             mat = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else (short_match.group(0) if short_match else target_id)
             conv = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=kwargs.get("sub_union_id"), coupon_url=(card or {}).get("coupon_url"))
             if conv.get("status") != "success":
+                logger.warning("[JD万能转链-好单库] 转链失败(%s)，准备降级至备用通道: target_id=%s", conv.get("error_msg"), target_id)
                 return conv
+            logger.info("[JD万能解析-好单库主力] 解析与转链成功: target_id=%s, final_link=%s", target_id, conv.get("final_link"))
             short = conv.get("short_url") or ""
             long = conv.get("click_url") or ""
             title = (card or {}).get("name") or "京东精选好物"
@@ -385,6 +394,22 @@ class JdAdapter(BasePlatformAdapter):
                 payload["detail_lookup_failed"] = True
             return stamp_universal_resolution(payload)
         return _universal
+
+    def _make_hdk_orders(self, client: HdkClient):
+        def _orders(start_time, end_time, page=1, page_size=50, **kwargs):
+            try:
+                s_ts = int(start_time.timestamp()) if hasattr(start_time, "timestamp") else int(start_time)
+                e_ts = int(end_time.timestamp()) if hasattr(end_time, "timestamp") else int(end_time)
+            except Exception:
+                return _error("INVALID_ARGUMENT", "京东订单时间范围无效")
+            cursor = kwargs.get("cursor")
+            res = client.query_jd_orders(s_ts, e_ts, page=page, page_size=page_size, cursor=cursor)
+            if res.get("status") != "success":
+                logger.warning("[JD订单同步-好单库主力] 拉取失败(%s: %s)，顺延至备用通道", res.get("error_code"), res.get("error_msg"))
+                return res
+            logger.info("[JD订单同步-好单库主力] 拉取成功: 订单数=%d, has_more=%s", len(res.get("order_list") or []), res.get("has_more"))
+            return res
+        return _orders
 
     def _refresh_capabilities(self) -> None:
         cat = getattr(self, "_has_ztk_catalog", False)
