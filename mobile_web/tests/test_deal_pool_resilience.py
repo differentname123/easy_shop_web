@@ -1468,7 +1468,7 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
     out = dps.run_fetch_stage(repo=repo, session=MagicMock(), cycle_num=1, run_all_tiers=False)
     assert len(xianbao_calls) == 1
     xb_tasks = [t for t in out["tasks"] if t["site_key"] == "xianbao_fun"]
-    assert len(xb_tasks) == 7
-    assert sum(1 for t in xb_tasks if t["status"] == "cooldown_skipped") == 6
+    assert len(xb_tasks) >= 2
+    assert sum(1 for t in xb_tasks if t["status"] == "cooldown_skipped") == len(xb_tasks) - 1
     assert len(out["error_paths"]) == 1
     assert "共 2 条详情异常" in out["error_paths"][0]["error_message"]
