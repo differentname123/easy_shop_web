@@ -403,7 +403,7 @@ SITE_DISPLAY_NAMES: Dict[str, str] = {
     "0818tuan": "0818团 (实战凑单线报)",
     "xianbao_fun": "线报酷 (21频道全网与拼多多聚合)",
     "bacaoo": "拔草哦 (国内优惠与拼多多商城专区)",
-    "iehou": "网猴线报 (24H热榜)",
+    "iehou": "网猴线报 (已永久停用/归档)",
 }
 
 OPS_TROUBLESHOOTING_PLAYBOOK: Dict[str, Dict[str, str]] = {
@@ -6339,7 +6339,6 @@ def run_fetch_stage(
     guangdiu_done = repo.get_existing_detailed_ids("guangdiu", limit=4000)
     tuan0818_done = repo.get_existing_detailed_ids("0818tuan", limit=3000)
     bacaoo_done = repo.get_existing_detailed_ids("bacaoo", limit=2000)
-    iehou_done = repo.get_existing_detailed_ids("iehou", limit=2000)
     tehuicaicai_done = repo.get_existing_detailed_ids("tehuicaicai", limit=4000)
 
     # ---------------- T0 高频核心源（每轮必跑：24 个高产频道，100% 覆盖全部 8 大高可靠站点 + 四大拼多多专属源） ----------------
@@ -6528,22 +6527,10 @@ def run_fetch_stage(
             ),
             0.5,
         ),
-        # ⏸️【暂缓抓取：网猴线报_24小时热榜（实测成材率 16.6%）】
-        # 停用原因：实测抓取 455 条淘汰 378 条（仅入库 75 条），外链残缺率极高，绝大部分为过期线报，投入产出比极低。如需恢复直接取消注释即可：
-        # (
-        #     "网猴线报_24小时热榜",
-        #     "iehou",
-        #     "T0_high_freq",
-        #     "https://www.iehou.com/index/index/dayhot.html",
-        #     lambda: fetch_iehou_deals(
-        #         mode="dayhot",
-        #         fetch_detail=True,
-        #         max_details=max_new_details_per_channel,
-        #         session=session,
-        #         skip_detail_ids=iehou_done,
-        #     ),
-        #     0.5,
-        # ),
+        # 🚨【永久停用：网猴线报 (iehou) 已彻底剔除】
+        # 淘汰根因：实测抓取 455 条淘汰 380 条（仅入库 75 条，成材率 16.5%）。经深入正文话术审计，该源 80% 以上
+        # 为快手抽奖、大众点评探店、游戏礼包、微信小程序活动等纯非电商内容（ERR_NO_ANCHOR 达 257 条），无有效转化价值，
+        # 已彻底关停并不参与抓取调度循环。
         # ⏸️【暂缓抓取：线报酷_1小时最热榜（实测成材率 1.4%）】
         # 停用原因：实测抓取 165 条仅 2 条入库（139 条淘汰），榜单充斥瞬时秒杀水帖，抓取时优惠券基本已被抢光失效。如需恢复直接取消注释即可：
         # (
@@ -7096,8 +7083,6 @@ def run_fetch_stage(
                         tuan0818_done.add(sid)
                     elif site_key == "bacaoo":
                         bacaoo_done.add(sid)
-                    elif site_key == "iehou":
-                        iehou_done.add(sid)
                     elif site_key == "tehuicaicai":
                         tehuicaicai_done.add(sid)
 

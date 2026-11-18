@@ -1657,3 +1657,45 @@ def test_commit_batch_results_records_supplementary_copies():
     assert len(tl_ops) == 1
     assert tl_ops[0]["tip_id"] == "xb_dup_1"
     assert tl_ops[0]["deal_price"] == 45.0
+
+
+def test_fetch_guangdiu_filters_vipshop(monkeypatch):
+    from mobile_web.scripts.test_deal_sites_scraper import fetch_guangdiu_deals
+    import requests
+
+    html_content = """
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=101">天猫高质商品</a>
+        <a class="rightmallname">天猫</a>
+    </div>
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=102">唯品会特卖包包</a>
+        <a class="rightmallname">唯品会</a>
+    </div>
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=103">京东自营好物</a>
+        <a class="rightmallname">京东</a>
+    </div>
+    """
+
+    class FakeResponse:
+        status_code = 200
+        text = html_content
+
+    fake_session = MagicMock()
+    fake_session.get.return_value = FakeResponse()
+
+    res = fetch_guangdiu_deals(
+        channel="latest",
+        fetch_detail=False,
+        session=fake_session,
+    )
+    records = res["records"]
+    assert len(records) == 2
+    item_ids = [r["source_item_id"] for r in records]
+    assert "101" in item_ids
+    assert "103" in item_ids
+    assert "102" not in item_ids
+    malls = [r["mall_name"] for r in records]
+    assert "唯品会" not in malls
+

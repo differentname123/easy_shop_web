@@ -2146,6 +2146,10 @@ def fetch_guangdiu_deals(
         m_mall = re.search(r'class=["\'][^"\']*rightmallname[^"\']*["\'][^>]*>(.*?)</a>', blk, re.S | re.I)
         mall_name = re.sub(r"<[^>]+>", "", html_lib.unescape(m_mall.group(1))).strip() if m_mall else ("拼多多" if channel == "pdd" else "")
 
+        # 严格过滤无联盟转链适配器的平台（如唯品会），避免无效拉取详情与算力空转
+        if mall_name in ("唯品会", "考拉海购", "网易严选") or "唯品会" in (mall_name or ""):
+            continue
+
         m_abs = re.search(r'<(?:div|a)\s+class=["\']abstractcontent["\'][^>]*>(.*?)</(?:div|a)>', blk, re.S | re.I)
         preview_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(m_abs.group(1)))).strip() if m_abs else ""
         preview_text = re.sub(r"\s*完整阅读>\s*$", "", preview_text).strip()
@@ -3006,7 +3010,7 @@ def run_all_sample_verifications(output_path: Optional[str] = None) -> Dict[str,
         ("T0_特惠采采_专员精选好价(含详情发单文案与短链)", lambda: fetch_tehuicaicai_deals(channel="home", page=1, page_size=10, fetch_detail=True, max_details=4)),
         ("T1_什么值得买_好价(含三路高可用切换与详情)", lambda: fetch_smzdm_faxian_deals(sort="hot_3h", page=1, fetch_detail=True, max_details=3)),
         ("T1_拔草哦_优惠线报(含详情口令)", lambda: fetch_bacaoo_deals(fetch_detail=True, max_details=3)),
-        ("T1_网猴线报_24小时热榜(含详情)", lambda: fetch_iehou_deals(mode="dayhot", fetch_detail=True, max_details=3)),
+        # ("T1_网猴线报_24小时热榜(含详情)", lambda: fetch_iehou_deals(mode="dayhot", fetch_detail=True, max_details=3)),  # 🚨 已永久停用：成材率仅16.5%，80%为非电商抽奖内容
         ("T1_购物党_最新折扣", lambda: fetch_gwdang_discounts(mode="0-latest")),
         ("T2_慢慢买_省钱控列表摘要", lambda: fetch_manmanbuy_list()),
         ("T2_55海淘_EdgeOne算术Cookie绕过", lambda: fetch_55haitao_deals()),
