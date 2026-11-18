@@ -7725,9 +7725,9 @@ def run_stage_pipeline_drain(
     if clean_limit > 0:
         ai1_batch = max(cleaner.ai_batch_size, clean_limit)
 
-    # Stage 2 & 3: 官方转链与 AI-2 终审（上游满足条件的有效记录 100% 全量认领排空，彻底取消人工狭隘卡口）
-    convert_batch = 5000
-    ai2_batch = 2000
+    # Stage 2 & 3: 官方转链与 AI-2 终审（采用小批次快流转，避免大批次长时间阻塞与中途重启丢失进度）
+    convert_batch = 200
+    ai2_batch = 100
 
     worker_ai1 = StageWorker(
         name="StageWorker-AI1",
@@ -8212,9 +8212,9 @@ def main():
     if getattr(args, "clean_limit", 0) > 0:
         ai1_batch = max(cleaner.ai_batch_size, args.clean_limit)
 
-    # Stage 2 & 3: 官方转链与 AI-2 终审（上游满足条件的有效记录 100% 全量认领排空，彻底取消人工狭隘卡口）
-    convert_batch = 5000
-    ai2_batch = 2000
+    # Stage 2 & 3: 官方转链与 AI-2 终审（采用小批次快流转，避免大批次长时间阻塞与中途重启丢失进度）
+    convert_batch = 200
+    ai2_batch = 100
 
     worker_ai1 = StageWorker(
         name="StageWorker-AI1",
