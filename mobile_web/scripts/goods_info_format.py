@@ -7,6 +7,7 @@ import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -24,6 +25,10 @@ from infrastructure.ai_api.model_api import generate_content, setup_logger
 from infrastructure.mongo import gen_db_object
 
 logger = setup_logger(app_name="goods_format")
+# 允许控制台同步打印 INFO 日志，便于在终端或 PyCharm 运行窗口实时观察调度进度
+for _h in logger.handlers:
+    if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+        _h.setLevel(logging.INFO)
 
 PROMPT_FILE_PATH = MOBILE_WEB_DIR / "prompt" / "商品数据结构化清洗.txt"
 LLM_MAX_RETRIES = 3
