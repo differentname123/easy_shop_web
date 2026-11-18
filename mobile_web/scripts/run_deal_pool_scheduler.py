@@ -368,6 +368,7 @@ ERR_ADAPTER_OFF_PROMOTION = "ERR_ADAPTER_OFF_PROMOTION"       # 商品已下架�
 ERR_ADAPTER_CONVERT_FAILED = "ERR_ADAPTER_CONVERT_FAILED"     # 上游转链接口未解析出有效结果（如口令过期、外链无效等）
 ERR_EMPTY_PRODUCT_IDENTITY = "ERR_EMPTY_PRODUCT_IDENTITY"     # 仅含纯优惠券/红包/活动会场链接，无具体主商品
 ERR_AI2_MAIN_DEAD_ONLY_FILLER = "ERR_AI2_MAIN_DEAD_ONLY_FILLER"  # 主商品死链、仅凑单品存活（铁面拦截）
+ERR_AI2_COUPON_FAILED_OR_DROPPED = "ERR_AI2_COUPON_FAILED_OR_DROPPED"  # 原始线报包含优惠券链接但转链失败或未保留（AI-2 铁面拦截）
 ERR_AI2_PRODUCT_MISMATCH = "ERR_AI2_PRODUCT_MISMATCH"         # 转链出的官方商品与爆料文案严重货不对板（AI-2 铁面拦截）
 ERR_AI2_VIRTUAL_OR_JUNK = "ERR_AI2_VIRTUAL_OR_JUNK"           # 0.01元引流/邮费补差价/虚拟垃圾商品（AI-2 铁面拦截）
 ERR_LOW_QUALITY_SCORE = "ERR_LOW_QUALITY_SCORE"               # 有效商品但综合质量评分低于60分（仅留存初步表，不晋升正式表）
@@ -2521,22 +2522,22 @@ class DealPoolCleaner:
                         if str(x or "").strip()
                     ]
                 tip_map = (neighbor_maps_by_id or {}).get(mid) or ({mid: orig_doc} if orig_doc else {})
-                # 确定性补齐：若源站结构化按钮 (extracted_links) 中存在 AI-1 漏提的联盟推广商品链（防止同帖仅提了纯数字 item.jd.com 而漏掉 union-click/u.jd.com），自动补入候选
+                # 确定性补齐：若源站结构化按钮 (extracted_links) 中存在 AI-1 漏提的联盟推广商品链或优惠券链接，自动补入候选
                 seen_clean_inputs = {t["clean_input"] for t in norm_targets}
                 for m_tid in ai1_res["merged_tip_ids"]:
                     src_d = tip_map.get(m_tid) or {}
+                    s_site = str(src_d.get("source_site") or (orig_doc or {}).get("source_site") or "")
                     for lk in src_d.get("extracted_links") or []:
                         if not isinstance(lk, dict) or len(norm_targets) >= 8:
                             continue
                         u_cand = self._strip_markdown_link_wrapper(str(lk.get("url") or "").strip())
-                        u_low = u_cand.lower()
-                        if (
-                            not u_cand
-                            or u_cand in seen_clean_inputs
-                            or rebuild_clean_official_venue_url(u_cand) is not None
-                        ):
+                        if not u_cand or u_cand in seen_clean_inputs:
                             continue
-                        if any(
+                        u_low = u_cand.lower()
+
+                        # 1. 联盟推广商品链补齐（防止同帖仅提了纯数字 item.jd.com 而漏掉 union-click/u.jd.com）
+                        is_venue = rebuild_clean_official_venue_url(u_cand) is not None
+                        if not is_venue and any(
                             dom in u_low
                             for dom in (
                                 "u.jd.com/",
@@ -2558,6 +2559,42 @@ class DealPoolCleaner:
                                 "platform": detect_candidate_platform(u_cand, str(lk.get("platform") or src_d.get("platform") or "unknown")),
                                 "text_role_hint": "main_candidate",
                             })
+                            continue
+
+                        # 2. 方案二：仅针对具有确定性 HTML DOM 结构的“逛丢”平台，确定性补齐漏提的官方优惠券链接
+                        if s_site == "guangdiu" and "duo_coupon_landing" not in u_low:
+                            t_low = str(lk.get("type") or "").strip().lower()
+                            lbl = str(lk.get("label") or "").strip()
+                            is_explicit_cpn = (
+                                is_venue
+                                or t_low in ("coupon_url", "tb_coupon")
+                                or ("uland.taobao.com" in u_low and "/coupon/" in u_low)
+                                or (
+                                    ("券" in lbl or "补贴" in lbl or "红包" in lbl)
+                                    and any(
+                                        p in u_low
+                                        for p in (
+                                            "jd.com",
+                                            "taobao.com",
+                                            "tmall.com",
+                                            "yangkeduo.com",
+                                            "pinduoduo.com",
+                                        )
+                                    )
+                                )
+                            )
+                            if is_explicit_cpn:
+                                c_plat = detect_candidate_platform(u_cand, str(lk.get("platform") or src_d.get("platform") or "unknown"))
+                                if c_plat in ("jd", "taobao", "pdd"):
+                                    seen_clean_inputs.add(u_cand)
+                                    next_lid = f"L{len(norm_targets) + 1}"
+                                    norm_targets.append({
+                                        "link_id": next_lid,
+                                        "raw_span": u_cand,
+                                        "clean_input": u_cand,
+                                        "platform": c_plat,
+                                        "text_role_hint": "coupon_candidate",
+                                    })
                 ai1_res["extracted_targets"] = norm_targets
                 raw_strips = ai1_res.get("strip_spans")
                 ai1_res["strip_spans"] = (
@@ -3194,6 +3231,35 @@ class DealPoolCleaner:
         )
         kept_lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
         return "\n".join(kept_lines).strip()
+
+    @staticmethod
+    def _is_explicit_coupon_target(c: Dict[str, Any]) -> bool:
+        """判定目标是否为原始线报中的优惠券/活动候选链接。"""
+        if not isinstance(c, dict):
+            return False
+        if str(c.get("text_role_hint") or "").strip().lower() == "coupon_candidate":
+            return True
+        if str(c.get("convert_status") or "").strip().lower() == "coupon_or_activity":
+            return True
+        clean_input = str(c.get("clean_input") or "").strip().lower()
+        if clean_input.startswith(("http://", "https://")):
+            try:
+                parts = urlsplit(clean_input)
+                host = (parts.hostname or "").lower()
+                path = parts.path or ""
+                if host in ("coupon.m.jd.com", "duo_coupon_landing.html"):
+                    return True
+                if host == "uland.taobao.com" and ("/quan/" in path or "/coupon/" in path):
+                    return True
+                if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active" in path:
+                    return True
+                if host in ("pages.tmall.com", "pages-fast.m.taobao.com") and path.startswith("/wow/"):
+                    return True
+                if "coupon" in path.lower() or "quan" in path.lower():
+                    return True
+            except Exception:
+                pass
+        return False
 
     @classmethod
     def _build_clean_original_copywriting(
@@ -4469,7 +4535,9 @@ class DealPoolCleaner:
 
             if not is_valid or not main_conv:
                 rej = str(ai2_res.get("reject_reason") or "ALL_PRODUCTS_DEAD").upper()
-                if "FILLER" in rej:
+                if "COUPON" in rej:
+                    err_code = ERR_AI2_COUPON_FAILED_OR_DROPPED
+                elif "FILLER" in rej:
                     err_code = ERR_AI2_MAIN_DEAD_ONLY_FILLER
                 elif "MISMATCH" in rej:
                     err_code = ERR_AI2_PRODUCT_MISMATCH
@@ -4579,6 +4647,58 @@ class DealPoolCleaner:
                     "token": c_tok,
                     "platform": c_plat or plat,
                 })
+
+            # 【优惠券与断链一致性拦截（Fail-Closed 铁律）】
+            # 若最终未产出任何有效优惠券（not coupon_links）：
+            # 1. 原始线报显式包含优惠券链接（raw_coupon_candidates 存在但转链失败或未被保留）；
+            # 2. 或原始线报包含转链失败的非凑单链接，且标称到手价显著低于官方售价（缺券断链被脑补直拍）。
+            # 满足任一即表明好价前置动作已断裂，全条线报予以淘汰，绝不脑补放行。
+            if is_valid and not coupon_links:
+                raw_coupon_candidates = [
+                    c for c in conv_list
+                    if c.get("link_id") != main_lid
+                    and c.get("text_role_hint") != "filler_candidate"
+                    and self._is_explicit_coupon_target(c)
+                ]
+                should_reject = False
+                reject_detail = ""
+                if raw_coupon_candidates:
+                    should_reject = True
+                    reject_detail = "原始优惠券链接转链失败或未被保留"
+                elif deal_price is not None:
+                    has_failed_non_filler = any(
+                        c.get("link_id") != main_lid
+                        and c.get("text_role_hint") != "filler_candidate"
+                        and c.get("convert_status") == "failed"
+                        for c in conv_list
+                    )
+                    if has_failed_non_filler:
+                        off_act_p = float(product_card.get("activity_price") or product_card.get("price") or 0.0)
+                        if off_act_p > 0 and deal_price < off_act_p * 0.95:
+                            should_reject = True
+                            reject_detail = "依赖的前置优惠链接转链失效且到手价低于官方售价"
+
+                if should_reject:
+                    is_valid = False
+                    ai2_res["is_valid_deal"] = False
+                    ai2_res["reject_reason"] = "COUPON_LINK_FAILED_OR_DROPPED"
+                    outcomes_by_id[mid] = {
+                        "status": "failed",
+                        "stage_outcome": "failed",
+                        "error_code": ERR_AI2_COUPON_FAILED_OR_DROPPED,
+                        "error_msg": f"AI-2 终审拦截 (COUPON_LINK_FAILED_OR_DROPPED: {reject_detail})",
+                        "source_site": site,
+                        "source_channel": channel,
+                        "source_item_id": mid,
+                        "title": raw_title,
+                        "ai_stage1_result": ai1_res,
+                        "converted_links": conv_summary_for_db,
+                        "ai_stage2_result": ai2_res,
+                        "quality_score": 0,
+                        "candidate_count": len(conv_list),
+                        "attempt_errors": [],
+                    }
+                    continue
 
             raw_steps_val = ai2_res.get("tutorial_steps")
             if isinstance(raw_steps_val, list):

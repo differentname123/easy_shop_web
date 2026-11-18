@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from mobile_web.scripts.run_deal_pool_scheduler import (
+    ERR_AI2_COUPON_FAILED_OR_DROPPED,
     DealPoolCleaner,
     _is_safe_public_http_url,
     _is_verified_station_promo_link,
@@ -469,3 +470,403 @@ def test_stage5_filters_cross_platform_and_redundant_tb_sclick():
     assert len(cpn_links) == 1
     assert cpn_links[0]["link_id"] == "L4"
     assert cpn_links[0]["url"] == "https://pages.tmall.com/wow/a/act/tmall/dailygroup/23288/wupr?wh_pid=daily-544479"
+
+
+def test_fail_closed_coupon_integrity_and_retention():
+    """
+    针对用户核心痛点的回归单测：
+    1. 原始线报含优惠券链接且转链失败（failed）-> 必须被 Fail-Closed 淘汰拦截（绝不放行、绝不脑补直拍）；
+    2. 原始线报含有效优惠券链接但 AI-2 漏填/丢弃（未保留入 coupon_links）-> 必须被 Fail-Closed 淘汰拦截；
+    3. 原始线报本无优惠券链接（纯直降/店内满减）-> 正常放行，绝不误杀；
+    4. 原始线报含重复优惠券链接（一残一全），有效链接成功保留 -> 正常放行；
+    5. 淘系二合一链接（虽标注 coupon_candidate 但实际转出主商品自身）-> 正常放行。
+    """
+    cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+
+    # 1. Case A: 原始线报含优惠券链接，但转链失败（如好单库截断的 3.cn/3cj）
+    cleaner.adapters = {
+        "jd": SimpleNamespace(
+            resolve_and_convert_universal=lambda inp: {
+                "status": "error" if ("DEAD_CPN" in inp or "item.jd.com" in inp) else "success",
+                "goods_id": f"JD_{inp}",
+                "goods_sign": f"JD_{inp}",
+                "final_link": f"https://u.jd.com/{inp}" if "MAIN" in inp else "",
+                "promotion_token": "",
+                "product": {
+                    "platform": "jd",
+                    "product_id": f"JD_{inp}",
+                    "name": f"商品_{inp}",
+                    "price": 6.9 if "MAIN_7" in inp else 36.9,
+                    "original_price": 6.9 if "MAIN_7" in inp else 36.9,
+                    "activity_price": 6.9 if "MAIN_7" in inp else 36.9,
+                    "coupon_amount": 0.0,
+                    "mall_name": "官方旗舰店",
+                } if "MAIN" in inp else None,
+            }
+        ),
+        "taobao": SimpleNamespace(
+            resolve_and_convert_universal=lambda inp: {
+                "status": "success",
+                "goods_id": "TB_2IN1",
+                "goods_sign": "TB_2IN1",
+                "final_link": "https://s.click.taobao.com/2in1",
+                "promotion_token": "￥2in1￥",
+                "product": {
+                    "platform": "taobao",
+                    "product_id": "TB_2IN1",
+                    "name": "淘系二合一商品",
+                    "price": 19.9,
+                    "original_price": 29.9,
+                    "activity_price": 19.9,
+                    "coupon_amount": 10.0,
+                    "mall_name": "天猫旗舰店",
+                },
+            }
+        ),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+    }
+
+    # 模拟 5 个典型场景
+    cleaner.run_ai_stage1_batch = lambda *_a, **_kw: {
+        # 场景 1: 券链转链失败
+        "tip_cpn_dead": {
+            "main_tip_id": "tip_cpn_dead",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_cpn_dead"],
+            "combined_raw_text": "白象方便面24袋 [#L1] 拍下26.9元 [#L2]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "DEAD_CPN", "clean_input": "DEAD_CPN", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L2", "raw_span": "MAIN_1", "clean_input": "MAIN_1", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        # 场景 2: 券链转链成功，但 AI-2 遗漏未保留
+        "tip_cpn_dropped": {
+            "main_tip_id": "tip_cpn_dropped",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_cpn_dropped"],
+            "combined_raw_text": "某商品好价 领券 [#L1] 下单 [#L2]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {
+                    "link_id": "L1",
+                    "raw_span": "https://coupon.m.jd.com/coupons/show.action?key=valid_key&roleId=123",
+                    "clean_input": "https://coupon.m.jd.com/coupons/show.action?key=valid_key&roleId=123",
+                    "platform": "jd",
+                    "text_role_hint": "coupon_candidate",
+                },
+                {"link_id": "L2", "raw_span": "MAIN_2", "clean_input": "MAIN_2", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        # 场景 3: 原始线报本无券链（纯直降）
+        "tip_no_coupon": {
+            "main_tip_id": "tip_no_coupon",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_no_coupon"],
+            "combined_raw_text": "直降特惠29.9元 [#L1]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "MAIN_3", "clean_input": "MAIN_3", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        # 场景 4: 重复券链（一残一全），有效链接成功保留
+        "tip_cpn_dup": {
+            "main_tip_id": "tip_cpn_dup",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_cpn_dup"],
+            "combined_raw_text": "领券 [#L1] ( [#L2] ) 拍 [#L3]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "DEAD_CPN", "clean_input": "DEAD_CPN", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {
+                    "link_id": "L2",
+                    "raw_span": "https://coupon.m.jd.com/coupons/show.action?key=full_key&roleId=456",
+                    "clean_input": "https://coupon.m.jd.com/coupons/show.action?key=full_key&roleId=456",
+                    "platform": "jd",
+                    "text_role_hint": "coupon_candidate",
+                },
+                {"link_id": "L3", "raw_span": "MAIN_4", "clean_input": "MAIN_4", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        # 场景 5: 淘系二合一链接（虽标注 coupon_candidate 但实际转出主商品自身）
+        "tip_2in1": {
+            "main_tip_id": "tip_2in1",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_2in1"],
+            "combined_raw_text": "天猫二合一特惠 [#L1]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "https://uland.taobao.com/coupon/edetail?e=test", "clean_input": "https://uland.taobao.com/coupon/edetail?e=test", "platform": "taobao", "text_role_hint": "coupon_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        # 场景 6: 白象方便面原型（短链截断导致非凑单链接失效，且到手价低于官方售价）
+        "tip_bx_truncated": {
+            "main_tip_id": "tip_bx_truncated",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_bx_truncated"],
+            "combined_raw_text": "白象方便面24袋 拍下26.9元 [#L1] [#L2]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "DEAD_CPN_TRUNCATED", "clean_input": "DEAD_CPN_TRUNCATED", "platform": "jd", "text_role_hint": "main_candidate"},
+                {"link_id": "L2", "raw_span": "MAIN_BX", "clean_input": "MAIN_BX", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        # 场景 7: 雪菲力盐汽水原型（冗余数字 SKU 链接 L1 转链失败，CPS 短链 L2 转链成功，到手价等于活动售价 6.9 元）
+        "tip_direct_with_failed_anchor": {
+            "main_tip_id": "tip_direct_with_failed_anchor",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_direct_with_failed_anchor"],
+            "combined_raw_text": "雪菲力盐汽水 6.9元 [#L1] 购买方案：1 加购 [#L2] 2 下单实付6.9元",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "https://item.jd.com/100013333390.html", "clean_input": "https://item.jd.com/100013333390.html", "platform": "jd", "text_role_hint": "main_candidate"},
+                {"link_id": "L2", "raw_span": "MAIN_7_CPS", "clean_input": "MAIN_7_CPS", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+    }
+
+    cleaner.run_ai_stage2_batch = lambda *_a, **_kw: {
+        # 场景 1: AI-2 试图放行（直拍特惠），但券链已死
+        "tip_cpn_dead": {
+            "main_tip_id": "tip_cpn_dead",
+            "is_valid_deal": True,
+            "main_link_id": "L2",
+            "deal_price": 26.9,
+            "coupon_links": [],
+            "tutorial_steps": ["1. 进入本品详情页拍下，实付26.9元"],
+            "quality_score": 85,
+        },
+        # 场景 2: 券链有效，但 AI-2 漏填 coupon_links
+        "tip_cpn_dropped": {
+            "main_tip_id": "tip_cpn_dropped",
+            "is_valid_deal": True,
+            "main_link_id": "L2",
+            "deal_price": 29.9,
+            "coupon_links": [],  # 漏填！
+            "tutorial_steps": ["1. 进入本品详情页拍下"],
+            "quality_score": 85,
+        },
+        # 场景 3: 原始无券，正常直拍
+        "tip_no_coupon": {
+            "main_tip_id": "tip_no_coupon",
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "deal_price": 29.9,
+            "coupon_links": [],
+            "tutorial_steps": ["1. 进入本品详情页下单，实付29.9元"],
+            "quality_score": 85,
+        },
+        # 场景 4: 保留有效券 L2
+        "tip_cpn_dup": {
+            "main_tip_id": "tip_cpn_dup",
+            "is_valid_deal": True,
+            "main_link_id": "L3",
+            "deal_price": 19.9,
+            "coupon_links": [{"link_id": "L2", "label": "优惠券"}],
+            "tutorial_steps": ["1. 上方领券", "2. 拍下商品"],
+            "quality_score": 90,
+        },
+        # 场景 5: 二合一商品
+        "tip_2in1": {
+            "main_tip_id": "tip_2in1",
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "deal_price": 19.9,
+            "coupon_links": [],
+            "tutorial_steps": ["1. 拍下二合一商品"],
+            "quality_score": 88,
+        },
+        # 场景 6: 白象原型，AI-2 试图脑补为无需用券直拍 26.9 元（官方价 36.9）
+        "tip_bx_truncated": {
+            "main_tip_id": "tip_bx_truncated",
+            "is_valid_deal": True,
+            "main_link_id": "L2",
+            "deal_price": 26.9,
+            "coupon_links": [],
+            "tutorial_steps": ["1. 进入本品详情页拍下 1 件，实付 26.9 元"],
+            "quality_score": 85,
+        },
+        # 场景 7: 雪菲力盐汽水原型
+        "tip_direct_with_failed_anchor": {
+            "main_tip_id": "tip_direct_with_failed_anchor",
+            "is_valid_deal": True,
+            "main_link_id": "L2",
+            "deal_price": 6.9,
+            "coupon_links": [],
+            "tutorial_steps": ["1. 进入可口可乐雪菲力详情页加购1件", "2. 直接下单付款实付6.9元"],
+            "quality_score": 94,
+        },
+    }
+
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+    input_records = [
+        {"source_site": "xianbao_fun", "source_channel": "jd", "source_item_id": "tip_cpn_dead", "platform": "jd", "title": "白象方便面", "tutorial_text": "白象方便面", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "xianbao_fun", "source_channel": "jd", "source_item_id": "tip_cpn_dropped", "platform": "jd", "title": "某商品", "tutorial_text": "某商品", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "xianbao_fun", "source_channel": "jd", "source_item_id": "tip_no_coupon", "platform": "jd", "title": "直降商品", "tutorial_text": "直降商品", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "xianbao_fun", "source_channel": "jd", "source_item_id": "tip_cpn_dup", "platform": "jd", "title": "重复券商品", "tutorial_text": "重复券商品", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "xianbao_fun", "source_channel": "tb", "source_item_id": "tip_2in1", "platform": "taobao", "title": "二合一商品", "tutorial_text": "二合一商品", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "haodanku", "source_channel": "jd", "source_item_id": "tip_bx_truncated", "platform": "jd", "title": "白象方便面组合", "tutorial_text": "白象方便面组合", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "guangdiu", "source_channel": "jd", "source_item_id": "tip_direct_with_failed_anchor", "platform": "jd", "title": "雪菲力柠檬味盐汽水", "tutorial_text": "雪菲力柠檬味盐汽水", "extracted_links": [], "extracted_tokens": []},
+    ]
+
+    results = cleaner.clean_batch_records(input_records, mock_col, shared_active_products={}, quiet_sub_logs=True)
+    res_map = {r["source_item_id"]: r for r in results}
+
+    # 验证 1: tip_cpn_dead 必须被拦截且错误码为 ERR_AI2_COUPON_FAILED_OR_DROPPED
+    assert res_map["tip_cpn_dead"]["status"] == "failed"
+    assert res_map["tip_cpn_dead"]["error_code"] == ERR_AI2_COUPON_FAILED_OR_DROPPED
+
+    # 验证 2: tip_cpn_dropped 必须被拦截且错误码为 ERR_AI2_COUPON_FAILED_OR_DROPPED
+    assert res_map["tip_cpn_dropped"]["status"] == "failed"
+    assert res_map["tip_cpn_dropped"]["error_code"] == ERR_AI2_COUPON_FAILED_OR_DROPPED
+
+    # 验证 3: tip_no_coupon 正常成功放行入库
+    assert res_map["tip_no_coupon"]["status"] == "success"
+    assert res_map["tip_no_coupon"]["product_doc"]["deal_info"]["coupon_links"] == []
+
+    # 验证 4: tip_cpn_dup 正常成功放行，且 coupon_links 包含有效券 L2
+    assert res_map["tip_cpn_dup"]["status"] == "success"
+    dup_cpns = res_map["tip_cpn_dup"]["product_doc"]["deal_info"]["coupon_links"]
+    assert len(dup_cpns) == 1
+    assert dup_cpns[0]["link_id"] == "L2"
+
+    # 验证 5: tip_2in1 正常成功放行
+    assert res_map["tip_2in1"]["status"] == "success"
+
+    # 验证 6: tip_bx_truncated 必须被门禁三拦截（缺券断链且到手价低于官方售价）
+    assert res_map["tip_bx_truncated"]["status"] == "failed"
+    assert res_map["tip_bx_truncated"]["error_code"] == ERR_AI2_COUPON_FAILED_OR_DROPPED
+
+    # 验证 7: tip_direct_with_failed_anchor 正常成功放行入库，绝不误杀
+    assert res_map["tip_direct_with_failed_anchor"]["status"] == "success"
+    assert res_map["tip_direct_with_failed_anchor"]["product_doc"]["deal_info"]["coupon_links"] == []
+    assert res_map["tip_direct_with_failed_anchor"]["product_doc"]["deal_info"]["deal_price"] == 6.9
+    assert res_map["tip_direct_with_failed_anchor"]["product_doc"]["deal_info"]["quality_score"] == 94
+
+
+def test_guangdiu_deterministic_coupon_supplement():
+    """
+    验证方案二：针对逛丢（guangdiu）确定性 HTML DOM 结构，
+    当 AI-1 偶发漏提提取出的官方优惠券链接时，
+    Stage 1 规范化逻辑能确定性自动补齐入 extracted_targets，并顺利完成转链与卡片展示。
+    """
+    cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+
+    cleaner.adapters = {
+        "jd": SimpleNamespace(
+            resolve_and_convert_universal=lambda inp: (
+                {
+                    "status": "success",
+                    "resolution_kind": "product",
+                    "goods_id": "JD_SOD",
+                    "goods_sign": "JD_SOD",
+                    "final_link": "https://u.jd.com/promo_sod",
+                    "promotion_token": "！SOD！",
+                    "product": {
+                        "platform": "jd",
+                        "product_id": "JD_SOD",
+                        "name": "巴半SOD蜜",
+                        "price": 5.9,
+                        "original_price": 5.9,
+                        "activity_price": 5.9,
+                        "coupon_amount": 0.0,
+                        "mall_name": "专营店",
+                    },
+                }
+                if "union-click" in inp
+                else {
+                    "status": "success",
+                    "resolution_kind": "coupon_or_venue",
+                    "goods_id": "",
+                    "goods_sign": "",
+                    "final_link": "https://u.jd.com/cpn_5yuan",
+                    "promotion_token": "！CPN5！",
+                    "product": None,
+                }
+            )
+        ),
+        "taobao": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+    }
+
+    # 模拟 AI-1 漏提：输入文案中有券，但 AI-1 只提取了主商品 L1
+    cleaner._call_ai_json_array = lambda *_a, **_kw: [
+        {
+            "main_tip_id": "tip_guangdiu_sod",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_guangdiu_sod"],
+            "extracted_targets": [
+                {
+                    "link_id": "L1",
+                    "raw_span": "https://union-click.jd.com/jdc?e=test",
+                    "clean_input": "https://union-click.jd.com/jdc?e=test",
+                    "platform": "jd",
+                    "text_role_hint": "main_candidate",
+                }
+            ],
+            "deal_price": 0.9,
+            "tutorial_score": 88,
+        }
+    ]
+
+    cleaner.run_ai_stage2_batch = lambda *_a, **_kw: {
+        "tip_guangdiu_sod": {
+            "main_tip_id": "tip_guangdiu_sod",
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "deal_price": 0.9,
+            "coupon_links": [{"link_id": "L2", "label": "满5.9减5元"}],
+            "tutorial_steps": ["1. 领取5元券", "2. 加购下单实付0.9元"],
+            "quality_score": 92,
+        }
+    }
+
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+
+    raw_doc = {
+        "source_site": "guangdiu",
+        "source_channel": "jd",
+        "source_item_id": "tip_guangdiu_sod",
+        "platform": "jd",
+        "title": "巴半 SOD蜜滋润霜 0.9元",
+        "tutorial_text": "巴半 SOD蜜滋润霜 0.9元",
+        "extracted_links": [
+            {
+                "label": "逛丢直达购买链",
+                "url": "https://union-click.jd.com/jdc?e=test",
+                "type": "guangdiu_go_target",
+                "platform": "jd",
+            },
+            {
+                "label": "专属隐藏券 满5.9元减5元（领取链接）",
+                "url": "https://pro.m.jd.com/mall/active/4UzdvZvEJCjjsit1ir62F2xjTagf/index.html",
+                "type": "anchor",
+                "platform": "jd",
+            },
+        ],
+        "extracted_tokens": [],
+    }
+
+    results = cleaner.clean_batch_records([raw_doc], mock_col, shared_active_products={}, quiet_sub_logs=True)
+    res = results[0]
+
+    # 断言：必须成功入库，且 coupon_links 包含自动补齐并成功转链的优惠券
+    assert res["status"] == "success"
+    deal_info = res["product_doc"]["deal_info"]
+    assert deal_info["deal_price"] == 0.9
+    assert len(deal_info["coupon_links"]) == 1
+    assert deal_info["coupon_links"][0]["url"] == "https://u.jd.com/cpn_5yuan"
+    assert deal_info["coupon_links"][0]["token"] == "！CPN5！"
+
+
