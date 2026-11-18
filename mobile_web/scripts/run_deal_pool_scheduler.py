@@ -2818,6 +2818,13 @@ class DealPoolCleaner:
                             "activity_price": round(act_price, 2),
                             "coupon_amount": round(cpn_amt, 2),
                             "shop_name": str(product_card.get("mall_name") or "").strip(),
+                            "commission_rate": float(product_card.get("commission_rate") or res.get("commission_rate") or 0.0),
+                            "commission_amount": float(product_card.get("commission_amount") or res.get("commission_amount") or 0.0),
+                            "image_url": str(product_card.get("image_url") or res.get("image_url") or res.get("pict_url") or "").strip(),
+                            "carousel_images": product_card.get("carousel_images") or res.get("carousel_images") or [],
+                            "category": str(product_card.get("category") or product_card.get("category_name") or ""),
+                            "brand": str(product_card.get("brand") or product_card.get("brand_name") or ""),
+                            "sales_tip": str(product_card.get("sales_tip") if product_card.get("sales_tip") is not None else "0"),
                         },
                         "my_promo_link": promo_link or None,
                         "my_promo_token": promo_token or None,
@@ -4584,6 +4591,13 @@ class DealPoolCleaner:
                     "activity_price": off_prod_fallback.get("activity_price") or off_prod_fallback.get("price") or 0.0,
                     "coupon_amount": off_prod_fallback.get("coupon_amount") or 0.0,
                     "mall_name": off_prod_fallback.get("shop_name") or "",
+                    "commission_rate": float(off_prod_fallback.get("commission_rate") or 0.0),
+                    "commission_amount": float(off_prod_fallback.get("commission_amount") or 0.0),
+                    "image_url": str(off_prod_fallback.get("image_url") or "").strip(),
+                    "carousel_images": off_prod_fallback.get("carousel_images") or [],
+                    "category": str(off_prod_fallback.get("category") or ""),
+                    "brand": str(off_prod_fallback.get("brand") or ""),
+                    "sales_tip": str(off_prod_fallback.get("sales_tip") if off_prod_fallback.get("sales_tip") is not None else "0"),
                 }
 
             my_promo_link = str(main_conv.get("my_promo_link") or "")
@@ -5087,9 +5101,12 @@ def upsert_cleaned_products_to_formal_table(
         set_fields: Dict[str, Any] = {
             **best_doc,
             "updated_at": now,
-            "detail_updated_at": now,
             "last_clean_source": "deal_pool",
         }
+        # 仅当商品真实带有官方高清轮播图且已包含有效佣金时，才标记详情已更新；
+        # 否则避免打上伪造的 detail_updated_at，以便后台 DetailPrefetcher 能自然发现并预取自愈
+        if len(best_doc.get("carousel_images") or []) > 1 and float(best_doc.get("commission_amount") or 0.0) > 0:
+            set_fields["detail_updated_at"] = now
 
         ex_record = existing_map.get((plat, pid))
         ex_di = (ex_record or {}).get("deal_info") if isinstance((ex_record or {}).get("deal_info"), dict) else {}

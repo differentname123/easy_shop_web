@@ -285,7 +285,15 @@
       copyText(text, code ? '✅ 专属邀请链接已复制，好友打开注册即自动填写邀请码！' : '✅ 网站推荐链接已复制，快发给微信好友吧！');
     };
     const handleAvatarError = event => { if (event?.target) event.target.src = DEFAULT_AVATAR; };
-    const handleOrderThumbError = event => { if (event?.target && event.target.src !== DEFAULT_ORDER_THUMB) event.target.src = DEFAULT_ORDER_THUMB; };
+    const handleOrderThumbError = event => {
+      const el = event?.target;
+      if (!el) return;
+      if (el.src && el.src.startsWith('http://') && global.location?.protocol === 'https:') {
+        el.src = el.src.replace(/^http:\/\//, 'https://');
+        return;
+      }
+      if (el.src !== DEFAULT_ORDER_THUMB) el.src = DEFAULT_ORDER_THUMB;
+    };
     return {
       isLoggedIn, uid, userPhone, userProfile, isRegisterMode, formPhone, formPassword, formNickname, formInviteCode,
       isSubmittingAuth, handleRegisterOrLogin, handleLogout, fetchUserInfo, shareSiteInvite,
