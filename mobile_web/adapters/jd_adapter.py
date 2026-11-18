@@ -354,6 +354,7 @@ class JdAdapter(BasePlatformAdapter):
 
             short_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9_-]+", text)
             is_confirmed_venue = False
+            venue_url = ""
             if short_match and not target_id:
                 res = client.resolve_short_url(short_match.group(0))
                 if res.get("status") == "success" and isinstance(res.get("data"), dict):
@@ -368,17 +369,32 @@ class JdAdapter(BasePlatformAdapter):
                             target_id = card.get("goods_sign") or card.get("goods_id")
                         except Exception:
                             pass
+            elif not target_id and not short_match and is_jd_official_venue_url(text):
+                cand_urls = re.findall(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text)
+                cand_venue = next((u for u in cand_urls if is_jd_official_venue_url(u)), "")
+                if cand_venue and product_url(cand_venue):
+                    sku_param_m = re.search(r"[?&](?:sku|mainSku|skuId)=([A-Za-z0-9_]+)", cand_venue, re.IGNORECASE)
+                    if sku_param_m:
+                        target_id = sku_param_m.group(1)
+                    else:
+                        is_confirmed_venue = True
+                        venue_url = cand_venue
 
-            if target_id and not card:
+            is_numeric_sku = bool(target_id and target_id.isdigit())
+            if target_id and not card and not is_numeric_sku:
                 det = self.get_goods_detail(target_id)
                 if det.get("status") == "success" and isinstance(det.get("data"), dict):
                     card = det["data"]
 
             material_url = ""
-            if target_id:
+            if target_id and not is_numeric_sku:
                 material_url = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else target_id
             elif short_match:
                 material_url = short_match.group(0)
+            elif venue_url:
+                material_url = venue_url
+            elif target_id:
+                material_url = target_id
 
             if not material_url and not target_id and not card and not is_confirmed_venue:
                 return _error("NOT_FOUND", "未能识别该京东链接或商品")

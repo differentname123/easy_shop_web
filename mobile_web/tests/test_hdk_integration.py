@@ -767,5 +767,81 @@ def test_jd_adapter_babel_product_resolves_to_single_item():
     assert res.get("convert_status") is None  # 不是会场，单品正常流转！
 
 
+def test_jd_adapter_numeric_sku_from_shortlink_preserves_shorturl_and_skips_detail_waste():
+    """验证当 u.jd.com 解包落地为纯数字 SKU 时：
+    1. 绝不拿纯数字 SKU 去冲击好单库/折淘客详情接口消耗配额；
+    2. 保留原始 u.jd.com 短链用于转链，不覆盖为必定报错的纯数字 SKU。
+    """
+    hdk_mock = Mock()
+    hdk_mock.resolve_short_url.return_value = {
+        "status": "success",
+        "data": {
+            "dest_url": "https://item.m.jd.com/product/100293139120.html",
+            "is_venue": False,
+            "sku_id": "100293139120",
+        },
+    }
+    hdk_mock.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/hdk_short_ok",
+        "click_url": "https://union-click.jd.com/hdk_long_ok",
+        "final_link": "https://u.jd.com/hdk_short_ok",
+        "promoter_id": "2035679405",
+    }
+    ztk_client = Mock()
+    ztk_client.convert_universal_material.return_value = {
+        "status": "error",
+        "error_code": "RATE_LIMIT",
+        "error_msg": "ztk limit",
+    }
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+    res = adapter.resolve_and_convert_universal("https://u.jd.com/462xWY1")
+
+    assert res["status"] == "success"
+    # 严禁拿纯数字去白打详情接口
+    hdk_mock.get_goods_detail.assert_not_called()
+    ztk_client.get_goods_detail.assert_not_called()
+    # 必须传原始短链给转链接口，而非纯数字 SKU
+    hdk_mock.convert_promotion_link.assert_called_once()
+    assert hdk_mock.convert_promotion_link.call_args.args[0] == "https://u.jd.com/462xWY1"
+    assert res["resolution_kind"] == "degraded_product"
+    assert res["detail_lookup_failed"] is True
+
+
+def test_jd_adapter_coupon_url_with_to_item_resolves_as_venue_via_hdk():
+    """验证官方领券链接 coupon.m.jd.com 即使尾部携带 to=item.jd.com/数字.html，也应直接由 HDK 正向转链并判为 coupon_or_venue，不被 ZTK 误杀。"""
+    coupon_url = "https://coupon.m.jd.com/coupons/show.action?key=f0f3eaf97a6d46a78346e7edb0b1d6b4&roleId=3485005903&to=item.jd.com/10072190437649.html"
+    hdk_mock = Mock()
+    hdk_mock.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/oaEmfdS",
+        "click_url": "https://union-click.jd.com/oaEmfdS",
+        "final_link": "https://u.jd.com/oaEmfdS",
+        "promoter_id": "2035679405",
+    }
+    ztk_client = Mock()
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+    res = adapter.resolve_and_convert_universal(coupon_url)
+
+    assert res["status"] == "success"
+    assert res["_provider"] == "hdk_jd_universal"
+    assert res["resolution_kind"] == "coupon_or_venue"
+    assert res["convert_status"] == "coupon_or_activity"
+    assert res["final_link"] == "https://u.jd.com/oaEmfdS"
+    hdk_mock.convert_promotion_link.assert_called_once()
+    assert hdk_mock.convert_promotion_link.call_args.args[0] == coupon_url
+    assert ztk_client.convert_universal_material.call_count == 0
+
+
+
+
 
 
