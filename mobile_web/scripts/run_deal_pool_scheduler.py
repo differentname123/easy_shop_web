@@ -3008,7 +3008,7 @@ class DealPoolCleaner:
         """
         并发执行 Stage 3 官方 API 转链：
         - 淘宝/拼多多通过多线程池全速并发转链；
-        - 京东独立走最多 3 通道受控并发车道（配合 JdClient 单 AppKey 0.22s 发包间隔与多 Key 轮询），兼顾高吞吐与零频控且不挤占淘/拼工作线程。
+        - 京东按折淘客 `appkey` 池规模匹配受控并发车道（1 Key ≈ 1 通道，配合单 Key 限流器避免队列积压超时与上游突发限流）。
         """
         if not unique_targets:
             return
@@ -3031,12 +3031,15 @@ class DealPoolCleaner:
             else:
                 other_targets.append(it)
 
-        # 动态分配车道：京东占据 70%~80% 业务量，按比例动态分配，避免被旧版写死的 3 车道扼住咽喉
+        # 按实际 ZTK appkey 数量控制 JD 并发车道（1 Key 对应 1 通道，上限 6 线程），避免多线程打穿 0.85s 限流队列；
+        # 其余并发槽位全量留给淘宝/拼多多。
+        jd_adapter = self.adapters.get("jd")
+        ztk_key_count = len(getattr(getattr(jd_adapter, "client", None), "appkey_list", ()) or ())
+        jd_lane_cap = min(max(2, ztk_key_count), 6) if ztk_key_count > 0 else 2
+        jd_lane_count = min(self.convert_max_workers, jd_lane_cap, len(jd_targets))
         if not other_targets:
-            jd_lane_count = min(self.convert_max_workers, len(jd_targets))
             other_slots = 0
         else:
-            jd_lane_count = min(max(3, int(self.convert_max_workers * 0.7)), len(jd_targets))
             other_slots = min(max(1, self.convert_max_workers - jd_lane_count), len(other_targets))
         worker_slots = max(1, other_slots + jd_lane_count)
 

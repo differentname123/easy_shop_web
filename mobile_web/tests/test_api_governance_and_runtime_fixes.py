@@ -663,5 +663,58 @@ def test_simplified_robustness_fail_closed_taobao_share_code_prefetch_and_order_
     assert 130 <= ores["data"]["sync_cooldown_remaining"] <= 145
 
 
+def test_stage3_jd_lane_count_scales_with_ztk_keys():
+    """验证 Stage 3 京东车道并发上限受 ZTK appkey 数量约束，防止 20 线程自伤踩踏，同时不挤占淘/拼并发。"""
+    import threading
+    from mobile_web.scripts import run_deal_pool_scheduler as sched
+
+    cleaner = sched.DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=20)
+    cleaner.adapters["jd"] = SimpleNamespace(client=SimpleNamespace(appkey_list=("k1", "k2", "k3")))
+
+    lock = threading.Lock()
+    active_jd, max_jd = 0, 0
+    active_other, max_other = 0, 0
+
+    def _fake_convert(tgt, default_plat="unknown"):
+        nonlocal active_jd, max_jd, active_other, max_other
+        plat = tgt.get("platform") or default_plat
+        if plat == "jd":
+            with lock:
+                active_jd += 1
+                max_jd = max(max_jd, active_jd)
+            time.sleep(0.03)
+            with lock:
+                active_jd -= 1
+        else:
+            with lock:
+                active_other += 1
+                max_other = max(max_other, active_other)
+            time.sleep(0.03)
+            with lock:
+                active_other -= 1
+        return {"convert_status": "product", "platform": plat, "error_code": "OK", "error_msg": ""}
+
+    cleaner.convert_single_target = _fake_convert
+    mixed_targets = [
+        ({"link_id": f"J{i}", "clean_input": f"https://u.jd.com/k{i}", "platform": "jd"}, "jd")
+        for i in range(12)
+    ] + [
+        ({"link_id": f"T{i}", "clean_input": f"https://m.tb.cn/h.{i}", "platform": "taobao"}, "taobao")
+        for i in range(6)
+    ]
+    cleaner.run_stage3_concurrent_conversions(mixed_targets, quiet_sub_logs=True)
+    assert 1 <= max_jd <= 3
+    assert max_other >= 4
+
+    max_jd = 0
+    pure_jd = [
+        ({"link_id": f"P{i}", "clean_input": f"https://u.jd.com/p{i}", "platform": "jd"}, "jd")
+        for i in range(9)
+    ]
+    cleaner.run_stage3_concurrent_conversions(pure_jd, quiet_sub_logs=True)
+    assert 1 <= max_jd <= 3
+
+
+
 
 
