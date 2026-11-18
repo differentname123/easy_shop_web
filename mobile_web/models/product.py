@@ -17,6 +17,29 @@ def normalize_platform(platform: Optional[str], default: str = "pdd") -> str:
     return "taobao" if code == "tb" else code
 
 
+SOURCE_SITE_NAMES: Dict[str, str] = {
+    "tehuicaicai": "特惠采采",
+    "haodanku": "好单库",
+    "zhetaoke": "折淘客",
+    "xianbao_fun": "线报酷",
+    "0818tuan": "0818团",
+    "guangdiu": "逛丢",
+    "xuandan": "选单网",
+    "bacaoo": "拔草哦",
+    "smzdm": "什么值得买",
+    "manmanbuy": "慢慢买",
+    "iehou": "网猴线报",
+    "gwdang": "购物党",
+    "55haitao": "55海淘",
+}
+
+
+def get_source_site_name(source_site: Optional[str]) -> str:
+    """获取线报信息源的中文显示名称（单一真源）"""
+    code = str(source_site or "").strip().lower()
+    return SOURCE_SITE_NAMES.get(code, code)
+
+
 _TB_CURRENCY_OR_EMOJI_CHARS = r"￥¥$€₴£¢💲🗝🔑🔐"
 _TB_WRAP_CHARS = _TB_CURRENCY_OR_EMOJI_CHARS + r"()（）/【】「」《》~|💰👉📲📦🎁"
 _SHARE_CODE_PAT = r"(?:CZ|CA|AC|ZH|MF|HU|TG|AA|SY|YD|TK)\s*\d{2,6}"
@@ -411,6 +434,8 @@ class ProductSummary(BaseModel):
     platform_name: str = "拼多多"
     goods_id: str = ""
     goods_sign: str = ""
+    deal_source: str = ""
+    deal_source_name: str = ""
     name: str
     image_url: str
     product_url: str = ""

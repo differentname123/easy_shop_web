@@ -114,6 +114,7 @@ from models.product import (
     extract_canonical_goods_id,
     extract_jd_image_key,
     extract_taobao_token_core,
+    get_source_site_name,
     is_jd_image_key,
 )
 from mobile_web.scripts.goods_info_format import string_to_object
@@ -125,6 +126,7 @@ from mobile_web.scripts.test_deal_sites_scraper import (
     fetch_haodanku_weal_list,
     fetch_haodanku_wire_report,
     fetch_iehou_deals,
+    fetch_tehuicaicai_deals,
     fetch_xianbao_fun_deals,
     fetch_xuandan_deals,
     fetch_zhetaoke_rank_list,
@@ -147,6 +149,19 @@ DEAL_INFO_PROTECTION_HOURS = 12.0
 DEAL_FORMAL_EXPIRY_HOURS = 72.0
 DEAL_RAW_TTL_DAYS = 14
 DEAL_MAX_CLEAN_AGE_DAYS = 2
+
+# ==============================================================================
+# 高质量信源与专员严选渠道信誉加分表 (Source Reputation Bonus)
+# ------------------------------------------------------------------------------
+# 业务设计：
+# 1. 仅对官方接口成功验真出单品 (convert_status == "product") 且 AI 终审通过 (is_valid_deal == True) 的合格品生效；
+# 2. 仅当原始评分达到及格基线 (raw_score >= QUALIFIED_DEAL_MIN_SCORE，即 60分) 时激活，绝不让次品或死链借加分偷渡入库；
+# 3. 最终得分严格执行 100 分封顶截断 (min(100, raw_score + bonus))；
+# 4. 支持按站点名 ("tehuicaicai") 或站点细分频道 ("site:channel") 配置，方便未来灵活扩展其他优质信源与微调分值。
+# ==============================================================================
+SOURCE_REPUTATION_BONUS: Dict[str, int] = {
+    "tehuicaicai": 10,  # 特惠采采/惠享购：专员人工严选集采，自带高清白底图与视频教程，信噪比极高
+}
 MAX_CLEAN_RETRIES = 3
 MAX_ANCHOR_CACHE_SIZE = 8000
 MAX_JSONL_FILE_BYTES = 10 * 1024 * 1024
@@ -3613,6 +3628,7 @@ class DealPoolCleaner:
                 continue
             docs_by_tip_id[mid] = doc
             site = str(doc.get("source_site") or "")
+            site_name = get_source_site_name(site)
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
 
@@ -3680,6 +3696,9 @@ class DealPoolCleaner:
                     "error_code": OK_SKIPPED_ALREADY_CLEANED,
                     "error_msg": f"前置锚点缓存命中已入库唯一商品({c_plat}:{c_gid})，提前终止跳过AI-1/转链/AI-2并累加共振",
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "platform": c_plat,
@@ -3808,6 +3827,7 @@ class DealPoolCleaner:
             if not mid or mid in outcomes_by_id:
                 continue
             site = str(doc.get("source_site") or "")
+            site_name = get_source_site_name(site)
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
             ai1_res = ai1_results.get(mid) or {}
@@ -3821,6 +3841,9 @@ class DealPoolCleaner:
                     "error_msg": f"群聊连续碎片已合并入相邻主线报 {parent_id}".strip(),
                     "merged_into_tip_id": parent_id,
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "title": raw_title,
@@ -3883,6 +3906,9 @@ class DealPoolCleaner:
                     "error_code": ERR_NO_ANCHOR,
                     "error_msg": "Stage 1 AI 未在爆料文本中识别出任何淘/京/拼链接或口令",
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "title": raw_title,
@@ -4005,6 +4031,7 @@ class DealPoolCleaner:
         for doc in selected_docs:
             mid = str(doc.get("source_item_id") or "")
             site = str(doc.get("source_site") or "")
+            site_name = get_source_site_name(site)
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
             ai1_res = doc.get("ai_stage1_result") or {}
@@ -4116,6 +4143,9 @@ class DealPoolCleaner:
                     "error_code": primary_err_code,
                     "error_msg": primary_err_msg,
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "title": raw_title,
@@ -4170,6 +4200,9 @@ class DealPoolCleaner:
                     "error_code": ERR_AI2_MAIN_DEAD_ONLY_FILLER,
                     "error_msg": "主商品链接转链失败，仅凑单品链接存活，提前终止拦截",
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "title": raw_title,
@@ -4227,6 +4260,9 @@ class DealPoolCleaner:
                     "error_code": OK_SKIPPED_ALREADY_CLEANED,
                     "error_msg": f"转链唯一商品({c_plat}:{c_gid})已在正式库清洗完毕(12h内)，提前终止跳过AI-2并累加共振",
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "platform": c_plat,
@@ -4277,6 +4313,7 @@ class DealPoolCleaner:
         post_stage3_batch_early_count = 0
         for mid, doc, ai1_res, conv_list, single_pid, _r_score in post_stage3_candidates:
             site = str(doc.get("source_site") or "")
+            site_name = get_source_site_name(site)
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
 
@@ -4301,6 +4338,9 @@ class DealPoolCleaner:
                     "error_code": OK_SKIPPED_ALREADY_CLEANED,
                     "error_msg": f"同批次已有更优线报({winner_mid})命中同一唯一商品({c_plat}:{c_gid})，提前终止跳过AI-2并累加共振",
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "platform": c_plat,
@@ -4468,6 +4508,7 @@ class DealPoolCleaner:
         for doc in selected_docs:
             mid = str(doc.get("source_item_id") or "")
             site = str(doc.get("source_site") or "")
+            site_name = get_source_site_name(site)
             channel = str(doc.get("source_channel") or "")
             raw_title = str(doc.get("title") or "").strip()
             ai1_res = doc.get("ai_stage1_result") or {}
@@ -4558,6 +4599,9 @@ class DealPoolCleaner:
                     "error_code": err_code,
                     "error_msg": f"AI-2 终审拦截 ({rej})",
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "title": raw_title,
@@ -4576,6 +4620,22 @@ class DealPoolCleaner:
                 quality_score = 0
             quality_score = max(0, min(100, quality_score))
             score_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
+
+            # 高质量信源信誉加分 (Source Reputation Bonus)
+            # 严格门禁：1. is_valid 且主商品单品验真存活 (前序已校验通过)；2. 原始分达到及格线 (>=60)；3. 上限 100 封顶截断
+            source_bonus = (
+                SOURCE_REPUTATION_BONUS.get(f"{site}:{channel}")
+                or SOURCE_REPUTATION_BONUS.get(site, 0)
+            )
+            if source_bonus > 0 and quality_score >= QUALIFIED_DEAL_MIN_SCORE:
+                raw_base_score = quality_score
+                quality_score = min(100, quality_score + source_bonus)
+                score_breakdown["base_quality_score"] = raw_base_score
+                score_breakdown["source_reputation_bonus"] = source_bonus
+                logger.info(
+                    "站点 [%s:%s] 命中高质量信源加分: 原始分 %d -> 加权分 %d (+%d)",
+                    site, channel, raw_base_score, quality_score, source_bonus,
+                )
 
             plat = str(main_conv.get("platform") or "")
             goods_id = str(main_conv.get("goods_id") or "")
@@ -4774,6 +4834,9 @@ class DealPoolCleaner:
             publish_time_str = str(doc.get("publish_time") or doc.get("fetched_at") or "").strip()
             deal_price_text = f"{deal_price}元" if deal_price is not None else (unit_deal_price or "")
 
+            site_name = get_source_site_name(site)
+            provider_nickname = str((doc.get("hot_metrics") or {}).get("provider_nickname") or "").strip()
+
             deal_info = {
                 "is_deal_tip": True,
                 "quality_score": quality_score,
@@ -4796,8 +4859,10 @@ class DealPoolCleaner:
                 "my_promotion_link": my_promo_link,
                 "my_promotion_token": my_promo_token,
                 "source_site": site,
+                "source_site_name": site_name,
                 "source_channel": channel,
                 "source_item_id": mid,
+                "provider_nickname": provider_nickname,
                 "source_url": source_detail_url,
                 "source_list_page_url": source_list_page_url,
                 "source_detail_url": source_detail_url,
@@ -4815,6 +4880,8 @@ class DealPoolCleaner:
                 "product_id": goods_id,
                 "goods_id": goods_id,
                 "goods_sign": goods_sign,
+                "deal_source": site,
+                "deal_source_name": site_name,
                 "name": str(product_card.get("name") or adapter_res.get("title") or clean_title).strip(),
                 "brand": str(product_card.get("brand") or product_card.get("brand_name") or ""),
                 "category": str(product_card.get("category") or product_card.get("category_name") or ""),
@@ -4847,6 +4914,9 @@ class DealPoolCleaner:
                     "error_code": ERR_LOW_QUALITY_SCORE,
                     "error_msg": f"综合评分 {quality_score} < {QUALIFIED_DEAL_MIN_SCORE} 分，仅留存初步表不入正式表",
                     "source_site": site,
+                    "source_site_name": site_name,
+                    "deal_source": site,
+                    "deal_source_name": site_name,
                     "source_channel": channel,
                     "source_item_id": mid,
                     "platform": plat,
@@ -5163,10 +5233,15 @@ def upsert_cleaned_products_to_formal_table(
             if mid and mid not in seen_tids:
                 seen_tids.add(mid)
                 pub_t = str(di.get("publish_time") or "")
+                s_site = str(di.get("source_site") or "")
+                s_name = str(di.get("source_site_name") or get_source_site_name(s_site))
+                p_nick = str(di.get("provider_nickname") or (di.get("hot_metrics") or {}).get("provider_nickname") or "")
                 batch_timeline_entries.append({
                     "tip_id": mid,
-                    "source_site": str(di.get("source_site") or ""),
+                    "source_site": s_site,
+                    "source_site_name": s_name,
                     "source_channel": str(di.get("source_channel") or ""),
+                    "provider_nickname": p_nick,
                     "publish_time": pub_t,
                     "publish_ts": parse_publish_time_epoch(pub_t) or 0.0,
                     "title": str(di.get("raw_tip_title") or d.get("name") or ""),
@@ -6250,7 +6325,7 @@ def run_fetch_stage(
 ) -> Dict[str, Any]:
     """
     执行单轮【阶段一（Producer）：多站点好价拉取入初步表 `deal_raw_tips`】：
-    - T0 核心源（24 个高可靠任务）全量覆盖 8 大高可靠站点与高转化拼多多专属源，每轮必跑；
+    - T0 核心源（25 个高可靠任务）全量覆盖 9 大高可靠站点与高转化拼多多专属源，每轮必跑；
     - T1 扩充源（27 个高可靠任务）涵盖细分采集群、拼多多扩展翻页与豆瓣/赚客吧/酷安专组，在 `--all-channels` 或偶数轮运行。
     - 已永久放弃 `gwdang`（购物党 100% 纯数字 SKU 0% 转化）与 `xianbao_fun/category_man`（慢慢买 `discuxiao_` 加密跳板壳）。
     """
@@ -6265,6 +6340,7 @@ def run_fetch_stage(
     tuan0818_done = repo.get_existing_detailed_ids("0818tuan", limit=3000)
     bacaoo_done = repo.get_existing_detailed_ids("bacaoo", limit=2000)
     iehou_done = repo.get_existing_detailed_ids("iehou", limit=2000)
+    tehuicaicai_done = repo.get_existing_detailed_ids("tehuicaicai", limit=4000)
 
     # ---------------- T0 高频核心源（每轮必跑：24 个高产频道，100% 覆盖全部 8 大高可靠站点 + 四大拼多多专属源） ----------------
     tasks: List[Tuple[str, str, str, str, Callable[[], Dict[str, Any]], float]] = [
@@ -6403,6 +6479,24 @@ def run_fetch_stage(
                 skip_detail_ids=tuan0818_done,
             ),
             0.5,
+        ),
+        (
+            "特惠采采_专员精选好价流",
+            "tehuicaicai",
+            "T0_high_freq",
+            "https://xhhcds.cn/api/v1/public/home-products/?feed=home",
+            lambda: fetch_tehuicaicai_deals(
+                channel="home",
+                page=1,
+                page_size=50,
+                max_pages=10,
+                auto_paginate=True,
+                fetch_detail=True,
+                max_details=max_new_details_per_channel,
+                session=session,
+                skip_detail_ids=tehuicaicai_done,
+            ),
+            0.3,
         ),
         # ⏸️【暂缓抓取：拔草哦_国内优惠口令（实测成材率 0.0%）】
         # 停用原因：实测抓取 17 条淘汰 17 条（0% 入库），全为纯文字口令且缺少有效商品签名与转链卡片，目前无法转出正式单品，暂停抓取以节省 AI 算力。如需恢复直接取消注释即可：
@@ -7004,6 +7098,8 @@ def run_fetch_stage(
                         bacaoo_done.add(sid)
                     elif site_key == "iehou":
                         iehou_done.add(sid)
+                    elif site_key == "tehuicaicai":
+                        tehuicaicai_done.add(sid)
 
             db_res = repo.save_batch(records, task_name=task_name)
             cost_ms = round((time.perf_counter() - t0) * 1000, 1)

@@ -19,12 +19,18 @@ from models.product import (
     clean_product_id,
     extract_canonical_goods_id,
     extract_search_keyword,
+    get_source_site_name,
     is_jd_image_key,
     normalize_platform,
     resolve_item_identity,
     utc_millis,
 )
 from config import PROMOTION_LINK_TTL, logger
+from infrastructure.search_meili import (
+    search_products,
+    index_documents,
+    is_meili_available,
+)
 
 
 SKU_UNIT_BASE_MAPPING = {
@@ -217,6 +223,17 @@ class ProductRepository(BaseRepository):
             insert_set["goods_sign"] = goods_id
 
         return update_set, insert_set
+
+    def _is_meili_searchable(self) -> bool:
+        """仅在具备真实持久化集合且 Meilisearch 处于健康状态时启用全文检索；单元测试内存集合默认保留本地管道断言。"""
+        if getattr(self, "_force_meili_enabled", None) is True:
+            return True
+        if getattr(self, "_force_meili_enabled", None) is False:
+            return False
+        col = getattr(self, "col", None)
+        if col is None or type(col).__name__ != "Collection":
+            return False
+        return is_meili_available()
 
     @staticmethod
     def _amount_float(value: Any) -> float:
@@ -666,16 +683,42 @@ class ProductRepository(BaseRepository):
         5. 尚未完成 format_info 清洗的商品按最新上架顺序排在末尾用作兜底。
         """
         filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
-        cursor = (
-            self.col.find(
-                {"$and": [filter_query, self._boom_content_filter()]},
-                self._COST_PERFORMANCE_PROJECTION,
+        raw_docs = None
+
+        if keyword and keyword.strip() and self._is_meili_searchable():
+            try:
+                raw_kw = keyword.strip()
+                cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
+                meili_hits = search_products(
+                    keyword=cleaned_kw,
+                    platform=platform,
+                    category=category,
+                    limit=self._MAX_COST_PERFORMANCE_CANDIDATES,
+                )
+                if meili_hits is not None:
+                    doc_keys = [(h.get("platform"), h.get("product_id")) for h in meili_hits]
+                    or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
+                    if or_clauses:
+                        mongo_docs = list(self.col.find({"$or": or_clauses}, self._COST_PERFORMANCE_PROJECTION))
+                        docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
+                        raw_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
+                    else:
+                        raw_docs = []
+            except Exception as meili_exc:
+                logger.warning("⚠️ 【Meilisearch性价比候选检索降级】: %s", format_exc_summary(meili_exc))
+                raw_docs = None
+
+        if raw_docs is None:
+            cursor = (
+                self.col.find(
+                    {"$and": [filter_query, self._boom_content_filter()]},
+                    self._COST_PERFORMANCE_PROJECTION,
+                )
+                .sort([("updated_at", -1)])
+                .limit(self._MAX_COST_PERFORMANCE_CANDIDATES)
+                .max_time_ms(2000)
             )
-            .sort([("updated_at", -1)])
-            .limit(self._MAX_COST_PERFORMANCE_CANDIDATES)
-            .max_time_ms(2000)
-        )
-        raw_docs = list(cursor)
+            raw_docs = list(cursor)
 
         formatted_candidates: List[Tuple[Dict[str, Any], List[Tuple[float, str, Dict[str, float]]]]] = []
         unformatted_items: List[Dict[str, Any]] = []
@@ -861,6 +904,47 @@ class ProductRepository(BaseRepository):
 
         filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
 
+        if keyword and keyword.strip() and self._is_meili_searchable():
+            try:
+                raw_kw = keyword.strip()
+                cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
+                meili_hits = search_products(
+                    keyword=cleaned_kw,
+                    platform=platform,
+                    category=category,
+                    sort_by=sort_by,
+                    limit=page_size + 1,
+                    offset=skip,
+                )
+                if meili_hits is not None:
+                    if not meili_hits:
+                        return {
+                            "status": "success",
+                            "total_count": 0,
+                            "page": page,
+                            "page_size": page_size,
+                            "has_more": False,
+                            "data": [],
+                        }
+                    doc_keys = [(h.get("platform"), h.get("product_id")) for h in meili_hits]
+                    or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
+                    if or_clauses:
+                        mongo_docs = list(self.col.find({"$or": or_clauses}, self._SUMMARY_PROJECTION))
+                        docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
+                        ordered_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
+                        has_more = len(ordered_docs) > page_size
+                        items = [self._normalize_doc_summary(doc) for doc in ordered_docs[:page_size]]
+                        return {
+                            "status": "success",
+                            "total_count": len(items),
+                            "page": page,
+                            "page_size": page_size,
+                            "has_more": has_more,
+                            "data": items,
+                        }
+            except Exception as meili_exc:
+                logger.warning("⚠️ 【Meilisearch商品检索降级】: %s", format_exc_summary(meili_exc))
+
         sort_mapping = {
             "latest": [("updated_at", -1)],
             "save_desc": [("saved_price", -1), ("updated_at", -1)],
@@ -917,6 +1001,13 @@ class ProductRepository(BaseRepository):
         from adapters import platform_name
 
         platform, goods_id, goods_sign = self._identity(doc)
+        deal_info = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
+        deal_source = str(doc.get("deal_source") or deal_info.get("source_site") or "").strip()
+        deal_source_name = str(
+            doc.get("deal_source_name")
+            or deal_info.get("source_site_name")
+            or get_source_site_name(deal_source)
+        ).strip()
         activity_price = self._amount_float(self._first_present(doc, "activity_price", "price", default=0.0))
         original_price = self._amount_float(self._first_present(doc, "original_price", default=activity_price))
         saved_price = self._amount_float(self._first_present(doc, "saved_price", "coupon_amount", default=max(0.0, round(original_price - activity_price, 2))))
@@ -940,6 +1031,8 @@ class ProductRepository(BaseRepository):
             "product_id": goods_id or goods_sign,
             "goods_id": goods_id,
             "goods_sign": goods_sign,
+            "deal_source": deal_source,
+            "deal_source_name": deal_source_name,
             "name": doc.get("name", "未命名商品"),
             "brand": doc.get("brand") or "",
             "category": doc.get("category") or "",
@@ -1343,6 +1436,11 @@ class ProductRepository(BaseRepository):
                 "【商品摘要入库】批量写入首页推荐商品完成 | 频道[%s] 变更数量[%d条] 提交总数[%d条]",
                 channel_type if channel_type is not None else "-", upserted_count, len(operations),
             )
+            if self._is_meili_searchable():
+                try:
+                    index_documents(goods_list)
+                except Exception:
+                    pass
             return upserted_count
         except Exception as e:
             logger.warning(
@@ -1417,7 +1515,14 @@ class ProductRepository(BaseRepository):
                 if getattr(result, "acknowledged", False) is not True:
                     return False
                 if result.matched_count == 1:
-                    return result.modified_count == 1
+                    if result.modified_count == 1:
+                        if self._is_meili_searchable():
+                            try:
+                                index_documents([detail])
+                            except Exception:
+                                pass
+                        return True
+                    return False
                 # 条件失败说明读后有新详情写入，重新判断胜出来源时间，不无条件重试覆盖。
             return False
         except Exception as e:

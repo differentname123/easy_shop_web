@@ -57,6 +57,9 @@ class Settings:
     jd_app_key: str = ""
     jd_app_secret: str = field(default="", repr=False)
     jd_api_base: str = "http://api.zhetaoke.com:20000/api"
+    meilisearch_url: str = "http://localhost:7700"
+    meilisearch_key: str = field(default="", repr=False)
+    meilisearch_enabled: bool = True
 
 
 def app_path(value) -> Path:
@@ -259,6 +262,10 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
     if not 60 <= detail_prefetch_interval_seconds <= 300:
         raise SettingsError("web_detail_prefetch_interval_seconds 必须是 60 到 300 的整数")
 
+    meilisearch_url = text("meilisearch_url", "http://localhost:7700").strip()
+    meilisearch_key = text("meilisearch_key", "").strip()
+    meilisearch_enabled = _boolean(values.get("meilisearch_enabled", True), "meilisearch_enabled")
+
     return Settings(
         pdd_client_id=pdd_client_id, pdd_client_secret=pdd_client_secret, pdd_pid=pdd_pid,
         mongo_host=mongo_host, mongo_port=mongo_port,
@@ -279,6 +286,8 @@ def load_settings(config_file=None, environ=None, *, require_credentials=True) -
         ztk_appkey=ztk_appkey, ztk_appkey_list=ztk_appkey_list, ztk_sid=ztk_sid, ztk_sid_list=ztk_sid_list,
         jd_enabled=jd_enabled, jd_union_id=jd_union_id, jd_position_id=jd_position_id,
         jd_app_key=jd_app_key, jd_app_secret=jd_app_secret, jd_api_base=jd_api_base,
+        meilisearch_url=meilisearch_url, meilisearch_key=meilisearch_key,
+        meilisearch_enabled=meilisearch_enabled,
     )
 
 

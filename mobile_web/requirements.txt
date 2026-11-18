@@ -13,3 +13,5 @@ python-multipart
 openai
 httpx==0.28.1
 socksio
+meilisearch>=0.43.0
+

@@ -1459,6 +1459,7 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
     monkeypatch.setattr(dps, "fetch_0818tuan_deals", ok_stub)
     monkeypatch.setattr(dps, "fetch_bacaoo_deals", ok_stub)
     monkeypatch.setattr(dps, "fetch_iehou_deals", ok_stub)
+    monkeypatch.setattr(dps, "fetch_tehuicaicai_deals", ok_stub)
 
     repo = MagicMock()
     repo.get_existing_detailed_ids.return_value = set()

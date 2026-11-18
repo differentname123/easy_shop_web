@@ -28,7 +28,8 @@
     只要通道能稳定产出含唯一商品锚点的记录，即使混有杂讯（有效比例低）也完全可取，后续通过正则/关键字规则过滤即可。
 
 三、【候选网站与细分频道最终取舍结论（严禁后续重复踩坑尝试已剔除站点）】
-  1. ✅ 正式纳入定时任务的 8 大高可靠站点（51 个有效子频道，含拼多多高产专属流）：
+  1. ✅ 正式纳入定时任务的 9 大高可靠站点（53 个有效子频道，含拼多多与专员严选高产专属流）：
+     - 【特惠采采 / 惠享购 (`xhhcds.cn`)】：免登纯净 RESTful JSON 接口（`/public/home-products/` 首页 Feed + `/public/categories/` 20大分类 + `/products/{id}/`），0 风控，发单专员人工严选高频快消好货，100% 包含京东 `u.jd.com`、拼多多 `p.pinduoduo.com` 官方推广短链与领券跳转链，转链成功率 100%。
      - 【好单库 (`haodanku.com`)】：免登纯净 JSON（`wire_report` 京东10004/淘宝10003/百补10005/飞猪10367/综合0 + `weal_list` 福利清单），0 风控，
        100% 包含 `https://u.jd.com/xxx` 短链或淘宝 46 位加密 `item_id`。
      - 【折淘客 (`zhetaoke.com`)】：免登直连 150+ 个真实 QQ/微信采集群实时大厅 (`xianbao.aspx` 京东群/淘宝群/拼多多群/综合群及高产群专流) +
@@ -2431,6 +2432,292 @@ def fetch_xuandan_deals(
 
 
 # ==============================================================================
+# 【T0-9】特惠采采 / 惠享购 专员精选集采好价流 (`https://xhhcds.cn/`)
+# ==============================================================================
+def fetch_tehuicaicai_deals(
+    channel: str = "home",
+    page: int = 1,
+    page_size: int = 50,
+    max_pages: int = 10,
+    category_id: Optional[int] = None,
+    fetch_detail: bool = True,
+    max_details: int = 30,
+    session: Optional[requests.Session] = None,
+    timeout: float = 10.0,
+    skip_detail_ids: Optional[set] = None,
+    auto_paginate: bool = True,
+) -> Dict[str, Any]:
+    """
+    【T0-9】特惠采采 / 惠享购 专员精选集采好价流 (`https://xhhcds.cn/`)
+    - 平台背景：
+      由济宁星汇海川电商有限公司运营，App 包名为 `cn.xhhcds.tehuicaicai`，Web/H5 端为 `https://xhhcds.cn/`。
+      全站商品均由发单专员人工精选（高频快消、食品生鲜、纸品清洁、酒水饮料），
+      商品质量高、客单实惠，每条均带有真实购买指引、领券链接与京东/拼多多单品直达短链。
+    - 水位线增量翻页机制 (Watermark Early-Stop Incremental Pagination):
+      * 每一轮调度默认从第 1 页开始扫描；
+      * 若当前页发现未入库新商品，则继续拉取下一页，直到某页全部商品均为已存数据 (new_items_on_page == 0) 或到达末页时自动终止；
+      * 常态无更新时：仅请求 1 次第 1 页 (~150ms)，详情请求为 0；
+      * 冷启动或专员发新单时：顺畅自动向后翻页拉全，不留死角、不漏任何新商品，亦不进行无谓的重复请求。
+    """
+    http = session or requests.Session()
+    base_api = "https://xhhcds.cn/api/v1"
+    skip_set = skip_detail_ids or set()
+
+    records: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    detail_fetched = 0
+    detail_attempted = 0
+    detail_circuit_broken = False
+    detail_errors: List[Dict[str, Any]] = []
+    total_items = 0
+    pages_crawled = 0
+    current_page = page
+    primary_req_url = ""
+    t0 = time.perf_counter()
+
+    while current_page <= max_pages:
+        if channel == "category" and category_id:
+            list_url = f"{base_api}/public/categories/{category_id}/products/?page={current_page}&page_size={page_size}"
+            web_page_url = f"https://xhhcds.cn/#/category?id={category_id}"
+            channel_name = f"category_{category_id}"
+        else:
+            list_url = f"{base_api}/public/home-products/?feed=home&page={current_page}&page_size={page_size}"
+            web_page_url = "https://xhhcds.cn/"
+            channel_name = "home_products"
+
+        if not primary_req_url:
+            primary_req_url = list_url
+
+        headers = {
+            **DEFAULT_HEADERS,
+            "Accept": "application/json",
+            "Referer": web_page_url,
+            "X-Request-ID": f"fetch-thcc-{int(time.time()*1000)}-{current_page}",
+        }
+
+        try:
+            resp = http.get(list_url, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                if pages_crawled == 0:
+                    return {
+                        "status": "error",
+                        "http_status": resp.status_code,
+                        "request_url": list_url,
+                        "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                        "count": 0,
+                        "detail_fetched": 0,
+                        "detail_errors": [{"error": f"HTTP {resp.status_code}", "http_status": resp.status_code}],
+                        "records": [],
+                    }
+                break
+            body = resp.json()
+        except Exception as e:
+            if pages_crawled == 0:
+                return {
+                    "status": "error",
+                    "http_status": getattr(resp, "status_code", None) if "resp" in locals() else None,
+                    "request_url": list_url,
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                    "count": 0,
+                    "detail_fetched": 0,
+                    "detail_errors": [{"error": str(e), "error_type": type(e).__name__}],
+                    "records": [],
+                }
+            break
+
+        data_block = body.get("data") if isinstance(body, dict) else {}
+        if not isinstance(data_block, dict):
+            data_block = {}
+
+        raw_items = data_block.get("items") or []
+        if not isinstance(raw_items, list) or not raw_items:
+            break
+
+        pagination = data_block.get("pagination") or {}
+        total_items = pagination.get("total", len(raw_items))
+        pages_crawled += 1
+        new_items_on_page = 0
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if not item_id or item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+
+            is_known = item_id in skip_set
+            if not is_known:
+                new_items_on_page += 1
+
+            title = str(item.get("title") or "").strip()
+            platform_code = str(item.get("platform_code") or "").strip().lower()
+            platform_name = str(item.get("platform_name") or ("京东" if platform_code == "jd" else ("拼多多" if platform_code == "pdd" else ""))).strip()
+            display_price = str(item.get("display_price") or "").strip()
+            cover_info = item.get("cover_image") or {}
+            image_url = ""
+            if isinstance(cover_info, dict):
+                image_url = str(cover_info.get("public_url") or cover_info.get("direct_public_url") or "").strip()
+
+            source_url = f"https://xhhcds.cn/#/product/{item_id}"
+            source_detail_url = f"{base_api}/products/{item_id}/"
+
+            hot_metrics: Dict[str, Any] = {
+                "sold_count": item.get("sold_count"),
+                "badge_text": item.get("badge_text"),
+                "platform_code": platform_code,
+            }
+            publish_time = ""
+            has_full_detail = is_known  # 若在 skip_set 中，说明数据库中已有详情记录
+
+            tutorial_text = f"【{platform_name or '特惠采采'}】{title}\n到手价: {display_price}".strip()
+            tutorial_images: List[str] = [image_url] if image_url else []
+            extracted_links: List[Dict[str, Any]] = []
+            extracted_tokens: List[str] = []
+            raw_payload: Any = item
+
+            # 若未爬取过详情且未熔断，且未达到单轮详情上限，则发起详情拉取
+            if fetch_detail and not detail_circuit_broken and detail_attempted < max_details and not is_known:
+                if detail_attempted > 0:
+                    time.sleep(0.08)
+                detail_attempted += 1
+                try:
+                    det_headers = {
+                        **DEFAULT_HEADERS,
+                        "Accept": "application/json",
+                        "Referer": source_url,
+                        "X-Request-ID": f"fetch-thcc-det-{item_id}-{int(time.time()*1000)}",
+                    }
+                    r_det = http.get(source_detail_url, headers=det_headers, timeout=timeout)
+                    if r_det.status_code == 200:
+                        det_body = r_det.json()
+                        det = det_body.get("data") if isinstance(det_body, dict) else {}
+                        if isinstance(det, dict) and det:
+                            detail_fetched += 1
+                            has_full_detail = True
+                            raw_payload = det
+
+                            cmd_text = str(det.get("material_info", {}).get("command_text") or "").strip()
+                            second_cmd = str(det.get("material_info", {}).get("second_command_text") or "").strip()
+                            desc_html = str(det.get("description_html") or "").strip()
+                            provider = str(det.get("provider_nickname") or "").strip()
+                            if provider:
+                                hot_metrics["provider_nickname"] = provider
+
+                            publish_time = str(det.get("updated_at") or det.get("created_at") or "")
+
+                            # 提取视频教程
+                            tutorials = det.get("tutorials") or []
+                            if isinstance(tutorials, list):
+                                for tut in tutorials:
+                                    if isinstance(tut, dict) and tut.get("video_url"):
+                                        hot_metrics["video_tutorial_url"] = str(tut["video_url"]).strip()
+                                        break
+
+                            # 组合教程与发单文案：发单文案优先级最高（内含领券和下单短链）
+                            full_text_parts: List[str] = []
+                            if cmd_text:
+                                full_text_parts.append(cmd_text)
+                            if second_cmd and second_cmd != cmd_text:
+                                full_text_parts.append(second_cmd)
+                            if not full_text_parts:
+                                if desc_html:
+                                    desc_clean = re.sub(r"<[^>]+>", " ", html_lib.unescape(desc_html))
+                                    desc_clean = re.sub(r"\s+", " ", desc_clean).strip()
+                                    full_text_parts.append(f"【{platform_name or '特惠采采'}】{title}\n{desc_clean}")
+                                else:
+                                    full_text_parts.append(f"【{platform_name or '特惠采采'}】{title}\n到手价: {display_price}")
+
+                            combined_tutorial_text = "\n".join(full_text_parts).strip()
+
+                            links, imgs, tokens = extract_links_images_and_tokens(combined_tutorial_text, base_url=source_url)
+                            all_imgs = [image_url] if image_url else []
+                            for im in imgs:
+                                if im and im not in all_imgs:
+                                    all_imgs.append(im)
+
+                            tutorial_text = combined_tutorial_text
+                            tutorial_images = all_imgs
+                            extracted_links = links
+                            extracted_tokens = tokens
+                    else:
+                        if r_det.status_code in _RATE_LIMIT_STATUSES:
+                            detail_circuit_broken = True
+                        detail_errors.append({
+                            "item_id": item_id,
+                            "error_url": source_detail_url,
+                            "http_status": r_det.status_code,
+                            "error_type": f"HTTP_{r_det.status_code}",
+                            "error": f"详情页返回状态码: {r_det.status_code}",
+                        })
+                except Exception as e_det:
+                    detail_errors.append({
+                        "item_id": item_id,
+                        "error_url": source_detail_url,
+                        "http_status": None,
+                        "error_type": type(e_det).__name__,
+                        "error": str(e_det)[:160],
+                    })
+
+            rec = build_deal_record(
+                source_site="tehuicaicai",
+                source_channel=f"{channel_name}:{platform_code}" if platform_code else channel_name,
+                source_item_id=item_id,
+                source_url=source_url,
+                source_list_page_url=list_url,
+                source_detail_url=source_detail_url,
+                title=title,
+                price_text=display_price,
+                image_url=image_url,
+                mall_name=platform_name,
+                publish_time=publish_time,
+                explicit_platform=platform_code,
+                hot_metrics=hot_metrics,
+                tutorial_text=tutorial_text,
+                tutorial_images=tutorial_images,
+                extracted_links=extracted_links,
+                extracted_tokens=extracted_tokens,
+                raw_payload=raw_payload,
+                is_group_stream=False,
+            )
+            rec["has_full_detail"] = has_full_detail
+            records.append(rec)
+
+        # 水位线早停机制 (Watermark Early Stop):
+        # 1. 若不开启自动翻页，则只拉取单页；
+        # 2. 若本页没有出现任何未入库的新商品 (new_items_on_page == 0)，说明已经触碰已知数据水位线，立即停止翻页；
+        # 3. 若已达末页 (has_next=False) 或触发网络熔断，立即停止；
+        # 4. 若本次抓取详情数已达上限，停止翻页以控制单轮时间，下一轮再接力。
+        if not auto_paginate:
+            break
+        if new_items_on_page == 0:
+            break
+        if detail_circuit_broken:
+            break
+        if fetch_detail and detail_attempted >= max_details:
+            break
+        if not pagination.get("has_next", True):
+            break
+
+        current_page += 1
+        time.sleep(0.08)
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+    return {
+        "status": "success" if len(records) > 0 else "error",
+        "http_status": 200,
+        "request_url": primary_req_url or list_url,
+        "elapsed_ms": elapsed_ms,
+        "count": len(records),
+        "total": total_items,
+        "detail_fetched": detail_fetched,
+        "detail_errors": detail_errors,
+        "records": records,
+        "pages_crawled": pages_crawled,
+    }
+
+
+# ==============================================================================
 # 4. T2 级扩展站点拉取器（慢慢买列表 / 55海淘 EdgeOne 解算）
 # ==============================================================================
 def fetch_manmanbuy_list(
@@ -2716,6 +3003,7 @@ def run_all_sample_verifications(output_path: Optional[str] = None) -> Dict[str,
         ("T0_线报酷_1小时最热榜(含详情教程)", lambda: fetch_xianbao_fun_deals(channel="hot_1h", fetch_detail=True, max_details=4)),
         ("T0_线报酷_实时聚合流(含详情教程)", lambda: fetch_xianbao_fun_deals(channel="latest", page=1, fetch_detail=True, max_details=4)),
         ("T0_0818团_最新线报(含详情凑单作业)", lambda: fetch_0818tuan_deals(page=1, fetch_detail=True, max_details=4)),
+        ("T0_特惠采采_专员精选好价(含详情发单文案与短链)", lambda: fetch_tehuicaicai_deals(channel="home", page=1, page_size=10, fetch_detail=True, max_details=4)),
         ("T1_什么值得买_好价(含三路高可用切换与详情)", lambda: fetch_smzdm_faxian_deals(sort="hot_3h", page=1, fetch_detail=True, max_details=3)),
         ("T1_拔草哦_优惠线报(含详情口令)", lambda: fetch_bacaoo_deals(fetch_detail=True, max_details=3)),
         ("T1_网猴线报_24小时热榜(含详情)", lambda: fetch_iehou_deals(mode="dayhot", fetch_detail=True, max_details=3)),
