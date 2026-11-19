@@ -870,3 +870,182 @@ def test_guangdiu_deterministic_coupon_supplement():
     assert deal_info["coupon_links"][0]["token"] == "！CPN5！"
 
 
+def test_tun_fake_ip_dns_allowed_for_domains_but_blocked_as_literal():
+    """验证域名解析返回 TUN Fake-IP (198.18.0.0/15) 允许解包，但直接访问裸 IP 198.18.x.x 及私网域名仍严格拦截。"""
+    def _fake_ip_resolver(host: str, port: int, *_args, **_kwargs):
+        ip_map = {
+            "3.cn": "198.18.0.65",
+            "internal.evil.test": "192.168.1.25",
+        }
+        ip = ip_map.get(host.lower(), "93.184.216.34")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    assert _is_safe_public_http_url("https://3.cn/3cKY-ZeN", resolver=_fake_ip_resolver) is True
+    assert _is_safe_public_http_url("http://198.18.0.65/coupons", resolver=_fake_ip_resolver) is False
+    assert _is_safe_public_http_url("https://internal.evil.test/coupon", resolver=_fake_ip_resolver) is False
+
+    session = _RouteSession({
+        "https://3.cn/3cKY-ZeN": _FakeResponse(
+            status_code=302,
+            headers={
+                "Location": "https://coupon.m.jd.com/coupons/show.action?linkKey=LK_TUN_OK&to=m.jd.com&utm_source=x"
+            },
+        ),
+    })
+    assert (
+        unwrap_to_official_public_venue_url(
+            "https://3.cn/3cKY-ZeN",
+            http_session=session,
+            resolver=_fake_ip_resolver,
+        )
+        == "https://coupon.m.jd.com/coupons/show.action?linkKey=LK_TUN_OK"
+    )
+
+
+def test_shop_m_jd_whitelist_and_false_positive_coupon_gates():
+    """验证 shop.m.jd.com 白名单提纯、淘宝双链接吸收放行、JD 冗余数字 SKU + 国补低价不误杀及维护常量导入完整。"""
+    import mobile_web.services.deal_pool_cleaner as cleaner_mod
+
+    assert isinstance(cleaner_mod.DEAL_FORMAL_EXPIRY_HOURS, (int, float))
+
+    # 1. shop.m.jd.com 店铺首页与会员卡页参数提纯，缺关键参数则拒绝
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://shop.m.jd.com/mshop/gethomepage?venderid=648791&cu=true&utm=bad"
+        )
+        == "https://shop.m.jd.com/mshop/gethomepage?venderId=648791"
+    )
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://shop.m.jd.com/member/card?venderId=200797238&shopId=200797238&channel=80545052&zdmcode=bad"
+        )
+        == "https://shop.m.jd.com/member/card?venderId=200797238&shopId=200797238"
+    )
+    assert rebuild_clean_official_venue_url("https://shop.m.jd.com/mshop/gethomepage?cu=true") is None
+
+    # 2. 端到端回归：
+    #    - tip_tb_absorbed: 淘系二合一 L1(coupon_candidate) 与 L2(main_candidate) 转出同 goods_id，AI-2 填 coupon_links=[L1] 不被误杀
+    #    - tip_jd_subsidy_with_sku: JD 国补低价 + 冗余数字 item.jd.com SKU(ERR_JD_NUMERIC_SKU) + 店铺首页 /mshop/gethomepage 正常放行
+    cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+
+    seen_ai2_link_ids = {}
+
+    def _mock_jd_convert(inp: str):
+        if "item.jd.com/" in inp:
+            return {"status": "error", "error_code": "UNSUPPORTED_JD_NUMERIC_SKU", "error_msg": "不支持数字id"}
+        return {
+            "status": "success",
+            "goods_id": "JD_PHONE_OK",
+            "goods_sign": "JD_PHONE_OK",
+            "final_link": "https://u.jd.com/ogcywB5",
+            "promotion_token": "！PHONE！",
+            "product": {
+                "platform": "jd",
+                "product_id": "JD_PHONE_OK",
+                "name": "真我 GT8 Pro 5G手机",
+                "price": 3989.0,
+                "original_price": 3989.0,
+                "activity_price": 3989.0,
+                "coupon_amount": 0.0,
+                "mall_name": "官方旗舰店",
+            },
+        }
+
+    cleaner.adapters = {
+        "jd": SimpleNamespace(resolve_and_convert_universal=_mock_jd_convert),
+        "taobao": SimpleNamespace(
+            resolve_and_convert_universal=lambda inp: {
+                "status": "success",
+                "goods_id": "GKM9yAVTqW",
+                "goods_sign": "GKM9yAVTqW",
+                "final_link": "https://s.click.taobao.com/costa2in1",
+                "promotion_token": "￥COSTA￥",
+                "product": {
+                    "platform": "taobao",
+                    "product_id": "GKM9yAVTqW",
+                    "name": "COSTA 巧克力威化饼干",
+                    "price": 23.2,
+                    "original_price": 27.3,
+                    "activity_price": 23.2,
+                    "coupon_amount": 68.0,
+                    "mall_name": "COSTA旗舰店",
+                },
+            }
+        ),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+    }
+
+    cleaner.run_ai_stage1_batch = lambda *_a, **_kw: {
+        "tip_tb_absorbed": {
+            "main_tip_id": "tip_tb_absorbed",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_tb_absorbed"],
+            "combined_raw_text": "COSTA 威化饼干 24.6元 [#L1] [#L2]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "TB_2IN1_A", "clean_input": "https://s.click.taobao.com/a", "platform": "taobao", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L2", "raw_span": "TB_2IN1_B", "clean_input": "https://s.click.taobao.com/b", "platform": "taobao", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        "tip_jd_subsidy_with_sku": {
+            "main_tip_id": "tip_jd_subsidy_with_sku",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_jd_subsidy_with_sku"],
+            "combined_raw_text": "店铺首页 [#L1] 真我手机 [#L2] 国补3169.61元 [#L3]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "https://shop.m.jd.com/mshop/gethomepage?venderid=1001&cu=true", "clean_input": "https://shop.m.jd.com/mshop/gethomepage?venderid=1001&cu=true", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L2", "raw_span": "https://item.jd.com/100286262170.html", "clean_input": "https://item.jd.com/100286262170.html", "platform": "jd", "text_role_hint": "main_candidate"},
+                {"link_id": "L3", "raw_span": "https://union-click.jd.com/jdc?e=phone", "clean_input": "https://union-click.jd.com/jdc?e=phone", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+    }
+
+    def _mock_ai2(stage2_inputs, *_a, **_kw):
+        for item in stage2_inputs:
+            seen_ai2_link_ids[item["main_tip_id"]] = [lk["link_id"] for lk in item["converted_links"]]
+        return {
+            "tip_tb_absorbed": {
+                "main_tip_id": "tip_tb_absorbed",
+                "is_valid_deal": True,
+                "main_link_id": "L2",
+                "deal_price": 24.6,
+                "coupon_links": [{"link_id": "L1", "label": "商品优惠券"}],
+                "tutorial_steps": ["1. 领券加购4件实付24.6元"],
+                "quality_score": 91,
+            },
+            "tip_jd_subsidy_with_sku": {
+                "main_tip_id": "tip_jd_subsidy_with_sku",
+                "is_valid_deal": True,
+                "main_link_id": "L3",
+                "deal_price": 3169.61,
+                "coupon_links": [],
+                "tutorial_steps": ["1. 叠加国家补贴实付3169.61元"],
+                "quality_score": 95,
+            },
+        }
+
+    cleaner.run_ai_stage2_batch = _mock_ai2
+
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+    input_records = [
+        {"source_site": "guangdiu", "source_channel": "latest", "source_item_id": "tip_tb_absorbed", "platform": "taobao", "title": "COSTA 威化饼干", "tutorial_text": "COSTA 威化饼干", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "guangdiu", "source_channel": "latest", "source_item_id": "tip_jd_subsidy_with_sku", "platform": "jd", "title": "国家补贴：真我 GT8 Pro", "tutorial_text": "真我 GT8 Pro", "extracted_links": [], "extracted_tokens": []},
+    ]
+
+    results = cleaner.clean_batch_records(input_records, mock_col, shared_active_products={}, quiet_sub_logs=True)
+    res_map = {r["source_item_id"]: r for r in results}
+
+    assert res_map["tip_tb_absorbed"]["status"] == "success"
+    assert res_map["tip_tb_absorbed"]["product_doc"]["deal_info"]["coupon_links"] == []
+
+    assert res_map["tip_jd_subsidy_with_sku"]["status"] == "success"
+    assert seen_ai2_link_ids["tip_jd_subsidy_with_sku"] == ["L1", "L3"]
+    assert res_map["tip_jd_subsidy_with_sku"]["product_doc"]["deal_info"]["deal_price"] == 3169.61
+
+
+

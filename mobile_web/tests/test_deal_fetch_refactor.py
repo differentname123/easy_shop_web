@@ -242,6 +242,7 @@ def test_scheduler_config_and_captcha_cooldown_behavior(monkeypatch, tmp_path):
         "逛丢_小时风云榜",
     ]
     assert all(c.site_key in ("tehuicaicai", "guangdiu") for c in active)
+    assert all(c.max_details == 3 for c in active if c.site_key == "guangdiu")
 
     # 2. 验证逛丢触发 CaptchaChallengeDetected 后：同轮后续频道冷却跳过 + 跨轮进入站点冷却期，且特惠采采不受影响
     monkeypatch.setattr(dp_mod.time, "sleep", lambda _: None)
@@ -306,8 +307,9 @@ def test_scheduler_config_and_captcha_cooldown_behavior(monkeypatch, tmp_path):
         site_cooldown_until=cooldown_map,
         channel_health_tracker=health_tracker,
     )
-    # 逛丢仅首页发起过 1 次请求即触发熔断，热门榜与小时榜立即 cooldown_skipped
-    assert gd_calls == ["latest"]
+    # 逛丢站内频道随机顺位触发：首个到期频道命中验证码熔断后，同轮其余 2 个频道立即 cooldown_skipped
+    assert len(gd_calls) == 1
+    assert gd_calls[0] in ("latest", "hots", "rank")
     assert cooldown_map.get("guangdiu", 0) > 0
     # 特惠采采返回 50 条全已抓过 (records=[])，状态为健康 success，不误报 empty_warning
     th_task = next(t for t in out1["tasks"] if t["site_key"] == "tehuicaicai")
@@ -328,7 +330,206 @@ def test_scheduler_config_and_captcha_cooldown_behavior(monkeypatch, tmp_path):
         site_cooldown_until=cooldown_map,
         channel_health_tracker=health_tracker,
     )
-    assert gd_calls == ["latest"]
+    assert len(gd_calls) == 1
     gd_tasks_2 = [t for t in out2["tasks"] if t["site_key"] == "guangdiu"]
     assert len(gd_tasks_2) == 3
     assert all(t["status"] == "cooldown_skipped" for t in gd_tasks_2)
+
+
+def test_run_fetch_stage_supports_pure_list_fetcher_without_skip_detail_kwargs(monkeypatch, tmp_path):
+    """新增好单库/折淘客/选单等不接收 skip_detail_ids/max_details 的纯列表抓取器时，不报错且能正确增量去重。"""
+    from mobile_web.scripts import run_deal_pool_scheduler as dps
+    from mobile_web.services import deal_pipeline as dp_mod
+    from mobile_web.services.deal_channel_config import DealChannelConfig
+
+    monkeypatch.setattr(dp_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(dp_mod, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"))
+    monkeypatch.setattr(dp_mod, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"))
+    monkeypatch.setattr(dp_mod, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"))
+    monkeypatch.setattr(dp_mod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"))
+
+    saved_batches = []
+    known_ids = {"hdk_known_1"}
+
+    def strict_pure_list_fetcher(min_id=1, session=None):
+        return {
+            "status": "success",
+            "http_status": 200,
+            "request_url": f"http://v2.api.haodanku.com/get_wire_report?min_id={min_id}",
+            "raw_list_count": 2,
+            "records": [
+                {
+                    "source_site": "haodanku",
+                    "source_item_id": "hdk_known_1",
+                    "title": "旧好单库线报",
+                    "has_full_detail": True,
+                    "extracted_links": [{"url": "https://item.jd.com/1.html"}],
+                },
+                {
+                    "source_site": "haodanku",
+                    "source_item_id": "hdk_new_2",
+                    "title": "新好单库线报",
+                    "has_full_detail": True,
+                    "extracted_links": [{"url": "https://item.jd.com/2.html"}],
+                },
+            ],
+        }
+
+    monkeypatch.setattr(dps, "fetch_haodanku_wire_report", strict_pure_list_fetcher)
+
+    repo = MagicMock()
+    repo.get_existing_detailed_ids.side_effect = lambda site, limit=5000: set(known_ids) if site == "haodanku" else set()
+    repo.generate_pool_summary.return_value = {"total_records": 1}
+
+    def fake_save_batch(records, task_name=""):
+        saved_batches.append((task_name, [r["source_item_id"] for r in records]))
+        for r in records:
+            known_ids.add(str(r["source_item_id"]))
+        return {"inserted": len(records), "updated": 0}
+
+    repo.save_batch.side_effect = fake_save_batch
+
+    pure_ch = [
+        DealChannelConfig(
+            name="好单库_实时线报",
+            site_key="haodanku",
+            default_url="http://v2.api.haodanku.com/get_wire_report",
+            fetcher_name="fetch_haodanku_wire_report",
+            fetcher_kwargs={"min_id": 1},
+            enabled=True,
+            interval_seconds=180,
+            sleep_after=0.0,
+        )
+    ]
+
+    last_run_map = {}
+    out1 = dps.run_fetch_stage(
+        repo=repo,
+        session=MagicMock(),
+        cycle_num=1,
+        channels=pure_ch,
+        channel_last_run=last_run_map,
+    )
+    assert out1["tasks"][0]["status"] == "success"
+    assert out1["tasks"][0]["skipped_known"] == 1
+    assert out1["tasks"][0]["fetched"] == 1
+    assert saved_batches == [("好单库_实时线报", ["hdk_new_2"])]
+
+    # 第二轮重拉同一列表时，两条均已入库去重
+    last_run_map["好单库_实时线报"] = 0.0
+    out2 = dps.run_fetch_stage(
+        repo=repo,
+        session=MagicMock(),
+        cycle_num=2,
+        channels=pure_ch,
+        channel_last_run=last_run_map,
+    )
+    assert out2["tasks"][0]["skipped_known"] == 2
+    assert out2["tasks"][0]["fetched"] == 0
+
+
+def test_run_fetch_stage_runs_sites_concurrently_and_shuffles_same_site(monkeypatch, tmp_path):
+    """不同 site_key 在独立线程并行运行；同站点多频道严格串行且顺位随机轮转。"""
+    import threading
+    from mobile_web.scripts import run_deal_pool_scheduler as dps
+    from mobile_web.services import deal_pipeline as dp_mod
+    from mobile_web.services.deal_channel_config import DealChannelConfig
+
+    monkeypatch.setattr(dp_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(dp_mod, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"))
+    monkeypatch.setattr(dp_mod, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"))
+    monkeypatch.setattr(dp_mod, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"))
+    monkeypatch.setattr(dp_mod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"))
+
+    # 1. 验证不同 site_key 真正并发（Barrier 必须双线程同时到达）
+    barrier = threading.Barrier(2, timeout=2.0)
+    seen_threads = {}
+
+    def concurrent_fetcher(site="", **kwargs):
+        seen_threads[site] = threading.get_ident()
+        barrier.wait()
+        return {
+            "status": "success",
+            "http_status": 200,
+            "request_url": f"https://{site}.example.com",
+            "raw_list_count": 0,
+            "records": [],
+        }
+
+    monkeypatch.setattr(dps, "fetch_tehuicaicai_deals", concurrent_fetcher)
+    monkeypatch.setattr(dps, "fetch_guangdiu_deals", concurrent_fetcher)
+
+    repo = MagicMock()
+    repo.get_existing_detailed_ids.return_value = set()
+    repo.save_batch.return_value = {"inserted": 0, "updated": 0}
+    repo.generate_pool_summary.return_value = {"total_records": 0}
+
+    parallel_channels = [
+        DealChannelConfig(
+            name="站点A_主频",
+            site_key="site_a",
+            default_url="https://site_a.example.com",
+            fetcher_name="fetch_tehuicaicai_deals",
+            fetcher_kwargs={"site": "site_a"},
+            sleep_after=0.0,
+        ),
+        DealChannelConfig(
+            name="站点B_主频",
+            site_key="site_b",
+            default_url="https://site_b.example.com",
+            fetcher_name="fetch_guangdiu_deals",
+            fetcher_kwargs={"site": "site_b"},
+            sleep_after=0.0,
+        ),
+    ]
+    dps.run_fetch_stage(
+        repo=repo,
+        session=MagicMock(),
+        cycle_num=1,
+        channels=parallel_channels,
+        channel_last_run={},
+    )
+    assert seen_threads["site_a"] != seen_threads["site_b"]
+
+    # 2. 验证同站点三榜严格串行且经多轮调用出现不止一种随机顺位
+    active_gd_count = 0
+    same_site_orders = []
+
+    def serial_gd_fetcher(channel="", **kwargs):
+        nonlocal active_gd_count
+        active_gd_count += 1
+        assert active_gd_count == 1
+        same_site_orders[-1].append(channel)
+        active_gd_count -= 1
+        return {
+            "status": "success",
+            "http_status": 200,
+            "request_url": f"https://guangdiu.com/{channel}",
+            "raw_list_count": 0,
+            "records": [],
+        }
+
+    monkeypatch.setattr(dps, "fetch_guangdiu_deals", serial_gd_fetcher)
+    gd_channels = [
+        DealChannelConfig(
+            name=f"逛丢_{ch_id}",
+            site_key="guangdiu",
+            default_url=f"https://guangdiu.com/{ch_id}",
+            fetcher_name="fetch_guangdiu_deals",
+            fetcher_kwargs={"channel": ch_id},
+            sleep_after=0.0,
+        )
+        for ch_id in ("latest", "hots", "rank")
+    ]
+    for cycle in range(15):
+        same_site_orders.append([])
+        dps.run_fetch_stage(
+            repo=repo,
+            session=MagicMock(),
+            cycle_num=cycle + 1,
+            channels=gd_channels,
+            channel_last_run={},
+        )
+
+    assert all(sorted(order) == ["hots", "latest", "rank"] for order in same_site_orders)
+    assert len({tuple(order) for order in same_site_orders}) > 1

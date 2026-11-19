@@ -8,10 +8,12 @@ import datetime
 import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
@@ -246,6 +248,16 @@ def run_fetch_stage(
         if is_channel_due(ch, last_run_map.get(ch.name, 0.0), now_wall)
     ]
 
+    # 按站点分组：不同站点彼此并行拉取；同一站点内部随机打乱到期频道顺序，
+    # 保证长列表/热门/实时等多个频道在单站限流窗口下公平轮转出单，避免首个频道长期饿死后续频道。
+    channels_by_site: Dict[str, List[DealChannelConfig]] = defaultdict(list)
+    for ch in due_channels:
+        channels_by_site[ch.site_key].append(ch)
+    site_items: List[Tuple[str, List[DealChannelConfig]]] = list(channels_by_site.items())
+    random.shuffle(site_items)
+    for _, site_channels in site_items:
+        random.shuffle(site_channels)
+
     active_sites = sorted({ch.site_key for ch in due_channels if ch.site_key})
     dedup_map: Dict[str, Set[str]] = {
         site: repo.get_existing_detailed_ids(site, limit=5000)
@@ -258,6 +270,7 @@ def run_fetch_stage(
     task_reports: List[Dict[str, Any]] = []
     cycle_error_paths: List[Dict[str, Any]] = []
     total_channels = len(due_channels)
+    task_counter = 0
 
     try:
         cur_pending_cnt = repo.col.count_documents(
@@ -267,10 +280,11 @@ def run_fetch_stage(
         cur_pending_cnt = 0
 
     logger.info(
-        "================ 开始第 #%d 轮 [阶段1-线报拉取] (本轮到期 %d/%d 个已启用频道 | 📦 库内Pending=%d条) ================",
+        "================ 开始第 #%d 轮 [阶段1-线报拉取] (本轮到期 %d/%d 个已启用频道 | %d 站点并行·同站随机 | 📦 库内Pending=%d条) ================",
         cycle_num,
         total_channels,
         len(active_channels),
+        len(site_items),
         cur_pending_cnt,
     )
 
@@ -280,290 +294,330 @@ def run_fetch_stage(
         if until_ts and until_ts > now_wall
     }
     _rate_limit_codes = {403, 429, 502, 503, 504}
+    lock = threading.Lock()
 
-    for task_idx, ch in enumerate(due_channels, 1):
-        rem_tasks = total_channels - task_idx
-        task_name = ch.name
-        site_key = ch.site_key
-        default_url = ch.default_url
-        pause_sec = ch.sleep_after
-        t0 = time.perf_counter()
+    def _execute_site_lane(site_key: str, site_channels: List[DealChannelConfig]) -> None:
+        nonlocal total_inserted, total_updated, total_fetched, task_counter
+        site_dedup = dedup_map.get(site_key)
 
-        ch_state = channel_health_tracker.setdefault(
-            task_name,
-            {"consecutive_failures": 0, "total_runs": 0, "total_errors": 0, "last_error_url": ""},
-        )
+        for ch in site_channels:
+            task_name = ch.name
+            default_url = ch.default_url
+            pause_sec = ch.sleep_after
+            t0 = time.perf_counter()
 
-        if site_key in rate_limited_sites:
-            logger.info(
-                "  ⏸️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 站点 [%s] 处于限流/验证码冷却期，跳过本轮",
-                task_idx,
-                total_channels,
-                rem_tasks,
-                task_name,
-                site_key,
-            )
-            task_reports.append({
-                "task_name": task_name,
-                "site_key": site_key,
-                "request_url": default_url,
-                "http_status": 429,
-                "status": "cooldown_skipped",
-                "fetched": 0,
-                "detail_fetched": 0,
-                "detail_error_count": 0,
-                "inserted": 0,
-                "updated": 0,
-                "unique_anchor_count": 0,
-                "consecutive_failures": ch_state["consecutive_failures"],
-                "elapsed_ms": 0.0,
-            })
-            continue
-
-        ch_state["total_runs"] += 1
-        fn = _resolve_fetcher_callable(ch.fetcher_name)
-        if fn is None:
-            logger.error("未找到频道 [%s] 对应的抓取函数 [%s]，请检查配置！", task_name, ch.fetcher_name)
-            continue
-
-        call_kwargs = dict(ch.fetcher_kwargs)
-        call_kwargs["session"] = session
-        if site_key in dedup_map:
-            call_kwargs["skip_detail_ids"] = dedup_map[site_key]
-        if call_kwargs.get("fetch_detail"):
-            eff_max_details = max_new_details_per_channel if max_new_details_per_channel is not None else ch.max_details
-            call_kwargs["max_details"] = eff_max_details
-            if getattr(fn, "__module__", "") == "services.deal_fetchers" and "detail_delay" not in call_kwargs:
-                call_kwargs["detail_delay"] = ch.detail_delay_seconds
-
-        try:
-            res = fn(**call_kwargs)
-            last_run_map[task_name] = time.time()
-            req_url = str(res.get("request_url") or default_url)
-            http_status = res.get("http_status")
-            raw_records = res.get("records") or []
-            detail_errors = res.get("detail_errors") or []
-
-            has_captcha_err = any("Captcha" in str(d.get("error_type") or "") for d in detail_errors)
-            is_rate_limited = (
-                bool(res.get("rate_limited"))
-                or http_status in _rate_limit_codes
-                or any(d.get("http_status") in _rate_limit_codes for d in detail_errors)
-                or has_captcha_err
-            )
-            if is_rate_limited:
-                rate_limited_sites.add(site_key)
-                cooldown_sec = max(30, int(getattr(ch, "rate_limit_cooldown_seconds", 300)))
-                cooldown_map[site_key] = time.time() + cooldown_sec
-
-            # 统一入池前门禁：绝不放行无完整详情或 100% 确定非淘京拼平台的记录
-            records: List[Dict[str, Any]] = []
-            pipeline_filtered = 0
-            for r in raw_records:
-                if not isinstance(r, dict):
-                    continue
-                if not r.get("has_full_detail", True):
-                    pipeline_filtered += 1
-                    continue
-                if is_record_confirmed_unsupported(r):
-                    pipeline_filtered += 1
-                    continue
-                records.append(r)
-
-            for r in records:
-                if r.get("has_full_detail") and r.get("source_item_id"):
-                    sid = str(r["source_item_id"])
-                    if site_key in dedup_map:
-                        dedup_map[site_key].add(sid)
-
-            db_res = repo.save_batch(records, task_name=task_name)
-            cost_ms = round((time.perf_counter() - t0) * 1000, 1)
-
-            ins = db_res.get("inserted", 0)
-            upd = db_res.get("updated", 0)
-            cnt = len(records)
-            det_cnt = res.get("detail_fetched", cnt)
-            raw_list_cnt = int(res.get("raw_list_count") if res.get("raw_list_count") is not None else cnt)
-            skipped_known = int(res.get("skipped_known") or 0)
-            skipped_unsup = int(res.get("skipped_unsupported") or 0) + pipeline_filtered
-            skipped_nodet = int(res.get("skipped_no_detail") or 0)
-
-            total_inserted += ins
-            total_updated += upd
-            total_fetched += cnt
-
-            unique_cnt = sum(
-                1 for r in records
-                if evaluate_quality_signals(r)["has_unique_product_anchor"]
-            )
-
-            if detail_errors:
-                first_err = detail_errors[0]
-                first_url = str(first_err.get("error_url") or first_err.get("detail_url") or req_url)
-                first_type = str(first_err.get("error_type") or "DetailFetchError")
-                first_msg = str(first_err.get("error") or "")
-                if len(detail_errors) == 1:
-                    summary_msg = first_msg
-                else:
-                    type_counts = Counter(str(d.get("error_type") or "DetailFetchError") for d in detail_errors)
-                    type_summary = ", ".join(f"{k}:{v}" for k, v in type_counts.items())
-                    summary_msg = f"本频道共 {len(detail_errors)} 条详情异常 ({type_summary})，首条: {first_msg}"
-                err_item = {
-                    "occurred_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "cycle_num": cycle_num,
-                    "site_key": site_key,
-                    "task_name": task_name,
-                    "stage": "detail_fetch",
-                    "severity": "warning",
-                    "error_url": first_url,
-                    "item_id": str(first_err.get("item_id") or ""),
-                    "http_status": first_err.get("http_status"),
-                    "error_type": first_type,
-                    "error_message": summary_msg,
-                    "consecutive_failures": 1,
-                    "ops_advice": get_ops_troubleshooting_advice(
-                        site_key=site_key,
-                        http_status=first_err.get("http_status"),
-                        error_type=first_type,
-                        fetched_count=cnt,
-                        consecutive_failures=1,
-                    ),
-                }
-                cycle_error_paths.append(err_item)
-                logger.warning(
-                    "  ⚠️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 详情异常 (异常=%d, 新抓=%d, 耗时=%.1fms) | 首条=%s",
-                    task_idx,
-                    total_channels,
-                    rem_tasks,
+            with lock:
+                task_counter += 1
+                task_idx = task_counter
+                rem_tasks = total_channels - task_idx
+                ch_state = channel_health_tracker.setdefault(
                     task_name,
-                    len(detail_errors),
-                    cnt,
-                    cost_ms,
-                    summary_msg,
+                    {"consecutive_failures": 0, "total_runs": 0, "total_errors": 0, "last_error_url": ""},
                 )
+                is_site_limited = site_key in rate_limited_sites
+                if not is_site_limited:
+                    ch_state["total_runs"] += 1
 
-            if is_rate_limited and cnt == 0:
-                ch_state["consecutive_failures"] += 1
-                status_label = "rate_limited"
-                logger.warning(
-                    "  🟠 [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 触发风控/验证码熔断，已进入 %ds 冷却 (耗时=%.1fms)",
-                    task_idx,
-                    total_channels,
-                    rem_tasks,
-                    task_name,
-                    max(30, int(getattr(ch, "rate_limit_cooldown_seconds", 300))),
-                    cost_ms,
-                )
-            elif raw_list_cnt == 0 and http_status == 200 and cnt == 0:
-                ch_state["consecutive_failures"] += 1
-                status_label = "empty_warning"
-                logger.warning(
-                    "  🟡 [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 列表解析为 0 条 (HTTP 200, 耗时=%.1fms)",
-                    task_idx,
-                    total_channels,
-                    rem_tasks,
-                    task_name,
-                    cost_ms,
-                )
-            else:
-                ch_state["consecutive_failures"] = 0
-                status_label = "success"
+            if is_site_limited:
                 logger.info(
-                    "  🟢 [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 列表=%02d | 跳过(已抓=%02d, 非淘京拼=%02d, 无详情=%02d) | 新入=%02d (新增=%02d, 耗时=%.1fms)",
+                    "  ⏸️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 站点 [%s] 处于限流/验证码冷却期，跳过本轮",
                     task_idx,
                     total_channels,
                     rem_tasks,
                     task_name,
-                    raw_list_cnt,
-                    skipped_known,
-                    skipped_unsup,
-                    skipped_nodet,
-                    cnt,
-                    ins,
-                    cost_ms,
+                    site_key,
+                )
+                with lock:
+                    task_reports.append({
+                        "task_name": task_name,
+                        "site_key": site_key,
+                        "request_url": default_url,
+                        "http_status": 429,
+                        "status": "cooldown_skipped",
+                        "fetched": 0,
+                        "detail_fetched": 0,
+                        "detail_error_count": 0,
+                        "inserted": 0,
+                        "updated": 0,
+                        "unique_anchor_count": 0,
+                        "consecutive_failures": ch_state["consecutive_failures"],
+                        "elapsed_ms": 0.0,
+                    })
+                continue
+
+            fn = _resolve_fetcher_callable(ch.fetcher_name)
+            if fn is None:
+                logger.error("未找到频道 [%s] 对应的抓取函数 [%s]，请检查配置！", task_name, ch.fetcher_name)
+                continue
+
+            call_kwargs = dict(ch.fetcher_kwargs)
+            call_kwargs["session"] = session
+            has_fetch_detail = bool(call_kwargs.get("fetch_detail"))
+            # 仅向支持详情抓取协议（fetch_detail=True）的抓取器传入 skip_detail_ids/max_details；
+            # 纯列表接口（好单库/折淘客/选单等）不接收这些参数，统一由下方入池门禁按 site_dedup 去重。
+            if has_fetch_detail:
+                if site_dedup is not None:
+                    call_kwargs["skip_detail_ids"] = site_dedup
+                eff_max_details = max_new_details_per_channel if max_new_details_per_channel is not None else ch.max_details
+                call_kwargs["max_details"] = eff_max_details
+                if getattr(fn, "__module__", "") == "services.deal_fetchers" and "detail_delay" not in call_kwargs:
+                    call_kwargs["detail_delay"] = ch.detail_delay_seconds
+
+            try:
+                res = fn(**call_kwargs)
+                now_done = time.time()
+                req_url = str(res.get("request_url") or default_url)
+                http_status = res.get("http_status")
+                raw_records = res.get("records") or []
+                detail_errors = res.get("detail_errors") or []
+
+                has_captcha_err = any("Captcha" in str(d.get("error_type") or "") for d in detail_errors)
+                is_rate_limited = (
+                    bool(res.get("rate_limited"))
+                    or http_status in _rate_limit_codes
+                    or any(d.get("http_status") in _rate_limit_codes for d in detail_errors)
+                    or has_captcha_err
                 )
 
-            task_reports.append({
-                "task_name": task_name,
-                "site_key": site_key,
-                "request_url": req_url,
-                "http_status": http_status,
-                "status": status_label,
-                "raw_list_count": raw_list_cnt,
-                "fetched": cnt,
-                "detail_fetched": det_cnt,
-                "skipped_known": skipped_known,
-                "skipped_unsupported": skipped_unsup,
-                "skipped_no_detail": skipped_nodet,
-                "detail_error_count": len(detail_errors),
-                "inserted": ins,
-                "updated": upd,
-                "unique_anchor_count": unique_cnt,
-                "consecutive_failures": ch_state["consecutive_failures"],
-                "elapsed_ms": cost_ms,
-            })
-        except Exception as e:
-            last_run_map[task_name] = time.time()
-            cost_ms = round((time.perf_counter() - t0) * 1000, 1)
-            ch_state["consecutive_failures"] += 1
-            ch_state["total_errors"] += 1
-            ch_state["last_error_url"] = default_url
-            err_type = type(e).__name__
-            advice = get_ops_troubleshooting_advice(
-                site_key=site_key,
-                http_status=None,
-                error_type=err_type,
-                fetched_count=0,
-                consecutive_failures=ch_state["consecutive_failures"],
-            )
-            err_item = {
-                "occurred_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "cycle_num": cycle_num,
-                "site_key": site_key,
-                "task_name": task_name,
-                "stage": "list_fetch",
-                "severity": "error",
-                "error_url": default_url,
-                "http_status": None,
-                "error_type": err_type,
-                "error_message": str(e)[:240],
-                "consecutive_failures": ch_state["consecutive_failures"],
-                "ops_advice": advice,
-            }
-            cycle_error_paths.append(err_item)
-            logger.warning(
-                "  ❌ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 拉取异常 (连续=%d轮, 耗时=%.1fms) | 错误路径=%s | 异常=%s: %s | 运维建议=%s",
-                task_idx,
-                total_channels,
-                rem_tasks,
-                task_name,
-                ch_state["consecutive_failures"],
-                cost_ms,
-                default_url,
-                err_type,
-                e,
-                advice,
-            )
-            task_reports.append({
-                "task_name": task_name,
-                "site_key": site_key,
-                "request_url": default_url,
-                "http_status": None,
-                "status": "error",
-                "fetched": 0,
-                "detail_fetched": 0,
-                "detail_error_count": 0,
-                "inserted": 0,
-                "updated": 0,
-                "unique_anchor_count": 0,
-                "consecutive_failures": ch_state["consecutive_failures"],
-                "error_type": err_type,
-                "error": str(e)[:240],
-                "elapsed_ms": cost_ms,
-            })
+                # 统一入池前门禁：绝不放行无完整详情或 100% 确定非淘京拼平台的记录；非 fetch_detail 源同步做已知 ID 去重
+                records: List[Dict[str, Any]] = []
+                pipeline_filtered = 0
+                pipeline_skipped_known = 0
+                for r in raw_records:
+                    if not isinstance(r, dict):
+                        continue
+                    if not r.get("has_full_detail", True):
+                        pipeline_filtered += 1
+                        continue
+                    if is_record_confirmed_unsupported(r):
+                        pipeline_filtered += 1
+                        continue
+                    sid = str(r.get("source_item_id") or "")
+                    if not has_fetch_detail and site_dedup is not None and sid and sid in site_dedup:
+                        pipeline_skipped_known += 1
+                        continue
+                    records.append(r)
 
-        if pause_sec > 0:
-            time.sleep(pause_sec)
+                if site_dedup is not None:
+                    for r in records:
+                        if r.get("has_full_detail", True) and r.get("source_item_id"):
+                            site_dedup.add(str(r["source_item_id"]))
+
+                unique_cnt = sum(
+                    1 for r in records
+                    if evaluate_quality_signals(r)["has_unique_product_anchor"]
+                )
+
+                err_item_detail: Optional[Dict[str, Any]] = None
+                if detail_errors:
+                    first_err = detail_errors[0]
+                    first_url = str(first_err.get("error_url") or first_err.get("detail_url") or req_url)
+                    first_type = str(first_err.get("error_type") or "DetailFetchError")
+                    first_msg = str(first_err.get("error") or "")
+                    if len(detail_errors) == 1:
+                        summary_msg = first_msg
+                    else:
+                        type_counts = Counter(str(d.get("error_type") or "DetailFetchError") for d in detail_errors)
+                        type_summary = ", ".join(f"{k}:{v}" for k, v in type_counts.items())
+                        summary_msg = f"本频道共 {len(detail_errors)} 条详情异常 ({type_summary})，首条: {first_msg}"
+                    err_item_detail = {
+                        "occurred_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "cycle_num": cycle_num,
+                        "site_key": site_key,
+                        "task_name": task_name,
+                        "stage": "detail_fetch",
+                        "severity": "warning",
+                        "error_url": first_url,
+                        "item_id": str(first_err.get("item_id") or ""),
+                        "http_status": first_err.get("http_status"),
+                        "error_type": first_type,
+                        "error_message": summary_msg,
+                        "consecutive_failures": 1,
+                        "ops_advice": get_ops_troubleshooting_advice(
+                            site_key=site_key,
+                            http_status=first_err.get("http_status"),
+                            error_type=first_type,
+                            fetched_count=len(records),
+                            consecutive_failures=1,
+                        ),
+                    }
+
+                with lock:
+                    db_res = repo.save_batch(records, task_name=task_name)
+                    cost_ms = round((time.perf_counter() - t0) * 1000, 1)
+                    ins = db_res.get("inserted", 0)
+                    upd = db_res.get("updated", 0)
+                    cnt = len(records)
+                    det_cnt = res.get("detail_fetched", cnt)
+                    raw_list_cnt = int(res.get("raw_list_count") if res.get("raw_list_count") is not None else len(raw_records))
+                    skipped_known = int(res.get("skipped_known") or 0) + pipeline_skipped_known
+                    skipped_unsup = int(res.get("skipped_unsupported") or 0) + pipeline_filtered
+                    skipped_nodet = int(res.get("skipped_no_detail") or 0)
+
+                    last_run_map[task_name] = now_done
+                    if is_rate_limited:
+                        rate_limited_sites.add(site_key)
+                        cooldown_sec = max(30, int(getattr(ch, "rate_limit_cooldown_seconds", 300)))
+                        cooldown_map[site_key] = now_done + cooldown_sec
+
+                    total_inserted += ins
+                    total_updated += upd
+                    total_fetched += cnt
+                    if err_item_detail is not None:
+                        cycle_error_paths.append(err_item_detail)
+
+                    if is_rate_limited and cnt == 0:
+                        ch_state["consecutive_failures"] += 1
+                        status_label = "rate_limited"
+                    elif raw_list_cnt == 0 and http_status == 200 and cnt == 0:
+                        ch_state["consecutive_failures"] += 1
+                        status_label = "empty_warning"
+                    else:
+                        ch_state["consecutive_failures"] = 0
+                        status_label = "success"
+                    consec_fail = ch_state["consecutive_failures"]
+
+                    task_reports.append({
+                        "task_name": task_name,
+                        "site_key": site_key,
+                        "request_url": req_url,
+                        "http_status": http_status,
+                        "status": status_label,
+                        "raw_list_count": raw_list_cnt,
+                        "fetched": cnt,
+                        "detail_fetched": det_cnt,
+                        "skipped_known": skipped_known,
+                        "skipped_unsupported": skipped_unsup,
+                        "skipped_no_detail": skipped_nodet,
+                        "detail_error_count": len(detail_errors),
+                        "inserted": ins,
+                        "updated": upd,
+                        "unique_anchor_count": unique_cnt,
+                        "consecutive_failures": consec_fail,
+                        "elapsed_ms": cost_ms,
+                    })
+
+                if detail_errors:
+                    logger.warning(
+                        "  ⚠️ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 详情异常 (异常=%d, 新抓=%d, 耗时=%.1fms) | 首条=%s",
+                        task_idx,
+                        total_channels,
+                        rem_tasks,
+                        task_name,
+                        len(detail_errors),
+                        cnt,
+                        cost_ms,
+                        summary_msg,
+                    )
+
+                if status_label == "rate_limited":
+                    logger.warning(
+                        "  🟠 [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 触发风控/验证码熔断，已进入 %ds 冷却 (耗时=%.1fms)",
+                        task_idx,
+                        total_channels,
+                        rem_tasks,
+                        task_name,
+                        max(30, int(getattr(ch, "rate_limit_cooldown_seconds", 300))),
+                        cost_ms,
+                    )
+                elif status_label == "empty_warning":
+                    logger.warning(
+                        "  🟡 [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 列表解析为 0 条 (HTTP 200, 耗时=%.1fms)",
+                        task_idx,
+                        total_channels,
+                        rem_tasks,
+                        task_name,
+                        cost_ms,
+                    )
+                else:
+                    logger.info(
+                        "  🟢 [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 列表=%02d | 跳过(已抓=%02d, 非淘京拼=%02d, 无详情=%02d) | 新入=%02d (新增=%02d, 耗时=%.1fms)",
+                        task_idx,
+                        total_channels,
+                        rem_tasks,
+                        task_name,
+                        raw_list_cnt,
+                        skipped_known,
+                        skipped_unsup,
+                        skipped_nodet,
+                        cnt,
+                        ins,
+                        cost_ms,
+                    )
+            except Exception as e:
+                now_done = time.time()
+                cost_ms = round((time.perf_counter() - t0) * 1000, 1)
+                err_type = type(e).__name__
+                with lock:
+                    last_run_map[task_name] = now_done
+                    ch_state["consecutive_failures"] += 1
+                    ch_state["total_errors"] += 1
+                    ch_state["last_error_url"] = default_url
+                    consec_fail = ch_state["consecutive_failures"]
+                    advice = get_ops_troubleshooting_advice(
+                        site_key=site_key,
+                        http_status=None,
+                        error_type=err_type,
+                        fetched_count=0,
+                        consecutive_failures=consec_fail,
+                    )
+                    err_item = {
+                        "occurred_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "cycle_num": cycle_num,
+                        "site_key": site_key,
+                        "task_name": task_name,
+                        "stage": "list_fetch",
+                        "severity": "error",
+                        "error_url": default_url,
+                        "http_status": None,
+                        "error_type": err_type,
+                        "error_message": str(e)[:240],
+                        "consecutive_failures": consec_fail,
+                        "ops_advice": advice,
+                    }
+                    cycle_error_paths.append(err_item)
+                    task_reports.append({
+                        "task_name": task_name,
+                        "site_key": site_key,
+                        "request_url": default_url,
+                        "http_status": None,
+                        "status": "error",
+                        "fetched": 0,
+                        "detail_fetched": 0,
+                        "detail_error_count": 0,
+                        "inserted": 0,
+                        "updated": 0,
+                        "unique_anchor_count": 0,
+                        "consecutive_failures": consec_fail,
+                        "error_type": err_type,
+                        "error": str(e)[:240],
+                        "elapsed_ms": cost_ms,
+                    })
+                logger.warning(
+                    "  ❌ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 拉取异常 (连续=%d轮, 耗时=%.1fms) | 错误路径=%s | 异常=%s: %s | 运维建议=%s",
+                    task_idx,
+                    total_channels,
+                    rem_tasks,
+                    task_name,
+                    consec_fail,
+                    cost_ms,
+                    default_url,
+                    err_type,
+                    e,
+                    advice,
+                )
+
+            if pause_sec > 0:
+                time.sleep(pause_sec)
+
+    if len(site_items) > 1:
+        with ThreadPoolExecutor(max_workers=min(8, len(site_items)), thread_name_prefix="DealFetchSite") as pool:
+            futures = [pool.submit(_execute_site_lane, sk, chs) for sk, chs in site_items]
+            for fut in as_completed(futures):
+                fut.result()
+    else:
+        for sk, chs in site_items:
+            _execute_site_lane(sk, chs)
 
     try:
         repo.col.delete_many({"has_full_detail": False})

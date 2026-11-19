@@ -37,6 +37,7 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
     CLEAN_SUCCESS_PREVIEW_JSONL,
+    DEAL_FORMAL_EXPIRY_HOURS,
     DEAL_INFO_PROTECTION_HOURS,
     DEAL_MAX_CLEAN_AGE_DAYS,
     DEFAULT_AI_TIMEOUT_SECONDS,
@@ -184,6 +185,7 @@ def rebuild_clean_official_venue_url(raw_input: str, _allow_login_unwrap: bool =
       2. `uland.taobao.com/quan/detail` -> 仅保留 `sellerId`, `activityId`（两者须同时存在；绝不放行 `/coupon/edetail` 或 `pid`）
       3. `pages.tmall.com/wow/...` 及 `pages-fast.m.taobao.com/wow/...` -> 严禁阿里妈妈联盟红包（`/lianmeng` 或 `wh_alimama=true`），其余仅保留路径与 `wh_pid`
       4. `pro.m.jd.com/mall/active/...` 及 `prodev.m.jd.com/mall/active/...` -> 仅保留路径本身（清空全部 query 参数）
+      5. `shop.m.jd.com/mshop/gethomepage` 及 `shop.m.jd.com/member/...` -> 仅保留 `venderId` / `shopId`（须至少含其一）
     其余任何链接（含一切第三方跳转短链、加密分佣页、未知域名）一律返回 None。
     """
     raw = str(raw_input or "").strip()
@@ -239,6 +241,12 @@ def rebuild_clean_official_venue_url(raw_input: str, _allow_login_unwrap: bool =
 
     if host in ("pro.m.jd.com", "prodev.m.jd.com") and path.startswith("/mall/active/"):
         return urlunsplit(("https", host, path, "", ""))
+
+    if host == "shop.m.jd.com" and (path == "/mshop/gethomepage" or path.startswith("/member/")):
+        pairs, found = _pick_allowed_params({"venderid": "venderId", "shopid": "shopId"})
+        if not (found.get("venderId") or found.get("shopId")):
+            return None
+        return urlunsplit(("https", host, path, urlencode(pairs), ""))
 
     return None
 
@@ -355,6 +363,9 @@ _UNWRAP_MOBILE_UA = (
 )
 
 
+_TUN_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
 def _is_safe_public_http_url(url_str: str, resolver: Callable[..., Any] = socket.getaddrinfo) -> bool:
     """SSRF 安全校验：每跳强制校验 http/https 标准端口与全局公网 IP，拒绝回环、内网、链路本地与云元数据地址。"""
     s = str(url_str or "").strip()
@@ -374,7 +385,9 @@ def _is_safe_public_http_url(url_str: str, resolver: Callable[..., Any] = socket
         return False
     try:
         ips = [ipaddress.ip_address(host.split("%", 1)[0])]
+        is_ip_literal = True
     except ValueError:
+        is_ip_literal = False
         try:
             infos = resolver(host, port or (443 if parts.scheme.lower() == "https" else 80), 0, socket.SOCK_STREAM)
             ips = [ipaddress.ip_address(str(info[4][0]).split("%", 1)[0]) for info in (infos or []) if info and len(info) >= 5 and info[4]]
@@ -382,18 +395,24 @@ def _is_safe_public_http_url(url_str: str, resolver: Callable[..., Any] = socket
             return False
     if not ips:
         return False
-    return all(
-        ip.is_global
-        and not (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        )
-        for ip in ips
-    )
+    for ip in ips:
+        if (
+            ip.is_global
+            and not (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            )
+        ):
+            continue
+        # 本机代理 TUN / Fake-IP 模式会将公网域名解析为 198.18.0.0/15；直接访问裸 198.18.x.x IP 仍严格拦截
+        if (not is_ip_literal) and ip in _TUN_FAKE_IP_NETWORK:
+            continue
+        return False
+    return True
 
 
 def unwrap_to_official_public_venue_url(
@@ -1941,28 +1960,34 @@ class DealPoolCleaner:
         """判定目标是否为原始线报中的优惠券/活动候选链接。"""
         if not isinstance(c, dict):
             return False
-        if str(c.get("text_role_hint") or "").strip().lower() == "coupon_candidate":
-            return True
-        if str(c.get("convert_status") or "").strip().lower() == "coupon_or_activity":
-            return True
         clean_input = str(c.get("clean_input") or "").strip().lower()
+        host, path = "", ""
         if clean_input.startswith(("http://", "https://")):
             try:
                 parts = urlsplit(clean_input)
                 host = (parts.hostname or "").lower()
                 path = parts.path or ""
-                if host in ("coupon.m.jd.com", "duo_coupon_landing.html"):
-                    return True
-                if host == "uland.taobao.com" and ("/quan/" in path or "/coupon/" in path):
-                    return True
-                if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active" in path:
-                    return True
-                if host in ("pages.tmall.com", "pages-fast.m.taobao.com") and path.startswith("/wow/"):
-                    return True
-                if "coupon" in path.lower() or "quan" in path.lower():
-                    return True
             except Exception:
-                pass
+                host, path = "", ""
+            if host == "shop.m.jd.com" and path == "/mshop/gethomepage":
+                return False
+        if str(c.get("text_role_hint") or "").strip().lower() == "coupon_candidate":
+            return True
+        if str(c.get("convert_status") or "").strip().lower() == "coupon_or_activity":
+            return True
+        if host:
+            if host in ("coupon.m.jd.com", "duo_coupon_landing.html"):
+                return True
+            if host == "shop.m.jd.com" and path.startswith("/member/"):
+                return True
+            if host == "uland.taobao.com" and ("/quan/" in path or "/coupon/" in path):
+                return True
+            if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active" in path:
+                return True
+            if host in ("pages.tmall.com", "pages-fast.m.taobao.com") and path.startswith("/wow/"):
+                return True
+            if "coupon" in path.lower() or "quan" in path.lower():
+                return True
         return False
 
     @classmethod
@@ -3146,6 +3171,11 @@ class DealPoolCleaner:
             )
             draft_copy_by_id[mid] = draft_copywriting
 
+            has_valid_prod = any(
+                c.get("convert_status") == "product"
+                and c.get("text_role_hint") != "filler_candidate"
+                for c in conv_list
+            )
             ai2_conv_links = [
                 {
                     "link_id": c["link_id"],
@@ -3155,6 +3185,11 @@ class DealPoolCleaner:
                     "official_product": c.get("official_product"),
                 }
                 for c in conv_list
+                if not (
+                    has_valid_prod
+                    and c.get("convert_status") == "failed"
+                    and c.get("error_code") in (ERR_JD_NUMERIC_SKU, ERR_TB_NUMERIC_ID, ERR_PDD_NUMERIC_ID)
+                )
             ]
             stage2_inputs.append({
                 "main_tip_id": mid,
@@ -3406,14 +3441,30 @@ class DealPoolCleaner:
 
             # 【优惠券与断链一致性拦截（Fail-Closed 铁律）】
             # 若最终未产出任何有效优惠券（not coupon_links）：
-            # 1. 原始线报显式包含优惠券链接（raw_coupon_candidates 存在但转链失败或未被保留）；
-            # 2. 或原始线报包含转链失败的非凑单链接，且标称到手价显著低于官方售价（缺券断链被脑补直拍）。
+            # 1. 且非“已被主商品二合一推广链吸收的同品券链”（has_absorbed_coupon）；
+            # 2. 若原始线报仍包含未转出有效券且未被吸收的显式优惠券链接，或包含非纯数字 SKU 拒识的转链失败非凑单链接且到手价显著低于官方售价，
             # 满足任一即表明好价前置动作已断裂，全条线报予以淘汰，绝不脑补放行。
-            if is_valid and not coupon_links:
+            def _is_coupon_absorbed_by_main(c: Dict[str, Any]) -> bool:
+                if c.get("link_id") == main_lid or c.get("convert_status") != "product":
+                    return False
+                c_gid = str(c.get("goods_id") or "").strip()
+                c_url = str(c.get("my_promo_link") or "").strip()
+                return bool(
+                    (goods_id and c_gid == goods_id)
+                    or (my_promo_link and c_url == my_promo_link)
+                    or plat == "taobao"
+                )
+
+            has_absorbed_coupon = any(
+                self._is_explicit_coupon_target(c) and _is_coupon_absorbed_by_main(c)
+                for c in conv_list
+            )
+            if is_valid and not coupon_links and not has_absorbed_coupon:
                 raw_coupon_candidates = [
                     c for c in conv_list
                     if c.get("link_id") != main_lid
                     and c.get("text_role_hint") != "filler_candidate"
+                    and not _is_coupon_absorbed_by_main(c)
                     and self._is_explicit_coupon_target(c)
                 ]
                 should_reject = False
@@ -3426,6 +3477,7 @@ class DealPoolCleaner:
                         c.get("link_id") != main_lid
                         and c.get("text_role_hint") != "filler_candidate"
                         and c.get("convert_status") == "failed"
+                        and c.get("error_code") not in (ERR_JD_NUMERIC_SKU, ERR_TB_NUMERIC_ID, ERR_PDD_NUMERIC_ID)
                         for c in conv_list
                     )
                     if has_failed_non_filler:

@@ -284,11 +284,11 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         fetcher_kwargs={"channel": "latest", "page": 1, "fetch_detail": True},
         enabled=True,
         interval_seconds=180,
-        max_details=6,
-        detail_delay_seconds=1.2,
-        sleep_after=1.0,
+        max_details=3,
+        detail_delay_seconds=1.5,
+        sleep_after=1.5,
         rate_limit_cooldown_seconds=300,
-        description="逛丢首页实时好价（详情过猛易触发滑块验证，注意控制 max_details 与 detail_delay_seconds）",
+        description="逛丢首页实时好价（同站三榜每轮随机顺序轮转，单频道限额 3 条以均摊每 5 分钟 ~6 条 IP 配额）",
     ),
     DealChannelConfig(
         name="逛丢_热门榜",
@@ -298,9 +298,9 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         fetcher_kwargs={"channel": "hots", "page": 1, "fetch_detail": True},
         enabled=True,
         interval_seconds=360,
-        max_details=5,
-        detail_delay_seconds=1.2,
-        sleep_after=1.0,
+        max_details=3,
+        detail_delay_seconds=1.5,
+        sleep_after=1.5,
         rate_limit_cooldown_seconds=300,
         description="逛丢热门上榜流",
     ),
@@ -312,16 +312,20 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         fetcher_kwargs={"channel": "rank", "page": 1, "fetch_detail": True},
         enabled=True,
         interval_seconds=360,
-        max_details=5,
-        detail_delay_seconds=1.2,
-        sleep_after=1.0,
+        max_details=3,
+        detail_delay_seconds=1.5,
+        sleep_after=1.5,
         rate_limit_cooldown_seconds=300,
         description="逛丢小时风云榜",
     ),
 
     # --------------------------------------------------------------------------
-    # 【扩展模板】：后续如需新增频道，复制下方任意一段取消注释或填写新抓取函数即可
+    # 【扩展模板】：后续如需新增频道，复制下方模板并按抓取器类型二选一配置：
+    # - 调度说明：不同 site_key 自动并行拉取；同一 site_key 内部每轮随机排序轮转，防首个频道饿死同站其他榜
+    # - 类型 A（含独立详情页抓取）：fetcher_kwargs 设 "fetch_detail": True，函数签名需接收 session / skip_detail_ids / max_details
+    # - 类型 B（纯列表/API 一次出全量）：不要传 "fetch_detail": True，函数仅需接收 session 及业务参数，由管道自动增量去重
     # --------------------------------------------------------------------------
+    # # 类型 A 示例（线报酷）：
     # DealChannelConfig(
     #     name="线报酷_好单拼多多专属流",
     #     site_key="xianbao_fun",
@@ -332,6 +336,17 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
     #     interval_seconds=240,
     #     max_details=15,
     #     sleep_after=0.5,
+    # ),
+    # # 类型 B 示例（好单库/折淘客/选单等纯列表源）：
+    # DealChannelConfig(
+    #     name="好单库_实时线报",
+    #     site_key="haodanku",
+    #     default_url="http://v2.api.haodanku.com/get_wire_report",
+    #     fetcher_name="fetch_haodanku_wire_report",
+    #     fetcher_kwargs={"min_id": 1},
+    #     enabled=False,
+    #     interval_seconds=180,
+    #     sleep_after=0.3,
     # ),
 ]
 
