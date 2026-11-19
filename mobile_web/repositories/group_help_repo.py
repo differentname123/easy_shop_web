@@ -9,6 +9,9 @@ from models.group_help import (
     DEFAULT_GROUP_TTL_SECONDS,
     ENTRY_TYPE_POSTER,
     ENTRY_TYPE_TOKEN,
+    EXPORT_STATUS_FAILED,
+    EXPORT_STATUS_SUCCESS,
+    EXPORT_TARGET_MIAOZHULI,
     GROUP_STATUS_ACTIVE,
     GROUP_STATUS_EXPIRED,
     GROUP_STATUS_FULL,
@@ -21,6 +24,7 @@ from models.group_help import (
     SOURCE_USER_UPLOAD,
     is_highly_similar_goods,
     validate_and_normalize_parsed_poster,
+    extract_pdd_share_token,
 )
 
 
@@ -42,6 +46,8 @@ class GroupHelpRepository(BaseRepository):
         )
         col.create_index([("goods_name", ASCENDING)], name="idx_goods_name")
         col.create_index([("keywords", ASCENDING)], name="idx_keywords")
+        col.create_index([("share_code", ASCENDING)], name="idx_share_code")
+        col.create_index([("last_exported_at", ASCENDING)], name="idx_last_exported")
         col.create_index(
             [("group_status", ASCENDING), ("expires_at", ASCENDING)],
             name="idx_status_expires",
@@ -134,6 +140,8 @@ class GroupHelpRepository(BaseRepository):
             "group_status": GROUP_STATUS_ACTIVE,
             "click_count": 0,
             "feedback_count": 0,
+            "exported_targets": dict(data.get("exported_targets") or {}),
+            "last_exported_at": data.get("last_exported_at"),
             "created_at": now,
             "updated_at": now,
             "expires_at": now + DEFAULT_GROUP_TTL_SECONDS,
@@ -341,21 +349,38 @@ class GroupHelpRepository(BaseRepository):
 
         kw_clean = str(keyword or "").strip()
         if kw_clean:
-            tokens = [t.strip() for t in re.split(r"\s+", kw_clean) if t.strip()][:5]
-            and_conditions = []
-            for tok in tokens:
-                pattern = re.escape(tok)
-                and_conditions.append(
-                    {
-                        "$or": [
-                            {"goods_name": {"$regex": pattern, "$options": "i"}},
-                            {"keywords": {"$regex": pattern, "$options": "i"}},
-                            {"group_order_id": tok},
-                        ]
-                    }
-                )
-            if and_conditions:
-                query["$and"] = and_conditions
+            extracted_token = extract_pdd_share_token(kw_clean)
+            if extracted_token:
+                # 用户直接粘贴了拼多多口令文案或带口令符号的内容，优先进行口令直搜
+                query["$or"] = [
+                    {"group_order_id": extracted_token},
+                    {"group_order_id": f"tok_{extracted_token}"},
+                    {"share_code": extracted_token},
+                ]
+            else:
+                tokens = [t.strip() for t in re.split(r"\s+", kw_clean) if t.strip()][:5]
+                and_conditions = []
+                for tok in tokens:
+                    pattern = re.escape(tok)
+                    clean_tok = tok.strip(" \t\r\n⇥⇤")
+                    or_branch = [
+                        {"goods_name": {"$regex": pattern, "$options": "i"}},
+                        {"keywords": {"$regex": pattern, "$options": "i"}},
+                        {"group_order_id": tok},
+                        {"group_order_id": f"tok_{tok}"},
+                        {"share_code": tok},
+                    ]
+                    if clean_tok and clean_tok != tok:
+                        or_branch.extend(
+                            [
+                                {"group_order_id": clean_tok},
+                                {"group_order_id": f"tok_{clean_tok}"},
+                                {"share_code": clean_tok},
+                            ]
+                        )
+                    and_conditions.append({"$or": or_branch})
+                if and_conditions:
+                    query["$and"] = and_conditions
 
         safe_offset = max(0, int(offset))
         safe_limit = max(1, min(50, int(limit)))
@@ -591,7 +616,7 @@ class GroupHelpRepository(BaseRepository):
                 projection={"_id": 0},
                 return_document=ReturnDocument.AFTER,
             )
-            return updated or existing, True, None
+            return updated or existing, False, None
 
         if expires_at <= current_ts:
             raise ValueError("该拼团已超过有效期，未录入")
@@ -640,6 +665,8 @@ class GroupHelpRepository(BaseRepository):
             "group_status": target_status,
             "click_count": 0,
             "feedback_count": 0,
+            "exported_targets": dict(data.get("exported_targets") or existing.get("exported_targets") if existing else {}),
+            "last_exported_at": data.get("last_exported_at", existing.get("last_exported_at") if existing else None),
             "created_at": created_at,
             "updated_at": current_ts,
             "expires_at": expires_at,
@@ -717,4 +744,78 @@ class GroupHelpRepository(BaseRepository):
             if len(results) >= safe_limit:
                 break
         return results
+
+    def list_pending_for_remote_export(
+        self,
+        target: str = EXPORT_TARGET_MIAOZHULI,
+        limit: int = 30,
+        now: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """获取符合向外部平台同步条件的站内在架记录（仅限真实用户上传/提交，避免循环反刍）。"""
+        current_ts = float(now if now is not None else time.time())
+        self.expire_outdated_groups(now=current_ts)
+        safe_limit = max(1, min(int(limit), 100))
+        target_name = str(target or EXPORT_TARGET_MIAOZHULI).strip()
+
+        query: Dict[str, Any] = {
+            "source": {"$in": [SOURCE_USER_UPLOAD, SOURCE_USER_TEXT]},
+            "parse_status": PARSE_STATUS_PARSED,
+            "group_status": GROUP_STATUS_ACTIVE,
+            "expires_at": {"$gt": current_ts},
+            "remain_people": {"$gt": 0},
+            f"exported_targets.{target_name}.status": {"$ne": EXPORT_STATUS_SUCCESS},
+            f"exported_targets.{target_name}.attempts": {"$not": {"$gte": 3}},
+        }
+        if target_name == EXPORT_TARGET_MIAOZHULI:
+            # 秒助力平台必须具备拼多多分享口令文本
+            query["share_text"] = {"$regex": r"\S+"}
+
+        cursor = (
+            self.col.find(query, {"_id": 0})
+            .sort([("remain_people", ASCENDING), ("created_at", DESCENDING)])
+            .limit(safe_limit)
+        )
+        return list(cursor)
+
+    def record_export_result(
+        self,
+        group_order_id: str,
+        target: str,
+        *,
+        success: bool,
+        remote_id: str = "",
+        error_msg: str = "",
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """原子记录向外部目标平台的发布审计结果与状态。"""
+        current_ts = float(now if now is not None else time.time())
+        gid = str(group_order_id or "").strip()
+        target_name = str(target or "").strip()
+        if not gid or not target_name:
+            return None
+
+        update_set: Dict[str, Any] = {
+            f"exported_targets.{target_name}.last_attempt_at": current_ts,
+            "updated_at": current_ts,
+        }
+        if success:
+            update_set[f"exported_targets.{target_name}.status"] = EXPORT_STATUS_SUCCESS
+            update_set[f"exported_targets.{target_name}.remote_id"] = str(remote_id or "")
+            update_set[f"exported_targets.{target_name}.exported_at"] = current_ts
+            update_set[f"exported_targets.{target_name}.error_msg"] = ""
+            update_set["last_exported_at"] = current_ts
+        else:
+            update_set[f"exported_targets.{target_name}.status"] = EXPORT_STATUS_FAILED
+            update_set[f"exported_targets.{target_name}.error_msg"] = str(error_msg or "")[:300]
+
+        return self.col.find_one_and_update(
+            {"group_order_id": gid},
+            {
+                "$set": update_set,
+                "$inc": {f"exported_targets.{target_name}.attempts": 1},
+            },
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+
 

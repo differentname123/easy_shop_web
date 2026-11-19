@@ -1417,12 +1417,14 @@ def test_xianbao_detail_loop_circuit_breaks_on_429_and_caps_attempts(monkeypatch
 def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, tmp_path):
     """验证同源站点在单轮内触发 429 后，后续同站点频道直接 cooldown_skipped 冷却跳过，且错误路径按频道聚合。"""
     from mobile_web.scripts import run_deal_pool_scheduler as dps
+    from mobile_web.services import deal_pipeline as dp_mod
+    from mobile_web.services.deal_channel_config import DealChannelConfig
 
-    monkeypatch.setattr(dps.time, "sleep", lambda _: None)
-    monkeypatch.setattr(dps, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"))
-    monkeypatch.setattr(dps, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"))
-    monkeypatch.setattr(dps, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"))
-    monkeypatch.setattr(dps, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"))
+    monkeypatch.setattr(dp_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(dp_mod, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"))
+    monkeypatch.setattr(dp_mod, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"))
+    monkeypatch.setattr(dp_mod, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"))
+    monkeypatch.setattr(dp_mod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"))
 
     xianbao_calls = []
 
@@ -1432,7 +1434,8 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
             "status": "success",
             "http_status": 200,
             "request_url": "https://new.xianbao.fun/test",
-            "count": 2,
+            "raw_list_count": 2,
+            "count": 1,
             "detail_fetched": 0,
             "detail_errors": [
                 {"item_id": "1", "error_url": "https://new.xianbao.fun/1.html", "http_status": 429, "error_type": "HTTP_429", "error": "429"},
@@ -1445,32 +1448,56 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
         "status": "success",
         "http_status": 200,
         "request_url": "https://example.com/ok",
+        "raw_list_count": 1,
         "count": 1,
         "detail_fetched": 1,
         "detail_errors": [],
-        "records": [{"source_site": "haodanku", "source_item_id": "h1", "has_full_detail": True, "extracted_links": [{"url": "https://u.jd.com/x"}]}],
+        "records": [{"source_site": "tehuicaicai", "source_item_id": "h1", "has_full_detail": True, "extracted_links": [{"url": "https://u.jd.com/x"}]}],
     }
 
     monkeypatch.setattr(dps, "fetch_xianbao_fun_deals", fake_xianbao)
-    monkeypatch.setattr(dps, "fetch_haodanku_wire_report", ok_stub)
-    monkeypatch.setattr(dps, "fetch_zhetaoke_xianbao_groups", ok_stub)
-    monkeypatch.setattr(dps, "fetch_guangdiu_deals", ok_stub)
-    monkeypatch.setattr(dps, "fetch_xuandan_deals", ok_stub)
-    monkeypatch.setattr(dps, "fetch_0818tuan_deals", ok_stub)
-    monkeypatch.setattr(dps, "fetch_bacaoo_deals", ok_stub)
-    monkeypatch.setattr(dps, "fetch_iehou_deals", ok_stub)
     monkeypatch.setattr(dps, "fetch_tehuicaicai_deals", ok_stub)
+
+    test_channels = [
+        DealChannelConfig(
+            name="线报酷_频道A",
+            site_key="xianbao_fun",
+            default_url="https://new.xianbao.fun/a/",
+            fetcher_name="fetch_xianbao_fun_deals",
+            fetcher_kwargs={"channel": "a", "fetch_detail": True},
+        ),
+        DealChannelConfig(
+            name="线报酷_频道B",
+            site_key="xianbao_fun",
+            default_url="https://new.xianbao.fun/b/",
+            fetcher_name="fetch_xianbao_fun_deals",
+            fetcher_kwargs={"channel": "b", "fetch_detail": True},
+        ),
+        DealChannelConfig(
+            name="特惠采采_测试",
+            site_key="tehuicaicai",
+            default_url="https://xhhcds.cn/",
+            fetcher_name="fetch_tehuicaicai_deals",
+            fetcher_kwargs={"channel": "home", "fetch_detail": True},
+        ),
+    ]
 
     repo = MagicMock()
     repo.get_existing_detailed_ids.return_value = set()
     repo.save_batch.return_value = {"inserted": 1, "updated": 0}
     repo.generate_pool_summary.return_value = {"total_records": 1}
 
-    out = dps.run_fetch_stage(repo=repo, session=MagicMock(), cycle_num=1, run_all_tiers=False)
+    out = dps.run_fetch_stage(
+        repo=repo,
+        session=MagicMock(),
+        cycle_num=1,
+        channels=test_channels,
+        channel_last_run={},
+    )
     assert len(xianbao_calls) == 1
     xb_tasks = [t for t in out["tasks"] if t["site_key"] == "xianbao_fun"]
-    assert len(xb_tasks) >= 2
-    assert sum(1 for t in xb_tasks if t["status"] == "cooldown_skipped") == len(xb_tasks) - 1
+    assert len(xb_tasks) == 2
+    assert sum(1 for t in xb_tasks if t["status"] == "cooldown_skipped") == 1
     assert len(out["error_paths"]) == 1
     assert "共 2 条详情异常" in out["error_paths"][0]["error_message"]
 
@@ -1698,4 +1725,171 @@ def test_fetch_guangdiu_filters_vipshop(monkeypatch):
     assert "102" not in item_ids
     malls = [r["mall_name"] for r in records]
     assert "唯品会" not in malls
+
+
+def test_fetch_guangdiu_rank_and_hots_parser():
+    from mobile_web.scripts.test_deal_sites_scraper import fetch_guangdiu_deals
+    from unittest.mock import MagicMock
+
+    rank_html = """
+    <div class="hourrankitem">
+        <a class="clickmask" href="./detail.php?id=801" target="_blank"></a>
+        <div class="hourranknum"><div class="hourranknumtext">No.1</div></div>
+        <a class="hourrankimgdiv" href="./detail.php?id=801" target="_blank">
+            <img class="hourrankimg" src="https://img.guangdiu.com/801.jpg" alt="京东生鲜 柿饼 16.6元" />
+        </a>
+        <div class="hourrankinfo">
+            <div class="hourrankmallandtitle">
+                <a class="hourranktitle" href="./detail.php?id=801" target="_blank">京鲜生 广西流心柿饼 2斤 <br/><span class="emphricepart">16.6元</span></a>
+            </div>
+            <div class="clear"></div>
+            <div class="hourrankfromsite">京东&nbsp;·&nbsp;水果源头直发京东自营专区</div>
+        </div>
+    </div>
+    <div class="clear"></div>
+    <div class="hourrankitem">
+        <a class="clickmask" href="./detail.php?id=802" target="_blank"></a>
+        <div class="hourranknum"><div class="hourranknumtext">No.2</div></div>
+        <div class="hourrankinfo">
+            <div class="hourrankmallandtitle">
+                <a class="hourranktitle" href="./detail.php?id=802" target="_blank">唯品会 特卖女装 <span class="emphricepart">99元</span></a>
+            </div>
+            <div class="clear"></div>
+            <div class="hourrankfromsite">唯品会&nbsp;·&nbsp;自营特卖</div>
+        </div>
+    </div>
+    """
+
+    go_js = """var _xdk9 = 'https%3A%2F%2Fitem.jd.com%2F10001.html';"""
+
+    def fake_get(url, *args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "go.php" in url:
+            resp.text = "var target = 'https://union-click.jd.com/jdc?e=mock_rank';"
+        elif "rank.php" in url:
+            resp.text = rank_html
+        elif "hots.php" in url:
+            resp.text = """
+            <div class="gooditem">
+                <a class="goodname" href="detail.php?id=901">热水壶 <span class="emphricepart">39元</span></a>
+                <a class="rightmallname">天猫</a>
+                <div class="abstractcontent">满100减60优惠券</div>
+            </div>
+            """
+        else:
+            resp.text = ""
+        return resp
+
+    session = MagicMock()
+    session.get.side_effect = fake_get
+
+    # 1. 验证 rank.php
+    res_rank = fetch_guangdiu_deals(channel="rank", fetch_detail=False, session=session)
+    assert res_rank["status"] == "success"
+    records_rank = res_rank["records"]
+    assert len(records_rank) == 1  # 唯品会被过滤，保留京东
+    rec1 = records_rank[0]
+    assert rec1["source_item_id"] == "801"
+    assert rec1["mall_name"] == "京东"
+    assert "京鲜生 广西流心柿饼 2斤" in rec1["title"]
+    assert rec1["price_text"] == "16.6元"
+    assert "https://union-click.jd.com/jdc?e=mock_rank" in [lk["url"] for lk in rec1["extracted_links"]]
+
+    # 2. 验证 hots.php
+    res_hots = fetch_guangdiu_deals(channel="hots", fetch_detail=False, session=session)
+    assert res_hots["status"] == "success"
+    rec_hot = res_hots["records"][0]
+    assert rec_hot["source_item_id"] == "901"
+    assert rec_hot["mall_name"] == "天猫"
+    assert "【逛丢热门】" in rec_hot["tutorial_text"]
+    assert "满100减60优惠券" in rec_hot["tutorial_text"]
+
+
+def test_fetch_guangdiu_captcha_circuit_breaker():
+    from mobile_web.scripts.test_deal_sites_scraper import fetch_guangdiu_deals
+    from unittest.mock import MagicMock
+
+    list_html = """
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=701">好价抽纸 9.9元</a>
+        <a class="rightmallname">京东</a>
+        <div class="abstractcontent">领券立减20元</div>
+    </div>
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=702">纯牛奶 49元</a>
+        <a class="rightmallname">天猫</a>
+        <div class="abstractcontent">买一送一</div>
+    </div>
+    """
+
+    captcha_html = """
+    <!DOCTYPE html>
+    <html>
+    <head><title>安全验证 - 逛丢</title></head>
+    <body>
+        <div class="verify-wrap">
+            <p class="verify-title">请完成安全验证</p>
+            <div class="slide-track" id="slidetrack"></div>
+        </div>
+    </body>
+    </html>
+    """
+
+    detail_called = []
+
+    def fake_get(url, *args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "go.php" in url:
+            resp.text = "var u = 'https://union-click.jd.com/jdc?e=ok';"
+        elif "detail.php" in url:
+            detail_called.append(url)
+            resp.text = captcha_html  # 模拟详情页触发滑块验证码
+        else:
+            resp.text = list_html
+        return resp
+
+    session = MagicMock()
+    session.get.side_effect = fake_get
+
+    # 验证“宁缺毋滥”铁律：当详情页遇到验证码未能拿到爆料教程时，系统主动断路保护 IP，且绝不入库空壳商品
+    res = fetch_guangdiu_deals(channel="latest", fetch_detail=True, max_details=5, session=session)
+    # 首次触发验证码后，detail_circuit_broken 触发，后续 702 不再发起 detail 请求
+    assert len(detail_called) == 1
+    assert "701" in detail_called[0]
+    # 两个商品均未获得实质性详情教程，宁缺毋滥，全部跳过等待下一轮冷却后重试，records 为空
+    assert len(res["records"]) == 0
+    assert any(err.get("error_type") == "CaptchaChallengeDetected" for err in res["detail_errors"])
+
+    # 验证正常成功获取详情教程时的入库逻辑
+    normal_detail_html = """
+    <html><body>
+        <div id="dabstract">
+            购买方案：1 店铺 京东自营，面价39元；2 领券 <a href="to.php?u=https%3A%2F%2Fitem.jd.com%2F701.html">直达商品</a>
+        </div>
+        <a class="dgotobutton"></a>
+    </body></html>
+    """
+    def fake_get_ok(url, *args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "go.php" in url:
+            resp.text = "var u = 'https://union-click.jd.com/jdc?e=ok';"
+        elif "detail.php" in url:
+            resp.text = normal_detail_html
+        else:
+            resp.text = list_html
+        return resp
+
+    session_ok = MagicMock()
+    session_ok.get.side_effect = fake_get_ok
+    res_ok = fetch_guangdiu_deals(channel="latest", fetch_detail=True, max_details=5, session=session_ok)
+    assert res_ok["status"] == "success"
+    assert len(res_ok["records"]) == 2
+    rec = res_ok["records"][0]
+    assert rec["has_full_detail"] is True
+    assert "购买方案" in rec["tutorial_text"]
+    assert any("union-click.jd.com" in lk["url"] for lk in rec["extracted_links"])
+
 

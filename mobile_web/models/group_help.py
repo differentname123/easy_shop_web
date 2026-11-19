@@ -24,6 +24,10 @@ ENTRY_TYPE_TOKEN = "token"
 SOURCE_USER_UPLOAD = "user_upload"
 SOURCE_USER_TEXT = "user_text"
 
+EXPORT_STATUS_SUCCESS = "success"
+EXPORT_STATUS_FAILED = "failed"
+EXPORT_TARGET_MIAOZHULI = "miaozhuli"
+
 DEFAULT_GROUP_TTL_SECONDS = 86400  # 默认 24 小时后自动下线
 MAX_PARSE_ATTEMPTS = 3
 
@@ -99,11 +103,11 @@ class GroupFeedbackRequest(BaseModel):
 class GroupTextSubmitRequest(BaseModel):
     """无海报图片时，用户直接提交拼多多口令或官方拼团链接的请求载荷。"""
     share_text: str = Field(..., min_length=6, max_length=500, description="拼多多 ⇥...⇤ 拼团口令或官方拼团链接")
-    goods_name: str = Field(..., min_length=2, max_length=120, description="商品名称")
-    group_price: float = Field(..., gt=0, le=50000, description="拼团价格（元）")
+    goods_name: Optional[str] = Field(default="", max_length=120, description="商品名称（留空时自动从口令文案提取）")
+    group_price: Optional[float] = Field(default=None, gt=0, le=50000, description="拼团价格（留空时自动从口令文案提取）")
     original_price: Optional[float] = Field(default=None, description="单买原价（可选）")
     total_people: int = Field(default=0, ge=0, le=50, description="成团总人数（可选，0表示未知）")
-    remain_people: int = Field(default=1, ge=1, le=20, description="还差几人成团")
+    remain_people: int = Field(default=1, ge=1, le=20, description="还差几人成团（默认1，口令含有时自动识别）")
     publisher_nick: Optional[str] = Field(default="", max_length=40, description="发布者昵称（可选）")
     owner_token: Optional[str] = Field(default=None, max_length=64, description="前端生成的团长本地管理口令")
 
@@ -222,11 +226,61 @@ def validate_optional_share_text(raw_text: Any) -> Dict[str, str]:
     }
 
 
+def extract_smart_fields_from_pdd_share_text(raw_text: str) -> Dict[str, Any]:
+    """从拼多多分享口令原始文案中智能提取价格、差额人数、总人数与商品名称（SSOT 唯一真源）。"""
+    text = str(raw_text or "").strip()
+    res: Dict[str, Any] = {}
+    if not text:
+        return res
+
+    price_m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*元\s*拼团购买", text) or re.search(r"([0-9]+(?:\.[0-9]+)?)\s*元", text)
+    if price_m:
+        try:
+            val = float(price_m.group(1))
+            if 0 < val <= 50000:
+                res["group_price"] = round(val, 2)
+        except ValueError:
+            pass
+
+    rem_m = re.search(r"仅剩\s*([0-9]+)\s*个名额", text) or re.search(r"(?:还差|差)\s*([0-9]+)\s*人", text)
+    if rem_m:
+        try:
+            rval = int(rem_m.group(1))
+            if 1 <= rval <= 20:
+                res["remain_people"] = rval
+        except ValueError:
+            pass
+
+    tot_m = re.search(r"([0-9]+)\s*人团", text)
+    if tot_m:
+        try:
+            tval = int(tot_m.group(1))
+            if 2 <= tval <= 50:
+                res["total_people"] = tval
+        except ValueError:
+            pass
+
+    title_m = re.search(r"拼团购买\s*(.*?)(?:\.\.\.|…|，仅剩|$)", text)
+    if title_m and len(title_m.group(1).strip()) >= 2:
+        t = title_m.group(1).strip()
+        suffix_m = re.search(r"仅剩\s*[0-9]+\s*个名额[。，、\s]+(.+?)$", text)
+        if suffix_m:
+            s = suffix_m.group(1).strip("。，、 ")
+            if len(s) >= 2 and s not in t and not re.search(r"(?:点击|复制|打开|微信|qq|私信)", s, re.I):
+                t = f"{t}（{s[:24]}）"
+        res["goods_name"] = t
+    else:
+        bracket_m = re.search(r"【([^【】]{3,80})】", text)
+        if bracket_m and not re.match(r"^(拼多多|百亿补贴|多人团)$", bracket_m.group(1).strip()):
+            res["goods_name"] = bracket_m.group(0).strip()
+    return res
+
+
 def parse_pdd_group_share_fields(
     *,
     share_text: str,
-    goods_name: str,
-    group_price: Any,
+    goods_name: str = "",
+    group_price: Any = None,
     original_price: Any = None,
     total_people: Any = 0,
     remain_people: Any = 1,
@@ -238,6 +292,17 @@ def parse_pdd_group_share_fields(
         raise ValueError("请填写拼多多 ⇥...⇤ 口令或官方拼团链接")
     if len(raw_share) > 500:
         raise ValueError("口令或链接内容过长（最多 500 字符）")
+
+    # 智能补全缺省字段（当调用方未传具体商品名或价格时从文案自动识别）
+    auto_fields = extract_smart_fields_from_pdd_share_text(raw_share)
+    if not str(goods_name or "").strip() and auto_fields.get("goods_name"):
+        goods_name = auto_fields["goods_name"]
+    if (group_price is None or group_price == "" or str(group_price).strip() == "") and auto_fields.get("group_price"):
+        group_price = auto_fields["group_price"]
+    if (remain_people is None or remain_people == 1 or remain_people == "") and auto_fields.get("remain_people"):
+        remain_people = auto_fields["remain_people"]
+    if (not total_people or total_people == 0 or total_people == "") and auto_fields.get("total_people"):
+        total_people = auto_fields["total_people"]
 
     cleaned_name = re.sub(r"\s+", " ", str(goods_name or "")).strip()
     cleaned_nick = re.sub(r"\s+", " ", str(publisher_nick or "")).strip()[:40]
@@ -493,6 +558,8 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
         "updated_at": int(doc.get("updated_at") or created_at),
         "expires_at": int(expires_at),
         "remaining_seconds": remaining_seconds,
+        "exported_targets": doc.get("exported_targets") or {},
+        "last_exported_at": doc.get("last_exported_at"),
         "poster_url": f"/api/group_help/poster/{gid}" if has_poster else "",
         "share_text": str(doc.get("share_text") or "").strip(),
         "share_code": str(doc.get("share_code") or "").strip(),

@@ -12,7 +12,7 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261119-1">
+  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261119-2">
   <script src="/static/js/vue.global.prod.js?v=ux-20261119-1"></script>
 </head>
 <body>
@@ -334,24 +334,23 @@
       </div>
 
       <div class="gh-sheet-content">
-        <!-- 核心商品信息（大字体突出） -->
-        <div class="gh-detail-top">
+        <!-- 核心商品与价格行（顶部图+价格+参团倒计时状态） -->
+        <div class="gh-detail-top-row">
           <img
             v-if="selectedGroup.poster_url"
             :src="selectedGroup.poster_url"
             :alt="selectedGroup.goods_name"
-            class="gh-detail-poster"
+            class="gh-detail-poster-thumb"
             @click="openPosterAndRecord(selectedGroup)"
           />
-          <div v-else class="gh-detail-text-thumb">
+          <div v-else class="gh-detail-text-thumb" style="width:76px;height:76px;flex-shrink:0">
             <div class="gh-text-card-thumb" :class="selectedGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
               <span class="gh-tct-tag">{{ selectedGroup.entry_type === 'link' ? '官方链接' : '拼团口令' }}</span>
               <span class="gh-tct-price" v-if="selectedGroup.group_price">¥{{ selectedGroup.group_price }}</span>
               <span class="gh-tct-sub">{{ selectedGroup.total_people ? selectedGroup.total_people + '人团' : '无图展示' }}</span>
             </div>
           </div>
-          <div class="gh-detail-meta">
-            <div class="gh-detail-title">{{ selectedGroup.goods_name }}</div>
+          <div class="gh-detail-primary-meta">
             <div class="gh-detail-price-row">
               <span class="gh-detail-price" v-if="selectedGroup.group_price">¥{{ selectedGroup.group_price }}</span>
               <span
@@ -365,7 +364,35 @@
             <div class="gh-sub-meta">
               {{ selectedGroup.click_count }}人去过 · 剩{{ formatRemaining(selectedGroup.remaining_seconds) }}
             </div>
+            <div class="gh-detail-entry-tag">
+              <span class="gh-badge" :class="selectedGroup.poster_path ? 'gh-badge-poster' : 'gh-badge-token'">
+                {{ selectedGroup.poster_path ? '📷 海报扫码团' : (selectedGroup.entry_type === 'link' ? '🔗 链接团' : '📝 口令团') }}
+              </span>
+              <span v-if="selectedGroup.total_people" class="gh-badge-people">{{ selectedGroup.total_people }}人团</span>
+            </div>
           </div>
+        </div>
+
+        <!-- 全宽商品完整标题卡（100%全显，无省略截断，彻底解决看不全商品名问题） -->
+        <div class="gh-detail-full-title-box">
+          <div class="gh-detail-full-title">{{ selectedGroup.goods_name || '拼多多拼团商品' }}</div>
+          <div class="gh-ellipsis-tip" v-if="selectedGroup.goods_name && selectedGroup.goods_name.includes('...')">
+            💡 拼多多官方复制口令时已截断长标题，点击去拼多多可看原装商品全名
+          </div>
+          <div class="gh-detail-keywords" v-if="selectedGroup.keywords && selectedGroup.keywords.length">
+            <span v-for="kw in selectedGroup.keywords" :key="kw" class="gh-tag-pill">#{{ kw }}</span>
+          </div>
+        </div>
+
+        <!-- 完整原始分享文案卡片（保证所有文字100%全显并支持一键复制） -->
+        <div class="gh-full-desc-card" v-if="selectedGroup.share_text && selectedGroup.share_text !== selectedGroup.goods_name">
+          <div class="gh-full-desc-header">
+            <span>📋 完整拼单分享文案 / 规格描述</span>
+            <button class="gh-text-btn" style="color:var(--gh-primary);font-weight:700" @click="copyShareText(selectedGroup.share_text, '已复制完整拼单文案！')">
+              复制文案
+            </button>
+          </div>
+          <div class="gh-full-desc-body">{{ selectedGroup.share_text }}</div>
         </div>
 
         <!-- 主操作：有数字团单走一键直达，无图口令走一键复制口令（并可手动复制） -->
@@ -599,24 +626,31 @@
         <div class="gh-dialog-body">
           <p>大厅中已有<b>同款同价</b>的商品正在凑团，直接去参团可更快拼成发货！您也可以选择继续上传自己的团：</p>
           <div
-            class="gh-card"
-            style="margin-top:10px;border:1.5px solid #ffd591;background:#fffbe6;box-shadow:none"
+            class="gh-dialog-goods-card is-matched"
             @click="chooseJoinMatchedGroup"
           >
-            <div class="gh-thumb-box" style="width:68px;height:68px">
-              <img v-if="uploadResultModal.matchedGroup.poster_url" :src="uploadResultModal.matchedGroup.poster_url" :alt="uploadResultModal.matchedGroup.goods_name" />
-              <div v-else class="gh-text-card-thumb" :class="uploadResultModal.matchedGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
+            <div class="gh-dgc-title">{{ uploadResultModal.matchedGroup.goods_name }}</div>
+            <div class="gh-dgc-meta-row">
+              <img
+                v-if="uploadResultModal.matchedGroup.poster_url"
+                :src="uploadResultModal.matchedGroup.poster_url"
+                :alt="uploadResultModal.matchedGroup.goods_name"
+                class="gh-dgc-thumb"
+              />
+              <div v-else class="gh-text-card-thumb" style="width:56px;height:56px;font-size:10px" :class="uploadResultModal.matchedGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
                 <span class="gh-tct-tag">{{ uploadResultModal.matchedGroup.entry_type === 'link' ? '链接' : '口令' }}</span>
-                <span class="gh-tct-price" style="font-size:13px" v-if="uploadResultModal.matchedGroup.group_price">¥{{ uploadResultModal.matchedGroup.group_price }}</span>
+                <span class="gh-tct-price" style="font-size:11px" v-if="uploadResultModal.matchedGroup.group_price">¥{{ uploadResultModal.matchedGroup.group_price }}</span>
               </div>
-            </div>
-            <div class="gh-card-body">
-              <div class="gh-status-row">
-                <span class="gh-remain-badge">{{ statusBadgeText(uploadResultModal.matchedGroup) }}</span>
-                <span class="gh-sub-meta">剩{{ formatRemaining(uploadResultModal.matchedGroup.remaining_seconds) }}</span>
+              <div class="gh-dgc-info">
+                <div class="gh-dgc-price-row">
+                  <span class="gh-dgc-price">¥{{ uploadResultModal.matchedGroup.group_price }}</span>
+                  <span class="gh-remain-badge">{{ statusBadgeText(uploadResultModal.matchedGroup) }}</span>
+                </div>
+                <div class="gh-dgc-sub-row">
+                  <span>剩{{ formatRemaining(uploadResultModal.matchedGroup.remaining_seconds) }}</span>
+                  <span>{{ uploadResultModal.matchedGroup.click_count || 0 }}人去过</span>
+                </div>
               </div>
-              <div class="gh-goods-title" style="font-size:13px">{{ uploadResultModal.matchedGroup.goods_name }}</div>
-              <div class="gh-price-val" style="font-size:15px">¥{{ uploadResultModal.matchedGroup.group_price }}</div>
             </div>
           </div>
         </div>
@@ -644,24 +678,31 @@
         <div class="gh-dialog-body">
           <p>您的拼团海报已展示在互助大厅，一键复制本团链接发给微信好友/群聊，点开就能直接参团：</p>
           <div
-            class="gh-card"
-            style="margin-top:10px;border:1.5px solid #b7eb8f;background:#f6ffed;box-shadow:none"
+            class="gh-dialog-goods-card is-own"
             @click="viewPublishedOwnGroup"
           >
-            <div class="gh-thumb-box" style="width:68px;height:68px">
-              <img v-if="uploadResultModal.ownGroup.poster_url" :src="uploadResultModal.ownGroup.poster_url" :alt="uploadResultModal.ownGroup.goods_name" />
-              <div v-else class="gh-text-card-thumb" :class="uploadResultModal.ownGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
+            <div class="gh-dgc-title">{{ uploadResultModal.ownGroup.goods_name }}</div>
+            <div class="gh-dgc-meta-row">
+              <img
+                v-if="uploadResultModal.ownGroup.poster_url"
+                :src="uploadResultModal.ownGroup.poster_url"
+                :alt="uploadResultModal.ownGroup.goods_name"
+                class="gh-dgc-thumb"
+              />
+              <div v-else class="gh-text-card-thumb" style="width:56px;height:56px;font-size:10px" :class="uploadResultModal.ownGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
                 <span class="gh-tct-tag">{{ uploadResultModal.ownGroup.entry_type === 'link' ? '链接' : '口令' }}</span>
-                <span class="gh-tct-price" style="font-size:13px" v-if="uploadResultModal.ownGroup.group_price">¥{{ uploadResultModal.ownGroup.group_price }}</span>
+                <span class="gh-tct-price" style="font-size:11px" v-if="uploadResultModal.ownGroup.group_price">¥{{ uploadResultModal.ownGroup.group_price }}</span>
               </div>
-            </div>
-            <div class="gh-card-body">
-              <div class="gh-status-row">
-                <span class="gh-remain-badge">{{ statusBadgeText(uploadResultModal.ownGroup) }}</span>
-                <span class="gh-sub-meta">剩{{ formatRemaining(uploadResultModal.ownGroup.remaining_seconds) }}</span>
+              <div class="gh-dgc-info">
+                <div class="gh-dgc-price-row">
+                  <span class="gh-dgc-price">¥{{ uploadResultModal.ownGroup.group_price }}</span>
+                  <span class="gh-remain-badge">{{ statusBadgeText(uploadResultModal.ownGroup) }}</span>
+                </div>
+                <div class="gh-dgc-sub-row">
+                  <span>剩{{ formatRemaining(uploadResultModal.ownGroup.remaining_seconds) }}</span>
+                  <span>{{ uploadResultModal.ownGroup.click_count || 0 }}人去过</span>
+                </div>
               </div>
-              <div class="gh-goods-title" style="font-size:13px">{{ uploadResultModal.ownGroup.goods_name }}</div>
-              <div class="gh-price-val" style="font-size:15px">¥{{ uploadResultModal.ownGroup.group_price }}</div>
             </div>
           </div>
         </div>
@@ -801,14 +842,23 @@
       <div class="gh-dialog-title">📝 无图口令 / 链接发团</div>
       <div class="gh-dialog-body" style="margin-bottom:10px">
         <div class="gh-form-field">
-          <label class="gh-form-label">拼多多口令（含 ⇥...⇤）或官方拼团链接 *</label>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <label class="gh-form-label" style="margin-bottom:0">拼多多口令或拼团链接 *</label>
+            <button type="button" class="gh-paste-quick-btn" @click="pasteClipboardIntoTextModal">
+              📋 粘贴剪贴板口令
+            </button>
+          </div>
           <textarea
             class="gh-form-textarea"
             maxlength="500"
-            placeholder="请粘贴从拼多多复制的多人团口令（含 ⇥...⇤）或 yk/pinduoduo 官方拼团链接..."
+            placeholder="粘贴从拼多多复制的完整口令（含 ⇥...⇤）或官方拼团链接，自动识别名称与价格..."
             v-model.trim="textSubmitModal.share_text"
             @input="onTextShareInput"
+            @paste="onTextSharePaste"
           ></textarea>
+        </div>
+        <div class="gh-smart-filled-tip" v-if="textSubmitModal.autoFilledTip">
+          {{ textSubmitModal.autoFilledTip }}
         </div>
         <div class="gh-form-field">
           <label class="gh-form-label">商品名称 *</label>
@@ -875,6 +925,6 @@
   </div>
 
 </div>
-<script src="/static/js/group_help.js?v=ux-20261119-1"></script>
+<script src="/static/js/group_help.js?v=ux-20261119-3"></script>
 </body>
 </html>

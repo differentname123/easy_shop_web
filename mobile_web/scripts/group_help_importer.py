@@ -38,6 +38,7 @@ from models.group_help import (
     GROUP_STATUS_EXPIRED,
     GROUP_STATUS_FULL,
     extract_pdd_share_token,
+    extract_smart_fields_from_pdd_share_text,
     parse_pdd_group_share_fields,
 )
 from repositories.group_help_repo import GroupHelpRepository
@@ -117,6 +118,22 @@ def _extract_list_items(payload: Any) -> List[Dict[str, Any]]:
                     candidates = nested[key]
                     break
     return [it for it in candidates if isinstance(it, dict)]
+
+
+def _clean_external_goods_name(title_candidate: str, raw_text: str) -> str:
+    """清洗外部截断标题，复用 models.group_help.extract_smart_fields_from_pdd_share_text 唯一真源。"""
+    title = str(title_candidate or "").strip()
+    raw = str(raw_text or "").strip()
+    smart = extract_smart_fields_from_pdd_share_text(raw)
+    smart_title = str(smart.get("goods_name") or "").strip()
+    if not title:
+        return smart_title
+    if smart_title and ("..." in title or "…" in title) and smart_title != title:
+        return smart_title
+    if "（" in smart_title and "）" in smart_title and "（" not in title:
+        suffix_part = smart_title[smart_title.rfind("（") :]
+        return f"{title}{suffix_part}"
+    return title
 
 
 class GroupHelpImporter:
@@ -201,14 +218,14 @@ class GroupHelpImporter:
             "created_at": min(created_at, now),
             "expires_at": expires_at,
         }
-        _, changed, _ = self.repo.upsert_parsed_group(
+        _, is_new, _ = self.repo.upsert_parsed_group(
             doc_input,
             ttl_seconds=DEFAULT_GROUP_TTL_SECONDS,
             now=now,
             preserve_local_takedown=True,
             check_similar=False,
         )
-        if changed:
+        if is_new:
             stats["upserted"] += 1
         else:
             stats["unchanged"] += 1
@@ -225,7 +242,7 @@ class GroupHelpImporter:
             "dry_run_ok": 0,
         }
         for page in range(1, self.pages + 1):
-            payload = self._fetch_json(ACDOG_API_URL, {"page": page, "size": 20})
+            payload = self._fetch_json(ACDOG_API_URL, {"page": page, "size": 50})
             items = _extract_list_items(payload)
             if not items:
                 break
@@ -274,11 +291,12 @@ class GroupHelpImporter:
                     stats["skipped_expired"] += 1
                     continue
 
+                cleaned_title = _clean_external_goods_name(str(item.get("titleDisplay") or ""), raw_text)
                 try:
                     self._upsert_external_candidate(
                         source="acdog",
                         raw_share_text=raw_text,
-                        goods_name=str(item.get("titleDisplay") or ""),
+                        goods_name=cleaned_title,
                         group_price=item.get("price"),
                         total_people=item.get("groupSize") or 0,
                         remain_people=spots_left if spots_left is not None else 1,
@@ -356,11 +374,12 @@ class GroupHelpImporter:
                     stats["skipped_expired"] += 1
                     continue
 
+                cleaned_title = _clean_external_goods_name(str(item.get("title") or ""), raw_text)
                 try:
                     self._upsert_external_candidate(
                         source="miaozhuli",
                         raw_share_text=raw_text,
-                        goods_name=str(item.get("title") or ""),
+                        goods_name=cleaned_title,
                         group_price=item.get("price"),
                         total_people=item.get("team_size") or 0,
                         remain_people=1,
@@ -375,6 +394,7 @@ class GroupHelpImporter:
         return stats
 
     def run_once(self, now: Optional[float] = None) -> Dict[str, Any]:
+        loop_t0 = time.perf_counter()
         current_ts = float(now if now is not None else time.time())
         summary: Dict[str, Any] = {"timestamp": int(current_ts), "sources": {}}
 
@@ -382,7 +402,7 @@ class GroupHelpImporter:
             try:
                 self.repo.expire_outdated_groups(now=current_ts)
             except Exception as exc:
-                self.log.warning("清理站内过期拼团异常: %s", exc)
+                self.log.warning("[IMPORTER-WARN] 清理站内过期拼团异常: %s", exc)
 
         for source_name, handler in (
             ("acdog", self._sync_acdog),
@@ -391,10 +411,68 @@ class GroupHelpImporter:
             try:
                 summary["sources"][source_name] = handler(current_ts)
             except Exception as exc:
-                self.log.warning("采集源 [%s] 本轮失败（跳过不中断）: %s", source_name, exc)
+                self.log.warning("[IMPORTER-WARN] 采集源 [%s] 本轮失败 (跳过不中断): %s", source_name, exc)
                 summary["sources"][source_name] = {"error": str(exc)}
 
-        self.log.info("外部多人团本轮采集完成: %s", summary)
+        total_time_ms = int((time.perf_counter() - loop_t0) * 1000)
+        acdog_st = summary["sources"].get("acdog", {})
+        miao_st = summary["sources"].get("miaozhuli", {})
+
+        def _fmt_src(st: Any) -> str:
+            if not isinstance(st, dict) or "error" in st:
+                err_text = st.get("error", "未知错误") if isinstance(st, dict) else str(st)
+                return f"异常 ({err_text})"
+            return (
+                f"抓取 {st.get('fetched', 0):3d} | 新增 {st.get('upserted', 0):2d} | "
+                f"刷新 {st.get('unchanged', 0):2d} | 满员/下架同步 {st.get('synced_inactive', 0):2d} | "
+                f"过滤垃圾/过期 {st.get('skipped_invalid', 0) + st.get('skipped_expired', 0):2d}"
+            )
+
+        total_fetched = (acdog_st.get("fetched", 0) if isinstance(acdog_st, dict) else 0) + (
+            miao_st.get("fetched", 0) if isinstance(miao_st, dict) else 0
+        )
+        total_upserted = (acdog_st.get("upserted", 0) if isinstance(acdog_st, dict) else 0) + (
+            miao_st.get("upserted", 0) if isinstance(miao_st, dict) else 0
+        )
+        total_unchanged = (acdog_st.get("unchanged", 0) if isinstance(acdog_st, dict) else 0) + (
+            miao_st.get("unchanged", 0) if isinstance(miao_st, dict) else 0
+        )
+        total_synced_inactive = (acdog_st.get("synced_inactive", 0) if isinstance(acdog_st, dict) else 0) + (
+            miao_st.get("synced_inactive", 0) if isinstance(miao_st, dict) else 0
+        )
+
+        try:
+            active_in_hall = self.repo.col.count_documents(
+                {
+                    "parse_status": "parsed",
+                    "group_status": "active",
+                    "expires_at": {"$gt": current_ts},
+                    "remain_people": {"$gt": 0},
+                }
+            )
+        except Exception:
+            active_in_hall = -1
+
+        hall_str = f"{active_in_hall} 款" if active_in_hall >= 0 else "未知"
+
+        self.log.info(
+            "\n"
+            "========================================================================================\n"
+            "[PDD-IMPORTER] 采集轮询完成 | 总耗时: %sms | 翻页深度: %s页\n"
+            "  ├─ 闪助力 [acdog]   : %s\n"
+            "  ├─ 秒助力 [miaozhuli]: %s\n"
+            "  └─ 全局汇总: 扫描 %d 款 | 实际新增 %d 款 | 状态刷新 %d 款 | 同步下架 %d 款 | 大厅在售: %s\n"
+            "========================================================================================",
+            total_time_ms,
+            self.pages,
+            _fmt_src(acdog_st),
+            _fmt_src(miao_st),
+            total_fetched,
+            total_upserted,
+            total_unchanged,
+            total_synced_inactive,
+            hall_str,
+        )
         return summary
 
 
@@ -402,7 +480,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="拼多多多人团外部高质量源定时采集守护脚本")
     parser.add_argument("--once", action="store_true", help="仅执行一轮采集后退出")
     parser.add_argument("--interval", type=int, default=90, help="后台轮询间隔秒数（默认 90）")
-    parser.add_argument("--pages", type=int, default=2, help="每次每个源抓取前 N 页（默认 2）")
+    parser.add_argument("--pages", type=int, default=3, help="每次每个源抓取前 N 页（默认 3）")
     parser.add_argument("--ttl-hours", type=float, default=6.0, help="外部团最多在站内保留小时数（默认 6）")
     parser.add_argument("--dry-run", action="store_true", help="仅抓取校验并打印统计，不写入数据库")
     args = parser.parse_args()

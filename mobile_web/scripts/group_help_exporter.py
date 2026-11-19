@@ -34,7 +34,8 @@ import tempfile
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import requests
 
 CURRENT_DIR = Path(__file__).resolve().parent
 MOBILE_WEB_DIR = CURRENT_DIR.parent
@@ -43,6 +44,7 @@ for _p in (str(MOBILE_WEB_DIR), str(CURRENT_DIR)):
         sys.path.insert(0, _p)
 
 from models.group_help import (
+    EXPORT_TARGET_MIAOZHULI,
     GROUP_STATUS_ACTIVE,
     PARSE_STATUS_PARSED,
     SOURCE_USER_UPLOAD,
@@ -107,6 +109,75 @@ def _atomic_copy_file(src: Path, dst: Path) -> None:
         raise
 
 
+class MiaozhuliPublisher:
+    """秒助力 (bz.5138zhuan.com) 匿名设备身份外发客户端。"""
+
+    INIT_URL = "http://bz.5138zhuan.com/zd/api/h5_init.php"
+    PUBLISH_URL = "http://bz.5138zhuan.com/zd/api/h5_publish.php"
+
+    def __init__(self, session: Optional[requests.Session] = None, timeout: int = 10):
+        self.session = session or requests.Session()
+        self.timeout = timeout
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Referer": "http://bz.5138zhuan.com/zd/",
+            "Origin": "http://bz.5138zhuan.com",
+            "Accept": "application/json",
+        })
+        self._initialized = False
+
+    def ensure_session(self) -> bool:
+        """确保具有有效的 zd_device_uid 设备身份 Cookie。"""
+        if self._initialized and "zd_device_uid" in self.session.cookies:
+            return True
+        try:
+            resp = self.session.get(self.INIT_URL, timeout=self.timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    self._initialized = True
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def publish_deal(self, doc: Dict[str, Any]) -> Tuple[bool, str, str]:
+        """向秒助力发布口令拼团。返回 (是否成功, 远程ID或空, 错误信息或空)。"""
+        if not self.ensure_session():
+            return False, "", "秒助力设备身份初始化失败"
+
+        share_text = str(doc.get("share_text") or "").strip()
+        if not share_text:
+            return False, "", "缺少有效的拼团口令文本"
+
+        title = str(doc.get("goods_name") or "")[:80].strip()
+        price = doc.get("group_price")
+        team_size = doc.get("total_people") or 2
+
+        payload = {
+            "title": title,
+            "url": "",
+            "share_text": share_text,
+            "price": float(price) if price is not None else 0.0,
+            "team_size": int(team_size) if team_size else 2,
+            "hp": "",
+        }
+        try:
+            resp = self.session.post(self.PUBLISH_URL, json=payload, timeout=self.timeout)
+            if resp.status_code != 200:
+                return False, "", f"HTTP {resp.status_code}"
+            res_json = resp.json()
+            if res_json.get("code") == 0:
+                remote_id = str(res_json.get("id") or "")
+                return True, remote_id, ""
+            return False, "", str(res_json.get("msg") or "对方拒绝发布")
+        except Exception as exc:
+            return False, "", str(exc)
+
+
 class GroupHelpExporter:
     """本平台真实海报拼团外发任务打包与生命周期同步器。"""
 
@@ -117,6 +188,8 @@ class GroupHelpExporter:
         bridge_dir: Optional[Path] = None,
         poster_dir: Optional[Path] = None,
         limit: int = 30,
+        publisher: Optional[Any] = None,
+        enable_remote_sync: bool = True,
         logger: Optional[logging.Logger] = None,
     ):
         self.repo = repo if repo is not None else GroupHelpRepository()
@@ -126,6 +199,8 @@ class GroupHelpExporter:
         self.state_file = self.bridge_dir / "export_state.json"
         self.queue_file = self.bridge_dir / "outbound_queue.json"
         self.limit = max(1, min(int(limit), 200))
+        self.publisher = publisher or MiaozhuliPublisher()
+        self.enable_remote_sync = bool(enable_remote_sync)
         self.log = logger or _setup_logger(self.bridge_dir)
 
     def _load_state(self, now: float) -> Dict[str, Dict[str, Any]]:
@@ -205,7 +280,84 @@ class GroupHelpExporter:
             "exported_at": int(exported_at),
         }
 
+    def _sync_remote_miaozhuli(self, now: float) -> Dict[str, int]:
+        """向秒助力平台自动同步在架口令拼团（仅限真实用户发起的未同步记录）。"""
+        stats = {"pending": 0, "success": 0, "failed": 0}
+        if not self.enable_remote_sync:
+            return stats
+
+        pending_items = self.repo.list_pending_for_remote_export(
+            target=EXPORT_TARGET_MIAOZHULI,
+            limit=self.limit,
+            now=now,
+        )
+        stats["pending"] = len(pending_items)
+        if not pending_items:
+            return stats
+
+        for doc in pending_items:
+            gid = str(doc.get("group_order_id") or "")
+            name = str(doc.get("goods_name") or "")
+            price = doc.get("group_price")
+            remain = doc.get("remain_people")
+            t0 = time.perf_counter()
+            try:
+                ok, remote_id, err_msg = self.publisher.publish_deal(doc)
+                duration_ms = int((time.perf_counter() - t0) * 1000)
+                if ok:
+                    self.repo.record_export_result(
+                        gid,
+                        target=EXPORT_TARGET_MIAOZHULI,
+                        success=True,
+                        remote_id=remote_id,
+                        now=now,
+                    )
+                    stats["success"] += 1
+                    self.log.info(
+                        "[EXPORTER-SUCCESS] [秒助力] 发布成功 | 团单: %s | 商品: %s (¥%s, 差%s人) | 远端ID: %s | 耗时: %sms",
+                        gid,
+                        name[:28],
+                        price,
+                        remain,
+                        remote_id,
+                        duration_ms,
+                    )
+                else:
+                    self.repo.record_export_result(
+                        gid,
+                        target=EXPORT_TARGET_MIAOZHULI,
+                        success=False,
+                        error_msg=err_msg,
+                        now=now,
+                    )
+                    stats["failed"] += 1
+                    self.log.warning(
+                        "[EXPORTER-FAIL] [秒助力] 发布失败 | 团单: %s | 商品: %s | 原因: %s | 耗时: %sms",
+                        gid,
+                        name[:28],
+                        err_msg,
+                        duration_ms,
+                    )
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - t0) * 1000)
+                self.repo.record_export_result(
+                    gid,
+                    target=EXPORT_TARGET_MIAOZHULI,
+                    success=False,
+                    error_msg=str(exc),
+                    now=now,
+                )
+                stats["failed"] += 1
+                self.log.error(
+                    "[EXPORTER-ERROR] [秒助力] 异常中断 | 团单: %s | 异常: %s | 耗时: %sms",
+                    gid,
+                    exc,
+                    duration_ms,
+                )
+        return stats
+
     def run_once(self, now: Optional[float] = None) -> Dict[str, Any]:
+        loop_t0 = time.perf_counter()
         current_ts = float(now if now is not None else time.time())
         self.pending_dir.mkdir(parents=True, exist_ok=True)
         state = self._load_state(current_ts)
@@ -316,6 +468,9 @@ class GroupHelpExporter:
             },
         )
 
+        # 3. 远端外部小站自动同步（秒助力口令团）
+        remote_stats = self._sync_remote_miaozhuli(now=current_ts)
+
         stats = {
             "timestamp": int(current_ts),
             "pending_total": len(queue_items),
@@ -323,8 +478,22 @@ class GroupHelpExporter:
             "refreshed": refreshed,
             "completed_via_flag": completed_via_flag,
             "withdrawn": withdrawn,
+            "remote_miaozhuli": remote_stats,
         }
-        self.log.info("外发队列同步完成: %s", stats)
+        total_time_ms = int((time.perf_counter() - loop_t0) * 1000)
+        self.log.info(
+            "========================================================================================\n"
+            "[PDD-EXPORTER] 轮询完成 | 总耗时: %sms | 本地海报队列: 待办 %s, 归档 %s, 撤回 %s | "
+            "秒助力外发: 待办 %s, 成功 %s, 失败 %s\n"
+            "========================================================================================",
+            total_time_ms,
+            stats["pending_total"],
+            stats["completed_via_flag"],
+            stats["withdrawn"],
+            remote_stats["pending"],
+            remote_stats["success"],
+            remote_stats["failed"],
+        )
         return stats
 
     def mark_done(self, gid: str, reason: str = "cli mark-done", now: Optional[float] = None) -> Dict[str, Any]:
@@ -390,11 +559,17 @@ def main() -> None:
     parser.add_argument("--mark-done", type=str, default="", help="将指定团单号标记为已外发完成")
     parser.add_argument("--mark-failed", type=str, default="", help="将指定团单号标记为外发失败")
     parser.add_argument("--reason", type=str, default="", help="配合 --mark-failed 记录失败原因")
+    parser.add_argument("--no-remote", action="store_true", help="禁用向秒助力等外部小站自动网络同步，仅保留本地海报文件队列")
     args = parser.parse_args()
 
     bridge_path = Path(args.bridge_dir) if args.bridge_dir else _DEFAULT_BRIDGE_DIR
     log = _setup_logger(bridge_path)
-    exporter = GroupHelpExporter(bridge_dir=bridge_path, limit=args.limit, logger=log)
+    exporter = GroupHelpExporter(
+        bridge_dir=bridge_path,
+        limit=args.limit,
+        enable_remote_sync=not args.no_remote,
+        logger=log,
+    )
 
     if args.mark_done:
         res = exporter.mark_done(args.mark_done, reason=args.reason or "cli mark-done")

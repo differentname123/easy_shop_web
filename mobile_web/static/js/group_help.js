@@ -161,6 +161,7 @@
         total_people: '',
         submitting: false,
         errorMsg: '',
+        autoFilledTip: '',
       });
 
       let toastTimer = null;
@@ -934,6 +935,61 @@
         openFullPoster(item.poster_url);
       };
 
+      const smartParsePddShareText = raw => {
+        const text = String(raw || '').trim();
+        const res = { goods_name: '', group_price: '', remain_people: null, total_people: null };
+        if (!text) return res;
+
+        // 1. 价格：支持 59.9元 / ¥59.9 / ￥59.9
+        const priceM = text.match(/(?:(?:¥|￥|拼团价|实付)\s*([0-9]+(?:\.[0-9]{1,2})?)|([0-9]+(?:\.[0-9]{1,2})?)\s*元)/);
+        if (priceM) {
+          res.group_price = priceM[1] || priceM[2] || '';
+        }
+
+        // 2. 还差人数：支持 "仅剩 1 个名额" / "还差 2 人" / "剩 1 人"
+        const remainM = text.match(/(?:仅剩|还差|剩)\s*([0-9]{1,2})\s*(?:个名额|人)/);
+        if (remainM) {
+          const num = parseInt(remainM[1], 10);
+          if (Number.isInteger(num) && num >= 1 && num <= 20) {
+            res.remain_people = num;
+          }
+        }
+
+        // 3. 几人团：支持 "2人团" / "3人团"
+        const totalM = text.match(/([0-9]{1,2})\s*人团/);
+        if (totalM) {
+          const tNum = parseInt(totalM[1], 10);
+          if (Number.isInteger(tNum) && tNum >= 2 && tNum <= 50) {
+            res.total_people = tNum;
+          }
+        }
+
+        // 4. 商品名称
+        const buyM = text.match(/拼团购买\s*(.*?)(?:\.\.\.|…|，仅剩|，还差|，剩|$)/);
+        if (buyM && buyM[1].trim()) {
+          let title = buyM[1].trim();
+          const suffixM = text.match(/仅剩\s*\d+\s*个名额[。，、\s]+(.+?)$/);
+          if (suffixM) {
+            const suffix = suffixM[1].replace(/[。，、\s]/g, '').trim();
+            if (suffix.length >= 2 && !title.includes(suffix)) {
+              if (!/(?:点击|复制|打开|微信|qq|私信|加群)/i.test(suffix)) {
+                title = `${title}（${suffix.slice(0, 24)}）`;
+              }
+            }
+          }
+          res.goods_name = title.slice(0, 120);
+        } else {
+          const bracketM = text.match(/【([^【】]{4,80})】/);
+          if (bracketM) {
+            const inner = bracketM[1].trim();
+            if (!/^(拼多多|百亿补贴|多人团|限时补贴)$/.test(inner)) {
+              res.goods_name = inner.slice(0, 120);
+            }
+          }
+        }
+        return res;
+      };
+
       const openTextSubmitModal = () => {
         textSubmitModal.value = {
           visible: true,
@@ -944,6 +1000,7 @@
           total_people: '',
           submitting: false,
           errorMsg: '',
+          autoFilledTip: '',
         };
       };
 
@@ -952,17 +1009,59 @@
         textSubmitModal.value.visible = false;
       };
 
-      const onTextShareInput = () => {
-        if (textSubmitModal.value.goods_name) return;
-        const raw = String(textSubmitModal.value.share_text || '');
-        const matches = raw.match(/【([^【】]{4,80})】/g) || [];
-        for (const seg of matches) {
-          const inner = seg.slice(1, -1).trim();
-          if (inner && !/^(拼多多|百亿补贴|多人团|限时补贴)$/.test(inner)) {
-            textSubmitModal.value.goods_name = inner.slice(0, 120);
-            break;
-          }
+      const applyParsedTextToForm = () => {
+        const raw = String(textSubmitModal.value.share_text || '').trim();
+        if (!raw) {
+          textSubmitModal.value.autoFilledTip = '';
+          return;
         }
+        const parsed = smartParsePddShareText(raw);
+        let filledCount = 0;
+        if (parsed.goods_name && !textSubmitModal.value.goods_name) {
+          textSubmitModal.value.goods_name = parsed.goods_name;
+          filledCount++;
+        }
+        if (parsed.group_price && !textSubmitModal.value.group_price) {
+          textSubmitModal.value.group_price = parsed.group_price;
+          filledCount++;
+        }
+        if (parsed.remain_people && (!textSubmitModal.value.remain_people || textSubmitModal.value.remain_people === 1)) {
+          textSubmitModal.value.remain_people = parsed.remain_people;
+          filledCount++;
+        }
+        if (parsed.total_people && !textSubmitModal.value.total_people) {
+          textSubmitModal.value.total_people = parsed.total_people;
+          filledCount++;
+        }
+
+        if (filledCount > 0 || (textSubmitModal.value.goods_name && textSubmitModal.value.group_price)) {
+          const priceDisplay = textSubmitModal.value.group_price ? `¥${textSubmitModal.value.group_price}` : '';
+          const remainDisplay = textSubmitModal.value.remain_people ? `差${textSubmitModal.value.remain_people}人` : '';
+          textSubmitModal.value.autoFilledTip = `✨ 已为您自动识别商品信息${priceDisplay ? `（${priceDisplay}，${remainDisplay}）` : ''}，可直接核验上架！`;
+        }
+      };
+
+      const onTextShareInput = () => {
+        applyParsedTextToForm();
+      };
+
+      const onTextSharePaste = () => {
+        global.setTimeout(() => applyParsedTextToForm(), 50);
+      };
+
+      const pasteClipboardIntoTextModal = async () => {
+        try {
+          if (global.navigator && global.navigator.clipboard && typeof global.navigator.clipboard.readText === 'function') {
+            const clip = await global.navigator.clipboard.readText();
+            if (clip && clip.trim()) {
+              textSubmitModal.value.share_text = clip.trim();
+              applyParsedTextToForm();
+              showToast('已读取剪贴板口令并自动填充！');
+              return;
+            }
+          }
+        } catch (_) {}
+        showToast('请直接在输入框中长按粘贴口令文本');
       };
 
       const submitTextGroupForm = async () => {
@@ -1865,6 +1964,8 @@
         openTextSubmitModal,
         closeTextSubmitModal,
         onTextShareInput,
+        onTextSharePaste,
+        pasteClipboardIntoTextModal,
         submitTextGroupForm,
         copyGroupToken,
         openPddHomeApp,

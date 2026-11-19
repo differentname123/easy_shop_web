@@ -1,0 +1,16 @@
+目前后续的处理只支持 拼多多 京东 和 淘宝。如果能够在拉取线报的时候就能够确定平台的话，就可以进行过滤（一定要是百分百确定商品的平台才过滤，防止误杀），防止后续浪费资源。
+空壳单品无价值：线报的核心价值是爆料作业（完整的领券方案、凑单品明细、凑单多件折扣、满减步骤等）；如果拿不到爆料详情，只退化为一个商品标题加单品购买链接，那它就失去了作为“线报”的意义
+
+1. https://xhhcds.cn/
+    理由：这是人工选择出来的，个个都是精品。
+    拉取策略：直接就拉取商品，直到该页全是已经拉取过的
+    备注：
+        监控 JSON 列表接口：https://xhhcds.cn/api/v1/public/home-products/?feed=home&page=1&page_size=50
+        监控 JSON 单品详情接口（示例）：https://xhhcds.cn/api/v1/public/products/1770/
+
+2. https://guangdiu.com/
+    理由：这里聚集了很多其它的爆料，能够将一些我无法爬取的数据也获取到
+    拉取策略：监控下面几个频道就行
+           首页：http://guangdiu.com/
+           热门榜：https://guangdiu.com/hots.php
+           小时榜单： https://guangdiu.com/rank.php

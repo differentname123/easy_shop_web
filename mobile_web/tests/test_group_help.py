@@ -95,6 +95,17 @@ class _MemoryCollection:
                     return False
                 if "$gte" in v and not (val is not None and val >= v["$gte"]):
                     return False
+                if "$in" in v and val not in v["$in"]:
+                    return False
+                if "$ne" in v and val == v["$ne"]:
+                    return False
+                if "$not" in v:
+                    sub_v = v["$not"]
+                    if isinstance(sub_v, dict):
+                        if "$gte" in sub_v and val is not None and val >= sub_v["$gte"]:
+                            return False
+                        if "$gt" in sub_v and val is not None and val > sub_v["$gt"]:
+                            return False
                 if "$regex" in v:
                     flags = re.IGNORECASE if "i" in v.get("$options", "") else 0
                     pat = re.compile(v["$regex"], flags)
@@ -112,10 +123,28 @@ class _MemoryCollection:
     def _apply_update(doc, update):
         if "$set" in update:
             for k, v in update["$set"].items():
-                doc[k] = deepcopy(v)
+                if "." in k:
+                    parts = k.split(".")
+                    cur = doc
+                    for p in parts[:-1]:
+                        if p not in cur or not isinstance(cur[p], dict):
+                            cur[p] = {}
+                        cur = cur[p]
+                    cur[parts[-1]] = deepcopy(v)
+                else:
+                    doc[k] = deepcopy(v)
         if "$inc" in update:
             for k, v in update["$inc"].items():
-                doc[k] = (doc.get(k) or 0) + v
+                if "." in k:
+                    parts = k.split(".")
+                    cur = doc
+                    for p in parts[:-1]:
+                        if p not in cur or not isinstance(cur[p], dict):
+                            cur[p] = {}
+                        cur = cur[p]
+                    cur[parts[-1]] = (cur.get(parts[-1]) or 0) + v
+                else:
+                    doc[k] = (doc.get(k) or 0) + v
 
     @staticmethod
     def _project_doc(doc, projection):
@@ -1193,10 +1222,17 @@ def test_text_token_and_link_group_submission_and_validation(tmp_path, monkeypat
         assert tok_data["app_wake_url"] == ""
         assert tok_data["share_code"] == "AbCdEf9876"
 
-        # 2. 列表、详情、点击统计正常工作，请求无图记录的 /poster 返回 404
+        # 2. 列表、详情、点击统计正常工作，且支持口令/纯token/带⇥⇤符号直搜
         list_resp = client.get("/api/group_help/list", params={"keyword": "维达抽纸"})
         assert list_resp.status_code == 200
         assert any(it["group_order_id"] == "tok_AbCdEf9876" for it in list_resp.json()["data"]["items"])
+
+        # 验证口令直搜（纯 token、带⇥⇤、整段口令文案）
+        for q_token in ["AbCdEf9876", "⇥AbCdEf9876⇤", "快来帮我拼团呀 ⇥AbCdEf9876⇤"]:
+            search_resp = client.get("/api/group_help/list", params={"keyword": q_token})
+            assert search_resp.status_code == 200
+            items = search_resp.json()["data"]["items"]
+            assert any(it["group_order_id"] == "tok_AbCdEf9876" for it in items), f"未能通过 {q_token} 搜出口令团"
 
         detail_resp = client.get("/api/group_help/detail/tok_AbCdEf9876")
         assert detail_resp.status_code == 200
@@ -1463,7 +1499,12 @@ def test_group_help_exporter_queues_completes_and_withdraws(tmp_path):
         check_similar=False,
     )
 
-    exporter = GroupHelpExporter(repo=repo, bridge_dir=bridge_dir, poster_dir=poster_dir)
+    exporter = GroupHelpExporter(
+        repo=repo,
+        bridge_dir=bridge_dir,
+        poster_dir=poster_dir,
+        enable_remote_sync=False,
+    )
     s1 = exporter.run_once(now=now + 5)
     assert s1["pending_total"] == 1
     assert s1["exported_new"] == 1
@@ -1489,3 +1530,131 @@ def test_group_help_exporter_queues_completes_and_withdraws(tmp_path):
     assert not (bridge_dir / "outbound_pending" / gid_2).exists()
     assert exporter.get_summary(now=now + 20)["counts"]["done"] == 1
     assert exporter.get_summary(now=now + 20)["counts"]["withdrawn"] == 1
+
+
+def test_extract_smart_fields_from_pdd_share_text_ssot():
+    from models.group_help import extract_smart_fields_from_pdd_share_text
+
+    # 1. 经典拼多多客户端口令（带省略号与末尾规格后缀）
+    sample_1 = "x:/⇥TIAx2omSkyLc9⇤ 复制并打开拼多多APP，59.9元拼团购买罗技GPW二代狗屁王无线游戏鼠标...，仅剩1个名额。游戏办公鼠标"
+    res1 = extract_smart_fields_from_pdd_share_text(sample_1)
+    assert res1["group_price"] == 59.9
+    assert res1["remain_people"] == 1
+    assert "罗技GPW" in res1["goods_name"]
+    assert "（游戏办公鼠标）" in res1["goods_name"]
+
+    # 2. 带【】标题但无省略号
+    sample_2 = "39.9元拼团购买【官方正品】维达超韧抽纸24包，仅剩2个名额"
+    res2 = extract_smart_fields_from_pdd_share_text(sample_2)
+    assert res2["group_price"] == 39.9
+    assert res2["remain_people"] == 2
+    assert "维达超韧抽纸24包" in res2["goods_name"]
+
+    # 3. 过滤违规引流营销后缀
+    sample_3 = "19.9元拼团购买男士纯棉T恤...，仅剩1个名额。加微信进群领福利"
+    res3 = extract_smart_fields_from_pdd_share_text(sample_3)
+    assert res3["group_price"] == 19.9
+    assert "加微信" not in res3["goods_name"]
+
+
+def test_group_help_exporter_miaozhuli_remote_sync_and_db_audit(tmp_path):
+    GroupHelpExporter = _load_mobile_script("group_help_exporter").GroupHelpExporter
+    from repositories.group_help_repo import GroupHelpRepository
+    from models.group_help import EXPORT_STATUS_SUCCESS, EXPORT_STATUS_FAILED, EXPORT_TARGET_MIAOZHULI
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    bridge_dir = tmp_path / "bridge"
+    poster_dir = tmp_path / "posters"
+    now = 1795000000.0
+
+    # 1. 种子插入一条用户真实提交的口令拼团
+    gid_user = "tok_UserText888"
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_user,
+            "entry_type": "token",
+            "source": "user_text",
+            "goods_name": "用户发起的罗技鼠标",
+            "group_price": 59.9,
+            "total_people": 2,
+            "remain_people": 1,
+            "share_text": "快来帮我拼团 ⇥UserText888⇤ 罗技鼠标",
+            "created_at": now,
+            "expires_at": now + 3600,
+        },
+        now=now,
+        check_similar=False,
+    )
+
+    class _FakeMiaozhuliPublisher:
+        def __init__(self):
+            self.calls = []
+
+        def publish_deal(self, doc):
+            self.calls.append(doc)
+            gid = doc.get("group_order_id")
+            if gid == gid_user:
+                return True, "miao_remote_998877", ""
+            return False, "", "口令已过期"
+
+    fake_publisher = _FakeMiaozhuliPublisher()
+    exporter = GroupHelpExporter(
+        repo=repo,
+        bridge_dir=bridge_dir,
+        poster_dir=poster_dir,
+        publisher=fake_publisher,
+        enable_remote_sync=True,
+    )
+
+    # 2. 执行轮询，验证成功外发与数据库原子记录回写
+    s1 = exporter.run_once(now=now + 5)
+    assert s1["remote_miaozhuli"]["pending"] == 1
+    assert s1["remote_miaozhuli"]["success"] == 1
+    assert s1["remote_miaozhuli"]["failed"] == 0
+    assert len(fake_publisher.calls) == 1
+
+    doc_after = repo.get_by_group_order_id(gid_user)
+    assert doc_after is not None
+    targets = doc_after.get("exported_targets") or {}
+    assert EXPORT_TARGET_MIAOZHULI in targets
+    miao_rec = targets[EXPORT_TARGET_MIAOZHULI]
+    assert miao_rec["status"] == EXPORT_STATUS_SUCCESS
+    assert miao_rec["remote_id"] == "miao_remote_998877"
+    assert miao_rec["exported_at"] == now + 5
+    assert doc_after.get("last_exported_at") == now + 5
+
+    # 3. 验证防重复外发的幂等性（下一轮不会再拉取成功外发过的记录）
+    s2 = exporter.run_once(now=now + 10)
+    assert s2["remote_miaozhuli"]["pending"] == 0
+    assert len(fake_publisher.calls) == 1
+
+    # 4. 验证外发失败时的审计记录与重试计数
+    gid_fail = "tok_UserTextFail"
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_fail,
+            "entry_type": "token",
+            "source": "user_text",
+            "goods_name": "用户发起的失败商品",
+            "group_price": 9.9,
+            "total_people": 2,
+            "remain_people": 1,
+            "share_text": "快来帮我拼团 ⇥UserTextFail⇤",
+            "created_at": now,
+            "expires_at": now + 3600,
+        },
+        now=now,
+        check_similar=False,
+    )
+
+    s3 = exporter.run_once(now=now + 15)
+    assert s3["remote_miaozhuli"]["pending"] == 1
+    assert s3["remote_miaozhuli"]["failed"] == 1
+
+    doc_fail = repo.get_by_group_order_id(gid_fail)
+    fail_rec = (doc_fail.get("exported_targets") or {}).get(EXPORT_TARGET_MIAOZHULI)
+    assert fail_rec["status"] == EXPORT_STATUS_FAILED
+    assert fail_rec["error_msg"] == "口令已过期"
+    assert fail_rec["attempts"] == 1
+
+

@@ -476,6 +476,9 @@ body {
 .gh-sheet {
   width: 100%;
   max-width: 540px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
   background: #fff;
   border-radius: 18px 18px 0 0;
   overflow: hidden;
@@ -495,6 +498,7 @@ body {
   justify-content: space-between;
   font-size: 15px;
   font-weight: 700;
+  flex-shrink: 0;
 }
 
 .gh-sheet-close {
@@ -510,12 +514,84 @@ body {
 
 .gh-sheet-content {
   padding: 16px 16px 22px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  flex: 1;
+}
+
+.gh-detail-top-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  align-items: center;
+}
+
+.gh-detail-poster-thumb {
+  width: 76px;
+  height: 76px;
+  border-radius: 10px;
+  object-fit: cover;
+  object-position: center 18%;
+  border: 1px solid var(--gh-border);
+  flex-shrink: 0;
+  cursor: zoom-in;
+}
+
+.gh-detail-primary-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.gh-detail-full-title-box {
+  background: #fbfbfd;
+  border: 1px solid #f0f0f2;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
+
+.gh-detail-full-title {
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.48;
+  color: var(--gh-text-main);
+  word-break: break-all;
+  white-space: normal;
+  user-select: text;
+  margin: 0;
+}
+
+.gh-detail-entry-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.gh-detail-keywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.gh-tag-pill {
+  font-size: 11px;
+  color: #595959;
+  background: #f0f0f0;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-weight: 600;
 }
 
 .gh-detail-top {
   display: flex;
   gap: 12px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
+  align-items: flex-start;
 }
 
 .gh-detail-poster {
@@ -534,14 +610,17 @@ body {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
+  gap: 6px;
 }
 
 .gh-detail-title {
   font-size: 16px;
   font-weight: 800;
-  line-height: 1.38;
+  line-height: 1.45;
   color: var(--gh-text-main);
+  word-break: break-all;
+  white-space: normal;
+  user-select: text;
 }
 
 .gh-detail-price-row {
@@ -1163,5 +1242,184 @@ body {
   grid-template-columns: 1fr 1fr;
   gap: 8px;
 }
+
+/* 弹窗与详情内无截断完整商品名称与完整文案 */
+.gh-goods-title-full {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--gh-text-main);
+  line-height: 1.45;
+  word-break: break-all;
+  white-space: normal;
+  margin: 4px 0 6px;
+}
+
+.gh-ellipsis-tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #d46b08;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.gh-full-desc-card {
+  background: #f8f9fa;
+  border: 1px solid #e9ecef;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-top: 10px;
+  margin-bottom: 12px;
+}
+
+.gh-full-desc-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gh-text-sub);
+  margin-bottom: 6px;
+}
+
+.gh-full-desc-body {
+  font-size: 13px;
+  color: #333;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: text;
+}
+
+/* 弹窗专用全显商品卡片（全宽无裁切排版，彻底解决弹窗看不了完整商品名问题） */
+.gh-dialog-goods-card {
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-top: 10px;
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  user-select: text;
+}
+
+.gh-dialog-goods-card:active {
+  transform: scale(0.985);
+}
+
+.gh-dialog-goods-card.is-matched {
+  background: #fffbe6;
+  border: 1.5px solid #ffd591;
+}
+
+.gh-dialog-goods-card.is-own {
+  background: #f6ffed;
+  border: 1.5px solid #b7eb8f;
+}
+
+.gh-dgc-title {
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.46;
+  color: #1f2329;
+  word-break: break-all;
+  white-space: normal;
+  margin-bottom: 10px;
+}
+
+.gh-dgc-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.gh-dgc-thumb {
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  object-fit: cover;
+  flex-shrink: 0;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.gh-dgc-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.gh-dgc-price-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.gh-dgc-price {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--gh-primary);
+}
+
+.gh-dgc-sub-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: #8c8c8c;
+}
+
+/* 表单辅助：一键粘贴与智能识别提示 */
+.gh-paste-quick-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #1677ff;
+  background: #e6f4ff;
+  border: 1px solid #91caff;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.gh-paste-quick-btn:hover {
+  background: #bae0ff;
+}
+
+.gh-smart-filled-tip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  color: #389e0d;
+  font-size: 12px;
+  font-weight: 600;
+  margin: 6px 0;
+  line-height: 1.4;
+}
+
+.gh-badge-people {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  background: #e6f4ff;
+  color: #1677ff;
+  border: 1px solid #91caff;
+}
+
+
 
 
