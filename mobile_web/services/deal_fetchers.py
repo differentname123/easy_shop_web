@@ -10,6 +10,10 @@
 ================================================================================
 """
 import html as html_lib
+import json
+import logging
+import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -22,6 +26,8 @@ from models.deal_constants import _UNSUPPORTED_EXTERNAL_DOMAINS
 from models.product import detect_platform_signal, extract_jd_image_key, normalize_platform
 
 SUPPORTED_PLATFORMS: Tuple[str, ...] = ("jd", "taobao", "pdd")
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_HEADERS: Dict[str, str] = {
     "User-Agent": (
@@ -638,9 +644,9 @@ def fetch_tehuicaicai_deals(
 ) -> Dict[str, Any]:
     """
     特惠采采专员精选集采流 (`https://xhhcds.cn/`)：
-    - 列表接口：`https://xhhcds.cn/api/v1/public/home-products/?feed=home&page={page}&page_size={page_size}`
-    - 详情接口：`https://xhhcds.cn/api/v1/products/{id}/`
-    - 策略：逐页拉取直到整页均为已抓商品；仅输出获取了完整详情、教程文案及有效下单线索的淘/京/拼商品。
+- 列表接口：`https://xhhcds.cn/api/v1/public/home-products/?feed=home&page={page}&page_size={page_size}`
+- 详情接口：`https://xhhcds.cn/api/v1/products/{id}/`
+- 策略：逐页拉取直到整页均为已抓商品；仅输出获取了完整详情、教程文案及有效下单线索的淘/京/拼商品。
     """
     http = session or requests.Session()
     base_api = "https://xhhcds.cn/api/v1"
@@ -956,6 +962,11 @@ def fetch_tehuicaicai_deals(
 
                 if not has_valid_detail_and_tutorial(rec):
                     skipped_no_detail += 1
+                    logger.warning(
+                        "  ⚠️ [特惠采采-无购买锚点跳过] id=%s | title=%s | 详情无可用淘/京/拼链接或口令，暂不入库",
+                        item_id,
+                        title[:32],
+                    )
                     continue
 
                 detail_fetched += 1
@@ -1008,6 +1019,603 @@ def fetch_tehuicaicai_deals(
 # ==============================================================================
 # 站点 2：逛丢 (`https://guangdiu.com/`)
 # ==============================================================================
+_GUANGDIU_CAPTCHA_MARKERS: Tuple[str, ...] = (
+    "安全验证",
+    "verify-wrap",
+    "slidetrack",
+    "请按住滑块",
+    "拖动到最右边",
+    "逛丢安全验证",
+)
+
+
+def _is_guangdiu_captcha_page(url: str, html_text: str) -> bool:
+    """判断响应是否落入逛丢 `verify.php` 滑块安全验证页。"""
+    if "verify.php" in str(url or "").lower():
+        return True
+    body = str(html_text or "")
+    return any(marker in body for marker in _GUANGDIU_CAPTCHA_MARKERS)
+
+
+def _load_guangdiu_cookies(session: requests.Session, cookie_file: Optional[str]) -> bool:
+    """从本地 JSON 文件加载已验证的逛丢 Cookie 到 requests.Session。"""
+    if not cookie_file or not os.path.exists(cookie_file):
+        return False
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        if not isinstance(items, list):
+            return False
+        now_ts = time.time()
+        loaded = 0
+        for c in items:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or "").strip()
+            value = str(c.get("value") or "")
+            if not name:
+                continue
+            expires = c.get("expires")
+            if isinstance(expires, (int, float)) and expires > 0 and expires < now_ts:
+                continue
+            domain = str(c.get("domain") or "guangdiu.com")
+            path = str(c.get("path") or "/")
+            session.cookies.set(name, value, domain=domain, path=path)
+            loaded += 1
+        return loaded > 0
+    except Exception:
+        return False
+
+
+def _save_guangdiu_cookies(session: requests.Session, cookie_file: Optional[str]) -> None:
+    """将 requests.Session 中的逛丢相关 Cookie 持久化到本地 JSON 文件。"""
+    if not cookie_file:
+        return
+    try:
+        parent = os.path.dirname(os.path.abspath(cookie_file))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        out: List[Dict[str, Any]] = []
+        for c in session.cookies:
+            dom = str(c.domain or "")
+            if dom and "guangdiu.com" not in dom.lower():
+                continue
+            out.append({
+                "name": c.name,
+                "value": c.value,
+                "domain": dom or "guangdiu.com",
+                "path": c.path or "/",
+                "expires": c.expires,
+            })
+        with open(cookie_file, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _launch_guangdiu_chromium(
+    p: Any,
+    *,
+    headless: bool = True,
+    proxy: Optional[str] = None,
+    browser_channel: Optional[str] = "chrome",
+    bypass_system_proxy: bool = True,
+) -> Any:
+    """
+    启动浏览器用于逛丢滑块验证：
+    优先复用本机系统 Chrome（与项目其余 Playwright 模块一致，无需额外下载 chromium_headless_shell），
+    若未检测到则依次回退至 Edge 与 Playwright 内置 Chromium。
+    """
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        # 禁用 QUIC：逛丢首包在走代理/丢 UDP 的网络下会因 HTTP/3 握手卡住（实测表现为
+        # ERR_TIMED_OUT 或半开连接），强制走 TCP 后验证页能正常提交
+        "--disable-quic",
+    ]
+    if not proxy and bypass_system_proxy:
+        launch_args.append("--no-proxy-server")
+
+    base_kwargs: Dict[str, Any] = {
+        "headless": headless,
+        "args": launch_args,
+        "ignore_default_args": [
+            "--enable-automation",
+            "--disable-extensions",
+            "--disable-default-apps",
+            "--disable-component-extensions-with-background-pages",
+        ],
+    }
+    if proxy:
+        base_kwargs["proxy"] = {"server": proxy}
+
+    candidates: List[Optional[str]] = []
+    if browser_channel and str(browser_channel).strip().lower() not in ("", "chromium", "none"):
+        candidates.append(str(browser_channel).strip())
+    if "chrome" not in candidates:
+        candidates.append("chrome")
+    if os.name == "nt" and "msedge" not in candidates:
+        candidates.append("msedge")
+    candidates.append(None)
+
+    last_err: Optional[Exception] = None
+    for ch in candidates:
+        kwargs = dict(base_kwargs)
+        if ch:
+            kwargs["channel"] = ch
+        try:
+            return p.chromium.launch(**kwargs)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err if last_err is not None else RuntimeError("无法启动任何可用 Chromium/Chrome 浏览器")
+
+
+_GUANGDIU_SLIDE_MAX_ATTEMPTS: int = 3
+
+
+def _guangdiu_slide_geometry(page: Any) -> Optional[Dict[str, float]]:
+    """
+    读取逛丢滑块轨道与把手的真实几何尺寸（CSS 像素）。
+
+    前端 `verify.php` 的实现是：
+      `maxX = track.clientWidth - handle.offsetWidth`，
+      mousemove 中位移达到 `maxX - 1` 才置 done 并 POST `verifyconfirm.php`（携带 token/dur/moves）。
+    因此终点必须按真实尺寸算，且必须产生真实的 mousedown 与连续多帧 mousemove。
+    """
+    try:
+        geo = page.evaluate(
+            """() => {
+                const track = document.getElementById('slidetrack');
+                const handle = document.getElementById('slidehandle');
+                if (!track || !handle) return null;
+                const t = track.getBoundingClientRect();
+                const h = handle.getBoundingClientRect();
+                if (!t.width || !h.width) return null;
+                return {
+                    trackLeft: t.left, trackTop: t.top, trackWidth: t.width, trackHeight: t.height,
+                    handleLeft: h.left, handleTop: h.top, handleWidth: h.width, handleHeight: h.height
+                };
+            }"""
+        )
+    except Exception:
+        return None
+    return geo if isinstance(geo, dict) else None
+
+
+def _guangdiu_slide_status(page: Any) -> Tuple[bool, str]:
+    """读取滑块当前状态：是否已滑到终点（`slide-ok`），以及页面上的失败提示文案。"""
+    try:
+        state = page.evaluate(
+            """() => {
+                const track = document.getElementById('slidetrack');
+                const err = document.getElementById('verifyerr');
+                const ok = Boolean(track && (track.className || '').indexOf('slide-ok') >= 0);
+                const errText = (err && err.style.display !== 'none') ? (err.innerText || '') : '';
+                return {ok: ok, err: errText};
+            }"""
+        )
+    except Exception:
+        return False, ""
+    if not isinstance(state, dict):
+        return False, ""
+    return bool(state.get("ok")), str(state.get("err") or "")
+
+
+def _guangdiu_drag_slider(page: Any, geo: Dict[str, float], *, rng: random.Random) -> None:
+    """
+    完成一次完整的真人式滑动：落点对准把手 → 按住 → 变速分段拖动 → 精确到达最右端 → 松手。
+
+    - 每帧位移带微小随机抖动、纵向 1~2 像素手部漂移，全程约 1.0~1.4 秒、数十次 mousemove，
+      与服务端校验的 `dur` / `moves` 口径一致；
+    - 终点取 `trackLeft + maxX + 3px`，前端会把位移 clamp 到 maxX，确保满足 `x >= maxX - 1`；
+    - 必须「先到达终点、再松手」：前端 `onUp` 在未完成时会把把手瞬间弹回起点并清空填充，
+      这正是此前观感上「拖了一下却没松开、页面一直停在原地」的根因。
+    """
+    max_x = float(geo["trackWidth"]) - float(geo["handleWidth"])
+    if max_x <= 4:
+        raise RuntimeError(
+            f"滑块轨道尺寸异常: track_width={geo['trackWidth']:.1f}, handle_width={geo['handleWidth']:.1f}"
+        )
+    grip_x = float(geo["handleLeft"]) + float(geo["handleWidth"]) / 2.0
+    grip_y = float(geo["handleTop"]) + float(geo["handleHeight"]) / 2.0
+    end_x = float(geo["trackLeft"]) + max_x + 3.0
+
+    page.mouse.move(grip_x, grip_y, steps=5)
+    page.wait_for_timeout(rng.randint(120, 260))
+
+    page.mouse.down()
+    page.wait_for_timeout(rng.randint(70, 140))
+
+    duration_s = rng.uniform(0.95, 1.35)
+    frames = max(28, int(duration_s / 0.018))
+    prev_x = 0.0
+    for i in range(1, frames + 1):
+        progress = i / float(frames)
+        eased = 1.0 - (1.0 - progress) ** 3
+        x = eased * max_x + rng.uniform(-0.8, 0.8)
+        x = max(prev_x, min(x, max_x))
+        prev_x = x
+        page.mouse.move(grip_x + x, grip_y + rng.uniform(-1.5, 1.5))
+        page.wait_for_timeout(rng.randint(14, 26))
+
+    page.mouse.move(end_x, grip_y, steps=2)
+    page.wait_for_timeout(rng.randint(90, 160))
+    page.mouse.up()
+
+
+def _wait_guangdiu_manual_slide(
+    page: Any,
+    target_url: str,
+    *,
+    timeout: float,
+    goto_timeout_ms: int,
+) -> Tuple[bool, str, str]:
+    """可视化模式（headless=False）下的人工兜底：等待用户在浏览器窗口中手动完成滑动验证。"""
+    print("\n" + "=" * 70)
+    print("[逛丢安全验证提示]")
+    print("自动拖动未通过，已在浏览器窗口中打开验证页。")
+    print("★ 请切换到该窗口，【按住滑块一直拖到最右边再松开鼠标】完成验证。")
+    print("★ 通过后脚本会自动捕获并持久化 Cookie，后续请求可直接复用。")
+    print("=" * 70 + "\n")
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    deadline = time.time() + max(40.0, float(timeout) * 2)
+    last_notify = 0.0
+    while time.time() < deadline:
+        page.wait_for_timeout(500)
+        now = time.time()
+        if now - last_notify >= 10.0:
+            print(f"  [等待人工滑动] 剩余 {int(max(0, deadline - now))} 秒，请在浏览器窗口中拖动滑块...")
+            last_notify = now
+
+        cur_url = page.url or ""
+        try:
+            cur_html = page.content()
+        except Exception:
+            continue
+        if not _is_guangdiu_captcha_page(cur_url, cur_html):
+            return True, cur_html, ""
+
+        reached, _ = _guangdiu_slide_status(page)
+        if reached:
+            page.wait_for_timeout(1200)
+            if "verify.php" in (page.url or "").lower():
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
+                except Exception:
+                    pass
+            cur_url = page.url or ""
+            try:
+                cur_html = page.content()
+            except Exception:
+                cur_html = ""
+            if not _is_guangdiu_captcha_page(cur_url, cur_html):
+                return True, cur_html, ""
+
+    return False, "", "等待人工完成滑块验证超时或页面未完成跳转"
+
+
+def _open_guangdiu_page(page: Any, url: str, *, timeout_ms: int, attempts: int = 2, settle_ms: int = 600) -> None:
+    """
+    打开逛丢页面并等滑块控件就绪。
+
+    两处必须如此：
+    1. 用 `wait_until="commit"` 而不是 `domcontentloaded`：逛丢首屏实测 10~20 秒、偶发首包
+       超时，等 DOMContentLoaded 会把浏览器卡死在半开状态（Playwright 超时也不会触发），
+       卡住后整个验证流程既不报错也不推进；
+    2. 真正需要的是滑块 DOM，因此提交后直接等 `#slidetrack` 挂载，拿到即可开始拖动。
+    """
+    last_err: Optional[Exception] = None
+    for i in range(max(1, int(attempts))):
+        try:
+            page.goto(url, wait_until="commit", timeout=timeout_ms)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            if i + 1 < attempts:
+                page.wait_for_timeout(1200)
+    if last_err is not None:
+        raise last_err
+
+    if "verify.php" in (page.url or "").lower():
+        try:
+            page.wait_for_selector(
+                "#slidetrack",
+                state="attached",
+                timeout=min(15000, max(3000, int(timeout_ms // 3))),
+            )
+        except Exception:
+            pass
+    page.wait_for_timeout(max(200, int(settle_ms)))
+
+
+def _fetch_guangdiu_html_after_verify(
+    session: requests.Session,
+    url: str,
+    *,
+    timeout: float,
+) -> str:
+    """
+    滑块通过后尽力取回目标页正文；取不到返回空串（上层会用已同步的 Cookie 重拉）。
+
+    注意：这里只负责「取正文」，不作为放行判据——放行由 `gdhuman` Cookie 的
+    服务端下发决定，避免把慢网下的读超时误判成验证失败。
+    """
+    try:
+        resp = session.get(
+            url,
+            headers={**DEFAULT_HEADERS, "Referer": "https://guangdiu.com/"},
+            timeout=max(15.0, float(timeout)),
+        )
+        resp.encoding = "utf-8"
+        final_url = getattr(resp, "url", url) or url
+        if resp.status_code == 200 and not _is_guangdiu_captcha_page(final_url, resp.text):
+            return resp.text
+        return ""
+    except Exception:
+        return ""
+
+
+def _solve_guangdiu_slider_playwright(
+    session: requests.Session,
+    target_url: str,
+    *,
+    verify_url: str = "",
+    user_agent: str = DEFAULT_HEADERS["User-Agent"],
+    timeout: float = 20.0,
+    headless: bool = True,
+    proxy: Optional[str] = None,
+    cookie_file: Optional[str] = None,
+    max_drag_retries: int = _GUANGDIU_SLIDE_MAX_ATTEMPTS,
+    browser_channel: Optional[str] = "chrome",
+    bypass_system_proxy: bool = True,
+) -> Tuple[bool, str, str]:
+    """
+    使用 Playwright 自动通过逛丢 `verify.php` 滑块验证，并将通过后的 Cookie 同步回 `requests.Session`。
+    返回 `(solved, landed_html, error_msg)`。
+
+    判定口径（正向实证，不用前端文案/类名）：
+    1. 拖动确实把把手推到 `maxX` —— 前端才会向 `verifyconfirm.php` 发出一次上报；
+    2. 服务端回执放行 —— 表现为下发/轮换 `gdhuman` Cookie，或前端把主框架跳回目标页。
+    两个证据都可能在拖动后滞后几百毫秒，所以用有界轮询收集，不读该 XHR 的响应体
+    （慢网下它会永久挂起，且跳转后 Chrome 会丢弃它）。
+    落地页正文属于「能取到就顺带带回」，取不到不算失败：`detail.php` 在本机实测单次渲染
+    可挂 70s 以上，上层会用同步好的 Cookie 重拉。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return (
+            False,
+            "",
+            "未安装 playwright，请先执行: pip install playwright",
+        )
+
+    open_url = verify_url or target_url
+    # 逛丢直连实测往返常在 10~20 秒，首屏超时必须给足，否则浏览器会停在半开的验证页上
+    goto_timeout_ms = int(max(35.0, float(timeout) * 1.6) * 1000)
+    rng = random.Random()
+    # 站点域名集合：Cookie 在浏览器与 requests 之间往返时只认这些域，避免夹带第三方 Cookie
+    site_hosts = {(urlsplit(u).hostname or "").lower() for u in (target_url, open_url)} - {""}
+    target_host = (urlsplit(target_url).hostname or "").lower() or "guangdiu.com"
+
+    def _is_site_domain(dom: str) -> bool:
+        d = str(dom or "").lstrip(".").lower()
+        if not d:
+            return True
+        return any(h == d or h.endswith("." + d) or d.endswith("." + h) for h in site_hosts)
+
+    try:
+        with sync_playwright() as p:
+            browser = _launch_guangdiu_chromium(
+                p,
+                headless=headless,
+                proxy=proxy,
+                browser_channel=browser_channel,
+                bypass_system_proxy=bypass_system_proxy,
+            )
+            try:
+                context = browser.new_context(
+                    user_agent=user_agent,
+                    locale="zh-CN",
+                    viewport={"width": 1280, "height": 800},
+                )
+                context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+
+                pw_cookies: List[Dict[str, Any]] = []
+                for c in session.cookies:
+                    dom = str(c.domain or "").strip()
+                    if not _is_site_domain(dom):
+                        continue
+                    pw_cookies.append({
+                        "name": c.name,
+                        "value": c.value,
+                        "domain": dom or target_host,
+                        "path": c.path or "/",
+                    })
+                if pw_cookies:
+                    try:
+                        context.add_cookies(pw_cookies)
+                    except Exception:
+                        pass
+
+                page = context.new_page()
+                page.set_default_timeout(goto_timeout_ms)
+
+                # 前端只在服务端回执 ok===true 时才会 POST 一次 verifyconfirm.php，
+                # 因此「是否收到过该上报」可作为拖动是否真的到位的确定性信号。
+                verify_reports: List[str] = []
+
+                def _on_verify_request(req: Any) -> None:
+                    if "verifyconfirm.php" in (req.url or ""):
+                        try:
+                            verify_reports.append(req.post_data or "")
+                        except Exception:
+                            verify_reports.append("")
+
+                page.on("request", _on_verify_request)
+
+                # 主框架被前端 `window.location.href = gdbackurl` 跳走，同样只在服务端回执 ok 时发生，
+                # 用事件收集而不是轮询 page.url（导航挂起时 page.url 会一直停在 verify.php）。
+                navigations: List[str] = []
+
+                def _on_frame_navigated(frame: Any) -> None:
+                    try:
+                        if frame == page.main_frame:
+                            navigations.append(frame.url or "")
+                    except Exception:
+                        pass
+
+                page.on("framenavigated", _on_frame_navigated)
+
+                _open_guangdiu_page(
+                    page,
+                    open_url,
+                    timeout_ms=goto_timeout_ms,
+                    settle_ms=rng.randint(500, 900),
+                )
+                page.wait_for_timeout(rng.randint(600, 1000))
+
+                solved = False
+                landed_html = ""
+                last_err = ""
+                cookies_synced = False
+
+                def _sync_context_cookies() -> List[str]:
+                    names: List[str] = []
+                    for c in context.cookies():
+                        dom = str(c.get("domain") or "").lstrip(".").lower()
+                        if not _is_site_domain(dom):
+                            continue
+                        names.append(str(c["name"]))
+                        session.cookies.set(
+                            str(c["name"]),
+                            str(c["value"]),
+                            domain=dom or target_host,
+                            path=str(c.get("path") or "/"),
+                        )
+                    _save_guangdiu_cookies(session, cookie_file)
+                    return names
+
+                def _gdhuman_value() -> str:
+                    """读取服务端放行 Cookie `gdhuman` 的当前值（尚未下发则返回空串）。"""
+                    for c in context.cookies():
+                        if str(c.get("name") or "") == "gdhuman":
+                            return str(c.get("value") or "")
+                    return ""
+
+                is_captcha = "verify.php" in (page.url or "").lower() or _is_guangdiu_captcha_page(
+                    page.url, page.content()
+                )
+
+                if is_captcha:
+                    attempts = max(1, int(max_drag_retries))
+                    for attempt in range(1, attempts + 1):
+                        geo = _guangdiu_slide_geometry(page)
+                        if not geo:
+                            last_err = "验证页未渲染出 #slidetrack / #slidehandle 滑块控件，无法自动拖动"
+                            break
+
+                        human_before = _gdhuman_value()
+                        reports_before = len(verify_reports)
+                        navs_before = len(navigations)
+                        _guangdiu_drag_slider(page, geo, rng=rng)
+
+                        # 前端只在把手推到 maxX 时才 POST verifyconfirm.php；服务端回执 ok 时才会下发/轮换
+                        # gdhuman 放行 Cookie 并跳回目标页。这三个证据都可能滞后几百毫秒，
+                        # 因此有界轮询收集，而不是 sleep 一次后就下结论（漏判会导致白重试、换 token）：
+                        #   ① 上报已发出  ② gdhuman 出现新值  ③ 主框架已被跳走
+                        posted = False
+                        human_after = human_before
+                        navigated_away = False
+                        passed = False
+                        wait_deadline = time.time() + 6.0
+                        while True:
+                            posted = len(verify_reports) > reports_before
+                            human_after = _gdhuman_value()
+                            navigated_away = any(
+                                "verify.php" not in (u or "").lower()
+                                for u in navigations[navs_before:]
+                            )
+                            if posted and (
+                                (bool(human_after) and human_after != human_before) or navigated_away
+                            ):
+                                passed = True
+                                break
+                            if time.time() >= wait_deadline:
+                                break
+                            page.wait_for_timeout(200)
+
+                        cookie_names = _sync_context_cookies()
+                        cookies_synced = True
+
+                        if passed:
+                            solved = True
+                            # 顺带尽力取回正文：detail.php 在慢网下单次渲染可挂 70s+，
+                            # 取不到不算失败，上层会用同步好的 Cookie 自行重拉。
+                            landed_html = _fetch_guangdiu_html_after_verify(
+                                session, target_url, timeout=min(45.0, max(15.0, float(timeout)))
+                            )
+                            break
+
+                        last_err = (
+                            f"第 {attempt}/{attempts} 次拖动未获服务端放行"
+                            f"（上报={posted}，已跳转={navigated_away}，"
+                            f"gdhuman={human_after[:14] or '未下发'}，"
+                            f"Cookie={'、'.join(cookie_names) or '无'}）"
+                        )
+
+                        if attempt < attempts:
+                            # 上报失败后 token 即作废，必须重新打开验证页拿新 token 再试
+                            try:
+                                _open_guangdiu_page(
+                                    page,
+                                    open_url,
+                                    timeout_ms=goto_timeout_ms,
+                                    settle_ms=rng.randint(700, 1200),
+                                )
+                            except Exception as e_reload:
+                                last_err = (
+                                    f"重新打开验证页失败: {type(e_reload).__name__}: {str(e_reload)[:120]}"
+                                )
+                                break
+
+                    if not solved and not headless:
+                        solved, landed_html, manual_err = _wait_guangdiu_manual_slide(
+                            page,
+                            target_url,
+                            timeout=timeout,
+                            goto_timeout_ms=goto_timeout_ms,
+                        )
+                        if solved:
+                            _sync_context_cookies()
+                            cookies_synced = True
+                        elif manual_err:
+                            last_err = f"{last_err}；人工兜底: {manual_err}" if last_err else manual_err
+
+                if solved:
+                    if not cookies_synced:
+                        try:
+                            _sync_context_cookies()
+                        except Exception:
+                            pass
+                    return True, landed_html, ""
+
+                return False, "", last_err or "滑块自动拖动未通过且未落回目标页"
+            finally:
+                browser.close()
+    except Exception as e:
+        return False, "", f"Playwright 滑块验证异常: {type(e).__name__}: {str(e)[:160]}"
+
+
 def _unwrap_guangdiu_to_php(html_fragment: str) -> str:
     """将逛丢内部跳板 `guangdiu.com/to.php?u=...` 与 `iguangdiu.com/to.php?u=...` 还原为明文电商 URL。"""
     def _repl(m: re.Match) -> str:
@@ -1051,21 +1659,36 @@ def fetch_guangdiu_deals(
     session: Optional[requests.Session] = None,
     timeout: float = 10.0,
     skip_detail_ids: Optional[Set[str]] = None,
+    enable_slider_solver: bool = True,
+    cookie_file: Optional[str] = None,
+    max_captcha_solves: int = 2,
+    solver_headless: bool = True,
+    proxy: Optional[str] = None,
+    browser_channel: Optional[str] = "chrome",
+    bypass_system_proxy: bool = True,
 ) -> Dict[str, Any]:
     """
     逛丢全网爆料与榜单流 (`https://guangdiu.com/`)：
-    - 支持频道：
-      * `"latest"` -> `https://guangdiu.com/` (首页)
-      * `"hots"`   -> `https://guangdiu.com/hots.php` (热门榜)
-      * `"rank"`   -> `https://guangdiu.com/rank.php` (小时风云榜)
-      * `"pdd"`    -> `https://guangdiu.com/cate.php?m=拼多多`
-      * `"cheaps"` -> `https://guangdiu.com/cheaps.php`
-    - 策略：
-      1. 列表页先行 100% 确定性平台过滤 + 已抓 ID 去重（不发多余 `detail.php`/`go.php` 请求）；
-      2. 优先拉取 `detail.php` 检查滑块验证码与 `#dabstract` 实质教程，拿不到详情/教程立即跳过；
-      3. 详情通过后再拉取 `go.php` 解包真实直达购买链，并二次确认非支持平台过滤。
+- 支持频道：
+  - `"latest"` -> `https://guangdiu.com/` (首页)
+  - `"hots"`   -> `https://guangdiu.com/hots.php` (热门榜)
+  - `"rank"`   -> `https://guangdiu.com/rank.php` (小时风云榜)
+  - `"pdd"`    -> `https://guangdiu.com/cate.php?m=拼多多`
+  - `"cheaps"` -> `https://guangdiu.com/cheaps.php`
+- 策略：
+1. 列表页先行 100% 确定性平台过滤 + 已抓 ID 去重（不发多余 `detail.php`/`go.php` 请求）；
+  1. 优先拉取 `detail.php` 检查滑块验证码与 `#dabstract` 实质教程，触发滑块时自动通过验证并同步 Cookie；
+  2. 详情通过后再拉取 `go.php` 解包真实直达购买链，并二次确认非支持平台过滤。
     """
     http = session or requests.Session()
+    if proxy:
+        http.proxies.update({"http": proxy, "https": proxy})
+    elif bypass_system_proxy:
+        # 逛丢为国内直连站点，避免被本机系统代理/VPN 劫持导致 SSL 握手超时
+        http.trust_env = False
+    if cookie_file:
+        _load_guangdiu_cookies(http, cookie_file)
+
     base = "https://guangdiu.com"
     if channel == "rank":
         list_url = f"{base}/rank.php"
@@ -1080,9 +1703,108 @@ def fetch_guangdiu_deals(
         list_url = f"{base}/" if page <= 1 else f"{base}/index.php?p={page}"
 
     eff_delay = max(0.0, float(detail_delay))
+    captcha_triggered = 0
+    captcha_solved = 0
+    captcha_solve_attempts = 0
+
+    def _try_solve_captcha(target_url: str, verify_url: str) -> Tuple[bool, str, str]:
+        nonlocal captcha_triggered, captcha_solved, captcha_solve_attempts
+        captcha_triggered += 1
+        if not enable_slider_solver:
+            return False, "", "滑块自动验证已关闭 (enable_slider_solver=False)"
+        if captcha_solve_attempts >= max(0, int(max_captcha_solves)):
+            return False, "", f"本轮滑块自动验证已达上限 ({max_captcha_solves} 次)"
+        captcha_solve_attempts += 1
+        ok, landed_html, err = _solve_guangdiu_slider_playwright(
+            http,
+            target_url,
+            verify_url=verify_url,
+            user_agent=DEFAULT_HEADERS["User-Agent"],
+            timeout=max(18.0, float(timeout)),
+            headless=solver_headless,
+            proxy=proxy,
+            cookie_file=cookie_file,
+            browser_channel=browser_channel,
+            bypass_system_proxy=bypass_system_proxy,
+        )
+        if ok:
+            captcha_solved += 1
+        return ok, landed_html, err
+
     t0 = time.perf_counter()
-    resp = http.get(list_url, headers=DEFAULT_HEADERS, timeout=timeout)
-    resp.encoding = "utf-8"
+    eff_timeout = max(15.0, float(timeout))
+    resp = None
+    try:
+        resp = http.get(list_url, headers=DEFAULT_HEADERS, timeout=eff_timeout)
+        resp.encoding = "utf-8"
+        list_html = resp.text
+    except Exception as e:
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        return make_fetch_result(
+            status="error",
+            http_status=getattr(resp, "status_code", 0) if resp is not None else 0,
+            request_url=list_url,
+            elapsed_ms=elapsed_ms,
+            records=[],
+            rate_limited=True,
+            detail_errors=[{
+                "error_url": list_url,
+                "http_status": 0,
+                "error_type": type(e).__name__,
+                "error": f"逛丢列表页网络请求异常 ({type(e).__name__}): {str(e)[:160]}",
+            }],
+            captcha_triggered=captcha_triggered,
+            captcha_solved=captcha_solved,
+        )
+
+    resp_url = getattr(resp, "url", list_url) or list_url
+    if resp.status_code == 200 and _is_guangdiu_captcha_page(resp_url, list_html):
+        solved, landed_html, solve_err = _try_solve_captcha(list_url, resp_url)
+        if solved:
+            if landed_html and not _is_guangdiu_captcha_page(list_url, landed_html):
+                list_html = landed_html
+            else:
+                try:
+                    resp = http.get(list_url, headers=DEFAULT_HEADERS, timeout=eff_timeout)
+                    resp.encoding = "utf-8"
+                    list_html = resp.text
+                except Exception as e_retry:
+                    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+                    return make_fetch_result(
+                        status="error",
+                        http_status=0,
+                        request_url=list_url,
+                        elapsed_ms=elapsed_ms,
+                        records=[],
+                        rate_limited=True,
+                        detail_errors=[{
+                            "error_url": list_url,
+                            "http_status": 0,
+                            "error_type": type(e_retry).__name__,
+                            "error": f"滑块通过后重拉列表页网络异常: {str(e_retry)[:160]}",
+                        }],
+                        captcha_triggered=captcha_triggered,
+                        captcha_solved=captcha_solved,
+                    )
+        else:
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            return make_fetch_result(
+                status="error",
+                http_status=resp.status_code,
+                request_url=list_url,
+                elapsed_ms=elapsed_ms,
+                records=[],
+                rate_limited=True,
+                detail_errors=[{
+                    "error_url": resp_url,
+                    "http_status": resp.status_code,
+                    "error_type": "CaptchaChallengeDetected",
+                    "error": f"逛丢列表页触发滑块验证且自动通过失败: {solve_err}",
+                }],
+                captcha_triggered=captcha_triggered,
+                captcha_solved=captcha_solved,
+            )
+
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
     if resp.status_code != 200:
@@ -1100,6 +1822,8 @@ def fetch_guangdiu_deals(
                 "error_type": f"HTTP_{resp.status_code}",
                 "error": f"列表页返回非200状态码: {resp.status_code}",
             }],
+            captcha_triggered=captcha_triggered,
+            captcha_solved=captcha_solved,
         )
 
     is_rank = (channel == "rank")
@@ -1107,13 +1831,13 @@ def fetch_guangdiu_deals(
     if is_rank:
         blocks = re.findall(
             r'(<div\s+class=["\'][^"\']*\bhourrankitem\b[^"\']*["\'][^>]*>.*?)(?=<div\s+class=["\'][^"\']*\bhourrankitem\b|<div\s+id=["\'][^"\']*(?:footer|sidebar)|<div\s+class=["\']headerholder|$)',
-            resp.text,
+            list_html,
             re.S | re.I,
         )
     if not blocks:
         blocks = re.findall(
             r'(<div\s+class=["\'][^"\']*\bgooditem\b[^"\']*["\'][^>]*>.*?)(?=<div\s+class=["\'][^"\']*\bgooditem\b|<div\s+class=["\'][^"\']*\b(?:page|centerfix)\b|$)',
-            resp.text,
+            list_html,
             re.S | re.I,
         )
 
@@ -1135,10 +1859,33 @@ def fetch_guangdiu_deals(
         try:
             r_go = http.get(go_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
             r_go.encoding = "utf-8"
+            go_html = r_go.text
+            r_go_url = getattr(r_go, "url", go_url) or go_url
+            if r_go.status_code == 200 and _is_guangdiu_captcha_page(r_go_url, go_html):
+                solved, landed_html, solve_err = _try_solve_captcha(go_url, r_go_url)
+                if solved:
+                    if landed_html and not _is_guangdiu_captcha_page(go_url, landed_html):
+                        go_html = landed_html
+                    else:
+                        r_go = http.get(go_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
+                        r_go.encoding = "utf-8"
+                        go_html = r_go.text
+                else:
+                    detail_circuit_broken = True
+                    rate_limited = True
+                    detail_errors.append({
+                        "item_id": item_id,
+                        "error_url": go_url,
+                        "http_status": r_go.status_code,
+                        "error_type": "CaptchaChallengeDetected",
+                        "error": f"go.php 触发滑块验证且自动通过失败: {solve_err}",
+                    })
+                    return ""
+
             if r_go.status_code == 200:
                 m_var = re.search(
                     r"var\s+[A-Za-z0-9_]+\s*=\s*['\"](https?://[^'\"]+|/[^'\"]+)['\"]",
-                    r_go.text,
+                    go_html,
                     re.I,
                 )
                 if m_var:
@@ -1317,7 +2064,7 @@ def fetch_guangdiu_deals(
             break
 
         if detail_attempted > 0 and eff_delay > 0:
-            time.sleep(eff_delay)
+            time.sleep(eff_delay * random.uniform(0.85, 1.35))
         detail_attempted += 1
 
         has_full_detail = False
@@ -1340,19 +2087,44 @@ def fetch_guangdiu_deals(
                 continue
 
             det_html = rd.text
-            is_captcha = ("安全验证" in det_html) or ("verify-wrap" in det_html) or ("slidetrack" in det_html)
+            raw_u = getattr(rd, "url", None)
+            rd_url = str(raw_u).strip() if isinstance(raw_u, str) and str(raw_u).strip() else detail_url
+            is_captcha = _is_guangdiu_captcha_page(rd_url, det_html)
             if is_captcha:
-                detail_circuit_broken = True
-                rate_limited = True
-                skipped_no_detail += 1
-                detail_errors.append({
-                    "item_id": item_id,
-                    "error_url": detail_url,
-                    "http_status": 200,
-                    "error_type": "CaptchaChallengeDetected",
-                    "error": "逛丢详情页触发滑块安全验证，触发主动熔断保护，本轮跳过未获取详情的商品留待下轮重试",
-                })
-                break
+                solved, landed_html, solve_err = _try_solve_captcha(detail_url, rd_url)
+                if solved:
+                    if landed_html and not _is_guangdiu_captcha_page(detail_url, landed_html):
+                        det_html = landed_html
+                    else:
+                        time.sleep(random.uniform(0.3, 0.7))
+                        rd_retry = http.get(detail_url, headers={**DEFAULT_HEADERS, "Referer": list_url}, timeout=timeout)
+                        rd_retry.encoding = "utf-8"
+                        retry_url = getattr(rd_retry, "url", detail_url) or detail_url
+                        if rd_retry.status_code != 200 or _is_guangdiu_captcha_page(retry_url, rd_retry.text):
+                            detail_circuit_broken = True
+                            rate_limited = True
+                            skipped_no_detail += 1
+                            detail_errors.append({
+                                "item_id": item_id,
+                                "error_url": detail_url,
+                                "http_status": rd_retry.status_code,
+                                "error_type": "CaptchaRetryFailed",
+                                "error": "滑块通过后重拉详情页仍被拦截，触发主动熔断保护",
+                            })
+                            break
+                        det_html = rd_retry.text
+                else:
+                    detail_circuit_broken = True
+                    rate_limited = True
+                    skipped_no_detail += 1
+                    detail_errors.append({
+                        "item_id": item_id,
+                        "error_url": rd_url,
+                        "http_status": 200,
+                        "error_type": "CaptchaChallengeDetected",
+                        "error": f"逛丢详情页触发滑块安全验证，自动通过失败（{solve_err}），触发主动熔断保护",
+                    })
+                    break
 
             dabs_html = _extract_div_by_id(det_html, "dabstract")
             if not dabs_html:
@@ -1449,10 +2221,18 @@ def fetch_guangdiu_deals(
 
         if not has_valid_detail_and_tutorial(rec):
             skipped_no_detail += 1
+            logger.warning(
+                "  ⚠️ [逛丢-无购买锚点跳过] id=%s | title=%s | 缺少实质教程或淘/京/拼购买链接",
+                item_id,
+                title[:32],
+            )
             continue
 
         detail_fetched += 1
         records.append(rec)
+
+    if cookie_file:
+        _save_guangdiu_cookies(http, cookie_file)
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
     is_ok = (raw_list_count > 0 or len(records) > 0) and not (rate_limited and len(records) == 0)
@@ -1469,4 +2249,159 @@ def fetch_guangdiu_deals(
         skipped_no_detail=skipped_no_detail,
         rate_limited=rate_limited,
         detail_errors=detail_errors,
+        captcha_triggered=captcha_triggered,
+        captcha_solved=captcha_solved,
     )
+
+
+# ==============================================================================
+# 逛丢滑块验证与详情拉取自测函数
+# ==============================================================================
+def test_guangdiu_slider_and_fetch(
+    test_item_id: str = "30679695",
+    channel: str = "latest",
+    max_details: int = 3,
+    cookie_file: str = "guangdiu_cookies.json",
+    headless: bool = False,
+    proxy: Optional[str] = None,
+    browser_channel: Optional[str] = "chrome",
+    bypass_system_proxy: bool = True,
+) -> Dict[str, Any]:
+    """
+    一键验证两件事：
+    1. 直接访问 `verify.php?url=%2Fdetail.php%3Fid%3D{test_item_id}` 实测滑块自动拖动是否能过，
+       并校验同步回 `requests.Session` 的 Cookie 能否直接拉取 `detail.php` 中的 `#dabstract`；
+    2. 调用 `fetch_guangdiu_deals(...)` 实测端到端列表+详情+直达链拉取是否正常产出爆料记录。
+
+    使用建议：
+    - 首次在本地调试建议 `headless=False`，可直接观察浏览器自动拖动滑块的完整过程；
+    - 服务器/定时任务确认可用后改为 `headless=True`。
+    """
+    session = requests.Session()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    elif bypass_system_proxy:
+        session.trust_env = False
+
+    target_detail_url = f"https://guangdiu.com/detail.php?id={test_item_id}"
+    verify_url = f"https://guangdiu.com/verify.php?url={quote(f'/detail.php?id={test_item_id}', safe='')}"
+
+    print("=" * 72)
+    print(f"[测试 1/2] 直连逛丢滑块页自动验证: {verify_url}")
+    t1 = time.perf_counter()
+    solved, landed_html, err_msg = _solve_guangdiu_slider_playwright(
+        session,
+        target_detail_url,
+        verify_url=verify_url,
+        user_agent=DEFAULT_HEADERS["User-Agent"],
+        timeout=25.0,
+        headless=headless,
+        proxy=proxy,
+        cookie_file=cookie_file,
+        browser_channel=browser_channel,
+        bypass_system_proxy=bypass_system_proxy,
+    )
+    t1_ms = round((time.perf_counter() - t1) * 1000, 1)
+    cookie_names = [c.name for c in session.cookies]
+
+    requests_detail_ok = False
+    requests_has_dabstract = False
+    requests_http_status = None
+    if solved:
+        try:
+            r_check = session.get(
+                target_detail_url,
+                headers={**DEFAULT_HEADERS, "Referer": "https://guangdiu.com/"},
+                timeout=10.0,
+            )
+            r_check.encoding = "utf-8"
+            requests_http_status = r_check.status_code
+            r_check_url = getattr(r_check, "url", target_detail_url) or target_detail_url
+            if r_check.status_code == 200 and not _is_guangdiu_captcha_page(r_check_url, r_check.text):
+                requests_detail_ok = True
+                requests_has_dabstract = bool(_extract_div_by_id(r_check.text, "dabstract"))
+        except Exception as e_chk:
+            err_msg = f"滑块通过但 requests 回查失败: {e_chk}"
+
+    slider_report = {
+        "solved": solved,
+        "elapsed_ms": t1_ms,
+        "synced_cookies": cookie_names,
+        "landed_has_dabstract": bool(_extract_div_by_id(landed_html, "dabstract")) if landed_html else False,
+        "requests_http_status": requests_http_status,
+        "requests_detail_ok": requests_detail_ok,
+        "requests_has_dabstract": requests_has_dabstract,
+        "error": err_msg,
+    }
+    print(
+        f"  -> solved={solved} | 耗时={t1_ms}ms | 同步Cookie={cookie_names} "
+        f"| requests直连通过={requests_detail_ok} | 含#dabstract={requests_has_dabstract}"
+    )
+    if err_msg:
+        print(f"  -> 错误信息: {err_msg}")
+
+    if not solved and not requests_detail_ok:
+        print("-" * 72)
+        print("[提示] 前置安全验证未完成或超时，跳过端到端拉取测试以避免加重站点风控拦截。")
+        print("请在浏览器中手动拖动滑块通过一次验证，或将已验证会话 Cookie 导出至 guangdiu_cookies.json 后再试。")
+        print("=" * 72)
+        print("[最终结论] CHECK - 安全验证未通过，请按提示完成验证后重试")
+        return {
+            "all_passed": False,
+            "slider_test": slider_report,
+            "fetch_test": {"status": "skipped", "reason": "captcha_not_solved"},
+        }
+
+    print("-" * 72)
+    print(f"[测试 2/2] 端到端调用 fetch_guangdiu_deals(channel={channel!r}, max_details={max_details})")
+    res = fetch_guangdiu_deals(
+        channel=channel,
+        page=1,
+        fetch_detail=True,
+        max_details=max_details,
+        detail_delay=1.0,
+        session=session,
+        cookie_file=cookie_file,
+        enable_slider_solver=True,
+        solver_headless=headless,
+        proxy=proxy,
+        browser_channel=browser_channel,
+        bypass_system_proxy=bypass_system_proxy,
+    )
+    print(
+        f"  -> status={res['status']} | raw_list={res['raw_list_count']} | detail_fetched={res['detail_fetched']} "
+        f"| 有效产出={res['count']} | captcha_triggered={res.get('captcha_triggered')} "
+        f"| captcha_solved={res.get('captcha_solved')} | rate_limited={res['rate_limited']}"
+    )
+    if res.get("detail_errors"):
+        print(f"  -> detail_errors: {res['detail_errors']}")
+    for idx, rec in enumerate(res.get("records", [])[:3], start=1):
+        preview = str(rec.get("tutorial_text") or "").replace("\n", " ")[:100]
+        print(
+            f"  [样本 {idx}] id={rec['source_item_id']} | platform={rec['platform']} "
+            f"| price={rec['price_text']} | links={len(rec.get('extracted_links') or [])} "
+            f"| title={rec['title'][:36]}"
+        )
+        print(f"           tutorial={preview}")
+
+    all_passed = bool(solved and requests_detail_ok and res.get("status") == "success" and res.get("count", 0) > 0)
+    print("=" * 72)
+    print(f"[最终结论] {'PASS - 滑块验证与详情拉取全部通过' if all_passed else 'CHECK - 请查看上方具体输出排查'}")
+    return {
+        "all_passed": all_passed,
+        "slider_test": slider_report,
+        "fetch_test": {
+            "status": res.get("status"),
+            "raw_list_count": res.get("raw_list_count"),
+            "detail_fetched": res.get("detail_fetched"),
+            "count": res.get("count"),
+            "captcha_triggered": res.get("captcha_triggered"),
+            "captcha_solved": res.get("captcha_solved"),
+            "rate_limited": res.get("rate_limited"),
+            "detail_errors": res.get("detail_errors"),
+        },
+    }
+
+
+if __name__ == "__main__":
+    test_guangdiu_slider_and_fetch(headless=False)

@@ -4014,6 +4014,13 @@ def upsert_cleaned_products_to_formal_table(
         ops.append(UpdateOne({"platform": plat, "product_id": pid}, update_spec, upsert=True))
 
     res = formal_col.bulk_write(ops, ordered=False)
+    try:
+        from infrastructure.search_meili import index_documents, is_meili_available
+        if is_meili_available():
+            index_documents(product_docs)
+    except Exception as meili_err:
+        logger.warning("线报商品写入正式表后同步 Meilisearch 异常: %s", meili_err)
+
     return {
         "upserted": res.upserted_count,
         "modified": res.modified_count,

@@ -89,6 +89,20 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         except (ValueError, TypeError):
             channel_type = None
 
+    search_keywords_list: List[str] = []
+    if isinstance(deal_info, dict):
+        raw_t = str(deal_info.get("raw_tip_title") or "").strip()
+        if raw_t and raw_t != name:
+            search_keywords_list.append(raw_t)
+        fmt = deal_info.get("format_info")
+        if isinstance(fmt, dict):
+            for e in fmt.get("core_entities") or []:
+                if isinstance(e, dict) and e.get("name"):
+                    search_keywords_list.append(str(e["name"]).strip())
+            for dk in fmt.get("decision_keywords") or []:
+                if isinstance(dk, dict) and dk.get("attribute_value"):
+                    search_keywords_list.append(str(dk["attribute_value"]).strip())
+
     return {
         "id": doc_id,
         "product_id": product_id,
@@ -97,6 +111,7 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "brand": str(doc.get("brand") or "").strip(),
         "mall_name": str(doc.get("mall_name") or "").strip(),
         "category": str(doc.get("category") or "").strip(),
+        "search_keywords": " ".join(dict.fromkeys(search_keywords_list)),
         "price": price,
         "activity_price": activity_price,
         "saved_price": saved_price,
@@ -164,6 +179,40 @@ def is_meili_available(force_check: bool = False) -> bool:
             return False
 
 
+# 电商高频搜索同义词与简称对照表
+DEFAULT_SYNONYMS: Dict[str, List[str]] = {
+    # 饮料冲调
+    "可乐": ["可口可乐", "百事可乐"],
+    "可口可乐": ["可乐"],
+    "百事可乐": ["可乐"],
+    "雪碧": ["柠檬汽水", "雪碧汽水"],
+    "芬达": ["橙味汽水", "芬达汽水"],
+    "纯牛奶": ["牛奶", "鲜奶"],
+    "牛奶": ["纯牛奶", "鲜奶"],
+    "酸奶": ["发酵乳", "风味发酵乳"],
+    "咖啡": ["美式咖啡", "拿铁咖啡", "速溶咖啡"],
+    # 纸品湿巾与家居日化
+    "抽纸": ["纸巾", "面巾纸", "抽纸巾"],
+    "纸巾": ["抽纸", "面巾纸", "餐巾纸"],
+    "卷纸": ["卷筒纸", "卫生纸"],
+    "湿巾": ["湿纸巾", "婴儿湿巾"],
+    "洗衣液": ["洗衣凝珠", "洗衣粉", "洗衣皂"],
+    "洗洁精": ["洗洁剂", "餐具洗涤剂"],
+    "洗发水": ["洗发露", "洗发膏"],
+    "沐浴露": ["沐浴乳", "沐浴液"],
+    "牙膏": ["洁齿膏"],
+    # 粮油速食
+    "方便面": ["泡面", "速食面"],
+    "挂面": ["面条", "手排面"],
+    "食用油": ["花生油", "大豆油", "菜籽油", "玉米油"],
+    # 数码配件
+    "充电宝": ["移动电源"],
+    "数据线": ["充电线", "快充线"],
+    "耳机": ["蓝牙耳机", "无线耳机"],
+    "手机": ["智能手机"],
+}
+
+
 def ensure_index_configured() -> bool:
     """确保 products 索引及分词过滤属性已就绪"""
     global _INDEX_CONFIGURED
@@ -186,12 +235,13 @@ def ensure_index_configured() -> bool:
                 index = client.index(INDEX_NAME)
 
             # 配置可搜索字段、可过滤字段、可排序字段与排序规则
-            index.update_searchable_attributes(["name", "brand", "mall_name", "category"])
+            index.update_searchable_attributes(["name", "brand", "mall_name", "category", "search_keywords"])
             index.update_filterable_attributes(["platform", "category", "is_off_promotion", "is_deal_tip", "channel_type"])
             index.update_sortable_attributes(["updated_at", "activity_price", "price", "saved_price"])
             index.update_ranking_rules(["words", "typo", "proximity", "attribute", "sort", "exactness"])
+            index.update_synonyms(DEFAULT_SYNONYMS)
             _INDEX_CONFIGURED = True
-            logger.info("✅ 【Meilisearch索引就绪】products 索引配置已完成")
+            logger.info("✅ 【Meilisearch索引就绪】products 索引及同义词配置已完成")
             return True
         except Exception as e:
             logger.warning("❌ 【Meilisearch配置索引异常】: %s", format_exc_summary(e))
@@ -294,6 +344,7 @@ def index_documents(docs: List[Dict[str, Any]]) -> int:
         return 0
 
     try:
+        ensure_index_configured()
         index = client.index(INDEX_NAME)
         task = index.add_documents(formatted)
         return len(formatted)
@@ -335,7 +386,7 @@ def sync_all_products(mongo_db, batch_size: int = 2000, progress_cb=None) -> int
 
     ensure_index_configured()
     index = client.index(INDEX_NAME)
-    col = mongo_db["products"]
+    col = mongo_db.get_collection("products") if hasattr(mongo_db, "get_collection") else mongo_db["products"]
 
     query = {"is_off_promotion": {"$ne": True}}
     total = col.count_documents(query)

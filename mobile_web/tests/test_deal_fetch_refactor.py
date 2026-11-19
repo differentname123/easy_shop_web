@@ -533,3 +533,51 @@ def test_run_fetch_stage_runs_sites_concurrently_and_shuffles_same_site(monkeypa
 
     assert all(sorted(order) == ["hots", "latest", "rank"] for order in same_site_orders)
     assert len({tuple(order) for order in same_site_orders}) > 1
+
+
+def test_tehuicaicai_watermark_stops_when_page_all_known():
+    """验证特惠采采水位线增量翻页：当当前页全部为已知商品时，确定性在第1页终止，不发多余网络请求。"""
+    from mobile_web.services.deal_fetchers import fetch_tehuicaicai_deals
+
+    requested_pages = []
+
+    def fake_get(url, headers=None, timeout=10.0):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "page=1" in url:
+            requested_pages.append(1)
+            resp.json.return_value = {
+                "code": "OK",
+                "data": {
+                    "items": [
+                        {"id": 3001, "title": "已知旧物1", "platform_code": "jd", "platform_name": "京东", "display_price": "9.9"},
+                        {"id": 3002, "title": "已知旧物2", "platform_code": "jd", "platform_name": "京东", "display_price": "19.9"},
+                    ],
+                    "pagination": {"page": 1, "total": 20, "has_next": True},
+                },
+            }
+        elif "page=2" in url:
+            requested_pages.append(2)
+            resp.json.return_value = {"code": "OK", "data": {"items": [], "pagination": {"page": 2, "total": 20, "has_next": False}}}
+        return resp
+
+    sess = MagicMock()
+    sess.get.side_effect = fake_get
+
+    res = fetch_tehuicaicai_deals(
+        fetch_detail=True,
+        max_details=10,
+        detail_delay=0.0,
+        skip_detail_ids={"3001", "3002"},
+        session=sess,
+        max_pages=5,
+        auto_paginate=True,
+    )
+
+    assert res["status"] == "success"
+    # 当第1页全为已知数据时，极简且确定性地在第1页早停，绝不向后发请求
+    assert requested_pages == [1]
+    assert len(res["records"]) == 0
+
+
+

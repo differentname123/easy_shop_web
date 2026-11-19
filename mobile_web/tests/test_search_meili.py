@@ -172,6 +172,39 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         res = self.repo.rank_boom_products_by_cost_performance(keyword="完全不存在的商品999")
         self.assertEqual(res, [])
 
+    def test_format_meili_doc_with_deal_info_and_entities(self):
+        """测试 format_meili_doc 自动将原始爆料标题与 AI 提取实体打包入 search_keywords"""
+        doc = {
+            "platform": "pdd",
+            "product_id": "P6635",
+            "name": "可口可乐多口味装包邮",
+            "price": 33.4,
+            "deal_info": {
+                "is_deal_tip": True,
+                "raw_tip_title": "【多多】可口可乐500ml*18瓶混合装",
+                "format_info": {
+                    "core_entities": [{"name": "碳酸饮料", "score": 10}],
+                    "decision_keywords": [{"attribute_name": "品类", "attribute_value": "可乐"}],
+                },
+            },
+        }
+        res = format_meili_doc(doc)
+        self.assertIsNotNone(res)
+        self.assertIn("search_keywords", res)
+        # 验证 search_keywords 中包含原始爆料标题与实体词
+        self.assertIn("【多多】可口可乐500ml*18瓶混合装", res["search_keywords"])
+        self.assertIn("碳酸饮料", res["search_keywords"])
+        self.assertIn("可乐", res["search_keywords"])
+
+    @patch("services.deal_pool_cleaner.upsert_cleaned_products_to_formal_table")
+    def test_repo_upsert_cleaned_deal_products_ssot(self, mock_upsert_deal):
+        """测试 ProductRepository 作为单一真源入口统一调度好价商品入库"""
+        mock_upsert_deal.return_value = {"upserted": 1, "modified": 0, "matched": 0}
+        product_docs = [{"platform": "pdd", "product_id": "P999", "name": "测试商品"}]
+        res = self.repo.upsert_cleaned_deal_products(product_docs)
+        mock_upsert_deal.assert_called_once_with(self.col, product_docs)
+        self.assertEqual(res["upserted"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

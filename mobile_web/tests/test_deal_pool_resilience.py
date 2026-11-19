@@ -986,18 +986,19 @@ def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
         captured_ops.extend(ops) or SimpleNamespace(upserted_count=0, modified_count=1, matched_count=1)
     )
 
-    res = upsert_cleaned_products_to_formal_table(
-        formal_col,
-        [
-            {
-                "platform": "jd",
-                "product_id": "10001",
-                "name": "可口可乐24罐",
-                "price": 45.9,
-                "deal_info": {"is_deal_tip": True, "quality_score": 80, "deal_price": 26.8},
-            }
-        ],
-    )
+    with patch("infrastructure.search_meili.is_meili_available", return_value=False):
+        res = upsert_cleaned_products_to_formal_table(
+            formal_col,
+            [
+                {
+                    "platform": "jd",
+                    "product_id": "10001",
+                    "name": "可口可乐24罐",
+                    "price": 45.9,
+                    "deal_info": {"is_deal_tip": True, "quality_score": 80, "deal_price": 26.8},
+                }
+            ],
+        )
     assert res["protected_high_score"] == 0
     set_doc = captured_ops[0]._doc["$set"]
     assert set_doc["deal_info.deal_price"] == 26.8
@@ -1593,23 +1594,24 @@ def test_upsert_cleaned_products_honors_lower_price_improvement():
     )
 
     # 新线报质量分 88 (低于库内 95)，但价格从 199 破低到 149 (降低超 2%) -> 必须放行更新 deal_price 而不被高分拦截！
-    res = upsert_cleaned_products_to_formal_table(
-        formal_col,
-        [
-            {
-                "platform": "jd",
-                "product_id": "10099",
-                "name": "某品牌耳机",
-                "price": 299.0,
-                "deal_info": {
-                    "is_deal_tip": True,
-                    "quality_score": 88,
-                    "deal_price": 149.0,
-                    "tutorial_steps": ["1. 领券", "2. 下单"],
-                },
-            }
-        ],
-    )
+    with patch("infrastructure.search_meili.is_meili_available", return_value=False):
+        res = upsert_cleaned_products_to_formal_table(
+            formal_col,
+            [
+                {
+                    "platform": "jd",
+                    "product_id": "10099",
+                    "name": "某品牌耳机",
+                    "price": 299.0,
+                    "deal_info": {
+                        "is_deal_tip": True,
+                        "quality_score": 88,
+                        "deal_price": 149.0,
+                        "tutorial_steps": ["1. 领券", "2. 下单"],
+                    },
+                }
+            ],
+        )
     assert res["protected_high_score"] == 0
     assert len(captured_ops) == 1
     set_fields = captured_ops[0]._doc["$set"]

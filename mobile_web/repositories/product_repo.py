@@ -1449,6 +1449,15 @@ class ProductRepository(BaseRepository):
             )
             return 0
 
+    def upsert_cleaned_deal_products(self, product_docs: List[Dict[str, Any]]) -> Dict[str, int]:
+        """
+        【单一真源 SSOT · 正式商品库好价线报统一入库中枢】
+        将完成 AI 清洗与官方转链的高分好价商品晋升入库到正式表 (`products`)，
+        并原子确定性触发 Meilisearch 搜索索引同步，使商品自动具备即时模糊检索与性价比排序能力。
+        """
+        from services.deal_pool_cleaner import upsert_cleaned_products_to_formal_table
+        return upsert_cleaned_products_to_formal_table(self.col, product_docs)
+
     _DETAIL_CAS_ATTEMPTS = 4
 
     @staticmethod
