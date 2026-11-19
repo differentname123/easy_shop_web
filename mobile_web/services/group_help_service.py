@@ -23,7 +23,14 @@ from config import logger
 from infrastructure.ai_api.model_api import extract_llm_json
 from infrastructure.logging_utils import format_exc_summary
 from models.group_help import (
+    ENTRY_TYPE_LINK,
+    ENTRY_TYPE_POSTER,
+    GROUP_STATUS_EXPIRED,
+    GROUP_STATUS_FULL,
+    GROUP_STATUS_PENDING_CONFIRM,
     MAX_TAKEDOWNS_PER_WINDOW,
+    SOURCE_USER_TEXT,
+    SOURCE_USER_UPLOAD,
     TAKEDOWN_RATE_WINDOW_SECONDS,
     GroupHelpAuthRequiredError,
     GroupHelpPermissionError,
@@ -33,7 +40,9 @@ from models.group_help import (
     is_takedown_feedback,
     is_valid_group_order_id,
     parse_group_redirect_url,
+    parse_pdd_group_share_fields,
     validate_and_normalize_parsed_poster,
+    validate_optional_share_text,
 )
 from repositories.group_help_repo import GroupHelpRepository
 from repositories.user_repo import UserRepository
@@ -43,6 +52,8 @@ _POSTER_DIR = _APP_DIR / "runtime" / "group_posters"
 _PROMPT_FILE = _APP_DIR / "prompt" / "多人团海报识别.txt"
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
 _POSTER_RETENTION_SECONDS = 7 * 86400  # 本地海报保留 7 天，自动清理超期历史文件
+_TEXT_SUBMIT_WINDOW_SECONDS = 600
+_TEXT_SUBMIT_MAX_PER_WINDOW = 5
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
@@ -178,6 +189,7 @@ class GroupHelpService:
         self._ai_generator = ai_generator
         self._wake_callback: Optional[Callable[[], None]] = None
         self._takedown_ts = ThreadSafeTTLCache(maxsize=4096, ttl=TAKEDOWN_RATE_WINDOW_SECONDS)
+        self._text_submit_ts = ThreadSafeTTLCache(maxsize=4096, ttl=_TEXT_SUBMIT_WINDOW_SECONDS)
         self._last_poster_cleanup_ts: float = 0.0
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
@@ -247,11 +259,17 @@ class GroupHelpService:
             return None
         gid = str(group_order_id).strip()
         doc = self.repo.get_by_group_order_id(gid)
-        # 仅对外展示已通过合规审核与字段校验的拼团海报，未审核或审核失败的图片保留在服务器磁盘但对外不可访问
+        # 仅对外展示已通过合规审核与字段校验的拼团海报，未审核或无图记录对外不可访问
         if not doc or doc.get("parse_status") != "parsed":
             return None
-        path = self.poster_dir / f"{gid}.jpg"
-        return path if path.is_file() else None
+        poster_path_str = str(doc.get("poster_path") or "").strip()
+        if not poster_path_str:
+            return None
+        path = Path(poster_path_str)
+        if path.is_file():
+            return path
+        fallback = self.poster_dir / f"{gid}.jpg"
+        return fallback if fallback.is_file() else None
 
     def _format_with_matched_group(self, doc: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
         current_ts = float(now if now is not None else time.time())
@@ -284,10 +302,11 @@ class GroupHelpService:
         image_bytes: bytes,
         owner_token: str = "",
         viewer_uid: Optional[str] = None,
+        share_text: str = "",
     ) -> Dict[str, Any]:
         """
         第一步（同步执行）：
-        1. 校验图片体积与格式；
+        1. 校验图片体积与格式，以及可选附带拼团口令；
         2. 识别图片中的二维码；
         3. 免登录请求 307 重定向提取 group_order_id 等关键字段；
         4. 为新团签发随机 owner_token，保存海报并在 pdd_multi_groups 表写入待解析记录。
@@ -296,6 +315,8 @@ class GroupHelpService:
             raise ValueError("上传的图片内容为空")
         if len(image_bytes) > _MAX_UPLOAD_BYTES:
             raise ValueError("图片大小不能超过 10MB")
+
+        share_meta = validate_optional_share_text(share_text)
 
         qr_text = decode_qr_from_image_bytes(image_bytes)
         if not qr_text:
@@ -323,6 +344,10 @@ class GroupHelpService:
         poster_path = self._save_poster_image(gid, image_bytes)
         record_input: Dict[str, Any] = {
             **link_meta,
+            "entry_type": ENTRY_TYPE_POSTER,
+            "source": SOURCE_USER_UPLOAD,
+            "share_text": share_meta["share_text"],
+            "share_code": share_meta["share_code"],
             "poster_path": str(poster_path),
             "created_at": now,
         }
@@ -341,6 +366,109 @@ class GroupHelpService:
 
         formatted = self._format_with_matched_group(doc, now=now)
         msg = "✅ 二维码核验通过，已加入【我的团】！正在自动审核并识别商品关键信息（约 10~20 秒），完成后立即反馈。"
+
+        result: Dict[str, Any] = {
+            "status": "success",
+            "is_new": is_new,
+            "message": msg,
+            "data": formatted,
+        }
+        if issued_owner_token:
+            result["owner_token"] = issued_owner_token
+        return result
+
+    def submit_text_group(
+        self,
+        *,
+        share_text: str,
+        goods_name: str,
+        group_price: float,
+        original_price: Optional[float] = None,
+        total_people: int = 0,
+        remain_people: int = 1,
+        publisher_nick: str = "",
+        owner_token: str = "",
+        viewer_uid: Optional[str] = None,
+        client_ip: str = "",
+    ) -> Dict[str, Any]:
+        """无图发团：支持直接提交拼多多 ⇥...⇤ 口令或官方拼团链接，走结构化核验、限频防刷与同款匹配。"""
+        now = time.time()
+        clean_uid = str(viewer_uid or "").strip()
+        rate_key = f"u:{clean_uid}" if clean_uid else f"ip:{str(client_ip or 'anon').strip() or 'anon'}"
+        cutoff = now - _TEXT_SUBMIT_WINDOW_SECONDS
+        recent_ts = [t for t in (self._text_submit_ts.get(rate_key) or []) if t >= cutoff]
+        if len(recent_ts) >= _TEXT_SUBMIT_MAX_PER_WINDOW:
+            self._text_submit_ts.set(rate_key, recent_ts)
+            raise GroupHelpPermissionError(
+                "10 分钟内无图发布拼团次数已达上限，请稍后再试或使用海报上传",
+                error_code="submit_rate_limited",
+                status_code=429,
+            )
+
+        parsed = parse_pdd_group_share_fields(
+            share_text=share_text,
+            goods_name=goods_name,
+            group_price=group_price,
+            original_price=original_price,
+            total_people=total_people,
+            remain_people=remain_people,
+            publisher_nick=publisher_nick,
+        )
+
+        if parsed["needs_url_resolve"] and parsed["short_url"]:
+            try:
+                link_meta = resolve_pdd_qr_link(parsed["short_url"], http_get=self._http_get)
+                parsed.update(link_meta)
+                parsed["entry_type"] = ENTRY_TYPE_LINK
+            except ValueError as exc:
+                if not parsed["share_code"]:
+                    raise ValueError(
+                        "该拼多多链接未能解析出有效拼团单号，请确认是多人团邀请链接或改贴 ⇥...⇤ 拼团口令"
+                    ) from exc
+
+        gid = str(parsed.get("group_order_id") or "").strip()
+        if not is_valid_group_order_id(gid):
+            raise ValueError("未能生成有效的拼团编号，请检查口令或链接格式")
+
+        existing = self.repo.get_by_group_order_id(gid)
+        issued_owner_token = ""
+        if existing is not None:
+            orig_status = str(existing.get("group_status") or "")
+            if float(existing.get("expires_at") or 0) <= now or orig_status == GROUP_STATUS_EXPIRED:
+                raise ValueError("该拼团已超过有效期失效，请在拼多多重新发起新团")
+            if orig_status == GROUP_STATUS_FULL:
+                raise ValueError("该拼团已被标记满员，如需继续拼单请在详情页点击「未满恢复」")
+            is_owner = self._is_group_owner(existing, owner_token=owner_token, viewer_uid=clean_uid)
+            if not is_owner:
+                raise ValueError("该拼团口令/链接已在大厅中存在，请直接搜索参团或在详情页反馈人数变化")
+            if owner_token:
+                issued_owner_token = str(owner_token).strip()
+        else:
+            issued_owner_token = secrets.token_hex(12)
+
+        record_input: Dict[str, Any] = {
+            **parsed,
+            "source": SOURCE_USER_TEXT,
+            "poster_path": "",
+            "created_at": now,
+        }
+        if existing is None:
+            record_input["owner_token"] = issued_owner_token
+            record_input["owner_uid"] = clean_uid
+
+        doc, is_new, matched_doc = self.repo.upsert_parsed_group(
+            record_input,
+            now=now,
+            preserve_local_takedown=True,
+            check_similar=(existing is None),
+        )
+        self._text_submit_ts.set(rate_key, recent_ts + [now])
+
+        formatted = self._format_with_matched_group(doc, now=now)
+        if formatted.get("group_status") == GROUP_STATUS_PENDING_CONFIRM and matched_doc:
+            msg = "🔎 大厅已有同款同价拼团正在凑人！推荐优先参团，或点击「仍要发布我的团」"
+        else:
+            msg = "✅ 无图拼团已发布到大厅！其他拼友可直接复制口令或点击链接参团。"
 
         result: Dict[str, Any] = {
             "status": "success",

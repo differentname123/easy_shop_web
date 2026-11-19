@@ -151,6 +151,18 @@
         matchedGroup: null,
       });
 
+      // 无图口令 / 官方链接直接发布弹窗
+      const textSubmitModal = ref({
+        visible: false,
+        share_text: '',
+        goods_name: '',
+        group_price: '',
+        remain_people: 1,
+        total_people: '',
+        submitting: false,
+        errorMsg: '',
+      });
+
       let toastTimer = null;
       let pollTimer = null;
       let pushedHistoryCount = 0;
@@ -917,9 +929,101 @@
       };
 
       const openPosterAndRecord = item => {
-        if (!item) return;
+        if (!item || !item.poster_url) return;
         recordClick(item.group_order_id);
         openFullPoster(item.poster_url);
+      };
+
+      const openTextSubmitModal = () => {
+        textSubmitModal.value = {
+          visible: true,
+          share_text: '',
+          goods_name: '',
+          group_price: '',
+          remain_people: 1,
+          total_people: '',
+          submitting: false,
+          errorMsg: '',
+        };
+      };
+
+      const closeTextSubmitModal = () => {
+        if (textSubmitModal.value.submitting) return;
+        textSubmitModal.value.visible = false;
+      };
+
+      const onTextShareInput = () => {
+        if (textSubmitModal.value.goods_name) return;
+        const raw = String(textSubmitModal.value.share_text || '');
+        const matches = raw.match(/【([^【】]{4,80})】/g) || [];
+        for (const seg of matches) {
+          const inner = seg.slice(1, -1).trim();
+          if (inner && !/^(拼多多|百亿补贴|多人团|限时补贴)$/.test(inner)) {
+            textSubmitModal.value.goods_name = inner.slice(0, 120);
+            break;
+          }
+        }
+      };
+
+      const submitTextGroupForm = async () => {
+        const f = textSubmitModal.value;
+        if (f.submitting) return;
+        if (!f.share_text) {
+          f.errorMsg = '请先粘贴含 ⇥...⇤ 的拼多多口令或官方拼团链接';
+          return;
+        }
+        if (!f.goods_name || f.goods_name.length < 2) {
+          f.errorMsg = '请填写商品名称（至少 2 个字）';
+          return;
+        }
+        const priceNum = Number(f.group_price);
+        if (!Number.isFinite(priceNum) || priceNum <= 0 || priceNum > 50000) {
+          f.errorMsg = '请填写有效的拼团价（0 ~ 50000 元）';
+          return;
+        }
+        const remainNum = Number(f.remain_people);
+        if (!Number.isInteger(remainNum) || remainNum < 1 || remainNum > 20) {
+          f.errorMsg = '还差人数请填写 1 ~ 20 之间的整数';
+          return;
+        }
+        const totalNum = f.total_people ? Number(f.total_people) : 0;
+
+        f.submitting = true;
+        f.errorMsg = '';
+        try {
+          const resp = await global.fetch('/api/group_help/submit_text', {
+            method: 'POST',
+            headers: buildAuthHeaders(true),
+            body: JSON.stringify({
+              share_text: f.share_text,
+              goods_name: f.goods_name,
+              group_price: priceNum,
+              remain_people: remainNum,
+              total_people: Number.isInteger(totalNum) && totalNum >= 0 ? totalNum : 0,
+            }),
+          });
+          const json = await resp.json();
+          if (resp.ok && json.status === 'success' && json.data) {
+            const ownerPatch = json.owner_token ? { owner_token: String(json.owner_token) } : {};
+            upsertMyGroup({ ...json.data, ...ownerPatch }, true);
+            f.visible = false;
+            showToast(json.message || '发布成功！', 3400);
+            if (filterMode.value !== 'mine') {
+              fetchGroups(true);
+            }
+            if (json.data.group_status === 'pending_confirm' && json.data.matched_group) {
+              openUploadResultModal(json.data);
+            } else {
+              openDetail(json.data);
+            }
+          } else {
+            f.errorMsg = (json && (json.error_msg || json.detail)) || '发布失败，请检查口令或链接内容';
+          }
+        } catch (_) {
+          f.errorMsg = '网络异常，请稍后重试';
+        } finally {
+          f.submitting = false;
+        }
       };
 
       const openHelpGuide = (failedItem = null) => {
@@ -1073,10 +1177,12 @@
         }
       };
 
+      const isNumericGroupId = gid => /^[0-9]{10,28}$/.test(String(gid || ''));
+
       const resolveH5JoinUrl = item => {
         if (!item) return '';
         if (item.h5_join_url) return String(item.h5_join_url);
-        if (item.group_order_id) {
+        if (isNumericGroupId(item.group_order_id)) {
           return `https://mobile.yangkeduo.com/group7.html?group_order_id=${encodeURIComponent(String(item.group_order_id))}`;
         }
         return '';
@@ -1085,10 +1191,27 @@
       const resolveAppWakeUrl = item => {
         if (!item) return '';
         if (item.app_wake_url) return String(item.app_wake_url);
-        if (item.group_order_id) {
+        if (isNumericGroupId(item.group_order_id)) {
           return `pinduoduo://com.xunmeng.pinduoduo/group7.html?group_order_id=${encodeURIComponent(String(item.group_order_id))}`;
         }
         return '';
+      };
+
+      const copyGroupToken = item => {
+        if (!item) return;
+        const tokenText = String(item.share_text || (item.share_code ? `⇥${item.share_code}⇤` : '')).trim();
+        if (!tokenText) {
+          showToast('该拼团暂无可复制口令');
+          return;
+        }
+        recordClick(item.group_order_id);
+        return copyShareText(tokenText, '✅ 拼团口令已复制！请打开【拼多多】App 自动弹窗参团');
+      };
+
+      const openPddHomeApp = item => {
+        if (!item) return;
+        copyGroupToken(item);
+        global.location.href = 'pinduoduo://com.xunmeng.pinduoduo/index.html';
       };
 
       const isInAppWebView = () => {
@@ -1161,7 +1284,12 @@
         const preferH5Only = Boolean(options.preferH5Only);
         const h5Url = resolveH5JoinUrl(item);
         const appUrl = resolveAppWakeUrl(item);
-        if (!h5Url && !appUrl) return;
+        if (!h5Url && !appUrl) {
+          if (item.share_text || item.share_code) {
+            copyGroupToken(item);
+          }
+          return;
+        }
 
         clearAppFallbackTimer();
         recordClick(item.group_order_id);
@@ -1561,7 +1689,7 @@
       };
 
       const openDeepLinkedGroup = async (gid, fromModalHistory = false) => {
-        if (!/^[0-9]{10,28}$/.test(gid)) return;
+        if (!/^(?:[0-9]{10,28}|tok_[A-Za-z0-9]{6,28})$/.test(gid)) return;
         consumeReturnGroup();
         if (!fromModalHistory) {
           try {
@@ -1733,6 +1861,15 @@
         reuploadFromHelp,
         openUploadResultModal,
         closeUploadResultModal,
+        textSubmitModal,
+        openTextSubmitModal,
+        closeTextSubmitModal,
+        onTextShareInput,
+        submitTextGroupForm,
+        copyGroupToken,
+        openPddHomeApp,
+        resolveH5JoinUrl,
+        resolveAppWakeUrl,
         viewPublishedOwnGroup,
         sharePublishedOwnGroup,
         shareGroup,

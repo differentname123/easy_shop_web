@@ -1132,3 +1132,360 @@ def test_group_help_upload_rejects_oversized_content_length_with_413():
     )
     assert resp.status_code == 413
     assert resp.json()["error_code"] == "payload_too_large"
+
+
+def test_text_token_and_link_group_submission_and_validation(tmp_path, monkeypatch):
+    """验证无图兼容全链路：⇥...⇤ 口令直发、官方短链解析直发、详情与海报404兜底、外站链接/违规引流拦截与10分钟限频。"""
+    import config
+    import main as main_module
+    from dataclasses import replace
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    short_link = "https://file-link.pinduoduo.com/fakeLink1"
+    numeric_gid = "3501999000111222333"
+
+    class _FakeResp:
+        def __init__(self, status_code=307, location=""):
+            self.status_code = status_code
+            self.headers = {"Location": location} if location else {}
+
+    def _fake_http_get(url, allow_redirects=False, timeout=10, headers=None):
+        if url == short_link:
+            return _FakeResp(
+                307,
+                f"https://mobile.yangkeduo.com/group7.html?group_order_id={numeric_gid}&refer_share_id=link-test-1",
+            )
+        return _FakeResp(404)
+
+    service = GroupHelpService(repo=repo, poster_dir=tmp_path, http_get=_fake_http_get)
+    monkeypatch.setattr(group_help_api, "group_help_service", service)
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(config.settings, warmup_enabled=False, detail_prefetch_enabled=False),
+    )
+
+    app = create_app()
+    with TestClient(app) as client:
+        # 1. 提交无图拼团口令
+        tok_resp = client.post(
+            "/api/group_help/submit_text",
+            json={
+                "share_text": "快来帮我拼团呀 ⇥AbCdEf9876⇤",
+                "goods_name": "维达抽纸24包整箱装",
+                "group_price": 29.9,
+                "original_price": 39.9,
+                "total_people": 3,
+                "remain_people": 1,
+                "publisher_nick": "测试团长",
+            },
+        )
+        assert tok_resp.status_code == 200, tok_resp.text
+        tok_json = tok_resp.json()
+        assert tok_json["status"] == "success"
+        assert tok_json["owner_token"]
+        tok_data = tok_json["data"]
+        assert tok_data["group_order_id"] == "tok_AbCdEf9876"
+        assert tok_data["entry_type"] == "token"
+        assert tok_data["has_poster"] is False
+        assert tok_data["poster_url"] == ""
+        assert tok_data["h5_join_url"] == ""
+        assert tok_data["app_wake_url"] == ""
+        assert tok_data["share_code"] == "AbCdEf9876"
+
+        # 2. 列表、详情、点击统计正常工作，请求无图记录的 /poster 返回 404
+        list_resp = client.get("/api/group_help/list", params={"keyword": "维达抽纸"})
+        assert list_resp.status_code == 200
+        assert any(it["group_order_id"] == "tok_AbCdEf9876" for it in list_resp.json()["data"]["items"])
+
+        detail_resp = client.get("/api/group_help/detail/tok_AbCdEf9876")
+        assert detail_resp.status_code == 200
+        assert detail_resp.json()["data"]["share_text"] == "快来帮我拼团呀 ⇥AbCdEf9876⇤"
+
+        click_resp = client.post("/api/group_help/click/tok_AbCdEf9876")
+        assert click_resp.status_code == 200
+        assert click_resp.json()["data"]["click_count"] == 1
+
+        poster_resp = client.get("/api/group_help/poster/tok_AbCdEf9876")
+        assert poster_resp.status_code == 404
+
+        # 3. 拦截站外链接与违规引流广告，且禁止他人篡改已有口令
+        evil_resp = client.post(
+            "/api/group_help/submit_text",
+            json={
+                "share_text": "点击 https://evil.example.com/phish ⇥ZzYyXx1234⇤",
+                "goods_name": "测试商品",
+                "group_price": 19.9,
+            },
+        )
+        assert evil_resp.status_code == 400
+
+        spam_resp = client.post(
+            "/api/group_help/submit_text",
+            json={
+                "share_text": "加微信abc12345领返现 ⇥ZzYyXx1234⇤",
+                "goods_name": "测试商品",
+                "group_price": 19.9,
+            },
+        )
+        assert spam_resp.status_code == 400
+
+        hijack_resp = client.post(
+            "/api/group_help/submit_text",
+            json={
+                "share_text": "我想改掉别人团名 ⇥AbCdEf9876⇤",
+                "goods_name": "恶意篡改标题",
+                "group_price": 1.0,
+            },
+        )
+        assert hijack_resp.status_code == 400
+
+        # 4. 提交拼多多官方短链（无海报图但能解析数字团单）
+        link_resp = client.post(
+            "/api/group_help/submit_text",
+            json={
+                "share_text": short_link,
+                "goods_name": "蓝月亮洗衣液3kg",
+                "group_price": 32.5,
+                "remain_people": 1,
+            },
+        )
+        assert link_resp.status_code == 200, link_resp.text
+        link_data = link_resp.json()["data"]
+        assert link_data["group_order_id"] == numeric_gid
+        assert link_data["entry_type"] == "link"
+        assert link_data["has_poster"] is False
+        assert link_data["poster_url"] == ""
+        assert f"group_order_id={numeric_gid}" in link_data["h5_join_url"]
+
+        # 5. 验证同 IP/用户 10 分钟最多无图发布 5 条，第 6 条触发 429 限频
+        for idx in range(3):
+            r = client.post(
+                "/api/group_help/submit_text",
+                json={
+                    "share_text": f"正常拼团 ⇥RateTok00{idx}⇤",
+                    "goods_name": f"常规日用品商品{idx}",
+                    "group_price": 10.0 + idx,
+                },
+            )
+            assert r.status_code == 200
+        limited_resp = client.post(
+            "/api/group_help/submit_text",
+            json={
+                "share_text": "超出限频 ⇥RateTok999⇤",
+                "goods_name": "常规日用品商品超限",
+                "group_price": 15.0,
+            },
+        )
+        assert limited_resp.status_code == 429
+        assert limited_resp.json()["error_code"] == "submit_rate_limited"
+
+
+def _load_mobile_script(module_name: str):
+    import importlib.util
+    from pathlib import Path
+
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, str(script_path))
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_group_help_importer_sanitizes_syncs_and_never_resurrects(tmp_path):
+    """验证外部采集脚本：按唯一真源清洗外部数据、设置较短外部过期时间、同期同步上游满员且绝不复活本地已满团。"""
+    mod = _load_mobile_script("group_help_importer")
+    ACDOG_API_URL = mod.ACDOG_API_URL
+    GroupHelpImporter = mod.GroupHelpImporter
+    MIAOZHULI_API_URL = mod.MIAOZHULI_API_URL
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    base_now = 1795000000.0
+    miao_state = {"full": 0, "status": "active"}
+
+    class _FakeJsonResp:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, params=None, headers=None, timeout=12):
+        page = (params or {}).get("page", 1)
+        if page != 1:
+            return _FakeJsonResp({"items": []})
+        if url == ACDOG_API_URL:
+            return _FakeJsonResp(
+                {
+                    "items": [
+                        {
+                            "id": "1",
+                            "platform": "pdd",
+                            "rawText": "复制这段口令打开拼多多 ⇥AcdogGood1⇤",
+                            "coreCode": "AcdogGood1",
+                            "price": 18.8,
+                            "titleDisplay": "清风抽纸原木纯品20包",
+                            "groupSize": 3,
+                            "spotsLeft": 1,
+                            "status": "active",
+                            "publisherDisplayName": "闪助拼友",
+                            "createdAt": int((base_now - 3600) * 1000),
+                            "expiresAt": int((base_now + 20 * 3600) * 1000),
+                            "markedFullCount": 0,
+                            "markedInvalidCount": 0,
+                        },
+                        {
+                            "id": "2",
+                            "platform": "pdd",
+                            "rawText": "加微信wx888领红包 ⇥SpamCode99⇤",
+                            "coreCode": "SpamCode99",
+                            "price": 9.9,
+                            "titleDisplay": "违规广告商品",
+                            "groupSize": 2,
+                            "spotsLeft": 1,
+                            "status": "active",
+                            "createdAt": int(base_now * 1000),
+                            "expiresAt": int((base_now + 12 * 3600) * 1000),
+                        },
+                    ]
+                }
+            )
+        if url == MIAOZHULI_API_URL:
+            return _FakeJsonResp(
+                {
+                    "items": [
+                        {
+                            "id": 101,
+                            "nick": "秒助拼友",
+                            "title": "舒洁湿厕纸80抽3包装",
+                            "url": "",
+                            "share_text": "拼单立减 ⇥MiaoGood01⇤",
+                            "price": 24.5,
+                            "team_size": 2,
+                            "status": miao_state["status"],
+                            "marks": {"full": miao_state["full"], "expire": 0, "same": 0},
+                            "created_at": "2026-11-18 12:00:00",
+                            "time_left": 18000,
+                        }
+                    ]
+                }
+            )
+        raise AssertionError(f"Unexpected url: {url}")
+
+    importer = GroupHelpImporter(
+        repo=repo,
+        http_get=_fake_get,
+        external_ttl_seconds=6 * 3600,
+        pages=2,
+    )
+    res1 = importer.run_once(now=base_now)
+    assert res1["sources"]["acdog"]["upserted"] == 1
+    assert res1["sources"]["acdog"]["skipped_invalid"] == 1
+    assert res1["sources"]["miaozhuli"]["upserted"] == 1
+
+    ac_doc = repo.get_by_group_order_id("tok_AcdogGood1")
+    assert ac_doc is not None
+    assert ac_doc["source"] == "acdog"
+    assert ac_doc["expires_at"] <= base_now + 6 * 3600 + 1
+    assert repo.get_by_group_order_id("tok_SpamCode99") is None
+
+    # 本地用户将 acdog 团标记满员后，即便上游仍报 active 也绝不能复活
+    repo.apply_user_feedback(
+        group_order_id="tok_AcdogGood1",
+        action="mark_full",
+        now=base_now + 30,
+        operator_uid="u_verifier",
+    )
+    # 同时秒助力的团在上游被人标满
+    miao_state["full"] = 1
+    miao_state["status"] = "full"
+
+    res2 = importer.run_once(now=base_now + 60)
+    assert res2["sources"]["miaozhuli"]["synced_inactive"] == 1
+    assert repo.get_by_group_order_id("tok_AcdogGood1")["group_status"] == GROUP_STATUS_FULL
+    assert repo.get_by_group_order_id("tok_MiaoGood01")["group_status"] == GROUP_STATUS_FULL
+
+
+def test_group_help_exporter_queues_completes_and_withdraws(tmp_path):
+    """验证海报外发脚本：仅导出真实用户海报、生成队列与 task.json、done.flag 完工归档及站内满员自动撤回。"""
+    from models.group_help import ENTRY_TYPE_POSTER, SOURCE_USER_UPLOAD
+    exporter_mod = _load_mobile_script("group_help_exporter")
+    GroupHelpExporter = exporter_mod.GroupHelpExporter
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    poster_dir = tmp_path / "posters"
+    bridge_dir = tmp_path / "bridge"
+    poster_dir.mkdir(parents=True, exist_ok=True)
+    now = 1795000000.0
+
+    def _seed_poster_group(gid: str, title: str):
+        p_path = poster_dir / f"{gid}.jpg"
+        p_path.write_bytes(_make_poster_image_bytes(f"https://file-link.pinduoduo.com/{gid[-6:]}"))
+        repo.upsert_parsed_group(
+            {
+                "group_order_id": gid,
+                "entry_type": ENTRY_TYPE_POSTER,
+                "source": SOURCE_USER_UPLOAD,
+                "goods_name": title,
+                "group_price": 19.9,
+                "total_people": 3,
+                "remain_people": 1,
+                "poster_path": str(p_path),
+                "h5_join_url": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid}",
+                "created_at": now,
+                "expires_at": now + 3600,
+            },
+            now=now,
+            check_similar=False,
+        )
+
+    gid_1 = "3501888000111222331"
+    gid_2 = "3501888000111222332"
+    _seed_poster_group(gid_1, "用户真实上传海报商品A")
+
+    # 外部采集无图口令绝不进入外发队列
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": "tok_ExtOnly001",
+            "entry_type": "token",
+            "source": "acdog",
+            "share_text": "外部 ⇥ExtOnly001⇤",
+            "share_code": "ExtOnly001",
+            "goods_name": "外部采集商品B",
+            "group_price": 9.9,
+            "remain_people": 1,
+            "created_at": now,
+            "expires_at": now + 3600,
+        },
+        now=now,
+        check_similar=False,
+    )
+
+    exporter = GroupHelpExporter(repo=repo, bridge_dir=bridge_dir, poster_dir=poster_dir)
+    s1 = exporter.run_once(now=now + 5)
+    assert s1["pending_total"] == 1
+    assert s1["exported_new"] == 1
+    assert (bridge_dir / "outbound_pending" / gid_1 / "poster.jpg").is_file()
+    assert (bridge_dir / "outbound_pending" / gid_1 / "task.json").is_file()
+    assert not (bridge_dir / "outbound_pending" / "tok_ExtOnly001").exists()
+
+    # 外部脚本落盘 done.flag 后自动归档完成并清理临时目录，不再重复导出
+    (bridge_dir / "outbound_pending" / gid_1 / "done.flag").write_text("ok", encoding="utf-8")
+    _seed_poster_group(gid_2, "用户真实上传海报商品C")
+    s2 = exporter.run_once(now=now + 10)
+    assert s2["completed_via_flag"] == 1
+    assert s2["exported_new"] == 1
+    assert s2["pending_total"] == 1
+    assert not (bridge_dir / "outbound_pending" / gid_1).exists()
+    assert (bridge_dir / "outbound_pending" / gid_2 / "poster.jpg").is_file()
+
+    # 站内该团被标记满员后，外发队列自动撤回并清理任务文件
+    repo.apply_user_feedback(group_order_id=gid_2, action="mark_full", now=now + 15, operator_uid="u_owner")
+    s3 = exporter.run_once(now=now + 20)
+    assert s3["withdrawn"] == 1
+    assert s3["pending_total"] == 0
+    assert not (bridge_dir / "outbound_pending" / gid_2).exists()
+    assert exporter.get_summary(now=now + 20)["counts"]["done"] == 1
+    assert exporter.get_summary(now=now + 20)["counts"]["withdrawn"] == 1

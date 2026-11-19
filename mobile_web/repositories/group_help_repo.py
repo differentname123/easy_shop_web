@@ -7,6 +7,8 @@ from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from repositories.base_repo import BaseRepository
 from models.group_help import (
     DEFAULT_GROUP_TTL_SECONDS,
+    ENTRY_TYPE_POSTER,
+    ENTRY_TYPE_TOKEN,
     GROUP_STATUS_ACTIVE,
     GROUP_STATUS_EXPIRED,
     GROUP_STATUS_FULL,
@@ -15,6 +17,8 @@ from models.group_help import (
     PARSE_STATUS_FAILED,
     PARSE_STATUS_PARSED,
     PARSE_STATUS_PENDING,
+    SOURCE_USER_TEXT,
+    SOURCE_USER_UPLOAD,
     is_highly_similar_goods,
     validate_and_normalize_parsed_poster,
 )
@@ -41,6 +45,15 @@ class GroupHelpRepository(BaseRepository):
         col.create_index(
             [("group_status", ASCENDING), ("expires_at", ASCENDING)],
             name="idx_status_expires",
+        )
+        col.create_index(
+            [
+                ("source", ASCENDING),
+                ("parse_status", ASCENDING),
+                ("group_status", ASCENDING),
+                ("created_at", DESCENDING),
+            ],
+            name="idx_source_status_created",
         )
         return True
 
@@ -69,12 +82,17 @@ class GroupHelpRepository(BaseRepository):
                 "redirect_url": data.get("redirect_url", existing.get("redirect_url", "")),
                 "refer_share_id": data.get("refer_share_id") or existing.get("refer_share_id", ""),
                 "poster_path": data.get("poster_path", existing.get("poster_path", "")),
+                "entry_type": str(data.get("entry_type") or existing.get("entry_type") or ENTRY_TYPE_POSTER),
+                "source": str(data.get("source") or existing.get("source") or SOURCE_USER_UPLOAD),
                 "parse_status": PARSE_STATUS_PENDING,
                 "parse_attempts": 0,
                 "parse_error": "",
                 "group_status": GROUP_STATUS_ACTIVE,
                 "updated_at": now,
             }
+            if str(data.get("share_text") or "").strip():
+                set_fields["share_text"] = str(data.get("share_text") or "").strip()
+                set_fields["share_code"] = str(data.get("share_code") or "")
 
             # 每次上传新图片均重置为 pending 重新执行大模型合规与关键信息审核，严禁跳过审核直接复用旧状态
             updated = self.col.find_one_and_update(
@@ -87,6 +105,8 @@ class GroupHelpRepository(BaseRepository):
 
         doc = {
             "group_order_id": gid,
+            "entry_type": str(data.get("entry_type") or ENTRY_TYPE_POSTER),
+            "source": str(data.get("source") or SOURCE_USER_UPLOAD),
             "short_url": str(data.get("short_url") or ""),
             "redirect_url": str(data.get("redirect_url") or ""),
             "refer_share_uin": str(data.get("refer_share_uin") or ""),
@@ -96,6 +116,9 @@ class GroupHelpRepository(BaseRepository):
             "h5_join_url": str(data.get("h5_join_url") or ""),
             "brand_card_url": str(data.get("brand_card_url") or ""),
             "poster_path": str(data.get("poster_path") or ""),
+            "share_text": str(data.get("share_text") or ""),
+            "share_code": str(data.get("share_code") or ""),
+            "publisher_nick": str(data.get("publisher_nick") or ""),
             "owner_token": str(data.get("owner_token") or ""),
             "owner_uid": str(data.get("owner_uid") or ""),
             "last_takedown_uid": "",
@@ -498,4 +521,200 @@ class GroupHelpRepository(BaseRepository):
             return_document=ReturnDocument.AFTER,
         )
         return by_uid if updated else ""
+
+    def upsert_parsed_group(
+        self,
+        data: Dict[str, Any],
+        *,
+        ttl_seconds: Optional[int] = None,
+        now: Optional[float] = None,
+        preserve_local_takedown: bool = True,
+        check_similar: bool = True,
+    ) -> Tuple[Dict[str, Any], bool, Optional[Dict[str, Any]]]:
+        """写入或刷新已结构化校验的无图拼团（口令/链接/外部采集同步）。
+
+        返回 (文档, 是否实际新增或刷新, 匹配到的站内同款已开团文档)。
+        """
+        current_ts = float(now if now is not None else time.time())
+        gid = str(data.get("group_order_id") or "").strip()
+        if not gid:
+            raise ValueError("group_order_id 不能为空")
+
+        ttl = max(60, min(int(ttl_seconds or DEFAULT_GROUP_TTL_SECONDS), DEFAULT_GROUP_TTL_SECONDS))
+        created_at = float(data.get("created_at") or current_ts)
+        raw_expires = float(data.get("expires_at") or (created_at + ttl))
+        expires_at = min(raw_expires, created_at + ttl)
+
+        existing = self.get_by_group_order_id(gid)
+        if existing is not None:
+            orig_status = str(existing.get("group_status") or GROUP_STATUS_ACTIVE)
+            orig_created = float(existing.get("created_at") or created_at)
+            orig_expires = float(existing.get("expires_at") or (orig_created + DEFAULT_GROUP_TTL_SECONDS))
+
+            if preserve_local_takedown and (
+                orig_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED) or orig_expires <= current_ts
+            ):
+                return existing, False, None
+
+            incoming_source = str(data.get("source") or SOURCE_USER_TEXT)
+            existing_source = str(
+                existing.get("source") or (SOURCE_USER_UPLOAD if existing.get("poster_path") else SOURCE_USER_TEXT)
+            )
+            # 外部采集不得覆盖真实用户上传的海报与归属信息
+            if preserve_local_takedown and existing_source == SOURCE_USER_UPLOAD and incoming_source != SOURCE_USER_UPLOAD:
+                return existing, False, None
+
+            if orig_expires <= current_ts:
+                raise ValueError("该拼团已超过有效期失效，请重新发起后再发布")
+
+            update_fields: Dict[str, Any] = {
+                "goods_name": str(data.get("goods_name") or existing.get("goods_name") or ""),
+                "keywords": list(data.get("keywords") or existing.get("keywords") or []),
+                "group_price": data.get("group_price", existing.get("group_price")),
+                "original_price": data.get("original_price", existing.get("original_price")),
+                "total_people": int(data.get("total_people") if data.get("total_people") is not None else (existing.get("total_people") or 0)),
+                "remain_people": max(1, int(data.get("remain_people") if data.get("remain_people") is not None else (existing.get("remain_people") or 1))),
+                "updated_at": current_ts,
+            }
+            if str(data.get("share_text") or "").strip():
+                update_fields["share_text"] = str(data.get("share_text") or "").strip()
+            if str(data.get("share_code") or "").strip():
+                update_fields["share_code"] = str(data.get("share_code") or "").strip()
+            if str(data.get("short_url") or "").strip() and not existing.get("short_url"):
+                update_fields["short_url"] = str(data.get("short_url") or "").strip()
+            if str(data.get("publisher_nick") or "").strip() and not existing.get("publisher_nick"):
+                update_fields["publisher_nick"] = str(data.get("publisher_nick") or "").strip()[:40]
+
+            updated = self.col.find_one_and_update(
+                {"group_order_id": gid},
+                {"$set": update_fields},
+                projection={"_id": 0},
+                return_document=ReturnDocument.AFTER,
+            )
+            return updated or existing, True, None
+
+        if expires_at <= current_ts:
+            raise ValueError("该拼团已超过有效期，未录入")
+
+        matched_doc: Optional[Dict[str, Any]] = None
+        if check_similar:
+            matched_doc = self.find_matching_active_group(
+                goods_name=str(data.get("goods_name") or ""),
+                group_price=data.get("group_price"),
+                exclude_group_order_id=gid,
+                now=current_ts,
+            )
+
+        target_status = GROUP_STATUS_PENDING_CONFIRM if matched_doc else GROUP_STATUS_ACTIVE
+        matched_gid = str(matched_doc.get("group_order_id") or "") if matched_doc else ""
+
+        doc = {
+            "group_order_id": gid,
+            "entry_type": str(data.get("entry_type") or ENTRY_TYPE_TOKEN),
+            "source": str(data.get("source") or SOURCE_USER_TEXT),
+            "short_url": str(data.get("short_url") or ""),
+            "redirect_url": str(data.get("redirect_url") or ""),
+            "refer_share_uin": str(data.get("refer_share_uin") or ""),
+            "refer_share_channel": str(data.get("refer_share_channel") or ""),
+            "refer_share_id": str(data.get("refer_share_id") or ""),
+            "app_wake_url": str(data.get("app_wake_url") or ""),
+            "h5_join_url": str(data.get("h5_join_url") or ""),
+            "brand_card_url": str(data.get("brand_card_url") or ""),
+            "poster_path": str(data.get("poster_path") or ""),
+            "share_text": str(data.get("share_text") or ""),
+            "share_code": str(data.get("share_code") or ""),
+            "publisher_nick": str(data.get("publisher_nick") or "")[:40],
+            "owner_token": str(data.get("owner_token") or ""),
+            "owner_uid": str(data.get("owner_uid") or ""),
+            "last_takedown_uid": "",
+            "parse_status": PARSE_STATUS_PARSED,
+            "parse_attempts": 1,
+            "parse_error": "",
+            "matched_group_order_id": matched_gid,
+            "goods_name": str(data.get("goods_name") or ""),
+            "keywords": list(data.get("keywords") or []),
+            "group_price": data.get("group_price"),
+            "original_price": data.get("original_price"),
+            "total_people": int(data.get("total_people") or 0),
+            "remain_people": max(1, int(data.get("remain_people") or 1)),
+            "group_status": target_status,
+            "click_count": 0,
+            "feedback_count": 0,
+            "created_at": created_at,
+            "updated_at": current_ts,
+            "expires_at": expires_at,
+        }
+        self.col.insert_one(dict(doc))
+        return doc, True, matched_doc
+
+    def sync_external_status(
+        self,
+        group_order_id: str,
+        *,
+        source: str,
+        new_status: str,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """同步外部来源已满员/失效状态，仅作用于相同外部 source 的在架记录。"""
+        gid = str(group_order_id or "").strip()
+        if not gid:
+            return None
+        existing = self.get_by_group_order_id(gid)
+        if not existing or str(existing.get("source") or "") != str(source or ""):
+            return None
+        if str(existing.get("group_status") or "") != GROUP_STATUS_ACTIVE:
+            return existing
+        current_ts = float(now if now is not None else time.time())
+        update_fields: Dict[str, Any] = {"updated_at": current_ts}
+        if new_status == GROUP_STATUS_FULL:
+            update_fields["group_status"] = GROUP_STATUS_FULL
+            update_fields["remain_people"] = 0
+        elif new_status == GROUP_STATUS_EXPIRED:
+            update_fields["group_status"] = GROUP_STATUS_EXPIRED
+        else:
+            return existing
+        return self.col.find_one_and_update(
+            {"group_order_id": gid, "source": str(source)},
+            {"$set": update_fields},
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def list_active_for_export(
+        self,
+        *,
+        source: str = SOURCE_USER_UPLOAD,
+        limit: int = 50,
+        now: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """获取处于在架且可导出的真实海报拼团列表（供外挂导出脚本轮询）。"""
+        current_ts = float(now if now is not None else time.time())
+        self.expire_outdated_groups(now=current_ts)
+        safe_limit = max(1, min(int(limit), 200))
+        target_source = str(source or SOURCE_USER_UPLOAD).strip()
+        cursor = (
+            self.col.find(
+                {
+                    "parse_status": PARSE_STATUS_PARSED,
+                    "group_status": GROUP_STATUS_ACTIVE,
+                    "expires_at": {"$gt": current_ts},
+                    "remain_people": {"$gt": 0},
+                },
+                {"_id": 0},
+            )
+            .sort([("remain_people", ASCENDING), ("created_at", DESCENDING)])
+            .limit(max(safe_limit * 4, 120))
+        )
+        results: List[Dict[str, Any]] = []
+        for doc in cursor:
+            poster_path = str(doc.get("poster_path") or "").strip()
+            if not poster_path:
+                continue
+            doc_source = str(doc.get("source") or SOURCE_USER_UPLOAD)
+            if target_source and doc_source != target_source:
+                continue
+            results.append(doc)
+            if len(results) >= safe_limit:
+                break
+        return results
 

@@ -12,8 +12,8 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261118-1">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261118-1"></script>
+  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261119-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261119-1"></script>
 </head>
 <body>
 <div id="group-help-app" v-cloak>
@@ -34,6 +34,9 @@
       <div class="gh-upload-group">
         <button class="gh-upload-trigger-btn" @click="triggerUpload">
           <span>➕ 传海报发团</span>
+        </button>
+        <button class="gh-upload-outline-btn" @click="openTextSubmitModal">
+          <span>📝 口令发团</span>
         </button>
         <button class="gh-help-icon-btn" @click="openHelpGuide(null)" title="玩法与海报要求">?</button>
       </div>
@@ -100,8 +103,21 @@
         class="gh-card"
         @click="onMyGroupCardClick(item)"
       >
-        <div class="gh-thumb-box" @click.stop="openFullPoster(item.parse_status === 'parsed' ? item.poster_url : (item.local_thumb || item.poster_url))">
-          <img :src="item.parse_status === 'parsed' ? item.poster_url : (item.local_thumb || item.poster_url)" alt="拼团图片" loading="lazy" />
+        <div
+          class="gh-thumb-box"
+          @click.stop="(item.parse_status === 'parsed' && item.poster_url) || item.local_thumb ? openFullPoster(item.parse_status === 'parsed' && item.poster_url ? item.poster_url : item.local_thumb) : onMyGroupCardClick(item)"
+        >
+          <img
+            v-if="(item.parse_status === 'parsed' && item.poster_url) || item.local_thumb"
+            :src="item.parse_status === 'parsed' && item.poster_url ? item.poster_url : item.local_thumb"
+            alt="拼团图片"
+            loading="lazy"
+          />
+          <div v-else class="gh-text-card-thumb" :class="item.entry_type === 'link' ? 'is-link' : 'is-token'">
+            <span class="gh-tct-tag">{{ item.entry_type === 'link' ? '链接团' : '口令团' }}</span>
+            <span class="gh-tct-price" v-if="item.group_price">¥{{ item.group_price }}</span>
+            <span class="gh-tct-sub">{{ statusBadgeText(item) }}</span>
+          </div>
         </div>
 
         <div class="gh-card-body">
@@ -195,10 +211,15 @@
 
     <div v-else class="gh-empty-box">
       <div class="gh-empty-title">暂无发团记录</div>
-      <div class="gh-empty-sub">在拼多多开团后点击【邀请好友】保存完整分享海报，上传后即可自动识别上架。</div>
-      <button class="gh-join-btn" style="padding:9px 22px;font-size:14px" @click="triggerUpload">
-        ➕ 传海报发团
-      </button>
+      <div class="gh-empty-sub">在拼多多开团后可传【多人团分享海报图】，也可直接粘贴【拼团口令 / 官方链接】无图发团。</div>
+      <div class="gh-empty-actions">
+        <button class="gh-join-btn" style="padding:9px 20px;font-size:14px" @click="triggerUpload">
+          ➕ 传海报发团
+        </button>
+        <button class="gh-join-outline-btn" @click="openTextSubmitModal">
+          📝 无图口令发团
+        </button>
+      </div>
     </div>
   </main>
 
@@ -250,13 +271,21 @@
         @click="openDetail(item)"
       >
         <div class="gh-thumb-box">
-          <img :src="item.poster_url" :alt="item.goods_name" loading="lazy" />
+          <img v-if="item.poster_url" :src="item.poster_url" :alt="item.goods_name" loading="lazy" />
+          <div v-else class="gh-text-card-thumb" :class="item.entry_type === 'link' ? 'is-link' : 'is-token'">
+            <span class="gh-tct-tag">{{ item.entry_type === 'link' ? '官方链接' : '拼团口令' }}</span>
+            <span class="gh-tct-price" v-if="item.group_price">¥{{ item.group_price }}</span>
+            <span class="gh-tct-sub">{{ item.total_people ? item.total_people + '人团' : statusBadgeText(item) }}</span>
+          </div>
         </div>
 
         <div class="gh-card-body">
           <div>
             <div class="gh-status-row">
               <span class="gh-remain-badge">{{ statusBadgeText(item) }}</span>
+              <span v-if="!item.poster_url" class="gh-entry-badge" :class="{ 'is-link': item.entry_type === 'link' }">
+                {{ item.entry_type === 'link' ? '直达链接' : '口令互助' }}
+              </span>
               <span class="gh-sub-meta">{{ item.click_count }}人去过 · 剩{{ formatRemaining(item.remaining_seconds) }}</span>
             </div>
             <h3 class="gh-goods-title">{{ item.goods_name }}</h3>
@@ -267,8 +296,8 @@
               <span class="gh-price-val">¥{{ item.group_price }}</span>
               <span class="gh-origin-price" v-if="item.original_price && item.original_price > item.group_price">¥{{ item.original_price }}</span>
             </div>
-            <span class="gh-sub-meta" v-else>价格见图</span>
-            <button class="gh-join-btn">去参团</button>
+            <span class="gh-sub-meta" v-else>{{ item.poster_url ? '价格见图' : '口令参团' }}</span>
+            <button class="gh-join-btn">{{ item.entry_type === 'token' && !resolveH5JoinUrl(item) ? '拿口令' : '去参团' }}</button>
           </div>
         </div>
       </div>
@@ -284,10 +313,15 @@
       <div class="gh-empty-title">
         {{ activeKeyword ? '未搜到「' + activeKeyword + '」相关的拼团' : '当前暂无正在凑人的团' }}
       </div>
-      <div class="gh-empty-sub">点击右上角【➕ 传海报发团】发布您的多人团完整分享海报</div>
-      <button class="gh-join-btn" style="padding:9px 22px;font-size:14px" @click="triggerUpload">
-        ➕ 传海报发团
-      </button>
+      <div class="gh-empty-sub">点击右上角【➕ 传海报发团】或【📝 口令发团】即可立刻上架大厅凑人</div>
+      <div class="gh-empty-actions">
+        <button class="gh-join-btn" style="padding:9px 20px;font-size:14px" @click="triggerUpload">
+          ➕ 传海报发团
+        </button>
+        <button class="gh-join-outline-btn" @click="openTextSubmitModal">
+          📝 无图口令发团
+        </button>
+      </div>
     </div>
   </template>
 
@@ -303,11 +337,19 @@
         <!-- 核心商品信息（大字体突出） -->
         <div class="gh-detail-top">
           <img
+            v-if="selectedGroup.poster_url"
             :src="selectedGroup.poster_url"
             :alt="selectedGroup.goods_name"
             class="gh-detail-poster"
             @click="openPosterAndRecord(selectedGroup)"
           />
+          <div v-else class="gh-detail-text-thumb">
+            <div class="gh-text-card-thumb" :class="selectedGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
+              <span class="gh-tct-tag">{{ selectedGroup.entry_type === 'link' ? '官方链接' : '拼团口令' }}</span>
+              <span class="gh-tct-price" v-if="selectedGroup.group_price">¥{{ selectedGroup.group_price }}</span>
+              <span class="gh-tct-sub">{{ selectedGroup.total_people ? selectedGroup.total_people + '人团' : '无图展示' }}</span>
+            </div>
+          </div>
           <div class="gh-detail-meta">
             <div class="gh-detail-title">{{ selectedGroup.goods_name }}</div>
             <div class="gh-detail-price-row">
@@ -326,23 +368,45 @@
           </div>
         </div>
 
-        <!-- 主操作：一键直达拼团页 + 辅助扫码/分享 -->
+        <!-- 主操作：有数字团单走一键直达，无图口令走一键复制口令（并可手动复制） -->
         <div class="gh-jump-section">
-          <button class="gh-btn-app-jump" @click="jumpToApp(selectedGroup)">
-            🚀 去拼多多参团
-          </button>
-          <div class="gh-h5-fallback-row">
-            <button class="gh-link-btn" @click="openPosterAndRecord(selectedGroup)">
-              📷 看二维码大图扫码
+          <template v-if="resolveH5JoinUrl(selectedGroup) || resolveAppWakeUrl(selectedGroup)">
+            <button class="gh-btn-app-jump" @click="jumpToApp(selectedGroup)">
+              🚀 去拼多多参团
             </button>
-            <template v-if="canWakeNativeApp">
-              <span class="gh-link-sep">|</span>
+          </template>
+          <template v-else>
+            <button class="gh-btn-app-jump" @click="copyGroupToken(selectedGroup)">
+              📋 复制拼团口令（打开拼多多自动弹窗）
+            </button>
+            <div class="gh-token-box" v-if="selectedGroup.share_text || selectedGroup.share_code">
+              {{ selectedGroup.share_text || ('⇥' + selectedGroup.share_code + '⇤') }}
+            </div>
+          </template>
+          <div class="gh-h5-fallback-row">
+            <template v-if="(resolveH5JoinUrl(selectedGroup) || resolveAppWakeUrl(selectedGroup)) && selectedGroup.poster_url">
+              <button class="gh-link-btn" @click="openPosterAndRecord(selectedGroup)">
+                📷 看二维码大图扫码
+              </button>
+            </template>
+            <template v-if="(resolveH5JoinUrl(selectedGroup) || resolveAppWakeUrl(selectedGroup)) && canWakeNativeApp">
+              <span class="gh-link-sep" v-if="selectedGroup.poster_url">|</span>
               <button class="gh-link-btn" @click="jumpToH5(selectedGroup)">
                 🌐 网页打开
               </button>
             </template>
+            <template v-if="(resolveH5JoinUrl(selectedGroup) || resolveAppWakeUrl(selectedGroup)) && (selectedGroup.share_text || selectedGroup.share_code)">
+              <span class="gh-link-sep" v-if="selectedGroup.poster_url || canWakeNativeApp">|</span>
+              <button class="gh-link-btn" @click="copyGroupToken(selectedGroup)">
+                📋 复制口令
+              </button>
+            </template>
+            <template v-if="!(resolveH5JoinUrl(selectedGroup) || resolveAppWakeUrl(selectedGroup)) && canWakeNativeApp">
+              <button class="gh-link-btn" @click="openPddHomeApp(selectedGroup)">
+                📱 唤醒拼多多 App
+              </button>
+            </template>
             <template v-if="selectedGroup.group_status === 'active' && selectedGroup.remaining_seconds > 0 && selectedGroup.remain_people > 0">
-              <span class="gh-link-sep">|</span>
               <button class="gh-link-btn gh-link-share" @click="shareGroup(selectedGroup)">
                 📤 分享凑人
               </button>
@@ -540,7 +604,11 @@
             @click="chooseJoinMatchedGroup"
           >
             <div class="gh-thumb-box" style="width:68px;height:68px">
-              <img :src="uploadResultModal.matchedGroup.poster_url" :alt="uploadResultModal.matchedGroup.goods_name" />
+              <img v-if="uploadResultModal.matchedGroup.poster_url" :src="uploadResultModal.matchedGroup.poster_url" :alt="uploadResultModal.matchedGroup.goods_name" />
+              <div v-else class="gh-text-card-thumb" :class="uploadResultModal.matchedGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
+                <span class="gh-tct-tag">{{ uploadResultModal.matchedGroup.entry_type === 'link' ? '链接' : '口令' }}</span>
+                <span class="gh-tct-price" style="font-size:13px" v-if="uploadResultModal.matchedGroup.group_price">¥{{ uploadResultModal.matchedGroup.group_price }}</span>
+              </div>
             </div>
             <div class="gh-card-body">
               <div class="gh-status-row">
@@ -581,7 +649,11 @@
             @click="viewPublishedOwnGroup"
           >
             <div class="gh-thumb-box" style="width:68px;height:68px">
-              <img :src="uploadResultModal.ownGroup.poster_url" :alt="uploadResultModal.ownGroup.goods_name" />
+              <img v-if="uploadResultModal.ownGroup.poster_url" :src="uploadResultModal.ownGroup.poster_url" :alt="uploadResultModal.ownGroup.goods_name" />
+              <div v-else class="gh-text-card-thumb" :class="uploadResultModal.ownGroup.entry_type === 'link' ? 'is-link' : 'is-token'">
+                <span class="gh-tct-tag">{{ uploadResultModal.ownGroup.entry_type === 'link' ? '链接' : '口令' }}</span>
+                <span class="gh-tct-price" style="font-size:13px" v-if="uploadResultModal.ownGroup.group_price">¥{{ uploadResultModal.ownGroup.group_price }}</span>
+              </div>
             </div>
             <div class="gh-card-body">
               <div class="gh-status-row">
@@ -718,7 +790,91 @@
   <!-- Toast 提示 -->
   <div class="gh-toast" v-if="toastMsg">{{ toastMsg }}</div>
 
+  <!-- ==================== 弹窗 5：无图拼团（口令 / 官方链接直接发布） ==================== -->
+  <div
+    class="gh-modal-mask"
+    style="align-items:center;padding:20px;z-index:285"
+    v-if="textSubmitModal.visible"
+    @click.self="closeTextSubmitModal"
+  >
+    <div class="gh-dialog">
+      <div class="gh-dialog-title">📝 无图口令 / 链接发团</div>
+      <div class="gh-dialog-body" style="margin-bottom:10px">
+        <div class="gh-form-field">
+          <label class="gh-form-label">拼多多口令（含 ⇥...⇤）或官方拼团链接 *</label>
+          <textarea
+            class="gh-form-textarea"
+            maxlength="500"
+            placeholder="请粘贴从拼多多复制的多人团口令（含 ⇥...⇤）或 yk/pinduoduo 官方拼团链接..."
+            v-model.trim="textSubmitModal.share_text"
+            @input="onTextShareInput"
+          ></textarea>
+        </div>
+        <div class="gh-form-field">
+          <label class="gh-form-label">商品名称 *</label>
+          <input
+            type="text"
+            maxlength="120"
+            class="gh-auth-input"
+            placeholder="例如：Apple AirPods 4 无线耳机"
+            v-model.trim="textSubmitModal.goods_name"
+          />
+        </div>
+        <div class="gh-form-row-2">
+          <div class="gh-form-field">
+            <label class="gh-form-label">拼团价（元）*</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0.01"
+              max="50000"
+              class="gh-auth-input"
+              placeholder="如 19.9"
+              v-model="textSubmitModal.group_price"
+            />
+          </div>
+          <div class="gh-form-field">
+            <label class="gh-form-label">还差几人 *</label>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              class="gh-auth-input"
+              v-model="textSubmitModal.remain_people"
+            />
+          </div>
+        </div>
+        <div class="gh-form-field" style="margin-bottom:4px">
+          <label class="gh-form-label">几人团（选填，例如 2 或 3）</label>
+          <input
+            type="number"
+            min="0"
+            max="50"
+            class="gh-auth-input"
+            placeholder="选填，默认不限制"
+            v-model="textSubmitModal.total_people"
+          />
+        </div>
+        <div class="gh-auth-err" v-if="textSubmitModal.errorMsg">{{ textSubmitModal.errorMsg }}</div>
+      </div>
+
+      <div class="gh-dialog-actions">
+        <button class="gh-btn-secondary" :disabled="textSubmitModal.submitting" @click="closeTextSubmitModal">
+          取消
+        </button>
+        <button
+          class="gh-btn-app-jump"
+          style="padding:10px;font-size:13.5px"
+          :disabled="textSubmitModal.submitting"
+          @click="submitTextGroupForm"
+        >
+          {{ textSubmitModal.submitting ? '核验提交中...' : '核验并上架大厅' }}
+        </button>
+      </div>
+    </div>
+  </div>
+
 </div>
-<script src="/static/js/group_help.js?v=ux-20261118-1"></script>
+<script src="/static/js/group_help.js?v=ux-20261119-1"></script>
 </body>
 </html>

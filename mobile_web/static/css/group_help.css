@@ -1016,4 +1016,152 @@ body {
   margin-bottom: 8px;
 }
 
+/* 无图口令/链接兼容样式与无图发团表单 */
+.gh-upload-outline-btn {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 99px;
+  padding: 5px 11px;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.gh-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.gh-join-outline-btn {
+  background: #fff2f0;
+  color: var(--gh-primary);
+  border: 1px solid #ffccc7;
+  border-radius: 99px;
+  padding: 8px 18px;
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.gh-text-card-thumb {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 4px;
+  text-align: center;
+  gap: 3px;
+  background: linear-gradient(155deg, #fff5ed 0%, #ffe6d5 100%);
+  color: #b52a1c;
+}
+
+.gh-text-card-thumb.is-link {
+  background: linear-gradient(155deg, #f0f7ff 0%, #dcebff 100%);
+  color: #165dff;
+}
+
+.gh-tct-tag {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.85);
+}
+
+.gh-tct-price {
+  font-size: 16px;
+  font-weight: 900;
+  line-height: 1.1;
+  word-break: break-all;
+}
+
+.gh-tct-sub {
+  font-size: 10px;
+  font-weight: 700;
+  opacity: 0.88;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gh-entry-badge {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #fff2e8;
+  color: #d4380d;
+}
+
+.gh-entry-badge.is-link {
+  background: #e8f3ff;
+  color: #165dff;
+}
+
+.gh-detail-text-thumb {
+  width: 88px;
+  height: 88px;
+  border-radius: 10px;
+  border: 1px solid #ffd8bf;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.gh-token-box {
+  background: #f7f8fa;
+  border: 1px dashed #dcdfe6;
+  border-radius: 9px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #303133;
+  line-height: 1.45;
+  word-break: break-all;
+  user-select: all;
+  margin-top: 8px;
+  text-align: left;
+}
+
+.gh-form-field {
+  margin-bottom: 10px;
+}
+
+.gh-form-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gh-text-sub);
+  margin-bottom: 4px;
+}
+
+.gh-form-textarea {
+  width: 100%;
+  min-height: 68px;
+  padding: 8px 10px;
+  border: 1px solid #dcdfe6;
+  border-radius: 9px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--gh-text-main);
+  resize: vertical;
+  outline: none;
+  font-family: inherit;
+}
+
+.gh-form-textarea:focus {
+  border-color: var(--gh-primary);
+}
+
+.gh-form-row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
 

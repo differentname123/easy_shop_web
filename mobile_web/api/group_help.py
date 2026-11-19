@@ -7,9 +7,11 @@ from fastapi import APIRouter, Path, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from auth import verify_access_token
 from models.group_help import (
+    GROUP_ID_PATH_PATTERN,
     GroupFeedbackRequest,
     GroupHelpAuthRequiredError,
     GroupHelpPermissionError,
+    GroupTextSubmitRequest,
 )
 from services.group_help_service import GroupHelpService, GroupHelpWorker
 
@@ -42,8 +44,8 @@ def _extract_viewer_auth(request: Request) -> Tuple[Optional[str], bool]:
     return (uid, False) if uid else (None, True)
 
 
-async def _extract_upload_payload(request: Request) -> Tuple[bytes, str]:
-    """兼容 JSON(image_base64 + 可选 owner_token)、multipart/form-data(file) 与原始二进制流三种上传方式。"""
+async def _extract_upload_payload(request: Request) -> Tuple[bytes, str, str]:
+    """兼容 JSON(image_base64 + 可选 owner_token/share_text)、multipart/form-data(file) 与原始二进制流三种上传方式。"""
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -71,8 +73,9 @@ async def _extract_upload_payload(request: Request) -> Tuple[bytes, str]:
         if "," in b64_str and b64_str.startswith("data:"):
             b64_str = b64_str.split(",", 1)[1]
         owner_token = str(body.get("owner_token") or "").strip()[:64]
+        share_text = str(body.get("share_text") or "").strip()[:500]
         try:
-            return base64.b64decode(b64_str), owner_token
+            return base64.b64decode(b64_str), owner_token, share_text
         except Exception as exc:
             raise ValueError("图片 Base64 编码格式无效") from exc
 
@@ -82,17 +85,18 @@ async def _extract_upload_payload(request: Request) -> Tuple[bytes, str]:
         if upload is None or not hasattr(upload, "read"):
             raise ValueError("请在表单 file 字段中上传二维码分享图片")
         owner_token = str(form.get("owner_token") or "").strip()[:64]
+        share_text = str(form.get("share_text") or "").strip()[:500]
         data = await upload.read(_MAX_REQUEST_BODY_BYTES + 1)
         if len(data) > _MAX_REQUEST_BODY_BYTES:
             raise _PayloadTooLargeError("上传请求体积过大，请上传 10MB 以内的图片")
-        return data, owner_token
+        return data, owner_token, share_text
 
     raw = await request.body()
     if not raw:
         raise ValueError("未检测到上传的图片内容")
     if len(raw) > _MAX_REQUEST_BODY_BYTES:
         raise _PayloadTooLargeError("上传请求体积过大，请上传 10MB 以内的图片")
-    return raw, ""
+    return raw, "", ""
 
 
 @router.post("/upload")
@@ -103,13 +107,14 @@ async def upload_group_poster(request: Request):
     """
     try:
         uid, _ = _extract_viewer_auth(request)
-        image_bytes, owner_token = await _extract_upload_payload(request)
+        image_bytes, owner_token, share_text = await _extract_upload_payload(request)
         async with _UPLOAD_SEMAPHORE:
             return await asyncio.to_thread(
                 group_help_service.submit_poster_image,
                 image_bytes,
                 owner_token=owner_token,
                 viewer_uid=uid,
+                share_text=share_text,
             )
     except _PayloadTooLargeError as exc:
         return JSONResponse(
@@ -126,6 +131,48 @@ async def upload_group_poster(request: Request):
             content={
                 "status": "error",
                 "error_code": "invalid_poster",
+                "error_msg": str(exc),
+            },
+        )
+
+
+@router.post("/submit_text")
+async def submit_group_text(request: Request, payload: GroupTextSubmitRequest):
+    """无图发团：直接提交拼多多 ⇥...⇤ 口令或官方拼团链接，结构化核验后立即写入大厅展示。"""
+    uid, _ = _extract_viewer_auth(request)
+    client_ip = (
+        (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        or (request.client.host if request.client else "")
+    )
+    try:
+        return await asyncio.to_thread(
+            group_help_service.submit_text_group,
+            share_text=payload.share_text,
+            goods_name=payload.goods_name,
+            group_price=payload.group_price,
+            original_price=payload.original_price,
+            total_people=payload.total_people,
+            remain_people=payload.remain_people,
+            publisher_nick=str(payload.publisher_nick or ""),
+            owner_token=str(payload.owner_token or "").strip(),
+            viewer_uid=uid,
+            client_ip=client_ip,
+        )
+    except GroupHelpPermissionError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "status": "error",
+                "error_code": exc.error_code,
+                "error_msg": str(exc),
+            },
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error_code": "invalid_group_text",
                 "error_msg": str(exc),
             },
         )
@@ -154,7 +201,7 @@ def list_groups(
 
 @router.get("/detail/{group_order_id}")
 def get_group_detail(
-    group_order_id: str = Path(..., min_length=15, max_length=24, pattern=r"^\d+$"),
+    group_order_id: str = Path(..., min_length=10, max_length=36, pattern=GROUP_ID_PATH_PATTERN),
 ):
     """获取单个多人团完整详情。"""
     detail = group_help_service.get_group_detail(group_order_id)
@@ -168,7 +215,7 @@ def get_group_detail(
 
 @router.post("/click/{group_order_id}")
 def record_group_click(
-    group_order_id: str = Path(..., min_length=15, max_length=24, pattern=r"^\d+$"),
+    group_order_id: str = Path(..., min_length=10, max_length=36, pattern=GROUP_ID_PATH_PATTERN),
 ):
     """记录用户点击一键跳转去参团。"""
     detail = group_help_service.record_jump_click(group_order_id)
@@ -184,7 +231,7 @@ def record_group_click(
 def submit_group_feedback(
     request: Request,
     payload: GroupFeedbackRequest,
-    group_order_id: str = Path(..., min_length=15, max_length=24, pattern=r"^\d+$"),
+    group_order_id: str = Path(..., min_length=10, max_length=36, pattern=GROUP_ID_PATH_PATTERN),
 ):
     """
     用户共创维护多人团状态（极简防恶意下架）：
@@ -250,7 +297,7 @@ def submit_group_feedback(
 
 @router.get("/poster/{group_order_id}")
 def get_group_poster(
-    group_order_id: str = Path(..., min_length=15, max_length=24, pattern=r"^\d+$"),
+    group_order_id: str = Path(..., min_length=10, max_length=36, pattern=GROUP_ID_PATH_PATTERN),
 ):
     """获取多人团分享海报图片。"""
     path = group_help_service.get_poster_file_path(group_order_id)

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """拼多多多人团互助：独立数据模型、链接解析规则与序列化工具。"""
 import difflib
+import math
 import re
 import time
 import urllib.parse
@@ -16,6 +17,13 @@ GROUP_STATUS_PENDING_CONFIRM = "pending_confirm"
 GROUP_STATUS_FULL = "full"
 GROUP_STATUS_EXPIRED = "expired"
 
+ENTRY_TYPE_POSTER = "poster"
+ENTRY_TYPE_LINK = "link"
+ENTRY_TYPE_TOKEN = "token"
+
+SOURCE_USER_UPLOAD = "user_upload"
+SOURCE_USER_TEXT = "user_text"
+
 DEFAULT_GROUP_TTL_SECONDS = 86400  # 默认 24 小时后自动下线
 MAX_PARSE_ATTEMPTS = 3
 
@@ -24,7 +32,15 @@ TAKEDOWN_RATE_WINDOW_SECONDS = 600
 MAX_TAKEDOWNS_PER_WINDOW = 3
 PERMANENT_BAN_STRIKES = 2
 
-_GROUP_ORDER_ID_RE = re.compile(r"^\d{15,24}$")
+GROUP_ID_PATH_PATTERN = r"^(?:\d{15,24}|tok_[A-Za-z0-9]{6,28})$"
+_NUMERIC_GROUP_ORDER_ID_RE = re.compile(r"^\d{15,24}$")
+_GROUP_ORDER_ID_RE = re.compile(GROUP_ID_PATH_PATTERN)
+_PDD_TOKEN_CODE_RE = re.compile(r"⇥\s*([A-Za-z0-9]{6,28})\s*⇤")
+_HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>\\]+", flags=re.IGNORECASE)
+_FORBIDDEN_SPAM_RE = re.compile(
+    r"(?:加微信|微信号|微信联系|加\s*v\b|加\s*vx\b|\bvx\s*[:：]|wechat|qq群|加群|加\s*q\b|刷单|兼职|代拍|扫码领|t\.me/)",
+    flags=re.IGNORECASE,
+)
 _ALLOWED_PDD_DOMAINS = (
     "pinduoduo.com",
     "yangkeduo.com",
@@ -80,11 +96,265 @@ class GroupFeedbackRequest(BaseModel):
     owner_token: Optional[str] = Field(default=None, max_length=64, description="发团团长管理口令（仅团长本人本地持有）")
 
 
+class GroupTextSubmitRequest(BaseModel):
+    """无海报图片时，用户直接提交拼多多口令或官方拼团链接的请求载荷。"""
+    share_text: str = Field(..., min_length=6, max_length=500, description="拼多多 ⇥...⇤ 拼团口令或官方拼团链接")
+    goods_name: str = Field(..., min_length=2, max_length=120, description="商品名称")
+    group_price: float = Field(..., gt=0, le=50000, description="拼团价格（元）")
+    original_price: Optional[float] = Field(default=None, description="单买原价（可选）")
+    total_people: int = Field(default=0, ge=0, le=50, description="成团总人数（可选，0表示未知）")
+    remain_people: int = Field(default=1, ge=1, le=20, description="还差几人成团")
+    publisher_nick: Optional[str] = Field(default="", max_length=40, description="发布者昵称（可选）")
+    owner_token: Optional[str] = Field(default=None, max_length=64, description="前端生成的团长本地管理口令")
+
+
 def is_valid_group_order_id(value: Any) -> bool:
     if not isinstance(value, (str, int)) or isinstance(value, bool):
         return False
     text = str(value).strip()
     return bool(_GROUP_ORDER_ID_RE.match(text))
+
+
+def is_numeric_group_order_id(value: Any) -> bool:
+    """判断是否为拼多多官方数字 group_order_id（可构造 group7.html 跳转链接）。"""
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return False
+    return bool(_NUMERIC_GROUP_ORDER_ID_RE.match(str(value).strip()))
+
+
+def contains_forbidden_group_spam(text: Any) -> bool:
+    """检查文案中是否包含站外引流、私加联系方式或刷单兼职等违规内容。"""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_FORBIDDEN_SPAM_RE.search(text))
+
+
+def is_allowed_pdd_url(url: str) -> bool:
+    """白名单校验：仅允许拼多多官方域名（pinduoduo.com / yangkeduo.com）。"""
+    try:
+        parsed = urllib.parse.urlsplit(str(url or "").strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    return any(host == dom or host.endswith(f".{dom}") for dom in _ALLOWED_PDD_DOMAINS)
+
+
+def extract_pdd_urls(text: str) -> List[str]:
+    """提取文本中的拼多多官方链接；若发现任何非拼多多外站链接立即抛出 ValueError。"""
+    urls: List[str] = []
+    seen = set()
+    for match in _HTTP_URL_RE.findall(str(text or "")):
+        cleaned = match.rstrip(".,;!?，。；！？)）】]\"'")
+        if not cleaned:
+            continue
+        if not is_allowed_pdd_url(cleaned):
+            raise ValueError("仅支持拼多多官方域名链接（pinduoduo.com / yangkeduo.com），已拦截站外链接")
+        if cleaned not in seen:
+            seen.add(cleaned)
+            urls.append(cleaned)
+    return urls
+
+
+def extract_pdd_share_token(text: Any) -> str:
+    """提取拼多多 ⇥code⇤ 分享口令核心码。"""
+    if not isinstance(text, str):
+        return ""
+    matched = _PDD_TOKEN_CODE_RE.search(text)
+    return matched.group(1) if matched else ""
+
+
+def extract_keywords_from_title(goods_name: str, limit: int = 4) -> List[str]:
+    """从商品标题中确定性提取用于匹配与搜索的关键词（不使用易变营销词规则）。"""
+    raw = str(goods_name or "").strip()
+    if not raw:
+        return []
+    tokens = re.split(r"[\s/|｜,，。!！?？【】\[\]()（）+＋]+", raw)
+    keywords: List[str] = []
+    seen = set()
+    for token in tokens:
+        cleaned = token.strip("-_:：·")
+        if len(cleaned) < 2:
+            continue
+        lowered = cleaned.lower()
+        if lowered not in seen:
+            seen.add(lowered)
+            keywords.append(cleaned[:24])
+            if len(keywords) >= limit:
+                break
+    return keywords
+
+
+def _extract_numeric_group_id_query(url: str) -> Dict[str, str]:
+    """从拼多多跳转链接 query 中提取数字型 group_order_id 与分润参数。"""
+    try:
+        parsed = urllib.parse.urlsplit(str(url or "").strip())
+        qs = urllib.parse.parse_qs(parsed.query)
+    except ValueError:
+        return {}
+    gid = (qs.get("group_order_id") or [""])[0].strip()
+    if not is_numeric_group_order_id(gid):
+        return {}
+    return {
+        "group_order_id": gid,
+        "refer_share_uin": (qs.get("refer_share_uin") or [""])[0].strip(),
+        "refer_share_channel": (qs.get("refer_share_channel") or [""])[0].strip(),
+        "refer_share_id": (qs.get("refer_share_id") or [""])[0].strip(),
+    }
+
+
+def validate_optional_share_text(raw_text: Any) -> Dict[str, str]:
+    """校验海报上传时附带的可选拼团口令/链接（防违规引流与外站链接）。"""
+    text = str(raw_text or "").strip()
+    if not text:
+        return {"share_text": "", "share_code": ""}
+    if len(text) > 500:
+        raise ValueError("附带口令或文案长度不能超过 500 字符")
+    if contains_forbidden_group_spam(text):
+        raise ValueError("附带文案包含违规引流或非拼团内容，已拦截")
+    extract_pdd_urls(text)
+    return {
+        "share_text": text,
+        "share_code": extract_pdd_share_token(text),
+    }
+
+
+def parse_pdd_group_share_fields(
+    *,
+    share_text: str,
+    goods_name: str,
+    group_price: Any,
+    original_price: Any = None,
+    total_people: Any = 0,
+    remain_people: Any = 1,
+    publisher_nick: str = "",
+) -> Dict[str, Any]:
+    """无图拼团口令/链接唯一校验与结构化解析真源（供 C 端提交与外部导入脚本共用）。"""
+    raw_share = str(share_text or "").strip()
+    if not raw_share:
+        raise ValueError("请填写拼多多 ⇥...⇤ 口令或官方拼团链接")
+    if len(raw_share) > 500:
+        raise ValueError("口令或链接内容过长（最多 500 字符）")
+
+    cleaned_name = re.sub(r"\s+", " ", str(goods_name or "")).strip()
+    cleaned_nick = re.sub(r"\s+", " ", str(publisher_nick or "")).strip()[:40]
+
+    for field_val in (raw_share, cleaned_name, cleaned_nick):
+        if contains_forbidden_group_spam(field_val):
+            raise ValueError("内容包含违规引流或非拼团广告信息，已拦截")
+
+    if _HTTP_URL_RE.search(cleaned_name) or _HTTP_URL_RE.search(cleaned_nick):
+        raise ValueError("商品名称或昵称中不能包含网页链接")
+
+    pdd_urls = extract_pdd_urls(raw_share)
+    share_code = extract_pdd_share_token(raw_share)
+    if not share_code and not pdd_urls:
+        raise ValueError("请粘贴包含 ⇥...⇤ 的拼多多口令，或拼多多官方拼团链接")
+
+    meaningful_chars = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", cleaned_name)
+    if len(meaningful_chars) < 3 or len(cleaned_name) > 120:
+        raise ValueError("商品名称至少需包含 3 个有效汉字/字母/数字，且不超过 120 字")
+
+    try:
+        price_val = float(group_price)
+    except (TypeError, ValueError):
+        raise ValueError("请填写有效的拼团价格（0 ~ 50000 元）")
+    if isinstance(group_price, bool) or not math.isfinite(price_val) or price_val <= 0 or price_val > 50000:
+        raise ValueError("请填写有效的拼团价格（0 ~ 50000 元）")
+    price_val = round(price_val, 2)
+
+    orig_val: Optional[float] = None
+    if original_price is not None and not isinstance(original_price, bool) and str(original_price).strip() != "":
+        try:
+            cand_orig = float(original_price)
+            if math.isfinite(cand_orig) and price_val < cand_orig <= 100000:
+                orig_val = round(cand_orig, 2)
+        except (TypeError, ValueError):
+            orig_val = None
+
+    if isinstance(remain_people, bool):
+        raise ValueError("还差人数格式错误")
+    try:
+        rem_val = int(remain_people)
+    except (TypeError, ValueError):
+        raise ValueError("还差人数必须为整数")
+    if rem_val < 1 or rem_val > 20:
+        raise ValueError("还差人数必须在 1 ~ 20 人之间")
+
+    if isinstance(total_people, bool):
+        tot_val = 0
+    else:
+        try:
+            tot_val = int(total_people or 0)
+        except (TypeError, ValueError):
+            raise ValueError("成团总人数必须为整数")
+    if tot_val < 0 or tot_val > 50:
+        raise ValueError("成团总人数必须在 0 ~ 50 人之间")
+    if tot_val == 1:
+        tot_val = 0
+    if tot_val > 0 and rem_val > tot_val:
+        rem_val = tot_val
+
+    gid = ""
+    redirect_url = ""
+    short_url = pdd_urls[0] if pdd_urls else ""
+    refer_uin = ""
+    refer_channel = ""
+    refer_id = ""
+    for candidate_url in pdd_urls:
+        parsed_q = _extract_numeric_group_id_query(candidate_url)
+        if parsed_q:
+            gid = parsed_q["group_order_id"]
+            redirect_url = candidate_url
+            refer_uin = parsed_q["refer_share_uin"]
+            refer_channel = parsed_q["refer_share_channel"]
+            refer_id = parsed_q["refer_share_id"]
+            break
+
+    if gid:
+        entry_type = ENTRY_TYPE_LINK
+        needs_url_resolve = False
+        jumps = build_group_jump_urls(
+            gid,
+            refer_share_channel=refer_channel,
+            refer_share_uin=refer_uin,
+            refer_share_id=refer_id,
+        )
+    elif pdd_urls and not share_code:
+        entry_type = ENTRY_TYPE_LINK
+        needs_url_resolve = True
+        jumps = {}
+    else:
+        gid = f"tok_{share_code}"
+        entry_type = ENTRY_TYPE_TOKEN
+        needs_url_resolve = bool(pdd_urls)
+        jumps = {}
+
+    return {
+        "group_order_id": gid,
+        "entry_type": entry_type,
+        "needs_url_resolve": needs_url_resolve,
+        "short_url": short_url,
+        "redirect_url": redirect_url,
+        "refer_share_uin": refer_uin,
+        "refer_share_channel": refer_channel,
+        "refer_share_id": refer_id,
+        "app_wake_url": jumps.get("app_wake_url", ""),
+        "h5_join_url": jumps.get("h5_join_url", ""),
+        "brand_card_url": jumps.get("brand_card_url", ""),
+        "share_text": raw_share,
+        "share_code": share_code,
+        "goods_name": cleaned_name,
+        "keywords": extract_keywords_from_title(cleaned_name),
+        "group_price": price_val,
+        "original_price": orig_val,
+        "total_people": tot_val,
+        "remain_people": rem_val,
+        "publisher_nick": cleaned_nick,
+    }
 
 
 def is_pdd_qr_url(url: str) -> bool:
@@ -179,6 +449,7 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
     else:
         effective_status = raw_status
 
+    has_numeric_gid = is_numeric_group_order_id(gid)
     jumps = (
         build_group_jump_urls(
             gid,
@@ -186,9 +457,14 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
             refer_share_uin=str(doc.get("refer_share_uin") or ""),
             refer_share_id=str(doc.get("refer_share_id") or ""),
         )
-        if gid
+        if has_numeric_gid
         else {}
     )
+    has_poster = bool(str(doc.get("poster_path") or "").strip())
+    default_entry_type = ENTRY_TYPE_POSTER if has_poster else (ENTRY_TYPE_LINK if has_numeric_gid else ENTRY_TYPE_TOKEN)
+    entry_type = str(doc.get("entry_type") or default_entry_type).strip() or default_entry_type
+    source = str(doc.get("source") or (SOURCE_USER_UPLOAD if has_poster else SOURCE_USER_TEXT)).strip()
+
     keywords: List[str] = [
         str(k).strip() for k in (doc.get("keywords") or []) if isinstance(k, str) and str(k).strip()
     ]
@@ -197,6 +473,9 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
 
     return {
         "group_order_id": gid,
+        "entry_type": entry_type,
+        "source": source,
+        "has_poster": has_poster,
         "goods_name": str(doc.get("goods_name") or "").strip() or fallback_name,
         "keywords": keywords,
         "group_price": doc.get("group_price"),
@@ -214,10 +493,13 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
         "updated_at": int(doc.get("updated_at") or created_at),
         "expires_at": int(expires_at),
         "remaining_seconds": remaining_seconds,
-        "poster_url": f"/api/group_help/poster/{gid}",
-        "app_wake_url": jumps.get("app_wake_url") or doc.get("app_wake_url", ""),
-        "h5_join_url": jumps.get("h5_join_url") or doc.get("h5_join_url", ""),
-        "brand_card_url": jumps.get("brand_card_url") or doc.get("brand_card_url", ""),
+        "poster_url": f"/api/group_help/poster/{gid}" if has_poster else "",
+        "share_text": str(doc.get("share_text") or "").strip(),
+        "share_code": str(doc.get("share_code") or "").strip(),
+        "publisher_nick": str(doc.get("publisher_nick") or "").strip(),
+        "app_wake_url": jumps.get("app_wake_url") or (doc.get("app_wake_url", "") if has_numeric_gid else ""),
+        "h5_join_url": jumps.get("h5_join_url") or (doc.get("h5_join_url", "") if has_numeric_gid else ""),
+        "brand_card_url": jumps.get("brand_card_url") or (doc.get("brand_card_url", "") if has_numeric_gid else ""),
     }
 
 
