@@ -4605,8 +4605,28 @@ class MaintenanceWorker(threading.Thread):
                 if reclaimed > 0:
                     logger.info("🧹 [维护清扫] 成功释放超时未完成租约 %d 条回队", reclaimed)
 
-                # 2. 渠道级保鲜清扫：按各渠道/站点独立保鲜期淘汰超时未处理记录
+                # 2. 字段自包含与渠道级保鲜清扫：优先依据数据库自带的 clean_cutoff_ts 一键淘汰
                 now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+                now_ts = time.time()
+                self.repo.col.update_many(
+                    {
+                        "clean_status": "pending",
+                        "clean_cutoff_ts": {"$gt": 0, "$lt": now_ts},
+                    },
+                    {
+                        "$set": {
+                            "clean_status": "cleaned_failed",
+                            "clean_stage": CLEAN_STAGE_DONE,
+                            "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
+                            "clean_error_msg": "已超过本爆料专属保鲜截止期，自动清扫",
+                            "cleaned_at": now_utc,
+                        },
+                        "$unset": {
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                        },
+                    },
+                )
                 site_age_map = get_site_max_age_days_map()
                 for s_key, age_days in site_age_map.items():
                     s_ts = time.time() - age_days * 86400.0
@@ -4614,6 +4634,7 @@ class MaintenanceWorker(threading.Thread):
                     self.repo.col.update_many(
                         {
                             "clean_status": "pending",
+                            "clean_cutoff_ts": {"$exists": False},
                             "source_site": s_key,
                             "$or": [
                                 {"publish_ts": {"$gt": 0, "$lt": s_ts}},
@@ -4640,6 +4661,7 @@ class MaintenanceWorker(threading.Thread):
                 self.repo.col.update_many(
                     {
                         "clean_status": "pending",
+                        "clean_cutoff_ts": {"$exists": False},
                         "source_site": {"$nin": configured_sites},
                         "$or": [
                             {"publish_ts": {"$gt": 0, "$lt": fallback_ts}},

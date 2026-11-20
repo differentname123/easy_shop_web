@@ -703,10 +703,14 @@ def test_channel_specific_max_age_days_configuration_and_behavior():
     )
     # 特惠采采 3 天前爆料：在 7 天保鲜期内，进入 pending
     assert captured_ops[0]._doc["$setOnInsert"]["clean_status"] == "pending"
+    assert captured_ops[0]._doc["$setOnInsert"]["clean_max_age_days"] == 7.0
+    assert captured_ops[0]._doc["$setOnInsert"]["clean_cutoff_ts"] > 0
     # 特惠采采 8 天前爆料：超过 7 天，被淘汰为 cleaned_failed
     assert captured_ops[1]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
     # 逛丢 3 天前爆料：超过 2 天，被淘汰为 cleaned_failed
     assert captured_ops[2]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
+    assert captured_ops[2]._doc["$setOnInsert"]["clean_max_age_days"] == 2.0
+    assert captured_ops[2]._doc["$setOnInsert"]["clean_cutoff_ts"] > 0
 
 
 

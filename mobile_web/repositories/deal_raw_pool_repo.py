@@ -588,9 +588,10 @@ class DealRawPoolRepository:
                 site_key=site,
                 default_days=DEAL_MAX_CLEAN_AGE_DAYS,
             )
+            clean_cutoff_ts = round(pub_ts + channel_max_age * 86400.0, 1)
             is_expired_over_age = (
                 parsed_pub_ts is not None
-                and parsed_pub_ts < (time.time() - channel_max_age * 86400.0)
+                and clean_cutoff_ts < time.time()
             )
 
             has_signal = bool(quality_signals["has_unique_product_anchor"])
@@ -628,6 +629,8 @@ class DealRawPoolRepository:
                 "clean_stage": CLEAN_STAGE_NEED_AI1 if initial_status == "pending" else CLEAN_STAGE_DONE,
                 "ai_clean_status": initial_status,
                 "clean_retry_count": 0,
+                "clean_max_age_days": channel_max_age,
+                "clean_cutoff_ts": clean_cutoff_ts,
             }
             if parsed_pub_ts is None:
                 set_on_insert["publish_ts"] = pub_ts
@@ -811,13 +814,17 @@ class DealRawPoolRepository:
         cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
 
         site_age_map = get_site_max_age_days_map()
+        # 消费端直接基于数据库自包含字段 clean_cutoff_ts 判定，无该字段时兼容老数据渠道映射
         nor_conditions: List[Dict[str, Any]] = [
+            {"clean_cutoff_ts": {"$gt": 0, "$lt": now_ts}},
             {"next_retry_after_ts": {"$gt": round(now_ts, 1)}},
         ]
+        # 兼容老数据兜底：仅当未落盘 clean_cutoff_ts 时，按站点映射计算
         for s_key, age_days in site_age_map.items():
             s_ts = now_ts - age_days * 86400.0
             s_dt = now_utc - datetime.timedelta(days=age_days)
             nor_conditions.append({
+                "clean_cutoff_ts": {"$exists": False},
                 "source_site": s_key,
                 "$or": [
                     {"publish_ts": {"$gt": 0, "$lt": s_ts}},
@@ -826,6 +833,7 @@ class DealRawPoolRepository:
             })
         configured_sites = list(site_age_map.keys())
         nor_conditions.append({
+            "clean_cutoff_ts": {"$exists": False},
             "source_site": {"$nin": configured_sites},
             "$or": [
                 {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
