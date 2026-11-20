@@ -3476,7 +3476,7 @@ class DealPoolCleaner:
                 elif deal_price is not None:
                     has_failed_non_filler = any(
                         c.get("link_id") != main_lid
-                        and c.get("text_role_hint") != "filler_candidate"
+                        and c.get("text_role_hint") == "coupon_candidate"
                         and c.get("convert_status") == "failed"
                         and c.get("error_code") not in (ERR_JD_NUMERIC_SKU, ERR_TB_NUMERIC_ID, ERR_PDD_NUMERIC_ID)
                         for c in conv_list
