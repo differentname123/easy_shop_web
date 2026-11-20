@@ -4,13 +4,59 @@
 1. https://xhhcds.cn/
     理由：这是人工选择出来的，个个都是精品。
     拉取策略：直接就拉取商品，直到该页全是已经拉取过的
-    备注：
-        监控 JSON 列表接口：https://xhhcds.cn/api/v1/public/home-products/?feed=home&page=1&page_size=50
-        监控 JSON 单品详情接口（示例）：https://xhhcds.cn/api/v1/public/products/1770/
+    备注： 拉取全部 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准 20分钟拉取一次
 
 2. https://guangdiu.com/
     理由：这里聚集了很多其它的爆料，能够将一些我无法爬取的数据也获取到
     拉取策略：监控下面几个频道就行
-           首页：http://guangdiu.com/
-           热门榜：https://guangdiu.com/hots.php
-           小时榜单： https://guangdiu.com/rank.php
+           首页：http://guangdiu.com/  3分钟拉取一次 只拉一页
+           热门榜：https://guangdiu.com/hots.php 20分钟拉取一次 只拉一页
+           小时榜单： https://guangdiu.com/rank.php 20分钟拉取一次 只拉一页
+
+
+
+3.haodanku 使用api获取 3大榜单：全量拉取 30分钟拉取一次  并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+
+
+
+4.https://www.xuandan.com/:
+    监控频道：
+        https://www.xuandan.com/allList.html?type=8  全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+        https://www.xuandan.com/allList.html?type=7&is_hidden=1 全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+        https://www.xuandan.com/allList.html?type=11  全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+
+
+5.http://www.0818tuan.com/list-1-0.html 就获取这个页面的爆料， 1小时拉取一次
+
+
+6. https://m.zzzdm.com/posts/ranking.html 全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+
+7.https://t.me/s/zzzdm  获取最近1h的数据， 间隔30分钟执行一次
+
+8.https://digi.ithome.com/lapin 获取两天内的爆料 间隔60分钟执行一次
+
+
+9.http://www.kiees.com：
+    监控频道：
+        http://www.kiees.com/index.html 全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+        http://www.kiees.com/hot_1  全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+
+10.https://www.niuza.com/：
+    监控频道：
+    https://www.niuza.com/index.html 全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+    https://www.niuza.com/hot_1 全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+
+11.https://www.zdzdm.com/youhui  获取第一页商品 30分钟拉取一次
+
+
+12.https://www.baicaio.com/：
+    监控频道：
+    https://www.baicaio.com/nice/  获取第一页 30分钟拉取一次
+    https://www.baicaio.com/hour/ 全量拉取 30分钟拉取一次 并且 线报的时间就是每次拉取的时间，不以相应的线报更新时间为准
+
+
+
+13. https://t.me/s/BaccanoSoul 获取最近15分钟的数据， 间隔10分钟执行一次
+
+
+14. https://t.me/s/Pojieapp 获取最近15分钟的数据， 间隔10分钟执行一次
