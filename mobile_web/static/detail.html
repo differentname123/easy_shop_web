@@ -652,8 +652,13 @@
   <!-- ==================== 线报好价卡片（有线报信息时统一展示，无则完全不渲染） ==================== -->
   <div class="detail-card-section deal-tip-card" v-if="dealTip">
     <div class="deal-tip-header">
-      <span class="deal-tip-badge">🔥 线报好价</span>
+      <span class="deal-tip-badge" :style="dealTip.is_deal_tip === false ? 'background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb;' : ''">
+        {{ dealTip.is_deal_tip === false ? '🕒 历史好价' : '🔥 线报好价' }}
+      </span>
       <span class="deal-tip-time" v-if="dealTip.publish_time">{{ dealTip.publish_time }} 爆料</span>
+      <span class="deal-tip-time" v-if="dealTip.updated_at && dealTip.updated_at !== dealTip.publish_time" style="margin-left: 6px; color: #9ca3af; font-size: 11px;">
+        (最新更新: {{ dealTip.updated_at }})
+      </span>
     </div>
 
     <div class="deal-price-box" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.unit_deal_price || dealTip.price_logic">

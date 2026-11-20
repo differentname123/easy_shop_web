@@ -1074,9 +1074,14 @@ class ProductRepository(BaseRepository):
 
     @classmethod
     def _extract_deal_tip(cls, doc: Dict[str, Any], fallback_time: str = "") -> Optional[Dict[str, Any]]:
-        """提取公开可展示的线报详情视图，严格过滤内部评分与爬虫源字段；非线报商品返回 None。"""
+        """提取公开可展示的线报详情视图，严格过滤内部评分与爬虫源字段；非线报商品返回 None。
+
+        秉持以用户体验为中心与信息可见原则：只要该商品记录中存在实质性的线报详情
+        （如购买教程、线报话术、券口令/链接、实付到手价等），无论是否已超 72 小时从严选榜单摘标，
+        在商品详情页均完整透出供用户参考，并通过 is_deal_tip 与 updated_at 明确区分时效状态。
+        """
         deal_info = doc.get("deal_info")
-        if not isinstance(deal_info, dict) or deal_info.get("is_deal_tip") is not True:
+        if not isinstance(deal_info, dict):
             return None
 
         tz_cn = datetime.timezone(datetime.timedelta(hours=8))
@@ -1096,6 +1101,21 @@ class ProductRepository(BaseRepository):
                 publish_time = s[:16].replace("T", " ") if len(s) >= 16 else s[:32]
         if not publish_time:
             publish_time = str(fallback_time or "").strip()
+
+        updated_at = ""
+        raw_upd = deal_info.get("updated_at")
+        if isinstance(raw_upd, datetime.datetime):
+            dt = raw_upd.astimezone(tz_cn) if raw_upd.tzinfo is not None else raw_upd
+            updated_at = dt.strftime("%Y-%m-%d %H:%M")
+        elif isinstance(raw_upd, str) and raw_upd.strip():
+            s = raw_upd.strip()
+            try:
+                dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(tz_cn)
+                updated_at = dt.strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                updated_at = s[:16].replace("T", " ") if len(s) >= 16 else s[:32]
 
         deal_price: Optional[float] = None
         raw_dp = deal_info.get("deal_price")
@@ -1170,7 +1190,9 @@ class ProductRepository(BaseRepository):
             return None
 
         return {
+            "is_deal_tip": bool(deal_info.get("is_deal_tip")),
             "publish_time": publish_time,
+            "updated_at": updated_at,
             "deal_price": deal_price,
             "unit_deal_price": unit_deal_price,
             "price_logic": price_logic,

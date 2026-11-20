@@ -146,3 +146,28 @@ def test_view_reports_error_when_query_raises():
 
     with _repo_with(boom) as (repo, _):
         assert repo.get_deal_tip_view("123", platform="pdd") == ("error", None)
+
+
+def test_expired_deal_remains_visible_with_is_deal_tip_false():
+    """验证用户产品原则：超期摘标(is_deal_tip=False)后，只要包含教程/文案/价格等实质内容，详情页依然保留展示。"""
+    from repositories.product_repo import ProductRepository
+
+    doc = {
+        "_id": "dummy_id",
+        "deal_info": {
+            "is_deal_tip": False,
+            "publish_time": "2026-11-16 19:56:31",
+            "updated_at": "2026-11-18 06:49:06",
+            "deal_price": 12.9,
+            "tutorial_steps": ["1. 领券下单", "2. 实付12.9元"],
+            "original_copywriting": "海天调料12件套组合",
+        },
+    }
+    tip = ProductRepository._extract_deal_tip(doc)
+    assert tip is not None
+    assert tip["is_deal_tip"] is False
+    assert tip["publish_time"] == "2026-11-16 19:56"
+    assert tip["updated_at"] == "2026-11-18 06:49"
+    assert tip["deal_price"] == 12.9
+    assert len(tip["tutorial_steps"]) == 2
+
