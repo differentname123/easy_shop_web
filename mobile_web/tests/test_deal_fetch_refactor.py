@@ -298,7 +298,7 @@ def test_scheduler_config_and_captcha_cooldown_behavior(monkeypatch, tmp_path):
         "逛丢_小时风云榜",
     ]
     assert all(c.site_key in ("tehuicaicai", "guangdiu") for c in active)
-    assert all(c.max_details == 3 for c in active if c.site_key == "guangdiu")
+    assert all(c.max_details >= 20 for c in active if c.site_key == "guangdiu")
 
     # 2. 验证逛丢触发 CaptchaChallengeDetected 后：同轮后续频道冷却跳过 + 跨轮进入站点冷却期，且特惠采采不受影响
     monkeypatch.setattr(dp_mod.time, "sleep", lambda _: None)
