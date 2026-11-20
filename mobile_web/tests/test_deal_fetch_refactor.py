@@ -636,4 +636,64 @@ def test_tehuicaicai_watermark_stops_when_page_all_known():
     assert len(res["records"]) == 0
 
 
+def test_guangdiu_relative_gophp_button_is_unpacked_not_used_as_direct_link():
+    """列表按钮给的是站内相对 go.php 时，必须交给 go.php 解包，不能当直达链入库。
+
+    实网依据：逛丢首页/热门对部分无联盟链接的帖子（京东直采等）给出的按钮 href 就是
+    `go.php?id=xxx`（相对、无域名），`_unwrap_known_redirect_url` 原样返回它，
+    若直接采信就会把自家相对链当成"直达购买链"，清洗端剥离站内链后只剩店铺页，
+    最终误判 ERR_EMPTY_PRODUCT_IDENTITY（如 30701581）。
+    """
+    from mobile_web.services.deal_fetchers import fetch_guangdiu_deals
+
+    list_html = """
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=201">相对链商品</a>
+        <a class="rightmallname">京东</a>
+        <span class="latesttime">3分钟前</span>
+        <a class="innergototobuybtn" href="go.php?id=201">直达</a>
+    </div>
+    """
+    called_urls = []
+
+    def fake_get(url, headers=None, timeout=10.0):
+        called_urls.append(url)
+        resp = MagicMock()
+        resp.status_code = 200
+        if url == "https://guangdiu.com/":
+            resp.text = list_html
+        elif "detail.php?id=201" in url:
+            resp.text = """
+            <div class="dabstract" id="dabstract">
+                <div>1. 店铺 <a href="https://shop.m.jd.com/mshop/gethomepage?venderid=1">某某旗舰店</a></div>
+                <div>2. 实付 79.9 元</div>
+            </div>
+            """
+        elif "go.php?id=201" in url:
+            resp.text = "var target = 'https://item.jd.com/201.html';"
+        else:
+            resp.text = ""
+        return resp
+
+    sess = MagicMock()
+    sess.get.side_effect = fake_get
+
+    res = fetch_guangdiu_deals(
+        channel="latest",
+        fetch_detail=True,
+        max_details=5,
+        detail_delay=0.0,
+        session=sess,
+    )
+
+    assert res["status"] == "success"
+    assert len(res["records"]) == 1
+    # 相对 go.php 必须触发一次真正的解包请求
+    assert any(u.startswith("https://guangdiu.com/go.php?id=201") for u in called_urls)
+    urls = [lk["url"] for lk in res["records"][0]["extracted_links"]]
+    assert "go.php?id=201" not in urls
+    assert "https://item.jd.com/201.html" in urls
+
+
+
 

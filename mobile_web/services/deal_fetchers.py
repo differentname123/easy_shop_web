@@ -1504,7 +1504,6 @@ def _has_substantive_guangdiu_tutorial(dabs_text: str, title: str) -> bool:
 
 def fetch_guangdiu_deals(
     channel: str = "latest",
-    page: int = 1,
     fetch_detail: bool = True,
     max_details: int = 30,
     detail_delay: float = 0.3,
@@ -1521,12 +1520,10 @@ def fetch_guangdiu_deals(
 ) -> Dict[str, Any]:
     """
     逛丢全网爆料与榜单流 (`https://guangdiu.com/`)：
-- 支持频道：
+- 支持频道（仅这三个，均单页整页拉取）：
   - `"latest"` -> `https://guangdiu.com/` (首页)
   - `"hots"`   -> `https://guangdiu.com/hots.php` (热门榜)
   - `"rank"`   -> `https://guangdiu.com/rank.php` (小时风云榜)
-  - `"pdd"`    -> `https://guangdiu.com/cate.php?m=拼多多`
-  - `"cheaps"` -> `https://guangdiu.com/cheaps.php`
 - 策略：
 1. 列表页先行 100% 确定性平台过滤 + 已抓 ID 去重（不发多余 `detail.php`/`go.php` 请求）；
   1. 优先拉取 `detail.php` 检查滑块验证码与 `#dabstract` 实质教程，触发滑块时自动通过验证并同步 Cookie；
@@ -1545,14 +1542,9 @@ def fetch_guangdiu_deals(
     if channel == "rank":
         list_url = f"{base}/rank.php"
     elif channel == "hots":
-        list_url = f"{base}/hots.php" if page <= 1 else f"{base}/hots.php?p={page}"
-    elif channel == "pdd":
-        pdd_m = quote("拼多多")
-        list_url = f"{base}/cate.php?m={pdd_m}" if page <= 1 else f"{base}/cate.php?m={pdd_m}&p={page}"
-    elif channel == "cheaps":
-        list_url = f"{base}/cheaps.php" if page <= 1 else f"{base}/cheaps.php?p={page}"
+        list_url = f"{base}/hots.php"
     else:
-        list_url = f"{base}/" if page <= 1 else f"{base}/index.php?p={page}"
+        list_url = f"{base}/"
 
     eff_delay = max(0.0, float(detail_delay))
     captcha_triggered = 0
@@ -1836,7 +1828,7 @@ def fetch_guangdiu_deals(
             img_url = html_lib.unescape(m_img.group(1)).strip() if m_img else ""
 
             m_mall = re.search(r'class=["\'][^"\']*rightmallname[^"\']*["\'][^>]*>(.*?)</a>', blk, re.S | re.I)
-            mall_name = re.sub(r"<[^>]+>", "", html_lib.unescape(m_mall.group(1))).strip() if m_mall else ("拼多多" if channel == "pdd" else "")
+            mall_name = re.sub(r"<[^>]+>", "", html_lib.unescape(m_mall.group(1))).strip() if m_mall else ""
 
             m_time = re.search(r'<span[^>]*class=["\'][^"\']*latesttime[^"\']*["\'][^>]*>(.*?)</span>', blk, re.S | re.I)
             if m_time:
@@ -1846,7 +1838,14 @@ def fetch_guangdiu_deals(
             if m_buy_tag:
                 m_href = re.search(r'href=["\']([^"\']+)["\']', m_buy_tag.group(0), re.I)
                 if m_href:
-                    list_buy_url = _unwrap_known_redirect_url(m_href.group(1))
+                    cand = _unwrap_known_redirect_url(m_href.group(1))
+                    # 只有「绝对 + 非源站自有域名」的地址才是真直达链；站内 go.php 一律留空，
+                    # 由下方 _fetch_go_target(go_url) 去解包（否则自家相对链会被当成直达链入库）
+                    host = (urlsplit(cand).hostname or "").lower()
+                    if cand.startswith(("http://", "https://")) and not any(
+                        _is_host_match(host, self_h) for self_h in _SOURCE_SELF_HOSTS
+                    ):
+                        list_buy_url = cand
 
             m_abs = re.search(r'<(?:div|a)\s+class=["\']abstractcontent["\'][^>]*>(.*?)</(?:div|a)>', blk, re.S | re.I)
             preview_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_lib.unescape(m_abs.group(1)))).strip() if m_abs else ""
@@ -2208,7 +2207,6 @@ def test_guangdiu_slider_and_fetch(
     print(f"[测试 2/2] 端到端调用 fetch_guangdiu_deals(channel={channel!r}, max_details={max_details})")
     res = fetch_guangdiu_deals(
         channel=channel,
-        page=1,
         fetch_detail=True,
         max_details=max_details,
         detail_delay=1.0,
