@@ -33,8 +33,11 @@ class DealChannelConfig:
     description: str = ""                      # 频道说明
 
 
-# 默认监控频道（严格对应《线报监控来源.txt》当前启用的 2 大站点 4 个频道）
+# 默认监控频道（支持特惠采采全量严选、逛丢实时榜单与好单库全量线报）
 DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
+    # --------------------------------------------------------------------------
+    # 1. 特惠采采（https://xhhcds.cn/）：人工严选 JSON 流，20分钟全量巡视
+    # --------------------------------------------------------------------------
     DealChannelConfig(
         name="特惠采采_首页精选",
         site_key="tehuicaicai",
@@ -50,14 +53,79 @@ DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
             "full_sweep": True,
         },
         enabled=True,
-        interval_seconds=180,
+        interval_seconds=1200,
         max_details=50,
         detail_delay_seconds=0.05,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=180,
         max_age_days=7.0,
-        description="特惠采采专员人工严选 JSON 流，每轮全量扫完列表，已抓商品只刷新确认时间",
+        description="特惠采采专员人工严选 JSON 流，20分钟全量巡视，已抓商品刷新确认时间，未在列表中自动判定失效",
     ),
+
+    # --------------------------------------------------------------------------
+    # 2. 好单库线报（https://www.haodanku.com/activity/tip_off）：淘宝/京东/百亿补贴 3 大频道
+    # --------------------------------------------------------------------------
+    DealChannelConfig(
+        name="好单库_淘宝实时线报",
+        site_key="haodanku",
+        default_url="https://www.haodanku.com/activity/tip_off",
+        fetcher_name="fetch_haodanku_wire_deals",
+        fetcher_kwargs={
+            "label_id": 10003,
+            "channel_name": "好单库_淘宝实时线报",
+            "full_sweep": True,
+        },
+        enabled=True,
+        interval_seconds=1200,
+        max_details=100,
+        detail_delay_seconds=0.0,
+        sleep_after=0.3,
+        rate_limit_cooldown_seconds=180,
+        max_age_days=2.0,
+        description="好单库官方淘宝实时线报，20分钟全量巡视，纯JSON直出无风控",
+    ),
+    DealChannelConfig(
+        name="好单库_京东实时线报",
+        site_key="haodanku",
+        default_url="https://www.haodanku.com/activity/tip_off",
+        fetcher_name="fetch_haodanku_wire_deals",
+        fetcher_kwargs={
+            "label_id": 10004,
+            "channel_name": "好单库_京东实时线报",
+            "full_sweep": True,
+        },
+        enabled=True,
+        interval_seconds=1200,
+        max_details=100,
+        detail_delay_seconds=0.0,
+        sleep_after=0.3,
+        rate_limit_cooldown_seconds=180,
+        max_age_days=2.0,
+        description="好单库官方京东实时线报，20分钟全量巡视，纯JSON直出无风控",
+    ),
+    DealChannelConfig(
+        name="好单库_淘宝百亿补贴",
+        site_key="haodanku",
+        default_url="https://www.haodanku.com/activity/tip_off",
+        fetcher_name="fetch_haodanku_wire_deals",
+        fetcher_kwargs={
+            "label_id": 10005,
+            "channel_name": "好单库_淘宝百亿补贴",
+            "full_sweep": True,
+        },
+        enabled=True,
+        interval_seconds=1200,
+        max_details=100,
+        detail_delay_seconds=0.0,
+        sleep_after=0.3,
+        rate_limit_cooldown_seconds=180,
+        max_age_days=2.0,
+        description="好单库官方淘宝百亿补贴线报，20分钟全量巡视，纯JSON直出无风控",
+    ),
+
+    # --------------------------------------------------------------------------
+    # 3. 逛丢（https://guangdiu.com/）：首页、热门榜、小时风云榜
+    # --------------------------------------------------------------------------
     DealChannelConfig(
         name="逛丢_首页实时流",
         site_key="guangdiu",

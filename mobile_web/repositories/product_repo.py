@@ -172,6 +172,7 @@ class ProductRepository(BaseRepository):
         """爆单推广与类目聚合仅读取已入库的榜单商品或已清洗线报商品，排除搜索/详情散查裸记录与已软下架商品。"""
         content_filter = deepcopy(cls._displayable_content_filter())
         content_filter["is_off_promotion"] = {"$ne": True}
+        content_filter["superseded_by"] = {"$exists": False}
         content_filter["$or"] = [
             {"channel_type": {"$exists": True, "$ne": None}},
             {"deal_info.is_deal_tip": True},
@@ -278,10 +279,29 @@ class ProductRepository(BaseRepository):
             update_set["has_coupon"] = bool(item["has_coupon"])
 
         commission = self._first_present(item, "commission_amount", "estimated_commission_yuan")
-        if commission is not None:
-            update_set["commission_amount"] = float(commission)
-        if item.get("commission_rate") is not None:
-            update_set["commission_rate"] = float(item["commission_rate"])
+        raw_rate = item.get("commission_rate")
+        effective_price = update_set.get("activity_price")
+        if effective_price is None and "price" in update_set:
+            effective_price = update_set.get("price")
+
+        comm_amt = float(commission) if commission is not None else None
+        comm_rate = float(raw_rate) if raw_rate is not None else None
+
+        if comm_amt is not None and comm_amt > 0:
+            update_set["commission_amount"] = comm_amt
+            if comm_rate is not None:
+                update_set["commission_rate"] = comm_rate
+            elif effective_price and effective_price > 0:
+                update_set["commission_rate"] = round(comm_amt / effective_price * 100.0, 2)
+        elif comm_rate is not None and comm_rate > 0:
+            update_set["commission_rate"] = comm_rate
+            if effective_price and effective_price > 0:
+                update_set["commission_amount"] = round(effective_price * comm_rate / 100.0, 2)
+        else:
+            if comm_amt is not None:
+                update_set["commission_amount"] = comm_amt
+            if comm_rate is not None:
+                update_set["commission_rate"] = comm_rate
 
         text_fields = {
             "name": ("name", "goods_name"),
@@ -694,12 +714,13 @@ class ProductRepository(BaseRepository):
                     platform=platform,
                     category=category,
                     limit=self._MAX_COST_PERFORMANCE_CANDIDATES,
+                    only_active_boom=True,
                 )
                 if meili_hits is not None:
                     doc_keys = [(h.get("platform"), h.get("product_id")) for h in meili_hits]
                     or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
                     if or_clauses:
-                        mongo_docs = list(self.col.find({"$or": or_clauses}, self._COST_PERFORMANCE_PROJECTION))
+                        mongo_docs = list(self.col.find({"$and": [{"$or": or_clauses}, self._boom_content_filter()]}, self._COST_PERFORMANCE_PROJECTION))
                         docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
                         raw_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
                     else:
@@ -929,7 +950,7 @@ class ProductRepository(BaseRepository):
                     doc_keys = [(h.get("platform"), h.get("product_id")) for h in meili_hits]
                     or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
                     if or_clauses:
-                        mongo_docs = list(self.col.find({"$or": or_clauses}, self._SUMMARY_PROJECTION))
+                        mongo_docs = list(self.col.find({"$and": [{"$or": or_clauses}, {"is_off_promotion": {"$ne": True}}]}, self._SUMMARY_PROJECTION))
                         docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
                         ordered_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
                         has_more = len(ordered_docs) > page_size
@@ -1206,6 +1227,8 @@ class ProductRepository(BaseRepository):
             "detail_updated_at": doc.get("detail_updated_at"),
             "is_off_promotion": doc.get("is_off_promotion", False),
             "off_promotion_at": doc.get("off_promotion_at"),
+            "superseded_by": doc.get("superseded_by"),
+            "off_promotion_reason": doc.get("off_promotion_reason"),
         })
         return result
 
@@ -1763,9 +1786,16 @@ class ProductRepository(BaseRepository):
                     "$unset": {"default_promotion": "", "default_promotion_expires_at": ""},
                 },
             )
-            modified = int(getattr(res, "modified_count", 0) or 0)
+            raw_mod = getattr(res, "modified_count", 0)
+            modified = int(raw_mod) if isinstance(raw_mod, (int, float)) else 0
             if matched_docs and gid:
                 self._record_deletion_tombstones(plat, matched_docs)
+            if self._is_meili_searchable() and gid:
+                try:
+                    from infrastructure.search_meili import delete_documents, make_meili_doc_id
+                    delete_documents([make_meili_doc_id(plat, gid)])
+                except Exception:
+                    pass
             if modified > 0:
                 logger.info(
                     "【失效商品软下架】已将取消推广/下架商品标记软隔离 | 平台[%s] 商品[%s] 影响条数[%d]",
@@ -1776,5 +1806,70 @@ class ProductRepository(BaseRepository):
             logger.warning(
                 "❌ 【失效商品清理异常】从products集合软下架商品失败 | 平台[%s] 商品[%s] 异常<%s>",
                 plat, gid or gsign, format_exc_summary(e),
+            )
+            return False
+
+    def mark_product_superseded(
+        self,
+        platform: str,
+        old_goods_id: str,
+        new_goods_id: str,
+        old_goods_sign: Optional[str] = None,
+    ) -> bool:
+        """
+        将因主图变更、加盐签名或规格迁移被新主键替代的旧商品软隔离（置为无效），
+        记录替代关系 (superseded_by)，同时保留旧记录供排查审计，避免首页/榜单/搜索继续展示老旧价格。
+        """
+        plat = self._platform(platform)
+        old_id = self._real_goods_id(old_goods_id)
+        new_id = self._real_goods_id(new_goods_id)
+        old_sign = str(old_goods_sign or "").strip()
+        if not old_id and not old_sign:
+            return False
+        if old_id == new_id:
+            return False
+
+        filter_spec = {"platform": plat}
+        if old_id and old_sign and old_id != old_sign:
+            filter_spec["$or"] = [{"product_id": old_id}, {"goods_sign": old_sign}]
+        else:
+            target = old_id or old_sign
+            filter_spec["$or"] = [{"product_id": target}, {"goods_sign": target}]
+
+        # 确保不误伤新商品自身
+        filter_spec["product_id"] = {"$ne": new_id}
+
+        try:
+            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            res = self.col.update_many(
+                filter_spec,
+                {
+                    "$set": {
+                        "is_off_promotion": True,
+                        "off_promotion_reason": "superseded",
+                        "superseded_by": new_id,
+                        "off_promotion_at": now_utc,
+                    },
+                    "$unset": {"default_promotion": "", "default_promotion_expires_at": ""},
+                },
+            )
+            raw_mod = getattr(res, "modified_count", 0)
+            modified = int(raw_mod) if isinstance(raw_mod, (int, float)) else 0
+            if self._is_meili_searchable() and old_id:
+                try:
+                    from infrastructure.search_meili import delete_documents, make_meili_doc_id
+                    delete_documents([make_meili_doc_id(plat, old_id)])
+                except Exception:
+                    pass
+            if modified > 0:
+                logger.info(
+                    "【商品身份迁移软下架】旧商品已被新商品主键替代，已置为无效并记录映射 | 平台[%s] 旧商品[%s] 新商品[%s] 影响条数[%d]",
+                    plat, old_id or old_sign, new_id, modified,
+                )
+            return modified > 0
+        except Exception as e:
+            logger.warning(
+                "❌ 【商品身份迁移异常】软下架旧商品记录失败 | 平台[%s] 旧商品[%s] 新商品[%s] 异常<%s>",
+                plat, old_id or old_sign, new_id, format_exc_summary(e),
             )
             return False

@@ -289,15 +289,18 @@ def test_scheduler_config_and_captcha_cooldown_behavior(monkeypatch, tmp_path):
     from mobile_web.services import deal_pipeline as dp_mod
     from mobile_web.services.deal_channel_config import get_active_channels
 
-    # 1. 验证主入口仅启用《线报监控来源.txt》要求的 2 站 4 频道
+    # 1. 验证主入口启用特惠采采、好单库 3 大频道与逛丢监控频道
     active = get_active_channels(dps.MONITORED_CHANNELS)
     assert [c.name for c in active] == [
         "特惠采采_首页精选",
+        "好单库_淘宝实时线报",
+        "好单库_京东实时线报",
+        "好单库_淘宝百亿补贴",
         "逛丢_首页实时流",
         "逛丢_热门榜",
         "逛丢_小时风云榜",
     ]
-    assert all(c.site_key in ("tehuicaicai", "guangdiu") for c in active)
+    assert all(c.site_key in ("tehuicaicai", "haodanku", "guangdiu") for c in active)
     assert all(c.max_details >= 20 for c in active if c.site_key == "guangdiu")
 
     # 2. 验证逛丢触发 CaptchaChallengeDetected 后：同轮后续频道冷却跳过 + 跨轮进入站点冷却期，且特惠采采不受影响

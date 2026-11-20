@@ -120,8 +120,11 @@ def extract_ztk_item_fields(
         original_price = max(size_price, price)
     commission_rate = max(0.0, clean_money(raw.get("tkrate3"), 0.0) or 0.0)
     raw_tkfee = max(0.0, clean_money(raw.get("tkfee3"), 0.0) or 0.0)
-    if zero_fallback_to_size and raw_tkfee <= 0 and price > 0 and commission_rate > 0:
+    if raw_tkfee <= 0 and price > 0 and commission_rate > 0:
         commission_amount = round(price * commission_rate / 100.0, 2)
+    elif commission_rate <= 0 and raw_tkfee > 0 and price > 0:
+        commission_amount = raw_tkfee
+        commission_rate = round(raw_tkfee / price * 100.0, 2)
     else:
         commission_amount = raw_tkfee
 

@@ -501,12 +501,24 @@ class DealRawPoolRepository:
             pass
         return deleted_raw
 
-    def get_existing_detailed_ids(self, source_site: str, limit: int = 5000) -> Set[str]:
-        """获取某站点近期已经成功拉取过完整详情的 `source_item_id` 集合，避免重复请求详情页。"""
+    def get_existing_detailed_ids(
+        self,
+        source_site: str,
+        limit: int = 50000,
+        channel: str = "",
+    ) -> Set[str]:
+        """获取某站点近期处于未失效状态（pending 或 cleaned_success）的 `source_item_id` 集合，避免重复请求详情页，同时防止已失效商品占用名单，让后续拉取有重试机会。"""
         try:
+            query: Dict[str, Any] = {
+                "source_site": source_site,
+                "has_full_detail": True,
+                "clean_status": {"$in": ["pending", "cleaned_success"]},
+            }
+            if channel:
+                query["source_channel"] = channel
             cursor = (
                 self.col.find(
-                    {"source_site": source_site, "has_full_detail": True},
+                    query,
                     {"_id": 0, "source_item_id": 1},
                 )
                 .sort("last_seen_at", -1)
@@ -544,8 +556,8 @@ class DealRawPoolRepository:
         if channel:
             update_doc["$addToSet"] = {"seen_channels": channel}
 
-        # 特惠采采专员严选数据：在架即代表有效好价，巡视再次见到时直接刷新用于后续判断的发布时间与保鲜时间
-        if site == "tehuicaicai":
+        # 特惠采采与好单库全量严选数据：在架即代表有效好价，巡视再次见到时直接刷新用于后续判断的发布时间与保鲜时间
+        if site in ("tehuicaicai", "haodanku"):
             now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             now_ts = now_dt.timestamp()
             update_doc["$set"]["publish_time"] = now_iso
@@ -562,13 +574,13 @@ class DealRawPoolRepository:
         except Exception as e:
             logger.warning("刷新站点 [%s] 本轮确认时间失败: %s", site, e)
 
-        if site == "tehuicaicai" and ids:
+        if site in ("tehuicaicai", "haodanku") and ids:
             try:
                 now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                 id_variants = list(set(ids + [int(i) for i in ids if i.isdigit()]))
                 self.formal_col.update_many(
                     {
-                        "deal_info.source_site": "tehuicaicai",
+                        "deal_info.source_site": site,
                         "$or": [
                             {"deal_info.source_item_id": {"$in": id_variants}},
                             {"deal_info.merged_tip_ids": {"$in": id_variants}},
@@ -583,9 +595,86 @@ class DealRawPoolRepository:
                     },
                 )
             except Exception as e:
-                logger.warning("刷新正式表特惠采采商品确认时间失败: %s", e)
+                logger.warning("刷新正式表商品确认时间失败: %s", e)
 
         return matched_cnt
+
+    def expire_missing_from_full_sweep(
+        self,
+        source_site: str,
+        channel: str,
+        sweep_start_time: datetime.datetime,
+    ) -> Dict[str, int]:
+        """【全量巡视 Fail-Closed 失效清除机制】：
+        对执行全量拉取 (full_sweep=True) 的站点或频道，未在本次拉取列表中出现的历史商品（last_seen_at < sweep_start_time），
+        代表上游已下架或失效：
+        1. 初步表 deal_raw_tips：处于 pending 状态的记录直接置为 cleaned_failed，
+           错误码 UPSTREAM_DISAPPEARED，避免无效消耗下游 AI 算力与转链请求；
+        2. 正式表 products：属于该站点对应频道的在架好价商品 (deal_info.is_deal_tip=True)，
+           若 updated_at < sweep_start_time，立即摘除好价标 (is_deal_tip=False) 并记录 expired_at。
+        """
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        now_naive = now_dt.replace(tzinfo=None)
+        res = {"raw_expired": 0, "formal_expired": 0}
+
+        try:
+            # 1. 清理初步表中 pending 的失效记录
+            raw_query: Dict[str, Any] = {
+                "source_site": source_site,
+                "last_seen_at": {"$lt": sweep_start_time},
+                "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
+            }
+            if channel:
+                raw_query["source_channel"] = channel
+            raw_res = self.col.update_many(
+                raw_query,
+                {
+                    "$set": {
+                        "clean_status": "cleaned_failed",
+                        "ai_clean_status": "cleaned_failed",
+                        "clean_error_code": "UPSTREAM_DISAPPEARED",
+                        "clean_error_msg": "全量线报巡视未包含此商品，上游已下架失效",
+                        "cleaned_at": now_naive,
+                    }
+                },
+            )
+            res["raw_expired"] = int(getattr(raw_res, "modified_count", 0) or 0)
+
+            # 2. 清理正式表中属于该频道的好价标
+            formal_query: Dict[str, Any] = {
+                "deal_info.source_site": source_site,
+                "deal_info.is_deal_tip": True,
+                "deal_info.updated_at": {"$lt": sweep_start_time},
+            }
+            if channel:
+                formal_query["$or"] = [
+                    {"deal_info.source_channel": channel},
+                    {"deal_info.seen_channels": channel},
+                ]
+            formal_res = self.formal_col.update_many(
+                formal_query,
+                {
+                    "$set": {
+                        "deal_info.is_deal_tip": False,
+                        "deal_info.expired_at": now_naive,
+                        "deal_info.updated_at": now_naive,
+                        "deal_info.expire_reason": "full_sweep_disappeared",
+                    }
+                },
+            )
+            res["formal_expired"] = int(getattr(formal_res, "modified_count", 0) or 0)
+            if res["raw_expired"] or res["formal_expired"]:
+                logger.info(
+                    "  🧹 [全量巡视-失效清除] 站点 [%s] 频道 [%s]: 清理初步表待清洗 %d 条, 摘除正式表失效好价 %d 条",
+                    source_site,
+                    channel,
+                    res["raw_expired"],
+                    res["formal_expired"],
+                )
+        except Exception as e:
+            logger.warning("全量巡视失效清除异常 [%s - %s]: %s", source_site, channel, e)
+
+        return res
 
     def save_batch(self, records: List[Dict[str, Any]], task_name: str = "") -> Dict[str, int]:
         """【Stage 1：源站拉取入初步表 `deal_raw_tips`】"""
@@ -596,6 +685,41 @@ class DealRawPoolRepository:
         ops = []
         skipped_no_signal = 0
         context_only_saved = 0
+
+        # 若新批次中包含此前清洗失败（cleaned_failed）的记录，因上游再次推入并予以重试机会，
+        # 将其状态原子重置为 pending，使其重新进入 AI 清洗队列
+        incoming_ids = [str(r.get("source_item_id") or "") for r in records if isinstance(r, dict) and r.get("source_item_id")]
+        first_site = str(records[0].get("source_site") or "").strip() if records and isinstance(records[0], dict) else ""
+        if incoming_ids and first_site:
+            try:
+                self.col.update_many(
+                    {
+                        "source_site": first_site,
+                        "source_item_id": {"$in": incoming_ids},
+                        "clean_status": "cleaned_failed",
+                    },
+                    {
+                        "$set": {
+                            "clean_status": "pending",
+                            "clean_stage": CLEAN_STAGE_NEED_AI1,
+                            "ai_clean_status": "pending",
+                            "clean_retry_count": 0,
+                            "clean_error_code": "",
+                            "clean_error_msg": "",
+                        },
+                        "$unset": {
+                            "ai_stage1_result": "",
+                            "converted_links": "",
+                            "stage3_converted_links": "",
+                            "ai_stage2_result": "",
+                            "next_retry_after_ts": "",
+                            "stage_lease_owner": "",
+                            "stage_lease_until_ts": "",
+                        },
+                    },
+                )
+            except Exception as e:
+                logger.warning("重置重新抓入的失败线报状态异常: %s", e)
 
         for rec in records:
             if not isinstance(rec, dict):

@@ -182,9 +182,15 @@ class JdAdapter(BasePlatformAdapter):
         name = _text(item.get("goodsname"))
         if not name:
             raise ValueError("missing goods title")
-        rate = clean_money(item.get("commission"), 0.0) or 0.0
-        rate_percent = round(rate * 100, 2) if 0 < rate <= 1.0 else rate
-        comm_amount = round(price * (rate_percent / 100.0), 2) if price else 0.0
+        raw_rate = clean_money(_pick(item.get("commissionshare"), item.get("commissionShare")), 0.0) or 0.0
+        rate_percent = round(raw_rate * 100, 2) if 0 < raw_rate <= 1.0 else round(raw_rate, 2)
+        comm_amount = clean_money(item.get("commission"), 0.0)
+        if comm_amount is None or comm_amount <= 0:
+            comm_amount = round(price * (rate_percent / 100.0), 2) if price and rate_percent > 0 else 0.0
+        elif rate_percent <= 0 and price and price > 0:
+            rate_percent = round((comm_amount / price) * 100, 2)
+        else:
+            comm_amount = round(comm_amount, 2)
         sales = _text(item.get("itemsale") or item.get("comments") or "0")
         mall = _text(item.get("shopname")) or "京东店铺"
         brand = _text(item.get("brand_name")) or "品牌甄选"

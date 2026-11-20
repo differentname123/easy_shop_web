@@ -261,7 +261,7 @@ def run_fetch_stage(
 
     active_sites = sorted({ch.site_key for ch in due_channels if ch.site_key})
     dedup_map: Dict[str, Set[str]] = {
-        site: repo.get_existing_detailed_ids(site, limit=5000)
+        site: repo.get_existing_detailed_ids(site, limit=50000)
         for site in active_sites
     }
 
@@ -354,9 +354,9 @@ def run_fetch_stage(
             call_kwargs = dict(ch.fetcher_kwargs)
             call_kwargs["session"] = session
             has_fetch_detail = bool(call_kwargs.get("fetch_detail"))
-            # 仅向支持详情抓取协议（fetch_detail=True）的抓取器传入 skip_detail_ids/max_details；
-            # 纯列表接口（好单库/折淘客/选单等）不接收这些参数，统一由下方入池门禁按 site_dedup 去重。
-            if has_fetch_detail:
+            is_full_sweep = bool(call_kwargs.get("full_sweep"))
+            # 向支持详情抓取协议或全量巡视协议的抓取器传入 skip_detail_ids/max_details；
+            if has_fetch_detail or is_full_sweep:
                 if site_dedup is not None:
                     call_kwargs["skip_detail_ids"] = site_dedup
                 eff_max_details = max_new_details_per_channel if max_new_details_per_channel is not None else ch.max_details
@@ -364,6 +364,7 @@ def run_fetch_stage(
                 if getattr(fn, "__module__", "") == "services.deal_fetchers" and "detail_delay" not in call_kwargs:
                     call_kwargs["detail_delay"] = ch.detail_delay_seconds
 
+            sweep_start_time = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             try:
                 res = fn(**call_kwargs)
                 now_done = time.time()
@@ -451,6 +452,13 @@ def run_fetch_stage(
 
                 with lock:
                     db_res = repo.save_batch(records, task_name=task_name)
+                    # 全量巡视源（full_sweep=True）：未在本轮扫描出现的历史商品即刻判定失效并清除
+                    if is_full_sweep and res.get("status") == "ok":
+                        repo.expire_missing_from_full_sweep(
+                            source_site=site_key,
+                            channel=task_name,
+                            sweep_start_time=sweep_start_time,
+                        )
                     cost_ms = round((time.perf_counter() - t0) * 1000, 1)
                     ins = db_res.get("inserted", 0)
                     upd = db_res.get("updated", 0)

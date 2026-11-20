@@ -18,7 +18,7 @@ from config import (
     CACHE_MAX_PROMOTION,
     PRODUCT_DETAIL_TTL,
 )
-from models.product import DetailSnapshot, ProductRef, resolve_item_identity
+from models.product import DetailSnapshot, ProductRef, normalize_platform, resolve_item_identity
 
 _DETAIL_CACHE_LOCK = threading.RLock()
 
@@ -62,14 +62,15 @@ def clear_product_off_promotion(platform: str, goods_id: str = "", goods_sign: s
         OFF_PROMOTION_CACHE.pop((plat, t), None)
 
 
-def evict_product_from_caches(platform: str, goods_id: str = "", goods_sign: str = "") -> None:
-    """当上游明确裁决商品已取消推广或下架时，从全内存缓存域驱逐并登记防复活黑名单。"""
+def evict_product_from_caches(platform: str, goods_id: str = "", goods_sign: str = "", blacklist: bool = True) -> None:
+    """当上游明确裁决商品已取消推广或下架时，从全内存缓存域驱逐并登记防复活黑名单。若 blacklist=False，则只清理各级展示与详情缓存，不记录黑名单以支持透明转发。"""
     plat = str(platform or "").strip().lower()
     targets = {str(x).strip() for x in (goods_id, goods_sign) if str(x or "").strip()}
     if not plat or not targets:
         return
     for t in targets:
-        OFF_PROMOTION_CACHE.set((plat, t), True)
+        if blacklist:
+            OFF_PROMOTION_CACHE.set((plat, t), True)
         MATERIAL_CACHE.pop((plat, "id", t), None)
         MATERIAL_CACHE.pop((plat, "sign", t), None)
         SIGN_BY_ID_CACHE.pop((plat, t), None)
@@ -132,9 +133,7 @@ def sync_product_summary_in_caches(platform: str, detail_data: dict) -> None:
     """当详情页获取到上游最新价格/摘要时，同步刷新列表内存缓存，并在价格变动时淘汰性价比排序缓存。"""
     if not isinstance(detail_data, dict):
         return
-    plat = str(platform or detail_data.get("platform") or "").strip().lower()
-    if plat == "tb":
-        plat = "taobao"
+    plat = normalize_platform(platform or detail_data.get("platform"))
     targets = {
         str(detail_data.get(k) or "").strip()
         for k in ("goods_id", "goods_sign", "product_id")
@@ -185,9 +184,7 @@ def sync_product_summary_in_caches(platform: str, detail_data: dict) -> None:
     def _matches_item(item: object) -> bool:
         if not isinstance(item, dict):
             return False
-        item_plat = str(item.get("platform") or plat).strip().lower()
-        if item_plat == "tb":
-            item_plat = "taobao"
+        item_plat = normalize_platform(item.get("platform") or plat)
         if item_plat != plat:
             return False
         return any(

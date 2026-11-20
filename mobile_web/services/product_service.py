@@ -134,15 +134,13 @@ class ProductService:
         if not isinstance(ref, ProductRef) or not ref.key:
             return
         evict_product_from_caches(ref.platform, ref.goods_id, ref.goods_sign)
-        delete_fn = getattr(self.repo, "delete_product", None)
-        if callable(delete_fn):
-            try:
-                delete_fn(ref.platform, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None)
-            except Exception as exc:
-                logger.warning(
-                    "❌ 【失效商品清理异常】物理删除下架商品记录时发生异常 | 平台[%s] 商品[%s] 异常<%s>",
-                    ref.platform, ref.key, format_exc_summary(exc),
-                )
+        try:
+            self.repo.delete_product(ref.platform, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None)
+        except Exception as exc:
+            logger.warning(
+                "❌ 【失效商品清理异常】物理删除下架商品记录时发生异常 | 平台[%s] 商品[%s] 异常<%s>",
+                ref.platform, ref.key, format_exc_summary(exc),
+            )
 
     def _offer_products(self, items, channel_type=None, snapshots=(), adapter=None):
         # 转链所需公开映射先发布，不能被可丢弃的后台摘要写入或预取开关阻断；同时过滤已在防复活黑名单中的下架商品。
@@ -231,23 +229,21 @@ class ProductService:
                 if not (isinstance(item, dict) and is_product_off_promotion(plat, item.get("goods_id"), item.get("goods_sign")))
             ]
             if getattr(adapter, "preserves_known_coupons_across_rank", False) is True and items:
-                overlay_fn = getattr(self.repo, "get_known_coupon_overlays", None)
-                if callable(overlay_fn):
-                    try:
-                        zero_keys = []
-                        for it in items:
-                            if not isinstance(it, dict):
-                                continue
-                            has_c = float(it.get("coupon_amount") or 0.0) > 0 and bool(str(it.get("coupon_url") or "").strip())
-                            if not has_c:
-                                for k in (it.get("goods_id"), it.get("goods_sign")):
-                                    if k:
-                                        zero_keys.append(k)
-                        overlays = overlay_fn(plat, zero_keys) if zero_keys else None
-                        if isinstance(overlays, dict) and overlays:
-                            items = [ProductRepository.apply_coupon_overlay(it, overlays) for it in items]
-                    except Exception:
-                        pass
+                try:
+                    zero_keys = []
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        has_c = float(it.get("coupon_amount") or 0.0) > 0 and bool(str(it.get("coupon_url") or "").strip())
+                        if not has_c:
+                            for k in (it.get("goods_id"), it.get("goods_sign")):
+                                if k:
+                                    zero_keys.append(k)
+                    overlays = self.repo.get_known_coupon_overlays(plat, zero_keys) if zero_keys else None
+                    if isinstance(overlays, dict) and overlays:
+                        items = [ProductRepository.apply_coupon_overlay(it, overlays) for it in items]
+                except Exception:
+                    pass
             result["data"] = items
             RECOMMEND_CACHE.set(cache_key, result)
             # Already-verified public snapshots can be read immediately; database
@@ -359,7 +355,11 @@ class ProductService:
             state, deal_tip = cached
         else:
             try:
-                state, deal_tip = self.repo.get_deal_tip_view(pid, platform=plat)
+                res = self.repo.get_deal_tip_view(pid, platform=plat)
+                if isinstance(res, (tuple, list)) and len(res) == 2:
+                    state, deal_tip = res
+                else:
+                    state, deal_tip = "not_found", None
             except Exception as exc:
                 logger.warning(
                     "❌ 【线报视图覆盖异常】读取线报视图失败，本次详情保持原样 | 平台[%s] 商品[%s] 异常<%s>",
@@ -419,7 +419,7 @@ class ProductService:
             return None
         return self._make_snapshot(item, datetime.fromtimestamp(deadline - PRODUCT_DETAIL_TTL, timezone.utc), platform)
 
-    def _commit_snapshot(self, snapshot, uid=None, public=None, stop_event=None):
+    def _commit_snapshot(self, snapshot, uid=None, public=None, stop_event=None, requested_ref=None):
         raw_deadline = self._parse_detail_deadline(snapshot.fetched_at)
         if raw_deadline <= time.time():
             return _LoadedDetail({"status": "error", "error_code": "expired_detail", "error_msg": "详情快照已过期"})
@@ -428,13 +428,32 @@ class ProductService:
         public = deepcopy(public) if public is not None else {"status": "success", "data": deepcopy(snapshot.data)}
         public["data"] = deepcopy(snapshot.data)
         sync_product_summary_in_caches(snapshot.ref.platform, snapshot.data)
+        if (
+            requested_ref
+            and requested_ref.goods_id
+            and snapshot.ref.goods_id
+            and snapshot.ref.goods_id != requested_ref.goods_id
+        ):
+            try:
+                self.repo.mark_product_superseded(
+                    snapshot.ref.platform,
+                    requested_ref.goods_id,
+                    snapshot.ref.goods_id,
+                    requested_ref.goods_sign,
+                )
+                evict_product_from_caches(
+                    snapshot.ref.platform,
+                    goods_id=requested_ref.goods_id,
+                    goods_sign=requested_ref.goods_sign,
+                    blacklist=False,
+                )
+            except Exception as exc:
+                logger.warning("【商品身份迁移联动异常】%s", format_exc_summary(exc))
         if not self._has_valid_images(snapshot.data):
-            upsert_summary = getattr(self.repo, "upsert_home_products", None)
-            if callable(upsert_summary):
-                try:
-                    upsert_summary([snapshot.data])
-                except Exception:
-                    pass
+            try:
+                self.repo.upsert_home_products([snapshot.data])
+            except Exception:
+                pass
             return _LoadedDetail(public, snapshot, persisted=False, retryable=False)
         deadline = raw_deadline
         try:
@@ -532,7 +551,7 @@ class ProductService:
                 snapshot = self._make_snapshot(detail_payload, utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), ref.platform)
             except ValueError:
                 return _LoadedDetail({"status": "error", "error_code": "invalid_product_detail", "error_msg": "平台商品详情身份无效"})
-            return self._commit_snapshot(snapshot, None, result, stop_event)
+            return self._commit_snapshot(snapshot, None, result, stop_event, requested_ref=ref)
         return self._singleflight(ref, uid, kwargs, load, stop_event)
 
     def get_goods_detail(self, platform="pdd", goods_id_or_sign="", goods_id=None,
@@ -554,6 +573,21 @@ class ProductService:
             return self._apply_deal_tip(plat, cached[1], ref)
         item = self._read_detail(ref)
         ref = self._upgrade_ref_sign(ref, item)
+        if isinstance(item, dict) and item.get("superseded_by"):
+            superseded_id = str(item.get("superseded_by") or "").strip()
+            if superseded_id and superseded_id != ref.goods_id:
+                logger.info(
+                    "【商品身份透明转发】请求商品已被新主键替代，无缝跳转新商品 | 平台[%s] 旧商品[%s] 新商品[%s]",
+                    plat, ref.goods_id, superseded_id,
+                )
+                return self.get_goods_detail(
+                    platform=plat,
+                    goods_id_or_sign=superseded_id,
+                    goods_id=superseded_id,
+                    goods_sign=None,
+                    uid=uid,
+                    **kwargs
+                )
         if isinstance(item, dict) and item.get("is_off_promotion") is True:
             evict_product_from_caches(plat, ref.goods_id, ref.goods_sign)
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}

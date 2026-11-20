@@ -620,14 +620,15 @@ class PddAdapter(BasePlatformAdapter):
             )
             if conv_res.get("status") != "success":
                 conv_res["product"] = product_detail
-                return conv_res
+                return stamp_universal_resolution(conv_res, single_item_evidence=True)
             if conv_res.get("is_fallback"):
-                return {
+                err_res = {
                     "status": "error",
                     "error_code": "PROMOTION_FAILED",
                     "error_msg": "该拼多多商品暂不支持生成推广链接",
                     "product": product_detail,
                 }
+                return stamp_universal_resolution(err_res, single_item_evidence=True)
 
             conv_res["goods_id"] = id_val
             conv_res["goods_sign"] = sign_val

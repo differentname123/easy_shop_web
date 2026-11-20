@@ -76,7 +76,6 @@ class PromoteService:
                 )
             # 若内存 DETAIL_CACHE 已持有经服务端验证的同平台商品详情，直接补齐权威 goods_id
             try:
-                from cache import DETAIL_CACHE
                 for dkey in ref.cache_keys():
                     entry = DETAIL_CACHE.get(dkey)
                     if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
@@ -499,12 +498,10 @@ class PromoteService:
         if data.get("status") != "success":
             if str(data.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION" and ref.key:
                 evict_product_from_caches(plat, ref.goods_id, ref.goods_sign)
-                delete_fn = getattr(self.repo, "delete_product", None)
-                if callable(delete_fn):
-                    try:
-                        delete_fn(plat, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None)
-                    except Exception:
-                        pass
+                try:
+                    self.repo.delete_product(plat, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None)
+                except Exception:
+                    pass
             logger.warning(
                 "%s 【推广转链失败】正在生成商品推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、物料链接有效性或上游联盟转链网关状态>",
                 severity_icon(error_code=data.get("error_code")),
@@ -683,7 +680,7 @@ class PromoteService:
             fetched_at = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
             snapshot = make_detail_snapshot(product, fetched_at, platform)
             sync_product_summary_in_caches(platform, snapshot.data)
-            if persist_db and callable(getattr(self.repo, "upsert_product_detail", None)):
+            if persist_db:
                 try:
                     self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=fetched_at))
                 except Exception:

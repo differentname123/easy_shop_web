@@ -126,6 +126,7 @@ _SOURCE_SELF_HOSTS: frozenset = frozenset({
     "youhui.bacaoo.com",
     "0818tuan.com",
     "iehou.com",
+    "haodanku.com",
 })
 
 _CONFIRMED_UNSUPPORTED_HOSTS: Tuple[str, ...] = tuple(
@@ -1506,6 +1507,273 @@ def _has_substantive_guangdiu_tutorial(dabs_text: str, title: str) -> bool:
     if clean_title and clean_body == clean_title:
         return False
     return True
+
+
+# ==============================================================================
+# 站点 3：好单库线报 (`https://www.haodanku.com/activity/tip_off`)
+# ==============================================================================
+def fetch_haodanku_wire_deals(
+    label_id: int = 10003,
+    channel_name: str = "好单库_淘宝实时线报",
+    page_size: int = 100,
+    max_pages: int = 30,
+    apikey: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+    timeout: float = 10.0,
+    skip_detail_ids: Optional[Set[str]] = None,
+    full_sweep: bool = True,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    好单库官方线报数据流 (`https://www.haodanku.com/activity/tip_off`)：
+    - 接口地址：`https://v2.api.haodanku.com/wire_report_new`
+    - 核心分类：`10003` 淘宝实时线报、`10004` 京东实时线报、`10005` 淘宝百亿补贴
+    - 特性：
+      1. 纯结构化 JSON 直出，自身已携带高清主图、完整爆料教程与购买链接，无需二次发起慢速详情请求；
+      2. 100% 确定非淘京拼平台（如 10367 飞猪旅游）确定性过滤，严格放行淘京正品；
+      3. 全量巡视（full_sweep=True）：逐页按 min_id 翻到最后一页；已抓商品只刷新确认时间；
+      4. 时间戳法则：严格采纳当前拉取时间作为唯一真源（不采用上游历史 starttime），配合下游判定失效；
+      5. 统一输出标准 DealRawRecord 与 FetchResult 结构。
+    """
+    http = session or requests.Session()
+    skip_set = skip_detail_ids or set()
+
+    eff_key = str(apikey or "").strip()
+    if not eff_key:
+        try:
+            from infrastructure.settings import get_settings
+            eff_key = str(get_settings().hdk_api_key or "").strip()
+        except Exception:
+            pass
+    if not eff_key:
+        eff_key = "test"
+
+    records: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    touch_ids: Set[str] = set()
+    raw_list_count = 0
+    skipped_known = 0
+    skipped_unsupported = 0
+    rate_limited = False
+    primary_req_url = ""
+    pages_crawled = 0
+    last_http_status: Optional[int] = None
+    min_id = 1
+    t0 = time.perf_counter()
+    base_url = "https://v2.api.haodanku.com/wire_report_new"
+
+    while pages_crawled < max_pages:
+        req_url = f"{base_url}?apikey={eff_key}&label_id={label_id}&min_size={page_size}&min_id={min_id}"
+        if not primary_req_url:
+            primary_req_url = req_url
+
+        resp = None
+        try:
+            resp = http.get(req_url, headers=DEFAULT_HEADERS, timeout=timeout)
+            last_http_status = getattr(resp, "status_code", None)
+            if resp.status_code != 200:
+                if resp.status_code in _RATE_LIMIT_STATUSES:
+                    rate_limited = True
+                if pages_crawled == 0:
+                    return make_fetch_result(
+                        status="error",
+                        http_status=resp.status_code,
+                        request_url=req_url,
+                        elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                        records=[],
+                        rate_limited=rate_limited,
+                        pages_crawled=0,
+                    )
+                break
+            body = resp.json()
+        except Exception as e:
+            if pages_crawled == 0:
+                return make_fetch_result(
+                    status="error",
+                    http_status=getattr(resp, "status_code", None),
+                    request_url=req_url,
+                    elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                    records=[],
+                    pages_crawled=0,
+                )
+            break
+
+        code = body.get("code")
+        if code != 200:
+            sub_msg = str(body.get("sub_msg") or body.get("msg") or "")
+            if any(kw in sub_msg for kw in ("频次", "频率", "超限", "上限", "频繁", "请稍后")):
+                rate_limited = True
+            break
+
+        items = body.get("data")
+        if not isinstance(items, list) or not items:
+            break
+
+        pages_crawled += 1
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            wire_id = str(item.get("wire_id") or "").strip()
+            if not wire_id or wire_id in seen_ids:
+                continue
+            seen_ids.add(wire_id)
+            raw_list_count += 1
+
+            plat_raw = str(item.get("platform") or "").strip()
+            if plat_raw == "1":
+                platform_code = "taobao"
+                platform_name = "淘宝"
+            elif plat_raw == "2":
+                platform_code = "jd"
+                platform_name = "京东"
+            elif plat_raw == "3":
+                # 飞猪旅行：非淘京拼实物电商，确定性过滤
+                skipped_unsupported += 1
+                continue
+            else:
+                platform_code = _normalize_explicit_platform_code(plat_raw)
+                platform_name = (
+                    "京东"
+                    if platform_code == "jd"
+                    else ("淘宝" if platform_code == "taobao" else ("拼多多" if platform_code == "pdd" else ""))
+                )
+
+            if is_confirmed_unsupported_deal(platform_code=platform_code, mall_name=platform_name):
+                skipped_unsupported += 1
+                continue
+
+            if full_sweep:
+                touch_ids.add(wire_id)
+
+            is_known = wire_id in skip_set
+            if is_known:
+                skipped_known += 1
+                continue
+
+            # 提取图片列表（支持数组或逗号隔开）
+            img_list: List[str] = []
+            for raw_img in item.get("images") or []:
+                if isinstance(raw_img, str):
+                    for sub_img in raw_img.split(","):
+                        c_img = sub_img.strip()
+                        if c_img.startswith("http"):
+                            img_list.append(c_img)
+
+            # 提取文本段落与购买线索
+            content_lines: List[str] = []
+            extracted_links: List[Dict[str, Any]] = []
+            extracted_tokens: List[str] = []
+
+            for sub in item.get("list") or []:
+                if not isinstance(sub, dict):
+                    continue
+                c_text = str(sub.get("content") or "").strip()
+                if c_text:
+                    content_lines.append(c_text)
+
+                sub_item_id = str(sub.get("item_id") or "").strip()
+                if sub_item_id:
+                    if sub_item_id.startswith(("http://", "https://")):
+                        extracted_links.append({"url": sub_item_id, "text": ""})
+                    elif sub_item_id.isdigit():
+                        if platform_code == "taobao":
+                            extracted_links.append({"url": f"https://item.taobao.com/item.htm?id={sub_item_id}", "text": ""})
+                        elif platform_code == "jd":
+                            extracted_links.append({"url": f"https://item.jd.com/{sub_item_id}.html", "text": ""})
+                        else:
+                            extracted_links.append({"url": sub_item_id, "text": ""})
+                    elif re.match(r"^[A-Za-z0-9_-]{8,}$", sub_item_id):
+                        if platform_code == "taobao":
+                            extracted_links.append({"url": f"https://uland.taobao.com/item/edetail?id={sub_item_id}", "text": ""})
+                        else:
+                            extracted_links.append({"url": sub_item_id, "text": ""})
+                    elif _TOKEN_RE.search(sub_item_id):
+                        extracted_tokens.append(sub_item_id)
+
+                coupon_url = str(sub.get("coupon_url") or "").strip()
+                if coupon_url.startswith(("http://", "https://")):
+                    extracted_links.append({"url": coupon_url, "text": "优惠券"})
+
+            # 空壳单品无实质线索则过滤
+            if not extracted_links and not extracted_tokens:
+                continue
+
+            tutorial_text = "\n".join(content_lines).strip()
+            # 提取商品标题
+            title = ""
+            for line in content_lines:
+                clean_line = re.sub(
+                    r"^(?:豪车❗|速[‼️!]|先领券|拍下|\d+亓[‼️!]?|特价|折\d+.*?[‼️!]|Bug[‼️!]|🎀速[‼️!]|🎀|⚠️速[‼️!])\s*",
+                    "",
+                    line,
+                ).strip()
+                if len(clean_line) >= 4 and not clean_line.startswith(("http", "①", "②", "③", "1、", "2、", "3、", "---")):
+                    title = clean_line
+                    break
+            if not title and content_lines:
+                title = content_lines[0]
+            if not title:
+                title = f"{platform_name}精选好价商品"
+
+            price, price_text = extract_first_price("", title, tutorial_text)
+
+            # 【时间戳铁律】：不采纳上游历史 starttime，严格以当前拉取时间为唯一真源
+            now_iso = utc_now_iso()
+
+            hot_metrics = {
+                "wire_id": wire_id,
+                "cate_id": item.get("cate_id"),
+                "label_id": label_id,
+                "platform_raw": plat_raw,
+            }
+            if item.get("starttime"):
+                hot_metrics["upstream_starttime"] = item.get("starttime")
+
+            rec = build_deal_record(
+                source_site="haodanku",
+                source_channel=channel_name,
+                source_item_id=wire_id,
+                source_url="https://www.haodanku.com/activity/tip_off",
+                source_list_page_url=primary_req_url,
+                source_detail_url=primary_req_url,
+                title=title,
+                price_text=price_text or "",
+                price=price,
+                image_url=img_list[0] if img_list else "",
+                mall_name=platform_name,
+                publish_time=now_iso,
+                explicit_platform=platform_code,
+                hot_metrics=hot_metrics,
+                tutorial_text=tutorial_text,
+                tutorial_images=img_list,
+                extracted_links=extracted_links,
+                extracted_tokens=extracted_tokens,
+                raw_payload=item,
+                is_group_stream=False,
+            )
+            rec["has_full_detail"] = True
+            records.append(rec)
+
+        next_min_id = body.get("min_id")
+        if not next_min_id or next_min_id == min_id:
+            break
+        min_id = next_min_id
+
+    return make_fetch_result(
+        status="ok",
+        http_status=last_http_status or 200,
+        request_url=primary_req_url,
+        elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+        records=records,
+        touch_ids=touch_ids,
+        rate_limited=rate_limited,
+        pages_crawled=pages_crawled,
+        raw_list_count=raw_list_count,
+        detail_fetched=len(records),
+        skipped_known=skipped_known,
+        skipped_unsupported=skipped_unsupported,
+    )
 
 
 def fetch_guangdiu_deals(

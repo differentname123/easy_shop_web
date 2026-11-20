@@ -115,7 +115,7 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "price": price,
         "activity_price": activity_price,
         "saved_price": saved_price,
-        "is_off_promotion": bool(doc.get("is_off_promotion") is True),
+        "is_off_promotion": bool(doc.get("is_off_promotion") is True or doc.get("superseded_by")),
         "is_deal_tip": is_deal_tip,
         "channel_type": channel_type,
         "image_url": str(doc.get("image_url") or "").strip(),
