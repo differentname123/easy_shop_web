@@ -2112,4 +2112,114 @@ def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path):
     assert len(after_mock_data) == 2
 
 
+def test_third_party_drainage_and_wechat_sanitization():
+    """验证第三方私域引流（微信号、客服微信、外部视频教程）在清洗链路中被彻底剔除且不伤正常商品与优惠。"""
+    raw_text = (
+        "【京东】香飘飘曼优优 锡兰红茶+乌龙茶双拼口味奶茶76g*6杯礼盒装\n"
+        "下单: https://u.jd.com/o6fxiBv\n"
+        "数量1以上都可以 单价不变\n"
+        "数量5 付74.5 折2.48/杯\n"
+        "不会下单看下方视频教程\n"
+        "有问题加客服: xhhc6688"
+    )
+    doc = {
+        "source_item_id": "5512",
+        "title": "香飘飘曼优优 锡兰红茶+乌龙茶双拼口味奶茶76g*6杯礼盒装",
+        "tutorial_text": raw_text,
+        "extracted_links": [{"url": "https://u.jd.com/o6fxiBv"}],
+        "extracted_tokens": [],
+    }
 
+    # 1. 验证 AI-1 产出 strip_spans 标记微信号时，_build_clean_original_copywriting 精准剥离
+    cleaned_draft = DealPoolCleaner._build_clean_original_copywriting(
+        ["5512"],
+        {"5512": doc},
+        [{"raw_span": "https://u.jd.com/o6fxiBv", "clean_input": "https://u.jd.com/o6fxiBv"}],
+        doc=doc,
+        strip_spans=["有问题加客服: xhhc6688"],
+    )
+    assert "xhhc6688" not in cleaned_draft
+    assert "香飘飘曼优优" in cleaned_draft
+    assert "76g*6杯" in cleaned_draft
+    assert "付74.5" in cleaned_draft
+
+    # 2. 验证 AI-2 终审按新提示词剔除引流后，文案与教程闭环且无外部引流
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    mock_ai2_res = {
+        "main_tip_id": "5512",
+        "is_valid_deal": True,
+        "main_link_id": "L1",
+        "clean_title": "香飘飘【曼优优好味轻享】锡兰红茶+乌龙茶双拼口味奶茶礼盒装6杯456g",
+        "deal_price": 74.5,
+        "unit_deal_price": "2.48元/杯",
+        "price_logic": "购买5件合计实付74.5元，折合2.48元/杯",
+        "coupon_links": [],
+        "tutorial_steps": [
+            "1. 进入香飘飘曼优优锡兰红茶+乌龙茶双拼口味奶茶礼盒商品详情页",
+            "2. 购买数量选择5件下单，实付74.5元，折合2.48元/杯",
+        ],
+        "polished_copywriting": (
+            "【京东】香飘飘曼优优 锡兰红茶+乌龙茶双拼口味奶茶76g*6杯礼盒装\n"
+            "下单\n"
+            "数量1以上都可以 单价不变\n"
+            "数量5 付74.5 折2.48/杯"
+        ),
+        "quality_score": 90,
+    }
+    raw_col = MagicMock()
+    raw_col.find.return_value = []
+    cleaner.run_ai_stage1_batch = MagicMock(return_value={
+        "5512": {
+            "main_tip_id": "5512",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["5512"],
+            "deal_price": 74.5,
+            "tutorial_score": 75,
+            "extracted_targets": [
+                {
+                    "link_id": "L1",
+                    "raw_span": "https://u.jd.com/o6fxiBv",
+                    "clean_input": "https://u.jd.com/o6fxiBv",
+                    "platform": "jd",
+                    "text_role_hint": "main_candidate",
+                }
+            ],
+            "strip_spans": ["有问题加客服: xhhc6688"],
+            "combined_raw_text": raw_text,
+        }
+    })
+    cleaner.convert_single_target = MagicMock(return_value={
+        "link_id": "L1",
+        "clean_input": "https://u.jd.com/o6fxiBv",
+        "text_role_hint": "main_candidate",
+        "convert_status": "product",
+        "platform": "jd",
+        "official_product": {
+            "title": "香飘飘【曼优优好味轻享】锡兰红茶+乌龙茶双拼口味奶茶礼盒装6杯456g",
+            "price": 14.9,
+            "original_price": 14.9,
+            "activity_price": 14.9,
+            "coupon_amount": 0.0,
+            "shop_name": "香飘飘京东自营旗舰店",
+            "goods_id": "688b1008F964081ff_e08a6bb2ecfa7a23",
+        },
+        "my_promo_link": "https://u.jd.com/my_promo",
+        "my_promo_token": None,
+        "adapter_res": {
+            "title": "香飘飘【曼优优好味轻享】锡兰红茶+乌龙茶双拼口味奶茶礼盒装6杯456g",
+            "price": 14.9,
+            "goods_id": "688b1008F964081ff_e08a6bb2ecfa7a23",
+        },
+    })
+    cleaner.run_ai_stage2_batch = MagicMock(return_value={"5512": mock_ai2_res})
+
+    results = cleaner.clean_batch_records([doc], raw_col, shared_active_products={}, quiet_sub_logs=True)
+    assert len(results) == 1
+    assert results[0]["status"] == "success"
+    di = results[0]["product_doc"]["deal_info"]
+    assert "xhhc6688" not in di["original_copywriting"]
+    assert "视频教程" not in di["original_copywriting"]
+    for step in di["tutorial_steps"]:
+        assert "xhhc6688" not in step
+        assert "视频教程" not in step
+    assert "数量5 付74.5 折2.48/杯" in di["original_copywriting"]
