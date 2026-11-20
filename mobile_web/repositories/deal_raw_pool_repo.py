@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from pymongo import UpdateOne
 
 from infrastructure.mongo import gen_db_object
-from services.deal_channel_config import (
+from services.deal_sources.catalog import (
     get_channel_max_age_days,
     get_site_max_age_days_map,
 )
@@ -27,19 +27,15 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
-    CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST,
     DEAL_FORMAL_EXPIRY_HOURS,
     DEAL_MAX_CLEAN_AGE_DAYS,
     DEAL_RAW_TTL_DAYS,
     DEFAULT_FORMAL_PRODUCTS_COLLECTION,
     DEFAULT_RAW_COLLECTION_NAME,
-    ENGINEERING_PHILOSOPHY_MANIFEST,
     ERROR_LOG_JSONL_PATH,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
     ERR_EMPTY_PRODUCT_IDENTITY,
     ERR_EXPIRED_OVER_7_DAYS,
-    EXCLUDED_SITES_AND_CHANNELS_MANIFEST,
-    LEGACY_SHADOW_TEST_COLLECTION,
     LOCAL_FALLBACK_JSONL,
     MAX_JSONL_FILE_BYTES,
     _UNSUPPORTED_EXTERNAL_DOMAINS,
@@ -256,6 +252,12 @@ def parse_publish_time_epoch(pub_time_str: str) -> Optional[float]:
     if s == "刚刚":
         return now_cn.timestamp()
 
+    m_hm_rel = re.search(r"(\d+)\s*小时\s*(\d+)\s*分钟前", s)
+    if m_hm_rel:
+        hrs = int(m_hm_rel.group(1))
+        mins = int(m_hm_rel.group(2))
+        return (now_cn - datetime.timedelta(hours=hrs, minutes=mins)).timestamp()
+
     m_rel = re.search(r"(\d+)\s*(秒|分钟|小时|天)前", s)
     if m_rel:
         num = int(m_rel.group(1))
@@ -279,6 +281,18 @@ def parse_publish_time_epoch(pub_time_str: str) -> Optional[float]:
             microsecond=0,
         )
         return base_dt.timestamp()
+
+    m_bare_hm = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
+    if m_bare_hm:
+        cand_dt = now_cn.replace(
+            hour=int(m_bare_hm.group(1)),
+            minute=int(m_bare_hm.group(2)),
+            second=int(m_bare_hm.group(3) or 0),
+            microsecond=0,
+        )
+        if cand_dt > now_cn + datetime.timedelta(minutes=5):
+            cand_dt -= datetime.timedelta(days=1)
+        return cand_dt.timestamp()
 
     patterns = [
         ("%Y-%m-%d %H:%M:%S", None),
@@ -474,31 +488,49 @@ class DealRawPoolRepository:
         return {"jd_recovered": jd_recovered, "tb_recovered": tb_recovered}
 
     def reset_raw_collection(self) -> int:
-        """清空初步表与挂载到正式表的数据。"""
+        """清空初步表，并彻底清除正式表内的好价线报单品及重叠推荐流单品上的好价清洗字段。"""
         deleted_raw = 0
         try:
             res = self.col.delete_many({})
-            deleted_raw = res.deleted_count
+            deleted_raw = int(getattr(res, "deleted_count", 0) or 0)
             logger.info("🧹 已清空初步表 [%s]，共删除 %d 条记录。", self.collection_name, deleted_raw)
         except Exception as e:
             logger.error("清空初步表 [%s] 失败: %s", self.collection_name, e)
 
         try:
-            res_formal = self.formal_col.delete_many({
+            res_formal_del = self.formal_col.delete_many({
                 "$or": [
                     {"source": "deal_pool"},
-                    {"last_clean_source": "deal_pool"},
-                    {"deal_info.is_deal_tip": True},
+                    {"source": {"$exists": False}, "last_clean_source": "deal_pool"},
                 ]
             })
-            logger.info("🧹 已清空正式表中的好价单品，共删除 %d 条。", res_formal.deleted_count)
-        except Exception:
-            pass
+            res_formal_unset = self.formal_col.update_many(
+                {
+                    "$or": [
+                        {"deal_info": {"$exists": True}},
+                        {"deal_source": {"$exists": True}},
+                        {"deal_source_name": {"$exists": True}},
+                        {"last_clean_source": "deal_pool"},
+                    ]
+                },
+                {
+                    "$unset": {
+                        "deal_info": "",
+                        "deal_source": "",
+                        "deal_source_name": "",
+                        "last_clean_source": "",
+                    }
+                },
+            )
+            logger.info(
+                "🧹 已清理正式表 [%s] 好价数据：删除纯线报单品 %d 条，剥离推荐流重叠单品好价字段 %d 条。",
+                self.formal_collection_name,
+                int(getattr(res_formal_del, "deleted_count", 0) or 0),
+                int(getattr(res_formal_unset, "modified_count", 0) or 0),
+            )
+        except Exception as e:
+            logger.warning("清理正式表好价数据异常: %s", e)
 
-        try:
-            self.db.get_collection(LEGACY_SHADOW_TEST_COLLECTION).drop()
-        except Exception:
-            pass
         return deleted_raw
 
     def get_existing_detailed_ids(
@@ -535,16 +567,15 @@ class DealRawPoolRepository:
         item_ids: Any,
         *,
         channel: str = "",
+        refresh_publish_time: bool = False,
+        max_age_days: Optional[float] = None,
         at: Optional[datetime.datetime] = None,
     ) -> int:
-        """把"本轮在列表里再次见到"的已存商品标记为仍在架：只刷新 `last_seen_at`。
+        """把"本轮在列表里再次见到"的已存商品标记为仍在架：刷新 `last_seen_at`。
 
-        刻意不动两处：
-        - `seen_count`：它会汇总成 `deal_info.total_seen_count`（代表"被重复推荐次数"），
-          每轮全量巡视都 +1 会把这个指标刷废；
-        - `publish_time` / `publish_ts`：那是源站自述的爆料时间，参与 7 天过期判定，
-          不能被本地拉取时间污染。
-        返回匹配到的已存文档数（不在库里的 ID 直接忽略）。
+        当频道配置显式传入 `refresh_publish_time=True`（即该源以每次拉取时间为保鲜基准）时，
+        同时刷新 `publish_time` / `publish_ts` / `clean_cutoff_ts` 并同步更新正式表 `deal_info`。
+        `seen_count` 刻意不自增，避免全量巡视污染“被重复推荐次数”指标。
         """
         site = str(source_site or "").strip()
         ids = [str(i).strip() for i in (item_ids or []) if str(i or "").strip()]
@@ -556,12 +587,18 @@ class DealRawPoolRepository:
         if channel:
             update_doc["$addToSet"] = {"seen_channels": channel}
 
-        # 特惠采采与好单库全量严选数据：在架即代表有效好价，巡视再次见到时直接刷新用于后续判断的发布时间与保鲜时间
-        if site in ("tehuicaicai", "haodanku"):
+        if refresh_publish_time:
             now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             now_ts = now_dt.timestamp()
+            eff_age = float(max_age_days) if max_age_days is not None else get_channel_max_age_days(
+                channel_name=channel,
+                site_key=site,
+                default_days=DEAL_MAX_CLEAN_AGE_DAYS,
+            )
             update_doc["$set"]["publish_time"] = now_iso
             update_doc["$set"]["publish_ts"] = now_ts
+            update_doc["$set"]["clean_cutoff_ts"] = round(now_ts + eff_age * 86400.0, 1)
+            update_doc["$set"]["clean_max_age_days"] = eff_age
 
         ops = [
             UpdateOne({"source_site": site, "source_item_id": item_id}, update_doc)
@@ -574,7 +611,7 @@ class DealRawPoolRepository:
         except Exception as e:
             logger.warning("刷新站点 [%s] 本轮确认时间失败: %s", site, e)
 
-        if site in ("tehuicaicai", "haodanku") and ids:
+        if refresh_publish_time and ids:
             try:
                 now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                 id_variants = list(set(ids + [int(i) for i in ids if i.isdigit()]))
@@ -676,7 +713,14 @@ class DealRawPoolRepository:
 
         return res
 
-    def save_batch(self, records: List[Dict[str, Any]], task_name: str = "") -> Dict[str, int]:
+    def save_batch(
+        self,
+        records: List[Dict[str, Any]],
+        task_name: str = "",
+        *,
+        refresh_publish_time: bool = False,
+        max_age_days: Optional[float] = None,
+    ) -> Dict[str, int]:
         """【Stage 1：源站拉取入初步表 `deal_raw_tips`】"""
         if not records:
             return {"inserted": 0, "updated": 0, "skipped_no_signal": 0, "context_only_saved": 0, "total": 0}
@@ -731,17 +775,14 @@ class DealRawPoolRepository:
 
             has_full_detail = bool(rec.get("has_full_detail", True))
             quality_signals = evaluate_quality_signals(rec)
-            is_group_stream = bool(
-                rec.get("is_group_stream")
-                or (site == "zhetaoke" and item_id.startswith("xb_"))
-            )
+            is_group_stream = bool(rec.get("is_group_stream"))
             hot_metrics = rec.get("hot_metrics") if isinstance(rec.get("hot_metrics"), dict) else {}
             group_id = str(hot_metrics.get("group_id") or "").strip()
             channel = str(rec.get("source_channel") or "").strip()
             pub_time_str = str(rec.get("publish_time") or "").strip()
             parsed_pub_ts = parse_publish_time_epoch(pub_time_str)
             pub_ts = parsed_pub_ts if parsed_pub_ts is not None else time.time()
-            channel_max_age = get_channel_max_age_days(
+            channel_max_age = float(max_age_days) if max_age_days is not None else get_channel_max_age_days(
                 channel_name=channel,
                 site_key=site,
                 default_days=DEAL_MAX_CLEAN_AGE_DAYS,
@@ -778,7 +819,8 @@ class DealRawPoolRepository:
             }
             if hot_metrics:
                 set_fields["hot_metrics"] = hot_metrics
-            if site == "tehuicaicai" and pub_time_str:
+            eff_refresh_pub = bool(refresh_publish_time or rec.get("_refresh_publish_time"))
+            if eff_refresh_pub and pub_time_str:
                 set_fields["publish_time"] = pub_time_str
                 set_fields["publish_ts"] = pub_ts
                 set_fields["clean_cutoff_ts"] = clean_cutoff_ts
@@ -1162,7 +1204,4 @@ class DealRawPoolRepository:
             "by_clean_error_code": {str(r["_id"]): r["count"] for r in by_clean_error},
             "by_platform": {str(r["_id"]): r["count"] for r in by_platform},
             "by_source_site": by_site,
-            "engineering_philosophy_manifest": ENGINEERING_PHILOSOPHY_MANIFEST,
-            "excluded_sites_manifest": EXCLUDED_SITES_AND_CHANNELS_MANIFEST,
-            "attempted_dead_ends_manifest": CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST,
         }

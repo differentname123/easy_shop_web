@@ -2,13 +2,11 @@
 """
 好价线报拉取 (`deal_raw_tips`) + 流水线清洗入正式表 (`products`) 主控入口。
 ================================================================================
-【运维直改配置说明】：
-1. 直接修改本文件下方的 `SCHEDULER_CONFIG` 与 `MONITORED_CHANNELS` 即可控制：
-   - 监控哪些站点/频道 (`enabled = True / False`)
-   - 每个频道的拉取间隔 (`interval_seconds`)、单轮最多抓多少新详情 (`max_details`)、
-     请求节奏 (`detail_delay_seconds`) 与风控冷却时间 (`rate_limit_cooldown_seconds`)
-   - 后续需要扩充新频道或新站点时，直接在 `MONITORED_CHANNELS` 追加一条 `DealChannelConfig` 即可
-2. 日常直接运行：`python run_deal_pool_scheduler.py`（无需记忆复杂的命令行配置参数）。
+【运维说明】：
+1. 运行调度参数集中在下方 `SCHEDULER_CONFIG`；
+2. 监控数据源与频道策略统一声明在 `services/deal_sources/catalog.py` (`DEFAULT_CHANNEL_CONFIGS`)，
+   插件注册表位于 `services/deal_sources/registry.py`；
+3. 日常直接运行：`python run_deal_pool_scheduler.py`（或 `--once` / `--stats` / `--ops-report` / `--reset-db`）。
 ================================================================================
 """
 import argparse
@@ -20,8 +18,6 @@ import threading
 import time
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List
-
-import requests
 
 # 确保 Windows 终端下正常输出中文与 Emoji
 if hasattr(sys.stdout, "reconfigure"):
@@ -49,10 +45,11 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
     CLEAN_SUCCESS_PREVIEW_JSONL,
-    CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST,
     DEAL_FORMAL_EXPIRY_HOURS,
     DEAL_INFO_PROTECTION_HOURS,
     DEAL_MAX_CLEAN_AGE_DAYS,
+    DEAL_POOL_LOG_PREFIXES,
+    DEAL_POOL_RUNTIME_HEALTH_PATH,
     DEAL_RAW_TTL_DAYS,
     DEFAULT_AI_TIMEOUT_SECONDS,
     DEFAULT_CLEAN_INTERVAL_SECONDS,
@@ -62,7 +59,6 @@ from models.deal_constants import (
     DEFAULT_STAGE_LEASE_SECONDS_AI,
     DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
     DEFAULT_STAGE_POLL_INTERVAL_SECONDS,
-    ENGINEERING_PHILOSOPHY_MANIFEST,
     ERROR_LOG_JSONL_PATH,
     ERR_ADAPTER_CONVERT_FAILED,
     ERR_ADAPTER_OFF_PROMOTION,
@@ -82,10 +78,8 @@ from models.deal_constants import (
     ERR_PDD_NUMERIC_ID,
     ERR_TB_NUMERIC_ID,
     ERR_UNSUPPORTED_PLATFORM,
-    EXCLUDED_SITES_AND_CHANNELS_MANIFEST,
     LATEST_CLEAN_OPS_REPORT_PATH,
     LATEST_OPS_REPORT_PATH,
-    LEGACY_SHADOW_TEST_COLLECTION,
     LOCAL_FALLBACK_JSONL,
     LOG_DIR,
     LOG_FILE_PATH,
@@ -117,27 +111,41 @@ from repositories.deal_raw_pool_repo import (
     parse_publish_time_epoch,
 )
 
-# 3. 导出频道配置模型
-from services.deal_channel_config import (
+# 3. 导出频道配置模型与线报采集插件体系（唯一真源: services.deal_sources）
+from services.deal_sources import (
     DEFAULT_CHANNEL_CONFIGS,
+    DEFAULT_GUANGDIU_COOKIE_FILE,
+    BaicaioSource,
+    BaseDealSource,
+    ChannelConfig,
     DealChannelConfig,
+    FetchContext,
+    FetchResult,
+    GuangdiuSource,
+    HaodankuSource,
+    IthomeLapinSource,
+    KieesSource,
+    MZzzdmSource,
+    NiuzaSource,
+    TehuicaicaiSource,
+    TelegramChannelSource,
+    Tuan0818Source,
+    XuandanSource,
+    ZdzdmSource,
+    create_site_session,
     get_active_channels,
     get_channel_max_age_days,
     get_site_max_age_days_map,
-    is_channel_due,
-)
-
-# 4. 导出统一线报抓取层
-from services.deal_fetchers import (
-    fetch_guangdiu_deals,
-    fetch_haodanku_wire_deals,
-    fetch_tehuicaicai_deals,
+    get_source,
+    get_source_troubleshooting,
     has_valid_detail_and_tutorial,
+    is_channel_due,
     is_confirmed_unsupported_deal,
     is_record_confirmed_unsupported,
+    list_sources,
 )
 
-# 5. 导出清洗引擎与阶段流水线
+# 4. 导出清洗引擎与阶段流水线
 from services.deal_pool_cleaner import (
     DealPoolCleaner,
     MaintenanceWorker,
@@ -152,9 +160,8 @@ from services.deal_pool_cleaner import (
     upsert_cleaned_products_to_formal_table,
 )
 
-# 6. 导出调度管道与运维报告
+# 5. 导出调度管道与运维报告
 from services.deal_pipeline import (
-    OPS_TROUBLESHOOTING_PLAYBOOK,
     SITE_DISPLAY_NAMES,
     build_and_log_cycle_ops_report,
     get_ops_troubleshooting_advice,
@@ -164,20 +171,6 @@ from services.deal_pipeline import (
     run_fetch_stage,
     run_single_cycle,
     run_stage_pipeline_drain,
-)
-
-# 7. 导出备用抓取器（供后续按需手动新增频道时直接配置 fetcher_name）
-from mobile_web.scripts.test_deal_sites_scraper import (
-    fetch_0818tuan_deals,
-    fetch_bacaoo_deals,
-    fetch_gwdang_discounts,
-    fetch_haodanku_weal_list,
-    fetch_haodanku_wire_report,
-    fetch_iehou_deals,
-    fetch_xianbao_fun_deals,
-    fetch_xuandan_deals,
-    fetch_zhetaoke_rank_list,
-    fetch_zhetaoke_xianbao_groups,
 )
 
 
@@ -240,184 +233,14 @@ SCHEDULER_CONFIG: Dict[str, Any] = {
 
 
 # ==============================================================================
-# 【运维直改配置区 2】：监控频道与单频道速度调控表（唯一真源）
+# 【监控频道表】：唯一真源已收敛至 services/deal_sources/catalog.py (DEFAULT_CHANNEL_CONFIGS)
 # ------------------------------------------------------------------------------
-# 每个频道独立掌控以下参数，按需直接修改或新增即可：
-# - enabled                    : True 开启监控 / False 停用
-# - interval_seconds           : 多久拉取一次（秒），如 120 / 180 / 360
-# - max_details                : 单轮最多抓多少条新商品详情（防触发目标站验证码）
-# - detail_delay_seconds       : 单条详情请求之间的休眠间隔（秒）
-# - sleep_after                : 本频道抓完后休眠多久（秒）
-# - rate_limit_cooldown_seconds: 遇到 429/滑块验证码后，该站点自动冷却休息多少秒
+# 每个频道由 ChannelConfig 声明式控制：
+# - enabled / interval_seconds / fetch_mode / lookback_seconds
+# - use_fetch_time_as_publish_time / expire_missing_on_sweep / network_mode / close_connection
+# - max_pages / max_details / detail_delay_seconds / sleep_after / rate_limit_cooldown_seconds
 # ==============================================================================
-MONITORED_CHANNELS: List[DealChannelConfig] = [
-    # --------------------------------------------------------------------------
-    # 1. 特惠采采（https://xhhcds.cn/）：人工精选 JSON 接口，逐页拉取直到整页均已抓过
-    # --------------------------------------------------------------------------
-    DealChannelConfig(
-        name="特惠采采_首页精选",
-        site_key="tehuicaicai",
-        default_url="https://xhhcds.cn/api/v1/public/home-products/?feed=home&page=1&page_size=50",
-        fetcher_name="fetch_tehuicaicai_deals",
-        fetcher_kwargs={
-            "channel": "home",
-            "page": 1,
-            "page_size": 50,
-            "max_pages": 10,
-            "auto_paginate": True,
-            "fetch_detail": True,
-            "full_sweep": True,
-        },
-        enabled=True,
-        interval_seconds=60 * 20,
-        max_details=50,
-        detail_delay_seconds=0.05,
-        sleep_after=0.3,
-        rate_limit_cooldown_seconds=180,
-        max_age_days=7.0,
-        description="特惠采采专员精选好价流，JSON 无风控，直达短链与文案完整；每轮全量扫完列表，已抓商品只刷新确认时间，未在列表中自动判定失效",
-    ),
-
-    # --------------------------------------------------------------------------
-    # 2. 好单库线报（https://www.haodanku.com/activity/tip_off）：淘宝/京东/百亿补贴 3 大频道
-    # --------------------------------------------------------------------------
-    DealChannelConfig(
-        name="好单库_淘宝实时线报",
-        site_key="haodanku",
-        default_url="https://www.haodanku.com/activity/tip_off",
-        fetcher_name="fetch_haodanku_wire_deals",
-        fetcher_kwargs={
-            "label_id": 10003,
-            "channel_name": "好单库_淘宝实时线报",
-            "full_sweep": True,
-        },
-        enabled=True,
-        interval_seconds=60 * 20,
-        max_details=100,
-        detail_delay_seconds=0.0,
-        sleep_after=0.3,
-        rate_limit_cooldown_seconds=180,
-        max_age_days=2.0,
-        description="好单库官方淘宝实时线报，20分钟全量巡视，纯JSON直出无风控",
-    ),
-    DealChannelConfig(
-        name="好单库_京东实时线报",
-        site_key="haodanku",
-        default_url="https://www.haodanku.com/activity/tip_off",
-        fetcher_name="fetch_haodanku_wire_deals",
-        fetcher_kwargs={
-            "label_id": 10004,
-            "channel_name": "好单库_京东实时线报",
-            "full_sweep": True,
-        },
-        enabled=True,
-        interval_seconds=60 * 20,
-        max_details=100,
-        detail_delay_seconds=0.0,
-        sleep_after=0.3,
-        rate_limit_cooldown_seconds=180,
-        max_age_days=2.0,
-        description="好单库官方京东实时线报，20分钟全量巡视，纯JSON直出无风控",
-    ),
-    DealChannelConfig(
-        name="好单库_淘宝百亿补贴",
-        site_key="haodanku",
-        default_url="https://www.haodanku.com/activity/tip_off",
-        fetcher_name="fetch_haodanku_wire_deals",
-        fetcher_kwargs={
-            "label_id": 10005,
-            "channel_name": "好单库_淘宝百亿补贴",
-            "full_sweep": True,
-        },
-        enabled=True,
-        interval_seconds=60 * 20,
-        max_details=100,
-        detail_delay_seconds=0.0,
-        sleep_after=0.3,
-        rate_limit_cooldown_seconds=180,
-        max_age_days=2.0,
-        description="好单库官方淘宝百亿补贴线报，20分钟全量巡视，纯JSON直出无风控",
-    ),
-
-    # --------------------------------------------------------------------------
-    # 3. 逛丢（https://guangdiu.com/）：首页、热门榜、小时风云榜
-    # --------------------------------------------------------------------------
-    DealChannelConfig(
-        name="逛丢_首页实时流",
-        site_key="guangdiu",
-        default_url="https://guangdiu.com/",
-        fetcher_name="fetch_guangdiu_deals",
-        fetcher_kwargs={"channel": "latest", "fetch_detail": True},
-        enabled=True,
-        interval_seconds=180,
-        max_details=35,
-        detail_delay_seconds=0.3,
-        sleep_after=0.3,
-        rate_limit_cooldown_seconds=300,
-        max_age_days=2.0,
-        description="逛丢首页实时好价，3分钟高频拉取整页最新详情（已抓过自动跳过）",
-    ),
-    DealChannelConfig(
-        name="逛丢_热门榜",
-        site_key="guangdiu",
-        default_url="https://guangdiu.com/hots.php",
-        fetcher_name="fetch_guangdiu_deals",
-        fetcher_kwargs={"channel": "hots", "fetch_detail": True},
-        enabled=True,
-        interval_seconds=600,
-        max_details=35,
-        detail_delay_seconds=0.3,
-        sleep_after=0.3,
-        rate_limit_cooldown_seconds=300,
-        max_age_days=2.0,
-        description="逛丢热门上榜流，10分钟巡视整页详情（已抓过自动跳过）",
-    ),
-    DealChannelConfig(
-        name="逛丢_小时风云榜",
-        site_key="guangdiu",
-        default_url="https://guangdiu.com/rank.php",
-        fetcher_name="fetch_guangdiu_deals",
-        fetcher_kwargs={"channel": "rank", "fetch_detail": True},
-        enabled=True,
-        interval_seconds=600,
-        max_details=30,
-        detail_delay_seconds=0.3,
-        sleep_after=0.3,
-        rate_limit_cooldown_seconds=300,
-        max_age_days=2.0,
-        description="逛丢小时风云榜，10分钟巡视整榜详情（已抓过自动跳过）",
-    ),
-
-    # --------------------------------------------------------------------------
-    # 【扩展模板】：后续如需新增频道，复制下方模板并按抓取器类型二选一配置：
-    # - 调度说明：不同 site_key 自动并行拉取；同一 site_key 内部每轮随机排序轮转，防首个频道饿死同站其他榜
-    # - 类型 A（含独立详情页抓取）：fetcher_kwargs 设 "fetch_detail": True，函数签名需接收 session / skip_detail_ids / max_details
-    # - 类型 B（纯列表/API 一次出全量）：不要传 "fetch_detail": True，函数仅需接收 session 及业务参数，由管道自动增量去重
-    # --------------------------------------------------------------------------
-    # # 类型 A 示例（线报酷）：
-    # DealChannelConfig(
-    #     name="线报酷_好单拼多多专属流",
-    #     site_key="xianbao_fun",
-    #     default_url="https://new.xianbao.fun/category-haodan-pdd/",
-    #     fetcher_name="fetch_xianbao_fun_deals",
-    #     fetcher_kwargs={"channel": "category_haodan_pdd", "page": 1, "fetch_detail": True},
-    #     enabled=False,
-    #     interval_seconds=240,
-    #     max_details=15,
-    #     sleep_after=0.5,
-    # ),
-    # # 类型 B 示例（好单库/折淘客/选单等纯列表源）：
-    # DealChannelConfig(
-    #     name="好单库_实时线报",
-    #     site_key="haodanku",
-    #     default_url="http://v2.api.haodanku.com/get_wire_report",
-    #     fetcher_name="fetch_haodanku_wire_report",
-    #     fetcher_kwargs={"min_id": 1},
-    #     enabled=False,
-    #     interval_seconds=180,
-    #     sleep_after=0.3,
-    # ),
-]
+MONITORED_CHANNELS: List[DealChannelConfig] = list(DEFAULT_CHANNEL_CONFIGS)
 
 
 def _reset_raw_pool_and_logs(repo: DealRawPoolRepository) -> None:
@@ -425,6 +248,8 @@ def _reset_raw_pool_and_logs(repo: DealRawPoolRepository) -> None:
         for fname in os.listdir(LOG_DIR):
             fpath = os.path.join(LOG_DIR, fname)
             if not os.path.isfile(fpath):
+                continue
+            if not any(fname.startswith(prefix) for prefix in DEAL_POOL_LOG_PREFIXES):
                 continue
             if fpath == LOG_FILE_PATH:
                 with open(fpath, "w", encoding="utf-8") as lf:
@@ -436,6 +261,11 @@ def _reset_raw_pool_and_logs(repo: DealRawPoolRepository) -> None:
                     pass
     except Exception:
         pass
+    if os.path.isfile(DEAL_POOL_RUNTIME_HEALTH_PATH):
+        try:
+            os.remove(DEAL_POOL_RUNTIME_HEALTH_PATH)
+        except Exception:
+            pass
     repo.reset_raw_collection()
 
 
@@ -562,16 +392,15 @@ def main():
     disabled_cnt = len(effective_channels) - active_cnt
 
     if mode == "once":
-        with requests.Session() as session:
-            run_fetch_stage(
-                repo=repo,
-                session=session,
-                cycle_num=1,
-                channel_health_tracker=channel_health_tracker,
-                channels=effective_channels,
-                channel_last_run=channel_last_run,
-                site_cooldown_until=site_cooldown_until,
-            )
+        run_fetch_stage(
+            repo=repo,
+            session=None,
+            cycle_num=1,
+            channel_health_tracker=channel_health_tracker,
+            channels=effective_channels,
+            channel_last_run=channel_last_run,
+            site_cooldown_until=site_cooldown_until,
+        )
         if cfg["serial"]:
             run_clean_stage(repo=repo, cleaner=cleaner, cycle_num=1, clean_limit=clean_limit)
         else:
@@ -605,18 +434,17 @@ def main():
             if has_due:
                 cycle_num += 1
                 try:
-                    with requests.Session() as session:
-                        run_single_cycle(
-                            repo=repo,
-                            cleaner=cleaner,
-                            session=session,
-                            cycle_num=cycle_num,
-                            clean_limit=clean_limit,
-                            channel_health_tracker=channel_health_tracker,
-                            channels=effective_channels,
-                            channel_last_run=channel_last_run,
-                            site_cooldown_until=site_cooldown_until,
-                        )
+                    run_single_cycle(
+                        repo=repo,
+                        cleaner=cleaner,
+                        session=None,
+                        cycle_num=cycle_num,
+                        clean_limit=clean_limit,
+                        channel_health_tracker=channel_health_tracker,
+                        channels=effective_channels,
+                        channel_last_run=channel_last_run,
+                        site_cooldown_until=site_cooldown_until,
+                    )
                 except Exception as cycle_exc:
                     logger.exception("🚨 第 #%d 轮执行异常: %s", cycle_num, cycle_exc)
 
@@ -668,18 +496,17 @@ def main():
             if due_now:
                 fetch_cycle += 1
                 try:
-                    with requests.Session() as session:
-                        fetch_res = run_fetch_stage(
-                            repo=repo,
-                            session=session,
-                            cycle_num=fetch_cycle,
-                            channel_health_tracker=channel_health_tracker,
-                            channels=effective_channels,
-                            channel_last_run=channel_last_run,
-                            site_cooldown_until=site_cooldown_until,
-                        )
-                        if fetch_res.get("total_inserted", 0) > 0:
-                            new_fetch_event.set()
+                    fetch_res = run_fetch_stage(
+                        repo=repo,
+                        session=None,
+                        cycle_num=fetch_cycle,
+                        channel_health_tracker=channel_health_tracker,
+                        channels=effective_channels,
+                        channel_last_run=channel_last_run,
+                        site_cooldown_until=site_cooldown_until,
+                    )
+                    if fetch_res.get("total_inserted", 0) > 0:
+                        new_fetch_event.set()
                 except Exception as fetch_exc:
                     logger.exception("🚨 [拉取线程/Producer] 第 #%d 轮拉取异常: %s", fetch_cycle, fetch_exc)
 

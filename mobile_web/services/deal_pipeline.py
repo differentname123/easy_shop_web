@@ -33,32 +33,45 @@ from models.deal_constants import (
     DEFAULT_CLEAN_WINDOW,
     DEFAULT_STAGE_LEASE_SECONDS_AI,
     DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
-    ENGINEERING_PHILOSOPHY_MANIFEST,
     ERROR_LOG_JSONL_PATH,
     ERR_AI_TIMEOUT_RETRY,
     ERR_EXPIRED_OVER_7_DAYS,
-    EXCLUDED_SITES_AND_CHANNELS_MANIFEST,
     LATEST_CLEAN_OPS_REPORT_PATH,
     LATEST_OPS_REPORT_PATH,
     MAX_CLEAN_RETRIES,
     OPS_REPORT_HISTORY_JSONL,
     STATS_SNAPSHOT_PATH,
-    CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST,
 )
+from models.product import SOURCE_SITE_NAMES
 from repositories.deal_raw_pool_repo import (
     DealRawPoolRepository,
     _append_bounded_jsonl_lines,
     evaluate_quality_signals,
 )
-from services.deal_channel_config import (
+from services.deal_sources.base import (
+    BaseDealSource,
+    ChannelConfig,
     DealChannelConfig,
+    FetchContext,
+)
+from services.deal_sources.catalog import (
     DEFAULT_CHANNEL_CONFIGS,
     get_active_channels,
     get_site_max_age_days_map,
     is_channel_due,
 )
-from services.deal_fetchers import (
+from services.deal_sources.filters import (
+    has_valid_detail_and_tutorial,
     is_record_confirmed_unsupported,
+)
+from services.deal_sources.http_client import (
+    RATE_LIMIT_STATUSES,
+    create_site_session,
+)
+from services.deal_sources.parsing import utc_now_iso
+from services.deal_sources.registry import (
+    get_source_troubleshooting,
+    list_sources,
 )
 from services.deal_pool_cleaner import (
     DealPoolCleaner,
@@ -71,69 +84,9 @@ from services.deal_pool_cleaner import (
 logger = logging.getLogger("deal_pool_scheduler")
 
 # ==============================================================================
-# 站点显示名称与排障手册
+# 站点显示名称与排障手册（单一真源：复用 models.product 与各数据源插件）
 # ==============================================================================
-SITE_DISPLAY_NAMES: Dict[str, str] = {
-    "tehuicaicai": "特惠采采 (专员人工严选集采)",
-    "guangdiu": "逛丢 (首页/热门榜/小时风云榜)",
-    "zhetaoke": "折淘客 (采集群/爆款榜)",
-    "haodanku": "好单库 (实时线报群/福利单)",
-    "xuandan": "选单网 (快抢群发素材)",
-    "0818tuan": "0818团 (实战凑单线报)",
-    "xianbao_fun": "线报酷 (聚合频道)",
-    "bacaoo": "拔草哦 (优惠与拼多多专区)",
-}
-
-OPS_TROUBLESHOOTING_PLAYBOOK: Dict[str, Dict[str, str]] = {
-    "tehuicaicai": {
-        "endpoint": "https://xhhcds.cn/api/v1/public/home-products/?feed=home | https://xhhcds.cn/api/v1/products/{id}/",
-        "http_403_429": "特惠采采返回限流：请调大 detail_delay_seconds 或降低 max_details。",
-        "empty_or_parse": "特惠采采列表返回 0 条：专员非工作时段发单较少，或请检查 JSON 接口字段。",
-        "timeout_or_conn": "特惠采采连接超时：接口抖动，下轮将自动重试。",
-    },
-    "guangdiu": {
-        "endpoint": "https://guangdiu.com/ | https://guangdiu.com/hots.php | https://guangdiu.com/rank.php",
-        "http_403_429": "逛丢触发限流或滑块安全验证：已触发自动熔断冷却，可适当调低 max_details 或增大 detail_delay_seconds。",
-        "empty_or_parse": "逛丢列表解析为 0：请访问报错路径核对页面 DOM 是否变更。",
-        "timeout_or_conn": "逛丢请求超时：单次超时不影响其余频道，下轮自动补抓。",
-    },
-    "zhetaoke": {
-        "endpoint": "https://www.zhetaoke.com/xianbao.aspx | https://www.zhetaoke.com/list/love_1_0_1.html",
-        "http_403_429": "折淘客触发频率限制：请调大 sleep_after。",
-        "empty_or_parse": "折淘客返回 0 条记录：请检查 `.sc-product` DOM 类名是否改版。",
-        "timeout_or_conn": "折淘客连接超时：偶发抖动将在下轮恢复。",
-    },
-    "haodanku": {
-        "endpoint": "https://www.haodanku.com/HolidayActivity/wire_report | https://www.haodanku.com/HolidayActivity/weal_list",
-        "http_403_429": "好单库接口返回 403/429：请检查请求头是否完整。",
-        "empty_or_parse": "好单库返回空列表：请核查接口字段。",
-        "timeout_or_conn": "好单库请求超时：下轮自动重试。",
-    },
-    "xuandan": {
-        "endpoint": "https://www.xuandan.com/NewHome/msKqList",
-        "http_403_429": "选单网接口限流：请确认请求头包含正确的 Referer。",
-        "empty_or_parse": "选单网返回 0 条：请检查 JSON 响应。",
-        "timeout_or_conn": "选单网连接超时：下轮自动重试。",
-    },
-    "0818tuan": {
-        "endpoint": "http://www.0818tuan.com/list-1-{page}.html",
-        "http_403_429": "0818团访问受限：请降低抓取上限。",
-        "empty_or_parse": "0818团列表为空：请检查列表容器 DOM 是否改动。",
-        "timeout_or_conn": "0818团详情页超时：下轮自动重试。",
-    },
-    "xianbao_fun": {
-        "endpoint": "https://new.xianbao.fun/",
-        "http_403_429": "线报酷触发频率限制：请调大请求间隔。",
-        "empty_or_parse": "线报酷返回 0 条：请检查列表结构。",
-        "timeout_or_conn": "线报酷详情页超时：下轮自动补抓。",
-    },
-    "bacaoo": {
-        "endpoint": "https://youhui.bacaoo.com/",
-        "http_403_429": "拔草哦返回 403/429：请调大请求间隔。",
-        "empty_or_parse": "拔草哦解析为 0 条：请检查页面响应。",
-        "timeout_or_conn": "拔草哦连接超时：下轮自动重试。",
-    },
-}
+SITE_DISPLAY_NAMES: Dict[str, str] = SOURCE_SITE_NAMES
 
 
 def get_ops_troubleshooting_advice(
@@ -144,7 +97,7 @@ def get_ops_troubleshooting_advice(
     consecutive_failures: int,
 ) -> str:
     """根据站点标识、HTTP 状态码、错误类型及连续失败次数，生成明确的运维人员处理建议。"""
-    playbook = OPS_TROUBLESHOOTING_PLAYBOOK.get(site_key, {})
+    playbook = get_source_troubleshooting(site_key)
     escalation = (
         f"【🚨 连续 {consecutive_failures} 轮异常，需人工介入】"
         if consecutive_failures >= 3
@@ -195,43 +148,25 @@ def append_error_records_jsonl(error_records: List[Dict[str, Any]]):
 _GLOBAL_CHANNEL_LAST_RUN: Dict[str, float] = {}
 
 
-def _resolve_fetcher_callable(fetcher_name: str) -> Optional[Callable[..., Dict[str, Any]]]:
-    """查找顺序：1. run_deal_pool_scheduler（支持测试 monkeypatch）-> 2. deal_fetchers -> 3. test_deal_sites_scraper。"""
-    sched_mod = sys.modules.get("mobile_web.scripts.run_deal_pool_scheduler")
-    if sched_mod and hasattr(sched_mod, fetcher_name):
-        return getattr(sched_mod, fetcher_name)
-    try:
-        import services.deal_fetchers as fetchers_mod
-        if hasattr(fetchers_mod, fetcher_name):
-            return getattr(fetchers_mod, fetcher_name)
-    except Exception:
-        pass
-    try:
-        import mobile_web.scripts.test_deal_sites_scraper as scraper_mod
-        if hasattr(scraper_mod, fetcher_name):
-            return getattr(scraper_mod, fetcher_name)
-    except Exception:
-        pass
-    return None
-
-
 def run_fetch_stage(
     repo: DealRawPoolRepository,
-    session: requests.Session,
-    cycle_num: int,
+    session: Optional[requests.Session] = None,
+    cycle_num: int = 1,
     max_new_details_per_channel: Optional[int] = None,
     run_all_tiers: bool = False,
     channel_health_tracker: Optional[Dict[str, Dict[str, Any]]] = None,
     latest_clean_report: Optional[Dict[str, Any]] = None,
-    channels: Optional[List[DealChannelConfig]] = None,
+    channels: Optional[List[ChannelConfig]] = None,
     channel_last_run: Optional[Dict[str, float]] = None,
     site_cooldown_until: Optional[Dict[str, float]] = None,
+    source_registry: Optional[Dict[str, BaseDealSource]] = None,
+    session_factory: Optional[Callable[[ChannelConfig], requests.Session]] = None,
 ) -> Dict[str, Any]:
     """
-    执行单轮【阶段一（Producer）：多站点好价拉取入初步表 `deal_raw_tips`】：
+    执行单轮【阶段一（Producer）：多站点插件并行拉取入初步表 `deal_raw_tips`】：
     - 仅运行 `enabled=True` 且已到自身 `interval_seconds`（且所属站点未处于冷却期）的频道；
-    - 统一按活跃站点加载已抓详情 ID 集合（零硬编码浪费）；
-    - 统一门禁：仅保存具备完整详情且未被 100% 确认为非淘京拼平台的标准化记录。
+    - 生产环境每个站点车道独立创建线程隔离的 HTTP Session（按频道 `network_mode` / `close_connection`）；
+    - 统一按插件契约执行、统一门禁与去重、统一策略落盘（`use_fetch_time_as_publish_time` / `expire_missing_on_sweep`）。
     """
     _ = run_all_tiers
     fetch_start = time.perf_counter()
@@ -294,10 +229,11 @@ def run_fetch_stage(
         for site, until_ts in cooldown_map.items()
         if until_ts and until_ts > now_wall
     }
-    _rate_limit_codes = {403, 429, 502, 503, 504}
+    _rate_limit_codes = set(RATE_LIMIT_STATUSES)
+    active_registry = source_registry if source_registry is not None else list_sources()
     lock = threading.Lock()
 
-    def _execute_site_lane(site_key: str, site_channels: List[DealChannelConfig]) -> None:
+    def _execute_site_lane(site_key: str, site_channels: List[ChannelConfig]) -> None:
         nonlocal total_inserted, total_updated, total_fetched, task_counter
         site_dedup = dedup_map.get(site_key)
 
@@ -346,42 +282,71 @@ def run_fetch_stage(
                     })
                 continue
 
-            fn = _resolve_fetcher_callable(ch.fetcher_name)
-            if fn is None:
-                logger.error("未找到频道 [%s] 对应的抓取函数 [%s]，请检查配置！", task_name, ch.fetcher_name)
+            source = active_registry.get(ch.resolved_source_key)
+            if source is None:
+                logger.error("未找到频道 [%s] 对应的数据源插件 [%s]，请检查注册表！", task_name, ch.resolved_source_key)
+                with lock:
+                    last_run_map[task_name] = time.time()
+                    ch_state["consecutive_failures"] += 1
+                    ch_state["total_errors"] += 1
+                    task_reports.append({
+                        "task_name": task_name,
+                        "site_key": site_key,
+                        "request_url": default_url,
+                        "http_status": None,
+                        "status": "error",
+                        "fetched": 0,
+                        "detail_fetched": 0,
+                        "detail_error_count": 0,
+                        "inserted": 0,
+                        "updated": 0,
+                        "unique_anchor_count": 0,
+                        "consecutive_failures": ch_state["consecutive_failures"],
+                        "error_type": "SourceNotRegistered",
+                        "error": f"Unknown source_key: {ch.resolved_source_key}",
+                        "elapsed_ms": 0.0,
+                    })
                 continue
 
-            call_kwargs = dict(ch.fetcher_kwargs)
-            call_kwargs["session"] = session
-            has_fetch_detail = bool(call_kwargs.get("fetch_detail"))
-            is_full_sweep = bool(call_kwargs.get("full_sweep"))
-            # 向支持详情抓取协议或全量巡视协议的抓取器传入 skip_detail_ids/max_details；
-            if has_fetch_detail or is_full_sweep:
-                if site_dedup is not None:
-                    call_kwargs["skip_detail_ids"] = site_dedup
-                eff_max_details = max_new_details_per_channel if max_new_details_per_channel is not None else ch.max_details
-                call_kwargs["max_details"] = eff_max_details
-                if getattr(fn, "__module__", "") == "services.deal_fetchers" and "detail_delay" not in call_kwargs:
-                    call_kwargs["detail_delay"] = ch.detail_delay_seconds
+            owns_session = False
+            if session_factory is not None:
+                lane_session = session_factory(ch)
+                owns_session = hasattr(lane_session, "close")
+            elif session is not None:
+                lane_session = session
+            else:
+                lane_session = create_site_session(
+                    network_mode=ch.network_mode,
+                    close_connection=ch.close_connection,
+                )
+                owns_session = True
 
             sweep_start_time = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             try:
-                res = fn(**call_kwargs)
+                ctx = FetchContext(
+                    channel=ch,
+                    session=lane_session,
+                    known_ids=site_dedup if site_dedup is not None else set(),
+                    now_ts=time.time(),
+                    max_details=max_new_details_per_channel,
+                )
+                raw_res = source.fetch(ctx)
+                res_dict = raw_res.to_dict() if hasattr(raw_res, "to_dict") else dict(raw_res)
                 now_done = time.time()
-                req_url = str(res.get("request_url") or default_url)
-                http_status = res.get("http_status")
-                raw_records = res.get("records") or []
-                detail_errors = res.get("detail_errors") or []
+                req_url = str(res_dict.get("request_url") or default_url)
+                http_status = res_dict.get("http_status")
+                raw_records = res_dict.get("records") or []
+                detail_errors = res_dict.get("detail_errors") or []
 
                 has_captcha_err = any("Captcha" in str(d.get("error_type") or "") for d in detail_errors)
                 is_rate_limited = (
-                    bool(res.get("rate_limited"))
+                    bool(res_dict.get("rate_limited"))
                     or http_status in _rate_limit_codes
                     or any(d.get("http_status") in _rate_limit_codes for d in detail_errors)
                     or has_captcha_err
                 )
 
-                # 统一入池前门禁：绝不放行无完整详情或 100% 确定非淘京拼平台的记录；非 fetch_detail 源同步做已知 ID 去重
+                fetch_time_iso = utc_now_iso()
                 records: List[Dict[str, Any]] = []
                 pipeline_filtered = 0
                 pipeline_skipped_known = 0
@@ -394,10 +359,21 @@ def run_fetch_stage(
                     if is_record_confirmed_unsupported(r):
                         pipeline_filtered += 1
                         continue
+                    if not has_valid_detail_and_tutorial(r):
+                        pipeline_filtered += 1
+                        continue
                     sid = str(r.get("source_item_id") or "")
-                    if not has_fetch_detail and site_dedup is not None and sid and sid in site_dedup:
+                    if site_dedup is not None and sid and sid in site_dedup:
                         pipeline_skipped_known += 1
                         continue
+                    orig_ch = str(r.get("source_channel") or "").strip()
+                    if orig_ch and orig_ch != task_name:
+                        hm = r.setdefault("hot_metrics", {})
+                        if isinstance(hm, dict) and "sub_channel" not in hm:
+                            hm["sub_channel"] = orig_ch
+                    r["source_channel"] = task_name
+                    if ch.use_fetch_time_as_publish_time:
+                        r["publish_time"] = fetch_time_iso
                     records.append(r)
 
                 if site_dedup is not None:
@@ -405,11 +381,15 @@ def run_fetch_stage(
                         if r.get("has_full_detail", True) and r.get("source_item_id"):
                             site_dedup.add(str(r["source_item_id"]))
 
-                # 全量巡视源：列表里再次见到的已存商品，刷新"本轮确认仍在架"的时间（last_seen_at），
-                # 用它做上架/下架观测，不覆盖源站自述的 publish_time。
-                touch_ids = res.get("touch_ids") or []
+                touch_ids = res_dict.get("touch_ids") or []
                 if touch_ids:
-                    repo.touch_seen(site_key, touch_ids, channel=task_name)
+                    repo.touch_seen(
+                        site_key,
+                        touch_ids,
+                        channel=task_name,
+                        refresh_publish_time=ch.use_fetch_time_as_publish_time,
+                        max_age_days=ch.max_age_days,
+                    )
 
                 unique_cnt = sum(
                     1 for r in records
@@ -451,9 +431,24 @@ def run_fetch_stage(
                     }
 
                 with lock:
-                    db_res = repo.save_batch(records, task_name=task_name)
-                    # 全量巡视源（full_sweep=True）：未在本轮扫描出现的历史商品即刻判定失效并清除
-                    if is_full_sweep and res.get("status") == "ok":
+                    db_res = repo.save_batch(
+                        records,
+                        task_name=task_name,
+                        refresh_publish_time=ch.use_fetch_time_as_publish_time,
+                        max_age_days=ch.max_age_days,
+                    )
+                    raw_list_cnt = int(
+                        res_dict.get("raw_list_count")
+                        if res_dict.get("raw_list_count") is not None
+                        else len(raw_records)
+                    )
+                    if (
+                        ch.expire_missing_on_sweep
+                        and res_dict.get("status") == "ok"
+                        and res_dict.get("sweep_completed")
+                        and not is_rate_limited
+                        and raw_list_cnt > 0
+                    ):
                         repo.expire_missing_from_full_sweep(
                             source_site=site_key,
                             channel=task_name,
@@ -463,11 +458,10 @@ def run_fetch_stage(
                     ins = db_res.get("inserted", 0)
                     upd = db_res.get("updated", 0)
                     cnt = len(records)
-                    det_cnt = res.get("detail_fetched", cnt)
-                    raw_list_cnt = int(res.get("raw_list_count") if res.get("raw_list_count") is not None else len(raw_records))
-                    skipped_known = int(res.get("skipped_known") or 0) + pipeline_skipped_known
-                    skipped_unsup = int(res.get("skipped_unsupported") or 0) + pipeline_filtered
-                    skipped_nodet = int(res.get("skipped_no_detail") or 0)
+                    det_cnt = res_dict.get("detail_fetched", cnt)
+                    skipped_known = int(res_dict.get("skipped_known") or 0) + pipeline_skipped_known
+                    skipped_unsup = int(res_dict.get("skipped_unsupported") or 0) + pipeline_filtered
+                    skipped_nodet = int(res_dict.get("skipped_no_detail") or 0)
 
                     last_run_map[task_name] = now_done
                     if is_rate_limited:
@@ -484,6 +478,10 @@ def run_fetch_stage(
                     if is_rate_limited and cnt == 0:
                         ch_state["consecutive_failures"] += 1
                         status_label = "rate_limited"
+                    elif res_dict.get("status") != "ok" and cnt == 0:
+                        ch_state["consecutive_failures"] += 1
+                        ch_state["total_errors"] += 1
+                        status_label = "error"
                     elif raw_list_cnt == 0 and http_status == 200 and cnt == 0:
                         ch_state["consecutive_failures"] += 1
                         status_label = "empty_warning"
@@ -492,7 +490,7 @@ def run_fetch_stage(
                         status_label = "success"
                     consec_fail = ch_state["consecutive_failures"]
 
-                    task_reports.append({
+                    task_report = {
                         "task_name": task_name,
                         "site_key": site_key,
                         "request_url": req_url,
@@ -510,7 +508,13 @@ def run_fetch_stage(
                         "unique_anchor_count": unique_cnt,
                         "consecutive_failures": consec_fail,
                         "elapsed_ms": cost_ms,
-                    })
+                    }
+                    if status_label == "error":
+                        task_report["error"] = str(
+                            res_dict.get("error")
+                            or (detail_errors[0].get("error") if detail_errors else f"HTTP {http_status}")
+                        )[:240]
+                    task_reports.append(task_report)
 
                 if detail_errors:
                     logger.warning(
@@ -534,6 +538,22 @@ def run_fetch_stage(
                         task_name,
                         max(30, int(getattr(ch, "rate_limit_cooldown_seconds", 300))),
                         cost_ms,
+                    )
+                elif status_label == "error":
+                    err_hint = str(
+                        res_dict.get("error")
+                        or (summary_msg if detail_errors else f"status={res_dict.get('status')}, http={http_status}")
+                    )
+                    logger.warning(
+                        "  ❌ [阶段1-拉取 %02d/%02d(剩%02d)] [%-22s] 抓取失败 (http=%s, 连续=%d轮, 耗时=%.1fms) | %s",
+                        task_idx,
+                        total_channels,
+                        rem_tasks,
+                        task_name,
+                        http_status,
+                        consec_fail,
+                        cost_ms,
+                        err_hint,
                     )
                 elif status_label == "empty_warning":
                     logger.warning(
@@ -621,12 +641,18 @@ def run_fetch_stage(
                     e,
                     advice,
                 )
+            finally:
+                if owns_session:
+                    try:
+                        lane_session.close()
+                    except Exception:
+                        pass
 
             if pause_sec > 0:
                 time.sleep(pause_sec)
 
     if len(site_items) > 1:
-        with ThreadPoolExecutor(max_workers=min(8, len(site_items)), thread_name_prefix="DealFetchSite") as pool:
+        with ThreadPoolExecutor(max_workers=min(12, len(site_items)), thread_name_prefix="DealFetchSite") as pool:
             futures = [pool.submit(_execute_site_lane, sk, chs) for sk, chs in site_items]
             for fut in as_completed(futures):
                 fut.result()
@@ -1182,8 +1208,6 @@ def run_clean_stage(
             "ai_stage2_fallbacks": cleaner.stats_ai2_fallbacks,
             "ai_retries_scheduled": cleaner.stats_ai_retries_scheduled,
         },
-        "engineering_philosophy_manifest": ENGINEERING_PHILOSOPHY_MANIFEST,
-        "attempted_dead_ends_manifest": CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST,
     }
 
     try:
@@ -1406,13 +1430,13 @@ def run_stage_pipeline_drain(
 def run_single_cycle(
     repo: DealRawPoolRepository,
     cleaner: DealPoolCleaner,
-    session: requests.Session,
-    cycle_num: int,
+    session: Optional[requests.Session] = None,
+    cycle_num: int = 1,
     max_new_details_per_channel: Optional[int] = None,
     run_all_tiers: bool = False,
     clean_limit: int = DEFAULT_CLEAN_WINDOW,
     channel_health_tracker: Optional[Dict[str, Dict[str, Any]]] = None,
-    channels: Optional[List[DealChannelConfig]] = None,
+    channels: Optional[List[ChannelConfig]] = None,
     channel_last_run: Optional[Dict[str, float]] = None,
     site_cooldown_until: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
@@ -1479,7 +1503,7 @@ def print_stats_report(repo: DealRawPoolRepository):
     )
     print(f"  • 清洗拦截错误码分布       : {json.dumps(summary['by_clean_error_code'], ensure_ascii=False)}")
     print("-" * 98)
-    print("  • 纳入监控的 8 大高可靠站点入池与清洗入库明细 :")
+    print("  • 纳入监控的各线报数据源入池与清洗入库明细 :")
     for s in summary.get("by_source_site") or []:
         cnt = max(1, s["count"])
         u_cnt = s.get("unique_anchor_count", 0)
@@ -1491,18 +1515,6 @@ def print_stats_report(repo: DealRawPoolRepository):
             f"含锚点={u_cnt:>4}条 ({u_cnt * 100.0 / cnt:>5.1f}%) | "
             f"已入正式表={ok_cnt:>4}条 | 已拦截={fail_cnt:>4}条 | 待清洗={pend_cnt:>4}条"
         )
-    print("-" * 98)
-    print(f"  • 核心工程准则备忘 ({len(ENGINEERING_PHILOSOPHY_MANIFEST)} 条铁律) :")
-    for pk, pv in ENGINEERING_PHILOSOPHY_MANIFEST.items():
-        print(f"    🧭 {pk}: {pv[:110]}...")
-    print("-" * 98)
-    print(f"  • 采集阶段已尝试并剔除的 {len(EXCLUDED_SITES_AND_CHANNELS_MANIFEST)} 个站点/频道备忘 (严禁重复踩坑) :")
-    for ex_name, ex_reason in EXCLUDED_SITES_AND_CHANNELS_MANIFEST.items():
-        print(f"    ❌ {ex_name}: {ex_reason[:110]}...")
-    print("-" * 98)
-    print(f"  • 清洗阶段历史探索与回归极简基线备忘 ({len(CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST)} 条) :")
-    for de_key, de_desc in CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST.items():
-        print(f"    🛑 {de_key}: {de_desc[:110]}...")
     print("=" * 98 + "\n")
 
 

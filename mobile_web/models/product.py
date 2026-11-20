@@ -19,18 +19,17 @@ def normalize_platform(platform: Optional[str], default: str = "pdd") -> str:
 
 SOURCE_SITE_NAMES: Dict[str, str] = {
     "tehuicaicai": "特惠采采",
-    "haodanku": "好单库",
-    "zhetaoke": "折淘客",
-    "xianbao_fun": "线报酷",
-    "0818tuan": "0818团",
     "guangdiu": "逛丢",
+    "haodanku": "好单库",
     "xuandan": "选单网",
-    "bacaoo": "拔草哦",
-    "smzdm": "什么值得买",
-    "manmanbuy": "慢慢买",
-    "iehou": "网猴线报",
-    "gwdang": "购物党",
-    "55haitao": "55海淘",
+    "0818tuan": "0818团",
+    "zzzdm": "值值得买",
+    "telegram": "Telegram线报",
+    "ithome_lapin": "IT之家辣品",
+    "kiees": "发现值得买",
+    "niuza": "牛杂网",
+    "zdzdm": "真的值得买",
+    "baicaio": "白菜哦",
 }
 
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """好价线报缓冲池 (`deal_raw_tips`) 与清洗调度器全局常量定义。"""
 import os
-from typing import Dict
+from typing import Dict, Tuple
 
 # 目录路径计算（单一真源）
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10,7 +10,6 @@ WORKSPACE_ROOT = os.path.dirname(PROJECT_ROOT)
 
 DEFAULT_RAW_COLLECTION_NAME = "deal_raw_tips"
 DEFAULT_FORMAL_PRODUCTS_COLLECTION = "products"
-LEGACY_SHADOW_TEST_COLLECTION = "deal_cleaned_products_test"
 
 PROMPT_DIR = os.path.join(PROJECT_ROOT, "prompt")
 PROMPT_STAGE1_PATH = os.path.join(PROMPT_DIR, "爆料阶段1_原始拆解与转链提纯.txt")
@@ -56,6 +55,18 @@ LATEST_CLEAN_OPS_REPORT_PATH = os.path.join(LOG_DIR, "latest_clean_ops_report.js
 CLEAN_OPS_HISTORY_JSONL = os.path.join(LOG_DIR, "clean_ops_history.jsonl")
 CLEAN_FAILED_SAMPLES_JSONL = os.path.join(LOG_DIR, "clean_failed_samples.jsonl")
 CLEAN_SUCCESS_PREVIEW_JSONL = os.path.join(LOG_DIR, "clean_success_preview.jsonl")
+DEAL_POOL_RUNTIME_HEALTH_PATH = os.path.join(LOG_DIR, "runtime", "upstream_health_deal_scheduler.json")
+DEAL_POOL_LOG_PREFIXES: Tuple[str, ...] = (
+    "deal_pool_",
+    "deal_raw_tips_fallback",
+    "cycle_ops_",
+    "latest_cycle_ops_",
+    "clean_ops_",
+    "latest_clean_ops_",
+    "clean_failed_samples",
+    "clean_success_preview",
+    "model_api_deal_pool.log",
+)
 
 # 清洗与转链状态与错误码定义（单一真源）
 OK_SKIPPED_ALREADY_CLEANED = "OK_SKIPPED_ALREADY_CLEANED"
@@ -78,7 +89,7 @@ ERR_EXPIRED_OVER_7_DAYS = "ERR_EXPIRED_OVER_7_DAYS"
 ERR_AI_TIMEOUT_RETRY = "ERR_AI_TIMEOUT_RETRY"
 ERR_AI_MAX_RETRIES_EXCEEDED = "ERR_AI_MAX_RETRIES_EXCEEDED"
 
-# 不支持的非淘京拼外链与泛娱乐域名（Fail-Fast 排除）
+# 不支持的非淘京拼外链与源站自身域（Fail-Fast 排除）
 _UNSUPPORTED_EXTERNAL_DOMAINS = (
     "vip.com",
     "douyin.com",
@@ -95,28 +106,14 @@ _UNSUPPORTED_EXTERNAL_DOMAINS = (
     "weibo.com",
     "kuaishou.com",
     "guangdiu.com/go.php",
-    "new.xianbao.fun",
-    "youhui.bacaoo.com",
     "0818tuan.com",
-    "iehou.com",
+    "go.ruanmei.com",
+    "ithome.com",
+    "zzzdm.com",
+    "kiees.com",
+    "niuza.com",
+    "zdzdm.com",
+    "baicaio.com",
+    "t.me",
+    "xuandan.com",
 )
-
-# 曾尝试并放弃的信源备忘清单（防重复造轮子/踩坑）
-EXCLUDED_SITES_AND_CHANNELS_MANIFEST: Dict[str, str] = {
-    "smzdm (什么值得买直连及镜像 zhidemai/zhidemai_hot)": "验证码风控与加密跳板 probe.js，已由逛丢服务端解包覆盖。",
-    "manmanbuy (慢慢买省钱控 cu.manmanbuy.com)": "前端 crypto-js 动态加密跳转，有效商品率为 0。",
-    "55haitao (55海淘 55haitao.com/deals)": "100% 欧美独立站海淘，无淘京拼 CPS 价值。",
-    "dataoke (大淘客网页端 dataoke.com/xp/xb)": "强依赖登录态 Cookie，数据已由好单库和折淘客覆盖。",
-    "shihuizhu & huim (实惠猪 / 惠喵)": "服务端 TCP Reset 阻断。",
-    "gwdang_all_channels (购物党全频道)": "100% 纯数字 SKU 拒识，99.7% 失败率。",
-    "xianbao_fun/category_man (慢慢买镜像)": "前端加密跳板壳，无明文推广链。",
-}
-
-ENGINEERING_PHILOSOPHY_MANIFEST: Dict[str, str] = {
-    "zero_foreign_commission": "宁少勿脏 · 绝不替他人做嫁衣：严禁任何未脱敏或未重置推广位的新链入库。",
-    "minimalist_unified_reliable": "越简单越可靠：全局逻辑统一收口，拒绝碎片化补丁与脆弱正则表达式。",
-}
-
-CLEANING_ATTEMPTED_DEAD_ENDS_MANIFEST: Dict[str, str] = {
-    "heuristic_regex_pricing": "已彻底废弃：通过正则表达式匹配各种营销文案抓取价格极其脆弱，现全量统一为 AI-1 与 AI-2 两阶段结构化核验。",
-}

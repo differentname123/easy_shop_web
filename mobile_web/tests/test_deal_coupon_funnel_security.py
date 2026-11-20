@@ -1048,4 +1048,246 @@ def test_shop_m_jd_whitelist_and_false_positive_coupon_gates():
     assert res_map["tip_jd_subsidy_with_sku"]["product_doc"]["deal_info"]["deal_price"] == 3169.61
 
 
+def test_transient_degraded_retry_and_cross_platform_consistency():
+    """
+    验证直播审计修复的两项核心根因保护：
+    1. 多链线报只要存在非凑单品链接触发详情反查暂态限流 (`resolution_kind == "degraded_product"`)，
+       在未达重试上限前必须走 `retry_pending` 重试，而非直接送入 AI-2 误杀；达到上限则正常放行判定，
+       且确定性永久失败 (`resolution_kind == "error"`) 不应触发无意义重试；
+    2. `_is_explicit_coupon_target` 不得将标为主推的淘宝二合一单品页 (`uland.taobao.com/coupon/edetail`) 误判为独立券；
+       异平台比价场景中，选对主平台不被异平台对比链误杀，选错且混配异平台券则防串货拦截。
+    """
+    from mobile_web.models.deal_constants import (
+        CLEAN_STAGE_NEED_CONVERT,
+        ERR_ADAPTER_CONVERT_FAILED,
+        MAX_CLEAN_RETRIES,
+    )
+
+    # --- A. _is_explicit_coupon_target 二合一主链 vs 独立领券页 ---
+    assert (
+        DealPoolCleaner._is_explicit_coupon_target({
+            "clean_input": "https://uland.taobao.com/coupon/edetail?e=abc",
+            "text_role_hint": "main_candidate",
+            "convert_status": "product",
+        })
+        is False
+    )
+    assert (
+        DealPoolCleaner._is_explicit_coupon_target({
+            "clean_input": "https://uland.taobao.com/coupon/edetail?e=abc",
+            "text_role_hint": "main_candidate",
+            "convert_status": "failed",
+        })
+        is False
+    )
+    assert (
+        DealPoolCleaner._is_explicit_coupon_target({
+            "clean_input": "https://uland.taobao.com/quan/detail?sellerId=1&activityId=2",
+            "text_role_hint": "main_candidate",
+            "convert_status": "failed",
+        })
+        is True
+    )
+    assert (
+        DealPoolCleaner._is_explicit_coupon_target({
+            "clean_input": "https://uland.taobao.com/coupon/edetail?e=abc",
+            "text_role_hint": "coupon_candidate",
+            "convert_status": "product",
+        })
+        is True
+    )
+
+    # --- B. 多链暂态 degraded_product 重试与上限收敛 ---
+    cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+
+    def _mock_jd_transient(inp: str):
+        if "coupon_ok" in inp or "perm_main_ok" in inp:
+            gid = "JD_PERM_OK" if "perm_main_ok" in inp else "JD_MAIN_OK"
+            return {
+                "status": "success",
+                "goods_id": gid,
+                "goods_sign": gid,
+                "final_link": f"https://u.jd.com/{gid.lower()}",
+                "promotion_token": f"！{gid}！",
+                "product": {
+                    "platform": "jd",
+                    "product_id": gid,
+                    "name": "主品运动鞋" if gid == "JD_MAIN_OK" else "葡口饮料",
+                    "price": 129.0,
+                    "original_price": 129.0,
+                    "activity_price": 129.0,
+                    "coupon_amount": 0.0,
+                    "mall_name": "官方旗舰店",
+                },
+            }
+        if "degraded_sec" in inp:
+            return {
+                "status": "error",
+                "detail_lookup_failed": True,
+                "resolution_kind": "degraded_product",
+                "error_code": "DETAIL_RATE_LIMITED",
+                "error_msg": "详情限流",
+            }
+        return {
+            "status": "error",
+            "resolution_kind": "error",
+            "error_code": "PROMOTION_FAILED",
+            "error_msg": "京东返回业务错误",
+        }
+
+    cleaner.adapters = {
+        "jd": SimpleNamespace(resolve_and_convert_universal=_mock_jd_transient),
+        "taobao": SimpleNamespace(
+            resolve_and_convert_universal=lambda _inp: {
+                "status": "success",
+                "goods_id": "TB_MAIN_OK",
+                "goods_sign": "TB_MAIN_OK",
+                "final_link": "https://s.click.taobao.com/tb_main",
+                "promotion_token": "￥TBMAIN￥",
+                "product": {
+                    "platform": "taobao",
+                    "product_id": "TB_MAIN_OK",
+                    "name": "喜美诺 100W 快充线",
+                    "price": 9.9,
+                    "original_price": 17.9,
+                    "activity_price": 9.9,
+                    "coupon_amount": 8.0,
+                    "mall_name": "喜美诺旗舰店",
+                },
+            }
+        ),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+    }
+
+    s3_docs = [
+        {
+            "source_site": "zdzdm",
+            "source_channel": "真的值得买_国内优惠",
+            "source_item_id": "tip_deg_retry",
+            "platform": "jd",
+            "title": "运动鞋",
+            "clean_retry_count": 0,
+            "ai_stage1_result": {
+                "main_tip_id": "tip_deg_retry",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["tip_deg_retry"],
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": "https://u.jd.com/coupon_ok", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L2", "clean_input": "https://union-click.jd.com/degraded_sec", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+            },
+        },
+        {
+            "source_site": "zdzdm",
+            "source_channel": "真的值得买_国内优惠",
+            "source_item_id": "tip_deg_maxed",
+            "platform": "jd",
+            "title": "运动鞋",
+            "clean_retry_count": MAX_CLEAN_RETRIES - 1,
+            "ai_stage1_result": {
+                "main_tip_id": "tip_deg_maxed",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["tip_deg_maxed"],
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": "https://u.jd.com/coupon_ok", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L2", "clean_input": "https://union-click.jd.com/degraded_sec", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+            },
+        },
+        {
+            "source_site": "zzzdm",
+            "source_channel": "值值得买_24小时热榜",
+            "source_item_id": "tip_perm_err",
+            "platform": "jd",
+            "title": "饮料",
+            "clean_retry_count": 0,
+            "ai_stage1_result": {
+                "main_tip_id": "tip_perm_err",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["tip_perm_err"],
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": "https://u.jd.com/perm_err", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L2", "clean_input": "https://u.jd.com/perm_main_ok", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+            },
+        },
+    ]
+
+    s3_out, _ = cleaner.process_convert_unit(s3_docs, shared_active_products={}, quiet_sub_logs=True)
+    s3_map = {o["source_item_id"]: o for o in s3_out}
+
+    assert s3_map["tip_deg_retry"]["status"] == "retry_pending"
+    assert s3_map["tip_deg_retry"]["clean_stage"] == CLEAN_STAGE_NEED_CONVERT
+    assert s3_map["tip_deg_retry"]["error_code"] == ERR_ADAPTER_CONVERT_FAILED
+    assert s3_map["tip_deg_retry"]["retry_count"] == 1
+
+    assert s3_map["tip_deg_maxed"]["stage_outcome"] == "advance_to_ai2"
+    assert s3_map["tip_perm_err"]["stage_outcome"] == "advance_to_ai2"
+
+    # --- C. 跨平台比价贴一致性校验 ---
+    cleaner.run_ai_stage1_batch = lambda *_a, **_kw: {
+        "tip_cross_ok": {
+            "main_tip_id": "tip_cross_ok",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_cross_ok"],
+            "combined_raw_text": "喜美诺快充线 8.03元 [#L1] 京东现售29.9 [#L2]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "TB_URL", "clean_input": "https://uland.taobao.com/coupon/edetail?e=ok", "platform": "taobao", "text_role_hint": "main_candidate"},
+                {"link_id": "L2", "raw_span": "JD_URL", "clean_input": "https://u.jd.com/coupon_ok", "platform": "jd", "text_role_hint": "coupon_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+        "tip_cross_mix": {
+            "main_tip_id": "tip_cross_mix",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_cross_mix"],
+            "combined_raw_text": "喜美诺快充线 8.03元 [#L1] 京东现售29.9 [#L2]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "TB_URL", "clean_input": "https://uland.taobao.com/coupon/edetail?e=ok", "platform": "taobao", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L2", "raw_span": "JD_URL", "clean_input": "https://u.jd.com/coupon_ok", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        },
+    }
+    cleaner.run_ai_stage2_batch = lambda *_a, **_kw: {
+        # 正确选中淘宝主商品 L1，不因文末京东比价链 L2 被误杀
+        "tip_cross_ok": {
+            "main_tip_id": "tip_cross_ok",
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "deal_price": 8.03,
+            "coupon_links": [],
+            "tutorial_steps": ["1. 领券拍下，淘金币抵扣后实付8.03元"],
+            "quality_score": 88,
+        },
+        # 错误选中京东比价链 L2 且把淘宝 L1 塞进 coupon_links -> 必须拦截防跨平台串货
+        "tip_cross_mix": {
+            "main_tip_id": "tip_cross_mix",
+            "is_valid_deal": True,
+            "main_link_id": "L2",
+            "deal_price": 8.03,
+            "coupon_links": [{"link_id": "L1", "label": "8元优惠券"}],
+            "tutorial_steps": ["1. 领淘宝券拍京东商品"],
+            "quality_score": 85,
+        },
+    }
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+    cross_inputs = [
+        {"source_site": "ithome_lapin", "source_channel": "IT之家辣品_好物", "source_item_id": "tip_cross_ok", "platform": "taobao", "title": "喜美诺快充线", "tutorial_text": "喜美诺", "extracted_links": [], "extracted_tokens": []},
+        {"source_site": "ithome_lapin", "source_channel": "IT之家辣品_好物", "source_item_id": "tip_cross_mix", "platform": "taobao", "title": "喜美诺快充线", "tutorial_text": "喜美诺", "extracted_links": [], "extracted_tokens": []},
+    ]
+    cross_res = cleaner.clean_batch_records(cross_inputs, mock_col, shared_active_products={}, quiet_sub_logs=True)
+    cross_map = {r["source_item_id"]: r for r in cross_res}
+
+    assert cross_map["tip_cross_ok"]["status"] == "success"
+    assert cross_map["tip_cross_ok"]["product_doc"]["platform"] == "taobao"
+    assert cross_map["tip_cross_mix"]["status"] == "failed"
+    assert cross_map["tip_cross_mix"]["error_code"] == ERR_AI2_COUPON_FAILED_OR_DROPPED
+
+
+
 

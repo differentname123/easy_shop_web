@@ -473,6 +473,8 @@ def test_save_batch_tehuicaicai_refresh_never_conflicts_set_and_set_on_insert():
             }
         ],
         task_name="unit_test",
+        refresh_publish_time=True,
+        max_age_days=7.0,
     )
 
     assert res["inserted"] == 1
@@ -567,53 +569,6 @@ def test_run_clean_stage_sweeps_stale_pending_by_either_publish_ts_or_first_seen
     assert by_id["cooling"]["clean_status"] == "pending"
 
 
-def test_format_raw_message_skips_xianbao_synthetic_haodan_weibo_title_but_keeps_real_titles():
-    # 1. xianbao_fun 好单线报 / 微博线报 synthetic title with broken regex price -> skipped when body exists
-    haodan_doc = {
-        "source_site": "xianbao_fun",
-        "source_channel": "category_haodan:好单线报-服饰-淘宝",
-        "source_item_id": "7465539",
-        "title": "乔丹被窝防风防泼水羽绒服 拍1 15元",
-        "tutorial_text": "速 乔丹被窝防风防泼水羽绒服\n弹 下拉叠金币任选拍115元\nhttps://m.tb.cn/h.jQvw5nR",
-    }
-    msg_haodan = DealPoolCleaner._format_raw_message_for_ai1(haodan_doc)
-    assert "【标题】" not in msg_haodan["content"]
-    assert "拍115元" in msg_haodan["content"]
-
-    # 2. Fallback safety: if xianbao_fun detail fetch failed, title is still preserved
-    haodan_err_doc = {
-        "source_site": "xianbao_fun",
-        "source_channel": "haodan_hot:好单线报-服饰-淘宝",
-        "source_item_id": "7465540",
-        "title": "波司登羽绒服 351.45元",
-        "tutorial_text": "预览\n[详情拉取异常: Timeout]",
-    }
-    msg_err = DealPoolCleaner._format_raw_message_for_ai1(haodan_err_doc)
-    assert "【标题】波司登羽绒服 351.45元" in msg_err["content"]
-
-    # 3. xianbao_fun 豆瓣线报 (real user thread title with price only in title) -> MUST keep 【标题】
-    douban_doc = {
-        "source_site": "xianbao_fun",
-        "source_channel": "category_douban:豆瓣线报-买组",
-        "source_item_id": "7460001",
-        "title": "欧莱雅紫熨斗眼霜60ml 145元",
-        "tutorial_text": "[教程图片: https://img3.doubanio.com/view/group_topic/l/public/p1.webp]",
-    }
-    msg_douban = DealPoolCleaner._format_raw_message_for_ai1(douban_doc)
-    assert msg_douban["content"].startswith("【标题】欧莱雅紫熨斗眼霜60ml 145元")
-
-    # 4. haodanku / bacaoo editorial title with price only in title -> MUST keep 【标题】
-    hdk_doc = {
-        "source_site": "haodanku",
-        "source_channel": "wire_report:淘宝实时线报",
-        "source_item_id": "1650001",
-        "title": "💰24.6 | 柏瑞美定妆喷雾100ml",
-        "tutorial_text": "①柏瑞美定妆喷雾 https://uland.taobao.com/item/edetail?id=abc",
-    }
-    msg_hdk = DealPoolCleaner._format_raw_message_for_ai1(hdk_doc)
-    assert msg_hdk["content"].startswith("【标题】💰24.6 | 柏瑞美定妆喷雾100ml")
-
-
 def test_stage2_prompt_hot_reloads_on_mtime_change(monkeypatch, tmp_path):
     import os
     import mobile_web.scripts.run_deal_pool_scheduler as sched_mod
@@ -683,7 +638,7 @@ def test_deal_max_clean_age_days_is_2_days():
 def test_channel_specific_max_age_days_configuration_and_behavior():
     """验证渠道级保鲜期灵活配置：特惠采采享 7 天长保鲜期，逛丢等常规站保持 2 天。"""
     import datetime
-    from mobile_web.services.deal_channel_config import (
+    from mobile_web.services.deal_sources.catalog import (
         DEFAULT_CHANNEL_CONFIGS,
         get_channel_max_age_days,
         get_site_max_age_days_map,
@@ -697,7 +652,7 @@ def test_channel_specific_max_age_days_configuration_and_behavior():
     assert get_channel_max_age_days(site_key="guangdiu") == 2.0
     assert get_channel_max_age_days(channel_name="未知频道", default_days=2.0) == 2.0
 
-    site_map = get_site_max_age_days_map()
+    site_map = get_site_max_age_days_map(DEFAULT_CHANNEL_CONFIGS)
     assert site_map.get("tehuicaicai") == 7.0
     assert site_map.get("guangdiu") == 2.0
 
@@ -737,6 +692,13 @@ def test_channel_specific_max_age_days_configuration_and_behavior():
                 "extracted_links": [{"url": "https://u.jd.com/thcc2"}],
                 "has_full_detail": True,
             },
+        ],
+        task_name="channel_age_test",
+        refresh_publish_time=True,
+        max_age_days=7.0,
+    )
+    repo.save_batch(
+        [
             {
                 "source_site": "guangdiu",
                 "source_channel": "逛丢_首页实时流",
@@ -748,16 +710,18 @@ def test_channel_specific_max_age_days_configuration_and_behavior():
             },
         ],
         task_name="channel_age_test",
+        refresh_publish_time=False,
+        max_age_days=2.0,
     )
     # 特惠采采 3 天前爆料：在 7 天保鲜期内，进入 pending
-    # 特惠采采每轮巡视会刷新保鲜字段，因此这三个键落在 $set（插入模板里不得重复，否则错误码 40）
+    # refresh_publish_time=True 时刷新保鲜字段，这三个键落在 $set（插入模板里不得重复，否则错误码 40）
     assert captured_ops[0]._doc["$setOnInsert"]["clean_status"] == "pending"
     assert captured_ops[0]._doc["$set"]["clean_max_age_days"] == 7.0
     assert captured_ops[0]._doc["$set"]["clean_cutoff_ts"] > 0
     assert "clean_max_age_days" not in captured_ops[0]._doc["$setOnInsert"]
     # 特惠采采 8 天前爆料：超过 7 天，被淘汰为 cleaned_failed
     assert captured_ops[1]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
-    # 逛丢 3 天前爆料：超过 2 天，被淘汰为 cleaned_failed（非特惠采采只在插入时写保鲜字段）
+    # 逛丢 3 天前爆料：超过 2 天，被淘汰为 cleaned_failed（refresh_publish_time=False 只在插入时写保鲜字段）
     assert captured_ops[2]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
     assert captured_ops[2]._doc["$setOnInsert"]["clean_max_age_days"] == 2.0
     assert captured_ops[2]._doc["$setOnInsert"]["clean_cutoff_ts"] > 0
@@ -1549,30 +1513,31 @@ def test_deal_pool_parse_publish_time_epoch_china_tz_consistency():
     assert ts_cn == ts_utc == ts_iso_offset
 
 
-def test_xianbao_detail_loop_circuit_breaks_on_429_and_caps_attempts(monkeypatch):
+def test_0818tuan_detail_loop_circuit_breaks_on_429_and_caps_attempts():
     """验证详情抓取遇到 429/502 立即熔断不再硬撞整页，且遇到 404 也严格按尝试次数封顶在 max_details。"""
-    from mobile_web.scripts import test_deal_sites_scraper as scraper
-
-    monkeypatch.setattr(scraper.time, "sleep", lambda _: None)
+    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, Tuan0818Source
 
     li_items = "".join(
-        f'<li class="article-list"><a href="/haodan/{1000 + i}.html" data-catename="京东" data-price="9.9">'
-        f"测试线报商品 #{i}</a></li>"
+        f'<li><a href="/xbhd/{1000 + i}.html">测试线报商品 #{i}</a></li>'
         for i in range(25)
     )
     list_html = f"<ul>{li_items}</ul>"
 
     calls_429 = []
 
-    def fake_get_429(url, headers=None, timeout=10.0):
+    def fake_get_429(url, headers=None, timeout=15.0):
         calls_429.append(url)
         resp = MagicMock()
-        if url.endswith("haodan-hot.html"):
+        if url.endswith("list-1-0.html"):
             resp.status_code = 200
             resp.text = list_html
         elif len(calls_429) == 2:
             resp.status_code = 200
-            resp.text = '<div class="article-content"><a href="https://u.jd.com/abc123">直达</a></div><div id="foot"></div>'
+            resp.text = (
+                '<div id="xbcontent">'
+                '<p>先领券再下单实付9.9元包邮 <a href="https://u.jd.com/abc123">直达购买</a></p>'
+                "</div>"
+            )
         else:
             resp.status_code = 429
             resp.text = "Too Many Requests"
@@ -1581,24 +1546,27 @@ def test_xianbao_detail_loop_circuit_breaks_on_429_and_caps_attempts(monkeypatch
     sess_429 = MagicMock()
     sess_429.get.side_effect = fake_get_429
 
-    res_429 = scraper.fetch_xianbao_fun_deals(
-        channel="haodan_hot",
-        fetch_detail=True,
+    ch_429 = ChannelConfig(
+        name="0818团_最新线报",
+        site_key="0818tuan",
+        default_url="http://www.0818tuan.com/list-1-0.html",
         max_details=15,
-        session=sess_429,
+        detail_delay_seconds=0.0,
     )
+    res_429 = Tuan0818Source().fetch(FetchContext(channel=ch_429, session=sess_429)).to_dict()
     assert len(calls_429) == 3
-    assert res_429["count"] == 25
+    assert res_429["rate_limited"] is True
     assert res_429["detail_fetched"] == 1
+    assert res_429["count"] == 1
     assert len(res_429["detail_errors"]) == 1
     assert res_429["detail_errors"][0]["http_status"] == 429
 
     calls_404 = []
 
-    def fake_get_404(url, headers=None, timeout=10.0):
+    def fake_get_404(url, headers=None, timeout=15.0):
         calls_404.append(url)
         resp = MagicMock()
-        if url.endswith("haodan-hot.html"):
+        if url.endswith("list-1-0.html"):
             resp.status_code = 200
             resp.text = list_html
         else:
@@ -1609,12 +1577,14 @@ def test_xianbao_detail_loop_circuit_breaks_on_429_and_caps_attempts(monkeypatch
     sess_404 = MagicMock()
     sess_404.get.side_effect = fake_get_404
 
-    res_404 = scraper.fetch_xianbao_fun_deals(
-        channel="haodan_hot",
-        fetch_detail=True,
+    ch_404 = ChannelConfig(
+        name="0818团_最新线报",
+        site_key="0818tuan",
+        default_url="http://www.0818tuan.com/list-1-0.html",
         max_details=4,
-        session=sess_404,
+        detail_delay_seconds=0.0,
     )
+    res_404 = Tuan0818Source().fetch(FetchContext(channel=ch_404, session=sess_404)).to_dict()
     assert len(calls_404) == 1 + 4
     assert res_404["detail_fetched"] == 0
     assert len(res_404["detail_errors"]) == 4
@@ -1622,69 +1592,84 @@ def test_xianbao_detail_loop_circuit_breaks_on_429_and_caps_attempts(monkeypatch
 
 def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, tmp_path):
     """验证同源站点在单轮内触发 429 后，后续同站点频道直接 cooldown_skipped 冷却跳过，且错误路径按频道聚合。"""
+    import sys
     from mobile_web.scripts import run_deal_pool_scheduler as dps
-    from mobile_web.services import deal_pipeline as dp_mod
-    from mobile_web.services.deal_channel_config import DealChannelConfig
+    from mobile_web.services.deal_sources import BaseDealSource, ChannelConfig, FetchContext, FetchResult
 
-    monkeypatch.setattr(dp_mod.time, "sleep", lambda _: None)
-    monkeypatch.setattr(dp_mod, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"))
-    monkeypatch.setattr(dp_mod, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"))
-    monkeypatch.setattr(dp_mod, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"))
-    monkeypatch.setattr(dp_mod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"))
+    for mod_name in ("mobile_web.services.deal_pipeline", "services.deal_pipeline"):
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            monkeypatch.setattr(mod.time, "sleep", lambda _: None, raising=False)
+            monkeypatch.setattr(mod, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"), raising=False)
+            monkeypatch.setattr(mod, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"), raising=False)
+            monkeypatch.setattr(mod, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"), raising=False)
+            monkeypatch.setattr(mod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"), raising=False)
+    for rmod_name in ("mobile_web.repositories.deal_raw_pool_repo", "repositories.deal_raw_pool_repo"):
+        rmod = sys.modules.get(rmod_name)
+        if rmod is not None:
+            monkeypatch.setattr(rmod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"), raising=False)
 
-    xianbao_calls = []
+    site_calls = []
 
-    def fake_xianbao(**kwargs):
-        xianbao_calls.append(kwargs.get("channel"))
-        return {
-            "status": "success",
-            "http_status": 200,
-            "request_url": "https://new.xianbao.fun/test",
-            "raw_list_count": 2,
-            "count": 1,
-            "detail_fetched": 0,
-            "detail_errors": [
-                {"item_id": "1", "error_url": "https://new.xianbao.fun/1.html", "http_status": 429, "error_type": "HTTP_429", "error": "429"},
-                {"item_id": "2", "error_url": "https://new.xianbao.fun/2.html", "http_status": 429, "error_type": "HTTP_429", "error": "429"},
-            ],
-            "records": [{"source_site": "xianbao_fun", "source_item_id": "1", "has_full_detail": False}],
-        }
+    class _RateLimitedMockSource(BaseDealSource):
+        site_key = "mock_site"
 
-    ok_stub = lambda **kwargs: {
-        "status": "success",
-        "http_status": 200,
-        "request_url": "https://example.com/ok",
-        "raw_list_count": 1,
-        "count": 1,
-        "detail_fetched": 1,
-        "detail_errors": [],
-        "records": [{"source_site": "tehuicaicai", "source_item_id": "h1", "has_full_detail": True, "extracted_links": [{"url": "https://u.jd.com/x"}]}],
-    }
+        def fetch(self, ctx: FetchContext) -> FetchResult:
+            site_calls.append(ctx.channel.params.get("channel"))
+            return FetchResult(
+                status="ok",
+                http_status=200,
+                request_url=ctx.channel.default_url,
+                elapsed_ms=2.0,
+                raw_list_count=2,
+                detail_errors=[
+                    {"item_id": "1", "error_url": f"{ctx.channel.default_url}/1.html", "http_status": 429, "error_type": "HTTP_429", "error": "429"},
+                    {"item_id": "2", "error_url": f"{ctx.channel.default_url}/2.html", "http_status": 429, "error_type": "HTTP_429", "error": "429"},
+                ],
+                records=[{"source_site": "mock_site", "source_item_id": "1", "has_full_detail": False}],
+            )
 
-    monkeypatch.setattr(dps, "fetch_xianbao_fun_deals", fake_xianbao)
-    monkeypatch.setattr(dps, "fetch_tehuicaicai_deals", ok_stub)
+    class _OkStubSource(BaseDealSource):
+        site_key = "tehuicaicai"
+
+        def fetch(self, ctx: FetchContext) -> FetchResult:
+            return FetchResult(
+                status="ok",
+                http_status=200,
+                request_url="https://example.com/ok",
+                elapsed_ms=1.0,
+                raw_list_count=1,
+                detail_fetched=1,
+                records=[{
+                    "source_site": "tehuicaicai",
+                    "source_item_id": "h1",
+                    "has_full_detail": True,
+                    "tutorial_text": "领券拍下立减20元包邮",
+                    "extracted_links": [{"url": "https://u.jd.com/x"}],
+                }],
+            )
 
     test_channels = [
-        DealChannelConfig(
-            name="线报酷_频道A",
-            site_key="xianbao_fun",
-            default_url="https://new.xianbao.fun/a/",
-            fetcher_name="fetch_xianbao_fun_deals",
-            fetcher_kwargs={"channel": "a", "fetch_detail": True},
+        ChannelConfig(
+            name="模拟站_频道A",
+            site_key="mock_site",
+            default_url="https://mock.example.com/a/",
+            params={"channel": "a"},
+            sleep_after=0.0,
         ),
-        DealChannelConfig(
-            name="线报酷_频道B",
-            site_key="xianbao_fun",
-            default_url="https://new.xianbao.fun/b/",
-            fetcher_name="fetch_xianbao_fun_deals",
-            fetcher_kwargs={"channel": "b", "fetch_detail": True},
+        ChannelConfig(
+            name="模拟站_频道B",
+            site_key="mock_site",
+            default_url="https://mock.example.com/b/",
+            params={"channel": "b"},
+            sleep_after=0.0,
         ),
-        DealChannelConfig(
+        ChannelConfig(
             name="特惠采采_测试",
             site_key="tehuicaicai",
             default_url="https://xhhcds.cn/",
-            fetcher_name="fetch_tehuicaicai_deals",
-            fetcher_kwargs={"channel": "home", "fetch_detail": True},
+            params={"channel": "home"},
+            sleep_after=0.0,
         ),
     ]
 
@@ -1699,9 +1684,13 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
         cycle_num=1,
         channels=test_channels,
         channel_last_run={},
+        source_registry={
+            "mock_site": _RateLimitedMockSource(),
+            "tehuicaicai": _OkStubSource(),
+        },
     )
-    assert len(xianbao_calls) == 1
-    xb_tasks = [t for t in out["tasks"] if t["site_key"] == "xianbao_fun"]
+    assert len(site_calls) == 1
+    xb_tasks = [t for t in out["tasks"] if t["site_key"] == "mock_site"]
     assert len(xb_tasks) == 2
     assert sum(1 for t in xb_tasks if t["status"] == "cooldown_skipped") == 1
     assert len(out["error_paths"]) == 1
@@ -1893,9 +1882,8 @@ def test_commit_batch_results_records_supplementary_copies():
     assert tl_ops[0]["deal_price"] == 45.0
 
 
-def test_fetch_guangdiu_filters_vipshop(monkeypatch):
-    from mobile_web.scripts.test_deal_sites_scraper import fetch_guangdiu_deals
-    import requests
+def test_fetch_guangdiu_filters_vipshop():
+    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
 
     html_content = """
     <div class="gooditem">
@@ -1912,18 +1900,39 @@ def test_fetch_guangdiu_filters_vipshop(monkeypatch):
     </div>
     """
 
-    class FakeResponse:
-        status_code = 200
-        text = html_content
+    called_urls = []
+
+    def fake_get(url, *args, **kwargs):
+        called_urls.append(url)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.url = url
+        if "detail.php" in url:
+            resp.text = (
+                '<div id="dabstract">购买攻略：领券下单实付19.9元 '
+                '<a href="to.php?u=https%3A%2F%2Fitem.jd.com%2F103.html">购买</a></div>'
+            )
+        elif "go.php" in url:
+            resp.text = "var target = 'https://u.jd.com/mock_vip_filter';"
+        else:
+            resp.text = html_content
+        return resp
 
     fake_session = MagicMock()
-    fake_session.get.return_value = FakeResponse()
+    fake_session.get.side_effect = fake_get
 
-    res = fetch_guangdiu_deals(
-        channel="latest",
-        fetch_detail=False,
-        session=fake_session,
+    ch = ChannelConfig(
+        name="逛丢_首页实时流",
+        site_key="guangdiu",
+        default_url="https://guangdiu.com/",
+        params={"channel": "latest", "cookie_file": ""},
+        max_details=10,
+        detail_delay_seconds=0.0,
     )
+    res = GuangdiuSource().fetch(FetchContext(channel=ch, session=fake_session)).to_dict()
+    assert res["status"] == "ok"
+    assert res["skipped_unsupported"] == 1
+    assert not any("102" in u for u in called_urls)
     records = res["records"]
     assert len(records) == 2
     item_ids = [r["source_item_id"] for r in records]
@@ -1935,8 +1944,7 @@ def test_fetch_guangdiu_filters_vipshop(monkeypatch):
 
 
 def test_fetch_guangdiu_rank_and_hots_parser():
-    from mobile_web.scripts.test_deal_sites_scraper import fetch_guangdiu_deals
-    from unittest.mock import MagicMock
+    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
 
     rank_html = """
     <div class="hourrankitem">
@@ -1967,13 +1975,22 @@ def test_fetch_guangdiu_rank_and_hots_parser():
     </div>
     """
 
-    go_js = """var _xdk9 = 'https%3A%2F%2Fitem.jd.com%2F10001.html';"""
-
     def fake_get(url, *args, **kwargs):
         resp = MagicMock()
         resp.status_code = 200
+        resp.url = url
         if "go.php" in url:
             resp.text = "var target = 'https://union-click.jd.com/jdc?e=mock_rank';"
+        elif "detail.php?id=801" in url:
+            resp.text = (
+                '<div id="dabstract">京东自营满减直降16.6元包邮 '
+                '<a href="to.php?u=https%3A%2F%2Fitem.jd.com%2F801.html">购买</a></div>'
+            )
+        elif "detail.php?id=901" in url:
+            resp.text = (
+                '<div id="dabstract">满100减60优惠券，领券后下单39元 '
+                '<a href="https://s.click.taobao.com/hots901">抢购</a></div>'
+            )
         elif "rank.php" in url:
             resp.text = rank_html
         elif "hots.php" in url:
@@ -1991,9 +2008,16 @@ def test_fetch_guangdiu_rank_and_hots_parser():
     session = MagicMock()
     session.get.side_effect = fake_get
 
-    # 1. 验证 rank.php
-    res_rank = fetch_guangdiu_deals(channel="rank", fetch_detail=False, session=session)
-    assert res_rank["status"] == "success"
+    ch_rank = ChannelConfig(
+        name="逛丢_小时风云榜",
+        site_key="guangdiu",
+        default_url="https://guangdiu.com/rank.php",
+        params={"channel": "rank", "cookie_file": ""},
+        max_details=10,
+        detail_delay_seconds=0.0,
+    )
+    res_rank = GuangdiuSource().fetch(FetchContext(channel=ch_rank, session=session)).to_dict()
+    assert res_rank["status"] == "ok"
     records_rank = res_rank["records"]
     assert len(records_rank) == 1  # 唯品会被过滤，保留京东
     rec1 = records_rank[0]
@@ -2003,9 +2027,16 @@ def test_fetch_guangdiu_rank_and_hots_parser():
     assert rec1["price_text"] == "16.6元"
     assert "https://union-click.jd.com/jdc?e=mock_rank" in [lk["url"] for lk in rec1["extracted_links"]]
 
-    # 2. 验证 hots.php
-    res_hots = fetch_guangdiu_deals(channel="hots", fetch_detail=False, session=session)
-    assert res_hots["status"] == "success"
+    ch_hots = ChannelConfig(
+        name="逛丢_热门榜",
+        site_key="guangdiu",
+        default_url="https://guangdiu.com/hots.php",
+        params={"channel": "hots", "cookie_file": ""},
+        max_details=10,
+        detail_delay_seconds=0.0,
+    )
+    res_hots = GuangdiuSource().fetch(FetchContext(channel=ch_hots, session=session)).to_dict()
+    assert res_hots["status"] == "ok"
     rec_hot = res_hots["records"][0]
     assert rec_hot["source_item_id"] == "901"
     assert rec_hot["mall_name"] == "天猫"
@@ -2013,18 +2044,8 @@ def test_fetch_guangdiu_rank_and_hots_parser():
     assert "满100减60优惠券" in rec_hot["tutorial_text"]
 
 
-def test_fetch_guangdiu_captcha_circuit_breaker(monkeypatch):
-    from mobile_web.scripts.test_deal_sites_scraper import fetch_guangdiu_deals
-    from unittest.mock import MagicMock
-
-    # 滑块求解器由用例显式注入失败结果：它内部会真起浏览器访问真实站点，
-    # 既不确定也不该出现在离线单测里（不能靠"真实站点当下是否放行"来决定断言）。
-    # 同一模块在 `mobile_web.services.*` 与 `services.*` 两种导入路径下各有一份实例，都要打。
-    for module_name in ("mobile_web.services.deal_fetchers", "services.deal_fetchers"):
-        monkeypatch.setattr(
-            f"{module_name}._solve_guangdiu_slider_playwright",
-            lambda *a, **k: (False, "", "用例注入：自动通过失败"),
-        )
+def test_fetch_guangdiu_captcha_circuit_breaker():
+    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
 
     list_html = """
     <div class="gooditem">
@@ -2057,11 +2078,12 @@ def test_fetch_guangdiu_captcha_circuit_breaker(monkeypatch):
     def fake_get(url, *args, **kwargs):
         resp = MagicMock()
         resp.status_code = 200
+        resp.url = url
         if "go.php" in url:
             resp.text = "var u = 'https://union-click.jd.com/jdc?e=ok';"
         elif "detail.php" in url:
             detail_called.append(url)
-            resp.text = captcha_html  # 模拟详情页触发滑块验证码
+            resp.text = captcha_html
         else:
             resp.text = list_html
         return resp
@@ -2069,12 +2091,20 @@ def test_fetch_guangdiu_captcha_circuit_breaker(monkeypatch):
     session = MagicMock()
     session.get.side_effect = fake_get
 
-    # 验证“宁缺毋滥”铁律：当详情页遇到验证码未能拿到爆料教程时，系统主动断路保护 IP，且绝不入库空壳商品
-    res = fetch_guangdiu_deals(channel="latest", fetch_detail=True, max_details=5, session=session)
-    # 首次触发验证码后，detail_circuit_broken 触发，后续 702 不再发起 detail 请求
+    ch = ChannelConfig(
+        name="逛丢_首页实时流",
+        site_key="guangdiu",
+        default_url="https://guangdiu.com/",
+        params={"channel": "latest", "cookie_file": ""},
+        max_details=5,
+        detail_delay_seconds=0.0,
+    )
+    # Fail-Closed：详情页触发安全验证时不做任何破解绕过，立即熔断，0 空壳入库
+    res = GuangdiuSource().fetch(FetchContext(channel=ch, session=session)).to_dict()
+    assert res["status"] == "error"
+    assert res["rate_limited"] is True
     assert len(detail_called) == 1
     assert "701" in detail_called[0]
-    # 两个商品均未获得实质性详情教程，宁缺毋滥，全部跳过等待下一轮冷却后重试，records 为空
     assert len(res["records"]) == 0
     assert any(err.get("error_type") == "CaptchaChallengeDetected" for err in res["detail_errors"])
 
@@ -2087,9 +2117,11 @@ def test_fetch_guangdiu_captcha_circuit_breaker(monkeypatch):
         <a class="dgotobutton"></a>
     </body></html>
     """
+
     def fake_get_ok(url, *args, **kwargs):
         resp = MagicMock()
         resp.status_code = 200
+        resp.url = url
         if "go.php" in url:
             resp.text = "var u = 'https://union-click.jd.com/jdc?e=ok';"
         elif "detail.php" in url:
@@ -2100,8 +2132,8 @@ def test_fetch_guangdiu_captcha_circuit_breaker(monkeypatch):
 
     session_ok = MagicMock()
     session_ok.get.side_effect = fake_get_ok
-    res_ok = fetch_guangdiu_deals(channel="latest", fetch_detail=True, max_details=5, session=session_ok)
-    assert res_ok["status"] == "success"
+    res_ok = GuangdiuSource().fetch(FetchContext(channel=ch, session=session_ok)).to_dict()
+    assert res_ok["status"] == "ok"
     assert len(res_ok["records"]) == 2
     rec = res_ok["records"][0]
     assert rec["has_full_detail"] is True
@@ -2115,28 +2147,29 @@ def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path):
     import json
     import os
     import requests
-    from mobile_web.services.deal_fetchers import (
+    from mobile_web.services.deal_sources.guangdiu import (
         DEFAULT_GUANGDIU_COOKIE_FILE,
-        _load_guangdiu_cookies,
-        _save_guangdiu_cookies,
-        fetch_guangdiu_deals,
+        GuangdiuSource,
+        load_guangdiu_cookies,
+        save_guangdiu_cookies,
     )
 
     # 1. 验证默认 Cookie 路径存在且为规范绝对路径
     assert DEFAULT_GUANGDIU_COOKIE_FILE.endswith("guangdiu_cookies.json")
     assert os.path.isabs(DEFAULT_GUANGDIU_COOKIE_FILE)
 
-    # 2. 验证 fetch_guangdiu_deals 默认参数已接入 DEFAULT_GUANGDIU_COOKIE_FILE
-    sig = inspect.signature(fetch_guangdiu_deals)
-    assert sig.parameters["cookie_file"].default == DEFAULT_GUANGDIU_COOKIE_FILE
+    # 2. 验证 load/save 默认参数均已接入 DEFAULT_GUANGDIU_COOKIE_FILE 且 GuangdiuSource 支持 cookie_file
+    assert inspect.signature(load_guangdiu_cookies).parameters["cookie_file"].default == DEFAULT_GUANGDIU_COOKIE_FILE
+    assert inspect.signature(save_guangdiu_cookies).parameters["cookie_file"].default == DEFAULT_GUANGDIU_COOKIE_FILE
+    assert GuangdiuSource.site_key == "guangdiu"
 
-    # 3. 验证 _save_guangdiu_cookies 与 _load_guangdiu_cookies 存取闭环
+    # 3. 验证 save_guangdiu_cookies 与 load_guangdiu_cookies 存取闭环
     test_cookie_file = str(tmp_path / "test_gd_cookies.json")
     sess = requests.Session()
     sess.cookies.set("gdhuman", "test_val_12345", domain="guangdiu.com", path="/")
     sess.cookies.set("PHPSESSID", "test_sess_67890", domain="guangdiu.com", path="/")
 
-    _save_guangdiu_cookies(sess, test_cookie_file)
+    save_guangdiu_cookies(sess, test_cookie_file)
     assert os.path.exists(test_cookie_file)
 
     with open(test_cookie_file, "r", encoding="utf-8") as f:
@@ -2145,18 +2178,16 @@ def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path):
     assert cookie_dict.get("gdhuman") == "test_val_12345"
     assert cookie_dict.get("PHPSESSID") == "test_sess_67890"
 
-    # 新 Session 加载验证
     sess2 = requests.Session()
     assert "gdhuman" not in sess2.cookies
-    loaded = _load_guangdiu_cookies(sess2, test_cookie_file)
+    loaded = load_guangdiu_cookies(sess2, test_cookie_file)
     assert loaded is True
     assert sess2.cookies.get("gdhuman") == "test_val_12345"
     assert sess2.cookies.get("PHPSESSID") == "test_sess_67890"
 
     # 4. 验证 Mock session 防御：传入 MagicMock 不会写坏文件
     mock_sess = MagicMock()
-    _save_guangdiu_cookies(mock_sess, test_cookie_file)
-    # 文件内容保持原样
+    save_guangdiu_cookies(mock_sess, test_cookie_file)
     with open(test_cookie_file, "r", encoding="utf-8") as f:
         after_mock_data = json.load(f)
     assert len(after_mock_data) == 2

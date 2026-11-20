@@ -27,7 +27,7 @@ from requests.adapters import HTTPAdapter
 from pymongo import UpdateOne
 
 from adapters import get_adapter, platform_name
-from services.deal_channel_config import get_site_max_age_days_map
+from services.deal_sources.catalog import get_site_max_age_days_map
 from infrastructure.ai_api.model_api import generate_content
 from infrastructure.api_governance import api_caller_context
 from infrastructure.mongo import gen_db_object
@@ -797,20 +797,6 @@ class DealPoolCleaner:
         return self.prompt_stage2_template
 
     @staticmethod
-    def _is_xianbao_synthetic_title_doc(msg_doc: Dict[str, Any], tut: str) -> bool:
-        """
-        线报酷 (`xianbao_fun`) 旗下的好单线报/微博线报属于无标题群聊/微博流，
-        其列表页 `title` 由源站后端用粗糙正则从正文机械截取并拼接猜测价格（易将红包/口令前缀/连写数字误拼为价格）；
-        当完整正文 `tut` 已存在时，不应把该合成标题前置注入 AI 输入（豆瓣/好单库/拔草哦等真实人工标题源站不受影响）。
-        """
-        if str(msg_doc.get("source_site") or "") != "xianbao_fun":
-            return False
-        if not tut or "[详情拉取异常" in tut:
-            return False
-        ch = str(msg_doc.get("source_channel") or "")
-        return any(k in ch for k in ("好单线报", "微博线报", "haodan", "weibo"))
-
-    @staticmethod
     def _extract_doc_images(msg_doc: Dict[str, Any]) -> List[str]:
         """确定性提取单条原始文档中的去重图片列表（代码直接提取，无需发给大模型复读）。"""
         imgs: List[str] = []
@@ -827,13 +813,13 @@ class DealPoolCleaner:
     def _format_raw_message_for_ai1(cls, msg_doc: Dict[str, Any], is_target: bool = False) -> Dict[str, Any]:
         """
         将单条 `deal_raw_tips` 文档格式化为 Stage 1 AI 标准输入的 `raw_messages` 元素。
-        确保 DOM 属性提取或源站中转解包出的链接/口令（如逛丢 `go.php`、拔草哦 `go.bacaoo.com`、好单库加密ID）
+        确保 DOM 属性提取或源站中转解包出的链接/口令（如逛丢 `go.php`、白菜哦 `tgo`、好单库加密ID）
         100% 出现在 `content` 文本中，同时仅传 `image_count` 节省无意义的 URL Token 开销。
         """
         title = _normalize_inline_spaces(str(msg_doc.get("title") or "")).strip()
         tut = _normalize_inline_spaces(str(msg_doc.get("tutorial_text") or "")).strip()
         content = tut if tut else title
-        if title and title not in content and not cls._is_xianbao_synthetic_title_doc(msg_doc, tut):
+        if title and title not in content:
             content = f"【标题】{title}\n{content}".strip()
 
         extra_anchor_lines: List[str] = []
@@ -1981,8 +1967,13 @@ class DealPoolCleaner:
                 return True
             if host == "shop.m.jd.com" and path.startswith("/member/"):
                 return True
-            if host == "uland.taobao.com" and ("/quan/" in path or "/coupon/" in path):
-                return True
+            if host == "uland.taobao.com":
+                if "/quan/" in path:
+                    return True
+                if "/edetail" in path:
+                    return False
+                if "/coupon/" in path:
+                    return True
             if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active" in path:
                 return True
             if host in ("pages.tmall.com", "pages-fast.m.taobao.com") and path.startswith("/wow/"):
@@ -2923,6 +2914,47 @@ class DealPoolCleaner:
                 }
                 continue
 
+            transient_degraded = next(
+                (
+                    c
+                    for c in conv_list
+                    if c.get("convert_status") == "failed"
+                    and c.get("resolution_kind") == "degraded_product"
+                    and c.get("text_role_hint") != "filler_candidate"
+                ),
+                None,
+            )
+            if transient_degraded is not None:
+                new_retries = int(doc.get("clean_retry_count") or 0) + 1
+                if new_retries < MAX_CLEAN_RETRIES:
+                    self.stats_ai_retries_scheduled += 1
+                    conv_summary_retry = [
+                        {k: v for k, v in c.items() if k != "adapter_res"}
+                        for c in conv_list
+                    ]
+                    outcomes_by_id[mid] = {
+                        "status": "retry_pending",
+                        "stage_outcome": "retry_pending",
+                        "clean_stage": CLEAN_STAGE_NEED_CONVERT,
+                        "error_code": ERR_ADAPTER_CONVERT_FAILED,
+                        "error_msg": (
+                            f"存在非凑单链接触发详情反查暂态限流，保留待下轮重试 "
+                            f"({new_retries}/{MAX_CLEAN_RETRIES}): {transient_degraded.get('error_msg') or ''}"
+                        ),
+                        "retry_count": new_retries,
+                        "source_site": site,
+                        "source_channel": channel,
+                        "source_item_id": mid,
+                        "title": raw_title,
+                        "ai_stage1_result": ai1_res,
+                        "converted_links": conv_summary_retry,
+                        "ai_stage2_result": None,
+                        "quality_score": 0,
+                        "candidate_count": len(targets),
+                        "attempt_errors": attempt_errors,
+                    }
+                    continue
+
             unique_main_pids = {
                 (str(c.get("platform") or ""), str(c.get("goods_id") or ""))
                 for c in main_prod_convs
@@ -3397,7 +3429,12 @@ class DealPoolCleaner:
             price_logic = _normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None
             clean_title = _normalize_inline_spaces(str(ai2_res.get("clean_title") or product_card.get("name") or raw_title)).strip()
 
+            def _is_other_known_platform(c: Dict[str, Any]) -> bool:
+                c_p = str(c.get("platform") or "").strip().lower()
+                return bool(plat in ("jd", "taobao", "pdd") and c_p in ("jd", "taobao", "pdd") and c_p != plat)
+
             coupon_links: List[Dict[str, Any]] = []
+            dropped_cross_platform_coupon = False
             seen_cpn_ids: Set[str] = set()
             seen_cpn_targets: Set[Tuple[str, str]] = set()
             for item in ai2_res.get("coupon_links") or []:
@@ -3413,7 +3450,8 @@ class DealPoolCleaner:
                 ):
                     continue
                 c_plat = str(c_obj.get("platform") or plat).strip().lower()
-                if plat in ("jd", "taobao", "pdd") and c_plat in ("jd", "taobao", "pdd") and c_plat != plat:
+                if _is_other_known_platform(c_obj):
+                    dropped_cross_platform_coupon = True
                     continue
                 if goods_id and str(c_obj.get("goods_id") or "").strip() == goods_id:
                     continue
@@ -3443,10 +3481,15 @@ class DealPoolCleaner:
             # 【优惠券与断链一致性拦截（Fail-Closed 铁律）】
             # 若最终未产出任何有效优惠券（not coupon_links）：
             # 1. 且非“已被主商品二合一推广链吸收的同品券链”（has_absorbed_coupon）；
-            # 2. 若原始线报仍包含未转出有效券且未被吸收的显式优惠券链接，或包含非纯数字 SKU 拒识的转链失败非凑单链接且到手价显著低于官方售价，
-            # 满足任一即表明好价前置动作已断裂，全条线报予以淘汰，绝不脑补放行。
+            # 2. 若原始线报仍包含未转出有效券且未被吸收的同平台显式优惠券链接，或包含非纯数字 SKU 拒识的同平台转链失败非凑单链接且到手价显著低于官方售价，
+            # 3. 或 AI-2 将异平台链接误配作主商品优惠券导致被剔除（防跨平台串货），
+            # 满足任一即表明好价前置动作已断裂或错配，全条线报予以淘汰，绝不脑补或串货放行。
             def _is_coupon_absorbed_by_main(c: Dict[str, Any]) -> bool:
-                if c.get("link_id") == main_lid or c.get("convert_status") != "product":
+                if (
+                    c.get("link_id") == main_lid
+                    or c.get("convert_status") != "product"
+                    or _is_other_known_platform(c)
+                ):
                     return False
                 c_gid = str(c.get("goods_id") or "").strip()
                 c_url = str(c.get("my_promo_link") or "").strip()
@@ -3460,32 +3503,38 @@ class DealPoolCleaner:
                 self._is_explicit_coupon_target(c) and _is_coupon_absorbed_by_main(c)
                 for c in conv_list
             )
-            if is_valid and not coupon_links and not has_absorbed_coupon:
-                raw_coupon_candidates = [
-                    c for c in conv_list
-                    if c.get("link_id") != main_lid
-                    and c.get("text_role_hint") != "filler_candidate"
-                    and not _is_coupon_absorbed_by_main(c)
-                    and self._is_explicit_coupon_target(c)
-                ]
+            if is_valid and not coupon_links and (dropped_cross_platform_coupon or not has_absorbed_coupon):
                 should_reject = False
                 reject_detail = ""
-                if raw_coupon_candidates:
+                if dropped_cross_platform_coupon:
                     should_reject = True
-                    reject_detail = "原始优惠券链接转链失败或未被保留"
-                elif deal_price is not None:
-                    has_failed_non_filler = any(
-                        c.get("link_id") != main_lid
+                    reject_detail = "AI-2 错将异平台链接混作主商品优惠券，防跨平台串货拦截"
+                else:
+                    raw_coupon_candidates = [
+                        c for c in conv_list
+                        if c.get("link_id") != main_lid
                         and c.get("text_role_hint") != "filler_candidate"
-                        and c.get("convert_status") == "failed"
-                        and c.get("error_code") not in (ERR_JD_NUMERIC_SKU, ERR_TB_NUMERIC_ID, ERR_PDD_NUMERIC_ID)
-                        for c in conv_list
-                    )
-                    if has_failed_non_filler:
-                        off_act_p = float(product_card.get("activity_price") or product_card.get("price") or 0.0)
-                        if off_act_p > 0 and deal_price < off_act_p * 0.95:
-                            should_reject = True
-                            reject_detail = "依赖的前置优惠链接转链失效且到手价低于官方售价"
+                        and not _is_other_known_platform(c)
+                        and not _is_coupon_absorbed_by_main(c)
+                        and self._is_explicit_coupon_target(c)
+                    ]
+                    if raw_coupon_candidates:
+                        should_reject = True
+                        reject_detail = "原始优惠券链接转链失败或未被保留"
+                    elif deal_price is not None:
+                        has_failed_non_filler = any(
+                            c.get("link_id") != main_lid
+                            and c.get("text_role_hint") != "filler_candidate"
+                            and not _is_other_known_platform(c)
+                            and c.get("convert_status") == "failed"
+                            and c.get("error_code") not in (ERR_JD_NUMERIC_SKU, ERR_TB_NUMERIC_ID, ERR_PDD_NUMERIC_ID)
+                            for c in conv_list
+                        )
+                        if has_failed_non_filler:
+                            off_act_p = float(product_card.get("activity_price") or product_card.get("price") or 0.0)
+                            if off_act_p > 0 and deal_price < off_act_p * 0.95:
+                                should_reject = True
+                                reject_detail = "依赖的前置优惠链接转链失效且到手价低于官方售价"
 
                 if should_reject:
                     is_valid = False
