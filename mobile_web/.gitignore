@@ -26,3 +26,4 @@ keys/
 *.pem
 *.p12
 *.pfx
+/services/guangdiu_cookies.json
