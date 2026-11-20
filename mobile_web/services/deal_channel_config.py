@@ -29,6 +29,7 @@ class DealChannelConfig:
     detail_delay_seconds: float = 0.2          # 详情页请求间隔（秒）
     sleep_after: float = 0.3                   # 抓完本频道后安全休眠（秒）
     rate_limit_cooldown_seconds: int = 300     # 触发 429/403/验证码后的同站冷却秒数
+    max_age_days: float = 2.0                  # 爆料有效保鲜期（天）：超出则丢弃，按频道灵活控制
     description: str = ""                      # 频道说明
 
 
@@ -54,6 +55,7 @@ DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
         detail_delay_seconds=0.05,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=180,
+        max_age_days=7.0,
         description="特惠采采专员人工严选 JSON 流，每轮全量扫完列表，已抓商品只刷新确认时间",
     ),
     DealChannelConfig(
@@ -68,6 +70,7 @@ DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
         detail_delay_seconds=0.3,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=300,
+        max_age_days=2.0,
         description="逛丢首页实时爆料流（含详情购买方案解析与 go.php 直链还原）",
     ),
     DealChannelConfig(
@@ -82,6 +85,7 @@ DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
         detail_delay_seconds=0.3,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=300,
+        max_age_days=2.0,
         description="逛丢综合热门上榜好价流",
     ),
     DealChannelConfig(
@@ -96,6 +100,7 @@ DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
         detail_delay_seconds=0.3,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=300,
+        max_age_days=2.0,
         description="逛丢每小时热门风云榜",
     ),
 ]
@@ -121,3 +126,40 @@ def is_channel_due(
     if last_run_at <= 0:
         return True
     return (current_time - last_run_at) >= max(10, int(channel.interval_seconds))
+
+
+def get_channel_max_age_days(
+    channel_name: str = "",
+    site_key: str = "",
+    default_days: float = 2.0,
+    channels: Optional[List[DealChannelConfig]] = None,
+) -> float:
+    """
+    根据频道名称或站点标识获取配置的有效保鲜期（天）。
+    - 优先精确匹配频道名（如 '特惠采采_首页精选' -> 7.0天）；
+    - 其次匹配站点标识（如 'tehuicaicai' -> 7.0天）；
+    - 未明确配置的兜底返回 default_days（默认2.0天）。
+    """
+    pool = channels if channels is not None else DEFAULT_CHANNEL_CONFIGS
+    if channel_name:
+        for c in pool:
+            if c.name == channel_name:
+                return float(c.max_age_days)
+    if site_key:
+        for c in pool:
+            if c.site_key == site_key:
+                return float(c.max_age_days)
+    return float(default_days)
+
+
+def get_site_max_age_days_map(
+    channels: Optional[List[DealChannelConfig]] = None,
+) -> Dict[str, float]:
+    """获取站点级保鲜期映射表（多频道同站点取其最大保鲜期）。"""
+    pool = channels if channels is not None else DEFAULT_CHANNEL_CONFIGS
+    m: Dict[str, float] = {}
+    for c in pool:
+        cur = m.get(c.site_key, 0.0)
+        m[c.site_key] = max(cur, float(c.max_age_days))
+    return m
+

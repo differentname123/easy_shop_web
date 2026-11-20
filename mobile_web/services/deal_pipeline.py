@@ -54,6 +54,7 @@ from services.deal_channel_config import (
     DealChannelConfig,
     DEFAULT_CHANNEL_CONFIGS,
     get_active_channels,
+    get_site_max_age_days_map,
     is_channel_due,
 )
 from services.deal_fetchers import (
@@ -808,33 +809,63 @@ def run_clean_stage(
     cutoff_ts = time.time() - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
     cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
 
-    # Step 0: 前置确定性清扫（超过 7 天保鲜期 & 重试次数已达上限的陈旧/异常记录直接出队，绝不浪费 AI 机会）
+    site_age_map = get_site_max_age_days_map()
     expired_over_7d_cnt = 0
     max_retry_swept_cnt = 0
     try:
-        exp_res = raw_col.update_many(
+        for s_key, age_days in site_age_map.items():
+            s_ts = time.time() - age_days * 86400.0
+            s_dt = now_utc - datetime.timedelta(days=age_days)
+            exp_res = raw_col.update_many(
+                {
+                    "source_site": s_key,
+                    "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
+                    "$and": [
+                        {
+                            "$or": [
+                                {"publish_ts": {"$gt": 0, "$lt": s_ts}},
+                                {"first_seen_at": {"$lt": s_dt}},
+                            ]
+                        }
+                    ],
+                },
+                {
+                    "$set": {
+                        "clean_status": "cleaned_failed",
+                        "ai_clean_status": "cleaned_failed",
+                        "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
+                        "clean_error_msg": f"爆料时间超过渠道 {s_key} 保鲜期 ({age_days:.0f}天)，自动跳过清洗",
+                        "cleaned_at": now_utc,
+                    }
+                },
+            )
+            expired_over_7d_cnt += int(exp_res.modified_count or 0)
+
+        configured_sites = list(site_age_map.keys())
+        fallback_exp_res = raw_col.update_many(
             {
+                "source_site": {"$nin": configured_sites},
+                "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
                 "$and": [
-                    {"$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]},
                     {
                         "$or": [
                             {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
                             {"first_seen_at": {"$lt": cutoff_dt}},
                         ]
-                    },
-                ]
+                    }
+                ],
             },
             {
                 "$set": {
                     "clean_status": "cleaned_failed",
                     "ai_clean_status": "cleaned_failed",
                     "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
-                    "clean_error_msg": f"爆料时间超过 {DEAL_MAX_CLEAN_AGE_DAYS} 天保鲜期，自动跳过清洗避免浪费资源",
+                    "clean_error_msg": f"爆料时间超过默认保鲜期 ({DEAL_MAX_CLEAN_AGE_DAYS}天)，自动跳过清洗",
                     "cleaned_at": now_utc,
                 }
             },
         )
-        expired_over_7d_cnt = int(exp_res.modified_count or 0)
+        expired_over_7d_cnt += int(fallback_exp_res.modified_count or 0)
 
         retry_sweep_res = raw_col.update_many(
             {

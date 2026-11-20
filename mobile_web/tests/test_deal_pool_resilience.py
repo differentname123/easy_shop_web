@@ -632,6 +632,84 @@ def test_deal_max_clean_age_days_is_2_days():
     assert captured_ops[1]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
 
 
+def test_channel_specific_max_age_days_configuration_and_behavior():
+    """验证渠道级保鲜期灵活配置：特惠采采享 7 天长保鲜期，逛丢等常规站保持 2 天。"""
+    import datetime
+    from mobile_web.services.deal_channel_config import (
+        DEFAULT_CHANNEL_CONFIGS,
+        get_channel_max_age_days,
+        get_site_max_age_days_map,
+    )
+    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
+
+    # 1. 验证配置读取与映射
+    assert get_channel_max_age_days(channel_name="特惠采采_首页精选") == 7.0
+    assert get_channel_max_age_days(site_key="tehuicaicai") == 7.0
+    assert get_channel_max_age_days(channel_name="逛丢_首页实时流") == 2.0
+    assert get_channel_max_age_days(site_key="guangdiu") == 2.0
+    assert get_channel_max_age_days(channel_name="未知频道", default_days=2.0) == 2.0
+
+    site_map = get_site_max_age_days_map()
+    assert site_map.get("tehuicaicai") == 7.0
+    assert site_map.get("guangdiu") == 2.0
+
+    # 2. 验证 save_batch 中特惠采采 3 天前爆料正常入 pending，而逛丢 3 天前爆料自动淘汰
+    captured_ops = []
+
+    class _DummyCol:
+        def bulk_write(self, ops, ordered=False):
+            captured_ops.extend(ops)
+            return SimpleNamespace(upserted_count=len(ops), modified_count=0)
+
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: _DummyCol()))
+    repo._indexes_ready = True
+
+    bj_tz = datetime.timezone(datetime.timedelta(hours=8))
+    now_bj = datetime.datetime.now(bj_tz)
+    stale_72h = (now_bj - datetime.timedelta(hours=72)).strftime("%Y-%m-%d %H:%M:%S")
+    stale_8d = (now_bj - datetime.timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+
+    repo.save_batch(
+        [
+            {
+                "source_site": "tehuicaicai",
+                "source_channel": "特惠采采_首页精选",
+                "source_item_id": "thcc_3d",
+                "publish_time": stale_72h,
+                "title": "特惠采采3天前在售爆料",
+                "extracted_links": [{"url": "https://u.jd.com/thcc1"}],
+                "has_full_detail": True,
+            },
+            {
+                "source_site": "tehuicaicai",
+                "source_channel": "特惠采采_首页精选",
+                "source_item_id": "thcc_8d",
+                "publish_time": stale_8d,
+                "title": "特惠采采8天前过期爆料",
+                "extracted_links": [{"url": "https://u.jd.com/thcc2"}],
+                "has_full_detail": True,
+            },
+            {
+                "source_site": "guangdiu",
+                "source_channel": "逛丢_首页实时流",
+                "source_item_id": "gd_3d",
+                "publish_time": stale_72h,
+                "title": "逛丢3天前过期货架",
+                "extracted_links": [{"url": "https://u.jd.com/gd1"}],
+                "has_full_detail": True,
+            },
+        ],
+        task_name="channel_age_test",
+    )
+    # 特惠采采 3 天前爆料：在 7 天保鲜期内，进入 pending
+    assert captured_ops[0]._doc["$setOnInsert"]["clean_status"] == "pending"
+    # 特惠采采 8 天前爆料：超过 7 天，被淘汰为 cleaned_failed
+    assert captured_ops[1]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
+    # 逛丢 3 天前爆料：超过 2 天，被淘汰为 cleaned_failed
+    assert captured_ops[2]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
+
+
+
 def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_real_deals():
     from mobile_web.scripts.run_deal_pool_scheduler import (
         DealRawPoolRepository,

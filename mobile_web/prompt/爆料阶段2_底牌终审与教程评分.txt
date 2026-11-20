@@ -70,8 +70,8 @@
 - **情况 B：主商品未转出单品，仅凑单品或优惠券存在（`MAIN_PRODUCT_DEAD_ONLY_FILLER`）**
   **`main_link_id` 必须严格指向一个 `"convert_status": "product"` 且带有真实 `official_product` 的主推商品链接！** 若主商品转链失败（`failed`）或仅为优惠券（`coupon_or_activity`），**绝不能把凑单辅助品当成主商品上架**，必须判定 `"is_valid_deal": false`，`"reject_reason": "MAIN_PRODUCT_DEAD_ONLY_FILLER"`。
 - **情况 C：指鹿为马 / 货不对板（`PRODUCT_MISMATCH`）**
-  若爆料文本明确描述的主推商品（品类、核心功能、关键规格），与对应链接转出的官方商品标题存在实质性冲突或完全风马牛不相及（货不对板），必须判定 `"is_valid_deal": false`，`"reject_reason": "PRODUCT_MISMATCH"`。
-  *(注：若原始文案简略如“手慢无 9.9元 `[#L1]`”，只要 `[#L1]` 转出正常实物商品且不冲突，即视为匹配通过)*。
+  仅当主推商品的核心品牌或品类与对应链接转出的官方商品完全风马牛不相及、特别离谱（如文案说买手机转出抽纸、文案说买牛奶转出衣服等彻底指鹿为马）时，才判定 `"is_valid_deal": false`，`"reject_reason": "PRODUCT_MISMATCH"`。
+  *(【容许常规营销与规格差异】只要核心品牌与品类大体相符，绝不能判定不符：1. 多件装/整箱/加量装/组合装差异（如“*2袋”、“5袋”、“整箱”、“含赠”）；2. 净含量或克重略有出入（如155g vs 138g、约30袋）；3. 促销附注说明（如“实发新日期”、“拍2件”）；4. 文案到手价与官方标价因满减活动产生的价格差距。只要不是特别离谱的货不对板，一律判定匹配通过)*。
 - **情况 D：虚拟垃圾 / 1分钱引流 / 邮费补差（`VIRTUAL_OR_JUNK`）**
   若主商品是邮费补差价专拍、0.01元虚拟测试链接、纯抽奖码、网盘教程等非正常商品，判定 `"is_valid_deal": false`，`"reject_reason": "VIRTUAL_OR_JUNK"`。
 - **情况 E：同帖推多款并列商品**

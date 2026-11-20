@@ -27,6 +27,7 @@ from requests.adapters import HTTPAdapter
 from pymongo import UpdateOne
 
 from adapters import get_adapter, platform_name
+from services.deal_channel_config import get_site_max_age_days_map
 from infrastructure.ai_api.model_api import generate_content
 from infrastructure.api_governance import api_caller_context
 from infrastructure.mongo import gen_db_object
@@ -4604,16 +4605,45 @@ class MaintenanceWorker(threading.Thread):
                 if reclaimed > 0:
                     logger.info("🧹 [维护清扫] 成功释放超时未完成租约 %d 条回队", reclaimed)
 
-                # 2. 保鲜清扫：将超过保鲜期的旧未清洗记录标为 cleaned_failed
+                # 2. 渠道级保鲜清扫：按各渠道/站点独立保鲜期淘汰超时未处理记录
                 now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-                cutoff_ts = time.time() - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
-                cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
+                site_age_map = get_site_max_age_days_map()
+                for s_key, age_days in site_age_map.items():
+                    s_ts = time.time() - age_days * 86400.0
+                    s_dt = now_utc - datetime.timedelta(days=age_days)
+                    self.repo.col.update_many(
+                        {
+                            "clean_status": "pending",
+                            "source_site": s_key,
+                            "$or": [
+                                {"publish_ts": {"$gt": 0, "$lt": s_ts}},
+                                {"first_seen_at": {"$lt": s_dt}},
+                            ],
+                        },
+                        {
+                            "$set": {
+                                "clean_status": "cleaned_failed",
+                                "clean_stage": CLEAN_STAGE_DONE,
+                                "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
+                                "clean_error_msg": f"超过渠道 {s_key} 保鲜期 ({age_days:.0f}天)，自动清扫",
+                                "cleaned_at": now_utc,
+                            },
+                            "$unset": {
+                                "stage_lease_owner": "",
+                                "stage_lease_until_ts": "",
+                            },
+                        },
+                    )
+                configured_sites = list(site_age_map.keys())
+                fallback_ts = time.time() - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
+                fallback_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
                 self.repo.col.update_many(
                     {
                         "clean_status": "pending",
+                        "source_site": {"$nin": configured_sites},
                         "$or": [
-                            {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
-                            {"first_seen_at": {"$lt": cutoff_dt}},
+                            {"publish_ts": {"$gt": 0, "$lt": fallback_ts}},
+                            {"first_seen_at": {"$lt": fallback_dt}},
                         ],
                     },
                     {
@@ -4621,7 +4651,7 @@ class MaintenanceWorker(threading.Thread):
                             "clean_status": "cleaned_failed",
                             "clean_stage": CLEAN_STAGE_DONE,
                             "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
-                            "clean_error_msg": f"超过 {DEAL_MAX_CLEAN_AGE_DAYS} 天保鲜期，自动清扫",
+                            "clean_error_msg": f"超过默认保鲜期 ({DEAL_MAX_CLEAN_AGE_DAYS}天)，自动清扫",
                             "cleaned_at": now_utc,
                         },
                         "$unset": {

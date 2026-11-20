@@ -18,6 +18,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from pymongo import UpdateOne
 
 from infrastructure.mongo import gen_db_object
+from services.deal_channel_config import (
+    get_channel_max_age_days,
+    get_site_max_age_days_map,
+)
 from models.deal_constants import (
     CLEAN_STAGE_DONE,
     CLEAN_STAGE_NEED_AI1,
@@ -575,12 +579,18 @@ class DealRawPoolRepository:
             )
             hot_metrics = rec.get("hot_metrics") if isinstance(rec.get("hot_metrics"), dict) else {}
             group_id = str(hot_metrics.get("group_id") or "").strip()
+            channel = str(rec.get("source_channel") or "").strip()
             pub_time_str = str(rec.get("publish_time") or "").strip()
             parsed_pub_ts = parse_publish_time_epoch(pub_time_str)
             pub_ts = parsed_pub_ts if parsed_pub_ts is not None else time.time()
-            is_expired_over_7d = (
+            channel_max_age = get_channel_max_age_days(
+                channel_name=channel,
+                site_key=site,
+                default_days=DEAL_MAX_CLEAN_AGE_DAYS,
+            )
+            is_expired_over_age = (
                 parsed_pub_ts is not None
-                and parsed_pub_ts < (time.time() - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0)
+                and parsed_pub_ts < (time.time() - channel_max_age * 86400.0)
             )
 
             has_signal = bool(quality_signals["has_unique_product_anchor"])
@@ -592,12 +602,11 @@ class DealRawPoolRepository:
                 else:
                     skipped_no_signal += 1
                     continue
-            elif is_expired_over_7d:
+            elif is_expired_over_age:
                 initial_status = "cleaned_failed"
             else:
                 initial_status = "pending"
 
-            channel = str(rec.get("source_channel") or "").strip()
             filter_spec = {"source_site": site, "source_item_id": item_id}
 
             source_url = str(rec.get("source_url") or "").strip()
@@ -622,9 +631,9 @@ class DealRawPoolRepository:
             }
             if parsed_pub_ts is None:
                 set_on_insert["publish_ts"] = pub_ts
-            if is_expired_over_7d and initial_status == "cleaned_failed":
+            if is_expired_over_age and initial_status == "cleaned_failed":
                 set_on_insert["clean_error_code"] = ERR_EXPIRED_OVER_7_DAYS
-                set_on_insert["clean_error_msg"] = f"爆料发布时间超过 {DEAL_MAX_CLEAN_AGE_DAYS} 天，自动跳过清洗"
+                set_on_insert["clean_error_msg"] = f"爆料发布时间超过渠道保鲜期 ({channel_max_age:.0f}天)，自动跳过清洗"
 
             core_fields = {
                 "source_channel": channel,
@@ -801,14 +810,33 @@ class DealRawPoolRepository:
         cutoff_ts = now_ts - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
         cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
 
+        site_age_map = get_site_max_age_days_map()
+        nor_conditions: List[Dict[str, Any]] = [
+            {"next_retry_after_ts": {"$gt": round(now_ts, 1)}},
+        ]
+        for s_key, age_days in site_age_map.items():
+            s_ts = now_ts - age_days * 86400.0
+            s_dt = now_utc - datetime.timedelta(days=age_days)
+            nor_conditions.append({
+                "source_site": s_key,
+                "$or": [
+                    {"publish_ts": {"$gt": 0, "$lt": s_ts}},
+                    {"first_seen_at": {"$lt": s_dt}},
+                ],
+            })
+        configured_sites = list(site_age_map.keys())
+        nor_conditions.append({
+            "source_site": {"$nin": configured_sites},
+            "$or": [
+                {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
+                {"first_seen_at": {"$lt": cutoff_dt}},
+            ],
+        })
+
         base_query: Dict[str, Any] = {
             "clean_status": "pending",
             "clean_stage": stage,
-            "$nor": [
-                {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
-                {"first_seen_at": {"$lt": cutoff_dt}},
-                {"next_retry_after_ts": {"$gt": round(now_ts, 1)}},
-            ],
+            "$nor": nor_conditions,
             "$or": [
                 {"stage_lease_until_ts": {"$exists": False}},
                 {"stage_lease_until_ts": {"$lt": round(now_ts, 1)}},

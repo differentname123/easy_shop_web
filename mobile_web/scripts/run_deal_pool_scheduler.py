@@ -122,6 +122,8 @@ from services.deal_channel_config import (
     DEFAULT_CHANNEL_CONFIGS,
     DealChannelConfig,
     get_active_channels,
+    get_channel_max_age_days,
+    get_site_max_age_days_map,
     is_channel_due,
 )
 
@@ -271,6 +273,7 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         detail_delay_seconds=0.05,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=180,
+        max_age_days=7.0,
         description="特惠采采专员精选好价流，JSON 无风控，直达短链与文案完整；每轮全量扫完列表，已抓商品只刷新确认时间",
     ),
 
@@ -289,6 +292,7 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         detail_delay_seconds=0.3,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=300,
+        max_age_days=2.0,
         description="逛丢首页实时好价，3分钟高频拉取整页最新详情（已抓过自动跳过）",
     ),
     DealChannelConfig(
@@ -303,6 +307,7 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         detail_delay_seconds=0.3,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=300,
+        max_age_days=2.0,
         description="逛丢热门上榜流，10分钟巡视整页详情（已抓过自动跳过）",
     ),
     DealChannelConfig(
@@ -317,6 +322,7 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         detail_delay_seconds=0.3,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=300,
+        max_age_days=2.0,
         description="逛丢小时风云榜，10分钟巡视整榜详情（已抓过自动跳过）",
     ),
 
