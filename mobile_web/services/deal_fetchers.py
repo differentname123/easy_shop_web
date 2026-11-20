@@ -786,6 +786,7 @@ def fetch_tehuicaicai_deals(
                 "platform_code": platform_code or raw_plat_code,
             }
 
+            now_iso = utc_now_iso()
             if not fetch_detail:
                 rec = build_deal_record(
                     source_site="tehuicaicai",
@@ -798,6 +799,7 @@ def fetch_tehuicaicai_deals(
                     price_text=display_price,
                     image_url=image_url,
                     mall_name=platform_name,
+                    publish_time=now_iso,
                     explicit_platform=platform_code or None,
                     hot_metrics=hot_metrics,
                     tutorial_text=f"【{platform_name or '特惠采采'}】{title}\n到手价: {display_price}".strip(),
@@ -870,7 +872,11 @@ def fetch_tehuicaicai_deals(
                 provider = str(det.get("provider_nickname") or "").strip()
                 if provider:
                     hot_metrics["provider_nickname"] = provider
-                publish_time = str(det.get("updated_at") or det.get("created_at") or "").strip()
+                upstream_time = str(det.get("updated_at") or det.get("created_at") or "").strip()
+                if upstream_time:
+                    hot_metrics["upstream_time"] = upstream_time
+                # 特惠采采专员人工严选流：在架展示即代表当前有效好价，采用拉取时间作为基准发布时间供下游保鲜与排序
+                publish_time = utc_now_iso()
 
                 video_url = ""
                 tutorials = det.get("tutorials") or []

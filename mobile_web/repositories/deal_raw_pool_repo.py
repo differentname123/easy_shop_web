@@ -538,20 +538,54 @@ class DealRawPoolRepository:
         ids = [str(i).strip() for i in (item_ids or []) if str(i or "").strip()]
         if not site or not ids:
             return 0
-        now = at or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        now_dt = at or datetime.datetime.now(datetime.timezone.utc)
+        now = now_dt.replace(tzinfo=None)
         update_doc: Dict[str, Any] = {"$set": {"last_seen_at": now}}
         if channel:
             update_doc["$addToSet"] = {"seen_channels": channel}
+
+        # 特惠采采专员严选数据：在架即代表有效好价，巡视再次见到时直接刷新用于后续判断的发布时间与保鲜时间
+        if site == "tehuicaicai":
+            now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            now_ts = now_dt.timestamp()
+            update_doc["$set"]["publish_time"] = now_iso
+            update_doc["$set"]["publish_ts"] = now_ts
+
         ops = [
             UpdateOne({"source_site": site, "source_item_id": item_id}, update_doc)
             for item_id in ids
         ]
+        matched_cnt = 0
         try:
             res = self.col.bulk_write(ops, ordered=False)
-            return int(res.matched_count)
+            matched_cnt = int(res.matched_count)
         except Exception as e:
             logger.warning("刷新站点 [%s] 本轮确认时间失败: %s", site, e)
-            return 0
+
+        if site == "tehuicaicai" and ids:
+            try:
+                now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                id_variants = list(set(ids + [int(i) for i in ids if i.isdigit()]))
+                self.formal_col.update_many(
+                    {
+                        "deal_info.source_site": "tehuicaicai",
+                        "$or": [
+                            {"deal_info.source_item_id": {"$in": id_variants}},
+                            {"deal_info.merged_tip_ids": {"$in": id_variants}},
+                        ],
+                    },
+                    {
+                        "$set": {
+                            "deal_info.publish_time": now_iso,
+                            "deal_info.updated_at": now,
+                            "deal_info.is_deal_tip": True,
+                        }
+                    },
+                )
+            except Exception as e:
+                logger.warning("刷新正式表特惠采采商品确认时间失败: %s", e)
+
+        return matched_cnt
 
     def save_batch(self, records: List[Dict[str, Any]], task_name: str = "") -> Dict[str, int]:
         """【Stage 1：源站拉取入初步表 `deal_raw_tips`】"""
@@ -620,6 +654,11 @@ class DealRawPoolRepository:
             }
             if hot_metrics:
                 set_fields["hot_metrics"] = hot_metrics
+            if site == "tehuicaicai" and pub_time_str:
+                set_fields["publish_time"] = pub_time_str
+                set_fields["publish_ts"] = pub_ts
+                set_fields["clean_cutoff_ts"] = clean_cutoff_ts
+                set_fields["clean_max_age_days"] = channel_max_age
 
             set_on_insert: Dict[str, Any] = {
                 "source_site": site,

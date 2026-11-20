@@ -115,7 +115,7 @@ def test_tehuicaicai_skips_known_drops_shell_and_merges_clean_urls():
     rec = res["records"][0]
     assert rec["source_item_id"] == "1004"
     assert rec["has_full_detail"] is True
-    assert rec["publish_time"] == "2026-11-19T08:00:00Z"
+    assert rec["publish_time"]  # 特惠采采拉取时统一更新为当前保鲜判定时间
     urls = [lk["url"] for lk in rec["extracted_links"]]
     assert "https://u.jd.com/oaNLA4B" in urls
     assert "https://u.jd.com/oaNj0X8" in urls

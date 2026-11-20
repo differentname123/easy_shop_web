@@ -207,3 +207,64 @@ def test_source_identifier_propagation():
     summary = repo._normalize_doc_summary(mock_doc)
     assert summary["deal_source"] == "tehuicaicai"
     assert summary["deal_source_name"] == "特惠采采"
+
+
+def test_tehuicaicai_touch_seen_refreshes_publish_time_and_formal_table():
+    """
+    测试特惠采采专享的时间保鲜刷新：
+    1. 特惠采采商品在 touch_seen 巡视时，更新 raw_col 的 publish_time 和 publish_ts；
+    2. 同步更新 formal_col (products) 中的 deal_info.publish_time 和 updated_at，保证下游好价与排序始终感知仍在架；
+    3. 非特惠采采站点（如 guangdiu）严格不动 publish_time，且不同步更新正式表。
+    """
+    import datetime
+    from types import SimpleNamespace
+    from mobile_web.repositories.deal_raw_pool_repo import DealRawPoolRepository
+
+    raw_ops = []
+    formal_updates = []
+
+    mock_raw_col = MagicMock()
+    mock_raw_col.bulk_write.side_effect = lambda ops, ordered=False: (
+        raw_ops.extend(ops),
+        SimpleNamespace(matched_count=len(ops)),
+    )[1]
+
+    mock_formal_col = MagicMock()
+    mock_formal_col.update_many.side_effect = lambda flt, upd: (
+        formal_updates.append((flt, upd)),
+        SimpleNamespace(matched_count=1),
+    )[1]
+
+    fake_db = SimpleNamespace(
+        get_collection=lambda name: mock_formal_col if "product" in name else mock_raw_col
+    )
+    repo = DealRawPoolRepository(db_instance=fake_db)
+
+    fixed_now = datetime.datetime(2026, 11, 20, 7, 0, 0, tzinfo=datetime.timezone.utc)
+
+    # 1. 测试特惠采采：刷新 raw 表发布时间并同步正式表
+    cnt_th = repo.touch_seen("tehuicaicai", ["5513", "5514"], channel="home_products", at=fixed_now)
+    assert cnt_th == 2
+    assert len(raw_ops) == 2
+    op_th = raw_ops[0]._doc
+    assert op_th["$set"]["publish_time"] == "2026-11-20T07:00:00Z"
+    assert "publish_ts" in op_th["$set"]
+    assert "last_seen_at" in op_th["$set"]
+
+    assert len(formal_updates) == 1
+    flt_f, upd_f = formal_updates[0]
+    assert flt_f["deal_info.source_site"] == "tehuicaicai"
+    assert upd_f["$set"]["deal_info.publish_time"] == "2026-11-20T07:00:00Z"
+    assert upd_f["$set"]["deal_info.is_deal_tip"] is True
+
+    # 2. 测试其他站点（如逛丢）：只刷 last_seen_at，不更新 publish_time，不同步正式表
+    raw_ops.clear()
+    formal_updates.clear()
+    cnt_gd = repo.touch_seen("guangdiu", ["9999"], channel="latest", at=fixed_now)
+    assert cnt_gd == 1
+    assert len(raw_ops) == 1
+    op_gd = raw_ops[0]._doc
+    assert "publish_time" not in op_gd["$set"]
+    assert "publish_ts" not in op_gd["$set"]
+    assert "last_seen_at" in op_gd["$set"]
+    assert len(formal_updates) == 0
