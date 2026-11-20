@@ -1444,6 +1444,172 @@ def test_group_help_importer_sanitizes_syncs_and_never_resurrects(tmp_path):
     assert repo.get_by_group_order_id("tok_MiaoGood01")["group_status"] == GROUP_STATUS_FULL
 
 
+def test_group_help_importer_all_pages_offline_missing_and_respect_user_takedown(tmp_path):
+    """验证新同步策略：默认10分钟轮询、全量翻页、两站皆无自动下架(大厅不展示)、用户反馈下架绝不恢复、无误杀保护。"""
+    mod = _load_mobile_script("group_help_importer")
+    ACDOG_API_URL = mod.ACDOG_API_URL
+    MIAOZHULI_API_URL = mod.MIAOZHULI_API_URL
+    GroupHelpImporter = mod.GroupHelpImporter
+    assert mod._DEFAULT_SYNC_INTERVAL_SECONDS == 600
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    base_now = 1795000000.0
+
+    class _FakeJsonResp:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+    # 动态模拟两站数据池
+    acdog_items_p1 = [
+        {
+            "id": "ac1",
+            "platform": "pdd",
+            "rawText": "快来拼单 ⇥AcItemOne01⇤",
+            "coreCode": "AcItemOne01",
+            "price": 19.9,
+            "titleDisplay": "抽纸24包",
+            "groupSize": 3,
+            "spotsLeft": 2,
+            "status": "active",
+            "createdAt": int((base_now - 1000) * 1000),
+            "expiresAt": int((base_now + 18 * 3600) * 1000),
+        }
+    ]
+    acdog_items_p2 = [
+        {
+            "id": "ac2",
+            "platform": "pdd",
+            "rawText": "好价拼单 ⇥AcItemTwo02⇤",
+            "coreCode": "AcItemTwo02",
+            "price": 29.9,
+            "titleDisplay": "洗衣液6斤",
+            "groupSize": 2,
+            "spotsLeft": 1,
+            "status": "active",
+            "createdAt": int((base_now - 2000) * 1000),
+            "expiresAt": int((base_now + 18 * 3600) * 1000),
+        }
+    ]
+    miaozhuli_items = [
+        {
+            "id": 201,
+            "nick": "秒助友",
+            "title": "湿厕纸",
+            "url": "",
+            "share_text": "秒杀拼单 ⇥MiaoItemOne01⇤",
+            "price": 9.9,
+            "team_size": 2,
+            "status": "active",
+            "marks": {"full": 0, "expire": 0},
+            "created_at": "2026-11-18 12:00:00",
+            "time_left": 18000,
+        }
+    ]
+    network_error_flag = {"error": False}
+
+    def _mock_get(url, params=None, headers=None, timeout=12):
+        if network_error_flag["error"]:
+            raise RuntimeError("Upstream network timeout")
+        page = (params or {}).get("page", 1)
+        if url == ACDOG_API_URL:
+            if page == 1:
+                return _FakeJsonResp({"data": {"items": acdog_items_p1, "hasMore": bool(acdog_items_p2)}})
+            elif page == 2 and acdog_items_p2:
+                return _FakeJsonResp({"data": {"items": acdog_items_p2, "hasMore": False}})
+            return _FakeJsonResp({"data": {"items": [], "hasMore": False}})
+        if url == MIAOZHULI_API_URL:
+            if page == 1:
+                return _FakeJsonResp({"list": miaozhuli_items, "has_more": False})
+            return _FakeJsonResp({"list": [], "has_more": False})
+        raise AssertionError(f"Unknown url: {url}")
+
+    # 1. 默认 pages=0 全量获取：两页 acdog 和一页 miaozhuli 均应入库
+    importer = GroupHelpImporter(repo=repo, http_get=_mock_get, pages=0)
+    assert importer.pages == 0
+    res1 = importer.run_once(now=base_now)
+    assert res1["sources"]["acdog"]["upserted"] == 2
+    assert res1["sources"]["miaozhuli"]["upserted"] == 1
+    assert res1["offline_synced"] == 0
+
+    # 验证大厅在架搜索包含这 3 款团
+    search1 = repo.search_groups(now=base_now)
+    assert search1["total"] == 3
+
+    # 2. 模拟网页用户反馈下架了 AcItemTwo02
+    repo.apply_user_feedback(
+        group_order_id="tok_AcItemTwo02",
+        action="mark_full",
+        now=base_now + 10,
+        operator_uid="u_online_user",
+    )
+    doc_ac2 = repo.get_by_group_order_id("tok_AcItemTwo02")
+    assert doc_ac2["group_status"] == "full"
+    assert doc_ac2["user_takedown"] is True
+
+    # 再次运行采集：就算 acdog 网站上依然有 AcItemTwo02 且报 active，也绝不能恢复上架！
+    res2 = importer.run_once(now=base_now + 30)
+    assert res2["sources"]["acdog"]["skipped_user_takedown"] == 1
+    doc_ac2_after = repo.get_by_group_order_id("tok_AcItemTwo02")
+    assert doc_ac2_after["group_status"] == "full"
+    assert doc_ac2_after["user_takedown"] is True
+
+    # 3. 模拟“这两个网站上都没有了”：
+    # acdog 将 AcItemOne01 移除（两页皆空），miaozhuli 也不包含它；只有 MiaoItemOne01 还在
+    acdog_items_p1.clear()
+    acdog_items_p2.clear()
+
+    res3 = importer.run_once(now=base_now + 60)
+    # AcItemOne01 因两站皆无被自动下架！
+    assert res3["offline_synced"] == 1
+    doc_ac1 = repo.get_by_group_order_id("tok_AcItemOne01")
+    assert doc_ac1["group_status"] == "expired"
+    assert doc_ac1["offline_reason"] == "upstream_missing"
+    assert doc_ac1["user_takedown"] is False
+
+    # 网页大厅检查：大厅仅剩未下架的 MiaoItemOne01，两站皆无的 AcItemOne01 和用户下架的 AcItemTwo02 绝不显示
+    search3 = repo.search_groups(now=base_now + 60)
+    assert search3["total"] == 1
+    assert search3["items"][0]["group_order_id"] == "tok_MiaoItemOne01"
+
+    # 4. 模拟外部源网络异常：宁缺毋滥防误杀，不应因此误下架尚存的 MiaoItemOne01
+    network_error_flag["error"] = True
+    res4 = importer.run_once(now=base_now + 90)
+    assert "error" in res4["sources"]["acdog"]
+    assert "error" in res4["sources"]["miaozhuli"]
+    assert res4["offline_synced"] == 0  # 遇异常绝不下架存量团
+    doc_miao = repo.get_by_group_order_id("tok_MiaoItemOne01")
+    assert doc_miao["group_status"] == "active"
+
+    # 5. 模拟外部网站重新出现 AcItemOne01（且未过期、非用户反馈下架）：可重新恢复上架并清除 upstream_missing
+    network_error_flag["error"] = False
+    acdog_items_p1.append(
+        {
+            "id": "ac1",
+            "platform": "pdd",
+            "rawText": "快来拼单 ⇥AcItemOne01⇤",
+            "coreCode": "AcItemOne01",
+            "price": 19.9,
+            "titleDisplay": "抽纸24包",
+            "groupSize": 3,
+            "spotsLeft": 2,
+            "status": "active",
+            "createdAt": int((base_now - 1000) * 1000),
+            "expiresAt": int((base_now + 18 * 3600) * 1000),
+        }
+    )
+    res5 = importer.run_once(now=base_now + 120)
+    doc_ac1_relist = repo.get_by_group_order_id("tok_AcItemOne01")
+    assert doc_ac1_relist["group_status"] == "active"
+    assert doc_ac1_relist["offline_reason"] == ""
+    # 但用户反馈下架的 AcItemTwo02 仍然保持 full，绝不恢复
+    doc_ac2_still_full = repo.get_by_group_order_id("tok_AcItemTwo02")
+    assert doc_ac2_still_full["group_status"] == "full"
+
+
 def test_group_help_exporter_queues_completes_and_withdraws(tmp_path):
     """验证海报外发脚本：仅导出真实用户海报、生成队列与 task.json、done.flag 完工归档及站内满员自动撤回。"""
     from models.group_help import ENTRY_TYPE_POSTER, SOURCE_USER_UPLOAD

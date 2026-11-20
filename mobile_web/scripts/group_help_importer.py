@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -35,6 +35,7 @@ for _p in (str(MOBILE_WEB_DIR), str(CURRENT_DIR)):
 
 from models.group_help import (
     DEFAULT_GROUP_TTL_SECONDS,
+    DEFAULT_SYNC_INTERVAL_SECONDS,
     GROUP_STATUS_EXPIRED,
     GROUP_STATUS_FULL,
     extract_pdd_share_token,
@@ -46,6 +47,7 @@ from repositories.group_help_repo import GroupHelpRepository
 _CST_TZ = timezone(timedelta(hours=8))
 _DEFAULT_BRIDGE_DIR = MOBILE_WEB_DIR / "runtime" / "group_help_bridge"
 _DEFAULT_EXTERNAL_TTL_SECONDS = 6 * 3600  # 外部流入默认 6 小时有效，避免陈旧滞留
+_DEFAULT_SYNC_INTERVAL_SECONDS = DEFAULT_SYNC_INTERVAL_SECONDS  # 外部同步默认 10 分钟间隔 (600s)
 _CORE_CODE_RE = re.compile(r"^[A-Za-z0-9]{6,28}$")
 
 ACDOG_API_URL = "https://acdog.cn/api/pin/deals"
@@ -145,7 +147,7 @@ class GroupHelpImporter:
         *,
         http_get: Optional[Callable[..., Any]] = None,
         external_ttl_seconds: int = _DEFAULT_EXTERNAL_TTL_SECONDS,
-        pages: int = 2,
+        pages: int = 0,
         dry_run: bool = False,
         logger: Optional[logging.Logger] = None,
     ):
@@ -155,7 +157,7 @@ class GroupHelpImporter:
             1800,
             min(int(external_ttl_seconds), DEFAULT_GROUP_TTL_SECONDS),
         )
-        self.pages = max(1, min(int(pages), 10))
+        self.pages = max(0, int(pages))  # 0 表示全量获取，>0 表示抓取指定页数
         self.dry_run = bool(dry_run)
         self.log = logger or _setup_logger(_DEFAULT_BRIDGE_DIR)
 
@@ -183,7 +185,7 @@ class GroupHelpImporter:
         upstream_expires_at: Optional[float],
         now: float,
         stats: Dict[str, int],
-    ) -> None:
+    ) -> Optional[str]:
         parsed = parse_pdd_group_share_fields(
             share_text=raw_share_text,
             goods_name=goods_name,
@@ -192,10 +194,18 @@ class GroupHelpImporter:
             remain_people=remain_people,
             publisher_nick=publisher_nick,
         )
-        if parsed["needs_url_resolve"] and not parsed["group_order_id"]:
+        gid = str(parsed.get("group_order_id") or "").strip()
+        if parsed["needs_url_resolve"] and not gid:
             # 外部采集列表不额外发起逐条短链反查请求，避免给目标或拼多多带来不必要请求压力
             stats["skipped_unresolved"] += 1
-            return
+            return None
+
+        # 核心铁律：网页用户反馈下架了的团，就算外部源还在，也绝不要恢复
+        if gid:
+            existing = self.repo.get_by_group_order_id(gid)
+            if existing is not None and bool(existing.get("user_takedown")):
+                stats["skipped_user_takedown"] = stats.get("skipped_user_takedown", 0) + 1
+                return gid
 
         local_cap = now + self.external_ttl_seconds
         pdd_cap = created_at + DEFAULT_GROUP_TTL_SECONDS
@@ -205,11 +215,11 @@ class GroupHelpImporter:
 
         if expires_at <= now:
             stats["skipped_expired"] += 1
-            return
+            return None
 
         if self.dry_run:
             stats["dry_run_ok"] += 1
-            return
+            return gid
 
         doc_input: Dict[str, Any] = {
             **parsed,
@@ -229,8 +239,9 @@ class GroupHelpImporter:
             stats["upserted"] += 1
         else:
             stats["unchanged"] += 1
+        return gid
 
-    def _sync_acdog(self, now: float) -> Dict[str, int]:
+    def _sync_acdog(self, now: float) -> Tuple[Dict[str, int], Set[str]]:
         stats = {
             "fetched": 0,
             "upserted": 0,
@@ -239,15 +250,20 @@ class GroupHelpImporter:
             "skipped_invalid": 0,
             "skipped_expired": 0,
             "skipped_unresolved": 0,
+            "skipped_user_takedown": 0,
             "dry_run_ok": 0,
         }
-        for page in range(1, self.pages + 1):
+        active_keys: Set[str] = set()
+        page = 1
+        max_pages = self.pages if self.pages > 0 else 50
+        while page <= max_pages:
             payload = self._fetch_json(ACDOG_API_URL, {"page": page, "size": 50})
             items = _extract_list_items(payload)
             if not items:
                 break
             stats["fetched"] += len(items)
 
+            page_all_expired = True
             for item in items:
                 platform = str(item.get("platform") or "").strip().lower()
                 if platform and platform not in ("pdd", "pinduoduo"):
@@ -271,6 +287,9 @@ class GroupHelpImporter:
                 created_at = _parse_epoch_seconds(item.get("createdAt"), now)
                 upstream_expires = _parse_epoch_seconds(item.get("expiresAt"), 0.0) or None
 
+                if (now - created_at) < DEFAULT_GROUP_TTL_SECONDS:
+                    page_all_expired = False
+
                 is_full = (
                     status_str in ("full", "completed", "finished")
                     or (spots_left is not None and not isinstance(spots_left, bool) and int(spots_left) <= 0)
@@ -293,7 +312,7 @@ class GroupHelpImporter:
 
                 cleaned_title = _clean_external_goods_name(str(item.get("titleDisplay") or ""), raw_text)
                 try:
-                    self._upsert_external_candidate(
+                    upserted_gid = self._upsert_external_candidate(
                         source="acdog",
                         raw_share_text=raw_text,
                         goods_name=cleaned_title,
@@ -306,11 +325,23 @@ class GroupHelpImporter:
                         now=now,
                         stats=stats,
                     )
+                    if upserted_gid:
+                        active_keys.add(upserted_gid)
+                    if gid_guess:
+                        active_keys.add(gid_guess)
+                    if token_code:
+                        active_keys.add(token_code)
                 except ValueError:
                     stats["skipped_invalid"] += 1
-        return stats
 
-    def _sync_miaozhuli(self, now: float) -> Dict[str, int]:
+            has_more = bool(payload.get("data", {}).get("hasMore", True)) if isinstance(payload, dict) else True
+            if not has_more or page_all_expired:
+                break
+            page += 1
+
+        return stats, active_keys
+
+    def _sync_miaozhuli(self, now: float) -> Tuple[Dict[str, int], Set[str]]:
         stats = {
             "fetched": 0,
             "upserted": 0,
@@ -319,9 +350,13 @@ class GroupHelpImporter:
             "skipped_invalid": 0,
             "skipped_expired": 0,
             "skipped_unresolved": 0,
+            "skipped_user_takedown": 0,
             "dry_run_ok": 0,
         }
-        for page in range(1, self.pages + 1):
+        active_keys: Set[str] = set()
+        page = 1
+        max_pages = self.pages if self.pages > 0 else 50
+        while page <= max_pages:
             payload = self._fetch_json(MIAOZHULI_API_URL, {"tab": "all", "page": page})
             items = _extract_list_items(payload)
             if not items:
@@ -376,7 +411,7 @@ class GroupHelpImporter:
 
                 cleaned_title = _clean_external_goods_name(str(item.get("title") or ""), raw_text)
                 try:
-                    self._upsert_external_candidate(
+                    upserted_gid = self._upsert_external_candidate(
                         source="miaozhuli",
                         raw_share_text=raw_text,
                         goods_name=cleaned_title,
@@ -389,14 +424,30 @@ class GroupHelpImporter:
                         now=now,
                         stats=stats,
                     )
+                    if upserted_gid:
+                        active_keys.add(upserted_gid)
+                    if gid_guess:
+                        active_keys.add(gid_guess)
+                    if token_code:
+                        active_keys.add(token_code)
                 except ValueError:
                     stats["skipped_invalid"] += 1
-        return stats
+
+            has_more = bool(payload.get("has_more", True)) if isinstance(payload, dict) else True
+            if not has_more:
+                break
+            page += 1
+
+        return stats, active_keys
 
     def run_once(self, now: Optional[float] = None) -> Dict[str, Any]:
         loop_t0 = time.perf_counter()
         current_ts = float(now if now is not None else time.time())
-        summary: Dict[str, Any] = {"timestamp": int(current_ts), "sources": {}}
+        summary: Dict[str, Any] = {
+            "timestamp": int(current_ts),
+            "sources": {},
+            "offline_synced": 0,
+        }
 
         if not self.dry_run:
             try:
@@ -404,15 +455,32 @@ class GroupHelpImporter:
             except Exception as exc:
                 self.log.warning("[IMPORTER-WARN] 清理站内过期拼团异常: %s", exc)
 
+        seen_active_keys: Set[str] = set()
+        has_source_error = False
+
         for source_name, handler in (
             ("acdog", self._sync_acdog),
             ("miaozhuli", self._sync_miaozhuli),
         ):
             try:
-                summary["sources"][source_name] = handler(current_ts)
+                st, source_keys = handler(current_ts)
+                summary["sources"][source_name] = st
+                seen_active_keys.update(source_keys)
             except Exception as exc:
+                has_source_error = True
                 self.log.warning("[IMPORTER-WARN] 采集源 [%s] 本轮失败 (跳过不中断): %s", source_name, exc)
                 summary["sources"][source_name] = {"error": str(exc)}
+
+        # 宁缺毋滥与防误杀铁律：两站皆无才自动下架；若任一外部源网络抖动/报错，不贸然下架存量团
+        if not self.dry_run and not has_source_error:
+            try:
+                offline_count = self.repo.mark_missing_external_groups_offline(
+                    seen_active_keys,
+                    now=current_ts,
+                )
+                summary["offline_synced"] = offline_count
+            except Exception as exc:
+                self.log.warning("[IMPORTER-WARN] 两站皆无自动下架同步异常: %s", exc)
 
         total_time_ms = int((time.perf_counter() - loop_t0) * 1000)
         acdog_st = summary["sources"].get("acdog", {})
@@ -425,6 +493,7 @@ class GroupHelpImporter:
             return (
                 f"抓取 {st.get('fetched', 0):3d} | 新增 {st.get('upserted', 0):2d} | "
                 f"刷新 {st.get('unchanged', 0):2d} | 满员/下架同步 {st.get('synced_inactive', 0):2d} | "
+                f"用户下架跳过 {st.get('skipped_user_takedown', 0):2d} | "
                 f"过滤垃圾/过期 {st.get('skipped_invalid', 0) + st.get('skipped_expired', 0):2d}"
             )
 
@@ -440,6 +509,10 @@ class GroupHelpImporter:
         total_synced_inactive = (acdog_st.get("synced_inactive", 0) if isinstance(acdog_st, dict) else 0) + (
             miao_st.get("synced_inactive", 0) if isinstance(miao_st, dict) else 0
         )
+        total_user_takedown_skipped = (acdog_st.get("skipped_user_takedown", 0) if isinstance(acdog_st, dict) else 0) + (
+            miao_st.get("skipped_user_takedown", 0) if isinstance(miao_st, dict) else 0
+        )
+        offline_count = int(summary.get("offline_synced") or 0)
 
         try:
             active_in_hall = self.repo.col.count_documents(
@@ -454,23 +527,26 @@ class GroupHelpImporter:
             active_in_hall = -1
 
         hall_str = f"{active_in_hall} 款" if active_in_hall >= 0 else "未知"
+        page_mode_str = f"{self.pages}页" if self.pages > 0 else "全量(直至无更多/超时)"
 
         self.log.info(
             "\n"
             "========================================================================================\n"
-            "[PDD-IMPORTER] 采集轮询完成 | 总耗时: %sms | 翻页深度: %s页\n"
+            "[PDD-IMPORTER] 采集轮询完成 | 总耗时: %sms | 翻页模式: %s\n"
             "  ├─ 闪助力 [acdog]   : %s\n"
             "  ├─ 秒助力 [miaozhuli]: %s\n"
-            "  └─ 全局汇总: 扫描 %d 款 | 实际新增 %d 款 | 状态刷新 %d 款 | 同步下架 %d 款 | 大厅在售: %s\n"
+            "  └─ 全局汇总: 扫描 %d 款 | 实际新增 %d 款 | 状态刷新 %d 款 | 同步下架 %d 款 | 两站皆无自动下架 %d 款 | 用户下架保持拦截 %d 款 | 大厅在售: %s\n"
             "========================================================================================",
             total_time_ms,
-            self.pages,
+            page_mode_str,
             _fmt_src(acdog_st),
             _fmt_src(miao_st),
             total_fetched,
             total_upserted,
             total_unchanged,
             total_synced_inactive,
+            offline_count,
+            total_user_takedown_skipped,
             hall_str,
         )
         return summary
@@ -479,8 +555,8 @@ class GroupHelpImporter:
 def main() -> None:
     parser = argparse.ArgumentParser(description="拼多多多人团外部高质量源定时采集守护脚本")
     parser.add_argument("--once", action="store_true", help="仅执行一轮采集后退出")
-    parser.add_argument("--interval", type=int, default=90, help="后台轮询间隔秒数（默认 90）")
-    parser.add_argument("--pages", type=int, default=3, help="每次每个源抓取前 N 页（默认 3）")
+    parser.add_argument("--interval", type=int, default=_DEFAULT_SYNC_INTERVAL_SECONDS, help="后台轮询间隔秒数（默认 600，即10分钟）")
+    parser.add_argument("--pages", type=int, default=0, help="每次每个源抓取前 N 页（默认 0 表示全量获取所有有效团）")
     parser.add_argument("--ttl-hours", type=float, default=6.0, help="外部团最多在站内保留小时数（默认 6）")
     parser.add_argument("--dry-run", action="store_true", help="仅抓取校验并打印统计，不写入数据库")
     args = parser.parse_args()
@@ -508,7 +584,7 @@ def main() -> None:
         signal.signal(signal.SIGTERM, _handle_stop)
 
     interval = max(15, int(args.interval))
-    log.info("外部多人团采集脚本已启动，轮询间隔=%ss，pages=%s", interval, importer.pages)
+    log.info("外部多人团采集脚本已启动，轮询间隔=%ss，pages=%s (0=全量获取)", interval, importer.pages)
     while not stop_flag["stop"]:
         importer.run_once()
         slept = 0

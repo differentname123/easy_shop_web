@@ -29,6 +29,8 @@ EXPORT_STATUS_FAILED = "failed"
 EXPORT_TARGET_MIAOZHULI = "miaozhuli"
 
 DEFAULT_GROUP_TTL_SECONDS = 86400  # 默认 24 小时后自动下线
+DEFAULT_SYNC_INTERVAL_SECONDS = 600  # 外部多人团定时同步默认间隔：10 分钟
+OFFLINE_REASON_UPSTREAM_MISSING = "upstream_missing"  # 两站外部源均已无此团导致自动下架
 MAX_PARSE_ATTEMPTS = 3
 
 # 防恶意下架极简阈值：内存级 10 分钟最多下架他人 3 个团；被团长恢复推翻满 2 次直接停用下架权限
@@ -550,6 +552,8 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
         "parse_status": parse_status,
         "parse_error": str(doc.get("parse_error") or ""),
         "group_status": effective_status,
+        "user_takedown": bool(doc.get("user_takedown")),
+        "offline_reason": str(doc.get("offline_reason") or ""),
         "matched_group_order_id": str(doc.get("matched_group_order_id") or ""),
         "matched_group": doc.get("matched_group"),
         "click_count": int(doc.get("click_count") or 0),

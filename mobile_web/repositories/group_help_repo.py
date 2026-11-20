@@ -2,7 +2,7 @@
 """拼多多多人团互助仓储层：独立操作 pdd_multi_groups 集合，与主站业务完全解耦。"""
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from repositories.base_repo import BaseRepository
 from models.group_help import (
@@ -17,6 +17,7 @@ from models.group_help import (
     GROUP_STATUS_FULL,
     GROUP_STATUS_PENDING_CONFIRM,
     MAX_PARSE_ATTEMPTS,
+    OFFLINE_REASON_UPSTREAM_MISSING,
     PARSE_STATUS_FAILED,
     PARSE_STATUS_PARSED,
     PARSE_STATUS_PENDING,
@@ -94,6 +95,8 @@ class GroupHelpRepository(BaseRepository):
                 "parse_attempts": 0,
                 "parse_error": "",
                 "group_status": GROUP_STATUS_ACTIVE,
+                "user_takedown": False,
+                "offline_reason": "",
                 "updated_at": now,
             }
             if str(data.get("share_text") or "").strip():
@@ -128,6 +131,8 @@ class GroupHelpRepository(BaseRepository):
             "owner_token": str(data.get("owner_token") or ""),
             "owner_uid": str(data.get("owner_uid") or ""),
             "last_takedown_uid": "",
+            "user_takedown": False,
+            "offline_reason": "",
             "parse_status": PARSE_STATUS_PENDING,
             "parse_attempts": 0,
             "parse_error": "",
@@ -519,6 +524,12 @@ class GroupHelpRepository(BaseRepository):
 
         if was_active and now_offline:
             update_fields["last_takedown_uid"] = "" if is_owner else clean_op_uid
+            update_fields["user_takedown"] = True
+            update_fields["user_takedown_at"] = current_ts
+
+        if target_status == GROUP_STATUS_ACTIVE and is_owner:
+            update_fields["user_takedown"] = False
+            update_fields["offline_reason"] = ""
 
         return self.col.find_one_and_update(
             {"group_order_id": gid},
@@ -572,14 +583,19 @@ class GroupHelpRepository(BaseRepository):
 
         existing = self.get_by_group_order_id(gid)
         if existing is not None:
+            is_user_takedown = bool(existing.get("user_takedown"))
             orig_status = str(existing.get("group_status") or GROUP_STATUS_ACTIVE)
             orig_created = float(existing.get("created_at") or created_at)
             orig_expires = float(existing.get("expires_at") or (orig_created + DEFAULT_GROUP_TTL_SECONDS))
 
-            if preserve_local_takedown and (
-                orig_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED) or orig_expires <= current_ts
-            ):
+            # 核心铁律：网页用户反馈下架了的团，就算外部两个网站还在，也绝不要恢复
+            if is_user_takedown:
                 return existing, False, None
+
+            if orig_expires <= current_ts:
+                if preserve_local_takedown:
+                    return existing, False, None
+                raise ValueError("该拼团已超过有效期失效，请重新发起后再发布")
 
             incoming_source = str(data.get("source") or SOURCE_USER_TEXT)
             existing_source = str(
@@ -589,8 +605,18 @@ class GroupHelpRepository(BaseRepository):
             if preserve_local_takedown and existing_source == SOURCE_USER_UPLOAD and incoming_source != SOURCE_USER_UPLOAD:
                 return existing, False, None
 
-            if orig_expires <= current_ts:
-                raise ValueError("该拼团已超过有效期失效，请重新发起后再发布")
+            was_upstream_missing = existing.get("offline_reason") == OFFLINE_REASON_UPSTREAM_MISSING
+            should_relist_from_missing = (
+                orig_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED)
+                and was_upstream_missing
+                and not is_user_takedown
+                and orig_expires > current_ts
+            )
+
+            if preserve_local_takedown and not should_relist_from_missing and (
+                orig_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED)
+            ):
+                return existing, False, None
 
             update_fields: Dict[str, Any] = {
                 "goods_name": str(data.get("goods_name") or existing.get("goods_name") or ""),
@@ -601,6 +627,9 @@ class GroupHelpRepository(BaseRepository):
                 "remain_people": max(1, int(data.get("remain_people") if data.get("remain_people") is not None else (existing.get("remain_people") or 1))),
                 "updated_at": current_ts,
             }
+            if should_relist_from_missing:
+                update_fields["group_status"] = GROUP_STATUS_ACTIVE
+                update_fields["offline_reason"] = ""
             if str(data.get("share_text") or "").strip():
                 update_fields["share_text"] = str(data.get("share_text") or "").strip()
             if str(data.get("share_code") or "").strip():
@@ -652,6 +681,8 @@ class GroupHelpRepository(BaseRepository):
             "owner_token": str(data.get("owner_token") or ""),
             "owner_uid": str(data.get("owner_uid") or ""),
             "last_takedown_uid": "",
+            "user_takedown": False,
+            "offline_reason": "",
             "parse_status": PARSE_STATUS_PARSED,
             "parse_attempts": 1,
             "parse_error": "",
@@ -706,6 +737,56 @@ class GroupHelpRepository(BaseRepository):
             projection={"_id": 0},
             return_document=ReturnDocument.AFTER,
         )
+
+    def mark_missing_external_groups_offline(
+        self,
+        active_external_keys: Set[str],
+        *,
+        now: Optional[float] = None,
+        sources: Tuple[str, ...] = ("acdog", "miaozhuli"),
+    ) -> int:
+        """两站皆无时自动下架：如果外部采集的活跃团在所有外部源中均已消失，则自动下架（从大厅隐藏）。
+
+        仅作用于来源为外部采集（sources）且当前处于活跃（active）的团。
+        下架时标记 offline_reason="upstream_missing"，保留其原本的 user_takedown 状态。
+        """
+        current_ts = float(now if now is not None else time.time())
+        query = {
+            "source": {"$in": list(sources)},
+            "group_status": GROUP_STATUS_ACTIVE,
+            "expires_at": {"$gt": current_ts},
+        }
+        cursor = self.col.find(query, {"_id": 0, "group_order_id": 1, "share_code": 1})
+        missing_gids = []
+        for doc in cursor:
+            gid = str(doc.get("group_order_id") or "").strip()
+            share_code = str(doc.get("share_code") or "").strip()
+            # 只要 gid、去 tok_ 前缀、或 share_code 任一在本次外部拉取集合中，就代表外部还在
+            if gid in active_external_keys:
+                continue
+            if gid.startswith("tok_") and gid[4:] in active_external_keys:
+                continue
+            if f"tok_{gid}" in active_external_keys:
+                continue
+            if share_code and share_code in active_external_keys:
+                continue
+            missing_gids.append(gid)
+
+        if not missing_gids:
+            return 0
+
+        res = self.col.update_many(
+            {"group_order_id": {"$in": missing_gids}},
+            {
+                "$set": {
+                    "group_status": GROUP_STATUS_EXPIRED,
+                    "offline_reason": OFFLINE_REASON_UPSTREAM_MISSING,
+                    "offline_at": current_ts,
+                    "updated_at": current_ts,
+                }
+            },
+        )
+        return int(res.modified_count or 0)
 
     def list_active_for_export(
         self,
