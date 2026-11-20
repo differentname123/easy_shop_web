@@ -35,6 +35,10 @@ MATERIAL_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL
 SIGN_BY_ID_CACHE = ThreadSafeTTLCache(maxsize=CACHE_MAX_DETAIL, ttl=PRODUCT_DETAIL_TTL)
 # 已确认下架/取消推广的商品防复活黑名单（30分钟内拦截榜单滞后快照重新入库或展示）
 OFF_PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=2048, ttl=1800)
+# 线报视图的权威短缓存：详情缓存可能存着转链/上游拼出的浅快照（不含线报），
+# 每次对外返回前用这份 60 秒投影结果覆盖，保证线报合入后最迟一分钟可见。
+# 条目值为 (found, deal_tip)：found=False 表示正式表无此文档，此时不改写详情 payload。
+DEAL_TIP_CACHE = ThreadSafeTTLCache(maxsize=4096, ttl=60)
 
 
 def is_product_off_promotion(platform: str, goods_id: str = "", goods_sign: str = "") -> bool:
@@ -307,6 +311,30 @@ def make_detail_snapshot(data: dict, fetched_at: datetime, platform: str) -> Det
     return DetailSnapshot(ref, payload, fetched_at)
 
 
+def get_cached_deal_tip(platform: str, product_id: str):
+    """读取线报视图短缓存；返回 (state, deal_tip) 或 None（未缓存）。"""
+    return DEAL_TIP_CACHE.get(("deal_tip", str(platform or ""), str(product_id or "")))
+
+
+def cache_deal_tip(platform: str, product_id: str, state: str, deal_tip) -> None:
+    """写入线报视图短缓存；只缓存确定的结论（ok/missing），error 不缓存以便重试。"""
+    if state not in ("ok", "missing"):
+        return
+    DEAL_TIP_CACHE.set(("deal_tip", str(platform or ""), str(product_id or "")), (state, deepcopy(deal_tip)))
+
+
+def clear_cached_deal_tip(platform: str = "", product_id: str = "") -> None:
+    """线报合并/过期后可主动失效；空参数表示清空整区。"""
+    if not platform and not product_id:
+        DEAL_TIP_CACHE.clear()
+        return
+    for key in DEAL_TIP_CACHE.keys():
+        if not isinstance(key, tuple) or len(key) != 3:
+            continue
+        if (not platform or key[1] == platform) and (not product_id or key[2] == product_id):
+            DEAL_TIP_CACHE.pop(key, None)
+
+
 def cache_product_detail(
     platform: str,
     result: dict,
@@ -380,3 +408,4 @@ def clear_all_caches():
     MATERIAL_CACHE.clear()
     SIGN_BY_ID_CACHE.clear()
     OFF_PROMOTION_CACHE.clear()
+    DEAL_TIP_CACHE.clear()

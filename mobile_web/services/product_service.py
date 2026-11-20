@@ -23,8 +23,10 @@ from cache import (
     RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
     MATERIAL_CACHE, SIGN_BY_ID_CACHE,
     _DETAIL_CACHE_LOCK,
+    cache_deal_tip,
     cache_product_detail,
     evict_product_from_caches,
+    get_cached_deal_tip,
     get_cached_product_detail,
     has_valid_product_images,
     is_product_off_promotion,
@@ -331,6 +333,45 @@ class ProductService:
         data.pop("detail_updated_at", None)
         return {"status": "success", "data": data, "source": source}
 
+    def _apply_deal_tip(self, plat: str, payload: dict, ref: Optional[ProductRef] = None) -> dict:
+        """对外返回详情前，用正式表的线报视图覆盖 payload 里的 deal_tip。
+
+        详情 payload 可能来自转链种子、上游接口或旧缓存，这些来源天然不含 deal_info，
+        所以“库里有线报、页面却没有”只取决于本次走的是哪条路径。这里统一按商品主键
+        做一次只读投影（60 秒短缓存），让线报与详情来源解耦：
+          - 文档存在  → 以库里视图为准覆盖（含“已过期应当隐藏”的情况）；
+          - 文档缺失  → 原样返回，不猜、不删；
+          - 查询失败  → 原样返回，避免把有效线报误清空。
+        只改本次返回对象，不写缓存、不写数据库。
+        """
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            return payload
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return payload
+        pid = str(
+            data.get("goods_id") or data.get("product_id") or (ref.goods_id if ref else "") or ""
+        ).strip()
+        if not pid:
+            return payload
+        cached = get_cached_deal_tip(plat, pid)
+        if cached is not None:
+            state, deal_tip = cached
+        else:
+            try:
+                state, deal_tip = self.repo.get_deal_tip_view(pid, platform=plat)
+            except Exception as exc:
+                logger.warning(
+                    "❌ 【线报视图覆盖异常】读取线报视图失败，本次详情保持原样 | 平台[%s] 商品[%s] 异常<%s>",
+                    plat, pid, format_exc_summary(exc),
+                )
+                return payload
+            cache_deal_tip(plat, pid, state, deal_tip)
+        if state != "ok":
+            return payload
+        data["deal_tip"] = deepcopy(deal_tip) if isinstance(deal_tip, dict) and deal_tip else None
+        return payload
+
     def _read_detail(self, ref, strict=False):
         options = {"strict": True} if strict else {}
         if ref.platform in ("taobao", "jd") and ref.goods_id and (
@@ -510,7 +551,7 @@ class ProductService:
         # 公开商品详情优先命中全局共享内存缓存
         cached = self._cached_detail(ref)
         if cached:
-            return cached[1]
+            return self._apply_deal_tip(plat, cached[1], ref)
         item = self._read_detail(ref)
         ref = self._upgrade_ref_sign(ref, item)
         if isinstance(item, dict) and item.get("is_off_promotion") is True:
@@ -518,7 +559,7 @@ class ProductService:
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}
         deadline = self._detail_expires_at(item) if item else 0.0
         if time.time() < deadline:
-            result = self._database_detail(item, "database")
+            result = self._apply_deal_tip(plat, self._database_detail(item, "database"), ref)
             return self._cache_detail(plat, result, deadline)
         loaded = self._load_official(
             ref, adapter, uid, kwargs,
@@ -546,12 +587,12 @@ class ProductService:
                         "%s 【商品详情降级】实时拉取上游商品详情未成功，已降级返回本地历史缓存 | 平台[%s] 商品[%s] 上游原因<%s>",
                         severity_icon(error_code=err_code), plat, goods_tag, reason,
                     )
-                return self._database_detail(item, "database_fallback")
+                return self._apply_deal_tip(plat, self._database_detail(item, "database_fallback"), ref)
             logger.warning(
                 "%s 【商品详情失败】拉取商品详情失败且本地无可用缓存 | 平台[%s] 商品[%s] 失败原因<%s> 排查方向<请检查商品ID/Sign是否有效、商品是否已下架或上游接口状态>",
                 severity_icon(error_code=err_code), plat, goods_tag, reason,
             )
-        return loaded.public
+        return self._apply_deal_tip(plat, loaded.public, ref)
 
     def prefetch_product_detail(self, ref, snapshot=None, refresh_ahead_seconds=330, stop_event=None):
         """只准备公开详情；内部结果明确区分已入库、确定下架与需告警失败。"""

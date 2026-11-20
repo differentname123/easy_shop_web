@@ -1262,6 +1262,34 @@ class ProductRepository(BaseRepository):
             )
             return None
 
+    def get_deal_tip_view(self, product_id: str, platform: str = "pdd") -> Tuple[str, Optional[Dict[str, Any]]]:
+        """按正式表主键只读线报视图，供详情接口返回前做权威覆盖。
+
+        只投影 deal_info，不读整条详情，也不做任何写入。
+        返回 (state, deal_tip)：
+          - state="ok"      文档存在，deal_tip 为当前权威视图（可能为 None，表示该商品暂无线报）；
+          - state="missing" 正式表没有该主键（例如仅存在于上游的临时商品），调用方不得改写 payload；
+          - state="error"   查询异常，调用方保持原 payload 不变，避免把可用线报误删。
+        """
+        key = self._real_goods_id(str(product_id or "").strip())
+        if not key:
+            return "missing", None
+        try:
+            # 必须保留 _id：商品没有 deal_info 时投影结果会是空字典，不能用真值判断文档是否存在
+            doc = self.col.find_one(
+                {"platform": self._platform(platform), "product_id": key},
+                {"deal_info": 1},
+            )
+        except Exception as e:
+            logger.warning(
+                "❌ 【线报视图读取异常】按商品主键读取线报视图失败，本次详情保持原样 | 平台[%s] 商品[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或products集合索引>",
+                self._platform(platform), key, format_exc_summary(e),
+            )
+            return "error", None
+        if doc is None:
+            return "missing", None
+        return "ok", self._extract_deal_tip(doc)
+
     def get_categories(self, platform: str = "all") -> List[str]:
         """获取类目列表"""
         filter_query = {}
