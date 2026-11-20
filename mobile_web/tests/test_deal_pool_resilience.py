@@ -1333,6 +1333,79 @@ def test_deal_pool_startup_recovery_idempotently_rescues_recent_misclassified_ti
     assert "https://union-click.jd.com/jdc?e=&p=JF8B_VALID" in extracted_urls
 
 
+def test_jd_empty_jcommand_never_skips_piliang_or_misclassified_as_venue():
+    """验证 AGENTS.md 准则三：京东 byunionid_get 即使返回空 jCommand，也严禁跳过 tkl_piliang，严禁误判为会场/纯券。"""
+    from infrastructure.jd_client import JdClient
+    from adapters.jd_adapter import JdAdapter
+
+    client = JdClient(appkey_list=["fake_key"], union_id="123456")
+
+    # 模拟 byunionid_get 成功但 jCommand 为空串
+    called_endpoints = []
+
+    def _fake_exec(endpoint, params, evaluator, **kwargs):
+        called_endpoints.append(endpoint)
+        if endpoint == "open_jing_union_open_promotion_byunionid_get.ashx":
+            return evaluator({
+                "status": 200,
+                "data": {
+                    "code": 200,
+                    "data": {
+                        "shortURL": "https://u.jd.com/myPromo",
+                        "clickURL": "https://union-click.jd.com/jdc?e=1",
+                        "jCommand": "",
+                        "jShortCommand": "",
+                    },
+                },
+            })
+        elif endpoint == "open_gaoyongzhuanlian_tkl_piliang.ashx":
+            return evaluator({
+                "status": 200,
+                "tao_id": "cipher_product_123",
+                "result_url": "https://u.jd.com/myPromo",
+                "result_tkl": "",
+                "pic": "https://img.jd.com/p.jpg",
+                "title": "京东测试牛奶",
+            })
+        return {"status": "error"}
+
+    client._execute_with_failover = _fake_exec
+    res = client.convert_universal_material("https://u.jd.com/oaTdF8d", "3110104129")
+
+    # 必须调用了 piliang，并且成功提取了 tao_id
+    assert "open_gaoyongzhuanlian_tkl_piliang.ashx" in called_endpoints
+    assert res.get("tao_id") == "cipher_product_123"
+
+    # 验证 adapter 绝不将普通短链判为 coupon_or_venue
+    adapter = JdAdapter(
+        settings=SimpleNamespace(
+            jd_enabled=True,
+            ztk_appkey="fake_key",
+            ztk_appkey_list=["fake_key"],
+            jd_union_id="123456",
+            jd_position_id="3110104129",
+            jd_app_key="",
+            jd_app_secret="",
+            jd_api_base="http://api.zhetaoke.com:20000/api",
+        ),
+        client=client,
+    )
+    adapter.get_goods_detail = MagicMock(return_value={
+        "status": "success",
+        "data": {
+            "name": "京东测试牛奶",
+            "price": 65.8,
+            "goods_id": "cipher_product_123",
+            "goods_sign": "sign_123",
+        },
+    })
+    conv_out = adapter.resolve_and_convert_universal("https://u.jd.com/oaTdF8d")
+    assert conv_out["status"] == "success"
+    assert conv_out["resolution_kind"] == "product"
+    assert conv_out["product"]["name"] == "京东测试牛奶"
+
+
+
 def test_deal_pool_parse_publish_time_epoch_china_tz_consistency():
     """验证东八区无时区字符串与显式 UTC Z 字符串解析结果严格一致，消除容器 UTC 8 小时漂移。"""
     from mobile_web.scripts.run_deal_pool_scheduler import parse_publish_time_epoch
@@ -1808,9 +1881,18 @@ def test_fetch_guangdiu_rank_and_hots_parser():
     assert "满100减60优惠券" in rec_hot["tutorial_text"]
 
 
-def test_fetch_guangdiu_captcha_circuit_breaker():
+def test_fetch_guangdiu_captcha_circuit_breaker(monkeypatch):
     from mobile_web.scripts.test_deal_sites_scraper import fetch_guangdiu_deals
     from unittest.mock import MagicMock
+
+    # 滑块求解器由用例显式注入失败结果：它内部会真起浏览器访问真实站点，
+    # 既不确定也不该出现在离线单测里（不能靠"真实站点当下是否放行"来决定断言）。
+    # 同一模块在 `mobile_web.services.*` 与 `services.*` 两种导入路径下各有一份实例，都要打。
+    for module_name in ("mobile_web.services.deal_fetchers", "services.deal_fetchers"):
+        monkeypatch.setattr(
+            f"{module_name}._solve_guangdiu_slider_playwright",
+            lambda *a, **k: (False, "", "用例注入：自动通过失败"),
+        )
 
     list_html = """
     <div class="gooditem">

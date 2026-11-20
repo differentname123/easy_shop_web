@@ -513,6 +513,42 @@ class DealRawPoolRepository:
             logger.warning("读取站点 [%s] 已存详情 ID 列表异常: %s", source_site, e)
             return set()
 
+    def touch_seen(
+        self,
+        source_site: str,
+        item_ids: Any,
+        *,
+        channel: str = "",
+        at: Optional[datetime.datetime] = None,
+    ) -> int:
+        """把"本轮在列表里再次见到"的已存商品标记为仍在架：只刷新 `last_seen_at`。
+
+        刻意不动两处：
+        - `seen_count`：它会汇总成 `deal_info.total_seen_count`（代表"被重复推荐次数"），
+          每轮全量巡视都 +1 会把这个指标刷废；
+        - `publish_time` / `publish_ts`：那是源站自述的爆料时间，参与 7 天过期判定，
+          不能被本地拉取时间污染。
+        返回匹配到的已存文档数（不在库里的 ID 直接忽略）。
+        """
+        site = str(source_site or "").strip()
+        ids = [str(i).strip() for i in (item_ids or []) if str(i or "").strip()]
+        if not site or not ids:
+            return 0
+        now = at or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        update_doc: Dict[str, Any] = {"$set": {"last_seen_at": now}}
+        if channel:
+            update_doc["$addToSet"] = {"seen_channels": channel}
+        ops = [
+            UpdateOne({"source_site": site, "source_item_id": item_id}, update_doc)
+            for item_id in ids
+        ]
+        try:
+            res = self.col.bulk_write(ops, ordered=False)
+            return int(res.matched_count)
+        except Exception as e:
+            logger.warning("刷新站点 [%s] 本轮确认时间失败: %s", site, e)
+            return 0
+
     def save_batch(self, records: List[Dict[str, Any]], task_name: str = "") -> Dict[str, int]:
         """【Stage 1：源站拉取入初步表 `deal_raw_tips`】"""
         if not records:

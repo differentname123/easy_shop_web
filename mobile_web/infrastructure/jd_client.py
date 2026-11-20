@@ -529,7 +529,6 @@ class JdClient:
             is_known_jingfen_or_venue = (
                 "jingfen.jd.com/detail/" in lower_mat
                 or is_jd_official_venue_url(lower_mat)
-                or not j_cmd_primary
             )
             if is_known_jingfen_or_venue:
                 return primary_res

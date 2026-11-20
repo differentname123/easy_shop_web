@@ -403,6 +403,12 @@ def run_fetch_stage(
                         if r.get("has_full_detail", True) and r.get("source_item_id"):
                             site_dedup.add(str(r["source_item_id"]))
 
+                # 全量巡视源：列表里再次见到的已存商品，刷新"本轮确认仍在架"的时间（last_seen_at），
+                # 用它做上架/下架观测，不覆盖源站自述的 publish_time。
+                touch_ids = res.get("touch_ids") or []
+                if touch_ids:
+                    repo.touch_seen(site_key, touch_ids, channel=task_name)
+
                 unique_cnt = sum(
                     1 for r in records
                     if evaluate_quality_signals(r)["has_unique_product_anchor"]

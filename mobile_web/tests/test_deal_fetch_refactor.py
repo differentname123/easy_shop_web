@@ -121,6 +121,62 @@ def test_tehuicaicai_skips_known_drops_shell_and_merges_clean_urls():
     assert "https://u.jd.com/oaNj0X8" in urls
 
 
+def test_tehuicaicai_full_sweep_pages_all_and_touches_known_without_detail_requests():
+    """全量巡视：翻到末页、详情配额用完也不提前收工，已抓 ID 只回传 touch_ids 不重复抓详情。"""
+    from mobile_web.services.deal_fetchers import fetch_tehuicaicai_deals
+
+    pages = {
+        "page=1": [
+            {"id": 2001, "title": "已知商品A", "platform_code": "jd", "platform_name": "京东", "display_price": "9.9"},
+            {"id": 2002, "title": "新商品B", "platform_code": "jd", "platform_name": "京东", "display_price": "19.9"},
+        ],
+        "page=2": [
+            {"id": 2003, "title": "新商品C", "platform_code": "jd", "platform_name": "京东", "display_price": "29.9"},
+        ],
+    }
+    url_count = {"n": 0}
+    detail_called = []
+
+    def fake_get(url, headers=None, timeout=10.0):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "home-products" in url:
+            url_count["n"] += 1
+            if "page=1" in url:
+                resp.json.return_value = {"data": {"items": pages["page=1"],
+                                                  "pagination": {"page": 1, "total": 3, "has_next": True}}}
+            else:
+                resp.json.return_value = {"data": {"items": pages["page=2"],
+                                                  "pagination": {"page": 2, "total": 3, "has_next": False}}}
+        else:
+            detail_called.append(url)
+            resp.json.return_value = {"data": {}}
+        return resp
+
+    sess = MagicMock()
+    sess.get.side_effect = fake_get
+
+    res = fetch_tehuicaicai_deals(
+        fetch_detail=True, max_details=0, detail_delay=0.0,
+        skip_detail_ids={"2001"}, session=sess, full_sweep=True,
+    )
+
+    assert url_count["n"] == 2, "全量巡视必须翻到末页，不能因详情配额用完就停"
+    assert res["pages_crawled"] == 2
+    assert res["raw_list_count"] == 3
+    assert res["touch_ids"] == ["2001"], "已抓 ID 只回传确认名单，不重新抓详情"
+    assert detail_called == [], "详情配额为 0 时不应发起任何详情请求"
+
+    # 对照组：关掉全量巡视则第一页即收工（保持原有增量语义，逛丢等反爬站仍走这条）
+    url_count["n"] = 0
+    res2 = fetch_tehuicaicai_deals(
+        fetch_detail=True, max_details=0, detail_delay=0.0,
+        skip_detail_ids={"2001"}, session=sess, full_sweep=False,
+    )
+    assert res2["pages_crawled"] == 1
+    assert res2["touch_ids"] == []
+
+
 def test_guangdiu_filters_before_requests_parses_nested_dabstract_and_drops_image_only():
     from mobile_web.services.deal_fetchers import fetch_guangdiu_deals
 

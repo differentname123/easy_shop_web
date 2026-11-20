@@ -263,6 +263,7 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
             "max_pages": 10,
             "auto_paginate": True,
             "fetch_detail": True,
+            "full_sweep": True,
         },
         enabled=True,
         interval_seconds=60 * 20,
@@ -270,7 +271,7 @@ MONITORED_CHANNELS: List[DealChannelConfig] = [
         detail_delay_seconds=0.05,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=180,
-        description="特惠采采专员精选好价流，JSON 无风控，直达短链与文案完整",
+        description="特惠采采专员精选好价流，JSON 无风控，直达短链与文案完整；每轮全量扫完列表，已抓商品只刷新确认时间",
     ),
 
     # --------------------------------------------------------------------------

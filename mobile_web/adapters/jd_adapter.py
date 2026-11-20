@@ -965,7 +965,7 @@ class JdAdapter(BasePlatformAdapter):
             is_explicit_venue_url = is_jd_official_venue_url(lower_urls)
             verified_coupon_or_venue = bool(
                 not extracted_encrypted_id
-                and (is_explicit_venue_url or not j_cmd.strip())
+                and is_explicit_venue_url
             )
 
             if conv.get("ztk_catalog_throttled") or (product_card is None and not verified_coupon_or_venue):

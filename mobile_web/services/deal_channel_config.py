@@ -46,6 +46,7 @@ DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
             "max_pages": 10,
             "auto_paginate": True,
             "fetch_detail": True,
+            "full_sweep": True,
         },
         enabled=True,
         interval_seconds=180,
@@ -53,7 +54,7 @@ DEFAULT_CHANNEL_CONFIGS: List[DealChannelConfig] = [
         detail_delay_seconds=0.05,
         sleep_after=0.3,
         rate_limit_cooldown_seconds=180,
-        description="特惠采采专员人工严选 JSON 流，逐页拉取直到整页均为已抓商品",
+        description="特惠采采专员人工严选 JSON 流，每轮全量扫完列表，已抓商品只刷新确认时间",
     ),
     DealChannelConfig(
         name="逛丢_首页实时流",
