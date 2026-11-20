@@ -242,12 +242,35 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     piliang_tkls = [mat for u, _, mat in calls if "piliang" in u]
     assert piliang_tkls and all(t == "https://u.jd.com/officialShort1" for t in piliang_tkls)
 
-    # 3) 纯领券短链 (jCommand 为空)：不白耗 piliang 与 quanwang，精准归为 coupon_or_venue
+    # 3) 纯领券短链（jCommand 为空）：它到底是什么，以实网结果为准，不能靠 mock 想象。
+    #    2026-11-20 实网验证（真实 ztk Key + 真实站点）：
+    #      · u.jd.com/oa0INNe（本用例的券短链）连跑 3 次稳定 = degraded_product（无 name/price，detail_lookup_failed=True）
+    #      · 真实数据里的券链接 u.jd.com/5reWTig（取自特惠采采 material_info.coupon_urls）同样 = degraded_product
+    #      · 真实下单短链 u.jd.com/oGpSC4R / ogpfg4F = product，带真实商品名与价格（如 49.9）
+    #    也就是说：券短链本身拿不到商品卡，"拿不到卡就不可能被标成 product"；旧断言 coupon_or_venue 也是错的。
+    #    这里锁住真正的不变量：无商品卡 → 绝不标 product，且不凭空编造商品卡。
+    #    （新语义下券短链也会去 piliang 试解析，不再用"口令为空"短路，所以 piliang 会被调用，这是有意的。）
+    class _NoCardHttp(_FakeHttp):
+        def get(self, url, **kw):
+            if "open_gaoyongzhuanlian_tkl_piliang.ashx" in url:
+                calls.append((url, kw.get("params", {}).get("appkey"), kw.get("params", {}).get("tkl")))
+                return SimpleNamespace(
+                    status_code=200,
+                    raise_for_status=lambda: None,
+                    json=lambda: {"status": 301, "content": "无符合条件的数据"},
+                )
+            return super().get(url, **kw)
+
     calls.clear()
+    adapter.client = JdClient(
+        appkey="ztk_k1", union_id="10001", http_session=_NoCardHttp(), appkey_list=("ztk_k1", "ztk_k2")
+    )
     res_cpn = adapter.resolve_and_convert_universal("https://u.jd.com/oa0INNe", promoter_id="10001")
     assert res_cpn["status"] == "success"
-    assert res_cpn["resolution_kind"] == "coupon_or_venue"
-    assert all("piliang" not in u and "quanwang" not in u for u, _, _ in calls)
+    assert res_cpn["product"] in (None, {})
+    assert res_cpn["resolution_kind"] != "product", "没有商品卡时绝不能标成 product"
+    assert res_cpn["resolution_kind"] in ("coupon_or_venue", "degraded_product")
+    assert any("piliang" in u for u, _, _ in calls), "券短链也应尝试 piliang 解析（不再按口令为空短路）"
 
     # 4) 若全部 Key 同时限流导致无商品卡：即使 jCommand 不含“抢购”，也精准标记 degraded_product，且不再重复浪费 quanwang 配额
     class _AllThrottledHttp(_FakeHttp):

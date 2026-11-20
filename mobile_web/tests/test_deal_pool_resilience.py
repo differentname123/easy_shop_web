@@ -1977,3 +1977,57 @@ def test_fetch_guangdiu_captcha_circuit_breaker(monkeypatch):
     assert any("union-click.jd.com" in lk["url"] for lk in rec["extracted_links"])
 
 
+def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path):
+    """验证逛丢 Cookie 持久化链路闭环：默认路径规范、持久化序列化及 Mock 防御。"""
+    import inspect
+    import json
+    import os
+    import requests
+    from mobile_web.services.deal_fetchers import (
+        DEFAULT_GUANGDIU_COOKIE_FILE,
+        _load_guangdiu_cookies,
+        _save_guangdiu_cookies,
+        fetch_guangdiu_deals,
+    )
+
+    # 1. 验证默认 Cookie 路径存在且为规范绝对路径
+    assert DEFAULT_GUANGDIU_COOKIE_FILE.endswith("guangdiu_cookies.json")
+    assert os.path.isabs(DEFAULT_GUANGDIU_COOKIE_FILE)
+
+    # 2. 验证 fetch_guangdiu_deals 默认参数已接入 DEFAULT_GUANGDIU_COOKIE_FILE
+    sig = inspect.signature(fetch_guangdiu_deals)
+    assert sig.parameters["cookie_file"].default == DEFAULT_GUANGDIU_COOKIE_FILE
+
+    # 3. 验证 _save_guangdiu_cookies 与 _load_guangdiu_cookies 存取闭环
+    test_cookie_file = str(tmp_path / "test_gd_cookies.json")
+    sess = requests.Session()
+    sess.cookies.set("gdhuman", "test_val_12345", domain="guangdiu.com", path="/")
+    sess.cookies.set("PHPSESSID", "test_sess_67890", domain="guangdiu.com", path="/")
+
+    _save_guangdiu_cookies(sess, test_cookie_file)
+    assert os.path.exists(test_cookie_file)
+
+    with open(test_cookie_file, "r", encoding="utf-8") as f:
+        saved_data = json.load(f)
+    cookie_dict = {c["name"]: c["value"] for c in saved_data}
+    assert cookie_dict.get("gdhuman") == "test_val_12345"
+    assert cookie_dict.get("PHPSESSID") == "test_sess_67890"
+
+    # 新 Session 加载验证
+    sess2 = requests.Session()
+    assert "gdhuman" not in sess2.cookies
+    loaded = _load_guangdiu_cookies(sess2, test_cookie_file)
+    assert loaded is True
+    assert sess2.cookies.get("gdhuman") == "test_val_12345"
+    assert sess2.cookies.get("PHPSESSID") == "test_sess_67890"
+
+    # 4. 验证 Mock session 防御：传入 MagicMock 不会写坏文件
+    mock_sess = MagicMock()
+    _save_guangdiu_cookies(mock_sess, test_cookie_file)
+    # 文件内容保持原样
+    with open(test_cookie_file, "r", encoding="utf-8") as f:
+        after_mock_data = json.load(f)
+    assert len(after_mock_data) == 2
+
+
+

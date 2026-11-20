@@ -1040,6 +1040,10 @@ _GUANGDIU_CAPTCHA_MARKERS: Tuple[str, ...] = (
     "逛丢安全验证",
 )
 
+DEFAULT_GUANGDIU_COOKIE_FILE: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "guangdiu_cookies.json"
+)
+
 
 def _is_guangdiu_captcha_page(url: str, html_text: str) -> bool:
     """判断响应是否落入逛丢 `verify.php` 滑块安全验证页。"""
@@ -1049,7 +1053,10 @@ def _is_guangdiu_captcha_page(url: str, html_text: str) -> bool:
     return any(marker in body for marker in _GUANGDIU_CAPTCHA_MARKERS)
 
 
-def _load_guangdiu_cookies(session: requests.Session, cookie_file: Optional[str]) -> bool:
+def _load_guangdiu_cookies(
+    session: requests.Session,
+    cookie_file: Optional[str] = DEFAULT_GUANGDIU_COOKIE_FILE,
+) -> bool:
     """从本地 JSON 文件加载已验证的逛丢 Cookie 到 requests.Session。"""
     if not cookie_file or not os.path.exists(cookie_file):
         return False
@@ -1079,28 +1086,38 @@ def _load_guangdiu_cookies(session: requests.Session, cookie_file: Optional[str]
         return False
 
 
-def _save_guangdiu_cookies(session: requests.Session, cookie_file: Optional[str]) -> None:
+def _save_guangdiu_cookies(
+    session: requests.Session,
+    cookie_file: Optional[str] = DEFAULT_GUANGDIU_COOKIE_FILE,
+) -> None:
     """将 requests.Session 中的逛丢相关 Cookie 持久化到本地 JSON 文件。"""
-    if not cookie_file:
+    if not cookie_file or not hasattr(session, "cookies"):
         return
     try:
+        from requests.cookies import RequestsCookieJar
+        if not isinstance(session.cookies, (RequestsCookieJar, list, tuple)):
+            return
         parent = os.path.dirname(os.path.abspath(cookie_file))
         if parent:
             os.makedirs(parent, exist_ok=True)
         out: List[Dict[str, Any]] = []
         for c in session.cookies:
-            dom = str(c.domain or "")
+            c_name = getattr(c, "name", None)
+            if not c_name or not isinstance(c_name, str):
+                continue
+            dom = str(getattr(c, "domain", "") or "")
             if dom and "guangdiu.com" not in dom.lower():
                 continue
             out.append({
-                "name": c.name,
-                "value": c.value,
+                "name": c_name,
+                "value": getattr(c, "value", ""),
                 "domain": dom or "guangdiu.com",
-                "path": c.path or "/",
-                "expires": c.expires,
+                "path": getattr(c, "path", "/") or "/",
+                "expires": getattr(c, "expires", None),
             })
-        with open(cookie_file, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
+        if out:
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -1285,7 +1302,7 @@ def _sync_guangdiu_cookies(
     session: requests.Session,
     context: Any,
     site_host: str,
-    cookie_file: Optional[str],
+    cookie_file: Optional[str] = DEFAULT_GUANGDIU_COOKIE_FILE,
 ) -> List[str]:
     """把浏览器里本站域名的 Cookie 写回 `requests.Session` 并持久化，返回 Cookie 名列表。"""
     names: List[str] = []
@@ -1313,7 +1330,7 @@ def _solve_guangdiu_slider_playwright(
     timeout: float = 20.0,
     headless: bool = True,
     proxy: Optional[str] = None,
-    cookie_file: Optional[str] = None,
+    cookie_file: Optional[str] = DEFAULT_GUANGDIU_COOKIE_FILE,
     max_drag_retries: int = _GUANGDIU_SLIDE_MAX_ATTEMPTS,
     browser_channel: Optional[str] = "chrome",
     bypass_system_proxy: bool = True,
@@ -1495,7 +1512,7 @@ def fetch_guangdiu_deals(
     timeout: float = 10.0,
     skip_detail_ids: Optional[Set[str]] = None,
     enable_slider_solver: bool = True,
-    cookie_file: Optional[str] = None,
+    cookie_file: Optional[str] = DEFAULT_GUANGDIU_COOKIE_FILE,
     max_captcha_solves: int = 2,
     solver_headless: bool = True,
     proxy: Optional[str] = None,
@@ -2096,7 +2113,7 @@ def test_guangdiu_slider_and_fetch(
     test_item_id: str = "30679695",
     channel: str = "latest",
     max_details: int = 3,
-    cookie_file: str = "guangdiu_cookies.json",
+    cookie_file: str = DEFAULT_GUANGDIU_COOKIE_FILE,
     headless: bool = False,
     proxy: Optional[str] = None,
     browser_channel: Optional[str] = "chrome",

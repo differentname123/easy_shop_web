@@ -25,6 +25,9 @@ _CONFIG = {
     "web_detail_prefetch_enabled": False,
     "pdd_dns_mode": "off",
     "pdd_trust_env": False,
+    # 离线边界必须关掉 Meilisearch：清洗结果写正式表时会调 is_meili_available() 探活，
+    # enabled 默认 True 就会真的去打 http://localhost:7700/health，被离线守卫判为"访问真实资源"。
+    "meilisearch_enabled": False,
 }
 
 
