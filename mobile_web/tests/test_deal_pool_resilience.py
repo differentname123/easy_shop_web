@@ -439,6 +439,54 @@ def test_save_batch_anchors_fallback_publish_ts_in_set_on_insert_without_conflic
     assert "publish_ts" not in op_with_pub["$setOnInsert"]
 
 
+def test_save_batch_tehuicaicai_refresh_never_conflicts_set_and_set_on_insert():
+    """Mongo 错误码 40：同一路径同时出现在 $set 与 $setOnInsert 会让整批 upsert 被拒。
+
+    特惠采采每轮刷新 publish_time/clean_cutoff_ts/clean_max_age_days，必须与插入模板互斥。
+    """
+    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
+
+    captured_ops = []
+
+    class _StrictCol:
+        def bulk_write(self, ops, ordered=False):
+            for op in ops:
+                doc = op._doc
+                overlap = set(doc.get("$set") or {}) & set(doc.get("$setOnInsert") or {})
+                assert not overlap, f"Mongo 会以错误码 40 拒绝该更新文档：{sorted(overlap)}"
+            captured_ops.extend(ops)
+            return SimpleNamespace(upserted_count=len(ops), modified_count=0)
+
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: _StrictCol()))
+    repo._indexes_ready = True
+
+    res = repo.save_batch(
+        [
+            {
+                "source_site": "tehuicaicai",
+                "source_item_id": "5524",
+                "publish_time": "2026-11-20T08:04:23Z",
+                "title": "蒙牛早餐红枣味牛奶 250ml*16盒*2箱",
+                "price": 28.88,
+                "extracted_links": [{"url": "https://u.jd.com/oOffv69"}],
+                "has_full_detail": True,
+            }
+        ],
+        task_name="unit_test",
+    )
+
+    assert res["inserted"] == 1
+    assert "error" not in res
+    doc = captured_ops[0]._doc
+    # 本次巡视刷新的字段走 $set
+    assert {"publish_time", "publish_ts", "clean_cutoff_ts", "clean_max_age_days"} <= set(doc["$set"])
+    # 插入模板不再重复持有，避免冲突
+    for key in ("clean_cutoff_ts", "clean_max_age_days", "publish_ts", "publish_time"):
+        assert key not in doc["$setOnInsert"]
+    # 插入语义仍完整
+    assert doc["$setOnInsert"]["clean_status"] == "pending"
+
+
 def test_run_clean_stage_sweeps_stale_pending_by_either_publish_ts_or_first_seen_at():
     import datetime
     import time
@@ -702,12 +750,14 @@ def test_channel_specific_max_age_days_configuration_and_behavior():
         task_name="channel_age_test",
     )
     # 特惠采采 3 天前爆料：在 7 天保鲜期内，进入 pending
+    # 特惠采采每轮巡视会刷新保鲜字段，因此这三个键落在 $set（插入模板里不得重复，否则错误码 40）
     assert captured_ops[0]._doc["$setOnInsert"]["clean_status"] == "pending"
-    assert captured_ops[0]._doc["$setOnInsert"]["clean_max_age_days"] == 7.0
-    assert captured_ops[0]._doc["$setOnInsert"]["clean_cutoff_ts"] > 0
+    assert captured_ops[0]._doc["$set"]["clean_max_age_days"] == 7.0
+    assert captured_ops[0]._doc["$set"]["clean_cutoff_ts"] > 0
+    assert "clean_max_age_days" not in captured_ops[0]._doc["$setOnInsert"]
     # 特惠采采 8 天前爆料：超过 7 天，被淘汰为 cleaned_failed
     assert captured_ops[1]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
-    # 逛丢 3 天前爆料：超过 2 天，被淘汰为 cleaned_failed
+    # 逛丢 3 天前爆料：超过 2 天，被淘汰为 cleaned_failed（非特惠采采只在插入时写保鲜字段）
     assert captured_ops[2]._doc["$setOnInsert"]["clean_status"] == "cleaned_failed"
     assert captured_ops[2]._doc["$setOnInsert"]["clean_max_age_days"] == 2.0
     assert captured_ops[2]._doc["$setOnInsert"]["clean_cutoff_ts"] > 0

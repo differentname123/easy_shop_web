@@ -707,6 +707,10 @@ class DealRawPoolRepository:
 
             if has_full_detail:
                 set_fields.update(core_fields)
+                # MongoDB 禁止同一路径同时出现在 $set 与 $setOnInsert（错误码 40），
+                # 以本次刷新的 $set 为准，把重复键从插入模板里剔除
+                for _dup_key in [k for k in set_on_insert if k in set_fields]:
+                    set_on_insert.pop(_dup_key)
                 update_doc: Dict[str, Any] = {
                     "$set": set_fields,
                     "$setOnInsert": set_on_insert,
