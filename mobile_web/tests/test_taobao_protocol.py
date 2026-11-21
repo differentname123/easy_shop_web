@@ -788,3 +788,33 @@ def test_tb_top_errors_enforce_fail_closed_red_cross_policy(monkeypatch):
     assert res_sess["status"] == "error"
     assert any(lvl == "INFO" and "自动切换至折淘客" in msg for lvl, msg in records)
     assert all("❌" not in msg for _, msg in records)
+
+
+def test_tb_universal_edetail_falls_back_to_official_top_on_ztk_network_error():
+    """验证 uland.taobao.com/item/edetail?id=... 在 ZTK 瞬断时无缝降级官方 TOP 通道，不回环到 ZTK。"""
+    enc_id = "nV21R9Q5oT7xYzA8bC3dE4fG6hJ7kL9mN"
+    ztk = ZtkClient(
+        "ztk_key",
+        "ztk_sid",
+        http_session=SimpleNamespace(get=Mock(side_effect=RuntimeError("conn reset"))),
+        appkey_list=("ztk_key",),
+    )
+    official = Mock()
+    off_row = official_item(sign=enc_id, input_id=enc_id, item_url=f"https://uland.taobao.com/item/edetail?id={enc_id}")
+    official.get_goods_details.return_value = {"status": "success", "data": [off_row]}
+    official.search_goods.return_value = {
+        "status": "success",
+        "data": [{**off_row, "coupon_share_url": "https://uland.taobao.com/coupon/edetail?e=off2in1"}],
+    }
+    official.create_tpwd.return_value = {"status": "success", "password_simple": "￥OfficialTpwd8￥"}
+
+    adapter = make_adapter(official, ztk=ztk, tb_channel_pid="mm_1_2_3", tb_adzone_id="3")
+    res = adapter.resolve_and_convert_universal(f"https://uland.taobao.com/item/edetail?id={enc_id}")
+
+    assert res["status"] == "success"
+    assert res["_provider"] == "tb_official_universal"
+    assert res["resolution_kind"] == "product"
+    assert res["promotion_token"] == "￥OfficialTpwd8￥"
+    assert res["product"]["name"] == "官方标题"
+    ztk.http.get.assert_called_once()
+

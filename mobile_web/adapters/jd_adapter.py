@@ -976,6 +976,13 @@ class JdAdapter(BasePlatformAdapter):
                             resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
                     except Exception:
                         pass
+                if (
+                    product_card is None
+                    and conv.get("piliang_empty_tao_id")
+                    and conv.get("known_single_item")
+                    and hasattr(self.client, "mark_catalog_rate_limited")
+                ):
+                    self.client.mark_catalog_rate_limited()
 
             verified_coupon_or_venue = bool(
                 not extracted_encrypted_id

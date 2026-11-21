@@ -782,7 +782,8 @@ class TaobaoAdapter(BasePlatformAdapter):
             )
 
         def _do_official_id_resolve():
-            conv = self.convert_promotion_url(official_target_id, uid=uid, identity=identity)
+            conv = dict(self.convert_promotion_url(official_target_id, uid=uid, identity=identity))
+            conv.pop("_provider", None)
             if conv.get("status") != "success":
                 return stamp_universal_resolution(conv, single_item_evidence=True)
             det = self.get_goods_detail(official_target_id)

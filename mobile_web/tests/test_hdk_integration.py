@@ -1083,6 +1083,38 @@ def test_hdk_jd_universal_skips_unsupported_union_click_without_error_metric():
     )
 
 
+def test_hdk_shop_homepage_venue_and_off_promotion_short_circuit():
+    """验证 shop.m.jd.com/member/home 解包判为纯会场且零 ZTK 配额消耗，及 hdk_jd_universal 遇 PRODUCT_OFF_PROMOTION 立即短路。"""
+    sess = Mock()
+    sess.get.side_effect = [
+        Mock(status_code=200, text="<script>var hrl='https://u.jd.com/jda?e=1';</script>", url="https://u.jd.com/orXLLP5"),
+        Mock(status_code=200, url="https://shop.m.jd.com/member/home?shopId=10001"),
+    ]
+    hdk_cli = HdkClient(api_key="test_k", http_session=sess)
+    shop_res = hdk_cli.resolve_short_url("https://u.jd.com/orXLLP5")
+    assert shop_res["status"] == "success"
+    assert shop_res["data"]["is_venue"] is True
+    assert shop_res["data"]["sku_id"] == ""
+
+    enc_id = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
+    ztk_mock = Mock()
+    ztk_mock.appkey_list = ("ztk_k",)
+    ztk_mock.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
+    ztk_mock.convert_promotion_link.return_value = {"status": "error", "jd_off_promotion": True, "error_msg": "不在推广中"}
+    hdk_mock = Mock()
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_mock,
+        hdk_client=hdk_mock,
+    )
+    off_res = adapter.resolve_and_convert_universal(f"https://jingfen.jd.com/detail/{enc_id}.html")
+    assert off_res["status"] == "error"
+    assert off_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+    hdk_mock.convert_promotion_link.assert_not_called()
+    ztk_mock.convert_universal_material.assert_not_called()
+
+
+
 
 
 

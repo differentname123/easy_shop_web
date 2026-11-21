@@ -2551,9 +2551,12 @@ test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting cop
   assert.equal(hDeal.copied.at(-1).includes('合并付款'), false);
   hDeal.page.dispose();
 
-  // 3. 模板守卫：统一条件渲染且外链图片声明 referrerpolicy="no-referrer"
+  // 3. 模板守卫：统一条件渲染、外链图片声明 referrerpolicy="no-referrer"，且线报时间仅保留单一爆料时间
   const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   assert.ok(detailHtml.includes('class="detail-card-section deal-tip-card" v-if="dealTip"'));
+  assert.ok(detailHtml.includes('dealTip.publish_time'));
+  assert.equal(detailHtml.includes('dealTip.updated_at'), false);
+  assert.equal(detailHtml.includes('最新更新'), false);
   assert.ok(detailHtml.includes('referrerpolicy="no-referrer"'));
 });
 

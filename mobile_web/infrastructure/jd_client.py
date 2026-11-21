@@ -603,6 +603,7 @@ class JdClient:
                         return primary_res
                     if u_sku:
                         known_single_item = True
+                        primary_res["known_single_item"] = True
 
         piliang_empty_tao_id_hits = 0
 
@@ -666,13 +667,12 @@ class JdClient:
                 if not primary_res.get("j_short_command") and piliang_res.get("j_short_command"):
                     primary_res["j_short_command"] = piliang_res["j_short_command"]
             elif (
-                piliang_empty_tao_id_hits >= 2
-                or piliang_res.get("catalog_cooling") is True
+                piliang_res.get("catalog_cooling") is True
                 or piliang_res.get("error_code") == "RATE_LIMIT"
             ):
                 primary_res["piliang_throttled"] = True
-                if known_single_item and piliang_empty_tao_id_hits >= 2:
-                    self.mark_catalog_rate_limited()
+            elif piliang_empty_tao_id_hits >= 2:
+                primary_res["piliang_empty_tao_id"] = True
             return primary_res
 
         if piliang_res.get("status") != "success":

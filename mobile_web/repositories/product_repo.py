@@ -275,7 +275,7 @@ class ProductRepository(BaseRepository):
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
             "sales_tip", "image_url", "mall_name", "updated_at", "product_url", "coupon_url",
             "deal_source", "deal_source_name",
-            "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.publish_ts", "deal_info.publish_time",
+            "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.unit_deal_price", "deal_info.publish_ts", "deal_info.publish_time",
             "deal_info.source_site", "deal_info.source_site_name",
         ), 1),
     }
@@ -826,7 +826,7 @@ class ProductRepository(BaseRepository):
         if clean_doc_img.startswith("//"):
             clean_doc_img = "https:" + clean_doc_img
         is_active_deal = bool(deal_info.get("is_deal_tip") is True)
-        deal_highlight = str(deal_info.get("card_highlight") or "").strip() if is_active_deal else ""
+        deal_highlight = self._resolve_deal_card_highlight(deal_info) if is_active_deal else ""
         deal_publish_time = self._format_deal_datetime(get_deal_publish_ts(deal_info)) if is_active_deal else ""
         return {
             "platform": platform,
@@ -857,24 +857,33 @@ class ProductRepository(BaseRepository):
         }
 
     @staticmethod
+    def _resolve_deal_card_highlight(deal_info: Any) -> str:
+        """提取外层商品卡片的线报短亮点：优先 `card_highlight`，缺失时回退展示 `unit_deal_price`。"""
+        if not isinstance(deal_info, dict):
+            return ""
+        card_hl = str(deal_info.get("card_highlight") or "").strip()
+        if card_hl:
+            return card_hl
+        return str(deal_info.get("unit_deal_price") or "").strip()
+
+    @staticmethod
     def _format_deal_datetime(raw_val: Any) -> str:
         """统一将线报时间字段格式化为北京时间 `YYYY-MM-DD HH:MM`，无效值返回空串。"""
         return format_timestamp_cn(raw_val)
 
     @classmethod
-    def _extract_deal_tip(cls, doc: Dict[str, Any], fallback_time: str = "") -> Optional[Dict[str, Any]]:
+    def _extract_deal_tip(cls, doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """提取公开可展示的线报详情视图，严格过滤内部评分与爬虫源字段；非线报商品返回 None。
 
         秉持以用户体验为中心与信息可见原则：只要该商品记录中存在实质性的线报详情
         （如购买教程、线报话术、券口令/链接、实付到手价等），无论是否已超 72 小时从严选榜单摘标，
-        在商品详情页均完整透出供用户参考，并通过 is_deal_tip 与 updated_at 明确区分时效状态。
+        在商品详情页均完整透出供用户参考，并通过 is_deal_tip 与 publish_time（源自 publish_ts）明确区分时效状态。
         """
         deal_info = doc.get("deal_info")
         if not isinstance(deal_info, dict):
             return None
 
-        publish_time = cls._format_deal_datetime(get_deal_publish_ts(deal_info)) or str(fallback_time or "").strip()
-        updated_at = cls._format_deal_datetime(deal_info.get("updated_at"))
+        publish_time = cls._format_deal_datetime(get_deal_publish_ts(deal_info))
 
         deal_price: Optional[float] = None
         raw_dp = deal_info.get("deal_price")
@@ -965,7 +974,6 @@ class ProductRepository(BaseRepository):
         return {
             "is_deal_tip": bool(deal_info.get("is_deal_tip")),
             "publish_time": publish_time,
-            "updated_at": updated_at,
             "deal_price": deal_price,
             "unit_deal_price": unit_deal_price,
             "price_logic": price_logic,
@@ -1018,7 +1026,7 @@ class ProductRepository(BaseRepository):
             "specs": deepcopy(doc.get("specs") or []),
             "coupon_info": deepcopy(doc.get("coupon_info") or {}),
             "search_id": doc.get("search_id") or "",
-            "deal_tip": self._extract_deal_tip(doc, result["updated_at"]),
+            "deal_tip": self._extract_deal_tip(doc),
             # 不把摘要 updated_at 冒充详情抓取时间；服务层负责过期决策。
             "detail_updated_at": doc.get("detail_updated_at"),
             "is_off_promotion": doc.get("is_off_promotion", False),
@@ -1247,6 +1255,7 @@ class ProductRepository(BaseRepository):
                     "goods_id": 1,
                     "goods_sign": 1,
                     "deal_info.card_highlight": 1,
+                    "deal_info.unit_deal_price": 1,
                     "deal_info.publish_ts": 1,
                     "deal_info.publish_time": 1,
                 },
@@ -1256,7 +1265,7 @@ class ProductRepository(BaseRepository):
                 if not isinstance(doc, dict):
                     continue
                 di = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
-                highlight = str(di.get("card_highlight") or "").strip()
+                highlight = self._resolve_deal_card_highlight(di)
                 pub_time = self._format_deal_datetime(get_deal_publish_ts(di))
                 if not highlight and not pub_time:
                     continue

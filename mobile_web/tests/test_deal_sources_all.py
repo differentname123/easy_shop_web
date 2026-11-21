@@ -1479,4 +1479,45 @@ def test_telegram_nested_div_in_message_text_preserved():
     assert any(lk["url"] == "https://u.jd.com/NEST202" for lk in res["records"][0]["extracted_links"])
 
 
+def test_haodanku_preserves_prefixed_coupon_urls_for_llm_and_links():
+    """好单库 coupon_url 带中文/序号前缀时不得被 startswith('http') 丢弃，须原文进 tutorial_text 并抽入 extracted_links。"""
+    u1 = "https://coupon.m.jd.com/coupons/show.action?key=k111&roleId=r111"
+    u2 = "https://coupon.m.jd.com/coupons/show.action?key=k222&roleId=r222"
+    payload = {
+        "code": 200,
+        "msg": "SUCCESS",
+        "min_id": 2,
+        "data": [{
+            "wire_id": "1659858",
+            "platform": "2",
+            "starttime": "1760000000",
+            "images": ["https://img14.360buyimg.com/a.jpg"],
+            "list": [
+                {"content": "①先领优惠券②拍下9.9元"},
+                {"item_id": "https://u.jd.com/orX999", "coupon_url": f"领 {u1}"},
+                {"content": "备用券", "coupon_url": f"②{u2}"},
+            ],
+        }],
+    }
+    sess = MagicMock()
+    sess.get.return_value = _mk_resp(200, json_data=payload)
+    ch = ChannelConfig(
+        name="好单库_京东实时线报",
+        site_key="haodanku",
+        default_url="https://www.haodanku.com/activity/tip_off",
+        params={"label_id": 10004},
+        fetch_mode="full_sweep",
+        max_pages=1,
+    )
+    res = HaodankuSource().fetch(FetchContext(channel=ch, session=sess)).to_dict()
+    assert res["status"] == "ok"
+    rec = res["records"][0]
+    assert f"领 {u1}" in rec["tutorial_text"]
+    assert f"②{u2}" in rec["tutorial_text"]
+    ext_urls = [lk["url"] for lk in rec["extracted_links"]]
+    assert u1 in ext_urls
+    assert u2 in ext_urls
+
+
+
 

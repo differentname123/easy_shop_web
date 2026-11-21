@@ -167,7 +167,7 @@ def test_expired_deal_remains_visible_with_is_deal_tip_false():
     assert tip is not None
     assert tip["is_deal_tip"] is False
     assert tip["publish_time"] == "2026-11-16 19:56"
-    assert tip["updated_at"] == "2026-11-18 06:49"
+    assert "updated_at" not in tip
     assert tip["deal_price"] == 12.9
     assert len(tip["tutorial_steps"]) == 2
 

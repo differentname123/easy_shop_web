@@ -727,9 +727,12 @@ def test_fail_closed_coupon_integrity_and_retention():
     assert res_map["tip_cpn_dead"]["status"] == "failed"
     assert res_map["tip_cpn_dead"]["error_code"] == ERR_AI2_COUPON_FAILED_OR_DROPPED
 
-    # 验证 2: tip_cpn_dropped 必须被拦截且错误码为 ERR_AI2_COUPON_FAILED_OR_DROPPED
-    assert res_map["tip_cpn_dropped"]["status"] == "failed"
-    assert res_map["tip_cpn_dropped"]["error_code"] == ERR_AI2_COUPON_FAILED_OR_DROPPED
+    # 验证 2: tip_cpn_dropped 已成功转链为有效 coupon_or_activity，即使 AI-2 漏填仍确定性保留回 coupon_links（不误杀）
+    assert res_map["tip_cpn_dropped"]["status"] == "success"
+    rescued_cpns = res_map["tip_cpn_dropped"]["product_doc"]["deal_info"]["coupon_links"]
+    assert len(rescued_cpns) == 1
+    assert rescued_cpns[0]["link_id"] == "L1"
+    assert rescued_cpns[0]["url"] == "https://coupon.m.jd.com/coupons/show.action?key=valid_key&roleId=123"
 
     # 验证 3: tip_no_coupon 正常成功放行入库
     assert res_map["tip_no_coupon"]["status"] == "success"
@@ -1425,6 +1428,88 @@ def test_shop_homepage_exclusion_empty_coupon_step_rewrite_score_clamp_and_confi
     assert "通过下方购买链接领取会员券" in di["tutorial_steps"][0]
     assert di["score_breakdown"]["match_score"] == 0
     assert di["score_breakdown"]["completeness_score"] == 30
+
+
+def test_ai1_verbatim_link_guard_isolated_retry_and_title_dedup():
+    """
+    验证 AI-1 提取链接原文逐字核验与标题折行/省略号去重：
+    1. 批处理返回非原文错拼/跨条拼接 URL -> 立即单条隔离重提并成功救回；
+    2. 单条重提仍幻觉/截断 URL -> Fail-Closed 打回 AI1_HALLUCINATED_LINK；
+    3. 淘宝 11 位混合口令仅归一化两侧包裹符 -> 直接通过逐字校验，不误触发重提；
+    4. `build_clean_original_copywriting` 自动对空白换行差异与省略号截断标题去重。
+    """
+    from services.deal_cleaning.text_sanitizer import build_clean_original_copywriting
+
+    cleaner = DealPoolCleaner(ai_batch_size=3, ai_max_workers=1, convert_max_workers=1)
+    good_u1 = "https://uland.taobao.com/item/edetail?id=ABC123DEF456GHI789"
+    bad_u1 = "https://uland.taobao.com/item/edetail?id=ABC123xEF456GHI789"
+    good_u2 = "https://union-click.jd.com/jdc?e=FULL999888777"
+    bad_u2 = "https://union-click.jd.com/jdc?e=FULL999"
+
+    call_log = []
+
+    def _fake_ai(prompt_tpl, chunk, label):
+        mids = [c["main_tip_id"] for c in chunk]
+        call_log.append(mids)
+        if len(chunk) > 1:
+            return [
+                {
+                    "main_tip_id": "t_rescue",
+                    "is_standalone_deal": True,
+                    "merged_tip_ids": ["t_rescue"],
+                    "extracted_targets": [{"link_id": "L1", "raw_span": bad_u1, "clean_input": bad_u1, "platform": "taobao", "text_role_hint": "main_candidate"}],
+                },
+                {
+                    "main_tip_id": "t_hallucinate",
+                    "is_standalone_deal": True,
+                    "merged_tip_ids": ["t_hallucinate"],
+                    "extracted_targets": [{"link_id": "L1", "raw_span": bad_u2, "clean_input": bad_u2, "platform": "jd", "text_role_hint": "main_candidate"}],
+                },
+                {
+                    "main_tip_id": "t_tok_norm",
+                    "is_standalone_deal": True,
+                    "merged_tip_ids": ["t_tok_norm"],
+                    "extracted_targets": [{"link_id": "L1", "raw_span": "(AbCdEf12345)", "clean_input": "￥AbCdEf12345￥", "platform": "taobao", "text_role_hint": "main_candidate"}],
+                },
+            ]
+        # 单条隔离重提：t_rescue 返回逐字原文链接，t_hallucinate 仍返回前缀截断链接
+        mid = mids[0]
+        u = good_u1 if mid == "t_rescue" else bad_u2
+        return [{
+            "main_tip_id": mid,
+            "is_standalone_deal": True,
+            "merged_tip_ids": [mid],
+            "extracted_targets": [{"link_id": "L1", "raw_span": u, "clean_input": u, "platform": "taobao" if mid == "t_rescue" else "jd", "text_role_hint": "main_candidate"}],
+        }]
+
+    cleaner._call_ai_json_array = _fake_ai
+    docs = {
+        "t_rescue": {"source_site": "xuandan", "source_item_id": "t_rescue", "title": "五年高考三年模拟", "tutorial_text": f"五年高考 {good_u1}", "extracted_links": [], "extracted_tokens": []},
+        "t_hallucinate": {"source_site": "guangdiu", "source_item_id": "t_hallucinate", "title": "牛奶", "tutorial_text": f"特惠 {good_u2}", "extracted_links": [], "extracted_tokens": []},
+        "t_tok_norm": {"source_site": "haodanku", "source_item_id": "t_tok_norm", "title": "抽纸", "tutorial_text": "复制口令 (AbCdEf12345) 下单", "extracted_links": [], "extracted_tokens": []},
+    }
+    inputs = [cleaner.build_stage1_task_input(d, None)[0] for d in docs.values()]
+    out = cleaner.run_ai_stage1_batch(inputs, docs, quiet_sub_logs=True)
+
+    assert call_log[0] == ["t_rescue", "t_hallucinate", "t_tok_norm"]
+    assert ["t_rescue"] in call_log
+    assert ["t_hallucinate"] in call_log
+    assert ["t_tok_norm"] not in call_log  # 口令仅包裹符差异，直接放行不重试
+
+    assert out["t_rescue"]["_from_fallback"] is False
+    assert out["t_rescue"]["extracted_targets"][0]["clean_input"] == good_u1
+    assert out["t_hallucinate"]["_from_fallback"] is True
+    assert out["t_hallucinate"]["_fallback_reason"] == "AI1_HALLUCINATED_LINK"
+    assert out["t_tok_norm"]["_from_fallback"] is False
+
+    # 验证省略号截断/空白差异标题不再重复输出两遍
+    clean_copy = build_clean_original_copywriting(
+        ["0818_1"],
+        {"0818_1": {"title": "超值抽纸 24包...", "tutorial_text": "超值 抽纸\n24包整箱特惠9.9元", "extracted_links": [], "extracted_tokens": []}},
+        [],
+    )
+    assert clean_copy.count("超值") == 1
+
 
 
 

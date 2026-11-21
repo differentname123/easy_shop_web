@@ -970,3 +970,25 @@ def test_search_material_urls_saved_even_without_detail_prefetch(monkeypatch, pr
     repo.upsert_home_products.assert_called_once_with([material_item], channel_type=None)
     repo.upsert_product_detail.assert_not_called()
 
+
+def test_jd_client_catalog_cooldown_short_circuits_catalog_only():
+    """选品库突发冷却开启后，api_detail / api_quanwang / tkl_piliang 零 HTTP 立即熔断，不影响 byunionid_get。"""
+    http = http_for(
+        wrapped(PROMOTION_ROOT, {"code": 200, "data": {"shortURL": "https://u.jd.com/ok"}}, field="result", string=True),
+    )
+    cli = client(http)
+    cli.mark_catalog_rate_limited(60.0, force=True)
+    assert cli.is_catalog_cooling() is True
+
+    det = cli.get_goods_detail("IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g")
+    srch = cli.search_goods("抽纸")
+    assert det["error_code"] == "RATE_LIMIT" and det.get("catalog_cooling") is True
+    assert srch["error_code"] == "RATE_LIMIT" and srch.get("catalog_cooling") is True
+    assert http.get.call_count == 0
+
+    promo = cli.convert_promotion_link("https://jingfen.jd.com/detail/IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g.html", "88")
+    assert promo["status"] == "success"
+    assert promo["short_url"] == "https://u.jd.com/ok"
+    assert http.get.call_count == 1
+
+
