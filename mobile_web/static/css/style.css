@@ -426,6 +426,23 @@ body {
 .plat-badge.taobao { background: #ff5000; }
 .plat-badge.jd { background: #e1251b; }
 
+.deal-time-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(0, 0, 0, 0.58);
+  color: #fff;
+  font-size: 9.5px;
+  line-height: 1.2;
+  padding: 2px 5px;
+  border-radius: 4px;
+  backdrop-filter: blur(2px);
+  max-width: 56%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .goods-body {
   padding: 6px 8px 8px;
   display: flex;
@@ -445,6 +462,40 @@ body {
   color: #1a1a1a;
   font-weight: 500;
   margin-bottom: 4px;
+}
+
+.deal-highlight-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 1px 0 4px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #fff1eb 0%, #fff7e6 100%);
+  border: 1px solid #ffd8bf;
+  min-width: 0;
+}
+
+.deal-highlight-badge {
+  flex-shrink: 0;
+  background: #fa541c;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  line-height: 1.2;
+}
+
+.deal-highlight-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: #d4380d;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .goods-tags {

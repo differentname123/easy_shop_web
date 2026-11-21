@@ -1069,19 +1069,19 @@ def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch,
     )
     assert seen_threads["site_a"] != seen_threads["site_b"]
 
-    # 2. 逛丢 Captcha 熔断冷却 + 同站其余频道 cooldown_skipped + 跨站零干扰
-    gd_calls = []
-
-    class _GdCaptchaSrc(BaseDealSource):
+    # 2. 逛丢 Captcha 按频道精准冷却（热门榜/小时榜触发验证码不连坐首页实时流），HTTP 429 仍触发站点级冷却且跨站零干扰
+    class _GdChannelCaptchaSrc(BaseDealSource):
         site_key = "guangdiu"
 
         def fetch(self, ctx: FetchContext) -> FetchResult:
-            gd_calls.append(ctx.channel.params.get("channel"))
-            return FetchResult(
-                status="error", http_status=200, request_url="https://guangdiu.com/", elapsed_ms=1.0,
-                raw_list_count=5, rate_limited=True,
-                detail_errors=[{"item_id": "1", "http_status": 200, "error_type": "CaptchaChallengeDetected", "error": "滑块验证"}],
-            )
+            ch_kind = (ctx.channel.params or {}).get("channel")
+            if ch_kind in ("hots", "rank"):
+                return FetchResult(
+                    status="error", http_status=200, request_url=ctx.channel.default_url, elapsed_ms=1.0,
+                    raw_list_count=5, rate_limited=True,
+                    detail_errors=[{"item_id": "1", "http_status": 200, "error_type": "CaptchaChallengeDetected", "error": "滑块验证"}],
+                )
+            return FetchResult(status="ok", http_status=200, request_url="https://guangdiu.com/", elapsed_ms=1.0, raw_list_count=10, skipped_known=10)
 
     class _ThOkSrc(BaseDealSource):
         site_key = "tehuicaicai"
@@ -1090,19 +1090,103 @@ def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch,
             return FetchResult(status="ok", http_status=200, request_url="https://xhhcds.cn/", elapsed_ms=1.0, raw_list_count=50, skipped_known=50, sweep_completed=True)
 
     cooldown_map = {}
-    out = dps.run_fetch_stage(
+    out_captcha = dps.run_fetch_stage(
         repo=repo,
         session=MagicMock(),
         cycle_num=1,
         channels=[c for c in dps.MONITORED_CHANNELS if c.site_key in ("guangdiu", "tehuicaicai")],
         channel_last_run={},
         site_cooldown_until=cooldown_map,
-        source_registry={"guangdiu": _GdCaptchaSrc(), "tehuicaicai": _ThOkSrc()},
+        source_registry={"guangdiu": _GdChannelCaptchaSrc(), "tehuicaicai": _ThOkSrc()},
     )
-    assert len(gd_calls) == 1
-    assert cooldown_map.get("guangdiu", 0) > 0
-    assert next(t for t in out["tasks"] if t["site_key"] == "tehuicaicai")["status"] == "success"
-    assert sum(1 for t in out["tasks"] if t["site_key"] == "guangdiu" and t["status"] == "cooldown_skipped") == 2
+    assert "guangdiu" not in cooldown_map
+    assert cooldown_map.get("逛丢_热门榜", 0) > 0
+    assert cooldown_map.get("逛丢_小时风云榜", 0) > 0
+    assert next(t for t in out_captcha["tasks"] if t["task_name"] == "逛丢_首页实时流")["status"] == "success"
+    assert next(t for t in out_captcha["tasks"] if t["site_key"] == "tehuicaicai")["status"] == "success"
+
+    # 第二轮：热门榜/小时榜仍在频道冷却期内被跳过，首页实时流照常成功拉取
+    out_captcha_r2 = dps.run_fetch_stage(
+        repo=repo,
+        session=MagicMock(),
+        cycle_num=2,
+        channels=[c for c in dps.MONITORED_CHANNELS if c.site_key == "guangdiu"],
+        channel_last_run={},
+        site_cooldown_until=cooldown_map,
+        source_registry={"guangdiu": _GdChannelCaptchaSrc()},
+    )
+    assert next(t for t in out_captcha_r2["tasks"] if t["task_name"] == "逛丢_首页实时流")["status"] == "success"
+    assert sum(1 for t in out_captcha_r2["tasks"] if t["status"] == "cooldown_skipped") == 2
+
+    # 3. 站点级 HTTP 429 限流：仍冷却整个站点，同站其余频道 cooldown_skipped 且跨站零干扰
+    gd_429_calls = []
+
+    class _Gd429Src(BaseDealSource):
+        site_key = "guangdiu"
+
+        def fetch(self, ctx: FetchContext) -> FetchResult:
+            gd_429_calls.append(ctx.channel.params.get("channel"))
+            return FetchResult(
+                status="error", http_status=429, request_url=ctx.channel.default_url, elapsed_ms=1.0,
+                raw_list_count=0, rate_limited=True,
+                detail_errors=[{"item_id": "1", "http_status": 429, "error_type": "HTTP_429", "error": "Too Many Requests"}],
+            )
+
+    site_cooldown_map = {}
+    out_429 = dps.run_fetch_stage(
+        repo=repo,
+        session=MagicMock(),
+        cycle_num=3,
+        channels=[c for c in dps.MONITORED_CHANNELS if c.site_key in ("guangdiu", "tehuicaicai")],
+        channel_last_run={},
+        site_cooldown_until=site_cooldown_map,
+        source_registry={"guangdiu": _Gd429Src(), "tehuicaicai": _ThOkSrc()},
+    )
+    assert len(gd_429_calls) == 1
+    assert site_cooldown_map.get("guangdiu", 0) > 0
+    assert next(t for t in out_429["tasks"] if t["site_key"] == "tehuicaicai")["status"] == "success"
+    assert sum(1 for t in out_429["tasks"] if t["site_key"] == "guangdiu" and t["status"] == "cooldown_skipped") == 2
+
+
+def test_repo_stops_perpetual_refetch_of_terminal_failures_and_allows_relisted_disappeared():
+    from mobile_web.repositories.deal_raw_pool_repo import DealRawPoolRepository
+
+    raw_col = MagicMock()
+    formal_col = MagicMock()
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda n: formal_col if "product" in n else raw_col))
+    repo._indexes_ready = True
+
+    # 1. get_existing_detailed_ids 屏蔽已定性失败与低分记录，仅放行 UPSTREAM_DISAPPEARED 重新上榜
+    raw_col.find.return_value.sort.return_value.limit.return_value = [{"source_item_id": "perm_fail_1"}]
+    ids = repo.get_existing_detailed_ids("haodanku", limit=100)
+    assert ids == {"perm_fail_1"}
+    find_query = raw_col.find.call_args[0][0]
+    assert "$or" in find_query
+    statuses = find_query["$or"][0]["clean_status"]["$in"]
+    assert {"pending", "cleaned_success", "cleaned_low_score", "merged_into_parent"}.issubset(set(statuses))
+    assert find_query["$or"][1] == {"clean_status": "cleaned_failed", "clean_error_code": {"$ne": "UPSTREAM_DISAPPEARED"}}
+
+    # 2. save_batch 仅重置因 UPSTREAM_DISAPPEARED 下架后重新上榜的记录，严禁把确定性失败洗回 pending
+    raw_col.update_many.return_value = SimpleNamespace(modified_count=0)
+    raw_col.bulk_write.return_value = SimpleNamespace(upserted_count=1, modified_count=0)
+    repo.save_batch([{
+        "source_site": "haodanku",
+        "source_channel": "好单库_京东实时线报",
+        "source_item_id": "hdk_123",
+        "title": "某商品",
+        "tutorial_text": "下单 https://u.jd.com/abc123",
+    }])
+    reset_filter, reset_update = raw_col.update_many.call_args[0]
+    assert reset_filter["clean_status"] == "cleaned_failed"
+    assert reset_filter["clean_error_code"] == "UPSTREAM_DISAPPEARED"
+    assert "ai_clean_status" not in reset_update["$set"]
+
+    # 3. touch_seen 仅刷新在架(pending/cleaned_success)记录，不动已失败归档时间戳
+    raw_col.bulk_write.reset_mock()
+    raw_col.bulk_write.return_value = SimpleNamespace(matched_count=1)
+    repo.touch_seen("haodanku", ["hdk_123"], refresh_publish_time=False)
+    touch_ops = raw_col.bulk_write.call_args[0][0]
+    assert touch_ops[0]._filter["clean_status"] == {"$in": ["pending", "cleaned_success"]}
 
 
 def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():

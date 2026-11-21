@@ -370,7 +370,7 @@
         currentTab, isHeaderHidden, showBackToTop, scrollToTop,
         pullDistance, pullStatus, isRefreshing, isTransitioning, pullText, executeRefresh,
         formatPhone: shop.formatPhone, formatMoney: shop.formatMoney, formatSales: shop.formatSales,
-        goodsKey: shop.goodsKey, openGoodsDetail,
+        formatDealTime: shop.formatDealTime, goodsKey: shop.goodsKey, openGoodsDetail,
       };
     },
   }).mount('#app');

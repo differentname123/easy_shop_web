@@ -13,7 +13,7 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261118-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261121-1">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
   <script src="/static/js/vue.global.prod.js?v=ux-20261118-1"></script>
 </head>
@@ -93,9 +93,14 @@
         <div class="goods-thumb-wrap">
           <img :src="item.image_url || defaultOrderThumb" :alt="item.name" class="goods-thumb" referrerpolicy="no-referrer" loading="lazy" @error="handleOrderThumbError" />
           <span class="plat-badge" :class="item.platform">{{ item.platform_name || homePlatformName() }}</span>
+          <span v-if="formatDealTime(item.deal_publish_time)" class="deal-time-badge">{{ formatDealTime(item.deal_publish_time) }}</span>
         </div>
         <div class="goods-body">
           <h4 class="goods-title">{{ item.name }}</h4>
+          <div v-if="item.deal_highlight" class="deal-highlight-bar" :title="item.deal_highlight">
+            <span class="deal-highlight-badge">线报</span>
+            <span class="deal-highlight-text">{{ item.deal_highlight }}</span>
+          </div>
           <div class="goods-tags">
             <span v-if="item.has_coupon && item.coupon_amount > 0" class="coupon-tag">
               <span class="tag-badge">券</span>
@@ -243,9 +248,14 @@
         <div class="goods-thumb-wrap">
           <img :src="item.image_url || defaultOrderThumb" :alt="item.name" class="goods-thumb" referrerpolicy="no-referrer" loading="lazy" @error="handleOrderThumbError" />
           <span class="plat-badge" :class="item.platform">{{ item.platform_name }}</span>
+          <span v-if="formatDealTime(item.deal_publish_time)" class="deal-time-badge">{{ formatDealTime(item.deal_publish_time) }}</span>
         </div>
         <div class="goods-body">
           <h4 class="goods-title">{{ item.name }}</h4>
+          <div v-if="item.deal_highlight" class="deal-highlight-bar" :title="item.deal_highlight">
+            <span class="deal-highlight-badge">线报</span>
+            <span class="deal-highlight-text">{{ item.deal_highlight }}</span>
+          </div>
           <div class="goods-tags">
             <span v-if="item.has_coupon && item.coupon_amount > 0" class="coupon-tag">
               <span class="tag-badge">券</span>
@@ -884,10 +894,10 @@
 <!-- 引入前端核心驱动脚本 -->
 <script src="/static/js/api.js?v=ux-20261118-1"></script>
 <script src="/static/js/session.js?v=ux-20261118-1"></script>
-<script src="/static/js/format.js?v=ux-20261118-1"></script>
+<script src="/static/js/format.js?v=ux-20261121-1"></script>
 <script src="/static/js/browser.js?v=ux-20261118-1"></script>
 <script src="/static/js/feeds.js?v=ux-20261118-1"></script>
 <script src="/static/js/account.js?v=ux-20261118-1"></script>
-<script src="/static/js/app.js?v=ux-20261118-1"></script>
+<script src="/static/js/app.js?v=ux-20261121-1"></script>
 </body>
 </html>

@@ -923,6 +923,21 @@ def test_shop_m_jd_whitelist_and_false_positive_coupon_gates():
     )
     assert rebuild_clean_official_venue_url("https://shop.m.jd.com/mshop/gethomepage?cu=true") is None
 
+    # 1b. store.taobao.com 店铺首页同样参数白名单提纯且不当成优惠券误杀
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://store.taobao.com/shop/view_shop.htm?user_number_id=221234&spm=bad"
+        )
+        == "https://store.taobao.com/shop/view_shop.htm?user_number_id=221234"
+    )
+    assert rebuild_clean_official_venue_url("https://store.taobao.com/shop/view_shop.htm?spm=bad") is None
+    assert DealPoolCleaner._is_explicit_coupon_target({"clean_input": "https://store.taobao.com/shop/view_shop.htm?user_number_id=221234"}) is False
+
+    # 1c. _sanitize_card_highlight 清洗截断与空洞套话剔除
+    assert DealPoolCleaner._sanitize_card_highlight("【到手4.9/件】[#L1] https://u.jd.com/abc") == "到手4.9/件"
+    assert DealPoolCleaner._sanitize_card_highlight("好价推荐") == ""
+    assert len(DealPoolCleaner._sanitize_card_highlight("拍4件叠加满200减20补贴到手价仅19.9元")) <= 16
+
     # 2. 端到端回归：
     #    - tip_tb_absorbed: 淘系二合一 L1(coupon_candidate) 与 L2(main_candidate) 转出同 goods_id，AI-2 填 coupon_links=[L1] 不被误杀
     #    - tip_jd_subsidy_with_sku: JD 国补低价 + 冗余数字 item.jd.com SKU(ERR_JD_NUMERIC_SKU) + 店铺首页 /mshop/gethomepage 正常放行
@@ -1013,6 +1028,7 @@ def test_shop_m_jd_whitelist_and_false_positive_coupon_gates():
                 "is_valid_deal": True,
                 "main_link_id": "L2",
                 "deal_price": 24.6,
+                "card_highlight": " 领券立减到手24.6 ",
                 "coupon_links": [{"link_id": "L1", "label": "商品优惠券"}],
                 "tutorial_steps": ["1. 领券加购4件实付24.6元"],
                 "quality_score": 91,
@@ -1041,7 +1057,11 @@ def test_shop_m_jd_whitelist_and_false_positive_coupon_gates():
     res_map = {r["source_item_id"]: r for r in results}
 
     assert res_map["tip_tb_absorbed"]["status"] == "success"
-    assert res_map["tip_tb_absorbed"]["product_doc"]["deal_info"]["coupon_links"] == []
+    tb_deal_info = res_map["tip_tb_absorbed"]["product_doc"]["deal_info"]
+    assert tb_deal_info["coupon_links"] == []
+    assert tb_deal_info["card_highlight"] == "领券立减到手24.6"
+    assert "deal_price_text" not in tb_deal_info
+    assert "tutorial_images" not in tb_deal_info
 
     assert res_map["tip_jd_subsidy_with_sku"]["status"] == "success"
     assert seen_ai2_link_ids["tip_jd_subsidy_with_sku"] == ["L1", "L3"]

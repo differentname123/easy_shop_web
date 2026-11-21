@@ -242,6 +242,14 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     piliang_tkls = [mat for u, _, mat in calls if "piliang" in u]
     assert piliang_tkls and all(t == "https://u.jd.com/officialShort1" for t in piliang_tkls)
 
+    # 2b) 原始长 union-click.jd.com 链接：同样优先透传 byunionid_get 转出的 shortURL (u.jd.com) 给 piliang，避免 ZTK 拒识长链报 301
+    calls.clear()
+    res_uc = adapter.resolve_and_convert_universal("https://union-click.jd.com/jdc?e=618%7Cpc%7C&p=abcLong", promoter_id="10001")
+    assert res_uc["status"] == "success"
+    assert res_uc["resolution_kind"] == "product"
+    uc_piliang_tkls = [mat for u, _, mat in calls if "piliang" in u]
+    assert uc_piliang_tkls and all(t == "https://u.jd.com/officialShort1" for t in uc_piliang_tkls)
+
     # 3) 纯领券短链（jCommand 为空）：它到底是什么，以实网结果为准，不能靠 mock 想象。
     #    2026-11-20 实网验证（真实 ztk Key + 真实站点）：
     #      · u.jd.com/oa0INNe（本用例的券短链）连跑 3 次稳定 = degraded_product（无 name/price，detail_lookup_failed=True）

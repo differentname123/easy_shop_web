@@ -181,12 +181,13 @@ def _clean_coupon_label(label: str) -> str:
 def rebuild_clean_official_venue_url(raw_input: str, _allow_login_unwrap: bool = True) -> Optional[str]:
     """
     【唯一例外辅通道：官方原生公共领券/会场页 · 路径白名单 + 参数白名单重组】
-    仅允许以下 4 类平台原生公共领券/活动页，且仅提取页面打开必需的官方参数重组为纯净 HTTPS URL（其余一切外部参数 100% 丢弃）：
+    仅允许以下 6 类平台原生公共领券/活动/店铺主页，且仅提取页面打开必需的官方参数重组为纯净 HTTPS URL（其余一切外部参数 100% 丢弃）：
       1. `coupon.m.jd.com/coupons/show.action` -> 仅保留 `key`, `roleId`, `linkKey`（须含 `linkKey` 或同时含 `key`+`roleId`）
       2. `uland.taobao.com/quan/detail` -> 仅保留 `sellerId`, `activityId`（两者须同时存在；绝不放行 `/coupon/edetail` 或 `pid`）
       3. `pages.tmall.com/wow/...` 及 `pages-fast.m.taobao.com/wow/...` -> 严禁阿里妈妈联盟红包（`/lianmeng` 或 `wh_alimama=true`），其余仅保留路径与 `wh_pid`
       4. `pro.m.jd.com/mall/active/...` 及 `prodev.m.jd.com/mall/active/...` -> 仅保留路径本身（清空全部 query 参数）
       5. `shop.m.jd.com/mshop/gethomepage` 及 `shop.m.jd.com/member/...` -> 仅保留 `venderId` / `shopId`（须至少含其一）
+      6. `store.taobao.com/shop/view_shop.htm` -> 仅保留 `user_number_id` / `shop_id`（须至少含其一）
     其余任何链接（含一切第三方跳转短链、加密分佣页、未知域名）一律返回 None。
     """
     raw = str(raw_input or "").strip()
@@ -246,6 +247,12 @@ def rebuild_clean_official_venue_url(raw_input: str, _allow_login_unwrap: bool =
     if host == "shop.m.jd.com" and (path == "/mshop/gethomepage" or path.startswith("/member/")):
         pairs, found = _pick_allowed_params({"venderid": "venderId", "shopid": "shopId"})
         if not (found.get("venderId") or found.get("shopId")):
+            return None
+        return urlunsplit(("https", host, path, urlencode(pairs), ""))
+
+    if host == "store.taobao.com" and path == "/shop/view_shop.htm":
+        pairs, found = _pick_allowed_params({"user_number_id": "user_number_id", "shop_id": "shop_id"})
+        if not (found.get("user_number_id") or found.get("shop_id")):
             return None
         return urlunsplit(("https", host, path, urlencode(pairs), ""))
 
@@ -1917,6 +1924,24 @@ class DealPoolCleaner:
         out = re.sub(r"[ \t]{2,}", " ", out)
         return out.strip()
 
+    _CARD_HIGHLIGHT_FLUFF = frozenset({
+        "好价推荐", "超值优惠", "限时特惠", "精选好物", "点击查看", "无", "null", "none",
+    })
+
+    @classmethod
+    def _sanitize_card_highlight(cls, raw_val: Any) -> str:
+        """提纯 Stage 2 AI 生成的缩略图超短亮点（复用无链清理，剔除空洞套话并截断至 16 字）。"""
+        if not isinstance(raw_val, str):
+            return ""
+        text = raw_val.replace("\r", " ").replace("\n", " ").strip()
+        if not text:
+            return ""
+        text = cls._sanitize_clean_tutorial_step(text)
+        text = text.strip(" \t\r\n-·•:：|｜,，。!！;；\"'“”‘’[]【】()")
+        if not text or text.lower() in cls._CARD_HIGHLIGHT_FLUFF:
+            return ""
+        return text[:16].rstrip(" \t-·•:：|｜,，;；")
+
     @staticmethod
     def _sanitize_polished_copywriting(text: str) -> str:
         """对 AI-2 微整形后的 `polished_copywriting` 执行确定性无链校验，杜绝偶发残留占位符或链接。"""
@@ -1957,6 +1982,8 @@ class DealPoolCleaner:
             except Exception:
                 host, path = "", ""
             if host == "shop.m.jd.com" and path == "/mshop/gethomepage":
+                return False
+            if host == "store.taobao.com" and path == "/shop/view_shop.htm":
                 return False
         if str(c.get("text_role_hint") or "").strip().lower() == "coupon_candidate":
             return True
@@ -3427,6 +3454,7 @@ class DealPoolCleaner:
 
             unit_deal_price = _normalize_inline_spaces(str(ai2_res.get("unit_deal_price") or "")).strip() or None
             price_logic = _normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None
+            card_highlight = self._sanitize_card_highlight(ai2_res.get("card_highlight"))
             clean_title = _normalize_inline_spaces(str(ai2_res.get("clean_title") or product_card.get("name") or raw_title)).strip()
 
             def _is_other_known_platform(c: Dict[str, Any]) -> bool:
@@ -3569,7 +3597,7 @@ class DealPoolCleaner:
                 s for s in (self._sanitize_clean_tutorial_step(st) for st in raw_step_lines)
                 if s
             ]
-            tutorial_text = "\\n".join(tutorial_steps)
+            tutorial_text = "\n".join(tutorial_steps)
 
             official_img = str(product_card.get("image_url") or "").strip()
             extracted_imgs = [
@@ -3616,7 +3644,6 @@ class DealPoolCleaner:
             saved_price = round(max(coupon_amount, max(0.0, original_price - official_activity_price)), 2)
 
             publish_time_str = str(doc.get("publish_time") or doc.get("fetched_at") or "").strip()
-            deal_price_text = f"{deal_price}元" if deal_price is not None else (unit_deal_price or "")
 
             site_name = get_source_site_name(site)
             provider_nickname = str((doc.get("hot_metrics") or {}).get("provider_nickname") or "").strip()
@@ -3626,10 +3653,10 @@ class DealPoolCleaner:
                 "quality_score": quality_score,
                 "score_breakdown": score_breakdown,
                 "clean_title": clean_title,
+                "card_highlight": card_highlight,
                 "publish_time": publish_time_str,
                 "expire_time": doc.get("expire_time"),
                 "deal_price": deal_price,
-                "deal_price_text": deal_price_text,
                 "unit_deal_price": unit_deal_price,
                 "price_logic": price_logic,
                 "official_price": round(official_price, 2),
@@ -3639,7 +3666,6 @@ class DealPoolCleaner:
                 "tutorial_steps": tutorial_steps,
                 "tutorial_text": tutorial_text,
                 "user_share_images": user_share_images,
-                "tutorial_images": user_share_images,
                 "my_promotion_link": my_promo_link,
                 "my_promotion_token": my_promo_token,
                 "source_site": site,
@@ -3755,7 +3781,7 @@ class DealPoolCleaner:
         out_list = [outcomes_by_id[str(d.get("source_item_id") or "")] for d in selected_docs if str(d.get("source_item_id") or "") in outcomes_by_id]
         if not quiet_sub_logs:
             succ_cnt = sum(1 for o in out_list if o.get("status") == "success")
-            low_cnt = sum(1 for o in out_list if o.get("status") == "cleaned_low_score")
+            low_cnt = sum(1 for o in out_list if o.get("status") in ("low_score", "cleaned_low_score"))
             retry_cnt = sum(1 for o in out_list if o.get("status") == "retry_pending")
             fail_cnt = sum(1 for o in out_list if o.get("status") in ("failed", "cleaned_failed"))
             logger.info(
@@ -4163,7 +4189,6 @@ def _commit_batch_results_to_db(
                             **common_ai_fields,
                             "clean_status": "cleaned_success",
                             "clean_stage": CLEAN_STAGE_DONE,
-                            "ai_clean_status": "cleaned_success",
                             "clean_error_code": "OK",
                             "clean_error_msg": "",
                             "resolved_platform": r["platform"],
@@ -4189,7 +4214,6 @@ def _commit_batch_results_to_db(
                                 "$set": {
                                     "clean_status": "merged_into_parent",
                                     "clean_stage": CLEAN_STAGE_DONE,
-                                    "ai_clean_status": "merged_into_parent",
                                     "merged_into_tip_id": s_id,
                                     "cleaned_at": now_utc,
                                 },
@@ -4211,7 +4235,6 @@ def _commit_batch_results_to_db(
                             **common_ai_fields,
                             "clean_status": "cleaned_success",
                             "clean_stage": CLEAN_STAGE_DONE,
-                            "ai_clean_status": "cleaned_early_terminated",
                             "clean_error_code": OK_SKIPPED_ALREADY_CLEANED,
                             "clean_error_msg": r["error_msg"],
                             "resolved_platform": r.get("platform"),
@@ -4237,7 +4260,6 @@ def _commit_batch_results_to_db(
                                 "$set": {
                                     "clean_status": "merged_into_parent",
                                     "clean_stage": CLEAN_STAGE_DONE,
-                                    "ai_clean_status": "merged_into_parent",
                                     "merged_into_tip_id": s_id,
                                     "cleaned_at": now_utc,
                                 },
@@ -4258,7 +4280,6 @@ def _commit_batch_results_to_db(
                             **common_ai_fields,
                             "clean_status": "merged_into_parent",
                             "clean_stage": CLEAN_STAGE_DONE,
-                            "ai_clean_status": "merged_into_parent",
                             "merged_into_tip_id": r.get("merged_into_tip_id") or "",
                             "clean_error_code": r["error_code"],
                             "clean_error_msg": r["error_msg"],
@@ -4277,7 +4298,6 @@ def _commit_batch_results_to_db(
             retry_set = {
                 "last_clean_attempt_at": now_utc,
                 "clean_status": "pending",
-                "ai_clean_status": "retry_pending",
                 "clean_retry_count": r_cnt,
                 "next_retry_after_ts": round(time.time() + 180.0 * r_cnt, 1),
                 "clean_error_code": r["error_code"],
@@ -4309,7 +4329,6 @@ def _commit_batch_results_to_db(
                             **common_ai_fields,
                             "clean_status": "cleaned_low_score",
                             "clean_stage": CLEAN_STAGE_DONE,
-                            "ai_clean_status": "cleaned_low_score",
                             "clean_error_code": r["error_code"],
                             "clean_error_msg": r["error_msg"],
                             "resolved_platform": r.get("platform"),
@@ -4330,7 +4349,6 @@ def _commit_batch_results_to_db(
                 **common_ai_fields,
                 "clean_status": "cleaned_failed",
                 "clean_stage": CLEAN_STAGE_DONE,
-                "ai_clean_status": "cleaned_failed",
                 "clean_error_code": r["error_code"],
                 "clean_error_msg": r["error_msg"],
                 "clean_attempt_errors": r.get("attempt_errors") or [],

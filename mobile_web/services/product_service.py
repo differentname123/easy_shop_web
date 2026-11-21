@@ -195,6 +195,25 @@ class ProductService:
         elif channel_type is not None and valid_items:
             self._save_summary_in_background(valid_items, channel_type)
 
+    def _overlay_deal_card_info(self, plat: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """将正式表已入库活跃线报的缩略图亮点与发布时间叠加到首页列表摘要（失败时降级原样返回）。"""
+        if not items or not hasattr(self.repo, "get_deal_card_overlays"):
+            return items
+        try:
+            keys = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                for k in (it.get("goods_id"), it.get("goods_sign"), it.get("product_id")):
+                    if k:
+                        keys.append(k)
+            overlays = self.repo.get_deal_card_overlays(plat, keys) if keys else None
+            if isinstance(overlays, dict) and overlays:
+                return [ProductRepository.apply_deal_card_overlay(it, overlays) for it in items]
+        except Exception:
+            pass
+        return items
+
     def get_home_recommendations(self, channel_type=5, offset=0, limit=20, uid=None,
                                  platform="pdd", force_refresh=False, cursor=None) -> Dict[str, Any]:
         plat = normalize_platform(platform)
@@ -244,7 +263,7 @@ class ProductService:
                         items = [ProductRepository.apply_coupon_overlay(it, overlays) for it in items]
                 except Exception:
                     pass
-            result["data"] = items
+            result["data"] = self._overlay_deal_card_info(plat, items)
             RECOMMEND_CACHE.set(cache_key, result)
             # Already-verified public snapshots can be read immediately; database
             # persistence is still a separate, tracked background outcome.
@@ -288,7 +307,7 @@ class ProductService:
                 item for item in raw_items
                 if not (isinstance(item, dict) and is_product_off_promotion(plat, item.get("goods_id"), item.get("goods_sign")))
             ]
-            result["data"] = items
+            result["data"] = self._overlay_deal_card_info(plat, items)
             SEARCH_CACHE.set(cache_key, result)
             # 搜索物料链接也保留到摘要库，不能依赖可关闭的详情预取来补映射。
             if getattr(adapter, "requires_material_url", False) is True:

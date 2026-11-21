@@ -703,9 +703,14 @@ class TestProductRepository(unittest.TestCase):
                 "activity_price", "price", "original_price", "saved_price", "coupon_amount", "has_coupon",
                 "commission_rate", "commission_amount", "sales_tip", "image_url", "mall_name", "updated_at",
                 "product_url", "coupon_url",
+                "deal_source", "deal_source_name",
+                "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.publish_time",
+                "deal_info.source_site", "deal_info.source_site_name",
             ), 1),
         })
-        for field in ("_id", "desc", "carousel_images", "default_promotion", "default_promotion_expires_at"):
+        for heavy_field in ("deal_info.original_copywriting", "deal_info.tutorial_steps", "deal_info.coupon_links"):
+            self.assertNotIn(heavy_field, self.col.projections[-1])
+        for field in ("_id", "desc", "carousel_images", "default_promotion", "default_promotion_expires_at", "deal_tip", "deal_info"):
             self.assertNotIn(field, result[0])
 
     def test_identity_lookup_is_platform_scoped_and_does_not_fetch_content(self):
@@ -1181,6 +1186,7 @@ class TestProductRepository(unittest.TestCase):
             "updated_at": now,
             "deal_info": {
                 "is_deal_tip": True,
+                "card_highlight": "领15券凑单24.9",
                 "deal_price": 24.9,
                 "unit_deal_price": "3.11元/斤",
                 "price_logic": "领15元商品券+拍凑单品满200减30，主商品实付约24.9元",
@@ -1225,6 +1231,10 @@ class TestProductRepository(unittest.TestCase):
         boom_res = self.repo.query_boom_products()
         self.assertEqual([item["product_id"] for item in boom_res["data"]], ["TB-DEAL-1", "PDD-PLAIN-1"])
         self.assertNotIn("deal_tip", boom_res["data"][0])
+        self.assertEqual(boom_res["data"][0]["deal_highlight"], "领15券凑单24.9")
+        self.assertEqual(boom_res["data"][0]["deal_publish_time"], "2026-11-12 17:04")
+        self.assertEqual(boom_res["data"][1]["deal_highlight"], "")
+        self.assertEqual(boom_res["data"][1]["deal_publish_time"], "")
         self.assertEqual(sorted(self.repo.get_categories()), ["家清", "食品"])
 
         # 2. 详情反查返回脱敏后的极简 deal_tip 白名单，UTC 时间转为北京时间展示，内部源字段与已废弃 filler_links 绝不外泄
@@ -1232,6 +1242,7 @@ class TestProductRepository(unittest.TestCase):
         self.assertIsNotNone(detail["deal_tip"])
         tip = detail["deal_tip"]
         self.assertEqual(tip["publish_time"], "2026-11-12 17:04")
+        self.assertEqual(tip["card_highlight"], "领15券凑单24.9")
         self.assertEqual(tip["deal_price"], 24.9)
         self.assertEqual(tip["unit_deal_price"], "3.11元/斤")
         self.assertEqual(len(tip["coupon_links"]), 1)
@@ -1616,6 +1627,54 @@ class TestProductRepository(unittest.TestCase):
         for key in other.cache_keys(uid="user_1"):
             self.assertIn(key, cache.DETAIL_CACHE)
         self.assertTrue(cache.is_product_off_promotion("pdd", goods_id="998877"))
+
+    def test_get_deal_card_overlays_and_home_feed_overlay(self):
+        from services.product_service import ProductService
+        import cache
+
+        cache.clear_all_caches()
+        self.col.docs = [
+            {
+                "platform": "jd",
+                "product_id": "JD-DEAL-88",
+                "goods_id": "JD-DEAL-88",
+                "goods_sign": "SIGN-88",
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "card_highlight": "拍2件折9.9/瓶",
+                    "publish_time": "2026-11-21T03:30:00Z",
+                },
+            },
+            {
+                "platform": "jd",
+                "product_id": "JD-EXPIRED-99",
+                "goods_id": "JD-EXPIRED-99",
+                "deal_info": {
+                    "is_deal_tip": False,
+                    "card_highlight": "过期旧线报",
+                    "publish_time": "2026-11-10T01:00:00Z",
+                },
+            },
+        ]
+        overlays = self.repo.get_deal_card_overlays("jd", ["JD-DEAL-88", "JD-EXPIRED-99", "JD-PLAIN-00"])
+        self.assertIn("JD-DEAL-88", overlays)
+        self.assertNotIn("JD-EXPIRED-99", overlays)
+        self.assertEqual(overlays["JD-DEAL-88"]["deal_highlight"], "拍2件折9.9/瓶")
+        self.assertEqual(overlays["JD-DEAL-88"]["deal_publish_time"], "2026-11-21 11:30")
+
+        svc = ProductService(product_repo=self.repo)
+        svc.prefetcher = None
+        svc.start_background_writes()
+        items = [
+            {"platform": "jd", "goods_id": "JD-DEAL-88", "goods_sign": "SIGN-88", "name": "好价水", "price": 19.8, "original_price": 29.8},
+            {"platform": "jd", "goods_id": "JD-PLAIN-00", "goods_sign": "SIGN-00", "name": "普通品", "price": 10.0, "original_price": 10.0},
+        ]
+        enriched = svc._overlay_deal_card_info("jd", items)
+        self.assertEqual(enriched[0]["deal_highlight"], "拍2件折9.9/瓶")
+        self.assertEqual(enriched[0]["deal_publish_time"], "2026-11-21 11:30")
+        self.assertEqual(enriched[1].get("deal_highlight", ""), "")
+        self.assertEqual(enriched[1].get("deal_publish_time", ""), "")
+        cache.clear_all_caches()
 
 
 if __name__ == "__main__":

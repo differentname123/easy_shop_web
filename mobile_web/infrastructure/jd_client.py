@@ -570,7 +570,7 @@ class JdClient:
 
         piliang_tkl = (
             (primary_res.get("short_url") or material)
-            if (primary_ok and "://" not in material)
+            if primary_ok
             else material
         )
         piliang_res = self._execute_with_failover(

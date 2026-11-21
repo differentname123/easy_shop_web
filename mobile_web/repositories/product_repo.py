@@ -118,6 +118,9 @@ class ProductRepository(BaseRepository):
             "category", "activity_price", "price", "original_price", "saved_price",
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
             "sales_tip", "image_url", "mall_name", "updated_at", "product_url", "coupon_url",
+            "deal_source", "deal_source_name",
+            "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.publish_time",
+            "deal_info.source_site", "deal_info.source_site_name",
         ), 1),
     }
     _COST_PERFORMANCE_PROJECTION = {
@@ -1046,6 +1049,9 @@ class ProductRepository(BaseRepository):
         clean_doc_img = str(raw_doc_img).strip() if isinstance(raw_doc_img, str) else ""
         if clean_doc_img.startswith("//"):
             clean_doc_img = "https:" + clean_doc_img
+        is_active_deal = bool(deal_info.get("is_deal_tip") is True)
+        deal_highlight = str(deal_info.get("card_highlight") or "").strip() if is_active_deal else ""
+        deal_publish_time = self._format_deal_datetime(deal_info.get("publish_time")) if is_active_deal else ""
         return {
             "platform": platform,
             "platform_name": platform_name(platform),
@@ -1054,6 +1060,8 @@ class ProductRepository(BaseRepository):
             "goods_sign": goods_sign,
             "deal_source": deal_source,
             "deal_source_name": deal_source_name,
+            "deal_highlight": deal_highlight,
+            "deal_publish_time": deal_publish_time,
             "name": doc.get("name", "未命名商品"),
             "brand": doc.get("brand") or "",
             "category": doc.get("category") or "",
@@ -1072,6 +1080,24 @@ class ProductRepository(BaseRepository):
             "updated_at": updated_at_str,
         }
 
+    @staticmethod
+    def _format_deal_datetime(raw_val: Any) -> str:
+        """统一将线报时间字段格式化为北京时间 `YYYY-MM-DD HH:MM`，空值或无效值返回空串。"""
+        tz_cn = datetime.timezone(datetime.timedelta(hours=8))
+        if isinstance(raw_val, datetime.datetime):
+            dt = raw_val.astimezone(tz_cn) if raw_val.tzinfo is not None else raw_val
+            return dt.strftime("%Y-%m-%d %H:%M")
+        if isinstance(raw_val, str) and raw_val.strip():
+            s = raw_val.strip()
+            try:
+                dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(tz_cn)
+                return dt.strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                return s[:16].replace("T", " ") if len(s) >= 16 else s[:32]
+        return ""
+
     @classmethod
     def _extract_deal_tip(cls, doc: Dict[str, Any], fallback_time: str = "") -> Optional[Dict[str, Any]]:
         """提取公开可展示的线报详情视图，严格过滤内部评分与爬虫源字段；非线报商品返回 None。
@@ -1084,38 +1110,8 @@ class ProductRepository(BaseRepository):
         if not isinstance(deal_info, dict):
             return None
 
-        tz_cn = datetime.timezone(datetime.timedelta(hours=8))
-        publish_time = ""
-        raw_pub = deal_info.get("publish_time")
-        if isinstance(raw_pub, datetime.datetime):
-            dt = raw_pub.astimezone(tz_cn) if raw_pub.tzinfo is not None else raw_pub
-            publish_time = dt.strftime("%Y-%m-%d %H:%M")
-        elif isinstance(raw_pub, str) and raw_pub.strip():
-            s = raw_pub.strip()
-            try:
-                dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-                if dt.tzinfo is not None:
-                    dt = dt.astimezone(tz_cn)
-                publish_time = dt.strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                publish_time = s[:16].replace("T", " ") if len(s) >= 16 else s[:32]
-        if not publish_time:
-            publish_time = str(fallback_time or "").strip()
-
-        updated_at = ""
-        raw_upd = deal_info.get("updated_at")
-        if isinstance(raw_upd, datetime.datetime):
-            dt = raw_upd.astimezone(tz_cn) if raw_upd.tzinfo is not None else raw_upd
-            updated_at = dt.strftime("%Y-%m-%d %H:%M")
-        elif isinstance(raw_upd, str) and raw_upd.strip():
-            s = raw_upd.strip()
-            try:
-                dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-                if dt.tzinfo is not None:
-                    dt = dt.astimezone(tz_cn)
-                updated_at = dt.strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                updated_at = s[:16].replace("T", " ") if len(s) >= 16 else s[:32]
+        publish_time = cls._format_deal_datetime(deal_info.get("publish_time")) or str(fallback_time or "").strip()
+        updated_at = cls._format_deal_datetime(deal_info.get("updated_at"))
 
         deal_price: Optional[float] = None
         raw_dp = deal_info.get("deal_price")
@@ -1178,10 +1174,12 @@ class ProductRepository(BaseRepository):
                 if u.startswith(("http://", "https://")) and u not in share_images:
                     share_images.append(u)
 
+        card_highlight = str(deal_info.get("card_highlight") or "").strip()
         if not (
             deal_price is not None
             or unit_deal_price
             or price_logic
+            or card_highlight
             or coupon_links
             or tutorial_steps
             or original_copywriting
@@ -1196,6 +1194,7 @@ class ProductRepository(BaseRepository):
             "deal_price": deal_price,
             "unit_deal_price": unit_deal_price,
             "price_logic": price_logic,
+            "card_highlight": card_highlight,
             "coupon_links": coupon_links,
             "tutorial_steps": tutorial_steps,
             "original_copywriting": original_copywriting,
@@ -1446,6 +1445,72 @@ class ProductRepository(BaseRepository):
                 else:
                     out["price"] = ov["activity_price"]
                 out["original_price"] = orig_val
+        return out
+
+    def get_deal_card_overlays(self, platform: str, keys: List[Any]) -> Dict[str, Dict[str, str]]:
+        """批量读取正式表活跃线报的超短亮点与发布时间快照，供首页推荐流/搜索卡片叠加展示。"""
+        plat = self._platform(platform)
+        clean_keys = list(dict.fromkeys(
+            str(k).strip() for k in (keys or ())
+            if k is not None and str(k).strip() and str(k).strip() not in ("0", "None")
+        ))
+        if not clean_keys:
+            return {}
+        try:
+            cursor = self.col.find(
+                {
+                    "platform": plat,
+                    "deal_info.is_deal_tip": True,
+                    "$or": [
+                        {"product_id": {"$in": clean_keys}},
+                        {"goods_sign": {"$in": clean_keys}},
+                    ],
+                },
+                {
+                    "_id": 0,
+                    "product_id": 1,
+                    "goods_id": 1,
+                    "goods_sign": 1,
+                    "deal_info.card_highlight": 1,
+                    "deal_info.publish_time": 1,
+                },
+            )
+            overlays: Dict[str, Dict[str, str]] = {}
+            for doc in cursor:
+                if not isinstance(doc, dict):
+                    continue
+                di = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
+                highlight = str(di.get("card_highlight") or "").strip()
+                pub_time = self._format_deal_datetime(di.get("publish_time"))
+                if not highlight and not pub_time:
+                    continue
+                entry = {"deal_highlight": highlight, "deal_publish_time": pub_time}
+                for alias in (doc.get("product_id"), doc.get("goods_id"), doc.get("goods_sign")):
+                    ak = str(alias or "").strip()
+                    if ak:
+                        overlays[ak] = entry
+            return overlays
+        except Exception as e:
+            logger.warning(
+                "⚠️ 【线报卡片快照降级】批量读取线报摘要亮点失败 | 平台[%s] 异常<%s>",
+                plat, format_exc_summary(e),
+            )
+            return {}
+
+    @classmethod
+    def apply_deal_card_overlay(cls, item: Dict[str, Any], overlays: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+        """将线报超短亮点与发布时间无损叠加到商品摘要字典（不覆盖已有非空值）。"""
+        if not isinstance(item, dict) or not overlays:
+            return item
+        _, gid, gsign = cls._identity(item)
+        ov = overlays.get(gid) or overlays.get(gsign) or overlays.get(str(item.get("product_id") or "").strip())
+        if not ov:
+            return item
+        out = dict(item)
+        if ov.get("deal_highlight") and not str(out.get("deal_highlight") or "").strip():
+            out["deal_highlight"] = ov["deal_highlight"]
+        if ov.get("deal_publish_time") and not str(out.get("deal_publish_time") or "").strip():
+            out["deal_publish_time"] = ov["deal_publish_time"]
         return out
 
     def upsert_home_products(

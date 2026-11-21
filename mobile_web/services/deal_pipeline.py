@@ -224,10 +224,16 @@ def run_fetch_stage(
         cur_pending_cnt,
     )
 
+    known_site_keys = {ch.site_key for ch in active_channels if ch.site_key}
     rate_limited_sites: Set[str] = {
-        site
-        for site, until_ts in cooldown_map.items()
-        if until_ts and until_ts > now_wall
+        key
+        for key, until_ts in cooldown_map.items()
+        if until_ts and until_ts > now_wall and key in known_site_keys
+    }
+    rate_limited_channels: Set[str] = {
+        key
+        for key, until_ts in cooldown_map.items()
+        if until_ts and until_ts > now_wall and key not in known_site_keys
     }
     _rate_limit_codes = set(RATE_LIMIT_STATUSES)
     active_registry = source_registry if source_registry is not None else list_sources()
@@ -251,7 +257,7 @@ def run_fetch_stage(
                     task_name,
                     {"consecutive_failures": 0, "total_runs": 0, "total_errors": 0, "last_error_url": ""},
                 )
-                is_site_limited = site_key in rate_limited_sites
+                is_site_limited = (site_key in rate_limited_sites) or (task_name in rate_limited_channels)
                 if not is_site_limited:
                     ch_state["total_runs"] += 1
 
@@ -339,10 +345,13 @@ def run_fetch_stage(
                 detail_errors = res_dict.get("detail_errors") or []
 
                 has_captcha_err = any("Captcha" in str(d.get("error_type") or "") for d in detail_errors)
+                is_http_rate_limited = (
+                    http_status in _rate_limit_codes
+                    or any(d.get("http_status") in _rate_limit_codes for d in detail_errors)
+                )
                 is_rate_limited = (
                     bool(res_dict.get("rate_limited"))
-                    or http_status in _rate_limit_codes
-                    or any(d.get("http_status") in _rate_limit_codes for d in detail_errors)
+                    or is_http_rate_limited
                     or has_captcha_err
                 )
 
@@ -465,9 +474,14 @@ def run_fetch_stage(
 
                     last_run_map[task_name] = now_done
                     if is_rate_limited:
-                        rate_limited_sites.add(site_key)
                         cooldown_sec = max(30, int(getattr(ch, "rate_limit_cooldown_seconds", 300)))
-                        cooldown_map[site_key] = now_done + cooldown_sec
+                        if has_captcha_err and not is_http_rate_limited:
+                            # 页面级验证码仅冷却触发验证的当前频道，避免连坐同站健康实时流频道
+                            rate_limited_channels.add(task_name)
+                            cooldown_map[task_name] = now_done + cooldown_sec
+                        else:
+                            rate_limited_sites.add(site_key)
+                            cooldown_map[site_key] = now_done + cooldown_sec
 
                     total_inserted += ins
                     total_updated += upd
@@ -866,7 +880,6 @@ def run_clean_stage(
                 {
                     "$set": {
                         "clean_status": "cleaned_failed",
-                        "ai_clean_status": "cleaned_failed",
                         "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
                         "clean_error_msg": f"爆料时间超过渠道 {s_key} 保鲜期 ({age_days:.0f}天)，自动跳过清洗",
                         "cleaned_at": now_utc,
@@ -892,7 +905,6 @@ def run_clean_stage(
             {
                 "$set": {
                     "clean_status": "cleaned_failed",
-                    "ai_clean_status": "cleaned_failed",
                     "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
                     "clean_error_msg": f"爆料时间超过默认保鲜期 ({DEAL_MAX_CLEAN_AGE_DAYS}天)，自动跳过清洗",
                     "cleaned_at": now_utc,
@@ -909,7 +921,6 @@ def run_clean_stage(
             {
                 "$set": {
                     "clean_status": "cleaned_failed",
-                    "ai_clean_status": "cleaned_failed",
                     "clean_error_code": ERR_AI_MAX_RETRIES_EXCEEDED,
                     "clean_error_msg": f"已达最大重试上限({MAX_CLEAN_RETRIES}次)，自动放弃避免占用清洗队列",
                     "cleaned_at": now_utc,

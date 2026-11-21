@@ -432,7 +432,6 @@ class DealRawPoolRepository:
             "$set": {
                 "clean_status": "pending",
                 "clean_stage": CLEAN_STAGE_NEED_AI1,
-                "ai_clean_status": "pending",
                 "clean_retry_count": 0,
                 "clean_error_code": "",
                 "clean_error_msg": "",
@@ -539,12 +538,18 @@ class DealRawPoolRepository:
         limit: int = 50000,
         channel: str = "",
     ) -> Set[str]:
-        """获取某站点近期处于未失效状态（pending 或 cleaned_success）的 `source_item_id` 集合，避免重复请求详情页，同时防止已失效商品占用名单，让后续拉取有重试机会。"""
+        """获取某站点已落盘且无需重复拉取详情的 `source_item_id` 集合：
+        包含 pending、cleaned_success、cleaned_low_score、merged_into_parent 以及所有终态 cleaned_failed；
+        仅放行因上次全量巡视暂离榜单 (`UPSTREAM_DISAPPEARED`) 而下架的记录，使其重新上榜时可被再次抓取。
+        """
         try:
             query: Dict[str, Any] = {
                 "source_site": source_site,
                 "has_full_detail": True,
-                "clean_status": {"$in": ["pending", "cleaned_success"]},
+                "$or": [
+                    {"clean_status": {"$in": ["pending", "cleaned_success", "cleaned_low_score", "merged_into_parent"]}},
+                    {"clean_status": "cleaned_failed", "clean_error_code": {"$ne": "UPSTREAM_DISAPPEARED"}},
+                ],
             }
             if channel:
                 query["source_channel"] = channel
@@ -601,7 +606,14 @@ class DealRawPoolRepository:
             update_doc["$set"]["clean_max_age_days"] = eff_age
 
         ops = [
-            UpdateOne({"source_site": site, "source_item_id": item_id}, update_doc)
+            UpdateOne(
+                {
+                    "source_site": site,
+                    "source_item_id": item_id,
+                    "clean_status": {"$in": ["pending", "cleaned_success"]},
+                },
+                update_doc,
+            )
             for item_id in ids
         ]
         matched_cnt = 0
@@ -668,7 +680,6 @@ class DealRawPoolRepository:
                 {
                     "$set": {
                         "clean_status": "cleaned_failed",
-                        "ai_clean_status": "cleaned_failed",
                         "clean_error_code": "UPSTREAM_DISAPPEARED",
                         "clean_error_msg": "全量线报巡视未包含此商品，上游已下架失效",
                         "cleaned_at": now_naive,
@@ -730,8 +741,8 @@ class DealRawPoolRepository:
         skipped_no_signal = 0
         context_only_saved = 0
 
-        # 若新批次中包含此前清洗失败（cleaned_failed）的记录，因上游再次推入并予以重试机会，
-        # 将其状态原子重置为 pending，使其重新进入 AI 清洗队列
+        # 仅当此前因全量巡视暂离榜单 (UPSTREAM_DISAPPEARED) 而下架的记录重新出现时，才将其重置为 pending 重新清洗；
+        # 其余确定性失败（如已停止推广、纯数字SKU、券链失效、货不对板、低分等）严禁重复洗库。
         incoming_ids = [str(r.get("source_item_id") or "") for r in records if isinstance(r, dict) and r.get("source_item_id")]
         first_site = str(records[0].get("source_site") or "").strip() if records and isinstance(records[0], dict) else ""
         if incoming_ids and first_site:
@@ -741,12 +752,12 @@ class DealRawPoolRepository:
                         "source_site": first_site,
                         "source_item_id": {"$in": incoming_ids},
                         "clean_status": "cleaned_failed",
+                        "clean_error_code": "UPSTREAM_DISAPPEARED",
                     },
                     {
                         "$set": {
                             "clean_status": "pending",
                             "clean_stage": CLEAN_STAGE_NEED_AI1,
-                            "ai_clean_status": "pending",
                             "clean_retry_count": 0,
                             "clean_error_code": "",
                             "clean_error_msg": "",
@@ -763,7 +774,7 @@ class DealRawPoolRepository:
                     },
                 )
             except Exception as e:
-                logger.warning("重置重新抓入的失败线报状态异常: %s", e)
+                logger.warning("重置重新上榜的暂离线报状态异常: %s", e)
 
         for rec in records:
             if not isinstance(rec, dict):
@@ -832,7 +843,6 @@ class DealRawPoolRepository:
                 "first_seen_at": now,
                 "clean_status": initial_status,
                 "clean_stage": CLEAN_STAGE_NEED_AI1 if initial_status == "pending" else CLEAN_STAGE_DONE,
-                "ai_clean_status": initial_status,
                 "clean_retry_count": 0,
                 "clean_max_age_days": channel_max_age,
                 "clean_cutoff_ts": clean_cutoff_ts,

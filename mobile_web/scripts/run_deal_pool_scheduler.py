@@ -283,7 +283,10 @@ def _compute_next_wake_seconds(
     for ch in channels:
         last_t = last_run_map.get(ch.name, 0.0)
         due_at = (last_t + max(10, int(ch.interval_seconds))) if last_t > 0 else now_ts
-        cool_until = site_cooldown_until.get(ch.site_key, 0.0)
+        cool_until = max(
+            site_cooldown_until.get(ch.site_key, 0.0),
+            site_cooldown_until.get(ch.name, 0.0),
+        )
         target_at = max(due_at, cool_until)
         wait_s = max(0.0, target_at - now_ts)
         if wait_s < min_wait:
@@ -428,7 +431,7 @@ def main():
             now_wall = time.time()
             has_due = any(
                 is_channel_due(ch, channel_last_run.get(ch.name, 0.0), now_wall)
-                and site_cooldown_until.get(ch.site_key, 0.0) <= now_wall
+                and max(site_cooldown_until.get(ch.site_key, 0.0), site_cooldown_until.get(ch.name, 0.0)) <= now_wall
                 for ch in enabled_channels
             )
             if has_due:
@@ -491,7 +494,7 @@ def main():
                 ch
                 for ch in enabled_channels
                 if is_channel_due(ch, channel_last_run.get(ch.name, 0.0), now_wall)
-                and site_cooldown_until.get(ch.site_key, 0.0) <= now_wall
+                and max(site_cooldown_until.get(ch.site_key, 0.0), site_cooldown_until.get(ch.name, 0.0)) <= now_wall
             ]
             if due_now:
                 fetch_cycle += 1

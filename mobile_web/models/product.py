@@ -435,6 +435,8 @@ class ProductSummary(BaseModel):
     goods_sign: str = ""
     deal_source: str = ""
     deal_source_name: str = ""
+    deal_highlight: str = ""
+    deal_publish_time: str = ""
     name: str
     image_url: str
     product_url: str = ""
