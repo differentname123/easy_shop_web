@@ -42,9 +42,9 @@ from .http_client import (
     request_with_retry,
 )
 from .ithome_lapin import IthomeLapinSource
+from .list_detail_base import DetailCircuitBreak, ListDetailDealSource, ListPhaseResult, SkipItem
 from .m_zzzdm import MZzzdmSource
 from .parsing import (
-    TOKEN_RE,
     build_deal_record,
     extract_balanced_tag,
     extract_div_by_id,
@@ -81,7 +81,6 @@ __all__ = [
     "create_site_session",
     "is_rate_limit_status",
     "request_with_retry",
-    "TOKEN_RE",
     "utc_now_iso",
     "strip_html_tags",
     "extract_first_price",
@@ -90,6 +89,10 @@ __all__ = [
     "extract_balanced_tag",
     "extract_div_by_id",
     "build_deal_record",
+    "ListDetailDealSource",
+    "ListPhaseResult",
+    "DetailCircuitBreak",
+    "SkipItem",
     "SUPPORTED_PLATFORMS",
     "SOURCE_SELF_HOSTS",
     "CONFIRMED_UNSUPPORTED_MALLS",

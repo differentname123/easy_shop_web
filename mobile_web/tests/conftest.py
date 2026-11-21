@@ -45,17 +45,28 @@ def offline_resources_and_registry(tmp_path):
         adapters._ADAPTER_REGISTRY.clear()
         adapters._ADAPTER_REGISTRY.update(registry)
         clear_all_caches()
+        mongo_mod = sys.modules.get("infrastructure.mongo")
+        if mongo_mod is not None:
+            mongo_mod.close_shared_db()
+        meili_mod = sys.modules.get("infrastructure.search_meili")
+        if meili_mod is not None:
+            meili_mod.reset_meili_state()
         api_gov._HEALTH_DIR = orig_health_dir
         api_gov._PROCESS_ROLE = orig_process_role
         api_gov.GLOBAL_UPSTREAM_HEALTH.reset()
         api_gov.GLOBAL_QUOTA_PACER.reset()
-        if model_api_mod is not None and orig_model_usage_path is not None:
+        if model_api_mod is None:
+            model_api_mod = sys.modules.get("infrastructure.ai_api.model_api")
+            orig_model_usage_path = None
+        if model_api_mod is not None:
             model_api_mod.MODEL_USAGE_JSON_PATH = orig_model_usage_path
-        order_service_mod = sys.modules.get("services.order_service")
-        if order_service_mod is not None:
-            order_service_mod._LAST_SYNC_TIMESTAMP.clear()
-            order_service_mod._LAST_SYNC_ATTEMPT.clear()
-            order_service_mod._SYNC_STATE.clear()
+            model_api_mod.reset_ai_cooldowns()
+            model_api_mod.reset_usage_tracker()
+        api_order_mod = sys.modules.get("api.order")
+        if api_order_mod is not None and hasattr(api_order_mod, "order_service"):
+            reset_fn = getattr(api_order_mod.order_service, "reset_state", None)
+            if callable(reset_fn):
+                reset_fn()
         if not had_playwright:
             for mod_name in list(sys.modules):
                 if mod_name == "playwright" or mod_name.startswith("playwright."):

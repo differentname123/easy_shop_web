@@ -2,32 +2,31 @@
 (function (global) {
   'use strict';
   const { createApp, ref, computed, onMounted, onUnmounted } = global.Vue;
+  const shop = global.EasyShop || {};
 
   const MY_GROUPS_STORAGE_KEY = 'pdd_gh_my_groups_v1';
   const CREDIT_WARN_ACK_KEY = 'pdd_gh_credit_ack_v1';
   const ONBOARD_DISMISSED_KEY = 'pdd_gh_onboard_dismissed_v1';
-  const UPLOAD_GUIDE_ACK_KEY = 'pdd_gh_upload_guide_ack_v1';
   const JOINED_GROUPS_KEY = 'pdd_gh_joined_gids_v1';
   const RETURN_GROUP_SESSION_KEY = 'pdd_gh_return_group_v1';
   const RETURN_GROUP_TTL_MS = 10 * 60 * 1000;
   const APP_WAKE_FALLBACK_MS = 800;
-  const EASY_SHOP_TOKEN_KEY = 'easy_shop_token';
-  const EASY_SHOP_UID_KEY = 'easy_shop_uid';
-  const EASY_SHOP_PHONE_KEY = 'easy_shop_phone';
-  const EASY_SHOP_INVITE_KEY = 'easy_shop_invite_code';
-  const EASY_SHOP_PENDING_INVITE_KEY = 'easy_shop_pending_invite';
   const DEFAULT_PAGE_TITLE = '拼多多多人团互助';
   const MAX_LOCAL_MY_GROUPS = 30;
 
   createApp({
     setup() {
+      const api = shop.createApi();
+      const session = shop.createSessionStore();
+      const browser = shop.createBrowserTools({ ref });
+      const ime = shop.createImeGuard();
+
       const keyword = ref('');
       const activeKeyword = ref('');
       const filterMode = ref('active'); // 'active' | 'almost' | 'mine'
       const items = ref([]);
       const total = ref(0);
       const hasMore = ref(false);
-      const pendingCount = ref(0);
       const loading = ref(false);
       const submittingFeedback = ref(false);
 
@@ -35,10 +34,9 @@
       const joinedGroupIds = ref({});
       const selectedGroup = ref(null);
       const fullPosterUrl = ref('');
-      const toastMsg = ref('');
+      const toastMsg = browser.toastMessage;
       const fileInputRef = ref(null);
       const searchInputRef = ref(null);
-      let isSearchComposing = false;
       const showOnboardGuide = ref(true);
 
       const authToken = ref('');
@@ -82,22 +80,15 @@
         }
       };
 
-      const loadSavedAuthToken = () => {
-        try {
-          authToken.value = String(global.localStorage.getItem(EASY_SHOP_TOKEN_KEY) || '').trim();
-        } catch (_) {
-          authToken.value = '';
-        }
+      const currentToken = () => {
+        const tok = String(session.token() || '').trim();
+        authToken.value = tok;
+        return tok;
       };
 
       const clearExpiredAuth = () => {
         authToken.value = '';
-        try {
-          global.localStorage.removeItem(EASY_SHOP_TOKEN_KEY);
-          global.localStorage.removeItem(EASY_SHOP_UID_KEY);
-          global.localStorage.removeItem(EASY_SHOP_PHONE_KEY);
-          global.localStorage.removeItem(EASY_SHOP_INVITE_KEY);
-        } catch (_) {}
+        session.clear();
       };
 
       const applyViewerGuard = guard => {
@@ -164,17 +155,13 @@
         autoFilledTip: '',
       });
 
-      let toastTimer = null;
       let pollTimer = null;
+      let listGeneration = 0;
       let pushedHistoryCount = 0;
       let ignoreNextPopState = false;
 
       const showToast = (msg, duration = 2800) => {
-        toastMsg.value = msg;
-        if (toastTimer) global.clearTimeout(toastTimer);
-        toastTimer = global.setTimeout(() => {
-          toastMsg.value = '';
-        }, duration);
+        browser.showToast(msg, duration);
       };
 
       const syncGroupPageTitle = group => {
@@ -191,59 +178,17 @@
         }
       };
 
-      const fallbackCopyText = (text, successMsg) => {
-        if (!global.document || !global.document.createElement || !global.document.body) {
-          showToast(successMsg, 3200);
-          return;
-        }
-        const input = global.document.createElement('textarea');
-        input.value = text;
-        input.readOnly = true;
-        if (input.style) {
-          input.style.position = 'fixed';
-          input.style.top = '-9999px';
-          input.style.left = '-9999px';
-          input.style.opacity = '0';
-        }
-        global.document.body.appendChild(input);
-        if (typeof input.select === 'function') input.select();
-        if (typeof input.setSelectionRange === 'function') {
-          try {
-            input.setSelectionRange(0, String(text).length);
-          } catch (_) {}
-        }
-        try {
-          if (global.document.execCommand && global.document.execCommand('copy')) {
-            showToast(successMsg, 3200);
-          } else {
-            showToast('复制失败，请手动复制浏览器地址栏链接');
-          }
-        } catch (_) {
-          showToast('复制失败，请手动复制浏览器地址栏链接');
-        } finally {
-          global.document.body.removeChild(input);
-        }
-      };
-
       const copyShareText = (text, successMsg) => {
         if (!text) return;
-        if (global.navigator && global.navigator.clipboard && global.navigator.clipboard.writeText) {
-          return global.navigator.clipboard
-            .writeText(text)
-            .then(() => showToast(successMsg, 3200))
-            .catch(() => fallbackCopyText(text, successMsg));
-        }
-        fallbackCopyText(text, successMsg);
+        return browser.copyText(text, successMsg);
       };
 
       const buildGroupShareText = group => {
         if (!group || !group.group_order_id) return '';
         const origin = String((global.location && global.location.origin) || '').replace(/\/+$/, '');
         const qs = new URLSearchParams({ gid: String(group.group_order_id) });
-        try {
-          const myInv = String(global.localStorage.getItem(EASY_SHOP_INVITE_KEY) || '').trim();
-          if (/^[A-Za-z0-9_-]{3,32}$/.test(myInv)) qs.set('invite_code', myInv);
-        } catch (_) {}
+        const myInv = String(session.myInviteCode() || '').trim();
+        if (/^[A-Za-z0-9_-]{3,32}$/.test(myInv)) qs.set('invite_code', myInv);
         const shareUrl = `${origin}/group_help?${qs.toString()}`;
         const rem = Math.max(1, Number(group.remain_people) || 1);
         const pricePart = group.group_price ? `¥${group.group_price} ` : '';
@@ -310,6 +255,10 @@
           helpModal.value.failedItem = null;
           return;
         }
+        if (textSubmitModal.value.visible) {
+          textSubmitModal.value.visible = false;
+          return;
+        }
         if (selectedGroup.value) {
           selectedGroup.value = null;
           syncGroupPageTitle(null);
@@ -354,9 +303,19 @@
         }
       };
 
+      const sanitizeGroupForStorage = it => {
+        if (!it || typeof it !== 'object') return it;
+        const cleaned = { ...it };
+        delete cleaned.local_thumb;
+        if (typeof cleaned.poster_url === 'string' && cleaned.poster_url.startsWith('data:')) {
+          delete cleaned.poster_url;
+        }
+        return cleaned;
+      };
+
       const saveMyGroupsToStorage = list => {
         try {
-          const trimmed = list.slice(0, MAX_LOCAL_MY_GROUPS);
+          const trimmed = (list || []).slice(0, MAX_LOCAL_MY_GROUPS).map(sanitizeGroupForStorage);
           global.localStorage.setItem(MY_GROUPS_STORAGE_KEY, JSON.stringify(trimmed));
         } catch (_) {}
       };
@@ -416,24 +375,12 @@
         return rec && rec.owner_token ? String(rec.owner_token) : '';
       };
 
-      const buildAuthHeaders = (includeJson = false) => {
-        const headers = {};
-        if (includeJson) {
-          headers['Content-Type'] = 'application/json';
-        }
-        loadSavedAuthToken();
-        if (authToken.value) {
-          headers['Authorization'] = `Bearer ${authToken.value}`;
-        }
-        return headers;
-      };
-
-      const buildFeedbackBody = (gid, action, remainPeople = null) => {
+      const buildFeedbackPayload = (gid, action, remainPeople = null) => {
         const payload = { action };
         if (remainPeople !== null) payload.remain_people = remainPeople;
         const ownerTok = getOwnerToken(gid);
         if (ownerTok) payload.owner_token = ownerTok;
-        return JSON.stringify(payload);
+        return payload;
       };
 
       const isTakedownBlockedForSelected = computed(() => {
@@ -462,9 +409,9 @@
         await Promise.all(
           targets.map(async item => {
             try {
-              const resp = await global.fetch(`/api/group_help/detail/${item.group_order_id}`);
-              if (!resp.ok) return;
-              const json = await resp.json();
+              const res = await api.get(`/api/group_help/detail/${encodeURIComponent(item.group_order_id)}`);
+              if (!res.ok) return;
+              const json = res.data || {};
               if (json.status === 'success' && json.data) {
                 const wasPending = item.parse_status === 'pending';
                 upsertMyGroup(json.data, false, item.local_id || '');
@@ -550,7 +497,8 @@
 
       // ==================== 大厅列表加载与搜索 ====================
       const fetchGroups = async (reset = true) => {
-        if (loading.value) return;
+        if (!reset && loading.value) return;
+        const generation = ++listGeneration;
         loading.value = true;
         try {
           const offset = reset ? 0 : items.value.length;
@@ -561,16 +509,14 @@
             offset: String(offset),
             limit: '20',
           });
-          const resp = await global.fetch(`/api/group_help/list?${params}`, {
-            headers: buildAuthHeaders(false),
-          });
-          const json = await resp.json();
-          if (json.status === 'success' && json.data) {
+          const res = await api.get(`/api/group_help/list?${params}`, { token: currentToken() });
+          if (generation !== listGeneration) return;
+          const json = res.data || {};
+          if (res.ok && json.status === 'success' && json.data) {
             const list = json.data.items || [];
             items.value = reset ? list : items.value.concat(list);
             total.value = Number(json.data.total || 0);
             hasMore.value = Boolean(json.data.has_more);
-            pendingCount.value = Number(json.data.pending_count || 0);
             if (json.data.viewer_guard) {
               applyViewerGuard(json.data.viewer_guard);
             }
@@ -580,9 +526,13 @@
             showToast(json.error_msg || '加载列表失败');
           }
         } catch (_) {
-          showToast('网络异常，请稍后重试');
+          if (generation === listGeneration) {
+            showToast('网络异常，请稍后重试');
+          }
         } finally {
-          loading.value = false;
+          if (generation === listGeneration) {
+            loading.value = false;
+          }
         }
       };
 
@@ -630,59 +580,9 @@
         }
       };
 
-      const syncSearchInputToKeyword = forceFromDom => {
-        const el = searchInputRef.value;
-        if (!el || typeof el.value !== 'string') return;
-        if (forceFromDom) {
-          isSearchComposing = false;
-          el.composing = false;
-          if (keyword.value !== el.value) keyword.value = el.value;
-          return;
-        }
-        if (!String(keyword.value || '').trim() && el.value.trim()) {
-          isSearchComposing = false;
-          el.composing = false;
-          keyword.value = el.value;
-        }
-      };
-
-      const onSearchCompositionStart = event => {
-        isSearchComposing = true;
-        if (event && event.target) event.target.composing = true;
-      };
-
-      const onSearchCompositionEnd = event => {
-        isSearchComposing = false;
-        const el = event && event.target;
-        if (!el) return;
-        if (el.composing) el.composing = false;
-        const snapshot = typeof el.value === 'string' ? el.value : '';
-        if (typeof el.value === 'string' && keyword.value !== el.value) {
-          keyword.value = el.value;
-        }
-        const syncDelayed = () => {
-          if (!isSearchComposing && (!el || !el.composing) && typeof el.value === 'string' && el.value !== snapshot && keyword.value !== el.value) {
-            keyword.value = el.value;
-          }
-        };
-        Promise.resolve().then(syncDelayed);
-        global.setTimeout(syncDelayed, 0);
-      };
-
-      const onSearchImeReset = (event, syncValue = false) => {
-        isSearchComposing = false;
-        const el = event && event.target;
-        if (el) {
-          if (el.composing) el.composing = false;
-          if (syncValue && typeof el.value === 'string' && keyword.value !== el.value) {
-            keyword.value = el.value;
-          }
-        }
-      };
-
       const onSearch = ev => {
         const fromUi = Boolean(ev && typeof ev === 'object' && ('target' in ev || 'type' in ev || 'preventDefault' in ev));
-        syncSearchInputToKeyword(fromUi);
+        ime.syncElementToRef(keyword, searchInputRef.value, fromUi);
         if (searchInputRef.value && typeof searchInputRef.value.blur === 'function') {
           try { searchInputRef.value.blur(); } catch (_) {}
         }
@@ -693,48 +593,11 @@
         fetchGroups(true);
       };
 
-      const onSearchKeydownEnter = event => {
-        const composingNow = Boolean(
-          isSearchComposing ||
-          (event && (event.isComposing || ((event.keyCode === 229 || event.which === 229) && (isSearchComposing || (event.target && event.target.composing)))))
-        );
-        if (composingNow) return;
-        const targetEl = (event && event.target) || searchInputRef.value;
-        if (targetEl && typeof targetEl.value === 'string') {
-          isSearchComposing = false;
-          targetEl.composing = false;
-          if (keyword.value !== targetEl.value) keyword.value = targetEl.value;
-        }
-        if (event && typeof event.preventDefault === 'function') event.preventDefault();
-        onSearch();
-      };
-
-      const onKeywordInput = event => {
-        if (event && event.isComposing) {
-          isSearchComposing = true;
-          if (event.target) event.target.composing = true;
-          return;
-        }
-        isSearchComposing = false;
-        if (event && event.target) {
-          if (event.target.composing) event.target.composing = false;
-          if (typeof event.target.value === 'string' && keyword.value !== event.target.value) {
-            keyword.value = event.target.value;
-          }
-        }
-        if (!keyword.value.trim() && activeKeyword.value) {
-          activeKeyword.value = '';
-          fetchGroups(true);
-        }
-      };
+      const onSearchKeydownEnter = event =>
+        ime.onEnterKeydown(keyword, searchInputRef.value, () => onSearch(), event);
 
       const clearSearch = () => {
-        isSearchComposing = false;
-        if (searchInputRef.value) {
-          searchInputRef.value.composing = false;
-          if (typeof searchInputRef.value.value === 'string') searchInputRef.value.value = '';
-        }
-        keyword.value = '';
+        ime.clearElementAndRef(keyword, searchInputRef.value);
         activeKeyword.value = '';
         fetchGroups(true);
       };
@@ -758,9 +621,6 @@
       };
 
       const triggerUpload = () => {
-        try {
-          global.localStorage.setItem(UPLOAD_GUIDE_ACK_KEY, '1');
-        } catch (_) {}
         openFilePickerDirectly();
       };
 
@@ -838,16 +698,9 @@
         (async () => {
           try {
             const uploadDataUrl = await resizeImageDataUrl(rawDataUrl, 1440, 0.88);
-            const resp = await global.fetch('/api/group_help/upload', {
-              method: 'POST',
-              headers: buildAuthHeaders(true),
-              body: JSON.stringify({ image_base64: uploadDataUrl }),
-            });
-            let json = null;
-            try {
-              json = await resp.json();
-            } catch (_) {}
-            if (resp.ok && json && json.status === 'success' && json.data) {
+            const res = await api.post('/api/group_help/upload', { image_base64: uploadDataUrl }, { token: currentToken() });
+            const json = res.data || null;
+            if (res.ok && json && json.status === 'success' && json.data) {
               const ownerPatch = json.owner_token ? { owner_token: String(json.owner_token) } : {};
               upsertMyGroup(
                 {
@@ -868,8 +721,9 @@
               }
             } else {
               const errMsg =
+                (res.status === 413 ? '上传图片过大，请控制在 10MB 以内' : '') ||
                 (json && json.error_msg) ||
-                (resp.status === 413 ? '上传图片过大，请控制在 10MB 以内' : '未在图片中识别到有效的拼多多多人团二维码');
+                '未在图片中识别到有效的拼多多多人团二维码';
               upsertMyGroup(
                 {
                   ...initialRecord,
@@ -1090,19 +944,15 @@
         f.submitting = true;
         f.errorMsg = '';
         try {
-          const resp = await global.fetch('/api/group_help/submit_text', {
-            method: 'POST',
-            headers: buildAuthHeaders(true),
-            body: JSON.stringify({
-              share_text: f.share_text,
-              goods_name: f.goods_name,
-              group_price: priceNum,
-              remain_people: remainNum,
-              total_people: Number.isInteger(totalNum) && totalNum >= 0 ? totalNum : 0,
-            }),
-          });
-          const json = await resp.json();
-          if (resp.ok && json.status === 'success' && json.data) {
+          const res = await api.post('/api/group_help/submit_text', {
+            share_text: f.share_text,
+            goods_name: f.goods_name,
+            group_price: priceNum,
+            remain_people: remainNum,
+            total_people: Number.isInteger(totalNum) && totalNum >= 0 ? totalNum : 0,
+          }, { token: currentToken() });
+          const json = res.data || {};
+          if (res.ok && json.status === 'success' && json.data) {
             const ownerPatch = json.owner_token ? { owner_token: String(json.owner_token) } : {};
             upsertMyGroup({ ...json.data, ...ownerPatch }, true);
             f.visible = false;
@@ -1148,9 +998,6 @@
       };
 
       const reuploadFromHelp = () => {
-        try {
-          global.localStorage.setItem(UPLOAD_GUIDE_ACK_KEY, '1');
-        } catch (_) {}
         closeHelpGuide();
         openFilePickerDirectly();
       };
@@ -1206,15 +1053,12 @@
         closeUploadResultModal();
         // 用户选择直接去拼已有同款团，将其待确认的重复团设为已结束并从“我的团”清理，随后一键直达该团
         if (own && own.group_order_id) {
-          const ownHeaders = buildAuthHeaders(true);
-          const ownBody = buildFeedbackBody(own.group_order_id, 'mark_expired');
           try {
-            global.fetch(`/api/group_help/feedback/${own.group_order_id}`, {
-              method: 'POST',
-              headers: ownHeaders,
-              body: ownBody,
-              keepalive: true,
-            });
+            api.post(
+              `/api/group_help/feedback/${encodeURIComponent(own.group_order_id)}`,
+              buildFeedbackPayload(own.group_order_id, 'mark_expired'),
+              { token: currentToken(), keepalive: true }
+            ).catch(() => {});
           } catch (_) {}
           myGroups.value = myGroups.value.filter(it => it.group_order_id !== own.group_order_id);
           saveMyGroupsToStorage(myGroups.value);
@@ -1229,13 +1073,13 @@
         if (!own || !own.group_order_id || submittingFeedback.value) return;
         submittingFeedback.value = true;
         try {
-          const resp = await global.fetch(`/api/group_help/feedback/${own.group_order_id}`, {
-            method: 'POST',
-            headers: buildAuthHeaders(true),
-            body: buildFeedbackBody(own.group_order_id, 'confirm_publish'),
-          });
-          const json = await resp.json();
-          if (resp.ok && json.status === 'success' && json.data) {
+          const res = await api.post(
+            `/api/group_help/feedback/${encodeURIComponent(own.group_order_id)}`,
+            buildFeedbackPayload(own.group_order_id, 'confirm_publish'),
+            { token: currentToken() }
+          );
+          const json = res.data || {};
+          if (res.ok && json.status === 'success' && json.data) {
             upsertMyGroup(json.data, false);
             closeUploadResultModal();
             showToast('🎉 您的拼团已上架互助大厅！', 3200);
@@ -1360,12 +1204,11 @@
       const recordClick = async gid => {
         if (!gid) return;
         try {
-          const resp = await global.fetch(`/api/group_help/click/${gid}`, {
-            method: 'POST',
+          const res = await api.post(`/api/group_help/click/${encodeURIComponent(gid)}`, undefined, {
             keepalive: true,
           });
-          const json = await resp.json();
-          if (json.status === 'success' && json.data) {
+          const json = res.data || {};
+          if (res.ok && json.status === 'success' && json.data) {
             const idx = items.value.findIndex(it => it.group_order_id === gid);
             if (idx !== -1) items.value[idx] = json.data;
             if (isMyOwnGroup(gid)) upsertMyGroup(json.data, false);
@@ -1500,42 +1343,25 @@
             mode: authModal.value.isRegister ? 'register' : 'login',
           };
           if (authModal.value.isRegister) {
-            try {
-              const pendingInv = String(
-                global.localStorage.getItem(EASY_SHOP_PENDING_INVITE_KEY) || ''
-              ).trim();
-              if (/^[A-Za-z0-9_-]{3,32}$/.test(pendingInv)) {
-                reqPayload.invite_code = pendingInv;
-              }
-            } catch (_) {}
+            const pendingInv = String(session.pendingInvite() || '').trim();
+            if (/^[A-Za-z0-9_-]{3,32}$/.test(pendingInv)) {
+              reqPayload.invite_code = pendingInv;
+            }
           }
-          const resp = await global.fetch('/api/user/register_or_login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(reqPayload),
-          });
-          const json = await resp.json();
-          if (resp.ok && json.status === 'success' && json.user && json.user.auth_token) {
+          const res = await api.post('/api/user/register_or_login', reqPayload);
+          const json = res.data || {};
+          if (res.ok && json.status === 'success' && json.user && json.user.auth_token) {
             const u = json.user;
             authToken.value = String(u.auth_token);
-            try {
-              global.localStorage.setItem(EASY_SHOP_TOKEN_KEY, u.auth_token);
-              global.localStorage.setItem(EASY_SHOP_UID_KEY, u.uid || '');
-              global.localStorage.setItem(EASY_SHOP_PHONE_KEY, u.phone || '');
-              if (u.invite_code) {
-                global.localStorage.setItem(EASY_SHOP_INVITE_KEY, u.invite_code);
-              }
-              global.localStorage.removeItem(EASY_SHOP_PENDING_INVITE_KEY);
-            } catch (_) {}
+            session.saveUser(u);
+            session.clearPendingInvite();
             const nextAction = authModal.value.pendingAction;
             const nextRemain = authModal.value.pendingRemain;
             closeAuthModal();
             // 同步该账号的下架信用状态
             try {
-              const gResp = await global.fetch('/api/group_help/list?limit=1', {
-                headers: buildAuthHeaders(false),
-              });
-              const gJson = await gResp.json();
+              const gRes = await api.get('/api/group_help/list?limit=1', { token: currentToken() });
+              const gJson = gRes.data || {};
               if (gJson && gJson.data && gJson.data.viewer_guard) {
                 applyViewerGuard(gJson.data.viewer_guard);
               }
@@ -1571,8 +1397,7 @@
           (action === 'joined_one' && Number(selectedGroup.value.remain_people) <= 1);
 
         if (isTakedown && !isMyOwnGroup(gid)) {
-          loadSavedAuthToken();
-          if (!authToken.value) {
+          if (!currentToken()) {
             openAuthModal(action, remainPeople);
             return;
           }
@@ -1622,21 +1447,21 @@
         const gid = selectedGroup.value.group_order_id;
         submittingFeedback.value = true;
         try {
-          const resp = await global.fetch(`/api/group_help/feedback/${gid}`, {
-            method: 'POST',
-            headers: buildAuthHeaders(true),
-            body: buildFeedbackBody(gid, action, remainPeople),
-          });
-          const json = await resp.json();
+          const res = await api.post(
+            `/api/group_help/feedback/${encodeURIComponent(gid)}`,
+            buildFeedbackPayload(gid, action, remainPeople),
+            { token: currentToken() }
+          );
+          const json = res.data || {};
           if (json && json.viewer_guard) {
             applyViewerGuard(json.viewer_guard);
           }
-          if (resp.status === 401 || (json && json.error_code === 'auth_required')) {
+          if (res.status === 401 || (json && json.error_code === 'auth_required')) {
             clearExpiredAuth();
             openAuthModal(action, remainPeople);
             return;
           }
-          if (resp.ok && json.status === 'success' && json.data) {
+          if (res.ok && json.status === 'success' && json.data) {
             if (action === 'joined_one') {
               const nextJoined = { ...joinedGroupIds.value, [gid]: true };
               joinedGroupIds.value = nextJoined;
@@ -1694,13 +1519,13 @@
           return;
         }
         try {
-          const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
-            method: 'POST',
-            headers: buildAuthHeaders(true),
-            body: buildFeedbackBody(item.group_order_id, 'mark_full'),
-          });
-          const json = await resp.json();
-          if (resp.ok && json.status === 'success' && json.data) {
+          const res = await api.post(
+            `/api/group_help/feedback/${encodeURIComponent(item.group_order_id)}`,
+            buildFeedbackPayload(item.group_order_id, 'mark_full'),
+            { token: currentToken() }
+          );
+          const json = res.data || {};
+          if (res.ok && json.status === 'success' && json.data) {
             upsertMyGroup(json.data, false);
             const idx = items.value.findIndex(it => it.group_order_id === item.group_order_id);
             if (idx !== -1) items.value.splice(idx, 1);
@@ -1723,13 +1548,13 @@
         }
         const targetRemain = item.remain_people > 0 ? item.remain_people : 1;
         try {
-          const resp = await global.fetch(`/api/group_help/feedback/${item.group_order_id}`, {
-            method: 'POST',
-            headers: buildAuthHeaders(true),
-            body: buildFeedbackBody(item.group_order_id, 'set_remain', targetRemain),
-          });
-          const json = await resp.json();
-          if (resp.ok && json.status === 'success' && json.data) {
+          const res = await api.post(
+            `/api/group_help/feedback/${encodeURIComponent(item.group_order_id)}`,
+            buildFeedbackPayload(item.group_order_id, 'set_remain', targetRemain),
+            { token: currentToken() }
+          );
+          const json = res.data || {};
+          if (res.ok && json.status === 'success' && json.data) {
             upsertMyGroup(json.data, false);
             if (json.penalized_saboteur) {
               showToast(
@@ -1752,9 +1577,9 @@
       const refreshSingleGroupSilently = async gid => {
         if (!gid) return;
         try {
-          const resp = await global.fetch(`/api/group_help/detail/${encodeURIComponent(gid)}`);
-          if (!resp.ok) return;
-          const json = await resp.json();
+          const res = await api.get(`/api/group_help/detail/${encodeURIComponent(gid)}`);
+          if (!res.ok) return;
+          const json = res.data || {};
           if (json && json.status === 'success' && json.data) {
             if (selectedGroup.value && selectedGroup.value.group_order_id === gid) {
               selectedGroup.value = json.data;
@@ -1778,9 +1603,9 @@
           openDetail(returned.snapshot);
         }
         try {
-          const resp = await global.fetch(`/api/group_help/detail/${encodeURIComponent(returned.gid)}`);
-          if (!resp.ok) return;
-          const json = await resp.json();
+          const res = await api.get(`/api/group_help/detail/${encodeURIComponent(returned.gid)}`);
+          if (!res.ok) return;
+          const json = res.data || {};
           if (json && json.status === 'success' && json.data) {
             openDetail(json.data);
           }
@@ -1798,9 +1623,9 @@
           } catch (_) {}
         }
         try {
-          const resp = await global.fetch(`/api/group_help/detail/${encodeURIComponent(gid)}`);
-          const json = await resp.json();
-          if (resp.ok && json && json.status === 'success' && json.data) {
+          const res = await api.get(`/api/group_help/detail/${encodeURIComponent(gid)}`);
+          const json = res.data || {};
+          if (res.ok && json && json.status === 'success' && json.data) {
             const d = json.data;
             if (
               d.parse_status === 'parsed' &&
@@ -1864,12 +1689,12 @@
           const params = new URLSearchParams((global.location && global.location.search) || '');
           const inv = String(params.get('invite_code') || '').trim();
           if (/^[A-Za-z0-9_-]{3,32}$/.test(inv)) {
-            global.localStorage.setItem(EASY_SHOP_PENDING_INVITE_KEY, inv);
+            session.savePendingInvite(inv);
           }
           deepGid = String(params.get('gid') || '').trim();
           fromModalHistory = Boolean(global.history && global.history.state && global.history.state.ghModal);
         } catch (_) {}
-        loadSavedAuthToken();
+        currentToken();
         joinedGroupIds.value = loadJoinedGroupsFromStorage();
         myGroups.value = loadMyGroupsFromStorage();
         fetchGroups(true);
@@ -1895,7 +1720,7 @@
         }
         clearAppFallbackTimer();
         if (pollTimer) global.clearInterval(pollTimer);
-        if (toastTimer) global.clearTimeout(toastTimer);
+        browser.dispose();
       });
 
       return {
@@ -1905,7 +1730,6 @@
         items,
         total,
         hasMore,
-        pendingCount,
         localPendingCount,
         loading,
         submittingFeedback,
@@ -1939,12 +1763,8 @@
         removeMyGroup,
         quickMyGroupTakedown,
         quickMyGroupRelist,
-        onSearchCompositionStart,
-        onSearchCompositionEnd,
-        onSearchImeReset,
         onSearchKeydownEnter,
         onSearch,
-        onKeywordInput,
         clearSearch,
         switchFilter,
         triggerUpload,

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
-from mobile_web.scripts.run_deal_pool_scheduler import (
+from models.deal_constants import (
     CLEAN_STAGE_DONE,
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
@@ -21,11 +21,13 @@ from mobile_web.scripts.run_deal_pool_scheduler import (
     ERR_ADAPTER_CONVERT_FAILED,
     ERR_AI_TIMEOUT_RETRY,
     ERR_NO_ANCHOR,
+)
+from repositories.deal_raw_pool_repo import DealRawPoolRepository
+from services.deal_pipeline import run_stage_pipeline_drain
+from services.deal_pool_cleaner import (
     DealPoolCleaner,
-    DealRawPoolRepository,
     StageWorker,
     _commit_batch_results_to_db,
-    run_stage_pipeline_drain,
 )
 
 

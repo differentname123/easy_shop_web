@@ -29,8 +29,37 @@ MAX_CLEAN_RETRIES = 3
 MAX_ANCHOR_CACHE_SIZE = 8000
 MAX_JSONL_FILE_BYTES = 10 * 1024 * 1024
 DEFAULT_CLEAN_WINDOW = 200
-DEFAULT_CLEAN_INTERVAL_SECONDS = 60
 DEFAULT_AI_TIMEOUT_SECONDS = 90.0
+
+# 站点与频道默认保鲜天数映射（纯领域常量，供仓储与清洗统一读取）
+SITE_MAX_AGE_DAYS: Dict[str, float] = {
+    "tehuicaicai": 7.0,
+    "ithome_lapin": 2.5,
+}
+CHANNEL_MAX_AGE_DAYS: Dict[str, float] = {
+    "特惠采采_首页精选": 7.0,
+    "IT之家辣品_好物": 2.5,
+}
+
+
+def resolve_deal_max_age_days(
+    channel_name: str = "",
+    site_key: str = "",
+    default_days: float = DEAL_MAX_CLEAN_AGE_DAYS,
+) -> float:
+    """根据频道名称或站点标识获取保鲜天数（单一纯领域真源）。"""
+    ch = str(channel_name or "").strip()
+    if ch and ch in CHANNEL_MAX_AGE_DAYS:
+        return float(CHANNEL_MAX_AGE_DAYS[ch])
+    sk = str(site_key or "").strip()
+    if sk and sk in SITE_MAX_AGE_DAYS:
+        return float(SITE_MAX_AGE_DAYS[sk])
+    return float(default_days)
+
+
+def get_default_site_max_age_days_map() -> Dict[str, float]:
+    """返回站点级保鲜天数映射副本。"""
+    return dict(SITE_MAX_AGE_DAYS)
 
 # 阶段化独立流水线常量 (Stage Pipeline Constants)
 CLEAN_STAGE_NEED_AI1 = "need_ai1"
@@ -70,6 +99,7 @@ DEAL_POOL_LOG_PREFIXES: Tuple[str, ...] = (
 
 # 清洗与转链状态与错误码定义（单一真源）
 OK_SKIPPED_ALREADY_CLEANED = "OK_SKIPPED_ALREADY_CLEANED"
+UPSTREAM_DISAPPEARED = "UPSTREAM_DISAPPEARED"
 ERR_NO_ANCHOR = "ERR_NO_ANCHOR"
 ERR_MERGED_INTO_NEIGHBOR = "ERR_MERGED_INTO_NEIGHBOR"
 ERR_UNSUPPORTED_PLATFORM = "ERR_UNSUPPORTED_PLATFORM"
@@ -79,7 +109,6 @@ ERR_JD_NUMERIC_SKU = "ERR_JD_NUMERIC_SKU"
 ERR_ADAPTER_OFF_PROMOTION = "ERR_ADAPTER_OFF_PROMOTION"
 ERR_ADAPTER_CONVERT_FAILED = "ERR_ADAPTER_CONVERT_FAILED"
 ERR_EMPTY_PRODUCT_IDENTITY = "ERR_EMPTY_PRODUCT_IDENTITY"
-ERR_MAIN_PRODUCT_DEAD = "ERR_MAIN_PRODUCT_DEAD_ONLY_FILLER"
 ERR_AI2_MAIN_DEAD_ONLY_FILLER = "ERR_AI2_MAIN_DEAD_ONLY_FILLER"
 ERR_AI2_COUPON_FAILED_OR_DROPPED = "ERR_AI2_COUPON_FAILED_OR_DROPPED"
 ERR_AI2_PRODUCT_MISMATCH = "ERR_AI2_PRODUCT_MISMATCH"

@@ -18,7 +18,7 @@ for _p in (str(_REPO_ROOT), str(_MOBILE_WEB_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from mobile_web.scripts import run_product_cloud_sync_scheduler as sync_mod
+from services import product_cloud_sync as sync_mod
 from tests.test_product_repository import MemoryCollection as ProductMemoryCollection
 
 

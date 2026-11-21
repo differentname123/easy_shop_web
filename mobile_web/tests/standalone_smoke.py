@@ -24,9 +24,16 @@ import unittest
 PRODUCTION_PACKAGES = ("adapters", "api", "infrastructure", "models", "repositories", "services", "scripts")
 SETTINGS_ENV = (
     "PDD_CLIENT_ID", "PDD_CLIENT_SECRET", "PDD_PID", "MONGO_HOST", "MONGO_PORT",
-    "MONGO_USER", "MONGO_PASSWORD", "MONGO_DB_NAME", "MONGO_AUTH_SOURCE",
+    "MONGO_USER", "MONGO_PASSWORD", "MONGO_DB_NAME", "MONGO_AUTH_SOURCE", "CLOUD_MONGO_URI",
+    "TAOBAO_ENABLED", "TAOBAO_APP_KEY", "TAOBAO_APP_SECRET", "TAOBAO_PID",
+    "TAOBAO_ADZONE_ID", "TAOBAO_SESSION", "TAOBAO_INVITER_CODE",
+    "JD_ENABLED", "JD_UNION_ID", "JD_POSITION_ID", "JD_APP_KEY", "JD_APP_SECRET", "JD_API_BASE",
+    "HAODANKU_API_KEY", "ZTK_APPKEY", "ZTK_SID",
+    "MEILISEARCH_URL", "MEILISEARCH_KEY", "MEILISEARCH_ENABLED",
     "WEB_AUTH_SECRET", "WEB_HOST", "WEB_PORT", "PORT", "WEB_CONFIG_FILE",
-    "WEB_WARMUP_ENABLED", "WEB_LOG_DIR", "WEB_LOG_LEVEL", "PDD_DNS_MODE", "PDD_TRUST_ENV",
+    "WEB_WARMUP_ENABLED", "WEB_DETAIL_PREFETCH_ENABLED", "WEB_DETAIL_PREFETCH_INTERVAL_SECONDS",
+    "WEB_LOG_DIR", "WEB_LOG_LEVEL", "PDD_DNS_MODE", "PDD_TRUST_ENV",
+    "XIANYU_USER_DATA_DIR", "XIANYU_SEARCH_USER_DATA_DIR", "XIANYU_GUEST_USER_DATA_DIR",
 )
 SMOKE_SECRET = "standalone-smoke-private-secret-not-for-production-2026"
 
@@ -46,6 +53,10 @@ def copy_production_tree(source, destination):
                 target = destination / path.relative_to(source)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
+    for txt_path in (source / "scripts").glob("*.txt"):
+        target = destination / txt_path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(txt_path, target)
     shutil.copytree(source / "static", destination / "static")
     if (source / "prompt").is_dir():
         shutil.copytree(source / "prompt", destination / "prompt")
@@ -199,6 +210,7 @@ def run_worker(app_dir, forbidden_root):
                     for route, filename in (("/", "index.html"), ("/detail", "detail.html"),
                                             ("/group_help", "group_help.html"),
                                             ("/static/css/style.css", "css/style.css"),
+                                            ("/static/css/detail.css", "css/detail.css"),
                                             ("/static/css/group_help.css", "css/group_help.css"),
                                             ("/static/js/detail.js", "js/detail.js"),
                                             ("/static/js/group_help.js", "js/group_help.js")):

@@ -100,9 +100,17 @@ import re
 import sys
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable, Dict, Any, List, Optional, Sequence, Union
 from urllib.parse import urlsplit
 import requests
+
+_MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
+if str(_MOBILE_WEB_DIR) not in sys.path:
+    sys.path.insert(0, str(_MOBILE_WEB_DIR))
+
+from infrastructure.http_utils import parse_appkey_list
+from infrastructure.settings import load_settings
 
 if sys.platform == "win32":
     try:
@@ -110,47 +118,27 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# ==================== 1. 核心有效配置 ====================
-# 折淘客 (折京客) 凭据池：支持配置多个绑定同一京东授权的 appkey，实现额度叠加与限流自动切换
-DEFAULT_ZTK_APPKEY_LIST: List[str] = [
-    "41ce110973f744118c1227d5f7f72b65",
-    "fe60ace35b00426b89a16a2baea50618",
-]
-
-
-def parse_appkey_list(raw: Union[str, Sequence[str], None]) -> List[str]:
-    """将字符串（支持逗号分隔）或字符串序列规范化为去重后的非空 appkey 列表。"""
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        candidates = raw.split(",")
-    elif isinstance(raw, (list, tuple)):
-        candidates = []
-        for item in raw:
-            if isinstance(item, str):
-                candidates.extend(item.split(","))
-    else:
-        return []
-    seen = []
-    for key in candidates:
-        clean = key.strip()
-        if clean and clean not in seen:
-            seen.append(clean)
-    return seen
-
+# ==================== 1. 核心有效配置（统一从 config.local.json / 环境变量读取，绝不硬编码私钥） ====================
+try:
+    _SETTINGS = load_settings(require_credentials=False)
+except Exception:
+    _SETTINGS = None
 
 _env_keys = os.environ.get("ZTK_APPKEY_LIST") or os.environ.get("ZTK_APPKEY")
-ZTK_APPKEY_LIST: List[str] = parse_appkey_list(_env_keys) or list(DEFAULT_ZTK_APPKEY_LIST)
-# 兼容单 Key 常量引用
-ZTK_APPKEY: str = ZTK_APPKEY_LIST[0]
+if _env_keys:
+    ZTK_APPKEY_LIST: List[str] = list(parse_appkey_list(_env_keys))
+elif _SETTINGS is not None:
+    ZTK_APPKEY_LIST = list(_SETTINGS.ztk_appkey_list or ([] if not _SETTINGS.ztk_appkey else [_SETTINGS.ztk_appkey]))
+else:
+    ZTK_APPKEY_LIST = []
 
-# 京东联盟账号 (用于折淘客定位归属账号) 与 站长默认推广位
-JD_UNION_ID = os.environ.get("JD_UNION_ID", "2035679405")           # 联盟纯数字ID
-DEFAULT_POSITION_ID = os.environ.get("JD_POSITION_ID", "3110104129") # 站长自营默认推广位ID
+ZTK_APPKEY: str = ZTK_APPKEY_LIST[0] if ZTK_APPKEY_LIST else ""
 
-# 京东开放平台应用凭据 (仅在订单行接口计算签名时使用)
-JD_APP_KEY = os.environ.get("JD_APP_KEY", "45cb55a17ecbad6e91b004c0c34babe2")
-JD_APP_SECRET = os.environ.get("JD_APP_SECRET", "8d501939a5084e62aeed3377f9d6e7ac")
+JD_UNION_ID = os.environ.get("JD_UNION_ID") or (getattr(_SETTINGS, "jd_union_id", "") if _SETTINGS else "")
+DEFAULT_POSITION_ID = os.environ.get("JD_POSITION_ID") or (getattr(_SETTINGS, "jd_position_id", "") if _SETTINGS else "")
+
+JD_APP_KEY = os.environ.get("JD_APP_KEY") or (getattr(_SETTINGS, "jd_app_key", "") if _SETTINGS else "")
+JD_APP_SECRET = os.environ.get("JD_APP_SECRET") or (getattr(_SETTINGS, "jd_app_secret", "") if _SETTINGS else "")
 
 # 折淘客 API 网关
 ZTK_API_BASE = "http://api.zhetaoke.com:20000/api"

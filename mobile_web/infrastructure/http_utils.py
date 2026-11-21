@@ -10,11 +10,6 @@ SHANGHAI = timezone(timedelta(hours=8))
 _KEY_CURSOR_LOCK = threading.Lock()
 ZTK_KEY_COOLDOWN_SECONDS = 60.0
 
-ZTK_KEY_FAILURE_KEYWORDS = (
-    "appkey", "key", "频次", "频率", "超限", "上限", "次数", "黑名单",
-    "封禁", "未授权", "到期", "过期", "积分", "余额", "限制",
-)
-
 
 def clean_text(value: Any) -> str:
     """将任意标量安全转换为去首尾空白的字符串，忽略布尔值与空占位。"""
@@ -145,14 +140,6 @@ def extract_ztk_item_fields(
     }
 
 
-
-def format_shanghai_time(timestamp: Any) -> Optional[str]:
-    """将秒级时间戳转换为北京时间 YYYY-MM-DD HH:MM:SS 字符串。"""
-    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
-        return None
-    return datetime.fromtimestamp(int(timestamp), tz=SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
-
-
 def parse_shanghai_timestamp(value: Any, *, precise: bool = False) -> Any:
     """将北京时间字符串或秒级/毫秒级时间戳统一转换为 UTC 秒级时间戳（precise=True 时保留浮点秒）。"""
     if value is None or value == "" or isinstance(value, bool):
@@ -207,20 +194,6 @@ def parse_appkey_list(raw: Any, extra_list: Any = None) -> Tuple[str, ...]:
         if clean not in seen:
             seen.append(clean)
     return tuple(seen)
-
-
-def should_failover_ztk_key(payload: Any) -> bool:
-    """判断折淘客响应是否因 AppKey 额度/频次/权限异常需要切换到下一个备用 Key。"""
-    if not isinstance(payload, dict):
-        return True
-    status_val = payload.get("status")
-    code_val = payload.get("code")
-    if status_val in (200, "200") or code_val in (200, "200"):
-        return False
-    msg = " ".join(clean_text(payload.get(k)) for k in ("content", "msg", "message", "sub_msg")).lower()
-    if "relationid" in msg:
-        return False
-    return any(kw in msg for kw in ZTK_KEY_FAILURE_KEYWORDS) or status_val not in (None, 200, "200")
 
 
 def error_dict(code: str, message: str, **extra: Any) -> Dict[str, Any]:
@@ -292,7 +265,7 @@ def execute_with_key_failover(
         if last_result is not None and callable(should_ignore_error) and should_ignore_error(result, last_result):
             continue
         last_result = result
-        if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR", "RATE_LIMIT"):
+        if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR", "RATE_LIMIT", "TIMEOUT", "QUOTA_PACE_BACKLOG"):
             return result
         if callable(should_stop_early) and should_stop_early(result):
             return result

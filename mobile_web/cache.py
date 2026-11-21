@@ -77,10 +77,7 @@ def evict_product_from_caches(platform: str, goods_id: str = "", goods_sign: str
     for dkey in DETAIL_CACHE.keys():
         if not isinstance(dkey, tuple):
             continue
-        if (
-            (len(dkey) >= 5 and dkey[0] == "detail" and dkey[1] == plat and dkey[4] in targets)
-            or (len(dkey) == 4 and dkey[0] == plat and dkey[3] in targets)
-        ):
+        if len(dkey) >= 5 and dkey[0] == "detail" and dkey[1] == plat and dkey[4] in targets:
             DETAIL_CACHE.pop(dkey, None)
     for pkey in PROMOTION_CACHE.keys():
         if isinstance(pkey, tuple) and len(pkey) >= 4 and pkey[1] == plat and pkey[3] in targets:

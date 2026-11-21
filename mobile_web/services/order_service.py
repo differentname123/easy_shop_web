@@ -16,21 +16,9 @@ from repositories.order_sync_repo import OrderSyncRepository
 from repositories.user_repo import UserRepository
 from config import ORDER_SYNC_INTERVAL, ORDER_SYNC_MAX_PAGES, logger
 
-# 兼容字段只记录已持久化确认的窗口终点，不把启动尝试当成功。
-_LAST_SYNC_TIMESTAMP: Dict[str, float] = {}
-_LAST_SYNC_ATTEMPT: Dict[str, float] = {}
-_SYNC_STATE: Dict[str, dict] = {}
-_SYNC_LOCK = threading.Lock()  # 仅为旧调用方保留默认平台锁，不再是全平台互斥。
-_SYNC_LOCKS = {"pdd": _SYNC_LOCK}
-_SYNC_LOCKS_GUARD = threading.Lock()
 _INITIAL_LOOKBACK_SECONDS = 23 * 3600
 _SYNC_OVERLAP_SECONDS = 5 * 60
 _PAGE_SIZE = 50
-
-
-def _platform_lock(platform: str):
-    with _SYNC_LOCKS_GUARD:
-        return _SYNC_LOCKS.setdefault(platform, threading.Lock())
 
 
 class OrderService:
@@ -41,6 +29,39 @@ class OrderService:
         self.repo = order_repo if order_repo is not None else OrderRepository()
         self.sync_repo = sync_repo if sync_repo is not None else OrderSyncRepository()
         self.user_repo = user_repo if user_repo is not None else UserRepository()
+        # 运行态游标与锁归属于服务实例（只记录已持久化确认的水位与冷却窗口）
+        self._last_sync_timestamp: Dict[str, float] = {}
+        self._last_sync_attempt: Dict[str, float] = {}
+        self._sync_state: Dict[str, dict] = {}
+        self._sync_locks: Dict[str, threading.Lock] = {}
+        self._sync_locks_guard = threading.Lock()
+        self._bg_threads_lock = threading.Lock()
+        self._bg_threads: Dict[int, threading.Thread] = {}
+
+    def _platform_lock(self, platform: str) -> threading.Lock:
+        with self._sync_locks_guard:
+            return self._sync_locks.setdefault(platform, threading.Lock())
+
+    def reset_state(self) -> None:
+        self._last_sync_timestamp.clear()
+        self._last_sync_attempt.clear()
+        self._sync_state.clear()
+
+    def wait_for_sync_threads(self, timeout: float = 5.0) -> None:
+        """等待所有已启动的后台增量拉单线程自然收敛退出，用于优雅停机。"""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._bg_threads_lock:
+                pending = tuple(t for t in self._bg_threads.values() if t.is_alive())
+            if not pending:
+                return
+            for thread in pending:
+                if thread is threading.current_thread():
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                thread.join(timeout=remaining)
 
     def _attribute_order(self, order: dict, platform: str, identity_cache: Optional[dict] = None) -> dict:
         """只信适配器归因证据；数字推广身份与平台授权状态无关。
@@ -102,7 +123,7 @@ class OrderService:
             state = deepcopy(self.sync_repo.get_state(platform)) or {"last_success_end": 0, "pending": None}
             success_end = int(state.get("last_success_end") or 0)
             if success_end:
-                _LAST_SYNC_TIMESTAMP[platform] = success_end
+                self._last_sync_timestamp[platform] = success_end
             earliest_allowed = int(end_time) - _INITIAL_LOOKBACK_SECONDS
             if auto_continue and isinstance(state.get("pending"), dict):
                 pending_start = int(state["pending"].get("start_time") or 0)
@@ -177,7 +198,7 @@ class OrderService:
                     state = next_state
                     advanced = advanced or not has_more
                     if state.get("last_success_end"):
-                        _LAST_SYNC_TIMESTAMP[platform] = state["last_success_end"]
+                        self._last_sync_timestamp[platform] = state["last_success_end"]
                     if state["pending"] is None:
                         if auto_continue and int(state.get("last_success_end") or 0) < int(end_time) - 60:
                             # 旧检查点追平后，若距离当前时间仍有缺口，继续推进至当前 end_time
@@ -216,36 +237,46 @@ class OrderService:
                         "【订单同步】平台[%s] 状态[partial] 已处理页数[%d] 已入库[%d笔] 耗时[%.1fms] 说明<已达单次分页预算，剩余窗口将在下一周期继续同步>",
                         platform, pages_fetched, processed, elapsed_ms,
                     )
-            _SYNC_STATE[platform] = summary
+            self._sync_state[platform] = summary
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - sync_started) * 1000
-            _SYNC_STATE[platform] = {"status": "partial" if processed or advanced else "error",
+            self._sync_state[platform] = {"status": "partial" if processed or advanced else "error",
                                      "error": "同步订单异常，请稍后重试", "synced_count": processed}
             logger.error(
                 "❌ 【订单同步异常】后台同步增量订单时发生系统异常 | 平台[%s] 已入库[%d笔] 耗时[%.1fms] 异常<%s> 排查方向<请检查MongoDB orders/order_sync_state集合连接状态、订单字段格式或上游接口>",
                 platform, processed, elapsed_ms, format_exc_summary(exc),
             )
         finally:
-            _platform_lock(platform).release()
+            with self._bg_threads_lock:
+                self._bg_threads.pop(id(threading.current_thread()), None)
+            self._platform_lock(platform).release()
 
     def _try_start_sync(self, platform: str, now: float) -> None:
-        if now - _LAST_SYNC_ATTEMPT.get(platform, 0.0) < ORDER_SYNC_INTERVAL:
+        if now - self._last_sync_attempt.get(platform, 0.0) < ORDER_SYNC_INTERVAL:
             return
-        lock = _platform_lock(platform)
+        lock = self._platform_lock(platform)
         if not lock.acquire(blocking=False):
             return
+        thread = None
         try:
-            if now - _LAST_SYNC_ATTEMPT.get(platform, 0.0) < ORDER_SYNC_INTERVAL:
+            if now - self._last_sync_attempt.get(platform, 0.0) < ORDER_SYNC_INTERVAL:
                 lock.release()
                 return
-            _LAST_SYNC_ATTEMPT[platform] = now
-            _SYNC_STATE[platform] = {"status": "running", "error": "", "synced_count": 0}
-            threading.Thread(
+            self._last_sync_attempt[platform] = now
+            self._sync_state[platform] = {"status": "running", "error": "", "synced_count": 0}
+            thread = threading.Thread(
                 target=self._sync_platform_orders_bg, args=(platform, int(now), True),
                 name=f"bg-order-sync-{platform}", daemon=True,
-            ).start()
+            )
+            if callable(getattr(thread, "is_alive", None)) and callable(getattr(thread, "join", None)):
+                with self._bg_threads_lock:
+                    self._bg_threads[id(thread)] = thread
+            thread.start()
         except Exception as exc:
-            _SYNC_STATE[platform] = {"status": "error", "error": "无法启动订单同步，请稍后重试", "synced_count": 0}
+            if thread is not None:
+                with self._bg_threads_lock:
+                    self._bg_threads.pop(id(thread), None)
+            self._sync_state[platform] = {"status": "error", "error": "无法启动订单同步，请稍后重试", "synced_count": 0}
             lock.release()
             logger.error(
                 "❌ 【订单同步异常】启动后台订单增量同步线程失败 | 平台[%s] 异常<%s> 排查方向<请检查系统线程资源限制>",
@@ -257,9 +288,8 @@ class OrderService:
         platform: str = "pdd",
         uid: str = "",
         days: int = 7,
-        force_sync: bool = False,
     ) -> Dict[str, Any]:
-        """兼容 force 参数，但任何调用都不能穿透冷却或平台互斥锁。"""
+        """异步触发受控频增量拉单，并查询当前认证推手本地订单及收益汇总。"""
         plat = normalize_platform(platform)
         clean_uid = str(uid or "").strip()
         if not clean_uid:
@@ -271,8 +301,17 @@ class OrderService:
         if isinstance(capabilities, dict) and capabilities.get("orders") is False:
             return {"status": "error", "error_code": "capability_unavailable", "platform": plat,
                     "error_msg": f"{adapter.platform_name}订单查询尚未配置，不能同步订单"}
+        if plat not in self._last_sync_timestamp:
+            try:
+                saved_state = self.sync_repo.get_state(plat)
+                if isinstance(saved_state, dict):
+                    saved_end = int(saved_state.get("last_success_end") or 0)
+                    if saved_end > 0:
+                        self._last_sync_timestamp[plat] = saved_end
+            except Exception:
+                pass
         now = time.time()
-        last_attempt_before = float(_LAST_SYNC_ATTEMPT.get(plat, 0.0) or 0.0)
+        last_attempt_before = float(self._last_sync_attempt.get(plat, 0.0) or 0.0)
         elapsed_before = now - last_attempt_before
         sync_cooldown_remaining = (
             max(1, int(math.ceil(ORDER_SYNC_INTERVAL - elapsed_before)))
@@ -292,11 +331,11 @@ class OrderService:
                 plat, clean_uid, days, format_exc_summary(exc),
             )
             return {"status": "error", "error_msg": "查询订单与收益失败，请稍后重试"}
-        state = _SYNC_STATE.get(plat, {})
+        state = self._sync_state.get(plat, {})
         result.update({
             "platform": plat, "uid": clean_uid, "query_days": days,
-            "last_sync_time": int(_LAST_SYNC_TIMESTAMP.get(plat, 0)),
-            "last_sync_attempt_time": int(_LAST_SYNC_ATTEMPT.get(plat, 0)),
+            "last_sync_time": int(self._last_sync_timestamp.get(plat, 0)),
+            "last_sync_attempt_time": int(self._last_sync_attempt.get(plat, 0)),
             "sync_cooldown_remaining": sync_cooldown_remaining,
             "sync_status": state.get("status", "idle"),
             "sync_error": state.get("error", ""),
@@ -320,18 +359,18 @@ class OrderService:
             if not plat:
                 continue
             now = time.time()
-            if now - _LAST_SYNC_ATTEMPT.get(plat, 0.0) < ORDER_SYNC_INTERVAL:
+            if now - self._last_sync_attempt.get(plat, 0.0) < ORDER_SYNC_INTERVAL:
                 outcomes[plat] = "skipped_cooldown"
                 continue
-            lock = _platform_lock(plat)
+            lock = self._platform_lock(plat)
             if not lock.acquire(blocking=False):
                 outcomes[plat] = "skipped_busy"
                 continue
-            _LAST_SYNC_ATTEMPT[plat] = now
-            _SYNC_STATE[plat] = {"status": "running", "error": "", "synced_count": 0}
+            self._last_sync_attempt[plat] = now
+            self._sync_state[plat] = {"status": "running", "error": "", "synced_count": 0}
             # _sync_platform_orders_bg 内部 finally 会负责释放 _platform_lock(plat)
             self._sync_platform_orders_bg(plat, int(now), True)
-            outcomes[plat] = (_SYNC_STATE.get(plat) or {}).get("status", "done")
+            outcomes[plat] = (self._sync_state.get(plat) or {}).get("status", "done")
         return outcomes
 
 

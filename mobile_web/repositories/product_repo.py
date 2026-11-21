@@ -3,17 +3,23 @@
 商品数据仓储模块 (MongoDB: products 集合)
 负责商品数据的高效读写、索引保障与爆品库检索。
 """
-import re
+from collections import defaultdict
 import datetime
 import math
+import re
 import time
 from copy import deepcopy
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple
 from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError
 from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
+from models.cost_performance import (
+    parse_deal_publish_timestamp,
+    rank_products_by_cost_performance,
+)
+from models.deal_constants import DEAL_INFO_PROTECTION_HOURS
 from models.product import (
     _BARE_YUAN_TAG_RE,
     clean_product_id,
@@ -21,75 +27,230 @@ from models.product import (
     extract_search_keyword,
     get_source_site_name,
     is_jd_image_key,
+    normalize_jd_material_url,
     normalize_platform,
     resolve_item_identity,
     utc_millis,
 )
 from config import PROMOTION_LINK_TTL, logger
 from infrastructure.search_meili import (
-    search_products,
+    delete_documents,
     index_documents,
     is_meili_available,
+    make_meili_doc_id,
+    search_products,
 )
 
 
-SKU_UNIT_BASE_MAPPING = {
-    "质量": {
-        "mg": 1,
-        "g": 1000,
-        "G": 1000,
-        "克": 1000,
-        "斤": 500000,
-        "kg": 1000000,
-        "Kg": 1000000,
-        "KG": 1000000,
-        "千克": 1000000,
-        "磅": 453592.37,
-    },
-    "容积与体积": {
-        "ml": 1,
-        "mL": 1,
-        "ML": 1,
-        "毫升": 1,
-        "L": 1000,
-        "升": 1000,
-    },
-    "数据存储": {
-        "GB": 1,
-        "TB": 1024,
-    },
-    "电池容量": {
-        "mAh": 1,
-        "Ah": 1000,
-        "AH": 1000,
-    },
-    "功率": {
-        "W": 1,
-        "kW": 1000,
-    },
-    "生物活性成分": {
-        "iu": 1,
-        "IU": 1,
-    },
-    "速率与排量": {
-        "L/日": 1,
-        "升/天": 1,
-    },
-}
+def _to_naive_utc(dt: Any) -> Optional[datetime.datetime]:
+    """统一将任意 datetime 转换为无时区偏移 (naive) UTC 时间。"""
+    if not isinstance(dt, datetime.datetime):
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
 
-UNIT_TO_CATEGORY: Dict[str, str] = {}
-UNIT_TO_MULTIPLIER: Dict[str, float] = {}
-for _cat, _units in SKU_UNIT_BASE_MAPPING.items():
-    for _u, _mul in _units.items():
-        UNIT_TO_CATEGORY[_u] = _cat
-        UNIT_TO_MULTIPLIER[_u] = _mul
+
+def upsert_cleaned_products_to_formal_table(
+    formal_col,
+    product_docs: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """
+    【Stage 5：高分好价商品晋升入正式表 `products`（含质量评分防覆盖保护）】
+    - 严格以唯一索引 `{"platform": plat, "product_id": pid}` 作为过滤条件；
+    - 顶层商品属性 (`name`, `price`, `original_price`, `activity_price` 等) 始终保持官方最新数据；
+    - 高分保护法则：
+      1) 同批次多条线报命中同一商品时，按 `deal_info.quality_score` 最高者胜出；
+      2) 若 `products` 表中该商品已有 `deal_info.is_deal_tip == True` 且 `updated_at` 在 12 小时保鲜期内，
+         仅当新线报 `quality_score >= 已有 deal_info.quality_score`（或价格明显更低 <98%）时才更新 `deal_info` 内容，
+         防止低分简陋线报覆盖高分精品线报。
+    """
+    if not product_docs:
+        return {"upserted": 0, "modified": 0, "matched": 0, "protected_high_score": 0, "total_ops": 0}
+
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    protection_cutoff = now - datetime.timedelta(hours=DEAL_INFO_PROTECTION_HOURS)
+
+    grouped_by_pid: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for doc in product_docs:
+        grouped_by_pid[(doc["platform"], doc["product_id"])].append(doc)
+
+    existing_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    try:
+        or_queries = [{"platform": p, "product_id": pid} for (p, pid) in grouped_by_pid.keys()]
+        if or_queries:
+            for ex_doc in formal_col.find(
+                {"$or": or_queries},
+                {
+                    "_id": 0,
+                    "platform": 1,
+                    "product_id": 1,
+                    "deal_info.is_deal_tip": 1,
+                    "deal_info.quality_score": 1,
+                    "deal_info.deal_price": 1,
+                    "deal_info.updated_at": 1,
+                },
+            ):
+                k = (str(ex_doc.get("platform") or ""), str(ex_doc.get("product_id") or ""))
+                existing_map[k] = ex_doc
+    except Exception as e:
+        logger.warning("查询正式表已有商品评分异常: %s", e)
+
+    ops = []
+    protected_high_score = 0
+
+    for (plat, pid), docs_for_item in grouped_by_pid.items():
+        docs_sorted = sorted(
+            docs_for_item,
+            key=lambda x: int((x.get("deal_info") or {}).get("quality_score") or 0),
+        )
+        best_doc = deepcopy(docs_sorted[-1])
+        deal_info = deepcopy(best_doc.pop("deal_info", {}) or {})
+        new_score = int(deal_info.get("quality_score") or 0)
+
+        total_seen_inc = 0
+        all_sites: List[str] = []
+        all_channels: List[str] = []
+        for d in docs_for_item:
+            di = d.get("deal_info") or {}
+            total_seen_inc += max(1, int(di.get("seen_count") or 1))
+            s_site = str(di.get("source_site") or "").strip()
+            if s_site and s_site not in all_sites:
+                all_sites.append(s_site)
+            for ch in di.get("seen_channels") or []:
+                ch_s = str(ch or "").strip()
+                if ch_s and ch_s not in all_channels:
+                    all_channels.append(ch_s)
+
+        deal_info.pop("seen_count", None)
+        deal_info.pop("seen_channels", None)
+
+        set_fields: Dict[str, Any] = {
+            **best_doc,
+            "updated_at": now,
+            "last_clean_source": "deal_pool",
+        }
+        if len(best_doc.get("carousel_images") or []) > 1 and float(best_doc.get("commission_amount") or 0.0) > 0:
+            set_fields["detail_updated_at"] = now
+
+        ex_record = existing_map.get((plat, pid))
+        ex_di = (ex_record or {}).get("deal_info") if isinstance((ex_record or {}).get("deal_info"), dict) else {}
+        ex_score = int(ex_di.get("quality_score") or 0)
+        ex_deal_updated = _to_naive_utc(ex_di.get("updated_at"))
+        is_fresh_existing = bool(
+            ex_di.get("is_deal_tip")
+            and ex_deal_updated is not None
+            and ex_deal_updated >= protection_cutoff
+        )
+
+        new_dp = (
+            float(deal_info["deal_price"])
+            if isinstance(deal_info.get("deal_price"), (int, float))
+            and not isinstance(deal_info.get("deal_price"), bool)
+            and float(deal_info["deal_price"]) > 0
+            else None
+        )
+        ex_dp = (
+            float(ex_di["deal_price"])
+            if isinstance(ex_di.get("deal_price"), (int, float))
+            and not isinstance(ex_di.get("deal_price"), bool)
+            and float(ex_di["deal_price"]) > 0
+            else None
+        )
+        price_improved = bool(new_dp is not None and ex_dp is not None and new_dp < ex_dp * 0.98)
+
+        if is_fresh_existing and ex_score > new_score and not price_improved:
+            protected_high_score += 1
+        else:
+            has_numeric_dp = (
+                isinstance(deal_info.get("deal_price"), (int, float))
+                and not isinstance(deal_info.get("deal_price"), bool)
+                and float(deal_info["deal_price"]) > 0
+            )
+            deal_info["updated_at"] = now
+            deal_info["expired_at"] = None
+            deal_info["need_reformat"] = has_numeric_dp
+            deal_info["format_status"] = "pending" if has_numeric_dp else "skipped"
+            deal_info["format_info"] = None
+            deal_info["format_deal_price"] = None
+            deal_info["format_retry_count"] = 0
+            deal_info["format_error"] = ""
+            for dk, dv in deal_info.items():
+                set_fields[f"deal_info.{dk}"] = dv
+
+        batch_timeline_entries: List[Dict[str, Any]] = []
+        seen_tids: Set[str] = set()
+        for d in docs_for_item:
+            di = d.get("deal_info") or {}
+            mid = str(di.get("source_item_id") or d.get("product_id") or "")
+            if mid and mid not in seen_tids:
+                seen_tids.add(mid)
+                pub_t = str(di.get("publish_time") or "")
+                s_site = str(di.get("source_site") or "")
+                s_name = str(di.get("source_site_name") or get_source_site_name(s_site))
+                p_nick = str(di.get("provider_nickname") or (di.get("hot_metrics") or {}).get("provider_nickname") or "")
+                batch_timeline_entries.append({
+                    "tip_id": mid,
+                    "source_site": s_site,
+                    "source_site_name": s_name,
+                    "source_channel": str(di.get("source_channel") or ""),
+                    "provider_nickname": p_nick,
+                    "publish_time": pub_t,
+                    "publish_ts": parse_deal_publish_timestamp(pub_t) or 0.0,
+                    "title": str(di.get("raw_tip_title") or d.get("name") or ""),
+                    "copywriting": str(di.get("original_copywriting") or "")[:300],
+                    "deal_price": di.get("deal_price"),
+                    "tutorial_score": int(di.get("tutorial_score") or di.get("quality_score") or 75),
+                })
+
+        update_spec: Dict[str, Any] = {
+            "$set": set_fields,
+            "$setOnInsert": {
+                "created_at": now,
+                "source": "deal_pool",
+            },
+            "$inc": {
+                "deal_info.total_seen_count": total_seen_inc,
+                "deal_info.tip_hit_count": len(docs_for_item),
+            },
+        }
+        if batch_timeline_entries:
+            update_spec["$push"] = {
+                "deal_info.tips_timeline": {
+                    "$each": batch_timeline_entries,
+                    "$sort": {"publish_ts": -1},
+                    "$slice": 20,
+                }
+            }
+        add_to_set: Dict[str, Any] = {}
+        if all_sites:
+            add_to_set["deal_info.resonance_sites"] = {"$each": all_sites}
+        if all_channels:
+            add_to_set["deal_info.resonance_channels"] = {"$each": all_channels}
+        if add_to_set:
+            update_spec["$addToSet"] = add_to_set
+
+        ops.append(UpdateOne({"platform": plat, "product_id": pid}, update_spec, upsert=True))
+
+    res = formal_col.bulk_write(ops, ordered=False)
+    try:
+        if is_meili_available():
+            index_documents(product_docs)
+    except Exception as meili_err:
+        logger.warning("线报商品写入正式表后同步 Meilisearch 异常: %s", meili_err)
+
+    return {
+        "upserted": res.upserted_count,
+        "modified": res.modified_count,
+        "matched": res.matched_count,
+        "protected_high_score": protected_high_score,
+        "total_ops": len(ops),
+    }
 
 
 class ProductRepository(BaseRepository):
     COLLECTION_NAME = "products"
     _MAX_COST_PERFORMANCE_CANDIDATES = 2000
-    _DEAL_COST_PERFORMANCE_TTL = 12 * 3600
-    _CN_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
     def _init_indexes(self):
         try:
@@ -139,7 +300,6 @@ class ProductRepository(BaseRepository):
         "deal_info.need_reformat": 1,
         "deal_info.format_info": 1,
     }
-    _PLAIN_SKU_PRICE_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 
     @staticmethod
     def _displayable_content_filter() -> Dict[str, Any]:
@@ -328,10 +488,15 @@ class ProductRepository(BaseRepository):
         if isinstance(product_url, str) and product_url.strip():
             clean_url = product_url.strip()
             target_id = goods_sign or goods_id
-            if platform == "jd" and len(target_id) >= 25 and "_" in target_id and not is_jd_image_key(target_id):
-                if clean_url == f"https://item.jd.com/{target_id}.html":
-                    clean_url = f"https://jingfen.jd.com/detail/{target_id}.html"
-                if not detail and clean_url == f"https://jingfen.jd.com/detail/{target_id}.html":
+            if platform == "jd":
+                clean_url = normalize_jd_material_url(clean_url, target_id) or clean_url
+                if (
+                    not detail
+                    and target_id
+                    and not target_id.isdigit()
+                    and not is_jd_image_key(target_id)
+                    and clean_url == f"https://jingfen.jd.com/detail/{target_id}.html"
+                ):
                     insert_set["product_url"] = clean_url
                 else:
                     update_set["product_url"] = clean_url
@@ -344,11 +509,6 @@ class ProductRepository(BaseRepository):
 
         update_set["updated_at"] = now
         update_set["is_off_promotion"] = False
-        try:
-            from cache import clear_product_off_promotion
-            clear_product_off_promotion(platform, goods_id, goods_sign)
-        except Exception:
-            pass
         if item.get("source") is not None:
             update_set["source"] = item["source"]
         elif not detail:
@@ -405,292 +565,6 @@ class ProductRepository(BaseRepository):
             filter_query["name"] = {"$regex": safe_kw, "$options": "i"}
         return filter_query
 
-    @staticmethod
-    def _is_specless_single_sku(sku_info: Any) -> bool:
-        """判定商品是否属于无细分规格属性的单品（成交价统一以顶层 activity_price 为准）。"""
-        if not isinstance(sku_info, list) or len(sku_info) == 0:
-            return True
-        if len(sku_info) == 1:
-            item = sku_info[0]
-            if not isinstance(item, dict):
-                return True
-            return not any(
-                k not in ("价格", "price", "截图地址", "image_url", "img") and str(v or "").strip()
-                for k, v in item.items()
-            )
-        return False
-
-    @classmethod
-    def _parse_plain_sku_price(cls, price_text: Any) -> Optional[float]:
-        """解析纯数值规格价格（如 '￥41.4' / 41.4）；区间或多档文案返回 None。"""
-        if price_text is None or isinstance(price_text, bool):
-            return None
-        if isinstance(price_text, (int, float, Decimal128)):
-            try:
-                val = cls._amount_float(price_text)
-                return val if math.isfinite(val) and val > 0 else None
-            except (ValueError, TypeError, OverflowError):
-                return None
-        match = cls._PLAIN_SKU_PRICE_RE.fullmatch(str(price_text).strip())
-        if not match:
-            return None
-        try:
-            val = float(match.group(1))
-            return val if math.isfinite(val) and val > 0 else None
-        except (ValueError, OverflowError):
-            return None
-
-    @classmethod
-    def _is_valid_sku_price(cls, price_val: Any, min_limit_price: Optional[float], *, exact_match: bool = False) -> bool:
-        """
-        校验规格价格有效性：
-        1. 必须为大于 0 的有限浮点数/整数/Decimal128；
-        2. 单规格商品（exact_match=True）下，若存在外层 activity_price，规格价格必须与外层当前价格一致；
-        3. 多规格模式下，任何规格价格不得低于全局 activity_price。
-        """
-        if isinstance(price_val, bool) or not isinstance(price_val, (int, float, Decimal128)):
-            return False
-        try:
-            p_float = cls._amount_float(price_val)
-        except (ValueError, TypeError, OverflowError):
-            return False
-        if not math.isfinite(p_float) or p_float <= 0:
-            return False
-        if min_limit_price is not None:
-            if exact_match:
-                if abs(round(p_float, 2) - round(float(min_limit_price), 2)) > 0.01:
-                    return False
-            elif round(p_float, 2) < round(float(min_limit_price), 2):
-                return False
-        return True
-
-    @classmethod
-    def _extract_sku_unit_entries(cls, doc: Dict[str, Any]) -> List[Tuple[float, str, Dict[str, float]]]:
-        """
-        从商品的 format_info 中提取所有合法规格的 (sku_price, raw_base_unit, extracted_units)。
-        尚未完成 format_info 清洗、标记 need_reformat 或外层价格已变但尚未重洗的商品返回空列表（归入末尾兜底组）。
-        """
-        if doc.get("need_reformat") is True:
-            return []
-        if "format_status" in doc and doc.get("format_status") not in (None, "success"):
-            return []
-        raw_format_info = doc.get("format_info")
-        if not isinstance(raw_format_info, dict) or not raw_format_info:
-            return []
-
-        raw_act = cls._first_present(doc, "activity_price", "price")
-        min_act_price = None
-        if raw_act is not None and not isinstance(raw_act, bool):
-            try:
-                act_f = cls._amount_float(raw_act)
-                if math.isfinite(act_f) and act_f > 0:
-                    min_act_price = float(act_f)
-            except (ValueError, TypeError, OverflowError):
-                min_act_price = None
-
-        sku_info_raw = doc.get("sku_info")
-        is_specless = cls._is_specless_single_sku(sku_info_raw)
-
-        raw_fmt_act = doc.get("format_activity_price")
-        if is_specless and min_act_price is not None and raw_fmt_act is not None and not isinstance(raw_fmt_act, bool):
-            try:
-                fmt_act_f = cls._amount_float(raw_fmt_act)
-            except (ValueError, TypeError, OverflowError):
-                return []
-            if not math.isfinite(fmt_act_f) or fmt_act_f <= 0 or abs(min_act_price - fmt_act_f) > 0.01:
-                return []
-
-        raw_sku_list: List[Tuple[float, Dict[str, Any]]] = []
-        if "pricing_basis" in raw_format_info and isinstance(raw_format_info.get("pricing_basis"), dict):
-            sku_price = raw_format_info.get("price")
-            if cls._is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
-                raw_sku_list.append((cls._amount_float(sku_price), raw_format_info))
-        else:
-            sku_info_list = sku_info_raw if isinstance(sku_info_raw, list) else []
-            product_id = str(doc.get("product_id") or doc.get("goods_id") or doc.get("goods_sign") or "").strip()
-            stale_sku_ids = set()
-            if not is_specless and sku_info_list and product_id:
-                snap_map = doc.get("format_sku_prices") if isinstance(doc.get("format_sku_prices"), dict) else {}
-                for idx, sku_item in enumerate(sku_info_list, start=1):
-                    if not isinstance(sku_item, dict):
-                        continue
-                    sku_id = f"{product_id}_{idx}"
-                    has_cn_price = "价格" in sku_item and sku_item.get("价格") is not None
-                    cur_p_str = str(sku_item.get("价格") or "").strip() if has_cn_price else ""
-                    if sku_id in snap_map and has_cn_price:
-                        if str(snap_map[sku_id]).strip() != cur_p_str:
-                            stale_sku_ids.add(sku_id)
-                            continue
-                    sku_fmt_entry = raw_format_info.get(sku_id)
-                    if isinstance(sku_fmt_entry, dict):
-                        cur_num = (
-                            cls._parse_plain_sku_price(cur_p_str)
-                            if has_cn_price
-                            else cls._parse_plain_sku_price(sku_item.get("price"))
-                        )
-                        if cur_num is not None:
-                            try:
-                                fmt_p = cls._amount_float(sku_fmt_entry.get("price"))
-                            except (ValueError, TypeError, OverflowError):
-                                fmt_p = None
-                            if fmt_p is None or not math.isfinite(fmt_p) or fmt_p <= 0 or abs(cur_num - fmt_p) > 0.01:
-                                stale_sku_ids.add(sku_id)
-
-            if sku_info_list and product_id:
-                for idx in range(1, len(sku_info_list) + 1):
-                    sku_id = f"{product_id}_{idx}"
-                    if sku_id in stale_sku_ids:
-                        continue
-                    sku_fmt = raw_format_info.get(sku_id)
-                    if not isinstance(sku_fmt, dict) or not isinstance(sku_fmt.get("pricing_basis"), dict):
-                        continue
-                    sku_price = sku_fmt.get("price")
-                    if cls._is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
-                        raw_sku_list.append((cls._amount_float(sku_price), sku_fmt))
-
-            if not raw_sku_list:
-                for sku_key, sku_fmt in raw_format_info.items():
-                    if sku_key in stale_sku_ids:
-                        continue
-                    if isinstance(sku_fmt, dict) and isinstance(sku_fmt.get("pricing_basis"), dict):
-                        sku_price = sku_fmt.get("price")
-                        if cls._is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
-                            raw_sku_list.append((cls._amount_float(sku_price), sku_fmt))
-
-        return [cls._parse_pricing_basis_entry(sku_price, sku_fmt) for sku_price, sku_fmt in raw_sku_list]
-
-    @staticmethod
-    def _parse_pricing_basis_entry(
-        sku_price: float,
-        sku_fmt: Dict[str, Any],
-    ) -> Tuple[float, str, Dict[str, float]]:
-        """将单条清洗后的规格 format_info 转换为 (sku_price, raw_base_unit, extracted_units)。"""
-        pricing_basis = sku_fmt.get("pricing_basis") or {}
-        raw_structure = pricing_basis.get("structure")
-        raw_base_unit = str(pricing_basis.get("base_unit") or "").strip() or "件"
-        raw_total_val = pricing_basis.get("total_value")
-
-        total_val_float = None
-        if raw_total_val is not None and not isinstance(raw_total_val, bool):
-            try:
-                tv = float(raw_total_val)
-                if math.isfinite(tv) and tv > 0:
-                    total_val_float = tv
-            except (ValueError, TypeError):
-                total_val_float = None
-
-        extracted_units: Dict[str, float] = {}
-        current_accum = 1.0
-        if isinstance(raw_structure, list) and raw_structure:
-            for struct_item in raw_structure:
-                if not isinstance(struct_item, dict):
-                    continue
-                u = str(struct_item.get("unit") or "").strip()
-                v = struct_item.get("value")
-                val_float = 1.0
-                if v is not None and not isinstance(v, bool):
-                    try:
-                        vf = float(v)
-                        if math.isfinite(vf) and vf > 0:
-                            val_float = vf
-                    except (ValueError, TypeError):
-                        val_float = 1.0
-                current_accum *= val_float
-                if u:
-                    extracted_units[u] = current_accum
-
-        if raw_base_unit:
-            final_val = total_val_float if total_val_float is not None else current_accum
-            extracted_units[raw_base_unit] = final_val
-
-        if not extracted_units:
-            extracted_units["件"] = 1.0
-
-        return (sku_price, raw_base_unit, extracted_units)
-
-    @classmethod
-    def _parse_deal_publish_timestamp(cls, val: Any) -> Optional[float]:
-        """将线报 publish_time（ISO 字符串、北京时间字符串、datetime 或数值时间戳）解析为秒级 Unix 时间戳。"""
-        if val is None or isinstance(val, bool):
-            return None
-        if isinstance(val, datetime.datetime):
-            dt = val.replace(tzinfo=cls._CN_TZ) if val.tzinfo is None else val
-            return dt.timestamp()
-        if isinstance(val, (int, float)):
-            ts = float(val)
-            if not math.isfinite(ts) or ts <= 0:
-                return None
-            return ts / 1000.0 if ts > 1e12 else ts
-        if isinstance(val, str):
-            s = val.strip()
-            if not s:
-                return None
-            if s.endswith(("Z", "z")):
-                s = s[:-1] + "+00:00"
-            if "/" in s[:10]:
-                s = s.replace("/", "-", 2)
-            try:
-                dt = datetime.datetime.fromisoformat(s)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=cls._CN_TZ)
-                return dt.timestamp()
-            except ValueError:
-                pass
-            for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16)):
-                try:
-                    return datetime.datetime.strptime(s[:width], fmt).replace(tzinfo=cls._CN_TZ).timestamp()
-                except ValueError:
-                    continue
-        return None
-
-    @classmethod
-    def _extract_fresh_deal_unit_entries(
-        cls,
-        doc: Dict[str, Any],
-        *,
-        now_ts: Optional[float] = None,
-    ) -> List[Tuple[float, str, Dict[str, float]]]:
-        """
-        若商品附带 12 小时内发布的有效爆料（is_deal_tip=True）且线报已完成结构化清洗（deal_info.format_info），
-        直接采用爆料清洗结构与爆料到手价计算性价比；否则返回空列表回退外层官方数据。
-        """
-        deal_info = doc.get("deal_info")
-        if not isinstance(deal_info, dict) or deal_info.get("is_deal_tip") is not True:
-            return []
-        if deal_info.get("need_reformat") is True or deal_info.get("format_status") != "success":
-            return []
-        deal_fmt = deal_info.get("format_info")
-        if not isinstance(deal_fmt, dict) or not isinstance(deal_fmt.get("pricing_basis"), dict):
-            return []
-
-        pub_ts = cls._parse_deal_publish_timestamp(deal_info.get("publish_time"))
-        cur_ts = float(now_ts) if now_ts is not None else time.time()
-        if pub_ts is None or (cur_ts - pub_ts) > cls._DEAL_COST_PERFORMANCE_TTL or (pub_ts - cur_ts) > 300.0:
-            return []
-
-        raw_dp = deal_info.get("deal_price")
-        if raw_dp is None or isinstance(raw_dp, bool):
-            return []
-        try:
-            deal_price = cls._amount_float(raw_dp)
-        except (ValueError, TypeError, OverflowError):
-            return []
-        if not math.isfinite(deal_price) or deal_price <= 0:
-            return []
-
-        for snap_val in (deal_info.get("format_deal_price"), deal_fmt.get("price")):
-            if snap_val is not None:
-                if isinstance(snap_val, bool):
-                    return []
-                try:
-                    snap_f = cls._amount_float(snap_val)
-                except (ValueError, TypeError, OverflowError):
-                    return []
-                if not math.isfinite(snap_f) or snap_f <= 0 or abs(round(deal_price, 2) - round(snap_f, 2)) > 0.01:
-                    return []
-
-        return [cls._parse_pricing_basis_entry(deal_price, deal_fmt)]
-
     def rank_boom_products_by_cost_performance(
         self,
         platform: str = "all",
@@ -698,12 +572,7 @@ class ProductRepository(BaseRepository):
         keyword: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        查询爆单库候选商品并按性价比排序：
-        1. 若商品存在 12 小时内的爆料且已完成线报清洗（deal_info.format_info），优先按爆料清洗数据计算性价比，否则回退外层官方 format_info；
-        2. 提取各商品合法规格的单位结构，按同类度量衡出现频次统一目标单位（如 kg/斤/克 -> g）；
-        3. 多 SKU 商品取其合法规格中性价比最高的主规格参与排序；
-        4. 按出现最多的单位优先、同单位内性价比从高到低排序，第二多的单位次之，依此类推；
-        5. 尚未完成 format_info 清洗的商品按最新上架顺序排在末尾用作兜底。
+        查询爆单库候选商品并委托纯领域性价比引擎 (`models.cost_performance`) 排序。
         """
         filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
         raw_docs = None
@@ -744,136 +613,11 @@ class ProductRepository(BaseRepository):
             )
             raw_docs = list(cursor)
 
-        formatted_candidates: List[Tuple[Dict[str, Any], List[Tuple[float, str, Dict[str, float]]]]] = []
-        unformatted_items: List[Dict[str, Any]] = []
-        category_unit_counts: Dict[str, Dict[str, int]] = {}
-        now_ts = time.time()
-
-        for doc in raw_docs:
-            summary = self._normalize_doc_summary(doc)
-            sku_entries = (
-                self._extract_fresh_deal_unit_entries(doc, now_ts=now_ts)
-                or self._extract_sku_unit_entries(doc)
-            )
-            if not sku_entries:
-                unformatted_items.append(summary)
-                continue
-
-            formatted_candidates.append((summary, sku_entries))
-            for _, _, extracted_units in sku_entries:
-                for u in extracted_units.keys():
-                    cat = UNIT_TO_CATEGORY.get(u)
-                    if cat:
-                        if cat not in category_unit_counts:
-                            category_unit_counts[cat] = {}
-                        category_unit_counts[cat][u] = category_unit_counts[cat].get(u, 0) + 1
-
-        category_target_unit: Dict[str, str] = {}
-        for cat, counts in category_unit_counts.items():
-            category_target_unit[cat] = max(counts.items(), key=lambda x: x[1])[0]
-
-        # 1. 收集所有商品的主单位集合 (active_base_units) 及每个商品在各单位下的最高性价比得分
-        product_unit_scores: List[Tuple[str, Dict[str, float]]] = []
-        active_base_units = set()
-
-        for idx, (summary, sku_entries) in enumerate(formatted_candidates):
-            unit_best_scores: Dict[str, float] = {}
-            best_primary_unit = "件"
-            best_primary_score = -1.0
-
-            for sku_price, raw_base_unit, extracted_units in sku_entries:
-                normalized_units: Dict[str, float] = {}
-                for u, val in extracted_units.items():
-                    cat = UNIT_TO_CATEGORY.get(u)
-                    final_u = u
-                    final_val = val
-                    if cat and cat in category_target_unit:
-                        tgt_u = category_target_unit[cat]
-                        if u != tgt_u:
-                            orig_mul = UNIT_TO_MULTIPLIER[u]
-                            tgt_mul = UNIT_TO_MULTIPLIER[tgt_u]
-                            final_val = val * (orig_mul / tgt_mul)
-                        final_u = tgt_u
-                    normalized_units[final_u] = round(final_val, 4) if isinstance(final_val, float) else final_val
-
-                cat = UNIT_TO_CATEGORY.get(raw_base_unit)
-                primary_base_unit = category_target_unit[cat] if (cat and cat in category_target_unit) else raw_base_unit
-                if primary_base_unit not in normalized_units:
-                    primary_base_unit = next(iter(normalized_units.keys()), "件")
-                active_base_units.add(primary_base_unit)
-
-                for u, raw_val in normalized_units.items():
-                    val_num = float(raw_val) if raw_val and raw_val > 0 else 1.0
-                    score = round(val_num / sku_price, 6) if sku_price and sku_price > 0 else 0.0
-                    if score > unit_best_scores.get(u, -1.0):
-                        unit_best_scores[u] = score
-                    if u == primary_base_unit and score > best_primary_score:
-                        best_primary_score = score
-                        best_primary_unit = primary_base_unit
-
-            product_unit_scores.append((best_primary_unit, unit_best_scores))
-
-        # 2. 将商品放入其支持的各个主单位分组中（同一单位内部按性价比从高到低排序）
-        unit_groups: Dict[str, List[Tuple[float, int, int]]] = {}
-        for idx, (best_primary_unit, unit_best_scores) in enumerate(product_unit_scores):
-            matched_any = False
-            for u, score in unit_best_scores.items():
-                if u in active_base_units:
-                    unit_groups.setdefault(u, []).append((score, -idx, idx))
-                    matched_any = True
-            if not matched_any:
-                score = unit_best_scores.get(best_primary_unit, 0.0)
-                unit_groups.setdefault(best_primary_unit, []).append((score, -idx, idx))
-
-        for group in unit_groups.values():
-            group.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-        # 3. 不同单位之间：按商品数量从多到少排序，并按数量比例计算每轮轮询名额 (quota)
-        ordered_units = sorted(
-            unit_groups.keys(),
-            key=lambda u: (len(unit_groups[u]), unit_groups[u][0][0]),
-            reverse=True,
+        return rank_products_by_cost_performance(
+            raw_docs,
+            normalize_summary=self._normalize_doc_summary,
+            now_ts=time.time(),
         )
-
-        sorted_items: List[Dict[str, Any]] = []
-        if ordered_units:
-            counts = [len(unit_groups[u]) for u in ordered_units]
-            min_count = max(1, min(counts))
-            max_count = max(counts)
-            # 若最大组与最小组悬殊过大（超过 5 倍），将单轮最大名额封顶为 5，确保少见单位的好商品也能在首屏靠前展示
-            base_step = float(min_count) if (max_count / min_count) <= 5 else (max_count / 5.0)
-            unit_quotas = {
-                u: max(1, int(len(unit_groups[u]) / base_step + 0.5))
-                for u in ordered_units
-            }
-
-            unit_cursors = {u: 0 for u in ordered_units}
-            emitted_indices = set()
-            total_formatted = len(formatted_candidates)
-
-            while len(emitted_indices) < total_formatted:
-                progressed = False
-                for u in ordered_units:
-                    group = unit_groups[u]
-                    cursor = unit_cursors[u]
-                    quota = unit_quotas[u]
-                    taken = 0
-                    while cursor < len(group) and taken < quota:
-                        _, _, cand_idx = group[cursor]
-                        cursor += 1
-                        if cand_idx in emitted_indices:
-                            continue
-                        emitted_indices.add(cand_idx)
-                        sorted_items.append(formatted_candidates[cand_idx][0])
-                        taken += 1
-                        progressed = True
-                    unit_cursors[u] = cursor
-                if not progressed:
-                    break
-
-        # 尚未完成 format_info 清洗的商品排在末尾用作兜底
-        sorted_items.extend(unformatted_items)
-        return sorted_items
 
     def query_boom_products(
         self,
@@ -900,7 +644,7 @@ class ProductRepository(BaseRepository):
                 has_more = (skip + page_size) < len(sorted_items)
                 return {
                     "status": "success",
-                    "total_count": len(page_items) if keyword else len(sorted_items),
+                    "total_count": len(sorted_items),
                     "page": page,
                     "page_size": page_size,
                     "has_more": has_more,
@@ -939,6 +683,7 @@ class ProductRepository(BaseRepository):
                     sort_by=sort_by,
                     limit=page_size + 1,
                     offset=skip,
+                    only_active_boom=True,
                 )
                 if meili_hits is not None:
                     if not meili_hits:
@@ -953,7 +698,7 @@ class ProductRepository(BaseRepository):
                     doc_keys = [(h.get("platform"), h.get("product_id")) for h in meili_hits]
                     or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
                     if or_clauses:
-                        mongo_docs = list(self.col.find({"$and": [{"$or": or_clauses}, {"is_off_promotion": {"$ne": True}}]}, self._SUMMARY_PROJECTION))
+                        mongo_docs = list(self.col.find({"$and": [{"$or": or_clauses}, self._boom_content_filter()]}, self._SUMMARY_PROJECTION))
                         docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
                         ordered_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
                         has_more = len(ordered_docs) > page_size
@@ -1082,10 +827,10 @@ class ProductRepository(BaseRepository):
 
     @staticmethod
     def _format_deal_datetime(raw_val: Any) -> str:
-        """统一将线报时间字段格式化为北京时间 `YYYY-MM-DD HH:MM`，空值或无效值返回空串。"""
+        """统一将线报时间字段格式化为北京时间 `YYYY-MM-DD HH:MM`，naive datetime 按 UTC 契约转换，无效值返回空串。"""
         tz_cn = datetime.timezone(datetime.timedelta(hours=8))
         if isinstance(raw_val, datetime.datetime):
-            dt = raw_val.astimezone(tz_cn) if raw_val.tzinfo is not None else raw_val
+            dt = (raw_val.replace(tzinfo=datetime.timezone.utc) if raw_val.tzinfo is None else raw_val).astimezone(tz_cn)
             return dt.strftime("%Y-%m-%d %H:%M")
         if isinstance(raw_val, str) and raw_val.strip():
             s = raw_val.strip()
@@ -1576,7 +1321,7 @@ class ProductRepository(BaseRepository):
             )
             if self._is_meili_searchable():
                 try:
-                    index_documents(goods_list)
+                    index_documents(effective_list)
                 except Exception:
                     pass
             return upserted_count
@@ -1593,7 +1338,6 @@ class ProductRepository(BaseRepository):
         将完成 AI 清洗与官方转链的高分好价商品晋升入库到正式表 (`products`)，
         并原子确定性触发 Meilisearch 搜索索引同步，使商品自动具备即时模糊检索与性价比排序能力。
         """
-        from services.deal_pool_cleaner import upsert_cleaned_products_to_formal_table
         return upsert_cleaned_products_to_formal_table(self.col, product_docs)
 
     _DETAIL_CAS_ATTEMPTS = 4
@@ -1875,12 +1619,22 @@ class ProductRepository(BaseRepository):
             )
             raw_mod = getattr(res, "modified_count", 0)
             modified = int(raw_mod) if isinstance(raw_mod, (int, float)) else 0
-            if matched_docs and gid:
-                self._record_deletion_tombstones(plat, matched_docs)
-            if self._is_meili_searchable() and gid:
+            deleted_pids: List[str] = []
+            seen_pids: Set[str] = set()
+            for d in matched_docs:
+                pid = self._real_goods_id(d.get("product_id") or d.get("goods_id"))
+                if pid and pid not in seen_pids:
+                    seen_pids.add(pid)
+                    deleted_pids.append(pid)
+            if gid and gid not in seen_pids:
+                seen_pids.add(gid)
+                deleted_pids.append(gid)
+            tombstone_docs = matched_docs or ([{"product_id": gid, "goods_sign": gsign}] if gid else [])
+            if tombstone_docs and deleted_pids:
+                self._record_deletion_tombstones(plat, tombstone_docs)
+            if self._is_meili_searchable() and deleted_pids:
                 try:
-                    from infrastructure.search_meili import delete_documents, make_meili_doc_id
-                    delete_documents([make_meili_doc_id(plat, gid)])
+                    delete_documents([make_meili_doc_id(plat, pid) for pid in deleted_pids])
                 except Exception:
                     pass
             if modified > 0:
@@ -1927,6 +1681,16 @@ class ProductRepository(BaseRepository):
         filter_spec["product_id"] = {"$ne": new_id}
 
         try:
+            matched_pids: List[str] = []
+            try:
+                for d in self.col.find(filter_spec, {"_id": 0, "product_id": 1, "goods_id": 1}):
+                    pid = self._real_goods_id(d.get("product_id") or d.get("goods_id"))
+                    if pid and pid not in matched_pids:
+                        matched_pids.append(pid)
+            except Exception:
+                pass
+            if old_id and old_id not in matched_pids:
+                matched_pids.append(old_id)
             now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             res = self.col.update_many(
                 filter_spec,
@@ -1942,10 +1706,9 @@ class ProductRepository(BaseRepository):
             )
             raw_mod = getattr(res, "modified_count", 0)
             modified = int(raw_mod) if isinstance(raw_mod, (int, float)) else 0
-            if self._is_meili_searchable() and old_id:
+            if self._is_meili_searchable() and matched_pids:
                 try:
-                    from infrastructure.search_meili import delete_documents, make_meili_doc_id
-                    delete_documents([make_meili_doc_id(plat, old_id)])
+                    delete_documents([make_meili_doc_id(plat, pid) for pid in matched_pids])
                 except Exception:
                     pass
             if modified > 0:

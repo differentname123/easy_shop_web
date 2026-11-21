@@ -209,91 +209,31 @@
   };
 
   shop.createImeGuard = function () {
-    const composing = Object.create(null);
-    const isComposing = key => Boolean(composing[key]);
-    const onCompositionStart = (key, event) => {
-      composing[key] = true;
-      if (event && event.target) event.target.composing = true;
-    };
-    const onCompositionEnd = (key, modelRef, event) => {
-      composing[key] = false;
-      const el = event && event.target;
-      if (!el) return;
-      if (el.composing) el.composing = false;
-      const snapshot = typeof el.value === 'string' ? el.value : '';
-      if (modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
-        modelRef.value = el.value;
-      }
-      const syncDelayedCommit = () => {
-        if (!composing[key] && (!el || !el.composing) && typeof el.value === 'string' && el.value !== snapshot && modelRef && modelRef.value !== el.value) {
-          modelRef.value = el.value;
-        }
-      };
-      Promise.resolve().then(syncDelayedCommit);
-      global.setTimeout(syncDelayedCommit, 0);
-    };
-    const onInput = (key, modelRef, event) => {
-      const el = event && event.target;
-      if (!el) return true;
-      if (event && event.isComposing) {
-        composing[key] = true;
-        el.composing = true;
-        return false;
-      }
-      if (composing[key]) return false;
-      if (el.composing) el.composing = false;
-      if (modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
-        modelRef.value = el.value;
-      }
-      return true;
-    };
-    const onReset = (key, modelRef, event, syncValue = false) => {
-      composing[key] = false;
-      const el = event && event.target;
-      if (el) {
-        if (el.composing) el.composing = false;
-        if (syncValue && modelRef && typeof el.value === 'string' && modelRef.value !== el.value) {
-          modelRef.value = el.value;
-        }
-      }
-    };
-    const syncElementToRef = (key, modelRef, el, forceFromDom = false) => {
+    const syncElementToRef = (modelRef, el, forceFromDom = false) => {
       if (!el || typeof el.value !== 'string' || !modelRef) return;
-      if (forceFromDom) {
-        composing[key] = false;
+      if (forceFromDom || (!String(modelRef.value || '').trim() && el.value.trim())) {
         if (el.composing) el.composing = false;
         if (modelRef.value !== el.value) modelRef.value = el.value;
-        return;
-      }
-      if (!String(modelRef.value || '').trim() && el.value.trim()) {
-        composing[key] = false;
-        if (el.composing) el.composing = false;
-        modelRef.value = el.value;
       }
     };
-    const clearElementAndRef = (key, modelRef, el) => {
-      composing[key] = false;
+    const clearElementAndRef = (modelRef, el) => {
       if (el) {
         if (el.composing) el.composing = false;
         if (typeof el.value === 'string') el.value = '';
       }
       if (modelRef) modelRef.value = '';
     };
-    const onEnterKeydown = (key, modelRef, el, submitFn, event) => {
+    const onEnterKeydown = (modelRef, el, submitFn, event) => {
       const eventComposing = Boolean(
-        composing[key] ||
-        (event && (event.isComposing || ((event.keyCode === 229 || event.which === 229) && (composing[key] || (event.target && event.target.composing)))))
+        event && (event.isComposing || ((event.keyCode === 229 || event.which === 229) && event.target && event.target.composing))
       );
       if (eventComposing) return false;
       const targetEl = (event && event.target) || el;
-      syncElementToRef(key, modelRef, targetEl, true);
+      syncElementToRef(modelRef, targetEl, true);
       if (event && typeof event.preventDefault === 'function') event.preventDefault();
       if (typeof submitFn === 'function') submitFn();
       return true;
     };
-    return {
-      isComposing, onCompositionStart, onCompositionEnd, onInput, onReset,
-      syncElementToRef, clearElementAndRef, onEnterKeydown,
-    };
+    return { syncElementToRef, clearElementAndRef, onEnterKeydown };
   };
 })(globalThis);

@@ -26,15 +26,6 @@ class PromoterUsers(MemoryUserRepository):
         return self.promoters.get(promoter_id)
 
 
-@pytest.fixture(autouse=True)
-def isolated_sync_state():
-    for state in (module._LAST_SYNC_TIMESTAMP, module._LAST_SYNC_ATTEMPT, module._SYNC_STATE):
-        state.clear()
-    yield
-    for state in (module._LAST_SYNC_TIMESTAMP, module._LAST_SYNC_ATTEMPT, module._SYNC_STATE):
-        state.clear()
-
-
 def service_for(monkeypatch, adapter=None, repo=None, sync=None, users=None):
     adapter = adapter or Adapter()
     monkeypatch.setattr(module, "get_adapter", lambda _: adapter)

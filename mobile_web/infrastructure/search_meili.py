@@ -4,24 +4,23 @@ Meilisearch 全文搜索引擎客户端基础设施
 负责商品数据的毫秒级搜索、高精度拼写容错、分词与分面过滤，
 并在服务不可用或被禁用时自动优雅降级，保障业务零中断。
 """
+import datetime
 import re
 import time
-import datetime
-from typing import Dict, Any, List, Optional, Tuple
 from threading import RLock
+from typing import Any, Dict, List, Optional
 
-from config import logger
+from infrastructure.http_utils import clean_money
+from infrastructure.logging_utils import format_exc_summary, get_app_logger
 from infrastructure.settings import get_settings
-from infrastructure.logging_utils import format_exc_summary
+
+logger = get_app_logger("search_meili")
 
 try:
     import meilisearch
-    from meilisearch.errors import MeilisearchError, MeilisearchCommunicationError
     _MEILISEARCH_INSTALLED = True
 except ImportError:
     meilisearch = None
-    MeilisearchError = Exception
-    MeilisearchCommunicationError = Exception
     _MEILISEARCH_INSTALLED = False
 
 INDEX_NAME = "products"
@@ -33,6 +32,16 @@ _IS_AVAILABLE = False
 _AVAILABILITY_CACHE_TTL = 10.0  # 健康检测缓存 10 秒，避免高频 I/O 阻塞主线程
 
 _INVALID_ID_CHARS_RE = re.compile(r"[^a-zA-Z0-9-_]")
+
+
+def reset_meili_state() -> None:
+    """重置 Meilisearch 客户端与健康缓存（供测试或配置重置使用）。"""
+    global _CLIENT_INSTANCE, _INDEX_CONFIGURED, _LAST_AVAILABILITY_CHECK, _IS_AVAILABLE
+    with _CLIENT_LOCK:
+        _CLIENT_INSTANCE = None
+        _INDEX_CONFIGURED = False
+        _LAST_AVAILABILITY_CHECK = 0.0
+        _IS_AVAILABLE = False
 
 
 def make_meili_doc_id(platform: str, product_id: str) -> str:
@@ -57,31 +66,24 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     platform = str(doc.get("platform") or "other").strip().lower()
     doc_id = make_meili_doc_id(platform, product_id)
 
-    def _safe_float(val: Any, default: float = 0.0) -> float:
-        if val is None or isinstance(val, bool):
-            return default
-        try:
-            f = float(val)
-            return f if f == f and f != float("inf") and f != float("-inf") else default
-        except (ValueError, TypeError):
-            return default
-
-    price = _safe_float(doc.get("price"))
-    activity_price = _safe_float(doc.get("activity_price"), default=price)
-    saved_price = _safe_float(doc.get("saved_price"))
+    price = clean_money(doc.get("price"), 0.0) or 0.0
+    activity_price = clean_money(doc.get("activity_price"), price)
+    if activity_price is None:
+        activity_price = price
+    saved_price = clean_money(doc.get("saved_price"), 0.0) or 0.0
     if saved_price <= 0 and price > activity_price > 0:
         saved_price = round(price - activity_price, 2)
 
     updated_at = doc.get("updated_at")
     if isinstance(updated_at, datetime.datetime):
         ts = int(updated_at.timestamp())
-    elif isinstance(updated_at, (int, float)):
+    elif isinstance(updated_at, (int, float)) and not isinstance(updated_at, bool):
         ts = int(updated_at / 1000) if updated_at > 1e12 else int(updated_at)
     else:
         ts = int(time.time())
 
     deal_info = doc.get("deal_info") or {}
-    is_deal_tip = bool(deal_info.get("is_deal_tip"))
+    is_deal_tip = bool(isinstance(deal_info, dict) and deal_info.get("is_deal_tip"))
     channel_type = doc.get("channel_type")
     if channel_type is not None and not isinstance(channel_type, int):
         try:
@@ -150,8 +152,15 @@ def get_meili_client() -> Optional[Any]:
             return None
 
 
+def _mark_unavailable() -> None:
+    global _IS_AVAILABLE, _LAST_AVAILABILITY_CHECK
+    with _CLIENT_LOCK:
+        _IS_AVAILABLE = False
+        _LAST_AVAILABILITY_CHECK = time.monotonic()
+
+
 def is_meili_available(force_check: bool = False) -> bool:
-    """带 TTL 缓存的健康状态检测，避免服务宕机时阻塞主干流程"""
+    """带单调时钟 TTL 缓存的健康状态检测，避免服务宕机时阻塞主干流程"""
     global _LAST_AVAILABILITY_CHECK, _IS_AVAILABLE
     if not _MEILISEARCH_INSTALLED:
         return False
@@ -160,28 +169,28 @@ def is_meili_available(force_check: bool = False) -> bool:
     if client is None:
         return False
 
-    now = time.time()
-    if not force_check and (now - _LAST_AVAILABILITY_CHECK) < _AVAILABILITY_CACHE_TTL:
+    now = time.monotonic()
+    if not force_check and _LAST_AVAILABILITY_CHECK > 0.0 and (now - _LAST_AVAILABILITY_CHECK) < _AVAILABILITY_CACHE_TTL:
         return _IS_AVAILABLE
 
     with _CLIENT_LOCK:
-        if not force_check and (time.time() - _LAST_AVAILABILITY_CHECK) < _AVAILABILITY_CACHE_TTL:
+        now = time.monotonic()
+        if not force_check and _LAST_AVAILABILITY_CHECK > 0.0 and (now - _LAST_AVAILABILITY_CHECK) < _AVAILABILITY_CACHE_TTL:
             return _IS_AVAILABLE
         try:
             health = client.health()
             _IS_AVAILABLE = bool(health and health.get("status") == "available")
-            _LAST_AVAILABILITY_CHECK = time.time()
+            _LAST_AVAILABILITY_CHECK = time.monotonic()
             return _IS_AVAILABLE
         except Exception as e:
             _IS_AVAILABLE = False
-            _LAST_AVAILABILITY_CHECK = time.time()
+            _LAST_AVAILABILITY_CHECK = time.monotonic()
             logger.debug("⚠️ 【Meilisearch健康检测失败】服务当前不可用，将自动降级: %s", format_exc_summary(e))
             return False
 
 
 # 电商高频搜索同义词与简称对照表
 DEFAULT_SYNONYMS: Dict[str, List[str]] = {
-    # 饮料冲调
     "可乐": ["可口可乐", "百事可乐"],
     "可口可乐": ["可乐"],
     "百事可乐": ["可乐"],
@@ -191,7 +200,6 @@ DEFAULT_SYNONYMS: Dict[str, List[str]] = {
     "牛奶": ["纯牛奶", "鲜奶"],
     "酸奶": ["发酵乳", "风味发酵乳"],
     "咖啡": ["美式咖啡", "拿铁咖啡", "速溶咖啡"],
-    # 纸品湿巾与家居日化
     "抽纸": ["纸巾", "面巾纸", "抽纸巾"],
     "纸巾": ["抽纸", "面巾纸", "餐巾纸"],
     "卷纸": ["卷筒纸", "卫生纸"],
@@ -201,11 +209,9 @@ DEFAULT_SYNONYMS: Dict[str, List[str]] = {
     "洗发水": ["洗发露", "洗发膏"],
     "沐浴露": ["沐浴乳", "沐浴液"],
     "牙膏": ["洁齿膏"],
-    # 粮油速食
     "方便面": ["泡面", "速食面"],
     "挂面": ["面条", "手排面"],
     "食用油": ["花生油", "大豆油", "菜籽油", "玉米油"],
-    # 数码配件
     "充电宝": ["移动电源"],
     "数据线": ["充电线", "快充线"],
     "耳机": ["蓝牙耳机", "无线耳机"],
@@ -214,7 +220,7 @@ DEFAULT_SYNONYMS: Dict[str, List[str]] = {
 
 
 def ensure_index_configured() -> bool:
-    """确保 products 索引及分词过滤属性已就绪"""
+    """确保 products 索引及分词过滤属性已就绪（单次原子 update_settings）。"""
     global _INDEX_CONFIGURED
     if _INDEX_CONFIGURED:
         return True
@@ -234,18 +240,23 @@ def ensure_index_configured() -> bool:
                 client.create_index(INDEX_NAME, {"primaryKey": "id"})
                 index = client.index(INDEX_NAME)
 
-            # 配置可搜索字段、可过滤字段、可排序字段与排序规则
-            index.update_searchable_attributes(["name", "brand", "mall_name", "category", "search_keywords"])
-            index.update_filterable_attributes(["platform", "category", "is_off_promotion", "is_deal_tip", "channel_type"])
-            index.update_sortable_attributes(["updated_at", "activity_price", "price", "saved_price"])
-            index.update_ranking_rules(["words", "typo", "proximity", "attribute", "sort", "exactness"])
-            index.update_synonyms(DEFAULT_SYNONYMS)
+            index.update_settings({
+                "searchableAttributes": ["name", "brand", "mall_name", "category", "search_keywords"],
+                "filterableAttributes": ["platform", "category", "is_off_promotion", "is_deal_tip", "channel_type"],
+                "sortableAttributes": ["updated_at", "activity_price", "price", "saved_price"],
+                "rankingRules": ["words", "typo", "proximity", "attribute", "sort", "exactness"],
+                "synonyms": DEFAULT_SYNONYMS,
+            })
             _INDEX_CONFIGURED = True
             logger.info("✅ 【Meilisearch索引就绪】products 索引及同义词配置已完成")
             return True
         except Exception as e:
             logger.warning("❌ 【Meilisearch配置索引异常】: %s", format_exc_summary(e))
             return False
+
+
+def _escape_filter_val(val: str) -> str:
+    return val.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def search_products(
@@ -276,10 +287,9 @@ def search_products(
 
         filter_exprs = ["NOT is_off_promotion = true"]
         if platform and platform.lower() != "all":
-            filter_exprs.append(f'platform = "{platform.lower()}"')
+            filter_exprs.append(f'platform = "{_escape_filter_val(platform.lower())}"')
         if category and category.strip() and category.strip() != "全部":
-            safe_cat = category.strip().replace('"', '\\"')
-            filter_exprs.append(f'category = "{safe_cat}"')
+            filter_exprs.append(f'category = "{_escape_filter_val(category.strip())}"')
         if only_active_boom:
             filter_exprs.append("(channel_type IS NOT NULL OR is_deal_tip = true)")
 
@@ -301,7 +311,6 @@ def search_products(
         if sort_rule:
             search_params["sort"] = sort_rule
 
-        # 过滤掉 None 值的键
         search_params = {k: v for k, v in search_params.items() if v is not None}
 
         result = index.search(keyword.strip(), search_params)
@@ -316,8 +325,7 @@ def search_products(
 
         return hits
     except Exception as e:
-        global _IS_AVAILABLE
-        _IS_AVAILABLE = False
+        _mark_unavailable()
         logger.warning(
             "❌ 【Meilisearch检索失败】关键词[%s] 平台[%s] 异常<%s>，自动回退到数据库查询",
             keyword, platform, format_exc_summary(e),
@@ -346,9 +354,10 @@ def index_documents(docs: List[Dict[str, Any]]) -> int:
     try:
         ensure_index_configured()
         index = client.index(INDEX_NAME)
-        task = index.add_documents(formatted)
+        index.add_documents(formatted)
         return len(formatted)
     except Exception as e:
+        _mark_unavailable()
         logger.warning("❌ 【Meilisearch增量同步失败】提交[%d]条文档发生异常: %s", len(formatted), format_exc_summary(e))
         return 0
 
@@ -368,18 +377,13 @@ def delete_documents(doc_ids: List[str]) -> int:
         index.delete_documents(doc_ids)
         return len(doc_ids)
     except Exception as e:
+        _mark_unavailable()
         logger.warning("❌ 【Meilisearch删除文档失败】: %s", format_exc_summary(e))
         return 0
 
 
 def sync_all_products(mongo_db, batch_size: int = 2000, progress_cb=None) -> int:
-    """
-    全量将 MongoDB products 集合同步到 Meilisearch
-    :param mongo_db: MongoDB 数据库实例
-    :param batch_size: 批处理数量
-    :param progress_cb: 进度回调函数 callback(synced_count, total_count)
-    :return: 成功同步的总记录数
-    """
+    """全量将 MongoDB products 集合同步到 Meilisearch"""
     client = get_meili_client()
     if not client or not is_meili_available():
         raise RuntimeError("Meilisearch 服务未就绪，无法执行全量同步")

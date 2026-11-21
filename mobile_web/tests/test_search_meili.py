@@ -196,7 +196,7 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         self.assertIn("碳酸饮料", res["search_keywords"])
         self.assertIn("可乐", res["search_keywords"])
 
-    @patch("services.deal_pool_cleaner.upsert_cleaned_products_to_formal_table")
+    @patch("repositories.product_repo.upsert_cleaned_products_to_formal_table")
     def test_repo_upsert_cleaned_deal_products_ssot(self, mock_upsert_deal):
         """测试 ProductRepository 作为单一真源入口统一调度好价商品入库"""
         mock_upsert_deal.return_value = {"upserted": 1, "modified": 0, "matched": 0}

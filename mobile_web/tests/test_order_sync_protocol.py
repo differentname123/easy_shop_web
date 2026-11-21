@@ -86,15 +86,6 @@ def pending(start=100, end=200, target=200, page_no=1, cursor=None, success=0):
     }}
 
 
-@pytest.fixture(autouse=True)
-def clean_sync_state():
-    for state in (module._LAST_SYNC_TIMESTAMP, module._LAST_SYNC_ATTEMPT, module._SYNC_STATE):
-        state.clear()
-    yield
-    for state in (module._LAST_SYNC_TIMESTAMP, module._LAST_SYNC_ATTEMPT, module._SYNC_STATE):
-        state.clear()
-
-
 @pytest.fixture
 def setup_service(monkeypatch):
     def build(adapter=None, sync=None, repo=None, users=None, platform="future_shop"):
@@ -109,7 +100,7 @@ def setup_service(monkeypatch):
 
 
 def run(service, platform="future_shop", now=200000):
-    lock = module._platform_lock(platform)
+    lock = service._platform_lock(platform)
     assert lock.acquire(blocking=False)
     service._sync_platform_orders_bg(platform, now)
     assert not lock.locked()
@@ -127,19 +118,17 @@ def test_more_than_five_pages_resume_after_restart_with_opaque_cursor(setup_serv
     assert frozen["page"] == 6
     assert frozen["start_time"] == 200000 - 23 * 3600
     assert frozen["end_time"] == frozen["target_end"] == 200000
-    assert module._SYNC_STATE["future_shop"]["status"] == "partial"
+    assert service._sync_state["future_shop"]["status"] == "partial"
     assert sync.states["future_shop"]["last_success_end"] == 0
-    # 模拟进程重启：模块内存丢失，但同一持久仓储仍有窗口/页/游标。
-    module._LAST_SYNC_TIMESTAMP.clear()
-    module._SYNC_STATE.clear()
+    # 模拟进程重启：新服务实例内存为空，但同一持久仓储仍有窗口/页/游标。
     restarted = module.OrderService(repo, sync_repo=sync, user_repo=users)
     run(restarted, now=999999)
     assert [call["page"] for call in adapter.calls] == list(range(1, 9))
     assert all(call["start_time"] == frozen["start_time"] and call["end_time"] == 200000 for call in adapter.calls)
     assert len(repo.docs) == 8
     assert sync.states["future_shop"] == {"last_success_end": 200000, "pending": None}
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 200000
-    assert module._SYNC_STATE["future_shop"]["status"] == "success"
+    assert restarted._last_sync_timestamp["future_shop"] == 200000
+    assert restarted._sync_state["future_shop"]["status"] == "success"
 
 
 def test_twenty_minute_windows_cover_only_initial_recent_23h_and_resume(setup_service):
@@ -160,7 +149,7 @@ def test_twenty_minute_windows_cover_only_initial_recent_23h_and_resume(setup_se
     assert adapter.calls[-1]["end_time"] == target
     assert all(left["end_time"] == right["start_time"] for left, right in zip(adapter.calls, adapter.calls[1:]))
     assert all(call["page"] == 1 and call["cursor"] is None for call in adapter.calls)
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == target
+    assert service._last_sync_timestamp["future_shop"] == target
 
 
 def test_pdd_legacy_pages_without_cursor(setup_service):
@@ -200,8 +189,8 @@ def test_failure_does_not_move_pending_page_or_success_watermark(setup_service, 
         adapter.fetch = lambda **kw: {"status": "success", "order_list": [], "has_more": True}
     run(service)
     assert sync.states == before
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 90
-    assert module._SYNC_STATE["future_shop"]["status"] == "error"
+    assert service._last_sync_timestamp["future_shop"] == 90
+    assert service._sync_state["future_shop"]["status"] == "error"
     assert adapter.calls[0]["page"] == 3
     assert adapter.calls[0]["cursor"] == {"x": "original"}
 
@@ -216,8 +205,8 @@ def test_checkpoint_failure_after_full_write_replays_page_safely(setup_service, 
     run(service)
     assert sync.states == before
     assert len(repo.pages) == 1
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 90
-    assert module._SYNC_STATE["future_shop"]["status"] == "partial"
+    assert service._last_sync_timestamp["future_shop"] == 90
+    assert service._sync_state["future_shop"]["status"] == "partial"
     sync.fail_save = None
     run(service, now=800000)
     assert [call["page"] for call in adapter.calls][:2] == [1, 1]
@@ -231,7 +220,7 @@ def test_initial_checkpoint_failure_never_fetches_platform(setup_service):
     service, adapter, sync, repo, _ = setup_service(sync=sync)
     run(service)
     assert not adapter.calls and not repo.pages and not sync.states
-    assert "future_shop" not in module._LAST_SYNC_TIMESTAMP
+    assert "future_shop" not in service._last_sync_timestamp
 
 
 def test_next_page_is_saved_only_after_complete_page_write(setup_service):
@@ -274,8 +263,8 @@ def test_failed_empty_window_checkpoint_does_not_advance_watermark(setup_service
     service, _, sync, _, _ = setup_service(sync=sync)
     run(service)
     assert sync.states["future_shop"] == pending(success=90)
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 90
-    assert module._SYNC_STATE["future_shop"]["status"] == "error"
+    assert service._last_sync_timestamp["future_shop"] == 90
+    assert service._sync_state["future_shop"]["status"] == "error"
 
 
 def test_failure_in_next_window_keeps_only_completed_window_watermark(setup_service):
@@ -286,9 +275,9 @@ def test_failure_in_next_window_keeps_only_completed_window_watermark(setup_serv
     service, _, sync, _, _ = setup_service(adapter, sync=sync)
     run(service)
     assert sync.states["future_shop"] == pending(start=1200, end=2400, target=2400, success=1200)
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 1200
-    assert module._SYNC_STATE["future_shop"]["status"] == "partial"
-    assert module._SYNC_STATE["future_shop"]["synced_count"] == 0
+    assert service._last_sync_timestamp["future_shop"] == 1200
+    assert service._sync_state["future_shop"]["status"] == "partial"
+    assert service._sync_state["future_shop"]["synced_count"] == 0
 
 
 def test_new_attempt_overlaps_last_completed_watermark(setup_service):
@@ -339,15 +328,15 @@ def test_two_platforms_do_not_block_each_other_but_same_platform_is_single_fligh
         for thread in created:
             thread.join(3)
     assert all(not thread.is_alive() for thread in created)
-    assert module._SYNC_STATE["slow_shop"]["status"] == "success"
-    assert module._SYNC_STATE["fast_shop"]["status"] == "success"
+    assert service._sync_state["slow_shop"]["status"] == "success"
+    assert service._sync_state["fast_shop"]["status"] == "success"
 
 
 def test_force_request_cannot_bypass_180_second_cooldown(setup_service):
     service, _, _, _, _ = setup_service()
-    module._LAST_SYNC_ATTEMPT["future_shop"] = 1000
+    service._last_sync_attempt["future_shop"] = 1000
     with patch.object(module.time, "time", return_value=1179), patch.object(module.threading, "Thread") as thread:
-        result = service.sync_and_query_orders("future_shop", "request-user", force_sync=True)
+        result = service.sync_and_query_orders("future_shop", "request-user")
     assert result["status"] == "success"
     assert module.ORDER_SYNC_INTERVAL == 180
     thread.assert_not_called()
@@ -618,14 +607,14 @@ def test_overlap_replays_order_idempotently_and_applies_delayed_refund(setup_ser
     adapter = Adapter(lambda **kw: next(responses))
     service, adapter, sync, _, _ = setup_service(adapter, repo=repo)
     run(service, now=200000)
-    module._LAST_SYNC_TIMESTAMP.clear()  # 重启后以持久成功终点而非内存作为重叠起点。
-    run(module.OrderService(repo, sync_repo=sync, user_repo=MemoryUserRepository()), now=200200)
+    restarted = module.OrderService(repo, sync_repo=sync, user_repo=MemoryUserRepository())
+    run(restarted, now=200200)
     assert adapter.calls[1]["start_time"] == 199700
     assert len(col.docs) == 1
     result = repo.query_user_orders("future_shop", "owner")
     assert result["total_count"] == result["refund_count"] == 1
     assert result["total_commission"] == 0 and result["refund_commission"] == 10
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 200200
+    assert restarted._last_sync_timestamp["future_shop"] == 200200
 
 
 def test_child_order_idempotence_is_scoped_by_platform_and_not_parent():
@@ -712,8 +701,8 @@ def test_identity_lookup_failure_does_not_advance_checkpoint(setup_service):
     service, _, sync, orders, _ = setup_service(adapter, repo=orders, sync=sync, users=users)
     run(service)
     assert sync.states == before and not orders.pages
-    assert module._LAST_SYNC_TIMESTAMP["future_shop"] == 90
-    assert module._SYNC_STATE["future_shop"]["status"] == "error"
+    assert service._last_sync_timestamp["future_shop"] == 90
+    assert service._sync_state["future_shop"]["status"] == "error"
 
 
 @pytest.mark.parametrize("source_time", [100, None])
@@ -771,3 +760,20 @@ def test_order_sync_worker_runs_periodically_and_stops_cleanly():
         worker.stop()
     assert worker._thread is None
     assert order_svc.run_scheduled_sync_round.call_count >= 1
+
+
+def test_cold_start_hydrates_last_sync_time_and_wait_for_sync_threads_joins():
+    entered = threading.Event()
+    release = threading.Event()
+    sync_repo = MemorySyncRepository({"future_shop": {"last_success_end": 180000, "pending": None}})
+    adapter = Adapter(lambda **kw: (entered.set(), release.wait(2.0), {"status": "success", "order_list": []})[2])
+    service = module.OrderService(MemoryOrders(), sync_repo=sync_repo, user_repo=MemoryUserRepository())
+    with patch.object(module, "require_adapter", return_value=adapter), \
+         patch.object(module, "get_adapter", return_value=adapter):
+        res = service.sync_and_query_orders("future_shop", "u_cold_start", days=7)
+        assert res["status"] == "success"
+        assert res["data"]["last_sync_time"] == 180000
+        assert entered.wait(2.0)
+        release.set()
+        service.wait_for_sync_threads(timeout=3.0)
+    assert service._bg_threads == {}

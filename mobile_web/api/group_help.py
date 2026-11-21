@@ -5,7 +5,7 @@ import base64
 from typing import Optional, Tuple
 from fastapi import APIRouter, Path, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
-from auth import verify_access_token
+from auth import extract_viewer_auth_soft
 from models.group_help import (
     GROUP_ID_PATH_PATTERN,
     GroupFeedbackRequest,
@@ -25,23 +25,6 @@ _MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024  # 15MB (兼容 10MB 原图的 Base64
 
 class _PayloadTooLargeError(ValueError):
     pass
-
-
-def _extract_viewer_auth(request: Request) -> Tuple[Optional[str], bool]:
-    """
-    提取可选登录身份与令牌过期状态（标准复用 Authorization / X-Auth-Token / token）。
-    公开浏览与上传接口绝不因本地残留过期令牌而报错阻断。
-    """
-    raw_token = (
-        request.headers.get("Authorization")
-        or request.headers.get("X-Auth-Token")
-        or request.query_params.get("token")
-        or ""
-    ).strip()
-    if not raw_token:
-        return None, False
-    uid = verify_access_token(raw_token)
-    return (uid, False) if uid else (None, True)
 
 
 async def _extract_upload_payload(request: Request) -> Tuple[bytes, str, str]:
@@ -106,7 +89,7 @@ async def upload_group_poster(request: Request):
     立即在受控工作线程解码二维码 -> 免登录核验 307 重定向提取 group_order_id -> 签发团长口令并写入待解析队列。
     """
     try:
-        uid, _ = _extract_viewer_auth(request)
+        uid, _ = extract_viewer_auth_soft(request)
         image_bytes, owner_token, share_text = await _extract_upload_payload(request)
         async with _UPLOAD_SEMAPHORE:
             return await asyncio.to_thread(
@@ -116,6 +99,15 @@ async def upload_group_poster(request: Request):
                 viewer_uid=uid,
                 share_text=share_text,
             )
+    except GroupHelpPermissionError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "status": "error",
+                "error_code": exc.error_code,
+                "error_msg": str(exc),
+            },
+        )
     except _PayloadTooLargeError as exc:
         return JSONResponse(
             status_code=413,
@@ -139,7 +131,7 @@ async def upload_group_poster(request: Request):
 @router.post("/submit_text")
 async def submit_group_text(request: Request, payload: GroupTextSubmitRequest):
     """无图发团：直接提交拼多多 ⇥...⇤ 口令或官方拼团链接，结构化核验后立即写入大厅展示。"""
-    uid, _ = _extract_viewer_auth(request)
+    uid, _ = extract_viewer_auth_soft(request)
     client_ip = (
         (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
         or (request.client.host if request.client else "")
@@ -187,7 +179,7 @@ def list_groups(
     limit: int = Query(20, ge=1, le=50, description="每页条数"),
 ):
     """获取多人团列表（仅展示已经过大模型解析出商品信息的团，同时返回当前用户下架权限状态）。"""
-    uid, token_expired = _extract_viewer_auth(request)
+    uid, token_expired = extract_viewer_auth_soft(request)
     data = group_help_service.list_groups(
         keyword=keyword,
         filter_mode=filter_mode,
@@ -239,7 +231,7 @@ def submit_group_feedback(
     - 差>=2人时 joined_one: 免登录可用，被禁下架权限用户仍可使用
     - 团长本人恢复上架 set_remain>=1: 自动对错误下架该团的非团长账号计数 +1（满 2 次停用下架权限）
     """
-    uid, token_expired = _extract_viewer_auth(request)
+    uid, token_expired = extract_viewer_auth_soft(request)
     try:
         res = group_help_service.submit_feedback_detailed(
             group_order_id=group_order_id,

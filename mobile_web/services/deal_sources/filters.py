@@ -212,25 +212,11 @@ def is_confirmed_unsupported_deal(
     """
     【100% 确定非淘/京/拼平台过滤器 · 防误杀铁律】：
     仅当平台信号【百分百确定】属于拼多多/京东/淘宝之外的平台时返回 True；
-    凡存在任何淘京拼正面信号，或平台归属尚不明确（如未知品牌名、未知第三方短链），一律返回 False 放行。
+    凡存在任何淘京拼正面信号（口令或受支持电商外链），或平台归属尚不明确，一律返回 False 放行。
     """
     norm_code = normalize_explicit_platform_code(platform_code)
     if norm_code and norm_code not in SUPPORTED_PLATFORMS:
         return True
-
-    clean_mall = re.sub(r"\s+", "", str(mall_name or "")).strip()
-    if clean_mall:
-        if any(kw in clean_mall for kw in _SUPPORTED_MALL_KEYWORDS):
-            return False
-        mall_low = clean_mall.lower()
-        if mall_low in CONFIRMED_UNSUPPORTED_MALLS or clean_mall in CONFIRMED_UNSUPPORTED_MALLS:
-            return True
-        first_seg = re.split(r"[·•\-|/]+", clean_mall)[0].strip()
-        if first_seg and (
-            first_seg in CONFIRMED_UNSUPPORTED_MALLS
-            or first_seg.lower() in CONFIRMED_UNSUPPORTED_MALLS
-        ):
-            return True
 
     if tokens and any(str(t or "").strip() for t in tokens):
         for tk in tokens:
@@ -258,6 +244,20 @@ def is_confirmed_unsupported_deal(
         if detect_platform_signal(u) in SUPPORTED_PLATFORMS:
             return False
         dest_hosts.append(host)
+
+    clean_mall = re.sub(r"\s+", "", str(mall_name or "")).strip()
+    if clean_mall:
+        if any(kw in clean_mall for kw in _SUPPORTED_MALL_KEYWORDS):
+            return False
+        mall_low = clean_mall.lower()
+        if mall_low in CONFIRMED_UNSUPPORTED_MALLS or clean_mall in CONFIRMED_UNSUPPORTED_MALLS:
+            return True
+        first_seg = re.split(r"[·•\-|/]+", clean_mall)[0].strip()
+        if first_seg and (
+            first_seg in CONFIRMED_UNSUPPORTED_MALLS
+            or first_seg.lower() in CONFIRMED_UNSUPPORTED_MALLS
+        ):
+            return True
 
     if norm_code in SUPPORTED_PLATFORMS:
         return False
@@ -319,8 +319,7 @@ def has_valid_detail_and_tutorial(record: Dict[str, Any], min_text_chars: int = 
 
     links = [lk for lk in (record.get("extracted_links") or []) if isinstance(lk, dict) and (lk.get("url") or lk.get("item_id"))]
     tokens = [str(tk).strip() for tk in (record.get("extracted_tokens") or []) if str(tk or "").strip()]
-    cand_id = str(record.get("candidate_goods_id") or "").strip()
-    if not (_has_external_actionable_link(links) or tokens or cand_id):
+    if not (_has_external_actionable_link(links) or tokens):
         return False
 
     tut = str(record.get("tutorial_text") or "").strip()

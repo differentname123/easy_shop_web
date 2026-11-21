@@ -10,29 +10,36 @@
 """
 import hashlib
 import json
-import logging
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
 import math
-import socket
-import time
-from typing import Dict, Any, List, Optional
-import requests
-from requests.adapters import HTTPAdapter
-from infrastructure.http_utils import error_dict as _error
+import os
+import threading
+from datetime import datetime
+from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
-logger = logging.getLogger("mobile_web")
+from infrastructure.http_utils import (
+    SHANGHAI,
+    clean_text as _text,
+    error_dict as _error,
+    normalize_http_url,
+)
+from infrastructure.logging_utils import get_app_logger
+from infrastructure.settings import persist_config_updates, resolve_config_path
+from infrastructure.transport import create_http_session
+
+logger = get_app_logger("tb_client")
 
 TOP_GATEWAY_URL = "https://eco.taobao.com/router/rest"
 
-_TB_SESSION = requests.Session()
-_TB_ADAPTER = HTTPAdapter(pool_connections=30, pool_maxsize=100, max_retries=1)
-_TB_SESSION.mount("https://", _TB_ADAPTER)
-_TB_SESSION.mount("http://", _TB_ADAPTER)
-_TB_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-})
+_TB_SESSION = create_http_session(
+    pool_connections=30,
+    pool_maxsize=100,
+    max_retries=1,
+    headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    },
+)
 
 
 def generate_tb_sign(params: dict, app_secret: str) -> str:
@@ -69,7 +76,7 @@ def call_tb_api(
     params = {
         "method": method,
         "app_key": str(app_key).strip(),
-        "timestamp": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(SHANGHAI).strftime("%Y-%m-%d %H:%M:%S"),
         "format": "json",
         "v": "2.0",
         "sign_method": "md5",
@@ -144,21 +151,12 @@ def call_tb_api(
     return {"status": "success", "data": result, "raw": result}
 
 
-def _text(value):
-    return str(value).strip() if value is not None else ""
-
-
 def _number(value, default=0.0):
     try:
         result = float(value)
         return result if math.isfinite(result) else default
     except (TypeError, ValueError):
         return default
-
-
-def _url(value):
-    value = _text(value)
-    return "https:" + value if value.startswith("//") else value
 
 
 def _list(value, key):
@@ -192,13 +190,13 @@ def clean_tb_goods_item(raw_item: dict, source_type: str = "") -> Optional[Dict[
         return None
     item_id = _text(raw_item["item_id"])
     input_id = _text(raw_item.get("input_item_iid"))
-    picture = _url(base.get("pict_url"))
+    picture = normalize_http_url(base.get("pict_url"))
     small_images = base.get("small_images") or []
     if isinstance(small_images, dict):
         small_images = small_images.get("string", [])
     if isinstance(small_images, str):
         small_images = [small_images]
-    images = [_url(u) for u in small_images if isinstance(u, str) and u.strip()] if isinstance(small_images, list) else []
+    images = [normalize_http_url(u) for u in small_images if normalize_http_url(u)] if isinstance(small_images, list) else []
     original = _number(price.get("reserve_price"), _number(price.get("zk_final_price")))
     final = _number(price.get("final_promotion_price"), _number(price.get("zk_final_price"), original))
     # Discounted price != coupon amount. Only explicit coupon evidence is admissible.
@@ -229,7 +227,8 @@ def clean_tb_goods_item(raw_item: dict, source_type: str = "") -> Optional[Dict[
         "commission_amount": _number(income.get("commission_amount"), _number(pub.get("commission_amount"))),
         "commission_rate": rate, "sales_tip": _text(base.get("tk_total_sales") or base.get("volume") or base.get("annual_vol") or "0"),
         "mall_name": base.get("shop_title") or "", "provcity": base.get("provcity") or "",
-        "click_url": _url(pub.get("click_url")), "coupon_share_url": _url(pub.get("coupon_share_url")),
+        "click_url": normalize_http_url(pub.get("click_url")),
+        "coupon_share_url": normalize_http_url(pub.get("coupon_share_url")),
         "detail_tags": [t["tag_name"] for t in tags if isinstance(t, dict) and t.get("tag_name")],
         "seller_id": _text(base.get("seller_id")), "raw_item": raw_item, "_source_api": source_type,
         "item_url": f"https://uland.taobao.com/item/edetail?id={input_id if input_id and input_id.isdigit() else item_id}",
@@ -447,37 +446,29 @@ def generate_tb_authority_url(app_key, app_secret, uid, session_key=None, invite
         if res.get("status") == "success":
             code = _text(res.get("data", {}).get("tbk_sc_invitecode_get_response", {}).get("data", {}).get("inviter_code"))
         if not code:
-            code = "VK6WGA"
+            return _error("CONFIG_ERROR", "淘宝授权缺少邀请码配置，请在 config.local.json 中配置 taobao_inviter_code")
     url = "https://mos.m.taobao.com/inviter/register?" + urlencode({
         "inviterCode": code, "src": "pub", "app": "common", "externalId": _text(uid),
     })
     return {"status": "success", "auth_url": url, "short_url": "", "we_app_info": {}}
 
 
-_TB_CFG_WRITE_LOCK = __import__("threading").Lock()
+_TB_CFG_WRITE_LOCK = threading.Lock()
 
 
 def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_session: str = "", _api_call=None) -> Dict[str, str]:
     """
     当检测到 taobao_session 缺失或触发 27:invalid-sessionkey 时：
-    1. 检查项目根目录下的 config.local.json 是否已更新了新的 taobao_session 或 zhetaoke_sid（支持热重载免重启）；
+    1. 检查 config.local.json 是否已更新了新的 taobao_session 或 zhetaoke_sid（支持热重载免重启）；
     2. 若配置了 taobao_refresh_token，尝试调用淘宝开放平台 taobao.top.auth.token.refresh 自动刷新并原子持久化。
     """
-    import os
-    import uuid
-    from pathlib import Path
-
     result = {"session_key": _text(current_session), "ztk_sid": ""}
-    app_dir = Path(__file__).resolve().parents[1]
     cfg_env = os.environ.get("WEB_CONFIG_FILE", "").strip()
-    if cfg_env:
-        config_path = Path(cfg_env).expanduser()
-        if not config_path.is_absolute():
-            config_path = (app_dir / config_path).resolve()
-    else:
-        config_path = app_dir / "config.local.json"
-        if not config_path.is_file():
-            config_path = app_dir.parent / "config.local.json"
+    config_path = resolve_config_path()
+    if not cfg_env and not config_path.is_file():
+        alt = config_path.parent.parent / "config.local.json"
+        if alt.is_file():
+            config_path = alt
 
     local_cfg = None
     if config_path.is_file():
@@ -521,24 +512,16 @@ def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_sess
                 new_refresh = _text(token_result.get("refresh_token"))
                 if new_session:
                     result["session_key"] = new_session
-                    # 仅当原始配置文件已被成功解析为非空字典时才原子写回，彻底杜绝 BOM/并发截断导致配置文件被覆写为空字典
+                    # 仅当原始配置文件已被成功解析为非空字典时才原子写回，避免覆写损坏的配置文件
                     if config_path.is_file() and isinstance(local_cfg, dict) and local_cfg:
+                        updates = {"taobao_session": new_session}
+                        if new_refresh:
+                            updates["taobao_refresh_token"] = new_refresh
                         with _TB_CFG_WRITE_LOCK:
-                            tmp_path = config_path.with_name(f".{config_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
                             try:
-                                latest_raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
-                                target_cfg = latest_raw if isinstance(latest_raw, dict) and latest_raw else dict(local_cfg)
-                                target_cfg["taobao_session"] = new_session
-                                if new_refresh:
-                                    target_cfg["taobao_refresh_token"] = new_refresh
-                                tmp_path.write_text(json.dumps(target_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                                os.replace(tmp_path, config_path)
+                                persist_config_updates(updates, config_file=config_path)
                             except Exception:
-                                try:
-                                    if tmp_path.exists():
-                                        tmp_path.unlink()
-                                except OSError:
-                                    pass
+                                pass
     return result
 
 
@@ -550,9 +533,9 @@ class TaobaoClient:
         self.adzone_id = adzone_id or regular_adzone_id
         self.session_key = session_key
         self.inviter_code = inviter_code
-        self.regular_adzone_id = regular_adzone_id or adzone_id or "116341500041"
-        self.channel_adzone_id = channel_adzone_id or adzone_id or "116343300219"
-        self.pid_prefix = pid_prefix or "mm_328750149_3161250458"
+        self.regular_adzone_id = regular_adzone_id or adzone_id or ""
+        self.channel_adzone_id = channel_adzone_id or adzone_id or ""
+        self.pid_prefix = pid_prefix or ""
         self.http_session = http_session
 
     def _call(self, **kwargs):

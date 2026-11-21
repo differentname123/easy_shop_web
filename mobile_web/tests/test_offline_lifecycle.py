@@ -281,13 +281,13 @@ def test_structured_logging_denoising_and_aggregation(monkeypatch):
     assert promo_warn[0].startswith("⚠️ 【推广转链失败】")
     assert "平台[pdd]" in promo_warn[0] and "商品[1001]" in promo_warn[0] and "排查方向<" in promo_warn[0]
 
-    for err_payload in (
-        {"status": "error", "error_msg": "未知上游异常"},
-        {"status": "error", "error_code": "CONFIG_ERROR", "error_msg": "缺少联盟配置"},
+    for gid, err_payload in (
+        ("1002", {"status": "error", "error_msg": "未知上游异常"}),
+        ("1003", {"status": "error", "error_code": "CONFIG_ERROR", "error_msg": "缺少联盟配置"}),
     ):
         promo_warn.clear()
         adapter.convert_promotion_url = lambda *a, payload=err_payload, **k: dict(payload)
-        res_ops = svc.convert_link("pdd", "1001", uid="u_12345678")
+        res_ops = svc.convert_link("pdd", gid, uid="u_12345678")
         assert res_ops["status"] == "error"
         assert len(promo_warn) == 1
         assert promo_warn[0].startswith("❌ 【推广转链失败】")

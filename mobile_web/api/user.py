@@ -12,12 +12,8 @@ router = APIRouter(prefix="/api/user", tags=["用户与授权"])
 user_service = UserService()
 
 
-# 保留旧导入名，参数约束统一由领域 DTO 定义。
-RegisterOrLoginRequest = RegisterOrLoginDTO
-
-
 @router.post("/register_or_login")
-def register_or_login(req: RegisterOrLoginRequest):
+def register_or_login(req: RegisterOrLoginDTO):
     """
     推手手机号注册与登录一体化接口
     - 手机号不存在：自动注册新账号，绑定邀请码，签发专属 auth_token 与 UID；
@@ -39,7 +35,6 @@ def register_or_login(req: RegisterOrLoginRequest):
 def get_user_info(
     current_uid: str = Depends(get_current_uid),
     uid: Optional[str] = Query(None, description="推手唯一UID (兼容参数，服务端严格校验)"),
-    phone: Optional[str] = Query(None, description="手机号 (兼容旧参数，必须与当前登录身份一致)"),
 ):
     """
     获取当前登录推手信息及各平台授权状态 (手机号脱敏返回)

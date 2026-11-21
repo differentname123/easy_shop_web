@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """京东字段/分页适配；无授权、用户仓储或个人转站长兜底。"""
 import hashlib
-import logging
-import math
 import re
 import time
-from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
-import requests
+from infrastructure.logging_utils import get_app_logger
 
-logger = logging.getLogger(__name__)
+logger = get_app_logger(__name__)
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
     is_real_requests_session,
@@ -27,19 +24,23 @@ from infrastructure.http_utils import (
     parse_shanghai_timestamp as _timestamp,
 )
 from infrastructure.jd_client import (
-    JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS, SHANGHAI,
+    JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS,
     canonical_promoter_id, is_jd_official_venue_url, jd_coupon_url, product_url,
 )
 from models.product import (
+    JD_JINGFEN_ID_RE,
     ProductDetail,
     ProductRef,
     ProductSummary,
+    URL_RE,
     clean_product_id,
     extract_canonical_goods_id,
     extract_jd_image_key,
     is_jd_image_key,
     normalize_jd_material_url,
 )
+
+_JD_SHORT_URL_RE = re.compile(r"https?://u\.jd\.com/[A-Za-z0-9_-]+")
 
 
 JD_ORDER_STATUS = {
@@ -130,7 +131,7 @@ class JdAdapter(BasePlatformAdapter):
     order_window_seconds = ORDER_WINDOW_SECONDS
 
     def __init__(self, settings=None, client=None, **overrides):
-        self._ensure_provider_state()
+        super().__init__()
         if settings is None:
             from config import settings
         def setting(name, default=""):
@@ -159,16 +160,24 @@ class JdAdapter(BasePlatformAdapter):
         self._refresh_capabilities()
 
     def attach_hdk(self, hdk_client: HdkClient) -> None:
-        """挂载好单库 (HDK) 为京东全能力主力提供者：搜索/详情/转链/万能/订单均设为主力，折淘客全面作为平滑兜底。"""
+        """挂载好单库 (HDK) 为京东搜索/详情/匿名推广主力提供者；订单同步保留折淘客官方网关以保障 CAS 精度与状态完备性。"""
         self.hdk = hdk_client
         self.register_provider("search", "hdk_jd_search", self._make_hdk_search(hdk_client), prepend=True)
         self.register_provider("detail", "hdk_jd_detail", self._make_hdk_detail(hdk_client), prepend=True)
         self.register_provider("promotion", "hdk_jd_promotion", self._make_hdk_promotion(hdk_client), prepend=True)
         self.register_provider("universal", "hdk_jd_universal", self._make_hdk_universal(hdk_client), prepend=True)
-        self.register_provider("orders", "hdk_jd_orders", self._make_hdk_orders(hdk_client), prepend=True)
+
+    def _is_personal_promoter(self, uid: Any, promoter: str) -> bool:
+        """好单库京东转链接口不接收 positionId，个人推手/非默认推广位必须交由折淘客保留完整归因。"""
+        return bool(uid) or (bool(promoter) and promoter != self.default_promoter_id)
 
     def _normalize_hdk_summary(self, item: dict) -> dict:
-        raw_sign = _text(item.get("skuid") or item.get("itemid"))
+        raw_itemid = _text(item.get("itemid"))
+        raw_skuid = _text(item.get("skuid"))
+        raw_sign = (
+            raw_itemid if _is_encrypted_jd_item_id(raw_itemid)
+            else (raw_skuid if _is_encrypted_jd_item_id(raw_skuid) else (raw_itemid or raw_skuid))
+        )
         if not raw_sign:
             raise ValueError("missing goods identity")
         image_url = normalize_http_url(item.get("itempic") or item.get("white_image"))
@@ -197,6 +206,13 @@ class JdAdapter(BasePlatformAdapter):
         cat_info = item.get("category_info") if isinstance(item.get("category_info"), dict) else {}
         cat = _text(cat_info.get("cid3Name") or cat_info.get("cid1Name")) or "精选好物"
 
+        if _is_encrypted_jd_item_id(raw_sign):
+            mat_url = f"https://jingfen.jd.com/detail/{raw_sign}.html"
+        elif raw_skuid.isdigit():
+            mat_url = f"https://item.jd.com/{raw_skuid}.html"
+        else:
+            mat_url = normalize_jd_material_url(item.get("item_url") or "")
+
         data = {
             "platform": self.platform_code,
             "platform_name": self.platform_name,
@@ -204,7 +220,6 @@ class JdAdapter(BasePlatformAdapter):
             "goods_sign": raw_sign,
             "name": name,
             "image_url": image_url,
-            "product_url": f"https://jingfen.jd.com/detail/{raw_sign}.html",
             "price": price,
             "original_price": original if original is not None else price,
             "coupon_amount": coupon_amt,
@@ -216,6 +231,8 @@ class JdAdapter(BasePlatformAdapter):
             "brand": brand,
             "category": cat,
         }
+        if mat_url:
+            data["product_url"] = mat_url
         if coupon_url:
             data["coupon_url"] = coupon_url
         return ProductSummary(**data).to_dict(exclude_unset=True)
@@ -299,18 +316,17 @@ class JdAdapter(BasePlatformAdapter):
             target_id = ref.goods_sign or ref.goods_id
             if not target_id or is_jd_image_key(target_id):
                 return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU")
-            res = client.get_goods_detail(target_id)
+            res, confirmed_off = self._retry_on_off_promotion(
+                lambda: client.get_goods_detail(target_id),
+                lambda r: (
+                    str(r.get("error_code") or "").upper() in ("PRODUCT_OFF_PROMOTION", "NOT_FOUND")
+                    or r.get("not_found") is True
+                ),
+            )
             if res.get("status") != "success":
-                code = str(res.get("error_code") or "").upper()
-                if code == "PRODUCT_OFF_PROMOTION" or res.get("not_found") is True or code == "NOT_FOUND":
-                    time.sleep(0.15)
-                    retry_res = client.get_goods_detail(target_id)
-                    if retry_res.get("status") == "success" and retry_res.get("data"):
-                        res = retry_res
-                    else:
-                        return _error("PRODUCT_OFF_PROMOTION", "该京东商品已下架或已停止推广")
-                else:
-                    return res
+                if confirmed_off:
+                    return _error("PRODUCT_OFF_PROMOTION", "该京东商品已下架或已停止推广")
+                return res
             raw_item = res.get("data") or {}
             try:
                 return {"status": "success", "data": self._normalize_hdk_detail(raw_item, ref)}
@@ -320,15 +336,17 @@ class JdAdapter(BasePlatformAdapter):
 
     def _make_hdk_promotion(self, client: HdkClient):
         def _promote(goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, promoter_id=None, **kwargs):
+            promoter = canonical_promoter_id(promoter_id or self.default_promoter_id)
+            if self._is_personal_promoter(uid, promoter):
+                return {"status": "skipped", "reason": "hdk_no_position_id"}
             ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
             target_id = ref.goods_sign or ref.goods_id
             if not target_id:
                 return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
-            promoter = canonical_promoter_id(promoter_id or self.default_promoter_id)
             mat = kwargs.get("trusted_product_url") or (f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else target_id)
             coupon = jd_coupon_url(kwargs.get("trusted_coupon_url"))
             sub_id = kwargs.get("sub_union_id")
-            res = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=sub_id, coupon_url=coupon)
+            res = client.convert_promotion_link(mat, sub_union_id=sub_id, coupon_url=coupon)
             if res.get("status") != "success":
                 logger.debug("[JD转链-好单库主力] 转链未成功(%s: %s)，顺延至备用通道: target_id=%s", res.get("error_code"), res.get("error_msg"), target_id)
                 return res
@@ -350,15 +368,17 @@ class JdAdapter(BasePlatformAdapter):
             if not text:
                 return _error("INVALID_ARGUMENT", "请输入京东链接或商品信息")
             promoter = canonical_promoter_id(promoter_id or self.default_promoter_id)
+            if self._is_personal_promoter(uid, promoter):
+                return {"status": "skipped", "reason": "hdk_no_position_id"}
             card = None
             target_id = ""
-            jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
+            jf_match = JD_JINGFEN_ID_RE.search(text)
             if jf_match:
                 target_id = jf_match.group(1)
             elif _is_encrypted_jd_item_id(text):
                 target_id = text
 
-            short_match = re.search(r"https?://u\.jd\.com/[A-Za-z0-9_-]+", text)
+            short_match = _JD_SHORT_URL_RE.search(text)
             is_confirmed_venue = False
             venue_url = ""
             if short_match and not target_id:
@@ -369,14 +389,8 @@ class JdAdapter(BasePlatformAdapter):
                         target_id = str(data["sku_id"]).strip()
                     elif data.get("is_venue"):
                         is_confirmed_venue = True
-                    if data.get("goodsname") or data.get("name"):
-                        try:
-                            card = self._normalize_hdk_detail(data)
-                            target_id = card.get("goods_sign") or card.get("goods_id")
-                        except Exception:
-                            pass
             elif not target_id and not short_match and is_jd_official_venue_url(text):
-                cand_urls = re.findall(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text)
+                cand_urls = [u.rstrip(".,!?)];'\"") for u in URL_RE.findall(text)]
                 cand_venue = next((u for u in cand_urls if is_jd_official_venue_url(u)), "")
                 if cand_venue and product_url(cand_venue):
                     sku_param_m = re.search(r"[?&](?:sku|mainSku|skuId)=([A-Za-z0-9_]+)", cand_venue, re.IGNORECASE)
@@ -406,35 +420,32 @@ class JdAdapter(BasePlatformAdapter):
                 return _error("NOT_FOUND", "未能识别该京东链接或商品")
 
             mat = material_url or (short_match.group(0) if short_match else target_id)
-            conv = client.convert_promotion_link(mat, promoter_id=promoter, sub_union_id=kwargs.get("sub_union_id"), coupon_url=(card or {}).get("coupon_url"))
+            conv = client.convert_promotion_link(
+                mat,
+                sub_union_id=kwargs.get("sub_union_id"),
+                coupon_url=(card or {}).get("coupon_url"),
+            )
             if conv.get("status") != "success":
                 logger.debug("[JD万能转链-好单库] 转链未成功(%s)，顺延至备用通道: mat=%s", conv.get("error_msg"), mat[:60])
                 return conv
             logger.info("[JD万能解析-好单库主力] 原生解析与转链成功: target_id=%s, final_link=%s", target_id or mat, conv.get("final_link"))
-            short = conv.get("short_url") or ""
-            long = conv.get("click_url") or ""
+
             title = (card or {}).get("name") or ("京东精选活动会场" if is_confirmed_venue else "京东精选好物")
             price = (card or {}).get("price")
             coupon = (card or {}).get("coupon_amount", 0.0)
             canonical_id = (card or {}).get("goods_id") or (extract_canonical_goods_id(self.platform_code, target_id) if target_id else "") or target_id or ""
             sign_id = (card or {}).get("goods_sign") or target_id or ""
-            payload = {
-                "status": "success",
-                "final_link": short or long,
-                "short_url": short,
-                "click_url": long,
-                "url": long or short,
-                "title": title,
-                "price": price,
-                "coupon_amount": coupon,
-                "product": card,
-                "promoter_id": promoter,
-                "goods_id": canonical_id,
-                "goods_sign": sign_id,
-                "attribution_status": "verified" if uid else "anonymous",
-                "need_auth": False,
-                "link_type": "京东推广链接",
-            }
+            payload = self._build_promotion_payload(
+                conv,
+                promoter=promoter,
+                goods_id=canonical_id,
+                goods_sign=sign_id,
+                uid=uid,
+                title=title,
+                price=price,
+                coupon_amount=coupon,
+                product=card,
+            )
             if is_confirmed_venue:
                 payload["convert_status"] = "coupon_or_activity"
                 payload["resolution_kind"] = "coupon_or_venue"
@@ -446,22 +457,6 @@ class JdAdapter(BasePlatformAdapter):
             return stamp_universal_resolution(payload, single_item_evidence=bool(target_id))
         return _universal
 
-    def _make_hdk_orders(self, client: HdkClient):
-        def _orders(start_time, end_time, page=1, page_size=50, **kwargs):
-            try:
-                s_ts = int(start_time.timestamp()) if hasattr(start_time, "timestamp") else int(start_time)
-                e_ts = int(end_time.timestamp()) if hasattr(end_time, "timestamp") else int(end_time)
-            except Exception:
-                return _error("INVALID_ARGUMENT", "京东订单时间范围无效")
-            cursor = kwargs.get("cursor")
-            res = client.query_jd_orders(s_ts, e_ts, page=page, page_size=page_size, cursor=cursor)
-            if res.get("status") != "success":
-                logger.warning("[JD订单同步-好单库主力] 拉取失败(%s: %s)，顺延至备用通道", res.get("error_code"), res.get("error_msg"))
-                return res
-            logger.info("[JD订单同步-好单库主力] 拉取成功: 订单数=%d, has_more=%s", len(res.get("order_list") or []), res.get("has_more"))
-            return res
-        return _orders
-
     def _refresh_capabilities(self) -> None:
         cat = getattr(self, "_has_ztk_catalog", False)
         orders_ok = getattr(self, "_has_ztk_orders", False)
@@ -470,12 +465,16 @@ class JdAdapter(BasePlatformAdapter):
             "search": bool(cat or self._has_extra_providers("search")),
             "detail": bool(cat or self._has_extra_providers("detail")),
             "promotion": bool((cat and self.default_promoter_id) or self._has_extra_providers("promotion")),
+            "universal": bool((cat and self.default_promoter_id) or self._has_extra_providers("universal")),
             "authorization": False,
             "orders": bool(orders_ok or self._has_extra_providers("orders")),
         }
 
     def _is_real_http(self) -> bool:
-        return is_real_requests_session(getattr(self.client, "http", None))
+        return (
+            is_real_requests_session(getattr(self.client, "http", None))
+            or is_real_requests_session(getattr(self.hdk, "http", None))
+        )
 
     def can_prefetch_detail(self, ref=None):
         """JD 折淘客共用小时级千次配额：榜单/搜索绝不后台盲刷 api_detail，仅允许外挂独立详情源后台预取。"""
@@ -787,9 +786,6 @@ class JdAdapter(BasePlatformAdapter):
         if not promoter:
             return _error("INVALID_PROMOTER_ID", "京东转链需要服务端数字推广ID")
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
-        from cache import is_product_off_promotion
-        if is_product_off_promotion("jd", ref.goods_id, ref.goods_sign):
-            return _error("PRODUCT_OFF_PROMOTION", "该京东商品已下架或已停止推广")
         target_id = ref.goods_sign or ref.goods_id
         if not target_id or "://" in target_id or target_id.startswith("//"):
             return _error("INVALID_ARGUMENT", "京东转链缺少已识别商品ID")
@@ -798,6 +794,7 @@ class JdAdapter(BasePlatformAdapter):
             # The service strips request kwargs before supplying these private bridges.
             material = product_url(kwargs.get("trusted_product_url"))
             clean_coupon = jd_coupon_url(kwargs.get("trusted_coupon_url"))
+            refreshed_material_url = ""
             # 【对齐 test_jd_api.py 实证基准】：
             # 加密 itemId 拼接为 https://item.jd.com/{id}.html 无法访问且转链必报 2001104 (商品不在推广中)；
             # 必须使用 https://jingfen.jd.com/detail/{id}.html 格式直接一步转链（若缓存中残留旧版 item.jd.com 拼接格式则自动纠正）。
@@ -829,14 +826,7 @@ class JdAdapter(BasePlatformAdapter):
                         clean_coupon = jd_coupon_url(detail["data"].get("coupon_id"))
                     if detail_material and detail_material != material:
                         material = detail_material
-                        try:
-                            from cache import MATERIAL_CACHE
-                            if ref.goods_sign:
-                                MATERIAL_CACHE.set(("jd", "sign", ref.goods_sign), detail_material)
-                            if ref.goods_id:
-                                MATERIAL_CACHE.set(("jd", "id", ref.goods_id), detail_material)
-                        except Exception:
-                            pass
+                        refreshed_material_url = detail_material
                         result = _convert_call(material, clean_coupon)
                 elif result.get("jd_off_promotion") is True:
                     return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
@@ -844,7 +834,11 @@ class JdAdapter(BasePlatformAdapter):
                 if result.get("jd_off_promotion") is True:
                     return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
                 return result
-            extra_payload = {"coupon_url": clean_coupon} if clean_coupon else {}
+            extra_payload = {}
+            if clean_coupon:
+                extra_payload["coupon_url"] = clean_coupon
+            if refreshed_material_url:
+                extra_payload["resolved_material_url"] = refreshed_material_url
             return self._build_promotion_payload(
                 result,
                 promoter=promoter,
@@ -930,7 +924,7 @@ class JdAdapter(BasePlatformAdapter):
             extracted_encrypted_id = ""
             product_card = None
             detail_lookup_failed = False
-            jf_match = re.search(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", text)
+            jf_match = JD_JINGFEN_ID_RE.search(text)
             if jf_match:
                 extracted_encrypted_id = jf_match.group(1)
             elif _is_encrypted_jd_item_id(text):

@@ -13,6 +13,7 @@ from typing import Optional
 from adapters import get_adapter, get_all_platforms
 from cache import is_product_off_promotion
 from config import logger
+from infrastructure.api_governance import api_caller_context
 from infrastructure.logging_utils import format_exc_summary
 from models.product import DetailSnapshot, ProductRef
 
@@ -241,6 +242,10 @@ class DetailPrefetcher:
                     )
 
     def _seed(self):
+        with api_caller_context("background"):
+            self._seed_inner()
+
+    def _seed_inner(self):
         for platform in self._platforms():
             capabilities = platform.get("capabilities") or {}
             if not platform.get("active") or not all(capabilities.get(name, True) for name in ("recommend", "detail")):
@@ -334,6 +339,10 @@ class DetailPrefetcher:
                     cursor = page_res.get("next_cursor")
 
     def _execute_detail(self, task):
+        with api_caller_context("background"):
+            return self._execute_detail_inner(task)
+
+    def _execute_detail_inner(self, task):
         snapshot = task.snapshot
         result = None
         last_exc_summary = ""

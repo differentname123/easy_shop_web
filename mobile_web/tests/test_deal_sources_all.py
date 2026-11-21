@@ -21,10 +21,10 @@ from unittest.mock import MagicMock
 
 import requests
 
-from mobile_web.models.product import SOURCE_SITE_NAMES
-from mobile_web.repositories.deal_raw_pool_repo import parse_publish_time_epoch
-from mobile_web.services import deal_pipeline as dp_mod
-from mobile_web.services.deal_sources import (
+from models.product import SOURCE_SITE_NAMES
+from repositories.deal_raw_pool_repo import parse_publish_time_epoch
+from services import deal_pipeline as dp_mod
+from services.deal_sources import (
     DEFAULT_CHANNEL_CONFIGS,
     BaicaioSource,
     BaseDealSource,
@@ -835,7 +835,7 @@ def test_confirmed_unsupported_platform_filter_prevents_false_kills():
 
 
 def test_tehuicaicai_skips_known_drops_shell_full_sweep_and_watermark():
-    from mobile_web.services.deal_sources import TehuicaicaiSource
+    from services.deal_sources import TehuicaicaiSource
 
     list_payload = {
         "code": "OK",
@@ -947,7 +947,7 @@ def test_tehuicaicai_skips_known_drops_shell_full_sweep_and_watermark():
 
 
 def test_guangdiu_dabstract_filtering_and_relative_gophp_unpack():
-    from mobile_web.services.deal_sources import GuangdiuSource
+    from services.deal_sources import GuangdiuSource
 
     list_html = """
     <div class="gooditem"><a class="goodname" href="detail.php?id=101">已知商品</a><a class="rightmallname">京东</a></div>
@@ -1037,7 +1037,8 @@ def test_haodanku_source_parsing_fliggy_filter_and_touch_ids():
 
 def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch, tmp_path):
     import threading
-    from mobile_web.scripts import run_deal_pool_scheduler as dps
+    from services.deal_pipeline import run_fetch_stage
+    from services.deal_sources import DEFAULT_CHANNEL_CONFIGS
 
     _patch_pipeline_log_paths(monkeypatch, tmp_path)
 
@@ -1056,7 +1057,7 @@ def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch,
     repo.save_batch.return_value = {"inserted": 0, "updated": 0}
     repo.generate_pool_summary.return_value = {"total_records": 0}
 
-    dps.run_fetch_stage(
+    run_fetch_stage(
         repo=repo,
         session=MagicMock(),
         cycle_num=1,
@@ -1090,11 +1091,11 @@ def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch,
             return FetchResult(status="ok", http_status=200, request_url="https://xhhcds.cn/", elapsed_ms=1.0, raw_list_count=50, skipped_known=50, sweep_completed=True)
 
     cooldown_map = {}
-    out_captcha = dps.run_fetch_stage(
+    out_captcha = run_fetch_stage(
         repo=repo,
         session=MagicMock(),
         cycle_num=1,
-        channels=[c for c in dps.MONITORED_CHANNELS if c.site_key in ("guangdiu", "tehuicaicai")],
+        channels=[c for c in DEFAULT_CHANNEL_CONFIGS if c.site_key in ("guangdiu", "tehuicaicai")],
         channel_last_run={},
         site_cooldown_until=cooldown_map,
         source_registry={"guangdiu": _GdChannelCaptchaSrc(), "tehuicaicai": _ThOkSrc()},
@@ -1106,11 +1107,11 @@ def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch,
     assert next(t for t in out_captcha["tasks"] if t["site_key"] == "tehuicaicai")["status"] == "success"
 
     # 第二轮：热门榜/小时榜仍在频道冷却期内被跳过，首页实时流照常成功拉取
-    out_captcha_r2 = dps.run_fetch_stage(
+    out_captcha_r2 = run_fetch_stage(
         repo=repo,
         session=MagicMock(),
         cycle_num=2,
-        channels=[c for c in dps.MONITORED_CHANNELS if c.site_key == "guangdiu"],
+        channels=[c for c in DEFAULT_CHANNEL_CONFIGS if c.site_key == "guangdiu"],
         channel_last_run={},
         site_cooldown_until=cooldown_map,
         source_registry={"guangdiu": _GdChannelCaptchaSrc()},
@@ -1133,11 +1134,11 @@ def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch,
             )
 
     site_cooldown_map = {}
-    out_429 = dps.run_fetch_stage(
+    out_429 = run_fetch_stage(
         repo=repo,
         session=MagicMock(),
         cycle_num=3,
-        channels=[c for c in dps.MONITORED_CHANNELS if c.site_key in ("guangdiu", "tehuicaicai")],
+        channels=[c for c in DEFAULT_CHANNEL_CONFIGS if c.site_key in ("guangdiu", "tehuicaicai")],
         channel_last_run={},
         site_cooldown_until=site_cooldown_map,
         source_registry={"guangdiu": _Gd429Src(), "tehuicaicai": _ThOkSrc()},
@@ -1149,7 +1150,7 @@ def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch,
 
 
 def test_repo_stops_perpetual_refetch_of_terminal_failures_and_allows_relisted_disappeared():
-    from mobile_web.repositories.deal_raw_pool_repo import DealRawPoolRepository
+    from repositories.deal_raw_pool_repo import DealRawPoolRepository
 
     raw_col = MagicMock()
     formal_col = MagicMock()
@@ -1190,11 +1191,11 @@ def test_repo_stops_perpetual_refetch_of_terminal_failures_and_allows_relisted_d
 
 
 def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
-    from mobile_web.models.deal_constants import QUALIFIED_DEAL_MIN_SCORE, SOURCE_REPUTATION_BONUS
-    from mobile_web.models.product import ProductSummary, get_source_site_name
-    from mobile_web.repositories.deal_raw_pool_repo import DealRawPoolRepository, evaluate_quality_signals
-    from mobile_web.repositories.product_repo import ProductRepository
-    from mobile_web.services.deal_sources import build_deal_record
+    from models.deal_constants import QUALIFIED_DEAL_MIN_SCORE, SOURCE_REPUTATION_BONUS
+    from models.product import ProductSummary, get_source_site_name
+    from repositories.deal_raw_pool_repo import DealRawPoolRepository, evaluate_quality_signals
+    from repositories.product_repo import ProductRepository
+    from services.deal_sources import build_deal_record
 
     # 1. 信誉加分与信源中文名映射（仅活跃 12 站点）
     assert SOURCE_REPUTATION_BONUS.get("tehuicaicai") == 10
@@ -1274,7 +1275,7 @@ def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
 
 
 def test_ithome_lapin_strips_sitewide_redpacket_footer():
-    from mobile_web.services.deal_sources.ithome_lapin import _clean_ithome_paragraph_html
+    from services.deal_sources.ithome_lapin import _clean_ithome_paragraph_html
 
     sample_html = (
         '<div id="paragraph">'
@@ -1294,5 +1295,114 @@ def test_ithome_lapin_strips_sitewide_redpacket_footer():
     assert "7NGMyki" not in cleaned
     assert "无门槛红包" not in cleaned
     assert "广告声明：" not in cleaned
+
+
+def test_filters_positive_link_overrides_mall_name_and_rejects_image_hash_only_shell():
+    # 1. 虽商户标签属于品牌/餐饮名，只要携带淘宝/京东/拼多多正向购买锚点即绝不误杀
+    assert is_confirmed_unsupported_deal(
+        mall_name="肯德基",
+        links=[{"url": "https://s.click.taobao.com/t?e=1"}],
+    ) is False
+    assert is_confirmed_unsupported_deal(
+        mall_name="瑞幸",
+        links=[{"url": "https://u.jd.com/abc"}],
+    ) is False
+    assert is_confirmed_unsupported_deal(mall_name="肯德基") is True
+
+    # 2. 仅包含京东主图哈希 candidate_goods_id 但无任何外部电商链接/口令时，严格视为无效空壳
+    hash_only_rec = {
+        "has_full_detail": True,
+        "candidate_goods_id": "jd_img_hash_0123456789abcdef",
+        "tutorial_text": "实付19.9元京东自营包邮",
+        "extracted_links": [],
+        "extracted_tokens": [],
+    }
+    assert has_valid_detail_and_tutorial(hash_only_rec) is False
+
+
+def test_token_ssot_and_publish_time_7digit_iso():
+    from models.product import extract_all_tokens
+
+    sample = (
+        "苹果手机(iPhone16Pro)优惠：￥Ab12Cd34Ef5￥ "
+        "！Ab12Cd34Ef56Gh！ "
+        "长串：AbCdEfGhIjKlMnOpQrStUvWx-0123456789abcdef"
+    )
+    tokens = extract_all_tokens(sample)
+    assert "￥Ab12Cd34Ef5￥" in tokens
+    assert "！Ab12Cd34Ef56Gh！" in tokens
+    assert "AbCdEfGhIjKlMnOpQrStUvWx-0123456789abcdef" in tokens
+    assert not any("iPhone16Pro" in tk for tk in tokens)
+
+    expected_ts = datetime.datetime(
+        2026, 11, 20, 22, 53, 52, 450000,
+        tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+    ).timestamp()
+    assert abs(parse_publish_time_epoch("2026-11-20T22:53:52.4500000+08:00") - expected_ts) < 1e-6
+
+
+def test_guangdiu_network_error_not_rate_limited_and_cookie_guard(tmp_path):
+    import os
+    from services.deal_sources.guangdiu import (
+        DEFAULT_GUANGDIU_COOKIE_FILE,
+        GuangdiuSource,
+        save_guangdiu_cookies,
+    )
+
+    sess_err = MagicMock()
+    sess_err.get.side_effect = requests.exceptions.ConnectionError("dns failed")
+    ch = ChannelConfig(
+        name="逛丢_首页实时流",
+        site_key="guangdiu",
+        default_url="https://guangdiu.com/",
+        params={"channel": "latest", "cookie_file": ""},
+    )
+    res = GuangdiuSource().fetch(FetchContext(channel=ch, session=sess_err)).to_dict()
+    assert res["status"] == "error"
+    assert res["rate_limited"] is False
+
+    # WEB_LOG_DIR="-" 保护默认运行时 cookie 文件，同时允许显式写入 tmp_path
+    s = requests.Session()
+    s.cookies.set("gdhuman", "v1", domain="guangdiu.com", path="/")
+    existed_before = os.path.exists(DEFAULT_GUANGDIU_COOKIE_FILE)
+    save_guangdiu_cookies(s, DEFAULT_GUANGDIU_COOKIE_FILE)
+    assert os.path.exists(DEFAULT_GUANGDIU_COOKIE_FILE) is existed_before
+
+    tmp_cookie = tmp_path / "gd_cookies.json"
+    save_guangdiu_cookies(s, str(tmp_cookie))
+    assert tmp_cookie.exists()
+
+
+def test_telegram_nested_div_in_message_text_preserved():
+    now_ts = 1_760_000_000.0
+    t_recent = datetime.datetime.fromtimestamp(now_ts - 120, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    tg_html = f"""
+    <section class="tgme_channel_history">
+      <div class="tgme_widget_message_wrap" data-post="zzzdm/202">
+        <div class="tgme_widget_message_text">
+          <div class="nested-quote">优惠说明：领券立减30元</div>
+          实付19.9元 <a href="https://u.jd.com/NEST202">立即购买</a>
+        </div>
+        <time datetime="{t_recent}"></time>
+      </div>
+    </section>
+    """
+    sess = MagicMock()
+    sess.get.return_value = _mk_resp(200, tg_html)
+    ch = ChannelConfig(
+        name="TG_NESTED",
+        site_key="telegram",
+        default_url="https://t.me/s/zzzdm",
+        params={"tg_channel": "zzzdm"},
+        fetch_mode="time_window",
+        lookback_seconds=3600,
+        max_pages=1,
+        network_mode="proxy",
+    )
+    res = TelegramChannelSource().fetch(FetchContext(channel=ch, session=sess, now_ts=now_ts)).to_dict()
+    assert res["status"] == "ok"
+    assert len(res["records"]) == 1
+    assert any(lk["url"] == "https://u.jd.com/NEST202" for lk in res["records"][0]["extracted_links"])
+
 
 

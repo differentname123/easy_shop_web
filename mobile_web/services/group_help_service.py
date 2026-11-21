@@ -22,20 +22,23 @@ from cache_utils import ThreadSafeTTLCache
 from config import logger
 from infrastructure.ai_api.model_api import extract_llm_json
 from infrastructure.logging_utils import format_exc_summary
+from infrastructure.runtime_io import load_prompt_cached
 from models.group_help import (
     ENTRY_TYPE_LINK,
     ENTRY_TYPE_POSTER,
+    GROUP_STATUS_ACTIVE,
     GROUP_STATUS_EXPIRED,
     GROUP_STATUS_FULL,
     GROUP_STATUS_PENDING_CONFIRM,
     MAX_TAKEDOWNS_PER_WINDOW,
+    PARSE_STATUS_PARSED,
     SOURCE_USER_TEXT,
     SOURCE_USER_UPLOAD,
     TAKEDOWN_RATE_WINDOW_SECONDS,
     GroupHelpAuthRequiredError,
     GroupHelpPermissionError,
     format_group_doc,
-    is_pdd_qr_url,
+    is_allowed_pdd_url,
     is_relist_feedback,
     is_takedown_feedback,
     is_valid_group_order_id,
@@ -125,7 +128,7 @@ def decode_qr_from_image_bytes(image_bytes: bytes) -> str:
 def resolve_pdd_qr_link(qr_url: str, http_get: Optional[Callable] = None) -> Dict[str, str]:
     """免登录核验二维码中的拼多多短链，通过 307 重定向提取 group_order_id 等关键元数据。"""
     clean_url = str(qr_url or "").strip()
-    if not is_pdd_qr_url(clean_url):
+    if not is_allowed_pdd_url(clean_url):
         raise ValueError("二维码内容不是拼多多官方链接，请上传拼多多【多人团邀请分享图】")
 
     # 若二维码本身就是包含 group_order_id 的长链接，直接解析
@@ -335,7 +338,30 @@ class GroupHelpService:
                 raise ValueError(
                     "该拼团已超过有效期失效（拼多多拼团仅24小时有效），请在拼多多重新发起新团后再上传最新海报"
                 )
-            if self._is_group_owner(existing, owner_token=owner_token, viewer_uid=clean_uid) and owner_token:
+            is_owner = (not self._has_owner_binding(existing)) or self._is_group_owner(
+                existing, owner_token=owner_token, viewer_uid=clean_uid
+            )
+            if not is_owner:
+                if existing.get("user_takedown") or existing.get("group_status") in (
+                    GROUP_STATUS_FULL,
+                    GROUP_STATUS_EXPIRED,
+                ):
+                    raise GroupHelpPermissionError(
+                        "该拼团已被下架或已成团，仅团长本人可重新上传恢复",
+                        error_code="owner_only",
+                        status_code=403,
+                    )
+                if (
+                    existing.get("parse_status") == PARSE_STATUS_PARSED
+                    and existing.get("group_status") == GROUP_STATUS_ACTIVE
+                ):
+                    return {
+                        "status": "success",
+                        "is_new": False,
+                        "message": "该拼团已在互助大厅展示，无需重复上传",
+                        "data": self._format_with_matched_group(existing, now=now),
+                    }
+            elif self._is_group_owner(existing, owner_token=owner_token, viewer_uid=clean_uid) and owner_token:
                 issued_owner_token = str(owner_token).strip()
         else:
             issued_owner_token = secrets.token_hex(12)
@@ -481,11 +507,9 @@ class GroupHelpService:
         return result
 
     def _load_prompt(self) -> str:
-        if _PROMPT_FILE.is_file():
-            try:
-                return _PROMPT_FILE.read_text(encoding="utf-8-sig").strip()
-            except Exception:
-                pass
+        prompt = load_prompt_cached(_PROMPT_FILE)
+        if prompt:
+            return prompt
         return (
             "请审核并识别这张拼多多多人团分享海报图中的合规性(is_compliant)、是否完整海报(is_group_poster)、"
             "商品名称(goods_name)、搜索关键词数组(keywords)、拼团价(group_price)、几人团(total_people)、"

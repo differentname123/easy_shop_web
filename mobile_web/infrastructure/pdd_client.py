@@ -7,195 +7,28 @@ logger setup. DNS optimization is installed only by configure_transport().
 
 import hashlib
 import json
-import logging
-import socket
-import sys
-import threading
 import time
 
-import requests
-from requests.adapters import HTTPAdapter
-
-
-logger = logging.getLogger("mobile_web")
-
-_REAL_STDLIB_GETADDRINFO = socket.getaddrinfo
-_ORIG_GETADDRINFO = socket.getaddrinfo
-_PDD_FALLBACK_IPS = ("101.226.73.254", "58.217.134.20", "101.226.73.255", "58.217.134.19")
-_GATEWAY_FALLBACK_IPS = {
-    "gw-api.pinduoduo.com": _PDD_FALLBACK_IPS,
-    "eco.taobao.com": ("59.82.121.73",),
-    "gw.api.taobao.com": ("59.82.23.84",),
-    "api.zhetaoke.com": ("111.198.53.170",),
-    "api.jd.com": ("106.39.169.86",),
-    "v2.api.haodanku.com": ("139.200.130.76", "113.125.206.117", "139.200.130.199"),
-}
-_PDD_DNS_CACHE = {}
-_PDD_DNS_REFRESHING = set()
-_PDD_DNS_LOCK = threading.Lock()
-_PDD_TRANSPORT_LOCK = threading.Lock()
-_PDD_DNS_ENABLED = False
-_PDD_DNS_INSTALLED = False
-_DNS_REAL_RESOLVE_TIMEOUT_SEC = 1.5
-_DNS_PROACTIVE_REFRESH_WINDOW_SEC = 90.0
-
-
-def _is_windows():
-    return sys.platform == "win32"
-
-
-def _resolve_with_bounded_timeout(resolver, host, port, family, type_, proto, flags):
-    """对真实 C 级系统 DNS 解析施加 1.5s 超时保护防 12s 卡死；单元测试 Mock 直接同步调用保持 100% 确定性。"""
-    if resolver is not _REAL_STDLIB_GETADDRINFO:
-        return resolver(host, port, family, type_, proto, flags)
-    box = [None, None]
-    done = threading.Event()
-
-    def _worker():
-        try:
-            box[0] = resolver(host, port, family, type_, proto, flags)
-        except Exception as exc:
-            box[1] = exc
-        finally:
-            done.set()
-
-    t = threading.Thread(target=_worker, name=f"dns-{host}", daemon=True)
-    t.start()
-    if not done.wait(timeout=_DNS_REAL_RESOLVE_TIMEOUT_SEC):
-        raise socket.gaierror(f"DNS resolve timed out (>{_DNS_REAL_RESOLVE_TIMEOUT_SEC}s) for {host}")
-    if box[1] is not None:
-        raise box[1]
-    return box[0]
-
-
-def _schedule_proactive_dns_refresh(host, port, type_, proto, flags):
-    resolver = _ORIG_GETADDRINFO
-    if resolver is not _REAL_STDLIB_GETADDRINFO:
-        return
-    with _PDD_DNS_LOCK:
-        if host in _PDD_DNS_REFRESHING:
-            return
-        _PDD_DNS_REFRESHING.add(host)
-
-    def _bg_refresh():
-        try:
-            res = _resolve_with_bounded_timeout(resolver, host, port, socket.AF_INET, type_, proto, flags)
-            if res:
-                with _PDD_DNS_LOCK:
-                    _PDD_DNS_CACHE[host] = (time.time() + 600, res)
-        except Exception:
-            pass
-        finally:
-            with _PDD_DNS_LOCK:
-                _PDD_DNS_REFRESHING.discard(host)
-
-    threading.Thread(target=_bg_refresh, name=f"dns-pre-{host}", daemon=True).start()
-
-
-def _pdd_cached_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    if _PDD_DNS_ENABLED and host in _GATEWAY_FALLBACK_IPS:
-        now = time.time()
-        entry = _PDD_DNS_CACHE.get(host)
-        if entry and now < entry[0]:
-            if (entry[0] - now) <= _DNS_PROACTIVE_REFRESH_WINDOW_SEC:
-                _schedule_proactive_dns_refresh(host, port, type, proto, flags)
-            return [(f, t, p, c, (addr[0], port or addr[1])) for f, t, p, c, addr in entry[1]]
-        with _PDD_DNS_LOCK:
-            entry = _PDD_DNS_CACHE.get(host)
-            if entry and now < entry[0]:
-                return [(f, t, p, c, (addr[0], port or addr[1])) for f, t, p, c, addr in entry[1]]
-            try:
-                res = _resolve_with_bounded_timeout(_ORIG_GETADDRINFO, host, port, socket.AF_INET, type, proto, flags)
-                _PDD_DNS_CACHE[host] = (now + 600, res)
-                return res
-            except Exception as exc:
-                logger.debug(
-                    "【DNS缓存兜底】解析联盟网关域名[%s]失败，已切换至缓存或内置备用IPv4地址 | 异常<%s>",
-                    host, exc.__class__.__name__,
-                )
-                if entry:
-                    return [(f, t, p, c, (addr[0], port or addr[1])) for f, t, p, c, addr in entry[1]]
-                fallback_ips = _GATEWAY_FALLBACK_IPS.get(host, _PDD_FALLBACK_IPS)
-                fallback_res = [
-                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))
-                    for ip in fallback_ips
-                ]
-                _PDD_DNS_CACHE[host] = (now + 300, fallback_res)
-                return fallback_res
-    return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
-
+from infrastructure.logging_utils import logger
+from infrastructure.transport import (
+    _GATEWAY_FALLBACK_IPS,
+    _PDD_FALLBACK_IPS,
+    configure_transport,
+    create_http_session,
+    register_gateway_fallback_ips,
+)
 
 # Session/pool construction performs no requests, configuration reads or writes.
-_PDD_SESSION = requests.Session()
-_PDD_SESSION.trust_env = not _is_windows()
-_PDD_ADAPTER = HTTPAdapter(pool_connections=30, pool_maxsize=100, max_retries=1)
-_PDD_SESSION.mount("https://", _PDD_ADAPTER)
-_PDD_SESSION.mount("http://", _PDD_ADAPTER)
-_PDD_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-})
-
-
-def configure_transport(dns_mode="auto", trust_env=None):
-    """Configure platform defaults explicitly; never resolve a host here.
-
-    auto keeps the original cached IPv4/fallback optimization on Windows and
-    uses native DNS elsewhere. on/off override DNS on either platform. A later
-    third-party resolver is never overwritten when disabling our wrapper; any
-    retained reference to our wrapper becomes a transparent pass-through.
-    """
-    global _ORIG_GETADDRINFO, _PDD_DNS_ENABLED, _PDD_DNS_INSTALLED
-
-    if dns_mode not in ("auto", "on", "off"):
-        raise ValueError("dns_mode must be 'auto', 'on', or 'off'")
-    if trust_env is not None and not isinstance(trust_env, bool):
-        raise TypeError("trust_env must be a bool or None")
-
-    enabled = dns_mode == "on" or (dns_mode == "auto" and _is_windows())
-    with _PDD_TRANSPORT_LOCK:
-        _PDD_SESSION.trust_env = not _is_windows() if trust_env is None else trust_env
-        if enabled:
-            if not _PDD_DNS_INSTALLED:
-                _ORIG_GETADDRINFO = socket.getaddrinfo
-                with _PDD_DNS_LOCK:
-                    if not _PDD_DNS_CACHE:
-                        now_ts = time.time()
-                        for host_key, ips in _GATEWAY_FALLBACK_IPS.items():
-                            _PDD_DNS_CACHE[host_key] = (
-                                now_ts + 600,
-                                [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))
-                                 for ip in ips],
-                            )
-                _PDD_DNS_ENABLED = True
-                socket.getaddrinfo = _pdd_cached_getaddrinfo
-                _PDD_DNS_INSTALLED = True
-            else:
-                # A third party may now wrap us. Do not capture that wrapper as
-                # our upstream: doing so would create a resolver recursion loop.
-                _PDD_DNS_ENABLED = True
-        else:
-            _PDD_DNS_ENABLED = False
-            if _PDD_DNS_INSTALLED and socket.getaddrinfo is _pdd_cached_getaddrinfo:
-                socket.getaddrinfo = _ORIG_GETADDRINFO
-                _PDD_DNS_INSTALLED = False
-
-
-def register_gateway_fallback_ips(host: str, ips) -> None:
-    """为新增第三方联盟网关域名登记备用 IPv4，复用 Windows DNS 防卡死兜底。"""
-    clean_host = str(host or "").strip().lower()
-    clean_ips = tuple(str(ip).strip() for ip in (ips or ()) if str(ip).strip())
-    if not clean_host or not clean_ips:
-        return
-    with _PDD_TRANSPORT_LOCK:
-        _GATEWAY_FALLBACK_IPS[clean_host] = clean_ips
-        if _PDD_DNS_ENABLED:
-            now_ts = time.time()
-            with _PDD_DNS_LOCK:
-                _PDD_DNS_CACHE[clean_host] = (
-                    now_ts + 600,
-                    [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443)) for ip in clean_ips],
-                )
+_PDD_SESSION = create_http_session(
+    pool_connections=30,
+    pool_maxsize=100,
+    max_retries=1,
+    headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    },
+)
+_PDD_ADAPTER = _PDD_SESSION.adapters["https://"]
 
 
 def warmup(http_session=None):
@@ -403,7 +236,7 @@ def clean_order_item(order):
         "order_modify_at": order.get("order_modify_at"),
     }
 
-def check_member_authority(client_id, client_secret, pid, uid):
+def check_member_authority(client_id, client_secret, pid, uid, http_session=None):
     """
     [基础函数] 查询指定推手/渠道是否已在拼多多完成绑定备案
     接口：pdd.ddk.member.authority.query
@@ -412,7 +245,7 @@ def check_member_authority(client_id, client_secret, pid, uid):
     params = {"pid": pid, "custom_parameters": custom_params}
 
     try:
-        res = call_pdd_api(client_id, client_secret, "pdd.ddk.member.authority.query", params)
+        res = call_pdd_api(client_id, client_secret, "pdd.ddk.member.authority.query", params, http_session=http_session)
         resp_data = res.get("authority_query_response", {})
         bind = resp_data.get("bind", 0)
         return {
@@ -425,7 +258,7 @@ def check_member_authority(client_id, client_secret, pid, uid):
         logger.debug("【拼多多网关】查询推手备案状态返回异常，交由上层服务聚合处理 | 用户[%s] 异常<%s>", uid, str(e))
         return {"status": "error", "bind": 0, "is_authorized": False, "error_msg": str(e)}
 
-def generate_authority_url(client_id, client_secret, pid, uid=None, **kwargs):
+def generate_authority_url(client_id, client_secret, pid, uid=None, http_session=None, **kwargs):
     """
     [基础函数] 生成推手/渠道专属授权备案链接 (channel_type=10)
     接口：pdd.ddk.rp.prom.url.generate
@@ -441,7 +274,7 @@ def generate_authority_url(client_id, client_secret, pid, uid=None, **kwargs):
     business_params.update(kwargs)
 
     try:
-        res = call_pdd_api(client_id, client_secret, "pdd.ddk.rp.prom.url.generate", business_params)
+        res = call_pdd_api(client_id, client_secret, "pdd.ddk.rp.prom.url.generate", business_params, http_session=http_session)
         url_list = res.get("rp_promotion_url_generate_response", {}).get("url_list", [])
         if url_list:
             return {"status": "success", "url_info": url_list[0]}
@@ -449,7 +282,7 @@ def generate_authority_url(client_id, client_secret, pid, uid=None, **kwargs):
     except Exception as e:
         return {"status": "error", "error_msg": f"生成备案链接失败: {str(e)}"}
 
-def convert_pdd_url(client_id, client_secret, pid, source_url, uid=None, **kwargs):
+def convert_pdd_url(client_id, client_secret, pid, source_url, uid=None, http_session=None, **kwargs):
     """
     [基础函数] 外部/单条拼多多链接清洗转换 (洗出带有自己 PID 的推广链)
     接口：pdd.ddk.goods.zs.unit.url.gen
@@ -462,7 +295,7 @@ def convert_pdd_url(client_id, client_secret, pid, source_url, uid=None, **kwarg
     params.update(kwargs)
 
     try:
-        res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.zs.unit.url.gen", params)
+        res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.zs.unit.url.gen", params, http_session=http_session)
         data = res.get("goods_zs_unit_generate_response", {})
         jump_url = extract_short_url(data)
         if jump_url:
@@ -472,7 +305,7 @@ def convert_pdd_url(client_id, client_secret, pid, source_url, uid=None, **kwarg
         err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
         return {"status": "error", "error_code": err_code, "error_msg": f"转链失败: {str(e)}"}
 
-def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=None, search_id=None, **kwargs):
+def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=None, search_id=None, http_session=None, **kwargs):
     """
     [基础函数] 使用官方标准接口直接将 goods_sign 生成推广短链
     接口：pdd.ddk.goods.promotion.url.generate
@@ -490,7 +323,7 @@ def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=
     params.update(kwargs)
 
     try:
-        res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.promotion.url.generate", params)
+        res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.promotion.url.generate", params, http_session=http_session)
         url_list = res.get("goods_promotion_url_generate_response", {}).get("goods_promotion_url_list", [])
         if url_list:
             return {"status": "success", "data": url_list[0]}
@@ -502,7 +335,7 @@ def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
         return {"status": "error", "error_msg": f"生成商品推广链接异常: {str(e)}"}
 
-def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash_gift_id=None, uid=None, **kwargs):
+def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash_gift_id=None, uid=None, http_session=None, **kwargs):
     """
     [复合应用函数] 终极智能降级生链：礼金 > 官方超级红包(Channel 23) > 普通推广链接
     """
@@ -520,7 +353,7 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
                 "custom_parameters": custom_params
             }
             params.update(kwargs)
-            res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.promotion.url.generate", params)
+            res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.promotion.url.generate", params, http_session=http_session)
             url_list = res.get("goods_promotion_url_generate_response", {}).get("goods_promotion_url_list", [])
             if url_list:
                 return {"status": "success", "link_type": "多多礼金秒杀", "data": url_list[0]}
@@ -536,7 +369,7 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
             "diy_sp_red_packet_param": {"goods_sign": goods_sign},
             "custom_parameters": custom_params
         }
-        hb_res = call_pdd_api(client_id, client_secret, "pdd.ddk.rp.prom.url.generate", hb_params)
+        hb_res = call_pdd_api(client_id, client_secret, "pdd.ddk.rp.prom.url.generate", hb_params, http_session=http_session)
         hb_url_list = hb_res.get("rp_promotion_url_generate_response", {}).get("url_list", [])
         if hb_url_list:
             return {"status": "success", "link_type": "官方超级红包", "data": hb_url_list[0]}
@@ -544,14 +377,16 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
         strategy_errors.append(str(exc))
 
     # 策略 3：标准兜底推广
-    fallback_res = generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=uid, **kwargs)
+    fallback_res = generate_goods_promotion_url(
+        client_id, client_secret, pid, goods_sign, uid=uid, http_session=http_session, **kwargs
+    )
     if fallback_res.get("status") == "success":
         fallback_res["link_type"] = "常规推广"
     elif strategy_errors:
         fallback_res["strategy_errors"] = strategy_errors
     return fallback_res
 
-def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_id=None, uid=None, **kwargs):
+def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_id=None, uid=None, http_session=None, **kwargs):
     """
     [基础函数] 统一单品详情查询器：
     - 优先根据 goods_sign 直连官方 Detail 接口；
@@ -572,11 +407,11 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
             }
             params.update(kwargs)
             try:
-                res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params)
+                res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params, http_session=http_session)
             except Exception as first_err:
                 if custom_params is not None and ("60001" in str(first_err) or "授权备案" in str(first_err)):
                     params.pop("custom_parameters", None)
-                    res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params)
+                    res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params, http_session=http_session)
                 else:
                     raise
             detail_resp = res.get("goods_detail_response")
@@ -600,7 +435,7 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
     # 路径 B：goods_id 降级策略（通过短链反查）
     try:
         source_url = f"https://mobile.pinduoduo.com/goods.html?goods_id={goods_id}"
-        zs_res = convert_pdd_url(client_id, client_secret, pid=pid, source_url=source_url, uid=uid)
+        zs_res = convert_pdd_url(client_id, client_secret, pid=pid, source_url=source_url, uid=uid, http_session=http_session)
         short_url = zs_res.get("jump_url")
         if not short_url:
             return {
@@ -615,7 +450,7 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
             "custom_parameters": custom_params,
             "page": 1,
             "page_size": 10
-        })
+        }, http_session=http_session)
         goods_list = search_res.get("goods_search_response", {}).get("goods_list", [])
         if goods_list:
             cleaned = clean_goods_item(goods_list[0], source_type="search_api_probe")
@@ -625,7 +460,7 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
         err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
         return {"status": "error", "error_code": err_code, "error_msg": f"goods_id 反查中断: {str(e)}"}
 
-def query_increment_orders(client_id, client_secret, start_time, end_time, page=1, page_size=50, **kwargs):
+def query_increment_orders(client_id, client_secret, start_time, end_time, page=1, page_size=50, http_session=None, **kwargs):
     """
     [订单同步] 按订单更新时间增量同步（用于佣金核算、处理退款与订单变更）
     接口：pdd.ddk.order.list.increment.get
@@ -640,7 +475,7 @@ def query_increment_orders(client_id, client_secret, start_time, end_time, page=
     params.update(kwargs)
 
     try:
-        res = call_pdd_api(client_id, client_secret, "pdd.ddk.order.list.increment.get", params)
+        res = call_pdd_api(client_id, client_secret, "pdd.ddk.order.list.increment.get", params, http_session=http_session)
         resp_data = res.get("order_list_get_response", {})
         raw_orders = resp_data.get("order_list", [])
         total_count = resp_data.get("total_count", 0)
@@ -665,12 +500,10 @@ class PddClient:
         self.http_session = http_session
 
     def call_api(self, api_type: str, business_params=None, timeout=(2.5, 4.0)):
-        if self.http_session is not None:
-            return call_pdd_api(
-                self.client_id, self.client_secret, api_type, business_params,
-                timeout=timeout, http_session=self.http_session,
-            )
-        return call_pdd_api(self.client_id, self.client_secret, api_type, business_params, timeout=timeout)
+        return call_pdd_api(
+            self.client_id, self.client_secret, api_type, business_params,
+            timeout=timeout, http_session=self.http_session,
+        )
 
     def warmup(self):
         return warmup(http_session=self.http_session)
@@ -678,26 +511,32 @@ class PddClient:
     def get_goods_detail(self, goods_sign=None, goods_id=None, uid=None, **kwargs):
         return get_goods_detail(
             self.client_id, self.client_secret, pid=self.pid,
-            goods_sign=goods_sign, goods_id=goods_id, uid=uid, **kwargs,
+            goods_sign=goods_sign, goods_id=goods_id, uid=uid, http_session=self.http_session, **kwargs,
         )
 
     def generate_smart_promotion_url(self, goods_sign, cash_gift_id=None, uid=None, **kwargs):
         return generate_smart_promotion_url(
             self.client_id, self.client_secret, self.pid, goods_sign,
-            cash_gift_id=cash_gift_id, uid=uid, **kwargs,
+            cash_gift_id=cash_gift_id, uid=uid, http_session=self.http_session, **kwargs,
         )
 
     def convert_pdd_url(self, source_url, uid=None, **kwargs):
-        return convert_pdd_url(self.client_id, self.client_secret, self.pid, source_url, uid=uid, **kwargs)
+        return convert_pdd_url(
+            self.client_id, self.client_secret, self.pid, source_url,
+            uid=uid, http_session=self.http_session, **kwargs,
+        )
 
     def check_authority(self, uid):
-        return check_member_authority(self.client_id, self.client_secret, self.pid, uid)
+        return check_member_authority(self.client_id, self.client_secret, self.pid, uid, http_session=self.http_session)
 
     def generate_authority_url(self, uid=None, **kwargs):
-        return generate_authority_url(self.client_id, self.client_secret, self.pid, uid=uid, **kwargs)
+        return generate_authority_url(
+            self.client_id, self.client_secret, self.pid, uid=uid,
+            http_session=self.http_session, **kwargs,
+        )
 
     def query_orders(self, start_time, end_time, page=1, page_size=50, **kwargs):
         return query_increment_orders(
             self.client_id, self.client_secret, start_time=start_time, end_time=end_time,
-            page=page, page_size=page_size, **kwargs,
+            page=page, page_size=page_size, http_session=self.http_session, **kwargs,
         )

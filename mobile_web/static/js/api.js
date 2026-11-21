@@ -3,12 +3,13 @@
   'use strict';
   const shop = global.EasyShop = global.EasyShop || {};
   shop.createApi = function ({ fetchImpl = global.fetch.bind(global) } = {}) {
-    const request = async (path, { method = 'GET', body, token, signal } = {}) => {
+    const request = async (path, { method = 'GET', body, token, signal, keepalive } = {}) => {
       const headers = {};
       if (body !== undefined) headers['Content-Type'] = 'application/json';
       if (token) headers.Authorization = `Bearer ${token}`;
       const response = await fetchImpl(path, {
         method, headers, signal,
+        ...(keepalive ? { keepalive: true } : {}),
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       let data;

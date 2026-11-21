@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from adapters.base import UnavailablePlatformAdapter
 from auth import create_access_token
 from cache import PROMOTION_CACHE
-from config import AUTH_STATUS_TTL, AUTH_NEGATIVE_STATUS_TTL
+from config import AUTH_NEGATIVE_STATUS_TTL
 from services.promote_service import PromoteService
 from services.user_service import UserService
 

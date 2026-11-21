@@ -17,8 +17,8 @@ for _p in (str(_REPO_ROOT), str(_MOBILE_WEB_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from repositories.product_repo import ProductRepository
-from mobile_web.scripts import goods_info_format as gif
+from models.cost_performance import extract_sku_unit_entries
+from services import goods_formatter as gif
 from tests.test_product_repository import MemoryCollection as ProductMemoryCollection
 
 
@@ -287,16 +287,16 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
     assert doc_empty_title["deal_info"]["format_status"] == "failed"
     assert doc_empty_title["deal_info"]["format_retry_count"] == gif.FORMAT_MAX_RETRIES
 
-    # 4. 验证下游 ProductRepository 仅读取顶层官方 format_info，不受 deal_info.format_info 干扰
-    entries = ProductRepository._extract_sku_unit_entries(doc_normal)
+    # 4. 验证下游性价比模型仅读取顶层官方 format_info，不受 deal_info.format_info 干扰
+    entries = extract_sku_unit_entries(doc_normal)
     assert len(entries) == 1
     sku_price, base_unit, unit_qty_map = entries[0]
     assert sku_price == 49.9
     assert base_unit == "ml"
     assert unit_qty_map["ml"] == 4000.0
 
-    # 同时验证 deal_info.format_info 单对象结构与 _extract_sku_unit_entries 解析协议天然兼容
-    deal_entries = ProductRepository._extract_sku_unit_entries({
+    # 同时验证 deal_info.format_info 单对象结构与 extract_sku_unit_entries 解析协议天然兼容
+    deal_entries = extract_sku_unit_entries({
         "format_status": doc_normal["deal_info"]["format_status"],
         "format_info": doc_normal["deal_info"]["format_info"],
     })
@@ -419,8 +419,8 @@ def test_run_format_round_recleans_specless_placeholder_sku_when_activity_price_
     assert counts_round2["success"] == 0
 
     # 验证下游性价比提取：18瓶装每元 9000/35.4 = 254.237ml，严格高于 24瓶装每元 12000/55.2 = 217.391ml
-    e18 = ProductRepository._extract_sku_unit_entries(cola_18)
-    e24 = ProductRepository._extract_sku_unit_entries(cola_24)
+    e18 = extract_sku_unit_entries(cola_18)
+    e24 = extract_sku_unit_entries(cola_24)
     assert round(e18[0][2]["ml"] / e18[0][0], 6) > round(e24[0][2]["ml"] / e24[0][0], 6)
 
 

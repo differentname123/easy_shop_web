@@ -151,63 +151,74 @@ def test_ready_fast_path_never_takes_metadata_or_collection_lock():
     assert repo.attempts == 1
 
 
-def test_lazy_connections_are_per_instance_and_created_once(monkeypatch):
+def test_lazy_connection_shares_process_pool_and_resets_cleanly(monkeypatch):
+    from infrastructure import mongo
+
+    mongo.close_shared_db()
     entered, release = threading.Event(), threading.Event()
     first = ProbeRepository()
     other = ProbeRepository()
-    db, other_db = MemoryDatabase(), MemoryDatabase()
+    shared_db = MemoryDatabase()
+    shared_db.close = MagicMock()
     calls = []
 
-    def connect():
+    def connect(settings=None, **kw):
         calls.append(threading.current_thread().name)
         if threading.current_thread().name == "slow-connection":
             entered.set()
             assert release.wait(5)
-            return db
-        return other_db
+        return shared_db
 
-    monkeypatch.setattr(module, "gen_db_object", connect)
+    monkeypatch.setattr(mongo, "gen_db_object", connect)
     assert calls == []
     errors = []
 
-    def open_first():
+    def open_repo(repo):
         try:
-            assert first.col is db.get_collection("products")
+            assert repo.col is shared_db.get_collection("products")
         except BaseException as exc:
             errors.append(exc)
 
-    slow = threading.Thread(target=open_first, name="slow-connection")
+    slow = threading.Thread(target=open_repo, args=(first,), name="slow-connection")
     slow.start()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        try:
-            assert entered.wait(2)
-            assert pool.submit(lambda: other.col).result(timeout=2) is other_db.get_collection("products")
-            waiting = pool.submit(lambda: first.col)
-        finally:
+    try:
+        assert entered.wait(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            waiting = pool.submit(open_repo, other)
             release.set()
-            slow.join(timeout=2)
-        assert waiting.result(timeout=2) is db.get_collection("products")
+            waiting.result(timeout=2)
+    finally:
+        release.set()
+        slow.join(timeout=2)
     assert not slow.is_alive() and not errors
-    assert len(calls) == 2 and first.attempts == other.attempts == 1
+    assert len(calls) == 1
+    assert first._db is shared_db and other._db is shared_db
+    assert first.attempts + other.attempts == 1
+    mongo.close_shared_db()
+    shared_db.close.assert_called_once()
 
 
 def test_connection_failure_remains_retryable(monkeypatch):
+    from infrastructure import mongo
+
+    mongo.close_shared_db()
     db = MemoryDatabase()
     attempts = []
 
-    def connect():
+    def connect(settings=None, **kw):
         attempts.append(True)
         if len(attempts) == 1:
             raise RuntimeError("connection unavailable")
         return db
 
-    monkeypatch.setattr(module, "gen_db_object", connect)
+    monkeypatch.setattr(mongo, "gen_db_object", connect)
     repo = ProbeRepository()
     with pytest.raises(RuntimeError, match="connection unavailable"):
         _ = repo.col
     assert repo._db is None
     assert repo.col is db.get_collection("products")
     assert len(attempts) == 2
+    mongo.close_shared_db()
 
 
 def test_mock_state_uses_database_identity_and_is_not_globally_retained():

@@ -18,19 +18,15 @@ from __future__ import annotations
 
 import html as html_lib
 import re
-import time
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from models.product import detect_platform_signal
 
-from .base import BaseDealSource, FetchContext, FetchResult
-from .filters import (
-    SOURCE_SELF_HOSTS,
-    has_valid_detail_and_tutorial,
-    is_confirmed_unsupported_deal,
-)
+from .base import FetchContext
+from .filters import SOURCE_SELF_HOSTS, is_confirmed_unsupported_deal, is_host_match
 from .http_client import DEFAULT_HEADERS, is_rate_limit_status, request_with_retry
+from .list_detail_base import ListDetailDealSource, ListPhaseResult, SkipItem, fetch_page_html
 from .parsing import (
     build_deal_record,
     extract_balanced_tag,
@@ -41,16 +37,9 @@ from .parsing import (
 )
 
 
-def _parse_empire_index_cards(html_text: str, base_url: str) -> List[Dict[str, Any]]:
-    wrap = html_text.split('id="home-left"', 1)[-1] if 'id="home-left"' in html_text else html_text
-    wrap = wrap.split('id="sidebar"', 1)[0]
-    boxes = re.findall(
-        r'<div\s+class=["\']postbox["\'][^>]*>(.*?)(?=<div\s+class=["\']postbox["\']|<div\s+class=["\']wp-pagenavi|$)',
-        wrap,
-        re.S | re.I,
-    )
+def _parse_empire_card_blocks(blocks: List[str], base_url: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-    for blk in boxes:
+    for blk in blocks:
         m_a = re.search(r'<a\b[^>]*href=["\']((?:https?://[^"\']+)?/\d{4}/\d{2}/\d{2}/(\d+)\.html)["\']', blk, re.I)
         if not m_a:
             continue
@@ -58,8 +47,7 @@ def _parse_empire_index_cards(html_text: str, base_url: str) -> List[Dict[str, A
         item_id = m_a.group(2).strip()
 
         m_h2 = re.search(r"<h2[^>]*>(.*?)</h2>", blk, re.S | re.I)
-        price_text = ""
-        title = ""
+        price_text, title = "", ""
         if m_h2:
             h2_inner = m_h2.group(1)
             m_span = re.search(r"<span[^>]*>(.*?)</span>", h2_inner, re.S | re.I)
@@ -70,13 +58,12 @@ def _parse_empire_index_cards(html_text: str, base_url: str) -> List[Dict[str, A
         img_url = html_lib.unescape(m_img.group(1)).strip() if m_img else ""
 
         m_buy = re.search(
-            r'<a\b[^>]*class=["\'][^"\']*imlink_gobuy[^"\']*["\'][^>]*href=["\']([^"\']+)["\']|<a\b[^>]*href=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*imlink_gobuy',
+            r'<a\b[^>]*class=["\'][^"\']*imlink_gobuy[^"\']*["\'][^>]*href=["\']([^"\']+)["\']'
+            r'|<a\b[^>]*href=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*imlink_gobuy',
             blk,
             re.S | re.I,
         )
-        list_buy_url = ""
-        if m_buy:
-            list_buy_url = html_lib.unescape(m_buy.group(1) or m_buy.group(2) or "").strip()
+        list_buy_url = html_lib.unescape(m_buy.group(1) or m_buy.group(2) or "").strip() if m_buy else ""
 
         items.append({
             "item_id": item_id,
@@ -87,65 +74,37 @@ def _parse_empire_index_cards(html_text: str, base_url: str) -> List[Dict[str, A
             "list_buy_url": list_buy_url,
         })
     return items
+
+
+def _parse_empire_index_cards(html_text: str, base_url: str) -> List[Dict[str, Any]]:
+    wrap = html_text.split('id="home-left"', 1)[-1] if 'id="home-left"' in html_text else html_text
+    wrap = wrap.split('id="sidebar"', 1)[0]
+    boxes = re.findall(
+        r'<div\s+class=["\']postbox["\'][^>]*>(.*?)(?=<div\s+class=["\']postbox["\']|<div\s+class=["\']wp-pagenavi|$)',
+        wrap,
+        re.S | re.I,
+    )
+    return _parse_empire_card_blocks(boxes, base_url)
 
 
 def _parse_empire_hot_cards(html_text: str, base_url: str) -> List[Dict[str, Any]]:
     lis = re.findall(r'<li\s+class=["\']list["\'][^>]*>(.*?)</li>', html_text, re.S | re.I)
-    items: List[Dict[str, Any]] = []
-    for li in lis:
-        m_a = re.search(r'<a\b[^>]*href=["\']((?:https?://[^"\']+)?/\d{4}/\d{2}/\d{2}/(\d+)\.html)["\']', li, re.I)
-        if not m_a:
-            continue
-        detail_url = urljoin(base_url, html_lib.unescape(m_a.group(1)).strip())
-        item_id = m_a.group(2).strip()
-
-        m_h2 = re.search(r"<h2[^>]*>(.*?)</h2>", li, re.S | re.I)
-        price_text = ""
-        title = ""
-        if m_h2:
-            h2_inner = m_h2.group(1)
-            m_span = re.search(r"<span[^>]*>(.*?)</span>", h2_inner, re.S | re.I)
-            price_text = strip_html_tags(m_span.group(1)) if m_span else ""
-            title = strip_html_tags(h2_inner)
-
-        m_img = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', li, re.I)
-        img_url = html_lib.unescape(m_img.group(1)).strip() if m_img else ""
-
-        m_buy = re.search(
-            r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*imlink_gobuy[^"\']*["\']|<a\b[^>]*class=["\'][^"\']*imlink_gobuy[^"\']*["\'][^>]*href=["\']([^"\']+)["\']',
-            li,
-            re.S | re.I,
-        )
-        list_buy_url = ""
-        if m_buy:
-            list_buy_url = html_lib.unescape(m_buy.group(1) or m_buy.group(2) or "").strip()
-
-        items.append({
-            "item_id": item_id,
-            "detail_url": detail_url,
-            "title": title,
-            "price_text": price_text,
-            "image_url": img_url,
-            "list_buy_url": list_buy_url,
-        })
-    return items
+    return _parse_empire_card_blocks(lis, base_url)
 
 
-class EmpireDealSource(BaseDealSource):
+class EmpireDealSource(ListDetailDealSource):
     """发现值得买 (`kiees`) 与 牛杂网 (`niuza`) 共享抓取实现。"""
 
     base_url: str = ""
     close_connection: bool = True
 
-    def fetch(self, ctx: FetchContext) -> FetchResult:
+    def fetch_list_cards(self, ctx: FetchContext, t0: float) -> ListPhaseResult:
         ch = ctx.channel
         params = ch.params or {}
         mode = str(params.get("mode") or "index").strip().lower()
         base = str(params.get("base_url") or self.base_url).rstrip("/")
         max_pages = 1 if mode == "index" else max(1, int(ch.max_pages or 8))
-        full_sweep = ch.fetch_mode == "full_sweep"
-        max_details = ctx.effective_max_details
-        skip_set = ctx.known_ids
+        primary_url = f"{base}/index.html" if mode == "index" else f"{base}/hot_1"
 
         all_cards: List[Dict[str, Any]] = []
         seen_ids: Set[str] = set()
@@ -153,44 +112,30 @@ class EmpireDealSource(BaseDealSource):
         rate_limited = False
         reached_end = False
         last_http_status: Optional[int] = None
-        primary_url = f"{base}/index.html" if mode == "index" else f"{base}/hot_1"
-        t0 = time.perf_counter()
 
         for page in range(1, max_pages + 1):
             if mode == "index":
-                page_url = f"{base}/index.html" if page == 1 else f"{base}/index{page}.html"
+                page_url = f"{base}/index.html"
             else:
                 page_url = f"{base}/hot_1" if page == 1 else f"{base}/hot_1/p{page}"
 
-            resp = None
-            try:
-                resp = request_with_retry(ctx.session, "get", page_url, headers=DEFAULT_HEADERS, timeout=ctx.timeout)
+            if pages_crawled == 0:
+                resp, html_text, err = fetch_page_html(ctx, page_url, t0=t0)
+                if err is not None:
+                    return ListPhaseResult(request_url=page_url, http_status=err.http_status, error_result=err)
                 last_http_status = resp.status_code
-                resp.encoding = "utf-8"
-                if resp.status_code != 200:
-                    if is_rate_limit_status(resp.status_code):
-                        rate_limited = True
-                    if pages_crawled == 0:
-                        return FetchResult(
-                            status="error",
-                            http_status=resp.status_code,
-                            request_url=page_url,
-                            elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
-                            rate_limited=rate_limited,
-                            detail_errors=[{"error": f"HTTP {resp.status_code}", "http_status": resp.status_code}],
-                        )
+            else:
+                try:
+                    resp = request_with_retry(ctx.session, "get", page_url, headers=DEFAULT_HEADERS, timeout=ctx.timeout)
+                    last_http_status = resp.status_code
+                    resp.encoding = "utf-8"
+                    if resp.status_code != 200:
+                        if is_rate_limit_status(resp.status_code):
+                            rate_limited = True
+                        break
+                    html_text = resp.text
+                except Exception:
                     break
-                html_text = resp.text
-            except Exception as exc:
-                if pages_crawled == 0:
-                    return FetchResult(
-                        status="error",
-                        http_status=getattr(resp, "status_code", None),
-                        request_url=page_url,
-                        elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
-                        detail_errors=[{"error": str(exc), "error_type": type(exc).__name__}],
-                    )
-                break
 
             pages_crawled += 1
             parsed = _parse_empire_index_cards(html_text, base) if mode == "index" else _parse_empire_hot_cards(html_text, base)
@@ -206,6 +151,7 @@ class EmpireDealSource(BaseDealSource):
                 seen_ids.add(cid)
                 unseen_on_page += 1
                 all_cards.append(card)
+
             if unseen_on_page == 0:
                 reached_end = True
                 break
@@ -213,188 +159,107 @@ class EmpireDealSource(BaseDealSource):
                 reached_end = True
                 break
 
-        records: List[Dict[str, Any]] = []
-        touch_ids: Set[str] = set()
-        detail_errors: List[Dict[str, Any]] = []
-        raw_list_count = len(all_cards)
-        detail_fetched = 0
-        detail_attempted = 0
-        skipped_known = 0
-        skipped_unsupported = 0
-        skipped_no_detail = 0
-        detail_circuit_broken = False
-
-        for card in all_cards:
-            item_id = card["item_id"]
-            list_buy_url = card.get("list_buy_url") or ""
-
-            if list_buy_url and is_confirmed_unsupported_deal(links=[{"url": list_buy_url}]):
-                skipped_unsupported += 1
-                continue
-
-            if full_sweep:
-                touch_ids.add(item_id)
-
-            if item_id in skip_set:
-                skipped_known += 1
-                continue
-
-            if detail_circuit_broken or detail_attempted >= max_details:
-                continue
-
-            if detail_attempted > 0:
-                self.sleep_detail_delay(ctx)
-            detail_attempted += 1
-
-            detail_url = card["detail_url"]
-            title = card["title"]
-            price_text = card["price_text"]
-            img_url = card["image_url"]
-
-            try:
-                rd = request_with_retry(
-                    ctx.session,
-                    "get",
-                    detail_url,
-                    headers={**DEFAULT_HEADERS, "Referer": primary_url},
-                    timeout=ctx.timeout,
-                )
-                rd.encoding = "utf-8"
-                if rd.status_code != 200:
-                    if is_rate_limit_status(rd.status_code):
-                        detail_circuit_broken = True
-                        rate_limited = True
-                    skipped_no_detail += 1
-                    detail_errors.append({
-                        "item_id": item_id,
-                        "error_url": detail_url,
-                        "http_status": rd.status_code,
-                        "error_type": f"HTTP_{rd.status_code}",
-                        "error": f"详情页返回非200状态码: {rd.status_code}",
-                    })
-                    continue
-
-                det_html = rd.text
-                body_part = det_html.split("<body", 1)[-1] if "<body" in det_html else det_html
-                post_html = extract_balanced_tag(body_part, "div", r'\bclass=["\'][^"\']*postsingle[^"\']*["\']')
-                if not post_html:
-                    post_html = extract_balanced_tag(body_part, "div", r'\bclass=["\'][^"\']*entry\b')
-                if not post_html:
-                    skipped_no_detail += 1
-                    continue
-
-                # 提取购买按钮 (#shop_url 或 .single_gobuy)
-                det_buy_links: List[Dict[str, Any]] = []
-                for m_gobuy in re.finditer(
-                    r'<a\b[^>]*href=["\'](https?://[^"\']+)["\'][^>]*>(.*?)</a>',
-                    post_html,
-                    re.S | re.I,
-                ):
-                    full_a = m_gobuy.group(0)
-                    href = html_lib.unescape(m_gobuy.group(1)).strip()
-                    a_txt = strip_html_tags(m_gobuy.group(2))
-                    if any(k in full_a for k in ("tracklink", "imlink_gobuy")) or any(
-                        k in a_txt for k in ("购买链接", "去购买", "领券", "直达")
-                    ):
-                        if not any(h in href.lower() for h in (self.site_key,)):
-                            det_buy_links.append({
-                                "label": a_txt or "购买链接",
-                                "url": href,
-                                "type": "buy_url",
-                                "platform": detect_platform_signal(href) or "unknown",
-                            })
-
-                # 提取正文内容区域 .entry-content
-                ec_html = extract_balanced_tag(post_html, "div", r'\bclass=["\'][^"\']*entry-content[^"\']*["\']')
-                if not ec_html:
-                    ec_html = post_html
-                ec_links, ec_imgs, ec_tokens = extract_links_images_and_tokens(
-                    ec_html,
-                    base_url=detail_url,
-                    exclude_hosts=SOURCE_SELF_HOSTS,
-                )
-                ec_text = html_to_tutorial_text(ec_html, base_url=detail_url).strip()
-
-                merged_links: List[Dict[str, Any]] = []
-                seen_urls: Set[str] = set()
-                for lk in [*det_buy_links, *ec_links]:
-                    u = str(lk.get("url") or "").strip()
-                    if u and u not in seen_urls:
-                        seen_urls.add(u)
-                        merged_links.append(lk)
-                if list_buy_url and list_buy_url not in seen_urls:
-                    merged_links.append({
-                        "label": "列表购买链接",
-                        "url": list_buy_url,
-                        "type": "list_buy_url",
-                        "platform": detect_platform_signal(list_buy_url) or "unknown",
-                    })
-
-                all_imgs: List[str] = [img_url] if img_url else []
-                for im in ec_imgs:
-                    if im and im not in all_imgs:
-                        all_imgs.append(im)
-
-                if is_confirmed_unsupported_deal(links=merged_links, tokens=ec_tokens):
-                    skipped_unsupported += 1
-                    continue
-
-                buy_summary = "\n".join(f"购买链接: {lk['url']}" for lk in det_buy_links[:2])
-                tutorial_text = f"{ec_text}\n{buy_summary}".strip() if buy_summary else ec_text
-
-                rec = build_deal_record(
-                    source_site=self.site_key,
-                    source_channel=ch.name,
-                    source_item_id=item_id,
-                    source_url=detail_url,
-                    source_list_page_url=primary_url,
-                    source_detail_url=detail_url,
-                    title=title or f"{self.site_key} #{item_id}",
-                    price_text=price_text,
-                    image_url=img_url,
-                    publish_time=utc_now_iso(),
-                    hot_metrics={"mode": mode},
-                    tutorial_text=tutorial_text,
-                    tutorial_images=all_imgs,
-                    extracted_links=merged_links,
-                    extracted_tokens=ec_tokens,
-                    raw_payload=ec_html,
-                    has_full_detail=True,
-                )
-                if not has_valid_detail_and_tutorial(rec):
-                    skipped_no_detail += 1
-                    continue
-
-                detail_fetched += 1
-                records.append(rec)
-            except Exception as exc:
-                skipped_no_detail += 1
-                detail_errors.append({
-                    "item_id": item_id,
-                    "error_url": detail_url,
-                    "http_status": None,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:160],
-                })
-
-        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-        is_ok = pages_crawled > 0 and raw_list_count > 0 and not (rate_limited and len(records) == 0 and len(touch_ids) == 0)
-        return FetchResult(
-            status="ok" if is_ok else "error",
-            http_status=last_http_status or 200,
+        return ListPhaseResult(
+            cards=all_cards,
             request_url=primary_url,
-            elapsed_ms=elapsed_ms,
-            records=records,
-            raw_list_count=raw_list_count,
-            detail_fetched=detail_fetched,
-            skipped_known=skipped_known,
-            skipped_unsupported=skipped_unsupported,
-            skipped_no_detail=skipped_no_detail,
+            http_status=last_http_status or 200,
             pages_crawled=pages_crawled,
-            touch_ids=sorted(touch_ids),
-            sweep_completed=bool(full_sweep and reached_end and not rate_limited),
+            reached_end=reached_end,
             rate_limited=rate_limited,
-            detail_errors=detail_errors,
+            extra_state={"mode": mode},
+        )
+
+    def parse_detail_record(
+        self,
+        card: Dict[str, Any],
+        det_resp: Any,
+        det_html: str,
+        list_res: ListPhaseResult,
+        ctx: FetchContext,
+    ) -> Optional[Dict[str, Any]]:
+        ch = ctx.channel
+        mode = str((ch.params or {}).get("mode") or "index").strip().lower()
+        item_id = card["item_id"]
+        detail_url = card["detail_url"]
+        list_buy_url = card.get("list_buy_url") or ""
+        img_url = card["image_url"]
+
+        body_part = det_html.split("<body", 1)[-1] if "<body" in det_html else det_html
+        post_html = extract_balanced_tag(body_part, "div", r'\bclass=["\'][^"\']*postsingle[^"\']*["\']')
+        if not post_html:
+            post_html = extract_balanced_tag(body_part, "div", r'\bclass=["\'][^"\']*entry\b')
+        if not post_html:
+            return None
+
+        # 提取购买按钮 (#shop_url 或 .single_gobuy)
+        det_buy_links: List[Dict[str, Any]] = []
+        for m_gobuy in re.finditer(r'<a\b[^>]*href=["\'](https?://[^"\']+)["\'][^>]*>(.*?)</a>', post_html, re.S | re.I):
+            full_a = m_gobuy.group(0)
+            href = html_lib.unescape(m_gobuy.group(1)).strip()
+            a_txt = strip_html_tags(m_gobuy.group(2))
+            if any(k in full_a for k in ("tracklink", "imlink_gobuy")) or any(
+                k in a_txt for k in ("购买链接", "去购买", "领券", "直达")
+            ):
+                buy_host = (urlsplit(href).hostname or "").strip().lower()
+                if not any(is_host_match(buy_host, sh) for sh in SOURCE_SELF_HOSTS):
+                    det_buy_links.append({
+                        "label": a_txt or "购买链接",
+                        "url": href,
+                        "type": "buy_url",
+                        "platform": detect_platform_signal(href) or "unknown",
+                    })
+
+        # 提取正文内容区域 .entry-content
+        ec_html = extract_balanced_tag(post_html, "div", r'\bclass=["\'][^"\']*entry-content[^"\']*["\']') or post_html
+        ec_links, ec_imgs, ec_tokens = extract_links_images_and_tokens(
+            ec_html, base_url=detail_url, exclude_hosts=SOURCE_SELF_HOSTS
+        )
+        ec_text = html_to_tutorial_text(ec_html, base_url=detail_url).strip()
+
+        merged_links: List[Dict[str, Any]] = []
+        seen_urls: Set[str] = set()
+        for lk in [*det_buy_links, *ec_links]:
+            u = str(lk.get("url") or "").strip()
+            if u and u not in seen_urls:
+                seen_urls.add(u)
+                merged_links.append(lk)
+        if list_buy_url and list_buy_url not in seen_urls:
+            merged_links.append({
+                "label": "列表购买链接",
+                "url": list_buy_url,
+                "type": "list_buy_url",
+                "platform": detect_platform_signal(list_buy_url) or "unknown",
+            })
+
+        all_imgs: List[str] = [img_url] if img_url else []
+        for im in ec_imgs:
+            if im and im not in all_imgs:
+                all_imgs.append(im)
+
+        if is_confirmed_unsupported_deal(links=merged_links, tokens=ec_tokens):
+            raise SkipItem("unsupported")
+
+        buy_summary = "\n".join(f"购买链接: {lk['url']}" for lk in det_buy_links[:2])
+        tutorial_text = f"{ec_text}\n{buy_summary}".strip() if buy_summary else ec_text
+
+        return build_deal_record(
+            source_site=self.site_key,
+            source_channel=ch.name,
+            source_item_id=item_id,
+            source_url=detail_url,
+            source_list_page_url=list_res.request_url,
+            source_detail_url=detail_url,
+            title=card["title"] or f"{self.site_key} #{item_id}",
+            price_text=card["price_text"],
+            image_url=img_url,
+            publish_time=utc_now_iso(),
+            hot_metrics={"mode": mode},
+            tutorial_text=tutorial_text,
+            tutorial_images=all_imgs,
+            extracted_links=merged_links,
+            extracted_tokens=ec_tokens,
+            raw_payload=ec_html,
+            has_full_detail=True,
         )
 
 

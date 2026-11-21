@@ -9,22 +9,14 @@
 3. 日常直接运行：`python run_deal_pool_scheduler.py`（或 `--once` / `--stats` / `--ops-report` / `--reset-db`）。
 ================================================================================
 """
+from __future__ import annotations
+
 import argparse
-import logging
 import os
-import signal
 import sys
 import threading
 import time
-from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List
-
-# 确保 Windows 终端下正常输出中文与 Emoji
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
@@ -33,138 +25,21 @@ for _path in (PROJECT_ROOT, WORKSPACE_ROOT, CURRENT_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from infrastructure.ai_api.model_api import generate_content
-from infrastructure.api_governance import set_process_role
-
-# 1. 导出全局常量与状态机标识（保持兼容）
+from infrastructure.runtime_io import bootstrap_script, install_shutdown_signals, interruptible_sleep
 from models.deal_constants import (
-    CLEAN_FAILED_SAMPLES_JSONL,
-    CLEAN_OPS_HISTORY_JSONL,
-    CLEAN_STAGE_DONE,
-    CLEAN_STAGE_NEED_AI1,
-    CLEAN_STAGE_NEED_AI2,
-    CLEAN_STAGE_NEED_CONVERT,
-    CLEAN_SUCCESS_PREVIEW_JSONL,
     DEAL_FORMAL_EXPIRY_HOURS,
-    DEAL_INFO_PROTECTION_HOURS,
-    DEAL_MAX_CLEAN_AGE_DAYS,
     DEAL_POOL_LOG_PREFIXES,
     DEAL_POOL_RUNTIME_HEALTH_PATH,
-    DEAL_RAW_TTL_DAYS,
     DEFAULT_AI_TIMEOUT_SECONDS,
-    DEFAULT_CLEAN_INTERVAL_SECONDS,
     DEFAULT_CLEAN_WINDOW,
     DEFAULT_FORMAL_PRODUCTS_COLLECTION,
     DEFAULT_RAW_COLLECTION_NAME,
-    DEFAULT_STAGE_LEASE_SECONDS_AI,
-    DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
-    DEFAULT_STAGE_POLL_INTERVAL_SECONDS,
-    ERROR_LOG_JSONL_PATH,
-    ERR_ADAPTER_CONVERT_FAILED,
-    ERR_ADAPTER_OFF_PROMOTION,
-    ERR_AI2_COUPON_FAILED_OR_DROPPED,
-    ERR_AI2_MAIN_DEAD_ONLY_FILLER,
-    ERR_AI2_PRODUCT_MISMATCH,
-    ERR_AI2_VIRTUAL_OR_JUNK,
-    ERR_AI_MAX_RETRIES_EXCEEDED,
-    ERR_AI_TIMEOUT_RETRY,
-    ERR_EMPTY_PRODUCT_IDENTITY,
-    ERR_EXPIRED_OVER_7_DAYS,
-    ERR_JD_NUMERIC_SKU,
-    ERR_LOW_QUALITY_SCORE,
-    ERR_MAIN_PRODUCT_DEAD,
-    ERR_MERGED_INTO_NEIGHBOR,
-    ERR_NO_ANCHOR,
-    ERR_PDD_NUMERIC_ID,
-    ERR_TB_NUMERIC_ID,
-    ERR_UNSUPPORTED_PLATFORM,
-    LATEST_CLEAN_OPS_REPORT_PATH,
-    LATEST_OPS_REPORT_PATH,
-    LOCAL_FALLBACK_JSONL,
     LOG_DIR,
     LOG_FILE_PATH,
-    MAX_ANCHOR_CACHE_SIZE,
-    MAX_CLEAN_RETRIES,
-    MAX_JSONL_FILE_BYTES,
-    OK_SKIPPED_ALREADY_CLEANED,
-    OPS_REPORT_HISTORY_JSONL,
-    PROMPT_DIR,
-    PROMPT_STAGE1_PATH,
-    PROMPT_STAGE2_PATH,
-    QUALIFIED_DEAL_MIN_SCORE,
-    SOURCE_REPUTATION_BONUS,
-    STATS_SNAPSHOT_PATH,
-    _UNSUPPORTED_EXTERNAL_DOMAINS,
 )
-
-# 2. 导出仓储层与信号检测核心
-from repositories.deal_raw_pool_repo import (
-    DealRawPoolRepository,
-    _SIGNAL_SKU_KEYWORDS,
-    _SIGNAL_TOKEN_SYMBOLS,
-    _SIGNAL_URL_OR_DOMAIN_KEYWORDS,
-    _append_bounded_jsonl_lines,
-    _is_pure_jd_coupon_only_record,
-    append_error_records_jsonl,
-    evaluate_quality_signals,
-    has_potential_product_signal,
-    parse_publish_time_epoch,
-)
-
-# 3. 导出频道配置模型与线报采集插件体系（唯一真源: services.deal_sources）
-from services.deal_sources import (
-    DEFAULT_CHANNEL_CONFIGS,
-    DEFAULT_GUANGDIU_COOKIE_FILE,
-    BaicaioSource,
-    BaseDealSource,
-    ChannelConfig,
-    DealChannelConfig,
-    FetchContext,
-    FetchResult,
-    GuangdiuSource,
-    HaodankuSource,
-    IthomeLapinSource,
-    KieesSource,
-    MZzzdmSource,
-    NiuzaSource,
-    TehuicaicaiSource,
-    TelegramChannelSource,
-    Tuan0818Source,
-    XuandanSource,
-    ZdzdmSource,
-    create_site_session,
-    get_active_channels,
-    get_channel_max_age_days,
-    get_site_max_age_days_map,
-    get_source,
-    get_source_troubleshooting,
-    has_valid_detail_and_tutorial,
-    is_channel_due,
-    is_confirmed_unsupported_deal,
-    is_record_confirmed_unsupported,
-    list_sources,
-)
-
-# 4. 导出清洗引擎与阶段流水线
-from services.deal_pool_cleaner import (
-    DealPoolCleaner,
-    MaintenanceWorker,
-    StageWorker,
-    _commit_batch_results_to_db,
-    _is_safe_public_http_url,
-    _is_verified_station_promo_link,
-    detect_candidate_platform,
-    is_direct_coupon_or_venue_url,
-    rebuild_clean_official_venue_url,
-    unwrap_to_official_public_venue_url,
-    upsert_cleaned_products_to_formal_table,
-)
-
-# 5. 导出调度管道与运维报告
+from repositories.deal_raw_pool_repo import DealRawPoolRepository
 from services.deal_pipeline import (
-    SITE_DISPLAY_NAMES,
-    build_and_log_cycle_ops_report,
-    get_ops_troubleshooting_advice,
+    DealPipelineRunner,
     print_latest_ops_report,
     print_stats_report,
     run_clean_stage,
@@ -172,39 +47,13 @@ from services.deal_pipeline import (
     run_single_cycle,
     run_stage_pipeline_drain,
 )
-
-
-def setup_scheduler_logger() -> logging.Logger:
-    """配置控制台与文件滚动日志器。"""
-    sched_logger = logging.getLogger("deal_pool_scheduler")
-    if sched_logger.handlers:
-        return sched_logger
-    sched_logger.setLevel(logging.INFO)
-    sched_logger.propagate = False
-
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(fmt)
-    sched_logger.addHandler(console_handler)
-
-    if os.environ.get("WEB_LOG_DIR", "").strip() != "-":
-        os.makedirs(LOG_DIR, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            LOG_FILE_PATH,
-            maxBytes=15 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(fmt)
-        sched_logger.addHandler(file_handler)
-    return sched_logger
-
-
-logger = setup_scheduler_logger()
-
+from services.deal_pool_cleaner import DealPoolCleaner
+from services.deal_sources import (
+    DEFAULT_CHANNEL_CONFIGS,
+    DealChannelConfig,
+    get_active_channels,
+    is_channel_due,
+)
 
 # ==============================================================================
 # 【运维直改配置区 1】：全局运行参数（直接改这里保存并运行 python run_deal_pool_scheduler.py）
@@ -231,14 +80,8 @@ SCHEDULER_CONFIG: Dict[str, Any] = {
     "formal_collection": DEFAULT_FORMAL_PRODUCTS_COLLECTION,
 }
 
-
 # ==============================================================================
 # 【监控频道表】：唯一真源已收敛至 services/deal_sources/catalog.py (DEFAULT_CHANNEL_CONFIGS)
-# ------------------------------------------------------------------------------
-# 每个频道由 ChannelConfig 声明式控制：
-# - enabled / interval_seconds / fetch_mode / lookback_seconds
-# - use_fetch_time_as_publish_time / expire_missing_on_sweep / network_mode / close_connection
-# - max_pages / max_details / detail_delay_seconds / sleep_after / rate_limit_cooldown_seconds
 # ==============================================================================
 MONITORED_CHANNELS: List[DealChannelConfig] = list(DEFAULT_CHANNEL_CONFIGS)
 
@@ -247,9 +90,7 @@ def _reset_raw_pool_and_logs(repo: DealRawPoolRepository) -> None:
     try:
         for fname in os.listdir(LOG_DIR):
             fpath = os.path.join(LOG_DIR, fname)
-            if not os.path.isfile(fpath):
-                continue
-            if not any(fname.startswith(prefix) for prefix in DEAL_POOL_LOG_PREFIXES):
+            if not os.path.isfile(fpath) or not any(fname.startswith(p) for p in DEAL_POOL_LOG_PREFIXES):
                 continue
             if fpath == LOG_FILE_PATH:
                 with open(fpath, "w", encoding="utf-8") as lf:
@@ -287,57 +128,20 @@ def _compute_next_wake_seconds(
             site_cooldown_until.get(ch.site_key, 0.0),
             site_cooldown_until.get(ch.name, 0.0),
         )
-        target_at = max(due_at, cool_until)
-        wait_s = max(0.0, target_at - now_ts)
+        wait_s = max(0.0, max(due_at, cool_until) - now_ts)
         if wait_s < min_wait:
             min_wait = wait_s
     return max(1, int(round(min_wait)))
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="好价线报拉取与清洗主控守护脚本（参数集中配置在文件顶部 SCHEDULER_CONFIG 与 MONITORED_CHANNELS）"
-    )
-    parser.add_argument("--once", action="store_true", help="临时执行单轮拉取+清洗后退出")
-    parser.add_argument("--clean-only", action="store_true", help="临时仅执行待清洗队列排空")
-    parser.add_argument("--stats", action="store_true", help="仅打印初步表与正式表统计")
-    parser.add_argument("--ops-report", action="store_true", help="仅打印最近一轮运维报告")
-    parser.add_argument("--reset-db", action="store_true", help="启动前清空初步表与统计日志")
-    args = parser.parse_args()
-
-    cfg = dict(SCHEDULER_CONFIG)
-    mode = str(cfg.get("run_mode") or "daemon").strip().lower()
-    if args.stats:
-        mode = "stats"
-    elif args.ops_report:
-        mode = "ops_report"
-    elif args.clean_only:
-        mode = "clean_only"
-    elif args.once or int(cfg.get("max_cycles") or 0) == 1:
-        mode = "once"
-
-    set_process_role("deal_scheduler")
-    try:
-        from infrastructure.pdd_client import configure_transport
-        from infrastructure.settings import get_settings as _get_app_settings
-        _st = _get_app_settings()
-        configure_transport(dns_mode=_st.pdd_dns_mode, trust_env=_st.pdd_trust_env)
-    except Exception:
-        pass
-
-    repo = DealRawPoolRepository(
-        collection_name=str(cfg["collection"]),
-        formal_collection_name=str(cfg["formal_collection"]),
-    )
-    cleaner = DealPoolCleaner(
-        use_ai_for_multi=True,
-        ai_batch_size=int(cfg["ai_batch_size"]),
-        ai2_batch_size=int(cfg.get("ai2_batch_size", 10)),
-        ai_max_workers=int(cfg["ai_workers"]),
-        convert_max_workers=int(cfg["convert_workers"]),
-        ai_timeout=float(cfg["ai_timeout"]),
-    )
-
+def _run_scheduler_body(
+    args: argparse.Namespace,
+    cfg: Dict[str, Any],
+    mode: str,
+    repo: DealRawPoolRepository,
+    cleaner: DealPoolCleaner,
+    logger: Any,
+) -> None:
     if args.reset_db or bool(cfg.get("reset_db_on_start")):
         _reset_raw_pool_and_logs(repo)
 
@@ -372,18 +176,9 @@ def main():
         print_stats_report(repo)
         return
 
-    stop_requested = False
+    stop_event = threading.Event()
     new_fetch_event = threading.Event()
-
-    def _handle_sig(signum, frame):
-        nonlocal stop_requested
-        logger.info("收到停止信号 (%s)，正在通知各工作线程优雅退出...", signum)
-        stop_requested = True
-        new_fetch_event.set()
-
-    signal.signal(signal.SIGINT, _handle_sig)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _handle_sig)
+    install_shutdown_signals(stop_event, logger=logger, on_signal=lambda _: new_fetch_event.set())
 
     channel_health_tracker: Dict[str, Dict[str, Any]] = {}
     channel_last_run: Dict[str, float] = {}
@@ -427,7 +222,7 @@ def main():
             fetch_tick_seconds,
         )
         cycle_num = 0
-        while not stop_requested:
+        while not stop_event.is_set():
             now_wall = time.time()
             has_due = any(
                 is_channel_due(ch, channel_last_run.get(ch.name, 0.0), now_wall)
@@ -451,22 +246,20 @@ def main():
                 except Exception as cycle_exc:
                     logger.exception("🚨 第 #%d 轮执行异常: %s", cycle_num, cycle_exc)
 
-            if max_cycles > 0 and cycle_num >= max_cycles:
-                break
-            if deadline_wall is not None and time.time() >= deadline_wall:
+            if (max_cycles > 0 and cycle_num >= max_cycles) or (
+                deadline_wall is not None and time.time() >= deadline_wall
+            ):
                 break
 
             sleep_sec = _compute_next_wake_seconds(
                 enabled_channels, channel_last_run, site_cooldown_until, time.time(), fetch_tick_seconds
             )
-            for _ in range(sleep_sec):
-                if stop_requested or (deadline_wall is not None and time.time() >= deadline_wall):
-                    break
-                time.sleep(1)
+            wait_cap = min(float(sleep_sec), max(0.0, deadline_wall - time.time())) if deadline_wall else float(sleep_sec)
+            if interruptible_sleep(stop_event, wait_cap):
+                break
         print_stats_report(repo)
         return
 
-    # 默认并行流水线常驻守护模式
     ch_summary = ", ".join(f"{c.name}({c.interval_seconds}s)" for c in enabled_channels) or "无"
     logger.info(
         "🚀 好价线报【流水线并行守护】已启动 | 初步表=[%s] -> 正式表=[%s] | 启用频道(%d): %s | AI批次=%d条/批",
@@ -477,18 +270,21 @@ def main():
         cleaner.ai_batch_size,
     )
 
-    cleaner.warmup_anchor_cache_from_db(repo.col)
-    shared_active_products = cleaner._load_active_formal_products(repo.formal_col)
-    shared_lock = threading.Lock()
-    ai_semaphore = threading.BoundedSemaphore(cleaner.ai_max_workers)
-
-    ai1_done_event = threading.Event()
-    convert_done_event = threading.Event()
+    runner = DealPipelineRunner(
+        repo=repo,
+        cleaner=cleaner,
+        clean_limit=clean_limit,
+        stop_event=stop_event,
+        ai1_upstream_event=new_fetch_event,
+        ai1_poll_interval=2.0,
+        convert_poll_interval=1.5,
+        ai2_poll_interval=2.0,
+        maint_poll_interval=30.0,
+    )
 
     def _producer_fetch_worker() -> None:
-        nonlocal stop_requested
         fetch_cycle = 0
-        while not stop_requested:
+        while not stop_event.is_set():
             now_wall = time.time()
             due_now = [
                 ch
@@ -507,117 +303,100 @@ def main():
                         channels=effective_channels,
                         channel_last_run=channel_last_run,
                         site_cooldown_until=site_cooldown_until,
+                        active_index=runner.active_index,
                     )
                     if fetch_res.get("total_inserted", 0) > 0:
                         new_fetch_event.set()
                 except Exception as fetch_exc:
                     logger.exception("🚨 [拉取线程/Producer] 第 #%d 轮拉取异常: %s", fetch_cycle, fetch_exc)
 
-            if max_cycles > 0 and fetch_cycle >= max_cycles:
-                stop_requested = True
-                new_fetch_event.set()
-                break
-
-            if deadline_wall is not None and time.time() >= deadline_wall:
-                stop_requested = True
+            if (max_cycles > 0 and fetch_cycle >= max_cycles) or (
+                deadline_wall is not None and time.time() >= deadline_wall
+            ):
+                stop_event.set()
                 new_fetch_event.set()
                 break
 
             sleep_sec = _compute_next_wake_seconds(
                 enabled_channels, channel_last_run, site_cooldown_until, time.time(), fetch_tick_seconds
             )
-            for _ in range(sleep_sec):
-                if stop_requested or (deadline_wall is not None and time.time() >= deadline_wall):
-                    stop_requested = True
-                    new_fetch_event.set()
-                    break
-                time.sleep(1)
+            wait_cap = min(float(sleep_sec), max(0.0, deadline_wall - time.time())) if deadline_wall else float(sleep_sec)
+            if interruptible_sleep(stop_event, wait_cap):
+                new_fetch_event.set()
+                break
 
-    ai1_batch = max(64, cleaner.ai_batch_size * cleaner.ai_max_workers * 2)
-    if clean_limit > 0:
-        ai1_batch = max(cleaner.ai_batch_size, clean_limit)
-
-    worker_ai1 = StageWorker(
-        name="StageWorker-AI1",
-        stage=CLEAN_STAGE_NEED_AI1,
-        repo=repo,
-        cleaner=cleaner,
-        batch_size=ai1_batch,
-        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
-        poll_interval=2.0,
-        stop_event=threading.Event(),
-        ai_semaphore=ai_semaphore,
-        upstream_event=new_fetch_event,
-        downstream_event=ai1_done_event,
-        shared_active_products=shared_active_products,
-        shared_lock=shared_lock,
-    )
-    worker_convert = StageWorker(
-        name="StageWorker-Convert",
-        stage=CLEAN_STAGE_NEED_CONVERT,
-        repo=repo,
-        cleaner=cleaner,
-        batch_size=200,
-        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
-        poll_interval=1.5,
-        stop_event=threading.Event(),
-        ai_semaphore=None,
-        upstream_event=ai1_done_event,
-        downstream_event=convert_done_event,
-        shared_active_products=shared_active_products,
-        shared_lock=shared_lock,
-    )
-    worker_ai2 = StageWorker(
-        name="StageWorker-AI2",
-        stage=CLEAN_STAGE_NEED_AI2,
-        repo=repo,
-        cleaner=cleaner,
-        batch_size=100,
-        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
-        poll_interval=2.0,
-        stop_event=threading.Event(),
-        ai_semaphore=ai_semaphore,
-        upstream_event=convert_done_event,
-        downstream_event=None,
-        shared_active_products=shared_active_products,
-        shared_lock=shared_lock,
-    )
-    worker_maint = MaintenanceWorker(repo=repo, poll_interval=30.0, stop_event=threading.Event())
     producer_thread = threading.Thread(target=_producer_fetch_worker, name="DealProducerFetch", daemon=True)
-
     producer_thread.start()
-    worker_ai1.start()
-    worker_convert.start()
-    worker_ai2.start()
-    worker_maint.start()
+    runner.start()
 
     try:
-        while producer_thread.is_alive() or worker_ai1.is_alive() or worker_convert.is_alive() or worker_ai2.is_alive():
+        while (
+            producer_thread.is_alive()
+            or runner.worker_ai1.is_alive()
+            or runner.worker_convert.is_alive()
+            or runner.worker_ai2.is_alive()
+        ):
             producer_thread.join(timeout=1.0)
-            worker_ai1.join(timeout=0.5)
-            worker_convert.join(timeout=0.5)
-            worker_ai2.join(timeout=0.5)
-            if stop_requested:
-                worker_ai1.stop_event.set()
-                worker_convert.stop_event.set()
-                worker_ai2.stop_event.set()
-                worker_maint.stop_event.set()
-                ai1_done_event.set()
-                convert_done_event.set()
+            runner.join(timeout_per_worker=0.5)
+            if stop_event.is_set():
+                runner.stop()
                 new_fetch_event.set()
                 break
     except KeyboardInterrupt:
-        stop_requested = True
-        worker_ai1.stop_event.set()
-        worker_convert.stop_event.set()
-        worker_ai2.stop_event.set()
-        worker_maint.stop_event.set()
-        ai1_done_event.set()
-        convert_done_event.set()
+        stop_event.set()
+        runner.stop()
         new_fetch_event.set()
 
     print_stats_report(repo)
 
 
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="好价线报拉取与清洗主控守护脚本（参数集中配置在文件顶部 SCHEDULER_CONFIG 与 MONITORED_CHANNELS）"
+    )
+    parser.add_argument("--once", action="store_true", help="临时执行单轮拉取+清洗后退出")
+    parser.add_argument("--clean-only", action="store_true", help="临时仅执行待清洗队列排空")
+    parser.add_argument("--stats", action="store_true", help="仅打印初步表与正式表统计")
+    parser.add_argument("--ops-report", action="store_true", help="仅打印最近一轮运维报告")
+    parser.add_argument("--reset-db", action="store_true", help="启动前清空初步表与统计日志")
+    args = parser.parse_args()
+
+    logger = bootstrap_script(
+        "deal_scheduler",
+        "deal_pool_scheduler",
+        log_path=LOG_FILE_PATH,
+        max_bytes=15 * 1024 * 1024,
+        backup_count=3,
+    )
+
+    cfg = dict(SCHEDULER_CONFIG)
+    mode = str(cfg.get("run_mode") or "daemon").strip().lower()
+    if args.stats:
+        mode = "stats"
+    elif args.ops_report:
+        mode = "ops_report"
+    elif args.clean_only:
+        mode = "clean_only"
+    elif args.once or int(cfg.get("max_cycles") or 0) == 1:
+        mode = "once"
+
+    repo = DealRawPoolRepository(
+        collection_name=str(cfg["collection"]),
+        formal_collection_name=str(cfg["formal_collection"]),
+    )
+    cleaner = DealPoolCleaner(
+        ai_batch_size=int(cfg["ai_batch_size"]),
+        ai2_batch_size=int(cfg.get("ai2_batch_size", 10)),
+        ai_max_workers=int(cfg["ai_workers"]),
+        convert_max_workers=int(cfg["convert_workers"]),
+        ai_timeout=float(cfg["ai_timeout"]),
+    )
+    try:
+        _run_scheduler_body(args, cfg, mode, repo, cleaner, logger)
+    finally:
+        cleaner.close()
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

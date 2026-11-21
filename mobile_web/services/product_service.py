@@ -22,9 +22,9 @@ from repositories.product_repo import ProductRepository
 from cache import (
     RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
     MATERIAL_CACHE, SIGN_BY_ID_CACHE,
-    _DETAIL_CACHE_LOCK,
     cache_deal_tip,
     cache_product_detail,
+    clear_product_off_promotion,
     evict_product_from_caches,
     get_cached_deal_tip,
     get_cached_product_detail,
@@ -38,12 +38,6 @@ from cache import (
     sync_product_summary_in_caches,
 )
 from config import PRODUCT_DETAIL_TTL, logger
-
-_RECOMMEND_CACHE = RECOMMEND_CACHE
-_DETAIL_CACHE = DETAIL_CACHE
-_SEARCH_CACHE = SEARCH_CACHE
-_CATEGORY_CACHE = CATEGORY_CACHE
-_BOOM_SORT_CACHE = BOOM_SORT_CACHE
 
 
 @dataclass
@@ -97,7 +91,11 @@ class ProductService:
     def _save_summary_in_background(self, items, channel_type):
         def save():
             try:
-                self.repo.upsert_home_products(items, channel_type=channel_type)
+                written_count = self.repo.upsert_home_products(items, channel_type=channel_type)
+                if written_count > 0:
+                    for it in items:
+                        if isinstance(it, dict):
+                            clear_product_off_promotion(it.get("platform"), it.get("goods_id"), it.get("goods_sign"))
             except Exception as exc:
                 logger.warning(
                     "❌ 【商品摘要入库异常】后台线程执行推荐摘要入库失败 | 频道[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或写入负载>",
@@ -470,13 +468,16 @@ class ProductService:
                 logger.warning("【商品身份迁移联动异常】%s", format_exc_summary(exc))
         if not self._has_valid_images(snapshot.data):
             try:
-                self.repo.upsert_home_products([snapshot.data])
+                if self.repo.upsert_home_products([snapshot.data]) > 0:
+                    clear_product_off_promotion(snapshot.ref.platform, snapshot.ref.goods_id, snapshot.ref.goods_sign)
             except Exception:
                 pass
             return _LoadedDetail(public, snapshot, persisted=False, retryable=False)
         deadline = raw_deadline
         try:
             written = self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=snapshot.fetched_at)) is True
+            if written:
+                clear_product_off_promotion(snapshot.ref.platform, snapshot.ref.goods_id, snapshot.ref.goods_sign)
         except Exception as exc:
             written = False
             logger.warning(
@@ -764,7 +765,7 @@ class ProductService:
             self._offer_products(page_items)
             return {
                 "status": "success",
-                "total_count": len(page_items) if kw_key else len(sorted_items),
+                "total_count": len(sorted_items),
                 "page": page,
                 "page_size": page_size,
                 "has_more": (skip + page_size) < len(sorted_items),

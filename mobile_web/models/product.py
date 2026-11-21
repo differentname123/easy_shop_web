@@ -41,23 +41,65 @@ def get_source_site_name(source_site: Optional[str]) -> str:
 
 _TB_CURRENCY_OR_EMOJI_CHARS = r"￥¥$€₴£¢💲🗝🔑🔐"
 _TB_WRAP_CHARS = _TB_CURRENCY_OR_EMOJI_CHARS + r"()（）/【】「」《》~|💰👉📲📦🎁"
-_SHARE_CODE_PAT = r"(?:CZ|CA|AC|ZH|MF|HU|TG|AA|SY|YD|TK)\s*\d{2,6}"
+_SHARE_CODE_PAT = r"(?:CZ|CA|AC|ZH|MF|HU|TG|AA|SY|YD|TK|MU|CB)\s*\d{2,6}"
 _SHARE_CODE_RE = re.compile(rf"\b{_SHARE_CODE_PAT}\b", re.IGNORECASE)
 _TB_UNIFIED_TOKEN_RE = re.compile(
     rf"([{_TB_WRAP_CHARS}])\s*(?:{_SHARE_CODE_PAT}\s+)?([A-Za-z0-9]{{8,15}})\s*(?:{_SHARE_CODE_PAT}\s*)?([{_TB_WRAP_CHARS}])",
     re.IGNORECASE,
 )
-_COMMON_MODEL_WORD_RE = re.compile(
-    r"(?:iphone|ipad|airpod|macbook|watch|mate|nova|pura|xiaomi|redmi|galaxy|vivo|oppo|honor|huawei|thinkpad|surface|rtx|gtx|ryzen)",
-    re.IGNORECASE,
-)
+_WEAK_TOKEN_LOWER_RUN_RE = re.compile(r"[a-z]{4,}")
+_WEAK_TOKEN_TITLE_SEG_RE = re.compile(r"[A-Z][a-z]{2,}")
 _JCMD_TOKEN_RE = re.compile(r"[！!][A-Za-z0-9]{10,20}[！!]")
 _BARE_ENCRYPTED_ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
-_SUPPORTED_ECOMMERCE_DOMAINS = (
+_BARE_ENCRYPTED_TOKEN_RE = re.compile(
+    r"(?:\b[A-Za-z0-9_-]{24,28}-[A-Za-z0-9_]{16,22}\b|\b[A-Za-z0-9]{25,35}_[A-Za-z0-9]{15,22}\b)"
+)
+URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+PDD_GOODS_SIGN_RE = re.compile(r"^[EYc][A-Za-z0-9_-]{25,}$")
+JD_JINGFEN_ID_RE = re.compile(r"jingfen\.jd\.com/detail/([A-Za-z0-9_]{20,})\.html", re.IGNORECASE)
+_SHORTLINK_DOMAIN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:u\.jd\.com|3\.cn|m\.tb\.cn|e\.tb\.cn|s\.tb\.cn|tb\.cn|tb3\.cn|s\.click\.taobao\.com|p\.pinduoduo\.com|yangkeduo\.com)/[A-Za-z0-9_.\-?=&/%]+",
+    re.IGNORECASE,
+)
+_HTTP_URL_STRIP_RE = re.compile(r"https?://[^\s\u4e00-\u9fa5\"'<>）)\]]+")
+_MP_MINIAPP_RE = re.compile(r"(?:#小程序|mp)://\S+")
+_TOKEN_LABEL_PAREN_RE = re.compile(r"[（(]\s*口令\s*[:：][^）)]+[）)]")
+_DEAL_TOKEN_SHELL_RE = re.compile(
+    r"(?i)\d{0,2}[ \t]*([￥¥$€£₴¢!！（(《「/]{1,2})[ \t]*([A-Za-z0-9]{8,16})[ \t]*([￥¥$€£₴¢!！）)》」/]{1,2})"
+    r"([ \t]*:?/{1,2}(?:[ \t]*(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?|[ \t]+(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?"
+)
+_STANDALONE_SHARE_CODE_SHELL_RE = re.compile(
+    r"(?i)(?:(?<=\s)|^)\d{0,2}[ \t]*(?:[\(（\$￥¥!！/\-]{1,3}[ \t]*[\)）\$￥¥!！/\-]{0,3}[ \t]*)?(?::?/{0,2}[ \t]*)?(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*(?=\s|$)"
+)
+_BARE_TOKEN_WRAPPER_RE = re.compile(
+    rf"\d{{0,2}}[ \t]*(?:[{_TB_WRAP_CHARS}]){{1,2}}[ \t]*(?:{_SHARE_CODE_PAT}[ \t]+)?([A-Za-z0-9]{{6,20}})[ \t]*(?:{_SHARE_CODE_PAT}[ \t]*)?(?:[{_TB_WRAP_CHARS}]){{1,2}}[ \t]*(?:(?:/|:/|：)\s*(?:{_SHARE_CODE_PAT})?)?",
+    re.IGNORECASE,
+)
+
+JD_DOMAINS = (
+    "u.jd.com", "jingfen.jd.com", "jingfen.com", "union-click.jd.com",
+    "item.jd.com", "m.jd.com", "3.cn", "jingxi.com", "jd.com",
+)
+TAOBAO_DOMAINS = (
+    "m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn", "tb3.cn", "s.click.taobao.com",
+    "uland.taobao.com", "item.taobao.com", "detail.tmall.com", "taobao.com", "tmall.com", "alimama.com",
+)
+PDD_DOMAINS = ("p.pinduoduo.com", "mobile.pinduoduo.com", "yangkeduo.com", "pinduoduo.com")
+SUPPORTED_ECOMMERCE_DOMAINS = (
     "jd.com", "jingfen.com", "3.cn", "jingxi.com",
     "tb.cn", "tb3.cn", "taobao.com", "tmall.com", "alimama.com",
     "pinduoduo.com", "yangkeduo.com",
 )
+_SUPPORTED_ECOMMERCE_DOMAINS = SUPPORTED_ECOMMERCE_DOMAINS
+
+
+def _looks_like_random_11char_token(tok: str) -> bool:
+    """结构化区分高熵 11 位淘口令与自然英文/拼音词（如 iPhone16Pro、MacBookPro1），绝不依赖型号黑名单。"""
+    if _WEAK_TOKEN_LOWER_RUN_RE.search(tok):
+        return False
+    if len(_WEAK_TOKEN_TITLE_SEG_RE.findall(tok)) >= 2:
+        return False
+    return True
 
 
 def extract_taobao_token_core(raw_text: Any) -> str:
@@ -66,7 +108,7 @@ def extract_taobao_token_core(raw_text: Any) -> str:
     - 先剥离 http(s) URL 防止误匹配 URL 路径段；
     - 货币/钥匙符号包裹（如 `￥...￥`、`🗝...💲`）允许 8~15 位字母数字混合码；
     - 普通括号/斜杠/书名号包裹（如 `(...)`、`/.../`、`【...】`）严格要求标准 11 位字母数字混合码，
-      且无分享前缀码时排除 `(iPhone16Pro)` 等常见数码型号词，兼顾高召回与搜索框零误判。
+      且无分享前缀码时以结构化熵规则排除自然英文/拼音词，兼顾高召回与搜索框零误判。
     """
     text = str(raw_text or "").strip()
     if not text:
@@ -80,9 +122,109 @@ def extract_taobao_token_core(raw_text: Any) -> str:
         is_strong_delim = (left_ch in _TB_CURRENCY_OR_EMOJI_CHARS) or (right_ch in _TB_CURRENCY_OR_EMOJI_CHARS)
         if is_strong_delim:
             return tok
-        if len(tok) == 11 and (has_share_code or not _COMMON_MODEL_WORD_RE.search(tok)):
+        if len(tok) == 11 and (has_share_code or _looks_like_random_11char_token(tok)):
             return tok
     return ""
+
+
+def extract_all_tokens(raw_text: Any) -> List[str]:
+    """跨模块口令提取唯一真源：提取正文中的淘口令、京口令（`！...！`）与裸加密商品串，自动去重。"""
+    text = str(raw_text or "").strip()
+    if not text:
+        return []
+    no_urls = re.sub(r"https?://\S+", " ", text)
+    has_share_code = bool(_SHARE_CODE_RE.search(no_urls) or re.search(r"\b\d{1,2}:/", no_urls))
+    found: List[str] = []
+    seen = set()
+
+    def _add(val: str) -> None:
+        v = str(val or "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            found.append(v)
+
+    for m in _TB_UNIFIED_TOKEN_RE.finditer(no_urls):
+        left_ch, tok_core, right_ch = m.group(1), m.group(2), m.group(3)
+        if not (any(c.isalpha() for c in tok_core) and any(c.isdigit() for c in tok_core)):
+            continue
+        is_strong_delim = (left_ch in _TB_CURRENCY_OR_EMOJI_CHARS) or (right_ch in _TB_CURRENCY_OR_EMOJI_CHARS)
+        if is_strong_delim:
+            _add(m.group(0))
+            continue
+        if len(tok_core) == 11 and (has_share_code or _looks_like_random_11char_token(tok_core)):
+            if left_ch == "/" or right_ch == "/":
+                before_ch = no_urls[m.start() - 1] if m.start() > 0 else ""
+                after_ch = no_urls[m.end()] if m.end() < len(no_urls) else ""
+                if (before_ch and re.match(r"[A-Za-z0-9:/._-]", before_ch)) or (
+                    after_ch and re.match(r"[A-Za-z0-9_.-]", after_ch)
+                ):
+                    continue
+            _add(m.group(0))
+
+    for m in _JCMD_TOKEN_RE.finditer(no_urls):
+        raw_jcmd = m.group(0).strip()
+        if any(c.isalpha() for c in raw_jcmd) and any(c.isdigit() for c in raw_jcmd):
+            _add(raw_jcmd)
+
+    for m in _BARE_ENCRYPTED_TOKEN_RE.finditer(no_urls):
+        val = m.group(0).strip()
+        if any(c.isalpha() for c in val) and any(c.isdigit() for c in val):
+            _add(val)
+
+    return found
+
+
+def is_standalone_ecommerce_token(raw_text: Any) -> bool:
+    """判断整段文本是否为单一独立电商口令或加密商品串。"""
+    s = str(raw_text or "").strip()
+    return bool(s) and extract_all_tokens(s) == [s]
+
+
+def strip_ecommerce_tokens_and_urls(raw_text: Any, *, preserve_newlines: bool = False) -> str:
+    """统一剥离分享文本中的链接、内部占位符 `[#L1]`、小程序路径、淘/京口令壳及分享前缀码。"""
+    text = str(raw_text or "")
+    if not text:
+        return ""
+    rep = "" if preserve_newlines else " "
+
+    def _replace_shell_if_token(m: re.Match[str]) -> str:
+        left_d, core, right_d, tail = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+        has_strong = any(ch in _TB_CURRENCY_OR_EMOJI_CHARS for ch in (left_d + right_d))
+        if has_strong or tail.strip():
+            return rep
+        if len(core) == 11 and any(c.isalpha() for c in core) and any(c.isdigit() for c in core) and _looks_like_random_11char_token(core):
+            return rep
+        return m.group(0)
+
+    def _replace_unified_if_token(m: re.Match[str]) -> str:
+        left_ch, core, right_ch = m.group(1), m.group(2), m.group(3)
+        if not (any(c.isalpha() for c in core) and any(c.isdigit() for c in core)):
+            return m.group(0)
+        if (left_ch in _TB_CURRENCY_OR_EMOJI_CHARS) or (right_ch in _TB_CURRENCY_OR_EMOJI_CHARS):
+            return rep
+        if len(core) == 11 and _looks_like_random_11char_token(core):
+            return rep
+        return m.group(0)
+
+    cleaned = re.sub(r"\s*\[#L\d+\]" if preserve_newlines else r"\[#L\d+\]", rep, text)
+    cleaned = _TOKEN_LABEL_PAREN_RE.sub(rep, cleaned)
+    cleaned = _MP_MINIAPP_RE.sub(rep, cleaned)
+    cleaned = _HTTP_URL_STRIP_RE.sub(rep, cleaned)
+    if not preserve_newlines:
+        cleaned = URL_RE.sub(rep, cleaned)
+    cleaned = _SHORTLINK_DOMAIN_RE.sub(rep, cleaned)
+    cleaned = _JCMD_TOKEN_RE.sub(rep, cleaned)
+    cleaned = _DEAL_TOKEN_SHELL_RE.sub(_replace_shell_if_token, cleaned)
+    cleaned = _TB_UNIFIED_TOKEN_RE.sub(_replace_unified_if_token, cleaned)
+    if preserve_newlines:
+        cleaned = _STANDALONE_SHARE_CODE_SHELL_RE.sub("", cleaned)
+    else:
+        cleaned = _BARE_TOKEN_WRAPPER_RE.sub(
+            lambda m: rep if (any(c.isalpha() for c in m.group(1)) and any(c.isdigit() for c in m.group(1)) and _looks_like_random_11char_token(m.group(1))) else m.group(0),
+            cleaned,
+        )
+        cleaned = _SHARE_CODE_RE.sub(rep, cleaned)
+    return cleaned
 
 
 def extract_search_keyword(raw_text: Any, max_length: int = 60) -> str:
@@ -138,20 +280,11 @@ def detect_platform_signal(raw_text: Any) -> Optional[str]:
     lower = text.lower()
 
     # 1. 显式域名特征识别
-    if any(
-        d in lower
-        for d in ("u.jd.com", "jingfen.jd.com", "jingfen.com", "union-click.jd.com", "item.jd.com", "m.jd.com", "3.cn", "jingxi.com", "jd.com")
-    ):
+    if any(d in lower for d in JD_DOMAINS):
         return "jd"
-    if any(
-        d in lower
-        for d in (
-            "m.tb.cn", "e.tb.cn", "s.tb.cn", "tb.cn", "tb3.cn", "s.click.taobao.com",
-            "uland.taobao.com", "item.taobao.com", "detail.tmall.com", "taobao.com", "tmall.com", "alimama.com",
-        )
-    ):
+    if any(d in lower for d in TAOBAO_DOMAINS):
         return "taobao"
-    if any(d in lower for d in ("p.pinduoduo.com", "yangkeduo.com", "pinduoduo.com", "goods_sign=")):
+    if any(d in lower for d in PDD_DOMAINS) or "goods_sign=" in lower:
         return "pdd"
 
     # 2. 口令与文案特征识别（统一复用 extract_taobao_token_core 单一真源）
@@ -161,7 +294,7 @@ def detect_platform_signal(raw_text: Any) -> Optional[str]:
         return "jd"
     if extract_taobao_token_core(text) or any(k in text for k in ("淘口令", "手淘", "淘宝", "天猫", "阿里妈妈")):
         return "taobao"
-    if any(k in text for k in ("拼多多", "多多进宝", "百亿补贴")) or re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
+    if any(k in text for k in ("拼多多", "多多进宝", "百亿补贴")) or PDD_GOODS_SIGN_RE.match(text):
         return "pdd"
 
     # 3. 裸加密商品 ID 特征识别
@@ -484,6 +617,22 @@ class ProductSummary(BaseModel):
         return self.model_dump(**kwargs)
 
 
+def normalize_detail_tags(raw_tags: Any) -> List[str]:
+    """详情标签去重并补全裸金额优惠券文案（如 '5元' -> '5元优惠券'）。"""
+    if not isinstance(raw_tags, list):
+        return []
+    normalized_tags: List[str] = []
+    for tag in raw_tags:
+        t = str(tag or "").strip()
+        if not t:
+            continue
+        if _BARE_YUAN_TAG_RE.match(t):
+            t = f"{t}优惠券"
+        if t not in normalized_tags:
+            normalized_tags.append(t)
+    return normalized_tags
+
+
 class ProductDetail(ProductSummary):
     """完整商品详情，商业承诺和券信息仅保存来源提供的真实值。"""
     desc: str = ""
@@ -498,16 +647,7 @@ class ProductDetail(ProductSummary):
     def __init__(self, **data: Any):
         raw_tags = data.get("detail_tags")
         if isinstance(raw_tags, list):
-            normalized_tags: List[str] = []
-            for tag in raw_tags:
-                t = str(tag or "").strip()
-                if not t:
-                    continue
-                if _BARE_YUAN_TAG_RE.match(t):
-                    t = f"{t}优惠券"
-                if t not in normalized_tags:
-                    normalized_tags.append(t)
-            data["detail_tags"] = normalized_tags
+            data["detail_tags"] = normalize_detail_tags(raw_tags)
         super().__init__(**data)
 
 

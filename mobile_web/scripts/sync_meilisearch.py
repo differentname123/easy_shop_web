@@ -19,7 +19,7 @@ APP_DIR = SCRIPT_DIR.parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from config import logger
+from infrastructure.logging_utils import configure_console_encoding
 from infrastructure.mongo import gen_db_object
 from infrastructure.search_meili import (
     get_meili_client,
@@ -31,6 +31,7 @@ from infrastructure.search_meili import (
 
 
 def main():
+    configure_console_encoding()
     parser = argparse.ArgumentParser(description="Meilisearch 全量商品索引同步脚本")
     parser.add_argument("--batch-size", type=int, default=2000, help="每批次推送文档数量 (默认 2000)")
     parser.add_argument("--reset", action="store_true", help="清空并重新创建索引")
@@ -79,6 +80,9 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        if callable(getattr(mongo, "close", None)):
+            mongo.close()
 
 
 if __name__ == "__main__":

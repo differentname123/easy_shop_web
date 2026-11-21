@@ -3,7 +3,6 @@
 import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlsplit
-import requests
 from infrastructure.api_governance import (
     GLOBAL_QUOTA_PACER,
     GLOBAL_UPSTREAM_HEALTH,
@@ -16,13 +15,13 @@ from infrastructure.http_utils import (
     execute_with_key_failover,
     parse_appkey_list,
 )
+from infrastructure.transport import create_http_session
 
 ZTK_ORDER_URL = "https://api.zhetaoke.com:10001/api/open_dingdanchaxun2.ashx"
 ZTK_CHANNEL_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl.ashx"
 ZTK_CHANNEL_PILIANG_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl_piliang.ashx"
 ZTK_PUBLISHER_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_publisher_get.ashx"
 ZTK_INVITECODE_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_invitecode_get.ashx"
-ZTK_AUTH_INFO_URL = "https://api.zhetaoke.com:10001/api/open_taokeshouquaninfo.ashx"
 TRUSTED_TOP_HOSTS = frozenset(("eco.taobao.com", "gw.api.taobao.com"))
 ORDER_RESPONSE_ROOTS = ("tbk_sc_order_details_get_response", "tbk_order_details_get_response")
 TRUSTED_ORDER_METHODS = frozenset(("taobao.tbk.sc.order.details.get", "taobao.tbk.order.details.get"))
@@ -105,7 +104,7 @@ class ZtkClient:
         self.sid_list = tuple(parsed_sids)
         self.sid = self.sid_list[0] if self.sid_list else ""
         self._active_key_index = 0
-        self.http = http_session or requests.Session()
+        self.http = http_session or create_http_session(pool_connections=16, pool_maxsize=32)
         self.timeout, self.signurl = timeout, signurl
 
     def _sid_for_key(self, current_key: str) -> str:
@@ -199,7 +198,7 @@ class ZtkClient:
                 )
             except QuotaPaceBacklogError:
                 _record_order_metric("rate_limit", "QUOTA_PACE_BACKLOG", "淘宝订单接口请求过于频繁")
-                return _error("UPSTREAM_ERROR", "淘宝订单接口请求过于频繁，请稍后重试")
+                return _error("QUOTA_PACE_BACKLOG", "淘宝订单接口请求过于频繁，请稍后重试")
 
             try:
                 body = self._get_response(ZTK_ORDER_URL, params=params)
@@ -286,7 +285,7 @@ class ZtkClient:
                     background_max_wait=12.0,
                 )
             except QuotaPaceBacklogError:
-                return _error("UPSTREAM_ERROR", "淘宝转链请求过于频繁，请稍后重试")
+                return _error("QUOTA_PACE_BACKLOG", "淘宝转链请求过于频繁，请稍后重试")
             try:
                 body = self._get_response(ZTK_CHANNEL_URL, params=params)
                 if isinstance(body, dict) and body.get("status") == "error":
@@ -326,49 +325,46 @@ class ZtkClient:
                         return _error("UNSUPPORTED_TB_NUMERIC_ID", f"折淘客渠道转链失败: {msg_text}")
 
                     if "商品id解析错误" in msg_text.lower() or "error tkl" in msg_text.lower():
-                        try:
-                            p_body = self._get_response(
-                                ZTK_CHANNEL_PILIANG_URL,
-                                params={
-                                    "appkey": current_key,
-                                    "sid": cur_sid,
-                                    "pid": pid,
-                                    "tkl": item_url,
-                                    "signurl": signurl,
-                                },
-                            )
-                            p_tao_id = str(p_body.get("tao_id") or "").strip() if isinstance(p_body, dict) else ""
-                            if isinstance(p_body, dict) and p_body.get("status") == 200 and p_tao_id:
-                                if relation_id:
-                                    rel_body = self._get_response(
-                                        ZTK_CHANNEL_URL,
-                                        params={
-                                            "appkey": current_key,
-                                            "sid": cur_sid,
-                                            "pid": pid,
-                                            "tkl": f"https://uland.taobao.com/item/edetail?id={p_tao_id}",
-                                            "signurl": signurl,
-                                            "relation_id": relation_id,
-                                        },
-                                    )
-                                    if isinstance(rel_body, dict):
-                                        if rel_body.get("status") == 200 and isinstance(rel_body.get("content"), list) and rel_body["content"]:
-                                            status_code = 200
-                                            content = rel_body["content"]
-                                        else:
-                                            rel_err = str(rel_body.get("content") or rel_body.get("msg") or "").strip()
-                                            if "relationid" in rel_err.lower() or "无效的relation" in rel_err.lower():
-                                                return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {rel_err}", need_auth=True)
-                                else:
-                                    c_item = dict(p_body)
-                                    c_item.setdefault("pict_url", c_item.get("pic") or "")
-                                    c_item.setdefault("tkl", c_item.get("result_tkl") or "")
-                                    c_item.setdefault("coupon_click_url", c_item.get("result_url") or "")
-                                    c_item.setdefault("item_url", f"https://uland.taobao.com/item/edetail?id={p_tao_id}")
-                                    status_code = 200
-                                    content = [c_item]
-                        except StopIteration:
-                            pass
+                        p_body = self._get_response(
+                            ZTK_CHANNEL_PILIANG_URL,
+                            params={
+                                "appkey": current_key,
+                                "sid": cur_sid,
+                                "pid": pid,
+                                "tkl": item_url,
+                                "signurl": signurl,
+                            },
+                        )
+                        p_tao_id = str(p_body.get("tao_id") or "").strip() if isinstance(p_body, dict) else ""
+                        if isinstance(p_body, dict) and p_body.get("status") == 200 and p_tao_id:
+                            if relation_id:
+                                rel_body = self._get_response(
+                                    ZTK_CHANNEL_URL,
+                                    params={
+                                        "appkey": current_key,
+                                        "sid": cur_sid,
+                                        "pid": pid,
+                                        "tkl": f"https://uland.taobao.com/item/edetail?id={p_tao_id}",
+                                        "signurl": signurl,
+                                        "relation_id": relation_id,
+                                    },
+                                )
+                                if isinstance(rel_body, dict):
+                                    if rel_body.get("status") == 200 and isinstance(rel_body.get("content"), list) and rel_body["content"]:
+                                        status_code = 200
+                                        content = rel_body["content"]
+                                    else:
+                                        rel_err = str(rel_body.get("content") or rel_body.get("msg") or "").strip()
+                                        if "relationid" in rel_err.lower() or "无效的relation" in rel_err.lower():
+                                            return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {rel_err}", need_auth=True)
+                            else:
+                                c_item = dict(p_body)
+                                c_item.setdefault("pict_url", c_item.get("pic") or "")
+                                c_item.setdefault("tkl", c_item.get("result_tkl") or "")
+                                c_item.setdefault("coupon_click_url", c_item.get("result_url") or "")
+                                c_item.setdefault("item_url", f"https://uland.taobao.com/item/edetail?id={p_tao_id}")
+                                status_code = 200
+                                content = [c_item]
 
                     if status_code != 200 or not content or not isinstance(content, list):
                         if "error tkl" in msg_text.lower():
@@ -519,24 +515,8 @@ class ZtkClient:
             if isinstance(res, dict) and res.get("status") == "success":
                 code = res.get("inviter_code") or ""
         if not code:
-            code = "VK6WGA"
+            return _error("CONFIG_ERROR", "淘宝授权缺少邀请码配置，请在 config.local.json 中配置 taobao_inviter_code")
         url = "https://mos.m.taobao.com/inviter/register?" + urlencode({
             "inviterCode": code, "src": "pub", "app": "common", "externalId": clean_uid,
         })
         return {"status": "success", "auth_url": url, "short_url": "", "we_app_info": {}}
-
-    def get_auth_info(self):
-        """查询折淘客 sid 授权详情及过期时间 (open_taokeshouquaninfo.ashx)。"""
-        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
-            return _error("CONFIG_ERROR", "缺少折淘客 appkey 或 sid")
-
-        def _info_once(current_key):
-            try:
-                body = self._get_response(ZTK_AUTH_INFO_URL, params={"appkey": current_key, "sid": self._sid_for_key(current_key)})
-                if not isinstance(body, dict) or body.get("status") != 200 or not isinstance(body.get("data"), list) or not body["data"]:
-                    return _error("UPSTREAM_ERROR", "未查询到折淘客授权信息")
-                return {"status": "success", "data": body["data"][0]}
-            except Exception:
-                return _error("NETWORK_ERROR", "折淘客授权信息查询失败")
-
-        return self._run_with_key_failover(_info_once)

@@ -176,7 +176,7 @@
         const isSameOrigin = parsed.origin === baseOrigin;
         if (parsed.pathname === '/group_help') {
           const gid = (parsed.searchParams.get('gid') || '').trim();
-          if (isSameOrigin || /^\d{15,24}$/.test(gid)) {
+          if (isSameOrigin || /^(?:\d{15,24}|tok_[A-Za-z0-9]{6,28})$/.test(gid)) {
             return parsed.pathname + parsed.search;
           }
         }

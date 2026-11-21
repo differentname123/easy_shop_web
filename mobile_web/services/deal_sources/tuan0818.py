@@ -12,15 +12,15 @@ from __future__ import annotations
 
 import html as html_lib
 import re
-import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
-from .base import BaseDealSource, FetchContext, FetchResult
-from .filters import has_valid_detail_and_tutorial, is_confirmed_unsupported_deal
-from .http_client import DEFAULT_HEADERS, is_rate_limit_status, request_with_retry
+from .base import FetchContext
+from .filters import SOURCE_SELF_HOSTS, is_confirmed_unsupported_deal
+from .list_detail_base import ListDetailDealSource, ListPhaseResult, SkipItem, fetch_page_html
 from .parsing import (
     build_deal_record,
+    extract_balanced_tag,
     extract_div_by_id,
     extract_links_images_and_tokens,
     html_to_tutorial_text,
@@ -28,7 +28,7 @@ from .parsing import (
 )
 
 
-class Tuan0818Source(BaseDealSource):
+class Tuan0818Source(ListDetailDealSource):
     site_key = "0818tuan"
     source_key = "0818tuan"
     troubleshooting = {
@@ -40,181 +40,82 @@ class Tuan0818Source(BaseDealSource):
 
     BASE_URL = "http://www.0818tuan.com"
 
-    def fetch(self, ctx: FetchContext) -> FetchResult:
-        ch = ctx.channel
-        list_url = str(ch.default_url or f"{self.BASE_URL}/list-1-0.html")
-        max_details = ctx.effective_max_details
-        skip_set = ctx.known_ids
+    def fetch_list_cards(self, ctx: FetchContext, t0: float) -> ListPhaseResult:
+        list_url = str(ctx.channel.default_url or f"{self.BASE_URL}/list-1-0.html")
+        resp, list_html, err = fetch_page_html(ctx, list_url, t0=t0)
+        if err is not None:
+            return ListPhaseResult(request_url=list_url, http_status=err.http_status, error_result=err)
 
-        t0 = time.perf_counter()
-        resp = None
-        try:
-            resp = request_with_retry(ctx.session, "get", list_url, headers=DEFAULT_HEADERS, timeout=ctx.timeout)
-            resp.encoding = "utf-8"
-            if resp.status_code != 200:
-                return FetchResult(
-                    status="error",
-                    http_status=resp.status_code,
-                    request_url=list_url,
-                    elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
-                    rate_limited=is_rate_limit_status(resp.status_code),
-                    detail_errors=[{"error": f"HTTP {resp.status_code}", "http_status": resp.status_code}],
-                )
-            list_html = resp.text
-        except Exception as exc:
-            return FetchResult(
-                status="error",
-                http_status=getattr(resp, "status_code", None),
-                request_url=list_url,
-                elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
-                detail_errors=[{"error": str(exc), "error_type": type(exc).__name__}],
-            )
-
-        anchors = re.findall(
+        cards: List[Dict[str, Any]] = []
+        for full_a, rel_href, item_id in re.findall(
             r'(<a\b[^>]*href=["\'](/xbhd/(\d+)\.html)["\'][^>]*>.*?</a>)',
             list_html,
             re.S | re.I,
-        )
-
-        records: List[Dict[str, Any]] = []
-        detail_errors: List[Dict[str, Any]] = []
-        seen_ids: Set[str] = set()
-        raw_list_count = 0
-        detail_fetched = 0
-        detail_attempted = 0
-        skipped_known = 0
-        skipped_unsupported = 0
-        skipped_no_detail = 0
-        detail_circuit_broken = False
-        rate_limited = False
-
-        for full_a, rel_href, item_id in anchors:
-            if item_id in seen_ids:
-                continue
-            seen_ids.add(item_id)
-            raw_list_count += 1
-
-            if item_id in skip_set:
-                skipped_known += 1
-                continue
-
-            if detail_circuit_broken or detail_attempted >= max_details:
-                break
-
-            if detail_attempted > 0:
-                self.sleep_detail_delay(ctx)
-            detail_attempted += 1
-
-            detail_url = urljoin(self.BASE_URL, rel_href)
+        ):
             time_m = re.search(r'<span[^>]*class=["\'][^"\']*badge[^"\']*["\'][^>]*>(.*?)</span>', full_a, re.S | re.I)
             pub_time = strip_html_tags(time_m.group(1)) if time_m else ""
             title_m = re.search(r'title=["\']([^"\']+)["\']', full_a, re.I)
             if title_m:
                 title = html_lib.unescape(title_m.group(1)).strip()
             else:
-                no_span = re.sub(r"<span[^>]*>.*?</span>", "", full_a, flags=re.S | re.I)
-                title = strip_html_tags(no_span)
+                title = strip_html_tags(re.sub(r"<span[^>]*>.*?</span>", "", full_a, flags=re.S | re.I))
+            cards.append({
+                "item_id": item_id,
+                "detail_url": urljoin(self.BASE_URL, rel_href),
+                "title": title,
+                "publish_time": pub_time,
+            })
 
-            try:
-                rd = request_with_retry(
-                    ctx.session,
-                    "get",
-                    detail_url,
-                    headers={**DEFAULT_HEADERS, "Referer": list_url},
-                    timeout=ctx.timeout,
-                )
-                rd.encoding = "utf-8"
-                if rd.status_code != 200:
-                    if is_rate_limit_status(rd.status_code):
-                        detail_circuit_broken = True
-                        rate_limited = True
-                    skipped_no_detail += 1
-                    detail_errors.append({
-                        "item_id": item_id,
-                        "error_url": detail_url,
-                        "http_status": rd.status_code,
-                        "error_type": f"HTTP_{rd.status_code}",
-                        "error": f"详情页返回非200状态码: {rd.status_code}",
-                    })
-                    continue
+        return ListPhaseResult(cards=cards, request_url=list_url, http_status=resp.status_code, pages_crawled=1)
 
-                det_html = rd.text
-                m_full_time = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)", det_html)
-                if m_full_time:
-                    pub_time = m_full_time.group(1)
+    def parse_detail_record(
+        self,
+        card: Dict[str, Any],
+        det_resp: Any,
+        det_html: str,
+        list_res: ListPhaseResult,
+        ctx: FetchContext,
+    ) -> Optional[Dict[str, Any]]:
+        item_id = card["item_id"]
+        detail_url = card["detail_url"]
+        pub_time = card["publish_time"]
 
-                xb_fragment = extract_div_by_id(det_html, "xbcontent")
-                if not xb_fragment:
-                    m_post = re.search(
-                        r'(<div[^>]*class=["\'][^"\']*post-content[^"\']*["\'][^>]*>.*?</div>)',
-                        det_html,
-                        re.S | re.I,
-                    )
-                    xb_fragment = m_post.group(1) if m_post else ""
+        m_full_time = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)", det_html)
+        if m_full_time:
+            pub_time = m_full_time.group(1)
 
-                if not xb_fragment:
-                    skipped_no_detail += 1
-                    continue
+        xb_fragment = extract_div_by_id(det_html, "xbcontent")
+        if not xb_fragment:
+            xb_fragment = extract_balanced_tag(det_html, "div", r'\bclass=["\'][^"\']*post-content[^"\']*["\']')
+        if not xb_fragment:
+            return None
 
-                clean_xb = re.sub(
-                    r"<p[^>]*>\s*(?:<a[^>]*href=[\"'][^\"']*member/fava[^\"']*[\"'][^>]*>.*?</a>|上一篇：.*?|下一篇：.*?)\s*</p>",
-                    "",
-                    xb_fragment,
-                    flags=re.S | re.I,
-                )
-                links, images, tokens = extract_links_images_and_tokens(clean_xb, base_url=detail_url)
-                tutorial_text = html_to_tutorial_text(clean_xb, base_url=detail_url)
+        clean_xb = re.sub(
+            r"<p[^>]*>\s*(?:<a[^>]*href=[\"'][^\"']*member/fava[^\"']*[\"'][^>]*>.*?</a>|上一篇：.*?|下一篇：.*?)\s*</p>",
+            "",
+            xb_fragment,
+            flags=re.S | re.I,
+        )
+        links, images, tokens = extract_links_images_and_tokens(
+            clean_xb, base_url=detail_url, exclude_hosts=SOURCE_SELF_HOSTS
+        )
+        if is_confirmed_unsupported_deal(links=links, tokens=tokens):
+            raise SkipItem("unsupported")
 
-                if is_confirmed_unsupported_deal(links=links, tokens=tokens):
-                    skipped_unsupported += 1
-                    continue
-
-                rec = build_deal_record(
-                    source_site="0818tuan",
-                    source_channel=ch.name,
-                    source_item_id=item_id,
-                    source_url=detail_url,
-                    source_list_page_url=list_url,
-                    source_detail_url=detail_url,
-                    title=title or f"0818团线报 #{item_id}",
-                    publish_time=pub_time,
-                    tutorial_text=tutorial_text,
-                    tutorial_images=images,
-                    extracted_links=links,
-                    extracted_tokens=tokens,
-                    raw_payload=xb_fragment,
-                    has_full_detail=True,
-                )
-                if not has_valid_detail_and_tutorial(rec):
-                    skipped_no_detail += 1
-                    continue
-
-                detail_fetched += 1
-                records.append(rec)
-            except Exception as exc:
-                skipped_no_detail += 1
-                detail_errors.append({
-                    "item_id": item_id,
-                    "error_url": detail_url,
-                    "http_status": None,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:160],
-                })
-
-        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-        is_ok = raw_list_count > 0 and not (rate_limited and len(records) == 0)
-        return FetchResult(
-            status="ok" if is_ok else "error",
-            http_status=resp.status_code,
-            request_url=list_url,
-            elapsed_ms=elapsed_ms,
-            records=records,
-            raw_list_count=raw_list_count,
-            detail_fetched=detail_fetched,
-            skipped_known=skipped_known,
-            skipped_unsupported=skipped_unsupported,
-            skipped_no_detail=skipped_no_detail,
-            pages_crawled=1,
-            rate_limited=rate_limited,
-            detail_errors=detail_errors,
+        tutorial_text = html_to_tutorial_text(clean_xb, base_url=detail_url)
+        return build_deal_record(
+            source_site="0818tuan",
+            source_channel=ctx.channel.name,
+            source_item_id=item_id,
+            source_url=detail_url,
+            source_list_page_url=list_res.request_url,
+            source_detail_url=detail_url,
+            title=card["title"] or f"0818团线报 #{item_id}",
+            publish_time=pub_time,
+            tutorial_text=tutorial_text,
+            tutorial_images=images,
+            extracted_links=links,
+            extracted_tokens=tokens,
+            raw_payload=xb_fragment,
+            has_full_detail=True,
         )

@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict, List, Set
 
 from .base import BaseDealSource, FetchContext, FetchResult
-from .filters import has_valid_detail_and_tutorial
+from .filters import SOURCE_SELF_HOSTS, has_valid_detail_and_tutorial
 from .http_client import DEFAULT_HEADERS, is_rate_limit_status, request_with_retry
 from .parsing import (
     build_deal_record,
@@ -171,7 +171,9 @@ class XuandanSource(BaseDealSource):
 
                 # 去掉内部的 <img ...> 占位，保留清晰纯文案与领券/下单链接
                 div_no_img = re.sub(r"<img\b[^>]*>", "", div_html, flags=re.I)
-                links, inner_imgs, tokens = extract_links_images_and_tokens(div_html, base_url=self.BASE_URL)
+                links, inner_imgs, tokens = extract_links_images_and_tokens(
+                    div_html, base_url=self.BASE_URL, exclude_hosts=SOURCE_SELF_HOSTS
+                )
                 all_imgs: List[str] = [img_url] if img_url else []
                 for im in inner_imgs:
                     if im and im not in all_imgs:

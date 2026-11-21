@@ -1548,19 +1548,6 @@ body {
   to { opacity: 1; }
 }
 
-.loading-wrap {
-  text-align: center;
-  padding: 24px;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.empty-wrap {
-  text-align: center;
-  padding: 60px 16px;
-  color: var(--text-muted);
-}
-
 /* ================== 商品深度详情富文本组件 ================== */
 .service-guarantees-grid {
   display: flex;
@@ -2732,7 +2719,7 @@ body {
 }
 
 @media (min-width: 1080px) {
-  #app,
+  #app:not(.detail-container),
   .top-header,
   .bottom-tab-bar {
     max-width: 980px !important;

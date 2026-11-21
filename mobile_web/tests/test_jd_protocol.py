@@ -885,7 +885,7 @@ def test_jd_client_pace_backlog_fast_fails_instead_of_blocking(monkeypatch):
     monkeypatch.setattr("infrastructure.api_governance.time.monotonic", lambda: 100.0)
 
     res = cli._get("https://api.zhetaoke.com:10001/api/open_jing_union_open_goods_jingfen_query.ashx", params={"appkey": "busy_key"})
-    assert res["status"] == "error" and res["error_code"] == "UPSTREAM_ERROR"
+    assert res["status"] == "error" and res["error_code"] == "QUOTA_PACE_BACKLOG"
 
 
 def test_jd_detail_rate_limit_fallback_uses_unified_detail_and_never_logs_red_cross(monkeypatch, caplog):
@@ -925,4 +925,48 @@ def test_jd_detail_rate_limit_fallback_uses_unified_detail_and_never_logs_red_cr
     assert res["status"] == "success" and res["source"] == "database_fallback"
     assert all("❌" not in rec.getMessage() for rec in caplog.records)
     clear_all_caches()
+
+
+@pytest.mark.parametrize("price", [None, "", "bad", float("nan"), float("inf"), -1, False])
+def test_missing_or_invalid_price_is_not_published_as_free(price):
+    mock_client = Mock()
+    mock_client.search_goods.return_value = {"status": "success", "data": [
+        {"tao_id": "opaque", "title": "商品", "quanhou_jiage": price}]}
+    jd_adapter = JdAdapter(SimpleNamespace(jd_enabled=True), client=mock_client)
+    assert jd_adapter.search_goods("测试商品")["status"] == "error"
+
+
+@pytest.mark.parametrize("price", [0, "0.00", 12.5])
+def test_real_known_prices_including_zero_are_preserved(price):
+    mock_client = Mock()
+    mock_client.search_goods.return_value = {"status": "success", "data": [
+        {"tao_id": "opaque", "title": "商品", "quanhou_jiage": price}]}
+    jd_adapter = JdAdapter(SimpleNamespace(jd_enabled=True), client=mock_client)
+    result = jd_adapter.search_goods("测试商品")
+    assert result["status"] == "success"
+    assert result["data"][0]["price"] == float(price)
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_search_material_urls_saved_even_without_detail_prefetch(monkeypatch, prefetch):
+    from cache import SEARCH_CACHE
+    from services.product_service import ProductService
+
+    SEARCH_CACHE.clear()
+    material_item = {"platform": "jd", "goods_id": "opaque", "name": "商品", "price": 12,
+                     "product_url": "https://jingfen.jd.com/detail/material.html"}
+    fake_adapter = SimpleNamespace(active=True, requires_material_url=True,
+                                   search_goods=Mock(return_value={"status": "success", "data": [material_item]}))
+    monkeypatch.setattr("services.product_service.get_adapter", lambda platform: fake_adapter)
+    repo = Mock()
+    service = ProductService(repo)
+    if prefetch:
+        service.prefetcher = Mock()
+    try:
+        assert service.search_home_goods("测试商品", platform="jd")["status"] == "success"
+    finally:
+        service.wait_for_background_writes()
+        SEARCH_CACHE.clear()
+    repo.upsert_home_products.assert_called_once_with([material_item], channel_type=None)
+    repo.upsert_product_detail.assert_not_called()
 

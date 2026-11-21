@@ -8,8 +8,8 @@ import socket
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from mobile_web.scripts.run_deal_pool_scheduler import (
-    ERR_AI2_COUPON_FAILED_OR_DROPPED,
+from models.deal_constants import ERR_AI2_COUPON_FAILED_OR_DROPPED
+from services.deal_pool_cleaner import (
     DealPoolCleaner,
     _is_safe_public_http_url,
     _is_verified_station_promo_link,
@@ -388,6 +388,7 @@ def test_stage5_filters_cross_platform_and_redundant_tb_sclick():
                 if inp == "MAIN_TB"
                 else {
                     "status": "success",
+                    "resolution_kind": "coupon_or_venue",
                     "goods_id": "",
                     "goods_sign": "",
                     "final_link": "https://s.click.taobao.com/redundant_tlj_item",
@@ -399,6 +400,7 @@ def test_stage5_filters_cross_platform_and_redundant_tb_sclick():
         "jd": SimpleNamespace(
             resolve_and_convert_universal=lambda _inp: {
                 "status": "success",
+                "resolution_kind": "coupon_or_venue",
                 "goods_id": "",
                 "goods_sign": "",
                 "final_link": "https://u.jd.com/cross_plat_ad",
@@ -904,7 +906,7 @@ def test_tun_fake_ip_dns_allowed_for_domains_but_blocked_as_literal():
 
 def test_shop_m_jd_whitelist_and_false_positive_coupon_gates():
     """验证 shop.m.jd.com 白名单提纯、淘宝双链接吸收放行、JD 冗余数字 SKU + 国补低价不误杀及维护常量导入完整。"""
-    import mobile_web.services.deal_pool_cleaner as cleaner_mod
+    import services.deal_pool_cleaner as cleaner_mod
 
     assert isinstance(cleaner_mod.DEAL_FORMAL_EXPIRY_HOURS, (int, float))
 
@@ -1077,7 +1079,7 @@ def test_transient_degraded_retry_and_cross_platform_consistency():
     2. `_is_explicit_coupon_target` 不得将标为主推的淘宝二合一单品页 (`uland.taobao.com/coupon/edetail`) 误判为独立券；
        异平台比价场景中，选对主平台不被异平台对比链误杀，选错且混配异平台券则防串货拦截。
     """
-    from mobile_web.models.deal_constants import (
+    from models.deal_constants import (
         CLEAN_STAGE_NEED_CONVERT,
         ERR_ADAPTER_CONVERT_FAILED,
         MAX_CLEAN_RETRIES,

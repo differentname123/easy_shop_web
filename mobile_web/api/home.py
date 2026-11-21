@@ -29,7 +29,6 @@ def get_recommend_goods(
     offset: int = Query(0, ge=0, le=1000, description="偏移量"),
     limit: int = Query(20, ge=1, le=50, description="条数 (1-50)"),
     cursor: Optional[str] = Query(None, max_length=2048, description="来源续页游标"),
-    uid: Optional[str] = Query(None, max_length=64, description="推手用户UID"),
     platform: str = Query("pdd", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台标识"),
     current_uid: Optional[str] = Depends(get_optional_uid),
 ):
@@ -51,7 +50,6 @@ def search_goods(
     keyword: str = Query(..., min_length=1, max_length=500, description="搜索关键词或分享文案"),
     page: int = Query(1, ge=1, le=20, description="页码 (最大20页)"),
     page_size: int = Query(20, ge=1, le=50, description="每页数量 (1-50)"),
-    uid: Optional[str] = Query(None, max_length=64, description="推手用户UID"),
     platform: str = Query("pdd", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台标识"),
     current_uid: Optional[str] = Depends(get_optional_uid),
 ):
@@ -71,7 +69,6 @@ def search_goods(
 def get_goods_detail(
     goods_sign: Optional[str] = Query(None, max_length=128, description="商品Sign"),
     goods_id: Optional[str] = Query(None, max_length=64, description="商品ID"),
-    uid: Optional[str] = Query(None, max_length=64, description="推手用户UID"),
     platform: str = Query("pdd", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台标识"),
     current_uid: Optional[str] = Depends(get_optional_uid),
 ):

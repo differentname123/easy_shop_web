@@ -9,9 +9,9 @@ import hmac
 import hashlib
 import secrets
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
-from fastapi import Header, Query, HTTPException, status
+from fastapi import Header, Query, HTTPException, Request, status
 from config import AUTH_SECRET
 
 TOKEN_TTL_SECONDS = 30 * 86400  # 访问令牌默认有效期 30 天
@@ -107,6 +107,20 @@ async def get_optional_uid(
                             detail="登录状态已过期或令牌不合法，请重新登录",
                             headers={"WWW-Authenticate": "Bearer"})
     return uid
+
+
+def extract_viewer_auth_soft(request: Request) -> Tuple[Optional[str], bool]:
+    """提取可选登录身份与令牌过期标记；失效令牌仅返回 (None, True)，不阻断公开请求。"""
+    raw_token = (
+        request.headers.get("Authorization")
+        or request.headers.get("X-Auth-Token")
+        or request.query_params.get("token")
+        or ""
+    ).strip()
+    if not raw_token:
+        return None, False
+    uid = verify_access_token(raw_token)
+    return (uid, False) if uid else (None, True)
 
 
 def hash_password(password: str) -> str:

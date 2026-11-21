@@ -469,10 +469,12 @@ def test_24h_auto_expiration():
     assert restored_from_expired["remain_people"] == 1
     assert restored_from_expired["expires_at"] == orig_expires
 
-    # 24 小时 + 1 秒后自动过期下线
+    # 24 小时 + 1 秒后仅通过只读查询即不可见（且未在 GET 上触发写库），后台过期巡检后状态持久化为 expired
     expired_now = base_ts + 24 * 3600 + 1
     res_24h = repo.search_groups(now=expired_now)
     assert len(res_24h["items"]) == 0
+    assert repo.get_by_group_order_id("3495229659187109999")["group_status"] == GROUP_STATUS_ACTIVE
+    assert repo.expire_outdated_groups(now=expired_now) == 1
     doc = repo.get_by_group_order_id("3495229659187109999")
     assert doc["group_status"] == GROUP_STATUS_EXPIRED
 
@@ -928,7 +930,10 @@ def test_reupload_qr_only_for_existing_group_order_id_must_not_bypass_audit(tmp_
             ),
         },
     )
-    up2 = svc_qr_only.submit_poster_image(_make_poster_image_bytes(short_url))
+    up2 = svc_qr_only.submit_poster_image(
+        _make_poster_image_bytes(short_url),
+        owner_token=up1["owner_token"],
+    )
     # 上传接口必须返回 pending，严禁直接返回 parsed
     assert up2["data"]["parse_status"] == PARSE_STATUS_PENDING
     svc_qr_only.process_pending_batch(batch_size=2)
@@ -1967,6 +1972,91 @@ def test_external_group_sync_consistent_with_sources_except_user_takedown():
     assert gid_a in hall_gids
     assert gid_b not in hall_gids
     assert gid_c not in hall_gids
+
+
+def test_group_help_preserves_exported_targets_expires_pending_confirm_and_blocks_poster_hijack(tmp_path):
+    from models.group_help import (
+        GROUP_STATUS_PENDING_CONFIRM,
+        GroupHelpPermissionError,
+        PARSE_STATUS_PENDING,
+        format_group_doc,
+    )
+
+    mem_db = _MemoryDB()
+    repo = GroupHelpRepository(db_instance=mem_db)
+    now = 1_760_000_000.0
+
+    # 1. 新建 parsed 拼团必须完整保留传入的 exported_targets（不再被三元运算优先级抹为空）
+    inserted_doc, _, _ = repo.upsert_parsed_group(
+        {
+            "group_order_id": "3495229659187999001",
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "保留导出记录测试",
+            "group_price": 19.9,
+            "remain_people": 1,
+            "exported_targets": {"miaozhuli": {"status": "success"}},
+            "last_exported_at": now,
+            "created_at": now,
+            "expires_at": now + 3600,
+        },
+        now=now,
+        check_similar=False,
+    )
+    assert inserted_doc["exported_targets"] == {"miaozhuli": {"status": "success"}}
+
+    # 2. expire_outdated_groups 同时清理 active 与 pending_confirm 过期团，且 search_groups 保持纯只读
+    repo.col.docs.append({
+        "group_order_id": "3495229659187999002",
+        "parse_status": PARSE_STATUS_PARSED,
+        "group_status": GROUP_STATUS_PENDING_CONFIRM,
+        "remain_people": 1,
+        "created_at": now - 3600,
+        "expires_at": now - 10,
+    })
+    assert [it["group_order_id"] for it in repo.search_groups(now=now)["items"]] == ["3495229659187999001"]
+    all_items = {it["group_order_id"]: it for it in repo.search_groups(filter_mode="all", now=now)["items"]}
+    assert format_group_doc(all_items["3495229659187999002"], now=now)["group_status"] == GROUP_STATUS_EXPIRED
+    assert repo.get_by_group_order_id("3495229659187999002")["group_status"] == GROUP_STATUS_PENDING_CONFIRM
+    assert repo.expire_outdated_groups(now=now) == 1
+    assert repo.get_by_group_order_id("3495229659187999002")["group_status"] == GROUP_STATUS_EXPIRED
+
+    # 3. 非团长路人重传不得覆盖在架海报与 parse_status，也不得复活已下架拼团
+    gid = "3495229659187999003"
+    short_url = "https://file-link.pinduoduo.com/s999003"
+    svc = GroupHelpService(
+        repo=repo,
+        poster_dir=tmp_path / "posters_sec",
+        http_get=lambda *a, **k: SimpleNamespace(
+            status_code=307,
+            headers={"Location": f"https://mobile.yangkeduo.com/group7.html?group_order_id={gid}&refer_share_id=s3"},
+            text="",
+        ),
+        ai_generator=lambda *a, **k: {
+            "status": "✅ 成功",
+            "content": json.dumps({
+                "is_group_poster": True, "is_compliant": True, "goods_name": "受保护海报名",
+                "keywords": ["受保护"], "group_price": 29.9, "total_people": 3, "remain_people": 2,
+                "remaining_seconds": 3600,
+            }),
+        },
+    )
+    owner_up = svc.submit_poster_image(_make_poster_image_bytes(short_url), viewer_uid="u_owner_1")
+    svc.process_pending_batch(batch_size=5)
+    poster_file = svc.get_poster_file_path(gid)
+    orig_bytes = b"OWNER_CANONICAL_POSTER_MARKER"
+    poster_file.write_bytes(orig_bytes)
+
+    hijack = svc.submit_poster_image(_make_poster_image_bytes(short_url), viewer_uid="u_stranger_2")
+    assert hijack["is_new"] is False
+    assert "owner_token" not in hijack
+    assert repo.get_by_group_order_id(gid)["parse_status"] == PARSE_STATUS_PARSED
+    assert poster_file.read_bytes() == orig_bytes
+
+    svc.submit_feedback_detailed(gid, "mark_full", viewer_uid="u_owner_1", owner_token=owner_up["owner_token"])
+    with pytest.raises(GroupHelpPermissionError) as exc_info:
+        svc.submit_poster_image(_make_poster_image_bytes(short_url), viewer_uid="u_stranger_2")
+    assert exc_info.value.status_code == 403 and exc_info.value.error_code == "owner_only"
 
 
 

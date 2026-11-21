@@ -8,14 +8,12 @@ import time
 from copy import deepcopy
 from typing import Dict, Any, Optional
 from adapters import get_adapter, PlatformUnavailableError
-from adapters.base import build_command_text
 from infrastructure.http_utils import sanitize_user_error_message
 from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import (
     ProductRef,
     classify_user_input,
     clean_product_id,
-    detect_platform_signal,
     extract_canonical_goods_id,
     is_jd_image_key,
     normalize_platform,
@@ -29,6 +27,7 @@ from cache import (
     SIGN_BY_ID_CACHE,
     cache_product_detail,
     evict_product_from_caches,
+    is_product_off_promotion,
     make_detail_snapshot,
     snapshot_detail_deadline,
     sync_product_summary_in_caches,
@@ -36,16 +35,12 @@ from cache import (
 from config import PROMOTION_LINK_TTL, logger
 
 _UID_PATTERN = re.compile(r"^u_[0-9a-f]{8}$")
-_PROMOTION_CACHE = PROMOTION_CACHE
 
 
 class PromoteService:
     def __init__(self, product_repo: Optional[ProductRepository] = None, user_service=None):
         self.repo = product_repo if product_repo is not None else ProductRepository()
         self.user_service = user_service
-
-    # 保留旧调用入口，但共享层不包含具体平台名称。
-    build_command_text = staticmethod(build_command_text)
 
     def _resolve_product_ref(self, ref: ProductRef) -> ProductRef:
         if ref.platform in ("taobao", "jd") and ref.goods_id:
@@ -369,6 +364,13 @@ class PromoteService:
         finally:
             if trace is not None:
                 trace.update(source="provider", provider_ms=(time.perf_counter() - provider_started) * 1000)
+        if isinstance(result, dict):
+            resolved_mat = str(result.pop("resolved_material_url", "") or "").strip()
+            if resolved_mat and result.get("status") == "success":
+                if ref.goods_sign:
+                    MATERIAL_CACHE.set((ref.platform, "sign", ref.goods_sign), resolved_mat)
+                if ref.goods_id:
+                    MATERIAL_CACHE.set((ref.platform, "id", ref.goods_id), resolved_mat)
         if not isinstance(result, dict) or result.get("status") != "success":
             message = result.get("error_msg") if isinstance(result, dict) else None
             error = {"status": "error", "error_msg": message or "未能生成有效推广转链，商品可能已失效或缺少必要标识"}
@@ -459,6 +461,8 @@ class PromoteService:
         product_url = str(product_url or "").strip()
         if not ref.key and not product_url:
             return {"status": "error", "error_msg": "缺少有效商品标识或链接"}
+        if ref.key and is_product_off_promotion(plat, ref.goods_id, ref.goods_sign):
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或已停止推广"}
 
         goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign) or "url"
         user_tag = raw_uid or "匿名"
@@ -657,13 +661,6 @@ class PromoteService:
         elif personal_fallback:
             result.update(is_fallback=True, cacheable=False, attribution_status="anonymous")
 
-    @staticmethod
-    def detect_platform_from_text(raw_text: str) -> str:
-        """
-        根据用户粘贴的链接、口令或商品标识智能识别所属电商平台 ('pdd' / 'jd' / 'taobao')。
-        """
-        return detect_platform_signal(raw_text) or "pdd"
-
     def _seed_resolved_product(
         self, platform: str, product: Optional[dict], uid: Optional[str] = None, *, persist_db: bool = False,
     ) -> None:
@@ -818,7 +815,7 @@ class PromoteService:
 
             product = data.get("product") if isinstance(data.get("product"), dict) else None
             if product:
-                self._seed_resolved_product(plat, product, uid=clean_uid or None)
+                self._seed_resolved_product(plat, product, uid=None)
                 upgrade_fn = getattr(adapter, "needs_coupon_upgrade", None)
                 if (
                     callable(upgrade_fn)

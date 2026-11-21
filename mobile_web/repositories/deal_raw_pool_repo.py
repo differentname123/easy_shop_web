@@ -18,10 +18,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from pymongo import UpdateOne
 
 from infrastructure.mongo import gen_db_object
-from services.deal_sources.catalog import (
-    get_channel_max_age_days,
-    get_site_max_age_days_map,
-)
+from infrastructure.runtime_io import append_bounded_jsonl, should_write_runtime_artifact
 from models.deal_constants import (
     CLEAN_STAGE_DONE,
     CLEAN_STAGE_NEED_AI1,
@@ -34,16 +31,19 @@ from models.deal_constants import (
     DEFAULT_RAW_COLLECTION_NAME,
     ERROR_LOG_JSONL_PATH,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
+    ERR_AI_MAX_RETRIES_EXCEEDED,
     ERR_EMPTY_PRODUCT_IDENTITY,
     ERR_EXPIRED_OVER_7_DAYS,
     LOCAL_FALLBACK_JSONL,
+    LOG_DIR,
+    MAX_CLEAN_RETRIES,
     MAX_JSONL_FILE_BYTES,
-    _UNSUPPORTED_EXTERNAL_DOMAINS,
+    UPSTREAM_DISAPPEARED,
+    get_default_site_max_age_days_map,
+    resolve_deal_max_age_days,
 )
 
 logger = logging.getLogger("deal_pool_scheduler")
-
-_JSONL_WRITE_LOCK = threading.Lock()
 
 
 def _append_bounded_jsonl_lines(
@@ -54,42 +54,27 @@ def _append_bounded_jsonl_lines(
     backup_count: int = 2,
 ) -> None:
     """线程安全且受磁盘容量上限约束地追加 JSONL 记录，超限时自动按 .1 / .2 滚动归档。"""
-    if not lines:
+    if not should_write_runtime_artifact(path, LOG_DIR):
         return
-    payload = "".join(line if line.endswith("\n") else f"{line}\n" for line in lines)
-    encoded_len = len(payload.encode("utf-8", errors="ignore"))
-    with _JSONL_WRITE_LOCK:
-        try:
-            if max_bytes > 0 and os.path.exists(path):
-                cur_size = os.path.getsize(path)
-                if cur_size + encoded_len > max_bytes:
-                    for idx in range(backup_count, 0, -1):
-                        src = path if idx == 1 else f"{path}.{idx - 1}"
-                        dst = f"{path}.{idx}"
-                        if os.path.exists(src):
-                            try:
-                                if os.path.exists(dst):
-                                    os.remove(dst)
-                                os.replace(src, dst)
-                            except OSError:
-                                pass
-        except OSError:
-            pass
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(payload)
+    append_bounded_jsonl(path, lines, max_bytes=max_bytes, backup_count=backup_count)
 
 
-def append_error_records_jsonl(error_records: List[Dict[str, Any]]) -> None:
+def append_error_records_jsonl(
+    error_records: List[Dict[str, Any]],
+    *,
+    path: Optional[str] = None,
+) -> None:
     """将本轮捕获的所有列表级与详情级错误路径持久化追加写入 logs/deal_pool_errors.jsonl。"""
     if not error_records:
         return
+    target = path or ERROR_LOG_JSONL_PATH
     try:
         _append_bounded_jsonl_lines(
-            ERROR_LOG_JSONL_PATH,
+            target,
             [json.dumps(item, ensure_ascii=False) for item in error_records],
         )
     except Exception as e:
-        logger.error("写入错误路径日志 [%s] 失败: %s", ERROR_LOG_JSONL_PATH, e)
+        logger.error("写入错误路径日志 [%s] 失败: %s", target, e)
 
 
 _SIGNAL_URL_OR_DOMAIN_KEYWORDS = (
@@ -139,14 +124,11 @@ def has_potential_product_signal(record: Dict[str, Any]) -> Tuple[bool, List[str
 
     links = record.get("extracted_links") or []
     tokens = record.get("extracted_tokens") or []
-    cand_id = str(record.get("candidate_goods_id") or "").strip()
 
     if any(isinstance(lk, dict) and (lk.get("url") or lk.get("item_id")) for lk in links):
         signal_types.append("extracted_links")
     if any(str(tk or "").strip() for tk in tokens):
         signal_types.append("extracted_tokens")
-    if cand_id:
-        signal_types.append("candidate_goods_id")
 
     text_blob = f"{record.get('title') or ''}\n{record.get('tutorial_text') or ''}".lower()
     if any(kw in text_blob for kw in _SIGNAL_URL_OR_DOMAIN_KEYWORDS):
@@ -168,8 +150,6 @@ def _is_pure_jd_coupon_only_record(record: Dict[str, Any]) -> bool:
     - 群聊流 (`is_group_stream=True`) 中将其存为 `context_only`；
     - 独立帖流 (`is_group_stream=False`) 中无具体主商品可直接跳过。
     """
-    if str(record.get("candidate_goods_id") or "").strip():
-        return False
     tokens = record.get("extracted_tokens") or []
     if any(str(tk or "").strip() for tk in tokens):
         return False
@@ -241,7 +221,8 @@ def parse_publish_time_epoch(pub_time_str: str) -> Optional[float]:
         pass
 
     try:
-        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        iso_cand = re.sub(r"(\.\d{6})\d+", r"\1", s).replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(iso_cand)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=_CHINA_TZ)
         return dt.timestamp()
@@ -322,11 +303,15 @@ class DealRawPoolRepository:
         collection_name: str = DEFAULT_RAW_COLLECTION_NAME,
         formal_collection_name: str = DEFAULT_FORMAL_PRODUCTS_COLLECTION,
         db_instance=None,
+        site_max_age_map: Optional[Dict[str, float]] = None,
     ):
         self.collection_name = collection_name
         self.formal_collection_name = formal_collection_name
         self._db = db_instance
         self._indexes_ready = False
+        self.site_max_age_map: Dict[str, float] = (
+            dict(site_max_age_map) if site_max_age_map is not None else get_default_site_max_age_days_map()
+        )
 
     @property
     def db(self):
@@ -350,10 +335,8 @@ class DealRawPoolRepository:
         try:
             col = self.db.get_collection(self.collection_name)
             col.create_index([("source_site", 1), ("source_item_id", 1)], unique=True, background=True)
-            col.create_index([("first_seen_at", -1)], background=True)
             col.create_index([("last_seen_at", -1)], background=True)
             col.create_index([("cleaned_at", -1)], background=True)
-            col.create_index([("clean_status", 1), ("source_site", 1)], background=True)
             col.create_index(
                 [("clean_status", 1), ("source_site", 1), ("publish_ts", -1), ("last_seen_at", -1)],
                 background=True,
@@ -369,7 +352,6 @@ class DealRawPoolRepository:
                 background=True,
             )
             col.create_index([("platform", 1), ("quality_signals.quality_tier", 1)], background=True)
-            col.create_index([("candidate_goods_id", 1)], background=True)
             col.create_index(
                 [("clean_status", 1), ("clean_stage", 1), ("stage_lease_until_ts", 1), ("publish_ts", -1)],
                 background=True,
@@ -548,7 +530,7 @@ class DealRawPoolRepository:
                 "has_full_detail": True,
                 "$or": [
                     {"clean_status": {"$in": ["pending", "cleaned_success", "cleaned_low_score", "merged_into_parent"]}},
-                    {"clean_status": "cleaned_failed", "clean_error_code": {"$ne": "UPSTREAM_DISAPPEARED"}},
+                    {"clean_status": "cleaned_failed", "clean_error_code": {"$ne": UPSTREAM_DISAPPEARED}},
                 ],
             }
             if channel:
@@ -595,7 +577,7 @@ class DealRawPoolRepository:
         if refresh_publish_time:
             now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             now_ts = now_dt.timestamp()
-            eff_age = float(max_age_days) if max_age_days is not None else get_channel_max_age_days(
+            eff_age = float(max_age_days) if max_age_days is not None else resolve_deal_max_age_days(
                 channel_name=channel,
                 site_key=site,
                 default_days=DEAL_MAX_CLEAN_AGE_DAYS,
@@ -680,10 +662,15 @@ class DealRawPoolRepository:
                 {
                     "$set": {
                         "clean_status": "cleaned_failed",
-                        "clean_error_code": "UPSTREAM_DISAPPEARED",
+                        "clean_stage": CLEAN_STAGE_DONE,
+                        "clean_error_code": UPSTREAM_DISAPPEARED,
                         "clean_error_msg": "全量线报巡视未包含此商品，上游已下架失效",
                         "cleaned_at": now_naive,
-                    }
+                    },
+                    "$unset": {
+                        "stage_lease_owner": "",
+                        "stage_lease_until_ts": "",
+                    },
                 },
             )
             res["raw_expired"] = int(getattr(raw_res, "modified_count", 0) or 0)
@@ -743,16 +730,22 @@ class DealRawPoolRepository:
 
         # 仅当此前因全量巡视暂离榜单 (UPSTREAM_DISAPPEARED) 而下架的记录重新出现时，才将其重置为 pending 重新清洗；
         # 其余确定性失败（如已停止推广、纯数字SKU、券链失效、货不对板、低分等）严禁重复洗库。
-        incoming_ids = [str(r.get("source_item_id") or "") for r in records if isinstance(r, dict) and r.get("source_item_id")]
-        first_site = str(records[0].get("source_site") or "").strip() if records and isinstance(records[0], dict) else ""
-        if incoming_ids and first_site:
+        ids_by_site: Dict[str, List[str]] = {}
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            s_key = str(rec.get("source_site") or "").strip()
+            s_id = str(rec.get("source_item_id") or "").strip()
+            if s_key and s_id:
+                ids_by_site.setdefault(s_key, []).append(s_id)
+        for s_key, s_ids in ids_by_site.items():
             try:
                 self.col.update_many(
                     {
-                        "source_site": first_site,
-                        "source_item_id": {"$in": incoming_ids},
+                        "source_site": s_key,
+                        "source_item_id": {"$in": s_ids},
                         "clean_status": "cleaned_failed",
-                        "clean_error_code": "UPSTREAM_DISAPPEARED",
+                        "clean_error_code": UPSTREAM_DISAPPEARED,
                     },
                     {
                         "$set": {
@@ -774,7 +767,7 @@ class DealRawPoolRepository:
                     },
                 )
             except Exception as e:
-                logger.warning("重置重新上榜的暂离线报状态异常: %s", e)
+                logger.warning("重置重新上榜的暂离线报状态异常 (%s): %s", s_key, e)
 
         for rec in records:
             if not isinstance(rec, dict):
@@ -793,7 +786,7 @@ class DealRawPoolRepository:
             pub_time_str = str(rec.get("publish_time") or "").strip()
             parsed_pub_ts = parse_publish_time_epoch(pub_time_str)
             pub_ts = parsed_pub_ts if parsed_pub_ts is not None else time.time()
-            channel_max_age = float(max_age_days) if max_age_days is not None else get_channel_max_age_days(
+            channel_max_age = float(max_age_days) if max_age_days is not None else resolve_deal_max_age_days(
                 channel_name=channel,
                 site_key=site,
                 default_days=DEAL_MAX_CLEAN_AGE_DAYS,
@@ -1032,7 +1025,7 @@ class DealRawPoolRepository:
         cutoff_ts = now_ts - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
         cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
 
-        site_age_map = get_site_max_age_days_map()
+        site_age_map = dict(self.site_max_age_map)
         # 消费端直接基于数据库自包含字段 clean_cutoff_ts 判定，无该字段时兼容老数据渠道映射
         nor_conditions: List[Dict[str, Any]] = [
             {"clean_cutoff_ts": {"$gt": 0, "$lt": now_ts}},
@@ -1125,6 +1118,131 @@ class DealRawPoolRepository:
         except Exception as e:
             logger.warning("清扫过期租约异常: %s", e)
             return 0
+
+    def sweep_expired_and_max_retry(
+        self,
+        now_utc: Optional[datetime.datetime] = None,
+        site_max_age_map: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, int]:
+        """统一保鲜到期与最大重试上限清扫（SSOT）：确保状态切换至 done 并清除残留租约。"""
+        ref_now = now_utc or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        now_ts = time.time()
+        age_map = dict(site_max_age_map) if site_max_age_map is not None else dict(self.site_max_age_map)
+        pending_filter: Dict[str, Any] = {
+            "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]
+        }
+        lease_unset = {"stage_lease_owner": "", "stage_lease_until_ts": ""}
+        expired_cnt = 0
+        max_retry_cnt = 0
+
+        try:
+            # 1. 字段自包含保鲜截止期清扫 (`clean_cutoff_ts`)
+            r_cutoff = self.col.update_many(
+                {
+                    "$and": [
+                        pending_filter,
+                        {"clean_cutoff_ts": {"$gt": 0, "$lt": now_ts}},
+                    ]
+                },
+                {
+                    "$set": {
+                        "clean_status": "cleaned_failed",
+                        "clean_stage": CLEAN_STAGE_DONE,
+                        "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
+                        "clean_error_msg": "已超过本爆料专属保鲜截止期，自动清扫",
+                        "cleaned_at": ref_now,
+                    },
+                    "$unset": lease_unset,
+                },
+            )
+            expired_cnt += int(getattr(r_cutoff, "modified_count", 0) or 0)
+
+            # 2. 未落盘 clean_cutoff_ts 的历史记录：按站点自定义保鲜期清扫
+            for s_key, age_days in age_map.items():
+                s_ts = now_ts - float(age_days) * 86400.0
+                s_dt = ref_now - datetime.timedelta(days=float(age_days))
+                r_site = self.col.update_many(
+                    {
+                        "$and": [
+                            pending_filter,
+                            {"clean_cutoff_ts": {"$exists": False}},
+                            {"source_site": s_key},
+                            {
+                                "$or": [
+                                    {"publish_ts": {"$gt": 0, "$lt": s_ts}},
+                                    {"first_seen_at": {"$lt": s_dt}},
+                                ]
+                            },
+                        ]
+                    },
+                    {
+                        "$set": {
+                            "clean_status": "cleaned_failed",
+                            "clean_stage": CLEAN_STAGE_DONE,
+                            "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
+                            "clean_error_msg": f"超过渠道 {s_key} 保鲜期 ({age_days:.0f}天)，自动清扫",
+                            "cleaned_at": ref_now,
+                        },
+                        "$unset": lease_unset,
+                    },
+                )
+                expired_cnt += int(getattr(r_site, "modified_count", 0) or 0)
+
+            # 3. 其余站点历史记录：按默认保鲜期清扫
+            configured_sites = list(age_map.keys())
+            fallback_ts = now_ts - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
+            fallback_dt = ref_now - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
+            r_fb = self.col.update_many(
+                {
+                    "$and": [
+                        pending_filter,
+                        {"clean_cutoff_ts": {"$exists": False}},
+                        {"source_site": {"$nin": configured_sites}},
+                        {
+                            "$or": [
+                                {"publish_ts": {"$gt": 0, "$lt": fallback_ts}},
+                                {"first_seen_at": {"$lt": fallback_dt}},
+                            ]
+                        },
+                    ]
+                },
+                {
+                    "$set": {
+                        "clean_status": "cleaned_failed",
+                        "clean_stage": CLEAN_STAGE_DONE,
+                        "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
+                        "clean_error_msg": f"超过默认保鲜期 ({DEAL_MAX_CLEAN_AGE_DAYS}天)，自动清扫",
+                        "cleaned_at": ref_now,
+                    },
+                    "$unset": lease_unset,
+                },
+            )
+            expired_cnt += int(getattr(r_fb, "modified_count", 0) or 0)
+
+            # 4. 重试达到上限清扫
+            r_retry = self.col.update_many(
+                {
+                    "$and": [
+                        pending_filter,
+                        {"clean_retry_count": {"$gte": MAX_CLEAN_RETRIES}},
+                    ]
+                },
+                {
+                    "$set": {
+                        "clean_status": "cleaned_failed",
+                        "clean_stage": CLEAN_STAGE_DONE,
+                        "clean_error_code": ERR_AI_MAX_RETRIES_EXCEEDED,
+                        "clean_error_msg": f"已达最大重试上限({MAX_CLEAN_RETRIES}次)，自动放弃避免占用清洗队列",
+                        "cleaned_at": ref_now,
+                    },
+                    "$unset": lease_unset,
+                },
+            )
+            max_retry_cnt = int(getattr(r_retry, "modified_count", 0) or 0)
+        except Exception as e:
+            logger.warning("保鲜过期与重试上限清扫异常: %s", e)
+
+        return {"expired_swept": expired_cnt, "max_retry_swept": max_retry_cnt}
 
     def generate_pool_summary(self) -> Dict[str, Any]:
         """聚合初步表与正式表的核心健康指标字典。"""

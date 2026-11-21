@@ -21,12 +21,6 @@ import sys
 import traceback
 from typing import Any, Dict, List
 
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 WORKSPACE_ROOT = os.path.dirname(PROJECT_ROOT)
@@ -34,6 +28,7 @@ for _p in (PROJECT_ROOT, WORKSPACE_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from infrastructure.logging_utils import configure_console_encoding
 from services.deal_sources import (
     DEFAULT_CHANNEL_CONFIGS,
     ChannelConfig,
@@ -188,6 +183,7 @@ def _verify_one_channel(
 
 
 def main(argv: List[str] | None = None) -> int:
+    configure_console_encoding()
     parser = argparse.ArgumentParser(description="Verify real live deal sources via services.deal_sources.")
     parser.add_argument("--site", default="", help="Filter by site_key (comma-separated)")
     parser.add_argument("--channel", default="", help="Filter by channel name substring (comma-separated)")

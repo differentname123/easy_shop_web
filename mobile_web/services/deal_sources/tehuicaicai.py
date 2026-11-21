@@ -13,11 +13,11 @@
 """
 from __future__ import annotations
 
-import logging
 import re
 import time
 from typing import Any, Dict, List, Set
 
+from infrastructure.logging_utils import get_app_logger
 from models.product import detect_platform_signal
 
 from .base import BaseDealSource, FetchContext, FetchResult
@@ -34,7 +34,7 @@ from .parsing import (
     utc_now_iso,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_app_logger(__name__)
 
 
 class TehuicaicaiSource(BaseDealSource):

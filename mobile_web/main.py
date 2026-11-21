@@ -18,7 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, set_process_role
 from infrastructure.logging_utils import configure_logging, format_exc_summary
-from infrastructure.pdd_client import configure_transport
+from infrastructure.mongo import close_shared_db
+from infrastructure.transport import configure_transport
 from services.detail_prefetch import DetailPrefetcher
 from services.order_service import OrderSyncWorker
 
@@ -52,6 +53,7 @@ async def lifespan(app: FastAPI):
     prefetcher = None
     warmup_thread = None
     order_sync_worker = None
+    gh_worker_started = False
     warmup_stop = threading.Event()
     app.state.detail_prefetcher = None
     app.state.order_sync_worker = None
@@ -103,9 +105,18 @@ async def lifespan(app: FastAPI):
         elif settings.warmup_enabled:
             warmup_thread = threading.Thread(target=warm_connections, name="platform-warmup", daemon=False)
             warmup_thread.start()
-        if settings.detail_prefetch_enabled or settings.warmup_enabled:
-            if GROUP_HELP_ENABLED:
-                group_help_worker.start()
+        gh_flag = getattr(settings, "group_help_worker_enabled", None)
+        order_flag = getattr(settings, "order_sync_worker_enabled", None)
+        gh_worker_on = GROUP_HELP_ENABLED and (
+            gh_flag if gh_flag is not None else (settings.detail_prefetch_enabled or settings.warmup_enabled)
+        )
+        order_worker_on = (
+            order_flag if order_flag is not None else (settings.detail_prefetch_enabled or settings.warmup_enabled)
+        )
+        if gh_worker_on:
+            group_help_worker.start()
+            gh_worker_started = True
+        if order_worker_on:
             order_sync_worker = OrderSyncWorker(order_service)
             app.state.order_sync_worker = order_sync_worker
             order_sync_worker.start()
@@ -115,7 +126,8 @@ async def lifespan(app: FastAPI):
         if order_sync_worker is not None:
             await asyncio.to_thread(order_sync_worker.stop)
             app.state.order_sync_worker = None
-        if GROUP_HELP_ENABLED:
+        await asyncio.to_thread(order_service.wait_for_sync_threads)
+        if gh_worker_started:
             await asyncio.to_thread(group_help_worker.stop)
         if prefetcher is not None:
             # stop 先封 admission/set Event/丢排队项，再完整 join；同步 I/O 由自身超时返回。
@@ -130,6 +142,7 @@ async def lifespan(app: FastAPI):
                 if service.prefetcher is prefetcher:
                     service.prefetcher = None
         app.state.detail_prefetcher = None
+        await asyncio.to_thread(close_shared_db)
 
 
 def _request_path(request) -> str:

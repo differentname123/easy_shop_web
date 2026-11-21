@@ -310,11 +310,11 @@ class GroupHelpRepository(BaseRepository):
         )
 
     def expire_outdated_groups(self, now: Optional[float] = None) -> int:
-        """将超过 24 小时（或超过 expires_at）的活跃团自动下线。"""
+        """将超过 24 小时（或超过 expires_at）的活跃及待确认团自动下线。"""
         current_ts = float(now if now is not None else time.time())
         res = self.col.update_many(
             {
-                "group_status": GROUP_STATUS_ACTIVE,
+                "group_status": {"$in": [GROUP_STATUS_ACTIVE, GROUP_STATUS_PENDING_CONFIRM]},
                 "expires_at": {"$lte": current_ts},
             },
             {
@@ -334,9 +334,8 @@ class GroupHelpRepository(BaseRepository):
         limit: int = 20,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """搜索并分页返回已完成大模型识别的多人团列表。"""
+        """纯只读搜索并分页返回已完成大模型识别的多人团列表。"""
         current_ts = float(now if now is not None else time.time())
-        self.expire_outdated_groups(now=current_ts)
 
         query: Dict[str, Any] = {"parse_status": PARSE_STATUS_PARSED}
         if filter_mode == "almost":
@@ -713,8 +712,8 @@ class GroupHelpRepository(BaseRepository):
             "group_status": target_status,
             "click_count": 0,
             "feedback_count": 0,
-            "exported_targets": dict(data.get("exported_targets") or existing.get("exported_targets") if existing else {}),
-            "last_exported_at": data.get("last_exported_at", existing.get("last_exported_at") if existing else None),
+            "exported_targets": dict(data.get("exported_targets") or {}),
+            "last_exported_at": data.get("last_exported_at"),
             "created_at": created_at,
             "updated_at": current_ts,
             "expires_at": expires_at,

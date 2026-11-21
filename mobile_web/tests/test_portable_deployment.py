@@ -130,13 +130,14 @@ def test_boolean_json_values(tmp_path, value, expected):
     (True, None, True), (False, None, False), (True, True, True),
     (True, False, False), (False, True, True), (False, False, False),
 ])
-def test_detail_prefetch_defaults_follow_warmup_and_json_explicit_value_wins(tmp_path, warmup, explicit, expected):
+def test_detail_prefetch_defaults_follow_warmup_and_json_explicit_value_wins(tmp_path, warmup, explicit, expected, monkeypatch):
     path = tmp_path / "prefetch.json"
     data = dict(PRIVATE, web_warmup_enabled=warmup)
     if explicit is not None:
         data["web_detail_prefetch_enabled"] = explicit
     path.write_text(json.dumps(data), encoding="utf-8")
-    settings = load_settings(path, environ={"WEB_DETAIL_PREFETCH_ENABLED": "opposite-value-ignored"})
+    monkeypatch.setenv("WEB_DETAIL_PREFETCH_ENABLED", "opposite-value-ignored")
+    settings = load_settings(path)
     assert settings.warmup_enabled is warmup
     assert settings.detail_prefetch_enabled is expected
     assert settings.detail_prefetch_interval_seconds == 300
@@ -198,24 +199,27 @@ def test_invalid_explicit_config_has_safe_value_error(tmp_path, text):
     path = tmp_path / "bad-config.json"
     path.write_text(text, encoding="utf-8")
     with pytest.raises(SettingsError) as error:
-        load_settings(path, environ={})
+        load_settings(path)
     assert isinstance(error.value, ValueError)
     assert "malformed-json-secret-canary" not in str(error.value)
 
 
-def test_explicit_missing_config_is_not_silently_ignored(tmp_path):
+def test_explicit_missing_config_is_not_silently_ignored(tmp_path, monkeypatch):
+    monkeypatch.setenv("PDD_CLIENT_ID", "env")
+    monkeypatch.setenv("PDD_CLIENT_SECRET", "env-secret")
+    monkeypatch.setenv("PDD_PID", "env-pid")
+    monkeypatch.setenv("WEB_AUTH_SECRET", SMOKE_SECRET)
     with pytest.raises(SettingsError):
-        load_settings(tmp_path / "does not exist.json", environ={"PDD_CLIENT_ID": "env",
-            "PDD_CLIENT_SECRET": "env-secret", "PDD_PID": "env-pid", "WEB_AUTH_SECRET": SMOKE_SECRET})
+        load_settings(tmp_path / "does not exist.json")
 
 
 def test_missing_credentials_can_be_skipped_only_when_requested(tmp_path):
     path = tmp_path / "empty.json"
     path.write_text("{}", encoding="utf-8")
-    settings = load_settings(path, environ={}, require_credentials=False)
+    settings = load_settings(path, require_credentials=False)
     assert settings.pdd_client_id == settings.pdd_client_secret == settings.pdd_pid == settings.auth_secret == ""
     with pytest.raises(SettingsError):
-        load_settings(path, environ={})
+        load_settings(path)
 
 
 def test_get_settings_caches_the_unified_loader(monkeypatch):
@@ -240,7 +244,7 @@ def test_mongo_factory_uses_unified_settings_and_never_connects(tmp_path, monkey
     data = dict(PRIVATE)
     data.update({"local_mongo_user": "name@realm", "local_mongo_password": "pass:/ word"})
     custom_config.write_text(json.dumps(data), encoding="utf-8")
-    settings = load_settings(custom_config, environ={})
+    settings = load_settings(custom_config)
     client = MagicMock()
     factory = MagicMock(return_value=client)
     monkeypatch.setattr(mongo, "MongoClient", factory)
@@ -546,7 +550,7 @@ assert values['local_mongo_port'] == 27017
 assert values['local_mongo_db_name'] == 'crawler_data'
 assert 'mongo_auth_source' not in values
 assert values['web_auth_secret'] == 'preserved-private-auth-secret-over-32-characters'
-settings = load_settings(output, environ={})
+settings = load_settings(output)
 assert (settings.mongo_host, settings.mongo_port, settings.mongo_db_name,
         settings.mongo_auth_source) == ('localhost', 27017, 'crawler_data', 'admin')
 import run

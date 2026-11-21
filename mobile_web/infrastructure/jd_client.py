@@ -5,7 +5,6 @@ import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
-import requests
 from infrastructure.api_governance import (
     GLOBAL_QUOTA_PACER,
     GLOBAL_UPSTREAM_HEALTH,
@@ -18,6 +17,7 @@ from infrastructure.http_utils import (
     execute_with_key_failover,
     parse_appkey_list,
 )
+from infrastructure.transport import create_http_session
 from models.user import normalize_promoter_id
 
 # Documented relay currently uses HTTP. Configure an approved secure alternative
@@ -197,12 +197,7 @@ class JdClient:
         if http_session is not None:
             self.http = http_session
         else:
-            from requests.adapters import HTTPAdapter
-            sess = requests.Session()
-            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32)
-            sess.mount("https://", adapter)
-            sess.mount("http://", adapter)
-            self.http = sess
+            self.http = create_http_session(pool_connections=16, pool_maxsize=32)
         self.timeout = timeout
 
     _MIN_KEY_DISPATCH_INTERVAL_SEC = 0.22
@@ -269,7 +264,7 @@ class JdClient:
         except QuotaPaceBacklogError:
             dt_ms = (time.perf_counter() - t0) * 1000.0
             GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="rate_limit", latency_ms=dt_ms, error_code="QUOTA_PACE_BACKLOG", allow_persist=is_real)
-            return _error("UPSTREAM_ERROR", "京东接口请求过于频繁，请稍后重试")
+            return _error("QUOTA_PACE_BACKLOG", "京东接口请求过于频繁，请稍后重试")
         except ValueError:
             dt_ms = (time.perf_counter() - t0) * 1000.0
             GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
@@ -525,7 +520,6 @@ class JdClient:
         primary_ok = primary_res.get("status") == "success"
         if primary_ok:
             lower_mat = material.lower()
-            j_cmd_primary = str(primary_res.get("j_command") or "").strip()
             is_known_jingfen_or_venue = (
                 "jingfen.jd.com/detail/" in lower_mat
                 or is_jd_official_venue_url(lower_mat)

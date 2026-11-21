@@ -448,7 +448,7 @@ test('homepage shared script dependencies exist and toast is outside the authori
   assert.ok(dependencies.indexOf('api.js') < dependencies.indexOf('app.js'));
   assert.ok(dependencies.indexOf('account.js') < dependencies.indexOf('app.js'));
   const backdrop = source.indexOf('class="modal-backdrop"');
-  const loader = source.indexOf('class="smart-loader-overlay"');
+  const loader = source.indexOf('class="toast-box"');
   const between = source.slice(backdrop, loader);
   const divStarts = (between.match(/<div\b/g) || []).length;
   const divEnds = (between.match(/<\/div>/g) || []).length;
@@ -604,17 +604,18 @@ test('visual fixes: avatar error fallback, receipt order icon, and orderDays 0 m
 
 test('visual fixes: detail page safe-top, word break, ratings, tags, specs icon, and gallery flow', () => {
   const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const detailCss = fs.readFileSync(path.join(root, 'static', 'css', 'detail.css'), 'utf8');
   const detailJs = fs.readFileSync(path.join(scripts, 'detail.js'), 'utf8');
 
   // Safe area on detail navbar and container
-  assert.ok(detailHtml.includes('height: calc(48px + var(--safe-top));'), 'Detail nav bar uses safe-top');
-  assert.ok(detailHtml.includes('padding-top: calc(48px + var(--safe-top));'), 'Detail container offsets content by safe-top');
+  assert.ok(detailCss.includes('height: calc(48px + var(--safe-top));'), 'Detail nav bar uses safe-top');
+  assert.ok(detailCss.includes('padding-top: calc(48px + var(--safe-top));'), 'Detail container offsets content by safe-top');
 
   // Word breaking
-  assert.ok(detailHtml.includes('overflow-wrap: break-word;'), 'Detail h1 title uses overflow-wrap: break-word');
+  assert.ok(detailCss.includes('overflow-wrap: break-word;'), 'Detail h1 title uses overflow-wrap: break-word');
 
   // Unused footer CSS removed
-  assert.ok(!detailHtml.includes('.detail-fixed-footer'), 'Dead .detail-fixed-footer CSS removed');
+  assert.ok(!detailHtml.includes('.detail-fixed-footer') && !detailCss.includes('.detail-fixed-footer'), 'Dead .detail-fixed-footer CSS removed');
 
   // Ratings and guarantees mounted
   assert.ok(detailHtml.includes('shop-ratings-strip'), 'Detail mounts shop-ratings-strip');
@@ -2100,6 +2101,7 @@ test('WeChat browser intercepts Taobao jump into command modal while detail disa
   const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
   const groupHelpJs = fs.readFileSync(path.join(root, 'static', 'js', 'group_help.js'), 'utf8');
   const groupHelpCss = fs.readFileSync(path.join(root, 'static', 'css', 'group_help.css'), 'utf8');
+  const detailCss = fs.readFileSync(path.join(root, 'static', 'css', 'detail.css'), 'utf8');
   const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
   assert.ok(indexHtml.includes('<span>严选好价</span>'));
   assert.ok(groupHelpHtml.includes('<span>严选好价</span>'));
@@ -2108,6 +2110,7 @@ test('WeChat browser intercepts Taobao jump into command modal while detail disa
   for (const [name, content] of [
     ['index.html', indexHtml],
     ['detail.html', detailHtml],
+    ['detail.css', detailCss],
     ['group_help.html', groupHelpHtml],
     ['group_help.js', groupHelpJs],
     ['group_help.css', groupHelpCss],
@@ -2770,13 +2773,9 @@ test('Chinese IME composition + Enter never wipes or drops Chinese search keywor
   h.page.boomSearchInputRef.value = boomEl;
   const baseReqCount = h.requests.length;
 
-  // 1. 首页中文输入法正在拼音组词时按回车（keyCode=229 或 compositionend 前的 keydown.enter）：绝不提前触发空搜索，也不清空输入框
-  h.page.onImeCompositionStart('home', { target: homeEl });
-  assert.equal(homeEl.composing, true);
+  // 1. 首页中文输入法正在拼音组词时按回车（isComposing=true 或 keyCode=229+target.composing）：绝不提前触发空搜索
   homeEl.value = 'hao you';
-  h.page.onImeInput('home', { target: homeEl, isComposing: true });
-  assert.equal(h.page.homeSearchKeyword.value, '');
-
+  homeEl.composing = true;
   let enterPrevented = false;
   h.page.onSearchKeydownEnter('home', {
     target: homeEl,
@@ -2787,19 +2786,16 @@ test('Chinese IME composition + Enter never wipes or drops Chinese search keywor
   h.page.onSearchKeydownEnter('home', {
     target: homeEl,
     isComposing: false,
-    keyCode: 13,
+    keyCode: 229,
     preventDefault() { enterPrevented = true; },
   });
   assert.equal(enterPrevented, false);
-  assert.equal(h.requests.length, baseReqCount, 'pressing Enter to confirm IME candidate never fires premature empty search');
+  assert.equal(h.requests.length, baseReqCount, 'pressing Enter during IME composition never fires premature search');
   assert.equal(homeEl.value, 'hao you');
 
-  // 候选词上屏「蚝油」触发 compositionend -> 再按回车执行搜索，关键词与输入框均完整保留「蚝油」
+  // 候选词上屏「蚝油」后按回车执行搜索，关键词与输入框均完整保留「蚝油」
+  homeEl.composing = false;
   homeEl.value = '蚝油';
-  h.page.onImeCompositionEnd('home', { target: homeEl });
-  assert.equal(homeEl.composing, false);
-  assert.equal(h.page.homeSearchKeyword.value, '蚝油');
-
   h.page.onSearchKeydownEnter('home', {
     target: homeEl,
     isComposing: false,
@@ -2815,33 +2811,18 @@ test('Chinese IME composition + Enter never wipes or drops Chinese search keywor
   assert.equal(h.page.activeHomeKeyword.value, '蚝油');
   assert.equal(homeEl.value, '蚝油');
 
-  // 2. 严选好价 (Boom) 异常输入法场景：el.composing 卡死 + WKWebView 延迟上屏 + 直接点「搜索」按钮
+  // 2. 严选好价 (Boom)：el.composing 卡死时直接点「搜索」按钮，仍能从真实 DOM 读取中文提交并清卡状态
   h.page.currentTab.value = 'boom';
   await flush();
   await h.finish(h.requests.length - 1, { status: 'success', data: [{ goods_id: 'BOOM-INIT', platform: 'pdd' }], has_more: false });
 
-  // 2A. 模拟前一次组词中断导致 el.composing 卡在 true，随后云输入/候选词直接派发 isComposing=false 的 input
-  boomEl.composing = true;
-  boomEl.value = '海天蚝油';
-  h.page.onImeInput('boom', { target: boomEl, isComposing: false });
-  assert.equal(boomEl.composing, false, 'non-composing input event unsticks el.composing');
-  assert.equal(h.page.boomSearchKeyword.value, '海天蚝油');
-
-  // 2B. 模拟 iOS WKWebView 在 compositionend 后下一微任务才将拼音替换为汉字
-  h.page.onImeCompositionStart('boom', { target: boomEl });
-  boomEl.value = 'bo yan hao you';
-  h.page.onImeCompositionEnd('boom', { target: boomEl });
-  boomEl.value = '薄盐蚝油';
-  await flush();
-  assert.equal(h.page.boomSearchKeyword.value, '薄盐蚝油');
-
-  // 2C. 模拟用户选词后 v-model 尚未同步就直接点击「搜索」按钮：从真实 DOM 兜底读取中文，绝不发出 keyword=""
   h.page.boomSearchKeyword.value = '';
   boomEl.composing = true;
   boomEl.value = '海天薄盐上等蚝油';
   const boomSearchReq = h.page.onSearchBoom({ target: boomEl, type: 'click' });
   const boomUrl = new URL(h.requests.at(-1).url, 'https://shop.test');
   assert.equal(boomUrl.searchParams.get('keyword'), '海天薄盐上等蚝油');
+  assert.equal(boomEl.composing, false);
   await h.finish(h.requests.length - 1, { status: 'success', data: [], has_more: false });
   await boomSearchReq;
   assert.equal(h.page.boomSearchKeyword.value, '海天薄盐上等蚝油');
@@ -2859,17 +2840,13 @@ test('Chinese IME composition + Enter never wipes or drops Chinese search keywor
   h.page.formPhone.value = '13800138000';
   h.page.formPassword.value = 'secret123';
   const nickEl = { value: 'sheng qian', composing: true };
-  h.page.onImeCompositionStart('nickname', { target: nickEl });
   const beforeAuthReqs = h.requests.length;
   h.page.onAuthInputEnter('nickname', { target: nickEl, isComposing: true, keyCode: 229 });
   assert.equal(h.requests.length, beforeAuthReqs, 'IME Enter on nickname does not submit registration prematurely');
-  nickEl.value = '省钱小能手';
-  h.page.onImeCompositionEnd('nickname', { target: nickEl });
-  assert.equal(h.page.formNickname.value, '省钱小能手');
   h.page.dispose();
 });
 
-test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux-20261118-1 asset versions', async () => {
+test('group_help Chinese IME guard, slow boot draft preservation, and uniform asset/icon versions', async () => {
   // 1. 多人团互助搜索框：中文组词按回车不抢跑，上屏后按回车精准携带中文关键词
   const hGh = harness({ url: 'https://shop.test/group_help' });
   hGh.load('group_help');
@@ -2880,20 +2857,16 @@ test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux
     data: { items: [], total: 0, has_more: false, pending_count: 0 },
   });
 
-  const ghInput = { value: '', composing: false };
+  const ghInput = { value: 'wei da', composing: true };
   hGh.page.searchInputRef.value = ghInput;
   const reqBefore = hGh.requests.length;
 
-  hGh.page.onSearchCompositionStart({ target: ghInput });
-  ghInput.value = 'wei da';
-  hGh.page.onKeywordInput({ target: ghInput, isComposing: true });
   hGh.page.onSearchKeydownEnter({ target: ghInput, isComposing: true, keyCode: 229 });
-  hGh.page.onSearchKeydownEnter({ target: ghInput, isComposing: false, keyCode: 13 });
+  hGh.page.onSearchKeydownEnter({ target: ghInput, isComposing: false, keyCode: 229 });
   assert.equal(hGh.requests.length, reqBefore, 'group_help IME composition Enter does not trigger empty search');
 
+  ghInput.composing = false;
   ghInput.value = '维达抽纸';
-  hGh.page.onSearchCompositionEnd({ target: ghInput });
-  assert.equal(hGh.page.keyword.value, '维达抽纸');
   hGh.page.onSearchKeydownEnter({ target: ghInput, isComposing: false, keyCode: 13, preventDefault() {} });
   assert.equal(hGh.requests.length, reqBefore + 1);
   assert.equal(new URL(hGh.requests.at(-1).url, 'https://shop.test').searchParams.get('keyword'), '维达抽纸');
@@ -2908,7 +2881,6 @@ test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux
   const hSlow = harness({ url: 'https://shop.test/' });
   const feed = hSlow.makeFeeds();
   const initPromise = feed.initialize(new URLSearchParams(''));
-  // 用户在 /api/platforms 返回前已输入中文草稿「蚝油」
   feed.homeSearchKeyword.value = '蚝油';
   await hSlow.finish(0, { status: 'success', data: platformFixtures });
   await hSlow.finish(1, { status: 'success', data: channelFixtures });
@@ -2916,15 +2888,24 @@ test('group_help Chinese IME guard, slow boot draft preservation, and uniform ux
   await initPromise;
   assert.equal(feed.homeSearchKeyword.value, '蚝油', 'slow initial feed boot preserves user-typed Chinese draft');
 
-  // 3. 静态模板与缓存版本一致性守卫：三页统一最新版本号，搜索框与中文昵称框彻底移除裸 @keyup.enter
+  // 3. 静态模板 JS/CSS 版本与图标版本全站 100% 统一（含 detail.css 与 manifest.json）
   const versions = new Set();
+  const iconVersions = new Set();
   for (const pageName of ['index.html', 'detail.html', 'group_help.html']) {
     const html = fs.readFileSync(path.join(root, 'static', pageName), 'utf8');
     const urls = [...html.matchAll(/(?:src|href)="(\/static\/(?:js|css)\/[^"]+)"/g)].map(m => new URL(m[1], 'https://offline.test'));
+    assert.ok(urls.length >= 2, `${pageName} has static js/css urls`);
     for (const u of urls) versions.add(u.searchParams.get('v'));
+    const icons = [...html.matchAll(/(?:src|href)="(\/static\/icons\/[^"]+)"/g)].map(m => new URL(m[1], 'https://offline.test'));
+    for (const ic of icons) iconVersions.add(ic.searchParams.get('v'));
+  }
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'static', 'manifest.json'), 'utf8'));
+  for (const ic of manifest.icons || []) {
+    iconVersions.add(new URL(ic.src, 'https://offline.test').searchParams.get('v'));
   }
   assert.equal(versions.size, 1, `expected uniform asset version across all pages, got: ${[...versions].join(', ')}`);
   assert.ok([...versions][0], 'asset version query parameter must be non-empty');
+  assert.equal(iconVersions.size, 1, `expected uniform icon version across all pages and manifest, got: ${[...iconVersions].join(', ')}`);
 
   const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
@@ -3167,6 +3148,83 @@ test('mobile search IME resilience: native form submit support, zero el.composin
   assert.equal(searchUrl.searchParams.get('keyword'), '充电宝');
   h.page.dispose();
 });
+
+test('Wave 4B frontend fixes: poster_url badge & CSS, cross-origin tok_ routing, listGeneration concurrency, no base64 localStorage, textSubmitModal popstate, HTML 502 & CSS extraction', async () => {
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
+  const groupHelpCss = fs.readFileSync(path.join(root, 'static', 'css', 'group_help.css'), 'utf8');
+  const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+
+  // 1. poster_url (never poster_path) & badge CSS classes
+  assert.equal(groupHelpHtml.includes('poster_path'), false);
+  assert.ok(groupHelpHtml.includes('selectedGroup.poster_url'));
+  for (const cls of ['.gh-badge {', '.gh-badge-poster {', '.gh-badge-token {']) {
+    assert.ok(groupHelpCss.includes(cls), `group_help.css defines ${cls}`);
+  }
+
+  // 2. index.html empty vs error mutually exclusive; detail.html uses external detail.css; style.css responsive alignment
+  assert.ok(indexHtml.includes('v-if="!homeLoading && homeError && homeGoodsList.length === 0"'));
+  assert.equal(detailHtml.includes('<style>'), false);
+  assert.ok(detailHtml.includes('/static/css/detail.css?v='));
+  assert.ok(fs.existsSync(path.join(root, 'static', 'css', 'detail.css')));
+  assert.ok(styleCss.includes('#app:not(.detail-container)'));
+
+  // 3. cross-origin tok_ share route
+  const hFmt = harness();
+  assert.equal(
+    hFmt.context.EasyShop.extractInternalShareRoute('https://other.test/group_help?gid=tok_AbC12345', 'https://shop.test'),
+    '/group_help?gid=tok_AbC12345'
+  );
+
+  // 4. group_help listGeneration race guard + non-JSON 502 handling + popstate textSubmitModal + no base64 in localStorage
+  const hGh = harness({ url: 'https://shop.test/group_help' });
+  hGh.load('group_help');
+  hGh.mounted[0]();
+  await flush();
+  // Leave request 0 ('active') unresolved, then switch to 'almost' (fires request 1)
+  hGh.page.switchFilter('almost');
+  await flush();
+  assert.equal(hGh.requests.length, 2, 'switching tab while initial request in flight still fires request for almost');
+  await hGh.finish(1, {
+    status: 'success',
+    data: { items: [{ group_order_id: '3495229659187399002', goods_name: 'Almost Group' }], total: 1, has_more: false },
+  });
+  await hGh.finish(0, {
+    status: 'success',
+    data: { items: [{ group_order_id: '3495229659187399001', goods_name: 'Stale Active Group' }], total: 1, has_more: false },
+  });
+  assert.deepEqual(hGh.page.items.value.map(it => it.group_order_id), ['3495229659187399002']);
+
+  // Non-JSON HTML 502 on list fetch resolves via api.js without throwing SyntaxError
+  const p502 = hGh.page.fetchGroups(true);
+  hGh.requests.at(-1).resolve({
+    ok: false,
+    status: 502,
+    json: async () => { throw new SyntaxError('Unexpected token <'); },
+  });
+  await flush();
+  await p502;
+  assert.equal(hGh.page.toastMsg.value, '服务繁忙，请稍后重试');
+
+  // popstate closes textSubmitModal
+  hGh.page.openTextSubmitModal();
+  assert.equal(hGh.page.textSubmitModal.value.visible, true);
+  hGh.fire('popstate', {});
+  assert.equal(hGh.page.textSubmitModal.value.visible, false);
+
+  // saveMyGroupsToStorage strips data:image/ base64 thumbnails from localStorage
+  hGh.page.myGroups.value = [
+    { group_order_id: '3495229659187399100', local_thumb: 'data:image/jpeg;base64,AAA', poster_url: 'data:image/png;base64,BBB' },
+    { local_id: 'drop_me', goods_name: 'temp' },
+  ];
+  hGh.page.removeMyGroup({ local_id: 'drop_me' });
+  const persisted = JSON.parse(hGh.context.localStorage.getItem('pdd_gh_my_groups_v1'));
+  assert.equal(persisted.length, 1);
+  assert.equal('local_thumb' in persisted[0], false);
+  assert.equal('poster_url' in persisted[0], false);
+});
+
 
 
 

@@ -2,7 +2,7 @@
 (function (global) {
   'use strict';
   const shop = global.EasyShop = global.EasyShop || {};
-  shop.createFeeds = function ({ ref, api, getUid, getScope = () => 'guest', showToast }) {
+  shop.createFeeds = function ({ ref, api, getScope = () => 'guest', showToast }) {
     const platforms = ref([]);
     const platformsError = ref(false);
     const homePlatform = ref('pdd');
@@ -113,13 +113,13 @@
       }
       const query = {
         platform: homePlatform.value, keyword: activeHomeKeyword.value, channel: currentChannel.value,
-        page: homeSearchPage, offset: homeOffset, cursor: homeCursor, uid: getUid() || '',
+        page: homeSearchPage, offset: homeOffset, cursor: homeCursor,
       };
       if (!isPullRefresh) homeLoading.value = true;
       try {
         const params = new URLSearchParams(query.keyword ? {
-          platform: query.platform, keyword: query.keyword, page: query.page, page_size: 20, uid: query.uid,
-        } : { platform: query.platform, channel_type: query.channel, offset: query.offset, limit: 20, uid: query.uid });
+          platform: query.platform, keyword: query.keyword, page: query.page, page_size: 20,
+        } : { platform: query.platform, channel_type: query.channel, offset: query.offset, limit: 20 });
         if (query.cursor) params.set('cursor', query.cursor);
         const response = await api.get(`/api/home/${query.keyword ? 'search' : 'recommend'}?${params}`);
         if (!current(generation, scope)) return false;

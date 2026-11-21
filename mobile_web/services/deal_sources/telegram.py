@@ -19,35 +19,24 @@ from __future__ import annotations
 import html as html_lib
 import re
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urlsplit
+
+from models.product import is_standalone_ecommerce_token
+from repositories.deal_raw_pool_repo import parse_publish_time_epoch
 
 from .base import BaseDealSource, FetchContext, FetchResult
 from .filters import (
     SOURCE_SELF_HOSTS,
     has_valid_detail_and_tutorial,
     is_confirmed_unsupported_deal,
-    is_host_match,
 )
 from .http_client import DEFAULT_HEADERS, is_rate_limit_status, request_with_retry
 from .parsing import (
-    TOKEN_RE,
     build_deal_record,
+    extract_balanced_tag,
     extract_links_images_and_tokens,
     html_to_tutorial_text,
 )
-
-
-def _parse_iso_epoch(dt_str: str) -> Optional[float]:
-    s = str(dt_str or "").strip()
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt.timestamp()
-    except Exception:
-        return None
 
 
 def _extract_tg_title(clean_text: str, tg_channel: str, msg_id: str) -> str:
@@ -57,7 +46,7 @@ def _extract_tg_title(clean_text: str, tg_channel: str, msg_id: str) -> str:
             continue
         if ln.startswith(("http://", "https://", "价格：", "商家：", "值率：", "领券：", "---", "【🛒")):
             continue
-        if TOKEN_RE.fullmatch(ln):
+        if is_standalone_ecommerce_token(ln):
             continue
         cleaned = re.sub(r"https?://\S+", "", ln).strip(" -|")
         if len(cleaned) >= 3:
@@ -170,7 +159,7 @@ class TelegramChannelSource(BaseDealSource):
 
                 m_dt = re.search(r'<time[^>]+datetime="([^"]+)"', blk)
                 dt_iso = m_dt.group(1).strip() if m_dt else ""
-                msg_ts = _parse_iso_epoch(dt_iso)
+                msg_ts = parse_publish_time_epoch(dt_iso)
                 if msg_ts is not None:
                     if page_oldest_ts is None or msg_ts < page_oldest_ts:
                         page_oldest_ts = msg_ts
@@ -182,12 +171,7 @@ class TelegramChannelSource(BaseDealSource):
                     skipped_known += 1
                     continue
 
-                m_txt = re.search(
-                    r'<div\s+class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-                    blk,
-                    re.S,
-                )
-                txt_html = m_txt.group(1) if m_txt else ""
+                txt_html = extract_balanced_tag(blk, "div", r'\bclass="tgme_widget_message_text[^"]*"')
                 if not txt_html:
                     skipped_no_detail += 1
                     continue
@@ -230,18 +214,6 @@ class TelegramChannelSource(BaseDealSource):
                 if is_confirmed_unsupported_deal(mall_name=mall_name, links=links, tokens=tokens):
                     skipped_unsupported += 1
                     continue
-
-                # 也过滤正文中虽被 exclude_hosts 过滤掉、但外链指向已知软件/网盘域的纯资源帖
-                raw_ext_urls = re.findall(r'href="(https?://[^"]+)"', txt_html)
-                if raw_ext_urls and not links and not tokens:
-                    # 仅包含 t.me 或内部参考链接而无电商购买链 -> 空壳跳过
-                    non_self_urls = [
-                        u for u in raw_ext_urls
-                        if not any(is_host_match((urlsplit(u).hostname or "").lower(), sh) for sh in SOURCE_SELF_HOSTS)
-                    ]
-                    if not non_self_urls:
-                        skipped_no_detail += 1
-                        continue
 
                 title = _extract_tg_title(tutorial_text, tg_channel, msg_id)
 

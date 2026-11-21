@@ -23,9 +23,10 @@ for _p in (str(MOBILE_WEB_DIR), str(CURRENT_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from infrastructure.logging_utils import configure_console_encoding
 from infrastructure.settings import get_settings
 from repositories.product_repo import ProductRepository
-from run_product_cloud_sync_scheduler import resolve_cloud_mongo_target
+from services.product_cloud_sync import resolve_cloud_mongo_target
 
 
 def build_queries():
@@ -107,7 +108,7 @@ def inspect_collection(label: str, col) -> dict:
 def main():
     from datetime import datetime, timezone
 
-    sys.stdout.reconfigure(encoding="utf-8")
+    configure_console_encoding()
     parser = argparse.ArgumentParser(description="清理本地与云端历史导入的 sku_info 商品数据")
     parser.add_argument("--cloud-uri", default=os.environ.get("CLOUD_MONGO_URI") or "")
     parser.add_argument("--execute", action="store_true", help="真正执行删除与字段剥离（默认仅只读预览）")

@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261121-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261121-2">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261118-1"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261121-2"></script>
 </head>
 <body>
 <div id="app" v-cloak>
@@ -169,7 +169,7 @@
       <span>{{ homeSearchKeyword ? '正在搜索商品与实在好价...' : '正在为您获取实时热销榜单...' }}</span>
     </div>
 
-    <div v-if="!homeLoading && homeError" class="empty-wrap" @click="retryLoadHomeGoods">{{ platformsError ? '平台信息暂不可用，请刷新页面重试' : '加载失败，点击重试' }}</div>
+    <div v-if="!homeLoading && homeError && homeGoodsList.length === 0" class="empty-wrap" @click="retryLoadHomeGoods">{{ platformsError ? '平台信息暂不可用，请刷新页面重试' : '加载失败，点击重试' }}</div>
     <div v-if="!homeLoading && !homeError && !homeHasMore && homeGoodsList.length === 0" class="empty-wrap">{{ homeEmptyMessage || '暂无符合条件的商品，换个关键词或切换上方平台试试' }}</div>
     <div v-if="!homeLoading && !homeError && homeHasMore" class="loading-wrap continue-load-wrap" :class="{ 'is-subtle': homeGoodsList.length > 0 }" @click="loadHomeGoods(false)">
       <button type="button" class="continue-load-btn">下滑自动加载 · 点击加载下一页</button>
@@ -866,38 +866,18 @@
       </div>
     </div>
   </div>
-  <!-- ==================== 全局高质感智能加载器与省钱话术轮播 ==================== -->
-  <div class="smart-loader-overlay" v-if="smartLoading.visible">
-    <div class="smart-loader-card">
-      <div class="smart-radar-wrapper">
-        <div class="smart-radar-ring"></div>
-        <div class="smart-radar-ring-inner"></div>
-        <div class="smart-radar-icon">🔍</div>
-      </div>
-      <div class="smart-loader-title">{{ smartLoading.title }}</div>
-      <div class="smart-loader-slogan-wrap">
-        <div class="smart-loader-slogan" :class="smartLoading.fadeClass">
-          {{ smartLoading.currentSlogan }}
-        </div>
-      </div>
-      <div class="smart-loader-bar">
-        <div class="smart-loader-bar-inner"></div>
-      </div>
-    </div>
-  </div>
-
   <!-- 轻量 Toast 提示 -->
   <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>
 
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261118-1"></script>
-<script src="/static/js/session.js?v=ux-20261118-1"></script>
-<script src="/static/js/format.js?v=ux-20261121-1"></script>
-<script src="/static/js/browser.js?v=ux-20261118-1"></script>
-<script src="/static/js/feeds.js?v=ux-20261118-1"></script>
-<script src="/static/js/account.js?v=ux-20261118-1"></script>
-<script src="/static/js/app.js?v=ux-20261121-1"></script>
+<script src="/static/js/api.js?v=ux-20261121-2"></script>
+<script src="/static/js/session.js?v=ux-20261121-2"></script>
+<script src="/static/js/format.js?v=ux-20261121-2"></script>
+<script src="/static/js/browser.js?v=ux-20261121-2"></script>
+<script src="/static/js/feeds.js?v=ux-20261121-2"></script>
+<script src="/static/js/account.js?v=ux-20261121-2"></script>
+<script src="/static/js/app.js?v=ux-20261121-2"></script>
 </body>
 </html>

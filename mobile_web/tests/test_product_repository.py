@@ -1155,14 +1155,14 @@ class TestProductRepository(unittest.TestCase):
         page1 = service.get_boom_products(platform="pdd", keyword="商品", page=1, page_size=2)
         self.assertEqual([item["product_id"] for item in page1["data"]], ["P3", "P2"])
         self.assertTrue(page1["has_more"])
-        self.assertEqual(page1["total_count"], 2)
+        self.assertEqual(page1["total_count"], 3)
         self.assertEqual(len(self.col.queries), queries_before + 1)
 
         # 第二页直接命中 BOOM_SORT_CACHE，不再查询数据库
         page2 = service.get_boom_products(platform="pdd", keyword="商品", page=2, page_size=2)
         self.assertEqual([item["product_id"] for item in page2["data"]], ["P1"])
         self.assertFalse(page2["has_more"])
-        self.assertEqual(page2["total_count"], 1)
+        self.assertEqual(page2["total_count"], 3)
         self.assertEqual(len(self.col.queries), queries_before + 1)
 
         # 淘汰单个商品时同步从 BOOM_SORT_CACHE 中剔除该商品且不触发重新查库
@@ -1601,7 +1601,7 @@ class TestProductRepository(unittest.TestCase):
         self.assertIsNone(self.repo.get_promotion_link_cache(platform="pdd", goods_id="88888"))
 
     def test_product_repo_uppercase_g_maps_to_mass_not_storage(self):
-        from repositories.product_repo import UNIT_TO_CATEGORY, UNIT_TO_MULTIPLIER
+        from models.cost_performance import UNIT_TO_CATEGORY, UNIT_TO_MULTIPLIER
 
         self.assertEqual(UNIT_TO_CATEGORY["G"], "质量")
         self.assertEqual(UNIT_TO_MULTIPLIER["G"], 1000)
@@ -1675,6 +1675,93 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(enriched[1].get("deal_highlight", ""), "")
         self.assertEqual(enriched[1].get("deal_publish_time", ""), "")
         cache.clear_all_caches()
+
+    def test_upsert_home_products_indexes_overlaid_effective_list_to_meili(self):
+        self.col.docs = [{
+            "platform": "jd",
+            "product_id": "JD-HASH-1",
+            "goods_id": "JD-HASH-1",
+            "goods_sign": "ENC_JD_SIGN_001",
+            "coupon_amount": 15.0,
+            "coupon_url": "https://coupon.jd.com/real_15",
+            "price": 34.9,
+            "activity_price": 34.9,
+            "original_price": 49.9,
+        }]
+        self.repo._force_meili_enabled = True
+        indexed_batches = []
+        with patch("repositories.product_repo.index_documents", side_effect=lambda docs: indexed_batches.append(deepcopy(docs))):
+            self.repo.upsert_home_products([{
+                "platform": "jd",
+                "goods_id": "JD-HASH-1",
+                "goods_sign": "ENC_JD_SIGN_001",
+                "name": "维达抽纸",
+                "price": 49.9,
+                "original_price": 49.9,
+                "coupon_amount": 0.0,
+                "coupon_url": "",
+            }], channel_type=5)
+        self.assertEqual(len(indexed_batches), 1)
+        self.assertEqual(indexed_batches[0][0]["coupon_amount"], 15.0)
+        self.assertEqual(indexed_batches[0][0]["coupon_url"], "https://coupon.jd.com/real_15")
+
+    def test_query_boom_products_meili_enforces_only_active_boom_and_content_filter(self):
+        self.col.docs = [
+            {"platform": "pdd", "product_id": "BOOM-OK", "name": "抽纸爆款", "activity_price": 9.9, "channel_type": 5},
+            {"platform": "pdd", "product_id": "STRAY-SEARCH", "name": "抽纸散查裸记录", "activity_price": 9.9},
+        ]
+        self.repo._force_meili_enabled = True
+        seen_kwargs = []
+
+        def fake_search(**kw):
+            seen_kwargs.append(kw)
+            return [{"platform": "pdd", "product_id": "BOOM-OK"}, {"platform": "pdd", "product_id": "STRAY-SEARCH"}]
+
+        with patch("repositories.product_repo.search_products", side_effect=fake_search):
+            res = self.repo.query_boom_products(platform="pdd", keyword="抽纸", page=1, page_size=20)
+        self.assertEqual(seen_kwargs[0]["only_active_boom"], True)
+        self.assertEqual([item["product_id"] for item in res["data"]], ["BOOM-OK"])
+
+    def test_delete_product_by_goods_sign_only_writes_tombstone_and_deletes_meili(self):
+        class TombMemoryCollection(MemoryCollection):
+            def update_many(self, query, update):
+                matched = modified = 0
+                for d in self.docs:
+                    if self.matches(d, query):
+                        matched += 1
+                        d.update(deepcopy(update.get("$set", {})))
+                        for k in update.get("$unset", {}):
+                            d.pop(k, None)
+                        modified += 1
+                return SimpleNamespace(matched_count=matched, modified_count=modified)
+
+        col = TombMemoryCollection()
+        tomb_col = TombMemoryCollection()
+        db = SimpleNamespace(get_collection=lambda name: tomb_col if name == "deleted_products_log" else col)
+        repo = ProductRepository(db_instance=db)
+        repo._force_meili_enabled = True
+        col.docs = [
+            {"platform": "jd", "product_id": "IMG_KEY_1", "goods_id": "IMG_KEY_1", "goods_sign": "ENC_SIGN_99", "name": "测试下架"},
+        ]
+        deleted_meili_ids = []
+        with patch("repositories.product_repo.delete_documents", side_effect=lambda ids: deleted_meili_ids.extend(ids)):
+            self.assertTrue(repo.delete_product("jd", goods_sign="ENC_SIGN_99"))
+        self.assertTrue(col.docs[0]["is_off_promotion"])
+        self.assertEqual(len(tomb_col.write_calls), 1)
+        self.assertEqual(tomb_col.docs[0]["product_id"], "IMG_KEY_1")
+        self.assertEqual(deleted_meili_ids, ["jd_IMG_KEY_1"])
+
+    def test_deal_datetime_and_timestamp_treat_naive_datetime_as_utc_and_naive_str_as_cn(self):
+        from models.cost_performance import parse_deal_publish_timestamp
+
+        naive_utc_dt = datetime.datetime(2026, 11, 21, 3, 30, 0)
+        aware_utc_dt = datetime.datetime(2026, 11, 21, 3, 30, 0, tzinfo=datetime.timezone.utc)
+        self.assertEqual(ProductRepository._format_deal_datetime(naive_utc_dt), "2026-11-21 11:30")
+        self.assertEqual(parse_deal_publish_timestamp(naive_utc_dt), aware_utc_dt.timestamp())
+        self.assertEqual(
+            parse_deal_publish_timestamp("2026-11-21 11:30:00"),
+            aware_utc_dt.timestamp(),
+        )
 
 
 if __name__ == "__main__":

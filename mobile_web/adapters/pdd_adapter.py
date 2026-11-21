@@ -8,9 +8,18 @@ from infrastructure.api_governance import (
     is_real_requests_session,
     stamp_universal_resolution,
 )
-from infrastructure.logging_utils import format_exc_summary
-from models.product import ProductRef, ProductSummary, ProductDetail, clean_product_id, extract_search_keyword
-from config import PDD_CLIENT_ID, PDD_CLIENT_SECRET, PDD_PID, logger, settings
+from infrastructure.http_utils import error_dict as _error
+from infrastructure.logging_utils import format_exc_summary, get_app_logger
+from models.product import (
+    PDD_DOMAINS,
+    PDD_GOODS_SIGN_RE,
+    ProductDetail,
+    ProductRef,
+    ProductSummary,
+    URL_RE,
+    clean_product_id,
+    extract_search_keyword,
+)
 from infrastructure.pdd_client import (
     _PDD_SESSION,
     call_pdd_api,
@@ -24,6 +33,8 @@ from infrastructure.pdd_client import (
     query_increment_orders,
 )
 
+logger = get_app_logger(__name__)
+
 
 class PddAdapter(BasePlatformAdapter):
     platform_code = "pdd"
@@ -31,12 +42,15 @@ class PddAdapter(BasePlatformAdapter):
     requires_authorized_promotion = True
     recommendation_limit = 400
 
-    def __init__(self, client_id=PDD_CLIENT_ID, client_secret=PDD_CLIENT_SECRET, pid=PDD_PID, enabled=None):
-        self._ensure_provider_state()
-        self.active = settings.pdd_enabled if enabled is None else bool(enabled)
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.pid = pid
+    def __init__(self, client_id=None, client_secret=None, pid=None, enabled=None, settings=None):
+        super().__init__()
+        if settings is None and any(v is None for v in (client_id, client_secret, pid, enabled)):
+            from config import settings as default_settings
+            settings = default_settings
+        self.active = bool(settings.pdd_enabled) if enabled is None else bool(enabled)
+        self.client_id = settings.pdd_client_id if client_id is None else client_id
+        self.client_secret = settings.pdd_client_secret if client_secret is None else client_secret
+        self.pid = settings.pdd_pid if pid is None else pid
         self._refresh_capabilities()
 
     def _has_official_creds(self) -> bool:
@@ -50,6 +64,7 @@ class PddAdapter(BasePlatformAdapter):
             "search": bool(pid_ok or self._has_extra_providers("search")),
             "detail": bool(pid_ok or self._has_extra_providers("detail")),
             "promotion": bool(pid_ok or self._has_extra_providers("promotion")),
+            "universal": bool(pid_ok or self._has_extra_providers("universal")),
             "authorization": bool(
                 pid_ok
                 or self._has_extra_providers("check_authority")
@@ -286,29 +301,21 @@ class PddAdapter(BasePlatformAdapter):
 
         def _detail_via_pdd():
             try:
-                res = pdd_get_detail(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
-                                     goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs)
+                res, confirmed_off = self._retry_on_off_promotion(
+                    lambda: pdd_get_detail(
+                        client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
+                        goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs,
+                    ),
+                    lambda r: str(r.get("error_code") or "UPSTREAM_ERROR") == "PRODUCT_OFF_PROMOTION",
+                )
                 if res.get("status") != "success" or not res.get("data"):
                     code = str(res.get("error_code") or "UPSTREAM_ERROR")
-                    if code == "PRODUCT_OFF_PROMOTION":
-                        import time
-                        time.sleep(0.15)
-                        retry_res = pdd_get_detail(client_id=self.client_id, client_secret=self.client_secret, pid=self.pid,
-                                                   goods_sign=ref.goods_sign or None, goods_id=ref.goods_id or None, uid=uid, **kwargs)
-                        if retry_res.get("status") == "success" and retry_res.get("data"):
-                            res = retry_res
-                        else:
-                            return {
-                                "status": "error",
-                                "error_code": "PRODUCT_OFF_PROMOTION",
-                                "error_msg": res.get("error_msg", "该拼多多商品已下架或无推广计划"),
-                            }
-                    else:
-                        return {
-                            "status": "error",
-                            "error_code": code,
-                            "error_msg": res.get("error_msg", "未查询到官方商品详情"),
-                        }
+                    if confirmed_off or code == "PRODUCT_OFF_PROMOTION":
+                        return _error(
+                            "PRODUCT_OFF_PROMOTION",
+                            res.get("error_msg", "该拼多多商品已下架或无推广计划"),
+                        )
+                    return _error(code, res.get("error_msg", "未查询到官方商品详情"))
                 item = self._normalize_goods(res["data"])
                 if ref.goods_sign and not item.get("goods_sign"):
                     item["goods_sign"] = ref.goods_sign
@@ -437,9 +444,6 @@ class PddAdapter(BasePlatformAdapter):
         if unavailable:
             return unavailable
         goods_id, goods_sign = self._resolve_goods_id(goods_id_or_sign, kwargs)
-        from cache import is_product_off_promotion
-        if is_product_off_promotion("pdd", goods_id, goods_sign):
-            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该拼多多商品已下架或无推广计划"}
         title = kwargs.get("title") or kwargs.get("name") or kwargs.get("goods_name") or "精选高性价比好物"
         price = kwargs.get("price")
         coupon = kwargs.get("coupon_amount") if kwargs.get("coupon_amount") is not None else kwargs.get("coupon")
@@ -527,15 +531,15 @@ class PddAdapter(BasePlatformAdapter):
         sign_param_match = re.search(r"goods_sign=([A-Za-z0-9_-]{20,})", text)
         if sign_param_match:
             extracted_sign = sign_param_match.group(1)
-        elif re.match(r"^[EYc][A-Za-z0-9_-]{25,}$", text):
+        elif PDD_GOODS_SIGN_RE.match(text):
             extracted_sign = text
 
         # 2. 提取纯净 ASCII URL，防止混排文案中 `]` 或中文尾缀污染链接
-        url_match = re.search(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text)
+        url_match = URL_RE.search(text)
         if url_match:
             extracted_url = url_match.group(0).rstrip(".,!?)];'\"")
             url_lower = extracted_url.lower()
-            if not any(d in url_lower for d in ("pinduoduo.com", "yangkeduo.com")):
+            if not any(d in url_lower for d in PDD_DOMAINS):
                 return {
                     "status": "error",
                     "error_code": "INVALID_PDD_URL",

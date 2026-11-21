@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """淘宝平台边界：官方商品、第三方ID榜单、核验身份与渠道订单映射。"""
 import json
-import logging
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit
 
-logger = logging.getLogger(__name__)
+from infrastructure.logging_utils import get_app_logger
+
+logger = get_app_logger(__name__)
 
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
@@ -42,7 +43,7 @@ class TaobaoAdapter(BasePlatformAdapter):
     order_window_seconds = ORDER_WINDOW_SECONDS
 
     def __init__(self, settings=None, official_client=None, hdk_client=None, ztk_client=None, **overrides):
-        self._ensure_provider_state()
+        super().__init__()
         if settings is None:
             from config import settings
         def setting(name, default=""):
@@ -67,9 +68,12 @@ class TaobaoAdapter(BasePlatformAdapter):
         if not pid_prefix and pid_val.startswith("mm_") and len(pid_val.split("_")) == 4:
             pid_prefix = pid_val.rsplit("_", 1)[0]
         if not pid_prefix:
-            pid_prefix = getattr(self.official, "pid_prefix", "") or "mm_328750149_3161250458"
-        channel_adzone = _text(setting("tb_channel_adzone_id")) or adzone or "116343300219"
-        self.channel_pid = _text(setting("tb_channel_pid")) or f"{pid_prefix}_{channel_adzone}"
+            off_prefix = getattr(self.official, "pid_prefix", "")
+            pid_prefix = off_prefix.strip() if isinstance(off_prefix, str) else ""
+        channel_adzone = _text(setting("tb_channel_adzone_id")) or adzone
+        self.channel_pid = _text(setting("tb_channel_pid")) or (
+            f"{pid_prefix}_{channel_adzone}" if pid_prefix and channel_adzone else ""
+        )
         self._official_ok = bool(official_client is not None or key and secret)
         self._search_ok = bool(official_client is not None or self._official_ok and adzone)
         has_hdk_key = bool(getattr(self.hdk, "appkey_list", None) or setting("hdk_api_key") or hdk_keys)
@@ -88,22 +92,20 @@ class TaobaoAdapter(BasePlatformAdapter):
         self._refresh_capabilities()
 
     def attach_hdk(self, hdk_client: HdkClient) -> None:
-        """挂载好单库 (HDK) 为淘宝高配额能力提供者：转链与订单能力设为主力/首选，未授权时自动无缝降级至折淘客。"""
+        """仅当显式配置了 hdk_tb_name 时挂载好单库淘宝高佣转链；订单同步始终保留折淘客渠道通道。"""
         self.hdk = hdk_client
-        self.register_provider("promotion", "hdk_tb_promotion", self._make_hdk_promotion(hdk_client), prepend=True)
-        self.register_provider("orders", "hdk_tb_orders", self._make_hdk_orders(hdk_client), prepend=True)
+        if getattr(self, "tb_name", ""):
+            self.register_provider("promotion", "hdk_tb_promotion", self._make_hdk_promotion(hdk_client), prepend=True)
 
     def _make_hdk_promotion(self, client: HdkClient):
         def _promote(goods_id_or_sign="", uid=None, **kwargs):
+            if not getattr(self, "tb_name", ""):
+                return {"status": "skipped", "reason": "missing_hdk_tb_name"}
             ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
             target_id = ref.goods_id if str(ref.goods_id).isdigit() else (ref.goods_sign or ref.goods_id)
             if not target_id:
                 return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
-            if not getattr(self, "tb_name", ""):
-                # 好单库 ratesurl 必填已在好单库授权的 tb_name，未配置时直接顺延给折淘客
-                logger.info("[TB转链-好单库] 未配置 hdk_tb_name，自动顺延至折淘客通道: target_id=%s", target_id)
-                return _error("UPSTREAM_PROVIDER_UNAUTHORIZED", "未配置好单库已授权淘宝账号(hdk_tb_name)")
-            pid = self.channel_pid or getattr(self.official, "pid", "")
+            pid = self.channel_pid or (self.official.pid if isinstance(getattr(self.official, "pid", None), str) else "")
             if not pid:
                 return _error("CONFIG_ERROR", "缺少淘宝 PID 配置")
             identity = kwargs.get("identity") or {}
@@ -147,22 +149,6 @@ class TaobaoAdapter(BasePlatformAdapter):
             }
         return _promote
 
-    def _make_hdk_orders(self, client: HdkClient):
-        def _orders(start_time, end_time, page=1, page_size=50, **kwargs):
-            try:
-                s_ts = int(start_time.timestamp()) if hasattr(start_time, "timestamp") else int(start_time)
-                e_ts = int(end_time.timestamp()) if hasattr(end_time, "timestamp") else int(end_time)
-            except Exception:
-                return _error("INVALID_ARGUMENT", "淘宝订单时间范围无效")
-            cursor = kwargs.get("cursor")
-            res = client.query_tb_orders(s_ts, e_ts, page=page, page_size=page_size, cursor=cursor)
-            if res.get("status") != "success":
-                logger.warning("[TB订单同步-好单库主力] 拉取失败(%s: %s)，顺延至折淘客通道", res.get("error_code"), res.get("error_msg"))
-                return res
-            logger.info("[TB订单同步-好单库主力] 拉取成功: 订单数=%d, has_more=%s", len(res.get("order_list") or []), res.get("has_more"))
-            return res
-        return _orders
-
     def _refresh_capabilities(self) -> None:
         self.capabilities = {
             "recommend": bool((self._official_ok and self._hdk_ok) or self._has_extra_providers("recommend")),
@@ -172,6 +158,11 @@ class TaobaoAdapter(BasePlatformAdapter):
                 self._search_ok
                 or (self._ztk_channel_ready() and bool(self.channel_pid))
                 or self._has_extra_providers("promotion")
+            ),
+            "universal": bool(
+                (self._ztk_channel_ready() and bool(self.channel_pid))
+                or self._official_ok
+                or self._has_extra_providers("universal")
             ),
             "authorization": bool(
                 self._official_auth_ok
@@ -407,35 +398,29 @@ class TaobaoAdapter(BasePlatformAdapter):
     def _official_detail(self, ref):
         if not ref.key:
             return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
-        res = self.official.get_goods_details([ref.key])
+
+        def _is_off(r):
+            if r.get("status") != "success":
+                code = str(r.get("error_code") or "")
+                msg = str(r.get("error_msg") or "")
+                return code in ("isv.item-not-exist", "isv.item-offline", "isv.item-delete", "PRODUCT_OFF_PROMOTION", "50001") or "无结果" in msg
+            raw_data = r.get("data")
+            return isinstance(raw_data, list) and len(raw_data) == 0
+
+        res, confirmed_off = self._retry_on_off_promotion(
+            lambda: self.official.get_goods_details([ref.key]),
+            _is_off,
+        )
         if res.get("status") != "success":
-            code = str(res.get("error_code") or "")
-            msg = str(res.get("error_msg") or "")
-            if code in ("isv.item-not-exist", "isv.item-offline", "isv.item-delete", "PRODUCT_OFF_PROMOTION", "50001") or "无结果" in msg:
-                import time
-                time.sleep(0.15)
-                retry_res = self.official.get_goods_details([ref.key])
-                if retry_res.get("status") == "success":
-                    res = retry_res
-                else:
-                    return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
-            else:
-                return res
+            if confirmed_off:
+                return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
+            return res
         items = [item for item in res.get("data", []) if self._matches(item, ref)]
         if not items:
             raw_data = res.get("data")
             if isinstance(raw_data, list) and len(raw_data) == 0:
-                import time
-                time.sleep(0.15)
-                retry_res = self.official.get_goods_details([ref.key])
-                if retry_res.get("status") == "success" and isinstance(retry_res.get("data"), list) and len(retry_res.get("data")) > 0:
-                    retry_items = [item for item in retry_res["data"] if self._matches(item, ref)]
-                    if retry_items:
-                        items = retry_items
-                if not items:
-                    return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
-            if not items:
-                return _error("PRODUCT_IDENTITY_MISMATCH", "官方商品详情未证实请求商品身份")
+                return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
+            return _error("PRODUCT_IDENTITY_MISMATCH", "官方商品详情未证实请求商品身份")
         item = dict(items[0])
         echoed = _text(item.get("input_item_iid"))
         if echoed and not echoed.isdigit():
@@ -499,9 +484,6 @@ class TaobaoAdapter(BasePlatformAdapter):
         if uid and identity.get("external_id") is not None and _text(identity["external_id"]) != _text(uid):
             return _error("IDENTITY_MISMATCH", "淘宝推广身份与站内用户不一致", need_auth=True, is_fallback=False)
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
-        from cache import is_product_off_promotion
-        if is_product_off_promotion("taobao", ref.goods_id, ref.goods_sign):
-            return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
 
         def _ztk_channel_convert(target, rel, goods_id_val, goods_sign_val, title_hint, *, allow_public=False):
             ztk_res = (

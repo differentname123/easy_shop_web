@@ -6,7 +6,7 @@
   const DEFAULT_ORDER_THUMB = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="%23f1f5f9"/><path d="M20 22h24l-2 22H22L20 22zm7 0v-2a5 5 0 0 1 10 0v2" fill="none" stroke="%2394a3b8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   shop.createAccount = function ({ ref, api, session, getPlatforms = () => [], copyText = () => {}, showToast, onSearchKeyword = null, shouldBlockDirectJump = () => false }) {
     const emptyProfile = () => ({ uid: '', phone: '', nickname: '未登录', avatar: DEFAULT_AVATAR,
-      invite_code: '', invited_by: null, balance: 0, total_rebate: 0, pending_rebate: 0, auth_status: {} });
+      invite_code: '', invited_by: null, auth_status: {} });
     const emptyOrders = () => ({ total_count: 0, total_commission: 0, settled_commission: 0, refund_commission: 0, refund_count: 0, order_list: [] });
     const isLoggedIn = ref(false), uid = ref(''), userPhone = ref(''), userProfile = ref(emptyProfile());
     const isRegisterMode = ref(false), formPhone = ref(''), formPassword = ref(''), formNickname = ref(''), formInviteCode = ref('');

@@ -31,10 +31,11 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
-import uuid
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import requests
+
+from infrastructure.runtime_io import atomic_write_json
 
 
 class ResolutionKind:
@@ -83,6 +84,11 @@ def set_process_role(role: str) -> None:
     clean = "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in str(role or "").strip())
     if clean:
         _PROCESS_ROLE = clean[:32]
+
+
+def get_process_role() -> str:
+    """获取当前进程角色标识（单一真源）。"""
+    return _PROCESS_ROLE
 
 
 def get_caller_context() -> str:
@@ -223,12 +229,9 @@ def stamp_universal_resolution(
         result["resolution_kind"] = ResolutionKind.COUPON_OR_VENUE
         return result
 
-    if verified_coupon_or_venue is False or result.get("detail_lookup_failed") or single_item_evidence:
-        result["detail_lookup_failed"] = True
-        result["resolution_kind"] = ResolutionKind.DEGRADED_PRODUCT
-        return result
-
-    result["resolution_kind"] = ResolutionKind.COUPON_OR_VENUE
+    # Fail-Closed：缺少正向优惠券/会场实证或存在单品证据/详情失败时，一律保守归为 degraded_product。
+    result["detail_lookup_failed"] = True
+    result["resolution_kind"] = ResolutionKind.DEGRADED_PRODUCT
     return result
 
 
@@ -354,20 +357,9 @@ class UpstreamHealthRegistry:
         if os.environ.get("WEB_LOG_DIR", "").strip() == "-":
             return
         try:
-            _HEALTH_DIR.mkdir(parents=True, exist_ok=True)
             snap = self.snapshot_local()
             target = _HEALTH_DIR / f"upstream_health_{_PROCESS_ROLE}.json"
-            tmp = _HEALTH_DIR / f".upstream_health_{_PROCESS_ROLE}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(snap, f, ensure_ascii=False, indent=2)
-            try:
-                os.replace(tmp, target)
-            finally:
-                if tmp.exists():
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
+            atomic_write_json(target, snap, indent=2)
         except Exception:
             pass
 
@@ -496,6 +488,8 @@ def track_provider_call(
         )
         raise
     dt_ms = (time.perf_counter() - t0) * 1000.0
+    if isinstance(res, dict) and res.get("status") == "skipped":
+        return res
     outcome, code, msg = classify_call_outcome(res)
     GLOBAL_UPSTREAM_HEALTH.record_call(
         platform,
@@ -554,7 +548,7 @@ def execute_provider_chain(
                 "_provider": prov_name,
             }
             continue
-        if not isinstance(res, dict):
+        if not isinstance(res, dict) or res.get("status") == "skipped":
             continue
         res.setdefault("_provider", prov_name)
         if res.get("status") == "success":

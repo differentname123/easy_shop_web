@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """拼多多多人团互助：独立数据模型、链接解析规则与序列化工具。"""
-import difflib
 import math
 import re
 import time
@@ -424,20 +423,6 @@ def parse_pdd_group_share_fields(
     }
 
 
-def is_pdd_qr_url(url: str) -> bool:
-    """校验二维码解析出的文本是否为拼多多合法域名链接。"""
-    if not isinstance(url, str) or not url.strip():
-        return False
-    try:
-        parsed = urllib.parse.urlparse(url.strip())
-    except Exception:
-        return False
-    if parsed.scheme not in ("http", "https"):
-        return False
-    host = (parsed.hostname or "").lower()
-    return any(host == d or host.endswith("." + d) for d in _ALLOWED_PDD_DOMAINS)
-
-
 def build_group_jump_urls(
     group_order_id: str,
     refer_share_channel: str = "",
@@ -509,6 +494,9 @@ def format_group_doc(doc: Dict[str, Any], now: Optional[float] = None) -> Dict[s
 
     raw_status = str(doc.get("group_status") or GROUP_STATUS_ACTIVE)
     if raw_status == GROUP_STATUS_EXPIRED:
+        effective_status = GROUP_STATUS_EXPIRED
+        remaining_seconds = 0
+    elif expires_at <= current_ts and raw_status in (GROUP_STATUS_ACTIVE, GROUP_STATUS_PENDING_CONFIRM):
         effective_status = GROUP_STATUS_EXPIRED
         remaining_seconds = 0
     elif remaining_seconds <= 0:

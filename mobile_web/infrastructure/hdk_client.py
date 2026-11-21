@@ -3,10 +3,9 @@
 1. 淘宝平台：高佣榜单获取（输出 item_ids 与游标分页元数据）；
 2. 京东平台：高配额全网搜索、详情反查及专属转链支持。
 """
-import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 import requests
 
@@ -16,17 +15,40 @@ from infrastructure.http_utils import (
     clean_text,
     error_dict as _error,
     execute_with_key_failover,
-    normalize_http_url,
     parse_appkey_list,
 )
+from infrastructure.jd_client import is_jd_official_venue_url
+from infrastructure.logging_utils import get_app_logger
+from infrastructure.transport import create_http_session
 
-logger = logging.getLogger(__name__)
+logger = get_app_logger(__name__)
 
 HDK_SALES_URL = "https://v2.api.haodanku.com/sales_list"
 HDK_DEFAULT_API_BASE = "https://v3.api.haodanku.com"
 HDK_RATE_LIMIT_KEYWORDS = (
     "频次", "频率", "超限", "上限", "次数", "限制", "频繁", "请稍后", "并发", "额度", "500",
 )
+
+
+def _is_trusted_jd_redirect_url(candidate: Any) -> bool:
+    """校验短链跳转/落地 URL 必须为合法无凭证且属于 jd.com / 3.cn 官方域名（防止 SSRF）。"""
+    if not isinstance(candidate, str):
+        return False
+    raw = candidate.strip()
+    if not raw or "\\" in raw or any(ord(c) < 33 for c in raw):
+        return False
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    return (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and parts.username is None
+        and parts.password is None
+        and (host == "jd.com" or host.endswith(".jd.com") or host == "3.cn" or host.endswith(".3.cn"))
+    )
 
 
 class HdkClient:
@@ -41,16 +63,12 @@ class HdkClient:
         union_id: str = "",
         api_base: str = HDK_DEFAULT_API_BASE,
     ) -> None:
-        if isinstance(http_session, str) and not union_id:
-            union_id = http_session
-            http_session = None
         self.appkey_list = parse_appkey_list(api_key, api_key_list)
         self.appkey = self.appkey_list[0] if self.appkey_list else clean_text(api_key)
         self.api_key = self.appkey
-        self.apikey = self.appkey
         self._active_key_index = 0
         self.union_id = clean_text(union_id)
-        self.http = http_session if http_session is not None else requests.Session()
+        self.http = http_session if http_session is not None else create_http_session(pool_connections=16, pool_maxsize=32)
         self.timeout = timeout
         self.api_base = clean_text(api_base).rstrip("/") or HDK_DEFAULT_API_BASE
 
@@ -133,7 +151,6 @@ class HdkClient:
 
         res = execute_with_key_failover(self, _fetch_once, round_robin=True)
         self.api_key = self.appkey
-        self.apikey = self.appkey
         return res
 
     def _request(
@@ -148,7 +165,7 @@ class HdkClient:
             return _error("CONFIG_ERROR", "好单库缺少 API Key 配置")
         url = f"{self.api_base}/{path.lstrip('/')}"
         is_real = is_real_requests_session(self.http)
-        plat = "jd" if ("jd" in path.lower() or "jing" in path.lower()) else "tb"
+        plat = "jd" if ("jd" in path.lower() or "jing" in path.lower()) else "taobao"
 
         def _do_single_request(current_key: str) -> Dict[str, Any]:
             t0 = time.monotonic()
@@ -207,7 +224,6 @@ class HdkClient:
         if self.appkey_list:
             res = execute_with_key_failover(self, _do_single_request, round_robin=True)
             self.api_key = self.appkey
-            self.apikey = self.appkey
             return res
         return _do_single_request(self.api_key)
 
@@ -289,12 +305,15 @@ class HdkClient:
            提取出确定性的数字 sku_id 并返回，供详情反查与精准卡片绑定。
         """
         url = clean_text(short_url)
-        if not url:
-            return _error("INVALID_ARGUMENT", "短链不能为空")
-        if not url.lower().startswith(("http://", "https://")):
+        if not url or "\\" in url or any(ord(c) < 33 for c in url):
             return _error("INVALID_ARGUMENT", "短链格式无效")
-
-        if "u.jd.com" not in url.lower():
+        try:
+            in_parts = urlsplit(url)
+        except ValueError:
+            return _error("INVALID_ARGUMENT", "短链格式无效")
+        if in_parts.scheme.lower() not in ("http", "https") or not in_parts.hostname or in_parts.username is not None or in_parts.password is not None:
+            return _error("INVALID_ARGUMENT", "短链格式无效")
+        if in_parts.hostname.lower() != "u.jd.com":
             return _error("NOT_SUPPORTED", "仅支持 u.jd.com 短链解包")
 
         headers = {
@@ -311,6 +330,8 @@ class HdkClient:
                 m = re.search(r"var\s+hrl\s*=\s*['\"]([^'\"]+)['\"]", getattr(resp, "text", "") or "")
                 if m:
                     hrl = m.group(1).strip()
+                    if not _is_trusted_jd_redirect_url(hrl):
+                        return _error("UNSAFE_REDIRECT", "拒绝非京东域名的短链跳转地址")
                     r2 = self.http.get(hrl, headers=headers, allow_redirects=True, timeout=timeout)
                     dest_url = str(getattr(r2, "url", "") or "").strip()
                 elif getattr(resp, "url", "") and resp.url != url:
@@ -323,6 +344,8 @@ class HdkClient:
 
         if not dest_url:
             return _error("NOT_FOUND", "未能解包该京东短链落地页")
+        if not _is_trusted_jd_redirect_url(dest_url):
+            return _error("UNSAFE_REDIRECT", "短链最终落地地址不属于京东官方域名")
 
         parts = urlsplit(dest_url)
         host = (parts.hostname or "").lower()
@@ -357,12 +380,10 @@ class HdkClient:
         # 铁律：只有在毫无任何单品 SKU/goods_sign 实证的前提下，才允许判定为纯会场！
         is_venue = False
         if not sku_id:
-            if host in ("pro.m.jd.com", "prodev.m.jd.com") and "/mall/active/" in path:
-                is_venue = True
-            elif host == "jingfen.jd.com" and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url):
-                is_venue = True
-            elif host == "coupon.m.jd.com":
-                is_venue = True
+            is_venue = is_jd_official_venue_url(dest_url) or (
+                host == "jingfen.jd.com"
+                and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url)
+            )
 
         return {
             "status": "success",
@@ -378,11 +399,10 @@ class HdkClient:
         material_id: str,
         *,
         union_id: Optional[str] = None,
-        promoter_id: Optional[str] = None,
         sub_union_id: Optional[str] = None,
         coupon_url: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """京东高佣转链生成专属推广短链 (接口 id=48: v3/get_jditems_link)。原生支持物料 ID、jingfen.jd.com 链接以及 u.jd.com 短链。"""
+        """京东高佣转链生成专属推广短链 (接口 id=48: v3/get_jditems_link；注意该接口不支持 positionId)。"""
         mat = clean_text(material_id)
         if not mat:
             return _error("INVALID_ARGUMENT", "缺少物料ID或商品链接")
@@ -416,7 +436,7 @@ class HdkClient:
             "short_url": short or click,
             "click_url": click or short,
             "final_link": short or click,
-            "promoter_id": promoter_id or uid,
+            "union_id": uid,
         }
 
     def query_jd_orders(

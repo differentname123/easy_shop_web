@@ -9,6 +9,7 @@ import re
 import string
 import secrets
 import threading
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from models.user import normalize_promoter_id
 from datetime import datetime, timezone
@@ -221,15 +222,11 @@ class UserRepository(BaseRepository):
             "created_at": now,
             "last_login_at": now,
             "last_active_at": now,
-            "balance": 0.0,
-            "total_rebate": 0.0,
-            "pending_rebate": 0.0,
             "auth_status": {
                 "pdd": {"is_authorized": False, "bind": 0, "updated_at": None},
                 "taobao": {"is_authorized": False, "bind": 0, "updated_at": None},
                 "jd": {"is_authorized": False, "bind": 0, "updated_at": None},
             },
-            "meta": {}
         }
 
         try:
@@ -253,58 +250,6 @@ class UserRepository(BaseRepository):
         user_doc.pop("password_hash", None)
         user_doc["_is_new_user"] = True
         return user_doc
-
-    def create_user(self, uid: Optional[str] = None, nickname: Optional[str] = None) -> Dict[str, Any]:
-        """访客用户初始化"""
-        now = datetime.now(timezone.utc)
-        final_uid = str(uid).strip() if uid else self.generate_uid()
-        final_nickname = nickname or f"推手_{final_uid[-4:]}"
-        my_invite_code = self.generate_unique_invite_code()
-
-        user_doc = {
-            "uid": final_uid,
-            "phone": None,
-            "password_hash": None,
-            "nickname": final_nickname,
-            "avatar": DEFAULT_AVATAR,
-            "invite_code": my_invite_code,
-            "invited_by": None,
-            "created_at": now,
-            "last_active_at": now,
-            "balance": 0.0,
-            "total_rebate": 0.0,
-            "pending_rebate": 0.0,
-            "auth_status": {
-                "pdd": {"is_authorized": False, "bind": 0, "updated_at": None},
-                "taobao": {"is_authorized": False, "bind": 0, "updated_at": None},
-                "jd": {"is_authorized": False, "bind": 0, "updated_at": None},
-            },
-            "meta": {}
-        }
-
-        try:
-            self.col.insert_one(user_doc)
-            user_doc.pop("_id", None)
-            return user_doc
-        except Exception as exc:
-            existing = self.get_user_by_uid(final_uid)
-            if existing:
-                existing.pop("password_hash", None)
-                return existing
-            logger.error(
-                "❌ 【数据库异常】初始化访客用户记录时写入失败 | 集合[users] 用户[%s] 异常<%s> 排查方向<请检查MongoDB连接状态、写入权限或唯一索引冲突>",
-                final_uid, format_exc_summary(exc),
-            )
-            raise
-
-    def get_or_create_user(self, uid: Optional[str] = None) -> Dict[str, Any]:
-        """按 uid 获取，不存在则创建"""
-        if uid:
-            user = self.get_user_by_uid(uid)
-            if user:
-                user.pop("password_hash", None)
-                return user
-        return self.create_user(uid=uid)
 
     @staticmethod
     def clean_platform_identity(identity: dict) -> dict:
@@ -372,14 +317,8 @@ class UserRepository(BaseRepository):
         )
         return res.modified_count > 0 or res.matched_count > 0
 
-    def get_group_help_guard(self, uid: str) -> Optional[Dict[str, Any]]:
-        """获取用户在多人团互助中的下架权限状态（仅读取单整数字段 gh_false_takedowns）。"""
-        clean_uid = str(uid or "").strip()
-        if not clean_uid:
-            return None
-        user = self.get_user_by_uid(clean_uid)
-        if not user:
-            return None
+    @staticmethod
+    def _format_group_help_guard(user: Dict[str, Any]) -> Dict[str, Any]:
         strikes = max(0, int(user.get("gh_false_takedowns") or 0))
         banned = strikes >= PERMANENT_BAN_STRIKES
         return {
@@ -396,6 +335,16 @@ class UserRepository(BaseRepository):
             ),
         }
 
+    def get_group_help_guard(self, uid: str) -> Optional[Dict[str, Any]]:
+        """获取用户在多人团互助中的下架权限状态（仅读取单整数字段 gh_false_takedowns）。"""
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return None
+        user = self.get_user_by_uid(clean_uid)
+        if not user:
+            return None
+        return self._format_group_help_guard(user)
+
     def inc_false_group_takedown(self, uid: str, group_order_id: str = "") -> Optional[Dict[str, Any]]:
         """当团长恢复上架被他人下架的拼团时，对该下架用户的误标计数原子 +1。"""
         clean_uid = str(uid or "").strip()
@@ -404,15 +353,17 @@ class UserRepository(BaseRepository):
         updated = self.col.find_one_and_update(
             {"uid": clean_uid},
             {"$inc": {"gh_false_takedowns": 1}},
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
         )
         if not updated:
             return None
-        guard = self.get_group_help_guard(clean_uid)
+        guard = self._format_group_help_guard(updated)
         logger.warning(
             "【多人团防破坏处罚】用户[%s] 因错误下架团单[%s]被团长恢复上架，累计误标[%s]次",
             clean_uid,
             group_order_id,
-            guard["strikes"] if guard else "?",
+            guard["strikes"],
         )
         return guard
 

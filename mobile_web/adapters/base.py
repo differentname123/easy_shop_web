@@ -4,10 +4,12 @@
 定义统一的导购商品查询、搜索、推广生链、推手授权备案协议。
 """
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from infrastructure.api_governance import execute_provider_chain, rotate_providers
+from infrastructure.http_utils import error_dict
 from models.product import ProductRef
 
 
@@ -52,6 +54,9 @@ class BasePlatformAdapter(ABC):
     promotion_scope: str = ""
     order_window_seconds: int = 23 * 3600
     capabilities = None
+
+    def __init__(self) -> None:
+        self._ensure_provider_state()
 
     def _ensure_provider_state(self) -> None:
         if not hasattr(self, "_provider_lock"):
@@ -206,47 +211,32 @@ class BasePlatformAdapter(ABC):
     def build_command_text(self, title, final_link, price=None, coupon=None) -> str:
         return build_command_text(title, final_link, price, coupon, self.platform_name)
 
+    def _retry_on_off_promotion(
+        self,
+        call_fn: Callable[[], Dict[str, Any]],
+        is_off_fn: Callable[[Dict[str, Any]], bool],
+        *,
+        delay: float = 0.15,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """短暂退避重试一次，确认商品是否确实已下架或停止推广。"""
+        res = call_fn()
+        if res.get("status") == "success" or not is_off_fn(res):
+            return res, False
+        if delay > 0:
+            time.sleep(delay)
+        retry_res = call_fn()
+        if retry_res.get("status") == "success" and retry_res.get("data"):
+            return retry_res, False
+        return retry_res, True
+
     def resolve_and_convert_universal(self, raw_text: str, uid: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """万能转链与商品详情反查统一接口（默认提示平台暂不支持）。"""
-        return self._universal_error(
-            "unsupported",
+        return error_dict(
+            "UNSUPPORTED_OPERATION",
             f"{self.platform_name or '该平台'}暂不支持万能转链",
-            error_code="UNSUPPORTED_OPERATION",
+            input_type="unsupported",
+            need_auth=False,
         )
-
-    def _universal_error(
-        self,
-        input_type: str,
-        error_msg: str,
-        *,
-        error_code: Optional[str] = None,
-        need_auth: bool = False,
-        product: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        res: Dict[str, Any] = {
-            "status": "error",
-            "input_type": input_type,
-            "need_auth": bool(need_auth),
-            "error_code": error_code,
-            "error_msg": error_msg,
-        }
-        if product is not None:
-            res["product"] = product
-        return res
-
-    def _universal_success(
-        self,
-        input_type: str,
-        promotion: Dict[str, Any],
-        product: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        return {
-            "status": "success",
-            "platform": self.platform_code,
-            "input_type": input_type,
-            "promotion": promotion,
-            "product": product or {},
-        }
 
 
     @abstractmethod

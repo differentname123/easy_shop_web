@@ -8,10 +8,8 @@ from unittest.mock import MagicMock, patch
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _MOBILE_WEB_DIR = os.path.dirname(_TESTS_DIR)
-_REPO_ROOT = os.path.dirname(_MOBILE_WEB_DIR)
-for _p in (_MOBILE_WEB_DIR, _REPO_ROOT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _MOBILE_WEB_DIR not in sys.path:
+    sys.path.insert(0, _MOBILE_WEB_DIR)
 
 try:
     import playwright.sync_api  # noqa: F401
@@ -24,16 +22,9 @@ except ModuleNotFoundError:
     sys.modules.setdefault("playwright", _pw_mod)
     sys.modules.setdefault("playwright.sync_api", _pw_sync)
 
-from mobile_web.scripts import publish_to_xianyu as pxy
-from mobile_web.scripts import run_xianyu_deal_discovery_scheduler as sched
-
-# 单元测试期间移除生产日志文件 Handler，避免把 Mock 测试日志写入真实业务日志
-sched.logger.handlers = [h for h in sched.logger.handlers if not isinstance(h, logging.FileHandler)]
-logging.getLogger("publish_to_xianyu").handlers = [
-    h
-    for h in logging.getLogger("publish_to_xianyu").handlers
-    if not isinstance(h, (logging.FileHandler, sched._ForwardWarningToFileHandler))
-]
+from infrastructure.xianyu import market as xianyu_market
+from infrastructure.xianyu import session as xianyu_session
+from services import xianyu_discovery as sched
 
 
 def _make_sample_deal_doc(
@@ -658,7 +649,7 @@ def test_auth_tracker_search_vs_h5_guest_detail_detection():
     fake_page = MagicMock()
     fake_page.frames = []
     fake_page.url = "https://h5.m.goofish.com/item?id=780427279990"
-    tracker = pxy._attach_auth_tracker(fake_page)
+    tracker = xianyu_session._attach_auth_tracker(fake_page)
     on_resp = tracker["_on_response_cb"]
 
     def _emit(url: str, ret_list):
@@ -676,7 +667,7 @@ def test_auth_tracker_search_vs_h5_guest_detail_detection():
         ["FAIL_SYS_SESSION_EXPIRED::Session过期"],
     )
     assert tracker["guest_login_blocked_rets"] == []
-    pxy._verify_guest_no_risk_block(fake_page, tracker, r"W:\temp\xianyu_guest", task_name="unit_test")
+    xianyu_market._verify_guest_no_risk_block(fake_page, tracker, r"W:\temp\xianyu_guest", task_name="unit_test")
 
     _emit(
         "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?jsv=2.7.2",
@@ -691,8 +682,8 @@ def test_auth_tracker_search_vs_h5_guest_detail_detection():
     assert len(tracker["guest_login_blocked_rets"]) == 1
     caught_err = None
     try:
-        pxy._verify_guest_no_risk_block(fake_page, tracker, r"W:\temp\xianyu_guest", task_name="unit_test")
-    except pxy.XianyuOfflineError as err:
+        xianyu_market._verify_guest_no_risk_block(fake_page, tracker, r"W:\temp\xianyu_guest", task_name="unit_test")
+    except xianyu_session.XianyuOfflineError as err:
         caught_err = err
     assert caught_err is not None
     assert caught_err.error_code == "RISK_CONTROL_BLOCKED"
@@ -733,7 +724,7 @@ def test_parse_h5_awesome_detail_packet_and_single_detail_delegation():
             "sellerDO": {"nick": "测试卖家", "city": "广州"},
         },
     }
-    parsed = pxy._parse_detail_packet_to_dict(
+    parsed = xianyu_market._parse_detail_packet_to_dict(
         success_packet=sample_h5_pkt,
         item_id="780427279990",
         detail_url="https://www.goofish.com/item?id=780427279990",
@@ -747,11 +738,11 @@ def test_parse_h5_awesome_detail_packet_and_single_detail_delegation():
     assert parsed["sku_list"][1]["price"] == 26.9
 
     with patch.object(
-        pxy,
+        xianyu_market,
         "get_xianyu_item_details_batch",
         return_value={"ok": True, "details_by_id": {"780427279990": parsed}},
     ) as mock_batch:
-        single_res = pxy.get_xianyu_item_detail("https://www.goofish.com/item?id=780427279990")
+        single_res = xianyu_market.get_xianyu_item_detail("https://www.goofish.com/item?id=780427279990")
     assert mock_batch.call_count == 1
     assert mock_batch.call_args.kwargs["item_ids"] == ["780427279990"]
     assert single_res["item_id"] == "780427279990"
@@ -763,7 +754,7 @@ def test_havana_silent_sso_cold_start_clears_transient_session_expired():
     fake_page.url = "https://www.goofish.com/"
     fake_ctx = MagicMock()
 
-    tracker = pxy._attach_auth_tracker(fake_page)
+    tracker = xianyu_session._attach_auth_tracker(fake_page)
     on_resp = tracker["_on_response_cb"]
 
     def _emit(url: str, ret_list, data=None):
@@ -796,7 +787,7 @@ def test_havana_silent_sso_cold_start_clears_transient_session_expired():
         )
 
     fake_page.wait_for_timeout.side_effect = _on_wait
-    unb = pxy._verify_account_online(fake_ctx, fake_page, tracker, r"W:\temp\xianyu_xiaohao", task_name="cold_start_test")
+    unb = xianyu_session._verify_account_online(fake_ctx, fake_page, tracker, r"W:\temp\xianyu_xiaohao", task_name="cold_start_test")
     assert unb == "4229872747"
     assert tracker["expired_rets"] == []
 
@@ -810,7 +801,7 @@ def test_ephemeral_h5_session_and_guest_risk_message():
     @contextmanager
     def _fake_ephemeral_guard(**kwargs):
         entered["ephemeral"] += 1
-        raise pxy.XianyuOfflineError(
+        raise xianyu_session.XianyuOfflineError(
             r"W:\temp\xianyu_guest",
             "H5详情接口触发风控滑块验证: RGV587_ERROR::SM",
             error_code="RISK_CONTROL_BLOCKED",
@@ -822,10 +813,10 @@ def test_ephemeral_h5_session_and_guest_risk_message():
         entered["persistent"] += 1
         yield MagicMock(), MagicMock(), {"failed_apis": []}  # pragma: no cover
 
-    with patch.object(pxy, "_ephemeral_h5_session_guard", side_effect=_fake_ephemeral_guard), patch.object(
-        pxy, "_browser_session_guard", side_effect=_fake_persistent_guard
+    with patch.object(xianyu_market, "_ephemeral_h5_session_guard", side_effect=_fake_ephemeral_guard), patch.object(
+        xianyu_market, "_browser_session_guard", side_effect=_fake_persistent_guard
     ):
-        res = pxy.get_xianyu_item_details_batch(["880001", "880002"])
+        res = xianyu_market.get_xianyu_item_details_batch(["880001", "880002"])
 
     assert entered["ephemeral"] == 1
     assert entered["persistent"] == 0
@@ -837,8 +828,9 @@ def test_ephemeral_h5_session_and_guest_risk_message():
 
 
 def test_xianyu_round_pool_lazy_init_and_discovery_cycle_closes_db():
-    with patch.object(pxy, "sync_playwright", side_effect=AssertionError("should not start eagerly")):
-        with pxy.XianyuRoundBrowserPool() as pool:
+    assert not any(isinstance(h, logging.FileHandler) for h in sched.logger.handlers)
+    with patch.object(xianyu_session, "sync_playwright", side_effect=AssertionError("should not start eagerly")):
+        with xianyu_session.XianyuRoundBrowserPool() as pool:
             assert pool._pw is None
 
     fake_db = MagicMock()

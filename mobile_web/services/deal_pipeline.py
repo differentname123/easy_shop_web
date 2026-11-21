@@ -19,26 +19,26 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 
 from itertools import zip_longest
+from infrastructure.runtime_io import (
+    atomic_write_json,
+    should_write_runtime_artifact,
+)
 from models.deal_constants import (
     CLEAN_FAILED_SAMPLES_JSONL,
-    CLEAN_SUCCESS_PREVIEW_JSONL,
-    ERR_AI_MAX_RETRIES_EXCEEDED,
     CLEAN_OPS_HISTORY_JSONL,
-    CLEAN_STAGE_DONE,
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
+    CLEAN_SUCCESS_PREVIEW_JSONL,
     DEAL_FORMAL_EXPIRY_HOURS,
     DEAL_MAX_CLEAN_AGE_DAYS,
     DEFAULT_CLEAN_WINDOW,
     DEFAULT_STAGE_LEASE_SECONDS_AI,
     DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
     ERROR_LOG_JSONL_PATH,
-    ERR_AI_TIMEOUT_RETRY,
-    ERR_EXPIRED_OVER_7_DAYS,
     LATEST_CLEAN_OPS_REPORT_PATH,
     LATEST_OPS_REPORT_PATH,
-    MAX_CLEAN_RETRIES,
+    LOG_DIR,
     OPS_REPORT_HISTORY_JSONL,
     STATS_SNAPSHOT_PATH,
 )
@@ -46,6 +46,7 @@ from models.product import SOURCE_SITE_NAMES
 from repositories.deal_raw_pool_repo import (
     DealRawPoolRepository,
     _append_bounded_jsonl_lines,
+    append_error_records_jsonl,
     evaluate_quality_signals,
 )
 from services.deal_sources.base import (
@@ -74,6 +75,7 @@ from services.deal_sources.registry import (
     list_sources,
 )
 from services.deal_pool_cleaner import (
+    ActiveProductIndex,
     DealPoolCleaner,
     MaintenanceWorker,
     StageWorker,
@@ -131,21 +133,13 @@ def get_ops_troubleshooting_advice(
     return f"{escalation} {base_advice}"
 
 
-def append_error_records_jsonl(error_records: List[Dict[str, Any]]):
-    """将本轮捕获的所有列表级与详情级错误路径持久化追加写入 logs/deal_pool_errors.jsonl。"""
-    if not error_records:
-        return
-    try:
-        _append_bounded_jsonl_lines(
-            ERROR_LOG_JSONL_PATH,
-            [json.dumps(item, ensure_ascii=False) for item in error_records],
-        )
-    except Exception as e:
-        logger.error("写入错误路径日志 [%s] 失败: %s", ERROR_LOG_JSONL_PATH, e)
-
-
 # 全局多源调度时间记录器：key=channel.name, value=上次运行的 epoch 时间戳
 _GLOBAL_CHANNEL_LAST_RUN: Dict[str, float] = {}
+
+
+def _write_json_artifact(path: str, payload: Any) -> None:
+    if should_write_runtime_artifact(path, LOG_DIR):
+        atomic_write_json(path, payload)
 
 
 def run_fetch_stage(
@@ -153,7 +147,6 @@ def run_fetch_stage(
     session: Optional[requests.Session] = None,
     cycle_num: int = 1,
     max_new_details_per_channel: Optional[int] = None,
-    run_all_tiers: bool = False,
     channel_health_tracker: Optional[Dict[str, Dict[str, Any]]] = None,
     latest_clean_report: Optional[Dict[str, Any]] = None,
     channels: Optional[List[ChannelConfig]] = None,
@@ -161,14 +154,14 @@ def run_fetch_stage(
     site_cooldown_until: Optional[Dict[str, float]] = None,
     source_registry: Optional[Dict[str, BaseDealSource]] = None,
     session_factory: Optional[Callable[[ChannelConfig], requests.Session]] = None,
+    active_index: Optional[ActiveProductIndex] = None,
 ) -> Dict[str, Any]:
     """
     执行单轮【阶段一（Producer）：多站点插件并行拉取入初步表 `deal_raw_tips`】：
     - 仅运行 `enabled=True` 且已到自身 `interval_seconds`（且所属站点未处于冷却期）的频道；
     - 生产环境每个站点车道独立创建线程隔离的 HTTP Session（按频道 `network_mode` / `close_connection`）；
-    - 统一按插件契约执行、统一门禁与去重、统一策略落盘（`use_fetch_time_as_publish_time` / `expire_missing_on_sweep`）。
+    - 数据库写入与全量失效摘除在站点车道内异步直落，全局锁仅保护共享内存统计字典。
     """
-    _ = run_all_tiers
     fetch_start = time.perf_counter()
     now_wall = time.time()
     cycle_mode = "PER_CHANNEL_SCHEDULE"
@@ -439,39 +432,42 @@ def run_fetch_stage(
                         ),
                     }
 
-                with lock:
-                    db_res = repo.save_batch(
-                        records,
-                        task_name=task_name,
-                        refresh_publish_time=ch.use_fetch_time_as_publish_time,
-                        max_age_days=ch.max_age_days,
+                db_res = repo.save_batch(
+                    records,
+                    task_name=task_name,
+                    refresh_publish_time=ch.use_fetch_time_as_publish_time,
+                    max_age_days=ch.max_age_days,
+                )
+                raw_list_cnt = int(
+                    res_dict.get("raw_list_count")
+                    if res_dict.get("raw_list_count") is not None
+                    else len(raw_records)
+                )
+                if (
+                    ch.expire_missing_on_sweep
+                    and res_dict.get("status") == "ok"
+                    and res_dict.get("sweep_completed")
+                    and not is_rate_limited
+                    and raw_list_cnt > 0
+                ):
+                    exp_res = repo.expire_missing_from_full_sweep(
+                        source_site=site_key,
+                        channel=task_name,
+                        sweep_start_time=sweep_start_time,
                     )
-                    raw_list_cnt = int(
-                        res_dict.get("raw_list_count")
-                        if res_dict.get("raw_list_count") is not None
-                        else len(raw_records)
-                    )
-                    if (
-                        ch.expire_missing_on_sweep
-                        and res_dict.get("status") == "ok"
-                        and res_dict.get("sweep_completed")
-                        and not is_rate_limited
-                        and raw_list_cnt > 0
-                    ):
-                        repo.expire_missing_from_full_sweep(
-                            source_site=site_key,
-                            channel=task_name,
-                            sweep_start_time=sweep_start_time,
-                        )
-                    cost_ms = round((time.perf_counter() - t0) * 1000, 1)
-                    ins = db_res.get("inserted", 0)
-                    upd = db_res.get("updated", 0)
-                    cnt = len(records)
-                    det_cnt = res_dict.get("detail_fetched", cnt)
-                    skipped_known = int(res_dict.get("skipped_known") or 0) + pipeline_skipped_known
-                    skipped_unsup = int(res_dict.get("skipped_unsupported") or 0) + pipeline_filtered
-                    skipped_nodet = int(res_dict.get("skipped_no_detail") or 0)
+                    if active_index is not None and exp_res.get("formal_expired", 0) > 0:
+                        active_index.invalidate_site(site_key)
 
+                cost_ms = round((time.perf_counter() - t0) * 1000, 1)
+                ins = db_res.get("inserted", 0)
+                upd = db_res.get("updated", 0)
+                cnt = len(records)
+                det_cnt = res_dict.get("detail_fetched", cnt)
+                skipped_known = int(res_dict.get("skipped_known") or 0) + pipeline_skipped_known
+                skipped_unsup = int(res_dict.get("skipped_unsupported") or 0) + pipeline_filtered
+                skipped_nodet = int(res_dict.get("skipped_no_detail") or 0)
+
+                with lock:
                     last_run_map[task_name] = now_done
                     if is_rate_limited:
                         cooldown_sec = max(30, int(getattr(ch, "rate_limit_cooldown_seconds", 300)))
@@ -674,18 +670,12 @@ def run_fetch_stage(
         for sk, chs in site_items:
             _execute_site_lane(sk, chs)
 
-    try:
-        repo.col.delete_many({"has_full_detail": False})
-    except Exception:
-        pass
-
-    append_error_records_jsonl(cycle_error_paths)
+    append_error_records_jsonl(cycle_error_paths, path=ERROR_LOG_JSONL_PATH)
     fetch_elapsed_s = round(time.perf_counter() - fetch_start, 2)
 
     summary = repo.generate_pool_summary()
     try:
-        with open(STATS_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
+        _write_json_artifact(STATS_SNAPSHOT_PATH, summary)
     except Exception:
         pass
 
@@ -826,8 +816,7 @@ def build_and_log_cycle_ops_report(
     }
 
     try:
-        with open(LATEST_OPS_REPORT_PATH, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+        _write_json_artifact(LATEST_OPS_REPORT_PATH, report)
         _append_bounded_jsonl_lines(
             OPS_REPORT_HISTORY_JSONL,
             [json.dumps(report, ensure_ascii=False)],
@@ -854,90 +843,22 @@ def run_clean_stage(
     raw_col = repo.col
     formal_col = repo.formal_col
     now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    cutoff_ts = time.time() - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
+    now_ts = time.time()
+    cutoff_ts = now_ts - DEAL_MAX_CLEAN_AGE_DAYS * 86400.0
     cutoff_dt = now_utc - datetime.timedelta(days=DEAL_MAX_CLEAN_AGE_DAYS)
 
-    site_age_map = get_site_max_age_days_map()
-    expired_over_7d_cnt = 0
-    max_retry_swept_cnt = 0
-    try:
-        for s_key, age_days in site_age_map.items():
-            s_ts = time.time() - age_days * 86400.0
-            s_dt = now_utc - datetime.timedelta(days=age_days)
-            exp_res = raw_col.update_many(
-                {
-                    "source_site": s_key,
-                    "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
-                    "$and": [
-                        {
-                            "$or": [
-                                {"publish_ts": {"$gt": 0, "$lt": s_ts}},
-                                {"first_seen_at": {"$lt": s_dt}},
-                            ]
-                        }
-                    ],
-                },
-                {
-                    "$set": {
-                        "clean_status": "cleaned_failed",
-                        "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
-                        "clean_error_msg": f"爆料时间超过渠道 {s_key} 保鲜期 ({age_days:.0f}天)，自动跳过清洗",
-                        "cleaned_at": now_utc,
-                    }
-                },
-            )
-            expired_over_7d_cnt += int(exp_res.modified_count or 0)
-
-        configured_sites = list(site_age_map.keys())
-        fallback_exp_res = raw_col.update_many(
-            {
-                "source_site": {"$nin": configured_sites},
-                "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
-                "$and": [
-                    {
-                        "$or": [
-                            {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
-                            {"first_seen_at": {"$lt": cutoff_dt}},
-                        ]
-                    }
-                ],
-            },
-            {
-                "$set": {
-                    "clean_status": "cleaned_failed",
-                    "clean_error_code": ERR_EXPIRED_OVER_7_DAYS,
-                    "clean_error_msg": f"爆料时间超过默认保鲜期 ({DEAL_MAX_CLEAN_AGE_DAYS}天)，自动跳过清洗",
-                    "cleaned_at": now_utc,
-                }
-            },
+    sweep_res = repo.sweep_expired_and_max_retry(
+        now_utc=now_utc,
+        site_max_age_map=get_site_max_age_days_map(),
+    )
+    expired_over_7d_cnt = sweep_res["expired_swept"]
+    max_retry_swept_cnt = sweep_res["max_retry_swept"]
+    if expired_over_7d_cnt > 0 or max_retry_swept_cnt > 0:
+        logger.info(
+            "🧹 [前置保鲜清扫] 自动剔除陈旧Pending=%d条, 重试满限=%d条",
+            expired_over_7d_cnt,
+            max_retry_swept_cnt,
         )
-        expired_over_7d_cnt += int(fallback_exp_res.modified_count or 0)
-
-        retry_sweep_res = raw_col.update_many(
-            {
-                "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}],
-                "clean_retry_count": {"$gte": MAX_CLEAN_RETRIES},
-            },
-            {
-                "$set": {
-                    "clean_status": "cleaned_failed",
-                    "clean_error_code": ERR_AI_MAX_RETRIES_EXCEEDED,
-                    "clean_error_msg": f"已达最大重试上限({MAX_CLEAN_RETRIES}次)，自动放弃避免占用清洗队列",
-                    "cleaned_at": now_utc,
-                }
-            },
-        )
-        max_retry_swept_cnt = int(retry_sweep_res.modified_count or 0)
-        if expired_over_7d_cnt > 0 or max_retry_swept_cnt > 0:
-            logger.info(
-                "🧹 [前置保鲜清扫] 自动剔除超%d天陈旧Pending=%d条, 已满%d次重试上限=%d条",
-                DEAL_MAX_CLEAN_AGE_DAYS,
-                expired_over_7d_cnt,
-                MAX_CLEAN_RETRIES,
-                max_retry_swept_cnt,
-            )
-    except Exception as e:
-        logger.warning("前置保鲜与重试上限清扫异常: %s", e)
 
     if cycle_num > 0 and cycle_num % 30 == 0:
         expired_deals = repo.expire_stale_formal_deals(now_utc=now_utc)
@@ -946,9 +867,10 @@ def run_clean_stage(
 
     fresh_guard_clause: Dict[str, Any] = {
         "$nor": [
+            {"clean_cutoff_ts": {"$gt": 0, "$lt": now_ts}},
             {"publish_ts": {"$gt": 0, "$lt": cutoff_ts}},
             {"first_seen_at": {"$lt": cutoff_dt}},
-            {"next_retry_after_ts": {"$gt": round(time.time(), 1)}},
+            {"next_retry_after_ts": {"$gt": round(now_ts, 1)}},
         ]
     }
     active_pending_filter: Dict[str, Any] = {
@@ -1040,7 +962,6 @@ def run_clean_stage(
         selected_docs,
         raw_col,
         formal_col=formal_col,
-        total_pending_count=total_pending_initial,
         shared_active_products=shared_active_products,
         shared_lock=None,
         quiet_sub_logs=False,
@@ -1222,8 +1143,7 @@ def run_clean_stage(
     }
 
     try:
-        with open(LATEST_CLEAN_OPS_REPORT_PATH, "w", encoding="utf-8") as f:
-            json.dump(clean_report, f, ensure_ascii=False, indent=2)
+        _write_json_artifact(LATEST_CLEAN_OPS_REPORT_PATH, clean_report)
         _append_bounded_jsonl_lines(
             CLEAN_OPS_HISTORY_JSONL,
             [json.dumps(clean_report, ensure_ascii=False)],
@@ -1233,9 +1153,10 @@ def run_clean_stage(
                 CLEAN_FAILED_SAMPLES_JSONL,
                 [json.dumps(item, ensure_ascii=False) for item in failed_samples[:200]],
             )
-        with open(CLEAN_SUCCESS_PREVIEW_JSONL, "w", encoding="utf-8") as f:
-            for doc in success_product_docs[:50]:
-                f.write(json.dumps(doc, ensure_ascii=False, default=str) + "\n")
+        if should_write_runtime_artifact(CLEAN_SUCCESS_PREVIEW_JSONL, LOG_DIR):
+            with open(CLEAN_SUCCESS_PREVIEW_JSONL, "w", encoding="utf-8") as f:
+                for doc in success_product_docs[:50]:
+                    f.write(json.dumps(doc, ensure_ascii=False, default=str) + "\n")
     except Exception as e:
         logger.warning("写入阶段二清洗报表文件异常: %s", e)
 
@@ -1304,6 +1225,115 @@ def run_clean_stage(
 # ==============================================================================
 
 
+class DealPipelineRunner:
+    """统一编排 StageWorker-AI1 / Convert / AI2 与 MaintenanceWorker 生命周期（供排空模式与常驻守护复用）。"""
+
+    def __init__(
+        self,
+        repo: DealRawPoolRepository,
+        cleaner: DealPoolCleaner,
+        *,
+        clean_limit: int = 0,
+        stop_event: Optional[threading.Event] = None,
+        ai1_upstream_event: Optional[threading.Event] = None,
+        ai1_poll_interval: float = 1.0,
+        convert_poll_interval: float = 1.0,
+        ai2_poll_interval: float = 1.0,
+        maint_poll_interval: float = 15.0,
+    ):
+        self.repo = repo
+        self.cleaner = cleaner
+        self.stop_event = stop_event or threading.Event()
+        self.ai1_done_event = threading.Event()
+        self.convert_done_event = threading.Event()
+        self.shared_lock = threading.Lock()
+        self.ai_semaphore = threading.BoundedSemaphore(cleaner.ai_max_workers)
+        cleaner.set_ai_semaphore(self.ai_semaphore)
+
+        cleaner.warmup_anchor_cache_from_db(repo.col)
+        self.active_index = ActiveProductIndex().load_from_formal_col(repo.formal_col)
+
+        ai1_batch = max(64, cleaner.ai_batch_size * cleaner.ai_max_workers * 2)
+        if clean_limit > 0:
+            ai1_batch = max(cleaner.ai_batch_size, clean_limit)
+
+        self.worker_ai1 = StageWorker(
+            name="StageWorker-AI1",
+            stage=CLEAN_STAGE_NEED_AI1,
+            repo=repo,
+            cleaner=cleaner,
+            batch_size=ai1_batch,
+            lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
+            poll_interval=ai1_poll_interval,
+            stop_event=self.stop_event,
+            ai_semaphore=self.ai_semaphore,
+            upstream_event=ai1_upstream_event,
+            downstream_event=self.ai1_done_event,
+            shared_active_products=self.active_index,
+            shared_lock=self.shared_lock,
+        )
+        self.worker_convert = StageWorker(
+            name="StageWorker-Convert",
+            stage=CLEAN_STAGE_NEED_CONVERT,
+            repo=repo,
+            cleaner=cleaner,
+            batch_size=200,
+            lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
+            poll_interval=convert_poll_interval,
+            stop_event=self.stop_event,
+            ai_semaphore=None,
+            upstream_event=self.ai1_done_event,
+            downstream_event=self.convert_done_event,
+            shared_active_products=self.active_index,
+            shared_lock=self.shared_lock,
+        )
+        self.worker_ai2 = StageWorker(
+            name="StageWorker-AI2",
+            stage=CLEAN_STAGE_NEED_AI2,
+            repo=repo,
+            cleaner=cleaner,
+            batch_size=100,
+            lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
+            poll_interval=ai2_poll_interval,
+            stop_event=self.stop_event,
+            ai_semaphore=self.ai_semaphore,
+            upstream_event=self.convert_done_event,
+            downstream_event=None,
+            shared_active_products=self.active_index,
+            shared_lock=self.shared_lock,
+        )
+        self.worker_maint = MaintenanceWorker(
+            repo=repo,
+            poll_interval=maint_poll_interval,
+            stop_event=self.stop_event,
+            active_index=self.active_index,
+        )
+        self.ai1_batch = ai1_batch
+
+    def start(self) -> None:
+        self.worker_ai1.start()
+        self.worker_convert.start()
+        self.worker_ai2.start()
+        self.worker_maint.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.ai1_done_event.set()
+        self.convert_done_event.set()
+
+    def join(self, timeout_per_worker: float = 3.0) -> None:
+        for w in (self.worker_ai1, self.worker_convert, self.worker_ai2):
+            w.join(timeout=timeout_per_worker)
+        self.worker_maint.join(timeout=min(2.0, timeout_per_worker))
+
+    def processed_counts(self) -> Dict[str, int]:
+        return {
+            "ai1_processed": self.worker_ai1.total_processed,
+            "convert_processed": self.worker_convert.total_processed,
+            "ai2_processed": self.worker_ai2.total_processed,
+        }
+
+
 def run_stage_pipeline_drain(
     repo: DealRawPoolRepository,
     cleaner: DealPoolCleaner,
@@ -1313,83 +1343,16 @@ def run_stage_pipeline_drain(
     """排空模式：并发流水线作业，直至库内所有阶段待处理记录全部排空或达到目标上限。"""
     t_start = time.perf_counter()
     repo.migrate_pending_to_stage_machine()
-    cleaner.warmup_anchor_cache_from_db(repo.col)
-    shared_active_products = cleaner._load_active_formal_products(repo.formal_col)
-    shared_lock = threading.Lock()
-    ai_semaphore = threading.BoundedSemaphore(cleaner.ai_max_workers)
-
-    stop_event = threading.Event()
-    ai1_done_event = threading.Event()
-    convert_done_event = threading.Event()
-
-    ai1_batch = max(64, cleaner.ai_batch_size * cleaner.ai_max_workers * 2)
-    if clean_limit > 0:
-        ai1_batch = max(cleaner.ai_batch_size, clean_limit)
-
-    convert_batch = 200
-    ai2_batch = 100
-
-    worker_ai1 = StageWorker(
-        name="StageWorker-AI1",
-        stage=CLEAN_STAGE_NEED_AI1,
-        repo=repo,
-        cleaner=cleaner,
-        batch_size=ai1_batch,
-        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
-        poll_interval=1.0,
-        stop_event=stop_event,
-        ai_semaphore=ai_semaphore,
-        upstream_event=None,
-        downstream_event=ai1_done_event,
-        shared_active_products=shared_active_products,
-        shared_lock=shared_lock,
-    )
-    worker_convert = StageWorker(
-        name="StageWorker-Convert",
-        stage=CLEAN_STAGE_NEED_CONVERT,
-        repo=repo,
-        cleaner=cleaner,
-        batch_size=convert_batch,
-        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
-        poll_interval=1.0,
-        stop_event=stop_event,
-        ai_semaphore=None,
-        upstream_event=ai1_done_event,
-        downstream_event=convert_done_event,
-        shared_active_products=shared_active_products,
-        shared_lock=shared_lock,
-    )
-    worker_ai2 = StageWorker(
-        name="StageWorker-AI2",
-        stage=CLEAN_STAGE_NEED_AI2,
-        repo=repo,
-        cleaner=cleaner,
-        batch_size=ai2_batch,
-        lease_seconds=DEFAULT_STAGE_LEASE_SECONDS_AI,
-        poll_interval=1.0,
-        stop_event=stop_event,
-        ai_semaphore=ai_semaphore,
-        upstream_event=convert_done_event,
-        downstream_event=None,
-        shared_active_products=shared_active_products,
-        shared_lock=shared_lock,
-    )
-    worker_maint = MaintenanceWorker(repo=repo, poll_interval=15.0, stop_event=stop_event)
+    runner = DealPipelineRunner(repo=repo, cleaner=cleaner, clean_limit=clean_limit)
 
     logger.info(
-        "🚀 [阶段化流水线启动] AI-1 (批=%d, 并发=%d) | 转链 (批=%d, 并发=%d) | AI-2 (批=%d, 并发=%d) | 排空模式运行中...",
-        ai1_batch,
+        "🚀 [阶段化流水线启动] AI-1(批=%d, 并发=%d) | 转链(批=200, 并发=%d) | AI-2(批=100, 并发=%d) | 排空模式",
+        runner.ai1_batch,
         cleaner.ai_max_workers,
-        convert_batch,
         cleaner.convert_max_workers,
-        ai2_batch,
         cleaner.ai_max_workers,
     )
-
-    worker_ai1.start()
-    worker_convert.start()
-    worker_ai2.start()
-    worker_maint.start()
+    runner.start()
 
     idle_count = 0
     try:
@@ -1398,7 +1361,7 @@ def run_stage_pipeline_drain(
             p_conv = repo.col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_CONVERT})
             p_ai2 = repo.col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI2})
             total_pending = p_ai1 + p_conv + p_ai2
-            total_done = worker_ai2.total_processed
+            total_done = runner.worker_ai2.total_processed
 
             if clean_limit > 0 and total_done >= clean_limit:
                 logger.info("🏁 已达到目标处理上限 (--clean-limit=%d)，通知各阶段 Worker 结束。", clean_limit)
@@ -1414,28 +1377,19 @@ def run_stage_pipeline_drain(
 
             time.sleep(2.0)
     finally:
-        stop_event.set()
-        ai1_done_event.set()
-        convert_done_event.set()
-        worker_ai1.join(timeout=3.0)
-        worker_convert.join(timeout=3.0)
-        worker_ai2.join(timeout=3.0)
-        worker_maint.join(timeout=2.0)
+        runner.stop()
+        runner.join()
 
     elapsed_s = round(time.perf_counter() - t_start, 2)
+    counts = runner.processed_counts()
     logger.info(
-        "🏁 [阶段化流水线排空完成] 耗时=%.2fs | AI-1处理=%d条, 转链处理=%d条, AI-2终审=%d条",
+        "🏁 [阶段化流水线排空完成] 耗时=%.2fs | AI-1=%d, 转链=%d, AI-2=%d",
         elapsed_s,
-        worker_ai1.total_processed,
-        worker_convert.total_processed,
-        worker_ai2.total_processed,
+        counts["ai1_processed"],
+        counts["convert_processed"],
+        counts["ai2_processed"],
     )
-    return {
-        "elapsed_s": elapsed_s,
-        "ai1_processed": worker_ai1.total_processed,
-        "convert_processed": worker_convert.total_processed,
-        "ai2_processed": worker_ai2.total_processed,
-    }
+    return {"elapsed_s": elapsed_s, **counts}
 
 
 def run_single_cycle(
@@ -1444,7 +1398,6 @@ def run_single_cycle(
     session: Optional[requests.Session] = None,
     cycle_num: int = 1,
     max_new_details_per_channel: Optional[int] = None,
-    run_all_tiers: bool = False,
     clean_limit: int = DEFAULT_CLEAN_WINDOW,
     channel_health_tracker: Optional[Dict[str, Dict[str, Any]]] = None,
     channels: Optional[List[ChannelConfig]] = None,
@@ -1457,7 +1410,6 @@ def run_single_cycle(
         session=session,
         cycle_num=cycle_num,
         max_new_details_per_channel=max_new_details_per_channel,
-        run_all_tiers=run_all_tiers,
         channel_health_tracker=channel_health_tracker,
         channels=channels,
         channel_last_run=channel_last_run,
@@ -1471,8 +1423,7 @@ def run_single_cycle(
     )
     summary = repo.generate_pool_summary()
     try:
-        with open(STATS_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
+        _write_json_artifact(STATS_SNAPSHOT_PATH, summary)
         if os.path.exists(LATEST_OPS_REPORT_PATH):
             with open(LATEST_OPS_REPORT_PATH, "r", encoding="utf-8") as f:
                 ops_rep = json.load(f)
@@ -1482,8 +1433,7 @@ def run_single_cycle(
             ops_rep["pool_pending_clean_records"] = summary.get("pending_clean_records", 0)
             ops_rep["formal_products_total"] = summary.get("formal_products_total", 0)
             ops_rep["formal_deal_products_count"] = summary.get("formal_deal_products_count", 0)
-            with open(LATEST_OPS_REPORT_PATH, "w", encoding="utf-8") as f:
-                json.dump(ops_rep, f, ensure_ascii=False, indent=2)
+            _write_json_artifact(LATEST_OPS_REPORT_PATH, ops_rep)
     except Exception:
         pass
 

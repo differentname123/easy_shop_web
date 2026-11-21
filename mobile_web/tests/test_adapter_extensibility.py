@@ -139,17 +139,20 @@ def test_pdd_anonymous_promotion_tries_extra_provider_before_direct_link_fallbac
 
 
 def test_pdd_client_wrapper_and_register_gateway_fallback_ips(monkeypatch):
-    from infrastructure import pdd_client
+    import socket
+    from infrastructure import transport
 
-    fake_ips = dict(pdd_client._GATEWAY_FALLBACK_IPS)
-    fake_cache = dict(pdd_client._PDD_DNS_CACHE)
-    monkeypatch.setattr(pdd_client, "_GATEWAY_FALLBACK_IPS", fake_ips)
-    monkeypatch.setattr(pdd_client, "_PDD_DNS_CACHE", fake_cache)
-    monkeypatch.setattr(pdd_client, "_PDD_DNS_ENABLED", True)
+    fake_ips = dict(transport._GATEWAY_FALLBACK_IPS)
+    fake_cache = dict(transport._DNS_CACHE)
+    monkeypatch.setattr(transport, "_GATEWAY_FALLBACK_IPS", fake_ips)
+    monkeypatch.setattr(transport, "_DNS_CACHE", fake_cache)
+    monkeypatch.setattr(transport, "_DNS_ENABLED", True)
+    monkeypatch.setattr(transport, "_ORIG_GETADDRINFO", Mock(side_effect=socket.gaierror("offline")))
 
     register_gateway_fallback_ips("API.CustomGateway.Test", ["10.0.0.1", " 10.0.0.2 "])
     assert fake_ips["api.customgateway.test"] == ("10.0.0.1", "10.0.0.2")
-    assert len(fake_cache["api.customgateway.test"][1]) == 2
+    resolved = transport._cached_getaddrinfo("api.customgateway.test", 443)
+    assert [r[4][0] for r in resolved] == ["10.0.0.1", "10.0.0.2"]
 
     sess = SimpleNamespace(head=Mock(), post=Mock(return_value=SimpleNamespace(raise_for_status=Mock(), json=lambda: {"ok": True})))
     cli = PddClient("cid", "csec", "pid", http_session=sess)

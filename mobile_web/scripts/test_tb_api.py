@@ -54,10 +54,10 @@
        返回新鲜的 `coupon_share_url` 与 `click_url`（注：返回的 `item_id` 会被重新加密）。
      - 第二步：将 `coupon_share_url` 或 `click_url` 传给 `taobao.tbk.tpwd.create`，生成真实淘口令。
   4. ❌ 不可用（折淘客高佣/渠道转链错误示范）：
-     - `pid` 参数若只传 1 段 `adzone_id`（如 `"116341500041"`），折淘客必报 `301: 很抱歉！转链失败！`
+     - `pid` 参数若只传 1 段 `adzone_id`（而非 4 段式），折淘客必报 `301: 很抱歉！转链失败！`
      - 调用 `open_gaoyongzhuanlian_tkl.ashx` 时若误传参数名 `num_iid` 而不传 `tkl`，必报 `1000: error tkl`！
   5. ✅ 可用（折淘客高佣/渠道轨，支持 relation_id）：
-     - `pid` 必须传入完整的 **4 段式 `mm_memberId_siteId_adzoneId`**（如 `mm_328750149_3161250458_116343300219`）。
+     - `pid` 必须传入完整的 **4 段式 `mm_memberId_siteId_adzoneId`**。
      - 方式 A：`open_gaoyongzhuanlian_tkl.ashx` 传 `tkl=https://uland.taobao.com/item/edetail?id={encrypted_id}`
        + `pid={4段式PID}` + 可选 `relation_id` + `signurl=5`，一步返回 `coupon_click_url` 与 `tkl` 淘口令。
      - 方式 B：`open_gaoyongzhuanlian.ashx` 传 `num_iid={encrypted_id}` + `pid={4段式PID}`
@@ -179,9 +179,10 @@ TB_APP_KEY = _cfg.get("myself_taobao_app_key", "")
 TB_APP_SECRET = _cfg.get("myself_taobao_app_secret", "")
 TB_PID = str(_cfg.get("myself_taobao_pid", "")).strip()
 TB_ADZONE_ID = str(_cfg.get("taobao_adzone_id") or (TB_PID.split("_")[-1] if "_" in TB_PID else TB_PID)).strip()
-TB_PID_PREFIX = str(_cfg.get("taobao_pid_prefix") or (TB_PID.rsplit("_", 1)[0] if TB_PID.startswith("mm_") and len(TB_PID.split("_")) == 4 else "mm_328750149_3161250458")).strip()
-TB_FULL_PID = TB_PID if (TB_PID.startswith("mm_") and len(TB_PID.split("_")) == 4) else f"{TB_PID_PREFIX}_{TB_ADZONE_ID or '116343300219'}"
-TB_CHANNEL_PID = str(_cfg.get("taobao_channel_pid") or f"{TB_PID_PREFIX}_{_cfg.get('taobao_channel_adzone_id') or TB_ADZONE_ID or '116343300219'}").strip()
+TB_PID_PREFIX = str(_cfg.get("taobao_pid_prefix") or (TB_PID.rsplit("_", 1)[0] if TB_PID.startswith("mm_") and len(TB_PID.split("_")) == 4 else "")).strip()
+TB_FULL_PID = TB_PID if (TB_PID.startswith("mm_") and len(TB_PID.split("_")) == 4) else (f"{TB_PID_PREFIX}_{TB_ADZONE_ID}" if TB_PID_PREFIX and TB_ADZONE_ID else "")
+TB_CHANNEL_ADZONE = str(_cfg.get("taobao_channel_adzone_id") or TB_ADZONE_ID).strip()
+TB_CHANNEL_PID = str(_cfg.get("taobao_channel_pid") or (f"{TB_PID_PREFIX}_{TB_CHANNEL_ADZONE}" if TB_PID_PREFIX and TB_CHANNEL_ADZONE else "")).strip()
 TB_SESSION_KEY = _cfg.get("taobao_session", "")
 TB_INVITER_CODE = _cfg.get("taobao_inviter_code", "")
 HDK_API_KEY = _cfg.get("haodanku_api_key", "")
@@ -602,7 +603,7 @@ def convert_channel_url_by_ztk(target_url_or_id: str, relation_id: Optional[str]
     """
     调用折淘客高佣转链接口生成专属淘口令与二合一链接（支持多 Key 故障切换）：
     - ✅ 基准规范 1: pid 必须传入完整的 4 段式 `mm_memberId_siteId_adzoneId` (TB_CHANNEL_PID)，
-      ❌ 若只传 1 段 adzone_id (如 "116341500041") 必定报错 `301: 很抱歉！转链失败！`。
+      ❌ 若只传 1 段 adzone_id 必定报错 `301: 很抱歉！转链失败！`。
     - ✅ 基准规范 2: `open_gaoyongzhuanlian_tkl.ashx` 接收参数名为 `tkl` (传入 uland/item/m.tb.cn 链接或淘口令)，
       ❌ 若误传 `num_iid` 必定报错 `1000: error tkl`。
     - ✅ 基准规范 3: 当输入为夹带 `uland.taobao.com` / `item.taobao.com` 的长促销文案导致 `tkl.ashx` 返回 `商品ID解析错误`

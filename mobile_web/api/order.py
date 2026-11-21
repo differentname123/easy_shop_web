@@ -17,7 +17,6 @@ def sync_and_query_orders(
     uid: Optional[str] = Query(None, description="前端传入的推手UID (兼容参数，服务端严格校验)"),
     platform: str = Query("pdd", max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台代码"),
     days: int = Query(7, ge=0, le=90, description="查询时间跨度(天)，0为全部，默认7天，最大90天"),
-    force: bool = Query(False, description="是否强制立即同步 (服务端统一控频，前端无法穿透)"),
 ):
     """
     异步触发增量订单同步入库，并查询当前认证推手在指定时间范围内的订单列表及佣金统计。
@@ -34,5 +33,4 @@ def sync_and_query_orders(
         platform=platform,
         uid=current_uid,
         days=days,
-        force_sync=False
     )

@@ -6,12 +6,24 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from mobile_web.infrastructure.http_utils import error_dict, execute_with_key_failover
-from mobile_web.scripts.run_deal_pool_scheduler import (
+from infrastructure.http_utils import error_dict, execute_with_key_failover
+from models.deal_constants import (
+    DEAL_MAX_CLEAN_AGE_DAYS,
     ERR_ADAPTER_CONVERT_FAILED,
+    ERR_AI_MAX_RETRIES_EXCEEDED,
+    ERR_AI_TIMEOUT_RETRY,
+    ERR_EXPIRED_OVER_7_DAYS,
     ERR_JD_NUMERIC_SKU,
-    DealPoolCleaner,
+    MAX_CLEAN_RETRIES,
 )
+from repositories.deal_raw_pool_repo import (
+    DealRawPoolRepository,
+    _is_pure_jd_coupon_only_record,
+    parse_publish_time_epoch,
+)
+from repositories.product_repo import upsert_cleaned_products_to_formal_table
+from services.deal_pipeline import run_clean_stage, run_fetch_stage
+from services.deal_pool_cleaner import DealPoolCleaner, _commit_batch_results_to_db
 
 
 def test_jd_and_ztk_client_real_round_robin_vs_sticky():
@@ -98,7 +110,7 @@ def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transien
 
     ai1_call_count = {"n": 0}
 
-    def _fake_stage1(stage1_inputs, docs_by_tip_id, neighbor_maps_by_id=None, total_pending_count=0, quiet_sub_logs=False):
+    def _fake_stage1(stage1_inputs, docs_by_tip_id, neighbor_maps_by_id=None, quiet_sub_logs=False):
         ai1_call_count["n"] += 1
         out = {}
         for inp in stage1_inputs:
@@ -123,7 +135,7 @@ def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transien
         return out
 
     cleaner.run_ai_stage1_batch = _fake_stage1
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, total_pending_count=0, quiet_sub_logs=False: {
+    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
         inp["main_tip_id"]: {
             "main_tip_id": inp["main_tip_id"],
             "is_valid_deal": True,
@@ -274,8 +286,6 @@ def test_four_key_pool_failover_and_cooldown_rotation():
 
 
 def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries():
-    from mobile_web.scripts.run_deal_pool_scheduler import ERR_AI_TIMEOUT_RETRY
-
     cleaner = DealPoolCleaner(ai_batch_size=6, ai_max_workers=2, convert_max_workers=2)
     cleaner.warmup_anchor_cache_from_db = lambda _col: None
 
@@ -304,7 +314,7 @@ def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries
     ai1_calls = {"n": 0}
     ai2_attempt = {"n": 0}
 
-    def _fake_stage1(stage1_inputs, docs_by_tip_id, neighbor_maps_by_id=None, total_pending_count=0, quiet_sub_logs=False):
+    def _fake_stage1(stage1_inputs, docs_by_tip_id, neighbor_maps_by_id=None, quiet_sub_logs=False):
         ai1_calls["n"] += 1
         return {
             inp["main_tip_id"]: {
@@ -327,7 +337,7 @@ def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries
             for inp in stage1_inputs
         }
 
-    def _fake_stage2(stage2_inputs, total_pending_count=0, quiet_sub_logs=False):
+    def _fake_stage2(stage2_inputs, quiet_sub_logs=False):
         ai2_attempt["n"] += 1
         if ai2_attempt["n"] == 1:
             return {}  # Simulate Stage 4 AI-2 timeout on Round 1
@@ -393,8 +403,6 @@ def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries
 
 
 def test_save_batch_anchors_fallback_publish_ts_in_set_on_insert_without_conflict():
-    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
-
     captured_ops = []
 
     class _DummyCol:
@@ -444,8 +452,6 @@ def test_save_batch_tehuicaicai_refresh_never_conflicts_set_and_set_on_insert():
 
     特惠采采每轮刷新 publish_time/clean_cutoff_ts/clean_max_age_days，必须与插入模板互斥。
     """
-    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
-
     captured_ops = []
 
     class _StrictCol:
@@ -492,14 +498,6 @@ def test_save_batch_tehuicaicai_refresh_never_conflicts_set_and_set_on_insert():
 def test_run_clean_stage_sweeps_stale_pending_by_either_publish_ts_or_first_seen_at():
     import datetime
     import time
-    from mobile_web.scripts.run_deal_pool_scheduler import (
-        DEAL_MAX_CLEAN_AGE_DAYS,
-        ERR_AI_MAX_RETRIES_EXCEEDED,
-        ERR_EXPIRED_OVER_7_DAYS,
-        MAX_CLEAN_RETRIES,
-        DealRawPoolRepository,
-        run_clean_stage,
-    )
 
     def _matches(doc, flt):
         for key, cond in flt.items():
@@ -569,15 +567,18 @@ def test_run_clean_stage_sweeps_stale_pending_by_either_publish_ts_or_first_seen
     assert by_id["cooling"]["clean_status"] == "pending"
 
 
-def test_stage2_prompt_hot_reloads_on_mtime_change(monkeypatch, tmp_path):
+def test_stage2_prompt_hot_reloads_on_mtime_change(tmp_path):
     import os
-    import mobile_web.scripts.run_deal_pool_scheduler as sched_mod
 
     p_file = tmp_path / "stage2_prompt.txt"
     p_file.write_text("初始提示词v1", encoding="utf-8")
-    monkeypatch.setattr(sched_mod, "PROMPT_STAGE2_PATH", str(p_file))
 
-    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    cleaner = DealPoolCleaner(
+        ai_batch_size=2,
+        ai_max_workers=1,
+        convert_max_workers=1,
+        stage2_prompt_path=str(p_file),
+    )
     assert cleaner._get_stage2_prompt() == "初始提示词v1"
 
     p_file.write_text("热更新提示词v2", encoding="utf-8")
@@ -588,10 +589,6 @@ def test_stage2_prompt_hot_reloads_on_mtime_change(monkeypatch, tmp_path):
 
 def test_deal_max_clean_age_days_is_2_days():
     import datetime
-    from mobile_web.scripts.run_deal_pool_scheduler import (
-        DEAL_MAX_CLEAN_AGE_DAYS,
-        DealRawPoolRepository,
-    )
 
     assert DEAL_MAX_CLEAN_AGE_DAYS == 2
 
@@ -638,12 +635,11 @@ def test_deal_max_clean_age_days_is_2_days():
 def test_channel_specific_max_age_days_configuration_and_behavior():
     """验证渠道级保鲜期灵活配置：特惠采采享 7 天长保鲜期，逛丢等常规站保持 2 天。"""
     import datetime
-    from mobile_web.services.deal_sources.catalog import (
+    from services.deal_sources.catalog import (
         DEFAULT_CHANNEL_CONFIGS,
         get_channel_max_age_days,
         get_site_max_age_days_map,
     )
-    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
 
     # 1. 验证配置读取与映射
     assert get_channel_max_age_days(channel_name="特惠采采_首页精选") == 7.0
@@ -729,11 +725,6 @@ def test_channel_specific_max_age_days_configuration_and_behavior():
 
 
 def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_real_deals():
-    from mobile_web.scripts.run_deal_pool_scheduler import (
-        DealRawPoolRepository,
-        _is_pure_jd_coupon_only_record,
-    )
-
     captured_ops = []
 
     class _DummyCol:
@@ -830,8 +821,6 @@ def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_
 
 
 def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
-    from mobile_web.scripts.run_deal_pool_scheduler import ERR_AI_TIMEOUT_RETRY
-
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
     cleaner._cache_warmed_up = True
 
@@ -869,7 +858,7 @@ def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
         ai1_calls["n"] += 1
         return {}
 
-    def _fake_stage2(stage2_inputs, total_pending_count=0, quiet_sub_logs=False):
+    def _fake_stage2(stage2_inputs, quiet_sub_logs=False):
         return {
             inp["main_tip_id"]: {
                 "main_tip_id": inp["main_tip_id"],
@@ -996,6 +985,7 @@ def test_convert_single_target_admits_own_promo_and_rejects_failed_or_echo():
         "jd": SimpleNamespace(
             resolve_and_convert_universal=lambda x: {
                 "status": "success",
+                "resolution_kind": "coupon_or_venue",
                 "final_link": "https://u.jd.com/echoSame" if "echoSame" in x else "https://u.jd.com/ogDTQlg",
                 "promotion_token": "" if "echoSame" in x else "！FBxJIEwx！ CA1393",
             }
@@ -1023,7 +1013,6 @@ def test_convert_single_target_admits_own_promo_and_rejects_failed_or_echo():
 
 def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
     import datetime
-    from mobile_web.scripts.run_deal_pool_scheduler import upsert_cleaned_products_to_formal_table
 
     # 1. \u00a0 不换行空格、mp://、/:/ 口令壳与 strip_spans 100% 精准剥离，正常型号与中文描述完好无损
     doc = {
@@ -1138,6 +1127,7 @@ def test_minimalist_four_element_pipeline_and_zero_loss_copywriting():
         if "CPN_OK" in raw_input:
             return {
                 "status": "success",
+                "resolution_kind": "coupon_or_venue",
                 "goods_id": "",
                 "goods_sign": "",
                 "final_link": "https://uland.taobao.com/quan/detail?sellerId=1&activityId=2",
@@ -1230,7 +1220,7 @@ def test_minimalist_four_element_pipeline_and_zero_loss_copywriting():
 
     captured_s2_inputs = []
 
-    def _mock_s2(stage2_inputs, total_pending_count=0, quiet_sub_logs=False):
+    def _mock_s2(stage2_inputs, quiet_sub_logs=False):
         captured_s2_inputs.extend(stage2_inputs)
         return {
             "ztk_999": {
@@ -1365,8 +1355,6 @@ def test_deal_cleaner_never_poisons_degraded_jd_shortlink_as_ok_coupon():
 
 
 def test_deal_pool_startup_recovery_idempotently_rescues_recent_misclassified_tips():
-    from mobile_web.scripts.run_deal_pool_scheduler import DealRawPoolRepository
-
     fake_db = MagicMock()
     fake_col = MagicMock()
     fake_db.get_collection.return_value = fake_col
@@ -1504,8 +1492,6 @@ def test_jd_empty_jcommand_never_skips_piliang_or_misclassified_as_venue():
 
 def test_deal_pool_parse_publish_time_epoch_china_tz_consistency():
     """验证东八区无时区字符串与显式 UTC Z 字符串解析结果严格一致，消除容器 UTC 8 小时漂移。"""
-    from mobile_web.scripts.run_deal_pool_scheduler import parse_publish_time_epoch
-
     ts_cn = parse_publish_time_epoch("2026-11-12 14:30:00")
     ts_utc = parse_publish_time_epoch("2026-11-12T06:30:00Z")
     ts_iso_offset = parse_publish_time_epoch("2026-11-12T14:30:00+08:00")
@@ -1515,7 +1501,7 @@ def test_deal_pool_parse_publish_time_epoch_china_tz_consistency():
 
 def test_0818tuan_detail_loop_circuit_breaks_on_429_and_caps_attempts():
     """验证详情抓取遇到 429/502 立即熔断不再硬撞整页，且遇到 404 也严格按尝试次数封顶在 max_details。"""
-    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, Tuan0818Source
+    from services.deal_sources import ChannelConfig, FetchContext, Tuan0818Source
 
     li_items = "".join(
         f'<li><a href="/xbhd/{1000 + i}.html">测试线报商品 #{i}</a></li>'
@@ -1593,21 +1579,18 @@ def test_0818tuan_detail_loop_circuit_breaks_on_429_and_caps_attempts():
 def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, tmp_path):
     """验证同源站点在单轮内触发 429 后，后续同站点频道直接 cooldown_skipped 冷却跳过，且错误路径按频道聚合。"""
     import sys
-    from mobile_web.scripts import run_deal_pool_scheduler as dps
-    from mobile_web.services.deal_sources import BaseDealSource, ChannelConfig, FetchContext, FetchResult
+    from services.deal_sources import BaseDealSource, ChannelConfig, FetchContext, FetchResult
 
-    for mod_name in ("mobile_web.services.deal_pipeline", "services.deal_pipeline"):
-        mod = sys.modules.get(mod_name)
-        if mod is not None:
-            monkeypatch.setattr(mod.time, "sleep", lambda _: None, raising=False)
-            monkeypatch.setattr(mod, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"), raising=False)
-            monkeypatch.setattr(mod, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"), raising=False)
-            monkeypatch.setattr(mod, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"), raising=False)
-            monkeypatch.setattr(mod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"), raising=False)
-    for rmod_name in ("mobile_web.repositories.deal_raw_pool_repo", "repositories.deal_raw_pool_repo"):
-        rmod = sys.modules.get(rmod_name)
-        if rmod is not None:
-            monkeypatch.setattr(rmod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"), raising=False)
+    mod = sys.modules.get("services.deal_pipeline")
+    if mod is not None:
+        monkeypatch.setattr(mod.time, "sleep", lambda _: None, raising=False)
+        monkeypatch.setattr(mod, "STATS_SNAPSHOT_PATH", str(tmp_path / "stats.json"), raising=False)
+        monkeypatch.setattr(mod, "LATEST_OPS_REPORT_PATH", str(tmp_path / "ops.json"), raising=False)
+        monkeypatch.setattr(mod, "OPS_REPORT_HISTORY_JSONL", str(tmp_path / "ops_hist.jsonl"), raising=False)
+        monkeypatch.setattr(mod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"), raising=False)
+    rmod = sys.modules.get("repositories.deal_raw_pool_repo")
+    if rmod is not None:
+        monkeypatch.setattr(rmod, "ERROR_LOG_JSONL_PATH", str(tmp_path / "errors.jsonl"), raising=False)
 
     site_calls = []
 
@@ -1678,7 +1661,7 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
     repo.save_batch.return_value = {"inserted": 1, "updated": 0}
     repo.generate_pool_summary.return_value = {"total_records": 1}
 
-    out = dps.run_fetch_stage(
+    out = run_fetch_stage(
         repo=repo,
         session=MagicMock(),
         cycle_num=1,
@@ -1698,8 +1681,6 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
 
 
 def test_deal_ai1_scoring_and_timeline_upgrade_conditions():
-    from mobile_web.scripts.run_deal_pool_scheduler import DealPoolCleaner
-
     # 1. 结构化时间线条目生成
     raw_doc = {
         "source_item_id": "tip_998",
@@ -1764,7 +1745,6 @@ def test_upsert_cleaned_products_honors_lower_price_improvement():
     import datetime
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    from mobile_web.scripts.run_deal_pool_scheduler import upsert_cleaned_products_to_formal_table
 
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
     stored_doc = {
@@ -1818,10 +1798,9 @@ def test_upsert_cleaned_products_honors_lower_price_improvement():
     assert tl_pushed[0]["deal_price"] == 149.0
 
 
-def test_commit_batch_results_records_supplementary_copies():
+def test_commit_batch_results_records_bounded_tips_timeline():
     from types import SimpleNamespace
     from unittest.mock import MagicMock
-    from mobile_web.scripts.run_deal_pool_scheduler import _commit_batch_results_to_db
 
     raw_col = MagicMock()
     raw_col.bulk_write.return_value = SimpleNamespace(modified_count=1)
@@ -1861,7 +1840,7 @@ def test_commit_batch_results_records_supplementary_copies():
         }
     ]
 
-    commit_res = _commit_batch_results_to_db(
+    _commit_batch_results_to_db(
         early_results,
         raw_col=raw_col,
         formal_col=formal_col,
@@ -1869,21 +1848,20 @@ def test_commit_batch_results_records_supplementary_copies():
     )
     assert len(captured_formal_ops) == 1
     upd_op = captured_formal_ops[0]._doc
-    assert "$addToSet" in upd_op
-    assert "deal_info.supplementary_copies" in upd_op["$addToSet"]
-    copies = upd_op["$addToSet"]["deal_info.supplementary_copies"]["$each"]
-    assert len(copies) == 1
-    assert "群友最新实操作业" in copies[0]
+    assert "deal_info.supplementary_copies" not in (upd_op.get("$addToSet") or {})
     assert "$push" in upd_op
     assert "deal_info.tips_timeline" in upd_op["$push"]
-    tl_ops = upd_op["$push"]["deal_info.tips_timeline"]["$each"]
+    tl_push = upd_op["$push"]["deal_info.tips_timeline"]
+    assert tl_push["$slice"] == 20
+    tl_ops = tl_push["$each"]
     assert len(tl_ops) == 1
     assert tl_ops[0]["tip_id"] == "xb_dup_1"
     assert tl_ops[0]["deal_price"] == 45.0
+    assert "群友最新实操作业" in tl_ops[0]["copywriting"]
 
 
 def test_fetch_guangdiu_filters_vipshop():
-    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
+    from services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
 
     html_content = """
     <div class="gooditem">
@@ -1944,7 +1922,7 @@ def test_fetch_guangdiu_filters_vipshop():
 
 
 def test_fetch_guangdiu_rank_and_hots_parser():
-    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
+    from services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
 
     rank_html = """
     <div class="hourrankitem">
@@ -2045,7 +2023,7 @@ def test_fetch_guangdiu_rank_and_hots_parser():
 
 
 def test_fetch_guangdiu_captcha_circuit_breaker():
-    from mobile_web.services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
+    from services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
 
     list_html = """
     <div class="gooditem">
@@ -2141,13 +2119,13 @@ def test_fetch_guangdiu_captcha_circuit_breaker():
     assert any("union-click.jd.com" in lk["url"] for lk in rec["extracted_links"])
 
 
-def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path):
-    """验证逛丢 Cookie 持久化链路闭环：默认路径规范、持久化序列化及 Mock 防御。"""
-    import inspect
+def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path, monkeypatch):
+    """验证逛丢 Cookie 持久化链路闭环：默认路径规范、默认缺省存取行为、持久化序列化及 Mock 防御。"""
     import json
     import os
     import requests
-    from mobile_web.services.deal_sources.guangdiu import (
+    from services.deal_sources import guangdiu as gd_mod
+    from services.deal_sources.guangdiu import (
         DEFAULT_GUANGDIU_COOKIE_FILE,
         GuangdiuSource,
         load_guangdiu_cookies,
@@ -2157,11 +2135,19 @@ def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path):
     # 1. 验证默认 Cookie 路径存在且为规范绝对路径
     assert DEFAULT_GUANGDIU_COOKIE_FILE.endswith("guangdiu_cookies.json")
     assert os.path.isabs(DEFAULT_GUANGDIU_COOKIE_FILE)
-
-    # 2. 验证 load/save 默认参数均已接入 DEFAULT_GUANGDIU_COOKIE_FILE 且 GuangdiuSource 支持 cookie_file
-    assert inspect.signature(load_guangdiu_cookies).parameters["cookie_file"].default == DEFAULT_GUANGDIU_COOKIE_FILE
-    assert inspect.signature(save_guangdiu_cookies).parameters["cookie_file"].default == DEFAULT_GUANGDIU_COOKIE_FILE
     assert GuangdiuSource.site_key == "guangdiu"
+
+    # 2. 验证未传 cookie_file 时实际使用运行时 DEFAULT_GUANGDIU_COOKIE_FILE
+    monkeypatch.setenv("WEB_LOG_DIR", "")
+    patched_default = str(tmp_path / "default_guangdiu_cookies.json")
+    monkeypatch.setattr(gd_mod, "DEFAULT_GUANGDIU_COOKIE_FILE", patched_default)
+    sess_def = requests.Session()
+    sess_def.cookies.set("gdhuman", "default_path_tok", domain="guangdiu.com", path="/")
+    save_guangdiu_cookies(sess_def)
+    assert os.path.exists(patched_default)
+    sess_def2 = requests.Session()
+    assert load_guangdiu_cookies(sess_def2) is True
+    assert sess_def2.cookies.get("gdhuman") == "default_path_tok"
 
     # 3. 验证 save_guangdiu_cookies 与 load_guangdiu_cookies 存取闭环
     test_cookie_file = str(tmp_path / "test_gd_cookies.json")

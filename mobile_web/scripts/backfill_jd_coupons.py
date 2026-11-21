@@ -25,6 +25,8 @@ for _p in (REPO_ROOT, APP_ROOT):
 
 from adapters import get_adapter  # noqa: E402
 from adapters.jd_adapter import _is_encrypted_jd_item_id  # noqa: E402
+from infrastructure.api_governance import set_process_role  # noqa: E402
+from infrastructure.logging_utils import configure_console_encoding  # noqa: E402
 from models.product import utc_millis  # noqa: E402
 from repositories.product_repo import ProductRepository  # noqa: E402
 
@@ -78,6 +80,8 @@ def build_query(*, only_recommend: bool, include_missing_coupon_url: bool) -> di
 
 
 def main(argv=None) -> int:
+    configure_console_encoding()
+    set_process_role("backfill_jd_coupons")
     parser = argparse.ArgumentParser(description="京东存量商品官方优惠券链接低耗回填脚本")
     parser.add_argument("--only-recommend", action="store_true", help="仅处理京东榜单商品 (channel_type in [1, 5])")
     parser.add_argument("--include-missing-coupon-url", action="store_true", help="同时补齐已有 coupon_amount>0 但缺 coupon_url 的历史记录")
@@ -87,82 +91,87 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     repo = ProductRepository()
-    adapter = get_adapter("jd")
-    query = build_query(
-        only_recommend=args.only_recommend,
-        include_missing_coupon_url=args.include_missing_coupon_url,
-    )
+    try:
+        adapter = get_adapter("jd")
+        query = build_query(
+            only_recommend=args.only_recommend,
+            include_missing_coupon_url=args.include_missing_coupon_url,
+        )
 
-    projection = {
-        "_id": 0,
-        "product_id": 1,
-        "goods_id": 1,
-        "goods_sign": 1,
-        "name": 1,
-        "coupon_amount": 1,
-        "detail_updated_at": 1,
-    }
-    cursor = repo.col.find(query, projection).sort([("updated_at", -1)])
-    if args.limit and args.limit > 0:
-        cursor = cursor.limit(args.limit)
-    candidates = [
-        doc for doc in cursor
-        if isinstance(doc, dict) and _is_encrypted_jd_item_id(doc.get("goods_sign"))
-    ]
+        projection = {
+            "_id": 0,
+            "product_id": 1,
+            "goods_id": 1,
+            "goods_sign": 1,
+            "name": 1,
+            "coupon_amount": 1,
+            "detail_updated_at": 1,
+        }
+        cursor = repo.col.find(query, projection).sort([("updated_at", -1)])
+        if args.limit and args.limit > 0:
+            cursor = cursor.limit(args.limit)
+        candidates = [
+            doc for doc in cursor
+            if isinstance(doc, dict) and _is_encrypted_jd_item_id(doc.get("goods_sign"))
+        ]
 
-    print(f"[backfill_jd_coupons] 匹配待补券加密ID商品: {len(candidates)} 条 (dry_run={args.dry_run})")
-    if args.dry_run or not candidates:
-        return 0
+        print(f"[backfill_jd_coupons] 匹配待补券加密ID商品: {len(candidates)} 条 (dry_run={args.dry_run})")
+        if args.dry_run or not candidates:
+            return 0
 
-    stats = {
-        "checked": 0,
-        "found_coupon": 0,
-        "zero_coupon": 0,
-        "off_promotion_deleted": 0,
-        "rate_limited": 0,
-        "other_error": 0,
-    }
-    started = time.perf_counter()
+        stats = {
+            "checked": 0,
+            "found_coupon": 0,
+            "zero_coupon": 0,
+            "off_promotion_deleted": 0,
+            "rate_limited": 0,
+            "other_error": 0,
+        }
+        started = time.perf_counter()
 
-    for idx, doc in enumerate(candidates, start=1):
-        sign = str(doc.get("goods_sign") or "").strip()
-        gid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
-        res = None
-        for delay in BACKOFF_SCHEDULE:
-            if delay > 0:
-                time.sleep(delay)
-            res = adapter.get_goods_detail(sign, goods_id=gid or None, goods_sign=sign)
-            if res.get("error_code") != "RATE_LIMIT":
-                break
+        for idx, doc in enumerate(candidates, start=1):
+            sign = str(doc.get("goods_sign") or "").strip()
+            gid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
+            res = None
+            for delay in BACKOFF_SCHEDULE:
+                if delay > 0:
+                    time.sleep(delay)
+                res = adapter.get_goods_detail(sign, goods_id=gid or None, goods_sign=sign)
+                if res.get("error_code") != "RATE_LIMIT":
+                    break
 
-        stats["checked"] += 1
-        if isinstance(res, dict) and res.get("status") == "success" and isinstance(res.get("data"), dict):
-            data = dict(res["data"])
-            now = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
-            repo.upsert_product_detail(dict(data, detail_updated_at=now))
-            if data.get("coupon_url") or float(data.get("coupon_amount") or 0.0) > 0:
-                stats["found_coupon"] += 1
+            stats["checked"] += 1
+            if isinstance(res, dict) and res.get("status") == "success" and isinstance(res.get("data"), dict):
+                data = dict(res["data"])
+                now = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
+                repo.upsert_product_detail(dict(data, detail_updated_at=now))
+                if data.get("coupon_url") or float(data.get("coupon_amount") or 0.0) > 0:
+                    stats["found_coupon"] += 1
+                else:
+                    stats["zero_coupon"] += 1
+            elif isinstance(res, dict) and res.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                repo.delete_product("jd", goods_id=gid or None, goods_sign=sign)
+                stats["off_promotion_deleted"] += 1
+            elif isinstance(res, dict) and res.get("error_code") == "RATE_LIMIT":
+                stats["rate_limited"] += 1
             else:
-                stats["zero_coupon"] += 1
-        elif isinstance(res, dict) and res.get("error_code") == "PRODUCT_OFF_PROMOTION":
-            repo.delete_product("jd", goods_id=gid or None, goods_sign=sign)
-            stats["off_promotion_deleted"] += 1
-        elif isinstance(res, dict) and res.get("error_code") == "RATE_LIMIT":
-            stats["rate_limited"] += 1
-        else:
-            stats["other_error"] += 1
+                stats["other_error"] += 1
 
-        if idx % 25 == 0 or idx == len(candidates):
-            elapsed = time.perf_counter() - started
-            print(
-                f"  [{idx}/{len(candidates)}] 耗时 {elapsed:.1f}s | "
-                f"发现优惠券:{stats['found_coupon']} 无券:{stats['zero_coupon']} "
-                f"下架清理:{stats['off_promotion_deleted']} 限流未决:{stats['rate_limited']} 其他失败:{stats['other_error']}"
-            )
-        if args.pace > 0 and idx < len(candidates):
-            time.sleep(args.pace)
+            if idx % 25 == 0 or idx == len(candidates):
+                elapsed = time.perf_counter() - started
+                print(
+                    f"  [{idx}/{len(candidates)}] 耗时 {elapsed:.1f}s | "
+                    f"发现优惠券:{stats['found_coupon']} 无券:{stats['zero_coupon']} "
+                    f"下架清理:{stats['off_promotion_deleted']} 限流未决:{stats['rate_limited']} 其他失败:{stats['other_error']}"
+                )
+            if args.pace > 0 and idx < len(candidates):
+                time.sleep(args.pace)
 
-    return 0
+        return 0
+    finally:
+        db = getattr(repo, "db", None)
+        if db is not None and callable(getattr(db, "close", None)):
+            db.close()
 
 
 if __name__ == "__main__":

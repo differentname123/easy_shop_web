@@ -118,18 +118,19 @@ def test_hdk_convert_promotion_link_success():
     client = HdkClient(api_key="test_key", union_id="2035679405", http_session=session)
     res = client.convert_promotion_link(
         "https://jingfen.jd.com/detail/test_enc.html",
-        promoter_id="888",
         sub_union_id="sub_123",
         coupon_url="https://coupon.jd.com/test",
     )
     assert res["status"] == "success"
     assert res["short_url"] == "https://u.jd.com/ogpcRGH"
     assert res["final_link"] == "https://u.jd.com/ogpcRGH"
-    assert res["promoter_id"] == "888"
+    assert res["union_id"] == "2035679405"
+    assert "promoter_id" not in res
     call_kwargs = session.post.call_args[1]["data"]
     assert call_kwargs["sceneId"] == 1
     assert call_kwargs["subUnionId"] == "sub_123"
     assert call_kwargs["coupon_url"] == "https://coupon.jd.com/test"
+    assert "positionId" not in call_kwargs
 
 
 def test_hdk_multi_key_failover():
@@ -195,10 +196,11 @@ def test_hdk_and_ztk_data_contract_equivalence():
     )
     adapter = JdAdapter(settings=settings)
 
-    # 1. 测试 ProductSummary 归一化
+    # 1. 测试 ProductSummary 归一化（优先保留官方加密 itemid，规范生成 product_url）
+    enc_itemid = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
     raw_hdk_item = {
         "skuid": "10001",
-        "itemid": "IwQNjAAA_test_enc_id",
+        "itemid": enc_itemid,
         "goodsname": "心相印经典茶语丝柔抽纸3层120抽*24包",
         "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/123.jpg",
         "itemprice": "49.90",
@@ -215,9 +217,10 @@ def test_hdk_and_ztk_data_contract_equivalence():
     # 核心字段校验
     assert summary["platform"] == "jd"
     assert summary["platform_name"] == "京东"
-    assert summary["goods_sign"] == "10001"
-    # goods_id 必须是由主图哈希生成的确定性主键，解耦动态 goods_sign
-    assert summary["goods_id"] == extract_canonical_goods_id("jd", "10001", image_url=raw_hdk_item["itempic"])
+    assert summary["goods_sign"] == enc_itemid
+    assert summary["product_url"] == f"https://jingfen.jd.com/detail/{enc_itemid}.html"
+    # goods_id 必须是由主图哈希或加密 ID 生成的确定性主键
+    assert summary["goods_id"] == extract_canonical_goods_id("jd", enc_itemid, image_url=raw_hdk_item["itempic"])
     assert summary["price"] == 39.90
     assert summary["original_price"] == 49.90
     assert summary["coupon_amount"] == 10.0
@@ -226,6 +229,16 @@ def test_hdk_and_ztk_data_contract_equivalence():
     assert summary["name"] == raw_hdk_item["goodsname"]
     assert summary["brand"] == "心相印"
     assert summary["mall_name"] == "心相印京东自营旗舰店"
+
+    # 纯数字 SKU 绝不可拼成 jingfen.jd.com/detail/{数字}.html
+    numeric_only_summary = adapter._normalize_hdk_summary({
+        "skuid": "10001",
+        "goodsname": "仅数字SKU商品",
+        "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/num.jpg",
+        "itemprice": "29.90",
+    })
+    assert numeric_only_summary["goods_sign"] == "10001"
+    assert numeric_only_summary["product_url"] == "https://item.jd.com/10001.html"
 
     # 2. 测试 ProductDetail 归一化
     raw_hdk_detail_item = {
@@ -395,27 +408,36 @@ def test_jd_adapter_promotion_fails_over_to_ztk_on_hdk_error():
 
 
 def test_jd_adapter_universal_resolve_via_hdk():
-    """验证当输入 u.jd.com 短链时，HDK 能够直接反查完整商品卡片并完成高佣转链。"""
+    """验证真实契约：resolve_short_url 仅返回 {dest_url, is_venue, sku_id}，随后调用 get_goods_detail 获取商品卡片与转链。"""
+    enc_id = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
     hdk_mock = Mock()
     hdk_mock.resolve_short_url.return_value = {
         "status": "success",
         "data": {
+            "dest_url": f"https://pro.m.jd.com/mall/active/abc/index.html?sku={enc_id}",
+            "is_venue": False,
+            "sku_id": enc_id,
+        },
+    }
+    hdk_mock.get_goods_detail.return_value = {
+        "status": "success",
+        "data": {
             "skuid": "10003",
-            "itemid": "IwQNjAAA_test_short_card",
+            "itemid": enc_id,
             "goodsname": "维达超韧抽纸3层100抽*24包",
             "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/vinda.jpg",
             "itemprice": "39.90",
             "itemendprice": "29.90",
             "couponmoney": "10.00",
             "couponurl": "https://coupon.jd.com/vinda_coupon",
-        }
+        },
     }
     hdk_mock.convert_promotion_link.return_value = {
         "status": "success",
         "short_url": "https://u.jd.com/vinda_promoted",
         "click_url": "https://union-click.jd.com/vinda_promoted",
         "final_link": "https://u.jd.com/vinda_promoted",
-        "promoter_id": "88",
+        "union_id": "2035679405",
     }
     ztk_client = Mock()
     ztk_client.convert_universal_material.return_value = {
@@ -432,24 +454,28 @@ def test_jd_adapter_universal_resolve_via_hdk():
 
     assert res["status"] == "success"
     assert res["_provider"] == "hdk_jd_universal"
+    assert res["resolution_kind"] == "product"
     assert res["final_link"] == "https://u.jd.com/vinda_promoted"
+    assert res["goods_sign"] == enc_id
     assert res["product"]["name"] == "维达超韧抽纸3层100抽*24包"
     assert res["product"]["price"] == 29.90
     assert res["product"]["coupon_amount"] == 10.0
+    hdk_mock.get_goods_detail.assert_called_once_with(enc_id)
 
 
 def test_hdk_agents_md_rule3_compliance():
     """严守 AGENTS.md 第三条铁律：
     1. 严禁指鹿为马：详情或转链反查失败时，严禁截取标题调用搜索接口首条顶替；
-    2. 主键解耦：product_id (goods_id) 必须使用静态主图哈希解耦动态 goods_sign；
-    3. 主图哈希绝不可传给上游详情接口。
+    2. 主键解耦：product_id (goods_id) 必须使用静态主图哈希解耦动态 goods_sign，优先保留加密 itemid；
+    3. 主图哈希绝不可传给上游详情接口，数字 SKU 绝不拼成 jingfen.jd.com/detail/{数字}.html。
     """
     adapter = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"))
 
-    # 1. 验证静态主图哈希解耦
+    # 1. 验证静态主图哈希解耦与加密 itemid 优先
+    enc_sign = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_3abcde1234567890"
     hdk_raw = {
         "skuid": "10099",
-        "itemid": "dynamic_goods_sign_salt_12345",
+        "itemid": enc_sign,
         "goodsname": "合规测试商品",
         "itempic": "https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg",
         "itemprice": "50.00",
@@ -458,7 +484,8 @@ def test_hdk_agents_md_rule3_compliance():
     img_key = extract_jd_image_key("https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg")
     assert img_key == "6ae3f40fF84b3cfef_0083320320005d73"
     assert summary["goods_id"] == img_key
-    assert summary["goods_sign"] == "10099"  # skuid 取首选
+    assert summary["goods_sign"] == enc_sign
+    assert summary["product_url"] == f"https://jingfen.jd.com/detail/{enc_sign}.html"
 
     # 2. 验证主图哈希绝不能作为 target_id 直接调用上游详情接口
     hdk_mock = Mock()
@@ -471,40 +498,20 @@ def test_hdk_agents_md_rule3_compliance():
 
 
 # ----------------------------------------------------------------------
-# 4. JD 订单同步与 TB 平台好单库主力扩展测试
+# 4. JD 订单通道保真与 TB 平台好单库按需挂载测试
 # ----------------------------------------------------------------------
 
-def test_jd_adapter_orders_prefers_hdk_and_fails_over_to_ztk():
-    """验证 JD 订单同步首选好单库，且能够无缝归一化；好单库失败时顺延至折淘客。"""
+def test_jd_adapter_orders_preserves_ztk_cas_and_does_not_prepend_hdk():
+    """验证 JD 订单同步保留官方折淘客主通道（保障毫秒 modifyTime CAS 精度与完备状态码），attach_hdk 不抢占 orders。"""
     hdk_mock = Mock()
-    hdk_mock.query_jd_orders.return_value = {
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+    ztk_client.query_orders.return_value = {
         "status": "success",
-        "order_list": [
-            {
-                "id": "trade_hdk_123",
-                "orderId": "parent_hdk_123",
-                "skuId": "10001",
-                "skuName": "好单库京东商品",
-                "skuNum": 2,
-                "estimateCosPrice": 99.0,
-                "estimateFee": 9.9,
-                "actualFee": 9.9,
-                "validCode": 18,
-                "orderTime": 1700000000,
-                "modifyTime": 1700000100,
-                "finishTime": 1700000200,
-                "positionId": "88",
-                "subUnionId": "sub_1",
-                "commissionRate": 10.0,
-            }
-        ],
-        "total_count": 1,
-        "page": 1,
+        "order_list": [{"id": "ztk_row_1", "orderId": "p1", "skuId": "2", "skuName": "ZTK商品", "validCode": 18, "estimateFee": 5.0, "actualFee": 5.0, "orderTime": 1700000000, "modifyTime": 1700000100.5}],
         "has_more": False,
         "next_cursor": None,
     }
-    ztk_client = Mock()
-    ztk_client.appkey_list = ("ztk_key",)
     adapter = JdAdapter(
         settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", jd_app_key="k", jd_app_secret="s"),
         client=ztk_client,
@@ -513,28 +520,10 @@ def test_jd_adapter_orders_prefers_hdk_and_fails_over_to_ztk():
     res = adapter.fetch_increment_orders(1700000000, 1700000200, page=1)
 
     assert res["status"] == "success"
-    assert res["_provider"] == "hdk_jd_orders"
-    assert len(res["order_list"]) == 1
-    # 验证字段被 normalize_order 正确映射
-    norm = adapter.normalize_order(res["order_list"][0])
-    assert norm["order_sn"] == "trade_hdk_123"
-    assert norm["goods_name"] == "好单库京东商品"
-    assert norm["is_settled"] is True
-    assert norm["promotion_amount_yuan"] == 9.9
-    ztk_client.query_orders.assert_not_called()
-
-    # 模拟好单库报错，验证顺延至折淘客
-    hdk_mock.query_jd_orders.return_value = {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "限流"}
-    ztk_client.query_orders.return_value = {
-        "status": "success",
-        "order_list": [{"id": "ztk_row_1", "orderId": "p1", "skuId": "2", "skuName": "ZTK商品", "validCode": 16, "estimateFee": 5.0, "orderTime": 1700000000, "modifyTime": 1700000000}],
-        "has_more": False,
-        "next_cursor": None,
-    }
-    res_fallback = adapter.fetch_increment_orders(1700000000, 1700000200, page=1)
-    assert res_fallback["status"] == "success"
-    assert res_fallback["_provider"] == "ztk_jd_orders"
-    assert res_fallback["order_list"][0]["id"] == "ztk_row_1"
+    assert res["_provider"] == "ztk_jd_orders"
+    assert res["order_list"][0]["id"] == "ztk_row_1"
+    hdk_mock.query_jd_orders.assert_not_called()
+    ztk_client.query_orders.assert_called_once()
 
 
 def test_tb_adapter_promotion_prefers_hdk_and_fails_over_to_ztk():
@@ -759,8 +748,9 @@ def test_jd_adapter_babel_product_resolves_to_single_item():
 
     assert res["status"] == "success"
     assert res["resolution_kind"] == "product"
-    assert res["goods_id"] == "100249470124"
-    assert res["goods_sign"] == "100249470124"
+    assert res["goods_id"] == "eu8kjNqEBGUN1MbOYF"
+    assert res["goods_sign"] == "eu8kjNqEBGUN1MbOYF"
+    assert res["product"]["product_url"] == "https://item.jd.com/100249470124.html"
     assert res["title"] == "格力高百奇大礼包316g"
     assert res["price"] == 22.9
     assert res["final_link"] == "https://u.jd.com/my_promo_short"
@@ -839,6 +829,211 @@ def test_jd_adapter_coupon_url_with_to_item_resolves_as_venue_via_hdk():
     hdk_mock.convert_promotion_link.assert_called_once()
     assert hdk_mock.convert_promotion_link.call_args.args[0] == coupon_url
     assert ztk_client.convert_universal_material.call_count == 0
+
+
+# ----------------------------------------------------------------------
+# 5. P0 安全、个人归因与容错回归测试
+# ----------------------------------------------------------------------
+
+def test_jd_personal_promoter_skips_hdk_without_health_errors_and_preserves_position_id():
+    """JD 个人推手转链与万能转链必须跳过不传输 positionId 的 HDK，且不记入错误指标，由折淘客完整透传 positionId。"""
+    from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH
+
+    GLOBAL_UPSTREAM_HEALTH.reset()
+    hdk_mock = Mock()
+    enc_id = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
+    hdk_mock.get_goods_detail.return_value = {
+        "status": "success",
+        "data": {
+            "itemid": enc_id,
+            "skuid": "10001",
+            "goodsname": "个人归因测试商品",
+            "itemendprice": "19.90",
+            "itemprice": "29.90",
+            "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/p.jpg",
+        },
+    }
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+
+    ztk_client.convert_promotion_link.return_value = {
+        "status": "success",
+        "promoter_id": "999999",
+        "short_url": "https://u.jd.com/personal_ok",
+        "click_url": "https://union-click.jd.com/personal_ok",
+        "j_command": "！个人专属京口令！",
+    }
+    ztk_client.convert_universal_material.return_value = {
+        "status": "success",
+        "promoter_id": "999999",
+        "short_url": "https://u.jd.com/personal_univ",
+        "click_url": "https://union-click.jd.com/personal_univ",
+        "j_command": "！个人万能京口令！",
+        "tao_id": enc_id,
+    }
+    ztk_client.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [{
+            "tao_id": enc_id,
+            "title": "个人归因测试商品",
+            "quanhou_jiage": "19.90",
+            "size": "29.90",
+            "pict_url": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/p.jpg",
+            "item_url": f"https://jingfen.jd.com/detail/{enc_id}.html",
+        }],
+    }
+
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+
+    res_promo = adapter.convert_promotion_url(
+        enc_id,
+        uid="u_12345678",
+        promoter_id="999999",
+        trusted_product_url=f"https://jingfen.jd.com/detail/{enc_id}.html",
+    )
+    assert res_promo["status"] == "success"
+    assert res_promo["_provider"] == "ztk_jd_byunionid"
+    assert res_promo["promoter_id"] == "999999"
+    assert res_promo["attribution_status"] == "verified"
+
+    res_univ = adapter.resolve_and_convert_universal("https://u.jd.com/someone1", uid="u_12345678", promoter_id="999999")
+    assert res_univ["status"] == "success"
+    assert res_univ["_provider"] == "ztk_jd_universal"
+    assert res_univ["promoter_id"] == "999999"
+
+    hdk_mock.convert_promotion_link.assert_not_called()
+    hdk_mock.resolve_short_url.assert_not_called()
+    ztk_client.convert_promotion_link.assert_called_once()
+    assert ztk_client.convert_promotion_link.call_args.args[1] == "999999"
+    ztk_client.convert_universal_material.assert_called_once()
+    assert ztk_client.convert_universal_material.call_args.args[1] == "999999"
+
+    snap = GLOBAL_UPSTREAM_HEALTH.snapshot_local()
+    promo_or_univ_hdk = [
+        b for b in snap["endpoints"]
+        if "hdk" in b["provider"] and b["operation"] in ("promotion", "universal")
+    ]
+    assert promo_or_univ_hdk == []
+    assert all(b["error_calls"] == 0 for b in snap["endpoints"] if "hdk" in b["provider"])
+
+
+def test_hdk_resolve_short_url_ssrf_guard():
+    """HdkClient.resolve_short_url 必须严格校验入口域名及内嵌 var hrl 目标，阻断 SSRF。"""
+    sess = Mock()
+    client = HdkClient(api_key="k", http_session=sess)
+
+    # 非 u.jd.com Host（查询串伪装）应直接拦截
+    res_evil_input = client.resolve_short_url("https://evil.com/?redirect=u.jd.com/abc")
+    assert res_evil_input["status"] == "error"
+    assert res_evil_input["error_code"] == "NOT_SUPPORTED"
+    sess.get.assert_not_called()
+
+    # var hrl 指向内网或非官方域名时，绝不发起第二次 GET
+    sess.get.return_value = Mock(status_code=200, text="<script>var hrl='http://127.0.0.1:8001/admin';</script>", url="https://u.jd.com/bad1")
+    res_ssrf = client.resolve_short_url("https://u.jd.com/bad1")
+    assert res_ssrf["status"] == "error"
+    assert res_ssrf["error_code"] == "UNSAFE_REDIRECT"
+    assert sess.get.call_count == 1
+
+
+def test_tb_adapter_without_hdk_tb_name_skips_hdk_cleanly():
+    """未配置 hdk_tb_name 时，TaobaoAdapter.attach_hdk 不注册 hdk_tb_promotion / hdk_tb_orders，无红灯告警。"""
+    from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH
+
+    GLOBAL_UPSTREAM_HEALTH.reset()
+    hdk_mock = Mock()
+    hdk_mock.appkey_list = ("hdk_k",)
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_k",)
+    ztk_client.sid = "192646"
+    ztk_client.convert_channel_url.return_value = {
+        "status": "success",
+        "url": "https://s.click.taobao.com/ztk_direct",
+        "short_url": "https://s.click.taobao.com/ztk_direct",
+        "tpwd": "￥ZTK直连口令￥",
+    }
+    official_client = Mock()
+    official_client.pid_prefix = "mm_1_2"
+    official_client.get_goods_details.return_value = {
+        "status": "success",
+        "data": [{"goods_id": "673231015690", "goods_sign": "sign_1", "goods_name": "淘宝测试商品"}],
+    }
+
+    adapter = TaobaoAdapter(
+        settings=SimpleNamespace(
+            taobao_enabled=True,
+            tb_app_key="k",
+            tb_app_secret="s",
+            tb_pid="mm_1_2_3",
+            tb_channel_pid="mm_1_2_3",
+            hdk_api_key="hdk_k",
+            hdk_tb_name="",
+            ztk_appkey="ztk_k",
+            ztk_sid="192646",
+        ),
+        official_client=official_client,
+        hdk_client=hdk_mock,
+        ztk_client=ztk_client,
+    )
+    res = adapter.convert_promotion_url("673231015690", identity={"relation_id": "12345"}, uid="u_1")
+    assert res["status"] == "success"
+    assert res["_provider"] == "tb_official_promote"
+    hdk_mock.convert_tb_promotion_link.assert_not_called()
+
+    ztk_client.query_orders.return_value = {"status": "success", "order_list": [], "has_more": False, "next_cursor": None}
+    ord_res = adapter.fetch_increment_orders(1700000000, 1700000600)
+    assert ord_res["status"] == "success"
+    assert ord_res["_provider"] == "ztk_tb_orders"
+    hdk_mock.query_tb_orders.assert_not_called()
+
+    snap = GLOBAL_UPSTREAM_HEALTH.snapshot_local()
+    assert [b for b in snap["endpoints"] if "hdk" in b["provider"]] == []
+
+
+def test_execute_with_key_failover_retries_on_timeout_and_quota_backlog():
+    """多 Key 容灾执行器遇到 TIMEOUT 与 QUOTA_PACE_BACKLOG 时自动切换下一把健康 Key 并迁移活跃游标。"""
+    from infrastructure.http_utils import execute_with_key_failover
+
+    client = SimpleNamespace(appkey_list=("k1", "k2", "k3"), appkey="k1", _active_key_index=0)
+    attempts = []
+
+    def action(key):
+        attempts.append(key)
+        if key == "k1":
+            return {"status": "error", "error_code": "TIMEOUT", "error_msg": "read timeout"}
+        if key == "k2":
+            return {"status": "error", "error_code": "QUOTA_PACE_BACKLOG", "error_msg": "pool busy"}
+        return {"status": "success", "used_key": key}
+
+    res = execute_with_key_failover(client, action)
+    assert res == {"status": "success", "used_key": "k3"}
+    assert attempts == ["k1", "k2", "k3"]
+    assert client.appkey == "k3"
+    assert client._active_key_index == 2
+
+
+def test_removed_hardcoded_inviter_code_returns_config_error():
+    """未配置 taobao_inviter_code 且上游未返回邀请码时，官方与折淘客客户端均返回明确 CONFIG_ERROR，不再使用个人硬编码。"""
+    from infrastructure import tb_client
+    from infrastructure.ztk_client import ZtkClient
+
+    tb_res = tb_client.generate_tb_authority_url(
+        "k", "s", "u_12345678", session_key="sess",
+        _api_call=lambda **_kw: {"status": "error", "error_code": "27", "error_msg": "expired"},
+    )
+    assert tb_res["status"] == "error"
+    assert tb_res["error_code"] == "CONFIG_ERROR"
+
+    ztk_http = SimpleNamespace(get=Mock(return_value=_mock_response(200, {"error_response": {"code": 27}})))
+    ztk = ZtkClient("ztk_k", "ztk_sid", http_session=ztk_http)
+    ztk_res = ztk.generate_authority_url("u_12345678")
+    assert ztk_res["status"] == "error"
+    assert ztk_res["error_code"] == "CONFIG_ERROR"
+
 
 
 

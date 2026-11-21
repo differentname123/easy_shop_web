@@ -9,11 +9,11 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="查券省钱">
   <title>拼多多多人团互助</title>
-  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261109-2">
-  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261109-2">
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261119-2">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261119-1"></script>
+  <link rel="stylesheet" href="/static/css/group_help.css?v=ux-20261121-2">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261121-2"></script>
 </head>
 <body>
 <div id="group-help-app" v-cloak>
@@ -365,8 +365,8 @@
               {{ selectedGroup.click_count }}人去过 · 剩{{ formatRemaining(selectedGroup.remaining_seconds) }}
             </div>
             <div class="gh-detail-entry-tag">
-              <span class="gh-badge" :class="selectedGroup.poster_path ? 'gh-badge-poster' : 'gh-badge-token'">
-                {{ selectedGroup.poster_path ? '📷 海报扫码团' : (selectedGroup.entry_type === 'link' ? '🔗 链接团' : '📝 口令团') }}
+              <span class="gh-badge" :class="selectedGroup.poster_url ? 'gh-badge-poster' : 'gh-badge-token'">
+                {{ selectedGroup.poster_url ? '📷 海报扫码团' : (selectedGroup.entry_type === 'link' ? '🔗 链接团' : '📝 口令团') }}
               </span>
               <span v-if="selectedGroup.total_people" class="gh-badge-people">{{ selectedGroup.total_people }}人团</span>
             </div>
@@ -925,6 +925,9 @@
   </div>
 
 </div>
-<script src="/static/js/group_help.js?v=ux-20261119-3"></script>
+<script src="/static/js/api.js?v=ux-20261121-2"></script>
+<script src="/static/js/session.js?v=ux-20261121-2"></script>
+<script src="/static/js/browser.js?v=ux-20261121-2"></script>
+<script src="/static/js/group_help.js?v=ux-20261121-2"></script>
 </body>
 </html>

@@ -56,7 +56,7 @@ def platform_name(platform: str) -> str:
 
 def get_all_platforms() -> List[Dict[str, Any]]:
     """平台名称与是否启用均来自同一装配表，前后端不再各自猜测。"""
-    capabilities = ("recommend", "search", "detail", "promotion", "authorization", "orders")
+    capabilities = ("recommend", "search", "detail", "promotion", "universal", "authorization", "orders")
     result = []
     for code in {**_ADAPTER_TYPES, **_ADAPTER_REGISTRY}:
         adapter = get_adapter(code)

@@ -17,20 +17,16 @@ from urllib.parse import urljoin, urlsplit
 
 from models.product import (
     detect_platform_signal,
+    extract_all_tokens,
     extract_jd_image_key,
     normalize_platform,
 )
 
+from .filters import is_host_match
+
 _EXPLICIT_YUAN_RE = re.compile(
     r"(?:(?:￥|¥|💰)\s*(\d+(?:\.\d{1,2})?)|(\d+(?:\.\d{1,2})?)\s*(?:元|r\b|R\b|块|亓))",
     re.IGNORECASE,
-)
-
-TOKEN_RE = re.compile(
-    r"(?:[￥¥$€₴£¢()（）!！](?=[0-9]*[A-Za-z])(?=[A-Za-z]*[0-9])[A-Za-z0-9]{6,22}[￥¥$€₴£¢()（）!！]"
-    r"|(?<![A-Za-z0-9:/._-])/(?=[0-9]*[A-Za-z])(?=[A-Za-z]*[0-9])[A-Za-z0-9]{8,16}/(?![A-Za-z0-9_.-])"
-    r"|\b[A-Za-z0-9_-]{24,28}-[A-Za-z0-9_]{16,22}\b"
-    r"|\b[A-Za-z0-9]{25,35}_[A-Za-z0-9]{15,22}\b)"
 )
 
 _RAW_URL_RE = re.compile(r"https?://[^\s<>\"'\]）】]+", re.IGNORECASE)
@@ -83,7 +79,7 @@ def _host_matches_any(url_str: str, excluded_hosts: Collection[str]) -> bool:
         return False
     if not host:
         return False
-    return any(host == dom or host.endswith("." + dom) for dom in excluded_hosts)
+    return any(is_host_match(host, dom) for dom in excluded_hosts)
 
 
 def extract_links_images_and_tokens(
@@ -166,11 +162,7 @@ def extract_links_images_and_tokens(
             if img_candidate not in images:
                 images.append(img_candidate)
 
-    tokens: List[str] = []
-    for m_tok in TOKEN_RE.finditer(html_lib.unescape(html_str)):
-        tok = m_tok.group(0).strip()
-        if tok not in tokens:
-            tokens.append(tok)
+    tokens = extract_all_tokens(html_lib.unescape(stripped_tags))
 
     return links, images, tokens
 

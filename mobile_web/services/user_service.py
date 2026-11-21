@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
-from config import AUTH_STATUS_TTL, AUTH_NEGATIVE_STATUS_TTL
+from config import AUTH_NEGATIVE_STATUS_TTL
 from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import normalize_platform
 from models.user import normalize_promoter_id
@@ -251,20 +251,6 @@ class UserService:
                 plat, uid, format_exc_summary(exc),
             )
             return {"status": "error", "platform": plat, "error_msg": "查询或保存授权状态失败，请稍后重试"}
-
-    def invalidate_promotion_authorization(self, uid: str, platform: str) -> bool:
-        """只用于平台转链明确拒绝授权，普通供应商失败不能撤销本地资格。"""
-        try:
-            return bool(self.repo.update_auth_status(
-                uid=uid, platform=normalize_platform(platform), is_authorized=False, bind=0,
-                extra={"identity": {}},
-            ))
-        except Exception as exc:
-            logger.warning(
-                "❌ 【渠道授权更新异常】标记用户转链授权失效状态时写入数据库失败 | 平台[%s] 用户[%s] 异常<%s> 排查方向<请检查MongoDB连接状态>",
-                platform, uid, format_exc_summary(exc),
-            )
-            return False
 
     def _assign_unmatched_orders(self, platform: str, identity: dict, uid: str) -> None:
         try:

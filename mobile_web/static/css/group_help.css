@@ -1420,6 +1420,37 @@ body {
   border: 1px solid #91caff;
 }
 
+.gh-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.gh-badge-poster {
+  background: #fff2e8;
+  color: #d4380d;
+  border: 1px solid #ffbb96;
+}
+
+.gh-badge-token {
+  background: #f0f5ff;
+  color: #1d39c4;
+  border: 1px solid #adc6ff;
+}
+
+@media (min-width: 768px) {
+  #group-help-app,
+  .gh-header,
+  .gh-bottom-bar,
+  .gh-sheet {
+    max-width: 760px;
+  }
+}
+
+
 
 
 

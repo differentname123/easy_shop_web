@@ -449,11 +449,8 @@ DEFAULT_CHANNEL_CONFIGS: List[ChannelConfig] = [
 
 def get_active_channels(
     channels: Optional[List[ChannelConfig]] = None,
-    run_all_tiers: bool = False,
-    cycle_num: int = 1,
 ) -> List[ChannelConfig]:
     """返回所有 `enabled=True` 的已启用频道。"""
-    _ = (run_all_tiers, cycle_num)
     pool = channels if channels is not None else DEFAULT_CHANNEL_CONFIGS
     return [ch for ch in pool if ch.enabled]
 

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""MongoDB 仓储基础设施：延迟连接、可注入数据库及可重试的索引初始化。"""
+"""MongoDB 仓储基础设施：延迟共享连接、可注入数据库及可重试的索引初始化。"""
 import threading
-from infrastructure.mongo import gen_db_object
-from infrastructure.logging_utils import format_exc_summary
-from config import logger
+
+from infrastructure.mongo import get_shared_db
+from infrastructure.logging_utils import format_exc_summary, get_app_logger
+
+logger = get_app_logger("base_repo")
 
 
 class _CollectionIndexState:
@@ -20,6 +22,7 @@ class BaseRepository:
     def __init__(self, db_instance=None):
         # 路由/服务装配不触发网络 I/O；真实连接和索引在首次仓储操作时获取。
         self._db = db_instance
+        self._owns_db = False
         self._connection_lock = threading.RLock()
         self._index_state = threading.local()
         self._collection_index_state = None
@@ -75,7 +78,7 @@ class BaseRepository:
         if self._db is None:
             with self._connection_lock:
                 if self._db is None:
-                    self._db = gen_db_object()
+                    self._db = get_shared_db()
         self._ensure_indexes()
         return self._db.get_collection(self.COLLECTION_NAME)
 

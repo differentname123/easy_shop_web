@@ -50,15 +50,22 @@ def install_offline_environment():
     atexit.register(directory.cleanup)
     config_path = Path(directory.name) / "config.json"
     config_path.write_text(json.dumps(_CONFIG), encoding="utf-8")
-    replacements = (
+    replacements = [
         patch.dict(os.environ, {
             "WEB_CONFIG_FILE": str(config_path),
             "WEB_LOG_DIR": "-",
             "MODEL_USAGE_JSON_PATH": str(Path(directory.name) / "model_usage.json"),
+            "MOBILE_WEB_OFFLINE_MODE": "1",
         }),
         patch("pymongo.MongoClient", new=_deny("MongoClient")),
         patch("requests.sessions.Session.request", new=_deny("platform HTTP")),
-    )
+    ]
+    try:
+        import httpx  # noqa: F401
+        replacements.append(patch("httpx.HTTPTransport.handle_request", new=_deny("httpx HTTP")))
+        replacements.append(patch("httpx.AsyncHTTPTransport.handle_async_request", new=_deny("httpx async HTTP")))
+    except ImportError:
+        pass
     for replacement in replacements:
         replacement.start()
         _PATCHES.append(replacement)

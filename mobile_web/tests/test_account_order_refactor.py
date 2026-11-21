@@ -41,12 +41,8 @@ class Adapter:
 @pytest.fixture(autouse=True)
 def isolated_state():
     promote_module.PROMOTION_CACHE.clear()
-    for state in (order_module._LAST_SYNC_TIMESTAMP, order_module._LAST_SYNC_ATTEMPT, order_module._SYNC_STATE):
-        state.clear()
     yield
     promote_module.PROMOTION_CACHE.clear()
-    for state in (order_module._LAST_SYNC_TIMESTAMP, order_module._LAST_SYNC_ATTEMPT, order_module._SYNC_STATE):
-        state.clear()
 
 
 @pytest.fixture
@@ -143,7 +139,7 @@ def test_promotion_cache_is_uid_scoped_and_defensively_copied(promotion):
 def test_command_helper_coupon_adaptive_and_long_link_suppression(promotion):
     from adapters.pdd_adapter import PddAdapter
 
-    text = promote_module.PromoteService.build_command_text("标题", "https://example.com", 10, 2)
+    text = build_command_text("标题", "https://example.com", 10, 2)
     assert "标题" in text and "10" in text and "https://example.com" in text
     assert "拼多多" not in text
     service, _, _ = promotion
@@ -290,26 +286,26 @@ def orders(monkeypatch):
 
 def test_busy_lock_returns_local_data_without_start_or_sdk(orders):
     service, adapter, repo = orders
-    assert order_module._platform_lock("future_shop").acquire(blocking=False)
+    assert service._platform_lock("future_shop").acquire(blocking=False)
     try:
         with patch.object(order_module.threading, "Thread") as thread:
-            result = service.sync_and_query_orders("future_shop", "u_a", days=0, force_sync=True)
+            result = service.sync_and_query_orders("future_shop", "u_a", days=0)
         assert result["status"] == "success"
         thread.assert_not_called()
         order_module.get_adapter.assert_not_called()
         adapter.fetch_increment_orders.assert_not_called()
         assert repo.query_user_orders.call_args.kwargs["start_timestamp"] is None
     finally:
-        order_module._platform_lock("future_shop").release()
+        service._platform_lock("future_shop").release()
 
 
 def test_thread_start_failure_releases_lock_and_preserves_success_watermark(orders):
     service, _, _ = orders
-    order_module._LAST_SYNC_TIMESTAMP["future_shop"] = 123
+    service._last_sync_timestamp["future_shop"] = 123
     with patch.object(order_module.threading, "Thread") as thread:
         thread.return_value.start.side_effect = RuntimeError("thread unavailable")
         result = service.sync_and_query_orders("future_shop", "u_a")
-    assert not order_module._platform_lock("future_shop").locked()
+    assert not service._platform_lock("future_shop").locked()
     assert result["data"]["last_sync_time"] == 123
     assert result["data"]["sync_status"] == "error"
     assert result["data"]["last_sync_attempt_time"] > 123
@@ -318,11 +314,11 @@ def test_thread_start_failure_releases_lock_and_preserves_success_watermark(orde
 def test_query_database_failure_returns_error_envelope(orders):
     service, _, repo = orders
     repo.query_user_orders.side_effect = RuntimeError("offline")
-    assert order_module._platform_lock("future_shop").acquire(blocking=False)
+    assert service._platform_lock("future_shop").acquire(blocking=False)
     try:
         result = service.sync_and_query_orders("future_shop", "u_a")
     finally:
-        order_module._platform_lock("future_shop").release()
+        service._platform_lock("future_shop").release()
     assert result["status"] == "error" and "data" not in result
 
 
@@ -348,7 +344,7 @@ def test_disabled_platforms_are_rejected_before_cached_results(promotion, user, 
 
 def test_api_days_zero_future_platform_syntax_and_force_protection(monkeypatch):
     # 包括路由首次导入的仓储构造也注入 mock，避免测试访问真实 Mongo。
-    with patch("repositories.base_repo.gen_db_object", return_value=MagicMock()):
+    with patch("repositories.base_repo.get_shared_db", return_value=MagicMock()):
         from api import order, user, promote
     from auth import get_current_uid
     app = FastAPI()
@@ -364,7 +360,7 @@ def test_api_days_zero_future_platform_syntax_and_force_protection(monkeypatch):
     with TestClient(app) as client:
         assert client.post("/api/order/sync_and_query", params={"days": 0, "platform": "future_shop", "force": True}).status_code == 200
         assert order_mock.call_args.kwargs["days"] == 0
-        assert order_mock.call_args.kwargs["force_sync"] is False
+        assert "force_sync" not in order_mock.call_args.kwargs
         assert client.get("/api/user/auth", params={"platform": "future_shop"}).status_code == 200
         assert client.post("/api/promote/convert", json={"platform": "future_shop", "goods_id": "sku-A"}).status_code == 200
         for bad in ("pdd.dot", "$bad", "Upper", "a" * 33):

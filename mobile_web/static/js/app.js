@@ -38,7 +38,6 @@
         shouldBlockDirectJump: browser.shouldBlockDirectJump,
       });
       let initialized = false;
-      let referralUid = '';
       let touchStartX = 0;
       let touchStartY = 0;
       let canPull = false;
@@ -62,7 +61,7 @@
       const ime = shop.createImeGuard();
       const homeSearchInputRef = ref(null);
       const boomSearchInputRef = ref(null);
-      feeds = shop.createFeeds({ ref, api, getUid: () => account.isLoggedIn.value ? account.uid.value : '',
+      feeds = shop.createFeeds({ ref, api,
         getScope: session.scope, showToast: browser.showToast });
       const resolveImeModelRef = key => {
         if (key === 'boom') return feeds.boomSearchKeyword;
@@ -70,15 +69,11 @@
         if (key === 'nickname') return account.formNickname;
         return feeds.homeSearchKeyword;
       };
-      const onImeCompositionStart = (key, event) => ime.onCompositionStart(key, event);
-      const onImeCompositionEnd = (key, event) => ime.onCompositionEnd(key, resolveImeModelRef(key), event);
-      const onImeInput = (key, event) => ime.onInput(key, resolveImeModelRef(key), event);
-      const onImeReset = (key, event, syncValue = false) => ime.onReset(key, resolveImeModelRef(key), event, syncValue);
       const isUiEvent = ev => Boolean(ev && typeof ev === 'object' && ('target' in ev || 'type' in ev || 'preventDefault' in ev));
       const smartSearch = async (sourceTab, fromUiEvent = false) => {
         const inputRef = sourceTab === 'boom' ? feeds.boomSearchKeyword : feeds.homeSearchKeyword;
         const inputEl = sourceTab === 'boom' ? boomSearchInputRef.value : homeSearchInputRef.value;
-        ime.syncElementToRef(sourceTab, inputRef, inputEl, fromUiEvent);
+        ime.syncElementToRef(inputRef, inputEl, fromUiEvent);
         if (inputEl && typeof inputEl.blur === 'function') {
           try { inputEl.blur(); } catch (_) {}
         }
@@ -86,7 +81,7 @@
         if (raw && typeof shop.extractInternalShareRoute === 'function') {
           const internalRoute = shop.extractInternalShareRoute(raw, global.location ? global.location.origin : '');
           if (internalRoute) {
-            ime.clearElementAndRef(sourceTab, inputRef, inputEl);
+            ime.clearElementAndRef(inputRef, inputEl);
             global.location.href = internalRoute;
             return;
           }
@@ -94,12 +89,12 @@
         if (raw && typeof shop.detectLinkOrToken === 'function') {
           const detected = shop.detectLinkOrToken(raw);
           if (detected.isEtbShareWithTitle && detected.keyword) {
-            ime.clearElementAndRef(sourceTab, inputRef, inputEl);
+            ime.clearElementAndRef(inputRef, inputEl);
             browser.showToast('已提取分享文案中的商品名称，正在为您搜索好价...');
             return jumpToHomeKeywordSearch(detected.keyword, 'taobao');
           }
           if (detected.isLinkOrToken) {
-            ime.clearElementAndRef(sourceTab, inputRef, inputEl);
+            ime.clearElementAndRef(inputRef, inputEl);
             currentTab.value = 'user';
             account.universalPlatform.value = 'auto';
             account.universalInput.value = raw;
@@ -113,20 +108,20 @@
       const onSearchHome = ev => smartSearch('home', isUiEvent(ev));
       const onSearchBoom = ev => smartSearch('boom', isUiEvent(ev));
       const clearHomeSearch = () => {
-        ime.clearElementAndRef('home', feeds.homeSearchKeyword, homeSearchInputRef.value);
+        ime.clearElementAndRef(feeds.homeSearchKeyword, homeSearchInputRef.value);
         return feeds.clearHomeSearch();
       };
       const clearBoomSearch = () => {
-        ime.clearElementAndRef('boom', feeds.boomSearchKeyword, boomSearchInputRef.value);
+        ime.clearElementAndRef(feeds.boomSearchKeyword, boomSearchInputRef.value);
         return feeds.clearBoomSearch();
       };
       const onSearchKeydownEnter = (sourceTab, event) => {
         const inputRef = sourceTab === 'boom' ? feeds.boomSearchKeyword : feeds.homeSearchKeyword;
         const inputEl = sourceTab === 'boom' ? boomSearchInputRef.value : homeSearchInputRef.value;
-        return ime.onEnterKeydown(sourceTab, inputRef, inputEl, () => smartSearch(sourceTab, false), event);
+        return ime.onEnterKeydown(inputRef, inputEl, () => smartSearch(sourceTab, false), event);
       };
       const onAuthInputEnter = (key, event) =>
-        ime.onEnterKeydown(key, resolveImeModelRef(key), event && event.target, () => account.handleRegisterOrLogin(), event);
+        ime.onEnterKeydown(resolveImeModelRef(key), event && event.target, () => account.handleRegisterOrLogin(), event);
       const restoreAccount = () => {
         if (walletRestore) return walletRestore;
         walletRestore = account.fetchUserInfo().then(restored => {
@@ -144,7 +139,7 @@
         } catch (_) {}
         if (currentTab.value === 'boom') feeds.saveBoomState();
         else feeds.saveSearchState();
-        const params = new URLSearchParams({ ...shop.goodsIdentity(item), uid: account.uid.value || referralUid });
+        const params = new URLSearchParams(shop.goodsIdentity(item));
         global.location.href = `/detail?${params}`;
       };
       const executeRefresh = async () => {
@@ -283,7 +278,6 @@
       };
       onMounted(async () => {
         const params = new URLSearchParams(global.location.search);
-        referralUid = params.get('uid') || '';
         const urlInvite = params.get('invite_code') || '';
         if (urlInvite && session.savePendingInvite) session.savePendingInvite(urlInvite);
         account.formInviteCode.value = urlInvite || (session.pendingInvite ? session.pendingInvite() : '') || '';
@@ -316,7 +310,6 @@
         global.addEventListener('focus', refreshAuthorization);
         global.document.addEventListener('visibilitychange', refreshAuthorization);
         global.addEventListener('scroll', handleGlobalScroll, { passive: true });
-        global.document.addEventListener('scroll', handleGlobalScroll, { passive: true });
         global.addEventListener('touchstart', onTouchStart, { passive: true });
         global.addEventListener('touchmove', onTouchMove, { passive: false });
         global.addEventListener('touchend', onTouchEnd, { passive: true });
@@ -329,7 +322,6 @@
         global.removeEventListener('focus', refreshAuthorization);
         global.document.removeEventListener('visibilitychange', refreshAuthorization);
         global.removeEventListener('scroll', handleGlobalScroll);
-        global.document.removeEventListener('scroll', handleGlobalScroll);
         global.removeEventListener('touchstart', onTouchStart);
         global.removeEventListener('touchmove', onTouchMove);
         global.removeEventListener('touchend', onTouchEnd);
@@ -364,7 +356,6 @@
       return {
         ...browser, ...account, ...feeds,
         homeSearchInputRef, boomSearchInputRef,
-        onImeCompositionStart, onImeCompositionEnd, onImeInput, onImeReset,
         onSearchKeydownEnter, onAuthInputEnter,
         onSearchHome, onSearchBoom, clearHomeSearch, clearBoomSearch,
         currentTab, isHeaderHidden, showBackToTop, scrollToTop,

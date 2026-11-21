@@ -14,6 +14,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set
 
+from models.product import extract_all_tokens
+
 from .base import BaseDealSource, FetchContext, FetchResult
 from .filters import (
     has_valid_detail_and_tutorial,
@@ -22,7 +24,6 @@ from .filters import (
 )
 from .http_client import DEFAULT_HEADERS, is_rate_limit_status, request_with_retry
 from .parsing import (
-    TOKEN_RE,
     build_deal_record,
     extract_first_price,
     utc_now_iso,
@@ -39,7 +40,7 @@ def _resolve_hdk_apikey(explicit_key: Optional[str] = None) -> str:
         key = str(get_settings().hdk_api_key or "").strip()
     except Exception:
         pass
-    return key or "test"
+    return key
 
 
 class HaodankuSource(BaseDealSource):
@@ -118,17 +119,15 @@ class HaodankuSource(BaseDealSource):
                 sub_msg = str(body.get("sub_msg") or body.get("msg") or "")
                 if any(kw in sub_msg for kw in ("频次", "频率", "超限", "上限", "频繁", "请稍后")):
                     rate_limited = True
-                if pages_crawled == 0 and (code != 200 and not isinstance(body.get("data"), list)):
-                    # 部分接口无数据时返回 code=0/2；仅限流或无有效页时判定处理
-                    if rate_limited:
-                        return FetchResult(
-                            status="error",
-                            http_status=last_http_status,
-                            request_url=req_url,
-                            elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
-                            rate_limited=True,
-                            detail_errors=[{"error": sub_msg or f"code={code}", "http_status": last_http_status}],
-                        )
+                if pages_crawled == 0 and not isinstance(body.get("data"), list) and rate_limited:
+                    return FetchResult(
+                        status="error",
+                        http_status=last_http_status,
+                        request_url=req_url,
+                        elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                        rate_limited=True,
+                        detail_errors=[{"error": sub_msg or f"code={code}", "http_status": last_http_status}],
+                    )
                 hit_cursor_end = pages_crawled > 0
                 break
 
@@ -209,7 +208,7 @@ class HaodankuSource(BaseDealSource):
                                 extracted_links.append({"label": "淘宝二合一", "url": f"https://uland.taobao.com/item/edetail?id={sub_item_id}", "item_id": sub_item_id, "type": "tb_encrypted_id", "platform": "taobao"})
                             else:
                                 extracted_links.append({"label": "加密ID", "url": sub_item_id, "type": "encrypted_id", "platform": platform_code or "unknown"})
-                        elif TOKEN_RE.search(sub_item_id):
+                        elif extract_all_tokens(sub_item_id):
                             extracted_tokens.append(sub_item_id)
 
                     coupon_url = str(sub.get("coupon_url") or "").strip()

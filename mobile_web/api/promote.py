@@ -5,11 +5,12 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from auth import get_optional_uid
+from api.user import user_service
 from pydantic import BaseModel, Field
 from services.promote_service import PromoteService
 
 router = APIRouter(prefix="/api/promote", tags=["推广生链与归因"])
-promote_service = PromoteService()
+promote_service = PromoteService(user_service=user_service)
 
 
 class ConvertRequest(BaseModel):

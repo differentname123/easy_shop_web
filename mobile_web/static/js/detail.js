@@ -36,7 +36,6 @@
       );
     };
     let requested = null;
-    let referralUid = '';
     let detailGeneration = 0;
     let identityRestore = null;
     let identitySnapshot = null;
@@ -309,7 +308,7 @@
       detailErrorMsg.value = '';
       isOffPromotion.value = false;
       try {
-        const params = new URLSearchParams({ ...requested, uid: uid.value || referralUid });
+        const params = new URLSearchParams(requested);
         const { ok, data } = await api.get(`/api/home/detail?${params}`);
         if (generation !== detailGeneration) return;
         if (ok && data.status === 'success' && data.data) {
@@ -537,7 +536,6 @@
       const incomingInvite = params.get('invite_code') || '';
       if (incomingInvite && session.savePendingInvite) session.savePendingInvite(incomingInvite);
       requested = shop.goodsIdentity({ goods_id: params.get('goods_id'), goods_sign: params.get('goods_sign'), platform: params.get('platform') });
-      referralUid = params.get('uid') || '';
       let hasSummary = false;
       try {
         const summary = JSON.parse(global.sessionStorage.getItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`) || 'null');

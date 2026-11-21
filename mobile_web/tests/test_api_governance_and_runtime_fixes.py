@@ -136,13 +136,21 @@ def test_stamp_universal_resolution_strict_four_state_contract():
     assert r_deg["resolution_kind"] == ResolutionKind.DEGRADED_PRODUCT
     assert r_deg["detail_lookup_failed"] is True
 
-    # 3) 真正的纯领券/活动会场链接（无单品证据、无限流失败）-> coupon_or_venue
+    # 3) 真正的纯领券/活动会场链接（必须具备正向 verified_coupon_or_venue=True 实证）-> coupon_or_venue
     r_cpn = stamp_universal_resolution(
         {"status": "success", "final_link": "https://u.jd.com/venue1", "product": None},
-        single_item_evidence=False,
+        verified_coupon_or_venue=True,
     )
     assert r_cpn["resolution_kind"] == ResolutionKind.COUPON_OR_VENUE
     assert not r_cpn.get("detail_lookup_failed")
+
+    # 4) Fail-Closed：无商品卡且缺少正向会场实证 (verified_coupon_or_venue=None) 时绝不能误标为纯券
+    r_unverified = stamp_universal_resolution(
+        {"status": "success", "final_link": "https://u.jd.com/unknown", "product": None},
+        single_item_evidence=False,
+    )
+    assert r_unverified["resolution_kind"] == ResolutionKind.DEGRADED_PRODUCT
+    assert r_unverified["detail_lookup_failed"] is True
 
 
 def test_upstream_health_monitoring_endpoint():
@@ -307,7 +315,7 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
 # ==============================================================================
 def test_taobao_token_variants_detected_even_when_default_plat_is_jd():
     from models.product import classify_user_input, extract_taobao_token_core
-    from mobile_web.scripts.run_deal_pool_scheduler import DealPoolCleaner, detect_candidate_platform
+    from services.deal_pool_cleaner import DealPoolCleaner, detect_candidate_platform
 
     samples = [
         "(kP89fb8d16p)/",
@@ -426,10 +434,8 @@ def test_universal_convert_then_detail_convert_never_inserts_null_ghost_product(
 # 5. 有界缓存、有界 JSONL 轮转、Windows 日志跨午夜滚动与闲鱼连接释放
 # ==============================================================================
 def test_bounded_anchor_cache_lru_and_bounded_jsonl_rotation():
-    from mobile_web.scripts.run_deal_pool_scheduler import (
-        DealPoolCleaner,
-        _append_bounded_jsonl_lines,
-    )
+    from repositories.deal_raw_pool_repo import _append_bounded_jsonl_lines
+    from services.deal_pool_cleaner import DealPoolCleaner
 
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
     cleaner.max_anchor_cache_size = 5
@@ -478,7 +484,7 @@ def test_ztk_order_query_recognizes_relay_status_throttle_and_pace_backlog():
     with patch("infrastructure.ztk_client.GLOBAL_QUOTA_PACER.pace", side_effect=QuotaPaceBacklogError("backlog")):
         res_backlog = client.query_orders(0, 600)
     assert res_backlog["status"] == "error"
-    assert res_backlog["error_code"] == "UPSTREAM_ERROR"
+    assert res_backlog["error_code"] == "QUOTA_PACE_BACKLOG"
 
 
 def test_upstream_health_report_skips_stale_snapshots_from_aggregation():
@@ -519,8 +525,9 @@ def test_upstream_health_report_skips_stale_snapshots_from_aggregation():
 
 
 def test_xianyu_round_pool_search_then_h5_never_self_deadlocks_and_ai_timeout_clean():
-    from mobile_web.scripts import publish_to_xianyu as pxy
-    from mobile_web.scripts import run_deal_pool_scheduler as sched
+    import logging
+    from infrastructure.xianyu import session as pxy
+    from services.deal_pool_cleaner import DealPoolCleaner
 
     # 1) 真实调用 _acquire_serial_browser_lock（仅桩掉 Playwright），验证同轮先 search_session 再 h5_detail_session 绝不自死锁
     class _FakePage:
@@ -609,15 +616,13 @@ def test_xianyu_round_pool_search_then_h5_never_self_deadlocks_and_ai_timeout_cl
             pxy._PROCESS_THREAD_LOCK.release()
 
     # 2) _call_ai_json_array 遇到 timed_out=True 时不抛 UnboundLocalError
-    cleaner = sched.DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    mock_ai = MagicMock(return_value={"status": "❌ 失败", "timed_out": True, "error_history": ["timeout"]})
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1, ai_caller=mock_ai)
     logged_warnings = []
-    with patch.object(
-        sched,
-        "generate_content",
-        return_value={"status": "❌ 失败", "timed_out": True, "error_history": ["timeout"]},
-    ), patch.object(sched.logger, "warning", side_effect=lambda msg, *args: logged_warnings.append(msg % args if args else msg)):
+    with patch.object(logging.getLogger("deal_pool_scheduler"), "warning", side_effect=lambda msg, *args: logged_warnings.append(msg % args if args else msg)):
         out = cleaner._call_ai_json_array("prompt", [{"id": 1}], "AI-Stage2")
     assert out == []
+    assert mock_ai.call_count == 1
     assert all("resp_text" not in w for w in logged_warnings)
 
 
@@ -628,7 +633,7 @@ def test_simplified_robustness_fail_closed_taobao_share_code_prefetch_and_order_
     from infrastructure.ztk_client import ZtkClient
     from models.product import ProductRef, classify_user_input
     from services.detail_prefetch import DetailPrefetcher, RATE_LIMIT_COOLDOWN_SECONDS
-    from services.order_service import OrderService, _LAST_SYNC_ATTEMPT, _SYNC_STATE
+    from services.order_service import OrderService
     from tests.test_detail_prefetch import Clock, MemoryService, idle, product
 
     # 1. Standalone share-code / hardware model keywords are NOT classified as links/tokens
@@ -682,14 +687,14 @@ def test_simplified_robustness_fail_closed_taobao_share_code_prefetch_and_order_
         worker.stop()
 
     # 4. OrderService surfaces real cooldown seconds remaining while keeping 180s interval locked
-    _LAST_SYNC_ATTEMPT["pdd"] = time.time() - 40
-    _SYNC_STATE["pdd"] = {"status": "success", "error": "", "synced_count": 1}
     o_repo = MagicMock()
     o_repo.query_user_orders.return_value = {"status": "success", "orders": [], "summary": {}}
-    osvc = OrderService(order_repo=o_repo)
+    osvc = OrderService(order_repo=o_repo, sync_repo=MagicMock(get_state=MagicMock(return_value=None)))
+    osvc._last_sync_attempt["pdd"] = time.time() - 40
+    osvc._sync_state["pdd"] = {"status": "success", "error": "", "synced_count": 1}
     with patch("services.order_service.require_adapter", return_value=SimpleNamespace(active=True, platform_name="拼多多", capabilities={"orders": True})), \
          patch("services.order_service.get_adapter", return_value=SimpleNamespace(active=True, platform_name="拼多多", capabilities={"orders": True})):
-        ores = osvc.sync_and_query_orders("pdd", "u_cool_test", force_sync=True)
+        ores = osvc.sync_and_query_orders("pdd", "u_cool_test")
     assert ores["status"] == "success"
     assert 130 <= ores["data"]["sync_cooldown_remaining"] <= 145
 
@@ -697,9 +702,9 @@ def test_simplified_robustness_fail_closed_taobao_share_code_prefetch_and_order_
 def test_stage3_jd_lane_count_scales_with_ztk_keys():
     """验证 Stage 3 京东车道并发上限受 ZTK appkey 数量约束，防止 20 线程自伤踩踏，同时不挤占淘/拼并发。"""
     import threading
-    from mobile_web.scripts import run_deal_pool_scheduler as sched
+    from services.deal_pool_cleaner import DealPoolCleaner
 
-    cleaner = sched.DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=20)
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=20)
     cleaner.adapters["jd"] = SimpleNamespace(client=SimpleNamespace(appkey_list=("k1", "k2", "k3")))
 
     lock = threading.Lock()
@@ -744,6 +749,51 @@ def test_stage3_jd_lane_count_scales_with_ztk_keys():
     ]
     cleaner.run_stage3_concurrent_conversions(pure_jd, quiet_sub_logs=True)
     assert 1 <= max_jd <= 3
+
+
+def test_universal_convert_with_logged_in_uid_seeds_public_detail_cache(monkeypatch):
+    from cache import clear_all_caches, get_cached_product_detail
+    from models.product import ProductRef
+    from services.promote_service import PromoteService
+
+    clear_all_caches()
+    product_card = {
+        "platform": "taobao",
+        "goods_id": "66778899",
+        "goods_sign": "sign_tb_66778899",
+        "name": "维达超韧抽纸",
+        "price": 29.9,
+        "original_price": 39.9,
+        "image_url": "https://img.alicdn.com/test.jpg",
+        "carousel_images": ["https://img.alicdn.com/test.jpg"],
+    }
+    fake_adapter = SimpleNamespace(
+        active=True,
+        platform_name="淘宝",
+        requires_authorized_promotion=False,
+        requires_numeric_promoter_id=False,
+        resolve_and_convert_universal=lambda *a, **k: {
+            "status": "success",
+            "final_link": "https://s.click.taobao.com/demo",
+            "goods_id": "66778899",
+            "goods_sign": "sign_tb_66778899",
+            "title": "维达超韧抽纸",
+            "price": 29.9,
+            "coupon_amount": 0.0,
+            "product": product_card,
+        },
+        build_command_text=lambda *a, **kw: "口令",
+    )
+    monkeypatch.setattr("services.promote_service.get_adapter", lambda p: fake_adapter)
+    svc = PromoteService(product_repo=MagicMock(), user_service=MagicMock())
+    res = svc.universal_convert("https://m.tb.cn/h.demo123", platform="taobao", uid="u_1234abcd")
+    assert res["status"] == "success"
+    cached_public = get_cached_product_detail(
+        ProductRef("taobao", "66778899", "sign_tb_66778899"),
+        uid=None,
+    )
+    assert cached_public is not None
+    assert cached_public[1]["data"]["name"] == "维达超韧抽纸"
 
 
 
