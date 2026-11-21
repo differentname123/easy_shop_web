@@ -119,9 +119,12 @@ def build_clean_original_copywriting(
     raw_blocks: List[str] = []
     doc_foreign_spans: List[str] = []
     for nd in ordered_docs:
-        tut = str(nd.get("tutorial_text") or "").strip()
-        ttl = str(nd.get("title") or "").strip()
-        block = tut if tut else ttl
+        tut = normalize_inline_spaces(str(nd.get("tutorial_text") or "")).strip()
+        ttl = normalize_inline_spaces(str(nd.get("title") or "")).strip()
+        if tut and ttl and ttl not in tut:
+            block = f"{ttl}\n{tut}"
+        else:
+            block = tut if tut else ttl
         if block:
             raw_blocks.append(block)
         for lk in nd.get("extracted_links") or []:

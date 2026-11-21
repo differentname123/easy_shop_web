@@ -82,6 +82,18 @@ def _host_matches_any(url_str: str, excluded_hosts: Collection[str]) -> bool:
     return any(is_host_match(host, dom) for dom in excluded_hosts)
 
 
+def _is_truncated_url_display(text: str, full_url: str) -> bool:
+    """判断 <a> 锚点展示文本是否为同一 href 完整 URL 的省略/截断前缀。"""
+    cleaned = re.sub(r"\s+", "", html_lib.unescape(str(text or ""))).rstrip("….")
+    target = str(full_url or "").strip()
+    return bool(
+        cleaned.lower().startswith(("http://", "https://"))
+        and len(cleaned) >= 12
+        and len(target) > len(cleaned)
+        and target.startswith(cleaned)
+    )
+
+
 def extract_links_images_and_tokens(
     raw_html: str,
     base_url: str = "",
@@ -128,9 +140,22 @@ def extract_links_images_and_tokens(
                 "platform": detect_platform_signal(full_url) or detect_platform_signal(anchor_text) or "unknown",
             })
 
-    stripped_tags = re.sub(r"<[^>]+>", " ", html_str)
+    def _drop_truncated_anchor_text(match: re.Match) -> str:
+        attrs, inner = match.group(1), match.group(2)
+        href_m = re.search(r'href=["\']([^"\']+)["\']', attrs, re.I)
+        if href_m:
+            raw_href = html_lib.unescape(href_m.group(1)).strip()
+            if raw_href and not raw_href.startswith(("javascript:", "#", "mailto:")):
+                full_url = urljoin(base_url, raw_href) if base_url else raw_href
+                a_text = strip_html_tags(inner)
+                if _is_truncated_url_display(a_text, full_url) or _is_truncated_url_display(a_text, raw_href):
+                    return " "
+        return inner
+
+    raw_url_html = re.sub(r"<a\b([^>]*)>(.*?)</a>", _drop_truncated_anchor_text, html_str, flags=re.S | re.I)
+    stripped_tags = re.sub(r"<[^>]+>", " ", raw_url_html)
     for m_url in _RAW_URL_RE.finditer(html_lib.unescape(stripped_tags)):
-        u = m_url.group(0).rstrip(".,;，。；!！")
+        u = m_url.group(0).rstrip(".,;，。；!！…")
         if excl and _host_matches_any(u, excl):
             continue
         if u not in seen_urls:
@@ -192,6 +217,8 @@ def html_to_tutorial_text(raw_html: str, base_url: str = "", *, keep_images: boo
             return full_url
         if full_url in text or raw_href in text:
             return text
+        if _is_truncated_url_display(text, full_url) or _is_truncated_url_display(text, raw_href):
+            return full_url
         return f"{text} ({full_url})"
 
     def _replace_img(match: re.Match) -> str:

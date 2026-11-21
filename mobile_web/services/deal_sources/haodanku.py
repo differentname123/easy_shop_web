@@ -81,9 +81,10 @@ class HaodankuSource(BaseDealSource):
         t0 = time.perf_counter()
 
         while pages_crawled < max_pages:
+            safe_url = f"{self.BASE_URL}?label_id={label_id}&min_size={page_size}&min_id={min_id}"
             req_url = f"{self.BASE_URL}?apikey={eff_key}&label_id={label_id}&min_size={page_size}&min_id={min_id}"
             if not primary_req_url:
-                primary_req_url = req_url
+                primary_req_url = safe_url
 
             resp = None
             try:
@@ -96,7 +97,7 @@ class HaodankuSource(BaseDealSource):
                         return FetchResult(
                             status="error",
                             http_status=resp.status_code,
-                            request_url=req_url,
+                            request_url=safe_url,
                             elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
                             rate_limited=rate_limited,
                             detail_errors=[{"error": f"HTTP {resp.status_code}", "http_status": resp.status_code}],
@@ -108,7 +109,7 @@ class HaodankuSource(BaseDealSource):
                     return FetchResult(
                         status="error",
                         http_status=getattr(resp, "status_code", None),
-                        request_url=req_url,
+                        request_url=safe_url,
                         elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
                         detail_errors=[{"error": str(exc), "error_type": type(exc).__name__}],
                     )
@@ -123,7 +124,7 @@ class HaodankuSource(BaseDealSource):
                     return FetchResult(
                         status="error",
                         http_status=last_http_status,
-                        request_url=req_url,
+                        request_url=safe_url,
                         elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
                         rate_limited=True,
                         detail_errors=[{"error": sub_msg or f"code={code}", "http_status": last_http_status}],
@@ -182,6 +183,7 @@ class HaodankuSource(BaseDealSource):
                                 img_list.append(c_img)
 
                 content_lines: List[str] = []
+                plain_text_lines: List[str] = []
                 extracted_links: List[Dict[str, Any]] = []
                 extracted_tokens: List[str] = []
 
@@ -191,37 +193,62 @@ class HaodankuSource(BaseDealSource):
                     c_text = str(sub.get("content") or "").strip()
                     if c_text:
                         content_lines.append(c_text)
+                        plain_text_lines.append(c_text)
 
                     sub_item_id = str(sub.get("item_id") or "").strip()
                     if sub_item_id:
                         if sub_item_id.startswith(("http://", "https://")):
                             extracted_links.append({"label": "商品/活动链接", "url": sub_item_id, "type": "item_url", "platform": platform_code or "unknown"})
+                            content_lines.append(sub_item_id)
                         elif sub_item_id.isdigit():
                             if platform_code == "taobao":
-                                extracted_links.append({"label": "淘宝商品", "url": f"https://item.taobao.com/item.htm?id={sub_item_id}", "type": "tb_numeric", "platform": "taobao"})
+                                target_u = f"https://item.taobao.com/item.htm?id={sub_item_id}"
+                                extracted_links.append({"label": "淘宝商品", "url": target_u, "type": "tb_numeric", "platform": "taobao"})
                             elif platform_code == "jd":
-                                extracted_links.append({"label": "京东商品", "url": f"https://item.jd.com/{sub_item_id}.html", "type": "jd_numeric", "platform": "jd"})
+                                target_u = f"https://item.jd.com/{sub_item_id}.html"
+                                extracted_links.append({"label": "京东商品", "url": target_u, "type": "jd_numeric", "platform": "jd"})
                             else:
-                                extracted_links.append({"label": "商品ID", "url": sub_item_id, "type": "item_id", "platform": platform_code or "unknown"})
-                        elif re.match(r"^[A-Za-z0-9_-]{8,}$", sub_item_id):
+                                target_u = sub_item_id
+                                extracted_links.append({"label": "商品ID", "url": target_u, "type": "item_id", "platform": platform_code or "unknown"})
+                            content_lines.append(target_u)
+                        elif (
+                            platform_code == "taobao"
+                            and len(sub_item_id) == 11
+                            and sub_item_id.isalnum()
+                            and any(c.isalpha() for c in sub_item_id)
+                            and any(c.isdigit() for c in sub_item_id)
+                        ):
+                            tok_wrapped = f"￥{sub_item_id}￥"
+                            extracted_tokens.append(tok_wrapped)
+                            content_lines.append(tok_wrapped)
+                        elif (
+                            (platform_code == "taobao" and re.match(r"^[A-Za-z0-9_-]{20,}$", sub_item_id))
+                            or (platform_code != "taobao" and re.match(r"^[A-Za-z0-9_-]{8,}$", sub_item_id))
+                        ):
                             if platform_code == "taobao":
-                                extracted_links.append({"label": "淘宝二合一", "url": f"https://uland.taobao.com/item/edetail?id={sub_item_id}", "item_id": sub_item_id, "type": "tb_encrypted_id", "platform": "taobao"})
+                                ed_url = f"https://uland.taobao.com/item/edetail?id={sub_item_id}"
+                                extracted_links.append({"label": "淘宝二合一", "url": ed_url, "item_id": sub_item_id, "type": "tb_encrypted_id", "platform": "taobao"})
+                                content_lines.append(ed_url)
                             else:
                                 extracted_links.append({"label": "加密ID", "url": sub_item_id, "type": "encrypted_id", "platform": platform_code or "unknown"})
+                                content_lines.append(sub_item_id)
                         elif extract_all_tokens(sub_item_id):
                             extracted_tokens.append(sub_item_id)
+                            content_lines.append(sub_item_id)
 
                     coupon_url = str(sub.get("coupon_url") or "").strip()
                     if coupon_url.startswith(("http://", "https://")):
                         extracted_links.append({"label": "优惠券", "url": coupon_url, "type": "coupon_url", "platform": platform_code or "unknown"})
+                        content_lines.append(coupon_url)
 
                 if not extracted_links and not extracted_tokens:
                     skipped_no_detail += 1
                     continue
 
                 tutorial_text = "\n".join(content_lines).strip()
+                plain_tutorial_text = "\n".join(plain_text_lines).strip()
                 title = ""
-                for line in content_lines:
+                for line in plain_text_lines:
                     clean_line = re.sub(
                         r"^(?:豪车❗|速[‼️!]|先领券|拍下|\d+亓[‼️!]?|特价|折\d+.*?[‼️!]|Bug[‼️!]|🎀速[‼️!]|🎀|⚠️速[‼️!])\s*",
                         "",
@@ -230,12 +257,12 @@ class HaodankuSource(BaseDealSource):
                     if len(clean_line) >= 4 and not clean_line.startswith(("http", "①", "②", "③", "1、", "2、", "3、", "---")):
                         title = clean_line
                         break
-                if not title and content_lines:
-                    title = content_lines[0]
+                if not title and plain_text_lines:
+                    title = plain_text_lines[0]
                 if not title:
                     title = f"{platform_name}精选好价商品"
 
-                price, price_text = extract_first_price("", title, tutorial_text)
+                price, price_text = extract_first_price("", title, plain_tutorial_text)
 
                 hot_metrics: Dict[str, Any] = {
                     "wire_id": wire_id,

@@ -71,6 +71,17 @@ def main(argv=None):
         return 1
 
     if args.check:
+        if settings.taobao_enabled and settings.ztk_appkey and settings.ztk_sid:
+            has_4part_pid = bool(
+                settings.tb_channel_pid
+                or (settings.tb_pid_prefix and (settings.tb_channel_adzone_id or settings.tb_adzone_id))
+                or (settings.tb_pid.startswith("mm_") and len(settings.tb_pid.split("_")) == 4)
+            )
+            if not has_4part_pid:
+                print(
+                    "配置告警：已启用淘宝并配置折淘客，但缺少 4 段式 PID（请配置 taobao_channel_pid 或 taobao_pid_prefix），淘宝万能转链与渠道转链将不可用。",
+                    file=sys.stderr,
+                )
         print("配置校验通过；未连接 MongoDB 或外部平台。")
         return 0
 

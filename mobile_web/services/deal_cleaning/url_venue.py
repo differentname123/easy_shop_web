@@ -366,11 +366,31 @@ def unwrap_to_official_public_venue_url(
     return None
 
 
+def is_shop_homepage_url(raw_input: Any) -> bool:
+    """判断 URL 是否为京东/淘宝店铺首页（绝不当作独立优惠券按钮或引发 Fail-Closed 拦截）。"""
+    s = str(raw_input or "").strip().lower()
+    if not s.startswith(("http://", "https://")):
+        return False
+    try:
+        parts = urlsplit(s)
+        host = (parts.hostname or "").lower()
+        path = parts.path or ""
+    except Exception:
+        return False
+    return bool(
+        (host == "shop.m.jd.com" and path == "/mshop/gethomepage")
+        or (host == "store.taobao.com" and path == "/shop/view_shop.htm")
+    )
+
+
 def is_explicit_coupon_target(c: Dict[str, Any]) -> bool:
     """判定目标是否为原始线报中的优惠券/活动候选链接。"""
     if not isinstance(c, dict):
         return False
     clean_input = str(c.get("clean_input") or "").strip().lower()
+    promo_link = str(c.get("my_promo_link") or "").strip().lower()
+    if is_shop_homepage_url(clean_input) or is_shop_homepage_url(promo_link):
+        return False
     host, path = "", ""
     if clean_input.startswith(("http://", "https://")):
         try:
@@ -379,10 +399,6 @@ def is_explicit_coupon_target(c: Dict[str, Any]) -> bool:
             path = parts.path or ""
         except Exception:
             host, path = "", ""
-        if host == "shop.m.jd.com" and path == "/mshop/gethomepage":
-            return False
-        if host == "store.taobao.com" and path == "/shop/view_shop.htm":
-            return False
     if str(c.get("text_role_hint") or "").strip().lower() == "coupon_candidate":
         return True
     if str(c.get("convert_status") or "").strip().lower() == "coupon_or_activity":

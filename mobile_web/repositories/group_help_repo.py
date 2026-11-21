@@ -737,7 +737,7 @@ class GroupHelpRepository(BaseRepository):
         if not existing or str(existing.get("source") or "") != str(source or ""):
             return None
         if str(existing.get("group_status") or "") != GROUP_STATUS_ACTIVE:
-            return existing
+            return None
         current_ts = float(now if now is not None else time.time())
         update_fields: Dict[str, Any] = {"updated_at": current_ts}
         if new_status == GROUP_STATUS_FULL:
@@ -746,7 +746,7 @@ class GroupHelpRepository(BaseRepository):
         elif new_status == GROUP_STATUS_EXPIRED:
             update_fields["group_status"] = GROUP_STATUS_EXPIRED
         else:
-            return existing
+            return None
         return self.col.find_one_and_update(
             {"group_order_id": gid, "source": str(source)},
             {"$set": update_fields},

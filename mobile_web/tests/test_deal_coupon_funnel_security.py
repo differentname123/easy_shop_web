@@ -1311,5 +1311,121 @@ def test_transient_degraded_retry_and_cross_platform_consistency():
     assert cross_map["tip_cross_mix"]["error_code"] == ERR_AI2_COUPON_FAILED_OR_DROPPED
 
 
+def test_shop_homepage_exclusion_empty_coupon_step_rewrite_score_clamp_and_config_error_retry():
+    """验证店铺首页不入 coupon_links、无券时改写上方【领券】假提示、剔除隐匿数字SKU占位符、分项评分钳位及 CONFIG_ERROR 可重试。"""
+    from models.deal_constants import CLEAN_STAGE_NEED_CONVERT, ERR_ADAPTER_CONFIG_ERROR, ERR_JD_NUMERIC_SKU
+
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+
+    cleaner.adapters = {
+        "jd": SimpleNamespace(
+            resolve_and_convert_universal=lambda inp: (
+                {"status": "error", "error_code": "CONFIG_ERROR", "error_msg": "缺少推广位"}
+                if "cfg_err" in inp
+                else (
+                    {"status": "error", "error_code": "UNSUPPORTED_JD_NUMERIC_SKU", "error_msg": "不支持数字id"}
+                    if "item.jd.com/" in inp
+                    else {
+                        "status": "success",
+                        "goods_id": "JD_MAIN_SHOP",
+                        "goods_sign": "JD_MAIN_SHOP",
+                        "final_link": "https://u.jd.com/main_shop",
+                        "promotion_token": "！MAIN！",
+                        "product": {
+                            "platform": "jd",
+                            "product_id": "JD_MAIN_SHOP",
+                            "name": "维达抽纸24包",
+                            "price": 29.9,
+                            "original_price": 39.9,
+                            "activity_price": 29.9,
+                            "coupon_amount": 0.0,
+                            "mall_name": "维达自营店",
+                        },
+                    }
+                )
+            )
+        ),
+        "taobao": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+    }
+
+    # 1. CONFIG_ERROR 必须进入 retry_pending 而非永久 FAILED
+    s3_out, _ = cleaner.process_convert_unit(
+        [{
+            "source_site": "guangdiu",
+            "source_channel": "latest",
+            "source_item_id": "tip_cfg_err",
+            "platform": "jd",
+            "title": "测试配置重试",
+            "clean_retry_count": 0,
+            "ai_stage1_result": {
+                "main_tip_id": "tip_cfg_err",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["tip_cfg_err"],
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": "https://u.jd.com/cfg_err", "platform": "jd", "text_role_hint": "main_candidate"}
+                ],
+            },
+        }],
+        shared_active_products={},
+        quiet_sub_logs=True,
+    )
+    assert s3_out[0]["status"] == "retry_pending"
+    assert s3_out[0]["clean_stage"] == CLEAN_STAGE_NEED_CONVERT
+    assert s3_out[0]["error_code"] == ERR_ADAPTER_CONFIG_ERROR
+
+    # 2. 店铺首页排除出 coupon_links + 无券步文改写 + 隐匿数字SKU占位符移除 + 负分项钳位
+    captured_combined = []
+    cleaner.run_ai_stage1_batch = lambda *_a, **_kw: {
+        "tip_shop_and_rewrite": {
+            "main_tip_id": "tip_shop_and_rewrite",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["tip_shop_and_rewrite"],
+            "combined_raw_text": "先看数字 [#L1] 进店 [#L2] 买抽纸 [#L3]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": "https://item.jd.com/10001.html", "clean_input": "https://item.jd.com/10001.html", "platform": "jd", "text_role_hint": "main_candidate"},
+                {"link_id": "L2", "raw_span": "https://shop.m.jd.com/mshop/gethomepage?venderId=123", "clean_input": "https://shop.m.jd.com/mshop/gethomepage?venderId=123", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L3", "raw_span": "https://u.jd.com/main_item", "clean_input": "https://u.jd.com/main_item", "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        }
+    }
+
+    def _mock_ai2(stage2_inputs, *_a, **_kw):
+        captured_combined.append(stage2_inputs[0]["combined_raw_text"])
+        return {
+            "tip_shop_and_rewrite": {
+                "main_tip_id": "tip_shop_and_rewrite",
+                "is_valid_deal": True,
+                "main_link_id": "L3",
+                "deal_price": 29.9,
+                "coupon_links": [{"link_id": "L2", "label": "店铺首页"}],
+                "tutorial_steps": ["1. 先在上方【领券】处领取会员券", "2. 下单实付29.9元"],
+                "quality_score": 82,
+                "score_breakdown": {"match_score": -5, "completeness_score": 45, "price_clarity_score": 15, "tutorial_and_image_score": 15},
+            }
+        }
+
+    cleaner.run_ai_stage2_batch = _mock_ai2
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+    res = cleaner.clean_batch_records(
+        [{"source_site": "guangdiu", "source_channel": "latest", "source_item_id": "tip_shop_and_rewrite", "platform": "jd", "title": "维达抽纸", "tutorial_text": "维达抽纸", "extracted_links": [], "extracted_tokens": []}],
+        mock_col,
+        shared_active_products={},
+        quiet_sub_logs=True,
+    )
+    assert res[0]["status"] == "success"
+    assert "[#L1]" not in captured_combined[0]
+    di = res[0]["product_doc"]["deal_info"]
+    assert di["coupon_links"] == []
+    assert "上方【领券】" not in di["tutorial_steps"][0]
+    assert "通过下方购买链接领取会员券" in di["tutorial_steps"][0]
+    assert di["score_breakdown"]["match_score"] == 0
+    assert di["score_breakdown"]["completeness_score"] == 30
+
+
 
 

@@ -153,7 +153,7 @@ def test_hdk_multi_key_failover():
 
 
 def test_jd_adapter_hdk_multi_key_round_robin():
-    """验证 JdAdapter 读取 hdk_api_key_list 并进行多 Key 轮询负载均衡。"""
+    """验证 JdAdapter 读取 hdk_api_key_list 并对健康推广转链通道进行多 Key 轮询负载均衡。"""
     settings = SimpleNamespace(
         jd_enabled=True,
         jd_union_id="2035679405",
@@ -168,17 +168,17 @@ def test_jd_adapter_hdk_multi_key_round_robin():
 
     call_keys = []
 
-    def _mock_get(url, params=None, **kw):
-        k = params.get("apikey")
-        call_keys.append(k)
-        return _mock_response(200, {"code": 200, "data": [{"skuid": "1", "goodsname": "纸巾"}]})
+    def _mock_post(url, params=None, data=None, **kw):
+        call_keys.append((data or {}).get("apikey"))
+        return _mock_response(200, {"code": 200, "data": {"short_url": "https://u.jd.com/ok"}})
 
-    adapter.hdk.http.get = _mock_get
+    adapter.hdk.http.post = _mock_post
 
-    # 连续调用 3 次 search，多 key 均匀轮询分摊配额 (Round Robin)
-    adapter.search_goods("纸巾")
-    adapter.search_goods("纸巾")
-    adapter.search_goods("纸巾")
+    enc_id = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
+    # 连续调用 3 次转链，多 key 均匀轮询分摊配额 (Round Robin)
+    adapter.convert_promotion_url(enc_id, promoter_id="88")
+    adapter.convert_promotion_url(enc_id, promoter_id="88")
+    adapter.convert_promotion_url(enc_id, promoter_id="88")
     assert call_keys == ["hdk_k1", "hdk_k2", "hdk_k3"]
 
 
@@ -271,48 +271,43 @@ def test_hdk_and_ztk_data_contract_equivalence():
 # 3. JdAdapter 多供应商链执行与主备降级集成验证
 # ----------------------------------------------------------------------
 
-def test_jd_adapter_search_prefers_hdk():
-    """HDK 挂载后，search 首选 HDK (高配额+全网搜索)；若 HDK 成功则直接返回。"""
+def test_jd_adapter_search_uses_ztk_directly_without_hdk_search():
+    """attach_hdk 不再挂载已被京东拦截的 hdk_jd_search，京东搜索直走折淘客。"""
     hdk_mock = Mock()
-    hdk_mock.search_goods.return_value = {
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+    ztk_client.search_goods.return_value = {
         "status": "success",
         "data": [
             {
-                "skuid": "10002",
-                "itemid": "enc_2",
-                "goodsname": "好单库首选商品",
-                "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/hdk.jpg",
-                "itemprice": "29.90",
+                "tao_id": "enc_2",
+                "title": "折淘客直连商品",
+                "pict_url": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/ztk_search.jpg",
+                "size": "29.90",
+                "quanhou_jiage": "29.90",
             }
         ],
         "total_count": 1,
-        "page": 1,
-        "page_size": 20,
         "has_more": False,
     }
-    ztk_client = Mock()
     adapter = JdAdapter(
         settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
         client=ztk_client,
         hdk_client=hdk_mock,
     )
+    assert not adapter._has_extra_providers("search")
     res = adapter.search_goods("抽纸")
 
     assert res["status"] == "success"
-    assert res["_provider"] == "hdk_jd_search"
-    assert res["data"][0]["name"] == "好单库首选商品"
-    # ZTK 未被调用（节省 ZTK 选品库额度）
-    ztk_client.search_goods.assert_not_called()
+    assert res["_provider"] == "ztk_jd_quanwang"
+    assert res["data"][0]["name"] == "折淘客直连商品"
+    hdk_mock.search_goods.assert_not_called()
+    ztk_client.search_goods.assert_called_once()
 
 
-def test_jd_adapter_detail_fails_over_to_ztk_on_hdk_rate_limit():
-    """HDK 详情触发 RATE_LIMIT 时，自动无缝降级到 ZTK 详情。"""
+def test_jd_adapter_detail_uses_ztk_directly_and_disables_blind_prefetch():
+    """attach_hdk 不挂载 hdk_jd_detail：详情直走 ZTK，且保留 can_prefetch_detail() == False 护栏以防后台预取击穿 ZTK 配额。"""
     hdk_mock = Mock()
-    hdk_mock.get_goods_detail.return_value = {
-        "status": "error",
-        "error_code": "RATE_LIMIT",
-        "error_msg": "好单库频次超限",
-    }
     ztk_client = Mock()
     ztk_client.appkey_list = ("ztk_key",)
     ztk_client.get_goods_detail.return_value = {
@@ -320,7 +315,7 @@ def test_jd_adapter_detail_fails_over_to_ztk_on_hdk_rate_limit():
         "data": [
             {
                 "tao_id": "enc_target",
-                "title": "ZTK兜底商品",
+                "title": "ZTK直连详情商品",
                 "wlprice": "19.90",
                 "pict_url": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/ztk.jpg",
             }
@@ -331,13 +326,14 @@ def test_jd_adapter_detail_fails_over_to_ztk_on_hdk_rate_limit():
         client=ztk_client,
         hdk_client=hdk_mock,
     )
+    assert not adapter._has_extra_providers("detail")
+    assert adapter.can_prefetch_detail(ProductRef("jd", "img_1", "ENC_1234567890123456789012345678901234567890")) is False
     res = adapter.get_goods_detail("enc_target", goods_sign="enc_target")
 
     assert res["status"] == "success"
     assert res["_provider"] == "ztk_jd_detail"
-    assert res["data"]["name"] == "ZTK兜底商品"
-    # 验证 HDK 被调用后失败，随后 ZTK 被调用
-    hdk_mock.get_goods_detail.assert_called_once()
+    assert res["data"]["name"] == "ZTK直连详情商品"
+    hdk_mock.get_goods_detail.assert_not_called()
     ztk_client.get_goods_detail.assert_called_once()
 
 
@@ -408,7 +404,7 @@ def test_jd_adapter_promotion_fails_over_to_ztk_on_hdk_error():
 
 
 def test_jd_adapter_universal_resolve_via_hdk():
-    """验证真实契约：resolve_short_url 仅返回 {dest_url, is_venue, sku_id}，随后调用 get_goods_detail 获取商品卡片与转链。"""
+    """验证真实契约：HDK 解包 u.jd.com 拿到加密 sku_id 后，通过 ZTK 详情反查卡片并由 HDK 原生转链成功。"""
     enc_id = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
     hdk_mock = Mock()
     hdk_mock.resolve_short_url.return_value = {
@@ -419,19 +415,6 @@ def test_jd_adapter_universal_resolve_via_hdk():
             "sku_id": enc_id,
         },
     }
-    hdk_mock.get_goods_detail.return_value = {
-        "status": "success",
-        "data": {
-            "skuid": "10003",
-            "itemid": enc_id,
-            "goodsname": "维达超韧抽纸3层100抽*24包",
-            "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/vinda.jpg",
-            "itemprice": "39.90",
-            "itemendprice": "29.90",
-            "couponmoney": "10.00",
-            "couponurl": "https://coupon.jd.com/vinda_coupon",
-        },
-    }
     hdk_mock.convert_promotion_link.return_value = {
         "status": "success",
         "short_url": "https://u.jd.com/vinda_promoted",
@@ -440,6 +423,20 @@ def test_jd_adapter_universal_resolve_via_hdk():
         "union_id": "2035679405",
     }
     ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+    ztk_client.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [{
+            "skuId": "10003",
+            "tao_id": enc_id,
+            "title": "维达超韧抽纸3层100抽*24包",
+            "pict_url": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/vinda.jpg",
+            "size": "39.90",
+            "quanhou_jiage": "29.90",
+            "coupon_info_money": "10.00",
+            "coupon_id": "https://coupon.jd.com/vinda_coupon",
+        }],
+    }
     ztk_client.convert_universal_material.return_value = {
         "status": "error",
         "error_code": "RATE_LIMIT",
@@ -460,7 +457,8 @@ def test_jd_adapter_universal_resolve_via_hdk():
     assert res["product"]["name"] == "维达超韧抽纸3层100抽*24包"
     assert res["product"]["price"] == 29.90
     assert res["product"]["coupon_amount"] == 10.0
-    hdk_mock.get_goods_detail.assert_called_once_with(enc_id)
+    hdk_mock.get_goods_detail.assert_not_called()
+    ztk_client.get_goods_detail.assert_called_once_with(enc_id)
 
 
 def test_hdk_agents_md_rule3_compliance():
@@ -469,7 +467,11 @@ def test_hdk_agents_md_rule3_compliance():
     2. 主键解耦：product_id (goods_id) 必须使用静态主图哈希解耦动态 goods_sign，优先保留加密 itemid；
     3. 主图哈希绝不可传给上游详情接口，数字 SKU 绝不拼成 jingfen.jd.com/detail/{数字}.html。
     """
-    adapter = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"))
+    ztk_mock = Mock()
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="ztk_test"),
+        client=ztk_mock,
+    )
 
     # 1. 验证静态主图哈希解耦与加密 itemid 优先
     enc_sign = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_3abcde1234567890"
@@ -495,6 +497,7 @@ def test_hdk_agents_md_rule3_compliance():
     assert res["error_code"] == "INVALID_ARGUMENT"
     assert "不能直接使用主图哈希 ID" in res["error_msg"]
     hdk_mock.get_goods_detail.assert_not_called()
+    ztk_mock.get_goods_detail.assert_not_called()
 
 
 # ----------------------------------------------------------------------
@@ -721,18 +724,6 @@ def test_jd_adapter_babel_product_resolves_to_single_item():
             "sku_id": "eu8kjNqEBGUN1MbOYF",
         },
     }
-    hdk_mock.get_goods_detail.return_value = {
-        "status": "success",
-        "data": {
-            "skuid": "100249470124",
-            "itemid": "eu8kjNqEBGUN1MbOYF",
-            "goodsname": "格力高百奇大礼包316g",
-            "itempic": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/glico.jpg",
-            "itemprice": "29.90",
-            "itemendprice": "22.90",
-            "couponmoney": "7.00",
-        },
-    }
     hdk_mock.convert_promotion_link.return_value = {
         "status": "success",
         "short_url": "https://u.jd.com/my_promo_short",
@@ -740,8 +731,23 @@ def test_jd_adapter_babel_product_resolves_to_single_item():
         "final_link": "https://u.jd.com/my_promo_short",
         "promoter_id": "2035679405",
     }
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_key",)
+    ztk_client.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [{
+            "skuId": "100249470124",
+            "tao_id": "eu8kjNqEBGUN1MbOYF",
+            "title": "格力高百奇大礼包316g",
+            "pict_url": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/glico.jpg",
+            "size": "29.90",
+            "quanhou_jiage": "22.90",
+            "coupon_info_money": "7.00",
+        }],
+    }
     adapter = JdAdapter(
         settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
         hdk_client=hdk_mock,
     )
     res = adapter.resolve_and_convert_universal("https://u.jd.com/ogAwTxc")
@@ -1033,6 +1039,48 @@ def test_removed_hardcoded_inviter_code_returns_config_error():
     ztk_res = ztk.generate_authority_url("u_12345678")
     assert ztk_res["status"] == "error"
     assert ztk_res["error_code"] == "CONFIG_ERROR"
+
+
+def test_hdk_jd_universal_skips_unsupported_union_click_without_error_metric():
+    """当 ZTK 可用时，hdk_jd_universal 遇到未识别的 union-click 应返回 skipped 而非记为错误指标。"""
+    from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH
+
+    GLOBAL_UPSTREAM_HEALTH.reset()
+    hdk_mock = Mock()
+    hdk_mock.appkey_list = ("hdk_k",)
+    ztk_client = Mock()
+    ztk_client.appkey_list = ("ztk_k",)
+    ztk_client.convert_universal_material.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/ok",
+        "click_url": "https://union-click.jd.com/ok",
+        "j_command": "！OK！",
+        "tao_id": "enc_id_12345678901234567890_123456",
+    }
+    ztk_client.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [{
+            "tao_id": "enc_id_12345678901234567890_123456",
+            "title": "京东测试商品",
+            "quanhou_jiage": "19.9",
+            "size": "29.9",
+            "pict_url": "https://img14.360buyimg.com/p.jpg",
+            "item_url": "https://jingfen.jd.com/detail/enc_id_12345678901234567890_123456.html",
+        }],
+    }
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_client,
+        hdk_client=hdk_mock,
+    )
+    res = adapter.resolve_and_convert_universal("https://union-click.jd.com/jdc?e=&p=JF8B_TEST")
+    assert res["status"] == "success"
+    assert res["_provider"] == "ztk_jd_universal"
+    snap = GLOBAL_UPSTREAM_HEALTH.snapshot_local()
+    assert not any(
+        b["provider"] == "hdk_jd_universal" and b["error_calls"] > 0
+        for b in snap["endpoints"]
+    )
 
 
 

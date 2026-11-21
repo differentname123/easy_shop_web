@@ -17,6 +17,7 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
+    ERR_ADAPTER_CONFIG_ERROR,
     ERR_ADAPTER_CONVERT_FAILED,
     ERR_ADAPTER_OFF_PROMOTION,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
@@ -65,6 +66,7 @@ from services.deal_cleaning.url_venue import (
     _precheck_direct_non_cps_venue_url,
     detect_candidate_platform,
     is_explicit_coupon_target,
+    is_shop_homepage_url,
     rebuild_clean_official_venue_url,
     unwrap_to_official_public_venue_url,
 )
@@ -741,6 +743,9 @@ def convert_single_target(
             err_code = ERR_PDD_NUMERIC_ID
         elif raw_code == "UNSUPPORTED_JD_NUMERIC_SKU" or (try_plat == "jd" and "不支持数字id" in raw_msg):
             err_code = ERR_JD_NUMERIC_SKU
+        elif raw_code == "CONFIG_ERROR":
+            err_code = ERR_ADAPTER_CONFIG_ERROR
+            logger.error("[Stage3配置缺失] 平台=%s 返回 CONFIG_ERROR: %s", try_plat, raw_msg)
         elif not is_degraded_product and (
             raw_code == "PRODUCT_OFF_PROMOTION"
             or any(k in raw_msg for k in ("下架", "不在推广", "取消推广", "不支持该商品"))
@@ -765,7 +770,8 @@ def convert_single_target(
             "my_promo_token": None,
             "adapter_res": {},
         }
-        pending_failed_cache.append((cache_keys, out))
+        if err_code != ERR_ADAPTER_CONFIG_ERROR:
+            pending_failed_cache.append((cache_keys, out))
         last_failed = out
 
     # 通道 2：安全重定向解包 -> 官方无佣金公共领券/会场白名单（非详情限流场景下执行）
@@ -1235,7 +1241,7 @@ def process_ai1_unit(
 
         saved_ai1 = doc.get("ai_stage1_result")
         if (
-            doc.get("clean_error_code") in (ERR_ADAPTER_CONVERT_FAILED, ERR_AI_TIMEOUT_RETRY)
+            doc.get("clean_error_code") in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR, ERR_AI_TIMEOUT_RETRY)
             and isinstance(saved_ai1, dict)
             and not saved_ai1.get("_from_fallback")
             and saved_ai1.get("is_standalone_deal") is not False
@@ -1521,7 +1527,10 @@ def process_convert_unit(
         conv_summary_s3 = [{k: v for k, v in c.items() if k != "adapter_res"} for c in conv_list]
 
         if not prod_convs:
-            transient_err = next((e for e in attempt_errors if e["error_code"] == ERR_ADAPTER_CONVERT_FAILED), None)
+            transient_err = next(
+                (e for e in attempt_errors if e["error_code"] in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR)),
+                None,
+            )
             if transient_err is not None:
                 cleaner.stats_ai_retries_scheduled += 1
                 outcomes_by_id[mid] = _build_retry_or_max_outcome(
@@ -1534,8 +1543,8 @@ def process_convert_unit(
                     conv_summary=conv_summary_s3,
                     ai2_res=None,
                     stage=CLEAN_STAGE_NEED_CONVERT,
-                    retry_err_code=ERR_ADAPTER_CONVERT_FAILED,
-                    max_err_code=ERR_ADAPTER_CONVERT_FAILED,
+                    retry_err_code=transient_err["error_code"],
+                    max_err_code=transient_err["error_code"],
                     retry_msg=f"官方转链或反查暂态失败，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_err['error_msg']}",
                     max_msg=f"官方转链连续 {{new_retries}} 轮失败，达最大重试上限({{max_retries}}次)放弃: {transient_err['error_msg']}",
                     attempt_errors=attempt_errors,
@@ -1580,7 +1589,7 @@ def process_convert_unit(
                     c
                     for c in conv_list
                     if c["convert_status"] == "failed"
-                    and c["error_code"] == ERR_ADAPTER_CONVERT_FAILED
+                    and c["error_code"] in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR)
                     and c.get("text_role_hint") != "filler_candidate"
                 ),
                 None,
@@ -1597,7 +1606,7 @@ def process_convert_unit(
                     conv_summary=conv_summary_s3,
                     ai2_res=None,
                     stage=CLEAN_STAGE_NEED_CONVERT,
-                    retry_err_code=ERR_ADAPTER_CONVERT_FAILED,
+                    retry_err_code=transient_main_err["error_code"],
                     max_err_code=ERR_AI2_MAIN_DEAD_ONLY_FILLER,
                     retry_msg=f"主商品官方转链暂态失败，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_main_err['error_msg']}",
                     max_msg="主商品链接转链失败，仅凑单品存活",
@@ -1872,26 +1881,40 @@ def process_ai2_unit(
             c.get("convert_status") == "product" and c.get("text_role_hint") != "filler_candidate"
             for c in conv_list
         )
-        ai2_conv_links = [
-            {
+        omitted_lids: List[str] = []
+        ai2_conv_links: List[Dict[str, Any]] = []
+        for c in conv_list:
+            if (
+                has_valid_prod
+                and c.get("convert_status") == "failed"
+                and c.get("error_code") in (ERR_JD_NUMERIC_SKU, ERR_TB_NUMERIC_ID, ERR_PDD_NUMERIC_ID)
+            ):
+                omitted_lids.append(str(c["link_id"]))
+                continue
+            item_view: Dict[str, Any] = {
                 "link_id": c["link_id"],
                 "text_role_hint": c.get("text_role_hint") or "main_candidate",
                 "convert_status": c["convert_status"],
                 "platform": c["platform"],
                 "official_product": _project_official_product_for_ai2(c.get("official_product")),
             }
-            for c in conv_list
-            if not (
-                has_valid_prod
-                and c.get("convert_status") == "failed"
-                and c.get("error_code") in (ERR_JD_NUMERIC_SKU, ERR_TB_NUMERIC_ID, ERR_PDD_NUMERIC_ID)
-            )
-        ]
+            if c.get("convert_status") == "product" and c.get("goods_id"):
+                item_view["goods_id"] = str(c["goods_id"])
+            ai2_conv_links.append(item_view)
+
+        combined_raw_for_ai2 = str(ai1_res.get("combined_raw_text") or "")
+        for omitted_lid in omitted_lids:
+            combined_raw_for_ai2 = re.sub(rf"[ \t]*\[#{re.escape(omitted_lid)}\]", "", combined_raw_for_ai2)
+        if omitted_lids:
+            combined_raw_for_ai2 = "\n".join(
+                ln.rstrip() for ln in combined_raw_for_ai2.splitlines() if ln.strip()
+            ).strip()
+
         stage2_inputs.append({
             "main_tip_id": mid,
             "source_site": site,
             "is_group_stream": bool(doc.get("is_group_stream")),
-            "combined_raw_text": str(ai1_res.get("combined_raw_text") or ""),
+            "combined_raw_text": combined_raw_for_ai2,
             "draft_copywriting": draft_copywriting,
             "share_image_count": len(ai1_res.get("extracted_images") or []),
             "converted_links": ai2_conv_links,
@@ -2001,7 +2024,22 @@ def process_ai2_unit(
         except Exception:
             quality_score = 0
         quality_score = max(0, min(100, quality_score))
-        score_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
+        raw_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
+        breakdown_caps = {
+            "match_score": 30,
+            "completeness_score": 30,
+            "price_clarity_score": 20,
+            "tutorial_and_image_score": 20,
+        }
+        score_breakdown: Dict[str, Any] = {}
+        for bk, bval in raw_breakdown.items():
+            if bk in breakdown_caps and not isinstance(bval, bool):
+                try:
+                    score_breakdown[bk] = max(0, min(breakdown_caps[bk], int(float(bval))))
+                except (TypeError, ValueError):
+                    pass
+            elif not isinstance(bval, bool):
+                score_breakdown[bk] = bval
 
         source_bonus = SOURCE_REPUTATION_BONUS.get(f"{site}:{channel}") or SOURCE_REPUTATION_BONUS.get(site, 0)
         if source_bonus > 0 and quality_score >= QUALIFIED_DEAL_MIN_SCORE:
@@ -2062,6 +2100,8 @@ def process_ai2_unit(
                 continue
             c_url = str(c_obj.get("my_promo_link") or "").strip()
             c_tok = str(c_obj.get("my_promo_token") or "").strip()
+            if is_shop_homepage_url(c_url) or is_shop_homepage_url(c_obj.get("clean_input")):
+                continue
             if not c_url and not c_tok:
                 continue
             if c_url and my_promo_link and c_url == my_promo_link:
@@ -2164,6 +2204,25 @@ def process_ai2_unit(
         else:
             raw_step_lines = str(ai2_res.get("tutorial_summary") or "").splitlines()
         tutorial_steps = [s for s in (sanitize_clean_tutorial_step(st) for st in raw_step_lines) if s]
+        if not coupon_links:
+            empty_cpn_ui_rewrites = (
+                ("先在上方【领券】处", "通过下方购买链接"),
+                ("在上方【领券】处", "通过下方购买链接"),
+                ("上方【领券】处", "下方购买链接"),
+                ("上方【领券】", "下方购买链接"),
+                ("先在上方领券处", "通过下方购买链接"),
+                ("在上方领券处", "通过下方购买链接"),
+                ("在上方领券", "通过下方购买链接"),
+                ("上方领券处", "下方购买链接"),
+                ("上方领券", "下方购买链接"),
+            )
+            rewritten_steps: List[str] = []
+            for step in tutorial_steps:
+                for old_ph, new_ph in empty_cpn_ui_rewrites:
+                    if old_ph in step:
+                        step = step.replace(old_ph, new_ph)
+                rewritten_steps.append(step)
+            tutorial_steps = rewritten_steps
         tutorial_text = "\n".join(tutorial_steps)
 
         official_img = str(product_card.get("image_url") or "").strip()

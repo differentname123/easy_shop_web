@@ -288,7 +288,7 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     assert res_cpn["resolution_kind"] in ("coupon_or_venue", "degraded_product")
     assert any("piliang" in u for u, _, _ in calls), "券短链也应尝试 piliang 解析（不再按口令为空短路）"
 
-    # 4) 若全部 Key 同时限流导致无商品卡：即使 jCommand 不含“抢购”，也精准标记 degraded_product，且不再重复浪费 quanwang 配额
+    # 4) 若 tkl_piliang 空 tao_id，自动回退一次精确短链 api_quanwang(q=short_u, youquan=0)；若仍无数据则稳健标记 degraded_product
     class _AllThrottledHttp(_FakeHttp):
         def get(self, url, **kw):
             if "open_gaoyongzhuanlian_tkl_piliang.ashx" in url:
@@ -307,7 +307,129 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     assert res_deg["resolution_kind"] == "degraded_product"
     assert res_deg.get("detail_lookup_failed") is True
     assert res_deg["title"] == "京东精选推广好物"
-    assert all("quanwang" not in u for u, _, _ in calls)
+    assert any("api_quanwang" in u and q == "https://u.jd.com/officialShort1" for u, _, q in calls)
+
+
+def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recovery():
+    """验证真实退化恢复链路：
+    1. tkl_piliang 全局返回空 tao_id 时，3-key 池最多尝试 2 次即早停，不浪费第 3 把 Key；
+    2. HDK 解包官方短链返回加密 sku_id -> api_detail 拿全量商品卡（以及 is_venue=True -> coupon_or_venue）；
+    3. 落地仅为数字 SKU 时，唯一匹配 api_quanwang(q=short_u)（剥离残缺 |h 后缀）救回商品卡，且 len != 1 时严禁误用。
+    """
+    from adapters.jd_adapter import JdAdapter
+    from infrastructure.jd_client import JdClient, PROMOTION_ROOT
+
+    enc_sku = "QIOFn31J70YqJ2LZfIp3i8gOzXpo4_3fgGzi3ummOJ1tnRAy"
+    calls = []
+
+    class _EarlyStopHttp:
+        def get(self, url, **kw):
+            params = kw.get("params") or {}
+            calls.append((url, params.get("appkey"), params))
+            if "byunionid_get" in url:
+                return SimpleNamespace(
+                    status_code=200,
+                    raise_for_status=lambda: None,
+                    json=lambda: {
+                        PROMOTION_ROOT: {
+                            "result": json.dumps({
+                                "code": 200,
+                                "data": {"shortURL": "https://u.jd.com/shortOk", "clickURL": "https://union-click.jd.com/longOk"},
+                            })
+                        }
+                    },
+                )
+            if "tkl_piliang" in url:
+                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 200, "tao_id": "", "content": "https://u.jd.com/p"})
+            if "api_detail" in url:
+                return SimpleNamespace(
+                    status_code=200,
+                    raise_for_status=lambda: None,
+                    json=lambda: {
+                        "status": 200,
+                        "content": [{
+                            "tao_id": enc_sku,
+                            "title": "美的燃气灶A3",
+                            "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/4/6ab9c932F86c506ae/0083320320b195ad.jpg",
+                            "quanhou_jiage": "488.81",
+                            "size": "714",
+                            "item_url": f"https://jingfen.jd.com/detail/{enc_sku}.html",
+                        }],
+                    },
+                )
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 301, "content": "无符合条件的数据"})
+
+    # 1 & 2a: union-click + 3-key tkl_piliang 空 tao_id -> 第 2 次早停 + Fallback A 加密 sku 救回全卡
+    hdk_enc = SimpleNamespace(
+        resolve_short_url=lambda _u: {"status": "success", "data": {"sku_id": enc_sku, "is_venue": False}},
+        convert_promotion_link=lambda *_a, **_kw: {"status": "error", "error_code": "NOT_SUPPORTED"},
+    )
+    cli1 = JdClient(union_id="2035679405", appkey_list=("k1", "k2", "k3"), http_session=_EarlyStopHttp())
+    ad1 = JdAdapter(client=cli1, jd_enabled=True, jd_position_id="88", hdk_client=hdk_enc)
+    res_enc = ad1.resolve_and_convert_universal("https://union-click.jd.com/jdc?e=&p=JF8BAQ", promoter_id="88")
+    assert res_enc["status"] == "success"
+    assert res_enc["resolution_kind"] == "product"
+    assert res_enc["product"]["name"] == "美的燃气灶A3"
+    assert res_enc["product"]["price"] == 488.81
+    piliang_calls = [c for c in calls if "tkl_piliang" in c[0]]
+    assert len(piliang_calls) == 2
+
+    # 2b: union-click 会场 -> Fallback A is_venue=True 识别为 coupon_or_venue
+    hdk_venue = SimpleNamespace(
+        resolve_short_url=lambda _u: {"status": "success", "data": {"sku_id": "", "is_venue": True}},
+        convert_promotion_link=lambda *_a, **_kw: {"status": "error", "error_code": "NOT_SUPPORTED"},
+    )
+    cli2 = JdClient(union_id="2035679405", appkey_list=("k1", "k2", "k3"), http_session=_EarlyStopHttp())
+    ad2 = JdAdapter(client=cli2, jd_enabled=True, jd_position_id="88", hdk_client=hdk_venue)
+    res_venue = ad2.resolve_and_convert_universal("https://union-click.jd.com/jdc?e=&p=JF8B_VENUE", promoter_id="88")
+    assert res_venue["status"] == "success"
+    assert res_venue["resolution_kind"] == "coupon_or_venue"
+
+    # 3: 数字 SKU 解包后走 Fallback B api_quanwang(q=short_u): 仅 len==1 时采信并清洗 |h 脏图片尾巴；len==2 严格拒绝
+    class _QuanwangHttp(_EarlyStopHttp):
+        def __init__(self, row_count):
+            self.row_count = row_count
+
+        def get(self, url, **kw):
+            if "api_quanwang" in url:
+                row = {
+                    "tao_id": "xPQNgratvgsxvGGtlMZ7xvG7SFJilQ_3LZQS3mHtarEqceyab",
+                    "title": "欧贝拉亚麻籽油500ml",
+                    "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/4/6af414c4Fef8155cc/0083320320b2df3d.jpg",
+                    "small_images": "https://img14.360buyimg.com/a.jpg|h",
+                    "quanhou_jiage": "45.4",
+                    "size": "45.4",
+                    "item_url": "https://jingfen.jd.com/detail/xPQNgratvgsxvGGtlMZ7xvG7SFJilQ_3LZQS3mHtarEqceyab.html",
+                }
+                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 200, "content": [dict(row) for _ in range(self.row_count)]})
+            return super().get(url, **kw)
+
+    hdk_num = SimpleNamespace(
+        resolve_short_url=lambda _u: {"status": "success", "data": {"sku_id": "10239086058847", "is_venue": False}},
+        convert_promotion_link=lambda *_a, **_kw: {"status": "error", "error_code": "RATE_LIMIT"},
+    )
+    ad_num1 = JdAdapter(
+        client=JdClient(union_id="2035679405", appkey_list=("k1", "k2"), http_session=_QuanwangHttp(1)),
+        jd_enabled=True,
+        jd_position_id="88",
+        hdk_client=hdk_num,
+    )
+    res_num1 = ad_num1.resolve_and_convert_universal("https://u.jd.com/ogVRibX", promoter_id="88")
+    assert res_num1["status"] == "success"
+    assert res_num1["resolution_kind"] == "product"
+    assert res_num1["product"]["name"] == "欧贝拉亚麻籽油500ml"
+    assert res_num1["product"]["carousel_images"] == ["https://img14.360buyimg.com/a.jpg"]
+
+    ad_num2 = JdAdapter(
+        client=JdClient(union_id="2035679405", appkey_list=("k1", "k2"), http_session=_QuanwangHttp(2)),
+        jd_enabled=True,
+        jd_position_id="88",
+        hdk_client=hdk_num,
+    )
+    res_num2 = ad_num2.resolve_and_convert_universal("https://u.jd.com/ogVRibX", promoter_id="88")
+    assert res_num2["status"] == "success"
+    assert res_num2["resolution_kind"] == "degraded_product"
+    assert res_num2["product"] is None
 
 
 # ==============================================================================

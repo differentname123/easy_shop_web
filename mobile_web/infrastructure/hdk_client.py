@@ -203,23 +203,25 @@ class HdkClient:
 
             code = payload.get("code")
             msg = clean_text(payload.get("msg") or payload.get("sub_msg") or "")
+            sub_msg = clean_text(payload.get("sub_msg") or "")
+            err_detail = f"{msg} ({sub_msg})" if (msg and sub_msg and sub_msg != msg) else (msg or sub_msg)
 
             if code in (200, 1, "200", "1"):
                 GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
                 return {"status": "success", "data": payload.get("data"), "raw": payload}
 
-            err_msg_lower = msg.lower()
-            if any(kw in msg for kw in HDK_RATE_LIMIT_KEYWORDS) or "429" in err_msg_lower:
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="rate_limit", latency_ms=dt_ms, error_code="RATE_LIMIT", error_msg=msg[:80], allow_persist=is_real)
+            err_msg_lower = err_detail.lower()
+            if any(kw in err_detail for kw in HDK_RATE_LIMIT_KEYWORDS) or "429" in err_msg_lower:
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="rate_limit", latency_ms=dt_ms, error_code="RATE_LIMIT", error_msg=err_detail[:120], allow_persist=is_real)
                 return _error("RATE_LIMIT", msg or "好单库接口调用频次超限", sub_msg=payload.get("sub_msg"))
-            if "未授权" in msg or "授权" in msg or "绑定" in msg:
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="AUTH_REQUIRED", error_msg=msg[:80], allow_persist=is_real)
+            if "未授权" in err_detail or "授权" in err_detail or "绑定" in err_detail:
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="AUTH_REQUIRED", error_msg=err_detail[:120], allow_persist=is_real)
                 return _error("AUTH_REQUIRED", msg or "好单库尚未绑定推客账号", sub_msg=payload.get("sub_msg"))
-            if "下架" in msg or "不在推广" in msg:
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="PRODUCT_OFF_PROMOTION", error_msg=msg[:80], allow_persist=is_real)
+            if "下架" in err_detail or "不在推广" in err_detail:
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="PRODUCT_OFF_PROMOTION", error_msg=err_detail[:120], allow_persist=is_real)
                 return _error("PRODUCT_OFF_PROMOTION", msg or "该商品不在推广中或已下架")
-            GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code=f"HDK_{code}", error_msg=msg[:80], allow_persist=is_real)
-            return _error("UPSTREAM_ERROR", msg or f"好单库返回错误码 {code}", upstream_code=code, sub_msg=payload.get("sub_msg"))
+            GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code=f"HDK_{code}", error_msg=err_detail[:120], allow_persist=is_real)
+            return _error("UPSTREAM_ERROR", err_detail or f"好单库返回错误码 {code}", upstream_code=code, sub_msg=payload.get("sub_msg"))
 
         if self.appkey_list:
             res = execute_with_key_failover(self, _do_single_request, round_robin=True)

@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, set_process_role
 from infrastructure.logging_utils import configure_logging, format_exc_summary
 from infrastructure.mongo import close_shared_db
+from infrastructure.search_meili import MeiliSyncWorker
 from infrastructure.transport import configure_transport
 from services.detail_prefetch import DetailPrefetcher
 from services.order_service import OrderSyncWorker
@@ -53,10 +54,12 @@ async def lifespan(app: FastAPI):
     prefetcher = None
     warmup_thread = None
     order_sync_worker = None
+    meili_sync_worker = None
     gh_worker_started = False
     warmup_stop = threading.Event()
     app.state.detail_prefetcher = None
     app.state.order_sync_worker = None
+    app.state.meili_sync_worker = None
 
     def warm_connections():
         # 预取关闭时保留旧的首榜预热，但线程及其摘要写入必须随 lifespan 回收。
@@ -120,9 +123,19 @@ async def lifespan(app: FastAPI):
             order_sync_worker = OrderSyncWorker(order_service)
             app.state.order_sync_worker = order_sync_worker
             order_sync_worker.start()
+        meili_worker_on = bool(getattr(settings, "meilisearch_enabled", True)) and (
+            settings.detail_prefetch_enabled or settings.warmup_enabled
+        )
+        if meili_worker_on:
+            meili_sync_worker = MeiliSyncWorker(lambda: getattr(product_service, "repo", None))
+            app.state.meili_sync_worker = meili_sync_worker
+            meili_sync_worker.start()
         yield
     finally:
         warmup_stop.set()
+        if meili_sync_worker is not None:
+            await asyncio.to_thread(meili_sync_worker.stop)
+            app.state.meili_sync_worker = None
         if order_sync_worker is not None:
             await asyncio.to_thread(order_sync_worker.stop)
             app.state.order_sync_worker = None

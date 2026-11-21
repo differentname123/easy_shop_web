@@ -1035,6 +1035,69 @@ def test_haodanku_source_parsing_fliggy_filter_and_touch_ids():
     assert any("uland.taobao.com" in lk["url"] for lk in rec["extracted_links"])
 
 
+def test_haodanku_inline_positions_and_11char_token_and_parsing_truncated_url_and_guangdiu_time():
+    from services.deal_sources.parsing import extract_links_images_and_tokens, html_to_tutorial_text
+    from services.deal_sources.guangdiu import GuangdiuSource
+
+    # 1. Haodanku: 保留多商品/凑单穿插位置（不污染标题/价格）+ 11位裸淘口令放入 tokens
+    mock_payload = {
+        "code": 200,
+        "msg": "SUCCESS",
+        "min_id": 2,
+        "data": [
+            {
+                "wire_id": "9010",
+                "platform": "1",
+                "starttime": "1630000000",
+                "images": ["https://img.alicdn.com/a.jpg"],
+                "list": [
+                    {"content": "东鹏特饮250ml×24瓶 到手35.9元"},
+                    {"item_id": "bJZkm9ksOhoR707wwZIy7buQtR-ebK049oszM0NnNZQhq"},
+                    {"content": "👉叠消费券，凑单商品1件"},
+                    {"item_id": "JCnV5YILEw9"},
+                ],
+            }
+        ],
+    }
+    sess = MagicMock()
+    sess.get.return_value = _mk_resp(200, json_data=mock_payload)
+    ch = ChannelConfig(
+        name="好单库_淘宝实时线报", site_key="haodanku", default_url="https://www.haodanku.com/activity/tip_off",
+        params={"label_id": 10003}, fetch_mode="full_sweep", max_pages=1,
+    )
+    res_hdk = HaodankuSource().fetch(FetchContext(channel=ch, session=sess)).to_dict()
+    assert len(res_hdk["records"]) == 1
+    r_hdk = res_hdk["records"][0]
+    assert r_hdk["title"] == "东鹏特饮250ml×24瓶 到手35.9元"
+    assert "￥JCnV5YILEw9￥" in r_hdk["extracted_tokens"]
+    assert not any("JCnV5YILEw9" in lk.get("url", "") for lk in r_hdk["extracted_links"])
+    tut_lines = r_hdk["tutorial_text"].splitlines()
+    assert tut_lines.index("https://uland.taobao.com/item/edetail?id=bJZkm9ksOhoR707wwZIy7buQtR-ebK049oszM0NnNZQhq") < tut_lines.index("👉叠消费券，凑单商品1件")
+    assert tut_lines.index("👉叠消费券，凑单商品1件") < tut_lines.index("￥JCnV5YILEw9￥")
+
+    # 2. parsing.py: <a> 展示文本为截断前缀 URL 时仅输出/抽取完整 href，绝不重复产出残缺 raw_url
+    full_cpn = "https://coupon.m.jd.com/coupons/show.action?linkKey=AAROH_xIpeffAs_-naABEFoeOj-9iMlEY&to=m.jd.com"
+    trunc_cpn = "https://coupon.m.jd.com/coupons/show.action?linkKey=AAROH_xIpeffAs_-naABEF..."
+    frag_html = f'<p>先领券：<a href="{full_cpn}">{trunc_cpn}</a> 再拍商品：<a href="https://u.jd.com/o6VybgQ">直达</a></p>'
+    links, _imgs, _toks = extract_links_images_and_tokens(frag_html)
+    assert [lk["url"] for lk in links] == [full_cpn, "https://u.jd.com/o6VybgQ"]
+    txt = html_to_tutorial_text(frag_html)
+    assert full_cpn in txt
+    assert trunc_cpn not in txt
+    assert f"({full_cpn})" not in txt
+
+    # 3. guangdiu: 相对时间如“7分钟前”确定性规范化为 UTC ISO 字符串
+    list_html = '<div class="gooditem"><a class="goodname" href="detail.php?id=201">测试好价牛奶</a><a class="rightmallname">京东</a><a class="innergototobuybtn" href="https://u.jd.com/ok201">直达</a></div>'
+    det_html = '<span class="dinfoweibo"><span class="latesttime">7分钟前</span></span><div class="dabstract" id="dabstract">领券下单实付19.9元</div>'
+    gd_sess = MagicMock()
+    gd_sess.get.side_effect = lambda url, **_kw: _mk_resp(200, det_html if "detail.php" in url else list_html, url=url)
+    gd_ch = ChannelConfig(name="逛丢_首页实时流", site_key="guangdiu", default_url="https://guangdiu.com/", params={"channel": "latest", "cookie_file": ""}, max_details=5, detail_delay_seconds=0.0)
+    res_gd = GuangdiuSource().fetch(FetchContext(channel=gd_ch, session=gd_sess)).to_dict()
+    assert len(res_gd["records"]) == 1
+    assert res_gd["records"][0]["publish_time"].endswith("Z")
+    assert "分钟前" not in res_gd["records"][0]["publish_time"]
+
+
 def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch, tmp_path):
     import threading
     from services.deal_pipeline import run_fetch_stage

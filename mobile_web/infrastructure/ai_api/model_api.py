@@ -631,8 +631,11 @@ def _record_model_outcome(
 
         fails = _MODEL_CONSECUTIVE_FAILS.get(model_name, 0) + 1
         _MODEL_CONSECUTIVE_FAILS[model_name] = fails
-        if fails >= 3:
-            cooldown = min(600.0, 60.0 * (2 ** (fails - 3)))
+        is_timeout = "timed out" in lower or "timeout" in lower
+        threshold = 2 if is_timeout else 3
+        if fails >= threshold:
+            base_cd = 120.0 if is_timeout else 60.0
+            cooldown = min(600.0, base_cd * (2 ** (fails - threshold)))
             _MODEL_COOLDOWN_UNTIL[model_name] = time.monotonic() + cooldown
             return True
         return False

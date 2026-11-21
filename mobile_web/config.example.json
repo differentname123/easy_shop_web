@@ -8,6 +8,8 @@
   "myself_taobao_app_secret": "",
   "myself_taobao_pid": "",
   "taobao_adzone_id": "",
+  "taobao_pid_prefix": "",
+  "taobao_channel_pid": "",
   "taobao_session": "",
   "taobao_inviter_code": "",
   "haodanku_api_key": "",

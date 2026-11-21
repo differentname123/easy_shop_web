@@ -571,6 +571,7 @@ class JdClient:
             "open_gaoyongzhuanlian_tkl_piliang.ashx",
             {"unionId": self.union_id, "positionId": promoter, "tkl": piliang_tkl, "signurl": 5},
             _evaluate_piliang,
+            extra_stop_early=lambda _r: piliang_empty_tao_id_hits >= 2,
         )
         if primary_ok:
             if piliang_res.get("status") == "success":
@@ -582,8 +583,6 @@ class JdClient:
                     primary_res["j_command"] = piliang_res["j_command"]
                 if not primary_res.get("j_short_command") and piliang_res.get("j_short_command"):
                     primary_res["j_short_command"] = piliang_res["j_short_command"]
-            elif piliang_empty_tao_id_hits >= max(1, len(self.appkey_list)):
-                primary_res["ztk_catalog_throttled"] = True
             return primary_res
 
         if piliang_res.get("status") != "success":

@@ -90,6 +90,10 @@ class TaobaoAdapter(BasePlatformAdapter):
         if self._hdk_ok and self.hdk:
             self.attach_hdk(self.hdk)
         self._refresh_capabilities()
+        if self.active and self._ztk_channel_ok and not self.channel_pid:
+            logger.warning(
+                "⚠️ 【淘宝配置告警】已启用淘宝并配置折淘客，但未形成 4 段式 channel_pid（请配置 taobao_channel_pid 或 taobao_pid_prefix），万能转链与推手渠道转链将不可用"
+            )
 
     def attach_hdk(self, hdk_client: HdkClient) -> None:
         """仅当显式配置了 hdk_tb_name 时挂载好单库淘宝高佣转链；订单同步始终保留折淘客渠道通道。"""

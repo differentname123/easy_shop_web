@@ -2290,3 +2290,27 @@ def test_third_party_drainage_and_wechat_sanitization():
         assert "xhhc6688" not in step
         assert "视频教程" not in step
     assert "数量5 付74.5 折2.48/杯" in di["original_copywriting"]
+
+
+def test_build_clean_original_copywriting_prepends_title_without_duplication():
+    """验证 kiees/niuza 等正文省略商品名的线报在原本文案首行补齐 title，已包含时不重复。"""
+    doc_missing_ttl = {
+        "source_item_id": "kiees_1",
+        "title": "【京东】蒙牛特仑苏纯牛奶250ml*16盒 29.9元",
+        "tutorial_text": "先领券 https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1\n下单 https://u.jd.com/abc123",
+        "extracted_links": [],
+        "extracted_tokens": [],
+    }
+    res1 = DealPoolCleaner._build_clean_original_copywriting(["kiees_1"], {"kiees_1": doc_missing_ttl}, [], doc=doc_missing_ttl)
+    assert res1.startswith("【京东】蒙牛特仑苏纯牛奶250ml*16盒 29.9元")
+    assert "先领券" in res1
+
+    doc_with_ttl = {
+        "source_item_id": "kiees_2",
+        "title": "蒙牛特仑苏纯牛奶250ml*16盒",
+        "tutorial_text": "蒙牛特仑苏纯牛奶250ml*16盒 到手29.9元",
+        "extracted_links": [],
+        "extracted_tokens": [],
+    }
+    res2 = DealPoolCleaner._build_clean_original_copywriting(["kiees_2"], {"kiees_2": doc_with_ttl}, [], doc=doc_with_ttl)
+    assert res2.count("蒙牛特仑苏纯牛奶250ml*16盒") == 1

@@ -34,10 +34,7 @@ from models.product import (
 )
 from config import PROMOTION_LINK_TTL, logger
 from infrastructure.search_meili import (
-    delete_documents,
-    index_documents,
     is_meili_available,
-    make_meili_doc_id,
     search_products,
 )
 
@@ -233,11 +230,6 @@ def upsert_cleaned_products_to_formal_table(
         ops.append(UpdateOne({"platform": plat, "product_id": pid}, update_spec, upsert=True))
 
     res = formal_col.bulk_write(ops, ordered=False)
-    try:
-        if is_meili_available():
-            index_documents(product_docs)
-    except Exception as meili_err:
-        logger.warning("线报商品写入正式表后同步 Meilisearch 异常: %s", meili_err)
 
     return {
         "upserted": res.upserted_count,
@@ -1319,11 +1311,6 @@ class ProductRepository(BaseRepository):
                 "【商品摘要入库】批量写入首页推荐商品完成 | 频道[%s] 变更数量[%d条] 提交总数[%d条]",
                 channel_type if channel_type is not None else "-", upserted_count, len(operations),
             )
-            if self._is_meili_searchable():
-                try:
-                    index_documents(effective_list)
-                except Exception:
-                    pass
             return upserted_count
         except Exception as e:
             logger.warning(
@@ -1335,8 +1322,8 @@ class ProductRepository(BaseRepository):
     def upsert_cleaned_deal_products(self, product_docs: List[Dict[str, Any]]) -> Dict[str, int]:
         """
         【单一真源 SSOT · 正式商品库好价线报统一入库中枢】
-        将完成 AI 清洗与官方转链的高分好价商品晋升入库到正式表 (`products`)，
-        并原子确定性触发 Meilisearch 搜索索引同步，使商品自动具备即时模糊检索与性价比排序能力。
+        将完成 AI 清洗与官方转链的高分好价商品晋升入库到正式表 (`products`)；
+        Meilisearch 搜索索引由后台唯一 `MeiliSyncWorker` 周期性双向差量对齐，不在此做分散双写。
         """
         return upsert_cleaned_products_to_formal_table(self.col, product_docs)
 
@@ -1407,11 +1394,6 @@ class ProductRepository(BaseRepository):
                     return False
                 if result.matched_count == 1:
                     if result.modified_count == 1:
-                        if self._is_meili_searchable():
-                            try:
-                                index_documents([detail])
-                            except Exception:
-                                pass
                         return True
                     return False
                 # 条件失败说明读后有新详情写入，重新判断胜出来源时间，不无条件重试覆盖。
@@ -1632,11 +1614,6 @@ class ProductRepository(BaseRepository):
             tombstone_docs = matched_docs or ([{"product_id": gid, "goods_sign": gsign}] if gid else [])
             if tombstone_docs and deleted_pids:
                 self._record_deletion_tombstones(plat, tombstone_docs)
-            if self._is_meili_searchable() and deleted_pids:
-                try:
-                    delete_documents([make_meili_doc_id(plat, pid) for pid in deleted_pids])
-                except Exception:
-                    pass
             if modified > 0:
                 logger.info(
                     "【失效商品软下架】已将取消推广/下架商品标记软隔离 | 平台[%s] 商品[%s] 影响条数[%d]",
@@ -1681,16 +1658,6 @@ class ProductRepository(BaseRepository):
         filter_spec["product_id"] = {"$ne": new_id}
 
         try:
-            matched_pids: List[str] = []
-            try:
-                for d in self.col.find(filter_spec, {"_id": 0, "product_id": 1, "goods_id": 1}):
-                    pid = self._real_goods_id(d.get("product_id") or d.get("goods_id"))
-                    if pid and pid not in matched_pids:
-                        matched_pids.append(pid)
-            except Exception:
-                pass
-            if old_id and old_id not in matched_pids:
-                matched_pids.append(old_id)
             now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             res = self.col.update_many(
                 filter_spec,
@@ -1706,11 +1673,6 @@ class ProductRepository(BaseRepository):
             )
             raw_mod = getattr(res, "modified_count", 0)
             modified = int(raw_mod) if isinstance(raw_mod, (int, float)) else 0
-            if self._is_meili_searchable() and matched_pids:
-                try:
-                    delete_documents([make_meili_doc_id(plat, pid) for pid in matched_pids])
-                except Exception:
-                    pass
             if modified > 0:
                 logger.info(
                     "【商品身份迁移软下架】旧商品已被新商品主键替代，已置为无效并记录映射 | 平台[%s] 旧商品[%s] 新商品[%s] 影响条数[%d]",

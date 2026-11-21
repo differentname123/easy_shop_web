@@ -1676,7 +1676,7 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(enriched[1].get("deal_publish_time", ""), "")
         cache.clear_all_caches()
 
-    def test_upsert_home_products_indexes_overlaid_effective_list_to_meili(self):
+    def test_upsert_home_products_preserves_existing_jd_coupon_overlay(self):
         self.col.docs = [{
             "platform": "jd",
             "product_id": "JD-HASH-1",
@@ -1688,22 +1688,18 @@ class TestProductRepository(unittest.TestCase):
             "activity_price": 34.9,
             "original_price": 49.9,
         }]
-        self.repo._force_meili_enabled = True
-        indexed_batches = []
-        with patch("repositories.product_repo.index_documents", side_effect=lambda docs: indexed_batches.append(deepcopy(docs))):
-            self.repo.upsert_home_products([{
-                "platform": "jd",
-                "goods_id": "JD-HASH-1",
-                "goods_sign": "ENC_JD_SIGN_001",
-                "name": "维达抽纸",
-                "price": 49.9,
-                "original_price": 49.9,
-                "coupon_amount": 0.0,
-                "coupon_url": "",
-            }], channel_type=5)
-        self.assertEqual(len(indexed_batches), 1)
-        self.assertEqual(indexed_batches[0][0]["coupon_amount"], 15.0)
-        self.assertEqual(indexed_batches[0][0]["coupon_url"], "https://coupon.jd.com/real_15")
+        self.repo.upsert_home_products([{
+            "platform": "jd",
+            "goods_id": "JD-HASH-1",
+            "goods_sign": "ENC_JD_SIGN_001",
+            "name": "维达抽纸",
+            "price": 49.9,
+            "original_price": 49.9,
+            "coupon_amount": 0.0,
+            "coupon_url": "",
+        }], channel_type=5)
+        self.assertEqual(self.col.docs[0]["coupon_amount"], 15.0)
+        self.assertEqual(self.col.docs[0]["coupon_url"], "https://coupon.jd.com/real_15")
 
     def test_query_boom_products_meili_enforces_only_active_boom_and_content_filter(self):
         self.col.docs = [
@@ -1722,7 +1718,7 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(seen_kwargs[0]["only_active_boom"], True)
         self.assertEqual([item["product_id"] for item in res["data"]], ["BOOM-OK"])
 
-    def test_delete_product_by_goods_sign_only_writes_tombstone_and_deletes_meili(self):
+    def test_delete_product_by_goods_sign_only_writes_tombstone(self):
         class TombMemoryCollection(MemoryCollection):
             def update_many(self, query, update):
                 matched = modified = 0
@@ -1739,17 +1735,13 @@ class TestProductRepository(unittest.TestCase):
         tomb_col = TombMemoryCollection()
         db = SimpleNamespace(get_collection=lambda name: tomb_col if name == "deleted_products_log" else col)
         repo = ProductRepository(db_instance=db)
-        repo._force_meili_enabled = True
         col.docs = [
             {"platform": "jd", "product_id": "IMG_KEY_1", "goods_id": "IMG_KEY_1", "goods_sign": "ENC_SIGN_99", "name": "测试下架"},
         ]
-        deleted_meili_ids = []
-        with patch("repositories.product_repo.delete_documents", side_effect=lambda ids: deleted_meili_ids.extend(ids)):
-            self.assertTrue(repo.delete_product("jd", goods_sign="ENC_SIGN_99"))
+        self.assertTrue(repo.delete_product("jd", goods_sign="ENC_SIGN_99"))
         self.assertTrue(col.docs[0]["is_off_promotion"])
         self.assertEqual(len(tomb_col.write_calls), 1)
         self.assertEqual(tomb_col.docs[0]["product_id"], "IMG_KEY_1")
-        self.assertEqual(deleted_meili_ids, ["jd_IMG_KEY_1"])
 
     def test_deal_datetime_and_timestamp_treat_naive_datetime_as_utc_and_naive_str_as_cn(self):
         from models.cost_performance import parse_deal_publish_timestamp
