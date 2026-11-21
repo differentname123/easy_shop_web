@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from datetime import datetime
+from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
 from infrastructure.api_governance import (
@@ -211,10 +212,12 @@ class JdClient:
         self.timeout = timeout
         self._catalog_cooldown_lock = threading.Lock()
         self._catalog_cooldown_until = 0.0
+        self._catalog_cooldown_streak = 0
 
     _MIN_KEY_DISPATCH_INTERVAL_SEC = 0.22
     _DETAIL_KEY_DISPATCH_INTERVAL_SEC = 1.35
     _CATALOG_BURST_COOLDOWN_SEC = 65.0
+    _CATALOG_COOLDOWN_STEPS_SEC = (65.0, 120.0, 240.0, 300.0)
     _MAX_KEY_PACE_WAIT_SEC = 2.0
     _MAX_DETAIL_KEY_PACE_WAIT_SEC = 3.0
     _MAX_BG_PACE_WAIT_SEC = 12.0
@@ -234,20 +237,34 @@ class JdClient:
         with self._catalog_cooldown_lock:
             return max(0.0, self._catalog_cooldown_until - time.monotonic())
 
+    def reset_catalog_cooldown_streak(self) -> None:
+        """选品库接口恢复正常返回时重置连续冷却退避计数。"""
+        with self._catalog_cooldown_lock:
+            self._catalog_cooldown_streak = 0
+
     def mark_catalog_rate_limited(
         self,
-        cooldown_sec: float = _CATALOG_BURST_COOLDOWN_SEC,
+        cooldown_sec: Optional[float] = None,
         *,
         force: bool = False,
     ) -> None:
-        """确证触发折淘客短时突发限流后开启全局选品库冷却窗口，避免多 Key/并发自伤雪崩。"""
+        """确证触发折淘客短时突发限流后开启全局选品库冷却窗口（带上限的阶梯退避），避免多 Key/并发自伤雪崩。"""
         if not force and not is_real_requests_session(self.http):
             return
         with self._catalog_cooldown_lock:
-            self._catalog_cooldown_until = max(
-                self._catalog_cooldown_until,
-                time.monotonic() + max(0.0, float(cooldown_sec)),
-            )
+            now = time.monotonic()
+            if cooldown_sec is None:
+                if now < self._catalog_cooldown_until:
+                    return
+                step_idx = min(self._catalog_cooldown_streak, len(self._CATALOG_COOLDOWN_STEPS_SEC) - 1)
+                dur = self._CATALOG_COOLDOWN_STEPS_SEC[step_idx]
+                self._catalog_cooldown_until = now + dur
+                self._catalog_cooldown_streak += 1
+            else:
+                self._catalog_cooldown_until = max(
+                    self._catalog_cooldown_until,
+                    now + max(0.0, float(cooldown_sec)),
+                )
 
     def _pace_real_http_by_key(self, kwargs, *, url=""):
         """委托 GLOBAL_QUOTA_PACER 按单 appkey 预约发包时间槽；详情/搜索/批量解析共享折淘客 1000 限流池统一节流。"""
@@ -311,6 +328,8 @@ class JdClient:
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="degraded", latency_ms=dt_ms, error_code="ZTK_EMPTY_TAO_ID", error_msg="status=200 with empty tao_id", allow_persist=is_real)
             else:
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
+                if is_catalog_pool:
+                    self.reset_catalog_cooldown_streak()
             return body
         except QuotaPaceBacklogError:
             dt_ms = (time.perf_counter() - t0) * 1000.0

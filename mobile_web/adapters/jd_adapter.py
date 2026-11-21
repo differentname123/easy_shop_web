@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """京东字段/分页适配；无授权、用户仓储或个人转站长兜底。"""
 import hashlib
+import html
 import re
 import time
 from typing import Any, Optional
@@ -41,6 +42,8 @@ from models.product import (
 )
 
 _JD_SHORT_URL_RE = re.compile(r"https?://u\.jd\.com/[A-Za-z0-9_-]+")
+_JD_UNION_CLICK_URL_RE = re.compile(r"https?://union-click\.jd\.com/[^\s<>'\"（）()【】]+")
+_JD_NUMERIC_ITEM_URL_RE = re.compile(r"^https?://(?:item|item\.m)\.jd\.com/(?:product/)?(\d+)\.html(?:\?.*)?$", re.IGNORECASE)
 
 
 JD_ORDER_STATUS = {
@@ -155,10 +158,17 @@ class JdAdapter(BasePlatformAdapter):
         self._refresh_capabilities()
 
     def attach_hdk(self, hdk_client: HdkClient) -> None:
-        """挂载好单库 (HDK) 健康的京东推广/万能短链主力；搜索/详情保留折淘客 (v3/jd_goods_search 被京东风控拦截)，订单保留折淘客 CAS 通道。"""
+        """挂载好单库 (HDK) 为京东搜索/详情/推广/万能解析主力通道（0 折淘客配额），折淘客作为备用兜底与 CAS 订单主通道。"""
         self.hdk = hdk_client
+        self.register_provider("search", "hdk_jd_search", self._make_hdk_search(hdk_client), prepend=True)
+        self.register_provider("detail", "hdk_jd_detail", self._make_hdk_detail(hdk_client), prepend=True)
         self.register_provider("promotion", "hdk_jd_promotion", self._make_hdk_promotion(hdk_client), prepend=True)
         self.register_provider("universal", "hdk_jd_universal", self._make_hdk_universal(hdk_client), prepend=True)
+
+    def _is_ztk_catalog_cooling(self) -> bool:
+        """严格判断折淘客选品库是否处于冷却窗口（仅明确返回 True 时成立，避免 Mock 真值误判）。"""
+        fn = getattr(getattr(self, "client", None), "is_catalog_cooling", None)
+        return bool(callable(fn) and fn() is True)
 
     def _is_personal_promoter(self, uid: Any, promoter: str) -> bool:
         """好单库京东转链接口不接收 positionId，个人推手/非默认推广位必须交由折淘客保留完整归因。"""
@@ -179,9 +189,17 @@ class JdAdapter(BasePlatformAdapter):
         original = clean_money(item.get("itemprice") or price, price)
         if original is not None and price is not None and original < price:
             original = price
-        coupon_amt = clean_money(item.get("couponmoney"), 0.0) or 0.0
+        raw_coupon = clean_money(item.get("couponmoney"), 0.0) or 0.0
+        coupon_amt = raw_coupon
+        # 好单库对京东折扣券常在 couponmoney 填折扣系数（如 0.95、0.8），需按价差纠正为真实优惠元数或门槛未抵扣时的 0
+        if 0 < raw_coupon < 1.0:
+            diff = round((original or 0.0) - (price or 0.0), 2)
+            if diff > raw_coupon + 0.02:
+                coupon_amt = diff
+            elif diff <= 0.0:
+                coupon_amt = 0.0
         coupon_url = jd_coupon_url(item.get("couponurl"))
-        name = _text(item.get("goodsname"))
+        name = html.unescape(_text(item.get("goodsname")))
         if not name:
             raise ValueError("missing goods title")
         raw_rate = clean_money(_pick(item.get("commissionshare"), item.get("commissionShare")), 0.0) or 0.0
@@ -194,10 +212,10 @@ class JdAdapter(BasePlatformAdapter):
         else:
             comm_amount = round(comm_amount, 2)
         sales = _text(item.get("itemsale") or item.get("comments") or "0")
-        mall = _text(item.get("shopname")) or "京东店铺"
-        brand = _text(item.get("brand_name")) or "品牌甄选"
+        mall = html.unescape(_text(item.get("shopname"))) or "京东店铺"
+        brand = html.unescape(_text(item.get("brand_name"))) or "品牌甄选"
         cat_info = item.get("category_info") if isinstance(item.get("category_info"), dict) else {}
-        cat = _text(cat_info.get("cid3Name") or cat_info.get("cid1Name")) or "精选好物"
+        cat = html.unescape(_text(cat_info.get("cid3Name") or cat_info.get("cid1Name"))) or "精选好物"
 
         if _is_encrypted_jd_item_id(raw_sign):
             mat_url = f"https://jingfen.jd.com/detail/{raw_sign}.html"
@@ -281,6 +299,46 @@ class JdAdapter(BasePlatformAdapter):
         }
         return ProductDetail(**detail_payload).to_dict(exclude_unset=True)
 
+    def _make_hdk_search(self, client: HdkClient):
+        def _search(keyword="", page=1, page_size=20, uid=None, **kwargs):
+            res = client.search_goods(keyword, page=page, page_size=page_size)
+            if res.get("status") != "success":
+                return res
+            items = res.get("data") or []
+            summaries = []
+            for it in items:
+                try:
+                    summaries.append(self._normalize_hdk_summary(it))
+                except Exception:
+                    continue
+            return {
+                "status": "success",
+                "data": summaries,
+                "total_count": res.get("total_count", len(summaries)),
+                "page": page,
+                "page_size": page_size,
+                "has_more": bool(res.get("has_more")) if "has_more" in res else len(summaries) >= page_size,
+            }
+        return _search
+
+    def _make_hdk_detail(self, client: HdkClient):
+        def _detail(goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):
+            ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
+            target_id = ref.goods_sign or ref.goods_id
+            if not target_id or is_jd_image_key(target_id):
+                return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU")
+            if target_id.isdigit():
+                return {"status": "skipped", "reason": "hdk_requires_encrypted_id"}
+            res = client.get_goods_detail(target_id)
+            if not isinstance(res, dict) or res.get("status") != "success":
+                return res
+            raw_item = res.get("data") or {}
+            try:
+                return {"status": "success", "data": self._normalize_hdk_detail(raw_item, ref)}
+            except Exception as exc:
+                return _error("PROTOCOL_ERROR", f"好单库详情解析失败: {exc}")
+        return _detail
+
     def _make_hdk_promotion(self, client: HdkClient):
         def _promote(goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, promoter_id=None, **kwargs):
             promoter = canonical_promoter_id(promoter_id or self.default_promoter_id)
@@ -326,17 +384,11 @@ class JdAdapter(BasePlatformAdapter):
                 target_id = text
 
             short_match = _JD_SHORT_URL_RE.search(text)
+            union_match = _JD_UNION_CLICK_URL_RE.search(text)
+            union_url = union_match.group(0).rstrip(".,!?)];'\"") if union_match else ""
             is_confirmed_venue = False
             venue_url = ""
-            if short_match and not target_id:
-                res = client.resolve_short_url(short_match.group(0))
-                if res.get("status") == "success" and isinstance(res.get("data"), dict):
-                    data = res["data"]
-                    if data.get("sku_id"):
-                        target_id = str(data["sku_id"]).strip()
-                    elif data.get("is_venue"):
-                        is_confirmed_venue = True
-            elif not target_id and not short_match and is_jd_official_venue_url(text):
+            if not target_id and not short_match and not union_url and is_jd_official_venue_url(text):
                 cand_urls = [u.rstrip(".,!?)];'\"") for u in URL_RE.findall(text)]
                 cand_venue = next((u for u in cand_urls if is_jd_official_venue_url(u)), "")
                 if cand_venue and product_url(cand_venue):
@@ -347,44 +399,85 @@ class JdAdapter(BasePlatformAdapter):
                         is_confirmed_venue = True
                         venue_url = cand_venue
 
-            is_numeric_sku = bool(target_id and target_id.isdigit())
-            detail_catalog_cooling = False
-            if target_id and not card and not is_numeric_sku:
-                det = self.get_goods_detail(target_id)
-                if det.get("status") == "success" and isinstance(det.get("data"), dict):
-                    card = det["data"]
-                elif det.get("error_code") == "PRODUCT_OFF_PROMOTION":
-                    return det
-                elif det.get("catalog_cooling") is True:
-                    detail_catalog_cooling = True
-
-            material_url = ""
-            if target_id and not is_numeric_sku:
-                material_url = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else target_id
-            elif short_match:
-                material_url = short_match.group(0)
-            elif venue_url:
-                material_url = venue_url
-            elif target_id:
-                material_url = target_id
-
-            if not material_url and not target_id and not card and not is_confirmed_venue:
+            if not (target_id or short_match or union_url or is_confirmed_venue):
                 return (
                     {"status": "skipped", "reason": "hdk_unsupported_input"}
                     if getattr(self, "_has_ztk_catalog", False)
                     else _error("NOT_FOUND", "未能识别该京东链接或商品")
                 )
 
-            mat = material_url or (short_match.group(0) if short_match else target_id)
+            is_numeric_sku = bool(target_id and target_id.isdigit())
+            detail_catalog_cooling = False
+            if target_id and not is_numeric_sku:
+                det = self.get_goods_detail(target_id)
+                if isinstance(det, dict):
+                    if det.get("status") == "success" and isinstance(det.get("data"), dict):
+                        card = det["data"]
+                    elif det.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                        return det
+                    elif det.get("catalog_cooling") is True:
+                        detail_catalog_cooling = True
+            elif not is_confirmed_venue and (short_match or union_url):
+                url_anchor = short_match.group(0) if short_match else union_url
+                hdk_det = client.get_goods_detail(url_anchor)
+                if isinstance(hdk_det, dict):
+                    if hdk_det.get("status") == "success" and isinstance(hdk_det.get("data"), dict):
+                        try:
+                            card = self._normalize_hdk_detail(hdk_det["data"])
+                            target_id = card.get("goods_sign") or card.get("goods_id") or target_id
+                        except Exception:
+                            card = None
+                    elif hdk_det.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                        return hdk_det
+
+                if card is None and short_match:
+                    res = client.resolve_short_url(short_match.group(0))
+                    if isinstance(res, dict) and res.get("status") == "success" and isinstance(res.get("data"), dict):
+                        data = res["data"]
+                        if data.get("sku_id"):
+                            target_id = str(data["sku_id"]).strip()
+                        elif data.get("is_venue"):
+                            is_confirmed_venue = True
+
+                    is_numeric_sku = bool(target_id and target_id.isdigit())
+                    if target_id and not is_numeric_sku and not is_confirmed_venue:
+                        det = self.get_goods_detail(target_id)
+                        if isinstance(det, dict):
+                            if det.get("status") == "success" and isinstance(det.get("data"), dict):
+                                card = det["data"]
+                            elif det.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                                return det
+                            elif det.get("catalog_cooling") is True:
+                                detail_catalog_cooling = True
+
+            if card is None and not is_confirmed_venue and (detail_catalog_cooling or self._is_ztk_catalog_cooling()):
+                return _error(
+                    "RATE_LIMIT",
+                    "京东商品详情暂不可用且备用选品库处于冷却窗口，暂跳过避免空转",
+                    catalog_cooling=True,
+                )
+
+            material_url = ""
+            if short_match:
+                material_url = short_match.group(0)
+            elif union_url:
+                material_url = union_url
+            elif venue_url:
+                material_url = venue_url
+            elif target_id and not is_numeric_sku:
+                material_url = f"https://jingfen.jd.com/detail/{target_id}.html" if _is_encrypted_jd_item_id(target_id) else target_id
+            elif target_id:
+                material_url = target_id
+
             conv = client.convert_promotion_link(
-                mat,
+                material_url,
                 sub_union_id=kwargs.get("sub_union_id"),
                 coupon_url=(card or {}).get("coupon_url"),
             )
             if conv.get("status") != "success":
-                logger.debug("[JD万能转链-好单库] 转链未成功(%s)，顺延至备用通道: mat=%s", conv.get("error_msg"), mat[:60])
+                logger.debug("[JD万能转链-好单库] 转链未成功(%s)，顺延至备用通道: mat=%s", conv.get("error_msg"), material_url[:60])
                 return conv
-            logger.info("[JD万能解析-好单库主力] 原生解析与转链成功: target_id=%s, final_link=%s", target_id or mat, conv.get("final_link"))
+            logger.info("[JD万能解析-好单库主力] 原生解析与转链成功: target_id=%s, final_link=%s", target_id or material_url[:48], conv.get("final_link"))
 
             title = (card or {}).get("name") or ("京东精选活动会场" if is_confirmed_venue else "京东精选好物")
             price = (card or {}).get("price")
@@ -412,7 +505,7 @@ class JdAdapter(BasePlatformAdapter):
                 payload["detail_lookup_failed"] = True
                 if detail_catalog_cooling:
                     payload["catalog_cooling"] = True
-            return stamp_universal_resolution(payload, single_item_evidence=bool(target_id))
+            return stamp_universal_resolution(payload, single_item_evidence=bool(target_id or short_match or union_url))
         return _universal
 
     def _refresh_capabilities(self) -> None:
@@ -435,13 +528,8 @@ class JdAdapter(BasePlatformAdapter):
         )
 
     def can_prefetch_detail(self, ref=None):
-        """JD 折淘客共用小时级千次配额：榜单/搜索绝不后台盲刷 api_detail，仅允许外挂独立详情源后台预取。"""
-        if ref is None or not isinstance(ref, ProductRef):
-            return False
-        if not self._has_extra_providers("detail"):
-            return False
-        sign = ref.goods_sign
-        return bool(_is_encrypted_jd_item_id(sign) or (sign and sign.isdigit()))
+        """JD 榜单/搜索严禁后台盲刷详情预取，避免击穿好单库限额或级联跌入折淘客小时级千次配额。"""
+        return False
 
     def normalize_material_url(self, url: str) -> str:
         return normalize_jd_material_url(url)
@@ -881,6 +969,17 @@ class JdAdapter(BasePlatformAdapter):
             return _error("INVALID_ARGUMENT", "请输入京东 u.jd.com 短链、京口令或京粉链接")
 
         def _do_resolve():
+            if _JD_NUMERIC_ITEM_URL_RE.match(text) or text.isdigit():
+                return _error(
+                    "UNSUPPORTED_JD_NUMERIC_SKU",
+                    "京东联盟接口已不支持纯数字商品ID转链，请粘贴 u.jd.com 短链、京口令或京粉链接",
+                )
+            if self._is_ztk_catalog_cooling() and not is_jd_official_venue_url(text):
+                return _error(
+                    "RATE_LIMIT",
+                    "京东选品库处于短时频控冷却中，暂跳过避免空转",
+                    catalog_cooling=True,
+                )
             extracted_encrypted_id = ""
             product_card = None
             detail_lookup_failed = False

@@ -823,7 +823,7 @@ def convert_single_target(
             )
         )
         is_catalog_cooling = bool(isinstance(res, dict) and res.get("catalog_cooling") is True)
-        if is_degraded_product:
+        if is_degraded_product or is_catalog_cooling:
             any_detail_lookup_failed = True
 
         if isinstance(res, dict) and res.get("status") == "success":
@@ -1730,7 +1730,7 @@ def process_convert_unit(
                     if c.get("convert_status") == "failed"
                     and c.get("error_code") in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR)
                 ]
-                is_local_cooling_only = bool(transient_failed_convs) and all(
+                is_local_cooling_only = bool(transient_failed_convs) and any(
                     c.get("catalog_cooling") is True for c in transient_failed_convs
                 )
                 cleaner.stats_ai_retries_scheduled += 1
@@ -1800,7 +1800,7 @@ def process_convert_unit(
                 and c.get("text_role_hint") != "filler_candidate"
             ]
             transient_main_err = transient_main_convs[0] if transient_main_convs else None
-            is_local_cooling_only = bool(transient_main_convs) and all(
+            is_local_cooling_only = bool(transient_main_convs) and any(
                 c.get("catalog_cooling") is True for c in transient_main_convs
             )
             if transient_main_err is not None and (is_local_cooling_only or (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES):
@@ -1856,11 +1856,11 @@ def process_convert_unit(
             c
             for c in conv_list
             if c.get("convert_status") == "failed"
-            and c.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT
+            and (c.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT or c.get("catalog_cooling") is True)
             and c.get("text_role_hint") != "filler_candidate"
         ]
         transient_degraded = transient_degraded_convs[0] if transient_degraded_convs else None
-        is_local_cooling_only = bool(transient_degraded_convs) and all(
+        is_local_cooling_only = bool(transient_degraded_convs) and any(
             c.get("catalog_cooling") is True for c in transient_degraded_convs
         )
         if transient_degraded is not None and (is_local_cooling_only or (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES):

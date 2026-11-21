@@ -992,3 +992,25 @@ def test_jd_client_catalog_cooldown_short_circuits_catalog_only():
     assert http.get.call_count == 1
 
 
+def test_jd_client_catalog_cooldown_stepped_backoff_and_reset_on_success():
+    """连续限流冷却按 65s -> 120s -> 240s -> 300s 阶梯退避；同一冷却窗内不重复递增；任一选品库成功即归零复位。"""
+    http = http_for(
+        {"status": 200, "content": [{"tao_id": "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g", "title": "商品", "wlprice": "19.9", "pict_url": "https://img14.360buyimg.com/a.jpg"}]},
+    )
+    cli = client(http)
+    expected_steps = [65.0, 120.0, 240.0, 300.0, 300.0]
+    for idx, expected_sec in enumerate(expected_steps):
+        cli.mark_catalog_rate_limited(force=True)
+        rem = cli.catalog_cooldown_remaining()
+        assert expected_sec - 2.0 <= rem <= expected_sec + 0.5
+        assert cli._catalog_cooldown_streak == idx + 1
+        # 同一冷却窗内并发再次调用不得推高 streak
+        cli.mark_catalog_rate_limited(force=True)
+        assert cli._catalog_cooldown_streak == idx + 1
+        cli._catalog_cooldown_until = 0.0
+
+    res = cli.get_goods_detail("IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g")
+    assert res["status"] == "success"
+    assert cli._catalog_cooldown_streak == 0
+
+

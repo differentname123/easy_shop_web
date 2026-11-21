@@ -2470,10 +2470,12 @@ def test_build_clean_original_copywriting_prepends_title_without_duplication():
 def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_cooldown():
     """
     验证本地 CATALOG_COOLDOWN 冷却期内跳过选品库时：
-    1. catalog_cooling=True 通过 JdClient -> execute_provider_chain -> JdAdapter -> Stage 3 -> DB 完整传播；
-    2. 处于 clean_retry_count=2 边缘与 clean_retry_count=0 的记录均保持原重试次数不被消耗/误杀，
+    1. 冷却期内非会场 JD 目标直接入口熔断（零 hdk.convert_promotion_link 与零 ZTK byunionid_get/选品库 HTTP），
+       同时纯官方领券/会场白名单仍可正常放行；
+    2. catalog_cooling=True 通过 JdClient -> execute_provider_chain -> JdAdapter -> Stage 3 -> DB 完整传播；
+    3. 单链接及“坏副链+冷却主链”多链接场景（如 haodanku#1659971）均保持原重试次数不被消耗/误杀，
        并精确排期在冷却结束后重试；
-    3. 非冷却态的真实上游失败依然正常累加 retry_count 并在 3/3 时退出，杜绝无限重试副作用。
+    4. 非冷却态的真实上游失败依然正常累加 retry_count 并在 3/3 时退出，杜绝无限重试副作用。
     """
     import time
     from adapters.jd_adapter import JdAdapter
@@ -2503,15 +2505,15 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
     assert jd_client.is_catalog_cooling() is True
     assert jd_client.catalog_cooldown_remaining() > 50.0
 
-    # Stub HdkClient: returns numeric SKU (so hdk_universal yields degraded without cooling,
-    # and execute_provider_chain falls through to ztk_universal which carries catalog_cooling=True)
+    # Stub HdkClient: returns NOT_FOUND on detail (forcing ZTK fallback which immediately short-circuits on cooldown)
     fake_hdk = MagicMock()
+    fake_hdk.get_goods_detail.return_value = {"status": "error", "error_code": "NOT_FOUND", "not_found": True}
     fake_hdk.resolve_short_url.return_value = {"status": "success", "data": {"sku_id": "100012345678", "is_venue": False}}
     fake_hdk.convert_promotion_link.return_value = {
         "status": "success",
-        "short_url": "https://u.jd.com/oHdk1",
-        "final_link": "https://u.jd.com/oHdk1",
-        "click_url": "https://u.jd.com/oHdk1",
+        "short_url": "https://u.jd.com/oHdkVenue",
+        "final_link": "https://u.jd.com/oHdkVenue",
+        "click_url": "https://u.jd.com/oHdkVenue",
     }
 
     settings_stub = SimpleNamespace(
@@ -2536,37 +2538,45 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
         "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _x: {"status": "error"}),
     }
 
-    def _make_doc(mid: str, retries: int, target_url: str):
+    def _make_doc(mid: str, retries: int, targets):
+        if isinstance(targets, str):
+            targets = [{"link_id": "L1", "clean_input": targets, "platform": "jd", "text_role_hint": "main_candidate"}]
         return {
             "source_site": "guangdiu",
             "source_channel": "latest",
             "source_item_id": mid,
             "platform": "jd",
-            "title": f"瓦伦丁啤酒_{mid}",
+            "title": f"测试商品_{mid}",
             "clean_retry_count": retries,
             "ai_stage1_result": {
                 "main_tip_id": mid,
                 "is_standalone_deal": True,
                 "merged_tip_ids": [mid],
-                "extracted_targets": [
-                    {"link_id": "L1", "clean_input": target_url, "platform": "jd", "text_role_hint": "main_candidate"}
-                ],
+                "extracted_targets": targets,
             },
         }
 
     doc_edge = _make_doc("tip_cool_2", 2, "https://union-click.jd.com/jdc?e=edge2")
     doc_zero = _make_doc("tip_cool_0", 0, "https://union-click.jd.com/jdc?e=zero0")
+    # 模拟 haodanku#1659971 多链混合：L1=非冷却失败(3.cn)，L2=冷却跳过(u.jd.com) -> 不得扣减重试次数
+    doc_multi = _make_doc(
+        "tip_cool_multi_1659971",
+        2,
+        [
+            {"link_id": "L1", "clean_input": "https://3.cn/3d1Ch7", "platform": "jd", "text_role_hint": "main_candidate"},
+            {"link_id": "L2", "clean_input": "https://u.jd.com/o6XQVeh", "platform": "jd", "text_role_hint": "main_candidate"},
+        ],
+    )
     t_before = time.time()
     outcomes, _ = cleaner.process_convert_unit(
-        [doc_edge, doc_zero],
+        [doc_edge, doc_zero, doc_multi],
         formal_col=None,
         shared_active_products={},
         quiet_sub_logs=True,
     )
-    # Cooling period: zero calls should hit api_detail / tkl_piliang / api_quanwang HTTP endpoints
-    assert not any(
-        ep in u for u in http_calls for ep in ("api_detail", "tkl_piliang", "api_quanwang")
-    )
+    # 冷却期内：非会场 JD 目标必须做到零 ZTK HTTP 请求、零无谓 hdk.convert_promotion_link 调用
+    assert http_calls == []
+    fake_hdk.convert_promotion_link.assert_not_called()
 
     out_map = {o["source_item_id"]: o for o in outcomes}
     assert out_map["tip_cool_2"]["status"] == "retry_pending"
@@ -2575,6 +2585,16 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
     assert out_map["tip_cool_0"]["status"] == "retry_pending"
     assert out_map["tip_cool_0"]["retry_count"] == 0
     assert out_map["tip_cool_0"]["retry_delay_sec"] >= 60.0
+    assert out_map["tip_cool_multi_1659971"]["status"] == "retry_pending"
+    assert out_map["tip_cool_multi_1659971"]["retry_count"] == 2
+    assert out_map["tip_cool_multi_1659971"]["retry_delay_sec"] >= 60.0
+
+    # 冷却期内，官方公共领券/会场白名单仍可正常直通转链不受阻塞
+    venue_res = jd_adapter.resolve_and_convert_universal("https://coupon.m.jd.com/coupons/show.action?key=venue1&roleId=1")
+    assert venue_res["status"] == "success"
+    assert venue_res["resolution_kind"] == "coupon_or_venue"
+    assert fake_hdk.convert_promotion_link.call_count == 1
+    assert http_calls == []
 
     raw_col = MagicMock()
     formal_col = MagicMock()
@@ -2584,12 +2604,13 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
     assert sets_by_id["tip_cool_2"]["clean_status"] == "pending"
     assert sets_by_id["tip_cool_2"]["clean_retry_count"] == 2
     assert sets_by_id["tip_cool_2"]["next_retry_after_ts"] >= t_before + 60.0
-    # Verify retry_count=0 is NOT coerced to 1 by `or 1`
     assert sets_by_id["tip_cool_0"]["clean_status"] == "pending"
     assert sets_by_id["tip_cool_0"]["clean_retry_count"] == 0
     assert sets_by_id["tip_cool_0"]["next_retry_after_ts"] >= t_before + 60.0
+    assert sets_by_id["tip_cool_multi_1659971"]["clean_status"] == "pending"
+    assert sets_by_id["tip_cool_multi_1659971"]["clean_retry_count"] == 2
 
-    # End cooldown -> genuine non-cooling upstream failure must still increment retries and fail at 3/3
+    # 冷却结束后，真实上游失败仍须正常累加重试次数并在 3/3 时终止退出
     jd_client._catalog_cooldown_until = 0.0
     cleaner._anchor_cache.evict_transient_failures()
     doc_real_fail = _make_doc("tip_real_2", 2, "https://union-click.jd.com/jdc?e=realfail")
