@@ -45,6 +45,11 @@ from models.cost_performance import (
     UNIT_TO_CATEGORY,
     UNIT_TO_MULTIPLIER,
 )
+from models.deal_constants import (
+    coerce_unix_timestamp,
+    format_timestamp_cn,
+    get_deal_publish_ts,
+)
 from repositories.product_repo import ProductRepository
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -393,8 +398,11 @@ def _resolve_candidate_brand(doc: Dict[str, Any], sku_fmt: Dict[str, Any]) -> st
 
 
 def _parse_deal_time_utc(val: Any, default_tz: datetime.timezone = _CN_TZ) -> Optional[datetime.datetime]:
-    if val is None:
+    if val is None or isinstance(val, bool):
         return None
+    if isinstance(val, (int, float)):
+        ts = coerce_unix_timestamp(val)
+        return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) if ts is not None else None
     if isinstance(val, datetime.datetime):
         return val.astimezone(datetime.timezone.utc) if val.tzinfo else val.replace(tzinfo=datetime.timezone.utc)
     s = str(val).strip()
@@ -406,13 +414,8 @@ def _parse_deal_time_utc(val: Any, default_tz: datetime.timezone = _CN_TZ) -> Op
             return dt.replace(tzinfo=default_tz).astimezone(datetime.timezone.utc)
         except Exception:
             continue
-    try:
-        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=default_tz)
-        return dt.astimezone(datetime.timezone.utc)
-    except Exception:
-        return None
+    ts = coerce_unix_timestamp(s)
+    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) if ts is not None else None
 
 
 def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.datetime) -> Optional[Dict[str, Any]]:
@@ -434,9 +437,12 @@ def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.dateti
     if not isinstance(deal_fmt, dict) or not isinstance(deal_fmt.get("core_entities"), list):
         return None
 
-    pub_utc = _parse_deal_time_utc(di.get("publish_time"), default_tz=_CN_TZ)
-    if pub_utc is None:
-        pub_utc = _parse_deal_time_utc(doc.get("updated_at"), default_tz=datetime.timezone.utc)
+    pub_ts = get_deal_publish_ts(di)
+    pub_utc = (
+        datetime.datetime.fromtimestamp(pub_ts, tz=datetime.timezone.utc)
+        if pub_ts is not None
+        else _parse_deal_time_utc(doc.get("updated_at"), default_tz=datetime.timezone.utc)
+    )
     if pub_utc is None or pub_utc < cutoff_utc:
         return None
 
@@ -460,7 +466,7 @@ def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.dateti
         "deal_price_logic": str(di.get("price_logic") or "").strip(),
         "deal_unit_price_text": str(di.get("unit_deal_price") or "").strip(),
         "deal_quality_score": di.get("quality_score"),
-        "deal_publish_time": str(di.get("publish_time") or "").strip(),
+        "deal_publish_time": format_timestamp_cn(pub_utc),
     }
 
 
@@ -706,6 +712,7 @@ def select_round_candidates_for_source(
             "deal_info.format_info": 1,
             "deal_info.price_logic": 1,
             "deal_info.quality_score": 1,
+            "deal_info.publish_ts": 1,
             "deal_info.publish_time": 1,
         }
         raw_docs = [

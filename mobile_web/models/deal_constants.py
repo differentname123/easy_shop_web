@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-"""好价线报缓冲池 (`deal_raw_tips`) 与清洗调度器全局常量定义。"""
+"""好价线报缓冲池 (`deal_raw_tips`) 与清洗调度器全局常量及时间唯一真源定义。"""
+import datetime
+import math
 import os
-from typing import Dict, Tuple
+import re
+from typing import Any, Dict, Optional, Tuple
 
 # 目录路径计算（单一真源）
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,3 +150,125 @@ _UNSUPPORTED_EXTERNAL_DOMAINS = (
     "t.me",
     "xuandan.com",
 )
+
+CN_TZ = datetime.timezone(datetime.timedelta(hours=8))
+_EPOCH_STR_RE = re.compile(r"^(?:\d{10}|\d{13})(?:\.\d+)?$")
+
+
+def coerce_unix_timestamp(val: Any) -> Optional[float]:
+    """严格将已入库时间戳（float/int/datetime/绝对时间字符串）归一化为秒级 Unix 时间戳；不猜测相对文案。"""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        ts = float(val)
+        if not math.isfinite(ts) or ts <= 0:
+            return None
+        return ts / 1000.0 if ts > 1e12 else ts
+    if isinstance(val, datetime.datetime):
+        dt = val.replace(tzinfo=datetime.timezone.utc) if val.tzinfo is None else val
+        return dt.timestamp()
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        if _EPOCH_STR_RE.fullmatch(s):
+            ts = float(s)
+            return ts / 1000.0 if ts > 1e12 else ts
+        iso_cand = re.sub(r"(\.\d{6})\d+", r"\1", s)
+        if iso_cand.endswith(("Z", "z")):
+            iso_cand = iso_cand[:-1] + "+00:00"
+        try:
+            dt = datetime.datetime.fromisoformat(iso_cand)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=CN_TZ)
+            return dt.timestamp()
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+            try:
+                return datetime.datetime.strptime(s, fmt).replace(tzinfo=CN_TZ).timestamp()
+            except ValueError:
+                continue
+    return None
+
+
+def parse_publish_time_epoch(val: Any) -> Optional[float]:
+    """采集入口唯一真源：将任意站点发布时间（数字/datetime/绝对时间/相对文案/HH:MM）归一为 UTC epoch 秒。"""
+    exact = coerce_unix_timestamp(val)
+    if exact is not None:
+        return exact
+    if not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s:
+        return None
+
+    now_cn = datetime.datetime.now(CN_TZ)
+    if s == "刚刚":
+        return now_cn.timestamp()
+
+    m_hm_rel = re.search(r"(\d+)\s*小时\s*(\d+)\s*分钟前", s)
+    if m_hm_rel:
+        hrs = int(m_hm_rel.group(1))
+        mins = int(m_hm_rel.group(2))
+        return (now_cn - datetime.timedelta(hours=hrs, minutes=mins)).timestamp()
+
+    m_rel = re.search(r"(\d+)\s*(秒|分钟|小时|天)前", s)
+    if m_rel:
+        num = int(m_rel.group(1))
+        unit = m_rel.group(2)
+        if unit == "秒":
+            return (now_cn - datetime.timedelta(seconds=num)).timestamp()
+        if unit == "分钟":
+            return (now_cn - datetime.timedelta(minutes=num)).timestamp()
+        if unit == "小时":
+            return (now_cn - datetime.timedelta(hours=num)).timestamp()
+        if unit == "天":
+            return (now_cn - datetime.timedelta(days=num)).timestamp()
+
+    m_day_hm = re.match(r"^(今天|昨天)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
+    if m_day_hm:
+        day_delta = 0 if m_day_hm.group(1) == "今天" else 1
+        base_dt = (now_cn - datetime.timedelta(days=day_delta)).replace(
+            hour=int(m_day_hm.group(2)),
+            minute=int(m_day_hm.group(3)),
+            second=int(m_day_hm.group(4) or 0),
+            microsecond=0,
+        )
+        return base_dt.timestamp()
+
+    m_bare_hm = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
+    if m_bare_hm:
+        cand_dt = now_cn.replace(
+            hour=int(m_bare_hm.group(1)),
+            minute=int(m_bare_hm.group(2)),
+            second=int(m_bare_hm.group(3) or 0),
+            microsecond=0,
+        )
+        if cand_dt > now_cn + datetime.timedelta(minutes=5):
+            cand_dt -= datetime.timedelta(days=1)
+        return cand_dt.timestamp()
+
+    try:
+        parsed = datetime.datetime.strptime(s, "%m-%d %H:%M").replace(year=now_cn.year, tzinfo=CN_TZ)
+        return parsed.timestamp()
+    except ValueError:
+        return None
+
+
+def get_deal_publish_ts(deal_info: Any) -> Optional[float]:
+    """统一读取线报发布时间戳（优先读取规范数值 `publish_ts`，兼容历史未迁移记录 `publish_time`）。"""
+    if not isinstance(deal_info, dict):
+        return None
+    ts = coerce_unix_timestamp(deal_info.get("publish_ts"))
+    if ts is not None:
+        return ts
+    return coerce_unix_timestamp(deal_info.get("publish_time"))
+
+
+def format_timestamp_cn(val: Any, *, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """将任意有效时间戳/绝对时间在展示边界转换为北京时间本地字符串，无效返回空串。"""
+    ts = coerce_unix_timestamp(val)
+    if ts is None:
+        return ""
+    return datetime.datetime.fromtimestamp(ts, tz=CN_TZ).strftime(fmt)

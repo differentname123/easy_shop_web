@@ -8,7 +8,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from bson.decimal128 import Decimal128
 
-CN_TZ = datetime.timezone(datetime.timedelta(hours=8))
+from models.deal_constants import CN_TZ, coerce_unix_timestamp, get_deal_publish_ts
+
 DEAL_FRESH_WINDOW_SECONDS = 12 * 3600
 PLAIN_SKU_PRICE_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 
@@ -286,38 +287,8 @@ def extract_sku_unit_entries(doc: Dict[str, Any]) -> List[Tuple[float, str, Dict
 
 
 def parse_deal_publish_timestamp(val: Any) -> Optional[float]:
-    """将线报 publish_time 解析为秒级 Unix 时间戳；naive datetime 按 UTC（Mongo 契约），无时区字符串按北京时间。"""
-    if val is None or isinstance(val, bool):
-        return None
-    if isinstance(val, datetime.datetime):
-        dt = val.replace(tzinfo=datetime.timezone.utc) if val.tzinfo is None else val
-        return dt.timestamp()
-    if isinstance(val, (int, float)):
-        ts = float(val)
-        if not math.isfinite(ts) or ts <= 0:
-            return None
-        return ts / 1000.0 if ts > 1e12 else ts
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return None
-        if s.endswith(("Z", "z")):
-            s = s[:-1] + "+00:00"
-        if "/" in s[:10]:
-            s = s.replace("/", "-", 2)
-        try:
-            dt = datetime.datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=CN_TZ)
-            return dt.timestamp()
-        except ValueError:
-            pass
-        for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16)):
-            try:
-                return datetime.datetime.strptime(s[:width], fmt).replace(tzinfo=CN_TZ).timestamp()
-            except ValueError:
-                continue
-    return None
+    """将已存储线报发布时间归一化为秒级 Unix 时间戳（委托单一真源 coerce_unix_timestamp）。"""
+    return coerce_unix_timestamp(val)
 
 
 def extract_fresh_deal_unit_entries(
@@ -338,7 +309,7 @@ def extract_fresh_deal_unit_entries(
     if not isinstance(deal_fmt, dict) or not isinstance(deal_fmt.get("pricing_basis"), dict):
         return []
 
-    pub_ts = parse_deal_publish_timestamp(deal_info.get("publish_time"))
+    pub_ts = get_deal_publish_ts(deal_info)
     cur_ts = float(now_ts) if now_ts is not None else time.time()
     if pub_ts is None or (cur_ts - pub_ts) > DEAL_FRESH_WINDOW_SECONDS or (pub_ts - cur_ts) > 300.0:
         return []

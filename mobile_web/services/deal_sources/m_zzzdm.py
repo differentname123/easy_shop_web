@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlsplit
 
@@ -31,7 +32,6 @@ from .parsing import (
     extract_links_images_and_tokens,
     html_to_tutorial_text,
     strip_html_tags,
-    utc_now_iso,
 )
 
 
@@ -210,7 +210,7 @@ class MZzzdmSource(ListDetailDealSource):
             price_text=card["price_text"],
             image_url=img_url,
             mall_name=mall_name,
-            publish_time=utc_now_iso(),
+            publish_ts=time.time(),
             hot_metrics={"upstream_time": card["upstream_time"]},
             tutorial_text=tutorial_text,
             tutorial_images=all_imgs,

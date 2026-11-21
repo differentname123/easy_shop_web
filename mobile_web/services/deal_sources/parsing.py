@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Collection, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
+from models.deal_constants import parse_publish_time_epoch
 from models.product import (
     detect_platform_signal,
     extract_all_tokens,
@@ -292,7 +293,8 @@ def build_deal_record(
     price: Optional[float] = None,
     image_url: str = "",
     mall_name: str = "",
-    publish_time: str = "",
+    publish_time: Any = "",
+    publish_ts: Optional[float] = None,
     expire_time: Optional[str] = None,
     hot_metrics: Optional[Dict[str, Any]] = None,
     tutorial_text: str = "",
@@ -341,6 +343,7 @@ def build_deal_record(
     primary_source_url = str(source_detail_url or source_url or source_list_page_url or "").strip()
     list_page_url = str(source_list_page_url or source_url or "").strip()
     detail_page_url = str(source_detail_url or source_url or list_page_url or "").strip()
+    resolved_pub_ts = parse_publish_time_epoch(publish_ts if publish_ts is not None else publish_time)
 
     return {
         "source_site": source_site,
@@ -358,7 +361,7 @@ def build_deal_record(
         "price": price,
         "image_url": primary_img,
         "mall_name": str(mall_name or "").strip(),
-        "publish_time": str(publish_time or "").strip(),
+        "publish_ts": resolved_pub_ts,
         "expire_time": str(expire_time).strip() if expire_time not in (None, "", "0", 0) else None,
         "hot_metrics": hot_metrics or {},
         "tutorial_text": tutorial_text,

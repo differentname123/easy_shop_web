@@ -31,7 +31,6 @@ from .parsing import (
     build_deal_record,
     extract_links_images_and_tokens,
     html_to_tutorial_text,
-    utc_now_iso,
 )
 
 logger = get_app_logger(__name__)
@@ -285,26 +284,49 @@ class TehuicaicaiSource(BaseDealSource):
                     combined_tutorial_text = "\n".join(full_text_parts).strip()
                     if not combined_tutorial_text and (video_url or qr_img):
                         combined_tutorial_text = f"【{det_plat_name or '特惠采采'}】{title}\n到手价: {display_price}".strip()
+                    extra_raw_refs = [
+                        raw_ref
+                        for raw_ref in (*coupon_urls, purchase_url)
+                        if raw_ref and raw_ref not in combined_tutorial_text
+                    ]
+                    if extra_raw_refs:
+                        combined_tutorial_text = (
+                            f"{combined_tutorial_text}\n" + "\n".join(extra_raw_refs)
+                            if combined_tutorial_text
+                            else "\n".join(extra_raw_refs)
+                        ).strip()
 
                     links, imgs, tokens = extract_links_images_and_tokens(combined_tutorial_text, base_url=source_url)
                     seen_link_urls = {str(lk.get("url") or "") for lk in links}
-                    for cu in coupon_urls:
-                        if cu.startswith(("http://", "https://")) and cu not in seen_link_urls:
-                            seen_link_urls.add(cu)
+
+                    def _append_extra_url(raw_val: str, *, label: str, link_type: str) -> None:
+                        sub_links, _, sub_tokens = extract_links_images_and_tokens(raw_val, base_url=source_url)
+                        for clk in sub_links:
+                            u_ext = str(clk.get("url") or "").strip()
+                            if u_ext and u_ext not in seen_link_urls:
+                                seen_link_urls.add(u_ext)
+                                links.append({
+                                    "label": label,
+                                    "url": u_ext,
+                                    "type": link_type,
+                                    "platform": detect_platform_signal(u_ext) or det_plat or "unknown",
+                                })
+                        for tk in sub_tokens:
+                            if tk and tk not in tokens:
+                                tokens.append(tk)
+                        if raw_val.startswith(("http://", "https://")) and raw_val not in seen_link_urls:
+                            seen_link_urls.add(raw_val)
                             links.append({
-                                "label": "特惠采采领券链接",
-                                "url": cu,
-                                "type": "coupon_url",
-                                "platform": detect_platform_signal(cu) or det_plat or "unknown",
+                                "label": label,
+                                "url": raw_val,
+                                "type": link_type,
+                                "platform": detect_platform_signal(raw_val) or det_plat or "unknown",
                             })
-                    if purchase_url.startswith(("http://", "https://")) and purchase_url not in seen_link_urls:
-                        seen_link_urls.add(purchase_url)
-                        links.append({
-                            "label": "特惠采采下单短链",
-                            "url": purchase_url,
-                            "type": "purchase_url",
-                            "platform": detect_platform_signal(purchase_url) or det_plat or "unknown",
-                        })
+
+                    for cu in coupon_urls:
+                        _append_extra_url(cu, label="特惠采采领券链接", link_type="coupon_url")
+                    if purchase_url:
+                        _append_extra_url(purchase_url, label="特惠采采下单短链", link_type="purchase_url")
 
                     all_imgs: List[str] = [image_url] if image_url else []
                     for extra_img in [*imgs, qr_img, second_qr_img]:
@@ -331,7 +353,7 @@ class TehuicaicaiSource(BaseDealSource):
                         price_text=str(det.get("display_price") or display_price).strip(),
                         image_url=image_url,
                         mall_name=det_plat_name,
-                        publish_time=utc_now_iso(),
+                        publish_ts=time.time(),
                         explicit_platform=det_plat or None,
                         hot_metrics=hot_metrics,
                         tutorial_text=combined_tutorial_text,

@@ -287,7 +287,14 @@ class ZtkClient:
             except QuotaPaceBacklogError:
                 return _error("QUOTA_PACE_BACKLOG", "淘宝转链请求过于频繁，请稍后重试")
             try:
-                body = self._get_response(ZTK_CHANNEL_URL, params=params)
+                try:
+                    body = self._get_response(ZTK_CHANNEL_URL, params=params)
+                except Exception:
+                    if is_real_requests_session(self.http):
+                        time.sleep(0.4)
+                        body = self._get_response(ZTK_CHANNEL_URL, params=params)
+                    else:
+                        raise
                 if isinstance(body, dict) and body.get("status") == "error":
                     return body
                 if not isinstance(body, dict):

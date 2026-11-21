@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import html as html_lib
 import logging
 import re
 import threading
@@ -38,9 +39,10 @@ from models.deal_constants import (
     OK_SKIPPED_ALREADY_CLEANED,
     QUALIFIED_DEAL_MIN_SCORE,
     SOURCE_REPUTATION_BONUS,
+    coerce_unix_timestamp,
+    parse_publish_time_epoch,
 )
-from models.product import get_source_site_name
-from repositories.deal_raw_pool_repo import parse_publish_time_epoch
+from models.product import _TB_WRAP_CHARS, get_source_site_name
 from services.deal_cleaning.cache_state import (
     AnchorConversionCache,
     lookup_active_product,
@@ -78,6 +80,7 @@ _AFFILIATE_MAIN_DOMAIN_HINTS = (
     "union-click.jd.com/",
     "jingfen.jd.com/detail/",
     "s.click.taobao.com/",
+    "uland.taobao.com/item/edetail",
     "m.tb.cn/",
     "e.tb.cn/",
     "p.pinduoduo.com/",
@@ -264,6 +267,164 @@ def _supplement_structured_links(
                     })
 
 
+def _build_ai1_verbatim_corpus(
+    merged_tip_ids: List[str],
+    tip_map: Dict[str, Dict[str, Any]],
+    orig_doc: Dict[str, Any],
+) -> Tuple[str, Set[str]]:
+    """构造单条 AI-1 任务允许引用的原始文本语料与精确链接/口令集合（严格隔离其它批内消息）。"""
+    ordered_docs: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    for tid in merged_tip_ids or []:
+        tid_s = str(tid or "").strip()
+        if tid_s and tid_s not in seen_ids and tid_s in (tip_map or {}):
+            seen_ids.add(tid_s)
+            ordered_docs.append(tip_map[tid_s])
+    if not ordered_docs and orig_doc:
+        ordered_docs.append(orig_doc)
+
+    parts: List[str] = []
+    exact_entries: Set[str] = set()
+    for nd in ordered_docs:
+        for field in ("title", "tutorial_text"):
+            raw_v = str(nd.get(field) or "").strip()
+            if raw_v:
+                norm_v = normalize_inline_spaces(html_lib.unescape(raw_v)).strip()
+                parts.append(raw_v)
+                if norm_v != raw_v:
+                    parts.append(norm_v)
+        for lk in nd.get("extracted_links") or []:
+            if isinstance(lk, dict):
+                for k in ("url", "item_id"):
+                    raw_u = str(lk.get(k) or "").strip()
+                    if raw_u:
+                        exact_entries.add(raw_u)
+                        parts.append(raw_u)
+                        norm_u = normalize_inline_spaces(strip_markdown_link_wrapper(raw_u))
+                        if norm_u:
+                            exact_entries.add(norm_u)
+                            parts.append(norm_u)
+        for tk in nd.get("extracted_tokens") or []:
+            raw_t = str(tk or "").strip()
+            if raw_t:
+                exact_entries.add(raw_t)
+                parts.append(raw_t)
+                norm_t = normalize_inline_spaces(strip_markdown_link_wrapper(raw_t))
+                if norm_t:
+                    exact_entries.add(norm_t)
+                    parts.append(norm_t)
+    return "\n".join(parts), exact_entries
+
+
+def _is_target_in_raw_corpus(clean_input: str, corpus: str, exact_entries: Set[str]) -> bool:
+    """校验 AI-1 提取出的链接/口令是否完整、逐字存在于本条原始数据中，拦截字符幻觉或跨线报拼接。"""
+    cand = normalize_inline_spaces(strip_markdown_link_wrapper(str(clean_input or ""))).strip()
+    if not cand:
+        return False
+    if cand in exact_entries:
+        return True
+
+    if cand.lower().startswith(("http://", "https://")):
+        scheme_idx = cand.find("://")
+        candidates = [cand]
+        if scheme_idx > 0 and len(cand[scheme_idx + 3 :]) >= 8:
+            candidates.append(cand[scheme_idx + 3 :])
+        for needle in candidates:
+            start = 0
+            while True:
+                idx = corpus.find(needle, start)
+                if idx < 0:
+                    break
+                end_idx = idx + len(needle)
+                next_ch = corpus[end_idx] if end_idx < len(corpus) else ""
+                if not next_ch or not re.match(r"[A-Za-z0-9_%&=+/?#.-]", next_ch):
+                    return True
+                start = idx + 1
+        return False
+
+    if re.fullmatch(r"[A-Za-z0-9_-]+", cand):
+        if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(cand)}(?![A-Za-z0-9_-])", corpus):
+            return True
+    elif cand in corpus:
+        return True
+
+    core = cand.strip(_TB_WRAP_CHARS + " \t")
+    if len(core) == 11 and core.isalnum() and any(c.isalpha() for c in core) and any(c.isdigit() for c in core):
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(core)}(?![A-Za-z0-9])", corpus):
+            return True
+    return False
+
+
+def _find_unverified_ai1_targets(
+    norm_targets: List[Dict[str, Any]],
+    merged_tip_ids: List[str],
+    tip_map: Dict[str, Dict[str, Any]],
+    orig_doc: Dict[str, Any],
+) -> List[str]:
+    corpus, exact_entries = _build_ai1_verbatim_corpus(merged_tip_ids, tip_map, orig_doc)
+    return [
+        t["clean_input"]
+        for t in norm_targets
+        if not _is_target_in_raw_corpus(t.get("clean_input", ""), corpus, exact_entries)
+    ]
+
+
+def _normalize_ai1_item(
+    mid: str,
+    ai1_res: Dict[str, Any],
+    tip_map: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """规范化单条 Stage 1 模型输出，返回规范后的 `norm_targets` 并就地更新结构化字段。"""
+    ai1_res["_from_fallback"] = False
+
+    raw_ts = ai1_res.get("tutorial_score")
+    ai1_res["tutorial_score"] = (
+        int(raw_ts)
+        if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool) and 0 <= raw_ts <= 100
+        else 50
+    )
+
+    raw_dp = ai1_res.get("deal_price")
+    if isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and 0.1 <= raw_dp <= 100000:
+        ai1_res["deal_price"] = round(float(raw_dp), 2)
+    elif isinstance(raw_dp, str):
+        try:
+            val = float(re.sub(r"[^\d.]", "", raw_dp))
+            ai1_res["deal_price"] = round(val, 2) if 0.1 <= val <= 100000 else None
+        except Exception:
+            ai1_res["deal_price"] = None
+    else:
+        ai1_res["deal_price"] = None
+
+    norm_targets: List[Dict[str, Any]] = []
+    for idx_t, tgt in enumerate(ai1_res.get("extracted_targets") or [], 1):
+        if not isinstance(tgt, dict):
+            continue
+        c_inp = strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
+        if not c_inp:
+            continue
+        raw_role = str(tgt.get("text_role_hint") or "main_candidate").strip().lower()
+        tgt["link_id"] = str(tgt.get("link_id") or f"L{idx_t}").strip()
+        tgt["raw_span"] = normalize_inline_spaces(str(tgt.get("raw_span") or "")).strip()
+        tgt["clean_input"] = c_inp
+        tgt["text_role_hint"] = ROLE_HINT_NORMALIZE_MAP.get(raw_role, "main_candidate")
+        norm_targets.append(tgt)
+
+    if not ai1_res.get("merged_tip_ids"):
+        ai1_res["merged_tip_ids"] = [mid]
+    else:
+        normalized_mids = [
+            (str(x).split(":", 1)[-1].strip() if ":" in str(x) else str(x).strip())
+            for x in ai1_res["merged_tip_ids"]
+            if str(x or "").strip()
+        ]
+        if tip_map:
+            normalized_mids = [tid for tid in normalized_mids if tid in tip_map]
+        ai1_res["merged_tip_ids"] = normalized_mids or [mid]
+
+    return norm_targets
+
+
 def run_ai_stage1_batch(
     cleaner: Any,
     stage1_inputs: List[Dict[str, Any]],
@@ -271,7 +432,7 @@ def run_ai_stage1_batch(
     neighbor_maps_by_id: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     quiet_sub_logs: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
-    """并发执行 Stage 1 (AI-1) 批处理，并由代码确定性拼接 `combined_raw_text` 与 `extracted_images`。"""
+    """并发执行 Stage 1 (AI-1) 批处理，逐条核验链接逐字保真并由代码确定性拼接正文与图片。"""
     results_by_id: Dict[str, Dict[str, Any]] = {}
     total_items = len(stage1_inputs)
     chunks = [stage1_inputs[i : i + cleaner.ai_batch_size] for i in range(0, total_items, cleaner.ai_batch_size)]
@@ -282,13 +443,19 @@ def run_ai_stage1_batch(
         cleaner.stats_ai1_calls += 1
         return cleaner._call_ai_json_array(prompt_tpl, chunk, "AI-Stage1")
 
+    def _normalize_mid(raw_mid: Any) -> str:
+        m = str(raw_mid or "").strip()
+        if m and ":" in m and m not in docs_by_tip_id:
+            suffix = m.split(":", 1)[-1].strip()
+            if suffix in docs_by_tip_id:
+                return suffix
+        return m
+
     def _ingest_arr(arr: List[Dict[str, Any]]) -> None:
         for item in arr:
-            mid = str(item.get("main_tip_id") or item.get("task_id") or "").strip()
-            if mid and ":" in mid and mid not in docs_by_tip_id:
-                mid_suffix = mid.split(":", 1)[-1].strip()
-                if mid_suffix in docs_by_tip_id:
-                    mid = mid_suffix
+            if not isinstance(item, dict):
+                continue
+            mid = _normalize_mid(item.get("main_tip_id") or item.get("task_id") or "")
             if mid:
                 item["main_tip_id"] = mid
                 results_by_id[mid] = item
@@ -344,50 +511,57 @@ def run_ai_stage1_batch(
             continue
 
         cleaner.stats_ai1_model_hits += 1
-        ai1_res["_from_fallback"] = False
-
-        raw_ts = ai1_res.get("tutorial_score")
-        ai1_res["tutorial_score"] = (
-            int(raw_ts)
-            if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool) and 0 <= raw_ts <= 100
-            else 50
-        )
-
-        raw_dp = ai1_res.get("deal_price")
-        if isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and 0.1 <= raw_dp <= 100000:
-            ai1_res["deal_price"] = round(float(raw_dp), 2)
-        elif isinstance(raw_dp, str):
-            try:
-                val = float(re.sub(r"[^\d.]", "", raw_dp))
-                ai1_res["deal_price"] = round(val, 2) if 0.1 <= val <= 100000 else None
-            except Exception:
-                ai1_res["deal_price"] = None
-        else:
-            ai1_res["deal_price"] = None
-
-        norm_targets: List[Dict[str, Any]] = []
-        for idx_t, tgt in enumerate(ai1_res.get("extracted_targets") or [], 1):
-            if not isinstance(tgt, dict):
-                continue
-            c_inp = strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
-            if not c_inp:
-                continue
-            raw_role = str(tgt.get("text_role_hint") or "main_candidate").strip().lower()
-            tgt["link_id"] = str(tgt.get("link_id") or f"L{idx_t}").strip()
-            tgt["raw_span"] = normalize_inline_spaces(str(tgt.get("raw_span") or "")).strip()
-            tgt["clean_input"] = c_inp
-            tgt["text_role_hint"] = ROLE_HINT_NORMALIZE_MAP.get(raw_role, "main_candidate")
-            norm_targets.append(tgt)
-
-        if not ai1_res.get("merged_tip_ids"):
-            ai1_res["merged_tip_ids"] = [mid]
-        else:
-            ai1_res["merged_tip_ids"] = [
-                (str(x).split(":", 1)[-1].strip() if ":" in str(x) else str(x).strip())
-                for x in ai1_res["merged_tip_ids"]
-                if str(x or "").strip()
-            ]
         tip_map = (neighbor_maps_by_id or {}).get(mid) or ({mid: orig_doc} if orig_doc else {})
+        norm_targets = _normalize_ai1_item(mid, ai1_res, tip_map)
+
+        unverified = _find_unverified_ai1_targets(norm_targets, ai1_res["merged_tip_ids"], tip_map, orig_doc)
+        if unverified:
+            logger.warning(
+                "🚨 [AI-1 链接非原文告警] %s#%s 提取到非原文链接/口令 %s，立即触发单条隔离重提",
+                str(orig_doc.get("source_site") or ""),
+                mid,
+                [u[:80] for u in unverified],
+            )
+            rescued = False
+            try:
+                retry_arr = _worker([inp]) or []
+                cand = next(
+                    (
+                        item
+                        for item in retry_arr
+                        if isinstance(item, dict)
+                        and (
+                            _normalize_mid(item.get("main_tip_id") or item.get("task_id") or "") == mid
+                            or (len(retry_arr) == 1 and not (item.get("main_tip_id") or item.get("task_id")))
+                        )
+                    ),
+                    None,
+                )
+                if isinstance(cand, dict) and "extracted_targets" in cand:
+                    cand["main_tip_id"] = mid
+                    cand_targets = _normalize_ai1_item(mid, cand, tip_map)
+                    cand_unverified = _find_unverified_ai1_targets(cand_targets, cand["merged_tip_ids"], tip_map, orig_doc)
+                    if not cand_unverified:
+                        ai1_res = cand
+                        norm_targets = cand_targets
+                        results_by_id[mid] = ai1_res
+                        rescued = True
+                        logger.info("✅ [AI-1 单条隔离重提成功] %s#%s 链接已通过原文逐字校验", str(orig_doc.get("source_site") or ""), mid)
+                    else:
+                        logger.warning(
+                            "🚨 [AI-1 单条隔离重提仍未通过校验] %s#%s -> %s",
+                            str(orig_doc.get("source_site") or ""),
+                            mid,
+                            [u[:80] for u in cand_unverified],
+                        )
+            except Exception as exc:
+                logger.warning("[AI-1 单条隔离重提异常] %s#%s: %s", str(orig_doc.get("source_site") or ""), mid, str(exc)[:160])
+
+            if not rescued:
+                cleaner.stats_ai1_fallbacks += 1
+                results_by_id[mid] = fallback_stage1_extract(orig_doc, fail_reason="AI1_HALLUCINATED_LINK")
+                continue
+
         _supplement_structured_links(norm_targets, ai1_res["merged_tip_ids"], tip_map, orig_doc)
 
         ai1_res["extracted_targets"] = norm_targets
@@ -863,7 +1037,7 @@ def run_stage3_concurrent_conversions(
 
     jd_adapter = cleaner.adapters.get("jd")
     ztk_key_count = len(getattr(getattr(jd_adapter, "client", None), "appkey_list", ()) or ())
-    jd_lane_cap = min(max(2, ztk_key_count), 6) if ztk_key_count > 0 else 2
+    jd_lane_cap = min(max(1, ztk_key_count), 2) if ztk_key_count > 0 else 1
     jd_lane_count = min(cleaner.convert_max_workers, jd_lane_cap, len(jd_targets))
     other_slots = 0 if not other_targets else min(max(1, cleaner.convert_max_workers - jd_lane_count), len(other_targets))
     worker_slots = max(1, other_slots + jd_lane_count)
@@ -2158,8 +2332,43 @@ def process_ai2_unit(
                     and is_explicit_coupon_target(c)
                 ]
                 if raw_coupon_candidates:
-                    should_reject = True
-                    reject_detail = "原始优惠券链接转链失败或未被保留"
+                    has_failed_cpn = any(
+                        c.get("convert_status") in ("failed", "skipped_filler")
+                        for c in raw_coupon_candidates
+                    )
+                    if not has_failed_cpn:
+                        for c in raw_coupon_candidates:
+                            if c.get("convert_status") != "coupon_or_activity":
+                                continue
+                            lid = str(c.get("link_id") or "").strip()
+                            if not lid or lid in seen_cpn_ids:
+                                continue
+                            c_plat = str(c.get("platform") or plat).strip().lower()
+                            c_url = str(c.get("my_promo_link") or "").strip()
+                            c_tok = str(c.get("my_promo_token") or "").strip()
+                            if is_shop_homepage_url(c_url) or is_shop_homepage_url(c.get("clean_input")):
+                                continue
+                            if (not c_url and not c_tok) or (c_url and my_promo_link and c_url == my_promo_link):
+                                continue
+                            if plat == "taobao":
+                                c_host = (urlsplit(c_url).hostname or "").strip().lower() if c_url else ""
+                                if c_host in ("s.click.taobao.com", "s.click.tmall.com"):
+                                    continue
+                            dedup_sig = (c_url, c_tok)
+                            if dedup_sig in seen_cpn_targets:
+                                continue
+                            seen_cpn_ids.add(lid)
+                            seen_cpn_targets.add(dedup_sig)
+                            coupon_links.append({
+                                "link_id": lid,
+                                "label": "优惠券",
+                                "url": c_url,
+                                "token": c_tok,
+                                "platform": c_plat or plat,
+                            })
+                    if not coupon_links:
+                        should_reject = True
+                        reject_detail = "原始优惠券链接转链失败或未被保留"
                 elif deal_price is not None:
                     has_failed_non_filler = any(
                         c.get("link_id") != main_lid
@@ -2278,6 +2487,13 @@ def process_ai2_unit(
             else 50
         )
 
+        pub_ts = (
+            coerce_unix_timestamp(doc.get("publish_ts"))
+            or parse_publish_time_epoch(doc.get("publish_time"))
+            or coerce_unix_timestamp(doc.get("fetched_at"))
+            or time.time()
+        )
+
         deal_info = {
             "is_deal_tip": True,
             "quality_score": quality_score,
@@ -2285,7 +2501,7 @@ def process_ai2_unit(
             "score_breakdown": score_breakdown,
             "clean_title": clean_title,
             "card_highlight": card_highlight,
-            "publish_time": str(doc.get("publish_time") or doc.get("fetched_at") or "").strip(),
+            "publish_ts": float(pub_ts),
             "expire_time": doc.get("expire_time"),
             "deal_price": deal_price,
             "unit_deal_price": unit_deal_price,

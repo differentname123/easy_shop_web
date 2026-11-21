@@ -28,7 +28,6 @@ from .parsing import (
     extract_balanced_tag,
     extract_links_images_and_tokens,
     html_to_tutorial_text,
-    utc_now_iso,
 )
 
 
@@ -195,7 +194,7 @@ class XuandanSource(BaseDealSource):
                     title=title,
                     image_url=img_url,
                     mall_name="淘宝/天猫",
-                    publish_time=utc_now_iso(),
+                    publish_ts=time.time(),
                     explicit_platform="taobao",
                     hot_metrics={"type_id": type_id, "is_hidden": bool(is_hidden)},
                     tutorial_text=tutorial_text,

@@ -704,7 +704,7 @@ class TestProductRepository(unittest.TestCase):
                 "commission_rate", "commission_amount", "sales_tip", "image_url", "mall_name", "updated_at",
                 "product_url", "coupon_url",
                 "deal_source", "deal_source_name",
-                "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.publish_time",
+                "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.publish_ts", "deal_info.publish_time",
                 "deal_info.source_site", "deal_info.source_site_name",
             ), 1),
         })
@@ -1754,6 +1754,90 @@ class TestProductRepository(unittest.TestCase):
             parse_deal_publish_timestamp("2026-11-21 11:30:00"),
             aware_utc_dt.timestamp(),
         )
+
+    def test_numeric_publish_ts_drives_fresh_deal_cost_performance_and_local_display(self):
+        """标准数值 publish_ts 直接驱动 12h 性价比排行，并在详情/榜单/时间线渲染为本地北京时间；旧脏相对字符串在读取期严格拒收。"""
+        from models.cost_performance import rank_products_by_cost_performance
+
+        now_ts = datetime.datetime(2026, 11, 21, 14, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+        pub_ts = now_ts - 3600.0  # 1 小时前：2026-11-21 13:00Z = 北京时间 2026-11-21 21:00
+        doc_better_fresh = {
+            "platform": "pdd",
+            "product_id": "COLA-5",
+            "name": "可口可乐500ml*5瓶装",
+            "activity_price": 10.79,
+            "price": 10.79,
+            "format_status": "success",
+            "format_info": {
+                "COLA-5_0": {
+                    "price": 10.79,
+                    "pricing_basis": {"structure": [{"value": 5, "unit": "瓶"}, {"value": 500, "unit": "ml"}], "total_value": 2500, "base_unit": "ml"},
+                }
+            },
+            "deal_info": {
+                "is_deal_tip": True,
+                "publish_ts": pub_ts,
+                "deal_price": 6.48,
+                "format_deal_price": 6.48,
+                "format_status": "success",
+                "tutorial_steps": ["1. 下单6.48元"],
+                "format_info": {
+                    "pricing_basis": {"structure": [{"value": 5, "unit": "瓶"}, {"value": 500, "unit": "ml"}], "total_value": 2500, "base_unit": "ml"},
+                },
+                "tips_timeline": [{"tip_id": "t1", "publish_ts": pub_ts, "deal_price": 6.48}],
+            },
+        }
+        doc_18_bottles = {
+            "platform": "pdd",
+            "product_id": "COLA-18",
+            "name": "可口可乐500ml*18瓶",
+            "activity_price": 33.4,
+            "price": 33.4,
+            "deal_info": {
+                "is_deal_tip": True,
+                "publish_ts": pub_ts,
+                "deal_price": 30.4,
+                "format_deal_price": 30.4,
+                "format_status": "success",
+                "format_info": {
+                    "pricing_basis": {"structure": [{"value": 18, "unit": "瓶"}, {"value": 500, "unit": "ml"}], "total_value": 9000, "base_unit": "ml"},
+                },
+            },
+        }
+        doc_unmigrated_dirty = {
+            "platform": "pdd",
+            "product_id": "COLA-DIRTY",
+            "name": "可口可乐未迁移脏时间",
+            "activity_price": 15.0,
+            "price": 15.0,
+            "format_status": "success",
+            "format_info": {
+                "COLA-DIRTY_0": {
+                    "price": 15.0,
+                    "pricing_basis": {"structure": [{"value": 2, "unit": "瓶"}, {"value": 500, "unit": "ml"}], "total_value": 1000, "base_unit": "ml"},
+                }
+            },
+            "deal_info": {
+                "is_deal_tip": True,
+                "publish_time": "14分钟前",  # 读取期严禁猜相对文案
+                "deal_price": 1.0,
+                "format_status": "success",
+                "format_info": {
+                    "pricing_basis": {"structure": [{"value": 2, "unit": "瓶"}, {"value": 500, "unit": "ml"}], "total_value": 1000, "base_unit": "ml"},
+                },
+            },
+        }
+
+        ranked = rank_products_by_cost_performance(
+            [doc_unmigrated_dirty, doc_18_bottles, doc_better_fresh],
+            normalize_summary=self.repo._normalize_doc_summary,
+            now_ts=now_ts,
+        )
+        self.assertEqual([d["product_id"] for d in ranked], ["COLA-5", "COLA-18", "COLA-DIRTY"])
+        self.assertEqual(ranked[0]["deal_publish_time"], "2026-11-21 21:00")
+        tip_view = self.repo._extract_deal_tip(doc_better_fresh)
+        self.assertEqual(tip_view["publish_time"], "2026-11-21 21:00")
+        self.assertEqual(tip_view["tips_timeline"][0]["publish_time"], "2026-11-21 21:00")
 
     def test_rank_boom_cost_performance_isolates_irrelevant_l3_and_keeps_unformatted(self):
         """即使廉价配件/狗粮单价极低，也不会在性价比排序中压过真本体商品；无清洗新品照常参与排序。"""

@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlsplit
 
+from models.deal_constants import parse_publish_time_epoch
 from models.product import detect_platform_signal
 
 from .base import FetchContext
@@ -34,7 +36,6 @@ from .parsing import (
     extract_links_images_and_tokens,
     html_to_tutorial_text,
     strip_html_tags,
-    utc_now_iso,
 )
 
 
@@ -309,7 +310,7 @@ class BaicaioSource(ListDetailDealSource):
         buy_line = f"\n直达购买: {merged_links[0]['url']}" if merged_links and merged_links[0]["url"] not in con_text else ""
         tutorial_text = f"【{mall_name or '白菜哦'}】{title}\n{con_text}{buy_line}".strip()
 
-        effective_pub_time = utc_now_iso() if use_fetch_time else pub_time
+        effective_pub_ts = time.time() if use_fetch_time else parse_publish_time_epoch(pub_time)
         hot_metrics: Dict[str, Any] = {"mode": mode}
         if pub_time:
             hot_metrics["upstream_time"] = pub_time
@@ -325,7 +326,7 @@ class BaicaioSource(ListDetailDealSource):
             price_text=price_text,
             image_url=img_url,
             mall_name=mall_name,
-            publish_time=effective_pub_time,
+            publish_ts=effective_pub_ts,
             hot_metrics=hot_metrics,
             tutorial_text=tutorial_text,
             tutorial_images=all_imgs,

@@ -29,6 +29,7 @@ for _p in (PROJECT_ROOT, WORKSPACE_ROOT):
         sys.path.insert(0, _p)
 
 from infrastructure.logging_utils import configure_console_encoding
+from models.deal_constants import format_timestamp_cn
 from services.deal_sources import (
     DEFAULT_CHANNEL_CONFIGS,
     ChannelConfig,
@@ -156,7 +157,7 @@ def _verify_one_channel(
         print(
             f"  [样本 {idx}] id={rec.get('source_item_id')} | platform={rec.get('platform') or '?'} "
             f"| mall={mall} | price={price_txt} | valid_gate={valid_flag} "
-            f"| pub={rec.get('publish_time') or '-'} | links={len(ext_links)} tokens={len(tokens)}"
+            f"| pub={format_timestamp_cn(rec.get('publish_ts') or rec.get('publish_time')) or '-'} | links={len(ext_links)} tokens={len(tokens)}"
         )
         print(f"    标题: {_truncate(rec.get('title'), 100)}")
         if src_url:

@@ -23,7 +23,6 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -31,7 +30,6 @@ import requests
 
 from infrastructure.runtime_io import atomic_write_json, should_write_runtime_artifact
 from models.product import detect_platform_signal
-from repositories.deal_raw_pool_repo import parse_publish_time_epoch
 
 from .base import FetchContext, FetchResult
 from .filters import (
@@ -910,10 +908,6 @@ class GuangdiuSource(ListDetailDealSource):
             parsed_t = strip_html_tags(m_det_time.group(1))
             if parsed_t:
                 pub_time = parsed_t
-        if pub_time and not re.match(r"^\d{4}-\d{2}-\d{2}", pub_time):
-            pub_ts = parse_publish_time_epoch(pub_time)
-            if isinstance(pub_ts, (int, float)):
-                pub_time = datetime.fromtimestamp(pub_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         go_target = card.get("list_buy_url") or self._fetch_go_target(
             f"{self.BASE_URL}/go.php?id={item_id}", item_id, list_res, ctx

@@ -378,13 +378,17 @@ class HdkClient:
             if ret_m:
                 sku_id = ret_m.group(1)
 
-        # 判定是否属于官方活动/会场/券包
+        # 判定是否属于官方活动/会场/券包/店铺首页
         # 铁律：只有在毫无任何单品 SKU/goods_sign 实证的前提下，才允许判定为纯会场！
         is_venue = False
         if not sku_id:
-            is_venue = is_jd_official_venue_url(dest_url) or (
-                host == "jingfen.jd.com"
-                and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url)
+            is_venue = (
+                is_jd_official_venue_url(dest_url)
+                or host in ("shop.m.jd.com", "mall.jd.com")
+                or (
+                    host == "jingfen.jd.com"
+                    and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url)
+                )
             )
 
         return {

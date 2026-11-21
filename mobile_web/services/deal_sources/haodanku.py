@@ -26,7 +26,7 @@ from .http_client import DEFAULT_HEADERS, is_rate_limit_status, request_with_ret
 from .parsing import (
     build_deal_record,
     extract_first_price,
-    utc_now_iso,
+    extract_links_images_and_tokens,
 )
 
 
@@ -186,6 +186,30 @@ class HaodankuSource(BaseDealSource):
                 plain_text_lines: List[str] = []
                 extracted_links: List[Dict[str, Any]] = []
                 extracted_tokens: List[str] = []
+                seen_link_urls: Set[str] = set()
+
+                def _add_link(entry: Dict[str, Any]) -> None:
+                    u = str(entry.get("url") or "").strip()
+                    if u and u not in seen_link_urls:
+                        seen_link_urls.add(u)
+                        extracted_links.append(entry)
+
+                def _add_token(tok: str) -> None:
+                    tk_s = str(tok or "").strip()
+                    if tk_s and tk_s not in extracted_tokens:
+                        extracted_tokens.append(tk_s)
+
+                def _ingest_text_signals(raw_str: str, *, link_label: str = "商品/活动链接", link_type: str = "item_url") -> None:
+                    txt_links, _, txt_tokens = extract_links_images_and_tokens(raw_str)
+                    for lk in txt_links:
+                        entry = dict(lk)
+                        entry["label"] = link_label
+                        entry["type"] = link_type
+                        if not entry.get("platform") or entry.get("platform") == "unknown":
+                            entry["platform"] = platform_code or "unknown"
+                        _add_link(entry)
+                    for tk in txt_tokens:
+                        _add_token(tk)
 
                 for sub in item.get("list") or []:
                     if not isinstance(sub, dict):
@@ -194,22 +218,23 @@ class HaodankuSource(BaseDealSource):
                     if c_text:
                         content_lines.append(c_text)
                         plain_text_lines.append(c_text)
+                        _ingest_text_signals(c_text)
 
                     sub_item_id = str(sub.get("item_id") or "").strip()
                     if sub_item_id:
                         if sub_item_id.startswith(("http://", "https://")):
-                            extracted_links.append({"label": "商品/活动链接", "url": sub_item_id, "type": "item_url", "platform": platform_code or "unknown"})
+                            _add_link({"label": "商品/活动链接", "url": sub_item_id, "type": "item_url", "platform": platform_code or "unknown"})
                             content_lines.append(sub_item_id)
                         elif sub_item_id.isdigit():
                             if platform_code == "taobao":
                                 target_u = f"https://item.taobao.com/item.htm?id={sub_item_id}"
-                                extracted_links.append({"label": "淘宝商品", "url": target_u, "type": "tb_numeric", "platform": "taobao"})
+                                _add_link({"label": "淘宝商品", "url": target_u, "type": "tb_numeric", "platform": "taobao"})
                             elif platform_code == "jd":
                                 target_u = f"https://item.jd.com/{sub_item_id}.html"
-                                extracted_links.append({"label": "京东商品", "url": target_u, "type": "jd_numeric", "platform": "jd"})
+                                _add_link({"label": "京东商品", "url": target_u, "type": "jd_numeric", "platform": "jd"})
                             else:
                                 target_u = sub_item_id
-                                extracted_links.append({"label": "商品ID", "url": target_u, "type": "item_id", "platform": platform_code or "unknown"})
+                                _add_link({"label": "商品ID", "url": target_u, "type": "item_id", "platform": platform_code or "unknown"})
                             content_lines.append(target_u)
                         elif (
                             platform_code == "taobao"
@@ -219,7 +244,7 @@ class HaodankuSource(BaseDealSource):
                             and any(c.isdigit() for c in sub_item_id)
                         ):
                             tok_wrapped = f"￥{sub_item_id}￥"
-                            extracted_tokens.append(tok_wrapped)
+                            _add_token(tok_wrapped)
                             content_lines.append(tok_wrapped)
                         elif (
                             (platform_code == "taobao" and re.match(r"^[A-Za-z0-9_-]{20,}$", sub_item_id))
@@ -227,19 +252,23 @@ class HaodankuSource(BaseDealSource):
                         ):
                             if platform_code == "taobao":
                                 ed_url = f"https://uland.taobao.com/item/edetail?id={sub_item_id}"
-                                extracted_links.append({"label": "淘宝二合一", "url": ed_url, "item_id": sub_item_id, "type": "tb_encrypted_id", "platform": "taobao"})
+                                _add_link({"label": "淘宝二合一", "url": ed_url, "item_id": sub_item_id, "type": "tb_encrypted_id", "platform": "taobao"})
                                 content_lines.append(ed_url)
                             else:
-                                extracted_links.append({"label": "加密ID", "url": sub_item_id, "type": "encrypted_id", "platform": platform_code or "unknown"})
+                                _add_link({"label": "加密ID", "url": sub_item_id, "type": "encrypted_id", "platform": platform_code or "unknown"})
                                 content_lines.append(sub_item_id)
-                        elif extract_all_tokens(sub_item_id):
-                            extracted_tokens.append(sub_item_id)
+                        else:
                             content_lines.append(sub_item_id)
+                            _ingest_text_signals(sub_item_id)
+                            if extract_all_tokens(sub_item_id):
+                                _add_token(sub_item_id)
 
                     coupon_url = str(sub.get("coupon_url") or "").strip()
-                    if coupon_url.startswith(("http://", "https://")):
-                        extracted_links.append({"label": "优惠券", "url": coupon_url, "type": "coupon_url", "platform": platform_code or "unknown"})
+                    if coupon_url:
                         content_lines.append(coupon_url)
+                        _ingest_text_signals(coupon_url, link_label="优惠券", link_type="coupon_url")
+                        if coupon_url.startswith(("http://", "https://")):
+                            _add_link({"label": "优惠券", "url": coupon_url, "type": "coupon_url", "platform": platform_code or "unknown"})
 
                 if not extracted_links and not extracted_tokens:
                     skipped_no_detail += 1
@@ -285,7 +314,7 @@ class HaodankuSource(BaseDealSource):
                     price=price,
                     image_url=img_list[0] if img_list else "",
                     mall_name=platform_name,
-                    publish_time=utc_now_iso(),
+                    publish_ts=time.time(),
                     explicit_platform=platform_code,
                     hot_metrics=hot_metrics,
                     tutorial_text=tutorial_text,

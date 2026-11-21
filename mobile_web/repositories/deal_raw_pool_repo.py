@@ -40,6 +40,7 @@ from models.deal_constants import (
     MAX_JSONL_FILE_BYTES,
     UPSTREAM_DISAPPEARED,
     get_default_site_max_age_days_map,
+    parse_publish_time_epoch,
     resolve_deal_max_age_days,
 )
 
@@ -201,96 +202,6 @@ def evaluate_quality_signals(record: Dict[str, Any]) -> Dict[str, Any]:
         "has_multi_links": len(links) > 1,
         "comments": comments,
     }
-
-
-_CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
-
-
-def parse_publish_time_epoch(pub_time_str: str) -> Optional[float]:
-    """解析多样化发布时间文本为 UTC epoch 时间戳（秒），无时区字符串统一按东八区解析。"""
-    if not pub_time_str:
-        return None
-    s = str(pub_time_str).strip()
-    if not s:
-        return None
-    try:
-        if s.isdigit() and len(s) in (10, 13):
-            val = float(s)
-            return val / 1000.0 if len(s) == 13 else val
-    except Exception:
-        pass
-
-    try:
-        iso_cand = re.sub(r"(\.\d{6})\d+", r"\1", s).replace("Z", "+00:00")
-        dt = datetime.datetime.fromisoformat(iso_cand)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_CHINA_TZ)
-        return dt.timestamp()
-    except Exception:
-        pass
-
-    now_cn = datetime.datetime.now(_CHINA_TZ)
-    if s == "刚刚":
-        return now_cn.timestamp()
-
-    m_hm_rel = re.search(r"(\d+)\s*小时\s*(\d+)\s*分钟前", s)
-    if m_hm_rel:
-        hrs = int(m_hm_rel.group(1))
-        mins = int(m_hm_rel.group(2))
-        return (now_cn - datetime.timedelta(hours=hrs, minutes=mins)).timestamp()
-
-    m_rel = re.search(r"(\d+)\s*(秒|分钟|小时|天)前", s)
-    if m_rel:
-        num = int(m_rel.group(1))
-        unit = m_rel.group(2)
-        if unit == "秒":
-            return (now_cn - datetime.timedelta(seconds=num)).timestamp()
-        elif unit == "分钟":
-            return (now_cn - datetime.timedelta(minutes=num)).timestamp()
-        elif unit == "小时":
-            return (now_cn - datetime.timedelta(hours=num)).timestamp()
-        elif unit == "天":
-            return (now_cn - datetime.timedelta(days=num)).timestamp()
-
-    m_day_hm = re.match(r"^(今天|昨天)\s*(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
-    if m_day_hm:
-        day_delta = 0 if m_day_hm.group(1) == "今天" else 1
-        base_dt = (now_cn - datetime.timedelta(days=day_delta)).replace(
-            hour=int(m_day_hm.group(2)),
-            minute=int(m_day_hm.group(3)),
-            second=int(m_day_hm.group(4) or 0),
-            microsecond=0,
-        )
-        return base_dt.timestamp()
-
-    m_bare_hm = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
-    if m_bare_hm:
-        cand_dt = now_cn.replace(
-            hour=int(m_bare_hm.group(1)),
-            minute=int(m_bare_hm.group(2)),
-            second=int(m_bare_hm.group(3) or 0),
-            microsecond=0,
-        )
-        if cand_dt > now_cn + datetime.timedelta(minutes=5):
-            cand_dt -= datetime.timedelta(days=1)
-        return cand_dt.timestamp()
-
-    patterns = [
-        ("%Y-%m-%d %H:%M:%S", None),
-        ("%Y-%m-%d %H:%M", None),
-        ("%Y/%m/%d %H:%M:%S", None),
-        ("%Y/%m/%d %H:%M", None),
-        ("%m-%d %H:%M", now_cn.year),
-    ]
-    for fmt, yr in patterns:
-        try:
-            parsed = datetime.datetime.strptime(s, fmt)
-            if yr:
-                parsed = parsed.replace(year=yr)
-            return parsed.replace(tzinfo=_CHINA_TZ).timestamp()
-        except Exception:
-            pass
-    return None
 
 
 class DealRawPoolRepository:
@@ -568,21 +479,24 @@ class DealRawPoolRepository:
         ids = [str(i).strip() for i in (item_ids or []) if str(i or "").strip()]
         if not site or not ids:
             return 0
-        now_dt = at or datetime.datetime.now(datetime.timezone.utc)
+        if at is None:
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+        elif at.tzinfo is None:
+            now_dt = at.replace(tzinfo=datetime.timezone.utc)
+        else:
+            now_dt = at.astimezone(datetime.timezone.utc)
         now = now_dt.replace(tzinfo=None)
         update_doc: Dict[str, Any] = {"$set": {"last_seen_at": now}}
         if channel:
             update_doc["$addToSet"] = {"seen_channels": channel}
 
+        now_ts = now_dt.timestamp()
         if refresh_publish_time:
-            now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            now_ts = now_dt.timestamp()
             eff_age = float(max_age_days) if max_age_days is not None else resolve_deal_max_age_days(
                 channel_name=channel,
                 site_key=site,
                 default_days=DEAL_MAX_CLEAN_AGE_DAYS,
             )
-            update_doc["$set"]["publish_time"] = now_iso
             update_doc["$set"]["publish_ts"] = now_ts
             update_doc["$set"]["clean_cutoff_ts"] = round(now_ts + eff_age * 86400.0, 1)
             update_doc["$set"]["clean_max_age_days"] = eff_age
@@ -607,7 +521,6 @@ class DealRawPoolRepository:
 
         if refresh_publish_time and ids:
             try:
-                now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                 id_variants = list(set(ids + [int(i) for i in ids if i.isdigit()]))
                 self.formal_col.update_many(
                     {
@@ -619,7 +532,7 @@ class DealRawPoolRepository:
                     },
                     {
                         "$set": {
-                            "deal_info.publish_time": now_iso,
+                            "deal_info.publish_ts": now_ts,
                             "deal_info.updated_at": now,
                             "deal_info.is_deal_tip": True,
                         }
@@ -783,8 +696,8 @@ class DealRawPoolRepository:
             hot_metrics = rec.get("hot_metrics") if isinstance(rec.get("hot_metrics"), dict) else {}
             group_id = str(hot_metrics.get("group_id") or "").strip()
             channel = str(rec.get("source_channel") or "").strip()
-            pub_time_str = str(rec.get("publish_time") or "").strip()
-            parsed_pub_ts = parse_publish_time_epoch(pub_time_str)
+            raw_pub = rec.get("publish_ts") if rec.get("publish_ts") is not None else rec.get("publish_time")
+            parsed_pub_ts = parse_publish_time_epoch(raw_pub)
             pub_ts = parsed_pub_ts if parsed_pub_ts is not None else time.time()
             channel_max_age = float(max_age_days) if max_age_days is not None else resolve_deal_max_age_days(
                 channel_name=channel,
@@ -824,8 +737,7 @@ class DealRawPoolRepository:
             if hot_metrics:
                 set_fields["hot_metrics"] = hot_metrics
             eff_refresh_pub = bool(refresh_publish_time or rec.get("_refresh_publish_time"))
-            if eff_refresh_pub and pub_time_str:
-                set_fields["publish_time"] = pub_time_str
+            if eff_refresh_pub:
                 set_fields["publish_ts"] = pub_ts
                 set_fields["clean_cutoff_ts"] = clean_cutoff_ts
                 set_fields["clean_max_age_days"] = channel_max_age
@@ -861,7 +773,6 @@ class DealRawPoolRepository:
                 "price": rec.get("price"),
                 "image_url": rec.get("image_url") or "",
                 "mall_name": rec.get("mall_name") or "",
-                "publish_time": pub_time_str,
                 "expire_time": rec.get("expire_time"),
                 "tutorial_text": rec.get("tutorial_text") or "",
                 "tutorial_images": rec.get("tutorial_images") or [],

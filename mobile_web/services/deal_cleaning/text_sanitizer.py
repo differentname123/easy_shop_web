@@ -7,8 +7,12 @@ import re
 import unicodedata
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from models.deal_constants import (
+    coerce_unix_timestamp,
+    format_timestamp_cn,
+    parse_publish_time_epoch,
+)
 from models.product import strip_ecommerce_tokens_and_urls
-from repositories.deal_raw_pool_repo import parse_publish_time_epoch
 
 _MATH_ALPHANUM_RE = re.compile(r"[\U0001D400-\U0001D7FF]+")
 _CARD_HIGHLIGHT_FLUFF = frozenset({
@@ -121,7 +125,9 @@ def build_clean_original_copywriting(
     for nd in ordered_docs:
         tut = normalize_inline_spaces(str(nd.get("tutorial_text") or "")).strip()
         ttl = normalize_inline_spaces(str(nd.get("title") or "")).strip()
-        if tut and ttl and ttl not in tut:
+        ttl_cmp = re.sub(r"\s+", "", ttl).rstrip("….")
+        tut_cmp = re.sub(r"\s+", "", tut)
+        if tut and ttl and (not ttl_cmp or ttl_cmp not in tut_cmp):
             block = f"{ttl}\n{tut}"
         else:
             block = tut if tut else ttl
@@ -249,7 +255,9 @@ def format_raw_message_for_ai1(msg_doc: Dict[str, Any], is_target: bool = False)
     return {
         "tip_id": str(msg_doc.get("source_item_id") or ""),
         "is_target": bool(is_target),
-        "publish_time": str(msg_doc.get("publish_time") or msg_doc.get("fetched_at") or ""),
+        "publish_time": format_timestamp_cn(
+            msg_doc.get("publish_ts") or msg_doc.get("publish_time") or msg_doc.get("fetched_at")
+        ),
         "content": content.strip(),
         "image_count": len(imgs),
     }
@@ -325,10 +333,11 @@ def make_timeline_entry(
     mid = str(doc.get("source_item_id") or "")
     site = str(doc.get("source_site") or "")
     channel = str(doc.get("source_channel") or "")
-    pub_time = str(doc.get("publish_time") or "")
-    pub_ts = doc.get("publish_ts")
-    if not isinstance(pub_ts, (int, float)):
-        pub_ts = parse_publish_time_epoch(pub_time) or 0.0
+    pub_ts = (
+        coerce_unix_timestamp(doc.get("publish_ts"))
+        or parse_publish_time_epoch(doc.get("publish_time"))
+        or 0.0
+    )
     title = str(doc.get("title") or "").strip()
     dp = ai1_res.get("deal_price") if isinstance(ai1_res, dict) else None
     ts = ai1_res.get("tutorial_score") if isinstance(ai1_res, dict) else 50
@@ -337,7 +346,6 @@ def make_timeline_entry(
         "tip_id": mid,
         "source_site": site,
         "source_channel": channel,
-        "publish_time": pub_time,
         "publish_ts": float(pub_ts),
         "title": title,
         "copywriting": sanitize_polished_copywriting(copywriting)[:300],

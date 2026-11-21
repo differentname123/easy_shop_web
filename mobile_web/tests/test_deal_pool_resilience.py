@@ -441,10 +441,43 @@ def test_save_batch_anchors_fallback_publish_ts_in_set_on_insert_without_conflic
     # Empty publish_time: publish_ts is only in $setOnInsert (never overwritten on re-poll, no Mongo path conflict)
     assert "publish_ts" in op_no_pub["$setOnInsert"]
     assert "publish_ts" not in op_no_pub["$set"]
+    assert "publish_time" not in op_no_pub["$set"]
+    assert "publish_time" not in op_no_pub["$setOnInsert"]
 
     # Explicit publish_time: publish_ts is in $set and absent from $setOnInsert
     assert "publish_ts" in op_with_pub["$set"]
     assert "publish_ts" not in op_with_pub["$setOnInsert"]
+    assert "publish_time" not in op_with_pub["$set"]
+    assert "publish_time" not in op_with_pub["$setOnInsert"]
+
+    # Relative & HH:MM strings must normalize to numeric publish_ts with zero dirty publish_time persisted
+    captured_ops.clear()
+    res_rel = repo.save_batch(
+        [
+            {
+                "source_site": "guangdiu",
+                "source_item_id": "gd_rel",
+                "publish_time": "14分钟前",
+                "title": "相对时间线报",
+                "extracted_links": [{"url": "https://u.jd.com/2GR8aBc"}],
+                "has_full_detail": True,
+            },
+            {
+                "source_site": "baicaio",
+                "source_item_id": "bc_hm",
+                "publish_time": "17:13",
+                "title": "纯时分线报",
+                "extracted_links": [{"url": "https://u.jd.com/3HS9dEf"}],
+                "has_full_detail": True,
+            },
+        ],
+        task_name="unit_test",
+    )
+    assert res_rel["inserted"] == 2
+    for op_doc in (op._doc for op in captured_ops):
+        assert isinstance(op_doc["$set"].get("publish_ts"), float)
+        assert "publish_time" not in op_doc["$set"]
+        assert "publish_time" not in op_doc["$setOnInsert"]
 
 
 def test_save_batch_tehuicaicai_refresh_never_conflicts_set_and_set_on_insert():
@@ -486,8 +519,9 @@ def test_save_batch_tehuicaicai_refresh_never_conflicts_set_and_set_on_insert():
     assert res["inserted"] == 1
     assert "error" not in res
     doc = captured_ops[0]._doc
-    # 本次巡视刷新的字段走 $set
-    assert {"publish_time", "publish_ts", "clean_cutoff_ts", "clean_max_age_days"} <= set(doc["$set"])
+    # 本次巡视刷新的字段走 $set（仅存规范化数值时间戳 publish_ts）
+    assert {"publish_ts", "clean_cutoff_ts", "clean_max_age_days"} <= set(doc["$set"])
+    assert "publish_time" not in doc["$set"]
     # 插入模板不再重复持有，避免冲突
     for key in ("clean_cutoff_ts", "clean_max_age_days", "publish_ts", "publish_time"):
         assert key not in doc["$setOnInsert"]

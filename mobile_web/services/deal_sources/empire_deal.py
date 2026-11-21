@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlsplit
 
@@ -33,7 +34,6 @@ from .parsing import (
     extract_links_images_and_tokens,
     html_to_tutorial_text,
     strip_html_tags,
-    utc_now_iso,
 )
 
 
@@ -252,7 +252,7 @@ class EmpireDealSource(ListDetailDealSource):
             title=card["title"] or f"{self.site_key} #{item_id}",
             price_text=card["price_text"],
             image_url=img_url,
-            publish_time=utc_now_iso(),
+            publish_ts=time.time(),
             hot_metrics={"mode": mode},
             tutorial_text=tutorial_text,
             tutorial_images=all_imgs,

@@ -16,10 +16,13 @@ from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
 from models.cost_performance import (
-    parse_deal_publish_timestamp,
     rank_products_by_cost_performance,
 )
-from models.deal_constants import DEAL_INFO_PROTECTION_HOURS
+from models.deal_constants import (
+    DEAL_INFO_PROTECTION_HOURS,
+    format_timestamp_cn,
+    get_deal_publish_ts,
+)
 from models.product import (
     _BARE_YUAN_TAG_RE,
     clean_product_id,
@@ -183,7 +186,7 @@ def upsert_cleaned_products_to_formal_table(
             mid = str(di.get("source_item_id") or d.get("product_id") or "")
             if mid and mid not in seen_tids:
                 seen_tids.add(mid)
-                pub_t = str(di.get("publish_time") or "")
+                pub_ts = float(get_deal_publish_ts(di) or 0.0)
                 s_site = str(di.get("source_site") or "")
                 s_name = str(di.get("source_site_name") or get_source_site_name(s_site))
                 p_nick = str(di.get("provider_nickname") or (di.get("hot_metrics") or {}).get("provider_nickname") or "")
@@ -193,8 +196,7 @@ def upsert_cleaned_products_to_formal_table(
                     "source_site_name": s_name,
                     "source_channel": str(di.get("source_channel") or ""),
                     "provider_nickname": p_nick,
-                    "publish_time": pub_t,
-                    "publish_ts": parse_deal_publish_timestamp(pub_t) or 0.0,
+                    "publish_ts": pub_ts,
                     "title": str(di.get("raw_tip_title") or d.get("name") or ""),
                     "copywriting": str(di.get("original_copywriting") or "")[:300],
                     "deal_price": di.get("deal_price"),
@@ -273,7 +275,7 @@ class ProductRepository(BaseRepository):
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
             "sales_tip", "image_url", "mall_name", "updated_at", "product_url", "coupon_url",
             "deal_source", "deal_source_name",
-            "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.publish_time",
+            "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.publish_ts", "deal_info.publish_time",
             "deal_info.source_site", "deal_info.source_site_name",
         ), 1),
     }
@@ -286,6 +288,7 @@ class ProductRepository(BaseRepository):
         "format_activity_price": 1,
         "format_sku_prices": 1,
         "deal_info.is_deal_tip": 1,
+        "deal_info.publish_ts": 1,
         "deal_info.publish_time": 1,
         "deal_info.deal_price": 1,
         "deal_info.format_deal_price": 1,
@@ -824,7 +827,7 @@ class ProductRepository(BaseRepository):
             clean_doc_img = "https:" + clean_doc_img
         is_active_deal = bool(deal_info.get("is_deal_tip") is True)
         deal_highlight = str(deal_info.get("card_highlight") or "").strip() if is_active_deal else ""
-        deal_publish_time = self._format_deal_datetime(deal_info.get("publish_time")) if is_active_deal else ""
+        deal_publish_time = self._format_deal_datetime(get_deal_publish_ts(deal_info)) if is_active_deal else ""
         return {
             "platform": platform,
             "platform_name": platform_name(platform),
@@ -855,21 +858,8 @@ class ProductRepository(BaseRepository):
 
     @staticmethod
     def _format_deal_datetime(raw_val: Any) -> str:
-        """统一将线报时间字段格式化为北京时间 `YYYY-MM-DD HH:MM`，naive datetime 按 UTC 契约转换，无效值返回空串。"""
-        tz_cn = datetime.timezone(datetime.timedelta(hours=8))
-        if isinstance(raw_val, datetime.datetime):
-            dt = (raw_val.replace(tzinfo=datetime.timezone.utc) if raw_val.tzinfo is None else raw_val).astimezone(tz_cn)
-            return dt.strftime("%Y-%m-%d %H:%M")
-        if isinstance(raw_val, str) and raw_val.strip():
-            s = raw_val.strip()
-            try:
-                dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-                if dt.tzinfo is not None:
-                    dt = dt.astimezone(tz_cn)
-                return dt.strftime("%Y-%m-%d %H:%M")
-            except ValueError:
-                return s[:16].replace("T", " ") if len(s) >= 16 else s[:32]
-        return ""
+        """统一将线报时间字段格式化为北京时间 `YYYY-MM-DD HH:MM`，无效值返回空串。"""
+        return format_timestamp_cn(raw_val)
 
     @classmethod
     def _extract_deal_tip(cls, doc: Dict[str, Any], fallback_time: str = "") -> Optional[Dict[str, Any]]:
@@ -883,7 +873,7 @@ class ProductRepository(BaseRepository):
         if not isinstance(deal_info, dict):
             return None
 
-        publish_time = cls._format_deal_datetime(deal_info.get("publish_time")) or str(fallback_time or "").strip()
+        publish_time = cls._format_deal_datetime(get_deal_publish_ts(deal_info)) or str(fallback_time or "").strip()
         updated_at = cls._format_deal_datetime(deal_info.get("updated_at"))
 
         deal_price: Optional[float] = None
@@ -960,6 +950,18 @@ class ProductRepository(BaseRepository):
         ):
             return None
 
+        raw_timeline = deal_info.get("tips_timeline") or []
+        tips_timeline = []
+        if isinstance(raw_timeline, list):
+            for entry in raw_timeline:
+                if not isinstance(entry, dict):
+                    continue
+                item = dict(entry)
+                fmt_pub = cls._format_deal_datetime(get_deal_publish_ts(item))
+                if fmt_pub:
+                    item["publish_time"] = fmt_pub
+                tips_timeline.append(item)
+
         return {
             "is_deal_tip": bool(deal_info.get("is_deal_tip")),
             "publish_time": publish_time,
@@ -972,7 +974,7 @@ class ProductRepository(BaseRepository):
             "tutorial_steps": tutorial_steps,
             "original_copywriting": original_copywriting,
             "share_images": share_images,
-            "tips_timeline": deal_info.get("tips_timeline") or [],
+            "tips_timeline": tips_timeline,
         }
 
     def _normalize_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -1245,6 +1247,7 @@ class ProductRepository(BaseRepository):
                     "goods_id": 1,
                     "goods_sign": 1,
                     "deal_info.card_highlight": 1,
+                    "deal_info.publish_ts": 1,
                     "deal_info.publish_time": 1,
                 },
             )
@@ -1254,7 +1257,7 @@ class ProductRepository(BaseRepository):
                     continue
                 di = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
                 highlight = str(di.get("card_highlight") or "").strip()
-                pub_time = self._format_deal_datetime(di.get("publish_time"))
+                pub_time = self._format_deal_datetime(get_deal_publish_ts(di))
                 if not highlight and not pub_time:
                     continue
                 entry = {"deal_highlight": highlight, "deal_publish_time": pub_time}

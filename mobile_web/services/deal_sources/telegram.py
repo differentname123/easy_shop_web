@@ -21,8 +21,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set
 
+from models.deal_constants import parse_publish_time_epoch
 from models.product import is_standalone_ecommerce_token
-from repositories.deal_raw_pool_repo import parse_publish_time_epoch
 
 from .base import BaseDealSource, FetchContext, FetchResult
 from .filters import (
@@ -228,6 +228,7 @@ class TelegramChannelSource(BaseDealSource):
                     image_url=images[0] if images else "",
                     mall_name=mall_name,
                     publish_time=dt_iso,
+                    publish_ts=msg_ts,
                     hot_metrics={"tg_channel": tg_channel, "msg_id": msg_id},
                     tutorial_text=tutorial_text,
                     tutorial_images=images,

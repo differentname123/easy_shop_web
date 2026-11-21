@@ -3,7 +3,7 @@
 import json
 import re
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from infrastructure.logging_utils import get_app_logger
 
@@ -653,6 +653,18 @@ class TaobaoAdapter(BasePlatformAdapter):
                 "该链接为阿里妈妈选品库/频道列表页而非具体单品链接，请复制单品的推广链接、淘口令或手淘商品分享文案",
             )
         is_bare_id = bool(re.match(r"^[A-Za-z0-9_-]{8,}$", text)) and not text.startswith(("http://", "https://"))
+        official_target_id = ""
+        if is_bare_id:
+            official_target_id = text
+        elif text.lower().startswith(("http://", "https://")):
+            try:
+                u_parts = urlsplit(text)
+                if (u_parts.hostname or "").lower() == "uland.taobao.com" and (u_parts.path or "") == "/item/edetail":
+                    cand_id = (parse_qs(u_parts.query).get("id") or [""])[0].strip()
+                    if cand_id and not cand_id.isdigit() and re.match(r"^[A-Za-z0-9_-]{8,}$", cand_id):
+                        official_target_id = cand_id
+            except Exception:
+                pass
         tkl_input = f"https://uland.taobao.com/item/edetail?id={text}" if is_bare_id else text
         rel_arg = relation_id if (uid and relation_id) else ""
 
@@ -769,23 +781,24 @@ class TaobaoAdapter(BasePlatformAdapter):
                 verified_coupon_or_venue=verified_coupon_or_venue,
             )
 
-        def _do_bare_id_resolve():
-            conv = self.convert_promotion_url(text, uid=uid, identity=identity)
+        def _do_official_id_resolve():
+            conv = self.convert_promotion_url(official_target_id, uid=uid, identity=identity)
             if conv.get("status") != "success":
                 return stamp_universal_resolution(conv, single_item_evidence=True)
-            det = self.get_goods_detail(text)
+            det = self.get_goods_detail(official_target_id)
             if det.get("status") == "success":
                 conv["product"] = det["data"]
             else:
                 conv["detail_lookup_failed"] = True
             return stamp_universal_resolution(conv, single_item_evidence=True)
 
+        base = []
         if self._ztk_channel_ready() and self.channel_pid:
-            base = [("ztk_tb_universal", _do_ztk_resolve)]
-        elif is_bare_id and self._official_ok:
-            base = [("tb_official_universal", _do_bare_id_resolve)]
-        else:
-            base = []
+            base.append(("ztk_tb_universal", _do_ztk_resolve))
+            if official_target_id and self._official_ok and self._search_ok and not (uid and relation_id):
+                base.append(("tb_official_universal", _do_official_id_resolve))
+        elif official_target_id and self._official_ok:
+            base.append(("tb_official_universal", _do_official_id_resolve))
 
         if not base and not self._has_extra_providers("universal"):
             return _error("CONFIG_ERROR", "淘宝折淘客万能转链未配置完整 (需 ZTK_APPKEY / ZTK_SID / TB_CHANNEL_PID)")

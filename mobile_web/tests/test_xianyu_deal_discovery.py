@@ -195,6 +195,12 @@ def test_build_deal_tip_virtual_doc_shelf_life_and_snapshot():
     doc_iso = _make_sample_deal_doc(publish_time="2026-11-11T08:30:00Z")
     assert sched._build_deal_tip_virtual_doc(doc_iso, cutoff_utc=cutoff_48h) is not None
 
+    doc_epoch = _make_sample_deal_doc(publish_time="")
+    doc_epoch["deal_info"]["publish_ts"] = datetime.datetime(2026, 11, 12, 4, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    vdoc_epoch = sched._build_deal_tip_virtual_doc(doc_epoch, cutoff_utc=cutoff_48h)
+    assert vdoc_epoch is not None
+    assert vdoc_epoch["deal_publish_time"] == "2026-11-12 12:00"
+
     doc_expired = _make_sample_deal_doc(publish_time="2026-11-09 10:00:00")
     assert sched._build_deal_tip_virtual_doc(doc_expired, cutoff_utc=cutoff_48h) is None
 

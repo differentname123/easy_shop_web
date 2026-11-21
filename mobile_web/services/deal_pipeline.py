@@ -69,7 +69,6 @@ from services.deal_sources.http_client import (
     RATE_LIMIT_STATUSES,
     create_site_session,
 )
-from services.deal_sources.parsing import utc_now_iso
 from services.deal_sources.registry import (
     get_source_troubleshooting,
     list_sources,
@@ -348,7 +347,7 @@ def run_fetch_stage(
                     or has_captcha_err
                 )
 
-                fetch_time_iso = utc_now_iso()
+                fetch_ts = time.time()
                 records: List[Dict[str, Any]] = []
                 pipeline_filtered = 0
                 pipeline_skipped_known = 0
@@ -375,7 +374,8 @@ def run_fetch_stage(
                             hm["sub_channel"] = orig_ch
                     r["source_channel"] = task_name
                     if ch.use_fetch_time_as_publish_time:
-                        r["publish_time"] = fetch_time_iso
+                        r["publish_ts"] = fetch_ts
+                        r.pop("publish_time", None)
                     records.append(r)
 
                 if site_dedup is not None:
@@ -1060,7 +1060,7 @@ def run_clean_stage(
         if r["status"] in ("success", "early_terminated") and r.get("platform")
     )
 
-    with_publish_time = sum(1 for d in success_product_docs if d["deal_info"].get("publish_time"))
+    with_publish_time = sum(1 for d in success_product_docs if d["deal_info"].get("publish_ts") or d["deal_info"].get("publish_time"))
     with_tutorial_text = sum(1 for d in success_product_docs if len(d["deal_info"].get("tutorial_text") or "") >= 10)
     with_proof_images = sum(1 for d in success_product_docs if d["deal_info"].get("user_share_images"))
     with_coupon_links = sum(1 for d in success_product_docs if d["deal_info"].get("coupon_links"))

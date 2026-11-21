@@ -21,7 +21,7 @@ import re
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin
 
-from repositories.deal_raw_pool_repo import parse_publish_time_epoch
+from models.deal_constants import parse_publish_time_epoch
 
 from .base import FetchContext
 from .filters import SOURCE_SELF_HOSTS, is_confirmed_unsupported_deal
@@ -216,6 +216,7 @@ class IthomeLapinSource(ListDetailDealSource):
             title=card["title"] or f"IT之家辣品 #{item_id}",
             image_url=img_url,
             publish_time=card["publish_time"],
+            publish_ts=card.get("publish_ts"),
             tutorial_text=tutorial_text,
             tutorial_images=all_imgs,
             extracted_links=links,

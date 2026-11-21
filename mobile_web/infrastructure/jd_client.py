@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """京东/折京客薄协议边界；支持多 ZTK_APPKEY_LIST 自动轮询与故障切换，与 scripts/test_jd_api.py 严格对齐。"""
 import json
+import threading
 import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
@@ -18,6 +19,7 @@ from infrastructure.http_utils import (
     parse_appkey_list,
 )
 from infrastructure.transport import create_http_session
+from models.product import is_jd_image_key
 from models.user import normalize_promoter_id
 
 # Documented relay currently uses HTTP. Configure an approved secure alternative
@@ -84,6 +86,14 @@ def is_jd_official_venue_url(text: str) -> bool:
     """判断文本/URL是否命中京东官方公开领券/活动会场域名白名单。"""
     lower = str(text or "").lower()
     return any(marker in lower for marker in JD_OFFICIAL_VENUE_URL_MARKERS)
+
+
+def is_encrypted_jd_item_id(value) -> bool:
+    """识别京东联盟官方加密 itemId（如榜单/搜索返回的字母数字下划线混合加密 ID），排除主图 CDN 哈希键。"""
+    text = str(value or "").strip()
+    if not text or is_jd_image_key(text):
+        return False
+    return len(text) >= 25 and "_" in text and all(c.isalnum() or c == "_" for c in text)
 
 
 def _trusted_signed_url(value):
@@ -199,9 +209,12 @@ class JdClient:
         else:
             self.http = create_http_session(pool_connections=16, pool_maxsize=32)
         self.timeout = timeout
+        self._catalog_cooldown_lock = threading.Lock()
+        self._catalog_cooldown_until = 0.0
 
     _MIN_KEY_DISPATCH_INTERVAL_SEC = 0.22
-    _DETAIL_KEY_DISPATCH_INTERVAL_SEC = 0.85
+    _DETAIL_KEY_DISPATCH_INTERVAL_SEC = 1.35
+    _CATALOG_BURST_COOLDOWN_SEC = 65.0
     _MAX_KEY_PACE_WAIT_SEC = 2.0
     _MAX_DETAIL_KEY_PACE_WAIT_SEC = 3.0
     _MAX_BG_PACE_WAIT_SEC = 12.0
@@ -210,6 +223,26 @@ class JdClient:
         "api_quanwang.ashx",
         "open_gaoyongzhuanlian_tkl_piliang.ashx",
     )
+
+    def is_catalog_cooling(self) -> bool:
+        """折淘客京东选品库 (tkl_piliang / api_detail / api_quanwang) 是否处于短时频控冷却窗口内。"""
+        with self._catalog_cooldown_lock:
+            return time.monotonic() < self._catalog_cooldown_until
+
+    def mark_catalog_rate_limited(
+        self,
+        cooldown_sec: float = _CATALOG_BURST_COOLDOWN_SEC,
+        *,
+        force: bool = False,
+    ) -> None:
+        """确证触发折淘客短时突发限流后开启全局选品库冷却窗口，避免多 Key/并发自伤雪崩。"""
+        if not force and not is_real_requests_session(self.http):
+            return
+        with self._catalog_cooldown_lock:
+            self._catalog_cooldown_until = max(
+                self._catalog_cooldown_until,
+                time.monotonic() + max(0.0, float(cooldown_sec)),
+            )
 
     def _pace_real_http_by_key(self, kwargs, *, url=""):
         """委托 GLOBAL_QUOTA_PACER 按单 appkey 预约发包时间槽；详情/搜索/批量解析共享折淘客 1000 限流池统一节流。"""
@@ -237,6 +270,19 @@ class JdClient:
     def _get(self, url, **kwargs):
         is_real = is_real_requests_session(self.http)
         op_name = self._endpoint_op_name(url)
+        is_catalog_pool = any(ep in str(url or "") for ep in self._SHARED_CATALOG_QUOTA_ENDPOINTS)
+        if is_catalog_pool and self.is_catalog_cooling():
+            GLOBAL_UPSTREAM_HEALTH.record_call(
+                "jd",
+                "ztk_jd",
+                op_name,
+                outcome="rate_limit",
+                latency_ms=0.0,
+                error_code="CATALOG_COOLDOWN",
+                error_msg="京东选品库处于短时频控冷却中",
+                allow_persist=is_real,
+            )
+            return _error("RATE_LIMIT", "京东选品库处于短时频控冷却中，暂跳过避免雪崩", catalog_cooling=True)
         t0 = time.perf_counter()
         try:
             self._pace_real_http_by_key(kwargs, url=url)
@@ -310,7 +356,8 @@ class JdClient:
             self,
             _call,
             should_stop_early=lambda res: (
-                (isinstance(last_body, dict) and (
+                (isinstance(res, dict) and res.get("catalog_cooling") is True)
+                or (isinstance(last_body, dict) and (
                     PROMOTION_ROOT in last_body or RANK_ROOT in last_body or ORDER_ROOT in last_body
                 ))
                 or (callable(extra_stop_early) and extra_stop_early(res))
@@ -402,23 +449,32 @@ class JdClient:
         )
         if res.get("ztk_ambiguous_empty"):
             return {"status": "success", "data": [], "has_more": False, "total_count": 0}
+        if res.get("ztk_explicit_rate_limit"):
+            self.mark_catalog_rate_limited()
         return res
 
     def get_goods_detail(self, goods_id):
         if not isinstance(goods_id, str) or not goods_id.strip():
             return _error("INVALID_ARGUMENT", "京东详情缺少商品ID")
-        return self._execute_with_failover(
+        res = self._execute_with_failover(
             "api_detail.ashx",
             {"unionId": self.union_id, "tao_id": goods_id, "type": 1},
             self._content,
         )
+        if res.get("ztk_explicit_rate_limit"):
+            self.mark_catalog_rate_limited()
+        return res
 
     def _content(self, body, page=None, size=None):
         if body.get("status") == "error":
             return body
         if str(body.get("status")) != "200":
-            if str(body.get("status")) == "301" and "下架" in str(body.get("content") or ""):
-                return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_301=True)
+            c_msg = str(body.get("content") or "")
+            if str(body.get("status")) == "301":
+                if any(kw in c_msg for kw in ("1000", "频繁", "频控", "上限", "超限")):
+                    return _error("RATE_LIMIT", "京东选品库接口触发频控", ztk_explicit_rate_limit=True)
+                if "下架" in c_msg:
+                    return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_301=True)
             return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误")
         if not _rows(body.get("content")):
             return _error("PROTOCOL_ERROR", "京东商品content列表无效")
@@ -469,7 +525,7 @@ class JdClient:
             _evaluate,
         )
 
-    def convert_universal_material(self, raw_material, promoter_id):
+    def convert_universal_material(self, raw_material, promoter_id, *, short_url_resolver=None):
         """
         京东万能转链协议入口（对齐 scripts/test_jd_api.py 基准规范 六）：
         支持直接传入 u.jd.com 短链、京口令文案（含 ！...！）、jingfen.jd.com 详情链或加密 itemId。
@@ -518,6 +574,7 @@ class JdClient:
             return primary_res
 
         primary_ok = primary_res.get("status") == "success"
+        known_single_item = False
         if primary_ok:
             lower_mat = material.lower()
             is_known_jingfen_or_venue = (
@@ -527,6 +584,26 @@ class JdClient:
             if is_known_jingfen_or_venue:
                 return primary_res
 
+            # Zero-quota short-URL unwrap before hitting rate-limited tkl_piliang:
+            # catches shop/venue pages (0 catalog calls) and Babel encrypted SKUs (skip tkl_piliang -> 1 api_detail call).
+            if callable(short_url_resolver) and primary_res.get("short_url"):
+                try:
+                    unwrap_res = short_url_resolver(primary_res["short_url"])
+                except Exception:
+                    unwrap_res = None
+                primary_res["_short_url_resolved"] = True
+                if isinstance(unwrap_res, dict) and unwrap_res.get("status") == "success":
+                    u_data = unwrap_res.get("data") or {}
+                    u_sku = str(u_data.get("sku_id") or "").strip()
+                    if u_data.get("is_venue") and not u_sku:
+                        primary_res["resolved_venue"] = True
+                        return primary_res
+                    if u_sku and is_encrypted_jd_item_id(u_sku):
+                        primary_res["tao_id"] = u_sku
+                        return primary_res
+                    if u_sku:
+                        known_single_item = True
+
         piliang_empty_tao_id_hits = 0
 
         def _evaluate_piliang(body):
@@ -534,6 +611,9 @@ class JdClient:
             if body.get("status") == "error":
                 return body
             if str(body.get("status")) != "200":
+                c_msg = str(body.get("content") or "")
+                if str(body.get("status")) == "301" and any(kw in c_msg for kw in ("1000", "频繁", "频控", "上限", "超限")):
+                    return _error("RATE_LIMIT", "京东批量转链触发频控", ztk_explicit_rate_limit=True)
                 return _error("UPSTREAM_ERROR", "京东批量文案转链未成功")
             p_tao_id = str(body.get("tao_id") or "").strip()
             p_res_url = product_url(body.get("result_url"))
@@ -573,6 +653,8 @@ class JdClient:
             _evaluate_piliang,
             extra_stop_early=lambda _r: piliang_empty_tao_id_hits >= 2,
         )
+        if piliang_res.get("ztk_explicit_rate_limit"):
+            self.mark_catalog_rate_limited()
         if primary_ok:
             if piliang_res.get("status") == "success":
                 if piliang_res.get("tao_id"):
@@ -583,6 +665,14 @@ class JdClient:
                     primary_res["j_command"] = piliang_res["j_command"]
                 if not primary_res.get("j_short_command") and piliang_res.get("j_short_command"):
                     primary_res["j_short_command"] = piliang_res["j_short_command"]
+            elif (
+                piliang_empty_tao_id_hits >= 2
+                or piliang_res.get("catalog_cooling") is True
+                or piliang_res.get("error_code") == "RATE_LIMIT"
+            ):
+                primary_res["piliang_throttled"] = True
+                if known_single_item and piliang_empty_tao_id_hits >= 2:
+                    self.mark_catalog_rate_limited()
             return primary_res
 
         if piliang_res.get("status") != "success":

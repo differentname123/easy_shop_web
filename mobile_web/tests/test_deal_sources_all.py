@@ -514,7 +514,9 @@ def test_kiees_and_niuza_empire_deal_sources():
     assert res_k["status"] == "ok"
     assert res_k["skipped_unsupported"] == 1  # suning.com filtered
     assert len(res_k["records"]) == 1
-    assert res_k["records"][0]["publish_time"].endswith("Z")
+    assert isinstance(res_k["records"][0]["publish_ts"], float)
+    assert res_k["records"][0]["publish_ts"] > 1_700_000_000
+    assert "publish_time" not in res_k["records"][0]
     assert not any("SIDEBAR_NOISE" in lk["url"] for lk in res_k["records"][0]["extracted_links"])
 
     ch_niuza = ChannelConfig(
@@ -655,7 +657,9 @@ def test_zdzdm_and_baicaio_sources_scope_and_302_unwrap():
     assert res_hour["status"] == "ok"
     assert res_hour["pages_crawled"] == 2
     assert len(res_hour["records"]) == 1
-    assert res_hour["records"][0]["publish_time"].endswith("Z")
+    assert isinstance(res_hour["records"][0]["publish_ts"], float)
+    assert res_hour["records"][0]["publish_ts"] > 1_700_000_000
+    assert "publish_time" not in res_hour["records"][0]
 
     # 验证合法空小时页面（无“前一小时”链接时）亦保持 status="ok" 不误报异常
     sess_empty_hour = MagicMock()
@@ -786,8 +790,9 @@ def test_pipeline_isolated_sessions_policy_flags_and_error_tracking(monkeypatch,
 
     # 2. 验证 use_fetch_time_as_publish_time 覆盖时间并向 touch_seen/save_batch 透传策略参数
     saved_recs, saved_kw = next((r, k) for r, k in save_calls if r)
-    assert saved_recs[0]["publish_time"].endswith("Z")
-    assert not saved_recs[0]["publish_time"].startswith("2019")
+    assert isinstance(saved_recs[0]["publish_ts"], float)
+    assert saved_recs[0]["publish_ts"] > 1_700_000_000
+    assert "publish_time" not in saved_recs[0]
     assert saved_kw["refresh_publish_time"] is True
     assert saved_kw["max_age_days"] == 5.0
     assert touch_calls[0][1]["refresh_publish_time"] is True
@@ -1031,7 +1036,9 @@ def test_haodanku_source_parsing_fliggy_filter_and_touch_ids():
     assert len(res["records"]) == 1
     rec = res["records"][0]
     assert len(rec["tutorial_images"]) == 2
-    assert rec["publish_time"].endswith("Z")
+    assert isinstance(rec["publish_ts"], float)
+    assert rec["publish_ts"] > 1_700_000_000
+    assert "publish_time" not in rec
     assert any("uland.taobao.com" in lk["url"] for lk in rec["extracted_links"])
 
 
@@ -1094,8 +1101,9 @@ def test_haodanku_inline_positions_and_11char_token_and_parsing_truncated_url_an
     gd_ch = ChannelConfig(name="逛丢_首页实时流", site_key="guangdiu", default_url="https://guangdiu.com/", params={"channel": "latest", "cookie_file": ""}, max_details=5, detail_delay_seconds=0.0)
     res_gd = GuangdiuSource().fetch(FetchContext(channel=gd_ch, session=gd_sess)).to_dict()
     assert len(res_gd["records"]) == 1
-    assert res_gd["records"][0]["publish_time"].endswith("Z")
-    assert "分钟前" not in res_gd["records"][0]["publish_time"]
+    assert isinstance(res_gd["records"][0]["publish_ts"], float)
+    assert abs(time.time() - res_gd["records"][0]["publish_ts"] - 420.0) < 30.0
+    assert "publish_time" not in res_gd["records"][0]
 
 
 def test_run_fetch_stage_concurrency_cooldown_and_incremental_dedup(monkeypatch, tmp_path):
@@ -1315,6 +1323,9 @@ def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
     fixed_now = datetime.datetime(2026, 11, 20, 7, 0, 0, tzinfo=datetime.timezone.utc)
     assert repo.touch_seen("tehuicaicai", ["5513", "5514"], channel="特惠采采_首页精选", refresh_publish_time=True, max_age_days=7.0, at=fixed_now) == 2
     assert formal_col.update_many.call_count == 1
+    formal_set = formal_col.update_many.call_args[0][1]["$set"]
+    assert formal_set["deal_info.publish_ts"] == fixed_now.timestamp()
+    assert "deal_info.publish_time" not in formal_set
 
     formal_col.update_many.reset_mock()
     assert repo.touch_seen("guangdiu", ["9999"], channel="逛丢_首页实时流", refresh_publish_time=False, at=fixed_now) == 2
