@@ -2073,11 +2073,11 @@ def test_fetch_guangdiu_captcha_circuit_breaker():
         name="逛丢_首页实时流",
         site_key="guangdiu",
         default_url="https://guangdiu.com/",
-        params={"channel": "latest", "cookie_file": ""},
+        params={"channel": "latest", "cookie_file": "", "enable_slider_solver": False},
         max_details=5,
         detail_delay_seconds=0.0,
     )
-    # Fail-Closed：详情页触发安全验证时不做任何破解绕过，立即熔断，0 空壳入库
+    # Fail-Closed：滑块自动验证关闭时不做任何破解绕过，详情页一被拦即熔断，0 空壳入库
     res = GuangdiuSource().fetch(FetchContext(channel=ch, session=session)).to_dict()
     assert res["status"] == "error"
     assert res["rate_limited"] is True
@@ -2117,6 +2117,123 @@ def test_fetch_guangdiu_captcha_circuit_breaker():
     assert rec["has_full_detail"] is True
     assert "购买方案" in rec["tutorial_text"]
     assert any("union-click.jd.com" in lk["url"] for lk in rec["extracted_links"])
+
+
+def test_guangdiu_captcha_autopass_then_refetch_detail(monkeypatch):
+    """详情页被验证页拦住时：调用滑块求解 -> 用新 Cookie 重拉详情 -> 正常入库。"""
+    from services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
+    from services.deal_sources import guangdiu as gd_mod
+
+    list_html = """
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=701">好价抽纸 9.9元</a>
+        <a class="rightmallname">京东</a>
+    </div>
+    """
+    captcha_html = """
+    <html><head><title>安全验证 - 逛丢</title></head>
+    <body><div class="verify-wrap"><div class="slide-track" id="slidetrack"></div></div></body></html>
+    """
+    normal_detail_html = """
+    <html><body>
+        <div id="dabstract">
+            购买方案：1 店铺 京东自营，面价39元；2 领券 <a href="to.php?u=https%3A%2F%2Fitem.jd.com%2F701.html">直达商品</a>
+        </div>
+    </body></html>
+    """
+
+    detail_state = {"n": 0}
+
+    def fake_get(url, *args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.url = url
+        if "go.php" in url:
+            resp.text = "var u = 'https://union-click.jd.com/jdc?e=ok';"
+        elif "detail.php" in url:
+            detail_state["n"] += 1
+            resp.text = captcha_html if detail_state["n"] == 1 else normal_detail_html
+        else:
+            resp.text = list_html
+        return resp
+
+    solved_calls = []
+
+    def fake_solver(session, target_url, verify_url="", **kwargs):
+        solved_calls.append((target_url, verify_url))
+        return True, ""
+
+    monkeypatch.setattr(gd_mod, "solve_guangdiu_slider", fake_solver)
+
+    session = MagicMock()
+    session.get.side_effect = fake_get
+    ch = ChannelConfig(
+        name="逛丢_首页实时流",
+        site_key="guangdiu",
+        default_url="https://guangdiu.com/",
+        params={"channel": "latest", "cookie_file": ""},
+        max_details=1,
+        detail_delay_seconds=0.0,
+    )
+    res = GuangdiuSource().fetch(FetchContext(channel=ch, session=session)).to_dict()
+
+    assert len(solved_calls) == 1
+    assert solved_calls[0][1].endswith("/detail.php?id=701") or "701" in solved_calls[0][1]
+    assert detail_state["n"] == 2
+    assert res["status"] == "ok"
+    assert len(res["records"]) == 1
+    assert "购买方案" in res["records"][0]["tutorial_text"]
+
+
+def test_guangdiu_captcha_autopass_limit_keeps_fail_closed(monkeypatch):
+    """滑块连续失败或次数用尽时保持 Fail-Closed：不重拉、0 入库、带 CaptchaChallengeDetected。"""
+    from services.deal_sources import ChannelConfig, FetchContext, GuangdiuSource
+    from services.deal_sources import guangdiu as gd_mod
+
+    list_html = """
+    <div class="gooditem">
+        <a class="goodname" href="detail.php?id=701">好价抽纸 9.9元</a>
+        <a class="rightmallname">京东</a>
+    </div>
+    """
+    captcha_html = """
+    <html><head><title>安全验证 - 逛丢</title></head>
+    <body><div class="verify-wrap"><div class="slide-track" id="slidetrack"></div></div></body></html>
+    """
+    detail_called = []
+
+    def fake_get(url, *args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.url = url
+        if "go.php" in url:
+            resp.text = "var u = 'https://union-click.jd.com/jdc?e=ok';"
+        elif "detail.php" in url:
+            detail_called.append(url)
+            resp.text = captcha_html
+        else:
+            resp.text = list_html
+        return resp
+
+    monkeypatch.setattr(gd_mod, "solve_guangdiu_slider", lambda *a, **k: (False, "模拟失败"))
+
+    session = MagicMock()
+    session.get.side_effect = fake_get
+    ch = ChannelConfig(
+        name="逛丢_首页实时流",
+        site_key="guangdiu",
+        default_url="https://guangdiu.com/",
+        params={"channel": "latest", "cookie_file": ""},
+        max_details=1,
+        detail_delay_seconds=0.0,
+    )
+    res = GuangdiuSource().fetch(FetchContext(channel=ch, session=session)).to_dict()
+
+    assert len(detail_called) == 1
+    assert res["status"] == "error"
+    assert res["rate_limited"] is True
+    assert len(res["records"]) == 0
+    assert any(err.get("error_type") == "CaptchaChallengeDetected" for err in res["detail_errors"])
 
 
 def test_guangdiu_default_cookie_file_wiring_and_persistence(tmp_path, monkeypatch):

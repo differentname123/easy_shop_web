@@ -36,6 +36,7 @@ from config import PROMOTION_LINK_TTL, logger
 from infrastructure.search_meili import (
     is_meili_available,
     search_products,
+    select_relevant_candidates,
 )
 
 
@@ -564,20 +565,22 @@ class ProductRepository(BaseRepository):
         keyword: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        查询爆单库候选商品并委托纯领域性价比引擎 (`models.cost_performance`) 排序。
+        查询爆单库候选商品并委托纯领域性价比引擎 (`models.cost_performance`) 分层排序。
         """
         filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
         raw_docs = None
+        cleaned_kw = ""
+        if keyword and keyword.strip():
+            raw_kw = keyword.strip()
+            cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
 
-        if keyword and keyword.strip() and self._is_meili_searchable():
+        if cleaned_kw and self._is_meili_searchable():
             try:
-                raw_kw = keyword.strip()
-                cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
                 meili_hits = search_products(
                     keyword=cleaned_kw,
                     platform=platform,
                     category=category,
-                    limit=self._MAX_COST_PERFORMANCE_CANDIDATES,
+                    limit=min(1000, self._MAX_COST_PERFORMANCE_CANDIDATES),
                     only_active_boom=True,
                 )
                 if meili_hits is not None:
@@ -605,10 +608,24 @@ class ProductRepository(BaseRepository):
             )
             raw_docs = list(cursor)
 
+        now_ts = time.time()
+        if cleaned_kw and raw_docs:
+            buckets = select_relevant_candidates(cleaned_kw, raw_docs, min_primary=5)
+            ranked: List[Dict[str, Any]] = []
+            for bucket in buckets:
+                ranked.extend(
+                    rank_products_by_cost_performance(
+                        bucket,
+                        normalize_summary=self._normalize_doc_summary,
+                        now_ts=now_ts,
+                    )
+                )
+            return ranked
+
         return rank_products_by_cost_performance(
             raw_docs,
             normalize_summary=self._normalize_doc_summary,
-            now_ts=time.time(),
+            now_ts=now_ts,
         )
 
     def query_boom_products(
@@ -668,13 +685,14 @@ class ProductRepository(BaseRepository):
             try:
                 raw_kw = keyword.strip()
                 cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
+                fetch_limit = min(500, max(100, (skip + page_size) * 4))
                 meili_hits = search_products(
                     keyword=cleaned_kw,
                     platform=platform,
                     category=category,
                     sort_by=sort_by,
-                    limit=page_size + 1,
-                    offset=skip,
+                    limit=fetch_limit,
+                    offset=0,
                     only_active_boom=True,
                 )
                 if meili_hits is not None:
@@ -687,22 +705,40 @@ class ProductRepository(BaseRepository):
                             "has_more": False,
                             "data": [],
                         }
-                    doc_keys = [(h.get("platform"), h.get("product_id")) for h in meili_hits]
+                    has_named_hits = any(isinstance(h, dict) and h.get("name") for h in meili_hits)
+                    if has_named_hits:
+                        buckets = select_relevant_candidates(cleaned_kw, meili_hits, min_primary=5)
+                        ordered_hits = [h for bucket in buckets for h in bucket]
+                        paged_hits = ordered_hits[skip : skip + page_size + 10]
+                        slice_has_tail = len(ordered_hits) > (skip + len(paged_hits))
+                    else:
+                        ordered_hits = meili_hits
+                        paged_hits = meili_hits[skip : skip + page_size + 1]
+                        slice_has_tail = False
+                    doc_keys = [(h.get("platform"), h.get("product_id")) for h in paged_hits]
                     or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
                     if or_clauses:
                         mongo_docs = list(self.col.find({"$and": [{"$or": or_clauses}, self._boom_content_filter()]}, self._SUMMARY_PROJECTION))
                         docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
                         ordered_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
-                        has_more = len(ordered_docs) > page_size
+                        has_more = len(ordered_docs) > page_size or slice_has_tail
                         items = [self._normalize_doc_summary(doc) for doc in ordered_docs[:page_size]]
                         return {
                             "status": "success",
-                            "total_count": len(items),
+                            "total_count": len(ordered_hits) if has_named_hits else len(items),
                             "page": page,
                             "page_size": page_size,
                             "has_more": has_more,
                             "data": items,
                         }
+                    return {
+                        "status": "success",
+                        "total_count": 0,
+                        "page": page,
+                        "page_size": page_size,
+                        "has_more": False,
+                        "data": [],
+                    }
             except Exception as meili_exc:
                 logger.warning("⚠️ 【Meilisearch商品检索降级】: %s", format_exc_summary(meili_exc))
 

@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from threading import RLock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from infrastructure.http_utils import clean_money
 from infrastructure.logging_utils import format_exc_summary, get_app_logger
@@ -32,6 +32,7 @@ _LAST_AVAILABILITY_CHECK = 0.0
 _IS_AVAILABLE = False
 _AVAILABILITY_CACHE_TTL = 10.0  # 健康检测缓存 10 秒，避免高频 I/O 阻塞主线程
 
+MEILI_SCHEMA_VERSION = 2
 DEFAULT_MEILI_SYNC_INTERVAL_SECONDS = 120.0
 DEFAULT_MEILI_SYNC_INITIAL_DELAY_SECONDS = 5.0
 _ACTIVE_PRODUCTS_QUERY: Dict[str, Any] = {
@@ -51,6 +52,88 @@ _SYNC_PROJECTION: Dict[str, int] = {
 }
 
 _INVALID_ID_CHARS_RE = re.compile(r"[^a-zA-Z0-9-_]")
+_PURE_CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
+
+
+def _collect_entities_from_fmt(fmt: Any) -> Tuple[List[str], List[str]]:
+    """从单个 format_info 节点提取主/次本体名称；任何字段异常均安全忽略。"""
+    primary: List[str] = []
+    secondary: List[str] = []
+    if not isinstance(fmt, dict):
+        return primary, secondary
+    if "core_entities" in fmt or "pricing_basis" in fmt or "decision_keywords" in fmt:
+        entries = [fmt]
+    else:
+        entries = [v for v in fmt.values() if isinstance(v, dict)]
+    for ent in entries:
+        raw_ces = ent.get("core_entities")
+        if not isinstance(raw_ces, list):
+            continue
+        for idx, item in enumerate(raw_ces):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            raw_score = item.get("score")
+            try:
+                score = (
+                    int(raw_score)
+                    if raw_score is not None and not isinstance(raw_score, bool)
+                    else (10 if idx == 0 else 5)
+                )
+            except (ValueError, TypeError):
+                score = 10 if idx == 0 else 5
+            if idx == 0 or score >= 9:
+                if name not in primary:
+                    primary.append(name)
+            else:
+                if name not in secondary:
+                    secondary.append(name)
+    return primary, secondary
+
+
+def extract_core_entities(doc: Any) -> Tuple[List[str], List[str]]:
+    """
+    极简可选读取商品本体名 (`core_entities[].name`)：
+    - 优先读取顶层官方 `format_info`（完整标题清洗）；
+    - `deal_info.format_info` 仅在官方缺失时作为主本体兜底，否则仅补充为次本体别名；
+    - 缺失或非预期类型时安全返回 `([], [])`，绝不强依赖或阻塞搜索。
+    """
+    if not isinstance(doc, dict):
+        return [], []
+    top_p, top_s = _collect_entities_from_fmt(doc.get("format_info"))
+    deal_info = doc.get("deal_info")
+    deal_fmt = deal_info.get("format_info") if isinstance(deal_info, dict) else None
+    deal_p, deal_s = _collect_entities_from_fmt(deal_fmt)
+
+    if top_p or top_s:
+        primary = list(dict.fromkeys(top_p))
+        sec_candidates = top_s + deal_p + deal_s
+    else:
+        primary = list(dict.fromkeys(deal_p))
+        sec_candidates = deal_s
+
+    primary_set = set(primary)
+    secondary = [s for s in dict.fromkeys(sec_candidates) if s not in primary_set]
+    return primary, secondary
+
+
+def _expand_cjk_right_suffixes(phrases: Sequence[str]) -> str:
+    """仅对短纯中文本体做右中心语后缀展开（如 生鲜牛肉 -> 生鲜牛肉 鲜牛肉 牛肉），缓解分词边界漏召回。"""
+    tokens: List[str] = []
+    for raw in phrases:
+        phrase = str(raw or "").strip()
+        if not phrase:
+            continue
+        if phrase not in tokens:
+            tokens.append(phrase)
+        if _PURE_CJK_RE.fullmatch(phrase) and 3 <= len(phrase) <= 6:
+            for start in range(1, len(phrase) - 1):
+                suffix = phrase[start:]
+                if len(suffix) >= 2 and suffix not in tokens:
+                    tokens.append(suffix)
+    return " ".join(tokens)
 
 
 def _to_unix_ts(value: Any) -> Optional[int]:
@@ -99,7 +182,7 @@ def make_meili_doc_id(platform: str, product_id: str) -> str:
 
 
 def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """将 MongoDB products 文档安全转换为 Meilisearch 索引文档结构"""
+    """将 MongoDB products 文档安全转换为极简 Meilisearch 索引文档结构"""
     if not isinstance(doc, dict):
         return None
 
@@ -136,19 +219,7 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         except (ValueError, TypeError):
             channel_type = None
 
-    search_keywords_list: List[str] = []
-    if isinstance(deal_info, dict):
-        raw_t = str(deal_info.get("raw_tip_title") or "").strip()
-        if raw_t and raw_t != name:
-            search_keywords_list.append(raw_t)
-        fmt = deal_info.get("format_info")
-        if isinstance(fmt, dict):
-            for e in fmt.get("core_entities") or []:
-                if isinstance(e, dict) and e.get("name"):
-                    search_keywords_list.append(str(e["name"]).strip())
-            for dk in fmt.get("decision_keywords") or []:
-                if isinstance(dk, dict) and dk.get("attribute_value"):
-                    search_keywords_list.append(str(dk["attribute_value"]).strip())
+    primary_ents, secondary_ents = extract_core_entities(doc)
 
     return {
         "id": doc_id,
@@ -158,7 +229,10 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "brand": str(doc.get("brand") or "").strip(),
         "mall_name": str(doc.get("mall_name") or "").strip(),
         "category": str(doc.get("category") or "").strip(),
-        "search_keywords": " ".join(dict.fromkeys(search_keywords_list)),
+        "core_entity": _expand_cjk_right_suffixes(primary_ents),
+        "core_entity_alias": _expand_cjk_right_suffixes(secondary_ents),
+        "core_entities_raw": primary_ents,
+        "core_entities_alias_raw": secondary_ents,
         "price": price,
         "activity_price": activity_price,
         "saved_price": saved_price,
@@ -168,6 +242,7 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "image_url": str(doc.get("image_url") or "").strip(),
         "updated_at": ts,
         "sync_ts": sync_ts,
+        "schema_ver": MEILI_SCHEMA_VERSION,
     }
 
 
@@ -236,38 +311,34 @@ def is_meili_available(force_check: bool = False) -> bool:
             return False
 
 
-# 电商高频搜索同义词与简称对照表
+# 电商高频严格等价同义词（保持精准对应，避免跨形态泛化导致降维污染）
 DEFAULT_SYNONYMS: Dict[str, List[str]] = {
     "可乐": ["可口可乐", "百事可乐"],
-    "可口可乐": ["可乐"],
-    "百事可乐": ["可乐"],
-    "雪碧": ["柠檬汽水", "雪碧汽水"],
-    "芬达": ["橙味汽水", "芬达汽水"],
-    "纯牛奶": ["牛奶", "鲜奶"],
-    "牛奶": ["纯牛奶", "鲜奶"],
+    "鲜牛肉": ["生鲜牛肉", "原切牛肉"],
+    "生鲜牛肉": ["鲜牛肉"],
+    "纯牛奶": ["纯奶"],
+    "抽纸": ["面巾纸", "抽纸巾"],
+    "卷纸": ["卷筒纸", "卫生纸"],
+    "卫生纸": ["卷纸", "卷筒纸", "厕纸"],
+    "湿巾": ["湿纸巾", "婴儿湿巾"],
     "酸奶": ["发酵乳", "风味发酵乳"],
     "咖啡": ["美式咖啡", "拿铁咖啡", "速溶咖啡"],
-    "抽纸": ["纸巾", "面巾纸", "抽纸巾"],
-    "纸巾": ["抽纸", "面巾纸", "餐巾纸"],
-    "卷纸": ["卷筒纸", "卫生纸"],
-    "湿巾": ["湿纸巾", "婴儿湿巾"],
-    "洗衣液": ["洗衣凝珠", "洗衣粉", "洗衣皂"],
     "洗洁精": ["洗洁剂", "餐具洗涤剂"],
-    "洗发水": ["洗发露", "洗发膏"],
+    "洗发水": ["洗发露"],
     "沐浴露": ["沐浴乳", "沐浴液"],
     "牙膏": ["洁齿膏"],
     "方便面": ["泡面", "速食面"],
     "挂面": ["面条", "手排面"],
-    "食用油": ["花生油", "大豆油", "菜籽油", "玉米油"],
     "充电宝": ["移动电源"],
     "数据线": ["充电线", "快充线"],
     "耳机": ["蓝牙耳机", "无线耳机"],
     "手机": ["智能手机"],
+    "苹果手机": ["iPhone"],
 }
 
 
 def ensure_index_configured(force: bool = False) -> bool:
-    """确保 products 索引及分词过滤属性已就绪（单次原子 update_settings）。"""
+    """确保 products 索引及中文分词、关闭中文容错、极简检索字段配置已就绪。"""
     global _INDEX_CONFIGURED
     if _INDEX_CONFIGURED and not force:
         return True
@@ -294,14 +365,16 @@ def ensure_index_configured(force: bool = False) -> bool:
                 index = client.index(INDEX_NAME)
 
             index.update_settings({
-                "searchableAttributes": ["name", "brand", "mall_name", "category", "search_keywords"],
+                "searchableAttributes": ["core_entity", "core_entity_alias", "brand", "name"],
                 "filterableAttributes": ["platform", "category", "is_off_promotion", "is_deal_tip", "channel_type"],
                 "sortableAttributes": ["updated_at", "activity_price", "price", "saved_price"],
                 "rankingRules": ["words", "typo", "proximity", "attribute", "sort", "exactness"],
+                "typoTolerance": {"enabled": False},
+                "localizedAttributes": [{"attributePatterns": ["*"], "locales": ["cmn"]}],
                 "synonyms": DEFAULT_SYNONYMS,
             })
             _INDEX_CONFIGURED = True
-            logger.info("✅ 【Meilisearch索引就绪】products 索引及同义词配置已完成")
+            logger.info("✅ 【Meilisearch索引就绪】products 极简中文索引配置已完成")
             return True
         except Exception as e:
             logger.warning("❌ 【Meilisearch配置索引异常】: %s", format_exc_summary(e))
@@ -322,8 +395,8 @@ def search_products(
     only_active_boom: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
     """
-    通过 Meilisearch 执行高精度分词与模糊搜索
-    :return: 命中商品列表（保持高相关性顺序）；如果 Meilisearch 不可用则返回 None（触发上游回退 Mongo）
+    通过 Meilisearch 执行无容错污染的精准中文分词搜索（matchingStrategy="all"）。
+    :return: 命中商品列表；如果 Meilisearch 不可用则返回 None（触发上游回退 Mongo）
     """
     if not keyword or not keyword.strip():
         return None
@@ -336,6 +409,8 @@ def search_products(
         return None
 
     try:
+        if not _INDEX_CONFIGURED:
+            ensure_index_configured()
         index = client.index(INDEX_NAME)
 
         filter_exprs = ["NOT is_off_promotion = true"]
@@ -355,11 +430,10 @@ def search_products(
         sort_rule = sort_mapping.get(sort_by)
 
         search_params: Dict[str, Any] = {
-            "limit": max(1, min(200, limit)),
+            "limit": max(1, min(1000, limit)),
             "offset": max(0, offset),
             "filter": " AND ".join(filter_exprs) if filter_exprs else None,
             "matchingStrategy": "all",
-            "rankingScoreThreshold": 0.6,
         }
         if sort_rule:
             search_params["sort"] = sort_rule
@@ -367,16 +441,7 @@ def search_products(
         search_params = {k: v for k, v in search_params.items() if v is not None}
 
         result = index.search(keyword.strip(), search_params)
-        hits = result.get("hits") or []
-
-        # 若高相关性阈值未召回结果，则平滑放宽阈值至 0.3 并放宽至 matchingStrategy="last"
-        if not hits and offset == 0:
-            search_params["matchingStrategy"] = "last"
-            search_params["rankingScoreThreshold"] = 0.3
-            result_fallback = index.search(keyword.strip(), search_params)
-            hits = result_fallback.get("hits") or []
-
-        return hits
+        return result.get("hits") or []
     except Exception as e:
         _mark_unavailable()
         logger.warning(
@@ -384,6 +449,169 @@ def search_products(
             keyword, platform, format_exc_summary(e),
         )
         return None
+
+
+def _extract_item_search_fields(item: Dict[str, Any]) -> Tuple[str, str, List[str], List[str]]:
+    name = str(item.get("name") or "").strip()
+    brand = str(item.get("brand") or "").strip()
+    if "core_entities_raw" in item or "core_entities_alias_raw" in item:
+        raw_p = item.get("core_entities_raw")
+        raw_s = item.get("core_entities_alias_raw")
+        primary = [str(x).strip() for x in (raw_p if isinstance(raw_p, list) else ()) if str(x or "").strip()]
+        secondary = [str(x).strip() for x in (raw_s if isinstance(raw_s, list) else ()) if str(x or "").strip()]
+    else:
+        primary, secondary = extract_core_entities(item)
+    return name, brand, primary, secondary
+
+
+def _match_modifier_head(query_lower: str, entities_lower: Sequence[str], mod_haystack: str) -> bool:
+    """检查 '修饰词+核心本体' 拆分（如 苹果+手机、伊利+纯牛奶、鲜+牛肉）是否命中。"""
+    if len(query_lower) < 3 or not entities_lower:
+        return False
+    for split_i in range(1, len(query_lower) - 1):
+        mod = query_lower[:split_i]
+        head = query_lower[split_i:]
+        if len(head) >= 2 and any(e == head or e.endswith(head) for e in entities_lower):
+            if mod in mod_haystack:
+                return True
+    return False
+
+
+def partition_search_candidates(
+    keyword: str,
+    items: Sequence[Dict[str, Any]],
+    *,
+    min_strict: int = 5,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    极简相关性分桶（SSOT）：不修改性价比/时间排序逻辑，仅在排序前净化候选集。
+    - 无清洗数据时平滑退化为无容错标题/品牌精准命中（绝不依赖 AI 字段存在）；
+    - 有可选 `core_entities` 时按中文右中心语 (`endswith`) 区分：
+      L1 (strict_items): 主本体直击 / 修饰词+主本体 / 明确品牌匹配 / 品牌词自适应提升
+      L2 (secondary_items): 次本体直击 / 本体衍生品包含（如 牛肉 -> 牛肉丸、牛肉辣酱）
+      L3 (fallback_items): 仅标题蹭词且本体无关（如狗粮、手机壳、充电线、猫砂）
+    """
+    del min_strict
+    raw_q = str(keyword or "").strip()
+    if not raw_q or not items:
+        return list(items), [], []
+
+    ql = raw_q.lower()
+    tokens = [t for t in ql.split() if t]
+    syn_list = [str(s).strip().lower() for s in DEFAULT_SYNONYMS.get(raw_q, []) if str(s or "").strip()]
+    q_variants = list(dict.fromkeys([ql] + syn_list))
+
+    tagged: List[Tuple[Dict[str, Any], int, bool]] = []
+    head_entity_hits = 0
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name, brand, primary, secondary = _extract_item_search_fields(item)
+        if not name and not brand and not primary and not secondary:
+            tagged.append((item, 1, True))
+            continue
+
+        name_l = name.lower()
+        brand_l = brand.lower()
+        p_l = [p.lower() for p in primary]
+        s_l = [s.lower() for s in secondary]
+        all_e = p_l + s_l
+
+        if len(tokens) >= 2:
+            name_brand_ok = all(t in name_l or t in brand_l for t in tokens)
+        else:
+            name_brand_ok = any(qv in name_l or qv in brand_l for qv in q_variants)
+
+        # Case A: 尚无清洗数据的商品，无缝退化为标题/品牌精准命中
+        if not all_e:
+            tagged.append((item, 1 if name_brand_ok else 3, name_brand_ok))
+            continue
+
+        # Case B: 多空格词查询（如 "伊利 纯牛奶"、"iPhone 17"）
+        if len(tokens) >= 2:
+            searchable_blob = f"{name_l} {brand_l} {' '.join(all_e)}"
+            if not all(t in searchable_blob for t in tokens):
+                tagged.append((item, 3, name_brand_ok))
+                continue
+            head = tokens[-1]
+            if any(e == head or e.endswith(head) for e in p_l):
+                head_entity_hits += 1
+                tagged.append((item, 1, name_brand_ok))
+            elif any(e == head or e.endswith(head) for e in s_l):
+                head_entity_hits += 1
+                tagged.append((item, 2, name_brand_ok))
+            elif any(head in e for e in all_e):
+                tagged.append((item, 2, name_brand_ok))
+            else:
+                tagged.append((item, 3, name_brand_ok))
+            continue
+
+        # Case C: 单词查询
+        mod_haystack = f"{brand_l} {name_l} {' '.join(all_e)}"
+        tier = 3
+        is_head_ent = False
+
+        if any(e == qv or e.endswith(qv) for qv in q_variants for e in p_l):
+            tier = 1
+            is_head_ent = True
+        elif _match_modifier_head(ql, p_l, mod_haystack):
+            tier = 1
+            is_head_ent = True
+        elif (
+            len(ql) >= 4
+            and len(q_variants) > 1
+            and any(e == ql[-2:] or e.endswith(ql[-2:]) for e in p_l)
+            and any(qv in name_l or qv in brand_l for qv in q_variants[1:])
+        ):
+            tier = 1
+            is_head_ent = True
+        elif brand_l and (ql == brand_l or (len(ql) >= 2 and ql in brand_l)):
+            tier = 1
+        elif any(e == qv or e.endswith(qv) for qv in q_variants for e in s_l) or _match_modifier_head(ql, s_l, mod_haystack):
+            tier = 2
+            is_head_ent = True
+        elif any(qv in e for qv in q_variants for e in all_e):
+            tier = 2
+
+        if is_head_ent:
+            head_entity_hits += 1
+        tagged.append((item, tier, name_brand_ok))
+
+    strict_items: List[Dict[str, Any]] = []
+    secondary_items: List[Dict[str, Any]] = []
+    fallback_items: List[Dict[str, Any]] = []
+    promote_brand_or_model = head_entity_hits == 0
+
+    for item, tier, name_brand_ok in tagged:
+        if tier == 1 or (promote_brand_or_model and name_brand_ok):
+            strict_items.append(item)
+        elif tier == 2:
+            secondary_items.append(item)
+        else:
+            fallback_items.append(item)
+
+    return strict_items, secondary_items, fallback_items
+
+
+def select_relevant_candidates(
+    keyword: str,
+    items: Sequence[Dict[str, Any]],
+    *,
+    min_primary: int = 5,
+) -> List[List[Dict[str, Any]]]:
+    """返回参与排序的分层候选桶列表：高相关 (L1+L2) 充足时屏蔽 L3 噪音；不足时附带 L3 兜底。"""
+    strict_items, secondary_items, fallback_items = partition_search_candidates(
+        keyword, items, min_strict=min_primary,
+    )
+    buckets: List[List[Dict[str, Any]]] = []
+    if strict_items:
+        buckets.append(strict_items)
+    if secondary_items:
+        buckets.append(secondary_items)
+    if (len(strict_items) + len(secondary_items)) < min_primary and fallback_items:
+        buckets.append(fallback_items)
+    return buckets
 
 
 def _resolve_products_collection(mongo_db):
@@ -405,14 +633,14 @@ def _fetch_meili_sync_map(
     *,
     page_size: int = 2000,
     max_pages: int = 1000,
-) -> Tuple[Dict[str, Optional[int]], bool]:
-    """分页拉取 Meilisearch 全部文档的 (id -> sync_ts)，并返回是否完整扫描完。"""
+) -> Tuple[Dict[str, Tuple[Optional[int], Optional[int]]], bool]:
+    """分页拉取 Meilisearch 全部文档的 (id -> (sync_ts, schema_ver))，并返回是否完整扫描完。"""
     step = max(1, int(page_size))
-    meili_map: Dict[str, Optional[int]] = {}
+    meili_map: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
     offset = 0
     complete = False
     for _ in range(max_pages):
-        res = index.get_documents({"fields": ["id", "sync_ts"], "limit": step, "offset": offset})
+        res = index.get_documents({"fields": ["id", "sync_ts", "schema_ver"], "limit": step, "offset": offset})
         results = res.get("results") if isinstance(res, dict) else getattr(res, "results", None)
         if not results:
             complete = True
@@ -421,9 +649,11 @@ def _fetch_meili_sync_map(
             if isinstance(item, dict):
                 doc_id = item.get("id")
                 raw_ts = item.get("sync_ts")
+                raw_ver = item.get("schema_ver")
             else:
                 doc_id = getattr(item, "id", None)
                 raw_ts = getattr(item, "sync_ts", None)
+                raw_ver = getattr(item, "schema_ver", None)
             clean_id = str(doc_id or "").strip()
             if not clean_id:
                 continue
@@ -432,7 +662,12 @@ def _fetch_meili_sync_map(
                 if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool)
                 else None
             )
-            meili_map[clean_id] = sync_ts
+            schema_ver = (
+                int(raw_ver)
+                if isinstance(raw_ver, (int, float)) and not isinstance(raw_ver, bool)
+                else None
+            )
+            meili_map[clean_id] = (sync_ts, schema_ver)
         offset += len(results)
         total = res.get("total") if isinstance(res, dict) else getattr(res, "total", None)
         if len(results) < step or (isinstance(total, int) and offset >= total):
@@ -502,7 +737,9 @@ def sync_products_diff(
 
     stale_ids = [doc_id for doc_id in meili_map if doc_id not in mongo_meta]
     upsert_ids = [
-        doc_id for doc_id, (_, _, m_ts) in mongo_meta.items() if meili_map.get(doc_id) != m_ts
+        doc_id
+        for doc_id, (_, _, m_ts) in mongo_meta.items()
+        if meili_map.get(doc_id) != (m_ts, MEILI_SCHEMA_VERSION)
     ]
     skipped = len(mongo_meta) - len(upsert_ids)
 

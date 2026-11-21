@@ -11,12 +11,17 @@ import datetime
 
 import infrastructure.search_meili as search_meili
 from infrastructure.search_meili import (
+    MEILI_SCHEMA_VERSION,
     MeiliSyncWorker,
     _extract_doc_sync_ts,
+    ensure_index_configured,
+    extract_core_entities,
     make_meili_doc_id,
     format_meili_doc,
     is_meili_available,
+    partition_search_candidates,
     search_products,
+    select_relevant_candidates,
     sync_all_products,
     sync_products_diff,
 )
@@ -97,7 +102,7 @@ class TestSearchMeili(unittest.TestCase):
     @patch("infrastructure.search_meili.is_meili_available", return_value=True)
     @patch("infrastructure.search_meili.get_meili_client")
     def test_search_products_query_building(self, mock_get_client, mock_avail):
-        """测试 search_products 组装 filter 与 sort 参数"""
+        """测试 search_products 组装 filter 与 sort 参数（严格 matchingStrategy=all 且无阈值兜底）"""
         mock_client = MagicMock()
         mock_index = MagicMock()
         mock_index.search.return_value = {"hits": [{"platform": "pdd", "product_id": "101"}]}
@@ -114,7 +119,7 @@ class TestSearchMeili(unittest.TestCase):
         )
         self.assertEqual(len(hits), 1)
         mock_index.search.assert_called_once()
-        args, kwargs = mock_index.search.call_args
+        args, _kwargs = mock_index.search.call_args
         self.assertEqual(args[0], "可乐")
         params = args[1]
         self.assertIn('platform = "pdd"', params["filter"])
@@ -122,6 +127,41 @@ class TestSearchMeili(unittest.TestCase):
         self.assertIn("NOT is_off_promotion = true", params["filter"])
         self.assertEqual(params["sort"], ["activity_price:asc"])
         self.assertEqual(params["limit"], 10)
+        self.assertEqual(params["matchingStrategy"], "all")
+        self.assertNotIn("rankingScoreThreshold", params)
+
+    @patch("infrastructure.search_meili.is_meili_available", return_value=True)
+    @patch("infrastructure.search_meili.get_meili_client")
+    def test_search_products_empty_does_not_fallback_to_last_strategy(self, mock_get_client, mock_avail):
+        """空命中时绝不放宽为 matchingStrategy=last（防止丢失中文核心中心词）"""
+        mock_client = MagicMock()
+        mock_index = MagicMock()
+        mock_index.search.return_value = {"hits": []}
+        mock_client.index.return_value = mock_index
+        mock_get_client.return_value = mock_client
+
+        hits = search_products(keyword="鲜牛肉", limit=100, offset=0)
+        self.assertEqual(hits, [])
+        mock_index.search.assert_called_once()
+
+    @patch("infrastructure.search_meili.is_meili_available", return_value=True)
+    @patch("infrastructure.search_meili.get_meili_client")
+    def test_ensure_index_configured_sets_cjk_no_typo_and_minimal_fields(self, mock_get_client, _mock_avail):
+        """验证索引配置关闭中文容错、开启 cmn 分词并剔除 mall_name/category 脏检索字段"""
+        mock_client = MagicMock()
+        mock_index = MagicMock()
+        mock_client.index.return_value = mock_index
+        mock_get_client.return_value = mock_client
+
+        self.assertTrue(ensure_index_configured(force=True))
+        mock_index.update_settings.assert_called_once()
+        cfg = mock_index.update_settings.call_args.args[0]
+        self.assertEqual(cfg["searchableAttributes"], ["core_entity", "core_entity_alias", "brand", "name"])
+        self.assertNotIn("mall_name", cfg["searchableAttributes"])
+        self.assertNotIn("category", cfg["searchableAttributes"])
+        self.assertEqual(cfg["typoTolerance"], {"enabled": False})
+        self.assertEqual(cfg["localizedAttributes"], [{"attributePatterns": ["*"], "locales": ["cmn"]}])
+        self.assertIn("鲜牛肉", cfg["synonyms"])
 
 
 class TestProductRepoMeiliIntegration(unittest.TestCase):
@@ -177,28 +217,63 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         self.assertEqual(res, [])
 
     def test_format_meili_doc_with_deal_info_and_entities(self):
-        """测试 format_meili_doc 自动将原始爆料标题与 AI 提取实体打包入 search_keywords"""
-        doc = {
+        """测试 format_meili_doc 优先提取官方 format_info 本体并支持线报兜底与中文右中心语展开"""
+        # 1. 官方顶层 SKU 清洗 + 线报清洗共存：官方为主本体，线报作为别名补充
+        doc_official = {
+            "platform": "jd",
+            "product_id": "J100",
+            "name": "大伊 原切牛腱子 4斤",
+            "price": 169.9,
+            "format_info": {
+                "J100_0": {
+                    "core_entities": [{"name": "牛腱子", "score": 10}],
+                }
+            },
+            "deal_info": {
+                "is_deal_tip": True,
+                "raw_tip_title": "169元抢牛腱子",
+                "format_info": {
+                    "core_entities": [{"name": "牛腱子", "score": 10}, {"name": "生鲜牛肉", "score": 8}],
+                },
+            },
+        }
+        res1 = format_meili_doc(doc_official)
+        self.assertIsNotNone(res1)
+        self.assertEqual(res1["core_entities_raw"], ["牛腱子"])
+        self.assertEqual(res1["core_entities_alias_raw"], ["生鲜牛肉"])
+        self.assertIn("生鲜牛肉", res1["core_entity_alias"])
+        self.assertIn("鲜牛肉", res1["core_entity_alias"])
+        self.assertIn("牛肉", res1["core_entity_alias"])
+        self.assertEqual(res1["schema_ver"], MEILI_SCHEMA_VERSION)
+        self.assertNotIn("search_keywords", res1)
+
+        # 2. 仅有线报清洗数据时安全兜底
+        doc_deal_only = {
             "platform": "pdd",
             "product_id": "P6635",
             "name": "可口可乐多口味装包邮",
             "price": 33.4,
             "deal_info": {
                 "is_deal_tip": True,
-                "raw_tip_title": "【多多】可口可乐500ml*18瓶混合装",
                 "format_info": {
-                    "core_entities": [{"name": "碳酸饮料", "score": 10}],
-                    "decision_keywords": [{"attribute_name": "品类", "attribute_value": "可乐"}],
+                    "core_entities": [
+                        {"name": "可口可乐", "score": 10},
+                        {"name": "碳酸饮料", "score": 7},
+                    ],
                 },
             },
         }
-        res = format_meili_doc(doc)
-        self.assertIsNotNone(res)
-        self.assertIn("search_keywords", res)
-        # 验证 search_keywords 中包含原始爆料标题与实体词
-        self.assertIn("【多多】可口可乐500ml*18瓶混合装", res["search_keywords"])
-        self.assertIn("碳酸饮料", res["search_keywords"])
-        self.assertIn("可乐", res["search_keywords"])
+        res2 = format_meili_doc(doc_deal_only)
+        self.assertEqual(res2["core_entities_raw"], ["可口可乐"])
+        self.assertEqual(res2["core_entities_alias_raw"], ["碳酸饮料"])
+        self.assertIn("可乐", res2["core_entity"])
+
+        # 3. 无任何清洗字段时不报错且安全返回空本体
+        doc_plain = {"platform": "pdd", "product_id": "P_RAW", "name": "未清洗新品牛肉", "format_info": "bad_type"}
+        res3 = format_meili_doc(doc_plain)
+        self.assertEqual(res3["core_entity"], "")
+        self.assertEqual(res3["core_entities_raw"], [])
+        self.assertEqual(extract_core_entities(None), ([], []))
 
     @patch("repositories.product_repo.upsert_cleaned_products_to_formal_table")
     def test_repo_upsert_cleaned_deal_products_ssot(self, mock_upsert_deal):
@@ -290,15 +365,27 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         mock_index.get_documents.side_effect = [
             SimpleNamespace(
                 results=[
-                    SimpleNamespace(id="pdd_KEEP_1", sync_ts=int(t_keep.timestamp())),
-                    SimpleNamespace(id="taobao_UPDATED_3", sync_ts=int(t_keep.timestamp())),
-                    SimpleNamespace(id="jd_OFF_5", sync_ts=int(t_new.timestamp())),
+                    SimpleNamespace(
+                        id="pdd_KEEP_1",
+                        sync_ts=int(t_keep.timestamp()),
+                        schema_ver=MEILI_SCHEMA_VERSION,
+                    ),
+                    SimpleNamespace(
+                        id="taobao_UPDATED_3",
+                        sync_ts=int(t_keep.timestamp()),
+                        schema_ver=MEILI_SCHEMA_VERSION,
+                    ),
+                    SimpleNamespace(
+                        id="jd_OFF_5",
+                        sync_ts=int(t_new.timestamp()),
+                        schema_ver=MEILI_SCHEMA_VERSION,
+                    ),
                 ],
                 total=5,
             ),
             {
                 "results": [
-                    {"id": "pdd_LEGACY_4"},  # 旧索引无 sync_ts
+                    {"id": "pdd_LEGACY_4"},  # 旧索引无 sync_ts 与 schema_ver
                     {"id": "taobao_GHOST"},
                 ],
                 "total": 5,
@@ -314,8 +401,9 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         pushed_docs = {doc["id"]: doc for call in mock_index.add_documents.call_args_list for doc in call.args[0]}
         self.assertEqual(set(pushed_docs.keys()), {"jd_MISSING_2", "taobao_UPDATED_3", "pdd_LEGACY_4"})
         self.assertNotIn("pdd_KEEP_1", pushed_docs)
-        self.assertIn("新实体词", pushed_docs["taobao_UPDATED_3"]["search_keywords"])
+        self.assertIn("新实体词", pushed_docs["taobao_UPDATED_3"]["core_entity"])
         self.assertEqual(pushed_docs["taobao_UPDATED_3"]["sync_ts"], int(t_fmt.timestamp()))
+        self.assertEqual(pushed_docs["taobao_UPDATED_3"]["schema_ver"], MEILI_SCHEMA_VERSION)
 
     @patch("infrastructure.search_meili.is_meili_available", return_value=True)
     @patch("infrastructure.search_meili.get_meili_client")
@@ -424,6 +512,101 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         self.assertIsNotNone(thread)
         self.assertFalse(thread.is_alive())
         self.assertTrue(all(t == "repo-obj" for t, _ in calls))
+
+    @patch("infrastructure.search_meili.ensure_index_configured", return_value=True)
+    @patch("infrastructure.search_meili.is_meili_available", return_value=True)
+    @patch("infrastructure.search_meili.get_meili_client")
+    def test_sync_products_diff_upgrades_outdated_schema_ver(self, mock_get_client, _mock_avail, _mock_cfg):
+        """即使 sync_ts 相同，旧文档缺少或低于当前 schema_ver 时也必须触发增量升级"""
+        ts = datetime.datetime(2026, 11, 21, 6, 0, 0, tzinfo=datetime.timezone.utc)
+        col = MagicMock()
+        col.find.return_value = [{"platform": "pdd", "product_id": "OLD_SCHEMA", "name": "旧版本索引商品", "updated_at": ts}]
+        mongo_db = SimpleNamespace(get_collection=lambda _name: col)
+
+        mock_client = MagicMock()
+        mock_index = MagicMock()
+        mock_client.index.return_value = mock_index
+        mock_get_client.return_value = mock_client
+        mock_index.get_documents.return_value = {
+            "results": [{"id": "pdd_OLD_SCHEMA", "sync_ts": int(ts.timestamp()), "schema_ver": 1}],
+            "total": 1,
+        }
+
+        res = sync_products_diff(mongo_db)
+        self.assertEqual(res, {"upserted": 1, "deleted": 0, "skipped": 0})
+        pushed = mock_index.add_documents.call_args.args[0]
+        self.assertEqual(pushed[0]["schema_ver"], MEILI_SCHEMA_VERSION)
+
+    def test_partition_search_candidates_all_scenarios(self):
+        """验证极简分桶函数在各类真实电商场景与无清洗数据降级下表现精确"""
+        # 1. 鲜牛肉：生鲜牛肉进 L1/L2，狗粮与牛奶小芋头隔离进 L3
+        beef_docs = [
+            {"product_id": "B1", "name": "大伊 原切牛腱子 生鲜牛肉", "core_entities_raw": ["生鲜牛肉"], "core_entities_alias_raw": []},
+            {"product_id": "B2", "name": "猫超 和牛牛腩块 生鲜牛肉", "core_entities_raw": ["牛腩块"], "core_entities_alias_raw": ["生鲜牛肉"]},
+            {"product_id": "DOG", "name": "比乐原味鲜狗粮10kg牛肉味", "core_entities_raw": ["狗粮"], "core_entities_alias_raw": []},
+            {"product_id": "TARO", "name": "京鲜生 云南牛奶小芋头", "core_entities_raw": ["小芋头"], "core_entities_alias_raw": []},
+        ]
+        l1, l2, l3 = partition_search_candidates("鲜牛肉", beef_docs)
+        self.assertEqual([d["product_id"] for d in l1], ["B1"])
+        self.assertEqual([d["product_id"] for d in l2], ["B2"])
+        self.assertEqual([d["product_id"] for d in l3], ["DOG", "TARO"])
+
+        # 2. 苹果手机：真 iPhone 进 L1，充电线/手机壳隔离进 L3；数量充足时屏蔽 L3
+        phone_docs = [
+            {"product_id": f"IP{i}", "name": f"Apple/苹果 iPhone 17 #{i}", "brand": "Apple", "core_entities_raw": ["手机"], "core_entities_alias_raw": []}
+            for i in range(5)
+        ] + [
+            {"product_id": "CABLE", "name": "适用苹果手机数据线快充线", "core_entities_raw": ["数据线"], "core_entities_alias_raw": []},
+            {"product_id": "CASE", "name": "苹果17手机壳防摔", "core_entities_raw": ["手机壳"], "core_entities_alias_raw": []},
+        ]
+        buckets = select_relevant_candidates("苹果手机", phone_docs, min_primary=5)
+        kept_ids = [d["product_id"] for b in buckets for d in b]
+        self.assertEqual(kept_ids, [f"IP{i}" for i in range(5)])
+
+        # 3. 咖啡：真咖啡进 L1，咖啡味猫砂隔离进 L3
+        coffee_docs = [
+            {"product_id": "CF1", "name": "瑞幸浓缩黑咖啡", "core_entities_raw": ["黑咖啡"], "core_entities_alias_raw": []},
+            {"product_id": "LITTER", "name": "肉垫速净咖啡纯木薯猫砂", "core_entities_raw": ["猫砂"], "core_entities_alias_raw": []},
+        ]
+        l1, l2, l3 = partition_search_candidates("咖啡", coffee_docs)
+        self.assertEqual([d["product_id"] for d in l1], ["CF1"])
+        self.assertEqual([d["product_id"] for d in l3], ["LITTER"])
+
+        # 4. 牛肉：真酱牛肉进 L1，牛肉丸/牛肉辣酱进 L2，狗粮/方便面进 L3
+        beef_broad = [
+            {"product_id": "RAW", "name": "内蒙古酱牛肉500g", "core_entities_raw": ["酱牛肉"], "core_entities_alias_raw": []},
+            {"product_id": "BALL", "name": "潮汕牛肉丸", "core_entities_raw": ["牛肉丸"], "core_entities_alias_raw": []},
+            {"product_id": "NOODLE", "name": "康师傅红烧牛肉面", "core_entities_raw": ["方便面"], "core_entities_alias_raw": []},
+        ]
+        l1, l2, l3 = partition_search_candidates("牛肉", beef_broad)
+        self.assertEqual([d["product_id"] for d in l1], ["RAW"])
+        self.assertEqual([d["product_id"] for d in l2], ["BALL"])
+        self.assertEqual([d["product_id"] for d in l3], ["NOODLE"])
+
+        # 5. 无清洗数据新品（无 format_info / core_entities_raw）：绝不报错且正常进入 L1
+        mixed_docs = [
+            {"product_id": "FMT", "name": "伊利纯牛奶", "format_info": {"0": {"core_entities": [{"name": "纯牛奶", "score": 10}]}}},
+            {"product_id": "NEW_RAW", "name": "光明鲜纯牛奶新品未清洗", "format_info": None},
+        ]
+        l1, l2, l3 = partition_search_candidates("纯牛奶", mixed_docs)
+        self.assertEqual([d["product_id"] for d in l1], ["FMT", "NEW_RAW"])
+        self.assertEqual(l3, [])
+
+        # 6. 纯品牌词自适应提升：即使拼多多商品缺少 brand 且少数线报漏了品牌前缀，也不误杀无 brand 同品牌商品
+        brand_docs = [
+            {"product_id": "JD_B", "name": "维达抽纸100抽", "brand": "维达", "core_entities_raw": ["抽纸"], "core_entities_alias_raw": []},
+            {"product_id": "PDD_NOBRAND", "name": "维达超韧卷纸", "brand": "", "core_entities_raw": ["卷纸"], "core_entities_alias_raw": ["维达卷纸"]},
+        ]
+        l1, l2, l3 = partition_search_candidates("维达", brand_docs)
+        self.assertEqual([d["product_id"] for d in l1], ["JD_B", "PDD_NOBRAND"])
+        self.assertEqual(l3, [])
+
+        # 7. 冷门/型号词（L1+L2 < 5）：自动附带 L3 兜底，不返回空列表
+        niche_docs = [
+            {"product_id": "ACC1", "name": "适用iPhone 17磁吸手机壳", "core_entities_raw": ["手机壳"], "core_entities_alias_raw": []},
+        ]
+        buckets_niche = select_relevant_candidates("iPhone 17", niche_docs, min_primary=5)
+        self.assertEqual([d["product_id"] for b in buckets_niche for d in b], ["ACC1"])
 
 
 if __name__ == "__main__":

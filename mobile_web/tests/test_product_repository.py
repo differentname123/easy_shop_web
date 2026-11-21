@@ -1755,6 +1755,123 @@ class TestProductRepository(unittest.TestCase):
             aware_utc_dt.timestamp(),
         )
 
+    def test_rank_boom_cost_performance_isolates_irrelevant_l3_and_keeps_unformatted(self):
+        """即使廉价配件/狗粮单价极低，也不会在性价比排序中压过真本体商品；无清洗新品照常参与排序。"""
+        now = datetime.datetime(2026, 11, 21, 12, 0, 0)
+        self.col.docs = [
+            # 5 条真 Apple 手机（单台 5000+，按“台/元”极低）
+            *[
+                {
+                    "platform": "jd",
+                    "product_id": f"IPHONE_{i}",
+                    "name": f"Apple/苹果 iPhone 17 #{i}",
+                    "brand": "Apple",
+                    "activity_price": 5000.0 + i * 100,
+                    "channel_type": 1,
+                    "updated_at": now - datetime.timedelta(minutes=i),
+                    "format_status": "success",
+                    "format_activity_price": 5000.0 + i * 100,
+                    "format_info": {
+                        f"IPHONE_{i}_0": {
+                            "price": 5000.0 + i * 100,
+                            "core_entities": [{"name": "手机", "score": 10}],
+                            "pricing_basis": {"base_unit": "台", "total_value": 1, "structure": [{"unit": "台", "value": 1}]},
+                        }
+                    },
+                }
+                for i in range(5)
+            ],
+            # 廉价配件：30条苹果手机数据线仅 9.9 元（3.03 根/元，若混入同池必定霸榜第1），本体是“数据线”
+            {
+                "platform": "pdd",
+                "product_id": "CHEAP_CABLE",
+                "name": "批发30个装苹果手机充电线",
+                "activity_price": 9.9,
+                "channel_type": 5,
+                "updated_at": now,
+                "format_status": "success",
+                "format_activity_price": 9.9,
+                "format_info": {
+                    "CHEAP_CABLE_0": {
+                        "price": 9.9,
+                        "core_entities": [{"name": "数据线", "score": 10}],
+                        "pricing_basis": {"base_unit": "根", "total_value": 30, "structure": [{"unit": "根", "value": 30}]},
+                    }
+                },
+            },
+            # 无清洗数据的鲜牛肉新品 + 有清洗生鲜牛肉 + 便宜狗粮
+            {
+                "platform": "pdd",
+                "product_id": "UNFMT_BEEF",
+                "name": "牧场直发鲜牛肉2斤新品",
+                "activity_price": 68.0,
+                "channel_type": 5,
+                "updated_at": now,
+            },
+            *[
+                {
+                    "platform": "jd",
+                    "product_id": f"FMT_BEEF_{i}",
+                    "name": f"原切生鲜牛肉 #{i}",
+                    "activity_price": 80.0 + i * 10,
+                    "channel_type": 1,
+                    "updated_at": now - datetime.timedelta(minutes=i + 1),
+                    "format_status": "success",
+                    "format_activity_price": 80.0 + i * 10,
+                    "format_info": {
+                        f"FMT_BEEF_{i}_0": {
+                            "price": 80.0 + i * 10,
+                            "core_entities": [{"name": "生鲜牛肉", "score": 10}],
+                            "pricing_basis": {"base_unit": "g", "total_value": 1000, "structure": [{"unit": "g", "value": 1000}]},
+                        }
+                    },
+                }
+                for i in range(4)
+            ],
+            {
+                "platform": "taobao",
+                "product_id": "DOG_FOOD",
+                "name": "鲜肉狗粮10kg牛肉味",
+                "activity_price": 29.0,
+                "channel_type": 1,
+                "updated_at": now,
+                "format_status": "success",
+                "format_activity_price": 29.0,
+                "format_info": {
+                    "DOG_FOOD_0": {
+                        "price": 29.0,
+                        "core_entities": [{"name": "狗粮", "score": 10}],
+                        "pricing_basis": {"base_unit": "g", "total_value": 10000, "structure": [{"unit": "g", "value": 10000}]},
+                    }
+                },
+            },
+        ]
+
+        self.repo._force_meili_enabled = True
+        try:
+            phone_hits = [
+                {"platform": "pdd", "product_id": "CHEAP_CABLE"},
+                *[{"platform": "jd", "product_id": f"IPHONE_{i}"} for i in range(5)],
+            ]
+            with patch("repositories.product_repo.search_products", return_value=phone_hits):
+                phone_ranked = self.repo.rank_boom_products_by_cost_performance(keyword="苹果手机")
+            self.assertEqual([item["product_id"] for item in phone_ranked], [f"IPHONE_{i}" for i in range(5)])
+            self.assertNotIn("CHEAP_CABLE", [item["product_id"] for item in phone_ranked])
+
+            beef_hits = [
+                {"platform": "taobao", "product_id": "DOG_FOOD"},
+                {"platform": "pdd", "product_id": "UNFMT_BEEF"},
+                *[{"platform": "jd", "product_id": f"FMT_BEEF_{i}"} for i in range(4)],
+            ]
+            with patch("repositories.product_repo.search_products", return_value=beef_hits):
+                beef_ranked = self.repo.rank_boom_products_by_cost_performance(keyword="鲜牛肉")
+            beef_ids = [item["product_id"] for item in beef_ranked]
+            self.assertIn("UNFMT_BEEF", beef_ids)
+            self.assertNotIn("DOG_FOOD", beef_ids)
+            self.assertEqual(beef_ids[:4], [f"FMT_BEEF_{i}" for i in range(4)])
+        finally:
+            self.repo._force_meili_enabled = None
+
 
 if __name__ == "__main__":
     unittest.main()
