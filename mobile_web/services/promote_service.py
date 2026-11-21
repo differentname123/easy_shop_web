@@ -26,8 +26,6 @@ from cache import (
     PROMOTION_CACHE,
     SIGN_BY_ID_CACHE,
     cache_product_detail,
-    evict_product_from_caches,
-    is_product_off_promotion,
     make_detail_snapshot,
     snapshot_detail_deadline,
     sync_product_summary_in_caches,
@@ -293,20 +291,10 @@ class PromoteService:
         cache_key = ("promotion", ref.platform, kind, ref.key, product_url, uid)
         if identity:
             cache_key += (hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),)
-        configured_scope = getattr(adapter, "promotion_scope", "")
-        configured_scope = configured_scope if isinstance(configured_scope, str) else ""
-        if configured_scope:
-            cache_key += (configured_scope,)
-
-        def matches_scope(data):
-            return (not configured_scope or data.get("promotion_scope") == configured_scope) and (
-                getattr(adapter, "requires_numeric_promoter_id", False) is not True
-                or data.get("promoter_id") == identity.get("promoter_id"))
 
         cached = PROMOTION_CACHE.get(cache_key)
         if (isinstance(cached, tuple) and len(cached) == 2 and self._valid_deadline(cached[0])
-                and self._cacheable(cached[1]) and matches_scope(cached[1])
-                and (uid or self._public_attribution(cached[1]))):
+                and self._cacheable(cached[1]) and (uid or self._public_attribution(cached[1]))):
             if trace is not None:
                 trace.update(source="memory", provider_ms=0.0)
             return self._link_data(cached[1])
@@ -314,19 +302,12 @@ class PromoteService:
             PROMOTION_CACHE.pop(cache_key)
 
         ref = self._resolve_product_ref(ref)
-        supports_coupon = getattr(adapter, "supports_coupon_enrichment", False) is True
-        local_coupon_for_db, _ = (
-            self._cached_or_db_coupon_url(ref, adapter=adapter)
-            if (not uid and supports_coupon)
-            else ("", None)
-        )
         if not uid and ref.key:
             cached = self.repo.get_promotion_link_cache(
                 platform=ref.platform, goods_id=ref.goods_id or None,
                 goods_sign=ref.goods_sign or None, goods_key=ref.key,
             )
-            if (self._cacheable(cached) and self._public_attribution(cached) and matches_scope(cached)
-                    and (not local_coupon_for_db or cached.get("coupon_url") == local_coupon_for_db)
+            if (self._cacheable(cached) and self._public_attribution(cached)
                     and self._valid_deadline(cached.get("_expires_at"))):
                 expires_at = cached["_expires_at"]
                 data = self._link_data(cached)
@@ -338,14 +319,14 @@ class PromoteService:
         adapter_kwargs = {k: v for k, v in kwargs.items()
                           if k not in ("goods_id", "goods_sign", "identity", "relation_id", "special_id",
                                        "promoter_id", "positionId", "position_id", "trusted_product_url",
-                                       "trusted_coupon_url", "promotion_scope", "unionId", "union_id")}
+                                       "trusted_coupon_url", "unionId", "union_id")}
         if getattr(adapter, "requires_authorized_promotion", False):
             adapter_kwargs["identity"] = identity
         if getattr(adapter, "requires_numeric_promoter_id", False) is True:
             adapter_kwargs["promoter_id"] = identity["promoter_id"]
         if getattr(adapter, "requires_material_url", False) is True:
             adapter_kwargs["trusted_product_url"] = self._trusted_material_url(ref, adapter=adapter)
-        if supports_coupon:
+        if getattr(adapter, "supports_coupon_enrichment", False) is True:
             trusted_coupon = self._trusted_coupon_url(ref, adapter)
             if trusted_coupon:
                 adapter_kwargs["trusted_coupon_url"] = trusted_coupon
@@ -383,8 +364,6 @@ class PromoteService:
         if getattr(adapter, "requires_numeric_promoter_id", False) is True and data.get("promoter_id") != identity.get("promoter_id"):
             return {"status": "error", "error_code": "invalid_promotion_identity",
                     "error_msg": "平台推广结果与当前推广身份不一致"}
-        if configured_scope:
-            data["promotion_scope"] = configured_scope
         final_link = self._final_link(data)
         if not final_link:
             return {"status": "error", "error_msg": "平台未返回有效推广链接"}
@@ -461,8 +440,6 @@ class PromoteService:
         product_url = str(product_url or "").strip()
         if not ref.key and not product_url:
             return {"status": "error", "error_msg": "缺少有效商品标识或链接"}
-        if ref.key and is_product_off_promotion(plat, ref.goods_id, ref.goods_sign):
-            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或已停止推广"}
 
         goods_tag = ref.goods_id or (ref.goods_sign[:16] + "..." if len(ref.goods_sign) > 16 else ref.goods_sign) or "url"
         user_tag = raw_uid or "匿名"
@@ -500,12 +477,6 @@ class PromoteService:
         source = trace.get("source", "provider")
         provider_ms = float(trace.get("provider_ms", 0.0))
         if data.get("status") != "success":
-            if str(data.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION" and ref.key:
-                evict_product_from_caches(plat, ref.goods_id, ref.goods_sign)
-                try:
-                    self.repo.delete_product(plat, goods_id=ref.goods_id or None, goods_sign=ref.goods_sign or None)
-                except Exception:
-                    pass
             logger.warning(
                 "%s 【推广转链失败】正在生成商品推广链接时失败 | 平台[%s] 商品[%s] 用户[%s] 模式[%s] 来源[%s] 授权耗时[%.1fms] 转链耗时[%.1fms] 总耗时[%.1fms] 失败原因<%s> 排查方向<请检查商品是否在推、物料链接有效性或上游联盟转链网关状态>",
                 severity_icon(error_code=data.get("error_code")),

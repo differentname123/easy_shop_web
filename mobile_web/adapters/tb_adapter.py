@@ -524,7 +524,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             expires = _timestamp(ztk_res.get("expires_at"))
             if expires:
                 result["expires_at"] = expires
-            result["cacheable"] = bool(expires)
+            result["cacheable"] = True
             return result
 
         def _promote_via_official_or_ztk():
@@ -592,7 +592,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             expires = _timestamp(token.get("expires_at") or (token.get("raw") or {}).get("expires_at"))
             if expires:
                 result["expires_at"] = expires
-            result["cacheable"] = bool(expires)
+            result["cacheable"] = True
             return result
 
         def _promote_via_ztk_only():

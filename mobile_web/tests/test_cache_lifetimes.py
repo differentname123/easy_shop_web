@@ -212,3 +212,589 @@ def test_detail_singleflight_collapses_concurrent_requests_across_different_uids
     assert all(r["status"] == "success" and r["data"]["price"] == 88.0 for r in results)
     # 防并发击穿 Singleflight 必须将 5 个不同用户的请求聚合成单次上游请求
     assert adapter.get_goods_detail.call_count == 1
+
+
+class _FormalProductsCollection(MemoryCollection):
+    """补齐 bulk_write.matched_count，便于直接驱动 upsert_cleaned_products_to_formal_table。"""
+
+    def bulk_write(self, operations, ordered=False):
+        inserted = modified = matched = 0
+        for operation in operations:
+            result = self.update_one(operation._filter, operation._doc, upsert=operation._upsert)
+            inserted += int(result.upserted_id is not None)
+            modified += result.modified_count
+            matched += int(result.matched_count)
+        return SimpleNamespace(upserted_count=inserted, modified_count=modified, matched_count=matched)
+
+
+def _make_preseed_platform_adapter(plat: str, spec: dict):
+    from unittest.mock import MagicMock
+    from adapters.base import build_command_text
+    from models.product import ProductRef
+
+    class _PreseedAdapter:
+        active = True
+        platform_code = plat
+        platform_name = {"jd": "京东", "taobao": "淘宝", "pdd": "拼多多"}[plat]
+        requires_numeric_promoter_id = plat == "jd"
+        default_promoter_id = "10086" if plat == "jd" else ""
+        supports_coupon_enrichment = plat == "jd"
+        requires_authorized_promotion = plat in ("taobao", "pdd")
+
+        def __init__(self):
+            self.resolve_and_convert_universal = MagicMock(return_value=dict(spec["stage3_res"]))
+            self.convert_promotion_url = MagicMock(return_value=dict(spec["refresh_res"]))
+
+        @staticmethod
+        def resolve_product_ref(raw="", goods_id=None, goods_sign=None):
+            return ProductRef(plat, goods_id or "", goods_sign or "")
+
+        @staticmethod
+        def extract_trusted_coupon_url(doc):
+            if not isinstance(doc, dict):
+                return ""
+            cinfo = doc.get("coupon_info") if isinstance(doc.get("coupon_info"), dict) else {}
+            return str(cinfo.get("coupon_url") or doc.get("coupon_url") or "")
+
+        @staticmethod
+        def should_enrich_promotion_coupon(ref, doc=None):
+            return False
+
+        @staticmethod
+        def build_command_text(title, final_link, price=None, coupon=None):
+            return build_command_text(title, final_link, price, coupon, {"jd": "京东", "taobao": "淘宝", "pdd": "拼多多"}[plat])
+
+    return _PreseedAdapter()
+
+
+@pytest.mark.parametrize(
+    ("plat", "spec"),
+    [
+        (
+            "jd",
+            {
+                "raw_input": "https://item.jd.com/1000123456.html",
+                "goods_id": "1000123456",
+                "goods_sign": "jd_sign_1000123456",
+                "stage3_res": {
+                    "status": "success",
+                    "goods_id": "1000123456",
+                    "goods_sign": "jd_sign_1000123456",
+                    "final_link": "https://u.jd.com/preseed_jd",
+                    "url": "https://u.jd.com/preseed_jd",
+                    "short_url": "https://u.jd.com/preseed_jd",
+                    "promotion_token": "21:/abcJDcmd",
+                    "promoter_id": "10086",
+                    "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=c1",
+                    "link_type": "京东推广链接",
+                    "cacheable": True,
+                    "is_fallback": False,
+                    "price": 99.0,
+                    "coupon_amount": 10.0,
+                    "title": "京东预置好物",
+                    "product": {
+                        "name": "京东预置好物",
+                        "price": 99.0,
+                        "original_price": 109.0,
+                        "activity_price": 89.0,
+                        "coupon_amount": 10.0,
+                        "product_url": "https://item.jd.com/1000123456.html",
+                        "image_url": "https://img.jd.com/1.jpg",
+                        "carousel_images": ["https://img.jd.com/1.jpg"],
+                        "coupon_info": {"coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=c1"},
+                        "raw_item": {"blob": "huge"},
+                    },
+                },
+                "refresh_res": {
+                    "status": "success",
+                    "final_link": "https://u.jd.com/fresh_jd",
+                    "url": "https://u.jd.com/fresh_jd",
+                    "short_url": "https://u.jd.com/fresh_jd",
+                    "promotion_token": "21:/freshJD",
+                    "promoter_id": "10086",
+                    "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=c1",
+                    "cacheable": True,
+                    "is_fallback": False,
+                },
+                "personal_res": {
+                    "status": "success",
+                    "final_link": "https://u.jd.com/personal_jd",
+                    "url": "https://u.jd.com/personal_jd",
+                    "promoter_id": "20086",
+                    "cacheable": True,
+                    "is_fallback": False,
+                },
+            },
+        ),
+        (
+            "taobao",
+            {
+                "raw_input": "https://uland.taobao.com/item/edetail?id=tb_opaque_1",
+                "goods_id": "tb_gid_1",
+                "goods_sign": "tb_sign_1",
+                "stage3_res": {
+                    "status": "success",
+                    "goods_id": "tb_gid_1",
+                    "goods_sign": "tb_sign_1",
+                    "final_link": "https://s.click.taobao.com/preseed_tb",
+                    "url": "https://s.click.taobao.com/preseed_tb",
+                    "short_url": "",
+                    "promotion_token": "￥TB123￥",
+                    "token_type": "tpwd",
+                    "link_type": "淘宝官方淘口令",
+                    "cacheable": True,
+                    "is_fallback": False,
+                    "price": 49.0,
+                    "coupon_amount": 5.0,
+                    "title": "淘宝预置好物",
+                    "product": {
+                        "name": "淘宝预置好物",
+                        "price": 49.0,
+                        "original_price": 59.0,
+                        "activity_price": 44.0,
+                        "coupon_amount": 5.0,
+                        "product_url": "https://uland.taobao.com/item/edetail?id=tb_opaque_1",
+                        "image_url": "https://img.alicdn.com/1.jpg",
+                        "carousel_images": ["https://img.alicdn.com/1.jpg"],
+                    },
+                },
+                "refresh_res": {
+                    "status": "success",
+                    "final_link": "https://s.click.taobao.com/fresh_tb",
+                    "url": "https://s.click.taobao.com/fresh_tb",
+                    "promotion_token": "￥FRESH￥",
+                    "token_type": "tpwd",
+                    "cacheable": True,
+                    "is_fallback": False,
+                },
+                "personal_res": {
+                    "status": "success",
+                    "final_link": "https://s.click.taobao.com/personal_tb",
+                    "url": "https://s.click.taobao.com/personal_tb",
+                    "promotion_token": "￥MINE￥",
+                    "token_type": "tpwd",
+                    "relation_id": "999888",
+                    "attribution_status": "verified",
+                    "cacheable": True,
+                    "is_fallback": False,
+                },
+            },
+        ),
+        (
+            "pdd",
+            {
+                "raw_input": "https://p.pinduoduo.com/preseed123",
+                "goods_id": "",
+                "goods_sign": "E9_pdd_sign_1",
+                "stage3_res": {
+                    "status": "success",
+                    "goods_id": "987654321",
+                    "goods_sign": "E9_pdd_sign_1",
+                    "final_link": "https://p.pinduoduo.com/preseed_pdd",
+                    "url": "https://p.pinduoduo.com/preseed_pdd",
+                    "mobile_url": "https://mobile.yangkeduo.com/preseed_pdd",
+                    "short_url": "https://p.pinduoduo.com/preseed_pdd",
+                    "we_app_info": {"page_path": "pages/index?a=1"},
+                    "link_type": "拼多多小程序推广",
+                    "cacheable": True,
+                    "is_fallback": False,
+                    "price": 19.9,
+                    "coupon_amount": 3.0,
+                    "title": "拼多多预置好物",
+                    "product": {
+                        "name": "拼多多预置好物",
+                        "price": 19.9,
+                        "original_price": 29.9,
+                        "activity_price": 16.9,
+                        "coupon_amount": 3.0,
+                        "product_url": "https://p.pinduoduo.com/preseed123",
+                        "image_url": "https://img.pddpic.com/1.jpg",
+                        "carousel_images": ["https://img.pddpic.com/1.jpg"],
+                    },
+                },
+                "refresh_res": {
+                    "status": "success",
+                    "final_link": "https://p.pinduoduo.com/fresh_pdd",
+                    "url": "https://p.pinduoduo.com/fresh_pdd",
+                    "short_url": "https://p.pinduoduo.com/fresh_pdd",
+                    "we_app_info": {"page_path": "pages/fresh?a=2"},
+                    "cacheable": True,
+                    "is_fallback": False,
+                },
+                "personal_res": {
+                    "status": "success",
+                    "final_link": "https://p.pinduoduo.com/personal_pdd",
+                    "url": "https://p.pinduoduo.com/personal_pdd",
+                    "attribution_status": "verified",
+                    "cacheable": True,
+                    "is_fallback": False,
+                },
+            },
+        ),
+    ],
+)
+def test_stage_worker_handoff_preseeds_default_promotion_and_hits_db_on_first_click(monkeypatch, plat, spec):
+    from copy import deepcopy
+    from unittest.mock import MagicMock, patch
+    from repositories.product_repo import upsert_cleaned_products_to_formal_table
+    from services.deal_pool_cleaner import DealPoolCleaner
+
+    promote_module.PROMOTION_CACHE.clear()
+    adapter = _make_preseed_platform_adapter(plat, spec)
+    cleaner = DealPoolCleaner(ai_batch_size=2, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+    cleaner.adapters = {plat: adapter}
+
+    raw_doc = {
+        "_id": f"tip_{plat}_1",
+        "source_site": "guangdiu",
+        "source_channel": "hot",
+        "source_item_id": f"tip_{plat}_1",
+        "title": spec["stage3_res"]["title"],
+        "platform": plat,
+        "publish_ts": 1800000000.0,
+        "ai_stage1_result": {
+            "is_standalone_deal": True,
+            "merged_tip_ids": [f"tip_{plat}_1"],
+            "combined_raw_text": f"好物推荐 [#L1]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "clean_input": spec["raw_input"], "platform_hint": plat, "text_role_hint": "main_candidate"}
+            ],
+        },
+    }
+
+    conv_out, _ = cleaner.process_convert_unit([raw_doc], formal_col=None, shared_active_products={})
+    assert len(conv_out) == 1
+    assert conv_out[0]["stage_outcome"] == "advance_to_ai2"
+    persisted_conv = deepcopy(conv_out[0]["converted_links"])
+    assert "adapter_res" not in persisted_conv[0]
+    assert "promo_payload" in persisted_conv[0]
+    assert "raw_item" not in persisted_conv[0]["promo_payload"]
+    assert "product" not in persisted_conv[0]["promo_payload"]
+
+    # 模拟 StageWorker-AI2 跨阶段从数据库读取（不携带全内存 full_conv_list）
+    stage4_doc = deepcopy(raw_doc)
+    stage4_doc["converted_links"] = persisted_conv
+    ai2_mock = {
+        f"tip_{plat}_1": {
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "deal_price": spec["stage3_res"]["price"] - spec["stage3_res"]["coupon_amount"],
+            "quality_score": 88,
+            "clean_title": spec["stage3_res"]["title"],
+            "tutorial_steps": ["1. 直接下单"],
+        }
+    }
+    with patch.object(cleaner, "run_ai_stage2_batch", return_value=ai2_mock):
+        ai2_out, _ = cleaner.process_ai2_unit([stage4_doc])
+
+    assert len(ai2_out) == 1 and ai2_out[0]["stage_outcome"] == "success"
+    product_doc = ai2_out[0]["product_doc"]
+    preseeded = product_doc.get("default_promotion")
+    assert isinstance(preseeded, dict)
+    assert preseeded["final_link"] == spec["stage3_res"]["final_link"]
+    assert isinstance(product_doc.get("default_promotion_updated_at"), datetime)
+    assert isinstance(product_doc.get("default_promotion_expires_at"), datetime)
+    if plat == "jd":
+        assert preseeded["token_type"] != "tpwd"
+        assert preseeded["promoter_id"] == "10086"
+        assert preseeded["coupon_url"] == spec["stage3_res"]["coupon_url"]
+    elif plat == "taobao":
+        assert preseeded["token_type"] == "tpwd"
+        assert preseeded["promotion_token"] == "￥TB123￥"
+    else:
+        assert preseeded["we_app_info"] == {"page_path": "pages/index?a=1"}
+
+    formal_col = _FormalProductsCollection()
+    upsert_cleaned_products_to_formal_table(formal_col, [product_doc])
+    repo = ProductRepository(SimpleNamespace(get_collection=lambda _n: formal_col))
+    monkeypatch.setattr(promote_module, "get_adapter", lambda _p: adapter)
+    user_service = MagicMock()
+    user_service.get_numeric_promotion_context.return_value = {"status": "success", "promoter_id": "20086"}
+    user_service.get_promotion_context.return_value = {
+        "status": "success", "is_authorized": True, "identity": {"relation_id": "999888"},
+    }
+    service = promote_module.PromoteService(repo, user_service=user_service)
+
+    # 第 1 次匿名点击（清空进程内存，仅走 L2 MongoDB default_promotion）-> 0 上游调用
+    promote_module.PROMOTION_CACHE.clear()
+    first = service.convert_link(
+        plat,
+        goods_id=spec["goods_id"] or None,
+        goods_sign=spec["goods_sign"] or None,
+        uid=None,
+        title="首击文案",
+    )
+    assert first["status"] == "success"
+    assert first["from_cache"] is True
+    assert first["final_link"] == spec["stage3_res"]["final_link"]
+    assert adapter.convert_promotion_url.call_count == 0
+    if plat == "taobao":
+        assert first["promotion_token"] == "￥TB123￥"
+    elif plat == "pdd":
+        assert first["we_app_info"] == {"page_path": "pages/index?a=1"}
+
+    # 第 2 次匿名点击 -> 命中 L1 进程内存 PROMOTION_CACHE，连 DB 都不额外回查
+    db_queries_after_first = len(formal_col.queries)
+    second = service.convert_link(
+        plat,
+        goods_id=spec["goods_id"] or None,
+        goods_sign=spec["goods_sign"] or None,
+        uid=None,
+        title="次击文案",
+    )
+    assert second["final_link"] == spec["stage3_res"]["final_link"]
+    assert adapter.convert_promotion_url.call_count == 0
+    assert len(formal_col.queries) == db_queries_after_first
+
+    # 登录推手访问 -> 必须跳过站长公共缓存，独立调用上游生成个人归因，且不污染站长 L2 缓存
+    adapter.convert_promotion_url.return_value = dict(spec["personal_res"])
+    personal = service.convert_link(
+        plat,
+        goods_id=spec["goods_id"] or None,
+        goods_sign=spec["goods_sign"] or None,
+        uid="u_1234abcd",
+        title="推手专属",
+    )
+    assert personal["status"] == "success"
+    assert personal["final_link"] == spec["personal_res"]["final_link"]
+    assert adapter.convert_promotion_url.call_count == 1
+    assert formal_col.docs[0]["default_promotion"]["final_link"] == spec["stage3_res"]["final_link"]
+    promote_module.PROMOTION_CACHE.clear()
+
+
+def test_preseed_guardrails_and_three_day_expiry_refresh(monkeypatch):
+    import time as py_time
+    from copy import deepcopy
+    from unittest.mock import patch
+    from repositories.product_repo import upsert_cleaned_products_to_formal_table
+    from services.deal_pool_cleaner import DealPoolCleaner
+
+    promote_module.PROMOTION_CACHE.clear()
+
+    def _run_ai2(plat: str, promo_payload: dict):
+        adapter = SimpleNamespace(
+            active=True,
+            platform_code=plat,
+            platform_name=plat,
+            requires_numeric_promoter_id=plat == "jd",
+        )
+        cleaner = DealPoolCleaner(ai_batch_size=2, convert_max_workers=1)
+        cleaner._cache_warmed_up = True
+        cleaner.adapters = {plat: adapter}
+        doc = {
+            "_id": f"guard_{plat}",
+            "source_site": "guangdiu",
+            "source_channel": "hot",
+            "source_item_id": f"guard_{plat}",
+            "title": "测试商品",
+            "platform": plat,
+            "publish_ts": py_time.time(),
+            "ai_stage1_result": {"is_standalone_deal": True, "merged_tip_ids": [f"guard_{plat}"]},
+            "converted_links": [
+                {
+                    "link_id": "L1",
+                    "clean_input": "https://u.jd.com/x",
+                    "text_role_hint": "main_candidate",
+                    "convert_status": "product",
+                    "platform": plat,
+                    "goods_id": "10002",
+                    "goods_sign": "sign_10002",
+                    "my_promo_link": "https://u.jd.com/promo_x",
+                    "my_promo_token": "",
+                    "official_product": {
+                        "title": "测试商品",
+                        "price": 50.0,
+                        "original_price": 60.0,
+                        "activity_price": 50.0,
+                        "coupon_amount": 0.0,
+                        "image_url": "https://img.jd.com/2.jpg",
+                        "carousel_images": ["https://img.jd.com/2.jpg"],
+                    },
+                    "promo_payload": promo_payload,
+                }
+            ],
+        }
+        ai2_mock = {
+            f"guard_{plat}": {
+                "is_valid_deal": True,
+                "main_link_id": "L1",
+                "deal_price": 50.0,
+                "quality_score": 85,
+                "clean_title": "测试商品",
+                "tutorial_steps": ["1. 下单"],
+            }
+        }
+        with patch.object(cleaner, "run_ai_stage2_batch", return_value=ai2_mock):
+            out, _ = cleaner.process_ai2_unit([doc])
+        return out[0]["product_doc"]
+
+    # 1) 降级 / cacheable=False 绝不预置 default_promotion
+    assert "default_promotion" not in _run_ai2("pdd", {"final_link": "https://p.pinduoduo.com/x", "is_fallback": True, "cacheable": True})
+    assert "default_promotion" not in _run_ai2("taobao", {"final_link": "https://s.click.taobao.com/x", "is_fallback": False, "cacheable": False})
+
+    # 2) 上游若返回更短 expires_at，default_promotion_expires_at 必须向下钳位而不强套 3 天
+    now_t = py_time.time()
+    shorter_doc = _run_ai2("taobao", {
+        "final_link": "https://s.click.taobao.com/short",
+        "is_fallback": False,
+        "cacheable": True,
+        "expires_at": now_t + 3600.0,
+    })
+    assert shorter_doc["default_promotion"]["expires_at"] == pytest.approx(now_t + 3600.0)
+    assert shorter_doc["default_promotion_expires_at"].timestamp() <= now_t + 3601.0
+
+    # 3) 入库后若超过 3 天过期（回拨 default_promotion_expires_at），下次匿名点击必须重拉上游并刷新 DB
+    seed_doc = _run_ai2("taobao", {
+        "final_link": "https://s.click.taobao.com/initial",
+        "promotion_token": "￥INIT￥",
+        "token_type": "tpwd",
+        "is_fallback": False,
+        "cacheable": True,
+    })
+    formal_col = _FormalProductsCollection()
+    upsert_cleaned_products_to_formal_table(formal_col, [deepcopy(seed_doc)])
+    formal_col.docs[0]["default_promotion_expires_at"] = datetime.fromtimestamp(py_time.time() - 60.0, timezone.utc)
+
+    tb_spec = {
+        "stage3_res": {"status": "success"},
+        "refresh_res": {
+            "status": "success",
+            "final_link": "https://s.click.taobao.com/refreshed_3d",
+            "url": "https://s.click.taobao.com/refreshed_3d",
+            "promotion_token": "￥REFRESHED￥",
+            "token_type": "tpwd",
+            "cacheable": True,
+            "is_fallback": False,
+        },
+    }
+    adapter = _make_preseed_platform_adapter("taobao", tb_spec)
+    adapter.requires_authorized_promotion = True
+    monkeypatch.setattr(promote_module, "get_adapter", lambda _p: adapter)
+    repo = ProductRepository(SimpleNamespace(get_collection=lambda _n: formal_col))
+    service = promote_module.PromoteService(repo)
+
+    res = service.convert_link("taobao", goods_id="10002", goods_sign="sign_10002", uid=None)
+    assert res["status"] == "success"
+    assert res["final_link"] == "https://s.click.taobao.com/refreshed_3d"
+    assert adapter.convert_promotion_url.call_count == 1
+    assert formal_col.docs[0]["default_promotion"]["final_link"] == "https://s.click.taobao.com/refreshed_3d"
+    assert formal_col.docs[0]["default_promotion_expires_at"].timestamp() > py_time.time() + PROMOTION_LINK_TTL - 30
+    promote_module.PROMOTION_CACHE.clear()
+
+
+def test_jd_l2_promotion_cache_ignores_coupon_mismatch_and_uses_ttl_only(monkeypatch):
+    import time as py_time
+    from repositories.product_repo import upsert_cleaned_products_to_formal_table
+    from services.deal_pool_cleaner import DealPoolCleaner
+
+    promote_module.PROMOTION_CACHE.clear()
+    jd_spec = {
+        "stage3_res": {
+            "status": "success",
+            "goods_id": "1000888",
+            "goods_sign": "jd_sign_888",
+            "final_link": "https://u.jd.com/cached_plain",
+            "url": "https://u.jd.com/cached_plain",
+            "short_url": "https://u.jd.com/cached_plain",
+            "promoter_id": "10086",
+            "coupon_url": "https://coupon.m.jd.com/old_coupon",
+            "cacheable": True,
+            "is_fallback": False,
+            "price": 80.0,
+            "coupon_amount": 10.0,
+            "title": "京东纯超时测试",
+            "product": {
+                "name": "京东纯超时测试",
+                "price": 80.0,
+                "original_price": 90.0,
+                "activity_price": 70.0,
+                "coupon_amount": 10.0,
+                "product_url": "https://item.jd.com/1000888.html",
+                "coupon_info": {"coupon_url": "https://coupon.m.jd.com/new_coupon"},
+            },
+        },
+        "refresh_res": {
+            "status": "success",
+            "final_link": "https://u.jd.com/after_ttl_fresh",
+            "url": "https://u.jd.com/after_ttl_fresh",
+            "short_url": "https://u.jd.com/after_ttl_fresh",
+            "promoter_id": "10086",
+            "cacheable": True,
+            "is_fallback": False,
+        },
+    }
+    adapter = _make_preseed_platform_adapter("jd", jd_spec)
+    cleaner = DealPoolCleaner(ai_batch_size=2, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+    cleaner.adapters = {"jd": adapter}
+    from unittest.mock import patch
+    stage4_doc = {
+        "_id": "jd_ttl_1",
+        "source_site": "guangdiu",
+        "source_channel": "hot",
+        "source_item_id": "jd_ttl_1",
+        "title": "京东纯超时测试",
+        "platform": "jd",
+        "publish_ts": py_time.time(),
+        "ai_stage1_result": {"is_standalone_deal": True, "merged_tip_ids": ["jd_ttl_1"]},
+        "converted_links": [
+            {
+                "link_id": "L1",
+                "clean_input": "https://item.jd.com/1000888.html",
+                "text_role_hint": "main_candidate",
+                "convert_status": "product",
+                "platform": "jd",
+                "goods_id": "1000888",
+                "goods_sign": "jd_sign_888",
+                "my_promo_link": "https://u.jd.com/cached_plain",
+                "my_promo_token": "",
+                "official_product": jd_spec["stage3_res"]["product"],
+                "promo_payload": {
+                    "final_link": "https://u.jd.com/cached_plain",
+                    "url": "https://u.jd.com/cached_plain",
+                    "short_url": "https://u.jd.com/cached_plain",
+                    "promoter_id": "10086",
+                    "coupon_url": "https://coupon.m.jd.com/old_coupon",
+                    "cacheable": True,
+                    "is_fallback": False,
+                },
+            }
+        ],
+    }
+    ai2_mock = {
+        "jd_ttl_1": {
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "deal_price": 70.0,
+            "quality_score": 88,
+            "clean_title": "京东纯超时测试",
+            "tutorial_steps": ["1. 下单"],
+        }
+    }
+    with patch.object(cleaner, "run_ai_stage2_batch", return_value=ai2_mock):
+        ai2_out, _ = cleaner.process_ai2_unit([stage4_doc])
+
+    formal_col = _FormalProductsCollection()
+    upsert_cleaned_products_to_formal_table(formal_col, [ai2_out[0]["product_doc"]])
+    repo = ProductRepository(SimpleNamespace(get_collection=lambda _n: formal_col))
+    monkeypatch.setattr(promote_module, "get_adapter", lambda _p: adapter)
+    service = promote_module.PromoteService(repo)
+
+    # 未过期前，即便商品文档中的 coupon_url 与 default_promotion.coupon_url 不同，仍直接命中 L2 缓存（0 上游、不额外补查券）
+    promote_module.PROMOTION_CACHE.clear()
+    hit = service.convert_link("jd", goods_id="1000888", goods_sign="jd_sign_888", uid=None)
+    assert hit["status"] == "success"
+    assert hit["from_cache"] is True
+    assert hit["final_link"] == "https://u.jd.com/cached_plain"
+    assert adapter.convert_promotion_url.call_count == 0
+
+    # 超时后才重新向上游生链并刷新数据库缓存
+    promote_module.PROMOTION_CACHE.clear()
+    formal_col.docs[0]["default_promotion_expires_at"] = datetime.fromtimestamp(py_time.time() - 60.0, timezone.utc)
+    refreshed = service.convert_link("jd", goods_id="1000888", goods_sign="jd_sign_888", uid=None)
+    assert refreshed["final_link"] == "https://u.jd.com/after_ttl_fresh"
+    assert adapter.convert_promotion_url.call_count == 1
+    promote_module.PROMOTION_CACHE.clear()
+

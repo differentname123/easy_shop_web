@@ -51,7 +51,6 @@ class BasePlatformAdapter(ABC):
     supports_coupon_enrichment: bool = False
     preserves_known_coupons_across_rank: bool = False
     default_promoter_id: str = ""
-    promotion_scope: str = ""
     order_window_seconds: int = 23 * 3600
     capabilities = None
 

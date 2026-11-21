@@ -186,7 +186,7 @@ def test_promotion_script_parameters_commands_and_server_identity_only(string):
     assert result["short_url"] == result["final_link"] == "https://u.jd.com/short"
     assert result["click_url"] == result["url"] == "https://union-click.jd.com/long"
     assert result["goods_id"] == "opaque-material" and result["goods_sign"] == "opaque-material"
-    assert result["cacheable"] is False and "expires_at" not in result
+    assert result["cacheable"] is True and "expires_at" not in result
     assert result["need_auth"] is False and result["is_fallback"] is False
     assert result["attribution_status"] == "verified"
     assert http.get.call_count == 1
@@ -390,8 +390,7 @@ def test_client_config_base_and_pagination_errors_are_offline():
 
 def test_numeric_scope_config_fingerprint_and_failure_has_no_owner_fallback():
     a = adapter(jd_union_id="100")
-    b = adapter(jd_union_id="101")
-    assert a.default_promoter_id == "77" and a.promotion_scope != b.promotion_scope
+    assert a.default_promoter_id == "77"
     assert canonical_promoter_id("00088") == "88" and canonical_promoter_id("１２") == ""
     c = Mock()
     c.convert_promotion_link.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR"}

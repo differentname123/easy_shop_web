@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import html as html_lib
 import logging
+import math
 import re
 import threading
 import time
@@ -13,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 from adapters import platform_name
+from config import PROMOTION_LINK_TTL
 from infrastructure.api_governance import ResolutionKind, api_caller_context
 from models.deal_constants import (
     CLEAN_STAGE_NEED_AI1,
@@ -653,6 +656,92 @@ def _extract_product_card_from_conv(
     return product_card, adapter_res
 
 
+def _attach_preseeded_default_promotion(
+    *,
+    plat: str,
+    goods_id: str,
+    goods_sign: str,
+    main_conv: Dict[str, Any],
+    adapter_res: Dict[str, Any],
+    my_promo_link: str,
+    my_promo_token: str,
+    product_doc: Dict[str, Any],
+) -> None:
+    """将阶段二产出的站长公共推广链接按统一 3 天 TTL 预置到 formal product_doc，实现首个匿名点击 0 上游命中。"""
+    raw_promo_payload = main_conv.get("promo_payload") if isinstance(main_conv.get("promo_payload"), dict) else {}
+    promo_meta: Dict[str, Any] = {
+        **raw_promo_payload,
+        **{k: v for k, v in adapter_res.items() if k != "product" and v is not None},
+    }
+    raw_pid = str(promo_meta.get("promoter_id") or "").strip()
+    final_link_val = str(
+        promo_meta.get("final_link")
+        or promo_meta.get("short_url")
+        or promo_meta.get("url")
+        or my_promo_link
+        or ""
+    ).strip()
+
+    if (
+        not final_link_val
+        or promo_meta.get("is_fallback")
+        or promo_meta.get("cacheable") is False
+    ):
+        return
+
+    now_ts = time.time()
+    default_exp_ts = now_ts + PROMOTION_LINK_TTL
+    exp_ts = default_exp_ts
+    raw_exp = promo_meta.get("expires_at")
+    has_valid_upstream_exp = (
+        isinstance(raw_exp, (int, float))
+        and not isinstance(raw_exp, bool)
+        and math.isfinite(raw_exp)
+        and float(raw_exp) > now_ts
+    )
+    if has_valid_upstream_exp:
+        exp_ts = min(default_exp_ts, float(raw_exp))
+
+    now_utc_dt = datetime.datetime.fromtimestamp(now_ts, datetime.timezone.utc)
+    exp_utc_dt = datetime.datetime.fromtimestamp(math.floor(exp_ts * 1000) / 1000, datetime.timezone.utc)
+
+    token_val = str(promo_meta.get("promotion_token") or my_promo_token or "")
+    preseeded_promo: Dict[str, Any] = {
+        "status": "success",
+        "platform": plat,
+        "goods_id": goods_id,
+        "goods_sign": goods_sign,
+        "url": str(promo_meta.get("url") or final_link_val),
+        "final_link": final_link_val,
+        "mobile_url": str(promo_meta.get("mobile_url") or promo_meta.get("url") or final_link_val),
+        "short_url": str(promo_meta.get("short_url") or ""),
+        "promotion_token": token_val,
+        "token_type": str(promo_meta.get("token_type") or ("tpwd" if (plat == "taobao" and token_val) else "")),
+        "we_app_info": dict(promo_meta.get("we_app_info") or {}) if isinstance(promo_meta.get("we_app_info"), dict) else {},
+        "attribution_status": "anonymous",
+        "need_auth": False,
+        "is_fallback": False,
+        "cacheable": True,
+        "title": product_doc["name"],
+        "price": product_doc["price"],
+        "coupon_amount": product_doc["coupon_amount"],
+    }
+    if promo_meta.get("link_type"):
+        preseeded_promo["link_type"] = str(promo_meta["link_type"])
+    if promo_meta.get("schema_url"):
+        preseeded_promo["schema_url"] = str(promo_meta["schema_url"])
+    if promo_meta.get("coupon_url"):
+        preseeded_promo["coupon_url"] = str(promo_meta["coupon_url"])
+    if raw_pid:
+        preseeded_promo["promoter_id"] = raw_pid
+    if has_valid_upstream_exp:
+        preseeded_promo["expires_at"] = float(raw_exp)
+
+    product_doc["default_promotion"] = preseeded_promo
+    product_doc["default_promotion_updated_at"] = now_utc_dt
+    product_doc["default_promotion_expires_at"] = exp_utc_dt
+
+
 def convert_single_target(
     cleaner: Any,
     target: Dict[str, Any],
@@ -848,6 +937,7 @@ def convert_single_target(
                     "official_product": _build_official_product_payload(try_plat, product_card, res, promo_link),
                     "my_promo_link": promo_link or None,
                     "my_promo_token": promo_token or None,
+                    "promo_payload": AnchorConversionCache.extract_promo_payload(res),
                     "adapter_res": cleaner._slim_adapter_res_for_cache(res, keep_product=True),
                 }
                 with cleaner._cache_lock:
@@ -2665,6 +2755,17 @@ def process_ai2_unit(
                 "attempt_errors": [],
             }
             continue
+
+        _attach_preseeded_default_promotion(
+            plat=plat,
+            goods_id=goods_id,
+            goods_sign=goods_sign,
+            main_conv=main_conv,
+            adapter_res=adapter_res,
+            my_promo_link=my_promo_link,
+            my_promo_token=my_promo_token,
+            product_doc=product_doc,
+        )
 
         outcomes_by_id[mid] = {
             "status": "success",

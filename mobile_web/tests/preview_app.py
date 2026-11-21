@@ -240,7 +240,6 @@ class PreviewAdapter(BasePlatformAdapter):
         self.requires_numeric_promoter_id = platform == "jd"
         self.requires_material_url = platform == "jd"
         self.default_promoter_id = "700000000" if platform == "jd" else ""
-        self.promotion_scope = "offline-union:700000000" if platform == "jd" else ""
         self.order_window_seconds = 3600 if platform == "jd" else adapter_type.order_window_seconds
         self.capabilities = {name: name != "authorization" or platform != "jd" for name in self.capabilities}
         self.calls = {"anonymous_converts": 0, "personal_converts": 0, "authority_checks": 0, "authority_urls": 0}

@@ -17,7 +17,6 @@ class NumericAdapter:
     requires_material_url = True
     requires_authorized_promotion = False
     default_promoter_id = "3110104129"
-    promotion_scope = "union-A:3110104129"
     capabilities = {"promotion": True}
 
     def __init__(self):
@@ -159,12 +158,19 @@ def test_cache_changes_with_numeric_identity_and_default_configuration(routing):
     assert len(adapter.calls) == 2
     public = service.convert_link("jd", "opaque-material")
     stored = dict(repo.save_promotion_link_cache.call_args.kwargs["data"], _expires_at=__import__("time").time() + 60)
-    # A changed deployment default must reject the old Mongo cache as well as memory cache.
+    # 匿名公共链接仅按有效期 TTL 复用：未过期时直接命中数据库缓存（0 上游），到期后按当前默认位重刷
+    module.PROMOTION_CACHE.clear()
     repo.get_promotion_link_cache.return_value = stored
     adapter.default_promoter_id = "3333"
-    adapter.promotion_scope = "union-B:3333"
-    assert service.convert_link("jd", "opaque-material")["promoter_id"] == "3333"
-    assert public["promoter_id"] != "3333"
+    cached_pub = service.convert_link("jd", "opaque-material")
+    assert cached_pub["final_link"] == public["final_link"]
+    assert len(adapter.calls) == 3
+
+    module.PROMOTION_CACHE.clear()
+    repo.get_promotion_link_cache.return_value = dict(stored, _expires_at=__import__("time").time() - 1)
+    refreshed_pub = service.convert_link("jd", "opaque-material")
+    assert refreshed_pub["promoter_id"] == "3333"
+    assert len(adapter.calls) == 4
 
 
 def test_universal_convert_deleted_user_falls_back_to_station_master_floor(monkeypatch):
@@ -175,7 +181,6 @@ def test_universal_convert_deleted_user_falls_back_to_station_master_floor(monke
         requires_numeric_promoter_id = True
         requires_authorized_promotion = False
         default_promoter_id = "3110104129"
-        promotion_scope = "jd-scope"
 
         def __init__(self):
             self.calls = []

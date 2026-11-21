@@ -770,7 +770,7 @@ class TestProductRepository(unittest.TestCase):
         original_id_doc = deepcopy(self.col.docs[0])
         result = self.repo.get_promotion_link_cache("pdd", goods_sign="123", goods_key="123")
         self.assertEqual(result["final_link"], "https://example.com/by-sign")
-        self.assertEqual(self.col.queries[-1], {"platform": "pdd", "is_off_promotion": {"$ne": True}, "goods_sign": "123"})
+        self.assertEqual(self.col.queries[-1], {"platform": "pdd", "goods_sign": "123"})
         self.assertTrue(self.repo.save_promotion_link_cache(
             "pdd", {"final_link": "https://example.com/updated-sign"}, goods_sign="123", goods_key="123",
         ))
@@ -789,7 +789,7 @@ class TestProductRepository(unittest.TestCase):
         original_sign_doc = deepcopy(self.col.docs[1])
         result = self.repo.get_promotion_link_cache("tb", goods_id="sku-A", goods_key="sku-A")
         self.assertEqual(result["final_link"], "https://example.com/by-id")
-        self.assertEqual(self.col.queries[-1], {"platform": "taobao", "is_off_promotion": {"$ne": True}, "product_id": "sku-A"})
+        self.assertEqual(self.col.queries[-1], {"platform": "taobao", "product_id": "sku-A"})
         self.assertTrue(self.repo.save_promotion_link_cache(
             "tb", {"final_link": "https://example.com/updated-id"}, goods_id="sku-A", goods_key="sku-A",
         ))

@@ -56,7 +56,7 @@ def test_search_detail_and_precise_promotion_keep_sign_primary_across_real_encry
     assert promotion["status"] == "success" and promotion["promotion_token"] == "￥OFFLINE_TOKEN￥"
     assert promotion["goods_sign"] == card["goods_sign"] and promotion["goods_id"] == "search-input-id"
     assert official.search_goods.call_args.args[0] == "https://uland.taobao.com/item/edetail?id=new-detail-id"
-    assert not promotion["cacheable"]
+    assert promotion["cacheable"] is True
 
 
 def test_reencrypted_detail_still_hits_shared_detail_cache(monkeypatch):

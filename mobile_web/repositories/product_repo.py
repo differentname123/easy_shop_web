@@ -1482,7 +1482,7 @@ class ProductRepository(BaseRepository):
         platform = self._platform(platform)
         gid, gsign = self._promotion_identity(goods_id, goods_sign, goods_key)
 
-        filter_spec = {"platform": platform, "is_off_promotion": {"$ne": True}}
+        filter_spec = {"platform": platform}
         if gid:
             filter_spec["product_id"] = gid
         elif gsign:

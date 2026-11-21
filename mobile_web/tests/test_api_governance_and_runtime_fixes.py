@@ -506,7 +506,6 @@ def test_universal_convert_then_detail_convert_never_inserts_null_ghost_product(
     fake_adapter.requires_authorized_promotion = False
     fake_adapter.requires_numeric_promoter_id = False
     fake_adapter.requires_material_url = False
-    fake_adapter.promotion_scope = ""
     from adapters.pdd_adapter import PddAdapter
 
     real_pdd = PddAdapter()

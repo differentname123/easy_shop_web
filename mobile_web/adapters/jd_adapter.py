@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """京东字段/分页适配；无授权、用户仓储或个人转站长兜底。"""
-import hashlib
 import html
 import re
 import time
@@ -137,7 +136,6 @@ class JdAdapter(BasePlatformAdapter):
         self.active = bool(setting("jd_enabled", False))
         self.default_promoter_id = canonical_promoter_id(setting("jd_position_id"))
         union_id = _text(setting("jd_union_id"))
-        self.promotion_scope = hashlib.sha256((union_id + ":" + self.default_promoter_id).encode()).hexdigest()[:24]
         raw_appkeys = setting("ztk_appkey_list", ()) or setting("ztk_appkey", "")
         self.client = client if client is not None else JdClient(
             raw_appkeys, union_id, setting("jd_app_key"), setting("jd_app_secret"),
@@ -469,10 +467,11 @@ class JdAdapter(BasePlatformAdapter):
             elif target_id:
                 material_url = target_id
 
+            used_coupon = (card or {}).get("coupon_url") or ""
             conv = client.convert_promotion_link(
                 material_url,
                 sub_union_id=kwargs.get("sub_union_id"),
-                coupon_url=(card or {}).get("coupon_url"),
+                coupon_url=used_coupon,
             )
             if conv.get("status") != "success":
                 logger.debug("[JD万能转链-好单库] 转链未成功(%s)，顺延至备用通道: mat=%s", conv.get("error_msg"), material_url[:60])
@@ -494,6 +493,7 @@ class JdAdapter(BasePlatformAdapter):
                 price=price,
                 coupon_amount=coupon,
                 product=card,
+                **({"coupon_url": used_coupon} if used_coupon else {}),
             )
             if is_confirmed_venue:
                 payload["convert_status"] = "coupon_or_activity"
@@ -943,7 +943,7 @@ class JdAdapter(BasePlatformAdapter):
             "attribution_status": "verified" if uid else "anonymous",
             "need_auth": False,
             "is_fallback": False,
-            "cacheable": False,
+            "cacheable": True,
             "link_type": "京东推广链接",
             **extra,
         }

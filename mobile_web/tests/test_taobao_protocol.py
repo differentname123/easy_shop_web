@@ -209,7 +209,7 @@ def test_precision_promotion_two_users_are_separated_and_real_token_preserved():
         assert result["status"] == "success" and result["promotion_token"] == f"￥口令_{relation}￥"
         assert result["token_type"] == "tpwd" and result["attribution_status"] == "verified"
         assert result["relation_id"] == relation
-        assert result["cacheable"] is False and "expires_at" not in result
+        assert result["cacheable"] is True and "expires_at" not in result
         assert ztk.convert_channel_url.call_args.args[1] == relation
     official.search_goods.assert_not_called()
     result = adapter.convert_promotion_url("101")
@@ -249,7 +249,7 @@ def test_source_expiry_is_not_invented_and_empty_token_is_error():
     official.create_tpwd.return_value = {"status": "success", "model": "￥token￥"}
     result = make_adapter(official).convert_promotion_url("101")
     assert result["status"] == "success" and result["promotion_token"] == "￥token￥"
-    assert "expires_at" not in result and result["cacheable"] is False
+    assert "expires_at" not in result and result["cacheable"] is True
     official.create_tpwd.return_value = {"status": "success"}
     assert make_adapter(official).convert_promotion_url("101")["status"] == "error"
 
