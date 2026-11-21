@@ -1824,3 +1824,149 @@ def test_group_help_exporter_miaozhuli_remote_sync_and_db_audit(tmp_path):
     assert fail_rec["attempts"] == 1
 
 
+def test_external_group_sync_consistent_with_sources_except_user_takedown():
+    """验证铁律：除了用户手动下架或反馈下架的团，外部采集团始终与外部网站源状态保持一致。
+    1. 外部源活跃在售的团（在拼多多24小时内），即使本地曾因旧TTL过期，重新轮询时也恢复为 active；
+    2. 用户反馈下架（user_takedown=True）的团，哪怕外部网站报 active，也绝不恢复；
+    3. 超过拼多多官方24小时物理周期的死团，绝不恢复。
+    """
+    from models.group_help import DEFAULT_GROUP_TTL_SECONDS
+    from repositories.group_help_repo import GroupHelpRepository
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    base_now = 1795000000.0
+
+    # 1. 种子数据：插入3条外部团记录
+    # 团A：正常外部团，后来本地过期（模拟老TTL导致过早过期）
+    gid_a = "tok_ExtSyncGroupA"
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_a,
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "商品A",
+            "group_price": 19.9,
+            "total_people": 2,
+            "remain_people": 1,
+            "share_text": "拼团 ⇥ExtSyncGroupA⇤",
+            "created_at": base_now - 10 * 3600,  # 10小时前发起（拼多多24h内尚有效）
+            "expires_at": base_now - 4 * 3600,   # 本地已过期4小时
+        },
+        now=base_now - 10 * 3600,
+        check_similar=False,
+    )
+    # 本地过期
+    repo.col.find_one_and_update({"group_order_id": gid_a}, {"$set": {"group_status": "expired"}})
+
+    # 团B：被站内用户/团友反馈下架（user_takedown=True）
+    gid_b = "tok_ExtSyncGroupB"
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_b,
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "商品B",
+            "group_price": 29.9,
+            "total_people": 3,
+            "remain_people": 1,
+            "share_text": "拼团 ⇥ExtSyncGroupB⇤",
+            "created_at": base_now - 2 * 3600,
+            "expires_at": base_now + 10 * 3600,
+        },
+        now=base_now - 2 * 3600,
+        check_similar=False,
+    )
+    repo.apply_user_feedback(gid_b, action="mark_full", now=base_now - 3600, operator_uid="u_buyer")
+    doc_b_before = repo.get_by_group_order_id(gid_b)
+    assert doc_b_before["user_takedown"] is True
+    assert doc_b_before["group_status"] == "full"
+
+    # 团C：已超过拼多多官方24小时（例如发布于26小时前）
+    gid_c = "tok_ExtSyncGroupC"
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_c,
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "商品C",
+            "group_price": 9.9,
+            "total_people": 2,
+            "remain_people": 1,
+            "share_text": "拼团 ⇥ExtSyncGroupC⇤",
+            "created_at": base_now - 26 * 3600,
+            "expires_at": base_now - 2 * 3600,
+        },
+        now=base_now - 26 * 3600,
+        check_similar=False,
+    )
+
+    # 2. 外部源再次抓取并推送：外部源称 A、B、C 都在售活跃
+    # 模拟外部源推送团A（在24h内且外部仍active）
+    doc_a_ret, is_new_a, _ = repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_a,
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "商品A-更新",
+            "group_price": 19.9,
+            "total_people": 2,
+            "remain_people": 1,
+            "created_at": base_now - 10 * 3600,
+            "expires_at": base_now + 14 * 3600,  # 距创建24小时到期
+        },
+        now=base_now,
+        check_similar=False,
+    )
+    doc_a_after = repo.get_by_group_order_id(gid_a)
+    assert doc_a_after["group_status"] == "active"
+    assert doc_a_after["offline_reason"] == ""
+    assert doc_a_after["expires_at"] == base_now + 14 * 3600
+
+    # 模拟外部源推送团B（虽外部在售，但用户反馈已满，绝不复活）
+    doc_b_ret, is_new_b, _ = repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_b,
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "商品B",
+            "group_price": 29.9,
+            "total_people": 3,
+            "remain_people": 1,
+            "created_at": base_now - 2 * 3600,
+            "expires_at": base_now + 10 * 3600,
+        },
+        now=base_now,
+        check_similar=False,
+    )
+    doc_b_after = repo.get_by_group_order_id(gid_b)
+    assert doc_b_after["group_status"] == "full"
+    assert doc_b_after["user_takedown"] is True
+
+    # 模拟外部源推送团C（已超拼多多24小时物理寿命，绝不复活）
+    doc_c_ret, is_new_c, _ = repo.upsert_parsed_group(
+        {
+            "group_order_id": gid_c,
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "商品C",
+            "group_price": 9.9,
+            "total_people": 2,
+            "remain_people": 1,
+            "created_at": base_now - 26 * 3600,
+            "expires_at": base_now + 3600,
+        },
+        now=base_now,
+        check_similar=False,
+    )
+    doc_c_after = repo.get_by_group_order_id(gid_c)
+    assert doc_c_after["group_status"] != "active"
+
+    # 大厅搜索验证：仅团A上架在售
+    hall = repo.search_groups(now=base_now)
+    hall_gids = [it["group_order_id"] for it in hall["items"]]
+    assert gid_a in hall_gids
+    assert gid_b not in hall_gids
+    assert gid_c not in hall_gids
+
+
+

@@ -587,15 +587,11 @@ class GroupHelpRepository(BaseRepository):
             orig_status = str(existing.get("group_status") or GROUP_STATUS_ACTIVE)
             orig_created = float(existing.get("created_at") or created_at)
             orig_expires = float(existing.get("expires_at") or (orig_created + DEFAULT_GROUP_TTL_SECONDS))
+            pdd_physical_expires = orig_created + DEFAULT_GROUP_TTL_SECONDS
 
             # 核心铁律：网页用户反馈下架了的团，就算外部两个网站还在，也绝不要恢复
             if is_user_takedown:
                 return existing, False, None
-
-            if orig_expires <= current_ts:
-                if preserve_local_takedown:
-                    return existing, False, None
-                raise ValueError("该拼团已超过有效期失效，请重新发起后再发布")
 
             incoming_source = str(data.get("source") or SOURCE_USER_TEXT)
             existing_source = str(
@@ -605,18 +601,37 @@ class GroupHelpRepository(BaseRepository):
             if preserve_local_takedown and existing_source == SOURCE_USER_UPLOAD and incoming_source != SOURCE_USER_UPLOAD:
                 return existing, False, None
 
+            is_external_source = incoming_source in ("acdog", "miaozhuli")
+
+            # 拼多多物理生命周期（24小时）绝对拦截
+            if pdd_physical_expires <= current_ts:
+                if orig_status == GROUP_STATUS_ACTIVE:
+                    self.col.find_one_and_update(
+                        {"group_order_id": gid},
+                        {"$set": {"group_status": GROUP_STATUS_EXPIRED, "updated_at": current_ts}},
+                    )
+                if preserve_local_takedown:
+                    return existing, False, None
+                raise ValueError("该拼团已超过有效期失效，请重新发起后再发布")
+
             was_upstream_missing = existing.get("offline_reason") == OFFLINE_REASON_UPSTREAM_MISSING
-            should_relist_from_missing = (
+            # 与外部网站保持一致铁律：
+            # 除了用户主动/反馈下架（已在上方被严格拦截），外部采集在拼多多24小时物理有效期内且上游在售时，
+            # 无论之前是因为两站皆无、上游暂态满员变动或旧TTL过期，只要上游当前在售（expires_at > current_ts）即重新上架激活
+            should_relist = (
                 orig_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED)
-                and was_upstream_missing
                 and not is_user_takedown
-                and orig_expires > current_ts
+                and expires_at > current_ts
+                and (was_upstream_missing or is_external_source)
             )
 
-            if preserve_local_takedown and not should_relist_from_missing and (
-                orig_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED)
-            ):
-                return existing, False, None
+            # 非重新上架且已失效的记录拦截
+            if preserve_local_takedown and not should_relist:
+                effective_expires = expires_at if (is_external_source and not is_user_takedown) else orig_expires
+                if effective_expires <= current_ts or orig_status in (GROUP_STATUS_FULL, GROUP_STATUS_EXPIRED):
+                    return existing, False, None
+            elif not preserve_local_takedown and orig_expires <= current_ts:
+                raise ValueError("该拼团已超过有效期失效，请重新发起后再发布")
 
             update_fields: Dict[str, Any] = {
                 "goods_name": str(data.get("goods_name") or existing.get("goods_name") or ""),
@@ -627,9 +642,11 @@ class GroupHelpRepository(BaseRepository):
                 "remain_people": max(1, int(data.get("remain_people") if data.get("remain_people") is not None else (existing.get("remain_people") or 1))),
                 "updated_at": current_ts,
             }
-            if should_relist_from_missing:
+            if should_relist:
                 update_fields["group_status"] = GROUP_STATUS_ACTIVE
                 update_fields["offline_reason"] = ""
+            if is_external_source or should_relist:
+                update_fields["expires_at"] = expires_at
             if str(data.get("share_text") or "").strip():
                 update_fields["share_text"] = str(data.get("share_text") or "").strip()
             if str(data.get("share_code") or "").strip():

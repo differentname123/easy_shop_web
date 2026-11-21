@@ -46,7 +46,7 @@ from repositories.group_help_repo import GroupHelpRepository
 
 _CST_TZ = timezone(timedelta(hours=8))
 _DEFAULT_BRIDGE_DIR = MOBILE_WEB_DIR / "runtime" / "group_help_bridge"
-_DEFAULT_EXTERNAL_TTL_SECONDS = 6 * 3600  # 外部流入默认 6 小时有效，避免陈旧滞留
+_DEFAULT_EXTERNAL_TTL_SECONDS = DEFAULT_GROUP_TTL_SECONDS  # 外部流入默认与拼多多24小时生命周期保持一致，与上游源站完全对齐
 _DEFAULT_SYNC_INTERVAL_SECONDS = DEFAULT_SYNC_INTERVAL_SECONDS  # 外部同步默认 10 分钟间隔 (600s)
 _CORE_CODE_RE = re.compile(r"^[A-Za-z0-9]{6,28}$")
 
@@ -557,7 +557,7 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="仅执行一轮采集后退出")
     parser.add_argument("--interval", type=int, default=_DEFAULT_SYNC_INTERVAL_SECONDS, help="后台轮询间隔秒数（默认 600，即10分钟）")
     parser.add_argument("--pages", type=int, default=0, help="每次每个源抓取前 N 页（默认 0 表示全量获取所有有效团）")
-    parser.add_argument("--ttl-hours", type=float, default=6.0, help="外部团最多在站内保留小时数（默认 6）")
+    parser.add_argument("--ttl-hours", type=float, default=24.0, help="外部团最多在站内保留小时数（默认 24，与上游源站保持一致）")
     parser.add_argument("--dry-run", action="store_true", help="仅抓取校验并打印统计，不写入数据库")
     args = parser.parse_args()
 
