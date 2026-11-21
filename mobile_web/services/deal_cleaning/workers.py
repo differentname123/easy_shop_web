@@ -183,13 +183,20 @@ def commit_batch_results_to_db(
             )
         elif r["status"] == "retry_pending":
             retry_pending_count += 1
-            r_cnt = int(r.get("retry_count") or 1)
+            raw_rcnt = r.get("retry_count")
+            r_cnt = int(raw_rcnt) if raw_rcnt is not None else 1
             base_retry_sec = 300.0 if r.get("clean_stage") == CLEAN_STAGE_NEED_CONVERT else 180.0
+            raw_delay = r.get("retry_delay_sec")
+            retry_delay = (
+                max(15.0, float(raw_delay))
+                if raw_delay is not None
+                else (base_retry_sec * max(1, r_cnt))
+            )
             retry_set = {
                 "last_clean_attempt_at": now_utc,
                 "clean_status": "pending",
                 "clean_retry_count": r_cnt,
-                "next_retry_after_ts": round(time.time() + base_retry_sec * r_cnt, 1),
+                "next_retry_after_ts": round(time.time() + retry_delay, 1),
                 "clean_error_code": r["error_code"],
                 "clean_error_msg": r["error_msg"],
                 "ai_stage1_result": r.get("ai_stage1_result"),

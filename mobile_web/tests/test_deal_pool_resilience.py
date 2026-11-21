@@ -2465,3 +2465,139 @@ def test_build_clean_original_copywriting_prepends_title_without_duplication():
     }
     res2 = DealPoolCleaner._build_clean_original_copywriting(["kiees_2"], {"kiees_2": doc_with_ttl}, [], doc=doc_with_ttl)
     assert res2.count("蒙牛特仑苏纯牛奶250ml*16盒") == 1
+
+
+def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_cooldown():
+    """
+    验证本地 CATALOG_COOLDOWN 冷却期内跳过选品库时：
+    1. catalog_cooling=True 通过 JdClient -> execute_provider_chain -> JdAdapter -> Stage 3 -> DB 完整传播；
+    2. 处于 clean_retry_count=2 边缘与 clean_retry_count=0 的记录均保持原重试次数不被消耗/误杀，
+       并精确排期在冷却结束后重试；
+    3. 非冷却态的真实上游失败依然正常累加 retry_count 并在 3/3 时退出，杜绝无限重试副作用。
+    """
+    import time
+    from adapters.jd_adapter import JdAdapter
+    from infrastructure.jd_client import JdClient, PROMOTION_ROOT
+
+    def _reply(body):
+        return SimpleNamespace(status_code=200, json=lambda: body, raise_for_status=lambda: None)
+
+    http_calls = []
+
+    def _fake_get(url, params=None, **_kw):
+        http_calls.append(url)
+        if "byunionid_get" in url:
+            return _reply({
+                PROMOTION_ROOT: {
+                    "result": {
+                        "code": 200,
+                        "data": {"shortURL": "https://u.jd.com/oMyPromo1", "clickURL": "https://union-click.jd.com/jdc?e=1"},
+                    }
+                }
+            })
+        return _reply({"status": 301, "content": "商品未参与推广"})
+
+    fake_http = SimpleNamespace(get=_fake_get)
+    jd_client = JdClient(appkey_list=["jd-k1"], union_id="2035679405", http_session=fake_http)
+    jd_client.mark_catalog_rate_limited(65.0, force=True)
+    assert jd_client.is_catalog_cooling() is True
+    assert jd_client.catalog_cooldown_remaining() > 50.0
+
+    # Stub HdkClient: returns numeric SKU (so hdk_universal yields degraded without cooling,
+    # and execute_provider_chain falls through to ztk_universal which carries catalog_cooling=True)
+    fake_hdk = MagicMock()
+    fake_hdk.resolve_short_url.return_value = {"status": "success", "data": {"sku_id": "100012345678", "is_venue": False}}
+    fake_hdk.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/oHdk1",
+        "final_link": "https://u.jd.com/oHdk1",
+        "click_url": "https://u.jd.com/oHdk1",
+    }
+
+    settings_stub = SimpleNamespace(
+        jd_enabled=True,
+        jd_position_id="3110104129",
+        jd_union_id="2035679405",
+        jd_app_key="",
+        jd_app_secret="",
+        jd_api_base=jd_client.api_base,
+        ztk_appkey="",
+        ztk_appkey_list=("jd-k1",),
+        hdk_api_key="",
+        hdk_api_key_list=(),
+    )
+    jd_adapter = JdAdapter(settings=settings_stub, client=jd_client, hdk_client=fake_hdk)
+
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+    cleaner.adapters = {
+        "jd": jd_adapter,
+        "taobao": SimpleNamespace(resolve_and_convert_universal=lambda _x: {"status": "error"}),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _x: {"status": "error"}),
+    }
+
+    def _make_doc(mid: str, retries: int, target_url: str):
+        return {
+            "source_site": "guangdiu",
+            "source_channel": "latest",
+            "source_item_id": mid,
+            "platform": "jd",
+            "title": f"瓦伦丁啤酒_{mid}",
+            "clean_retry_count": retries,
+            "ai_stage1_result": {
+                "main_tip_id": mid,
+                "is_standalone_deal": True,
+                "merged_tip_ids": [mid],
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": target_url, "platform": "jd", "text_role_hint": "main_candidate"}
+                ],
+            },
+        }
+
+    doc_edge = _make_doc("tip_cool_2", 2, "https://union-click.jd.com/jdc?e=edge2")
+    doc_zero = _make_doc("tip_cool_0", 0, "https://union-click.jd.com/jdc?e=zero0")
+    t_before = time.time()
+    outcomes, _ = cleaner.process_convert_unit(
+        [doc_edge, doc_zero],
+        formal_col=None,
+        shared_active_products={},
+        quiet_sub_logs=True,
+    )
+    # Cooling period: zero calls should hit api_detail / tkl_piliang / api_quanwang HTTP endpoints
+    assert not any(
+        ep in u for u in http_calls for ep in ("api_detail", "tkl_piliang", "api_quanwang")
+    )
+
+    out_map = {o["source_item_id"]: o for o in outcomes}
+    assert out_map["tip_cool_2"]["status"] == "retry_pending"
+    assert out_map["tip_cool_2"]["retry_count"] == 2
+    assert out_map["tip_cool_2"]["retry_delay_sec"] >= 60.0
+    assert out_map["tip_cool_0"]["status"] == "retry_pending"
+    assert out_map["tip_cool_0"]["retry_count"] == 0
+    assert out_map["tip_cool_0"]["retry_delay_sec"] >= 60.0
+
+    raw_col = MagicMock()
+    formal_col = MagicMock()
+    _commit_batch_results_to_db(outcomes, raw_col, formal_col, cycle_num=1)
+    ops = raw_col.bulk_write.call_args.args[0]
+    sets_by_id = {op._filter["source_item_id"]: op._doc["$set"] for op in ops}
+    assert sets_by_id["tip_cool_2"]["clean_status"] == "pending"
+    assert sets_by_id["tip_cool_2"]["clean_retry_count"] == 2
+    assert sets_by_id["tip_cool_2"]["next_retry_after_ts"] >= t_before + 60.0
+    # Verify retry_count=0 is NOT coerced to 1 by `or 1`
+    assert sets_by_id["tip_cool_0"]["clean_status"] == "pending"
+    assert sets_by_id["tip_cool_0"]["clean_retry_count"] == 0
+    assert sets_by_id["tip_cool_0"]["next_retry_after_ts"] >= t_before + 60.0
+
+    # End cooldown -> genuine non-cooling upstream failure must still increment retries and fail at 3/3
+    jd_client._catalog_cooldown_until = 0.0
+    cleaner._anchor_cache.evict_transient_failures()
+    doc_real_fail = _make_doc("tip_real_2", 2, "https://union-click.jd.com/jdc?e=realfail")
+    fail_outcomes, _ = cleaner.process_convert_unit(
+        [doc_real_fail],
+        formal_col=None,
+        shared_active_products={},
+        quiet_sub_logs=True,
+    )
+    assert fail_outcomes[0]["status"] == "failed"
+    assert fail_outcomes[0]["retry_count"] == 3

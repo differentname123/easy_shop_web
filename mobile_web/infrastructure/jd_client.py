@@ -229,6 +229,11 @@ class JdClient:
         with self._catalog_cooldown_lock:
             return time.monotonic() < self._catalog_cooldown_until
 
+    def catalog_cooldown_remaining(self) -> float:
+        """返回折淘客京东选品库当前剩余冷却秒数（未处于冷却期时返回 0.0）。"""
+        with self._catalog_cooldown_lock:
+            return max(0.0, self._catalog_cooldown_until - time.monotonic())
+
     def mark_catalog_rate_limited(
         self,
         cooldown_sec: float = _CATALOG_BURST_COOLDOWN_SEC,
@@ -671,6 +676,8 @@ class JdClient:
                 or piliang_res.get("error_code") == "RATE_LIMIT"
             ):
                 primary_res["piliang_throttled"] = True
+                if piliang_res.get("catalog_cooling") is True:
+                    primary_res["catalog_cooling"] = True
             elif piliang_empty_tao_id_hits >= 2:
                 primary_res["piliang_empty_tao_id"] = True
             return primary_res

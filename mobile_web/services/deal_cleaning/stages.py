@@ -822,6 +822,7 @@ def convert_single_target(
                 or res.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT
             )
         )
+        is_catalog_cooling = bool(isinstance(res, dict) and res.get("catalog_cooling") is True)
         if is_degraded_product:
             any_detail_lookup_failed = True
 
@@ -943,6 +944,7 @@ def convert_single_target(
             "my_promo_link": None,
             "my_promo_token": None,
             "adapter_res": {},
+            **({"catalog_cooling": True} if is_catalog_cooling else {}),
         }
         if err_code != ERR_ADAPTER_CONFIG_ERROR:
             pending_failed_cache.append((cache_keys, out))
@@ -1184,6 +1186,19 @@ def run_ai_stage2_batch(
     return results_by_id
 
 
+def _jd_catalog_cooldown_retry_delay_sec(cleaner: Any) -> float:
+    """读取 JD 客户端选品库剩余冷却时间并追加 10s 缓冲，确保下轮重领在冷却结束后执行。"""
+    jd_adapter = (getattr(cleaner, "adapters", None) or {}).get("jd")
+    rem_fn = getattr(getattr(jd_adapter, "client", None), "catalog_cooldown_remaining", None)
+    remaining = 0.0
+    if callable(rem_fn):
+        try:
+            remaining = max(0.0, float(rem_fn()))
+        except Exception:
+            remaining = 0.0
+    return round(max(15.0, remaining + 10.0), 1)
+
+
 def _build_retry_or_max_outcome(
     *,
     doc: Dict[str, Any],
@@ -1201,13 +1216,17 @@ def _build_retry_or_max_outcome(
     max_msg: str,
     attempt_errors: Optional[List[Dict[str, str]]] = None,
     candidate_count: int = 0,
+    consume_retry: bool = True,
+    retry_delay_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
-    new_retries = int(doc.get("clean_retry_count") or 0) + 1
-    is_retry = new_retries < MAX_CLEAN_RETRIES
+    cur_retries = int(doc.get("clean_retry_count") or 0)
+    new_retries = (cur_retries + 1) if consume_retry else cur_retries
+    is_retry = True if not consume_retry else (new_retries < MAX_CLEAN_RETRIES)
     return {
         "status": "retry_pending" if is_retry else "failed",
         "stage_outcome": "retry_pending" if is_retry else "failed",
         **({"clean_stage": stage} if is_retry else {}),
+        **({"retry_delay_sec": round(max(15.0, float(retry_delay_sec)), 1)} if (is_retry and retry_delay_sec is not None) else {}),
         "error_code": retry_err_code if is_retry else max_err_code,
         "error_msg": retry_msg.format(new_retries=new_retries, max_retries=MAX_CLEAN_RETRIES)
         if is_retry
@@ -1706,7 +1725,20 @@ def process_convert_unit(
                 None,
             )
             if transient_err is not None:
+                transient_failed_convs = [
+                    c for c in conv_list
+                    if c.get("convert_status") == "failed"
+                    and c.get("error_code") in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR)
+                ]
+                is_local_cooling_only = bool(transient_failed_convs) and all(
+                    c.get("catalog_cooling") is True for c in transient_failed_convs
+                )
                 cleaner.stats_ai_retries_scheduled += 1
+                retry_msg_tpl = (
+                    f"京东选品库处于本地冷却窗口，延后重试（不消耗重试次数 {{new_retries}}/{{max_retries}}）: {transient_err['error_msg']}"
+                    if is_local_cooling_only
+                    else f"官方转链或反查暂态失败，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_err['error_msg']}"
+                )
                 outcomes_by_id[mid] = _build_retry_or_max_outcome(
                     doc=doc,
                     site=site,
@@ -1719,10 +1751,12 @@ def process_convert_unit(
                     stage=CLEAN_STAGE_NEED_CONVERT,
                     retry_err_code=transient_err["error_code"],
                     max_err_code=transient_err["error_code"],
-                    retry_msg=f"官方转链或反查暂态失败，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_err['error_msg']}",
+                    retry_msg=retry_msg_tpl,
                     max_msg=f"官方转链连续 {{new_retries}} 轮失败，达最大重试上限({{max_retries}}次)放弃: {transient_err['error_msg']}",
                     attempt_errors=attempt_errors,
                     candidate_count=len(targets),
+                    consume_retry=not is_local_cooling_only,
+                    retry_delay_sec=_jd_catalog_cooldown_retry_delay_sec(cleaner) if is_local_cooling_only else None,
                 )
                 continue
 
@@ -1758,18 +1792,24 @@ def process_convert_unit(
 
         main_prod_convs = [c for c in prod_convs if c.get("text_role_hint") != "filler_candidate"]
         if not main_prod_convs:
-            transient_main_err = next(
-                (
-                    c
-                    for c in conv_list
-                    if c["convert_status"] == "failed"
-                    and c["error_code"] in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR)
-                    and c.get("text_role_hint") != "filler_candidate"
-                ),
-                None,
+            transient_main_convs = [
+                c
+                for c in conv_list
+                if c["convert_status"] == "failed"
+                and c["error_code"] in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR)
+                and c.get("text_role_hint") != "filler_candidate"
+            ]
+            transient_main_err = transient_main_convs[0] if transient_main_convs else None
+            is_local_cooling_only = bool(transient_main_convs) and all(
+                c.get("catalog_cooling") is True for c in transient_main_convs
             )
-            if transient_main_err is not None and (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES:
+            if transient_main_err is not None and (is_local_cooling_only or (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES):
                 cleaner.stats_ai_retries_scheduled += 1
+                retry_msg_tpl = (
+                    f"京东选品库处于本地冷却窗口，延后重试（不消耗重试次数 {{new_retries}}/{{max_retries}}）: {transient_main_err['error_msg']}"
+                    if is_local_cooling_only
+                    else f"主商品官方转链暂态失败，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_main_err['error_msg']}"
+                )
                 outcomes_by_id[mid] = _build_retry_or_max_outcome(
                     doc=doc,
                     site=site,
@@ -1782,10 +1822,12 @@ def process_convert_unit(
                     stage=CLEAN_STAGE_NEED_CONVERT,
                     retry_err_code=transient_main_err["error_code"],
                     max_err_code=ERR_AI2_MAIN_DEAD_ONLY_FILLER,
-                    retry_msg=f"主商品官方转链暂态失败，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_main_err['error_msg']}",
+                    retry_msg=retry_msg_tpl,
                     max_msg="主商品链接转链失败，仅凑单品存活",
                     attempt_errors=attempt_errors,
                     candidate_count=len(targets),
+                    consume_retry=not is_local_cooling_only,
+                    retry_delay_sec=_jd_catalog_cooldown_retry_delay_sec(cleaner) if is_local_cooling_only else None,
                 )
                 continue
 
@@ -1810,18 +1852,24 @@ def process_convert_unit(
             }
             continue
 
-        transient_degraded = next(
-            (
-                c
-                for c in conv_list
-                if c.get("convert_status") == "failed"
-                and c.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT
-                and c.get("text_role_hint") != "filler_candidate"
-            ),
-            None,
+        transient_degraded_convs = [
+            c
+            for c in conv_list
+            if c.get("convert_status") == "failed"
+            and c.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT
+            and c.get("text_role_hint") != "filler_candidate"
+        ]
+        transient_degraded = transient_degraded_convs[0] if transient_degraded_convs else None
+        is_local_cooling_only = bool(transient_degraded_convs) and all(
+            c.get("catalog_cooling") is True for c in transient_degraded_convs
         )
-        if transient_degraded is not None and (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES:
+        if transient_degraded is not None and (is_local_cooling_only or (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES):
             cleaner.stats_ai_retries_scheduled += 1
+            retry_msg_tpl = (
+                f"京东选品库处于本地冷却窗口，延后重试（不消耗重试次数 {{new_retries}}/{{max_retries}}）: {transient_degraded.get('error_msg') or ''}"
+                if is_local_cooling_only
+                else f"存在非凑单链接触发详情反查暂态限流，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_degraded.get('error_msg') or ''}"
+            )
             outcomes_by_id[mid] = _build_retry_or_max_outcome(
                 doc=doc,
                 site=site,
@@ -1834,10 +1882,12 @@ def process_convert_unit(
                 stage=CLEAN_STAGE_NEED_CONVERT,
                 retry_err_code=ERR_ADAPTER_CONVERT_FAILED,
                 max_err_code=ERR_ADAPTER_CONVERT_FAILED,
-                retry_msg=f"存在非凑单链接触发详情反查暂态限流，保留待下轮重试 ({{new_retries}}/{{max_retries}}): {transient_degraded.get('error_msg') or ''}",
+                retry_msg=retry_msg_tpl,
                 max_msg="详情反查达重试上限",
                 attempt_errors=attempt_errors,
                 candidate_count=len(targets),
+                consume_retry=not is_local_cooling_only,
+                retry_delay_sec=_jd_catalog_cooldown_retry_delay_sec(cleaner) if is_local_cooling_only else None,
             )
             continue
 
@@ -2254,48 +2304,70 @@ def process_ai2_unit(
         dropped_cross_platform_coupon = False
         seen_cpn_ids: Set[str] = set()
         seen_cpn_targets: Set[Tuple[str, str]] = set()
+        seen_cpn_venues: Set[str] = set()
+
+        def _append_coupon_candidate(c_obj: Dict[str, Any], raw_label: Any) -> bool:
+            lid = str(c_obj.get("link_id") or "").strip()
+            if (
+                not lid
+                or lid == main_lid
+                or lid in seen_cpn_ids
+                or c_obj.get("convert_status") in ("failed", "skipped_filler")
+                or _is_other_known_platform(c_obj)
+            ):
+                return False
+            if goods_id and str(c_obj.get("goods_id") or "").strip() == goods_id:
+                return False
+            c_plat = str(c_obj.get("platform") or plat).strip().lower()
+            c_url = str(c_obj.get("my_promo_link") or "").strip()
+            c_tok = str(c_obj.get("my_promo_token") or "").strip()
+            c_inp = str(c_obj.get("clean_input") or "").strip()
+            if is_shop_homepage_url(c_url) or is_shop_homepage_url(c_inp):
+                return False
+            if not c_url and not c_tok:
+                return False
+            if c_url and my_promo_link and c_url == my_promo_link:
+                return False
+            if plat == "taobao":
+                c_host = (urlsplit(c_url).hostname or "").strip().lower() if c_url else ""
+                if c_obj.get("convert_status") == "product" or c_host in ("s.click.taobao.com", "s.click.tmall.com"):
+                    return False
+            dedup_sig = (c_url, c_tok)
+            if dedup_sig in seen_cpn_targets:
+                return False
+            venue_sigs = {
+                v
+                for v in (
+                    rebuild_clean_official_venue_url(c_inp),
+                    rebuild_clean_official_venue_url(c_url) if c_url else None,
+                )
+                if v
+            }
+            if venue_sigs & seen_cpn_venues:
+                return False
+            seen_cpn_ids.add(lid)
+            seen_cpn_targets.add(dedup_sig)
+            seen_cpn_venues.update(venue_sigs)
+            coupon_links.append({
+                "link_id": lid,
+                "label": clean_coupon_label(raw_label or "优惠券"),
+                "url": c_url,
+                "token": c_tok,
+                "platform": c_plat or plat,
+            })
+            return True
+
         for item in ai2_res.get("coupon_links") or []:
             if not isinstance(item, dict):
                 continue
             lid = str(item.get("link_id") or "").strip()
             c_obj = link_map.get(lid)
-            if (
-                not c_obj
-                or c_obj.get("convert_status") in ("failed", "skipped_filler")
-                or lid == main_lid
-                or lid in seen_cpn_ids
-            ):
+            if not c_obj or c_obj.get("convert_status") in ("failed", "skipped_filler") or lid == main_lid or lid in seen_cpn_ids:
                 continue
-            c_plat = str(c_obj.get("platform") or plat).strip().lower()
             if _is_other_known_platform(c_obj):
                 dropped_cross_platform_coupon = True
                 continue
-            if goods_id and str(c_obj.get("goods_id") or "").strip() == goods_id:
-                continue
-            c_url = str(c_obj.get("my_promo_link") or "").strip()
-            c_tok = str(c_obj.get("my_promo_token") or "").strip()
-            if is_shop_homepage_url(c_url) or is_shop_homepage_url(c_obj.get("clean_input")):
-                continue
-            if not c_url and not c_tok:
-                continue
-            if c_url and my_promo_link and c_url == my_promo_link:
-                continue
-            if plat == "taobao":
-                c_host = (urlsplit(c_url).hostname or "").strip().lower() if c_url else ""
-                if c_obj.get("convert_status") == "product" or c_host in ("s.click.taobao.com", "s.click.tmall.com"):
-                    continue
-            dedup_sig = (c_url, c_tok)
-            if dedup_sig in seen_cpn_targets:
-                continue
-            seen_cpn_ids.add(lid)
-            seen_cpn_targets.add(dedup_sig)
-            coupon_links.append({
-                "link_id": lid,
-                "label": clean_coupon_label(item.get("label") or item.get("coupon_desc") or "优惠券"),
-                "url": c_url,
-                "token": c_tok,
-                "platform": c_plat or plat,
-            })
+            _append_coupon_candidate(c_obj, item.get("label") or item.get("coupon_desc") or "优惠券")
 
         def _is_coupon_absorbed_by_main(c: Dict[str, Any]) -> bool:
             if (
@@ -2311,6 +2383,49 @@ def process_ai2_unit(
                 or (my_promo_link and c_url == my_promo_link)
             )
 
+        raw_coupon_candidates = [
+            c
+            for c in conv_list
+            if c.get("link_id") != main_lid
+            and c.get("text_role_hint") != "filler_candidate"
+            and not _is_other_known_platform(c)
+            and not _is_coupon_absorbed_by_main(c)
+            and is_explicit_coupon_target(c)
+        ]
+
+        if is_valid and not dropped_cross_platform_coupon and raw_coupon_candidates:
+            has_failed_cpn = any(
+                c.get("convert_status") in ("failed", "skipped_filler")
+                for c in raw_coupon_candidates
+            )
+            if not has_failed_cpn:
+                generic_link_labels = frozenset({"逛丢直达购买链", "领取链接", "直达链接", "领券链接", "优惠券链接", "点击领券"})
+                url_label_map: Dict[str, str] = {}
+                for lk in doc.get("extracted_links") or []:
+                    if not isinstance(lk, dict):
+                        continue
+                    u_raw = html_lib.unescape(str(lk.get("url") or "")).strip()
+                    lbl = normalize_inline_spaces(str(lk.get("label") or "")).strip()
+                    if (
+                        not u_raw
+                        or not lbl
+                        or lbl.lower().startswith(("http://", "https://"))
+                        or len(lbl) > 24
+                        or lbl in generic_link_labels
+                    ):
+                        continue
+                    url_label_map.setdefault(u_raw, lbl)
+                    u_venue = rebuild_clean_official_venue_url(u_raw)
+                    if u_venue:
+                        url_label_map.setdefault(u_venue, lbl)
+                for c in raw_coupon_candidates:
+                    if c.get("convert_status") != "coupon_or_activity":
+                        continue
+                    c_inp_raw = str(c.get("clean_input") or "").strip()
+                    c_inp_venue = rebuild_clean_official_venue_url(c_inp_raw) or ""
+                    cand_label = url_label_map.get(c_inp_raw) or url_label_map.get(c_inp_venue) or "优惠券"
+                    _append_coupon_candidate(c, cand_label)
+
         has_absorbed_coupon = any(
             is_explicit_coupon_target(c) and _is_coupon_absorbed_by_main(c)
             for c in conv_list
@@ -2322,53 +2437,9 @@ def process_ai2_unit(
                 should_reject = True
                 reject_detail = "AI-2 错将异平台链接混作主商品优惠券，防跨平台串货拦截"
             else:
-                raw_coupon_candidates = [
-                    c
-                    for c in conv_list
-                    if c.get("link_id") != main_lid
-                    and c.get("text_role_hint") != "filler_candidate"
-                    and not _is_other_known_platform(c)
-                    and not _is_coupon_absorbed_by_main(c)
-                    and is_explicit_coupon_target(c)
-                ]
                 if raw_coupon_candidates:
-                    has_failed_cpn = any(
-                        c.get("convert_status") in ("failed", "skipped_filler")
-                        for c in raw_coupon_candidates
-                    )
-                    if not has_failed_cpn:
-                        for c in raw_coupon_candidates:
-                            if c.get("convert_status") != "coupon_or_activity":
-                                continue
-                            lid = str(c.get("link_id") or "").strip()
-                            if not lid or lid in seen_cpn_ids:
-                                continue
-                            c_plat = str(c.get("platform") or plat).strip().lower()
-                            c_url = str(c.get("my_promo_link") or "").strip()
-                            c_tok = str(c.get("my_promo_token") or "").strip()
-                            if is_shop_homepage_url(c_url) or is_shop_homepage_url(c.get("clean_input")):
-                                continue
-                            if (not c_url and not c_tok) or (c_url and my_promo_link and c_url == my_promo_link):
-                                continue
-                            if plat == "taobao":
-                                c_host = (urlsplit(c_url).hostname or "").strip().lower() if c_url else ""
-                                if c_host in ("s.click.taobao.com", "s.click.tmall.com"):
-                                    continue
-                            dedup_sig = (c_url, c_tok)
-                            if dedup_sig in seen_cpn_targets:
-                                continue
-                            seen_cpn_ids.add(lid)
-                            seen_cpn_targets.add(dedup_sig)
-                            coupon_links.append({
-                                "link_id": lid,
-                                "label": "优惠券",
-                                "url": c_url,
-                                "token": c_tok,
-                                "platform": c_plat or plat,
-                            })
-                    if not coupon_links:
-                        should_reject = True
-                        reject_detail = "原始优惠券链接转链失败或未被保留"
+                    should_reject = True
+                    reject_detail = "原始优惠券链接转链失败或未被保留"
                 elif deal_price is not None:
                     has_failed_non_filler = any(
                         c.get("link_id") != main_lid

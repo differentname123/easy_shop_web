@@ -555,10 +555,14 @@ def execute_provider_chain(
             if res.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT or res.get("detail_lookup_failed"):
                 if best_degraded is None:
                     best_degraded = res
+                elif res.get("catalog_cooling") is True and not best_degraded.get("catalog_cooling"):
+                    best_degraded = {**best_degraded, "catalog_cooling": True}
                 continue
             return res
 
         err_code = str(res.get("error_code") or "").strip().upper()
+        if best_degraded is not None and res.get("catalog_cooling") is True and not best_degraded.get("catalog_cooling"):
+            best_degraded = {**best_degraded, "catalog_cooling": True}
         last_result = res
         if err_code in NON_FALLBACK_DETERMINISTIC_ERRORS:
             return res

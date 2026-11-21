@@ -1502,13 +1502,163 @@ def test_ai1_verbatim_link_guard_isolated_retry_and_title_dedup():
     assert out["t_hallucinate"]["_fallback_reason"] == "AI1_HALLUCINATED_LINK"
     assert out["t_tok_norm"]["_from_fallback"] is False
 
-    # 验证省略号截断/空白差异标题不再重复输出两遍
+    # 验证省略号截断/空白差异标题不再重复输出两遍，以及正文中穿插短链时仍识别标题前缀不重复
     clean_copy = build_clean_original_copywriting(
         ["0818_1"],
         {"0818_1": {"title": "超值抽纸 24包...", "tutorial_text": "超值 抽纸\n24包整箱特惠9.9元", "extracted_links": [], "extracted_tokens": []}},
         [],
     )
     assert clean_copy.count("超值") == 1
+
+    clean_0818_url_split = build_clean_original_copywriting(
+        ["0818_2"],
+        {
+            "0818_2": {
+                "title": "金利来睡衣套装活.动入 金利来 长袖长裤家居服套装女 99元双面磨毛 亲",
+                "tutorial_text": "金利来睡衣套装活.动入\n金利来 长袖长裤家居服套装女\nhttps://u.jd.com/oDXtZ6b\n99元双面磨毛 亲肤又柔软\n拍下99元",
+                "extracted_links": [],
+                "extracted_tokens": [],
+            }
+        },
+        [],
+    )
+    assert clean_0818_url_split.count("金利来 长袖长裤家居服套装女") == 1
+    assert "99元双面磨毛 亲肤又柔软" in clean_0818_url_split
+
+
+def test_ai2_partial_coupon_drop_backfills_missing_distinct_coupon_and_html_unescape():
+    """
+    验证：
+    1. Stage 3 成功转出多张独立有效券而 AI-2 仅保留其中 1 张时（如 guangdiu#30726305），
+       消费端自动从 extracted_links / Stage 3 补回遗漏的独立券并保留标签；
+    2. 不同 zdmcode 但同一官方 pro.m.jd.com 会场路径的重复活动页及店铺首页绝不重复/泄露入券链；
+    3. extract_ztk_item_fields 正确解码淘宝/京东标题与店名中的 HTML 实体（如 &amp;）。
+    """
+    from infrastructure.api_governance import ResolutionKind
+    from infrastructure.http_utils import extract_ztk_item_fields
+
+    fields = extract_ztk_item_fields({
+        "tao_id": "TB_HTML_1",
+        "title": "佳乐滋&amp;CHIIKAWA金勺慕斯猫零食",
+        "shop_title": "Pets&amp;More旗舰店",
+        "quanhou_jiage": "41",
+        "size": "41.2",
+    })
+    assert fields["title"] == "佳乐滋&CHIIKAWA金勺慕斯猫零食"
+    assert fields["mall_name"] == "Pets&More旗舰店"
+
+    active_url_1 = "https://pro.m.jd.com/mall/active/JAjtcpqK8RDvB8A4k1ZBgViBKAL/index.html?zdmcode=first111"
+    active_url_dup = "https://pro.m.jd.com/mall/active/JAjtcpqK8RDvB8A4k1ZBgViBKAL/index.html?zdmcode=second222"
+    direct_cpn_2 = "https://coupon.m.jd.com/coupons/show.action?linkKey=AAROH_distinct_9off"
+    shop_home = "https://shop.m.jd.com/mshop/gethomepage?venderId=888999"
+    main_url = "https://union-click.jd.com/jdc?e=main_huangjiu"
+
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
+    cleaner._cache_warmed_up = True
+
+    def _mock_jd_univ(inp: str):
+        if inp == active_url_1:
+            return {
+                "status": "success",
+                "resolution_kind": ResolutionKind.COUPON_OR_VENUE,
+                "final_link": "https://u.jd.com/oPromoCpn1",
+                "short_url": "https://u.jd.com/oPromoCpn1",
+                "product": None,
+            }
+        if inp == active_url_dup:
+            return {
+                "status": "success",
+                "resolution_kind": ResolutionKind.COUPON_OR_VENUE,
+                "final_link": "https://u.jd.com/oPromoCpnDup",
+                "short_url": "https://u.jd.com/oPromoCpnDup",
+                "product": None,
+            }
+        if inp == main_url:
+            return {
+                "status": "success",
+                "resolution_kind": ResolutionKind.PRODUCT,
+                "goods_id": "JD_HUANGJIU_1",
+                "goods_sign": "JD_HUANGJIU_1",
+                "final_link": "https://u.jd.com/oMainHJ",
+                "promotion_token": "！MAINHJ！",
+                "product": {
+                    "platform": "jd",
+                    "product_id": "JD_HUANGJIU_1",
+                    "name": "塔牌锦丽春十年绍兴黄酒花雕酒428ml*6瓶",
+                    "price": 218.0,
+                    "original_price": 218.0,
+                    "activity_price": 201.11,
+                    "coupon_amount": 0.0,
+                    "mall_name": "塔牌京东自营旗舰店",
+                },
+            }
+        return {"status": "error"}
+
+    cleaner.adapters = {
+        "jd": SimpleNamespace(resolve_and_convert_universal=_mock_jd_univ),
+        "taobao": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+    }
+    cleaner.run_ai_stage1_batch = lambda *_a, **_kw: {
+        "gd_30726305": {
+            "main_tip_id": "gd_30726305",
+            "is_standalone_deal": True,
+            "merged_tip_ids": ["gd_30726305"],
+            "combined_raw_text": "先领 [#L1] 和 [#L2] ( [#L3] [#L4] ) 下单 [#L5]",
+            "extracted_images": [],
+            "extracted_targets": [
+                {"link_id": "L1", "raw_span": active_url_1, "clean_input": active_url_1, "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L2", "raw_span": direct_cpn_2, "clean_input": direct_cpn_2, "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L3", "raw_span": active_url_dup, "clean_input": active_url_dup, "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L4", "raw_span": shop_home, "clean_input": shop_home, "platform": "jd", "text_role_hint": "coupon_candidate"},
+                {"link_id": "L5", "raw_span": main_url, "clean_input": main_url, "platform": "jd", "text_role_hint": "main_candidate"},
+            ],
+            "_from_fallback": False,
+        }
+    }
+    # AI-2 仅保留了 L1，漏掉了独立有效券 L2
+    cleaner.run_ai_stage2_batch = lambda *_a, **_kw: {
+        "gd_30726305": {
+            "main_tip_id": "gd_30726305",
+            "is_valid_deal": True,
+            "main_link_id": "L5",
+            "deal_price": 150.94,
+            "coupon_links": [{"link_id": "L1", "label": "满200减20元优惠券"}],
+            "tutorial_steps": ["1. 先领券", "2. 下单实付150.94元"],
+            "quality_score": 90,
+        }
+    }
+
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+    res = cleaner.clean_batch_records(
+        [
+            {
+                "source_site": "guangdiu",
+                "source_channel": "latest",
+                "source_item_id": "gd_30726305",
+                "platform": "jd",
+                "title": "塔牌 锦丽春十年 绍兴黄酒花雕酒 428ml*6瓶 券后150.94元",
+                "tutorial_text": "参与满10元打9折，叠加200-20，实付150.94元",
+                "extracted_links": [
+                    {"label": "满200元减20元", "url": active_url_1},
+                    {"label": "满10元打9折", "url": direct_cpn_2},
+                    {"label": "进店逛逛", "url": shop_home},
+                ],
+                "extracted_tokens": [],
+            }
+        ],
+        mock_col,
+        shared_active_products={},
+        quiet_sub_logs=True,
+    )
+    assert len(res) == 1
+    assert res[0]["status"] == "success"
+    cpns = res[0]["product_doc"]["deal_info"]["coupon_links"]
+    assert [c["link_id"] for c in cpns] == ["L1", "L2"]
+    assert cpns[0]["label"] == "满200减20元优惠券"
+    assert cpns[1]["label"] == "满10元打9折"
+    assert cpns[1]["url"] == direct_cpn_2
 
 
 

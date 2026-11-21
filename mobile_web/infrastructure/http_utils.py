@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """跨平台客户端与适配器的公共解析、时间转换与折淘客多 Key 容灾工具。"""
+import html as html_lib
 import math
 import threading
 import time
@@ -92,7 +93,7 @@ def extract_ztk_item_fields(
     """
     raw = raw_item if isinstance(raw_item, dict) else {}
     tao_id = clean_text(raw.get("tao_id") or raw.get("skuId") or raw.get("item_id"))
-    title = clean_text(raw.get("title") or raw.get("tao_title") or raw.get("skuName"))
+    title = html_lib.unescape(clean_text(raw.get("title") or raw.get("tao_title") or raw.get("skuName")))
     image_url = normalize_http_url(
         raw.get("pict_url") or raw.get("pic") or raw.get("imageUrl") or raw.get("white_image")
     )
@@ -134,7 +135,7 @@ def extract_ztk_item_fields(
         "has_coupon": coupon_amount > 0,
         "commission_rate": commission_rate,
         "commission_amount": commission_amount,
-        "mall_name": clean_text(raw.get("shop_title") or raw.get("nick")) or default_mall_name,
+        "mall_name": html_lib.unescape(clean_text(raw.get("shop_title") or raw.get("nick"))) or default_mall_name,
         "sales_tip": clean_text(raw.get("volume") or raw.get("TKtotalSales")) or default_sales_tip,
         "item_url": normalize_http_url(raw.get("item_url")),
     }

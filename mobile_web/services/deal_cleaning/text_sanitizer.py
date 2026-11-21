@@ -125,8 +125,8 @@ def build_clean_original_copywriting(
     for nd in ordered_docs:
         tut = normalize_inline_spaces(str(nd.get("tutorial_text") or "")).strip()
         ttl = normalize_inline_spaces(str(nd.get("title") or "")).strip()
-        ttl_cmp = re.sub(r"\s+", "", ttl).rstrip("….")
-        tut_cmp = re.sub(r"\s+", "", tut)
+        ttl_cmp = re.sub(r"\s+", "", strip_ecommerce_tokens_and_urls(ttl)).rstrip("….")
+        tut_cmp = re.sub(r"\s+", "", strip_ecommerce_tokens_and_urls(tut))
         if tut and ttl and (not ttl_cmp or ttl_cmp not in tut_cmp):
             block = f"{ttl}\n{tut}"
         else:

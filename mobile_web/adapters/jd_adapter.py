@@ -348,12 +348,15 @@ class JdAdapter(BasePlatformAdapter):
                         venue_url = cand_venue
 
             is_numeric_sku = bool(target_id and target_id.isdigit())
+            detail_catalog_cooling = False
             if target_id and not card and not is_numeric_sku:
                 det = self.get_goods_detail(target_id)
                 if det.get("status") == "success" and isinstance(det.get("data"), dict):
                     card = det["data"]
                 elif det.get("error_code") == "PRODUCT_OFF_PROMOTION":
                     return det
+                elif det.get("catalog_cooling") is True:
+                    detail_catalog_cooling = True
 
             material_url = ""
             if target_id and not is_numeric_sku:
@@ -407,6 +410,8 @@ class JdAdapter(BasePlatformAdapter):
 
             if card is None:
                 payload["detail_lookup_failed"] = True
+                if detail_catalog_cooling:
+                    payload["catalog_cooling"] = True
             return stamp_universal_resolution(payload, single_item_evidence=bool(target_id))
         return _universal
 
@@ -904,6 +909,7 @@ class JdAdapter(BasePlatformAdapter):
 
             if conv.get("piliang_throttled"):
                 detail_lookup_failed = True
+            detail_catalog_cooling = bool(conv.get("catalog_cooling") is True)
             if not extracted_encrypted_id and conv.get("tao_id"):
                 extracted_encrypted_id = _text(conv.get("tao_id"))
 
@@ -927,6 +933,8 @@ class JdAdapter(BasePlatformAdapter):
                     resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
                 elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
                     detail_lookup_failed = True
+                    if det.get("catalog_cooling") is True:
+                        detail_catalog_cooling = True
             lower_urls = f"{text} {short} {long}".lower()
             is_explicit_venue_url = is_jd_official_venue_url(lower_urls) or bool(conv.get("resolved_venue"))
             short_u_match = _JD_SHORT_URL_RE.search(short or "")
@@ -953,6 +961,8 @@ class JdAdapter(BasePlatformAdapter):
                             resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
                         elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
                             detail_lookup_failed = True
+                            if det.get("catalog_cooling") is True:
+                                detail_catalog_cooling = True
                     elif u_data.get("is_venue") and not u_sku:
                         is_explicit_venue_url = True
 
@@ -1018,6 +1028,8 @@ class JdAdapter(BasePlatformAdapter):
             }
             if detail_lookup_failed and product_card is None:
                 extra_fields["detail_lookup_failed"] = True
+                if detail_catalog_cooling:
+                    extra_fields["catalog_cooling"] = True
 
             payload = self._build_promotion_payload(
                 conv,
