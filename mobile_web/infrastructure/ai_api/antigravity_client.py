@@ -9,7 +9,7 @@ Antigravity Official Local Client (Multi-Account Sandbox Pool + High Concurrency
    - 池子中的每个小号都会在 `%LOCALAPPDATA%\\Antigravity\\sandboxes\\<小号邮箱>\\` 下启动各自物理隔离的
      官方 `language_server.exe` 进程（独立进程、独立端口、独立登录态文件、独立设备 UUID）；
    - 桌面端大号（`EXCLUDED_MAIN_ACCOUNTS`）被严格排除在账号池之外，100% 绝不触碰大号；
-   - 每个小号独立享有 `max_concurrency_per_account=3` 的跨进程并发锁与独立错峰锁（2 个小号即支持最高 6 并发）；
+   - 每个小号独立享有 `max_concurrency_per_account=4` 的跨进程并发锁与独立错峰锁（单个小号支持最高 4 并发）；
    - 调用方只需指定模型名（如 `antigravity-3.8-flash-high` 或 `antigravity-argon-high`），内部路由器会自动
      识别哪些小号拥有该模型的调用权限与剩余额度，并从当前空闲槽位的小号中【随机选择】一个执行；
    - 每次调用（无论成功或异常重试）均会返回并记录实际使用的小号邮箱与沙箱端口，方便溯源与成功率复盘。
@@ -56,9 +56,9 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 # ==============================================================================
 # 【核心配置 2】小号沙箱白名单账号池（SUB_ACCOUNT_POOL）
 # - 严格采用白名单策略：仅使用下列显式配置的可用小号，不做自动探测扫描；
-# - 每个小号独立限制并发=3（当前 2 个白名单小号总并发 = 2 * 3 = 6）。
+# - 每个小号独立限制并发=4（单个小号支持最高 4 并发）。
 # ==============================================================================
-DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT: int = 3
+DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT: int = 4
 
 SUB_ACCOUNT_POOL: List[str] = [
     "just4mike@usa.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
@@ -434,7 +434,7 @@ class AntigravityClient:
         slot_acquire_timeout: Optional[float] = None,
     ):
         """
-        获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=3 个跨进程并发槽位）：
+        获取当前账号的并发槽位（每个小号独立拥有 max_concurrency=4 个跨进程并发槽位）：
         - 若由账号池调度器传入了已经非阻塞抢到的 `pre_acquired_fd`，则直接使用；
         - 否则在当前账号的槽位上等待直到空闲（若配置了 slot_acquire_timeout 则超时快速抛出 SlotAcquireTimeoutError）。
         """
