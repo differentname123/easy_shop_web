@@ -426,23 +426,6 @@ body {
 .plat-badge.taobao { background: #ff5000; }
 .plat-badge.jd { background: #e1251b; }
 
-.deal-time-badge {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  background: rgba(0, 0, 0, 0.58);
-  color: #fff;
-  font-size: 9.5px;
-  line-height: 1.2;
-  padding: 2px 5px;
-  border-radius: 4px;
-  backdrop-filter: blur(2px);
-  max-width: 56%;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .goods-body {
   padding: 6px 8px 8px;
   display: flex;
@@ -534,33 +517,6 @@ body {
   color: #e02e24;
 }
 
-.rebate-tag {
-  display: inline-flex;
-  align-items: center;
-  background: #fff8e6;
-  border: 1px solid #ffd591;
-  color: #d46b08;
-  border-radius: 4px;
-  font-size: 10px;
-  line-height: 1;
-  overflow: hidden;
-  box-shadow: 0 1px 2px rgba(212, 107, 8, 0.06);
-}
-
-.rebate-tag .tag-badge {
-  background: linear-gradient(135deg, #fa8c16 0%, #d46b08 100%);
-  color: #fff;
-  font-weight: 700;
-  padding: 2px 4px;
-  font-size: 9px;
-}
-
-.rebate-tag .tag-val {
-  padding: 2px 5px;
-  font-weight: 700;
-  color: #d46b08;
-}
-
 .goods-footer {
   display: flex;
   justify-content: space-between;
@@ -611,6 +567,7 @@ body {
 .sales-row {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   flex-wrap: wrap;
   gap: 5px;
   font-size: 10px;
@@ -637,37 +594,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.goods-action-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 1px;
-  background: linear-gradient(135deg, #ff4d4f 0%, #e02e24 100%);
-  color: #ffffff;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 4px 8px;
-  border-radius: 12px;
-  box-shadow: 0 2px 6px rgba(224, 46, 36, 0.28);
-  white-space: nowrap;
-  flex-shrink: 0;
-  margin-bottom: 2px;
-  cursor: pointer;
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
-}
-
-.goods-action-btn:active {
-  transform: scale(0.94);
-  box-shadow: 0 1px 3px rgba(224, 46, 36, 0.2);
-}
-
-.action-arrow {
-  width: 12px;
-  height: 12px;
-  fill: currentColor;
-  margin-left: -1px;
 }
 
 /* ================== 加载指示器与骨架屏 ================== */
@@ -781,12 +707,6 @@ body {
 .skeleton-line.line-price {
   width: 44%;
   height: 16px;
-}
-
-.skeleton-line.line-btn {
-  width: 48px;
-  height: 20px;
-  border-radius: 10px;
 }
 
 .skeleton-thumb::after,
@@ -1386,55 +1306,6 @@ body {
   backdrop-filter: blur(2px);
 }
 
-/* 省赚特权计算器卡片 */
-.privilege-box {
-  background: linear-gradient(135deg, #fffcf0 0%, #fff7e6 100%);
-  border: 1px solid #ffe58f;
-  border-radius: 8px;
-  padding: 10px 12px;
-  margin-bottom: 12px;
-}
-
-.privilege-header {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  font-weight: 700;
-  color: #d46b08;
-  margin-bottom: 8px;
-}
-
-.price-calc-flow {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--text-sub);
-}
-
-.calc-step {
-  text-align: center;
-}
-.calc-step .c-lbl {
-  font-size: 10px;
-  color: var(--text-muted);
-}
-.calc-step .c-num {
-  font-weight: 700;
-  font-size: 13px;
-  margin-top: 2px;
-  color: var(--text-main);
-}
-.calc-step.highlight .c-num {
-  color: var(--primary-color);
-  font-size: 16px;
-}
-
-.calc-sep {
-  color: #d46b08;
-  font-weight: 700;
-}
-
 /* 详情文本信息 */
 .detail-price-box {
   display: flex;
@@ -1505,27 +1376,6 @@ body {
   text-align: center;
 }
 
-/* 登录解锁横幅 */
-.login-unlock-banner {
-  background: #fffbe6;
-  border: 1px solid #ffe58f;
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 12px;
-  color: #d46b08;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  margin-bottom: 8px;
-}
-
-.login-unlock-banner > span:last-child {
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
 /* Toast 提示 */
 .toast-box {
   position: fixed;
@@ -1548,93 +1398,6 @@ body {
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }
-}
-
-/* ================== 商品深度详情富文本组件 ================== */
-.service-guarantees-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 10px;
-}
-
-.guarantee-chip {
-  background: #f6ffed;
-  border: 1px solid #b7eb8f;
-  color: #389e0d;
-  font-size: 11px;
-  padding: 3px 8px;
-  border-radius: 4px;
-  display: inline-flex;
-  align-items: center;
-}
-
-.shop-ratings-strip {
-  display: flex;
-  background: #fbfbfb;
-  border-radius: 6px;
-  padding: 8px 10px;
-  margin-bottom: 12px;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 11px;
-  color: var(--text-sub);
-  border: 1px solid #f0f0f0;
-}
-
-.shop-rating-col b {
-  color: #f5222d;
-  font-weight: 600;
-  margin-left: 2px;
-}
-
-.shop-rating-col b.score-mid {
-  color: #fa8c16;
-}
-
-.shop-rating-col b.score-low {
-  color: #595959;
-}
-
-.specs-table {
-  background: #fafafa;
-  border-radius: 8px;
-  padding: 10px 12px;
-  margin-bottom: 12px;
-  border: 1px solid #f0f0f0;
-}
-
-.specs-table-title {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text-main);
-  margin-bottom: 6px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.spec-row {
-  display: flex;
-  font-size: 11px;
-  line-height: 1.6;
-  border-bottom: 1px dashed #f0f0f0;
-  padding: 4px 0;
-}
-.spec-row:last-child {
-  border-bottom: none;
-}
-
-.spec-label {
-  width: 70px;
-  flex-shrink: 0;
-  color: var(--text-muted);
-}
-
-.spec-value {
-  flex: 1;
-  color: var(--text-main);
-  word-break: break-all;
 }
 
 .detail-loading-box {
@@ -1972,44 +1735,6 @@ body {
 
 .a2hs-banner ~ .back-to-top-btn {
   bottom: calc(var(--tab-height) + var(--safe-bottom) + 74px);
-}
-
-/* 详情页已生成口令内联展示框 */
-.generated-command-card {
-  margin-top: 10px;
-  padding: 8px 10px;
-  background: #ffffff;
-  border: 1px dashed #ffa940;
-  border-radius: 6px;
-}
-
-.generated-command-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  font-weight: 600;
-  color: #d46b08;
-  margin-bottom: 4px;
-}
-
-.btn-re-copy {
-  background: #fff7e6;
-  color: #d46b08;
-  border: 1px solid #ffd591;
-  border-radius: 10px;
-  padding: 2px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.generated-command-body {
-  font-size: 12px;
-  color: var(--text-main);
-  word-break: break-all;
-  line-height: 1.45;
-  user-select: text;
 }
 
 /* 首页跨平台搜索状态条 */

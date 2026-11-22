@@ -45,9 +45,9 @@
     return `${pad2(targetCn.getUTCMonth() + 1)}-${pad2(targetCn.getUTCDate())} ${hhmm}`;
   };
   shop.formatSales = salesTip => {
-    if (!salesTip || salesTip === '0') return '热销爆款';
+    if (!salesTip || salesTip === '0') return '';
     let text = String(salesTip).trim();
-    if (!text || text === '0') return '热销爆款';
+    if (!text || text === '0') return '';
     if (text.startsWith('已拼')) {
       text = text.replace(/^已拼\s*/, '');
     } else if (/^已售\s*/.test(text)) {

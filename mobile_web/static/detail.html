@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261122-1">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261122-1"></script>
-  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261122-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261122-2">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261122-2"></script>
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261122-2">
 </head>
 <body>
 <div id="app" class="detail-container" v-cloak>
@@ -69,8 +69,7 @@
       <span class="unit">¥</span>
       <span class="val">{{ formatMoney(goods.price) }}</span>
       <span class="orig" v-if="goods.original_price && goods.original_price > goods.price">¥{{ formatMoney(goods.original_price) }}</span>
-      <span class="coupon-pill-detail" v-if="goods.coupon_amount > 0">立减 ¥{{ formatMoney(goods.coupon_amount) }}<template v-if="goods.coupon_info?.coupon_remain_quantity"> · 剩{{ goods.coupon_info.coupon_remain_quantity }}张</template></span>
-      <span class="rebate-pill-detail" v-if="goods.commission_amount > 0">预估推广佣金 ¥{{ formatMoney(goods.commission_amount) }}</span>
+      <span class="coupon-pill-detail" v-if="goods.coupon_amount > 0">立减 ¥{{ formatMoney(goods.coupon_amount) }}</span>
       <span class="plat-badge" :class="goods.platform" style="position:static;margin-left:auto;font-size:10px">
         {{ platformName }}
       </span>
@@ -78,25 +77,9 @@
 
     <h1 class="detail-h1-title">{{ goods.name }}</h1>
 
-    <!-- 标签服务保障 (detail_tags) -->
-    <div class="service-guarantees-grid" v-if="goods.detail_tags && goods.detail_tags.length">
-      <span class="guarantee-chip" v-for="(tag, tIdx) in goods.detail_tags" :key="tIdx">✓ {{ tag }}</span>
-    </div>
-
-    <!-- 店铺评分 (shop_ratings) -->
-    <div class="shop-ratings-strip" v-if="goods.shop_ratings && (goods.shop_ratings.desc_score || goods.shop_ratings.serv_score || goods.shop_ratings.lgst_score)">
-      <span class="shop-rating-col" v-if="goods.shop_ratings.desc_score">描述相符 <b :class="{ 'score-low': String(goods.shop_ratings.desc_score).includes('低'), 'score-mid': String(goods.shop_ratings.desc_score).includes('中') || String(goods.shop_ratings.desc_score).includes('平') }">{{ goods.shop_ratings.desc_score }}</b></span>
-      <span class="shop-rating-col" v-if="goods.shop_ratings.serv_score">服务态度 <b :class="{ 'score-low': String(goods.shop_ratings.serv_score).includes('低'), 'score-mid': String(goods.shop_ratings.serv_score).includes('中') || String(goods.shop_ratings.serv_score).includes('平') }">{{ goods.shop_ratings.serv_score }}</b></span>
-      <span class="shop-rating-col" v-if="goods.shop_ratings.lgst_score">物流服务 <b :class="{ 'score-low': String(goods.shop_ratings.lgst_score).includes('低'), 'score-mid': String(goods.shop_ratings.lgst_score).includes('中') || String(goods.shop_ratings.lgst_score).includes('平') }">{{ goods.shop_ratings.lgst_score }}</b></span>
-    </div>
-
-    <div class="detail-meta-row" style="margin-bottom:4px;display:flex;justify-content:space-between;color:var(--text-muted);font-size:12px">
-      <span>{{ formatSales(goods.sales_tip) }}</span>
+    <div class="detail-meta-row" v-if="goods.mall_name || formatSales(goods.sales_tip)">
       <span v-if="goods.mall_name">{{ goods.mall_name }}</span>
-    </div>
-
-    <div class="detail-summary-desc" v-if="goods.desc && goods.desc !== goods.name">
-      {{ goods.desc }}
+      <span v-if="formatSales(goods.sales_tip)">{{ formatSales(goods.sales_tip) }}</span>
     </div>
   </div>
 
@@ -146,11 +129,17 @@
 
     <div class="deal-sub-block" v-if="dealTip.original_copywriting">
       <div class="deal-sub-header">
-        <span>💬 线报原文</span>
+        <button type="button" class="deal-collapse-trigger" v-if="hasDealGuide" @click="toggleCopywritingExpand">
+          <span>💬 线报原文</span>
+          <span class="deal-collapse-arrow">{{ isCopywritingExpanded ? '收起 ▲' : '展开 ▼' }}</span>
+        </button>
+        <span v-else>💬 线报原文</span>
         <button class="deal-copy-btn" @click="copyDealCopywriting">复制话术</button>
       </div>
-      <div class="deal-copywriting-body" :class="{ collapsed: isLongCopywriting && !isCopywritingExpanded }">{{ dealTip.original_copywriting }}</div>
-      <button class="deal-expand-btn" v-if="isLongCopywriting" @click="toggleCopywritingExpand">{{ isCopywritingExpanded ? '收起全文 ▲' : '展开全部 ▼' }}</button>
+      <template v-if="isCopywritingExpanded || !hasDealGuide">
+        <div class="deal-copywriting-body" :class="{ collapsed: !hasDealGuide && isLongCopywriting && !isCopywritingExpanded }">{{ dealTip.original_copywriting }}</div>
+        <button class="deal-expand-btn" v-if="!hasDealGuide && isLongCopywriting" @click="toggleCopywritingExpand">{{ isCopywritingExpanded ? '收起全文 ▲' : '展开全部 ▼' }}</button>
+      </template>
     </div>
 
     <div class="deal-sub-block" v-if="dealShareImages.length">
@@ -179,7 +168,7 @@
   <div class="detail-card-section deep-loading-card" v-if="isDeepLoading">
     <div class="deep-loading-content">
       <span class="loading-spinner"></span>
-      <span class="deep-loading-text">正在加载商品图片、规格与优惠信息...</span>
+      <span class="deep-loading-text">正在加载商品图片与优惠信息...</span>
     </div>
   </div>
 
@@ -191,88 +180,11 @@
     </div>
   </div>
 
-  <!-- ==================== 商品价格、优惠券与预估推广佣金 ==================== -->
-  <div class="detail-card-section" v-if="goods">
-    <div class="privilege-box" style="margin-bottom:0">
-      <div class="privilege-header">
-        <span>价格与推广信息</span>
-        <span>佣金为预估，不抵扣付款；最终以平台结算为准</span>
-      </div>
-      <div class="price-calc-flow">
-        <div class="calc-step">
-          <div class="c-lbl">原标价</div>
-          <div class="c-num" :style="{ textDecoration: (goods.original_price ?? 0) > (goods.price ?? 0) ? 'line-through' : 'none', color: 'var(--text-muted)' }">
-            ¥{{ formatMoney(goods.original_price ?? goods.price) }}
-          </div>
-        </div>
-        <span class="calc-sep">·</span>
-        <div class="calc-step" v-if="(goods.coupon_amount ?? goods.saved_price ?? 0) > 0">
-          <div class="c-lbl">优惠券金额</div>
-          <div class="c-num" style="color:#f5222d">
-            ¥{{ formatMoney(goods.coupon_amount ?? goods.saved_price) }}
-          </div>
-        </div>
-        <span class="calc-sep" v-if="(goods.coupon_amount ?? goods.saved_price ?? 0) > 0">·</span>
-        <div class="calc-step">
-          <div class="c-lbl">预估推广佣金</div>
-          <div class="c-num" style="color:#fa8c16">
-            ¥{{ formatMoney(goods.commission_amount) }}
-          </div>
-        </div>
-        <span class="calc-sep">·</span>
-        <div class="calc-step highlight">
-          <div class="c-lbl" style="color:var(--primary-color);font-weight:700">付款参考价</div>
-          <div class="c-num">
-            ¥{{ formatMoney(goods.price) }}
-          </div>
-        </div>
-      </div>
-
-      <!-- 已生成口令可视化展示与二次复制兜底 -->
-      <div class="generated-command-card" v-if="generatedCommand">
-        <div class="generated-command-header">
-          <span>📋 已生成专属口令 / 推广链接</span>
-          <button class="btn-re-copy" @click="copyText(generatedCommand, '推广口令已复制')">再次复制</button>
-        </div>
-        <div class="generated-command-body">{{ generatedCommand }}</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 游客推广归因与账户入口 -->
-  <div class="detail-card-section" style="padding:10px 14px;" v-if="!isLoggedIn" @click="goToRegister">
-    <div class="login-unlock-banner" style="margin-bottom:0">
-      <span>无需登录即可直接领券前往官方 App 下单；游客转链使用站长默认推广位（平台支持时），不计入个人推广佣金。登录后可查看本人推广订单与佣金记录。</span>
-      <span style="font-weight:700;color:var(--primary-color)">我的账户 ›</span>
-    </div>
-  </div>
-
-  <!-- ==================== 官方服务承诺 ==================== -->
-  <div class="detail-card-section trust-bar-section" v-if="goods?.service_guarantees?.length">
-    <div class="trust-bar">
-      <span class="trust-item" v-for="(guarantee, idx) in goods.service_guarantees" :key="idx">{{ guarantee }}</span>
-    </div>
-  </div>
-
-  <!-- ==================== 商品核心规格参数表 ==================== -->
-  <div class="detail-card-section" v-if="realSpecs && realSpecs.length">
-    <div class="specs-table" style="margin-bottom:0">
-      <div class="specs-table-title">
-        <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/></svg>
-        <span>商品核心参数</span>
-      </div>
-      <div class="spec-row" v-for="(spec, sIdx) in realSpecs" :key="sIdx">
-        <span class="spec-label">{{ spec.label }}</span>
-        <span class="spec-value">{{ spec.value }}</span>
-      </div>
-    </div>
-  </div>
-
   <!-- ==================== 实拍大图展示流 ==================== -->
   <div class="detail-card-section detail-gallery-flow" v-if="carouselList.length > 1">
     <div class="detail-gallery-header">
       <svg style="width:14px;height:14px;fill:var(--primary-color)" viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
-      <span>商品高清实拍与图文详情</span>
+      <span>更多商品实拍</span>
     </div>
     <div v-for="(img, gIdx) in detailGalleryList" :key="'flow_' + gIdx">
       <img :src="img" class="detail-img-full" referrerpolicy="no-referrer" loading="lazy" :alt="goods?.name + ' 图' + (gIdx+1)" @error="onProductImageError(img)" />
@@ -386,10 +298,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261122-1"></script>
-<script src="/static/js/session.js?v=ux-20261122-1"></script>
-<script src="/static/js/format.js?v=ux-20261122-1"></script>
-<script src="/static/js/browser.js?v=ux-20261122-1"></script>
-<script src="/static/js/detail.js?v=ux-20261122-1"></script>
+<script src="/static/js/api.js?v=ux-20261122-2"></script>
+<script src="/static/js/session.js?v=ux-20261122-2"></script>
+<script src="/static/js/format.js?v=ux-20261122-2"></script>
+<script src="/static/js/browser.js?v=ux-20261122-2"></script>
+<script src="/static/js/detail.js?v=ux-20261122-2"></script>
 </body>
 </html>

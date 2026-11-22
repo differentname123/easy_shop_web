@@ -23,7 +23,6 @@
         global.document.title = '商品详情 - 查券省钱';
       }
     };
-    const generatedCommand = ref('');
     const commandModal = ref({ visible: false, text: '', token: '', link: '', wechatGuide: false });
     const closeCommandModal = () => {
       commandModal.value = { visible: false, text: '', token: '', link: '', wechatGuide: false };
@@ -50,7 +49,7 @@
     const canUse = info => !disposed && info && promotionSessions.has(info) && session.isCurrent(promotionSessions.get(info));
     const invalidateSession = () => {
       session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; myInviteCode.value = ''; isLoggedIn.value = false;
-      generatedCommand.value = ''; closeCommandModal(); closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
+      closeCommandModal(); closeAuthModal(); browser.showToast('登录凭证已过期，请重新登录');
     };
     const brokenProductImages = ref({});
     const normalizeImg = raw => {
@@ -174,8 +173,6 @@
         } catch (_) {}
       }
     };
-    const realSpecs = computed(() => !goods.value || !Array.isArray(goods.value.specs) ? [] :
-      goods.value.specs.filter(spec => spec && spec.label && spec.value));
     const brokenDealImages = ref({});
     const previewImageUrl = ref('');
     const isCopywritingExpanded = ref(false);
@@ -183,6 +180,9 @@
       const tip = goods.value?.deal_tip;
       return tip && typeof tip === 'object' ? tip : null;
     });
+    const hasDealGuide = computed(() => Boolean(
+      dealTip.value && (dealTip.value.price_logic || (Array.isArray(dealTip.value.tutorial_steps) && dealTip.value.tutorial_steps.length)),
+    ));
     const dealShareImages = computed(() => {
       const list = dealTip.value?.share_images;
       return Array.isArray(list) ? list.filter(u => typeof u === 'string' && u && !brokenDealImages.value[u]) : [];
@@ -274,7 +274,6 @@
     };
     const restoreIdentity = () => {
       if (identityRestore && identitySnapshot && session.isCurrent(identitySnapshot)) return identityRestore;
-      generatedCommand.value = '';
       closeCommandModal();
       identitySnapshot = session.capture();
       identityRestore = session.restore(api).then(result => {
@@ -447,7 +446,6 @@
       const content = info.command_text || info.promotion_token || info.final_link;
       if (browser.shouldBlockDirectJump && browser.shouldBlockDirectJump(info, goods.value?.product_url || '')) {
         if (content) {
-          generatedCommand.value = content;
           commandModal.value = {
             visible: true,
             text: content,
@@ -462,7 +460,6 @@
         return;
       }
       if (content) {
-        generatedCommand.value = content;
         browser.copyText(content, `已复制推广信息，正在前往${platformName.value}领券...`);
       }
       browser.jumpToLink(info, goods.value?.product_url || '', () => canUse(info));
@@ -471,7 +468,6 @@
       if (!canUse(info)) return;
       const content = info.command_text || info.final_link;
       if (content) {
-        generatedCommand.value = content;
         commandModal.value = {
           visible: true,
           text: content,
@@ -565,7 +561,7 @@
         }
       } catch (_) {}
       if (!hasSummary) browser.startSmartLoading('正在加载商品详情...', [
-        '正在请求商品信息...', '正在加载商品图片与规格...',
+        '正在请求商品信息...', '正在加载商品图片与优惠...',
         '正在获取价格与优惠券信息...', '商品信息以平台展示为准...',
       ]);
       global.addEventListener('focus', refreshAuthorization);
@@ -579,7 +575,6 @@
     };
     const dispose = () => {
       disposed = true;
-      generatedCommand.value = '';
       closeImagePreview();
       closeCommandModal();
       closeAuthModal();
@@ -590,11 +585,11 @@
       browser.dispose();
     };
     return {
-      ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, hasNoAvailableImages, onProductImageError, realSpecs, isLoggedIn, uid,
-      dealTip, dealShareImages, previewImageUrl, isCopywritingExpanded, isLongCopywriting,
+      ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, hasNoAvailableImages, onProductImageError, isLoggedIn, uid,
+      dealTip, hasDealGuide, dealShareImages, previewImageUrl, isCopywritingExpanded, isLongCopywriting,
       onDealImageError, openImagePreview, closeImagePreview, toggleCopywritingExpand,
       copyDealTutorial, copyDealCopywriting, copyDealAuxItem, openDealAuxItem,
-      isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, generatedCommand, commandModal, closeCommandModal, copyCommandFromModal,
+      isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, commandModal, closeCommandModal, copyCommandFromModal,
       onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,

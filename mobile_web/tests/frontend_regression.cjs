@@ -463,7 +463,8 @@ test('detail HTML loads shared dependencies and the external controller exactly 
   assert.ok(dependencies.indexOf('session.js') < dependencies.indexOf('detail.js'));
   assert.ok(dependencies.indexOf('browser.js') < dependencies.indexOf('detail.js'));
   assert.equal(source.includes('const { createApp, ref, computed, onMounted } = Vue;'), false);
-  assert.ok(source.includes('v-for="(guarantee, idx) in goods.service_guarantees"'));
+  assert.equal(source.includes('service_guarantees'), false);
+  assert.equal(source.includes('specs-table'), false);
 });
 
 test('homepage and detail use one asset version to avoid mixing stale session and new controllers', () => {
@@ -602,7 +603,7 @@ test('visual fixes: avatar error fallback, receipt order icon, and orderDays 0 m
   assert.ok(indexHtml.includes("orderDays === 0 ? '全部历史暂无出单记录"), 'Empty order message correctly addresses all-history (0 days)');
 });
 
-test('visual fixes: detail page safe-top, word break, ratings, tags, specs icon, and gallery flow', () => {
+test('visual fixes: detail page safe-top, word break, preserved platform badge, and gallery flow', () => {
   const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   const detailCss = fs.readFileSync(path.join(root, 'static', 'css', 'detail.css'), 'utf8');
   const detailJs = fs.readFileSync(path.join(scripts, 'detail.js'), 'utf8');
@@ -614,15 +615,12 @@ test('visual fixes: detail page safe-top, word break, ratings, tags, specs icon,
   // Word breaking
   assert.ok(detailCss.includes('overflow-wrap: break-word;'), 'Detail h1 title uses overflow-wrap: break-word');
 
-  // Unused footer CSS removed
+  // Unused footer and redundant detail blocks removed; platform badge preserved
   assert.ok(!detailHtml.includes('.detail-fixed-footer') && !detailCss.includes('.detail-fixed-footer'), 'Dead .detail-fixed-footer CSS removed');
-
-  // Ratings and guarantees mounted
-  assert.ok(detailHtml.includes('shop-ratings-strip'), 'Detail mounts shop-ratings-strip');
-  assert.ok(detailHtml.includes('service-guarantees-grid'), 'Detail mounts service-guarantees-grid');
-
-  // Specs icon is sliders SVG
-  assert.ok(detailHtml.includes('d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2z'), 'Specs table uses sliders/parameters SVG icon');
+  assert.ok(detailHtml.includes('class="plat-badge"'), 'Detail preserves platform badge');
+  assert.equal(detailHtml.includes('shop-ratings-strip'), false);
+  assert.equal(detailHtml.includes('service-guarantees-grid'), false);
+  assert.equal(detailHtml.includes('specs-table'), false);
 
   // Gallery flow uses detailGalleryList to avoid hero image duplication
   assert.ok(detailJs.includes('detailGalleryList'), 'detail.js exports detailGalleryList');
@@ -637,12 +635,12 @@ test('formatSales produces universal sales text across multi-platform formats', 
   assert.equal(shop.formatSales('月销 2000'), '月销 2000');
   assert.equal(shop.formatSales('热销1000件'), '热销1000件');
   assert.equal(shop.formatSales('100+'), '已售 100+');
-  assert.equal(shop.formatSales('0'), '热销爆款');
-  assert.equal(shop.formatSales(''), '热销爆款');
-  assert.equal(shop.formatSales(null), '热销爆款');
+  assert.equal(shop.formatSales('0'), '');
+  assert.equal(shop.formatSales(''), '');
+  assert.equal(shop.formatSales(null), '');
 });
 
-test('goods card layout eliminates bottom-right void and highlights coupon/estimated promotion commission tags', () => {
+test('goods card layout focuses on platform badge, title, exclusive highlight/coupon, and price without commission noise', () => {
   const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   const css = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
@@ -655,21 +653,19 @@ test('goods card layout eliminates bottom-right void and highlights coupon/estim
   assert.ok(indexHtml.includes('formatSales(item.sales_tip)'), 'index.html uses formatSales');
   assert.ok(detailHtml.includes('formatSales(goods.sales_tip)'), 'detail.html uses formatSales');
 
-  // Action button in index.html
-  assert.ok(indexHtml.includes('goods-action-btn'), 'index.html includes right-bottom action button');
-  assert.ok(indexHtml.includes("item.has_coupon ? '去领券' : '马上抢'"), 'index.html shows dynamic CTA text');
-
-  // Dual-tone tags with tag-badge and tag-val
-  assert.ok(indexHtml.includes('tag-badge'), 'index.html uses tag-badge for highlighted chips');
-  assert.ok(indexHtml.includes('tag-val'), 'index.html uses tag-val for amounts');
-
-  // CSS definitions
-  assert.ok(css.includes('.goods-action-btn'), 'CSS defines goods-action-btn');
+  // Platform badges preserved on Home & Boom grids, while redundant action button, time badge, and commission UI are removed
+  assert.equal((indexHtml.match(/<div class="goods-thumb-wrap">[\s\S]*?class="plat-badge"/g) || []).length, 2,
+    'both Home and Boom product cards preserve platform badge');
+  assert.equal((indexHtml.match(/v-else-if="item\.has_coupon && item\.coupon_amount > 0"/g) || []).length, 2,
+    'both Home and Boom product cards render exclusive deal-highlight or coupon tag');
+  assert.equal(indexHtml.includes('goods-action-btn'), false, 'index.html removes redundant goods-action-btn');
+  assert.equal(indexHtml.includes('deal-time-badge'), false, 'index.html removes deal-time-badge');
+  assert.equal(indexHtml.includes('预估推广佣金'), false, 'index.html hides product-level commission labels');
+  assert.equal(indexHtml.includes('rebate-tag'), false, 'index.html removes product-level commission tags');
+  assert.equal(css.includes('.goods-action-btn'), false, 'CSS removes dead goods-action-btn');
+  assert.equal(css.includes('.rebate-tag'), false, 'CSS removes dead rebate-tag');
   assert.ok(css.includes('.goods-footer'), 'CSS defines goods-footer layout');
   assert.ok(css.includes('.coupon-tag .tag-badge'), 'CSS defines dual-tone coupon badge');
-  assert.ok(css.includes('.rebate-tag .tag-badge'), 'CSS defines dual-tone commission badge');
-  assert.equal((indexHtml.match(/<span class="tag-badge">预估推广佣金<\/span>/g) || []).length, 2,
-    'both existing goods grids label the amount as estimated promotion commission');
 });
 
 for (const [field, changed, payloadField] of [
@@ -866,30 +862,23 @@ test('account order statistics preserve zero and never fall back to profile plac
   }
 });
 
-test('detail separates coupon and estimated commission from payment and preserves known zero prices', () => {
+test('detail highlights price, original price, and coupon cleanly without commission/redundant price cards', () => {
   const source = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   const formatMoney = harness().context.EasyShop.formatMoney;
-  const payment = source.match(/<div class="calc-step highlight">([\s\S]*?)<\/div>\s*<\/div>/)?.[1];
-  assert.ok(payment.includes('付款参考价'));
-  const expression = payment.match(/{{\s*(formatMoney\([^}]+)\s*}}/)?.[1];
-  assert.ok(expression);
-  assert.equal(vm.runInNewContext(expression, { formatMoney, goods: { price: 10, commission_amount: 30 } }), '10.00');
-  assert.equal(vm.runInNewContext(expression, { formatMoney, goods: { price: 0, commission_amount: 30 } }), '0.00');
-  assert.ok(source.includes('预估推广佣金'));
-  assert.ok(source.includes('佣金为预估，不抵扣付款；最终以平台结算为准'));
-  assert.ok(source.includes('formatMoney(goods.original_price ?? goods.price)'));
-  assert.ok(source.includes('formatMoney(goods.coupon_amount ?? goods.saved_price)'));
-  assert.ok(source.includes('v-if="(goods.coupon_amount ?? goods.saved_price ?? 0) > 0"'));
-  assert.equal(vm.runInNewContext('formatMoney(goods.original_price ?? goods.price)', {
-    formatMoney, goods: { original_price: 0, price: 10 },
+  const priceStrip = source.match(/<div class="price-strip-main">([\s\S]*?)<\/div>/)?.[1] || '';
+  assert.ok(priceStrip.includes('formatMoney(goods.price)'));
+  assert.ok(priceStrip.includes('formatMoney(goods.original_price)'));
+  assert.ok(priceStrip.includes('formatMoney(goods.coupon_amount)'));
+  assert.equal(vm.runInNewContext('formatMoney(goods.price)', {
+    formatMoney, goods: { price: 10, commission_amount: 30 },
+  }), '10.00');
+  assert.equal(vm.runInNewContext('formatMoney(goods.price)', {
+    formatMoney, goods: { price: 0, commission_amount: 30 },
   }), '0.00');
-  assert.equal(vm.runInNewContext('formatMoney(goods.coupon_amount ?? goods.saved_price)', {
-    formatMoney, goods: { coupon_amount: 0, saved_price: 10 },
-  }), '0.00');
-  assert.equal(/goods\.price\s*-|折合到手|购物补贴/.test(source), false);
+  assert.equal(/预估推广佣金|privilege-box|折合到手|购物补贴/.test(source), false);
 });
 
-test('account and detail copy describe current attribution and unavailable capabilities without cash promises', () => {
+test('account copy describes current attribution and unavailable capabilities without cash promises', () => {
   const index = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const detail = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   const controller = fs.readFileSync(path.join(scripts, 'detail.js'), 'utf8');
@@ -898,7 +887,7 @@ test('account and detail copy describe current attribution and unavailable capab
   }
   assert.ok(index.includes('平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本'));
   assert.ok(index.includes('游客使用站长默认推广位，不按分享页 UID 归因'));
-  assert.ok(detail.includes('游客转链使用站长默认推广位'));
+  assert.equal(detail.includes('login-unlock-banner'), false);
   assert.ok(index.includes('v-for="p in platforms"'), 'authorization placeholders use platform descriptors');
   assert.ok(index.includes("!supportsPlatform(p.code, 'authorization') ? '暂未接入 / 未配置'"));
   assert.equal(index.includes("handleCheckAndGetAuth('pdd')"), false, 'authorization actions are not hardcoded to one platform');
@@ -1707,18 +1696,17 @@ test('syncAndQueryOrders schedules bounded follow-up polling when sync_status is
   assert.equal(imgTarget.src, account.defaultOrderThumb);
 });
 
-test('detail generatedCommand stores latest copied promotion command and clears on session invalidation or disposal', async () => {
+test('detail commandModal stores latest copied promotion command and clears on session invalidation or disposal', async () => {
   const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
   await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
-  assert.equal(h.page.generatedCommand.value, '');
+  assert.equal(h.page.commandModal.value.text, '');
   assert.equal(h.page.commandModal.value.visible, false);
 
   const copy = h.page.handleCopyPromoteLink(); await flush();
   await h.finish(2, { status: 'success', final_link: 'https://buy.test/A', command_text: '专属口令文案 https://buy.test/A' });
   await copy;
-  assert.equal(h.page.generatedCommand.value, '专属口令文案 https://buy.test/A');
   assert.equal(h.page.commandModal.value.visible, true);
   assert.equal(h.page.commandModal.value.text, '专属口令文案 https://buy.test/A');
 
@@ -1727,9 +1715,15 @@ test('detail generatedCommand stores latest copied promotion command and clears 
   h.page.closeCommandModal();
   assert.equal(h.page.commandModal.value.visible, false);
 
-  h.page.dispose();
-  assert.equal(h.page.generatedCommand.value, '');
+  const copy2 = h.page.handleCopyPromoteLink(); await flush();
+  await h.finish(3, { status: 'error', detail: 'expired' }, { status: 401 });
+  await copy2;
   assert.equal(h.page.commandModal.value.visible, false);
+  assert.equal(h.page.commandModal.value.text, '');
+
+  h.page.dispose();
+  assert.equal(h.page.commandModal.value.visible, false);
+  assert.equal(h.page.commandModal.value.text, '');
 });
 
 test('switching platforms on Tab 1 while searching preserves activeHomeKeyword and searches the new platform', async () => {
@@ -3342,6 +3336,77 @@ test('converged QA fixes: logout cleanup, missing detail guard, group_help token
   assert.ok(styleCss.includes('.a2hs-banner ~ .back-to-top-btn'));
   assert.equal(styleCss.includes('margin: -24px 12px 12px;'), false);
   assert.ok(detailCss.includes('height: 420px;'));
+});
+
+test('detail hasDealGuide collapses redundant original_copywriting only when price_logic or tutorial_steps exist', async () => {
+  const hWithPriceLogic = harness({ url: 'https://shop.test/detail?goods_id=D_GUIDE_1&platform=taobao', useRealVue: true });
+  hWithPriceLogic.load('detail');
+  const init1 = hWithPriceLogic.mounted[0]();
+  await hWithPriceLogic.finish(0, {
+    status: 'success',
+    data: {
+      goods_id: 'D_GUIDE_1',
+      platform: 'taobao',
+      name: '测试线报商品1',
+      price: 19.9,
+      deal_tip: {
+        price_logic: '领5元券后19.9元',
+        tutorial_steps: [],
+        original_copywriting: '原始线报长文案1',
+      },
+    },
+  });
+  await init1;
+  assert.equal(hWithPriceLogic.page.hasDealGuide.value, true);
+  assert.equal(hWithPriceLogic.page.isCopywritingExpanded.value, false);
+  hWithPriceLogic.page.toggleCopywritingExpand();
+  assert.equal(hWithPriceLogic.page.isCopywritingExpanded.value, true);
+  hWithPriceLogic.page.copyDealCopywriting();
+  await flush();
+  assert.equal(hWithPriceLogic.copied.at(-1), '原始线报长文案1');
+  hWithPriceLogic.page.dispose();
+
+  const hWithSteps = harness({ url: 'https://shop.test/detail?goods_id=D_GUIDE_2&platform=pdd', useRealVue: true });
+  hWithSteps.load('detail');
+  const init2 = hWithSteps.mounted[0]();
+  await hWithSteps.finish(0, {
+    status: 'success',
+    data: {
+      goods_id: 'D_GUIDE_2',
+      platform: 'pdd',
+      name: '测试线报商品2',
+      price: 29.9,
+      deal_tip: {
+        price_logic: '',
+        tutorial_steps: ['1. 先领券下单'],
+        original_copywriting: '原始线报长文案2',
+      },
+    },
+  });
+  await init2;
+  assert.equal(hWithSteps.page.hasDealGuide.value, true);
+  hWithSteps.page.dispose();
+
+  const hOnlyCopy = harness({ url: 'https://shop.test/detail?goods_id=D_ONLY_COPY&platform=jd', useRealVue: true });
+  hOnlyCopy.load('detail');
+  const init3 = hOnlyCopy.mounted[0]();
+  await hOnlyCopy.finish(0, {
+    status: 'success',
+    data: {
+      goods_id: 'D_ONLY_COPY',
+      platform: 'jd',
+      name: '仅原文线报商品',
+      price: 39.9,
+      deal_tip: {
+        price_logic: '',
+        tutorial_steps: [],
+        original_copywriting: '唯一保留的线报话术内容',
+      },
+    },
+  });
+  await init3;
+  assert.equal(hOnlyCopy.page.hasDealGuide.value, false);
+  hOnlyCopy.page.dispose();
 });
 
 
