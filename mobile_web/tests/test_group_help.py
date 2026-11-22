@@ -1739,6 +1739,15 @@ def test_extract_smart_fields_from_pdd_share_text_ssot():
     res5 = extract_smart_fields_from_pdd_share_text(sample_5)
     assert res5["goods_name"] == "维达抽纸整箱24包"
 
+    # 5. 非协议【...】促销角标绝不误抓为商品名称
+    sample_6 = "【好物精选】⇥AbCdEf123456⇤"
+    res6 = extract_smart_fields_from_pdd_share_text(sample_6)
+    assert not res6.get("goods_name")
+    sample_7 = "【还差1人】29.9元 ⇥AbCdEf123456⇤"
+    res7 = extract_smart_fields_from_pdd_share_text(sample_7)
+    assert not res7.get("goods_name")
+    assert res7["group_price"] == 29.9
+
 
 def test_group_help_exporter_miaozhuli_remote_sync_and_db_audit(tmp_path):
     GroupHelpExporter = _load_mobile_script("group_help_exporter").GroupHelpExporter

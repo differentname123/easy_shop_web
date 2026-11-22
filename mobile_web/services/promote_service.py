@@ -436,6 +436,8 @@ class PromoteService:
         "PRODUCT_IDENTITY_MISMATCH",
         "AMBIGUOUS_IDENTITY",
         "INVALID_PDD_URL",
+        "INVALID_TAOBAO_URL",
+        "INVALID_JD_URL",
         "INVALID_TKL",
         "INVALID_IDENTITY",
         "MATERIAL_URL_REQUIRED",
@@ -528,7 +530,14 @@ class PromoteService:
                 source, auth_ms, provider_ms, total_ms,
                 data.get("error_msg") or data.get("error_code") or "未知错误",
             )
-            return data
+            sanitized_data = dict(data)
+            sanitized_data["error_msg"] = sanitize_user_error_message(
+                data.get("error_code"),
+                data.get("error_msg"),
+                platform_name=getattr(adapter, "platform_name", ""),
+                scene="convert",
+            )
+            return sanitized_data
 
         result = self._with_command(data, adapter, kwargs)
         self._decorate_auth_fallback(

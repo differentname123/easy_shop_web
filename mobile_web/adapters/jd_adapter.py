@@ -10,6 +10,7 @@ from infrastructure.logging_utils import get_app_logger
 logger = get_app_logger(__name__)
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
+    get_caller_context,
     is_real_requests_session,
     stamp_universal_resolution,
 )
@@ -29,6 +30,7 @@ from infrastructure.jd_client import (
     resolve_jd_short_url,
 )
 from models.product import (
+    JD_DOMAINS,
     JD_JINGFEN_ID_RE,
     ProductDetail,
     ProductRef,
@@ -39,6 +41,7 @@ from models.product import (
     extract_jd_image_key,
     is_jd_image_key,
     normalize_jd_material_url,
+    text_has_disallowed_url,
 )
 
 _JD_SHORT_URL_RE = re.compile(r"https?://u\.jd\.com/[A-Za-z0-9_-]+")
@@ -1240,7 +1243,7 @@ class JdAdapter(BasePlatformAdapter):
                                 if det.get("catalog_cooling") is True:
                                     detail_catalog_cooling = True
 
-            # 2b. 折淘客 :20000 京东联盟官方全网查询直接支持 u.jd.com（118-243ms，不占选品库 1.35s 池；冷却期内跳过）
+            # 2b. 折淘客 :20000 京东联盟官方全网查询直接支持 u.jd.com（118-243ms，不占选品库 1.35s 池）
             if (
                 product_card is None
                 and not is_venue
@@ -1248,7 +1251,6 @@ class JdAdapter(BasePlatformAdapter):
                 and short_match
                 and self._has_ztk_catalog
                 and hasattr(self.client, "query_union_goods")
-                and not self._is_ztk_catalog_cooling()
             ):
                 uq = self._guard_provider_result(
                     self.client.query_union_goods(keyword=short_match.group(0), page=1, page_size=2)
@@ -1430,11 +1432,17 @@ class JdAdapter(BasePlatformAdapter):
         text = _text(raw_text)
         if not text:
             return _error("INVALID_ARGUMENT", "请输入京东 u.jd.com 短链、京口令或京粉链接")
+        if text_has_disallowed_url(text, JD_DOMAINS):
+            return _error("INVALID_JD_URL", "该链接不属于京东平台，请切换为「自动识别」或对应平台")
 
         is_personal = self._is_personal_promoter(uid, promoter)
 
         def _do_resolve():
-            if self._is_ztk_catalog_cooling() and not is_jd_official_venue_url(text):
+            if (
+                get_caller_context() == "background"
+                and self._is_ztk_catalog_cooling()
+                and not is_jd_official_venue_url(text)
+            ):
                 return _error(
                     "RATE_LIMIT",
                     "京东选品库处于短时频控冷却中，暂跳过避免空转",
@@ -1528,14 +1536,12 @@ class JdAdapter(BasePlatformAdapter):
                 and bool(hdk_mat)
             )
             if self._has_ztk_catalog:
-                if self._is_ztk_catalog_cooling() and not is_jd_official_venue_url(text):
-                    if not can_hdk_fallback:
-                        return _error(
-                            "RATE_LIMIT",
-                            "京东选品库处于短时频控冷却中，暂跳过避免空转",
-                            catalog_cooling=True,
-                        )
-                else:
+                skip_ztk_for_hdk = (
+                    self._is_ztk_catalog_cooling()
+                    and not is_jd_official_venue_url(text)
+                    and can_hdk_fallback
+                )
+                if not skip_ztk_for_hdk:
                     material_input = f"https://jingfen.jd.com/detail/{text}.html" if _is_encrypted_jd_item_id(text) else text
                     short_resolver = (
                         (lambda u: _memo_unwrap(u) or _error("NOT_FOUND", "解包失败"))

@@ -598,7 +598,7 @@ class ProductRepository(BaseRepository):
 
         now_ts = time.time()
         if cleaned_kw and raw_docs:
-            buckets = select_relevant_candidates(cleaned_kw, raw_docs, min_primary=5)
+            buckets = select_relevant_candidates(cleaned_kw, raw_docs, min_primary=1)
             ranked: List[Dict[str, Any]] = []
             for bucket in buckets:
                 ranked.extend(
@@ -695,7 +695,7 @@ class ProductRepository(BaseRepository):
                         }
                     has_named_hits = any(isinstance(h, dict) and h.get("name") for h in meili_hits)
                     if has_named_hits:
-                        buckets = select_relevant_candidates(cleaned_kw, meili_hits, min_primary=5)
+                        buckets = select_relevant_candidates(cleaned_kw, meili_hits, min_primary=1)
                         ordered_hits = [h for bucket in buckets for h in bucket]
                         paged_hits = ordered_hits[skip : skip + page_size + 10]
                         slice_has_tail = len(ordered_hits) > (skip + len(paged_hits))

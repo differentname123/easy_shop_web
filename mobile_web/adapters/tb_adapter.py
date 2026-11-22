@@ -33,10 +33,12 @@ from models.product import (
     ProductRef,
     ProductSummary,
     ProductDetail,
+    TAOBAO_DOMAINS,
     URL_RE,
     clean_product_id,
     extract_canonical_goods_id,
     extract_taobao_token_core,
+    text_has_disallowed_url,
 )
 from infrastructure.tb_client import TaobaoClient, _TB_SESSION
 from infrastructure.hdk_client import HdkClient
@@ -1076,6 +1078,8 @@ class TaobaoAdapter(BasePlatformAdapter):
         text = _text(raw_text)
         if not text:
             return _error("INVALID_ARGUMENT", "请输入淘宝链接、淘口令或商品ID")
+        if text_has_disallowed_url(text, TAOBAO_DOMAINS):
+            return _error("INVALID_TAOBAO_URL", "该链接不属于淘宝/天猫平台，请切换为「自动识别」或对应平台")
 
         identity = kwargs.get("identity") or {}
         relation_id = _text(identity.get("relation_id")) if isinstance(identity, dict) else ""

@@ -3442,6 +3442,91 @@ test('detail hasDealGuide reflects tutorial_steps only, removes redundant 怎么
   hOnlyCopy.page.dispose();
 });
 
+test('QA surgical fixes: group_help copyShareText/firstPosterExampleUrl/smartParse, app tab scroll reset, and UI label contracts', async () => {
+  // 1. group_help.js: copyShareText exported, firstPosterExampleUrl picks first item with poster, smartParse ignores 【角标】 and repaste updates untouched auto-fields
+  const hGh = harness({ url: 'https://shop.test/group_help' });
+  hGh.load('group_help');
+  hGh.mounted[0]();
+  await flush();
+  await hGh.finish(0, {
+    status: 'success',
+    data: {
+      items: [
+        { group_order_id: 'tok_NoImg1111', goods_name: '纯口令团', group_price: 9.9, remain_people: 1, poster_url: '' },
+        { group_order_id: '3495229659187000222', goods_name: '海报团示例', group_price: 19.9, remain_people: 1, poster_url: '/api/group_help/poster/3495229659187000222' },
+      ],
+      total: 2,
+      has_more: false,
+    },
+  });
+
+  assert.equal(typeof hGh.page.copyShareText, 'function');
+  hGh.page.copyShareText('拼单完整文案', '已复制完整拼单文案！');
+  await flush();
+  assert.equal(hGh.copied.at(-1), '拼单完整文案');
+  assert.equal(hGh.page.toastMsg.value, '已复制完整拼单文案！');
+
+  assert.equal(hGh.page.firstPosterExampleUrl.value, '/api/group_help/poster/3495229659187000222');
+  hGh.page.openHelpGuide();
+  assert.equal(hGh.page.helpModal.value.visible, true);
+  hGh.page.goSeeOthersExample();
+  assert.equal(hGh.page.helpModal.value.visible, false);
+  assert.equal(hGh.page.fullPosterUrl.value, '/api/group_help/poster/3495229659187000222');
+
+  // 【好物精选】/【还差1人】不再误填商品名，且重贴新文案刷新未手改的自动字段、保留已手改字段
+  hGh.page.openTextSubmitModal();
+  hGh.page.textSubmitModal.value.share_text = '【好物精选】29.9元 ⇥AbCdEf123456⇤';
+  hGh.page.onTextShareInput();
+  assert.equal(hGh.page.textSubmitModal.value.goods_name, '');
+  assert.equal(hGh.page.textSubmitModal.value.group_price, '29.9');
+
+  hGh.page.textSubmitModal.value.share_text = '19.9元拼团购买维达超韧抽纸24包，仅剩2个名额 ⇥ZzYyXx112233⇤';
+  hGh.page.onTextShareInput();
+  assert.equal(hGh.page.textSubmitModal.value.goods_name, '维达超韧抽纸24包');
+  assert.equal(hGh.page.textSubmitModal.value.group_price, '19.9');
+
+  hGh.page.textSubmitModal.value.share_text = '49.9元拼团购买清风原木卷纸27卷，仅剩1个名额 ⇥MmNnOo445566⇤';
+  hGh.page.onTextShareInput();
+  assert.equal(hGh.page.textSubmitModal.value.goods_name, '清风原木卷纸27卷');
+  assert.equal(hGh.page.textSubmitModal.value.group_price, '49.9');
+
+  hGh.page.textSubmitModal.value.goods_name = '用户自定义商品名';
+  hGh.page.textSubmitModal.value.share_text = '39.9元拼团购买蓝月亮洗衣液，仅剩1个名额 ⇥PpQqRr778899⇤';
+  hGh.page.onTextShareInput();
+  assert.equal(hGh.page.textSubmitModal.value.goods_name, '用户自定义商品名');
+  assert.equal(hGh.page.textSubmitModal.value.group_price, '39.9');
+
+  // 2. app.js: tab switch scrolls back to top (0, 0)
+  const hApp = harness({ url: 'https://shop.test/' });
+  hApp.load('app');
+  const bootApp = hApp.mounted[0]();
+  await flush();
+  await hApp.finish(0, { status: 'success', data: platformFixtures });
+  await hApp.finish(1, { status: 'success', data: channelFixtures });
+  await hApp.finish(2, goodsResponse('H-1', false));
+  await bootApp;
+  hApp.scrolled.length = 0;
+  hApp.page.currentTab.value = 'user';
+  await flush();
+  assert.ok(hApp.scrolled.some(([x, y]) => x === 0 && y === 0));
+
+  // 3. Static HTML & CSS contracts
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
+  const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+  const groupHelpCss = fs.readFileSync(path.join(root, 'static', 'css', 'group_help.css'), 'utf8');
+
+  assert.ok(indexHtml.includes("item.deal_highlight ? '单件券后' : '券后'"));
+  assert.ok(indexHtml.includes('本页面不提供提现或资金账本。\', 6000)'));
+  assert.ok(detailHtml.includes('券减 ¥{{ formatMoney(goods.coupon_amount) }}'));
+  assert.ok(groupHelpHtml.includes('firstPosterExampleUrl'));
+  assert.ok(groupHelpHtml.includes('aria-label="关闭"'));
+  assert.ok(styleCss.includes('.tab-user .user-profile-header,'));
+  assert.ok(groupHelpCss.includes('text-overflow: ellipsis;'));
+});
+
+
 
 
 

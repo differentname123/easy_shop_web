@@ -291,15 +291,39 @@ def register_sensitive_provider_keywords(*keywords: str) -> None:
             _PROVIDER_LEAK_KEYWORDS.append(clean)
 
 
-def sanitize_user_error_message(error_code: Any, raw_msg: Any, platform_name: str = "") -> str:
+_USER_FACING_ERROR_CODES = frozenset({
+    "AMBIGUOUS_PLATFORM_TEXT",
+    "KEYWORD_NOT_LINK",
+    "UNSUPPORTED_URL_DOMAIN",
+    "PRODUCT_OFF_PROMOTION",
+    "INVALID_PDD_URL",
+    "INVALID_TAOBAO_URL",
+    "INVALID_JD_URL",
+    "UNSUPPORTED_TB_PORTAL_PAGE",
+    "MISSING_PRODUCT_IDENTITY",
+    "INVALID_ARGUMENT",
+    "UNRESOLVED_PDD_INPUT",
+})
+
+
+def sanitize_user_error_message(
+    error_code: Any,
+    raw_msg: Any,
+    platform_name: str = "",
+    scene: str = "universal",
+) -> str:
     """将上游网关或第三方中转原始报错统一清洗为面向普通用户的友好提示。"""
     code = clean_text(error_code).upper()
     msg = clean_text(raw_msg)
     plat = clean_text(platform_name) or "该平台"
     lower = msg.lower()
+    if scene == "detail":
+        scene_fallback = f"暂未能获取该{plat}商品详情，请确认商品仍在售或返回挑选其他好物"
+    elif scene == "convert":
+        scene_fallback = f"暂未能生成该{plat}推广链接，请稍后重试"
+    else:
+        scene_fallback = f"暂未能解析该{plat}链接，请确认商品仍在售且分享链接完整有效，或在「首页」搜索同款商品"
 
-    if code in ("AMBIGUOUS_PLATFORM_TEXT", "KEYWORD_NOT_LINK", "UNSUPPORTED_URL_DOMAIN", "PRODUCT_OFF_PROMOTION"):
-        return msg
     if code == "UNSUPPORTED_TB_NUMERIC_ID":
         return "手淘普通分享链接（e.tb.cn）暂不支持直接解析，请复制淘口令，或点击下方按钮在「首页」搜索该商品"
     if code == "UNSUPPORTED_PDD_ID_ONLY_URL":
@@ -310,6 +334,22 @@ def sanitize_user_error_message(error_code: Any, raw_msg: Any, platform_name: st
         return f"您的{plat}推广渠道尚未完成授权或已失效，请在「我的」页面下方完成渠道授权后再试"
     if code == "INVALID_TKL" or "error tkl" in lower or "商品id解析错误" in lower:
         return f"未能识别该{plat}口令或链接，请确认粘贴的是完整的商品分享口令/短链，或在「首页」搜索商品名称"
+    if code in ("RATE_LIMIT", "QUOTA_PACE_BACKLOG"):
+        return "当前平台查询较繁忙，请稍后再试"
+    if code in ("TIMEOUT", "NETWORK_ERROR"):
+        return "平台网络响应较慢，请稍后重试"
     if any(k in lower for k in _PROVIDER_LEAK_KEYWORDS):
-        return f"暂未能解析该{plat}链接，请确认商品仍在售且分享链接完整有效，或在「首页」搜索同款商品"
-    return msg or f"暂未能解析该{plat}链接，请检查链接或口令是否完整有效"
+        return scene_fallback
+    if code in _USER_FACING_ERROR_CODES and msg:
+        return msg
+    if code in (
+        "UPSTREAM_ERROR",
+        "PROTOCOL_ERROR",
+        "NO_PROVIDER_AVAILABLE",
+        "PROVIDER_EXCEPTION",
+        "PROMOTION_FAILED",
+        "NOT_FOUND",
+        "PRODUCT_IDENTITY_MISMATCH",
+    ) or code.isdigit():
+        return scene_fallback
+    return msg or scene_fallback

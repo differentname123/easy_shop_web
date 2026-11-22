@@ -3,7 +3,7 @@
 import html as html_lib
 import re
 from typing import Dict, Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
     is_real_requests_session,
@@ -13,12 +13,14 @@ from infrastructure.hdk_client import HdkClient
 from infrastructure.http_utils import clean_money, error_dict as _error, normalize_http_url
 from infrastructure.logging_utils import format_exc_summary, get_app_logger
 from models.product import (
+    PDD_DOMAINS,
     PDD_GOODS_SIGN_RE,
     ProductDetail,
     ProductRef,
     ProductSummary,
     URL_RE,
     clean_product_id,
+    url_matches_domains,
 )
 import infrastructure.pdd_client as _pdd_client_mod
 from infrastructure.pdd_client import (
@@ -111,14 +113,7 @@ class PddAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_valid_pdd_url(url: str) -> bool:
-        try:
-            parsed = urlsplit(str(url or "").strip())
-            host = (parsed.hostname or "").lower()
-            return parsed.scheme in ("http", "https") and any(
-                host == root or host.endswith("." + root) for root in ("pinduoduo.com", "yangkeduo.com")
-            )
-        except Exception:
-            return False
+        return url_matches_domains(url, PDD_DOMAINS)
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None) -> ProductRef:
         raw = str(goods_id_or_sign or "").strip()

@@ -1312,6 +1312,84 @@ def test_jd_short_url_coupon_timestamps_cooling_preservation_and_uid_fail_closed
     assert cool_ztk_ok.convert_promotion_link.call_count == 1
 
 
+def test_jd_universal_domain_guard_and_foreground_vs_background_cooling():
+    from infrastructure.api_governance import api_caller_context
+    from models.product import JD_DOMAINS, url_matches_domains
+
+    # 1. 官方域名匹配严谨且拒绝伪域名、淘宝/拼多多跨平台域名
+    assert url_matches_domains("https://u.jd.com/oOUaUwq", JD_DOMAINS) is True
+    assert url_matches_domains("https://coupon.m.jd.com/coupons/show.action?key=1", JD_DOMAINS) is True
+    assert url_matches_domains("https://eviljd.com/123.html", JD_DOMAINS) is False
+
+    ztk_guard = Mock()
+    ad_guard = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="k1"), client=ztk_guard)
+    for bad_url in ("https://m.tb.cn/h.demo123", "https://mobile.yangkeduo.com/goods.html?goods_id=1", "https://eviljd.com/x"):
+        err = ad_guard.resolve_and_convert_universal(bad_url)
+        assert err["status"] == "error" and err["error_code"] == "INVALID_JD_URL"
+    ztk_guard.convert_universal_material.assert_not_called()
+
+    # 2. 冷却期内：background 上下文保持零 HTTP 入口熔断；foreground 依然放行 :20000 官方查询 + byunionid_get
+    enc_id = "G6QDzEKCKU5wE4ebWFK3wE4ebcI4vQ_3lzC2xxOIoDavPIXww"
+    union_row = {
+        "itemId": enc_id,
+        "skuId": 100088,
+        "skuName": "维达抽纸整箱24包",
+        "materialUrl": f"item.jd.com/{enc_id}.html",
+        "imageInfo": {"imageList": [{"url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/vinda.jpg"}]},
+        "priceInfo": {"price": 39.9, "lowestCouponPrice": 29.9},
+        "couponInfo": {"couponList": []},
+        "commissionInfo": {"commissionShare": 6.5, "couponCommission": 1.94},
+        "shopInfo": {"shopName": "维达旗舰店"},
+        "comments": 10000,
+    }
+    calls = []
+
+    def _cooling_get(url, params=None, **_kw):
+        calls.append(url)
+        if "open_jing_union_open_goods_query" in url:
+            return reply({"jd_union_open_goods_query_response": {"result": json.dumps({"code": 200, "totalCount": 1, "data": [union_row]})}})
+        if "byunionid_get" in url:
+            return reply({PROMOTION_ROOT: {"result": json.dumps({"code": 200, "data": {"shortURL": "https://u.jd.com/fgOk1", "clickURL": "https://union-click.jd.com/fgOk1"}})}})
+        raise AssertionError(f"Catalog pool must stay skipped while cooling: {url}")
+
+    cli_fg = JdClient(appkey_list=("k1",), union_id="2035679405", http_session=SimpleNamespace(get=_cooling_get))
+    cli_fg.mark_catalog_rate_limited(60.0, force=True)
+    ad_fg = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="k1"), client=cli_fg)
+
+    with api_caller_context("background"):
+        bg_res = ad_fg.resolve_and_convert_universal("https://u.jd.com/oGP72oi")
+    assert bg_res["status"] == "error" and bg_res["error_code"] == "RATE_LIMIT" and bg_res.get("catalog_cooling") is True
+    assert calls == []
+
+    fg_res = ad_fg.resolve_and_convert_universal("https://u.jd.com/oGP72oi")
+    assert fg_res["status"] == "success"
+    assert fg_res["resolution_kind"] == "product"
+    assert fg_res["final_link"] == "https://u.jd.com/fgOk1"
+    assert fg_res["product"]["name"] == "维达抽纸整箱24包"
+
+    # 3. 冷却期前台个人推广位且 :20000 未命中时，仍经 byunionid_get 保底返回可用 degraded_product（不打 tkl_piliang）
+    calls.clear()
+
+    def _cooling_deg_get(url, params=None, **_kw):
+        calls.append(url)
+        if "open_jing_union_open_goods_query" in url:
+            return reply({"jd_union_open_goods_query_response": {"result": json.dumps({"code": 200, "totalCount": 0, "data": []})}})
+        if "byunionid_get" in url:
+            return reply({PROMOTION_ROOT: {"result": json.dumps({"code": 200, "data": {"shortURL": "https://u.jd.com/fgDeg1", "clickURL": "https://union-click.jd.com/fgDeg1", "jCommand": "！CMD1234567890！"}})}})
+        raise AssertionError(f"Unexpected catalog call while cooling: {url}")
+
+    cli_deg = JdClient(appkey_list=("k1",), union_id="2035679405", http_session=SimpleNamespace(get=_cooling_deg_get))
+    cli_deg.mark_catalog_rate_limited(60.0, force=True)
+    ad_deg = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="k1"), client=cli_deg)
+    deg_res = ad_deg.resolve_and_convert_universal("https://u.jd.com/oDeg777", uid="u_12345678", promoter_id="999999")
+    assert deg_res["status"] == "success"
+    assert deg_res["resolution_kind"] == "degraded_product"
+    assert deg_res["detail_lookup_failed"] is True
+    assert deg_res["final_link"] == "https://u.jd.com/fgDeg1"
+    assert not any("tkl_piliang" in u for u in calls)
+
+
+
 
 
 

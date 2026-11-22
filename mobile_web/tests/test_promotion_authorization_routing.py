@@ -389,3 +389,37 @@ def test_universal_convert_http_route_and_keyword_or_ambiguous_interceptions(mon
     assert body["status"] == "success" and body["platform"] == "taobao"
     assert body["promotion_token"] == "￥JBnB61RqEqX￥"
     assert body["product"]["goods_id"] == "TB_ENC_ID_999"
+
+    # 验证错误清洗单一真源对 UPSTREAM_ERROR / RATE_LIMIT / 数字网关码的收口（detail 与 convert 出口）
+    from unittest.mock import MagicMock as _MM
+    from services.product_service import ProductService
+
+    msg_upstream = sanitize_user_error_message("UPSTREAM_ERROR", "京东返回业务错误 (2001703)", "京东")
+    assert "2001703" not in msg_upstream and "业务错误" not in msg_upstream
+    msg_rl = sanitize_user_error_message("RATE_LIMIT", "京东选品库处于短时频控冷却中，暂跳过避免空转", "京东")
+    assert "空转" not in msg_rl and "冷却" not in msg_rl and "繁忙" in msg_rl
+    msg_num = sanitize_user_error_message("50001", "PDD网关拒绝: [50001:400011]", "拼多多", scene="detail")
+    assert "50001" not in msg_num and "网关" not in msg_num and "转链" not in msg_num
+    assert sanitize_user_error_message("INVALID_TAOBAO_URL", "该链接不属于淘宝/天猫平台", "淘宝") == "该链接不属于淘宝/天猫平台"
+
+    err_repo = _MM()
+    err_repo.get_product_detail.return_value = None
+    err_repo.get_promotion_link_cache.return_value = None
+    err_adapter = _MM()
+    err_adapter.active = True
+    err_adapter.platform_code = "pdd"
+    err_adapter.platform_name = "拼多多"
+    err_adapter.capabilities = {"detail": True, "promotion": True}
+    err_adapter.requires_authorized_promotion = False
+    err_adapter.requires_numeric_promoter_id = False
+    err_adapter.resolve_product_ref.return_value = ProductRef("pdd", "999", "SIGN_ERR")
+    err_adapter.get_goods_detail.return_value = {"status": "error", "error_code": "50001", "error_msg": "PDD网关拒绝: [50001:400011]"}
+    err_adapter.convert_promotion_url.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "error_msg": "京东返回业务错误 (2001703)"}
+
+    monkeypatch.setattr("services.product_service.get_adapter", lambda _p: err_adapter)
+    monkeypatch.setattr("services.promote_service.get_adapter", lambda _p: err_adapter)
+    det_err = ProductService(err_repo).get_goods_detail(platform="pdd", goods_sign="SIGN_ERR")
+    assert "50001" not in det_err["error_msg"] and "网关" not in det_err["error_msg"]
+    conv_err = PromoteService(product_repo=err_repo, user_service=_MM()).convert_link("pdd", "SIGN_ERR")
+    assert "2001703" not in conv_err["error_msg"] and "业务错误" not in conv_err["error_msg"]
+

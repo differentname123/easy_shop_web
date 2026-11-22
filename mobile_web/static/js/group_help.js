@@ -143,6 +143,8 @@
       });
 
       // 无图口令 / 官方链接直接发布弹窗
+      const emptyAutoFilled = () => ({ goods_name: '', group_price: '', remain_people: null, total_people: '' });
+      let lastAutoFilled = emptyAutoFilled();
       const textSubmitModal = ref({
         visible: false,
         share_text: '',
@@ -837,19 +839,12 @@
             }
           }
           res.goods_name = title.slice(0, 120);
-        } else {
-          const bracketM = text.match(/【([^【】]{4,80})】/);
-          if (bracketM) {
-            const inner = bracketM[1].trim();
-            if (!/^(拼多多|百亿补贴|多人团|限时补贴)$/.test(inner)) {
-              res.goods_name = inner.slice(0, 120);
-            }
-          }
         }
         return res;
       };
 
       const openTextSubmitModal = () => {
+        lastAutoFilled = emptyAutoFilled();
         textSubmitModal.value = {
           visible: true,
           share_text: '',
@@ -869,35 +864,35 @@
       };
 
       const applyParsedTextToForm = () => {
-        textSubmitModal.value.errorMsg = '';
-        const raw = String(textSubmitModal.value.share_text || '').trim();
+        const m = textSubmitModal.value;
+        m.errorMsg = '';
+        const raw = String(m.share_text || '').trim();
         if (!raw) {
-          textSubmitModal.value.autoFilledTip = '';
+          m.autoFilledTip = '';
           return;
         }
         const parsed = smartParsePddShareText(raw);
         let filledCount = 0;
-        if (parsed.goods_name && !textSubmitModal.value.goods_name) {
-          textSubmitModal.value.goods_name = parsed.goods_name;
-          filledCount++;
-        }
-        if (parsed.group_price && !textSubmitModal.value.group_price) {
-          textSubmitModal.value.group_price = parsed.group_price;
-          filledCount++;
-        }
-        if (parsed.remain_people && (!textSubmitModal.value.remain_people || textSubmitModal.value.remain_people === 1)) {
-          textSubmitModal.value.remain_people = parsed.remain_people;
-          filledCount++;
-        }
-        if (parsed.total_people && !textSubmitModal.value.total_people) {
-          textSubmitModal.value.total_people = parsed.total_people;
-          filledCount++;
-        }
+        [
+          ['goods_name', parsed.goods_name || '', ''],
+          ['group_price', parsed.group_price || '', ''],
+          ['remain_people', parsed.remain_people || null, 1],
+          ['total_people', parsed.total_people || '', ''],
+        ].forEach(([key, parsedVal, defaultVal]) => {
+          const cur = m[key];
+          if (!cur || cur === defaultVal || cur === lastAutoFilled[key]) {
+            m[key] = parsedVal || defaultVal;
+            lastAutoFilled[key] = parsedVal;
+            if (parsedVal) filledCount++;
+          }
+        });
 
-        if (filledCount > 0 || (textSubmitModal.value.goods_name && textSubmitModal.value.group_price)) {
-          const priceDisplay = textSubmitModal.value.group_price ? `¥${textSubmitModal.value.group_price}` : '';
-          const remainDisplay = textSubmitModal.value.remain_people ? `差${textSubmitModal.value.remain_people}人` : '';
-          textSubmitModal.value.autoFilledTip = `✨ 已为您自动识别商品信息${priceDisplay ? `（${priceDisplay}，${remainDisplay}）` : ''}，可直接核验上架！`;
+        if (filledCount > 0 || (m.goods_name && m.group_price)) {
+          const priceDisplay = m.group_price ? `¥${m.group_price}` : '';
+          const remainDisplay = m.remain_people ? `差${m.remain_people}人` : '';
+          m.autoFilledTip = `✨ 已为您自动识别商品信息${priceDisplay ? `（${priceDisplay}，${remainDisplay}）` : ''}，可直接核验上架！`;
+        } else {
+          m.autoFilledTip = '';
         }
       };
 
@@ -992,11 +987,16 @@
         helpModal.value = { visible: false, failedItem: null };
       };
 
+      const firstPosterExampleUrl = computed(() => {
+        const hit = items.value.find(it => it && it.poster_url);
+        return hit ? hit.poster_url : '';
+      });
+
       const goSeeOthersExample = () => {
         closeHelpGuide();
-        // 如果列表里已经有别人上传的团，直接弹出第一张真实海报大图供用户直观参考
-        if (items.value.length > 0 && items.value[0].poster_url) {
-          openFullPoster(items.value[0].poster_url);
+        // 如果列表里已经有别人上传的海报团，直接弹出首张真实海报大图供用户直观参考
+        if (firstPosterExampleUrl.value) {
+          openFullPoster(firstPosterExampleUrl.value);
           return;
         }
         filterMode.value = 'active';
@@ -1790,6 +1790,7 @@
         openPosterAndRecord,
         openHelpGuide,
         closeHelpGuide,
+        firstPosterExampleUrl,
         goSeeOthersExample,
         reuploadFromHelp,
         openUploadResultModal,
@@ -1801,6 +1802,7 @@
         onTextSharePaste,
         pasteClipboardIntoTextModal,
         submitTextGroupForm,
+        copyShareText,
         copyGroupToken,
         openPddHomeApp,
         resolveH5JoinUrl,

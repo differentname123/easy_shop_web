@@ -500,4 +500,13 @@ def test_pdd_40009_bypasses_hdk_search_detail_60001_mismatch_numeric_sign_and_co
     assert clamped["estimated_commission_yuan"] == 0.0
 
 
+def test_pdd_non_numeric_goods_id_rejected_before_gateway(fake_gateway):
+    post, _ = fake_gateway
+    res = pdd_client.get_goods_detail("c", "s", "pid", goods_id="invalid_test_999")
+    assert res["status"] == "error" and res["error_code"] == "INVALID_ARGUMENT"
+    assert "网关" not in res["error_msg"] and "转链" not in res["error_msg"]
+    post.assert_not_called()
+
+
+
 

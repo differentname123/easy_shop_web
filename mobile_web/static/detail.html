@@ -69,7 +69,7 @@
       <span class="unit">¥</span>
       <span class="val">{{ formatMoney(goods.price) }}</span>
       <span class="orig" v-if="goods.original_price && goods.original_price > goods.price">¥{{ formatMoney(goods.original_price) }}</span>
-      <span class="coupon-pill-detail" v-if="goods.coupon_amount > 0">立减 ¥{{ formatMoney(goods.coupon_amount) }}</span>
+      <span class="coupon-pill-detail" v-if="goods.coupon_amount > 0">券减 ¥{{ formatMoney(goods.coupon_amount) }}</span>
       <span class="plat-badge" :class="goods.platform" style="position:static;margin-left:auto;font-size:10px">
         {{ platformName }}
       </span>

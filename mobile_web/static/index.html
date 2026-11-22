@@ -109,7 +109,7 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span v-if="item.has_coupon" class="price-label">券后</span>
+                <span v-if="item.has_coupon" class="price-label">{{ item.deal_highlight ? '单件券后' : '券后' }}</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>
@@ -251,7 +251,7 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span v-if="item.has_coupon" class="price-label">券后</span>
+                <span v-if="item.has_coupon" class="price-label">{{ item.deal_highlight ? '单件券后' : '券后' }}</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>
@@ -670,7 +670,7 @@
         </span>
         <span style="color:var(--primary-color);font-size:13px;font-weight:600">easyeverything98 <span style="font-size:11px;font-weight:normal;opacity:0.8">[点击复制]</span></span>
       </div>
-      <div class="menu-item" @click="showToast('商品佣金为预估，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。')">
+      <div class="menu-item" @click="showToast('商品佣金为预估，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。', 6000)">
         <span>订单佣金与平台结算说明</span>
         <span style="color:var(--text-muted)">›</span>
       </div>

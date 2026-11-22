@@ -1053,4 +1053,17 @@ def test_tb_detail_mismatch_hdk_status_retry_promo_id_and_carousel():
     ]
 
 
+def test_taobao_universal_rejects_cross_platform_and_spoofed_domains():
+    ztk = Mock()
+    official = Mock()
+    adapter = make_adapter(official, ztk=ztk, tb_channel_pid="mm_1_2_3")
+
+    for bad_url in ("https://u.jd.com/oOUaUwq", "https://p.pinduoduo.com/act123", "https://eviltaobao.com/item.htm?id=1"):
+        res = adapter.resolve_and_convert_universal(bad_url)
+        assert res["status"] == "error" and res["error_code"] == "INVALID_TAOBAO_URL"
+    ztk.convert_channel_url.assert_not_called()
+    official.convert_promotion_url.assert_not_called()
+
+
+
 

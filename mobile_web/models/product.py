@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
@@ -92,6 +92,26 @@ SUPPORTED_ECOMMERCE_DOMAINS = (
     "tb.cn", "tb3.cn", "taobao.com", "tmall.com", "alimama.com",
     "pinduoduo.com", "yangkeduo.com",
 )
+
+
+def url_matches_domains(url: Any, domains: Sequence[str]) -> bool:
+    """严格按 URL 主机名后缀匹配官方域名白名单（SSOT，供三平台适配器共用）。"""
+    try:
+        parsed = urlsplit(str(url or "").strip())
+        host = (parsed.hostname or "").lower()
+        return parsed.scheme in ("http", "https") and any(
+            host == root or host.endswith("." + root)
+            for root in domains
+            if root
+        )
+    except Exception:
+        return False
+
+
+def text_has_disallowed_url(text: Any, allowed_domains: Sequence[str]) -> bool:
+    """文本中包含 HTTP(S) 链接且无一属于 allowed_domains 时返回 True（SSOT 跨平台守卫）。"""
+    urls = [u.rstrip(".,!?)];'\"") for u in URL_RE.findall(str(text or ""))]
+    return bool(urls) and not any(url_matches_domains(u, allowed_domains) for u in urls)
 
 
 def _looks_like_random_11char_token(tok: str) -> bool:

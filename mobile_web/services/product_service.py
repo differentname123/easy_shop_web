@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from adapters import get_adapter, normalize_platform
+from infrastructure.http_utils import sanitize_user_error_message
 from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import (
     ProductRef,
@@ -674,6 +675,14 @@ class ProductService:
                 "%s 【商品详情失败】拉取商品详情失败且本地无可用缓存 | 平台[%s] 商品[%s] 失败原因<%s> 排查方向<请检查商品ID/Sign是否有效、商品是否已下架或上游接口状态>",
                 severity_icon(error_code=err_code), plat, goods_tag, reason,
             )
+            sanitized_err = dict(loaded.public)
+            sanitized_err["error_msg"] = sanitize_user_error_message(
+                err_code,
+                loaded.public.get("error_msg"),
+                platform_name=getattr(adapter, "platform_name", ""),
+                scene="detail",
+            )
+            return self._apply_deal_tip(plat, sanitized_err, ref)
         return self._apply_deal_tip(plat, loaded.public, ref)
 
     def prefetch_product_detail(self, ref, snapshot=None, refresh_ahead_seconds=330, stop_event=None):

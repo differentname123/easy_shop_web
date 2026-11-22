@@ -2451,6 +2451,7 @@ body {
     padding: 12px 14px;
   }
 
+  .tab-user .user-profile-header,
   .tab-user .universal-convert-card,
   .tab-user .auth-reg-card,
   .tab-user .stats-card,
@@ -2461,5 +2462,9 @@ body {
     max-width: 680px;
     margin-left: auto;
     margin-right: auto;
+  }
+
+  .tab-user .user-profile-header {
+    border-radius: 0 0 16px 16px;
   }
 }

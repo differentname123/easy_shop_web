@@ -502,8 +502,11 @@ def _get_goods_detail_by_sign(client_id, client_secret, pid, goods_sign, custom_
 
 
 def _get_goods_detail_by_numeric_id(client_id, client_secret, pid, goods_id, uid, custom_params, http_session=None):
+    clean_gid = str(goods_id or "").strip()
+    if not clean_gid.isdigit():
+        return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "商品参数无效或已失效，请返回挑选其他好物"}
     try:
-        source_url = f"https://mobile.pinduoduo.com/goods.html?goods_id={goods_id}"
+        source_url = f"https://mobile.pinduoduo.com/goods.html?goods_id={clean_gid}"
         zs_res = convert_pdd_url(client_id, client_secret, pid=pid, source_url=source_url, uid=uid, http_session=http_session)
         short_url = zs_res.get("jump_url")
         if not short_url:

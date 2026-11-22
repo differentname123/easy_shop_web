@@ -351,8 +351,9 @@
         }
       };
       watch(currentTab, newTab => {
-        isHeaderHidden.value = false; showBackToTop.value = false;
+        isHeaderHidden.value = false; showBackToTop.value = false; lastScrollTop = 0;
         pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
+        global.scrollTo(0, 0);
         try {
           global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`);
           const url = new URL(global.location.href);

@@ -539,8 +539,9 @@
   <!-- ==================== 弹窗 2：问号说明 / 失败原因与示例引导弹窗 ==================== -->
   <div class="gh-modal-mask" style="align-items:center;padding:20px;z-index:250" v-if="helpModal.visible" @click.self="closeHelpGuide">
     <div class="gh-dialog">
-      <div class="gh-dialog-title">
-        {{ helpModal.failedItem ? '⚠️ 为什么这张图上传未成功？' : '📌 10秒看懂：如何上传拼团海报？' }}
+      <div class="gh-dialog-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <span>{{ helpModal.failedItem ? '⚠️ 为什么这张图上传未成功？' : '📌 10秒看懂：如何上传拼团海报？' }}</span>
+        <button type="button" class="gh-sheet-close" @click="closeHelpGuide" aria-label="关闭">×</button>
       </div>
 
       <!-- 若是从失败记录点进来的，先展示具体失败原因 -->
@@ -583,8 +584,8 @@
       </div>
 
       <div class="gh-dialog-actions">
-        <button class="gh-btn-secondary" @click="items.length > 0 ? goSeeOthersExample() : closeHelpGuide()">
-          {{ items.length > 0 ? '看真实海报大图' : '先逛逛大厅' }}
+        <button class="gh-btn-secondary" @click="firstPosterExampleUrl ? goSeeOthersExample() : closeHelpGuide()">
+          {{ firstPosterExampleUrl ? '看真实海报大图' : '我知道了' }}
         </button>
         <button class="gh-btn-app-jump" style="padding:10px;font-size:13.5px" @click="reuploadFromHelp">
           去相册选海报上传

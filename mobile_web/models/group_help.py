@@ -273,10 +273,6 @@ def extract_smart_fields_from_pdd_share_text(raw_text: str) -> Dict[str, Any]:
             if len(s) >= 2 and s not in t and not re.search(r"(?:点击|复制|打开|微信|qq|私信)", s, re.I):
                 t = f"{t}（{s[:24]}）"
         res["goods_name"] = t
-    else:
-        bracket_m = re.search(r"【([^【】]{3,80})】", text)
-        if bracket_m and not re.match(r"^(拼多多|百亿补贴|多人团)$", bracket_m.group(1).strip()):
-            res["goods_name"] = bracket_m.group(0).strip()
     return res
 
 
