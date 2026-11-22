@@ -13,7 +13,16 @@
     const isSubmittingAuth = ref(false), isAuthModalOpen = ref(false), currentAuthInfo = ref(null), isCheckingAuth = ref(false);
     const orderPlatform = ref('pdd'), orderDays = ref(7), isSyncingOrders = ref(false), userOrdersData = ref(emptyOrders());
     const orderMessage = ref('');
-    let orderGeneration = 0, authGeneration = 0, disposed = false, authSnapshot = null, orderPollTimer = null;
+    let orderGeneration = 0, authGeneration = 0, universalGeneration = 0, disposed = false, authSnapshot = null, orderPollTimer = null;
+    const universalInput = ref(''), universalPlatform = ref('auto'), universalLoading = ref(false);
+    const universalResult = ref(null), universalError = ref(''), universalSuggestedKeyword = ref(''), universalSuggestedPlatform = ref('');
+    const clearUniversalConvert = () => {
+      universalGeneration += 1;
+      universalInput.value = '';
+      universalResult.value = null;
+      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform.value = '';
+      universalLoading.value = false;
+    };
     const stopOrderPoll = () => {
       if (orderPollTimer !== null) {
         global.clearTimeout(orderPollTimer);
@@ -37,9 +46,15 @@
       isAuthModalOpen.value = false; currentAuthInfo.value = null; isCheckingAuth.value = false;
     };
     const handleLogout = (notify = true) => {
+      const wasLoggedIn = isLoggedIn.value;
       session.clear(); orderGeneration += 1; stopOrderPoll(); closeAccountAuth();
       isLoggedIn.value = false; uid.value = ''; userPhone.value = ''; userProfile.value = emptyProfile();
       userOrdersData.value = emptyOrders(); isSyncingOrders.value = false; orderMessage.value = '';
+      if (notify || wasLoggedIn) {
+        clearUniversalConvert();
+        formPassword.value = ''; formNickname.value = ''; formInviteCode.value = '';
+        isRegisterMode.value = false;
+      }
       if (notify && !disposed) showToast('已安全退出登录');
     };
     const invalidSession = () => { handleLogout(false); if (!disposed) showToast('登录凭证已过期，请重新登录'); };
@@ -190,16 +205,6 @@
     };
     const initializeOrderPlatform = preferred => {
       orderPlatform.value = getPlatforms().find(item => item.code === preferred)?.code || getPlatforms().find(item => item.active)?.code || '';
-    };
-    const universalInput = ref(''), universalPlatform = ref('auto'), universalLoading = ref(false);
-    const universalResult = ref(null), universalError = ref(''), universalSuggestedKeyword = ref(''), universalSuggestedPlatform = ref('');
-    let universalGeneration = 0;
-    const clearUniversalConvert = () => {
-      universalGeneration += 1;
-      universalInput.value = '';
-      universalResult.value = null;
-      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform.value = '';
-      universalLoading.value = false;
     };
     const handleUniversalConvert = async () => {
       if (disposed || universalLoading.value) return;

@@ -339,14 +339,32 @@
         isHeaderHidden.value = false; showBackToTop.value = false; lastScrollTop = 0;
         pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
       });
+      const onClickHomeTab = () => {
+        if (currentTab.value !== 'home') {
+          currentTab.value = 'home';
+          return;
+        }
+        if (feeds.activeHomeKeyword.value) {
+          clearHomeSearch();
+        } else {
+          scrollToTop();
+        }
+      };
       watch(currentTab, newTab => {
         isHeaderHidden.value = false; showBackToTop.value = false;
         pullDistance.value = 0; pullStatus.value = 'idle'; isRefreshing.value = false;
         try {
           global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`);
           const url = new URL(global.location.href);
-          if (newTab === 'home') url.searchParams.delete('tab');
-          else url.searchParams.set('tab', newTab);
+          if (newTab === 'home') {
+            url.searchParams.delete('tab');
+            if (feeds.activeHomeKeyword.value) url.searchParams.set('keyword', feeds.activeHomeKeyword.value);
+            else { url.searchParams.delete('keyword'); url.searchParams.delete('q'); }
+          } else {
+            url.searchParams.set('tab', newTab);
+            url.searchParams.delete('keyword');
+            url.searchParams.delete('q');
+          }
           global.history.replaceState({ tab: newTab, scope: session.scope() }, '', url.toString());
         } catch (_) {}
         if (newTab === 'boom' && feeds.boomGoodsList.value.length === 0 && !feeds.boomLoading.value && !feeds.activeBoomKeyword.value) {
@@ -358,7 +376,7 @@
         homeSearchInputRef, boomSearchInputRef,
         onSearchKeydownEnter, onAuthInputEnter,
         onSearchHome, onSearchBoom, clearHomeSearch, clearBoomSearch,
-        currentTab, isHeaderHidden, showBackToTop, scrollToTop,
+        currentTab, onClickHomeTab, isHeaderHidden, showBackToTop, scrollToTop,
         pullDistance, pullStatus, isRefreshing, isTransitioning, pullText, executeRefresh,
         formatPhone: shop.formatPhone, formatMoney: shop.formatMoney, formatSales: shop.formatSales,
         formatDealTime: shop.formatDealTime, goodsKey: shop.goodsKey, openGoodsDetail,

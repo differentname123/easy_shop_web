@@ -562,6 +562,8 @@ class ProductService:
             if normalize_platform(result["data"].get("platform") or ref.platform) != ref.platform:
                 return _LoadedDetail({"status": "error", "error_msg": "商品返回平台不匹配", "error_code": "product_identity_mismatch"})
             detail_payload = dict(result["data"])
+            if not str(detail_payload.get("name") or "").strip():
+                return _LoadedDetail({"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"})
             if isinstance(deal_tip, dict) and deal_tip and not detail_payload.get("deal_tip"):
                 detail_payload["deal_tip"] = deepcopy(deal_tip)
             try:

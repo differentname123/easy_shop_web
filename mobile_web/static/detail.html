@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261121-2">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261121-2"></script>
-  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261121-2">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261122-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261122-1"></script>
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261122-1">
 </head>
 <body>
 <div id="app" class="detail-container" v-cloak>
@@ -313,7 +313,7 @@
         <button class="sheet-close" @click="closeAuthModal">×</button>
       </div>
 
-      <div style="padding: 10px 0 20px;">
+      <div class="sheet-scroll-body" style="padding: 10px 0 20px;">
         <div style="text-align:center;margin-bottom:16px;">
           <div style="font-size:36px;margin-bottom:8px">🔐</div>
           <h3 style="font-size:16px;color:var(--text-main)">{{ authModal.pendingInfo?.authorization_status === 'unknown' ? '渠道授权状态待确认' : '未完成推手授权备案' }}</h3>
@@ -339,7 +339,7 @@
         <span>{{ commandModal.wechatGuide ? ('📱 微信内请复制口令打开 ' + platformName + ' App') : ('📋 ' + platformName + '推广口令与链接已生成') }}</span>
         <button class="sheet-close" @click="closeCommandModal">×</button>
       </div>
-      <div style="padding: 10px 0 18px;">
+      <div class="sheet-scroll-body" style="padding: 10px 0 18px;">
         <div class="command-preview-box">{{ commandModal.text }}</div>
         <p v-if="commandModal.wechatGuide" style="font-size:12px;color:#d46b08;background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:8px 10px;margin:10px 0 14px;line-height:1.55;">
           微信内暂不支持直接打开淘宝网页。口令已为您准备好，点击下方按钮一键复制后，<b>打开手机{{ platformName }} App</b> 即可自动弹窗领券下单！
@@ -386,10 +386,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261121-2"></script>
-<script src="/static/js/session.js?v=ux-20261121-2"></script>
-<script src="/static/js/format.js?v=ux-20261121-2"></script>
-<script src="/static/js/browser.js?v=ux-20261121-2"></script>
-<script src="/static/js/detail.js?v=ux-20261121-2"></script>
+<script src="/static/js/api.js?v=ux-20261122-1"></script>
+<script src="/static/js/session.js?v=ux-20261122-1"></script>
+<script src="/static/js/format.js?v=ux-20261122-1"></script>
+<script src="/static/js/browser.js?v=ux-20261122-1"></script>
+<script src="/static/js/detail.js?v=ux-20261122-1"></script>
 </body>
 </html>

@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261121-2">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261122-1">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261121-2"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261122-1"></script>
 </head>
 <body>
 <div id="app" v-cloak>
@@ -61,7 +61,7 @@
         </div>
       </nav>
       <nav class="search-status-bar" v-else>
-        <span class="search-status-text">当前在 <b>{{ homePlatformName() }}</b> 搜索「{{ activeHomeKeyword }}」，点上方平台可切换搜索</span>
+        <span class="search-status-text"><b>{{ homePlatformName() }}</b>搜「{{ activeHomeKeyword }}」· 点上方可切平台</span>
         <button type="button" class="search-back-btn" @click="clearHomeSearch">返回热销榜单</button>
       </nav>
     </header>
@@ -201,7 +201,8 @@
 
       <!-- 平台筛选芯片 (第一行) -->
       <div class="platform-bar">
-        <div 
+        <button 
+          type="button"
           v-for="p in boomPlatforms" 
           :key="p.code"
           class="plat-chip"
@@ -211,7 +212,7 @@
           @click="switchBoomPlatform(p.code)"
         >
           {{ p.name }}<span v-if="!p.active" class="plat-chip-badge">待开放</span>
-        </div>
+        </button>
       </div>
 
       <!-- 排序栏（搜索同品类商品时展示智能性价比排序与返回入口） -->
@@ -318,6 +319,9 @@
     <div v-if="!boomLoading && boomError && boomGoodsList.length === 0" class="empty-wrap" @click="retryLoadBoomGoods">加载严选好物失败，点击重试 ↻</div>
     <div v-if="!boomLoading && !boomError && boomGoodsList.length === 0" class="empty-wrap">暂未检索到符合条件的严选好物</div>
     <div v-if="!boomLoading && !boomError && !boomHasMore && boomGoodsList.length > 0" class="loading-wrap" style="color:var(--text-muted)">已到底部，无更多商品</div>
+    <div v-if="!boomLoading && !boomError && boomHasMore" class="loading-wrap continue-load-wrap" :class="{ 'is-subtle': boomGoodsList.length > 0 }" @click="loadBoomGoods(false)">
+      <button type="button" class="continue-load-btn">下滑自动加载 · 点击加载下一页</button>
+    </div>
     <div id="boomBottomSentinel" style="height: 10px;"></div>
   </div>
 
@@ -713,17 +717,6 @@
     </div>
   </div>
 
-  <!-- 悬浮回到顶部按钮 -->
-  <button
-    v-if="showBackToTop && (currentTab === 'home' || currentTab === 'boom')"
-    class="back-to-top-btn"
-    @click="scrollToTop"
-    title="回到顶部"
-    aria-label="回到顶部"
-  >
-    <svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/></svg>
-  </button>
-
   <!-- 首页轻量添加到手机桌面引导浮条（点 ✕ 关闭后不再自动打扰） -->
   <div class="a2hs-banner" v-if="showDesktopBanner && !isStandalone && currentTab === 'home'">
     <div class="a2hs-banner-left" @click="triggerAddToDesktop">
@@ -739,9 +732,20 @@
     </div>
   </div>
 
+  <!-- 悬浮回到顶部按钮 -->
+  <button
+    v-if="showBackToTop && (currentTab === 'home' || currentTab === 'boom')"
+    class="back-to-top-btn"
+    @click="scrollToTop"
+    title="回到顶部"
+    aria-label="回到顶部"
+  >
+    <svg viewBox="0 0 24 24"><path d="M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z"/></svg>
+  </button>
+
   <!-- ==================== 底部固定导航栏 (TabBar) ==================== -->
   <footer class="bottom-tab-bar">
-    <div class="tab-item" :class="{ active: currentTab === 'home' }" @click="currentTab = 'home'">
+    <div class="tab-item" :class="{ active: currentTab === 'home' }" @click="onClickHomeTab">
       <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
       <span>首页</span>
     </div>
@@ -766,7 +770,7 @@
         <span>添加到手机桌面</span>
         <button class="sheet-close" @click="closeDesktopGuide(false)">×</button>
       </div>
-      <div class="a2hs-guide-body">
+      <div class="a2hs-guide-body sheet-scroll-body">
         <div class="a2hs-guide-preview">
           <img src="/static/icons/icon-192.png?v=20261111-1" alt="查券省钱" class="a2hs-guide-logo" />
           <div>
@@ -838,7 +842,7 @@
         <button class="sheet-close" @click="closeAccountAuth">×</button>
       </div>
 
-      <div style="padding: 10px 0 20px;">
+      <div class="sheet-scroll-body" style="padding: 10px 0 20px;">
         <div style="text-align:center;margin-bottom:16px;">
           <div style="font-size:36px;margin-bottom:8px">
             {{ currentAuthInfo?.is_authorized ? '🎉' : '🔐' }}
@@ -872,12 +876,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261121-2"></script>
-<script src="/static/js/session.js?v=ux-20261121-2"></script>
-<script src="/static/js/format.js?v=ux-20261121-2"></script>
-<script src="/static/js/browser.js?v=ux-20261121-2"></script>
-<script src="/static/js/feeds.js?v=ux-20261121-2"></script>
-<script src="/static/js/account.js?v=ux-20261121-2"></script>
-<script src="/static/js/app.js?v=ux-20261121-2"></script>
+<script src="/static/js/api.js?v=ux-20261122-1"></script>
+<script src="/static/js/session.js?v=ux-20261122-1"></script>
+<script src="/static/js/format.js?v=ux-20261122-1"></script>
+<script src="/static/js/browser.js?v=ux-20261122-1"></script>
+<script src="/static/js/feeds.js?v=ux-20261122-1"></script>
+<script src="/static/js/account.js?v=ux-20261122-1"></script>
+<script src="/static/js/app.js?v=ux-20261122-1"></script>
 </body>
 </html>

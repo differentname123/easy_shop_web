@@ -55,7 +55,7 @@ def assert_calls(strategy, api_types, uid):
 @pytest.mark.parametrize("uid", [None, UID])
 def test_real_smart_red_packet_success_stops_without_standard_or_wash(strategy, uid):
     strategy.replies.append({"rp_promotion_url_generate_response": {"url_list": [{"short_url": PROMOTION}]}})
-    result = strategy.adapter.convert_promotion_url("123", uid=uid)
+    result = strategy.adapter.convert_promotion_url(SIGN, uid=uid)
     assert result["final_link"] == PROMOTION
     assert result["is_fallback"] is False
     assert result["need_auth"] is False
@@ -72,7 +72,7 @@ def test_real_smart_uses_standard_once_and_strips_internal_identity(strategy, ui
         requests.Timeout("red packet timeout"),
         {"goods_promotion_url_generate_response": {"goods_promotion_url_list": [{"short_url": PROMOTION}]}},
     ])
-    result = strategy.adapter.convert_promotion_url("123", uid=uid, identity={}, search_id="SEARCH")
+    result = strategy.adapter.convert_promotion_url(SIGN, uid=uid, identity={}, search_id="SEARCH")
     assert result["final_link"] == PROMOTION
     assert result["link_type"] == "常规推广"
     strategy.smart.assert_called_once()
@@ -85,7 +85,7 @@ def test_real_smart_uses_standard_once_and_strips_internal_identity(strategy, ui
 
 def test_personal_all_fail_runs_one_smart_one_standard_one_numeric_wash_and_no_anonymous_retry(strategy):
     strategy.replies.extend([{}, {}, {}])
-    result = strategy.adapter.convert_promotion_url("123", uid=UID)
+    result = strategy.adapter.convert_promotion_url(SIGN, uid=UID, goods_id="123", goods_sign=SIGN)
     assert result["status"] == "error"
     assert result["error_code"] == "PERSONAL_PROMOTION_UNAVAILABLE"
     assert result["need_auth"] is False
@@ -113,7 +113,7 @@ def test_personal_sign_failure_never_synthesizes_anonymous_success_or_direct_lin
 
 def test_smart_preserves_intermediate_authorization_evidence_when_last_failure_is_generic(strategy):
     strategy.replies.extend([RuntimeError("PDD网关拒绝: [60001:] 未传入已经授权备案过的相关参数"), {}, {}])
-    result = strategy.adapter.convert_promotion_url("123", uid=UID)
+    result = strategy.adapter.convert_promotion_url(SIGN, uid=UID, goods_id="123", goods_sign=SIGN)
     assert result["status"] == "error"
     assert result["need_auth"] is True
     assert result["error_code"] == "AUTH_REQUIRED"
@@ -209,21 +209,28 @@ def test_sign_only_ignores_unverified_product_url_after_smart_is_exhausted(strat
     assert_calls(strategy, [RED_API, STANDARD_API], uid)
 
 
-@pytest.mark.parametrize("uid,goods_sign", [(None, None), (UID, SIGN)])
-def test_numeric_identity_cannot_be_overridden_by_conflicting_product_url(strategy, uid, goods_sign):
-    strategy.replies.extend([{}, {}, {"goods_zs_unit_generate_response": {"short_url": PROMOTION}}])
+@pytest.mark.parametrize("uid,goods_sign,expected_calls", [
+    (None, None, [WASH_API]),
+    (UID, SIGN, [RED_API, STANDARD_API, WASH_API]),
+])
+def test_numeric_identity_cannot_be_overridden_by_conflicting_product_url(strategy, uid, goods_sign, expected_calls):
+    strategy.replies.extend([{} for _ in expected_calls[:-1]] + [{"goods_zs_unit_generate_response": {"short_url": PROMOTION}}])
     result = strategy.adapter.convert_promotion_url(
         "123", uid=uid, goods_id="123", goods_sign=goods_sign,
         product_url="https://mobile.pinduoduo.com/goods.html?goods_id=999",
     )
     assert result["final_link"] == PROMOTION
     assert result["is_fallback"] is False
-    strategy.smart.assert_called_once()
-    strategy.standard.assert_called_once()
+    if goods_sign:
+        strategy.smart.assert_called_once()
+        strategy.standard.assert_called_once()
+    else:
+        strategy.smart.assert_not_called()
+        strategy.standard.assert_not_called()
     strategy.wash.assert_called_once()
     assert strategy.wash.call_args.kwargs["source_url"] == SOURCE
-    assert strategy.api.call_args_list[2].args[3]["source_url"] == SOURCE
-    assert_calls(strategy, [RED_API, STANDARD_API, WASH_API], uid)
+    assert strategy.api.call_args_list[-1].args[3]["source_url"] == SOURCE
+    assert_calls(strategy, expected_calls, uid)
 
 
 def test_url_only_conversion_does_not_try_smart_or_standard(strategy):
@@ -266,7 +273,7 @@ def test_unsupported_url_only_input_is_error_not_direct_link_success(strategy, s
 
 
 @pytest.mark.parametrize("target,source,direct,expected_calls", [
-    ("123", None, SOURCE, [RED_API, STANDARD_API, WASH_API]),
+    ("123", None, SOURCE, [WASH_API]),
     (SIGN, None, "https://mobile.yangkeduo.com/goods.html?goods_sign=SIGNED_PRODUCT", [RED_API, STANDARD_API]),
     ("", SOURCE, SOURCE, [WASH_API]),
 ])
@@ -331,4 +338,57 @@ def test_universal_convert_supports_app_share_ps_url_and_rejects_ambiguous_or_id
     plain_res = strategy.adapter.resolve_and_convert_universal("百事可乐无糖生可乐500ml*5瓶", uid=None)
     assert plain_res["status"] == "error"
     assert plain_res["error_code"] == "UNRESOLVED_PDD_INPUT"
+
+
+def test_numeric_only_id_never_calls_red_packet_or_standard_promotion(strategy):
+    strategy.replies.append({})
+    result = strategy.adapter.convert_promotion_url("999999999999")
+    assert result["is_fallback"] is True
+    assert result["final_link"] == "https://mobile.pinduoduo.com/goods.html?goods_id=999999999999"
+    strategy.smart.assert_not_called()
+    strategy.standard.assert_not_called()
+    strategy.wash.assert_called_once()
+    assert_calls(strategy, [WASH_API], None)
+
+
+def test_pdd_detail_and_service_reject_empty_shell_or_missing_id(monkeypatch):
+    from services.product_service import ProductService
+
+    adapter = pdd_adapter.PddAdapter(client_id="c", client_secret="s", pid="pid", enabled=True)
+
+    # 1. 上游返回空标题 / goods_id=0 的空壳数据时，直接判定 PRODUCT_OFF_PROMOTION，绝不放行 ¥0.00
+    monkeypatch.setattr(
+        pdd_adapter,
+        "pdd_get_detail",
+        Mock(return_value={"status": "success", "data": {"goods_id": 0, "goods_name": "", "min_group_price_yuan": 0.0}}),
+    )
+    shell_res = adapter.get_goods_detail(goods_id="999999999999")
+    assert shell_res["status"] == "error"
+    assert shell_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    # 2. 即使带有商品名称，但仅凭 goods_id 查询却返回缺失 goods_id（""），也绝不放行
+    monkeypatch.setattr(
+        pdd_adapter,
+        "pdd_get_detail",
+        Mock(return_value={"status": "success", "data": {"goods_id": 0, "goods_name": "幽灵商品", "min_group_price_yuan": 1.0}}),
+    )
+    no_id_res = adapter.get_goods_detail(goods_id="999999999999")
+    assert no_id_res["status"] == "error"
+    assert no_id_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    # 3. ProductService._load_official 全局门禁：任意平台返回无标题空壳详情均统一拦截
+    fake_adapter = SimpleNamespace(
+        platform_code="pdd",
+        platform_name="拼多多",
+        active=True,
+        capabilities={"detail": True},
+        resolve_product_ref=adapter.resolve_product_ref,
+        get_goods_detail=Mock(return_value={"status": "success", "data": {"platform": "pdd", "goods_id": "999999999999", "name": ""}}),
+    )
+    monkeypatch.setattr("services.product_service.get_adapter", lambda _plat: fake_adapter)
+    svc = ProductService(product_repo=SimpleNamespace(get_product_detail=lambda *a, **kw: None))
+    svc_res = svc.get_goods_detail(platform="pdd", goods_id="999999999999")
+    assert svc_res["status"] == "error"
+    assert svc_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+
 

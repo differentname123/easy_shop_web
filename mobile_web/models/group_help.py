@@ -266,7 +266,10 @@ def extract_smart_fields_from_pdd_share_text(raw_text: str) -> Dict[str, Any]:
         t = title_m.group(1).strip()
         suffix_m = re.search(r"仅剩\s*[0-9]+\s*个名额[。，、\s]+(.+?)$", text)
         if suffix_m:
-            s = suffix_m.group(1).strip("。，、 ")
+            s = _PDD_TOKEN_CODE_RE.sub(" ", suffix_m.group(1))
+            s = _HTTP_URL_RE.sub(" ", s)
+            s = re.sub(r"[0-9]{1,2}\s*人团", " ", s)
+            s = re.sub(r"\s+", " ", s).strip("。，、.,!?！？ ")
             if len(s) >= 2 and s not in t and not re.search(r"(?:点击|复制|打开|微信|qq|私信)", s, re.I):
                 t = f"{t}（{s[:24]}）"
         res["goods_name"] = t

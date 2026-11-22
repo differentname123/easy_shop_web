@@ -3228,6 +3228,123 @@ test('Wave 4B frontend fixes: poster_url badge & CSS, cross-origin tok_ routing,
   assert.equal('poster_url' in persisted[0], false);
 });
 
+test('converged QA fixes: logout cleanup, missing detail guard, group_help token strip & invalid gid, tab URL hygiene, and layout contracts', async () => {
+  // 1. account.js: handleLogout clears universalResult/error/input and auth form state, while guest boot handleLogout(false) keeps invite prefill
+  const hAcc = harness({ url: 'https://shop.test/?tab=user&invite_code=INV_999' });
+  hAcc.load('app');
+  const accBoot = hAcc.mounted[0]();
+  await flush();
+  await hAcc.finish(0, { status: 'success', data: platformFixtures });
+  await hAcc.finish(1, { status: 'success', data: channelFixtures });
+  await hAcc.finish(2, goodsResponse('H1', false));
+  await accBoot;
+  assert.equal(hAcc.page.formInviteCode.value, 'INV_999');
+  assert.equal(hAcc.page.isRegisterMode.value, true);
+
+  hAcc.page.isLoggedIn.value = true;
+  hAcc.page.universalInput.value = 'https://u.jd.com/abc';
+  hAcc.page.universalResult.value = { status: 'success', final_link: 'https://u.jd.com/out', attribution_status: 'verified' };
+  hAcc.page.universalError.value = 'old err';
+  hAcc.page.formPassword.value = 'secret123';
+  hAcc.page.formNickname.value = 'nick';
+  hAcc.page.handleLogout();
+  assert.equal(hAcc.page.universalInput.value, '');
+  assert.equal(hAcc.page.universalResult.value, null);
+  assert.equal(hAcc.page.universalError.value, '');
+  assert.equal(hAcc.page.formPassword.value, '');
+  assert.equal(hAcc.page.formNickname.value, '');
+  assert.equal(hAcc.page.formInviteCode.value, '');
+  assert.equal(hAcc.page.isRegisterMode.value, false);
+
+  // 2. detail.js: missing goods_id & goods_sign skips /api/home/detail, disables CTAs, and shows detailErrorMsg
+  const hDetEmpty = harness({ url: 'https://shop.test/detail' });
+  hDetEmpty.load('detail');
+  await hDetEmpty.mounted[0]();
+  assert.equal(hDetEmpty.requests.some(r => r.url.includes('/api/home/detail')), false);
+  assert.equal(hDetEmpty.page.isDeepLoading.value, false);
+  assert.equal(hDetEmpty.page.detailError.value, true);
+  assert.equal(hDetEmpty.page.isOffPromotion.value, true);
+  assert.equal(hDetEmpty.page.canOperateDetail.value, false);
+  assert.ok(hDetEmpty.page.detailErrorMsg.value.includes('缺少商品参数'));
+
+  // 3. group_help.js: smartParsePddShareText strips trailing 3人团/口令码, clears stale errorMsg, and invalid ?gid= cleans URL
+  const ghReplacedUrls = [];
+  const hGh = harness({ url: 'https://shop.test/group_help?gid=bad_id' });
+  hGh.context.history.replaceState = (_s, _t, nextUrl) => {
+    ghReplacedUrls.push(nextUrl);
+    hGh.context.location.href = new URL(nextUrl, 'https://shop.test').toString();
+    hGh.context.location.search = new URL(nextUrl, 'https://shop.test').search;
+  };
+  hGh.load('group_help');
+  hGh.mounted[0]();
+  await flush();
+  await hGh.finish(0, { status: 'success', data: { items: [], total: 0, has_more: false } });
+  assert.ok(ghReplacedUrls.includes('/group_help'));
+  assert.ok(hGh.page.toastMsg.value.includes('格式无效'));
+
+  hGh.page.openTextSubmitModal();
+  hGh.page.textSubmitModal.value.errorMsg = '请先粘贴含 ⇥...⇤ 的拼多多口令或官方拼团链接';
+  hGh.page.textSubmitModal.value.share_text = '【拼多多】29.9元拼团购买维达抽纸整箱24包，仅剩2个名额，3人团 ⇥AbCdEf12345⇤';
+  hGh.page.onTextShareInput();
+  assert.equal(hGh.page.textSubmitModal.value.errorMsg, '');
+  assert.equal(hGh.page.textSubmitModal.value.goods_name, '维达抽纸整箱24包');
+  assert.equal(hGh.page.textSubmitModal.value.group_price, '29.9');
+  assert.equal(hGh.page.textSubmitModal.value.remain_people, 2);
+  assert.equal(hGh.page.textSubmitModal.value.total_people, 3);
+
+  // 4. app.js: tab switch clears stale keyword from URL and onClickHomeTab clears search when already on home
+  const appReplaced = [];
+  const hApp = harness({ url: 'https://shop.test/?platform=pdd&keyword=%E7%89%9B%E5%A5%B6' });
+  hApp.context.history.replaceState = (_s, _t, nextUrl) => {
+    appReplaced.push(nextUrl);
+    const parsed = new URL(nextUrl, 'https://shop.test');
+    hApp.context.location.href = parsed.toString();
+    hApp.context.location.search = parsed.search;
+  };
+  hApp.load('app');
+  const bootApp = hApp.mounted[0]();
+  await flush();
+  await hApp.finish(0, { status: 'success', data: platformFixtures });
+  await hApp.finish(1, { status: 'success', data: channelFixtures });
+  await hApp.finish(2, goodsResponse('MILK-1', false));
+  await bootApp;
+  assert.equal(hApp.page.activeHomeKeyword.value, '牛奶');
+
+  hApp.page.currentTab.value = 'user';
+  await flush();
+  assert.equal(new URL(hApp.context.location.href).searchParams.get('tab'), 'user');
+  assert.equal(new URL(hApp.context.location.href).searchParams.get('keyword'), null);
+
+  hApp.page.onClickHomeTab();
+  await flush();
+  assert.equal(hApp.page.currentTab.value, 'home');
+  assert.equal(new URL(hApp.context.location.href).searchParams.get('keyword'), '牛奶');
+
+  // Clicking home tab again while searching clears search and loads hot feed
+  hApp.page.onClickHomeTab();
+  await flush();
+  await hApp.finish(hApp.requests.length - 1, goodsResponse('HOT-1', false));
+  assert.equal(hApp.page.activeHomeKeyword.value, '');
+  assert.equal(new URL(hApp.context.location.href).searchParams.get('keyword'), null);
+
+  // 5. Static HTML & CSS contracts for overlays, scroll sheets, stats-card spacing, and group_help navigation
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const groupHelpHtml = fs.readFileSync(path.join(root, 'static', 'group_help.html'), 'utf8');
+  const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+  const detailCss = fs.readFileSync(path.join(root, 'static', 'css', 'detail.css'), 'utf8');
+
+  assert.ok(indexHtml.indexOf('class="a2hs-banner"') < indexHtml.indexOf('class="back-to-top-btn"'));
+  assert.ok(indexHtml.includes('@click="onClickHomeTab"'));
+  assert.ok(indexHtml.includes('sheet-scroll-body'));
+  assert.ok(detailHtml.includes('sheet-scroll-body'));
+  assert.ok(groupHelpHtml.includes('href="/?tab=home&reset=1"'));
+  assert.ok(styleCss.includes('.a2hs-banner ~ .back-to-top-btn'));
+  assert.equal(styleCss.includes('margin: -24px 12px 12px;'), false);
+  assert.ok(detailCss.includes('height: 420px;'));
+});
+
+
 
 
 

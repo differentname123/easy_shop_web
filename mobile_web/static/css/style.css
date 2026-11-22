@@ -186,7 +186,7 @@ body {
 }
 
 .tab-page.tab-boom.is-searching {
-  padding-top: calc(126px + var(--safe-top));
+  padding-top: calc(132px + var(--safe-top));
 }
 
 .tab-page.tab-user {
@@ -807,7 +807,7 @@ body {
 .user-profile-header {
   background: var(--accent-gradient);
   color: #fff;
-  padding: calc(24px + var(--safe-top)) 16px 40px;
+  padding: calc(24px + var(--safe-top)) 16px 22px;
   border-bottom-left-radius: 20px;
   border-bottom-right-radius: 20px;
   position: relative;
@@ -945,7 +945,7 @@ body {
 .stats-card {
   background: #fff;
   border-radius: 12px;
-  margin: -24px 12px 12px;
+  margin: 12px;
   padding: 16px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.06);
   position: relative;
@@ -1286,7 +1286,7 @@ body {
   width: 100%;
   height: 100%;
   background: rgba(0,0,0,0.6);
-  z-index: 1000;
+  z-index: 1100;
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -1308,6 +1308,8 @@ body {
 
 .sheet-scroll-body {
   overflow-y: auto;
+  min-height: 0;
+  -webkit-overflow-scrolling: touch;
   flex: 1;
   padding-right: 2px;
 }
@@ -1968,6 +1970,10 @@ body {
   fill: currentColor;
 }
 
+.a2hs-banner ~ .back-to-top-btn {
+  bottom: calc(var(--tab-height) + var(--safe-bottom) + 74px);
+}
+
 /* 详情页已生成口令内联展示框 */
 .generated-command-card {
   margin-top: 10px;
@@ -2050,7 +2056,8 @@ body {
   font-size: 13px;
   color: var(--text-main);
   line-height: 1.55;
-  word-break: break-all;
+  overflow-wrap: anywhere;
+  word-break: normal;
   white-space: pre-wrap;
   user-select: text;
   max-height: 180px;
@@ -2711,6 +2718,14 @@ body {
     max-width: 760px !important;
   }
 
+  .a2hs-banner {
+    display: none;
+  }
+
+  .back-to-top-btn {
+    right: max(16px, calc(50% - 364px));
+  }
+
   .goods-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
@@ -2723,6 +2738,10 @@ body {
   .top-header,
   .bottom-tab-bar {
     max-width: 980px !important;
+  }
+
+  .back-to-top-btn {
+    right: max(16px, calc(50% - 474px));
   }
 
   .goods-grid {

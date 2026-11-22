@@ -21,7 +21,7 @@ from config import logger
 from models.product import normalize_platform
 from models.group_help import PERMANENT_BAN_STRIKES
 
-DEFAULT_AVATAR = "https://img.pddpic.com/mms-avatar/default_avatar.png"
+DEFAULT_AVATAR = ""
 
 
 class UserRepository(BaseRepository):

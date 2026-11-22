@@ -102,7 +102,12 @@ class PddAdapter(BasePlatformAdapter):
 
     def _normalize_goods_summary(self, raw_cleaned: dict) -> dict:
         """摘要是详情的公共子集，金额/佣金只在平台边界转换一次。"""
+        if not isinstance(raw_cleaned, dict):
+            raise ValueError("missing or invalid public product content")
+        name = str(raw_cleaned.get("goods_name") or "").strip()
         price = float(raw_cleaned.get("min_group_price_yuan") or 0.0)
+        if not name or price < 0:
+            raise ValueError("missing or invalid public product content")
         has_coupon = bool(raw_cleaned.get("has_coupon"))
         coupon = float(raw_cleaned.get("coupon_discount_yuan") or 0.0) if has_coupon else 0.0
         data = {
@@ -110,7 +115,7 @@ class PddAdapter(BasePlatformAdapter):
             "platform_name": self.platform_name,
             "goods_id": clean_product_id(raw_cleaned.get("goods_id")),
             "goods_sign": raw_cleaned.get("goods_sign") or "",
-            "name": raw_cleaned.get("goods_name") or "",
+            "name": name,
             "image_url": raw_cleaned.get("goods_image_url") or raw_cleaned.get("goods_thumbnail_url") or "",
             "price": round(max(0.0, price - coupon), 2),
             "original_price": price,
@@ -193,8 +198,14 @@ class PddAdapter(BasePlatformAdapter):
                 res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.recommend.get", params)
                 response = res.get("goods_basic_detail_response", {})
                 raw_items = response.get("list", [])
-                items = [self._normalize_goods_summary(clean_goods_item(item, source_type=f"pdd_recommend_{channel_type}"))
-                         for item in raw_items if item]
+                items = []
+                for item in raw_items:
+                    if not item:
+                        continue
+                    try:
+                        items.append(self._normalize_goods_summary(clean_goods_item(item, source_type=f"pdd_recommend_{channel_type}")))
+                    except (ValueError, TypeError):
+                        continue
                 total = response.get("total")
                 has_total = isinstance(total, int) and not isinstance(total, bool) and total > 0
                 effective_limit = min(self.recommendation_limit, total) if has_total else self.recommendation_limit
@@ -265,8 +276,14 @@ class PddAdapter(BasePlatformAdapter):
                         raise
                 response = res.get("goods_search_response", {})
                 raw_items = response.get("goods_list", [])
-                items = [self._normalize_goods_summary(clean_goods_item(item, source_type="pdd_search"))
-                         for item in raw_items if item]
+                items = []
+                for item in raw_items:
+                    if not item:
+                        continue
+                    try:
+                        items.append(self._normalize_goods_summary(clean_goods_item(item, source_type="pdd_search")))
+                    except (ValueError, TypeError):
+                        continue
                 total = response.get("total_count")
                 has_more = page * size < total if total is not None else (len(items) > size if gateway_size > size else len(raw_items) >= gateway_size)
                 items = items[:size]
@@ -315,11 +332,17 @@ class PddAdapter(BasePlatformAdapter):
                             res.get("error_msg", "该拼多多商品已下架或无推广计划"),
                         )
                     return _error(code, res.get("error_msg", "未查询到官方商品详情"))
-                item = self._normalize_goods(res["data"])
+                try:
+                    item = self._normalize_goods(res["data"])
+                except (ValueError, TypeError):
+                    return _error("PRODUCT_OFF_PROMOTION", "该拼多多商品已下架或无推广计划")
                 if ref.goods_sign and not item.get("goods_sign"):
                     item["goods_sign"] = ref.goods_sign
-                if not ref.goods_sign and ref.goods_id and item.get("goods_id") not in ("", ref.goods_id):
-                    return {"status": "error", "error_msg": "商品 ID 反查结果不匹配", "error_code": "product_identity_mismatch"}
+                if not ref.goods_sign and ref.goods_id:
+                    if not item.get("goods_id"):
+                        return _error("PRODUCT_OFF_PROMOTION", "该拼多多商品已下架或无推广计划")
+                    if item.get("goods_id") != ref.goods_id:
+                        return {"status": "error", "error_msg": "商品 ID 反查结果不匹配", "error_code": "product_identity_mismatch"}
                 return {"status": "success", "data": item}
             except Exception as exc:
                 logger.debug(
@@ -449,7 +472,8 @@ class PddAdapter(BasePlatformAdapter):
         product_url = kwargs.get("product_url")
         options = {k: v for k, v in kwargs.items() if k not in
                    ("goods_id", "goods_sign", "product_url", "title", "name", "goods_name", "price", "coupon", "coupon_amount", "identity")}
-        target = goods_sign or goods_id
+        # 仅真实 goods_sign 可进入智能红包/标准生链；纯数字 goods_id 绝不能喂给 goods_sign（否则网关会返回无关通用红包页造成串货）
+        target = goods_sign or None
         # 商品身份优先：客户端 URL 未经验证，不能把另一件商品洗链后写入当前商品缓存。
         source_url = product_url if not goods_id and not goods_sign else None
         if goods_id and str(goods_id).isdigit():

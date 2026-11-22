@@ -342,6 +342,7 @@
             detailErrorMsg.value = '商品图片暂未加载成功，请点击重新获取';
           }
         } else {
+          if (data?.error_msg) detailErrorMsg.value = data.error_msg;
           if (data?.error_code === 'PRODUCT_OFF_PROMOTION') {
             isOffPromotion.value = true;
             detailErrorMsg.value = data.error_msg || '该商品已取消推广或已下架，请挑选其他好物';
@@ -350,6 +351,8 @@
             syncOuterSnapshots(null, true);
             try { global.sessionStorage.removeItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`); } catch (_) {}
             browser.showToast(detailErrorMsg.value);
+          } else if (data?.error_code === 'missing_product_identity' || data?.error_code === 'INVALID_ARGUMENT') {
+            isOffPromotion.value = true;
           }
           detailError.value = true;
         }
@@ -536,6 +539,18 @@
       const incomingInvite = params.get('invite_code') || '';
       if (incomingInvite && session.savePendingInvite) session.savePendingInvite(incomingInvite);
       requested = shop.goodsIdentity({ goods_id: params.get('goods_id'), goods_sign: params.get('goods_sign'), platform: params.get('platform') });
+      if (!requested.goods_id && !requested.goods_sign) {
+        isDeepLoading.value = false;
+        detailError.value = true;
+        isOffPromotion.value = true;
+        detailErrorMsg.value = '缺少商品参数，请返回首页挑选好物';
+        syncDocumentTitle();
+        global.addEventListener('focus', refreshAuthorization);
+        global.document.addEventListener('visibilitychange', refreshAuthorization);
+        await restoreIdentity();
+        resumePendingAuthorization();
+        return;
+      }
       let hasSummary = false;
       try {
         const summary = JSON.parse(global.sessionStorage.getItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`) || 'null');

@@ -824,7 +824,12 @@
           let title = buyM[1].trim();
           const suffixM = text.match(/仅剩\s*\d+\s*个名额[。，、\s]+(.+?)$/);
           if (suffixM) {
-            const suffix = suffixM[1].replace(/[。，、\s]/g, '').trim();
+            const suffix = suffixM[1]
+              .replace(/⇥\s*[A-Za-z0-9]{6,28}\s*⇤/g, ' ')
+              .replace(/https?:\/\/[^\s"'<>\\]+/gi, ' ')
+              .replace(/[0-9]{1,2}\s*人团/g, ' ')
+              .replace(/[。，、.,!?！？\s]+/g, '')
+              .trim();
             if (suffix.length >= 2 && !title.includes(suffix)) {
               if (!/(?:点击|复制|打开|微信|qq|私信|加群)/i.test(suffix)) {
                 title = `${title}（${suffix.slice(0, 24)}）`;
@@ -864,6 +869,7 @@
       };
 
       const applyParsedTextToForm = () => {
+        textSubmitModal.value.errorMsg = '';
         const raw = String(textSubmitModal.value.share_text || '').trim();
         if (!raw) {
           textSubmitModal.value.autoFilledTip = '';
@@ -1613,7 +1619,15 @@
       };
 
       const openDeepLinkedGroup = async (gid, fromModalHistory = false) => {
-        if (!/^(?:[0-9]{10,28}|tok_[A-Za-z0-9]{6,28})$/.test(gid)) return;
+        if (!/^(?:\d{15,24}|tok_[A-Za-z0-9]{6,28})$/.test(gid)) {
+          try {
+            if (global.history && typeof global.history.replaceState === 'function') {
+              global.history.replaceState(null, '', '/group_help');
+            }
+          } catch (_) {}
+          showToast('拼团链接格式无效，已为您展示大厅最新拼团', 3200);
+          return;
+        }
         consumeReturnGroup();
         if (!fromModalHistory) {
           try {

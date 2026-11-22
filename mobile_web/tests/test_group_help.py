@@ -1727,6 +1727,18 @@ def test_extract_smart_fields_from_pdd_share_text_ssot():
     assert res3["group_price"] == 19.9
     assert "加微信" not in res3["goods_name"]
 
+    # 4. 尾部携带 3人团 / 口令码 / 官方链接时绝不拼接进商品名
+    sample_4 = "【拼多多】29.9元拼团购买维达抽纸整箱24包，仅剩2个名额，3人团 ⇥AbCdEf12345⇤"
+    res4 = extract_smart_fields_from_pdd_share_text(sample_4)
+    assert res4["group_price"] == 29.9
+    assert res4["remain_people"] == 2
+    assert res4["total_people"] == 3
+    assert res4["goods_name"] == "维达抽纸整箱24包"
+
+    sample_5 = "29.9元拼团购买维达抽纸整箱24包，仅剩2个名额 https://mobile.yangkeduo.com/group7.html?group_order_id=123456789012345"
+    res5 = extract_smart_fields_from_pdd_share_text(sample_5)
+    assert res5["goods_name"] == "维达抽纸整箱24包"
+
 
 def test_group_help_exporter_miaozhuli_remote_sync_and_db_audit(tmp_path):
     GroupHelpExporter = _load_mobile_script("group_help_exporter").GroupHelpExporter

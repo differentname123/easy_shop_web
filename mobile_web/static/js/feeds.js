@@ -311,13 +311,13 @@
           return true;
         } else {
           boomError.value = true;
-          showToast('加载爆品失败，点击重试');
+          showToast('加载严选好价失败，点击重试');
           return false;
         }
       } catch (_) {
         if (!disposed && generation === boomGeneration && scope === getScope()) {
           boomError.value = true;
-          showToast('加载爆品失败');
+          showToast('加载严选好价失败');
         }
         return false;
       } finally { if (generation === boomGeneration && scope === getScope() && !isPullRefresh) boomLoading.value = false; }
