@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import copy
-import datetime
-import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -18,9 +16,6 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_CONVERT,
     DEFAULT_STAGE_LEASE_SECONDS_AI,
     DEFAULT_STAGE_LEASE_SECONDS_CONVERT,
-    ERR_ADAPTER_CONVERT_FAILED,
-    ERR_AI_TIMEOUT_RETRY,
-    ERR_NO_ANCHOR,
 )
 from repositories.deal_raw_pool_repo import DealRawPoolRepository
 from services.deal_pipeline import run_stage_pipeline_drain
@@ -224,6 +219,39 @@ def test_atomic_claim_stage_docs_and_lease_expiry():
     assert claimed_b2[0]["_id"] == "d1"
     assert "worker_B" in claimed_b2[0]["stage_lease_owner"]
 
+    # 6. _select_fair_candidate_ids 仅发起 1 次 find（0 次 distinct），即可跨站点轮询公平抽样
+    now2 = time.time()
+    multi_docs = [
+        {"_id": "g1", "source_site": "guangdiu", "source_item_id": "g1", "clean_status": "pending", "clean_stage": "need_ai1", "publish_ts": now2 - 1, "clean_retry_count": 0},
+        {"_id": "g2", "source_site": "guangdiu", "source_item_id": "g2", "clean_status": "pending", "clean_stage": "need_ai1", "publish_ts": now2 - 2, "clean_retry_count": 0},
+        {"_id": "t1", "source_site": "tehuicaicai", "source_item_id": "t1", "clean_status": "pending", "clean_stage": "need_ai1", "publish_ts": now2 - 3, "clean_retry_count": 0},
+        {"_id": "t2", "source_site": "tehuicaicai", "source_item_id": "t2", "clean_status": "pending", "clean_stage": "need_ai1", "publish_ts": now2 - 4, "clean_retry_count": 0},
+    ]
+    find_count = 0
+    distinct_count = 0
+    fair_col = _MemMongoCollection(multi_docs)
+    orig_find = fair_col.find
+    orig_distinct = fair_col.distinct
+
+    def _tracked_find(*a, **kw):
+        nonlocal find_count
+        find_count += 1
+        return orig_find(*a, **kw)
+
+    def _tracked_distinct(*a, **kw):
+        nonlocal distinct_count
+        distinct_count += 1
+        return orig_distinct(*a, **kw)
+
+    fair_col.find = _tracked_find
+    fair_col.distinct = _tracked_distinct
+    fair_repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: fair_col))
+    fair_repo._indexes_ready = True
+    selected = fair_repo._select_fair_candidate_ids({"clean_status": "pending"}, limit=2)
+    assert distinct_count == 0
+    assert find_count == 1
+    assert selected == ["g1", "t1"]
+
 
 def test_commit_batch_results_stage_transitions():
     """测试 _commit_batch_results_to_db 正确处理中间阶段流转与终态落盘。"""
@@ -291,7 +319,6 @@ def test_commit_batch_results_stage_transitions():
 def test_cleaner_modular_units_and_clean_batch_records():
     """测试 Cleaner 三个独立单元函数及其统一驱动 clean_batch_records。"""
     cleaner = DealPoolCleaner(ai_batch_size=10, ai_max_workers=2, convert_max_workers=2)
-    cleaner._cache_warmed_up = True
 
     raw_docs = [
         {
@@ -392,7 +419,6 @@ def test_stage_workers_pipeline_drain_parallel():
     repo._indexes_ready = True
 
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=2, convert_max_workers=2)
-    cleaner._cache_warmed_up = True
 
     # Mock 各阶段纯单元输出
     def mock_ai1_unit(docs, *args, **kwargs):

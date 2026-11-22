@@ -211,15 +211,16 @@ def test_build_deal_tip_virtual_doc_shelf_life_and_snapshot():
 def test_category_eval_count_rotation_official_price_filter_and_1to1_interleave():
     """验证按类别已比价次数升序轮转排序、正式商品实时价格暴涨淘汰（含单商品分类）、线报免覆盖，以及 1:1 交替编排。"""
     # 模拟评估库历史记录：「洗衣液」已比价 3 次，「抽纸」已比价 1 次，「纯牛奶」已比价 0 次，「洗发水」已比价 0 次但实时价格暴涨失效
-    eval_history = [
-        {"platform": "pdd", "product_id": "old_1", "category_name": "洗衣液", "source_type": "official"},
-        {"platform": "pdd", "product_id": "old_2", "category_name": "洗衣液", "source_type": "official"},
-        {"platform": "pdd", "product_id": "old_3", "category_name": "洗衣液", "source_type": "official"},
-        {"platform": "pdd", "product_id": "old_4", "category_name": "抽纸", "source_type": "official"},
-        {"platform": "pdd", "product_id": "already_done", "category_name": "纯牛奶", "source_type": "official"},
+    eval_cat_agg = [
+        {"_id": {"category_name": "洗衣液", "source_type": "official"}, "count": 3},
+        {"_id": {"category_name": "抽纸", "source_type": "official"}, "count": 1},
+        {"_id": {"category_name": "纯牛奶", "source_type": "official"}, "count": 1},
     ]
     fake_eval_col = MagicMock()
-    fake_eval_col.find.return_value = eval_history
+    fake_eval_col.aggregate.return_value = eval_cat_agg
+    fake_eval_col.find.return_value = [
+        {"platform": "pdd", "product_id": "already_done", "source_type": "official"}
+    ]
     fake_db = MagicMock()
     fake_db.get_collection.return_value = fake_eval_col
 
@@ -256,6 +257,13 @@ def test_category_eval_count_rotation_official_price_filter_and_1to1_interleave(
     # 预期顺序：0次比价的「纯牛奶」(过滤掉 already_done 选出 milk_new) -> 1次比价的「抽纸」 -> 3次比价的「洗衣液」；「洗发水」因涨价淘汰
     assert [c["category_name"] for c in off_cands] == ["纯牛奶", "抽纸", "洗衣液"]
     assert off_cands[0]["product_id"] == "milk_new"
+    assert fake_eval_col.aggregate.call_count == 1
+    assert fake_eval_col.find.call_count == 1
+    eval_find_filter = fake_eval_col.find.call_args.args[0]
+    assert "product_id" in eval_find_filter and "$in" in eval_find_filter["product_id"]
+    assert set(eval_find_filter["product_id"]["$in"]) == {
+        "already_done", "milk_new", "shampoo_spiked", "tissue_new", "detergent_new"
+    }
 
     # 验证 1:1 交替合并
     deal_cands = [

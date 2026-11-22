@@ -64,7 +64,6 @@ class DealAIClient:
             "max_retries_per_model": 1,
             "timeout": self.ai_timeout,
             "stop_on_timeout": True,
-            "slot_acquire_timeout": 5.0,
         }
         if self.ai_semaphore is not None:
             with self.ai_semaphore:

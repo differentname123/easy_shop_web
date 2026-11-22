@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi.testclient import TestClient
 
-from adapters.base import UnavailablePlatformAdapter
+from adapters.base import BasePlatformAdapter
 from auth import create_access_token
 from cache import PROMOTION_CACHE
 from config import AUTH_NEGATIVE_STATUS_TTL
@@ -29,10 +29,22 @@ def public_link(**extra):
             "expires_at": time.time() + 3600, **extra}
 
 
-class RoutedAdapter(UnavailablePlatformAdapter):
+class RoutedAdapter(BasePlatformAdapter):
     active = True
+    channels = ()
     requires_authorized_promotion = True
     required_identity_fields = ("relation_id",)
+
+    def _unimplemented(self, *args, **kwargs):
+        return {"status": "error", "error_code": "platform_unavailable"}
+
+    get_recommend_goods = _unimplemented
+    search_goods = _unimplemented
+    get_goods_detail = _unimplemented
+    convert_promotion_url = _unimplemented
+    check_authority = _unimplemented
+    generate_authority_url = _unimplemented
+    fetch_increment_orders = _unimplemented
 
     def __init__(self, platform):
         self.platform_code = platform

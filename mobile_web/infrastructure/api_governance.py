@@ -31,7 +31,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, Optional, Sequence, Tuple
 
 import requests
 
@@ -200,7 +200,6 @@ def stamp_universal_resolution(
     result: Dict[str, Any],
     *,
     verified_coupon_or_venue: Optional[bool] = None,
-    single_item_evidence: bool = False,
 ) -> Dict[str, Any]:
     """
     为 `resolve_and_convert_universal` 返回结果打上确定性的四态 `resolution_kind` 标签：
@@ -378,7 +377,7 @@ class UpstreamHealthRegistry:
                         upd_ts = float(data.get("updated_ts") or 0.0)
                         age_sec = now_ts - upd_ts
                         is_stale = age_sec > self.SNAPSHOT_MAX_AGE_SEC
-                        if is_stale and (age_sec > 3600.0 or role.startswith("live_verifier")):
+                        if is_stale and age_sec > 3600.0:
                             try:
                                 fp.unlink()
                             except OSError:
@@ -502,18 +501,6 @@ def track_provider_call(
         allow_persist=allow_persist,
     )
     return res
-
-
-def rotate_providers(
-    providers: Sequence[Tuple[str, Callable[[], Dict[str, Any]]]],
-    start_index: int = 0,
-) -> List[Tuple[str, Callable[[], Dict[str, Any]]]]:
-    """按起始游标旋转供应商列表，兼顾轮询负载均衡与单次故障自动顺延。"""
-    items = list(providers)
-    if len(items) <= 1:
-        return items
-    offset = int(start_index) % len(items)
-    return items[offset:] + items[:offset]
 
 
 def execute_provider_chain(

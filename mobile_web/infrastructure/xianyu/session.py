@@ -198,9 +198,9 @@ def _acquire_serial_browser_lock(
     file_locked = False
     try:
         os.makedirs(os.path.dirname(_GLOBAL_LOCK_FILE_PATH), exist_ok=True)
-        lock_file = open(_GLOBAL_LOCK_FILE_PATH, "a+b")
-        lock_file.seek(0)
-        if lock_file.tell() == 0:
+        fd = os.open(_GLOBAL_LOCK_FILE_PATH, os.O_CREAT | os.O_RDWR)
+        lock_file = os.fdopen(fd, "r+b")
+        if os.fstat(lock_file.fileno()).st_size == 0:
             lock_file.write(b"0")
             lock_file.flush()
 

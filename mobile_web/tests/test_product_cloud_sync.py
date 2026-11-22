@@ -75,6 +75,7 @@ class _FakeSyncCollection:
         for op in operations:
             filt = op._filter
             upd = op._doc
+            allow_upsert = bool(getattr(op, "_upsert", True))
             target = next(
                 (
                     d for d in self.docs
@@ -83,6 +84,8 @@ class _FakeSyncCollection:
                 None,
             )
             if target is None:
+                if not allow_upsert:
+                    continue
                 new_doc = {
                     "_id": f"cloud_oid_{len(self.docs) + 1}",
                     "platform": filt["platform"],
@@ -99,6 +102,8 @@ class _FakeSyncCollection:
                 before = copy.deepcopy(target)
                 for k, v in upd.get("$set", {}).items():
                     target[k] = copy.deepcopy(v)
+                for k in upd.get("$unset", {}).keys():
+                    target.pop(k, None)
                 if target != before:
                     modified += 1
         return _FakeBulkWriteResult(matched=matched, modified=modified, upserted=upserted)
@@ -356,9 +361,7 @@ def test_sync_detects_deal_info_updated_at_and_never_propagates_sku_info():
     assert "format_sku_prices" not in op._doc["$set"]
 
 
-def test_cloud_sync_tombstones_deal_expiry_and_cloud_only_pullback():
-    from unittest.mock import MagicMock
-
+def test_cloud_sync_off_promotion_superseded_deal_expiry_and_cloud_only_pullback():
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     t_old = now - datetime.timedelta(hours=80)
 
@@ -397,11 +400,35 @@ def test_cloud_sync_tombstones_deal_expiry_and_cloud_only_pullback():
     op = sync_mod.build_product_merge_operation(local_expired_deal, c_fp)
     assert op._doc["$set"]["deal_info"]["is_deal_tip"] is False
 
-    # 2) 墓碑跨云端删除 + 云端独有未清洗推荐流商品回拉到本地（自动排除已墓碑删除商品，走真实 Query 过滤）
-    tombstone_col = MagicMock()
-    tombstone_col.find.return_value = [{"platform": "pdd", "product_id": "dead_off_promo_1", "deleted_at": now}]
-
-    local_col = _FakeSyncCollection([])
+    # 2) 本地软下架与 superseded 商品直接向云端同步 is_off_promotion=True（且同轮不会被 candidate 查询复活重插）+ 云端独有未清洗回拉
+    local_col = _FakeSyncCollection(
+        [
+            {
+                "_id": "l_dead",
+                "platform": "pdd",
+                "product_id": "dead_off_promo_1",
+                "name": "已下架死链商品",
+                "price": 19.9,
+                "activity_price": 19.9,
+                "updated_at": now,
+                "is_off_promotion": True,
+                "off_promotion_at": now,
+            },
+            {
+                "_id": "l_super",
+                "platform": "jd",
+                "product_id": "superseded_old_1",
+                "name": "被迁移替代旧商品",
+                "price": 29.9,
+                "activity_price": 29.9,
+                "updated_at": now,
+                "is_off_promotion": True,
+                "off_promotion_reason": "superseded",
+                "superseded_by": "jd_new_target_1",
+                "off_promotion_at": now,
+            },
+        ]
+    )
     cloud_col = _FakeSyncCollection(
         [
             {
@@ -411,6 +438,16 @@ def test_cloud_sync_tombstones_deal_expiry_and_cloud_only_pullback():
                 "name": "已下架死链商品",
                 "price": 19.9,
                 "activity_price": 19.9,
+                "updated_at": now,
+                "default_promotion": {"final_link": "https://p.pinduoduo.com/stale"},
+            },
+            {
+                "_id": "c_super",
+                "platform": "jd",
+                "product_id": "superseded_old_1",
+                "name": "被迁移替代旧商品",
+                "price": 29.9,
+                "activity_price": 29.9,
                 "updated_at": now,
             },
             {
@@ -442,13 +479,25 @@ def test_cloud_sync_tombstones_deal_expiry_and_cloud_only_pullback():
         local_col,
         cloud_col,
         window_days=3.0,
-        tombstone_col=tombstone_col,
         pull_cloud_unformatted=True,
     )
-    assert rep["cloud_deleted_tombstones"] == 1
+    assert rep["cloud_off_promotion_synced"] == 2
+    assert rep["planned_sync_count"] == 0
     assert rep["local_pulled_cloud_unformatted"] == 1
-    assert all(d["product_id"] != "dead_off_promo_1" for d in cloud_col.docs)
-    assert len(local_col.docs) == 1
-    assert local_col.docs[0]["product_id"] == "cloud_stream_new_1"
-    assert "default_promotion" not in local_col.docs[0]
+
+    cloud_by_key = {(d["platform"], d["product_id"]): d for d in cloud_col.docs}
+    assert cloud_by_key[("pdd", "dead_off_promo_1")]["is_off_promotion"] is True
+    assert "default_promotion" not in cloud_by_key[("pdd", "dead_off_promo_1")]
+    assert cloud_by_key[("jd", "superseded_old_1")]["is_off_promotion"] is True
+    assert cloud_by_key[("jd", "superseded_old_1")]["superseded_by"] == "jd_new_target_1"
+
+    assert any(d["product_id"] == "cloud_stream_new_1" and "default_promotion" not in d for d in local_col.docs)
+
+    # 第 2 轮紧接着重跑：云端已是最新软下架状态，写库数为 0，绝不再发生“删后重插”循环
+    writes_before = cloud_col.bulk_write_calls
+    rep2 = sync_mod.run_sync_round(local_col, cloud_col, window_days=3.0, pull_cloud_unformatted=False)
+    assert rep2["cloud_off_promotion_synced"] == 0
+    assert rep2["planned_sync_count"] == 0
+    assert rep2["written_ops"] == 0
+    assert cloud_col.bulk_write_calls == writes_before
 

@@ -18,7 +18,6 @@ TIP = {
     "tutorial_steps": ["1. 下单5件"],
     "original_copywriting": "爆料原文",
     "share_images": [],
-    "tips_timeline": [],
 }
 
 

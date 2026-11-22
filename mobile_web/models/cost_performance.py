@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
-"""纯领域性价比计算模型：单位度量衡映射、规格校验、鲜活线报优先级与跨单位轮询排序。"""
-import datetime
+"""纯领域性价比计算模型：单位度量衡映射、单规格校验、鲜活线报优先级与跨单位轮询排序。"""
 import math
-import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from bson.decimal128 import Decimal128
 
-from models.deal_constants import CN_TZ, coerce_unix_timestamp, get_deal_publish_ts
+from models.deal_constants import coerce_unix_timestamp, get_deal_publish_ts
 
 DEAL_FRESH_WINDOW_SECONDS = 12 * 3600
-PLAIN_SKU_PRICE_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 
 SKU_UNIT_BASE_MAPPING: Dict[str, Dict[str, float]] = {
     "质量": {
@@ -78,53 +75,13 @@ def _amount_float(value: Any) -> float:
     return float(value.to_decimal() if isinstance(value, Decimal128) else value)
 
 
-def is_specless_single_sku(sku_info: Any) -> bool:
-    """判定商品是否属于无细分规格属性的单品（成交价统一以顶层 activity_price 为准）。"""
-    if not isinstance(sku_info, list) or len(sku_info) == 0:
-        return True
-    if len(sku_info) == 1:
-        item = sku_info[0]
-        if not isinstance(item, dict):
-            return True
-        return not any(
-            k not in ("价格", "price", "截图地址", "image_url", "img") and str(v or "").strip()
-            for k, v in item.items()
-        )
-    return False
-
-
-def parse_plain_sku_price(price_text: Any) -> Optional[float]:
-    """解析纯数值规格价格（如 '￥41.4' / 41.4）；区间或多档文案返回 None。"""
-    if price_text is None or isinstance(price_text, bool):
-        return None
-    if isinstance(price_text, (int, float, Decimal128)):
-        try:
-            val = _amount_float(price_text)
-            return val if math.isfinite(val) and val > 0 else None
-        except (ValueError, TypeError, OverflowError):
-            return None
-    match = PLAIN_SKU_PRICE_RE.fullmatch(str(price_text).strip())
-    if not match:
-        return None
-    try:
-        val = float(match.group(1))
-        return val if math.isfinite(val) and val > 0 else None
-    except (ValueError, OverflowError):
-        return None
-
-
 def is_valid_sku_price(
     price_val: Any,
     min_limit_price: Optional[float],
     *,
-    exact_match: bool = False,
+    exact_match: bool = True,
 ) -> bool:
-    """
-    校验规格价格有效性：
-    1. 必须为大于 0 的有限浮点数/整数/Decimal128；
-    2. 单规格商品（exact_match=True）下，若存在外层 activity_price，规格价格必须与外层当前价格一致；
-    3. 多规格模式下，任何规格价格不得低于全局 activity_price。
-    """
+    """校验规格价格：大于 0 有限数字，且与外层当前活动价一致。"""
     if isinstance(price_val, bool) or not isinstance(price_val, (int, float, Decimal128)):
         return False
     try:
@@ -193,7 +150,7 @@ def parse_pricing_basis_entry(
 
 def extract_sku_unit_entries(doc: Dict[str, Any]) -> List[Tuple[float, str, Dict[str, float]]]:
     """
-    从商品的 format_info 中提取所有合法规格的 (sku_price, raw_base_unit, extracted_units)。
+    从单规格商品的 format_info 中提取合法的 (sku_price, raw_base_unit, extracted_units)。
     尚未完成 format_info 清洗、标记 need_reformat 或外层价格已变但尚未重洗的商品返回空列表（归入末尾兜底组）。
     """
     if doc.get("need_reformat") is True:
@@ -214,11 +171,8 @@ def extract_sku_unit_entries(doc: Dict[str, Any]) -> List[Tuple[float, str, Dict
         except (ValueError, TypeError, OverflowError):
             min_act_price = None
 
-    sku_info_raw = doc.get("sku_info")
-    is_specless = is_specless_single_sku(sku_info_raw)
-
     raw_fmt_act = doc.get("format_activity_price")
-    if is_specless and min_act_price is not None and raw_fmt_act is not None and not isinstance(raw_fmt_act, bool):
+    if min_act_price is not None and raw_fmt_act is not None and not isinstance(raw_fmt_act, bool):
         try:
             fmt_act_f = _amount_float(raw_fmt_act)
         except (ValueError, TypeError, OverflowError):
@@ -227,61 +181,16 @@ def extract_sku_unit_entries(doc: Dict[str, Any]) -> List[Tuple[float, str, Dict
             return []
 
     raw_sku_list: List[Tuple[float, Dict[str, Any]]] = []
-    if "pricing_basis" in raw_format_info and isinstance(raw_format_info.get("pricing_basis"), dict):
+    if isinstance(raw_format_info.get("pricing_basis"), dict):
         sku_price = raw_format_info.get("price")
-        if is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
+        if is_valid_sku_price(sku_price, min_act_price, exact_match=True):
             raw_sku_list.append((_amount_float(sku_price), raw_format_info))
     else:
-        sku_info_list = sku_info_raw if isinstance(sku_info_raw, list) else []
-        product_id = str(doc.get("product_id") or doc.get("goods_id") or doc.get("goods_sign") or "").strip()
-        stale_sku_ids = set()
-        if not is_specless and sku_info_list and product_id:
-            snap_map = doc.get("format_sku_prices") if isinstance(doc.get("format_sku_prices"), dict) else {}
-            for idx, sku_item in enumerate(sku_info_list, start=1):
-                if not isinstance(sku_item, dict):
-                    continue
-                sku_id = f"{product_id}_{idx}"
-                has_cn_price = "价格" in sku_item and sku_item.get("价格") is not None
-                cur_p_str = str(sku_item.get("价格") or "").strip() if has_cn_price else ""
-                if sku_id in snap_map and has_cn_price:
-                    if str(snap_map[sku_id]).strip() != cur_p_str:
-                        stale_sku_ids.add(sku_id)
-                        continue
-                sku_fmt_entry = raw_format_info.get(sku_id)
-                if isinstance(sku_fmt_entry, dict):
-                    cur_num = (
-                        parse_plain_sku_price(cur_p_str)
-                        if has_cn_price
-                        else parse_plain_sku_price(sku_item.get("price"))
-                    )
-                    if cur_num is not None:
-                        try:
-                            fmt_p = _amount_float(sku_fmt_entry.get("price"))
-                        except (ValueError, TypeError, OverflowError):
-                            fmt_p = None
-                        if fmt_p is None or not math.isfinite(fmt_p) or fmt_p <= 0 or abs(cur_num - fmt_p) > 0.01:
-                            stale_sku_ids.add(sku_id)
-
-        if sku_info_list and product_id:
-            for idx in range(1, len(sku_info_list) + 1):
-                sku_id = f"{product_id}_{idx}"
-                if sku_id in stale_sku_ids:
-                    continue
-                sku_fmt = raw_format_info.get(sku_id)
-                if not isinstance(sku_fmt, dict) or not isinstance(sku_fmt.get("pricing_basis"), dict):
-                    continue
+        for sku_fmt in raw_format_info.values():
+            if isinstance(sku_fmt, dict) and isinstance(sku_fmt.get("pricing_basis"), dict):
                 sku_price = sku_fmt.get("price")
-                if is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
+                if is_valid_sku_price(sku_price, min_act_price, exact_match=True):
                     raw_sku_list.append((_amount_float(sku_price), sku_fmt))
-
-        if not raw_sku_list:
-            for sku_key, sku_fmt in raw_format_info.items():
-                if sku_key in stale_sku_ids:
-                    continue
-                if isinstance(sku_fmt, dict) and isinstance(sku_fmt.get("pricing_basis"), dict):
-                    sku_price = sku_fmt.get("price")
-                    if is_valid_sku_price(sku_price, min_act_price, exact_match=is_specless):
-                        raw_sku_list.append((_amount_float(sku_price), sku_fmt))
 
     return [parse_pricing_basis_entry(sku_price, sku_fmt) for sku_price, sku_fmt in raw_sku_list]
 

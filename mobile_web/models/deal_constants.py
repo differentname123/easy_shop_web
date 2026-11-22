@@ -83,20 +83,12 @@ ERROR_LOG_JSONL_PATH = os.path.join(LOG_DIR, "deal_pool_errors.jsonl")
 LATEST_OPS_REPORT_PATH = os.path.join(LOG_DIR, "latest_cycle_ops_report.json")
 OPS_REPORT_HISTORY_JSONL = os.path.join(LOG_DIR, "cycle_ops_history.jsonl")
 
-LATEST_CLEAN_OPS_REPORT_PATH = os.path.join(LOG_DIR, "latest_clean_ops_report.json")
-CLEAN_OPS_HISTORY_JSONL = os.path.join(LOG_DIR, "clean_ops_history.jsonl")
-CLEAN_FAILED_SAMPLES_JSONL = os.path.join(LOG_DIR, "clean_failed_samples.jsonl")
-CLEAN_SUCCESS_PREVIEW_JSONL = os.path.join(LOG_DIR, "clean_success_preview.jsonl")
 DEAL_POOL_RUNTIME_HEALTH_PATH = os.path.join(LOG_DIR, "runtime", "upstream_health_deal_scheduler.json")
 DEAL_POOL_LOG_PREFIXES: Tuple[str, ...] = (
     "deal_pool_",
     "deal_raw_tips_fallback",
     "cycle_ops_",
     "latest_cycle_ops_",
-    "clean_ops_",
-    "latest_clean_ops_",
-    "clean_failed_samples",
-    "clean_success_preview",
     "model_api_deal_pool.log",
 )
 

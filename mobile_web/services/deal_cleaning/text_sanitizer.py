@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""线报文本脱敏、无链文案重建、阶段输入组装与时间线结构构建（复用单一口令/链接剥离真源）。"""
+"""线报文本脱敏、无链文案重建与阶段输入组装（复用单一口令/链接剥离真源）。"""
 from __future__ import annotations
 
 import html as html_lib
@@ -7,11 +7,7 @@ import re
 import unicodedata
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from models.deal_constants import (
-    coerce_unix_timestamp,
-    format_timestamp_cn,
-    parse_publish_time_epoch,
-)
+from models.deal_constants import format_timestamp_cn
 from models.product import strip_ecommerce_tokens_and_urls
 
 _MATH_ALPHANUM_RE = re.compile(r"[\U0001D400-\U0001D7FF]+")
@@ -69,7 +65,6 @@ def _strip_collector_prefixes(text: str) -> str:
 def sanitize_clean_tutorial_step(text: str) -> str:
     """确保购买教程步骤为 100% 纯文字规范指引：剥离占位符、裸网址与口令壳。"""
     out = normalize_inline_spaces(str(text or ""))
-    out = re.sub(r"[（(]\s*口令\s*[:：][^）)]*[）)]", "", out)
     out = strip_ecommerce_tokens_and_urls(out, preserve_newlines=True)
     out = re.sub(r"[ \t]{2,}", " ", out)
     return out.strip()
@@ -322,33 +317,3 @@ def assemble_combined_text_and_images(
         combined = (combined + "\n" + " ".join(f"[#{lid}]" for lid in unmatched_lids)).strip()
 
     return combined, extracted_images
-
-
-def make_timeline_entry(
-    doc: Dict[str, Any],
-    ai1_res: Optional[Dict[str, Any]] = None,
-    clean_copy: str = "",
-) -> Dict[str, Any]:
-    """构造有界线报时间线记录（用于 `products.deal_info.tips_timeline` 时序展示）。"""
-    mid = str(doc.get("source_item_id") or "")
-    site = str(doc.get("source_site") or "")
-    channel = str(doc.get("source_channel") or "")
-    pub_ts = (
-        coerce_unix_timestamp(doc.get("publish_ts"))
-        or parse_publish_time_epoch(doc.get("publish_time"))
-        or 0.0
-    )
-    title = str(doc.get("title") or "").strip()
-    dp = ai1_res.get("deal_price") if isinstance(ai1_res, dict) else None
-    ts = ai1_res.get("tutorial_score") if isinstance(ai1_res, dict) else 50
-    copywriting = clean_copy or (str(ai1_res.get("combined_raw_text") or "") if isinstance(ai1_res, dict) else "") or title
-    return {
-        "tip_id": mid,
-        "source_site": site,
-        "source_channel": channel,
-        "publish_ts": float(pub_ts),
-        "title": title,
-        "copywriting": sanitize_polished_copywriting(copywriting)[:300],
-        "deal_price": dp,
-        "tutorial_score": int(ts) if ts is not None else 50,
-    }

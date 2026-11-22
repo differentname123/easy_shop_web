@@ -28,7 +28,6 @@ from cache import (
     cache_product_detail,
     make_detail_snapshot,
     snapshot_detail_deadline,
-    sync_product_summary_in_caches,
 )
 from config import PROMOTION_LINK_TTL, logger
 
@@ -382,11 +381,10 @@ class PromoteService:
         if self._cacheable(data):
             PROMOTION_CACHE.set(cache_key, (expires_at, deepcopy(data)))
             if not uid and ref.key:
-                extra_repo_kw = {"only_if_exists": True} if isinstance(self.repo, ProductRepository) else {}
                 self.repo.save_promotion_link_cache(
                     platform=ref.platform, data=deepcopy(data), goods_id=ref.goods_id or None,
                     goods_sign=ref.goods_sign or None, goods_key=ref.key, expires_at=expires_at,
-                    **extra_repo_kw,
+                    only_if_exists=True,
                 )
         return data
 
@@ -647,7 +645,6 @@ class PromoteService:
             from models.product import utc_millis
             fetched_at = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
             snapshot = make_detail_snapshot(product, fetched_at, platform)
-            sync_product_summary_in_caches(platform, snapshot.data)
             if persist_db:
                 try:
                     self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=fetched_at))
@@ -716,26 +713,21 @@ class PromoteService:
         clean_uid = raw_uid if _UID_PATTERN.fullmatch(raw_uid) else ""
 
         # 第一性原理：确定性单平台路由，禁止在某平台转链失败后盲目跨平台回退到其他平台全文检索造成张冠李戴
-        candidate_platforms = [detected_plat]
-
         last_error: Dict[str, Any] = {"status": "error", "error_msg": "未能识别或转换该内容，请检查链接或口令是否有效"}
         last_platform_name = ""
-        for plat in candidate_platforms:
-            try:
-                adapter = get_adapter(plat)
-                last_platform_name = getattr(adapter, "platform_name", "") or ""
-            except Exception:
-                continue
-            if not getattr(adapter, "active", False):
-                last_error = {"status": "error", "error_code": "platform_unavailable", "error_msg": f"{adapter.platform_name}暂未接入"}
-                continue
-            resolve_fn = getattr(adapter, "resolve_and_convert_universal", None)
-            if not callable(resolve_fn):
-                continue
+        try:
+            adapter = get_adapter(detected_plat)
+            last_platform_name = getattr(adapter, "platform_name", "") or ""
+        except Exception:
+            adapter = None
 
+        resolve_fn = getattr(adapter, "resolve_and_convert_universal", None) if adapter is not None else None
+        if adapter is not None and not getattr(adapter, "active", False):
+            last_error = {"status": "error", "error_code": "platform_unavailable", "error_msg": f"{adapter.platform_name}暂未接入"}
+        elif adapter is not None and callable(resolve_fn):
             err_resp, effective_uid, identity, public_identity, context, need_auth, personal_fallback, _ = (
                 self._resolve_user_promotion_context(
-                    plat, adapter, raw_uid, total_started=total_started, log_errors=False
+                    detected_plat, adapter, raw_uid, total_started=total_started, log_errors=False
                 )
             )
             if err_resp is not None:
@@ -773,65 +765,57 @@ class PromoteService:
                     adapter_kwargs = public_kwargs
                     data = resolve_fn(text, uid=None, **public_kwargs)
 
-            if not isinstance(data, dict) or data.get("status") != "success":
-                last_error = dict(data) if isinstance(data, dict) else dict(last_error)
-                # 若是明确的数字 SKU 不支持或已下架，直接返回给用户，不再盲目尝试其他平台
-                if isinstance(data, dict) and data.get("error_code") in (
-                    "UNSUPPORTED_JD_NUMERIC_SKU",
-                    "UNSUPPORTED_PDD_ID_ONLY_URL",
-                    "PRODUCT_OFF_PROMOTION",
-                ):
-                    break
-                continue
+            if isinstance(data, dict) and data.get("status") == "success":
+                product = data.get("product") if isinstance(data.get("product"), dict) else None
+                if product:
+                    self._seed_resolved_product(detected_plat, product, uid=None)
+                    upgrade_fn = getattr(adapter, "needs_coupon_upgrade", None)
+                    if (
+                        callable(upgrade_fn)
+                        and upgrade_fn(data, product) is True
+                        and callable(getattr(adapter, "convert_promotion_url", None))
+                    ):
+                        upgraded = adapter.convert_promotion_url(
+                            goods_id_or_sign=product.get("goods_sign") or product.get("goods_id") or "",
+                            uid=active_uid,
+                            goods_id=product.get("goods_id") or None,
+                            goods_sign=product.get("goods_sign") or None,
+                            trusted_product_url=product["product_url"],
+                            trusted_coupon_url=product["coupon_url"],
+                            **adapter_kwargs,
+                        )
+                        if isinstance(upgraded, dict) and upgraded.get("status") == "success":
+                            for k in ("url", "final_link", "mobile_url", "short_url", "click_url", "j_command", "j_short_command", "promotion_token", "coupon_url"):
+                                if upgraded.get(k):
+                                    data[k] = upgraded[k]
 
-            product = data.get("product") if isinstance(data.get("product"), dict) else None
-            if product:
-                self._seed_resolved_product(plat, product, uid=None)
-                upgrade_fn = getattr(adapter, "needs_coupon_upgrade", None)
-                if (
-                    callable(upgrade_fn)
-                    and upgrade_fn(data, product) is True
-                    and callable(getattr(adapter, "convert_promotion_url", None))
-                ):
-                    upgraded = adapter.convert_promotion_url(
-                        goods_id_or_sign=product.get("goods_sign") or product.get("goods_id") or "",
-                        uid=active_uid,
-                        goods_id=product.get("goods_id") or None,
-                        goods_sign=product.get("goods_sign") or None,
-                        trusted_product_url=product["product_url"],
-                        trusted_coupon_url=product["coupon_url"],
-                        **adapter_kwargs,
-                    )
-                    if isinstance(upgraded, dict) and upgraded.get("status") == "success":
-                        for k in ("url", "final_link", "mobile_url", "short_url", "click_url", "j_command", "j_short_command", "promotion_token", "coupon_url"):
-                            if upgraded.get(k):
-                                data[k] = upgraded[k]
+                cmd_kwargs = {
+                    "title": data.get("title") or (product or {}).get("name") or "精选高性价比好物",
+                    "price": data.get("price") if data.get("price") is not None else (product or {}).get("price"),
+                    "coupon_amount": data.get("coupon_amount") if data.get("coupon_amount") is not None else (product or {}).get("coupon_amount"),
+                }
+                result = self._with_command(data, adapter, cmd_kwargs)
+                result["platform"] = detected_plat
+                result["platform_name"] = adapter.platform_name
+                if product:
+                    result["product"] = product
 
-            cmd_kwargs = {
-                "title": data.get("title") or (product or {}).get("name") or "精选高性价比好物",
-                "price": data.get("price") if data.get("price") is not None else (product or {}).get("price"),
-                "coupon_amount": data.get("coupon_amount") if data.get("coupon_amount") is not None else (product or {}).get("coupon_amount"),
-            }
-            result = self._with_command(data, adapter, cmd_kwargs)
-            result["platform"] = plat
-            result["platform_name"] = adapter.platform_name
-            if product:
-                result["product"] = product
+                self._decorate_auth_fallback(
+                    result, detected_plat, adapter, context, need_auth=need_auth, personal_fallback=personal_fallback, hint_location="下方推广渠道授权区"
+                )
 
-            self._decorate_auth_fallback(
-                result, plat, adapter, context, need_auth=need_auth, personal_fallback=personal_fallback, hint_location="下方推广渠道授权区"
-            )
+                total_ms = (time.perf_counter() - total_started) * 1000
+                logger.info(
+                    "【万能转链】平台[%s] 识别模式[%s] 用户[%s] 商品[%s] 结果[成功] 总耗时[%.1fms]",
+                    detected_plat,
+                    "auto" if is_auto else "manual",
+                    clean_uid or "匿名",
+                    (product or {}).get("goods_id") or data.get("goods_id") or "url",
+                    total_ms,
+                )
+                return result
 
-            total_ms = (time.perf_counter() - total_started) * 1000
-            logger.info(
-                "【万能转链】平台[%s] 识别模式[%s] 用户[%s] 商品[%s] 结果[成功] 总耗时[%.1fms]",
-                plat,
-                "auto" if is_auto else "manual",
-                clean_uid or "匿名",
-                (product or {}).get("goods_id") or data.get("goods_id") or "url",
-                total_ms,
-            )
-            return result
+            last_error = dict(data) if isinstance(data, dict) else dict(last_error)
 
         total_ms = (time.perf_counter() - total_started) * 1000
         raw_err_msg = last_error.get("error_msg") or last_error.get("error_code") or "未知错误"

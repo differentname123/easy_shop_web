@@ -155,7 +155,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     cloud_indexes_ready = False
 
                 local_col = local_db.get_collection(pcs.COLLECTION_NAME)
-                tombstone_col = local_db.get_collection(pcs.DELETED_TOMBSTONES_COLLECTION)
                 cloud_col = cloud_client[cloud_db_name][pcs.COLLECTION_NAME]
 
                 if not cloud_indexes_ready and not eff_dry_run:
@@ -170,7 +169,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     batch_size=args.batch_size,
                     dry_run=eff_dry_run,
                     logger=logger,
-                    tombstone_col=tombstone_col,
                     pull_cloud_unformatted=is_full_sweep,
                 )
                 report["cycle_num"] = cycle_num

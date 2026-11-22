@@ -16,39 +16,90 @@ from models.deal_constants import (
     UPSTREAM_DISAPPEARED,
 )
 from repositories.deal_raw_pool_repo import DealRawPoolRepository, parse_publish_time_epoch
-from services.deal_cleaning.cache_state import ActiveProductIndex
 from services.deal_cleaning.workers import MaintenanceWorker
 from services.deal_pipeline import run_fetch_stage
 from services.deal_pool_cleaner import DealPoolCleaner
 from services.deal_sources.base import BaseDealSource, ChannelConfig, FetchContext, FetchResult
 
 
-def test_active_product_index_ttl_lru_and_invalidation_hooks(tmp_path, monkeypatch):
-    clock = {"now": 1000.0}
-    idx = ActiveProductIndex(ttl_seconds=12 * 3600.0, max_size=2, clock=lambda: clock["now"])
+def test_convert_unit_batch_db_dedup_and_no_same_batch_early_kill(tmp_path, monkeypatch):
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
+    cleaner.adapters["jd"] = SimpleNamespace(
+        resolve_and_convert_universal=lambda inp: {
+            "status": "success",
+            "goods_id": "NEW_PROD_1" if "new" in inp else "EXISTING_PROD_1",
+            "goods_sign": "SIG_NEW" if "new" in inp else "SIG_EX",
+            "final_link": "https://u.jd.com/out1" if "new" in inp else "https://u.jd.com/out_ex",
+            "promotion_token": "",
+            "product": {
+                "platform": "jd",
+                "product_id": "NEW_PROD_1" if "new" in inp else "EXISTING_PROD_1",
+                "name": "测试商品",
+                "price": 50.0,
+            },
+        }
+    )
 
-    idx.upsert(("jd", "p1"), {"official_title": "A", "quality_score": 80}, source_site="guangdiu")
-    idx.upsert(("tb", "p2"), {"official_title": "B", "quality_score": 85}, source_site="tehuicaicai")
-    idx.upsert(("pdd", "p3"), {"official_title": "C", "quality_score": 90}, source_site="tehuicaicai")
+    find_calls = []
 
-    # LRU 上限淘汰最早写入的 p1
-    assert idx.get(("jd", "p1")) is None
-    assert idx.get(("tb", "p2")) is not None
-    assert idx.get(("pdd", "p3")) is not None
+    class _FormalCol:
+        def find(self, query, projection=None):
+            find_calls.append((query, projection))
+            return [
+                {
+                    "platform": "jd",
+                    "product_id": "EXISTING_PROD_1",
+                    "goods_sign": "SIG_EX",
+                    "name": "测试商品",
+                    "price": 60.0,
+                    "deal_source": "guangdiu",
+                    "deal_info": {
+                        "source_site": "guangdiu",
+                        "quality_score": 80,
+                        "deal_price": 50.0,
+                        "tutorial_score": 80,
+                    },
+                }
+            ]
 
-    # TTL 超时自动失效
-    clock["now"] += 12 * 3600.0 + 1.0
-    assert idx.get(("tb", "p2")) is None
-    assert ("pdd", "p3") not in idx
+    def _make_convert_doc(mid: str, url: str, deal_price: float):
+        return {
+            "source_site": "guangdiu",
+            "source_channel": "逛丢_首页实时流",
+            "source_item_id": mid,
+            "platform": "jd",
+            "title": f"线报 {mid}",
+            "ai_stage1_result": {
+                "main_tip_id": mid,
+                "is_standalone_deal": True,
+                "merged_tip_ids": [mid],
+                "deal_price": deal_price,
+                "tutorial_score": 70,
+                "combined_raw_text": "下单 [#L1]",
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": url, "platform": "jd", "text_role_hint": "main_candidate"}
+                ],
+            },
+        }
 
-    # 单站点精准失效与单项失效
-    idx.upsert(("jd", "a1"), {"official_title": "X"}, source_site="haodanku")
-    idx.upsert(("jd", "a2"), {"official_title": "Y"}, source_site="tehuicaicai")
-    assert idx.invalidate_site("haodanku") == 1
-    assert idx.get(("jd", "a1")) is None
-    assert idx.get(("jd", "a2")) is not None
+    # 1. 同批两条命中未入库新商品 NEW_PROD_1 -> 绝不提前批内误杀，两条都推进 AI-2；
+    # 2. 已在库商品 EXISTING_PROD_1：同价(50.0)触发 post_stage3_db 早停，显著更低价(40.0)触发升级推进 AI-2；
+    # 3. 整批仅发起 1 次按 pid_keys 的精确批量查库。
+    docs = [
+        _make_convert_doc("tip_new_a", "https://u.jd.com/new_a", 30.0),
+        _make_convert_doc("tip_new_b", "https://u.jd.com/new_b", 29.0),
+        _make_convert_doc("tip_ex_dup", "https://u.jd.com/ex_1", 50.0),
+        _make_convert_doc("tip_ex_upgrade", "https://u.jd.com/ex_2", 40.0),
+    ]
+    outcomes, _ = cleaner.process_convert_unit(docs, formal_col=_FormalCol(), quiet_sub_logs=True)
+    out_by_id = {o["source_item_id"]: o for o in outcomes}
+    assert out_by_id["tip_new_a"]["stage_outcome"] == "advance_to_ai2"
+    assert out_by_id["tip_new_b"]["stage_outcome"] == "advance_to_ai2"
+    assert out_by_id["tip_ex_dup"]["status"] == "early_terminated"
+    assert out_by_id["tip_ex_upgrade"]["stage_outcome"] == "advance_to_ai2"
+    assert len(find_calls) == 1
 
-    # run_fetch_stage 全量巡视失效后联动 invalidate_site
+    # run_fetch_stage 全量巡视与 MaintenanceWorker 到期清扫正常执行
     class _SweepSource(BaseDealSource):
         site_key = "tehuicaicai"
 
@@ -92,26 +143,22 @@ def test_active_product_index_ttl_lru_and_invalidation_hooks(tmp_path, monkeypat
         channels=[ch],
         channel_last_run={},
         source_registry={"tehuicaicai": _SweepSource()},
-        active_index=idx,
     )
-    assert idx.get(("jd", "a2")) is None
+    repo.expire_missing_from_full_sweep.assert_called_once()
 
-    # MaintenanceWorker 在第 30 次心跳到期摘标时联动 invalidate_all
-    idx.upsert(("jd", "m1"), {"official_title": "M"}, source_site="guangdiu")
     repo_m = MagicMock()
     repo_m.reclaim_expired_leases.return_value = 0
     repo_m.sweep_expired_and_max_retry.return_value = {"expired_swept": 0, "max_retry_swept": 0}
     repo_m.expire_stale_formal_deals.return_value = 1
     repo_m.generate_pool_summary.return_value = {}
     stop_ev = threading.Event()
-    mw = MaintenanceWorker(repo=repo_m, poll_interval=5.0, stop_event=stop_ev, active_index=idx)
+    mw = MaintenanceWorker(repo=repo_m, poll_interval=5.0, stop_event=stop_ev)
     mw.run_once(tick=30)
-    assert len(idx) == 0
+    repo_m.expire_stale_formal_deals.assert_called_once()
 
 
 def test_daemon_mode_preserves_rich_product_fields_while_keeping_ai2_prompt_lean():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     cleaner.adapters["jd"] = SimpleNamespace(
         resolve_and_convert_universal=lambda _inp: {
@@ -212,10 +259,6 @@ def test_daemon_mode_preserves_rich_product_fields_while_keeping_ai2_prompt_lean
     assert pdoc["carousel_images"] == ["https://img14.360buyimg.com/c1.jpg", "https://img14.360buyimg.com/c2.jpg"]
     assert pdoc["deal_info"]["tutorial_score"] == 84
 
-    active_idx = ActiveProductIndex()
-    active_idx.upsert_from_product_doc(pdoc)
-    assert active_idx.get(("jd", "JD_RICH_1"))["tutorial_score"] == 84
-
 
 def test_ai_semaphore_caps_concurrent_llm_requests_across_stages(tmp_path):
     p1 = tmp_path / "p1.txt"
@@ -275,7 +318,6 @@ def test_ai_semaphore_caps_concurrent_llm_requests_across_stages(tmp_path):
 
 def test_taobao_absorbed_coupon_fail_closed_when_goods_and_link_mismatch():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
     cleaner.adapters["taobao"] = SimpleNamespace(
         resolve_and_convert_universal=lambda inp: (
             {
@@ -459,3 +501,149 @@ def test_parse_publish_time_chinese_relative_and_cleaner_close_releases_session(
     cleaner.close()
     mock_sess.close.assert_called_once()
     assert cleaner._shared_unwrap_session is None
+
+
+def test_generate_pool_summary_single_facet_aggregation_and_empty_edge():
+    from models.deal_constants import CLEAN_STAGE_NEED_AI1, CLEAN_STAGE_NEED_AI2, CLEAN_STAGE_NEED_CONVERT
+
+    _MISSING = object()
+
+    def _get_field(doc, path):
+        cur = doc
+        for part in path.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return _MISSING
+            cur = cur[part]
+        return cur
+
+    def _eval_expr(expr, doc):
+        if isinstance(expr, str) and expr.startswith("$"):
+            return _get_field(doc, expr[1:])
+        if isinstance(expr, dict):
+            if "$eq" in expr:
+                lhs, rhs = expr["$eq"]
+                return _eval_expr(lhs, doc) == _eval_expr(rhs, doc)
+            if "$or" in expr:
+                return any(bool(_eval_expr(sub, doc)) for sub in expr["$or"])
+            if "$type" in expr:
+                val = _eval_expr(expr["$type"], doc)
+                return "missing" if val is _MISSING else ("null" if val is None else type(val).__name__)
+            if "$cond" in expr:
+                cond, t_val, f_val = expr["$cond"]
+                return _eval_expr(t_val, doc) if _eval_expr(cond, doc) else _eval_expr(f_val, doc)
+        return expr
+
+    def _match_query(doc, flt):
+        for k, cond in flt.items():
+            val = _get_field(doc, k)
+            if isinstance(cond, dict) and "$in" in cond:
+                if val is _MISSING or val not in cond["$in"]:
+                    return False
+            elif val is _MISSING or val != cond:
+                return False
+        return True
+
+    def _run_sub_pipeline(docs, stages):
+        rows = list(docs)
+        for st in stages:
+            if "$match" in st:
+                rows = [d for d in rows if _match_query(d, st["$match"])]
+            elif "$group" in st:
+                spec = st["$group"]
+                grouped = {}
+                for d in rows:
+                    gval = _eval_expr(spec["_id"], d)
+                    gk = None if gval is _MISSING else gval
+                    acc = grouped.setdefault(gk, {"_id": gk, **{f: 0 for f in spec if f != "_id"}})
+                    for fname, agg in spec.items():
+                        if fname == "_id":
+                            continue
+                        if "$sum" in agg:
+                            acc[fname] += int(_eval_expr(agg["$sum"], d) or 0)
+                rows = list(grouped.values())
+            elif "$sort" in st:
+                for field, direction in reversed(list(st["$sort"].items())):
+                    rows.sort(key=lambda r: (r.get(field) is None, r.get(field)), reverse=(direction < 0))
+        return rows
+
+    class _RawFacetCol:
+        def __init__(self, docs):
+            self.docs = list(docs)
+            self.count_calls = 0
+            self.agg_calls = 0
+
+        def count_documents(self, flt):
+            self.count_calls += 1
+            raise AssertionError("generate_pool_summary must use single $facet aggregate instead of col.count_documents")
+
+        def aggregate(self, pipeline):
+            self.agg_calls += 1
+            assert len(pipeline) == 1 and "$facet" in pipeline[0]
+            return [{name: _run_sub_pipeline(self.docs, sub) for name, sub in pipeline[0]["$facet"].items()}]
+
+    class _FormalCountCol:
+        def __init__(self, docs):
+            self.docs = list(docs)
+
+        def count_documents(self, flt):
+            return sum(1 for d in self.docs if _match_query(d, flt))
+
+    sample_raw_docs = [
+        {"source_site": "guangdiu", "platform": "jd", "has_full_detail": True, "quality_signals": {"has_unique_product_anchor": True}, "clean_status": "cleaned_success"},
+        {"source_site": "guangdiu", "platform": "tb", "has_full_detail": True, "quality_signals": {"has_unique_product_anchor": True}, "clean_status": "cleaned_low_score", "clean_error_code": "LOW_SCORE"},
+        {"source_site": "xianbao_fun", "platform": "jd", "has_full_detail": False, "clean_status": "merged_into_parent"},
+        {"source_site": "xianbao_fun", "clean_status": "context_only"},
+        {"source_site": "tehuicaicai", "platform": "pdd", "clean_status": "cleaned_failed", "clean_error_code": "OFF_PROMO"},
+        {"source_site": "tehuicaicai", "clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI1},
+        {"source_site": "tehuicaicai", "clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_CONVERT},
+        {"source_site": "guangdiu", "clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI2},
+        {"source_site": "guangdiu", "clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI2},
+        {"source_site": "haodanku"},  # 缺失 clean_status，应计入 pending_clean_records
+    ]
+    raw_col = _RawFacetCol(sample_raw_docs)
+    formal_col = _FormalCountCol([{"deal_info": {"is_deal_tip": True}}, {}])
+    repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda n: raw_col if n == "deal_raw_tips" else formal_col))
+    repo._indexes_ready = True
+
+    summary = repo.generate_pool_summary()
+    assert raw_col.count_calls == 0
+    assert raw_col.agg_calls == 1
+    assert summary["total_records"] == 10
+    assert summary["full_detail_records"] == 2
+    assert summary["unique_product_anchor_records"] == 2
+    assert summary["unique_product_anchor_ratio"] == 20.0
+    assert summary["cleaned_success_records"] == 1
+    assert summary["cleaned_low_score_records"] == 1
+    assert summary["merged_into_parent_records"] == 1
+    assert summary["context_only_records"] == 1
+    assert summary["cleaned_failed_records"] == 1
+    assert summary["pending_clean_records"] == 5
+    assert summary["pending_by_stage"] == {
+        CLEAN_STAGE_NEED_AI1: 1,
+        CLEAN_STAGE_NEED_CONVERT: 1,
+        CLEAN_STAGE_NEED_AI2: 2,
+    }
+    assert summary["by_clean_error_code"] == {"LOW_SCORE": 1, "OFF_PROMO": 1}
+    assert summary["by_platform"] == {"None": 6, "jd": 2, "tb": 1, "pdd": 1}
+    assert summary["formal_products_total"] == 2
+    assert summary["formal_deal_products_count"] == 1
+    assert summary["by_source_site"][0]["_id"] == "guangdiu"
+
+    # 空集合边界：零除保护与全零字段
+    empty_raw = _RawFacetCol([])
+    empty_formal = _FormalCountCol([])
+    empty_repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda n: empty_raw if n == "deal_raw_tips" else empty_formal))
+    empty_repo._indexes_ready = True
+    empty_summary = empty_repo.generate_pool_summary()
+    assert empty_raw.agg_calls == 1 and empty_raw.count_calls == 0
+    assert empty_summary["total_records"] == 0
+    assert empty_summary["unique_product_anchor_ratio"] == 0.0
+    assert empty_summary["pending_clean_records"] == 0
+    assert empty_summary["pending_by_stage"] == {
+        CLEAN_STAGE_NEED_AI1: 0,
+        CLEAN_STAGE_NEED_CONVERT: 0,
+        CLEAN_STAGE_NEED_AI2: 0,
+    }
+    assert empty_summary["by_source_site"] == []
+    assert empty_summary["by_clean_error_code"] == {}
+    assert empty_summary["by_platform"] == {}

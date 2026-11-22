@@ -84,7 +84,6 @@
         else { url.searchParams.delete('keyword'); url.searchParams.delete('q'); }
         store('home_search_keyword', keyword);
         if (!keyword) global.sessionStorage.removeItem(key('home_search_state'));
-        store('home_selected_platform', homePlatform.value);
         global.history.replaceState({ keyword, platform: homePlatform.value, scope: getScope(), tab: 'home' }, '', url.toString());
       } catch (_) {}
     };

@@ -48,7 +48,7 @@ from models.deal_constants import (
 from models.product import _TB_WRAP_CHARS, get_source_site_name
 from services.deal_cleaning.cache_state import (
     AnchorConversionCache,
-    lookup_active_product,
+    query_active_formal_products,
     should_upgrade_existing_deal,
 )
 from services.deal_cleaning.text_sanitizer import (
@@ -57,7 +57,6 @@ from services.deal_cleaning.text_sanitizer import (
     clean_coupon_label,
     extract_doc_images,
     format_raw_message_for_ai1,
-    make_timeline_entry,
     normalize_inline_spaces,
     sanitize_card_highlight,
     sanitize_clean_tutorial_step,
@@ -1360,7 +1359,6 @@ def _build_early_terminated_outcome(
     seen_count: int,
     seen_channels: List[str],
     clean_copy: str,
-    timeline_entry: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
         "status": "early_terminated",
@@ -1395,7 +1393,6 @@ def _build_early_terminated_outcome(
             "source_site": site,
             "seen_channels": seen_channels,
             "copywriting": clean_copy,
-            "timeline_entry": timeline_entry,
         },
     }
 
@@ -1404,123 +1401,24 @@ def process_ai1_unit(
     cleaner: Any,
     selected_docs: List[Dict[str, Any]],
     raw_col,
-    formal_col=None,
-    shared_active_products: Any = None,
-    shared_lock: Optional[threading.Lock] = None,
     quiet_sub_logs: bool = False,
 ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Dict[str, Dict[str, Any]]]]:
-    """阶段一/AI-1 拆解单元：缓存前置早停、复用有效重试 AI-1、调用 AI-1、邻居合并吸收判定。"""
+    """阶段一/AI-1 拆解单元：复用有效重试 AI-1、调用 AI-1 拆解、邻居合并吸收判定。"""
     if not selected_docs:
         return [], 0.0, {}
 
     t_ai1_start = time.perf_counter()
-    cleaner.warmup_anchor_cache_from_db(raw_col)
-    active_formal_products = (
-        shared_active_products
-        if shared_active_products is not None
-        else cleaner._load_active_formal_products(formal_col)
-    )
 
     docs_by_tip_id: Dict[str, Dict[str, Any]] = {}
     neighbor_maps_by_id: Dict[str, Dict[str, Dict[str, Any]]] = {}
     stage1_inputs: List[Dict[str, Any]] = []
     outcomes_by_id: Dict[str, Dict[str, Any]] = {}
-    pre_ai1_early_count = 0
 
     for doc in selected_docs:
         mid = str(doc.get("source_item_id") or "")
         if not mid:
             continue
         docs_by_tip_id[mid] = doc
-        site = str(doc.get("source_site") or "")
-        site_name = get_source_site_name(site)
-        channel = str(doc.get("source_channel") or "")
-        raw_title = str(doc.get("title") or "").strip()
-
-        raw_anchors: List[str] = []
-        for lk in doc.get("extracted_links") or []:
-            if isinstance(lk, dict):
-                u = strip_markdown_link_wrapper(str(lk.get("url") or lk.get("item_id") or ""))
-                if u and u not in raw_anchors:
-                    raw_anchors.append(u)
-        for tk in doc.get("extracted_tokens") or []:
-            tk_s = strip_markdown_link_wrapper(str(tk or ""))
-            if tk_s and tk_s not in raw_anchors:
-                raw_anchors.append(tk_s)
-
-        matched_cached_conv: Optional[Dict[str, Any]] = None
-        matched_cached_list: List[Dict[str, Any]] = []
-        matched_ex_info: Optional[Dict[str, Any]] = None
-        if raw_anchors:
-            def_plat = str(doc.get("platform") or "unknown").strip().lower()
-            all_anchors_cached = True
-            with cleaner._cache_lock:
-                for anchor_item in raw_anchors:
-                    guess_plat = detect_candidate_platform(anchor_item, def_plat)
-                    plats_to_check = [guess_plat] if guess_plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
-                    found_entry = None
-                    for cp in plats_to_check:
-                        for ck in AnchorConversionCache.build_keys(cp, anchor_item):
-                            if ck in cleaner.anchor_cache:
-                                found_entry = cleaner.anchor_cache[ck]
-                                break
-                        if found_entry is not None:
-                            break
-                    if found_entry is None:
-                        all_anchors_cached = False
-                        break
-                    matched_cached_list.append(found_entry)
-
-                if all_anchors_cached and matched_cached_list:
-                    prod_entries = [e for e in matched_cached_list if e.get("convert_status") == "product"]
-                    unique_pids = {
-                        (str(e.get("platform") or ""), str(e.get("goods_id") or ""))
-                        for e in prod_entries
-                        if e.get("platform") and e.get("goods_id")
-                    }
-                    if len(unique_pids) == 1:
-                        only_pid = next(iter(unique_pids))
-                        ex_cand = lookup_active_product(active_formal_products, only_pid, lock=shared_lock)
-                        if ex_cand is not None:
-                            matched_cached_conv = copy.deepcopy(prod_entries[0])
-                            matched_ex_info = ex_cand
-                            cleaner.stats_cache_hits += len(matched_cached_list)
-
-        if matched_cached_conv is not None and matched_ex_info is not None:
-            c_plat = str(matched_cached_conv.get("platform") or "")
-            c_gid = str(matched_cached_conv.get("goods_id") or "")
-            c_gsign = str(matched_cached_conv.get("goods_sign") or "")
-            ex_info = matched_ex_info
-            cleaner.stats_early_terminated_pre_ai1 += 1
-            pre_ai1_early_count += 1
-            clean_copy_pre = sanitize_polished_copywriting(str(doc.get("tutorial_text") or raw_title))
-            outcomes_by_id[mid] = _build_early_terminated_outcome(
-                early_stage="pre_ai1",
-                error_msg=f"前置锚点缓存命中已入库唯一商品({c_plat}:{c_gid})，提前终止跳过AI-1/转链/AI-2并累加共振",
-                site=site,
-                site_name=site_name,
-                channel=channel,
-                mid=mid,
-                raw_title=raw_title,
-                c_plat=c_plat,
-                c_gid=c_gid,
-                c_gsign=c_gsign,
-                official_title=ex_info.get("official_title") or raw_title,
-                official_price=ex_info.get("official_price"),
-                deal_price=ex_info.get("deal_price"),
-                quality_score=ex_info.get("quality_score", 75),
-                merged_tids=[mid],
-                ai1_res={"early_terminated": "pre_ai1_cache_hit"},
-                converted_links=[{k: v for k, v in e.items() if k != "adapter_res"} for e in matched_cached_list],
-                ai2_marker={"early_terminated": "pre_ai1_cache_hit"},
-                candidate_count=len(raw_anchors),
-                attempt_errors=[],
-                seen_count=max(1, int(doc.get("seen_count") or 1)),
-                seen_channels=doc.get("seen_channels") or ([channel] if channel else []),
-                clean_copy=clean_copy_pre,
-                timeline_entry=make_timeline_entry(doc, clean_copy=clean_copy_pre),
-            )
-            continue
 
         saved_ai1 = doc.get("ai_stage1_result")
         if (
@@ -1535,15 +1433,13 @@ def process_ai1_unit(
                 for tid in (saved_ai1.get("merged_tip_ids") or [])
                 if str(tid or "").strip() and str(tid or "").strip() != mid
             ]
+            site = str(doc.get("source_site") or "")
             neighbor_maps_by_id[mid] = load_neighbor_docs(raw_col, site, extra_mids, current_doc=doc)
             continue
 
         s1_inp, tip_map = build_stage1_task_input(doc, raw_col)
         neighbor_maps_by_id[mid] = tip_map
         stage1_inputs.append(s1_inp)
-
-    if pre_ai1_early_count > 0 and not quiet_sub_logs:
-        logger.info("⚡ [Stage 2 前置缓存早停] 命中已入库缓存提前终止=%d条", pre_ai1_early_count)
 
     ai1_hits_before = cleaner.stats_ai1_model_hits
     if not quiet_sub_logs:
@@ -1713,16 +1609,11 @@ def process_convert_unit(
     shared_lock: Optional[threading.Lock] = None,
     quiet_sub_logs: bool = False,
 ) -> Tuple[List[Dict[str, Any]], float]:
-    """阶段二/官方转链核验单元：去重并发转链、暂态降级重试、Tier-2 已入库早停/择优升级。"""
+    """阶段二/官方转链核验单元：去重并发转链、暂态降级重试、统一在库去重/择优升级。"""
     if not selected_docs:
         return [], 0.0
 
     t_stage3_start = time.perf_counter()
-    active_formal_products = (
-        shared_active_products
-        if shared_active_products is not None
-        else cleaner._load_active_formal_products(formal_col)
-    )
 
     total_target_mentions = 0
     unique_target_map: Dict[Tuple[str, str], Tuple[Dict[str, Any], str]] = {}
@@ -1754,10 +1645,9 @@ def process_convert_unit(
     t_stage3_elapsed = round(time.perf_counter() - t_stage3_start, 2)
 
     outcomes_by_id: Dict[str, Dict[str, Any]] = {}
-    post_stage3_candidates: List[
-        Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Optional[Tuple[str, str]], float]
+    surviving_candidates: List[
+        Tuple[str, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, str]], Optional[Tuple[str, str]]]
     ] = []
-    post_stage3_db_early_count = 0
 
     for doc in selected_docs:
         mid = str(doc.get("source_item_id") or "")
@@ -1987,8 +1877,33 @@ def process_convert_unit(
             if c.get("platform") and c.get("goods_id")
         }
         single_main_pid: Optional[Tuple[str, str]] = next(iter(unique_main_pids)) if len(unique_main_pids) == 1 else None
+        surviving_candidates.append(
+            (mid, doc, ai1_res, conv_list, main_prod_convs, conv_summary_s3, attempt_errors, single_main_pid)
+        )
 
-        ex_info_s3 = lookup_active_product(active_formal_products, single_main_pid, lock=shared_lock)
+    cleaner._evict_transient_failed_cache()
+
+    batch_pids = {cand[7] for cand in surviving_candidates if cand[7] is not None}
+    if isinstance(shared_active_products, dict):
+        if shared_lock is not None:
+            with shared_lock:
+                active_formal_products = {pid: dict(shared_active_products[pid]) for pid in batch_pids if pid in shared_active_products}
+        else:
+            active_formal_products = shared_active_products
+    elif formal_col is not None and batch_pids:
+        active_formal_products = query_active_formal_products(formal_col, pid_keys=batch_pids)
+    else:
+        active_formal_products = {}
+
+    post_stage3_db_early_count = 0
+    for mid, doc, ai1_res, conv_list, main_prod_convs, conv_summary_s3, attempt_errors, single_main_pid in surviving_candidates:
+        site = str(doc.get("source_site") or "")
+        site_name = get_source_site_name(site)
+        channel = str(doc.get("source_channel") or "")
+        raw_title = str(doc.get("title") or "").strip()
+        targets = ai1_res.get("extracted_targets") or []
+
+        ex_info_s3 = active_formal_products.get(single_main_pid) if single_main_pid is not None else None
         should_upgrade = False
         if single_main_pid is not None and ex_info_s3 is not None:
             should_upgrade, upgrade_reason = should_upgrade_existing_deal(ex_info_s3, ai1_res, doc)
@@ -2037,74 +1952,6 @@ def process_convert_unit(
                 seen_count=max(1, int(doc.get("seen_count") or 1)),
                 seen_channels=doc.get("seen_channels") or ([channel] if channel else []),
                 clean_copy=clean_copy,
-                timeline_entry=make_timeline_entry(doc, ai1_res=ai1_res, clean_copy=clean_copy),
-            )
-            continue
-
-        new_score = int(ai1_res.get("tutorial_score") or 50)
-        richness_score = (
-            len(conv_list) * 10.0
-            + len(ai1_res.get("extracted_images") or []) * 5.0
-            + new_score * 0.3
-            + (25.0 if should_upgrade else 0.0)
-        )
-        post_stage3_candidates.append((mid, doc, ai1_res, conv_list, single_main_pid, richness_score))
-
-    cleaner._evict_transient_failed_cache()
-
-    best_mid_by_pid: Dict[Tuple[str, str], Tuple[float, str]] = {}
-    for mid, _doc, _ai1_res, _conv_list, single_pid, r_score in post_stage3_candidates:
-        if single_pid is not None:
-            prev = best_mid_by_pid.get(single_pid)
-            if prev is None or r_score > prev[0]:
-                best_mid_by_pid[single_pid] = (r_score, mid)
-
-    post_stage3_batch_early_count = 0
-    for mid, doc, ai1_res, conv_list, single_pid, _r_score in post_stage3_candidates:
-        site = str(doc.get("source_site") or "")
-        site_name = get_source_site_name(site)
-        channel = str(doc.get("source_channel") or "")
-        raw_title = str(doc.get("title") or "").strip()
-        conv_summary_s3 = [{k: v for k, v in c.items() if k != "adapter_res"} for c in conv_list]
-
-        if single_pid is not None and best_mid_by_pid.get(single_pid, (0.0, mid))[1] != mid:
-            winner_mid = best_mid_by_pid[single_pid][1]
-            c_plat, c_gid = single_pid
-            main_prod_convs = [c for c in conv_list if c["convert_status"] == "product" and c.get("text_role_hint") != "filler_candidate"]
-            primary_conv = main_prod_convs[0]
-            c_gsign = str(primary_conv.get("goods_sign") or "")
-            off_p = primary_conv.get("official_product") or {}
-            merged_tids = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
-            if mid not in merged_tids:
-                merged_tids.insert(0, mid)
-            cleaner.stats_early_terminated_post_stage3 += 1
-            post_stage3_batch_early_count += 1
-            clean_copy_batch = sanitize_polished_copywriting(str(ai1_res.get("combined_raw_text") or raw_title))
-            outcomes_by_id[mid] = _build_early_terminated_outcome(
-                early_stage="post_stage3_batch",
-                error_msg=f"同批次已有更优线报({winner_mid})命中同一唯一商品({c_plat}:{c_gid})，提前终止跳过AI-2并累加共振",
-                site=site,
-                site_name=site_name,
-                channel=channel,
-                mid=mid,
-                raw_title=raw_title,
-                c_plat=c_plat,
-                c_gid=c_gid,
-                c_gsign=c_gsign,
-                official_title=off_p.get("title") or raw_title,
-                official_price=off_p.get("price"),
-                deal_price=None,
-                quality_score=75,
-                merged_tids=merged_tids,
-                ai1_res=ai1_res,
-                converted_links=conv_summary_s3,
-                ai2_marker={"early_terminated": "post_stage3_same_batch_duplicate", "winner_tip_id": winner_mid},
-                candidate_count=len(conv_list),
-                attempt_errors=[],
-                seen_count=max(1, int(doc.get("seen_count") or 1)),
-                seen_channels=doc.get("seen_channels") or ([channel] if channel else []),
-                clean_copy=clean_copy_batch,
-                timeline_entry=make_timeline_entry(doc, ai1_res=ai1_res, clean_copy=clean_copy_batch),
             )
             continue
 
@@ -2121,13 +1968,8 @@ def process_convert_unit(
             "candidate_count": len(conv_list),
         }
 
-    if (post_stage3_db_early_count > 0 or post_stage3_batch_early_count > 0) and not quiet_sub_logs:
-        logger.info(
-            "⚡ [Stage 3 早停] 唯一商品早停=%d条 (在库=%d, 同批=%d)",
-            post_stage3_db_early_count + post_stage3_batch_early_count,
-            post_stage3_db_early_count,
-            post_stage3_batch_early_count,
-        )
+    if post_stage3_db_early_count > 0 and not quiet_sub_logs:
+        logger.info("⚡ [Stage 2 在库去重早停] 唯一商品命中正式库跳过AI-2=%d条", post_stage3_db_early_count)
 
     out_list = [
         outcomes_by_id[str(d.get("source_item_id") or "")]
@@ -2834,9 +2676,6 @@ def clean_batch_records(
     ai1_outcomes, t_ai1_elapsed, neighbor_maps = cleaner.process_ai1_unit(
         selected_docs,
         raw_col,
-        formal_col=formal_col,
-        shared_active_products=shared_active_products,
-        shared_lock=shared_lock,
         quiet_sub_logs=quiet_sub_logs,
     )
     ai1_map = {str(r.get("source_item_id") or ""): r for r in ai1_outcomes}

@@ -3,12 +3,9 @@
 
 from services.deal_cleaning.ai_client import DealAIClient
 from services.deal_cleaning.cache_state import (
-    ActiveProductIndex,
     AnchorConversionCache,
-    lookup_active_product,
     query_active_formal_products,
     should_upgrade_existing_deal,
-    update_active_product_store,
 )
 from services.deal_cleaning.stages import (
     build_stage1_task_input,
@@ -30,7 +27,6 @@ from services.deal_cleaning.text_sanitizer import (
     clean_coupon_label,
     extract_doc_images,
     format_raw_message_for_ai1,
-    make_timeline_entry,
     normalize_inline_spaces,
     sanitize_card_highlight,
     sanitize_clean_tutorial_step,
@@ -44,7 +40,6 @@ from services.deal_cleaning.url_venue import (
     _is_verified_station_promo_link,
     _precheck_direct_non_cps_venue_url,
     detect_candidate_platform,
-    is_direct_coupon_or_venue_url,
     is_explicit_coupon_target,
     rebuild_clean_official_venue_url,
     unwrap_to_official_public_venue_url,
@@ -57,7 +52,6 @@ from services.deal_cleaning.workers import (
 )
 
 __all__ = [
-    "ActiveProductIndex",
     "AnchorConversionCache",
     "DealAIClient",
     "MaintenanceWorker",
@@ -80,11 +74,8 @@ __all__ = [
     "fallback_stage1_extract",
     "fallback_stage2_evaluate",
     "format_raw_message_for_ai1",
-    "is_direct_coupon_or_venue_url",
     "is_explicit_coupon_target",
     "load_neighbor_docs",
-    "lookup_active_product",
-    "make_timeline_entry",
     "normalize_inline_spaces",
     "process_ai1_unit",
     "process_ai2_unit",
@@ -100,5 +91,4 @@ __all__ = [
     "should_upgrade_existing_deal",
     "strip_markdown_link_wrapper",
     "unwrap_to_official_public_venue_url",
-    "update_active_product_store",
 ]

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """京东/折京客薄协议边界；支持多 ZTK_APPKEY_LIST 自动轮询与故障切换，与 scripts/test_jd_api.py 严格对齐。"""
 import json
+import re
 import threading
 import time
 from datetime import datetime
-from typing import Optional
-from urllib.parse import parse_qs, urlsplit
+from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from infrastructure.api_governance import (
     GLOBAL_QUOTA_PACER,
@@ -15,13 +16,17 @@ from infrastructure.api_governance import (
 )
 from infrastructure.http_utils import (
     SHANGHAI,
+    clean_text,
     error_dict as _error,
     execute_with_key_failover,
     parse_appkey_list,
 )
+from infrastructure.logging_utils import get_app_logger
 from infrastructure.transport import create_http_session
 from models.product import is_jd_image_key
 from models.user import normalize_promoter_id
+
+logger = get_app_logger(__name__)
 
 # Documented relay currently uses HTTP. Configure an approved secure alternative
 # before sending production secrets; never silently substitute the Taobao relay.
@@ -95,6 +100,130 @@ def is_encrypted_jd_item_id(value) -> bool:
     if not text or is_jd_image_key(text):
         return False
     return len(text) >= 25 and "_" in text and all(c.isalnum() or c == "_" for c in text)
+
+
+def _is_trusted_jd_redirect_url(candidate: Any) -> bool:
+    """校验短链跳转/落地 URL 必须为合法无凭证且属于 jd.com / 3.cn 官方域名（防止 SSRF）。"""
+    if not isinstance(candidate, str):
+        return False
+    raw = candidate.strip()
+    if not raw or "\\" in raw or any(ord(c) < 33 for c in raw):
+        return False
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    return (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and parts.username is None
+        and parts.password is None
+        and (host == "jd.com" or host.endswith(".jd.com") or host == "3.cn" or host.endswith(".3.cn"))
+    )
+
+
+def resolve_jd_short_url(short_url: str, *, http_session: Optional[Any] = None) -> Dict[str, Any]:
+    """
+    轻量解包京东 u.jd.com 推广短链，判定是活动会场页还是单品商品：
+    1. 跟随一次内部 302/hrl 跳转拿到落地真实 URL；
+    2. 若落地为活动/会场/券包（pro.m.jd.com、jingfen 活动包、coupon.m.jd.com）：返回 is_venue=True；
+    3. 若落地为单品页（item.m.jd.com / item.jd.com / skuId）：提取确定性 sku_id 返回。
+    """
+    url = clean_text(short_url)
+    if not url or "\\" in url or any(ord(c) < 33 for c in url):
+        return _error("INVALID_ARGUMENT", "短链格式无效")
+    try:
+        in_parts = urlsplit(url)
+    except ValueError:
+        return _error("INVALID_ARGUMENT", "短链格式无效")
+    if in_parts.scheme.lower() not in ("http", "https") or not in_parts.hostname or in_parts.username is not None or in_parts.password is not None:
+        return _error("INVALID_ARGUMENT", "短链格式无效")
+    if in_parts.hostname.lower() != "u.jd.com":
+        return _error("NOT_SUPPORTED", "仅支持 u.jd.com 短链解包")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        )
+    }
+    owned_session = http_session is None
+    sess = create_http_session(pool_connections=4, pool_maxsize=4) if owned_session else http_session
+    dest_url = ""
+    try:
+        timeout = (2.0, 3.5)
+        resp = sess.get(url, headers=headers, timeout=timeout)
+        if getattr(resp, "status_code", 0) == 200:
+            m = re.search(r"var\s+hrl\s*=\s*['\"]([^'\"]+)['\"]", getattr(resp, "text", "") or "")
+            if m:
+                hrl = m.group(1).strip()
+                if not _is_trusted_jd_redirect_url(hrl):
+                    return _error("UNSAFE_REDIRECT", "拒绝非京东域名的短链跳转地址")
+                r2 = sess.get(hrl, headers=headers, allow_redirects=True, timeout=timeout)
+                dest_url = str(getattr(r2, "url", "") or "").strip()
+            elif getattr(resp, "url", "") and resp.url != url:
+                dest_url = str(resp.url).strip()
+        elif getattr(resp, "status_code", 0) in (301, 302, 303, 307, 308) and getattr(resp, "headers", None):
+            dest_url = str(resp.headers.get("Location") or "").strip()
+    except Exception as e:
+        logger.debug("[JD短链解包] 访问异常: url=%s, err=%s", url, e)
+        return _error("UPSTREAM_ERROR", f"京东短链解包失败: {e}")
+    finally:
+        if owned_session and hasattr(sess, "close"):
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    if not dest_url:
+        return _error("NOT_FOUND", "未能解包该京东短链落地页")
+    if not _is_trusted_jd_redirect_url(dest_url):
+        return _error("UNSAFE_REDIRECT", "短链最终落地地址不属于京东官方域名")
+
+    parts = urlsplit(dest_url)
+    host = (parts.hostname or "").lower()
+    path = parts.path or ""
+    qs = parse_qs(parts.query)
+
+    sku_id = ""
+    for param_key in ("sku", "mainSku", "skuId"):
+        cand = qs.get(param_key, [""])[0].strip()
+        if cand:
+            sku_id = cand
+            break
+
+    if not sku_id:
+        path_m = re.search(r"/(?:product|item)/(\d+)\.html", path, re.IGNORECASE)
+        if path_m:
+            sku_id = path_m.group(1)
+
+    if not sku_id and "returnurl" in qs:
+        ret_url = unquote(qs["returnurl"][0])
+        ret_parts = urlsplit(ret_url)
+        ret_m = re.search(r"/(?:product|item)/(\d+)\.html", ret_parts.path, re.IGNORECASE) or re.search(r"[?&]sku(?:Id)?=([A-Za-z0-9_]+)", ret_parts.query)
+        if ret_m:
+            sku_id = ret_m.group(1)
+
+    is_venue = False
+    if not sku_id:
+        is_venue = (
+            is_jd_official_venue_url(dest_url)
+            or host in ("shop.m.jd.com", "mall.jd.com")
+            or (
+                host == "jingfen.jd.com"
+                and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url)
+            )
+        )
+
+    return {
+        "status": "success",
+        "data": {
+            "dest_url": dest_url,
+            "is_venue": is_venue,
+            "sku_id": sku_id,
+        },
+    }
 
 
 def _trusted_signed_url(value):
@@ -615,7 +744,6 @@ class JdClient:
                     unwrap_res = short_url_resolver(primary_res["short_url"])
                 except Exception:
                     unwrap_res = None
-                primary_res["_short_url_resolved"] = True
                 if isinstance(unwrap_res, dict) and unwrap_res.get("status") == "success":
                     u_data = unwrap_res.get("data") or {}
                     u_sku = str(u_data.get("sku_id") or "").strip()

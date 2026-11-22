@@ -240,6 +240,16 @@ class TestApiSecurityRoutes(unittest.TestCase):
         huge_payload = {"platform": "pdd", "goods_id": "x" * 150, "title": "title", "price": 10.0}
         self.assertEqual(self.client.post("/api/promote/convert", json=huge_payload).status_code, 422)
 
+    def test_search_keyword_preserves_natural_english_model_and_strips_real_tokens(self):
+        from models.product import extract_search_keyword
+        from services.deal_cleaning.url_venue import is_explicit_coupon_target
+
+        self.assertEqual(extract_search_keyword("(iPhone16Pro) 手机壳"), "(iPhone16Pro) 手机壳")
+        self.assertEqual(extract_search_keyword("￥Ab12Cd34Ef5￥ 苹果手机壳"), "苹果手机壳")
+        self.assertTrue(
+            is_explicit_coupon_target({"clean_input": "https://mobile.yangkeduo.com/duo_coupon_landing.html?goods_id=1"})
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

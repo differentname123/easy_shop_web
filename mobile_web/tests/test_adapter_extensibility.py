@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """多供应商可插拔扩展、主备降级、轮询分流与服务层声明式契约回归测试。"""
 import json
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,10 +10,10 @@ from adapters.base import BasePlatformAdapter
 from adapters.jd_adapter import JdAdapter
 from adapters.pdd_adapter import PddAdapter
 from adapters.tb_adapter import TaobaoAdapter
-from cache import DETAIL_CACHE, MATERIAL_CACHE, clear_all_caches
+from cache import MATERIAL_CACHE, clear_all_caches
 from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH
 from infrastructure.http_utils import register_sensitive_provider_keywords, sanitize_user_error_message
-from infrastructure.pdd_client import PddClient, register_gateway_fallback_ips
+from infrastructure.transport import register_gateway_fallback_ips
 from infrastructure.settings import SettingsError, load_settings
 from models.product import ProductRef, extract_canonical_goods_id, extract_jd_image_key
 from services.product_service import ProductService
@@ -74,37 +73,6 @@ def test_register_provider_failover_and_prepend_across_all_platforms():
     assert res_pdd["status"] == "success" and res_pdd["order_list"][0]["order_sn"] == "p1"
 
 
-def test_round_robin_strategy_rotates_and_fails_over_within_single_call():
-    jd_client = Mock()
-    jd_client.appkey_list = ("ztk-1",)
-    jd = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405"), client=jd_client)
-    calls = []
-
-    def p1(**kw):
-        calls.append("p1")
-        if len(calls) == 3:
-            return {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "busy"}
-        return {"status": "success", "data": {"platform": "jd", "goods_id": "1", "name": "A", "price": 10.0}}
-
-    def p2(**kw):
-        calls.append("p2")
-        return {"status": "success", "data": {"platform": "jd", "goods_id": "1", "name": "B", "price": 10.0}}
-
-    # 只启用注册的两个通道进行轮询（built-in client 通过置空 _has_ztk_catalog 退出默认通道）
-    jd._has_ztk_catalog = False
-    jd.register_provider("detail", "p1", p1)
-    jd.register_provider("detail", "p2", p2, strategy="round_robin")
-
-    assert jd.get_goods_detail("12345")["data"]["name"] == "A"
-    assert jd.get_goods_detail("12345")["data"]["name"] == "B"
-    # 第 3 次轮到 p1，返回 RATE_LIMIT 时单次请求内无缝顺延到 p2 成功
-    assert jd.get_goods_detail("12345")["data"]["name"] == "B"
-    assert calls == ["p1", "p2", "p1", "p2"]
-
-    with pytest.raises(ValueError):
-        jd.set_provider_strategy("detail", "invalid_mode")
-
-
 @pytest.mark.parametrize("err_code", [
     "PRODUCT_OFF_PROMOTION",
     "AUTH_REQUIRED",
@@ -138,7 +106,7 @@ def test_pdd_anonymous_promotion_tries_extra_provider_before_direct_link_fallbac
     assert res["final_link"] == "https://u.third.test/p"
 
 
-def test_pdd_client_wrapper_and_register_gateway_fallback_ips(monkeypatch):
+def test_register_gateway_fallback_ips(monkeypatch):
     import socket
     from infrastructure import transport
 
@@ -153,13 +121,6 @@ def test_pdd_client_wrapper_and_register_gateway_fallback_ips(monkeypatch):
     assert fake_ips["api.customgateway.test"] == ("10.0.0.1", "10.0.0.2")
     resolved = transport._cached_getaddrinfo("api.customgateway.test", 443)
     assert [r[4][0] for r in resolved] == ["10.0.0.1", "10.0.0.2"]
-
-    sess = SimpleNamespace(head=Mock(), post=Mock(return_value=SimpleNamespace(raise_for_status=Mock(), json=lambda: {"ok": True})))
-    cli = PddClient("cid", "csec", "pid", http_session=sess)
-    cli.warmup()
-    sess.head.assert_called_once()
-    assert cli.call_api("pdd.test", {"a": 1}) == {"ok": True}
-    assert sess.post.call_count == 1
 
 
 def test_settings_allows_ztk_only_taobao_profile(tmp_path):
@@ -234,11 +195,6 @@ def test_services_use_declarative_adapter_hooks_for_arbitrary_platform(monkeypat
 
         def needs_coupon_upgrade(self, universal_result: dict, product=None) -> bool:
             return bool(product and product.get("coupon_url") and product.get("product_url") and not universal_result.get("coupon_url"))
-
-        def skip_prefetch_if_detail_checked(self, ref: ProductRef, item=None):
-            if isinstance(item, dict) and item.get("detail_updated_at") is not None:
-                return 3600.0
-            return None
 
         def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
             return ProductRef(self.platform_code, goods_id or "", goods_sign or goods_id_or_sign)
@@ -319,17 +275,6 @@ def test_services_use_declarative_adapter_hooks_for_arbitrary_platform(monkeypat
     assert univ["status"] == "success"
     assert univ["final_link"] == "https://u.custom.test/up"
     assert univ["coupon_url"] == "https://coupon.custom.test/5off"
-
-    # 4. 后台预取遵从 skip_prefetch_if_detail_checked 返回的 3600s 冷却时间，不重复打详情接口
-    repo.get_product_detail.return_value = {
-        "platform": "customplat", "goods_id": "c1", "goods_sign": "SIG_C1",
-        "image_url": "https://img.custom.test/c1.jpg",
-        "detail_updated_at": datetime.now(timezone.utc),
-    }
-    DETAIL_CACHE.clear()
-    pre = prod_svc.prefetch_product_detail(ProductRef("customplat", "c1", "SIG_C1"))
-    assert pre.status == "ready"
-    assert len(custom.detail_calls) == 1
     clear_all_caches()
 
 
@@ -355,16 +300,11 @@ def test_all_capability_operation_slots_and_runtime_strategy_switch():
     assert tb.generate_authority_url("u_12345678")["auth_url"] == "https://auth.tb/1"
     assert tb.fetch_increment_orders(1, 2)["status"] == "success"
 
-    # 2. JdAdapter universal / orders 在无折淘客配置时也能通过 register_provider 接入，并可随时切换 failover / round_robin
+    # 2. JdAdapter universal / orders 在无折淘客配置时也能通过 register_provider 接入并执行 failover
     jd = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_position_id="8899"))
     assert jd.capabilities["orders"] is False and jd.capabilities["promotion"] is False
     jd.register_provider("universal", "ext_jd_u1", lambda **kw: {"status": "success", "final_link": "https://u.jd.com/1", "_tag": "u1"})
     jd.register_provider("universal", "ext_jd_u2", lambda **kw: {"status": "success", "final_link": "https://u.jd.com/2", "_tag": "u2"})
-    assert jd.resolve_and_convert_universal("https://u.jd.com/abc")["_tag"] == "u1"
-    jd.set_provider_strategy("universal", "round_robin")
-    assert jd.resolve_and_convert_universal("https://u.jd.com/abc")["_tag"] == "u1"
-    assert jd.resolve_and_convert_universal("https://u.jd.com/abc")["_tag"] == "u2"
-    jd.set_provider_strategy("universal", "failover")
     assert jd.resolve_and_convert_universal("https://u.jd.com/abc")["_tag"] == "u1"
 
     # 3. PddAdapter universal 支持前置新接口并在失败时无缝退回官方路由

@@ -159,12 +159,6 @@ def rebuild_clean_official_venue_url(raw_input: str, _allow_login_unwrap: bool =
     return None
 
 
-def is_direct_coupon_or_venue_url(raw_input: str, role_hint: str = "") -> bool:
-    """判断一个 URL 是否满足官方公共领券/会场白名单准入。"""
-    _ = role_hint
-    return rebuild_clean_official_venue_url(raw_input) is not None
-
-
 def _precheck_direct_non_cps_venue_url(raw_input: str) -> Optional[str]:
     """纯无佣金公共领券/活动页前置直出（排除可转佣的 pro*.m.jd.com 会场）。"""
     rebuilt = rebuild_clean_official_venue_url(raw_input)
@@ -404,7 +398,7 @@ def is_explicit_coupon_target(c: Dict[str, Any]) -> bool:
     if str(c.get("convert_status") or "").strip().lower() == "coupon_or_activity":
         return True
     if host:
-        if host in ("coupon.m.jd.com", "duo_coupon_landing.html"):
+        if host == "coupon.m.jd.com" or "duo_coupon_landing.html" in path.lower():
             return True
         if host == "shop.m.jd.com" and path.startswith("/member/"):
             return True

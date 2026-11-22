@@ -290,50 +290,6 @@ def test_deal_tip_survives_official_detail_refresh_and_cache_hits(prepared):
     assert repo.reads == 1
 
 
-def test_detail_commit_syncs_list_caches_and_invalidates_boom_sort_on_price_change(prepared):
-    from cache import BOOM_SORT_CACHE, SEARCH_CACHE, clear_all_caches
-
-    clear_all_caches()
-    service, _, adapter, clock = prepared
-    stale_item = {
-        "platform": "fixture", "goods_id": "123", "goods_sign": "SIGN",
-        "name": "旧价格商品", "price": 10.0, "original_price": 12.0,
-        "coupon_amount": 0.0, "has_coupon": False, "sales_tip": "100",
-        "image_url": "https://image.test/old.jpg",
-    }
-    RECOMMEND_CACHE.set(("fixture", "", 5, 0, 20, ""), {"status": "success", "data": [deepcopy(stale_item)], "has_more": False})
-    SEARCH_CACHE.set(("fixture", "", "抽纸", 1, 20), {"status": "success", "data": [deepcopy(stale_item)], "has_more": False})
-    BOOM_SORT_CACHE.set(("fixture", "", "抽纸", "cost_performance"), [deepcopy(stale_item)])
-
-    # 1. Price changes from 10.0 -> 8.0: RECOMMEND_CACHE & SEARCH_CACHE update in-place; BOOM_SORT_CACHE invalidates
-    fresh_detail = dict(
-        data(price=8.0),
-        coupon_amount=2.0,
-        saved_price=2.0,
-        has_coupon=True,
-        sales_tip="500+",
-        image_url="https://image.test/new.jpg",
-    )
-    adapter.get_goods_detail.return_value = {"status": "success", "data": fresh_detail}
-    res = service.get_goods_detail(platform="fixture", goods_id="123", goods_sign="SIGN")
-    assert res["status"] == "success" and res["data"]["price"] == 8.0
-
-    rec_item = RECOMMEND_CACHE.get(("fixture", "", 5, 0, 20, ""))["data"][0]
-    search_item = SEARCH_CACHE.get(("fixture", "", "抽纸", 1, 20))["data"][0]
-    assert rec_item["price"] == 8.0 and rec_item["has_coupon"] is True and rec_item["coupon_amount"] == 2.0
-    assert search_item["price"] == 8.0 and search_item["image_url"] == "https://image.test/new.jpg"
-    assert ("fixture", "", "抽纸", "cost_performance") not in BOOM_SORT_CACHE
-
-    # 2. Price stays 8.0 while sales_tip updates: BOOM_SORT_CACHE updates in-place without invalidation
-    clock.now = NOW + PRODUCT_DETAIL_TTL + 5
-    BOOM_SORT_CACHE.set(("fixture", "", "抽纸", "cost_performance"), [deepcopy(rec_item)])
-    same_price_detail = dict(fresh_detail, sales_tip="1万+")
-    adapter.get_goods_detail.return_value = {"status": "success", "data": same_price_detail}
-    service.get_goods_detail(platform="fixture", goods_id="123", goods_sign="SIGN")
-    assert ("fixture", "", "抽纸", "cost_performance") in BOOM_SORT_CACHE
-    assert BOOM_SORT_CACHE.get(("fixture", "", "抽纸", "cost_performance"))[0]["sales_tip"] == "1万+"
-
-
 def test_imageless_detail_never_poisons_cache_or_ttl_and_recovers_on_second_visit(prepared):
     from unittest.mock import MagicMock
     from cache import clear_all_caches

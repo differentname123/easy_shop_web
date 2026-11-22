@@ -268,9 +268,8 @@ class OrderService:
                 target=self._sync_platform_orders_bg, args=(platform, int(now), True),
                 name=f"bg-order-sync-{platform}", daemon=True,
             )
-            if callable(getattr(thread, "is_alive", None)) and callable(getattr(thread, "join", None)):
-                with self._bg_threads_lock:
-                    self._bg_threads[id(thread)] = thread
+            with self._bg_threads_lock:
+                self._bg_threads[id(thread)] = thread
             thread.start()
         except Exception as exc:
             if thread is not None:

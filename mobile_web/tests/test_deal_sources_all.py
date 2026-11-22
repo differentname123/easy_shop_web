@@ -37,7 +37,6 @@ from services.deal_sources import (
     MZzzdmSource,
     NiuzaSource,
     TelegramChannelSource,
-    Tuan0818Source,
     XuandanSource,
     ZdzdmSource,
     create_site_session,
@@ -1296,18 +1295,10 @@ def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
             "provider_nickname": "特惠采采-专员3",
             "tutorial_steps": ["领券下单"],
             "coupon_links": [{"label": "5元券", "url": "https://u.jd.com/test"}],
-            "tips_timeline": [
-                {
-                    "tip_id": "1",
-                    "source_site": "tehuicaicai",
-                    "source_site_name": "特惠采采",
-                    "provider_nickname": "特惠采采-专员3",
-                    "publish_time": "2026-11-18 12:00",
-                }
-            ],
         },
     }
-    assert ProductRepository._extract_deal_tip(_doc)["tips_timeline"][0]["source_site_name"] == "特惠采采"
+    tip = ProductRepository._extract_deal_tip(_doc)
+    assert tip["deal_price"] == 19.9 and "tips_timeline" not in tip
 
     # 2. touch_seen, expire_missing_from_full_sweep & reset_raw_collection
     raw_col = MagicMock()

@@ -2,7 +2,6 @@
 """京东字段/分页适配；无授权、用户仓储或个人转站长兜底。"""
 import html
 import re
-import time
 from typing import Any, Optional
 
 from infrastructure.logging_utils import get_app_logger
@@ -26,6 +25,7 @@ from infrastructure.http_utils import (
 from infrastructure.jd_client import (
     JdClient, DEFAULT_API_BASE, ORDER_WINDOW_SECONDS,
     canonical_promoter_id, is_encrypted_jd_item_id, is_jd_official_venue_url, jd_coupon_url, product_url,
+    resolve_jd_short_url,
 )
 from models.product import (
     JD_JINGFEN_ID_RE,
@@ -505,7 +505,7 @@ class JdAdapter(BasePlatformAdapter):
                 payload["detail_lookup_failed"] = True
                 if detail_catalog_cooling:
                     payload["catalog_cooling"] = True
-            return stamp_universal_resolution(payload, single_item_evidence=bool(target_id or short_match or union_url))
+            return stamp_universal_resolution(payload)
         return _universal
 
     def _refresh_capabilities(self) -> None:
@@ -560,15 +560,6 @@ class JdAdapter(BasePlatformAdapter):
             and product.get("product_url")
             and not universal_result.get("coupon_url")
         )
-
-    def skip_prefetch_if_detail_checked(self, ref: ProductRef, item: Optional[dict]) -> Optional[float]:
-        if (
-            isinstance(item, dict)
-            and item.get("detail_updated_at") is not None
-            and (bool(item.get("coupon_url")) or float(item.get("coupon_amount") or 0.0) <= 0)
-        ):
-            return 86400.0
-        return None
 
     def resolve_product_ref(self, goods_id_or_sign="", goods_id=None, goods_sign=None):
         sign = _text(goods_sign or goods_id_or_sign or goods_id)
@@ -798,11 +789,9 @@ class JdAdapter(BasePlatformAdapter):
                     if probe.get("status") == "success":
                         if hasattr(self.client, "mark_catalog_rate_limited"):
                             self.client.mark_catalog_rate_limited()
-                        short_url = probe.get("short_url") or probe.get("click_url") or ""
                         return _error(
                             "RATE_LIMIT",
                             "京东详情接口触发临时频控，商品仍在正常推广中",
-                            probe_short_url=short_url,
                         )
                     if probe.get("jd_off_promotion") is True:
                         return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
@@ -990,11 +979,12 @@ class JdAdapter(BasePlatformAdapter):
                 extracted_encrypted_id = text
 
             material_input = f"https://jingfen.jd.com/detail/{text}.html" if _is_encrypted_jd_item_id(text) else text
-            unwrap_fn = (
-                self.hdk.resolve_short_url
-                if (self.hdk is not None and not self._is_personal_promoter(uid, promoter))
-                else None
-            )
+            if self.hdk is not None and not self._is_personal_promoter(uid, promoter):
+                unwrap_fn = self.hdk.resolve_short_url
+            elif is_real_requests_session(getattr(self.client, "http", None)):
+                unwrap_fn = lambda u: resolve_jd_short_url(u, http_session=self.client.http)
+            else:
+                unwrap_fn = None
             conv = (
                 self.client.convert_universal_material(material_input, promoter, short_url_resolver=unwrap_fn)
                 if unwrap_fn is not None
@@ -1037,33 +1027,6 @@ class JdAdapter(BasePlatformAdapter):
             lower_urls = f"{text} {short} {long}".lower()
             is_explicit_venue_url = is_jd_official_venue_url(lower_urls) or bool(conv.get("resolved_venue"))
             short_u_match = _JD_SHORT_URL_RE.search(short or "")
-
-            # Fallback A: HDK 轻量短链解包（零 ZTK 配额）识别通天塔加密 sku 或确定性会场
-            if (
-                not product_card
-                and not extracted_encrypted_id
-                and not is_explicit_venue_url
-                and not conv.get("_short_url_resolved")
-                and short_u_match
-                and self.hdk is not None
-            ):
-                unwrap_res = self.hdk.resolve_short_url(short_u_match.group(0))
-                if isinstance(unwrap_res, dict) and unwrap_res.get("status") == "success":
-                    u_data = unwrap_res.get("data") or {}
-                    u_sku = _text(u_data.get("sku_id"))
-                    if u_sku and _is_encrypted_jd_item_id(u_sku):
-                        extracted_encrypted_id = u_sku
-                        resolved_id = extracted_encrypted_id
-                        det = self.get_goods_detail(extracted_encrypted_id)
-                        if det.get("status") == "success" and isinstance(det.get("data"), dict):
-                            product_card = det["data"]
-                            resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
-                        elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
-                            detail_lookup_failed = True
-                            if det.get("catalog_cooling") is True:
-                                detail_catalog_cooling = True
-                    elif u_data.get("is_venue") and not u_sku:
-                        is_explicit_venue_url = True
 
             # Fallback B: 确定非会场且仍缺商品卡时，用转链所得精确 u.jd.com 短链查全网选品库（严格唯一匹配，绝不用标题关键词搜索）
             is_cooling = hasattr(self.client, "is_catalog_cooling") and self.client.is_catalog_cooling()

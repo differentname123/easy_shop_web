@@ -59,25 +59,17 @@ class UserRepository(BaseRepository):
                 self._promoter_index_ready = True
 
     def _ensure_identity_index(self, path: str) -> None:
-        col = self.col
-        ensured = getattr(self._db, "_ensured_identity_indexes", None)
-        if not isinstance(ensured, set):
-            ensured = set()
-            try:
-                self._db._ensured_identity_indexes = ensured
-            except Exception:
-                ensured = self._ensured_identity_indexes
         cache_key = (self.COLLECTION_NAME, path)
-        if cache_key in ensured:
+        if cache_key in self._ensured_identity_indexes:
             return
         with self._promoter_index_lock:
-            if cache_key not in ensured:
-                col.create_index(
+            if cache_key not in self._ensured_identity_indexes:
+                self.col.create_index(
                     [(path, 1)],
                     unique=True,
                     partialFilterExpression={path: {"$type": "string"}},
                 )
-                ensured.add(cache_key)
+                self._ensured_identity_indexes.add(cache_key)
 
     @staticmethod
     def _unassigned_promoter(uid):

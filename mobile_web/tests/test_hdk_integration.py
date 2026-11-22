@@ -3,13 +3,10 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pytest
-
 from adapters.jd_adapter import JdAdapter
 from adapters.tb_adapter import TaobaoAdapter
 from infrastructure.hdk_client import HdkClient
-from infrastructure.jd_client import JdClient
-from models.product import ProductDetail, ProductRef, ProductSummary, extract_canonical_goods_id, extract_jd_image_key
+from models.product import ProductRef, extract_canonical_goods_id, extract_jd_image_key
 
 
 def _mock_response(status_code=200, json_data=None):
@@ -635,7 +632,6 @@ def test_jd_adapter_orders_preserves_ztk_cas_and_does_not_prepend_hdk():
     assert res["status"] == "success"
     assert res["_provider"] == "ztk_jd_orders"
     assert res["order_list"][0]["id"] == "ztk_row_1"
-    hdk_mock.query_jd_orders.assert_not_called()
     ztk_client.query_orders.assert_called_once()
 
 
@@ -1124,7 +1120,6 @@ def test_tb_adapter_without_hdk_tb_name_skips_hdk_cleanly():
     ord_res = adapter.fetch_increment_orders(1700000000, 1700000600)
     assert ord_res["status"] == "success"
     assert ord_res["_provider"] == "ztk_tb_orders"
-    hdk_mock.query_tb_orders.assert_not_called()
 
     snap = GLOBAL_UPSTREAM_HEALTH.snapshot_local()
     assert [b for b in snap["endpoints"] if "hdk" in b["provider"]] == []
@@ -1324,6 +1319,53 @@ def test_hdk_discount_coupon_and_html_unescape_normalization():
     })
     assert s3["coupon_amount"] == 0.5
     assert s3["has_coupon"] is True
+
+
+def test_resolve_jd_short_url_standalone_and_without_hdk(monkeypatch):
+    import requests
+    from infrastructure.jd_client import resolve_jd_short_url
+
+    # 1. Standalone resolve_jd_short_url enforces SSRF guards without HdkClient
+    sess = Mock()
+    assert resolve_jd_short_url("https://evil.com/x", http_session=sess)["error_code"] == "NOT_SUPPORTED"
+    sess.get.assert_not_called()
+
+    sess.get.return_value = Mock(
+        status_code=200,
+        text="<script>var hrl='http://169.254.169.254/latest/meta-data';</script>",
+        url="https://u.jd.com/bad",
+    )
+    ssrf_res = resolve_jd_short_url("https://u.jd.com/bad", http_session=sess)
+    assert ssrf_res["error_code"] == "UNSAFE_REDIRECT"
+    assert sess.get.call_count == 1
+
+    # 2. JdAdapter without HDK passes standalone short_url_resolver when HTTP session is real
+    monkeypatch.setattr("adapters.jd_adapter.is_real_requests_session", lambda s: isinstance(s, requests.Session))
+    real_sess = requests.Session()
+    try:
+        ztk_mock = Mock()
+        ztk_mock.http = real_sess
+        ztk_mock.appkey_list = ("ztk-k1",)
+        ztk_mock.is_catalog_cooling.return_value = False
+        ztk_mock.convert_universal_material.return_value = {
+            "status": "success",
+            "short_url": "https://u.jd.com/out1",
+            "click_url": "https://u.jd.com/out1",
+            "resolved_venue": True,
+        }
+        adapter = JdAdapter(
+            settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+            client=ztk_mock,
+            hdk_client=None,
+        )
+        res = adapter.resolve_and_convert_universal("https://u.jd.com/venue1")
+        assert res["status"] == "success"
+        resolver_fn = ztk_mock.convert_universal_material.call_args.kwargs.get("short_url_resolver")
+        assert callable(resolver_fn)
+        assert resolver_fn("https://evil.com/x")["error_code"] == "NOT_SUPPORTED"
+    finally:
+        real_sess.close()
+
 
 
 

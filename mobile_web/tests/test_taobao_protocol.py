@@ -818,3 +818,27 @@ def test_tb_universal_edetail_falls_back_to_official_top_on_ztk_network_error():
     assert res["product"]["name"] == "官方标题"
     ztk.http.get.assert_called_once()
 
+
+def test_reload_or_refresh_tb_credentials_never_treats_user_nick_as_session(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.local.json"
+    cfg.write_text(json.dumps({
+        "taobao_session": "6100_valid_old_session",
+        "taobao_refresh_token": "refresh_tok_1",
+    }), encoding="utf-8")
+    monkeypatch.setenv("WEB_CONFIG_FILE", str(cfg))
+
+    def fake_api(**kwargs):
+        return {
+            "status": "success",
+            "data": {
+                "top_auth_token_refresh_response": {
+                    "token_result": json.dumps({"taobao_user_nick": "my_nick_not_a_token"}),
+                }
+            },
+        }
+
+    res = tb_client.reload_or_refresh_tb_credentials("appk", "apps", "6100_valid_old_session", _api_call=fake_api)
+    assert res == {"session_key": "6100_valid_old_session"}
+    persisted = json.loads(cfg.read_text(encoding="utf-8"))
+    assert persisted["taobao_session"] == "6100_valid_old_session"
+

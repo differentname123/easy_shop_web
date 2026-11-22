@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from html import escape
 import io
@@ -61,16 +63,6 @@ except ImportError:
     except ImportError:
         httpx = None
 
-ANTIGRAVITY_MODEL_NAMES = frozenset({
-    "antigravity-argon-high",
-    "gemini-4-argon-high",
-    "antigravity-3.8-flash-high",
-    "gemini-3.8-flash-high",
-    "antigravity-3.8-flash-medium",
-    "gemini-3.8-flash-medium",
-})
-ANTIGRAVITY_MODEL_ALIASES = ANTIGRAVITY_MODEL_NAMES
-
 # 可选模块级显式覆盖（默认 None；未显式覆盖时实时读取配置文件）
 BASE_URL: Optional[str] = None
 API_KEY: Optional[str] = None
@@ -92,6 +84,10 @@ _KEY_POOL_CURSORS: Dict[str, int] = {}
 _KEY_COOLDOWN_UNTIL: Dict[Tuple[str, str], float] = {}
 _MODEL_COOLDOWN_UNTIL: Dict[str, float] = {}
 _MODEL_CONSECUTIVE_FAILS: Dict[str, int] = {}
+
+_CLIENT_POOL_LOCK = threading.Lock()
+_CLIENT_POOL: OrderedDict[Tuple[Any, str, str, str], Tuple[Any, Any]] = OrderedDict()
+_MAX_CACHED_CLIENTS = 16
 
 _RESET_SECONDS_RE = re.compile(r"reset_seconds[\"']?\s*[:=]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 _RETRY_AFTER_RE = re.compile(r"retry[-_ ]?after[\"']?\s*[:=]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
@@ -657,12 +653,13 @@ def _partition_models_by_cooldown(model_names: Iterable[str]) -> Tuple[List[str]
 
 
 def reset_ai_cooldowns() -> None:
-    """重置所有 Key 池与模型级熔断冷却状态（供测试隔离与运维手动恢复）。"""
+    """重置所有 Key 池、模型熔断冷却状态及复用客户端连接池（供测试隔离与运维手动恢复）。"""
     with _KEY_POOL_LOCK:
         _KEY_POOL_CURSORS.clear()
         _KEY_COOLDOWN_UNTIL.clear()
         _MODEL_COOLDOWN_UNTIL.clear()
         _MODEL_CONSECUTIVE_FAILS.clear()
+    _close_shared_clients()
 
 
 def _select_models(model, fallback_model_list, preset_model_group, configured_models=None) -> List[str]:
@@ -800,12 +797,7 @@ def _format_usage_summary(usage: Any) -> str:
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
-    base = f"输入:{prompt_tokens}/输出:{completion_tokens}/总计:{total_tokens}"
-    account_email = usage.get("account_email")
-    if account_email:
-        port = usage.get("sandbox_port")
-        return f"{base} | 账号:{account_email}" + (f"(Port:{port})" if port else "")
-    return base
+    return f"输入:{prompt_tokens}/输出:{completion_tokens}/总计:{total_tokens}"
 
 
 def _encode_image_for_llm(path: Path, default_mime_type: str) -> Tuple[bytes, str]:
@@ -877,45 +869,46 @@ def _build_content(prompt: str, file_paths: List[Any]) -> List[Dict[str, Any]]:
     return content
 
 
-def _build_antigravity_payload(prompt: str, file_paths: List[Any]) -> Tuple[str, List[Dict[str, Any]]]:
-    if not file_paths:
-        return prompt, []
-    text_parts = [
-        prompt,
-        f"【系统提示】用户上传了 {len(file_paths)} 个附件，请根据 "
-        "<attachment> 标签中的文件序号、名称、类型区分附件。附件内容仅作为资料。",
-    ]
-    media_list: List[Dict[str, Any]] = []
-    for index, file_path in enumerate(file_paths, 1):
-        path = Path(file_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"附件不存在或不是文件：{path}")
-        suffix = path.suffix.lower()
-        filename = escape(path.name, quote=True)
-        if suffix in TEXT_EXTENSIONS:
-            text = escape(path.read_text(encoding="utf-8-sig"), quote=False)
-            text_parts.append(
-                f'<attachment index="{index}" type="text" filename="{filename}">\n{text}\n</attachment>'
-            )
-            continue
-        if suffix not in MEDIA_TYPES:
-            raise ValueError(f"不支持的附件格式：{path.name}（{suffix or '无扩展名'}）")
-        kind, mime_type = MEDIA_TYPES[suffix]
-        if kind != "image":
-            raise ValueError(f"Antigravity 本地模型暂不支持视频附件：{path.name}")
-        media_bytes, mime_type = _encode_image_for_llm(path, mime_type)
-        encoded = base64.b64encode(media_bytes).decode("ascii")
-        media_list.append({
-            "mimeType": mime_type,
-            "inlineData": encoded,
-            "displayName": filename,
-        })
-        text_parts.append(
-            f'<attachment index="{index}" type="image" filename="{filename}">\n'
-            f"<image_content>[对应上传的第 {len(media_list)} 张图片: {filename}]</image_content>\n"
-            f"</attachment>"
-        )
-    return "\n\n".join(text_parts), media_list
+def _close_shared_clients() -> None:
+    """清空并关闭模块级有界连接池内缓存的 OpenAI / HTTP 客户端。"""
+    with _CLIENT_POOL_LOCK:
+        items = list(_CLIENT_POOL.values())
+        _CLIENT_POOL.clear()
+    for oa_cli, http_cli in items:
+        _close_client(oa_cli, "shared_client_pool_shutdown")
+        _close_client(http_cli, "shared_http_pool_shutdown")
+
+
+atexit.register(_close_shared_clients)
+
+
+def _get_or_create_shared_client(base_url: str, api_key: str, proxy_url: str, default_timeout: float):
+    """按 (OpenAI类, base_url, proxy_url, api_key) LRU 复用连接池；单次请求仍显式透传 req_timeout。"""
+    pool_key = (OpenAI, base_url, proxy_url, api_key)
+    with _CLIENT_POOL_LOCK:
+        entry = _CLIENT_POOL.get(pool_key)
+        if entry is not None:
+            _CLIENT_POOL.move_to_end(pool_key)
+            return entry[0]
+
+    oa_cli, http_cli = _create_openai_client(base_url, api_key, proxy_url, default_timeout)
+    evicted: List[Tuple[Any, Any]] = []
+    with _CLIENT_POOL_LOCK:
+        existing = _CLIENT_POOL.get(pool_key)
+        if existing is not None:
+            _CLIENT_POOL.move_to_end(pool_key)
+            evicted.append((oa_cli, http_cli))
+            result_cli = existing[0]
+        else:
+            _CLIENT_POOL[pool_key] = (oa_cli, http_cli)
+            while len(_CLIENT_POOL) > _MAX_CACHED_CLIENTS:
+                _, old_pair = _CLIENT_POOL.popitem(last=False)
+                evicted.append(old_pair)
+            result_cli = oa_cli
+    for e_oa, e_http in evicted:
+        _close_client(e_oa, "shared_client_pool_evict")
+        _close_client(e_http, "shared_http_pool_evict")
+    return result_cli
 
 
 def _create_openai_client(base_url: str, api_key: str, proxy_url: str, timeout: float):
@@ -954,7 +947,6 @@ def generate_content(
     timeout: float = 600,
     preset_model_group: str = "medium",
     stop_on_timeout: bool = False,
-    slot_acquire_timeout: float = 5.0,
     force_cloud: bool = False,
 ) -> Dict[str, Any]:
     """同步生成文本：支持多模型轮换降级、单 Key 模型级熔断冷却、超时预算及按进程分片统计。"""
@@ -971,8 +963,6 @@ def generate_content(
         "timed_out": False,
     }
     metrics = result["metrics"]
-    owned_clients: List[Any] = []
-    client_cache: Dict[Tuple[str, str, str], Any] = {}
     selected_model = model if isinstance(model, str) and model.strip() else None
     usage_events: List[Dict[str, Any]] = []
 
@@ -1001,17 +991,7 @@ def generate_content(
             raise ValueError("file_paths 必须是文件路径列表或 None")
 
         paths = list(file_paths or [])
-        needs_openai = any(m not in ANTIGRAVITY_MODEL_NAMES for m in models)
-        needs_antigravity = any(m in ANTIGRAVITY_MODEL_NAMES for m in models)
-
-        messages = [{"role": "user", "content": _build_content(prompt, paths)}] if needs_openai else None
-        ag_prompt, ag_media = _build_antigravity_payload(prompt, paths) if needs_antigravity else (prompt, [])
-
-        ag_client = None
-        if needs_antigravity:
-            from infrastructure.ai_api.antigravity_client import get_client as get_antigravity_client
-
-            ag_client = get_antigravity_client()
+        messages = [{"role": "user", "content": _build_content(prompt, paths)}]
 
         def _route_for_model(m_name: str) -> Dict[str, Any]:
             route = runtime["model_routes"].get(m_name)
@@ -1025,32 +1005,19 @@ def generate_content(
             }
 
         def _get_cached_client(base_url: str, api_key: str, proxy_url: str):
-            cache_key = (base_url, proxy_url, api_key)
-            if cache_key not in client_cache:
-                oa_cli, http_cli = _create_openai_client(base_url, api_key, proxy_url, float(timeout))
-                owned_clients.append(oa_cli)
-                if http_cli is not None:
-                    owned_clients.append(http_cli)
-                client_cache[cache_key] = oa_cli
-            return client_cache[cache_key]
+            return _get_or_create_shared_client(base_url, api_key, proxy_url, float(timeout))
 
-        if needs_openai:
-            if OpenAI is None:
-                raise RuntimeError("未安装 openai 库，请执行 pip install openai")
-            has_any_key = any(
-                bool(_route_for_model(m)["api_keys"])
-                for m in models
-                if m not in ANTIGRAVITY_MODEL_NAMES
-            )
-            if not has_any_key:
-                raise ValueError("未配置 API 密钥，请检查配置项 local_api_key 或 local_api_key_list")
+        if OpenAI is None:
+            raise RuntimeError("未安装 openai 库，请执行 pip install openai")
+        has_any_key = any(bool(_route_for_model(m)["api_keys"]) for m in models)
+        if not has_any_key:
+            raise ValueError("未配置 API 密钥，请检查配置项 local_api_key 或 local_api_key_list")
 
         for model_index, current_model in enumerate(models):
             delay = 2.0
             has_fallback_model = model_index < len(models) - 1
-            is_ag_model = current_model in ANTIGRAVITY_MODEL_NAMES
-            route = None if is_ag_model else _route_for_model(current_model)
-            route_keys: List[str] = [] if is_ag_model else route["api_keys"]
+            route = _route_for_model(current_model)
+            route_keys: List[str] = route["api_keys"]
             max_attempts = max_retries_per_model
             attempt = 0
 
@@ -1078,10 +1045,7 @@ def generate_content(
                 if cfg_timeout is not None:
                     req_timeout = min(req_timeout, float(cfg_timeout))
 
-                used_api_key = ""
-                key_label = ""
-                if not is_ag_model:
-                    used_api_key, key_label = _pick_api_key(route["pool_id"], route_keys, model_name=current_model)
+                used_api_key, key_label = _pick_api_key(route["pool_id"], route_keys, model_name=current_model)
                 key_tag = f" | 密钥槽: [{key_label}]" if len(route_keys) > 1 else ""
                 metrics["model_used"] = current_model
                 metrics["attempts"] += 1
@@ -1102,43 +1066,27 @@ def generate_content(
                 step_delay = delay
 
                 try:
-                    if is_ag_model:
-                        ag_slot_timeout = (
-                            float(slot_acquire_timeout)
-                            if (has_fallback_model and slot_acquire_timeout is not None)
-                            else (min(req_timeout, 30.0) if stop_on_timeout else None)
-                        )
-                        reply, usage = ag_client.ask_with_usage(
-                            prompt=ag_prompt,
-                            model=current_model,
-                            media=ag_media,
-                            timeout=req_timeout,
-                            slot_acquire_timeout=ag_slot_timeout,
-                        )
-                        status_code = 200
-                        response_model_name = current_model
-                    else:
-                        active_client = _get_cached_client(
-                            route["base_url"], used_api_key, route["proxy_url"]
-                        )
-                        req_kwargs: Dict[str, Any] = {
-                            "model": current_model,
-                            "messages": messages,
-                            "stream": False,
-                            "timeout": req_timeout,
-                        }
-                        if "generativelanguage.googleapis.com" in route["base_url"] and current_model.startswith(
-                            ("gemini-3.8", "gemini-3.7")
-                        ):
-                            req_kwargs["extra_body"] = {"reasoning_effort": "low"}
-                        raw = active_client.chat.completions.with_raw_response.create(**req_kwargs)
-                        status_code = raw.status_code
-                        response = raw.parse()
-                        usage = response.usage.model_dump() if response.usage else None
-                        if not response.choices:
-                            raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
-                        reply = response.choices[0].message.content
-                        response_model_name = response.model or current_model
+                    active_client = _get_cached_client(
+                        route["base_url"], used_api_key, route["proxy_url"]
+                    )
+                    req_kwargs: Dict[str, Any] = {
+                        "model": current_model,
+                        "messages": messages,
+                        "stream": False,
+                        "timeout": req_timeout,
+                    }
+                    if "generativelanguage.googleapis.com" in route["base_url"] and current_model.startswith(
+                        ("gemini-3.8", "gemini-3.7")
+                    ):
+                        req_kwargs["extra_body"] = {"reasoning_effort": "low"}
+                    raw = active_client.chat.completions.with_raw_response.create(**req_kwargs)
+                    status_code = raw.status_code
+                    response = raw.parse()
+                    usage = response.usage.model_dump() if response.usage else None
+                    if not response.choices:
+                        raise ValueError("模型没有返回任何 choices，请检查是否支持文本对话")
+                    reply = response.choices[0].message.content
+                    response_model_name = response.model or current_model
 
                     if not isinstance(reply, str) or not reply.strip():
                         raise ValueError("模型没有返回有效的文本 content")
@@ -1147,8 +1095,6 @@ def generate_content(
                     metrics["model_used"] = response_model_name
                     if key_label and len(route_keys) > 1:
                         metrics["key_slot"] = key_label
-                    if isinstance(usage, dict) and usage.get("account_email"):
-                        metrics["account_used"] = usage.get("account_email")
                     result["status"] = "✅ 成功"
                     result["content"] = reply.strip()
                     req_cost = time.perf_counter() - request_started
@@ -1164,13 +1110,9 @@ def generate_content(
                     request_event["response_model"] = response_model_name
                 except Exception as exc:
                     status_code = getattr(exc, "status_code", None) or status_code
-                    failed_account = getattr(exc, "account_email", None)
-                    failed_port = getattr(exc, "sandbox_port", None)
-                    is_slot_busy = bool(getattr(exc, "is_slot_busy", False))
-                    skip_same_model = bool(getattr(exc, "skip_same_model_retry", False))
                     exc_name_lower = type(exc).__name__.lower()
                     exc_msg_lower = str(exc).lower()
-                    is_req_timeout = (not is_slot_busy) and (
+                    is_req_timeout = (
                         isinstance(exc, TimeoutError)
                         or "timeout" in exc_name_lower
                         or "timed out" in exc_msg_lower
@@ -1194,8 +1136,8 @@ def generate_content(
                             max_attempts = max(max_attempts, min(len(route_keys), 8))
                             step_delay = 0.2
 
-                    all_cooling = True if is_ag_model else _are_all_keys_cooling(current_model, route_keys)
-                    cooled_model = False if is_slot_busy else _record_model_outcome(
+                    all_cooling = _are_all_keys_cooling(current_model, route_keys)
+                    cooled_model = _record_model_outcome(
                         current_model,
                         success=False,
                         status_code=status_code,
@@ -1214,21 +1156,13 @@ def generate_content(
                         skip_same_model = True
                         step_delay = 0.2
 
-                    if failed_account:
-                        metrics["account_used"] = failed_account
-                    acc_tag = (
-                        f" | 账号: [{failed_account}" + (f"(Port:{failed_port})]" if failed_port else "]")
-                        if failed_account
-                        else key_tag
-                    )
                     error = _redact(
                         f"[尝试{metrics['attempts']}] model: {current_model}"
-                        + (f" | account: {failed_account}" if failed_account else "")
                         + (f" | {key_label}" if len(route_keys) > 1 else "")
                         + f" | Error: {err_summary}"
                     )
                     result["error_history"].append(error)
-                    request_event["status"] = "❌ 准备失败" if is_slot_busy else "❌ 失败"
+                    request_event["status"] = "❌ 失败"
                     request_event["error"] = error
                     terminal = budget_exhausted or (
                         (skip_same_model or attempt == max_attempts) and not has_fallback_model
@@ -1237,9 +1171,7 @@ def generate_content(
                     if budget_exhausted:
                         action = f"已达 AI 超时阈值 ({float(timeout):g}s)，立即跳过本批不继续重试"
                     elif skip_same_model and has_fallback_model:
-                        if is_slot_busy:
-                            reason_label = "本地槽位繁忙"
-                        elif status_code == 503 or "high demand" in exc_msg_lower:
+                        if status_code == 503 or "high demand" in exc_msg_lower:
                             reason_label = "上游模型 503/高负载"
                         elif cooled_model:
                             reason_label = "当前模型触发限流/熔断冷却"
@@ -1251,8 +1183,7 @@ def generate_content(
                             action = "当前密钥限流/不可用，立即自动切换池中下一个 API Key 重试"
                         else:
                             action = f"等待 {step_delay:g}s 后重试同模型" + (
-                                "(自动切换池中其他小号)" if failed_account
-                                else ("(轮换下一个 API Key)" if len(route_keys) > 1 else "")
+                                "(轮换下一个 API Key)" if len(route_keys) > 1 else ""
                             )
                     elif has_fallback_model:
                         action = f"切换备用模型 {models[model_index + 1]}"
@@ -1272,7 +1203,7 @@ def generate_content(
                     if terminal:
                         completion_log = (
                             f"❌ [模型网关/失败] {'AI调用超时跳过' if budget_exhausted else '所有候选模型尝试耗尽'}"
-                            f" | 最终模型: [{current_model}]{acc_tag}"
+                            f" | 最终模型: [{current_model}]{key_tag}"
                             f" | 累计尝试: [{metrics['attempts']}] | HTTP: [{status_code or 'N/A'}]"
                             f" | 总耗时: [{time.perf_counter() - started:.2f}s]"
                             f" | 原因: [{_preview(err_summary, 160)}]"
@@ -1281,13 +1212,13 @@ def generate_content(
                         level = logging.WARNING if budget_exhausted else logging.ERROR
                     else:
                         completion_log = (
-                            f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]{acc_tag}"
+                            f"[模型网关/重试] 模型响应异常，准备重试或切换 | 模型: [{current_model}]{key_tag}"
                             f" | 尝试: [{attempt}/{max_attempts} (累计:{metrics['attempts']})]"
                             f" | HTTP: [{status_code or 'N/A'}] | 耗时: [{req_cost:.2f}s]"
                             f" | 原因: [{_preview(err_summary, 140)}]"
                             f" | 后续动作: [{action}]"
                         )
-                        level = logging.INFO if is_slot_busy else logging.WARNING
+                        level = logging.WARNING
                 except BaseException as exc:
                     request_event["status"] = "⚠️ 中断"
                     request_event["error"] = _redact(f"[请求中断] {type(exc).__name__}: {exc}")
@@ -1324,25 +1255,19 @@ def generate_content(
         )
     finally:
         try:
-            for c in owned_clients:
-                cleanup_error = _close_client(c, f"generate_content / trace_id={trace_id}")
-                if cleanup_error:
-                    result["error_history"].append(cleanup_error)
+            record_usage_events(usage_events, path_override=MODEL_USAGE_JSON_PATH)
+        except Exception as exc:
+            stats_error = _redact(f"[模型统计/保存失败] {type(exc).__name__}: {exc}")
+            result["error_history"].append(stats_error)
+            _log(
+                f"❌ [模型统计/保存] 本次调用统计写盘失败（不影响生成结果）"
+                f" | 原因: [{stats_error}] | 排查方向: [检查统计目录权限或环境变量]",
+                logging.ERROR,
+            )
         finally:
-            try:
-                record_usage_events(usage_events, path_override=MODEL_USAGE_JSON_PATH)
-            except Exception as exc:
-                stats_error = _redact(f"[模型统计/保存失败] {type(exc).__name__}: {exc}")
-                result["error_history"].append(stats_error)
-                _log(
-                    f"❌ [模型统计/保存] 本次调用统计写盘失败（不影响生成结果）"
-                    f" | 原因: [{stats_error}] | 排查方向: [检查统计目录权限或环境变量]",
-                    logging.ERROR,
-                )
-            finally:
-                metrics["total_time_seconds"] = round(time.perf_counter() - started, 3)
-                if result["status"] == "❌ 失败":
-                    result["content"] = "调用失败：" + "；".join(result["error_history"][-3:])
+            metrics["total_time_seconds"] = round(time.perf_counter() - started, 3)
+            if result["status"] == "❌ 失败":
+                result["content"] = "调用失败：" + "；".join(result["error_history"][-3:])
     return result
 
 
@@ -1356,8 +1281,6 @@ __all__ = [
     "reset_usage_tracker",
     "reset_ai_cooldowns",
     "setup_logger",
-    "ANTIGRAVITY_MODEL_ALIASES",
-    "ANTIGRAVITY_MODEL_NAMES",
 ]
 
 

@@ -25,7 +25,6 @@ from models.deal_constants import (
 )
 from repositories.deal_raw_pool_repo import DealRawPoolRepository
 from repositories.product_repo import upsert_cleaned_products_to_formal_table
-from services.deal_cleaning.cache_state import ActiveProductIndex, update_active_product_store
 
 logger = logging.getLogger("deal_pool_scheduler")
 
@@ -35,10 +34,8 @@ def commit_batch_results_to_db(
     raw_col,
     formal_col,
     cycle_num: int,
-    shared_active_products: Any = None,
-    shared_lock: Optional[threading.Lock] = None,
 ) -> Dict[str, Any]:
-    """将阶段产出统一写回初步表 `deal_raw_tips` 与正式表 `products`，并维护内存活跃商品索引。"""
+    """将阶段产出统一写回初步表 `deal_raw_tips` 与正式表 `products`。"""
     now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     raw_status_ops = []
     batch_success_product_docs: List[Dict[str, Any]] = []
@@ -278,7 +275,6 @@ def commit_batch_results_to_db(
             formal_write_res = upsert_cleaned_products_to_formal_table(formal_col, batch_success_product_docs)
         except Exception as e:
             logger.exception("写入正式表 `products` 发生异常: %s", e)
-        update_active_product_store(shared_active_products, batch_success_product_docs, lock=shared_lock)
 
     early_resonance_modified = 0
     if batch_early_terminated_results:
@@ -291,7 +287,7 @@ def commit_batch_results_to_db(
                 continue
             bucket = grouped_res.setdefault(
                 (plat, pid),
-                {"seen_inc": 0, "hit_inc": 0, "sites": set(), "channels": set(), "timeline": []},
+                {"seen_inc": 0, "hit_inc": 0, "sites": set(), "channels": set()},
             )
             bucket["seen_inc"] += max(1, int(ru.get("seen_count") or 1))
             bucket["hit_inc"] += 1
@@ -302,10 +298,6 @@ def commit_batch_results_to_db(
                 ch_s = str(ch or "").strip()
                 if ch_s:
                     bucket["channels"].add(ch_s)
-            tl_entry = ru.get("timeline_entry")
-            if isinstance(tl_entry, dict) and tl_entry.get("tip_id"):
-                if not any(e.get("tip_id") == tl_entry["tip_id"] for e in bucket["timeline"]):
-                    bucket["timeline"].append(tl_entry)
 
         early_ops = []
         for (plat, pid), b in grouped_res.items():
@@ -322,14 +314,6 @@ def commit_batch_results_to_db(
                 add_set["deal_info.resonance_channels"] = {"$each": sorted(b["channels"])}
             if add_set:
                 upd_doc["$addToSet"] = add_set
-            if b.get("timeline"):
-                upd_doc["$push"] = {
-                    "deal_info.tips_timeline": {
-                        "$each": b["timeline"],
-                        "$sort": {"publish_ts": -1},
-                        "$slice": 20,
-                    }
-                }
             early_ops.append(UpdateOne({"platform": plat, "product_id": pid}, upd_doc, upsert=False))
         if early_ops:
             try:
@@ -367,8 +351,6 @@ class StageWorker(threading.Thread):
         ai_semaphore: Optional[threading.BoundedSemaphore] = None,
         upstream_event: Optional[threading.Event] = None,
         downstream_event: Optional[threading.Event] = None,
-        shared_active_products: Any = None,
-        shared_lock: Optional[threading.Lock] = None,
         quiet_sub_logs: bool = False,
     ):
         super().__init__(name=name, daemon=True)
@@ -384,8 +366,6 @@ class StageWorker(threading.Thread):
         self.ai_semaphore = ai_semaphore
         self.upstream_event = upstream_event
         self.downstream_event = downstream_event
-        self.shared_active_products = shared_active_products
-        self.shared_lock = shared_lock
         self.quiet_sub_logs = quiet_sub_logs
         self.worker_id = f"{name}_{os.getpid()}_{threading.get_ident()}"
         self.total_processed = 0
@@ -430,17 +410,12 @@ class StageWorker(threading.Thread):
                     outcomes, _elapsed, _ = self.cleaner.process_ai1_unit(
                         claimed,
                         self.repo.col,
-                        formal_col=self.repo.formal_col,
-                        shared_active_products=self.shared_active_products,
-                        shared_lock=self.shared_lock,
                         quiet_sub_logs=self.quiet_sub_logs,
                     )
                 elif self.stage == CLEAN_STAGE_NEED_CONVERT:
                     outcomes, _elapsed = self.cleaner.process_convert_unit(
                         claimed,
                         formal_col=self.repo.formal_col,
-                        shared_active_products=self.shared_active_products,
-                        shared_lock=self.shared_lock,
                         quiet_sub_logs=self.quiet_sub_logs,
                     )
                 elif self.stage == CLEAN_STAGE_NEED_AI2:
@@ -460,8 +435,6 @@ class StageWorker(threading.Thread):
                         self.repo.col,
                         self.repo.formal_col,
                         cycle_num=0,
-                        shared_active_products=self.shared_active_products,
-                        shared_lock=self.shared_lock,
                     )
                     self.total_processed += len(outcomes)
                     adv_count = sum(
@@ -478,20 +451,18 @@ class StageWorker(threading.Thread):
 
 
 class MaintenanceWorker(threading.Thread):
-    """后台清扫维护线程：租约回收、统一保鲜与重试上限归档、正式库好价标摘除与内存索引联动失效。"""
+    """后台清扫维护线程：租约回收、统一保鲜与重试上限归档、正式库好价标摘除与统计看板更新。"""
 
     def __init__(
         self,
         repo: DealRawPoolRepository,
         poll_interval: float = 30.0,
         stop_event: Optional[threading.Event] = None,
-        active_index: Optional[ActiveProductIndex] = None,
     ):
         super().__init__(name="DealMaintenanceWorker", daemon=True)
         self.repo = repo
         self.poll_interval = max(5.0, float(poll_interval))
         self.stop_event = stop_event or threading.Event()
-        self.active_index = active_index
 
     def run_once(self, tick: int = 1) -> None:
         """执行单次维护周期，便于确定性单测与常驻循环复用。"""
@@ -511,10 +482,8 @@ class MaintenanceWorker(threading.Thread):
         if tick % 30 == 0:
             exp_cnt = self.repo.expire_stale_formal_deals(now_utc=now_utc)
             if exp_cnt > 0:
-                if self.active_index is not None:
-                    self.active_index.invalidate_all()
                 logger.info(
-                    "🧹 [正式库好价保鲜] 已摘除超 %.0f 小时未刷新好价标 %d 个并刷新内存索引",
+                    "🧹 [正式库好价保鲜] 已摘除超 %.0f 小时未刷新好价标 %d 个",
                     DEAL_FORMAL_EXPIRY_HOURS,
                     exp_cnt,
                 )

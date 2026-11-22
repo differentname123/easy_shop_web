@@ -1,10 +1,9 @@
-import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 from types import SimpleNamespace
 from adapters.jd_adapter import JdAdapter
-from models.product import ProductRef, DetailSnapshot
+from models.product import ProductRef
 from services.product_service import ProductService
-from cache import clear_all_caches, is_product_off_promotion
+from cache import clear_all_caches
 
 
 def test_hdk_commission_normalization():
@@ -243,33 +242,4 @@ def test_extract_ztk_item_fields_symmetric_commission():
     )
     assert f2["commission_amount"] == 10.0
     assert f2["commission_rate"] == 20.0
-
-
-def test_cache_normalize_platform_sync():
-    from cache import SEARCH_CACHE, sync_product_summary_in_caches, clear_all_caches
-    clear_all_caches()
-
-    # 预置 "taobao" 的搜索结果列表
-    SEARCH_CACHE.set(
-        ("taobao", "纸巾", "all", None, 0, 20),
-        {
-            "status": "success",
-            "data": [
-                {"platform": "taobao", "goods_id": "tb_999", "price": 19.9, "name": "旧标题"}
-            ],
-        },
-    )
-
-    # 详情页使用缩写 "tb" 回流同步摘要
-    sync_product_summary_in_caches(
-        platform="tb",
-        detail_data={"goods_id": "tb_999", "price": 12.9, "name": "新标题"},
-    )
-
-    cached = SEARCH_CACHE.get(("taobao", "纸巾", "all", None, 0, 20))
-    assert cached is not None
-    updated_item = cached["data"][0]
-    assert updated_item["price"] == 12.9
-    assert updated_item["name"] == "新标题"
-    clear_all_caches()
 

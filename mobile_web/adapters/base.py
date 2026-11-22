@@ -8,7 +8,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from infrastructure.api_governance import execute_provider_chain, rotate_providers
+from infrastructure.api_governance import execute_provider_chain
 from infrastructure.http_utils import error_dict
 from models.product import ProductRef
 
@@ -62,10 +62,6 @@ class BasePlatformAdapter(ABC):
             self._provider_lock = threading.Lock()
         if not hasattr(self, "_extra_providers"):
             self._extra_providers: Dict[str, List[Tuple[str, Callable[..., Dict[str, Any]], bool]]] = {}
-        if not hasattr(self, "_provider_strategies"):
-            self._provider_strategies: Dict[str, str] = {}
-        if not hasattr(self, "_rr_cursors"):
-            self._rr_cursors: Dict[str, int] = {}
 
     def register_provider(
         self,
@@ -74,13 +70,11 @@ class BasePlatformAdapter(ABC):
         fn: Callable[..., Dict[str, Any]],
         *,
         prepend: bool = False,
-        strategy: Optional[str] = None,
     ) -> None:
         """
         向指定平台能力挂载额外的第三方供应商实现（与对应 Adapter 公开方法同签名）：
         - `operation`: 'recommend' | 'search' | 'detail' | 'promotion' | 'universal' | 'check_authority' | 'generate_authority_url' | 'orders'
-        - `prepend=True` 可将其设为首选主通道，原内置供应商自动退居备用；
-        - `strategy`: 可选 'failover'（默认主备降级）或 'round_robin'（轮询分摊 + 单次故障顺延）。
+        - `prepend=True` 可将其设为首选主通道，原内置供应商自动退居备用。
         """
         self._ensure_provider_state()
         op = str(operation or "").strip().lower()
@@ -88,20 +82,9 @@ class BasePlatformAdapter(ABC):
             entries = self._extra_providers.setdefault(op, [])
             entries[:] = [item for item in entries if item[0] != name]
             entries.append((name, fn, bool(prepend)))
-            if strategy in ("failover", "round_robin"):
-                self._provider_strategies[op] = strategy
         refresh = getattr(self, "_refresh_capabilities", None)
         if callable(refresh):
             refresh()
-
-    def set_provider_strategy(self, operation: str, strategy: str = "failover") -> None:
-        """切换某项能力的多供应商调度策略：'failover' 或 'round_robin'。"""
-        if strategy not in ("failover", "round_robin"):
-            raise ValueError("strategy must be 'failover' or 'round_robin'")
-        self._ensure_provider_state()
-        op = str(operation or "").strip().lower()
-        with self._provider_lock:
-            self._provider_strategies[op] = strategy
 
     def _has_extra_providers(self, operation: str) -> bool:
         self._ensure_provider_state()
@@ -127,24 +110,15 @@ class BasePlatformAdapter(ABC):
         operation: str,
         providers: Sequence[Tuple[str, Callable[[], Dict[str, Any]]]],
         *,
-        strategy: Optional[str] = None,
         allow_persist: bool = True,
         metric_operation: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """统一执行某能力的多供应商链（支持主备降级与轮询分流，复用全局健康与配额治理）。"""
-        self._ensure_provider_state()
+        """统一执行某能力的多供应商主备降级链（复用全局健康与配额治理）。"""
         op = str(operation or "").strip().lower()
-        with self._provider_lock:
-            eff_strategy = strategy or self._provider_strategies.get(op, "failover")
-            ordered = list(providers)
-            if eff_strategy == "round_robin" and len(ordered) > 1:
-                idx = self._rr_cursors.get(op, 0)
-                self._rr_cursors[op] = (idx + 1) % len(ordered)
-                ordered = rotate_providers(ordered, idx)
         return execute_provider_chain(
             self.platform_code or "unknown",
             metric_operation or op,
-            ordered,
+            list(providers),
             allow_persist=allow_persist,
         )
 
@@ -195,10 +169,6 @@ class BasePlatformAdapter(ABC):
     def needs_coupon_upgrade(self, universal_result: dict, product: Optional[dict]) -> bool:
         """判断万能转链后是否需要叠加优惠券进行二合一升级转链。"""
         return False
-
-    def skip_prefetch_if_detail_checked(self, ref: ProductRef, item: Optional[dict]) -> Optional[float]:
-        """若平台对已拉取过详情的商品无需重复刷新，返回冷却秒数，否则返回 None。"""
-        return None
 
     def warmup(self) -> None:
         """可选的启动预热，不要求通用入口了解任何平台 SDK。"""
@@ -351,30 +321,4 @@ class BasePlatformAdapter(ABC):
         :return: {"status": "success", "order_list": List[Dict], "total_count": int}
         """
         pass
-
-
-class UnavailablePlatformAdapter(BasePlatformAdapter):
-    """未接入平台只保留兼容入口，不能生成假链接或假授权成功。"""
-    active = False
-    channels = ()
-
-    def _unavailable(self, *args, **kwargs):
-        return {
-            "status": "error",
-            "error_code": "platform_unavailable",
-            "error_msg": f"{self.platform_name}暂未接入",
-            "data": [],
-            "order_list": [],
-            "total_count": 0,
-            "is_authorized": False,
-        }
-
-    get_recommend_goods = _unavailable
-    search_goods = _unavailable
-    get_goods_detail = _unavailable
-    convert_promotion_url = _unavailable
-    resolve_and_convert_universal = _unavailable
-    check_authority = _unavailable
-    generate_authority_url = _unavailable
-    fetch_increment_orders = _unavailable
 

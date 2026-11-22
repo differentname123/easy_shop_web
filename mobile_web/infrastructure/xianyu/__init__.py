@@ -8,14 +8,9 @@ from .market import (
 )
 from .seller import (
     check_login_status,
-    delete_item,
-    downshelf_item,
     get_messages,
     get_selling_items,
     open_browser_for_manual_use,
-    publish_item,
-    reply_message,
-    sanitize_content,
 )
 from .session import (
     DEFAULT_GUEST_USER_DATA_DIR,
@@ -52,8 +47,6 @@ __all__ = [
     "XianyuRoundBrowserPool",
     "check_login_status",
     "clean_browser_cache",
-    "delete_item",
-    "downshelf_item",
     "get_messages",
     "get_selling_items",
     "get_xianyu_item_detail",
@@ -61,8 +54,5 @@ __all__ = [
     "launch_persistent_context",
     "logger",
     "open_browser_for_manual_use",
-    "publish_item",
-    "reply_message",
-    "sanitize_content",
     "search_xianyu_items",
 ]

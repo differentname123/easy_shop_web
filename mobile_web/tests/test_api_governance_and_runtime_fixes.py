@@ -123,7 +123,6 @@ def test_stamp_universal_resolution_strict_four_state_contract():
     assert is_valid_product_card(valid_prod) is True
     r_prod = stamp_universal_resolution(
         {"status": "success", "final_link": "https://u.jd.com/new1", "product": valid_prod},
-        single_item_evidence=True,
     )
     assert r_prod["resolution_kind"] == ResolutionKind.PRODUCT
     assert "detail_lookup_failed" not in r_prod
@@ -131,7 +130,6 @@ def test_stamp_universal_resolution_strict_four_state_contract():
     # 2) 转链成功但缺商品卡片，且具备单品证据（如解包出加密 itemId）-> 强制标记 degraded_product + detail_lookup_failed=True
     r_deg = stamp_universal_resolution(
         {"status": "success", "final_link": "https://u.jd.com/new2", "product": None},
-        single_item_evidence=True,
     )
     assert r_deg["resolution_kind"] == ResolutionKind.DEGRADED_PRODUCT
     assert r_deg["detail_lookup_failed"] is True
@@ -147,7 +145,6 @@ def test_stamp_universal_resolution_strict_four_state_contract():
     # 4) Fail-Closed：无商品卡且缺少正向会场实证 (verified_coupon_or_venue=None) 时绝不能误标为纯券
     r_unverified = stamp_universal_resolution(
         {"status": "success", "final_link": "https://u.jd.com/unknown", "product": None},
-        single_item_evidence=False,
     )
     assert r_unverified["resolution_kind"] == ResolutionKind.DEGRADED_PRODUCT
     assert r_unverified["detail_lookup_failed"] is True

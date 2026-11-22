@@ -9,7 +9,7 @@ import math
 import re
 import time
 from copy import deepcopy
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError
 from bson.decimal128 import Decimal128
@@ -26,7 +26,6 @@ from models.deal_constants import (
 from models.product import (
     _BARE_YUAN_TAG_RE,
     clean_product_id,
-    extract_canonical_goods_id,
     extract_search_keyword,
     get_source_site_name,
     is_jd_image_key,
@@ -179,30 +178,6 @@ def upsert_cleaned_products_to_formal_table(
             for dk, dv in deal_info.items():
                 set_fields[f"deal_info.{dk}"] = dv
 
-        batch_timeline_entries: List[Dict[str, Any]] = []
-        seen_tids: Set[str] = set()
-        for d in docs_for_item:
-            di = d.get("deal_info") or {}
-            mid = str(di.get("source_item_id") or d.get("product_id") or "")
-            if mid and mid not in seen_tids:
-                seen_tids.add(mid)
-                pub_ts = float(get_deal_publish_ts(di) or 0.0)
-                s_site = str(di.get("source_site") or "")
-                s_name = str(di.get("source_site_name") or get_source_site_name(s_site))
-                p_nick = str(di.get("provider_nickname") or (di.get("hot_metrics") or {}).get("provider_nickname") or "")
-                batch_timeline_entries.append({
-                    "tip_id": mid,
-                    "source_site": s_site,
-                    "source_site_name": s_name,
-                    "source_channel": str(di.get("source_channel") or ""),
-                    "provider_nickname": p_nick,
-                    "publish_ts": pub_ts,
-                    "title": str(di.get("raw_tip_title") or d.get("name") or ""),
-                    "copywriting": str(di.get("original_copywriting") or "")[:300],
-                    "deal_price": di.get("deal_price"),
-                    "tutorial_score": int(di.get("tutorial_score") or di.get("quality_score") or 75),
-                })
-
         update_spec: Dict[str, Any] = {
             "$set": set_fields,
             "$setOnInsert": {
@@ -214,14 +189,6 @@ def upsert_cleaned_products_to_formal_table(
                 "deal_info.tip_hit_count": len(docs_for_item),
             },
         }
-        if batch_timeline_entries:
-            update_spec["$push"] = {
-                "deal_info.tips_timeline": {
-                    "$each": batch_timeline_entries,
-                    "$sort": {"publish_ts": -1},
-                    "$slice": 20,
-                }
-            }
         add_to_set: Dict[str, Any] = {}
         if all_sites:
             add_to_set["deal_info.resonance_sites"] = {"$each": all_sites}
@@ -283,10 +250,8 @@ class ProductRepository(BaseRepository):
         **_SUMMARY_PROJECTION,
         "format_info": 1,
         "format_status": 1,
-        "sku_info": 1,
         "need_reformat": 1,
         "format_activity_price": 1,
-        "format_sku_prices": 1,
         "deal_info.is_deal_tip": 1,
         "deal_info.publish_ts": 1,
         "deal_info.publish_time": 1,
@@ -959,18 +924,6 @@ class ProductRepository(BaseRepository):
         ):
             return None
 
-        raw_timeline = deal_info.get("tips_timeline") or []
-        tips_timeline = []
-        if isinstance(raw_timeline, list):
-            for entry in raw_timeline:
-                if not isinstance(entry, dict):
-                    continue
-                item = dict(entry)
-                fmt_pub = cls._format_deal_datetime(get_deal_publish_ts(item))
-                if fmt_pub:
-                    item["publish_time"] = fmt_pub
-                tips_timeline.append(item)
-
         return {
             "is_deal_tip": bool(deal_info.get("is_deal_tip")),
             "publish_time": publish_time,
@@ -982,7 +935,6 @@ class ProductRepository(BaseRepository):
             "tutorial_steps": tutorial_steps,
             "original_copywriting": original_copywriting,
             "share_images": share_images,
-            "tips_timeline": tips_timeline,
         }
 
     def _normalize_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -1587,39 +1539,6 @@ class ProductRepository(BaseRepository):
             )
             return False
 
-    def _record_deletion_tombstones(self, platform: str, docs_to_delete: List[Dict[str, Any]]) -> None:
-        """向 deleted_products_log 写入 7 天自动过期的删除墓碑，供云端同步守护进程跨库清理已下架死链。"""
-        if not docs_to_delete or self._db is None or not hasattr(self._db, "get_collection"):
-            return
-        try:
-            tomb_col = self._db.get_collection("deleted_products_log")
-            if not getattr(self, "_tombstone_idx_ready", False):
-                try:
-                    tomb_col.create_index([("platform", 1), ("product_id", 1)], unique=True, background=True)
-                    tomb_col.create_index([("deleted_at", 1)], expireAfterSeconds=7 * 86400, background=True)
-                    self._tombstone_idx_ready = True
-                except Exception:
-                    pass
-            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-            for d in docs_to_delete:
-                pid = self._real_goods_id(d.get("product_id") or d.get("goods_id"))
-                if not pid:
-                    continue
-                tomb_col.update_one(
-                    {"platform": platform, "product_id": pid},
-                    {
-                        "$set": {
-                            "platform": platform,
-                            "product_id": pid,
-                            "goods_sign": str(d.get("goods_sign") or "").strip(),
-                            "deleted_at": now_utc,
-                        }
-                    },
-                    upsert=True,
-                )
-        except Exception:
-            pass
-
     def delete_product(
         self,
         platform: str,
@@ -1634,11 +1553,6 @@ class ProductRepository(BaseRepository):
             return False
         filter_spec = self._identity_filter(plat, gid, gsign)
         try:
-            matched_docs: List[Dict[str, Any]] = []
-            try:
-                matched_docs = list(self.col.find(filter_spec, {"_id": 0, "product_id": 1, "goods_id": 1, "goods_sign": 1}))
-            except Exception:
-                matched_docs = [{"product_id": gid, "goods_sign": gsign}] if gid else []
             now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             res = self.col.update_many(
                 filter_spec,
@@ -1649,25 +1563,14 @@ class ProductRepository(BaseRepository):
             )
             raw_mod = getattr(res, "modified_count", 0)
             modified = int(raw_mod) if isinstance(raw_mod, (int, float)) else 0
-            deleted_pids: List[str] = []
-            seen_pids: Set[str] = set()
-            for d in matched_docs:
-                pid = self._real_goods_id(d.get("product_id") or d.get("goods_id"))
-                if pid and pid not in seen_pids:
-                    seen_pids.add(pid)
-                    deleted_pids.append(pid)
-            if gid and gid not in seen_pids:
-                seen_pids.add(gid)
-                deleted_pids.append(gid)
-            tombstone_docs = matched_docs or ([{"product_id": gid, "goods_sign": gsign}] if gid else [])
-            if tombstone_docs and deleted_pids:
-                self._record_deletion_tombstones(plat, tombstone_docs)
+            raw_matched = getattr(res, "matched_count", 0)
+            matched = int(raw_matched) if isinstance(raw_matched, (int, float)) else 0
             if modified > 0:
                 logger.info(
                     "【失效商品软下架】已将取消推广/下架商品标记软隔离 | 平台[%s] 商品[%s] 影响条数[%d]",
                     plat, gid or gsign, modified,
                 )
-            return modified > 0 or len(matched_docs) > 0
+            return modified > 0 or matched > 0
         except Exception as e:
             logger.warning(
                 "❌ 【失效商品清理异常】从products集合软下架商品失败 | 平台[%s] 商品[%s] 异常<%s>",

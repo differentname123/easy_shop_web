@@ -667,28 +667,6 @@ def select_round_candidates_for_source(
     cutoff_dt = cutoff_utc.replace(tzinfo=None)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    eval_col = db.get_collection(EVAL_COLLECTION_NAME)
-    all_eval_docs = list(
-        eval_col.find({}, {"platform": 1, "product_id": 1, "category_name": 1, "source_type": 1})
-    )
-    same_src_eval_docs = [d for d in all_eval_docs if _normalize_source_type(d.get("source_type")) == src_type]
-    evaluated_keys = {
-        (normalize_platform(d.get("platform") or "pdd"), str(d.get("product_id") or "").strip())
-        for d in same_src_eval_docs
-        if d.get("product_id")
-    }
-    cat_eval_counts: Dict[str, int] = defaultdict(int)
-    for d in same_src_eval_docs:
-        cname = str(d.get("category_name") or "").strip()
-        if cname:
-            cat_eval_counts[cname] += 1
-
-    global_cat_eval_counts: Dict[str, int] = defaultdict(int)
-    for d in all_eval_docs:
-        cname = str(d.get("category_name") or "").strip()
-        if cname:
-            global_cat_eval_counts[cname] += 1
-
     if src_type == SOURCE_TYPE_DEAL_TIP:
         query = {
             "$and": [
@@ -735,6 +713,42 @@ def select_round_candidates_for_source(
             {**d, "source_type": SOURCE_TYPE_OFFICIAL}
             for d in repo.col.find(query, projection).sort([("updated_at", -1)])
         ]
+
+    eval_col = db.get_collection(EVAL_COLLECTION_NAME)
+    cat_eval_counts: Dict[str, int] = defaultdict(int)
+    global_cat_eval_counts: Dict[str, int] = defaultdict(int)
+    for row in eval_col.aggregate([
+        {
+            "$group": {
+                "_id": {"category_name": "$category_name", "source_type": "$source_type"},
+                "count": {"$sum": 1},
+            }
+        }
+    ]):
+        gid = row.get("_id") or {}
+        cname = str(gid.get("category_name") or "").strip()
+        cnt = int(row.get("count") or 0)
+        if not cname or cnt <= 0:
+            continue
+        global_cat_eval_counts[cname] += cnt
+        if _normalize_source_type(gid.get("source_type")) == src_type:
+            cat_eval_counts[cname] += cnt
+
+    candidate_pids = list({
+        str(d.get("product_id") or d.get("goods_id") or "").strip()
+        for d in raw_docs
+        if str(d.get("product_id") or d.get("goods_id") or "").strip()
+    })
+    evaluated_keys = set()
+    if candidate_pids:
+        for d in eval_col.find(
+            {"product_id": {"$in": candidate_pids}},
+            {"platform": 1, "product_id": 1, "source_type": 1},
+        ):
+            if _normalize_source_type(d.get("source_type")) == src_type and d.get("product_id"):
+                evaluated_keys.add(
+                    (normalize_platform(d.get("platform") or "pdd"), str(d.get("product_id") or "").strip())
+                )
 
     by_cat: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any], float]]] = defaultdict(list)
     skipped_evaluated_cnt = 0

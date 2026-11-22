@@ -20,7 +20,7 @@ from models.product import (
 )
 from repositories.product_repo import ProductRepository
 from cache import (
-    RECOMMEND_CACHE, DETAIL_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
+    RECOMMEND_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
     MATERIAL_CACHE, SIGN_BY_ID_CACHE,
     cache_deal_tip,
     cache_product_detail,
@@ -35,7 +35,6 @@ from cache import (
     make_detail_snapshot,
     parse_detail_deadline,
     snapshot_detail_deadline,
-    sync_product_summary_in_caches,
 )
 from config import PRODUCT_DETAIL_TTL, logger
 
@@ -444,7 +443,6 @@ class ProductService:
             return _LoadedDetail({"status": "error", "error_code": "cancelled"})
         public = deepcopy(public) if public is not None else {"status": "success", "data": deepcopy(snapshot.data)}
         public["data"] = deepcopy(snapshot.data)
-        sync_product_summary_in_caches(snapshot.ref.platform, snapshot.data)
         if (
             requested_ref
             and requested_ref.goods_id
@@ -498,7 +496,6 @@ class ProductService:
                 except Exception:
                     break
                 if winner and self._detail_expires_at(winner) >= deadline:
-                    sync_product_summary_in_caches(snapshot.ref.platform, winner)
                     winner_snapshot = self._document_snapshot(winner, snapshot.ref.platform)
                     result = self._database_detail(winner, "database")
                     result = self._cache_detail(snapshot.ref.platform, result, self._detail_expires_at(winner), None,
@@ -669,12 +666,6 @@ class ProductService:
                 ref = self._upgrade_ref_sign(ref)
                 item = self._read_detail(ref, strict=True)
                 ref = self._upgrade_ref_sign(ref, item)
-                skip_fn = getattr(adapter, "skip_prefetch_if_detail_checked", None)
-                if callable(skip_fn):
-                    cooldown_sec = skip_fn(ref, item)
-                    if isinstance(cooldown_sec, (int, float)) and not isinstance(cooldown_sec, bool) and cooldown_sec > 0:
-                        saved = self._document_snapshot(item, ref.platform)
-                        return DetailPrefetchResult("ready", saved, next_check_at=time.time() + cooldown_sec)
                 deadline = self._detail_expires_at(item) if item else 0.0
                 if deadline - time.time() > refresh_ahead_seconds:
                     saved = self._document_snapshot(item, ref.platform)

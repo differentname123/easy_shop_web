@@ -1087,30 +1087,14 @@ class TestProductRepository(unittest.TestCase):
                     "pricing_basis": {"base_unit": "g", "total_value": 500, "structure": [{"unit": "g", "value": 500}]},
                 },
             },
-            # 多 SKU 商品：
-            # - 脏规格：price(10) < activity_price(20)，即使性价比极高也必须过滤
-            # - 低性价比合法规格：100g @ 20元 -> 5 g/元
-            # - 高性价比合法规格：500g * 2袋 @ 50元 -> 20 g/元（应作为该商品代表主规格）
+            # 嵌套结构的合法单规格商品：500g * 2袋 @ 20元 -> 50 g/元
             {
-                "platform": "pdd", "product_id": "MULTI_SKU", "name": "多规格商品",
+                "platform": "pdd", "product_id": "HIGH_RATIO", "name": "高性价比单规格商品",
                 "activity_price": 20.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=5),
                 "format_status": "success",
-                "sku_info": [
-                    {"sku": "引流脏规格", "price": 10.0},
-                    {"sku": "小包装", "price": 20.0},
-                    {"sku": "家庭大包装", "price": 50.0},
-                ],
                 "format_info": {
-                    "MULTI_SKU_1": {
-                        "price": 10.0,
-                        "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
-                    },
-                    "MULTI_SKU_2": {
+                    "HIGH_RATIO_0": {
                         "price": 20.0,
-                        "pricing_basis": {"base_unit": "g", "total_value": 100, "structure": [{"unit": "g", "value": 100}]},
-                    },
-                    "MULTI_SKU_3": {
-                        "price": 50.0,
                         "pricing_basis": {
                             "base_unit": "g", "total_value": 1000,
                             "structure": [{"unit": "袋", "value": 2}, {"unit": "g", "value": 500}],
@@ -1118,16 +1102,28 @@ class TestProductRepository(unittest.TestCase):
                     },
                 },
             },
+            # 价格与活动价不一致的脏规格（price=10 != activity_price=20）：必须过滤归入未清洗末尾
+            {
+                "platform": "pdd", "product_id": "DIRTY_PRICE_MISMATCH", "name": "引流脏价格商品",
+                "activity_price": 20.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=15),
+                "format_status": "success",
+                "format_info": {
+                    "DIRTY_PRICE_MISMATCH_0": {
+                        "price": 10.0,
+                        "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
+                    },
+                },
+            },
         ]
         ranked = self.repo.rank_boom_products_by_cost_performance(platform="pdd")
-        # MULTI_SKU (20 g/元) > SINGLE_SKU (10 g/元) > UNFORMATTED_NEW > UNFORMATTED_OLD
+        # HIGH_RATIO (50 g/元) > SINGLE_SKU (10 g/元) > UNFORMATTED_NEW > UNFORMATTED_OLD > DIRTY_PRICE_MISMATCH
         self.assertEqual(
             [item["product_id"] for item in ranked],
-            ["MULTI_SKU", "SINGLE_SKU", "UNFORMATTED_NEW", "UNFORMATTED_OLD"],
+            ["HIGH_RATIO", "SINGLE_SKU", "UNFORMATTED_NEW", "UNFORMATTED_OLD", "DIRTY_PRICE_MISMATCH"],
         )
 
     def test_service_get_boom_products_uses_cache_and_paginates_cost_performance(self):
-        from cache import BOOM_SORT_CACHE, clear_all_caches, evict_product_from_caches
+        from cache import clear_all_caches, evict_product_from_caches
         from services.product_service import ProductService
 
         clear_all_caches()
@@ -1299,12 +1295,11 @@ class TestProductRepository(unittest.TestCase):
                     "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
                 },
             },
-            # 4. 无规格单条 sku_info 降价未重洗：sku="" 且 format_info["..._1"].price(41.4) != activity_price(35.4)
+            # 4. 兼容旧 _1 键单规格降价未重洗：format_info["..._1"].price(41.4) != activity_price(35.4)
             {
                 "platform": "pdd", "product_id": "STALE_SPECLESS_SKU", "name": "立白无规格SKU降价未重洗",
                 "activity_price": 35.4, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=3),
                 "format_status": "success",
-                "sku_info": [{"sku": "", "price": 41.4}],
                 "format_info": {
                     "STALE_SPECLESS_SKU_1": {
                         "price": 41.4,
@@ -1322,38 +1317,29 @@ class TestProductRepository(unittest.TestCase):
                     "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
                 },
             },
-            # 6. 多 SKU 商品（2 个规格）：规格 1 低于活动价被过滤，规格 2 价格已变（sku_info="¥18.0" != format_info.price=25.0），全部失效归入未清洗末尾
+            # 6. 快照价格已变 (format_activity_price=25.0 != activity_price=18.0) -> 失效归入未清洗末尾
             {
-                "platform": "pdd", "product_id": "STALE_MULTI_SKU", "name": "立白多规格改价未重洗",
+                "platform": "pdd", "product_id": "STALE_SNAPSHOT_PRICE", "name": "立白快照价格过期",
                 "activity_price": 18.0, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=5),
                 "format_status": "success",
-                "sku_info": [
-                    {"sku": "引流小样", "price": "¥9.0"},
-                    {"sku": "补充装", "price": "¥18.0"},
-                ],
-                "format_sku_prices": {"STALE_MULTI_SKU_2": "¥25.0"},
+                "format_activity_price": 25.0,
                 "format_info": {
-                    "STALE_MULTI_SKU_1": {
-                        "price": 9.0,
-                        "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
-                    },
-                    "STALE_MULTI_SKU_2": {
+                    "STALE_SNAPSHOT_PRICE_0": {
                         "price": 25.0,
                         "pricing_basis": {"base_unit": "g", "total_value": 99999, "structure": [{"unit": "g", "value": 99999}]},
                     },
                 },
             },
-            # 7. 拼多多带具体规格属性的 1-SKU 多档文案（"￥19.46多人团价￥21.46"，清洗快照一致）：合法保留，绝不误杀！(10 g/元 < FRESH_VALID 的 20 g/元，但排在全部未清洗商品之前)
+            # 7. 兼容旧 _1 键且价格与快照均一致的单规格商品：合法保留！(10 g/元 < FRESH_VALID 的 20 g/元，但排在全部未清洗商品之前)
             {
-                "platform": "pdd", "product_id": "PDD_SINGLE_SPEC_MULTITIER", "name": "立白蓝色2瓶装",
+                "platform": "pdd", "product_id": "PDD_SINGLE_SPEC_LEGACY", "name": "立白蓝色2瓶装",
                 "activity_price": 19.46, "channel_type": 5, "updated_at": now - datetime.timedelta(minutes=6),
                 "format_status": "success",
-                "sku_info": [{"规格": "蓝色2瓶", "价格": "￥19.46多人团价￥21.46"}],
-                "format_sku_prices": {"PDD_SINGLE_SPEC_MULTITIER_1": "￥19.46多人团价￥21.46"},
+                "format_activity_price": 19.46,
                 "format_info": {
-                    "PDD_SINGLE_SPEC_MULTITIER_1": {
-                        "price": 21.46,
-                        "pricing_basis": {"base_unit": "g", "total_value": 214.6, "structure": [{"unit": "g", "value": 214.6}]},
+                    "PDD_SINGLE_SPEC_LEGACY_1": {
+                        "price": 19.46,
+                        "pricing_basis": {"base_unit": "g", "total_value": 194.6, "structure": [{"unit": "g", "value": 194.6}]},
                     },
                 },
             },
@@ -1364,12 +1350,12 @@ class TestProductRepository(unittest.TestCase):
             [item["product_id"] for item in ranked],
             [
                 "FRESH_VALID",
-                "PDD_SINGLE_SPEC_MULTITIER",
+                "PDD_SINGLE_SPEC_LEGACY",
                 "STALE_SINGLE_DROP",
                 "STALE_SINGLE_HIKE",
                 "STALE_SPECLESS_SKU",
                 "NEED_REFORMAT_FLAG",
-                "STALE_MULTI_SKU",
+                "STALE_SNAPSHOT_PRICE",
             ],
         )
         # 返回的外层展示价格始终是最新 activity_price，且不丢失商品
@@ -1764,8 +1750,8 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(seen_kwargs[0]["only_active_boom"], True)
         self.assertEqual([item["product_id"] for item in res["data"]], ["BOOM-OK"])
 
-    def test_delete_product_by_goods_sign_only_writes_tombstone(self):
-        class TombMemoryCollection(MemoryCollection):
+    def test_delete_product_by_goods_sign_only_soft_off_promotes(self):
+        class SoftDeleteMemoryCollection(MemoryCollection):
             def update_many(self, query, update):
                 matched = modified = 0
                 for d in self.docs:
@@ -1777,17 +1763,23 @@ class TestProductRepository(unittest.TestCase):
                         modified += 1
                 return SimpleNamespace(matched_count=matched, modified_count=modified)
 
-        col = TombMemoryCollection()
-        tomb_col = TombMemoryCollection()
-        db = SimpleNamespace(get_collection=lambda name: tomb_col if name == "deleted_products_log" else col)
-        repo = ProductRepository(db_instance=db)
+        col = SoftDeleteMemoryCollection()
+        repo = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda _n: col))
         col.docs = [
-            {"platform": "jd", "product_id": "IMG_KEY_1", "goods_id": "IMG_KEY_1", "goods_sign": "ENC_SIGN_99", "name": "测试下架"},
+            {
+                "platform": "jd",
+                "product_id": "IMG_KEY_1",
+                "goods_id": "IMG_KEY_1",
+                "goods_sign": "ENC_SIGN_99",
+                "name": "测试下架",
+                "default_promotion": {"final_link": "https://u.jd.com/stale"},
+            },
         ]
         self.assertTrue(repo.delete_product("jd", goods_sign="ENC_SIGN_99"))
         self.assertTrue(col.docs[0]["is_off_promotion"])
-        self.assertEqual(len(tomb_col.write_calls), 1)
-        self.assertEqual(tomb_col.docs[0]["product_id"], "IMG_KEY_1")
+        self.assertIsInstance(col.docs[0]["off_promotion_at"], datetime.datetime)
+        self.assertNotIn("default_promotion", col.docs[0])
+        self.assertEqual(len(col.queries), 0)
 
     def test_deal_datetime_and_timestamp_treat_naive_datetime_as_utc_and_naive_str_as_cn(self):
         from models.cost_performance import parse_deal_publish_timestamp
@@ -1830,7 +1822,6 @@ class TestProductRepository(unittest.TestCase):
                 "format_info": {
                     "pricing_basis": {"structure": [{"value": 5, "unit": "瓶"}, {"value": 500, "unit": "ml"}], "total_value": 2500, "base_unit": "ml"},
                 },
-                "tips_timeline": [{"tip_id": "t1", "publish_ts": pub_ts, "deal_price": 6.48}],
             },
         }
         doc_18_bottles = {
@@ -1883,7 +1874,6 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(ranked[0]["deal_publish_time"], "2026-11-21 21:00")
         tip_view = self.repo._extract_deal_tip(doc_better_fresh)
         self.assertEqual(tip_view["publish_time"], "2026-11-21 21:00")
-        self.assertEqual(tip_view["tips_timeline"][0]["publish_time"], "2026-11-21 21:00")
 
     def test_rank_boom_cost_performance_isolates_irrelevant_l3_and_keeps_unformatted(self):
         """即使廉价配件/狗粮单价极低，也不会在性价比排序中压过真本体商品；无清洗新品照常参与排序。"""

@@ -42,9 +42,7 @@ from services.deal_pipeline import (
     DealPipelineRunner,
     print_latest_ops_report,
     print_stats_report,
-    run_clean_stage,
     run_fetch_stage,
-    run_single_cycle,
     run_stage_pipeline_drain,
 )
 from services.deal_pool_cleaner import DealPoolCleaner
@@ -75,7 +73,6 @@ SCHEDULER_CONFIG: Dict[str, Any] = {
     # 运行时限与集合
     "duration_hours": 0.0,                   # 限定运行时长（0.0 表示持续运行）
     "max_cycles": 0,                         # 最大拉取轮次（0 表示不限轮次）
-    "serial": False,                         # False: 并行流水线常驻; True: 串行单轮交替
     "collection": DEFAULT_RAW_COLLECTION_NAME,
     "formal_collection": DEFAULT_FORMAL_PRODUCTS_COLLECTION,
 }
@@ -159,20 +156,9 @@ def _run_scheduler_body(
     if init_expired > 0:
         logger.info("🧹 [启动好价保鲜清扫] 自动摘除超 %.0f 小时未刷新好价标 %d 个", DEAL_FORMAL_EXPIRY_HOURS, init_expired)
 
-    recovered = repo.recover_recent_misclassified_tips(lookback_hours=48.0)
-    if recovered["jd_recovered"] or recovered["tb_recovered"]:
-        logger.info(
-            "♻️ [启动误杀线报幂等救援] 已释放近 48h 误杀线报回 pending: 京东短链/联盟链=%d 条, 淘口令误路由=%d 条",
-            recovered["jd_recovered"],
-            recovered["tb_recovered"],
-        )
-
     clean_limit = int(cfg["clean_limit"])
     if mode == "clean_only":
-        if cfg["serial"]:
-            run_clean_stage(repo=repo, cleaner=cleaner, cycle_num=1, clean_limit=clean_limit)
-        else:
-            run_stage_pipeline_drain(repo=repo, cleaner=cleaner, clean_limit=clean_limit)
+        run_stage_pipeline_drain(repo=repo, cleaner=cleaner, clean_limit=clean_limit)
         print_stats_report(repo)
         return
 
@@ -187,7 +173,6 @@ def _run_scheduler_body(
     effective_channels = list(MONITORED_CHANNELS)
     enabled_channels = get_active_channels(effective_channels)
     active_cnt = len(enabled_channels)
-    disabled_cnt = len(effective_channels) - active_cnt
 
     if mode == "once":
         run_fetch_stage(
@@ -199,10 +184,7 @@ def _run_scheduler_body(
             channel_last_run=channel_last_run,
             site_cooldown_until=site_cooldown_until,
         )
-        if cfg["serial"]:
-            run_clean_stage(repo=repo, cleaner=cleaner, cycle_num=1, clean_limit=clean_limit)
-        else:
-            run_stage_pipeline_drain(repo=repo, cleaner=cleaner, clean_limit=clean_limit)
+        run_stage_pipeline_drain(repo=repo, cleaner=cleaner, clean_limit=clean_limit)
         print_stats_report(repo)
         return
 
@@ -211,54 +193,6 @@ def _run_scheduler_body(
     max_cycles = int(cfg.get("max_cycles") or 0)
     fetch_tick_seconds = max(5, int(cfg.get("fetch_tick_seconds") or 15))
     deadline_wall = (start_wall + duration_hours * 3600.0) if duration_hours > 0 else None
-
-    if cfg["serial"]:
-        logger.info(
-            "🚀 好价线报【串行模式】已启动 | 初步表=[%s] -> 正式表=[%s] | 监控频道: %d启用/%d停用 | 心跳=%ds",
-            cfg["collection"],
-            cfg["formal_collection"],
-            active_cnt,
-            disabled_cnt,
-            fetch_tick_seconds,
-        )
-        cycle_num = 0
-        while not stop_event.is_set():
-            now_wall = time.time()
-            has_due = any(
-                is_channel_due(ch, channel_last_run.get(ch.name, 0.0), now_wall)
-                and max(site_cooldown_until.get(ch.site_key, 0.0), site_cooldown_until.get(ch.name, 0.0)) <= now_wall
-                for ch in enabled_channels
-            )
-            if has_due:
-                cycle_num += 1
-                try:
-                    run_single_cycle(
-                        repo=repo,
-                        cleaner=cleaner,
-                        session=None,
-                        cycle_num=cycle_num,
-                        clean_limit=clean_limit,
-                        channel_health_tracker=channel_health_tracker,
-                        channels=effective_channels,
-                        channel_last_run=channel_last_run,
-                        site_cooldown_until=site_cooldown_until,
-                    )
-                except Exception as cycle_exc:
-                    logger.exception("🚨 第 #%d 轮执行异常: %s", cycle_num, cycle_exc)
-
-            if (max_cycles > 0 and cycle_num >= max_cycles) or (
-                deadline_wall is not None and time.time() >= deadline_wall
-            ):
-                break
-
-            sleep_sec = _compute_next_wake_seconds(
-                enabled_channels, channel_last_run, site_cooldown_until, time.time(), fetch_tick_seconds
-            )
-            wait_cap = min(float(sleep_sec), max(0.0, deadline_wall - time.time())) if deadline_wall else float(sleep_sec)
-            if interruptible_sleep(stop_event, wait_cap):
-                break
-        print_stats_report(repo)
-        return
 
     ch_summary = ", ".join(f"{c.name}({c.interval_seconds}s)" for c in enabled_channels) or "无"
     logger.info(
@@ -303,7 +237,6 @@ def _run_scheduler_body(
                         channels=effective_channels,
                         channel_last_run=channel_last_run,
                         site_cooldown_until=site_cooldown_until,
-                        active_index=runner.active_index,
                     )
                     if fetch_res.get("total_inserted", 0) > 0:
                         new_fetch_event.set()

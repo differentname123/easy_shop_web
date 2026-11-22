@@ -86,7 +86,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             official_client is not None or self._official_ok and (setting("tb_session") or has_ztk_channel)
         )
         self._orders_ok = bool(ztk_client is not None or has_ztk_channel)
-        self.tb_name = _text(setting("hdk_tb_name") or setting("tb_name") or setting("tb_account_name"))
+        self.tb_name = _text(setting("hdk_tb_name"))
         if self._hdk_ok and self.hdk:
             self.attach_hdk(self.hdk)
         self._refresh_capabilities()
@@ -103,13 +103,11 @@ class TaobaoAdapter(BasePlatformAdapter):
 
     def _make_hdk_promotion(self, client: HdkClient):
         def _promote(goods_id_or_sign="", uid=None, **kwargs):
-            if not getattr(self, "tb_name", ""):
-                return {"status": "skipped", "reason": "missing_hdk_tb_name"}
             ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
             target_id = ref.goods_id if str(ref.goods_id).isdigit() else (ref.goods_sign or ref.goods_id)
             if not target_id:
                 return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
-            pid = self.channel_pid or (self.official.pid if isinstance(getattr(self.official, "pid", None), str) else "")
+            pid = self.channel_pid
             if not pid:
                 return _error("CONFIG_ERROR", "缺少淘宝 PID 配置")
             identity = kwargs.get("identity") or {}
@@ -785,13 +783,13 @@ class TaobaoAdapter(BasePlatformAdapter):
             conv = dict(self.convert_promotion_url(official_target_id, uid=uid, identity=identity))
             conv.pop("_provider", None)
             if conv.get("status") != "success":
-                return stamp_universal_resolution(conv, single_item_evidence=True)
+                return stamp_universal_resolution(conv)
             det = self.get_goods_detail(official_target_id)
             if det.get("status") == "success":
                 conv["product"] = det["data"]
             else:
                 conv["detail_lookup_failed"] = True
-            return stamp_universal_resolution(conv, single_item_evidence=True)
+            return stamp_universal_resolution(conv)
 
         base = []
         if self._ztk_channel_ready() and self.channel_pid:

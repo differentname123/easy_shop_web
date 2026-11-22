@@ -3,21 +3,18 @@
 1. 淘宝平台：高佣榜单获取（输出 item_ids 与游标分页元数据）；
 2. 京东平台：高配额全网搜索、详情反查及专属转链支持。
 """
-import re
 import time
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, unquote, urlsplit
 import requests
 
 from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, is_real_requests_session
 from infrastructure.http_utils import (
-    clean_money,
     clean_text,
     error_dict as _error,
     execute_with_key_failover,
     parse_appkey_list,
 )
-from infrastructure.jd_client import is_jd_official_venue_url
+from infrastructure.jd_client import resolve_jd_short_url
 from infrastructure.logging_utils import get_app_logger
 from infrastructure.transport import create_http_session
 
@@ -28,27 +25,6 @@ HDK_DEFAULT_API_BASE = "https://v3.api.haodanku.com"
 HDK_RATE_LIMIT_KEYWORDS = (
     "频次", "频率", "超限", "上限", "次数", "限制", "频繁", "请稍后", "并发", "额度", "500",
 )
-
-
-def _is_trusted_jd_redirect_url(candidate: Any) -> bool:
-    """校验短链跳转/落地 URL 必须为合法无凭证且属于 jd.com / 3.cn 官方域名（防止 SSRF）。"""
-    if not isinstance(candidate, str):
-        return False
-    raw = candidate.strip()
-    if not raw or "\\" in raw or any(ord(c) < 33 for c in raw):
-        return False
-    try:
-        parts = urlsplit(raw)
-    except ValueError:
-        return False
-    host = (parts.hostname or "").lower()
-    return (
-        parts.scheme in ("http", "https")
-        and bool(host)
-        and parts.username is None
-        and parts.password is None
-        and (host == "jd.com" or host.endswith(".jd.com") or host == "3.cn" or host.endswith(".3.cn"))
-    )
 
 
 class HdkClient:
@@ -298,107 +274,9 @@ class HdkClient:
         *,
         union_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        轻量解包京东 u.jd.com 推广短链，判定是活动会场页还是单品商品：
-        1. 跟随一次内部 302/hrl 跳转拿到落地真实 URL；
-        2. 若落地为活动/会场/券包（pro.m.jd.com、jingfen 活动包、coupon.m.jd.com）：
-           返回 is_venue=True，上游转链后直接作为 coupon_or_venue 成功流转，避免无谓反查单品详情；
-        3. 若落地为单品页（item.m.jd.com / item.jd.com / skuId）：
-           提取出确定性的数字 sku_id 并返回，供详情反查与精准卡片绑定。
-        """
-        url = clean_text(short_url)
-        if not url or "\\" in url or any(ord(c) < 33 for c in url):
-            return _error("INVALID_ARGUMENT", "短链格式无效")
-        try:
-            in_parts = urlsplit(url)
-        except ValueError:
-            return _error("INVALID_ARGUMENT", "短链格式无效")
-        if in_parts.scheme.lower() not in ("http", "https") or not in_parts.hostname or in_parts.username is not None or in_parts.password is not None:
-            return _error("INVALID_ARGUMENT", "短链格式无效")
-        if in_parts.hostname.lower() != "u.jd.com":
-            return _error("NOT_SUPPORTED", "仅支持 u.jd.com 短链解包")
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-            )
-        }
-        dest_url = ""
-        try:
-            timeout = (2.0, 3.5)
-            resp = self.http.get(url, headers=headers, timeout=timeout)
-            if getattr(resp, "status_code", 0) == 200:
-                m = re.search(r"var\s+hrl\s*=\s*['\"]([^'\"]+)['\"]", getattr(resp, "text", "") or "")
-                if m:
-                    hrl = m.group(1).strip()
-                    if not _is_trusted_jd_redirect_url(hrl):
-                        return _error("UNSAFE_REDIRECT", "拒绝非京东域名的短链跳转地址")
-                    r2 = self.http.get(hrl, headers=headers, allow_redirects=True, timeout=timeout)
-                    dest_url = str(getattr(r2, "url", "") or "").strip()
-                elif getattr(resp, "url", "") and resp.url != url:
-                    dest_url = str(resp.url).strip()
-            elif getattr(resp, "status_code", 0) in (301, 302, 303, 307, 308) and getattr(resp, "headers", None):
-                dest_url = str(resp.headers.get("Location") or "").strip()
-        except Exception as e:
-            logger.debug("[HDK短链解包] 访问异常: url=%s, err=%s", url, e)
-            return _error("UPSTREAM_ERROR", f"京东短链解包失败: {e}")
-
-        if not dest_url:
-            return _error("NOT_FOUND", "未能解包该京东短链落地页")
-        if not _is_trusted_jd_redirect_url(dest_url):
-            return _error("UNSAFE_REDIRECT", "短链最终落地地址不属于京东官方域名")
-
-        parts = urlsplit(dest_url)
-        host = (parts.hostname or "").lower()
-        path = parts.path or ""
-        qs = parse_qs(parts.query)
-
-        # 判定是否包含明确单品 SKU 或 goods_sign（通天塔单品页常携带 sku 或 mainSku）
-        sku_id = ""
-        sku_param = qs.get("sku", [""])[0].strip()
-        main_sku_param = qs.get("mainSku", [""])[0].strip()
-        skuid_param = qs.get("skuId", [""])[0].strip()
-        if sku_param:
-            sku_id = sku_param
-        elif main_sku_param:
-            sku_id = main_sku_param
-        elif skuid_param:
-            sku_id = skuid_param
-
-        if not sku_id:
-            path_m = re.search(r"/(?:product|item)/(\d+)\.html", path, re.IGNORECASE)
-            if path_m:
-                sku_id = path_m.group(1)
-
-        if not sku_id and "returnurl" in qs:
-            ret_url = unquote(qs["returnurl"][0])
-            ret_parts = urlsplit(ret_url)
-            ret_m = re.search(r"/(?:product|item)/(\d+)\.html", ret_parts.path, re.IGNORECASE) or re.search(r"[?&]sku(?:Id)?=([A-Za-z0-9_]+)", ret_parts.query)
-            if ret_m:
-                sku_id = ret_m.group(1)
-
-        # 判定是否属于官方活动/会场/券包/店铺首页
-        # 铁律：只有在毫无任何单品 SKU/goods_sign 实证的前提下，才允许判定为纯会场！
-        is_venue = False
-        if not sku_id:
-            is_venue = (
-                is_jd_official_venue_url(dest_url)
-                or host in ("shop.m.jd.com", "mall.jd.com")
-                or (
-                    host == "jingfen.jd.com"
-                    and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url)
-                )
-            )
-
-        return {
-            "status": "success",
-            "data": {
-                "dest_url": dest_url,
-                "is_venue": is_venue,
-                "sku_id": sku_id,
-            },
-        }
+        """委托无状态京东短链安全解包函数（不消耗好单库 Key 配额）。"""
+        _ = union_id
+        return resolve_jd_short_url(short_url, http_session=self.http)
 
     def convert_promotion_link(
         self,
@@ -443,45 +321,6 @@ class HdkClient:
             "click_url": click or short,
             "final_link": short or click,
             "union_id": uid,
-        }
-
-    def query_jd_orders(
-        self,
-        start_time: int,
-        end_time: int,
-        page: int = 1,
-        page_size: int = 50,
-        date_type: int = 1,
-        state: int = 0,
-        cursor: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """拉取京东联盟订单明细 (接口 id=239: v3/unify_jd_order_list)。"""
-        cur_page = cursor or page or 1
-        size = min(100, max(1, int(page_size or 50)))
-        params = {
-            "min_id": cur_page,
-            "back": size,
-            "start_date": int(start_time),
-            "end_date": int(end_time),
-            "date_type": int(date_type),
-            "state": int(state),
-        }
-        res = self._request("GET", "unify_jd_order_list", params=params)
-        if res.get("status") != "success":
-            return res
-        raw_items = res.get("data")
-        rows = raw_items if isinstance(raw_items, list) else []
-        mapped_orders = [_map_hdk_jd_order_to_row(row) for row in rows if isinstance(row, dict)]
-        raw_payload = res.get("raw") or {}
-        next_min_id = raw_payload.get("min_id")
-        has_more = bool(next_min_id and str(next_min_id) != "0" and str(next_min_id) != str(cur_page) and len(rows) >= size)
-        return {
-            "status": "success",
-            "order_list": mapped_orders,
-            "total_count": len(mapped_orders),
-            "page": int(cur_page) if str(cur_page).isdigit() else 1,
-            "has_more": has_more,
-            "next_cursor": str(next_min_id) if has_more else None,
         }
 
     def convert_tb_promotion_link(
@@ -536,78 +375,3 @@ class HdkClient:
             "taoword": taoword,
             "raw": data,
         }
-
-    def query_tb_orders(
-        self,
-        start_time: int,
-        end_time: int,
-        page: int = 1,
-        page_size: int = 50,
-        cursor: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """淘宝订单拉取 (接口: v3/tb_live_order_list)。"""
-        cur_page = cursor or page or 1
-        size = min(100, max(1, int(page_size or 50)))
-        params = {
-            "min_id": cur_page,
-            "back": size,
-            "start_date": int(start_time),
-            "end_date": int(end_time),
-        }
-        res = self._request("GET", "tb_live_order_list", params=params)
-        if res.get("status") != "success":
-            return res
-        raw_items = res.get("data")
-        rows = raw_items if isinstance(raw_items, list) else []
-        mapped = []
-        for r in rows:
-            if isinstance(r, dict):
-                mapped.append({
-                    "trade_id": clean_text(r.get("trade_id") or r.get("order_sn")),
-                    "trade_parent_id": clean_text(r.get("trade_parent_id")),
-                    "item_id": clean_text(r.get("item_id")),
-                    "item_title": clean_text(r.get("item_title")),
-                    "item_num": r.get("item_num", 1),
-                    "alipay_total_price": clean_money(r.get("pay_price"), 0.0),
-                    "pub_share_pre_fee": clean_money(r.get("predict_money"), 0.0),
-                    "pub_share_fee": clean_money(r.get("actual_money"), 0.0),
-                    "tk_status": r.get("order_status", 12),
-                    "tk_create_time": r.get("create_time"),
-                    "tk_paid_time": r.get("paid_time"),
-                    "tk_earning_time": r.get("earning_time"),
-                    "relation_id": clean_text(r.get("relation_id")),
-                })
-        raw_payload = res.get("raw") or {}
-        next_min_id = raw_payload.get("min_id")
-        has_more = bool(next_min_id and str(next_min_id) != "0" and str(next_min_id) != str(cur_page) and len(rows) >= size)
-        return {
-            "status": "success",
-            "order_list": mapped,
-            "total_count": len(mapped),
-            "page": int(cur_page) if str(cur_page).isdigit() else 1,
-            "has_more": has_more,
-            "next_cursor": str(next_min_id) if has_more else None,
-        }
-
-
-def _map_hdk_jd_order_to_row(row: dict) -> dict:
-    status_map = {1: 16, 2: 18, 3: 28, 4: 17}
-    st = row.get("order_status")
-    valid_code = status_map.get(int(st) if str(st).isdigit() else 0, row.get("validCode") or 16)
-    return {
-        "id": clean_text(row.get("trade_id") or row.get("id")),
-        "orderId": clean_text(row.get("trade_parent_id") or row.get("orderId")),
-        "skuId": clean_text(row.get("item_id") or row.get("skuId")),
-        "skuName": clean_text(row.get("item_title") or row.get("skuName")),
-        "skuNum": row.get("item_num") or row.get("skuNum") or 1,
-        "estimateCosPrice": clean_money(row.get("pay_price") or row.get("estimateCosPrice"), 0.0),
-        "estimateFee": clean_money(row.get("predict_money") or row.get("estimateFee"), 0.0),
-        "actualFee": clean_money(row.get("actual_money") or row.get("actualFee"), 0.0),
-        "validCode": valid_code,
-        "orderTime": row.get("create_time") or row.get("orderTime"),
-        "modifyTime": row.get("update_time") or row.get("create_time") or row.get("modifyTime"),
-        "finishTime": row.get("earning_time") or row.get("finishTime"),
-        "positionId": clean_text(row.get("channel_code") or row.get("positionId")),
-        "subUnionId": clean_text(row.get("sub_union_id") or row.get("subUnionId")),
-        "commissionRate": clean_money(row.get("commission_rate") or row.get("commissionRate"), 0.0),
-    }

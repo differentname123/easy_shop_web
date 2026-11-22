@@ -41,7 +41,9 @@ def get_source_site_name(source_site: Optional[str]) -> str:
 
 _TB_CURRENCY_OR_EMOJI_CHARS = r"￥¥$€₴£¢💲🗝🔑🔐"
 _TB_WRAP_CHARS = _TB_CURRENCY_OR_EMOJI_CHARS + r"()（）/【】「」《》~|💰👉📲📦🎁"
-_SHARE_CODE_PAT = r"(?:CZ|CA|AC|ZH|MF|HU|TG|AA|SY|YD|TK|MU|CB)\s*\d{2,6}"
+_SHARE_CODE_PREFIXES = r"(?:CZ|CA|AC|ZH|MF|HU|TG|AA|SY|YD|TK|MU|CB)"
+_SHARE_CODE_PAT = rf"{_SHARE_CODE_PREFIXES}\s*\d{{2,6}}"
+_SHARE_CODE_HSPACE_PAT = rf"{_SHARE_CODE_PREFIXES}[ \t]*\d{{2,6}}"
 _SHARE_CODE_RE = re.compile(rf"\b{_SHARE_CODE_PAT}\b", re.IGNORECASE)
 _TB_UNIFIED_TOKEN_RE = re.compile(
     rf"([{_TB_WRAP_CHARS}])\s*(?:{_SHARE_CODE_PAT}\s+)?([A-Za-z0-9]{{8,15}})\s*(?:{_SHARE_CODE_PAT}\s*)?([{_TB_WRAP_CHARS}])",
@@ -65,11 +67,11 @@ _HTTP_URL_STRIP_RE = re.compile(r"https?://[^\s\u4e00-\u9fa5\"'<>）)\]]+")
 _MP_MINIAPP_RE = re.compile(r"(?:#小程序|mp)://\S+")
 _TOKEN_LABEL_PAREN_RE = re.compile(r"[（(]\s*口令\s*[:：][^）)]+[）)]")
 _DEAL_TOKEN_SHELL_RE = re.compile(
-    r"(?i)\d{0,2}[ \t]*([￥¥$€£₴¢!！（(《「/]{1,2})[ \t]*([A-Za-z0-9]{8,16})[ \t]*([￥¥$€£₴¢!！）)》」/]{1,2})"
-    r"([ \t]*:?/{1,2}(?:[ \t]*(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?|[ \t]+(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*)?"
+    rf"(?i)\d{{0,2}}[ \t]*([￥¥$€£₴¢!！（(《「/]{{1,2}})[ \t]*([A-Za-z0-9]{{8,16}})[ \t]*([￥¥$€£₴¢!！）)》」/]{{1,2}})"
+    rf"([ \t]*:?/{{1,2}}(?:[ \t]*{_SHARE_CODE_HSPACE_PAT}[ \t]*/*)?|[ \t]+{_SHARE_CODE_HSPACE_PAT}[ \t]*/*)?"
 )
 _STANDALONE_SHARE_CODE_SHELL_RE = re.compile(
-    r"(?i)(?:(?<=\s)|^)\d{0,2}[ \t]*(?:[\(（\$￥¥!！/\-]{1,3}[ \t]*[\)）\$￥¥!！/\-]{0,3}[ \t]*)?(?::?/{0,2}[ \t]*)?(?:CZ|MF|HU|CA|ZH|MU|AC|CB|TK)[ \t]*\d{2,6}[ \t]*/*(?=\s|$)"
+    rf"(?i)(?:(?<=\s)|^)\d{{0,2}}[ \t]*(?:[\(（\$￥¥!！/\-]{{1,3}}[ \t]*[\)）\$￥¥!！/\-]{{0,3}}[ \t]*)?(?::?/{{0,2}}[ \t]*){_SHARE_CODE_HSPACE_PAT}[ \t]*/*(?=\s|$)"
 )
 _BARE_TOKEN_WRAPPER_RE = re.compile(
     rf"\d{{0,2}}[ \t]*(?:[{_TB_WRAP_CHARS}]){{1,2}}[ \t]*(?:{_SHARE_CODE_PAT}[ \t]+)?([A-Za-z0-9]{{6,20}})[ \t]*(?:{_SHARE_CODE_PAT}[ \t]*)?(?:[{_TB_WRAP_CHARS}]){{1,2}}[ \t]*(?:(?:/|:/|：)\s*(?:{_SHARE_CODE_PAT})?)?",
@@ -90,7 +92,6 @@ SUPPORTED_ECOMMERCE_DOMAINS = (
     "tb.cn", "tb3.cn", "taobao.com", "tmall.com", "alimama.com",
     "pinduoduo.com", "yangkeduo.com",
 )
-_SUPPORTED_ECOMMERCE_DOMAINS = SUPPORTED_ECOMMERCE_DOMAINS
 
 
 def _looks_like_random_11char_token(tok: str) -> bool:
@@ -100,6 +101,27 @@ def _looks_like_random_11char_token(tok: str) -> bool:
     if len(_WEAK_TOKEN_TITLE_SEG_RE.findall(tok)) >= 2:
         return False
     return True
+
+
+def _iter_taobao_token_matches(no_urls: str):
+    """生成 (核心口令, 完整匹配文本)，统一实施强包裹符或 11 位高熵 + 斜杠边界校验。"""
+    has_share_code = bool(_SHARE_CODE_RE.search(no_urls) or re.search(r"\b\d{1,2}:/", no_urls))
+    for m in _TB_UNIFIED_TOKEN_RE.finditer(no_urls):
+        left_ch, tok_core, right_ch = m.group(1), m.group(2), m.group(3)
+        if not (any(c.isalpha() for c in tok_core) and any(c.isdigit() for c in tok_core)):
+            continue
+        is_strong_delim = (left_ch in _TB_CURRENCY_OR_EMOJI_CHARS) or (right_ch in _TB_CURRENCY_OR_EMOJI_CHARS)
+        if not is_strong_delim:
+            if not (len(tok_core) == 11 and (has_share_code or _looks_like_random_11char_token(tok_core))):
+                continue
+            if left_ch == "/" or right_ch == "/":
+                before_ch = no_urls[m.start() - 1] if m.start() > 0 else ""
+                after_ch = no_urls[m.end()] if m.end() < len(no_urls) else ""
+                if (before_ch and re.match(r"[A-Za-z0-9:/._-]", before_ch)) or (
+                    after_ch and re.match(r"[A-Za-z0-9_.-]", after_ch)
+                ):
+                    continue
+        yield tok_core, m.group(0)
 
 
 def extract_taobao_token_core(raw_text: Any) -> str:
@@ -113,17 +135,9 @@ def extract_taobao_token_core(raw_text: Any) -> str:
     text = str(raw_text or "").strip()
     if not text:
         return ""
-    no_urls = re.sub(r"https?://\S+", " ", text)
-    has_share_code = bool(_SHARE_CODE_RE.search(no_urls) or re.search(r"\b\d{1,2}:/", no_urls))
-    for m in _TB_UNIFIED_TOKEN_RE.finditer(no_urls):
-        left_ch, tok, right_ch = m.group(1), m.group(2), m.group(3)
-        if not (any(c.isalpha() for c in tok) and any(c.isdigit() for c in tok)):
-            continue
-        is_strong_delim = (left_ch in _TB_CURRENCY_OR_EMOJI_CHARS) or (right_ch in _TB_CURRENCY_OR_EMOJI_CHARS)
-        if is_strong_delim:
-            return tok
-        if len(tok) == 11 and (has_share_code or _looks_like_random_11char_token(tok)):
-            return tok
+    no_urls = URL_RE.sub(" ", text)
+    for tok_core, _ in _iter_taobao_token_matches(no_urls):
+        return tok_core
     return ""
 
 
@@ -132,8 +146,7 @@ def extract_all_tokens(raw_text: Any) -> List[str]:
     text = str(raw_text or "").strip()
     if not text:
         return []
-    no_urls = re.sub(r"https?://\S+", " ", text)
-    has_share_code = bool(_SHARE_CODE_RE.search(no_urls) or re.search(r"\b\d{1,2}:/", no_urls))
+    no_urls = URL_RE.sub(" ", text)
     found: List[str] = []
     seen = set()
 
@@ -143,23 +156,8 @@ def extract_all_tokens(raw_text: Any) -> List[str]:
             seen.add(v)
             found.append(v)
 
-    for m in _TB_UNIFIED_TOKEN_RE.finditer(no_urls):
-        left_ch, tok_core, right_ch = m.group(1), m.group(2), m.group(3)
-        if not (any(c.isalpha() for c in tok_core) and any(c.isdigit() for c in tok_core)):
-            continue
-        is_strong_delim = (left_ch in _TB_CURRENCY_OR_EMOJI_CHARS) or (right_ch in _TB_CURRENCY_OR_EMOJI_CHARS)
-        if is_strong_delim:
-            _add(m.group(0))
-            continue
-        if len(tok_core) == 11 and (has_share_code or _looks_like_random_11char_token(tok_core)):
-            if left_ch == "/" or right_ch == "/":
-                before_ch = no_urls[m.start() - 1] if m.start() > 0 else ""
-                after_ch = no_urls[m.end()] if m.end() < len(no_urls) else ""
-                if (before_ch and re.match(r"[A-Za-z0-9:/._-]", before_ch)) or (
-                    after_ch and re.match(r"[A-Za-z0-9_.-]", after_ch)
-                ):
-                    continue
-            _add(m.group(0))
+    for _, raw_tok in _iter_taobao_token_matches(no_urls):
+        _add(raw_tok)
 
     for m in _JCMD_TOKEN_RE.finditer(no_urls):
         raw_jcmd = m.group(0).strip()
@@ -247,10 +245,7 @@ def extract_search_keyword(raw_text: Any, max_length: int = 60) -> str:
         ):
             return candidate[:max_length].strip()
 
-    cleaned = re.sub(r"https?://\S+", " ", text)
-    cleaned = _TB_UNIFIED_TOKEN_RE.sub(" ", cleaned)
-    cleaned = _JCMD_TOKEN_RE.sub(" ", cleaned)
-    cleaned = _SHARE_CODE_RE.sub(" ", cleaned)
+    cleaned = strip_ecommerce_tokens_and_urls(text, preserve_newlines=False)
     cleaned = re.sub(
         r"【(?:淘宝|天猫|京东|京东自营|拼多多|多多进宝|百亿补贴|好物推荐|好物分享|好物精选|手淘分享|券后特惠|特惠参考价|抢购口令|平台口令)[^】]*】",
         " ",
@@ -323,7 +318,7 @@ def classify_user_input(raw_text: Any) -> Dict[str, Any]:
 
     lower = text.lower()
     has_http = bool(re.search(r"https?://", lower))
-    has_supported_domain = any(d in lower for d in _SUPPORTED_ECOMMERCE_DOMAINS)
+    has_supported_domain = any(d in lower for d in SUPPORTED_ECOMMERCE_DOMAINS)
     if has_http and not has_supported_domain:
         return {
             "kind": "unsupported_url",
@@ -368,10 +363,6 @@ def clean_product_id(value: Any) -> str:
 
 
 _JD_IMAGE_KEY_RE = re.compile(r"^[0-9a-fA-F]{14,22}_[0-9a-fA-F]{12,20}$")
-_JD_ITEM_OR_JINGFEN_URL_RE = re.compile(
-    r"^https?://(?:jingfen\.jd\.com/detail|item\.jd\.com)/([^/?#.]+)\.html$",
-    re.IGNORECASE,
-)
 _JD_ITEM_URL_RE = re.compile(r"^https?://item\.jd\.com/([^/?#.]+)\.html$", re.IGNORECASE)
 
 
@@ -379,20 +370,6 @@ def is_jd_image_key(value: Any) -> bool:
     """判断字符串是否为京东主图 CDN 提取的 <目录哈希>_<文件哈希> 静态唯一标识。"""
     text = clean_product_id(value)
     return bool(text and _JD_IMAGE_KEY_RE.match(text))
-
-
-def extract_jd_encrypted_id_from_url(url: Any) -> str:
-    """从京东 jingfen.jd.com/detail/{id}.html 或加密版 item.jd.com/{id}.html 中提取加密 itemId。"""
-    raw = str(url or "").strip()
-    if raw.startswith("//"):
-        raw = "https:" + raw
-    match = _JD_ITEM_OR_JINGFEN_URL_RE.match(raw)
-    if not match:
-        return ""
-    token = clean_product_id(match.group(1))
-    if not token or token.isdigit():
-        return ""
-    return token
 
 
 def normalize_jd_material_url(raw_url: Any, candidate_id: Any = "") -> str:
@@ -651,7 +628,7 @@ class ProductDetail(ProductSummary):
         super().__init__(**data)
 
 
-_DETAIL_FIELDS = frozenset((getattr(ProductDetail, "model_fields", None) or ProductDetail.__fields__).keys()) | {
+_DETAIL_FIELDS = frozenset(ProductDetail.model_fields.keys()) | {
     "brand_name", "category_name", "unified_tags", "search_id",
 }
 

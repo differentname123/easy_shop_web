@@ -5,7 +5,6 @@
 """
 import copy
 import datetime
-import html as html_lib
 import json
 import logging
 import os
@@ -30,9 +29,7 @@ from models.deal_constants import (
     DEFAULT_FORMAL_PRODUCTS_COLLECTION,
     DEFAULT_RAW_COLLECTION_NAME,
     ERROR_LOG_JSONL_PATH,
-    ERR_AI2_COUPON_FAILED_OR_DROPPED,
     ERR_AI_MAX_RETRIES_EXCEEDED,
-    ERR_EMPTY_PRODUCT_IDENTITY,
     ERR_EXPIRED_OVER_7_DAYS,
     LOCAL_FALLBACK_JSONL,
     LOG_DIR,
@@ -207,8 +204,6 @@ def evaluate_quality_signals(record: Dict[str, Any]) -> Dict[str, Any]:
 class DealRawPoolRepository:
     """好价线报初步缓冲池仓储 (`deal_raw_tips`) + 正式商品表 (`products`) 关联管理。"""
 
-    RECOVERY_VERSION_TAG = "20261116_v3"
-
     def __init__(
         self,
         collection_name: str = DEFAULT_RAW_COLLECTION_NAME,
@@ -314,70 +309,6 @@ class DealRawPoolRepository:
         except Exception as e:
             logger.warning("清理超期好价标识 (`deal_info.is_deal_tip`) 异常: %s", e)
             return 0
-
-    def recover_recent_misclassified_tips(self, lookback_hours: float = 48.0) -> Dict[str, int]:
-        """按版本号幂等救援近期误杀线报回 pending。"""
-        cutoff = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(
-            hours=max(1.0, float(lookback_hours))
-        )
-        jd_cps_re = r"(?:u\.jd\.com|union-click\.jd\.com)"
-        reset_payload = {
-            "$set": {
-                "clean_status": "pending",
-                "clean_stage": CLEAN_STAGE_NEED_AI1,
-                "clean_retry_count": 0,
-                "clean_error_code": "",
-                "clean_error_msg": "",
-                "recovery_version": self.RECOVERY_VERSION_TAG,
-            },
-            "$unset": {
-                "ai_stage1_result": "",
-                "converted_links": "",
-                "stage3_converted_links": "",
-                "ai_stage2_result": "",
-                "next_retry_after_ts": "",
-                "stage_lease_owner": "",
-                "stage_lease_until_ts": "",
-            },
-        }
-        jd_recovered = 0
-        tb_recovered = 0
-        try:
-            r_jd = self.col.update_many(
-                {
-                    "clean_status": "cleaned_failed",
-                    "clean_error_code": {
-                        "$in": [
-                            ERR_EMPTY_PRODUCT_IDENTITY,
-                            "ERR_JD_NUMERIC_SKU",
-                            "ERR_AI2_MAIN_DEAD_ONLY_FILLER",
-                        ]
-                    },
-                    "first_seen_at": {"$gte": cutoff},
-                    "recovery_version": {"$ne": self.RECOVERY_VERSION_TAG},
-                    "$or": [
-                        {"tutorial_text": {"$regex": jd_cps_re, "$options": "i"}},
-                        {"source_url": {"$regex": jd_cps_re, "$options": "i"}},
-                        {"extracted_links.url": {"$regex": jd_cps_re, "$options": "i"}},
-                        {"converted_links.clean_input": {"$regex": jd_cps_re, "$options": "i"}},
-                    ],
-                },
-                reset_payload,
-            )
-            jd_recovered = int(getattr(r_jd, "modified_count", 0) or 0)
-            r_tb = self.col.update_many(
-                {
-                    "clean_status": "cleaned_failed",
-                    "first_seen_at": {"$gte": cutoff},
-                    "recovery_version": {"$ne": self.RECOVERY_VERSION_TAG},
-                    "clean_error_msg": {"$regex": "京东.*业务错误"},
-                },
-                reset_payload,
-            )
-            tb_recovered = int(getattr(r_tb, "modified_count", 0) or 0)
-        except Exception as e:
-            logger.warning("按版本幂等救援近期误杀线报异常: %s", e)
-        return {"jd_recovered": jd_recovered, "tb_recovered": tb_recovered}
 
     def reset_raw_collection(self) -> int:
         """清空初步表，并彻底清除正式表内的好价线报单品及重叠推荐流单品上的好价清洗字段。"""
@@ -881,37 +812,31 @@ class DealRawPoolRepository:
         base_query: Dict[str, Any],
         limit: int,
     ) -> List[Any]:
-        """按站点倒序各取候选记录，公平轮询抽取最多 `limit` 个待认领 _id。"""
+        """单次查询按最近发布序抽取上限内候选集，再按站点公平轮询选择最多 `limit` 个待认领 _id。"""
         if limit <= 0:
             return []
-        sites = [
-            str(s or "").strip()
-            for s in self.col.distinct("source_site", base_query)
-            if str(s or "").strip()
-        ]
-        sorted_sites = sorted(set(sites))
-        if not sorted_sites:
-            cursor = (
-                self.col.find(base_query, {"_id": 1})
-                .sort([("publish_ts", -1), ("last_seen_at", -1)])
-                .limit(limit)
-            )
-            return [doc["_id"] for doc in cursor]
+        fetch_cap = max(limit * 6, 120)
+        docs = list(
+            self.col.find(base_query, {"_id": 1, "source_site": 1, "clean_retry_count": 1})
+            .sort([("publish_ts", -1), ("last_seen_at", -1)])
+            .limit(fetch_cap)
+        )
+        if not docs:
+            return []
 
-        per_site_candidates: Dict[str, List[Any]] = {}
-        for s_site in sorted_sites:
-            q = {"$and": [{"source_site": s_site}, base_query]}
-            docs = list(
-                self.col.find(q, {"_id": 1, "clean_retry_count": 1})
-                .sort([("publish_ts", -1), ("last_seen_at", -1)])
-                .limit(limit)
-            )
-            docs.sort(key=lambda d: int(d.get("clean_retry_count") or 0))
-            per_site_candidates[s_site] = [d["_id"] for d in docs]
+        per_site: Dict[str, List[Dict[str, Any]]] = {}
+        for doc in docs:
+            s_key = str(doc.get("source_site") or "").strip() or "_unknown"
+            per_site.setdefault(s_key, []).append(doc)
+
+        queues: List[List[Any]] = []
+        for s_key in sorted(per_site):
+            bucket = per_site[s_key]
+            bucket.sort(key=lambda d: int(d.get("clean_retry_count") or 0))
+            queues.append([d["_id"] for d in bucket])
 
         chosen_ids: List[Any] = []
         chosen_set = set()
-        queues = [per_site_candidates[s] for s in sorted_sites if per_site_candidates.get(s)]
         for group in zip_longest(*queues):
             for doc_id in group:
                 if doc_id is not None and doc_id not in chosen_set:
@@ -1156,72 +1081,137 @@ class DealRawPoolRepository:
         return {"expired_swept": expired_cnt, "max_retry_swept": max_retry_cnt}
 
     def generate_pool_summary(self) -> Dict[str, Any]:
-        """聚合初步表与正式表的核心健康指标字典。"""
+        """单次 $facet 聚合初步表指标与正式表计数，保持对外指标字典不变。"""
         col = self.col
         pcol = self.formal_col
-        total_docs = col.count_documents({})
-        full_detail_docs = col.count_documents({"has_full_detail": True})
-        unique_anchor_docs = col.count_documents({"quality_signals.has_unique_product_anchor": True})
-        cleaned_success_docs = col.count_documents({"clean_status": "cleaned_success"})
-        cleaned_low_score_docs = col.count_documents({"clean_status": "cleaned_low_score"})
-        merged_neighbor_docs = col.count_documents({"clean_status": "merged_into_parent"})
-        context_only_docs = col.count_documents({"clean_status": "context_only"})
-        cleaned_failed_docs = col.count_documents({"clean_status": "cleaned_failed"})
-        pending_clean_docs = col.count_documents({"$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]})
+        pending_stages = (
+            CLEAN_STAGE_NEED_AI1,
+            CLEAN_STAGE_NEED_CONVERT,
+            CLEAN_STAGE_NEED_AI2,
+        )
+        facet_rows = list(
+            col.aggregate([
+                {
+                    "$facet": {
+                        "totals": [
+                            {
+                                "$group": {
+                                    "_id": None,
+                                    "total_docs": {"$sum": 1},
+                                    "full_detail_docs": {
+                                        "$sum": {"$cond": [{"$eq": ["$has_full_detail", True]}, 1, 0]}
+                                    },
+                                    "unique_anchor_docs": {
+                                        "$sum": {
+                                            "$cond": [
+                                                {"$eq": ["$quality_signals.has_unique_product_anchor", True]},
+                                                1,
+                                                0,
+                                            ]
+                                        }
+                                    },
+                                    "cleaned_success_docs": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_success"]}, 1, 0]}
+                                    },
+                                    "cleaned_low_score_docs": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_low_score"]}, 1, 0]}
+                                    },
+                                    "merged_neighbor_docs": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "merged_into_parent"]}, 1, 0]}
+                                    },
+                                    "context_only_docs": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "context_only"]}, 1, 0]}
+                                    },
+                                    "cleaned_failed_docs": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_failed"]}, 1, 0]}
+                                    },
+                                    "pending_clean_docs": {
+                                        "$sum": {
+                                            "$cond": [
+                                                {
+                                                    "$or": [
+                                                        {"$eq": ["$clean_status", "pending"]},
+                                                        {"$eq": [{"$type": "$clean_status"}, "missing"]},
+                                                    ]
+                                                },
+                                                1,
+                                                0,
+                                            ]
+                                        }
+                                    },
+                                }
+                            }
+                        ],
+                        "by_site": [
+                            {
+                                "$group": {
+                                    "_id": "$source_site",
+                                    "count": {"$sum": 1},
+                                    "unique_anchor_count": {
+                                        "$sum": {
+                                            "$cond": [
+                                                {"$eq": ["$quality_signals.has_unique_product_anchor", True]},
+                                                1,
+                                                0,
+                                            ]
+                                        }
+                                    },
+                                    "cleaned_success_count": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_success"]}, 1, 0]}
+                                    },
+                                    "cleaned_failed_count": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_failed"]}, 1, 0]}
+                                    },
+                                    "pending_count": {
+                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "pending"]}, 1, 0]}
+                                    },
+                                }
+                            },
+                            {"$sort": {"cleaned_success_count": -1, "unique_anchor_count": -1, "count": -1}},
+                        ],
+                        "by_clean_error": [
+                            {"$match": {"clean_status": {"$in": ["cleaned_failed", "cleaned_low_score"]}}},
+                            {"$group": {"_id": "$clean_error_code", "count": {"$sum": 1}}},
+                            {"$sort": {"count": -1}},
+                        ],
+                        "by_platform": [
+                            {"$group": {"_id": "$platform", "count": {"$sum": 1}}},
+                            {"$sort": {"count": -1}},
+                        ],
+                        "pending_by_stage": [
+                            {
+                                "$match": {
+                                    "clean_status": "pending",
+                                    "clean_stage": {"$in": list(pending_stages)},
+                                }
+                            },
+                            {"$group": {"_id": "$clean_stage", "count": {"$sum": 1}}},
+                        ],
+                    }
+                }
+            ])
+        )
+        facet = facet_rows[0] if facet_rows else {}
+        totals = (facet.get("totals") or [{}])[0]
+
+        total_docs = int(totals.get("total_docs") or 0)
+        full_detail_docs = int(totals.get("full_detail_docs") or 0)
+        unique_anchor_docs = int(totals.get("unique_anchor_docs") or 0)
+        cleaned_success_docs = int(totals.get("cleaned_success_docs") or 0)
+        cleaned_low_score_docs = int(totals.get("cleaned_low_score_docs") or 0)
+        merged_neighbor_docs = int(totals.get("merged_neighbor_docs") or 0)
+        context_only_docs = int(totals.get("context_only_docs") or 0)
+        cleaned_failed_docs = int(totals.get("cleaned_failed_docs") or 0)
+        pending_clean_docs = int(totals.get("pending_clean_docs") or 0)
+
+        by_site = list(facet.get("by_site") or [])
+        by_clean_error = list(facet.get("by_clean_error") or [])
+        by_platform = list(facet.get("by_platform") or [])
+        stage_counts = {str(r["_id"]): int(r["count"]) for r in (facet.get("pending_by_stage") or [])}
+        pending_by_stage = {stage: stage_counts.get(stage, 0) for stage in pending_stages}
 
         formal_total_products = pcol.count_documents({})
         formal_deal_products = pcol.count_documents({"deal_info.is_deal_tip": True})
-
-        by_site = list(
-            col.aggregate([
-                {
-                    "$group": {
-                        "_id": "$source_site",
-                        "count": {"$sum": 1},
-                        "unique_anchor_count": {
-                            "$sum": {
-                                "$cond": [
-                                    {"$eq": ["$quality_signals.has_unique_product_anchor", True]},
-                                    1,
-                                    0,
-                                ]
-                            }
-                        },
-                        "cleaned_success_count": {
-                            "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_success"]}, 1, 0]}
-                        },
-                        "cleaned_failed_count": {
-                            "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_failed"]}, 1, 0]}
-                        },
-                        "pending_count": {
-                            "$sum": {"$cond": [{"$eq": ["$clean_status", "pending"]}, 1, 0]}
-                        },
-                    }
-                },
-                {"$sort": {"cleaned_success_count": -1, "unique_anchor_count": -1, "count": -1}},
-            ])
-        )
-
-        by_clean_error = list(
-            col.aggregate([
-                {"$match": {"clean_status": {"$in": ["cleaned_failed", "cleaned_low_score"]}}},
-                {"$group": {"_id": "$clean_error_code", "count": {"$sum": 1}}},
-                {"$sort": {"count": -1}},
-            ])
-        )
-
-        by_platform = list(
-            col.aggregate([
-                {"$group": {"_id": "$platform", "count": {"$sum": 1}}},
-                {"$sort": {"count": -1}},
-            ])
-        )
-
-        pending_by_stage = {
-            CLEAN_STAGE_NEED_AI1: col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI1}),
-            CLEAN_STAGE_NEED_CONVERT: col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_CONVERT}),
-            CLEAN_STAGE_NEED_AI2: col.count_documents({"clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI2}),
-        }
 
         return {
             "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

@@ -5,7 +5,7 @@
 底层核心实现已解耦至 `services/deal_cleaning/` 子包：
 - `url_venue`      : 平台信号识别、官方公共会场/领券页白名单重组与 SSRF 安全短链解包
 - `text_sanitizer` : 无链活人文案清洗、教程脱敏与时间线结构构建
-- `cache_state`    : LRU 转链锚点缓存 (`AnchorConversionCache`) 与 TTL 活跃商品索引 (`ActiveProductIndex`)
+- `cache_state`    : 运行期 LRU 转链锚点缓存 (`AnchorConversionCache`) 与正式库活跃商品批量去重查询
 - `ai_client`      : 显式提示词路径、热加载缓存、单次 LLM 调用并发信号量与 JSON 解析
 - `stages`         : Stage 1 (AI-1) / Stage 2 (并发转链) / Stage 3 (AI-2) 执行单元
 - `workers`        : 状态机写库、阶段工作线程 (`StageWorker`) 与后台保鲜维护线程 (`MaintenanceWorker`)
@@ -32,7 +32,6 @@ from models.deal_constants import (
 from repositories.product_repo import upsert_cleaned_products_to_formal_table
 from services.deal_cleaning.ai_client import DealAIClient
 from services.deal_cleaning.cache_state import (
-    ActiveProductIndex,
     AnchorConversionCache,
     query_active_formal_products,
     should_upgrade_existing_deal,
@@ -54,7 +53,6 @@ from services.deal_cleaning.text_sanitizer import (
     clean_coupon_label,
     extract_doc_images,
     format_raw_message_for_ai1,
-    make_timeline_entry,
     normalize_inline_spaces,
     sanitize_card_highlight,
     sanitize_clean_tutorial_step,
@@ -65,7 +63,6 @@ from services.deal_cleaning.url_venue import (
     _is_safe_public_http_url,
     _is_verified_station_promo_link,
     detect_candidate_platform,
-    is_direct_coupon_or_venue_url,
     is_explicit_coupon_target,
     rebuild_clean_official_venue_url,
     unwrap_to_official_public_venue_url,
@@ -136,7 +133,6 @@ class DealPoolCleaner:
         self.stats_ai2_model_hits = 0
         self.stats_ai2_fallbacks = 0
         self.stats_ai_retries_scheduled = 0
-        self.stats_early_terminated_pre_ai1 = 0
         self.stats_early_terminated_post_stage3 = 0
         self.stats_deal_upgrades_post_stage3 = 0
         self.last_batch_stage_timings: Dict[str, float] = {}
@@ -152,14 +148,6 @@ class DealPoolCleaner:
     @max_anchor_cache_size.setter
     def max_anchor_cache_size(self, value: int) -> None:
         self._anchor_cache.max_size = max(1, int(value))
-
-    @property
-    def _cache_warmed_up(self) -> bool:
-        return self._anchor_cache.warmed_up
-
-    @_cache_warmed_up.setter
-    def _cache_warmed_up(self, value: bool) -> None:
-        self._anchor_cache.warmed_up = bool(value)
 
     def set_ai_semaphore(self, sem: Optional[threading.BoundedSemaphore]) -> None:
         self.ai_client.set_ai_semaphore(sem)
@@ -197,9 +185,6 @@ class DealPoolCleaner:
 
     def _evict_transient_failed_cache(self) -> None:
         self._anchor_cache.evict_transient_failures()
-
-    def warmup_anchor_cache_from_db(self, raw_col) -> None:
-        self._anchor_cache.warmup_from_db(raw_col)
 
     def _get_unwrap_session(self) -> Any:
         if self.unwrap_http_session is not None:
@@ -283,18 +268,12 @@ class DealPoolCleaner:
         self,
         selected_docs: List[Dict[str, Any]],
         raw_col,
-        formal_col=None,
-        shared_active_products: Any = None,
-        shared_lock: Optional[threading.Lock] = None,
         quiet_sub_logs: bool = False,
     ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Dict[str, Dict[str, Any]]]]:
         return _process_ai1_unit_impl(
             self,
             selected_docs,
             raw_col,
-            formal_col=formal_col,
-            shared_active_products=shared_active_products,
-            shared_lock=shared_lock,
             quiet_sub_logs=quiet_sub_logs,
         )
 
@@ -362,7 +341,6 @@ class DealPoolCleaner:
     _is_explicit_coupon_target = staticmethod(is_explicit_coupon_target)
     _build_clean_original_copywriting = staticmethod(build_clean_original_copywriting)
     _should_upgrade_existing_deal = staticmethod(should_upgrade_existing_deal)
-    _make_timeline_entry = staticmethod(make_timeline_entry)
 
     @classmethod
     def _lookup_active_formal_products(
@@ -372,13 +350,8 @@ class DealPoolCleaner:
     ) -> Dict[Tuple[str, str], Dict[str, Any]]:
         return query_active_formal_products(formal_col, pid_keys=pid_keys)
 
-    @classmethod
-    def _load_active_formal_products(cls, formal_col) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        return query_active_formal_products(formal_col, pid_keys=None)
-
 
 __all__ = [
-    "ActiveProductIndex",
     "DEAL_FORMAL_EXPIRY_HOURS",
     "DealPoolCleaner",
     "MaintenanceWorker",
@@ -388,7 +361,6 @@ __all__ = [
     "_is_verified_station_promo_link",
     "commit_batch_results_to_db",
     "detect_candidate_platform",
-    "is_direct_coupon_or_venue_url",
     "rebuild_clean_official_venue_url",
     "unwrap_to_official_public_venue_url",
     "upsert_cleaned_products_to_formal_table",

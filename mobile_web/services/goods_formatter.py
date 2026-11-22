@@ -30,7 +30,7 @@ MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
 PROMPT_FILE_PATH = MOBILE_WEB_DIR / "prompt" / "商品数据结构化清洗.txt"
 DEAL_SUPPLEMENT_PROMPT_PATH = MOBILE_WEB_DIR / "prompt" / "商品数据结构化清洗_线报补充.txt"
 
-LLM_MAX_RETRIES = 3
+LLM_MAX_RETRIES = 1
 FORMAT_MAX_RETRIES = 3
 LOCKED_RETRY_SENTINEL = 999
 PRICE_COMPARE_ABS_TOL = 1e-4
@@ -44,7 +44,6 @@ BSON_MAX_INT64 = 2 ** 63 - 1
 COUNT_KEYS = ("success", "failed", "skipped")
 
 _MULTI_SPACE_RE = re.compile(r"\s+")
-_PLAIN_PRICE_TEXT_RE = re.compile(r"^[￥¥]?\s*(\d+(?:\.\d+)?)\s*$")
 
 logger = logging.getLogger("goods_format")
 
@@ -150,7 +149,7 @@ class ProductManager:
 
 
 def pending_format_query(recent_days: int = RECENT_DAYS) -> Dict[str, Any]:
-    """候选商品索引查询条件：最近 N 天内更新且未被人工锁死 (`format_retry_count < 999`)。"""
+    """候选商品索引查询条件：最近 N 天内更新，下推未成功/缺快照/改价/重洗条件，排除人工锁死 (`format_retry_count >= 999`)。"""
     cutoff_time = datetime.now(timezone.utc) - timedelta(days=recent_days)
     return {
         "$and": [
@@ -159,6 +158,34 @@ def pending_format_query(recent_days: int = RECENT_DAYS) -> Dict[str, Any]:
                 "$or": [
                     {"format_retry_count": {"$exists": False}},
                     {"format_retry_count": {"$lt": LOCKED_RETRY_SENTINEL}},
+                ]
+            },
+            {
+                "$or": [
+                    {"need_reformat": True},
+                    {
+                        "$and": [
+                            {"format_activity_price": {"$exists": True}},
+                            {"activity_price": {"$type": "number", "$gt": 0}},
+                            {"$expr": {"$ne": ["$activity_price", "$format_activity_price"]}},
+                        ]
+                    },
+                    {
+                        "$and": [
+                            {
+                                "$or": [
+                                    {"format_status": {"$ne": "success"}},
+                                    {"format_activity_price": {"$exists": False}},
+                                ]
+                            },
+                            {
+                                "$or": [
+                                    {"format_retry_count": {"$exists": False}},
+                                    {"format_retry_count": {"$lt": FORMAT_MAX_RETRIES}},
+                                ]
+                            },
+                        ]
+                    },
                 ]
             },
         ]
@@ -261,6 +288,14 @@ def _is_clean_string(value: Any) -> bool:
     return True
 
 
+def _clean_stripped_str(container: Dict[str, Any], key: str) -> bool:
+    val = container.get(key)
+    if isinstance(val, str):
+        val = val.strip()
+        container[key] = val
+    return _is_clean_string(val)
+
+
 def _is_positive_number(value: Any) -> bool:
     return type(value) in (int, float) and 0 < value <= BSON_MAX_INT64 and math.isfinite(value)
 
@@ -273,7 +308,7 @@ def _check_ranked_items(items, field, text_keys):
         location = f"{field}[{index}]"
         if not isinstance(item, dict) or set(item) != required_keys:
             return False, f"{location} 必须且只能包含 {'、'.join((*text_keys, 'score'))}"
-        if not all(_is_clean_string(item[key]) for key in text_keys):
+        if not all(_clean_stripped_str(item, key) for key in text_keys):
             return False, f"{location} 的 {'、'.join(text_keys)} 必须是非空、无首尾空白的 UTF-8 字符串"
         if type(item["score"]) is not int or not 1 <= item["score"] <= 10:
             return False, f"{location}.score 必须是 1—10 的整数"
@@ -304,8 +339,7 @@ def _check_single_item(format_info, index):
         return False, f"{prefix} pricing_basis 必须是包含指定字段的完整对象，不能为 null"
     if type(pricing["is_inferred"]) is not bool:
         return False, f"{prefix} pricing_basis.is_inferred 必须是布尔值"
-    description = pricing["equivalent_description"]
-    if description is not None and not _is_clean_string(description):
+    if pricing["equivalent_description"] is not None and not _clean_stripped_str(pricing, "equivalent_description"):
         return False, f"{prefix} pricing_basis.equivalent_description 必须为 null 或非空、无首尾空白的字符串"
     structure = pricing["structure"]
     if not isinstance(structure, list) or not structure:
@@ -317,7 +351,7 @@ def _check_single_item(format_info, index):
             return False, f"{location} 必须且只能包含 value、unit"
         if not _is_positive_number(layer["value"]):
             return False, f"{location}.value 必须是 (0, BSON_MAX_INT64] 范围内的有限数值，允许小数"
-        if not _is_clean_string(layer["unit"]):
+        if not _clean_stripped_str(layer, "unit"):
             return False, f"{location}.unit 必须是非空、无首尾空白的字符串"
         total *= layer["value"]
     total_value = pricing["total_value"]
@@ -330,7 +364,7 @@ def _check_single_item(format_info, index):
             pricing["total_value"] = round(total, 6)
         else:
             return False, f"{prefix} pricing_basis.total_value ({total_value}) 必须等于各层 value 的乘积 ({total})"
-    if not _is_clean_string(pricing["base_unit"]) or pricing["base_unit"] != structure[-1]["unit"]:
+    if not _clean_stripped_str(pricing, "base_unit") or pricing["base_unit"] != structure[-1]["unit"]:
         return False, f"{prefix} pricing_basis.base_unit 必须与最后一层 unit 一致"
     return True, ""
 
@@ -437,7 +471,6 @@ def gen_goods_format_info(
                 preset_model_group="low",
                 max_retries_per_model=1,
                 timeout=150,
-                slot_acquire_timeout=5.0,
             )
             model_used = (result.get("metrics") or {}).get("model_used")
             if model_used:
@@ -483,93 +516,45 @@ def _clean_price_number_str(value: float) -> str:
     return f"{rounded:.4f}".rstrip("0").rstrip(".")
 
 
-def _extract_sku_desc(item: Any) -> str:
-    if not isinstance(item, dict):
-        return ""
-    desc_parts = [
-        f"{k}：{v}" for k, v in item.items()
-        if k not in ("价格", "截图地址") and str(v or "").strip()
-    ]
-    return " | ".join(desc_parts)
-
-
-def _is_specless_single_sku(sku_info: Any) -> bool:
-    if not isinstance(sku_info, list) or len(sku_info) == 0:
-        return True
-    if len(sku_info) == 1:
-        return _extract_sku_desc(sku_info[0]) == ""
-    return False
-
-
-def _parse_plain_sku_price(price_text: Any) -> Optional[float]:
-    match = _PLAIN_PRICE_TEXT_RE.fullmatch(str(price_text or "").strip())
-    if not match:
-        return None
-    val = float(match.group(1))
-    return val if _is_positive_number(val) else None
+def _resolve_single_spec_key(product_id: str, existing_fmt: Dict[str, Any]) -> str:
+    """单规格主键统一为 `{product_id}_0`；兼容库中已存在的旧键 `{product_id}_1`。"""
+    legacy_key = f"{product_id}_1"
+    if isinstance(existing_fmt, dict) and legacy_key in existing_fmt and f"{product_id}_0" not in existing_fmt:
+        return legacy_key
+    return f"{product_id}_0"
 
 
 def _detect_product_price_changes(product: Dict[str, Any]):
-    """检测商品当前价格是否与上次清洗时认定的价格发生变动。"""
+    """检测单规格商品当前活动价与上次清洗认定的价格是否发生变动。"""
     product_id = str(product.get("product_id") or "").strip()
     if not product_id:
         return False, set()
 
-    sku_info = product.get("sku_info")
     raw_fmt = product.get("format_info")
     existing_fmt = raw_fmt if isinstance(raw_fmt, dict) and "pricing_basis" not in raw_fmt else {}
+    act_price = product.get("activity_price")
+    if not _is_positive_number(act_price):
+        return False, set()
+    act_float = float(act_price)
+    exp_sku_id = _resolve_single_spec_key(product_id, existing_fmt)
 
-    if _is_specless_single_sku(sku_info):
-        act_price = product.get("activity_price")
-        if not _is_positive_number(act_price):
-            return False, set()
-        act_float = float(act_price)
-        exp_sku_id = (
-            f"{product_id}_1"
-            if isinstance(sku_info, list) and len(sku_info) == 1
-            else f"{product_id}_0"
-        )
-        prev_act = product.get("format_activity_price")
-        if type(prev_act) in (int, float) and math.isfinite(prev_act):
-            if abs(act_float - float(prev_act)) > PRICE_COMPARE_ABS_TOL:
-                return True, {exp_sku_id}
-            return False, set()
-
-        if not existing_fmt:
-            return False, set()
-        first_entry = existing_fmt.get(exp_sku_id)
-        if (
-            len(existing_fmt) != 1
-            or not isinstance(first_entry, dict)
-            or not _is_positive_number(first_entry.get("price"))
-            or abs(act_float - float(first_entry["price"])) > PRICE_COMPARE_ABS_TOL
-        ):
+    prev_act = product.get("format_activity_price")
+    if type(prev_act) in (int, float) and math.isfinite(prev_act):
+        if abs(act_float - float(prev_act)) > PRICE_COMPARE_ABS_TOL:
             return True, {exp_sku_id}
         return False, set()
 
-    raw_snap = product.get("format_sku_prices")
-    snap_map = raw_snap if isinstance(raw_snap, dict) else {}
-    if not existing_fmt and not snap_map:
+    if not existing_fmt:
         return False, set()
-
-    stale_sku_ids = set()
-    for idx, item in enumerate(sku_info, start=1):
-        sku_id = f"{product_id}_{idx}"
-        cur_p_str = str(item.get("价格", "")).strip() if isinstance(item, dict) else ""
-        if sku_id in snap_map:
-            if str(snap_map[sku_id]) != cur_p_str:
-                stale_sku_ids.add(sku_id)
-        elif sku_id in existing_fmt:
-            plain_p = _parse_plain_sku_price(cur_p_str)
-            fmt_entry = existing_fmt.get(sku_id)
-            fmt_p = fmt_entry.get("price") if isinstance(fmt_entry, dict) else None
-            if plain_p is not None and (
-                not _is_positive_number(fmt_p)
-                or abs(plain_p - float(fmt_p)) > PRICE_COMPARE_ABS_TOL
-            ):
-                stale_sku_ids.add(sku_id)
-
-    return bool(stale_sku_ids), stale_sku_ids
+    first_entry = existing_fmt.get(exp_sku_id)
+    if (
+        len(existing_fmt) != 1
+        or not isinstance(first_entry, dict)
+        or not _is_positive_number(first_entry.get("price"))
+        or abs(act_float - float(first_entry["price"])) > PRICE_COMPARE_ABS_TOL
+    ):
+        return True, {exp_sku_id}
+    return False, set()
 
 
 def _chunk_sku_batches(tasks: list, batch_size: int):
@@ -586,6 +571,63 @@ def _chunk_sku_batches(tasks: list, batch_size: int):
     return batches
 
 
+def _execute_format_batches(
+    batches: list,
+    eff_workers: int,
+    process_batch_fn: Callable[[list, dict], None],
+    counts: Dict[str, int],
+    *,
+    err_tag: str,
+    done_prefix: str,
+    started: float,
+) -> None:
+    """并发调度格式化批次并汇总成功/失败/跳过计数与统一日志。"""
+    unexpected_errors = 0
+    with ThreadPoolExecutor(max_workers=eff_workers) as executor:
+        futures = {}
+        for batch in batches:
+            batch_counts = {
+                "success": 0, "failed": 0, "skipped": 0,
+                "normal_success": 0, "normal_failed": 0, "normal_skipped": 0,
+                "reformat_success": 0, "reformat_failed": 0, "reformat_skipped": 0,
+            }
+            futures[executor.submit(process_batch_fn, batch, batch_counts)] = (batch, batch_counts)
+
+        for future in as_completed(futures):
+            batch, batch_counts = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                unfinished = len(batch) - (batch_counts["success"] + batch_counts["failed"] + batch_counts["skipped"])
+                unexpected_errors += unfinished
+                logger.exception(
+                    "❌ [%s/批次异常] 本批未完成 | 首个 SKU: [%s] | 未完成: [%d] | 原因: %s",
+                    err_tag,
+                    batch[0]["sku_id"],
+                    unfinished,
+                    exc,
+                )
+
+            for key in counts:
+                counts[key] += batch_counts[key]
+
+    done_log = logger.warning if unexpected_errors else logger.info
+    done_log(
+        "[%s] 本轮处理结束 | 成功/失败/跳过: [%d/%d/%d] | 常规: [%d/%d/%d] | 重洗: [%d/%d/%d] | 耗时: [%.2f 秒]",
+        done_prefix,
+        counts["success"],
+        counts["failed"],
+        counts["skipped"],
+        counts["normal_success"],
+        counts["normal_failed"],
+        counts["normal_skipped"],
+        counts["reformat_success"],
+        counts["reformat_failed"],
+        counts["reformat_skipped"],
+        time.monotonic() - started,
+    )
+
+
 def run_format_round(
     product_manager: ProductManager,
     *,
@@ -593,7 +635,7 @@ def run_format_round(
     batch_size: Optional[int] = None,
     recent_days: Optional[int] = None,
 ):
-    """按 SKU 粒度并发生成结构化信息，支持断点补洗、价格变动自动重洗与增量写回 `format_info.{sku_id}`。"""
+    """并发生成单规格结构化信息，支持价格变动自动重洗与写回 `format_info.{product_id}_0`。"""
     started = time.monotonic()
     eff_workers = max(1, int(workers if workers is not None else FORMAT_WORKERS))
     eff_batch_size = max(1, int(batch_size if batch_size is not None else FORMAT_BATCH_SIZE))
@@ -608,13 +650,11 @@ def run_format_round(
             "product_id": 1,
             "name": 1,
             "need_reformat": 1,
-            "sku_info": 1,
             "activity_price": 1,
             "format_info": 1,
             "format_status": 1,
             "format_retry_count": 1,
             "format_activity_price": 1,
-            "format_sku_prices": 1,
         },
         sort=[("updated_at", -1)],
     )
@@ -641,8 +681,6 @@ def run_format_round(
 
         product_id = str(product.get("product_id") or "").strip()
         name = str(product.get("name") or "").strip()
-        sku_info = product.get("sku_info")
-        is_specless = _is_specless_single_sku(sku_info)
         raw_format_info = product.get("format_info")
         has_invalid_format_info = "format_info" in product and not isinstance(raw_format_info, dict)
         has_legacy_flat_format = isinstance(raw_format_info, dict) and "pricing_basis" in raw_format_info
@@ -651,26 +689,17 @@ def run_format_round(
             if isinstance(raw_format_info, dict) and not has_legacy_flat_format
             else {}
         )
-        raw_sku_prices = product.get("format_sku_prices")
-        has_invalid_sku_prices = "format_sku_prices" in product and not isinstance(raw_sku_prices, dict)
-        existing_sku_prices = raw_sku_prices.copy() if isinstance(raw_sku_prices, dict) else {}
 
-        has_price_mismatch, stale_sku_ids = _detect_product_price_changes(product)
+        has_price_mismatch, _ = _detect_product_price_changes(product)
         explicit_reformat = bool(product.get("need_reformat"))
         is_reformat = explicit_reformat or has_price_mismatch
 
-        if not is_reformat and not has_legacy_flat_format and not has_invalid_format_info and not has_invalid_sku_prices:
+        if not is_reformat and not has_legacy_flat_format and not has_invalid_format_info:
             if type(retry_cnt) in (int, float) and retry_cnt >= FORMAT_MAX_RETRIES:
                 continue
-            if product_id and product.get("format_status") == "success":
-                if is_specless:
-                    exp_key = f"{product_id}_1" if (isinstance(sku_info, list) and len(sku_info) == 1) else f"{product_id}_0"
-                    is_complete = exp_key in existing_format_info
-                else:
-                    is_complete = isinstance(sku_info, list) and all(
-                        f"{product_id}_{idx}" in existing_format_info for idx in range(1, len(sku_info) + 1)
-                    )
-                if is_complete:
+            if product_id and product.get("format_status") == "success" and "format_activity_price" in product:
+                exp_key = _resolve_single_spec_key(product_id, existing_format_info)
+                if exp_key in existing_format_info:
                     continue
 
         if is_reformat:
@@ -682,7 +711,7 @@ def run_format_round(
             continue
 
         act_raw = product.get("activity_price")
-        if not name or (is_specless and not _is_positive_number(act_raw)):
+        if not name or not _is_positive_number(act_raw):
             fail_patch = {
                 "platform": product["platform"],
                 "product_id": product_id,
@@ -691,61 +720,31 @@ def run_format_round(
                 "format_error": "缺少可清洗的商品标题" if not name else "单规格商品缺少大于0的有效 activity_price",
                 "format_retry_count": FORMAT_MAX_RETRIES,
                 "format_updated_at": datetime.now(timezone.utc),
-            }
-            if is_reformat or has_legacy_flat_format or has_invalid_format_info:
-                fail_patch["format_info"] = {}
-            if is_specless:
-                fail_patch["format_activity_price"] = (
+                "format_activity_price": (
                     float(act_raw)
                     if type(act_raw) in (int, float) and math.isfinite(act_raw)
                     else 0.0
-                )
+                ),
+            }
+            if is_reformat or has_legacy_flat_format or has_invalid_format_info:
+                fail_patch["format_info"] = {}
             product_manager.update(fail_patch, condition={"_id": product["_id"]}, upsert=False)
             counts["skipped"] += 1
             counts["reformat_skipped" if is_reformat else "normal_skipped"] += 1
             continue
 
-        if is_reformat or has_legacy_flat_format or has_invalid_format_info or has_invalid_sku_prices:
-            if explicit_reformat or has_legacy_flat_format or has_invalid_format_info or is_specless:
-                retained_format_info = {}
-            else:
-                valid_sku_keys = {f"{product_id}_{i}" for i in range(1, len(sku_info) + 1)}
-                retained_format_info = {
-                    k: v for k, v in existing_format_info.items()
-                    if k in valid_sku_keys and k not in stale_sku_ids
-                }
-
+        act_float = float(act_raw)
+        if is_reformat or has_legacy_flat_format or has_invalid_format_info:
+            retained_format_info = {}
             reset_patch = {
                 "platform": product["platform"],
                 "product_id": product_id,
                 "need_reformat": False,
-                "format_status": "success" if retained_format_info else "pending",
+                "format_status": "pending",
                 "format_info": retained_format_info,
                 "format_retry_count": 0,
+                "format_activity_price": act_float,
             }
-            if is_specless:
-                act_float = float(act_raw)
-                reset_patch["format_activity_price"] = act_float
-                if isinstance(sku_info, list) and len(sku_info) == 1:
-                    shot_path = str(sku_info[0].get("截图地址") or "") if isinstance(sku_info[0], dict) else ""
-                    synced_sku_info = [{"价格": f"￥{_clean_price_number_str(act_float)}", "截图地址": shot_path}]
-                    reset_patch["sku_info"] = synced_sku_info
-                    sku_info = synced_sku_info
-                    product["sku_info"] = synced_sku_info
-            else:
-                if explicit_reformat or has_invalid_sku_prices:
-                    new_sku_prices = {}
-                else:
-                    valid_sku_keys = {f"{product_id}_{i}" for i in range(1, len(sku_info) + 1)}
-                    new_sku_prices = {k: v for k, v in existing_sku_prices.items() if k in valid_sku_keys}
-                for sid in stale_sku_ids:
-                    idx_num = int(sid.rsplit("_", 1)[1]) - 1
-                    if 0 <= idx_num < len(sku_info) and isinstance(sku_info[idx_num], dict):
-                        new_sku_prices[sid] = str(sku_info[idx_num].get("价格", "")).strip()
-                reset_patch["format_sku_prices"] = new_sku_prices
-                existing_sku_prices = new_sku_prices
-                product["format_sku_prices"] = existing_sku_prices
-
             existing_format_info = retained_format_info
             product["format_info"] = existing_format_info
             product["need_reformat"] = False
@@ -753,57 +752,8 @@ def run_format_round(
         else:
             product["format_info"] = existing_format_info
 
-        product_pending_tasks = []
-        if is_specless:
-            total_expected = 1
-            has_one_placeholder = isinstance(sku_info, list) and len(sku_info) == 1
-            sku_id = f"{product_id}_1" if has_one_placeholder else f"{product_id}_0"
-            if sku_id not in existing_format_info:
-                act_float = float(act_raw)
-                act_price_str = _clean_price_number_str(act_float)
-                synced_sku_info = None
-                if has_one_placeholder:
-                    shot_path = str(sku_info[0].get("截图地址") or "") if isinstance(sku_info[0], dict) else ""
-                    cur_sku0_p = str(sku_info[0].get("价格") or "").strip() if isinstance(sku_info[0], dict) else ""
-                    target_sku0_p = f"￥{act_price_str}"
-                    if cur_sku0_p != target_sku0_p:
-                        synced_sku_info = [{"价格": target_sku0_p, "截图地址": shot_path}]
-                product_pending_tasks.append({
-                    "sku_id": sku_id,
-                    "product_id": product_id,
-                    "product_desc": name,
-                    "sku_desc": "",
-                    "价格": act_price_str,
-                    "expected_price": act_float,
-                    "sync_specless_sku_info": synced_sku_info,
-                    "record_sku_price_str": None,
-                    "product_ref": product,
-                    "total_expected_skus": 1,
-                    "is_reformat": is_reformat,
-                })
-        else:
-            total_expected = len(sku_info)
-            for idx, item in enumerate(sku_info, start=1):
-                sku_id = f"{product_id}_{idx}"
-                if sku_id in existing_format_info:
-                    continue
-                sku_desc = _extract_sku_desc(item)
-                price_str = str(item.get("价格", "")).strip() if isinstance(item, dict) else ""
-                product_pending_tasks.append({
-                    "sku_id": sku_id,
-                    "product_id": product_id,
-                    "product_desc": name,
-                    "sku_desc": sku_desc,
-                    "价格": price_str,
-                    "expected_price": None,
-                    "sync_specless_sku_info": None,
-                    "record_sku_price_str": price_str,
-                    "product_ref": product,
-                    "total_expected_skus": total_expected,
-                    "is_reformat": is_reformat,
-                })
-
-        if not product_pending_tasks and len(existing_format_info) >= total_expected:
+        sku_id = _resolve_single_spec_key(product_id, existing_format_info)
+        if sku_id in existing_format_info:
             done_patch = {
                 "platform": product["platform"],
                 "product_id": product_id,
@@ -811,12 +761,21 @@ def run_format_round(
                 "need_reformat": False,
                 "format_error": "",
                 "format_updated_at": datetime.now(timezone.utc),
+                "format_activity_price": act_float,
             }
-            if is_specless:
-                done_patch["format_activity_price"] = float(act_raw)
             product_manager.update(done_patch, condition={"_id": product["_id"]}, upsert=False)
-        else:
-            all_sku_tasks.extend(product_pending_tasks)
+            continue
+
+        all_sku_tasks.append({
+            "sku_id": sku_id,
+            "product_id": product_id,
+            "product_desc": name,
+            "sku_desc": "",
+            "价格": _clean_price_number_str(act_float),
+            "expected_price": act_float,
+            "product_ref": product,
+            "is_reformat": is_reformat,
+        })
 
     if not all_sku_tasks:
         logger.info("[调度/完成] 查到候选商品，其下规格均已生成完毕并已同步状态 | 耗时: [%.2f 秒]", time.monotonic() - started)
@@ -846,7 +805,6 @@ def run_format_round(
             doc_id = product["_id"]
             product_id = product["product_id"]
             is_reformat = task["is_reformat"]
-            total_expected_skus = task["total_expected_skus"]
 
             format_info_item = generated["results"].get(sku_id)
             is_success = format_info_item is not None
@@ -860,13 +818,8 @@ def run_format_round(
                 "product_id": product_id,
                 "format_model": generated["model_used"],
                 "format_updated_at": datetime.now(timezone.utc),
+                "format_activity_price": task["expected_price"],
             }
-            if task.get("expected_price") is not None:
-                update_fields["format_activity_price"] = task["expected_price"]
-                if task.get("sync_specless_sku_info") is not None:
-                    update_fields["sku_info"] = task["sync_specless_sku_info"]
-            if task.get("record_sku_price_str") is not None:
-                update_fields[f"format_sku_prices.{sku_id}"] = task["record_sku_price_str"]
 
             increments_arg = None
             with state_lock:
@@ -876,9 +829,8 @@ def run_format_round(
                     fmt_map[sku_id] = format_info_item
                     update_fields["format_status"] = "success"
                     update_fields["need_reformat"] = False
-                    if len(fmt_map) >= total_expected_skus:
-                        update_fields["format_error"] = ""
-                        update_fields["format_retry_count"] = 0
+                    update_fields["format_error"] = ""
+                    update_fields["format_retry_count"] = 0
                 else:
                     update_fields["format_status"] = "success" if fmt_map else "failed"
                     update_fields["format_error"] = error
@@ -928,49 +880,15 @@ def run_format_round(
             ", ".join(skipped_ids) or "无",
         )
 
-    unexpected_errors = 0
-    with ThreadPoolExecutor(max_workers=eff_workers) as executor:
-        futures = {}
-        for batch in batches:
-            batch_counts = {
-                "success": 0, "failed": 0, "skipped": 0,
-                "normal_success": 0, "normal_failed": 0, "normal_skipped": 0,
-                "reformat_success": 0, "reformat_failed": 0, "reformat_skipped": 0,
-            }
-            futures[executor.submit(process_batch, batch, batch_counts)] = (batch, batch_counts)
-
-        for future in as_completed(futures):
-            batch, batch_counts = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                unfinished = len(batch) - (batch_counts["success"] + batch_counts["failed"] + batch_counts["skipped"])
-                unexpected_errors += unfinished
-                logger.exception(
-                    "❌ [规格/批次异常] 本批未完成 | 首个 SKU: [%s] | 未完成: [%d] | 原因: %s",
-                    batch[0]["sku_id"],
-                    unfinished,
-                    exc,
-                )
-
-            for key in counts:
-                counts[key] += batch_counts[key]
-
-    done_log = logger.warning if unexpected_errors else logger.info
-    done_log(
-        "[调度/完成] 本轮处理结束 | 规格成功/失败/跳过: [%d/%d/%d] | 常规: [%d/%d/%d] | 重洗: [%d/%d/%d] | 耗时: [%.2f 秒]",
-        counts["success"],
-        counts["failed"],
-        counts["skipped"],
-        counts["normal_success"],
-        counts["normal_failed"],
-        counts["normal_skipped"],
-        counts["reformat_success"],
-        counts["reformat_failed"],
-        counts["reformat_skipped"],
-        time.monotonic() - started,
+    _execute_format_batches(
+        batches,
+        eff_workers,
+        process_batch,
+        counts,
+        err_tag="规格",
+        done_prefix="调度/完成",
+        started=started,
     )
-
     return counts
 
 
@@ -1184,47 +1102,13 @@ def run_deal_format_round(
             ", ".join(skipped_ids) or "无",
         )
 
-    unexpected_errors = 0
-    with ThreadPoolExecutor(max_workers=eff_workers) as executor:
-        futures = {}
-        for batch in batches:
-            batch_counts = {
-                "success": 0, "failed": 0, "skipped": 0,
-                "normal_success": 0, "normal_failed": 0, "normal_skipped": 0,
-                "reformat_success": 0, "reformat_failed": 0, "reformat_skipped": 0,
-            }
-            futures[executor.submit(process_deal_batch, batch, batch_counts)] = (batch, batch_counts)
-
-        for future in as_completed(futures):
-            batch, batch_counts = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                unfinished = len(batch) - (batch_counts["success"] + batch_counts["failed"] + batch_counts["skipped"])
-                unexpected_errors += unfinished
-                logger.exception(
-                    "❌ [线报/批次异常] 本批未完成 | 首个 SKU: [%s] | 未完成: [%d] | 原因: %s",
-                    batch[0]["sku_id"],
-                    unfinished,
-                    exc,
-                )
-
-            for key in counts:
-                counts[key] += batch_counts[key]
-
-    done_log = logger.warning if unexpected_errors else logger.info
-    done_log(
-        "[线报调度/完成] 本轮处理结束 | 线报成功/失败/跳过: [%d/%d/%d] | 常规: [%d/%d/%d] | 重洗: [%d/%d/%d] | 耗时: [%.2f 秒]",
-        counts["success"],
-        counts["failed"],
-        counts["skipped"],
-        counts["normal_success"],
-        counts["normal_failed"],
-        counts["normal_skipped"],
-        counts["reformat_success"],
-        counts["reformat_failed"],
-        counts["reformat_skipped"],
-        time.monotonic() - started,
+    _execute_format_batches(
+        batches,
+        eff_workers,
+        process_deal_batch,
+        counts,
+        err_tag="线报",
+        done_prefix="线报调度/完成",
+        started=started,
     )
-
     return counts

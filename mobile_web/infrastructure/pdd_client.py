@@ -10,13 +10,7 @@ import json
 import time
 
 from infrastructure.logging_utils import logger
-from infrastructure.transport import (
-    _GATEWAY_FALLBACK_IPS,
-    _PDD_FALLBACK_IPS,
-    configure_transport,
-    create_http_session,
-    register_gateway_fallback_ips,
-)
+from infrastructure.transport import create_http_session
 
 # Session/pool construction performs no requests, configuration reads or writes.
 _PDD_SESSION = create_http_session(
@@ -488,55 +482,3 @@ def query_increment_orders(client_id, client_secret, start_time, end_time, page=
         }
     except Exception as e:
         return {"status": "error", "error_msg": f"增量订单查询失败: {str(e)}", "order_list": []}
-
-
-class PddClient:
-    """拼多多官方多多进宝客户端封装，统一面向对象与 Session 注入风格；保留模块函数兼容。"""
-
-    def __init__(self, client_id: str, client_secret: str, pid: str = "", http_session=None):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.pid = pid
-        self.http_session = http_session
-
-    def call_api(self, api_type: str, business_params=None, timeout=(2.5, 4.0)):
-        return call_pdd_api(
-            self.client_id, self.client_secret, api_type, business_params,
-            timeout=timeout, http_session=self.http_session,
-        )
-
-    def warmup(self):
-        return warmup(http_session=self.http_session)
-
-    def get_goods_detail(self, goods_sign=None, goods_id=None, uid=None, **kwargs):
-        return get_goods_detail(
-            self.client_id, self.client_secret, pid=self.pid,
-            goods_sign=goods_sign, goods_id=goods_id, uid=uid, http_session=self.http_session, **kwargs,
-        )
-
-    def generate_smart_promotion_url(self, goods_sign, cash_gift_id=None, uid=None, **kwargs):
-        return generate_smart_promotion_url(
-            self.client_id, self.client_secret, self.pid, goods_sign,
-            cash_gift_id=cash_gift_id, uid=uid, http_session=self.http_session, **kwargs,
-        )
-
-    def convert_pdd_url(self, source_url, uid=None, **kwargs):
-        return convert_pdd_url(
-            self.client_id, self.client_secret, self.pid, source_url,
-            uid=uid, http_session=self.http_session, **kwargs,
-        )
-
-    def check_authority(self, uid):
-        return check_member_authority(self.client_id, self.client_secret, self.pid, uid, http_session=self.http_session)
-
-    def generate_authority_url(self, uid=None, **kwargs):
-        return generate_authority_url(
-            self.client_id, self.client_secret, self.pid, uid=uid,
-            http_session=self.http_session, **kwargs,
-        )
-
-    def query_orders(self, start_time, end_time, page=1, page_size=50, **kwargs):
-        return query_increment_orders(
-            self.client_id, self.client_secret, start_time=start_time, end_time=end_time,
-            page=page, page_size=page_size, http_session=self.http_session, **kwargs,
-        )

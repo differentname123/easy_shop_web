@@ -442,7 +442,6 @@ def test_stage_worker_handoff_preseeds_default_promotion_and_hits_db_on_first_cl
     promote_module.PROMOTION_CACHE.clear()
     adapter = _make_preseed_platform_adapter(plat, spec)
     cleaner = DealPoolCleaner(ai_batch_size=2, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
     cleaner.adapters = {plat: adapter}
 
     raw_doc = {
@@ -581,7 +580,6 @@ def test_preseed_guardrails_and_three_day_expiry_refresh(monkeypatch):
             requires_numeric_promoter_id=plat == "jd",
         )
         cleaner = DealPoolCleaner(ai_batch_size=2, convert_max_workers=1)
-        cleaner._cache_warmed_up = True
         cleaner.adapters = {plat: adapter}
         doc = {
             "_id": f"guard_{plat}",
@@ -727,7 +725,6 @@ def test_jd_l2_promotion_cache_ignores_coupon_mismatch_and_uses_ttl_only(monkeyp
     }
     adapter = _make_preseed_platform_adapter("jd", jd_spec)
     cleaner = DealPoolCleaner(ai_batch_size=2, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
     cleaner.adapters = {"jd": adapter}
     from unittest.mock import patch
     stage4_doc = {

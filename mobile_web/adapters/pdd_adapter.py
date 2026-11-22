@@ -2,7 +2,7 @@
 """拼多多边界：SDK 调用、原始字段转换、商品标识与推广降级策略。"""
 import re
 from typing import Dict, Any
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import urlencode, urlsplit
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
     is_real_requests_session,
@@ -18,7 +18,6 @@ from models.product import (
     ProductSummary,
     URL_RE,
     clean_product_id,
-    extract_search_keyword,
 )
 from infrastructure.pdd_client import (
     _PDD_SESSION,
@@ -624,7 +623,7 @@ class PddAdapter(BasePlatformAdapter):
             )
             if conv_res.get("status") != "success":
                 conv_res["product"] = product_detail
-                return stamp_universal_resolution(conv_res, single_item_evidence=True)
+                return stamp_universal_resolution(conv_res)
             if conv_res.get("is_fallback"):
                 err_res = {
                     "status": "error",
@@ -632,7 +631,7 @@ class PddAdapter(BasePlatformAdapter):
                     "error_msg": "该拼多多商品暂不支持生成推广链接",
                     "product": product_detail,
                 }
-                return stamp_universal_resolution(err_res, single_item_evidence=True)
+                return stamp_universal_resolution(err_res)
 
             conv_res["goods_id"] = id_val
             conv_res["goods_sign"] = sign_val
@@ -640,7 +639,7 @@ class PddAdapter(BasePlatformAdapter):
             conv_res["price"] = price
             conv_res["coupon_amount"] = coupon
             conv_res["product"] = product_detail
-            return stamp_universal_resolution(conv_res, single_item_evidence=True)
+            return stamp_universal_resolution(conv_res)
 
         base = [("pdd_router_universal", _do_pdd_universal)] if (self._has_official_creds() and self.pid) else []
         providers = self._compose_providers("universal", base, raw_text=text, uid=uid, **kwargs)

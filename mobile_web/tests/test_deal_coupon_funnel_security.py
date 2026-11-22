@@ -362,7 +362,6 @@ def test_gate1_blocks_echo_back_spoofing_and_prechecks_pure_non_cps_coupons():
 
 def test_stage5_filters_cross_platform_and_redundant_tb_sclick():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     # Stage 5 组装净化：淘宝商品自动剔除冗余单品 s.click 伪券链和跨平台京东广告尾巴，仅保留真实消费券会场
     cleaner.adapters = {
@@ -484,7 +483,6 @@ def test_fail_closed_coupon_integrity_and_retention():
     5. 淘系二合一链接（虽标注 coupon_candidate 但实际转出主商品自身）-> 正常放行。
     """
     cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     # 1. Case A: 原始线报含优惠券链接，但转链失败（如好单库截断的 3.cn/3cj）
     cleaner.adapters = {
@@ -765,7 +763,6 @@ def test_guangdiu_deterministic_coupon_supplement():
     Stage 1 规范化逻辑能确定性自动补齐入 extracted_targets，并顺利完成转链与卡片展示。
     """
     cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     cleaner.adapters = {
         "jd": SimpleNamespace(
@@ -947,7 +944,6 @@ def test_shop_m_jd_whitelist_and_false_positive_coupon_gates():
     #    - tip_tb_absorbed: 淘系二合一 L1(coupon_candidate) 与 L2(main_candidate) 转出同 goods_id，AI-2 填 coupon_links=[L1] 不被误杀
     #    - tip_jd_subsidy_with_sku: JD 国补低价 + 冗余数字 item.jd.com SKU(ERR_JD_NUMERIC_SKU) + 店铺首页 /mshop/gethomepage 正常放行
     cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     seen_ai2_link_ids = {}
 
@@ -1124,7 +1120,6 @@ def test_transient_degraded_retry_and_cross_platform_consistency():
 
     # --- B. 多链暂态 degraded_product 重试与上限收敛 ---
     cleaner = DealPoolCleaner(ai_batch_size=5, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     def _mock_jd_transient(inp: str):
         if "coupon_ok" in inp or "perm_main_ok" in inp:
@@ -1316,10 +1311,9 @@ def test_transient_degraded_retry_and_cross_platform_consistency():
 
 def test_shop_homepage_exclusion_empty_coupon_step_rewrite_score_clamp_and_config_error_retry():
     """验证店铺首页不入 coupon_links、无券时改写上方【领券】假提示、剔除隐匿数字SKU占位符、分项评分钳位及 CONFIG_ERROR 可重试。"""
-    from models.deal_constants import CLEAN_STAGE_NEED_CONVERT, ERR_ADAPTER_CONFIG_ERROR, ERR_JD_NUMERIC_SKU
+    from models.deal_constants import CLEAN_STAGE_NEED_CONVERT, ERR_ADAPTER_CONFIG_ERROR
 
     cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     cleaner.adapters = {
         "jd": SimpleNamespace(
@@ -1554,7 +1548,6 @@ def test_ai2_partial_coupon_drop_backfills_missing_distinct_coupon_and_html_unes
     main_url = "https://union-click.jd.com/jdc?e=main_huangjiu"
 
     cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     def _mock_jd_univ(inp: str):
         if inp == active_url_1:

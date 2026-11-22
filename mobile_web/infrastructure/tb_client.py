@@ -459,10 +459,10 @@ _TB_CFG_WRITE_LOCK = threading.Lock()
 def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_session: str = "", _api_call=None) -> Dict[str, str]:
     """
     当检测到 taobao_session 缺失或触发 27:invalid-sessionkey 时：
-    1. 检查 config.local.json 是否已更新了新的 taobao_session 或 zhetaoke_sid（支持热重载免重启）；
+    1. 检查 config.local.json 是否已更新了新的 taobao_session（支持热重载免重启）；
     2. 若配置了 taobao_refresh_token，尝试调用淘宝开放平台 taobao.top.auth.token.refresh 自动刷新并原子持久化。
     """
-    result = {"session_key": _text(current_session), "ztk_sid": ""}
+    result = {"session_key": _text(current_session)}
     cfg_env = os.environ.get("WEB_CONFIG_FILE", "").strip()
     config_path = resolve_config_path()
     if not cfg_env and not config_path.is_file():
@@ -481,9 +481,6 @@ def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_sess
 
     cfg_view = local_cfg or {}
     file_session = _text(cfg_view.get("taobao_session") or cfg_view.get("TB_SESSION"))
-    file_sid = _text(cfg_view.get("zhetaoke_sid") or cfg_view.get("ZTK_SID"))
-    if file_sid:
-        result["ztk_sid"] = file_sid
     if file_session and file_session != _text(current_session):
         result["session_key"] = file_session
         return result
@@ -508,7 +505,7 @@ def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_sess
                 except Exception:
                     token_result = {}
             if isinstance(token_result, dict):
-                new_session = _text(token_result.get("access_token") or token_result.get("taobao_user_nick"))
+                new_session = _text(token_result.get("access_token"))
                 new_refresh = _text(token_result.get("refresh_token"))
                 if new_session:
                     result["session_key"] = new_session
@@ -528,13 +525,11 @@ def reload_or_refresh_tb_credentials(app_key: str, app_secret: str, current_sess
 class TaobaoClient:
     """实例边界用于默认配置装配与无网络协议测试；保留现有模块函数兼容。"""
     def __init__(self, app_key, app_secret, adzone_id="", session_key="", inviter_code="",
-                 regular_adzone_id="", channel_adzone_id="", pid_prefix="", http_session=None):
+                 pid_prefix="", http_session=None):
         self.app_key, self.app_secret = app_key, app_secret
-        self.adzone_id = adzone_id or regular_adzone_id
+        self.adzone_id = adzone_id
         self.session_key = session_key
         self.inviter_code = inviter_code
-        self.regular_adzone_id = regular_adzone_id or adzone_id or ""
-        self.channel_adzone_id = channel_adzone_id or adzone_id or ""
         self.pid_prefix = pid_prefix or ""
         self.http_session = http_session
 

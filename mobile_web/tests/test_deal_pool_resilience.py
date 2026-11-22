@@ -22,7 +22,7 @@ from repositories.deal_raw_pool_repo import (
     parse_publish_time_epoch,
 )
 from repositories.product_repo import upsert_cleaned_products_to_formal_table
-from services.deal_pipeline import run_clean_stage, run_fetch_stage
+from services.deal_pipeline import run_fetch_stage
 from services.deal_pool_cleaner import DealPoolCleaner, _commit_batch_results_to_db
 
 
@@ -69,7 +69,6 @@ def test_jd_and_ztk_client_real_round_robin_vs_sticky():
 
 def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transient_cache():
     cleaner = DealPoolCleaner(ai_batch_size=10, ai_max_workers=2, convert_max_workers=2)
-    cleaner._cache_warmed_up = True
 
     fake_jd_adapter = MagicMock()
     # Round 1: Zhetaoke JD transient 301 "无符合条件的数据"
@@ -204,7 +203,6 @@ def test_stage3_transient_failure_schedules_retry_reuses_ai1_and_evicts_transien
 
 def test_deterministic_error_remains_cached_and_does_not_retry():
     cleaner = DealPoolCleaner(ai_batch_size=10, ai_max_workers=2, convert_max_workers=2)
-    cleaner._cache_warmed_up = True
     fake_jd_adapter = MagicMock()
     fake_jd_adapter.resolve_and_convert_universal.return_value = {
         "status": "error",
@@ -287,7 +285,6 @@ def test_four_key_pool_failover_and_cooldown_rotation():
 
 def test_ai2_timeout_retry_reuses_valid_ai1_without_dropping_ai1_timeout_retries():
     cleaner = DealPoolCleaner(ai_batch_size=6, ai_max_workers=2, convert_max_workers=2)
-    cleaner.warmup_anchor_cache_from_db = lambda _col: None
 
     fake_jd_adapter = MagicMock()
     fake_jd_adapter.resolve_and_convert_universal.return_value = {
@@ -529,7 +526,7 @@ def test_save_batch_tehuicaicai_refresh_never_conflicts_set_and_set_on_insert():
     assert doc["$setOnInsert"]["clean_status"] == "pending"
 
 
-def test_run_clean_stage_sweeps_stale_pending_by_either_publish_ts_or_first_seen_at():
+def test_sweep_expired_and_max_retry_by_either_publish_ts_or_first_seen_at():
     import datetime
     import time
 
@@ -588,9 +585,9 @@ def test_run_clean_stage_sweeps_stale_pending_by_either_publish_ts_or_first_seen
     repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: raw_col))
     repo._indexes_ready = True
 
-    out = run_clean_stage(repo, cleaner=SimpleNamespace(), cycle_num=1, clean_limit=10)
-    assert out["expired_over_7d_swept"] == 2
-    assert out["total_pending_found"] == 0
+    out = repo.sweep_expired_and_max_retry(now_utc=now_utc)
+    assert out["expired_swept"] == 2
+    assert out["max_retry_swept"] == 1
     by_id = {d["_id"]: d for d in docs}
     assert by_id["exp_pub"]["clean_status"] == "cleaned_failed"
     assert by_id["exp_pub"]["clean_error_code"] == ERR_EXPIRED_OVER_7_DAYS
@@ -856,7 +853,6 @@ def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_
 
 def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     fake_jd_adapter = MagicMock()
 
@@ -973,43 +969,6 @@ def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
     assert "领楼上券拍维达抽纸19.9元" in deal_info["original_copywriting"]
     assert "https://zhetaoke.example/msg/xb_100" in deal_info["merged_source_urls"]
     assert "https://zhetaoke.example/msg/xb_101" in deal_info["merged_source_urls"]
-
-
-def test_warmup_anchor_cache_from_db_sorts_by_cleaned_at_desc():
-    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    sort_calls = []
-    limit_calls = []
-
-    class _FakeCursor:
-        def sort(self, key, direction):
-            sort_calls.append((key, direction))
-            return self
-
-        def limit(self, n):
-            limit_calls.append(n)
-            return [
-                {
-                    "converted_links": [
-                        {
-                            "link_id": "L1",
-                            "clean_input": "https://u.jd.com/cached_anchor_1",
-                            "convert_status": "product",
-                            "platform": "jd",
-                            "goods_id": "100012345678",
-                            "goods_sign": "https://u.jd.com/my_cached_1",
-                            "my_promo_link": "https://u.jd.com/my_cached_1",
-                        }
-                    ]
-                }
-            ]
-
-    raw_col = MagicMock()
-    raw_col.find.return_value = _FakeCursor()
-
-    cleaner.warmup_anchor_cache_from_db(raw_col)
-    assert sort_calls == [("cleaned_at", -1)]
-    assert limit_calls == [3000]
-    assert "jd:https://u.jd.com/cached_anchor_1" in cleaner.anchor_cache
 
 
 def test_convert_single_target_admits_own_promo_and_rejects_failed_or_echo():
@@ -1129,7 +1088,6 @@ def test_copywriting_space_normalization_and_deal_12h_clock_isolation():
 
 def test_minimalist_four_element_pipeline_and_zero_loss_copywriting():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
 
     # 1. 数学斜体/粗体 Unicode 还原为标准 ASCII，同时完整保留中文全角标点与 Emoji；剥离拔草哦合集拼接头
     bacaoo_doc = {
@@ -1342,76 +1300,8 @@ def test_deal_cleaner_never_poisons_degraded_jd_shortlink_as_ok_coupon():
     cleaner._evict_transient_failed_cache()
     assert "jd:https://u.jd.com/o6P5O9L" not in cleaner.anchor_cache
 
-    # 验证预热门禁：旧库中未标记 resolution_kind 的 u.jd.com 与 union-click.jd.com OK_COUPON 均拒绝预热
-    class _WarmupCursor:
-        def sort(self, *_a):
-            return self
 
-        def limit(self, *_a):
-            return [
-                {
-                    "converted_links": [
-                        {
-                            "link_id": "L_OLD_POISON_U",
-                            "clean_input": "https://u.jd.com/poisonedOld",
-                            "convert_status": "coupon_or_activity",
-                            "error_code": "OK_COUPON",
-                            "platform": "jd",
-                            "my_promo_link": "https://u.jd.com/myPoisonedOut",
-                        },
-                        {
-                            "link_id": "L_OLD_POISON_UC",
-                            "clean_input": "https://union-click.jd.com/jdc?e=&p=JF8B_OLD",
-                            "convert_status": "coupon_or_activity",
-                            "error_code": "OK_COUPON",
-                            "platform": "jd",
-                            "my_promo_link": "https://u.jd.com/myPoisonedOut2",
-                        },
-                        {
-                            "link_id": "L_NEW_VENUE",
-                            "clean_input": "https://u.jd.com/realVenue",
-                            "convert_status": "coupon_or_activity",
-                            "resolution_kind": "coupon_or_venue",
-                            "error_code": "OK_COUPON",
-                            "platform": "jd",
-                            "my_promo_link": "https://u.jd.com/myRealVenueOut",
-                        },
-                    ]
-                }
-            ]
-
-    raw_col = MagicMock()
-    raw_col.find.return_value = _WarmupCursor()
-    cleaner.warmup_anchor_cache_from_db(raw_col)
-    assert "jd:https://u.jd.com/poisonedOld" not in cleaner.anchor_cache
-    assert "jd:https://union-click.jd.com/jdc?e=&p=JF8B_OLD" not in cleaner.anchor_cache
-    assert "jd:https://u.jd.com/realVenue" in cleaner.anchor_cache
-
-
-def test_deal_pool_startup_recovery_idempotently_rescues_recent_misclassified_tips():
-    fake_db = MagicMock()
-    fake_col = MagicMock()
-    fake_db.get_collection.return_value = fake_col
-
-    repo = DealRawPoolRepository(db_instance=fake_db)
-    fake_col.update_many.reset_mock()
-    fake_col.update_many.side_effect = [
-        SimpleNamespace(modified_count=7),
-        SimpleNamespace(modified_count=3),
-    ]
-    out = repo.recover_recent_misclassified_tips(lookback_hours=48.0)
-    assert out == {"jd_recovered": 7, "tb_recovered": 3}
-    assert fake_col.update_many.call_count == 2
-    jd_flt, jd_upd = fake_col.update_many.call_args_list[0].args
-    assert ERR_JD_NUMERIC_SKU in jd_flt["clean_error_code"]["$in"]
-    assert any("union-click" in str(cond) for cond in jd_flt["$or"])
-    for call in fake_col.update_many.call_args_list:
-        flt, upd = call.args
-        assert flt["recovery_version"] == {"$ne": DealRawPoolRepository.RECOVERY_VERSION_TAG}
-        assert upd["$set"]["clean_status"] == "pending"
-        assert upd["$set"]["recovery_version"] == DealRawPoolRepository.RECOVERY_VERSION_TAG
-        assert "ai_stage1_result" in upd["$unset"]
-
+def test_ai1_supplements_union_click_link_when_numeric_jd_present():
     # 验证同帖同时含 item.jd.com/{数字} 与 extracted_links(union-click.jd.com) 时，若 AI-1 漏提 union-click，由代码确定性补齐
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
     doc = {
@@ -1714,8 +1604,7 @@ def test_run_fetch_stage_short_circuits_same_site_after_rate_limit(monkeypatch, 
     assert "共 2 条详情异常" in out["error_paths"][0]["error_message"]
 
 
-def test_deal_ai1_scoring_and_timeline_upgrade_conditions():
-    # 1. 结构化时间线条目生成
+def test_deal_ai1_scoring_and_upgrade_conditions():
     raw_doc = {
         "source_item_id": "tip_998",
         "source_site": "zhetaoke",
@@ -1730,15 +1619,8 @@ def test_deal_ai1_scoring_and_timeline_upgrade_conditions():
         "tutorial_score": 85,
         "combined_raw_text": "拍1件领券立减到手9.9元",
     }
-    entry = DealPoolCleaner._make_timeline_entry(raw_doc, ai1_res=ai1_res)
-    assert entry["tip_id"] == "tip_998"
-    assert entry["source_site"] == "zhetaoke"
-    assert entry["publish_ts"] == 1794936000.0
-    assert entry["deal_price"] == 9.9
-    assert entry["tutorial_score"] == 85
-    assert "9.9元" in entry["copywriting"]
 
-    # 2. 教程更优升级（库内商品教程分仅 60，新线报 AI-1 评出 85 分高质量教程）
+    # 1. 教程更优升级（库内商品教程分仅 60，新线报 AI-1 评出 85 分高质量教程）
     ex_poor = {
         "platform": "tb",
         "product_id": "111",
@@ -1825,14 +1707,10 @@ def test_upsert_cleaned_products_honors_lower_price_improvement():
     set_fields = captured_ops[0]._doc["$set"]
     assert set_fields["deal_info.deal_price"] == 149.0
     assert set_fields["deal_info.tutorial_steps"] == ["1. 领券", "2. 下单"]
-    assert "$push" in captured_ops[0]._doc
-    assert "deal_info.tips_timeline" in captured_ops[0]._doc["$push"]
-    tl_pushed = captured_ops[0]._doc["$push"]["deal_info.tips_timeline"]["$each"]
-    assert len(tl_pushed) == 1
-    assert tl_pushed[0]["deal_price"] == 149.0
+    assert "$push" not in captured_ops[0]._doc
 
 
-def test_commit_batch_results_records_bounded_tips_timeline():
+def test_commit_batch_results_updates_resonance_without_tips_timeline():
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -1859,17 +1737,6 @@ def test_commit_batch_results_records_bounded_tips_timeline():
                 "source_site": "xianbao_fun",
                 "seen_channels": ["ch1"],
                 "copywriting": "群友最新实操作业：拍2件叠加88vip再减5元，凑单某某可退！",
-                "timeline_entry": {
-                    "tip_id": "xb_dup_1",
-                    "source_site": "xianbao_fun",
-                    "source_channel": "ch1",
-                    "publish_time": "2026-11-18 01:25:00",
-                    "publish_ts": 1794936300.0,
-                    "title": "群友爆料作业",
-                    "copywriting": "群友最新实操作业：拍2件叠加88vip再减5元",
-                    "deal_price": 45.0,
-                    "tutorial_score": 80,
-                },
             },
         }
     ]
@@ -1883,15 +1750,11 @@ def test_commit_batch_results_records_bounded_tips_timeline():
     assert len(captured_formal_ops) == 1
     upd_op = captured_formal_ops[0]._doc
     assert "deal_info.supplementary_copies" not in (upd_op.get("$addToSet") or {})
-    assert "$push" in upd_op
-    assert "deal_info.tips_timeline" in upd_op["$push"]
-    tl_push = upd_op["$push"]["deal_info.tips_timeline"]
-    assert tl_push["$slice"] == 20
-    tl_ops = tl_push["$each"]
-    assert len(tl_ops) == 1
-    assert tl_ops[0]["tip_id"] == "xb_dup_1"
-    assert tl_ops[0]["deal_price"] == 45.0
-    assert "群友最新实操作业" in tl_ops[0]["copywriting"]
+    assert "$push" not in upd_op
+    assert upd_op["$inc"]["deal_info.total_seen_count"] == 1
+    assert upd_op["$inc"]["deal_info.tip_hit_count"] == 1
+    assert upd_op["$addToSet"]["deal_info.resonance_sites"]["$each"] == ["xianbao_fun"]
+    assert upd_op["$addToSet"]["deal_info.resonance_channels"]["$each"] == ["ch1"]
 
 
 def test_fetch_guangdiu_filters_vipshop():
@@ -2531,7 +2394,6 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
     jd_adapter = JdAdapter(settings=settings_stub, client=jd_client, hdk_client=fake_hdk)
 
     cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
-    cleaner._cache_warmed_up = True
     cleaner.adapters = {
         "jd": jd_adapter,
         "taobao": SimpleNamespace(resolve_and_convert_universal=lambda _x: {"status": "error"}),
