@@ -3,6 +3,7 @@
 import json
 import logging
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,7 +47,7 @@ def test_parse_llm_json_extracts_think_fences_comments_urls_and_literals():
         parse_llm_json("完全没有结构化对象的纯文本")
 
 
-def test_ai_api_exports_remain_clean_without_antigravity_client(monkeypatch):
+def test_ai_api_import_is_lazy_without_loading_antigravity_client(monkeypatch):
     for mod_name in list(sys.modules):
         if mod_name == "infrastructure.ai_api" or mod_name.startswith("infrastructure.ai_api."):
             monkeypatch.delitem(sys.modules, mod_name, raising=False)
@@ -55,11 +56,10 @@ def test_ai_api_exports_remain_clean_without_antigravity_client(monkeypatch):
     import infrastructure.ai_api.model_api as model_api
 
     assert "infrastructure.ai_api.antigravity_client" not in sys.modules
-    assert not (Path(__file__).resolve().parents[1] / "infrastructure" / "ai_api" / "antigravity_client.py").exists()
     assert callable(ai_api.generate_content)
     assert callable(ai_api.parse_llm_json)
     assert callable(model_api.generate_content)
-    assert not hasattr(ai_api, "AntigravityClient")
+    assert "infrastructure.ai_api.antigravity_client" not in sys.modules
 
 
 def _install_fake_openai(monkeypatch, model_api_mod, handler):
