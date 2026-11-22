@@ -97,7 +97,13 @@ class FakeMongoDB:
         return self.collection
 
 
-def _sample_valid_llm_item(sku_id: str, price: float, total_value: float = 8000, unit: str = "ml") -> dict:
+def _sample_valid_llm_item(
+    sku_id: str,
+    price: float,
+    total_value: float = 8000,
+    unit: str = "ml",
+    card_highlight: str | None = "7.6元/瓶",
+) -> dict:
     return {
         "sku_id": sku_id,
         "price": price,
@@ -118,6 +124,7 @@ def _sample_valid_llm_item(sku_id: str, price: float, total_value: float = 8000,
             "base_unit": unit,
             "equivalent_description": None,
         },
+        "card_highlight": card_highlight,
     }
 
 
@@ -128,7 +135,7 @@ def test_build_deal_product_desc_strips_urls_and_tokens():
         "deal_info": {
             "clean_title": "蓝月亮薰衣草洗衣液8斤套装",
             "price_logic": "领满99减30券 + 拍2件立减",
-            "unit_deal_price": "折30.4元/套",
+            "card_highlight": "30.4元/套",
             "tutorial_text": (
                 "1. 先领券 https://u.jd.com/abc123 （口令：￥88XYZ99￥） "
                 "2. 主商品拍 2 件 https://s.click.taobao.com/xyz (口令: $AAA111$) 实付60.8元起"
@@ -144,11 +151,31 @@ def test_build_deal_product_desc_strips_urls_and_tokens():
     assert "官方标题参考：【官方旗舰店】蓝月亮深层洁净洗衣液4kg套装" in desc
     assert "官方日常价：49.9元" in desc
     assert "优惠方式：领满99减30券 + 拍2件立减" in desc
-    assert "折算参考：折30.4元/套" in desc
     assert "购买步骤：1. 先领券 2. 主商品拍 2 件 实付60.8元起" in desc
     assert "原始爆料文案：群友爆料 蓝月亮8斤套装 拍2件实付60.8元" in desc
     assert "https://" not in desc
     assert "口令" not in desc
+
+
+def test_check_format_info_validates_and_sanitizes_card_highlight():
+    ok_none, res_none, _, _ = gif.check_format_info([_sample_valid_llm_item("s1", 96.0, card_highlight="到手96元")], ["s1"])
+    assert ok_none and res_none["s1"]["card_highlight"] == "到手96元"
+
+    ok_null, res_null, _, _ = gif.check_format_info([_sample_valid_llm_item("s2", 96.0, card_highlight=None)], ["s2"])
+    assert ok_null and res_null["s2"]["card_highlight"] is None
+
+    ok_fluff, res_fluff, _, _ = gif.check_format_info([_sample_valid_llm_item("s3", 29.9, card_highlight=" 好价推荐 ")], ["s3"])
+    assert ok_fluff and res_fluff["s3"]["card_highlight"] is None
+
+    bad_type = _sample_valid_llm_item("s4", 29.9)
+    bad_type["card_highlight"] = 123
+    ok_bad, _, err_bad, _ = gif.check_format_info([bad_type], ["s4"])
+    assert not ok_bad and "card_highlight" in err_bad["s4"]
+
+    missing_key = _sample_valid_llm_item("s5", 29.9)
+    del missing_key["card_highlight"]
+    ok_miss, _, err_miss, _ = gif.check_format_info([missing_key], ["s5"])
+    assert not ok_miss and "card_highlight" in err_miss["s5"]
 
 
 def test_check_format_info_enforces_expected_deal_price():
@@ -276,6 +303,7 @@ def test_run_deal_format_round_preserves_official_format_info_and_handles_lifecy
     assert doc_normal["deal_info"]["format_clean_title"] == "蓝月亮洗衣液4kg*2套 共16斤"
     assert doc_normal["deal_info"]["format_retry_count"] == 0
     assert doc_normal["deal_info"]["format_info"]["pricing_basis"]["total_value"] == 8000
+    assert doc_normal["deal_info"]["format_info"]["card_highlight"] == "7.6元/瓶"
 
     # 2. 验证新线报覆盖后重洗失败：清空旧陈腐 deal_info.format_info 为 None，重试计数重置为 1
     assert doc_reformat_fail["deal_info"]["format_status"] == "failed"
@@ -392,6 +420,7 @@ def test_run_format_round_recleans_when_activity_price_changes_and_skips_in_quer
                 "base_unit": " ml ",
                 "equivalent_description": None,
             },
+            "card_highlight": " 1.97元/瓶 ",
         }]
         return {
             "status": "✅ 成功",
@@ -412,6 +441,7 @@ def test_run_format_round_recleans_when_activity_price_changes_and_skips_in_quer
     assert cola_18["format_activity_price"] == 35.4
     assert cola_18["format_info"]["663508084573_0"]["price"] == 35.4
     assert cola_18["format_info"]["663508084573_0"]["core_entities"][0]["name"] == "碳酸饮料"
+    assert cola_18["format_info"]["663508084573_0"]["card_highlight"] == "1.97元/瓶"
     assert cola_18["format_retry_count"] == 0
 
     # 第二轮：Mongo 查询条件直接过滤已成功且未改价的商品，零 DB 结果也零模型请求

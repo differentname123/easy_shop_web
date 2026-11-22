@@ -12,7 +12,7 @@ from services.product_service import ProductService
 TIP = {
     "publish_time": "2026-11-20 14:27",
     "deal_price": 74.5,
-    "unit_deal_price": "2.48元/杯",
+    "card_highlight": "2.48元/杯",
     "price_logic": "买5件合计74.5元",
     "coupon_links": [],
     "tutorial_steps": ["1. 下单5件"],

@@ -262,7 +262,11 @@ class ProductRepository(BaseRepository):
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
             "sales_tip", "image_url", "mall_name", "updated_at", "product_url", "coupon_url",
             "deal_source", "deal_source_name",
-            "deal_info.is_deal_tip", "deal_info.card_highlight", "deal_info.unit_deal_price", "deal_info.publish_ts", "deal_info.publish_time",
+            "format_status", "need_reformat", "format_activity_price", "format_info",
+            "deal_info.is_deal_tip", "deal_info.card_highlight",
+            "deal_info.deal_price", "deal_info.format_deal_price",
+            "deal_info.format_status", "deal_info.need_reformat", "deal_info.format_info",
+            "deal_info.publish_ts", "deal_info.publish_time",
             "deal_info.source_site", "deal_info.source_site_name",
         ), 1),
     }
@@ -811,7 +815,11 @@ class ProductRepository(BaseRepository):
         if clean_doc_img.startswith("//"):
             clean_doc_img = "https:" + clean_doc_img
         is_active_deal = bool(deal_info.get("is_deal_tip") is True)
-        deal_highlight = self._resolve_deal_card_highlight(deal_info) if is_active_deal else ""
+        deal_highlight = self._resolve_card_highlight(
+            doc,
+            is_active_deal=is_active_deal,
+            activity_price=activity_price if activity_price > 0 else None,
+        )
         deal_publish_time = self._format_deal_datetime(get_deal_publish_ts(deal_info)) if is_active_deal else ""
         return {
             "platform": platform,
@@ -821,6 +829,7 @@ class ProductRepository(BaseRepository):
             "goods_sign": goods_sign,
             "deal_source": deal_source,
             "deal_source_name": deal_source_name,
+            "is_deal_tip": is_active_deal,
             "deal_highlight": deal_highlight,
             "deal_publish_time": deal_publish_time,
             "name": doc.get("name", "未命名商品"),
@@ -841,15 +850,100 @@ class ProductRepository(BaseRepository):
             "updated_at": updated_at_str,
         }
 
-    @staticmethod
-    def _resolve_deal_card_highlight(deal_info: Any) -> str:
-        """提取外层商品卡片的线报短亮点：优先 `card_highlight`，缺失时回退展示 `unit_deal_price`。"""
+    @classmethod
+    def _positive_finite_float(cls, raw_val: Any) -> Optional[float]:
+        if raw_val is None or isinstance(raw_val, bool):
+            return None
+        try:
+            val = cls._amount_float(raw_val)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(val) or val <= 0:
+            return None
+        return float(val)
+
+    @classmethod
+    def _extract_format_info_highlight(
+        cls,
+        fmt_obj: Any,
+        *,
+        format_status: Any = None,
+        need_reformat: bool = False,
+        current_price: Any = None,
+        format_price: Any = None,
+    ) -> str:
+        """从结构化清洗结果（单对象或 SKU 映射）中提取未过期的 card_highlight。"""
+        if need_reformat is True:
+            return ""
+        if format_status is not None and format_status != "success":
+            return ""
+        cur_p = cls._positive_finite_float(current_price)
+        fmt_p = cls._positive_finite_float(format_price)
+        if cur_p is not None and fmt_p is not None and abs(cur_p - fmt_p) > 0.01:
+            return ""
+        if not isinstance(fmt_obj, dict) or not fmt_obj:
+            return ""
+
+        if "card_highlight" in fmt_obj or "pricing_basis" in fmt_obj:
+            sku_p = cls._positive_finite_float(fmt_obj.get("price"))
+            if cur_p is not None and sku_p is not None and abs(cur_p - sku_p) > 0.01:
+                return ""
+            return str(fmt_obj.get("card_highlight") or "").strip()
+
+        first_fallback = ""
+        for sku_dict in fmt_obj.values():
+            if not isinstance(sku_dict, dict):
+                continue
+            hl = str(sku_dict.get("card_highlight") or "").strip()
+            if not hl:
+                continue
+            sku_p = cls._positive_finite_float(sku_dict.get("price"))
+            if cur_p is not None and sku_p is not None:
+                if abs(cur_p - sku_p) <= 0.01:
+                    return hl
+            elif not first_fallback:
+                first_fallback = hl
+        return first_fallback
+
+    @classmethod
+    def _resolve_deal_highlight(cls, deal_info: Any) -> str:
+        """提取线报高光：优先采用线报清洗 `deal_info.card_highlight`，缺失/空时回退至 `deal_info.format_info.card_highlight`。"""
         if not isinstance(deal_info, dict):
             return ""
         card_hl = str(deal_info.get("card_highlight") or "").strip()
         if card_hl:
             return card_hl
-        return str(deal_info.get("unit_deal_price") or "").strip()
+        return cls._extract_format_info_highlight(
+            deal_info.get("format_info"),
+            format_status=deal_info.get("format_status"),
+            need_reformat=(deal_info.get("need_reformat") is True),
+            current_price=deal_info.get("deal_price"),
+            format_price=deal_info.get("format_deal_price"),
+        )
+
+    @classmethod
+    def _resolve_card_highlight(
+        cls,
+        doc: Dict[str, Any],
+        *,
+        is_active_deal: bool,
+        activity_price: Optional[float] = None,
+    ) -> str:
+        """统一卡片亮点优先级：活跃线报优先 `deal_info.card_highlight` -> `deal_info.format_info.card_highlight`，否则读取官方 `format_info` 亮点。"""
+        if is_active_deal:
+            deal_info = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
+            deal_hl = cls._resolve_deal_highlight(deal_info)
+            if deal_hl:
+                return deal_hl
+            if cls._positive_finite_float(deal_info.get("deal_price")) is not None:
+                return ""
+        return cls._extract_format_info_highlight(
+            doc.get("format_info"),
+            format_status=doc.get("format_status"),
+            need_reformat=(doc.get("need_reformat") is True),
+            current_price=activity_price,
+            format_price=doc.get("format_activity_price"),
+        )
 
     @staticmethod
     def _format_deal_datetime(raw_val: Any) -> str:
@@ -880,7 +974,6 @@ class ProductRepository(BaseRepository):
             except (TypeError, ValueError, OverflowError):
                 deal_price = None
 
-        unit_deal_price = str(deal_info.get("unit_deal_price") or "").strip()
         price_logic = str(deal_info.get("price_logic") or "").strip()
 
         coupon_links: List[Dict[str, Any]] = []
@@ -931,10 +1024,9 @@ class ProductRepository(BaseRepository):
                 if u.startswith(("http://", "https://")) and u not in share_images:
                     share_images.append(u)
 
-        card_highlight = str(deal_info.get("card_highlight") or "").strip()
+        card_highlight = cls._resolve_deal_highlight(deal_info)
         if not (
             deal_price is not None
-            or unit_deal_price
             or price_logic
             or card_highlight
             or coupon_links
@@ -948,7 +1040,6 @@ class ProductRepository(BaseRepository):
             "is_deal_tip": bool(deal_info.get("is_deal_tip")),
             "publish_time": publish_time,
             "deal_price": deal_price,
-            "unit_deal_price": unit_deal_price,
             "price_logic": price_logic,
             "card_highlight": card_highlight,
             "coupon_links": coupon_links,
@@ -1206,8 +1297,8 @@ class ProductRepository(BaseRepository):
                 out["original_price"] = orig_val
         return out
 
-    def get_deal_card_overlays(self, platform: str, keys: List[Any]) -> Dict[str, Dict[str, str]]:
-        """批量读取正式表活跃线报的超短亮点与发布时间快照，供首页推荐流/搜索卡片叠加展示。"""
+    def get_deal_card_overlays(self, platform: str, keys: List[Any]) -> Dict[str, Dict[str, Any]]:
+        """批量读取正式表活跃线报或已结构化商品的超短亮点与发布时间快照，供首页推荐流/搜索卡片叠加展示。"""
         plat = self._platform(platform)
         clean_keys = list(dict.fromkeys(
             str(k).strip() for k in (keys or ())
@@ -1219,7 +1310,6 @@ class ProductRepository(BaseRepository):
             cursor = self.col.find(
                 {
                     "platform": plat,
-                    "deal_info.is_deal_tip": True,
                     "$or": [
                         {"product_id": {"$in": clean_keys}},
                         {"goods_sign": {"$in": clean_keys}},
@@ -1230,22 +1320,43 @@ class ProductRepository(BaseRepository):
                     "product_id": 1,
                     "goods_id": 1,
                     "goods_sign": 1,
+                    "activity_price": 1,
+                    "price": 1,
+                    "format_status": 1,
+                    "need_reformat": 1,
+                    "format_activity_price": 1,
+                    "format_info": 1,
+                    "deal_info.is_deal_tip": 1,
                     "deal_info.card_highlight": 1,
-                    "deal_info.unit_deal_price": 1,
+                    "deal_info.deal_price": 1,
+                    "deal_info.format_deal_price": 1,
+                    "deal_info.format_status": 1,
+                    "deal_info.need_reformat": 1,
+                    "deal_info.format_info": 1,
                     "deal_info.publish_ts": 1,
                     "deal_info.publish_time": 1,
                 },
             )
-            overlays: Dict[str, Dict[str, str]] = {}
+            overlays: Dict[str, Dict[str, Any]] = {}
             for doc in cursor:
                 if not isinstance(doc, dict):
                     continue
                 di = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
-                highlight = self._resolve_deal_card_highlight(di)
-                pub_time = self._format_deal_datetime(get_deal_publish_ts(di))
+                is_active_deal = bool(di.get("is_deal_tip") is True)
+                act_p = self._amount_float(self._first_present(doc, "activity_price", "price", default=0.0))
+                highlight = self._resolve_card_highlight(
+                    doc,
+                    is_active_deal=is_active_deal,
+                    activity_price=act_p if act_p > 0 else None,
+                )
+                pub_time = self._format_deal_datetime(get_deal_publish_ts(di)) if is_active_deal else ""
                 if not highlight and not pub_time:
                     continue
-                entry = {"deal_highlight": highlight, "deal_publish_time": pub_time}
+                entry = {
+                    "is_deal_tip": is_active_deal,
+                    "deal_highlight": highlight,
+                    "deal_publish_time": pub_time,
+                }
                 for alias in (doc.get("product_id"), doc.get("goods_id"), doc.get("goods_sign")):
                     ak = str(alias or "").strip()
                     if ak:
@@ -1259,8 +1370,8 @@ class ProductRepository(BaseRepository):
             return {}
 
     @classmethod
-    def apply_deal_card_overlay(cls, item: Dict[str, Any], overlays: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
-        """将线报超短亮点与发布时间无损叠加到商品摘要字典（不覆盖已有非空值）。"""
+    def apply_deal_card_overlay(cls, item: Dict[str, Any], overlays: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """将线报/性价比超短亮点与发布时间无损叠加到商品摘要字典（不覆盖已有非空值）。"""
         if not isinstance(item, dict) or not overlays:
             return item
         _, gid, gsign = cls._identity(item)
@@ -1268,6 +1379,8 @@ class ProductRepository(BaseRepository):
         if not ov:
             return item
         out = dict(item)
+        if ov.get("is_deal_tip") is True:
+            out["is_deal_tip"] = True
         if ov.get("deal_highlight") and not str(out.get("deal_highlight") or "").strip():
             out["deal_highlight"] = ov["deal_highlight"]
         if ov.get("deal_publish_time") and not str(out.get("deal_publish_time") or "").strip():

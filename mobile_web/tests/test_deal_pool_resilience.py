@@ -1221,7 +1221,7 @@ def test_minimalist_four_element_pipeline_and_zero_loss_copywriting():
                 "main_link_id": "L2",
                 "clean_title": "名创优品一次性纯棉洗脸巾3包",
                 "deal_price": 9.9,
-                "unit_deal_price": "3.3元/包",
+                "card_highlight": "3.3元/包",
                 "price_logic": "88VIP + 首单礼金 + 淘金币 + 领满200减20券凑单（可退）",
                 "coupon_links": [{"link_id": "L1", "label": "先领：黑五满200减20券"}],
                 "tutorial_steps": [
@@ -2232,7 +2232,7 @@ def test_third_party_drainage_and_wechat_sanitization():
         "main_link_id": "L1",
         "clean_title": "香飘飘【曼优优好味轻享】锡兰红茶+乌龙茶双拼口味奶茶礼盒装6杯456g",
         "deal_price": 74.5,
-        "unit_deal_price": "2.48元/杯",
+        "card_highlight": "2.48元/杯",
         "price_logic": "购买5件合计实付74.5元，折合2.48元/杯",
         "coupon_links": [],
         "tutorial_steps": [

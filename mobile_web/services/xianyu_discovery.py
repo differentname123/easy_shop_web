@@ -453,6 +453,7 @@ def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.dateti
 
     off_ref_price = _num(doc.get("activity_price") or doc.get("price"), 0.0)
     clean_fmt = {**deal_fmt, "price": round(deal_price, 2)}
+    deal_highlight = str(di.get("card_highlight") or deal_fmt.get("card_highlight") or "").strip()
     return {
         **doc,
         "source_type": SOURCE_TYPE_DEAL_TIP,
@@ -464,7 +465,7 @@ def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.dateti
         "format_info": {"deal": clean_fmt},
         "format_status": "success",
         "deal_price_logic": str(di.get("price_logic") or "").strip(),
-        "deal_unit_price_text": str(di.get("unit_deal_price") or "").strip(),
+        "deal_highlight_text": deal_highlight,
         "deal_quality_score": di.get("quality_score"),
         "deal_publish_time": format_timestamp_cn(pub_utc),
     }
@@ -644,7 +645,7 @@ def _pick_verified_candidate_from_category(
         "image_url": str(w_doc.get("image_url") or ""),
         "updated_at": str(w_doc.get("updated_at") or ""),
         "deal_price_logic": str(w_doc.get("deal_price_logic") or ""),
-        "deal_unit_price_text": str(w_doc.get("deal_unit_price_text") or ""),
+        "deal_highlight_text": str(w_doc.get("deal_highlight_text") or ""),
         "deal_quality_score": w_doc.get("deal_quality_score"),
         "deal_publish_time": str(w_doc.get("deal_publish_time") or ""),
     }
@@ -684,7 +685,7 @@ def select_round_candidates_for_source(
             "deal_info.clean_title": 1,
             "deal_info.deal_price": 1,
             "deal_info.format_deal_price": 1,
-            "deal_info.unit_deal_price": 1,
+            "deal_info.card_highlight": 1,
             "deal_info.format_status": 1,
             "deal_info.need_reformat": 1,
             "deal_info.format_info": 1,
@@ -858,8 +859,8 @@ def evaluate_candidate_eligibility_and_keywords(
         payload["original_price"] = candidate.get("original_price")
     if candidate.get("deal_price_logic"):
         payload["deal_price_logic"] = candidate.get("deal_price_logic")
-    if candidate.get("deal_unit_price_text"):
-        payload["unit_deal_price"] = candidate.get("deal_unit_price_text")
+    if candidate.get("deal_highlight_text"):
+        payload["card_highlight"] = candidate.get("deal_highlight_text")
 
     base_prompt = (
         f"{prompt_template}\n"
@@ -1347,8 +1348,8 @@ def compare_candidate_with_xianyu(
         my_candidate_for_llm["outer_name"] = cand["outer_name"]
     if cand.get("deal_price_logic"):
         my_candidate_for_llm["deal_price_logic"] = cand["deal_price_logic"]
-    if cand.get("deal_unit_price_text"):
-        my_candidate_for_llm["unit_deal_price"] = cand["deal_unit_price_text"]
+    if cand.get("deal_highlight_text"):
+        my_candidate_for_llm["card_highlight"] = cand["deal_highlight_text"]
 
     pool_kw = {"browser_pool": browser_pool} if browser_pool is not None else {}
 

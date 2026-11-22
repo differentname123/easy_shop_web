@@ -117,6 +117,21 @@
   2. **严禁拿 19 位后缀 `goods_id` 直接请求 TOP 详情接口**：
      - 若将剥离了 `<prefix>-` 的 19 位 `goods_id`（如 `5n9p6DJF6yr3QZWzFNY`）直接作为 `item_id` 传给 `taobao.tbk.item.info.upgrade.get`，淘宝开放平台必报 `[15:50001] 无结果`！
      - 防护闭环：前端列表/卡片跳转详情时必须分别透传 `goods_id` 与完整 `goods_sign`（严禁以 `goods_id` 覆盖 `goods_sign`）；当后端收到 `goods_sign == goods_id`（或缺失 `goods_sign`）的请求时，必须先通过内存 `SIGN_BY_ID_CACHE` 或 MongoDB `{"platform": "taobao", "product_id": goods_id}` 索引反查还原出完整的 46 位 `goods_sign`，再命中缓存或调用上游接口。
+
+八、【2026-11-23 实测补充：无配对 `sid` 备用 Key 可用矩阵、批量对齐与二义性陷阱】
+  1. **折淘客多 `appkey` 与单一 `sid` 真实可用矩阵（`:10001` 淘宝 + `:20000` 京东）**：
+     - ✅ **无需 `sid`，全 3 Key 100% 独立可用**：淘宝 `api_detail.ashx`、`api_all.ashx`，以及**京东 `:20000` 全部 6 个接口**（`api_detail` / `goods_query` / `api_quanwang` / `tkl_piliang` / `byunionid_get` / `rank_query`）。
+     - ✅ **传入主 `sid0` 后全 3 Key 可用**：`api_quanwang.ashx`（淘宝全网搜索）、`open_shangpin_id.ashx`（口令解 ID）。
+     - ❌ **强校验 `(appkey, sid)` 成对绑定（无配对 `sid` 的备用 Key 100% 报 `301: 授权账号sid过期或者sid和appkey不匹配`）**：
+       `open_gaoyongzhuanlian_tkl.ashx`、`open_gaoyongzhuanlian_tkl_piliang.ashx`、`open_gaoyongzhuanlian.ashx`、`open_sc_publisher_get.ashx`、`open_dingdanchaxun2.ashx`。
+       -> 对以上 5 个强绑定接口，严禁对无独立 `sid` 的 `appkey` 发起盲目 failover；对确定性错误 `商品ID解析错误` 应立即短路停止多 Key 重试（实测 `open_shangpin_id` 在 `tkl`/`tkl_piliang` 失败后线上救活率为 `0/58`）。
+  2. **各接口全格式实测边界与关键发现（2026-11-23）**：
+     - `open_gaoyongzhuanlian_tkl.ashx`：实测直接传入裸加密 `item_id` 即可一步转链（不一定需要补全 `uland` 前缀），同时也接受 `uland`/`item.taobao.com/{加密id}`/`s.click`/口令；不支持混排长文案、数字 ID 与 `wh_alimama` 会场链（均报 `301: 商品ID解析错误` 或 `不支持数字id`）。
+     - `open_gaoyongzhuanlian_tkl_piliang.ashx`：**不支持**裸加密 `item_id`（报 `301: 转链失败`），支持 `uland`/`s.click`/口令/混排长文案；对 `pages-fast.m.taobao.com/...&wh_alimama=true` 会场链实测返回 `status=200, tao_id="", result_url="https://s.click.taobao.com/..."`——代码不得仅因 `tao_id` 为空而丢弃有效会场推广链！
+     - 折淘客淘宝 `api_detail.ashx`：支持裸加密 `item_id` 与 `uland` 链接，但对 **19 位剥离后缀** 与 **已下架加密 ID** 均返回 `status=200` 且带 1 条 `tao_id=""` 的占位空记录（二义性陷阱！调用方必须校验 `tao_id` 非空，否则不可当作有效详情）。
+     - TOP 官方 `taobao.tbk.item.info.upgrade.get`：实测支持最多 **20 个**加密 `item_id` 批量查询；通过 **`input_item_iid`** 与入参 **5/5 100% 精准对齐**；批量中混入下架 ID 或伪造假 ID 时均仅剔除坏项（返回 4/5），**不连坐同批正常商品**；对下架 ID、19 位后缀及 URL 入参均返回 `50001: 无结果`。
+     - 好单库淘宝 `v2/item_detail`：实测支持有效加密 `item_id` 返回 `code=200`，下架 ID 或 19 位后缀返回 `该宝贝详情不存在`，纯数字 ID 返回 `暂不支持搜索`。
+  3. **当前账户授权备注**：`taobao_session`（24 小时短效）实测已过期（`27:invalid-sessionkey`）且未配置 `taobao_refresh_token`，正式备案核验与邀请码依赖折淘客 90 天长效 `sid` 完成。
 ================================================================================
 """
 

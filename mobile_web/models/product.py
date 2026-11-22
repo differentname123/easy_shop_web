@@ -565,6 +565,7 @@ class ProductSummary(BaseModel):
     goods_sign: str = ""
     deal_source: str = ""
     deal_source_name: str = ""
+    is_deal_tip: bool = False
     deal_highlight: str = ""
     deal_publish_time: str = ""
     name: str

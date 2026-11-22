@@ -35,10 +35,12 @@ from models.deal_constants import (
     ERR_JD_NUMERIC_SKU,
     ERR_LOW_QUALITY_SCORE,
     ERR_MERGED_INTO_NEIGHBOR,
+    ERR_MULTI_PRODUCT_COLLECTION,
     ERR_NO_ANCHOR,
     ERR_PDD_NUMERIC_ID,
     ERR_TB_NUMERIC_ID,
     ERR_UNSUPPORTED_PLATFORM,
+    MAX_AI1_MAIN_CANDIDATES,
     MAX_CLEAN_RETRIES,
     OK_SKIPPED_ALREADY_CLEANED,
     QUALIFIED_DEAL_MIN_SCORE,
@@ -102,6 +104,53 @@ _AI2_OFFICIAL_PRODUCT_KEYS = (
 )
 
 _RAW_NUM_RE = re.compile(r"(?<!\d)(\d+(?:\.\d{1,2})?)(?!\d)")
+
+
+def _count_distinct_ai1_main_candidates(targets: List[Dict[str, Any]]) -> int:
+    """统计 AI-1 识别出的独立主推商品候选数（仅统计 main_candidate，coupon/filler 不计入）。"""
+    cands: Set[str] = set()
+    for tgt in targets or []:
+        if not isinstance(tgt, dict) or tgt.get("text_role_hint") != "main_candidate":
+            continue
+        c_inp = strip_markdown_link_wrapper(str(tgt.get("clean_input") or "").strip())
+        if c_inp:
+            cands.add(c_inp)
+    return len(cands)
+
+
+def _build_multi_product_failed_outcome(
+    *,
+    site: str,
+    site_name: str,
+    channel: str,
+    mid: str,
+    raw_title: str,
+    ai1_res: Any,
+    conv_summary: List[Dict[str, Any]],
+    attempt_errors: List[Dict[str, str]],
+    candidate_count: int,
+    error_msg: str,
+) -> Dict[str, Any]:
+    """统一构造多商品合集帖的确定性拦截结果（永久失败不重试、不入正式表）。"""
+    return {
+        "status": "failed",
+        "stage_outcome": "failed",
+        "error_code": ERR_MULTI_PRODUCT_COLLECTION,
+        "error_msg": error_msg,
+        "source_site": site,
+        "source_site_name": site_name,
+        "deal_source": site,
+        "deal_source_name": site_name,
+        "source_channel": channel,
+        "source_item_id": mid,
+        "title": raw_title,
+        "ai_stage1_result": ai1_res,
+        "converted_links": conv_summary,
+        "ai_stage2_result": None,
+        "quality_score": 0,
+        "candidate_count": candidate_count,
+        "attempt_errors": attempt_errors,
+    }
 
 
 def _detect_ai2_price_leakage(
@@ -1521,6 +1570,8 @@ def process_ai1_unit(
     for mid, ai1_res in sorted_ai1_items:
         if ai1_res.get("_from_fallback") or not ai1_res.get("is_standalone_deal", True) or mid in absorbed_by_neighbor:
             continue
+        if _count_distinct_ai1_main_candidates(ai1_res.get("extracted_targets") or []) > MAX_AI1_MAIN_CANDIDATES:
+            continue
         for m_tid in ai1_res.get("merged_tip_ids") or []:
             m_tid_str = str(m_tid or "").strip()
             if (
@@ -1606,6 +1657,22 @@ def process_ai1_unit(
                 "candidate_count": 0,
                 "attempt_errors": [],
             }
+            continue
+
+        main_cand_cnt = _count_distinct_ai1_main_candidates(targets)
+        if main_cand_cnt > MAX_AI1_MAIN_CANDIDATES:
+            outcomes_by_id[mid] = _build_multi_product_failed_outcome(
+                site=site,
+                site_name=site_name,
+                channel=channel,
+                mid=mid,
+                raw_title=raw_title,
+                ai1_res=ai1_res,
+                conv_summary=[],
+                attempt_errors=[],
+                candidate_count=len(targets),
+                error_msg=f"多商品合集帖拦截（AI-1 识别出 {main_cand_cnt} 个独立主推商品候选 > {MAX_AI1_MAIN_CANDIDATES}）",
+            )
             continue
 
         outcomes_by_id[mid] = {
@@ -1915,6 +1982,30 @@ def process_convert_unit(
             for c in main_prod_convs
             if c.get("platform") and c.get("goods_id")
         }
+        explicit_main_pids_by_plat: Dict[str, Set[str]] = {}
+        for c in main_prod_convs:
+            if c.get("text_role_hint") != "main_candidate":
+                continue
+            c_p = str(c.get("platform") or "").strip().lower()
+            c_g = str(c.get("goods_id") or "").strip()
+            if c_p and c_g:
+                explicit_main_pids_by_plat.setdefault(c_p, set()).add(c_g)
+        total_explicit_main_pids = sum(len(gids) for gids in explicit_main_pids_by_plat.values())
+        max_same_plat_main_pids = max((len(gids) for gids in explicit_main_pids_by_plat.values()), default=0)
+        if max_same_plat_main_pids >= 2 or total_explicit_main_pids >= 3:
+            outcomes_by_id[mid] = _build_multi_product_failed_outcome(
+                site=site,
+                site_name=site_name,
+                channel=channel,
+                mid=mid,
+                raw_title=raw_title,
+                ai1_res=ai1_res,
+                conv_summary=conv_summary_s3,
+                attempt_errors=attempt_errors,
+                candidate_count=len(targets),
+                error_msg=f"多商品合集帖拦截（转链核验含 {total_explicit_main_pids} 款独立主商品，单平台最多 {max_same_plat_main_pids} 款）",
+            )
+            continue
         single_main_pid: Optional[Tuple[str, str]] = next(iter(unique_main_pids)) if len(unique_main_pids) == 1 else None
         surviving_candidates.append(
             (mid, doc, ai1_res, conv_list, main_prod_convs, conv_summary_s3, attempt_errors, single_main_pid)
@@ -2288,7 +2379,6 @@ def process_ai2_unit(
             )
             continue
 
-        unit_deal_price = normalize_inline_spaces(str(ai2_res.get("unit_deal_price") or "")).strip() or None
         price_logic = normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None
         card_highlight = sanitize_card_highlight(ai2_res.get("card_highlight"))
         clean_title = normalize_inline_spaces(str(ai2_res.get("clean_title") or product_card.get("name") or raw_title)).strip()
@@ -2572,7 +2662,6 @@ def process_ai2_unit(
             "publish_ts": float(pub_ts),
             "expire_time": doc.get("expire_time"),
             "deal_price": deal_price,
-            "unit_deal_price": unit_deal_price,
             "price_logic": price_logic,
             "official_price": round(official_price, 2),
             "raw_tip_title": raw_title or str(product_card.get("name") or ""),

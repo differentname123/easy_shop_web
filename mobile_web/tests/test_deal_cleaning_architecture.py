@@ -847,5 +847,290 @@ def test_stage2_prompt_contract_removes_misleading_fields_and_example_artifacts(
     assert '"coupon_amount"' not in prompt_text
     assert "coupon_amount 为 0" not in prompt_text
     assert "附实付图" not in prompt_text
+    assert "unit_deal_price" not in prompt_text
+    assert '"card_highlight"' in prompt_text
     assert "价格唯一真源" in prompt_text
     assert "严禁二次扣减" in prompt_text
+
+
+def test_multi_product_collection_guard_post_ai1_and_post_convert_no_false_positive():
+    """验证合集帖双保险简洁拦截（AI-1主推>2直接拦截 / 转链后同平台>=2或跨平台>=3主商品拦截）及单品零误杀。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from models.deal_constants import ERR_MULTI_PRODUCT_COLLECTION
+
+    cleaner = DealPoolCleaner(ai_batch_size=10, ai_max_workers=1, convert_max_workers=1)
+    ai1_called_ids = []
+    converted_urls = []
+    ai2_called_ids = []
+
+    def _fake_ai1(stage1_inputs, *_a, **_kw):
+        for inp in stage1_inputs:
+            ai1_called_ids.append(inp["main_tip_id"])
+        return {
+            # 多链接单品（6条原始链接全都是 券/凑单 + 1主品）：不再前置快筛误拦，正常走完 AI-1 并入库
+            "ok_many_raw_links": {
+                "main_tip_id": "ok_many_raw_links",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["ok_many_raw_links"],
+                "extracted_targets": [
+                    {"link_id": "L1", "raw_span": "https://u.jd.com/cpn1", "clean_input": "https://u.jd.com/cpn1", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L2", "raw_span": "https://u.jd.com/cpn2", "clean_input": "https://u.jd.com/cpn2", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L3", "raw_span": "https://u.jd.com/cpn3", "clean_input": "https://u.jd.com/cpn3", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L4", "raw_span": "https://u.jd.com/cpn4", "clean_input": "https://u.jd.com/cpn4", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L5", "raw_span": "https://u.jd.com/rich_main", "clean_input": "https://u.jd.com/rich_main", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L6", "raw_span": "https://u.jd.com/rich_filler", "clean_input": "https://u.jd.com/rich_filler", "platform": "jd", "text_role_hint": "filler_candidate"},
+                ],
+                "_from_fallback": False,
+            },
+            # AI-1 后拦截：识别出 3 个独立 main_candidate，转链零调用直接拦截且不吸收 neighbor
+            "col_post_ai1": {
+                "main_tip_id": "col_post_ai1",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["col_post_ai1", "single_neighbor"],
+                "extracted_targets": [
+                    {"link_id": "L1", "raw_span": "https://u.jd.com/c1", "clean_input": "https://u.jd.com/c1", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L2", "raw_span": "https://u.jd.com/c2", "clean_input": "https://u.jd.com/c2", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L3", "raw_span": "https://u.jd.com/c3", "clean_input": "https://u.jd.com/c3", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+                "_from_fallback": False,
+            },
+            "single_neighbor": {
+                "main_tip_id": "single_neighbor",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["single_neighbor"],
+                "extracted_targets": [
+                    {"link_id": "L1", "raw_span": "https://u.jd.com/nb1", "clean_input": "https://u.jd.com/nb1", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+                "_from_fallback": False,
+            },
+            # 2 个同平台不同商品 -> 转链后凭真实 goods_id >= 2 拦截，0 AI-2 调用
+            "col_same_plat_2prods": {
+                "main_tip_id": "col_same_plat_2prods",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["col_same_plat_2prods"],
+                "extracted_targets": [
+                    {"link_id": "L1", "raw_span": "https://u.jd.com/sp1", "clean_input": "https://u.jd.com/sp1", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L2", "raw_span": "https://u.jd.com/sp2", "clean_input": "https://u.jd.com/sp2", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+                "_from_fallback": False,
+            },
+            # 边界单品1：AI-1 标出 2 个 main_candidate，转链证实其中 1 个是券会场、1 个是商品 -> 仅 1 个商品，正常放行
+            "ok_2mains_1coupon_1prod": {
+                "main_tip_id": "ok_2mains_1coupon_1prod",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["ok_2mains_1coupon_1prod"],
+                "extracted_targets": [
+                    {"link_id": "L1", "raw_span": "https://u.jd.com/cpn_disguise", "clean_input": "https://u.jd.com/cpn_disguise", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L2", "raw_span": "https://u.jd.com/nb1", "clean_input": "https://u.jd.com/nb1", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+                "_from_fallback": False,
+            },
+            # 边界单品2：1个数字SKU + 1个主推 + 1个凑单 + 2个优惠券
+            "ok_single_rich": {
+                "main_tip_id": "ok_single_rich",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["ok_single_rich"],
+                "extracted_targets": [
+                    {"link_id": "L1", "raw_span": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=1", "clean_input": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=1", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L2", "raw_span": "https://coupon.m.jd.com/coupons/show.action?key=k2&roleId=2", "clean_input": "https://coupon.m.jd.com/coupons/show.action?key=k2&roleId=2", "platform": "jd", "text_role_hint": "coupon_candidate"},
+                    {"link_id": "L3", "raw_span": "https://item.jd.com/10001.html", "clean_input": "https://item.jd.com/10001.html", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L4", "raw_span": "https://u.jd.com/rich_main", "clean_input": "https://u.jd.com/rich_main", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L5", "raw_span": "https://u.jd.com/rich_filler", "clean_input": "https://u.jd.com/rich_filler", "platform": "jd", "text_role_hint": "filler_candidate"},
+                ],
+                "_from_fallback": False,
+            },
+            # 边界单品3：同商品双链（口令 + 短链 -> 同一 goods_id）
+            "ok_dual_same_gid": {
+                "main_tip_id": "ok_dual_same_gid",
+                "is_standalone_deal": True,
+                "merged_tip_ids": ["ok_dual_same_gid"],
+                "extracted_targets": [
+                    {"link_id": "L1", "raw_span": "￥TOKEN_SAME￥", "clean_input": "￥TOKEN_SAME￥", "platform": "taobao", "text_role_hint": "main_candidate"},
+                    {"link_id": "L2", "raw_span": "https://s.click.taobao.com/same_gid", "clean_input": "https://s.click.taobao.com/same_gid", "platform": "taobao", "text_role_hint": "main_candidate"},
+                ],
+                "_from_fallback": False,
+            },
+        }
+
+    cleaner.run_ai_stage1_batch = _fake_ai1
+
+    def _mock_jd_conv(inp: str):
+        converted_urls.append(inp)
+        if "item.jd.com/" in inp:
+            return {"status": "error", "error_code": "UNSUPPORTED_JD_NUMERIC_SKU", "error_msg": "数字ID"}
+        if "cpn" in inp:
+            return {
+                "status": "success",
+                "resolution_kind": "coupon_or_venue",
+                "final_link": f"https://u.jd.com/my_{inp.rsplit('/', 1)[-1]}",
+                "promotion_token": "",
+            }
+        gid_map = {
+            "https://u.jd.com/sp1": ("JD_SP_1", "毛巾"),
+            "https://u.jd.com/sp2": ("JD_SP_2", "干发帽"),
+            "https://u.jd.com/rich_main": ("JD_RICH_1", "维达抽纸24包"),
+            "https://u.jd.com/nb1": ("JD_NB_1", "独立邻居商品"),
+        }
+        gid, title = gid_map.get(inp, ("JD_OTHER", "其他"))
+        return {
+            "status": "success",
+            "goods_id": gid,
+            "goods_sign": gid,
+            "final_link": inp,
+            "promotion_token": "",
+            "product": {"platform": "jd", "product_id": gid, "name": title, "price": 29.9, "original_price": 39.9, "activity_price": 29.9, "coupon_amount": 0.0, "mall_name": "自营店"},
+        }
+
+    def _mock_tb_conv(inp: str):
+        converted_urls.append(inp)
+        return {
+            "status": "success",
+            "goods_id": "TB_SAME_999",
+            "goods_sign": "TB_SAME_999",
+            "final_link": "https://s.click.taobao.com/same_gid",
+            "promotion_token": "￥SAME￥",
+            "product": {"platform": "taobao", "product_id": "TB_SAME_999", "name": "可口可乐330ml*12瓶", "price": 15.6, "original_price": 25.0, "activity_price": 15.6, "coupon_amount": 0.0, "mall_name": "可口可乐旗舰店"},
+        }
+
+    cleaner.adapters = {
+        "jd": SimpleNamespace(resolve_and_convert_universal=_mock_jd_conv),
+        "taobao": SimpleNamespace(resolve_and_convert_universal=_mock_tb_conv),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _inp: {"status": "error"}),
+    }
+
+    def _fake_ai2(stage2_inputs, *_a, **_kw):
+        out = {}
+        for item in stage2_inputs:
+            mid = item["main_tip_id"]
+            ai2_called_ids.append(mid)
+            main_lid = next(lk["link_id"] for lk in item["converted_links"] if lk["convert_status"] == "product")
+            cpns = [{"link_id": lk["link_id"], "label": "优惠券"} for lk in item["converted_links"] if lk["convert_status"] == "coupon_or_activity"]
+            out[mid] = {
+                "main_tip_id": mid,
+                "is_valid_deal": True,
+                "main_link_id": main_lid,
+                "deal_price": 15.6,
+                "card_highlight": "【1.3元/瓶】",
+                "coupon_links": cpns,
+                "tutorial_steps": ["1. 下单购买"],
+                "quality_score": 88,
+            }
+        return out
+
+    cleaner.run_ai_stage2_batch = _fake_ai2
+
+    docs = [
+        # 原文含 6 个裸链但仅 1 个是主品（不再做前置快筛误杀，全部交由 AI-1 拆解识别）
+        {
+            "source_site": "haodanku", "source_channel": "好单库", "source_item_id": "ok_many_raw_links",
+            "platform": "jd", "title": "多券多活动单品", "tutorial_text": "15.6",
+            "extracted_links": [{"url": f"https://u.jd.com/cpn{i}"} for i in range(1, 5)] + [{"url": "https://u.jd.com/rich_main"}, {"url": "https://u.jd.com/rich_filler"}],
+            "extracted_tokens": [],
+        },
+        # AI-1 识别出 3 个 main_candidate -> 转链零调用拦截，且不吸收 single_neighbor
+        {
+            "source_site": "haodanku", "source_channel": "好单库", "source_item_id": "col_post_ai1",
+            "platform": "jd", "title": "3品合集", "tutorial_text": "3品",
+            "extracted_links": [{"url": f"https://u.jd.com/c{i}"} for i in (1, 2, 3)],
+            "extracted_tokens": [],
+        },
+        {
+            "source_site": "haodanku", "source_channel": "好单库", "source_item_id": "single_neighbor",
+            "platform": "jd", "title": "无辜单品", "tutorial_text": "单品",
+            "extracted_links": [{"url": "https://u.jd.com/nb1"}],
+            "extracted_tokens": [],
+        },
+        # 同平台 2 个不同商品 -> 转链后拦截，0 AI-2 调用
+        {
+            "source_site": "haodanku", "source_channel": "好单库", "source_item_id": "col_same_plat_2prods",
+            "platform": "jd", "title": "毛巾干发帽2件合集", "tutorial_text": "2品",
+            "extracted_links": [{"url": "https://u.jd.com/sp1"}, {"url": "https://u.jd.com/sp2"}],
+            "extracted_tokens": [],
+        },
+        # 2 个 main_candidate 中实为 1券 + 1品
+        {
+            "source_site": "haodanku", "source_channel": "好单库", "source_item_id": "ok_2mains_1coupon_1prod",
+            "platform": "jd", "title": "先领券再买单品", "tutorial_text": "15.6",
+            "extracted_links": [{"url": "https://u.jd.com/cpn_disguise"}, {"url": "https://u.jd.com/nb1"}],
+            "extracted_tokens": [],
+        },
+        # 合法多券+数字SKU+凑单 单品
+        {
+            "source_site": "guangdiu", "source_channel": "逛丢", "source_item_id": "ok_single_rich",
+            "platform": "jd", "title": "维达抽纸", "tutorial_text": "维达抽纸15.6",
+            "extracted_links": [
+                {"url": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=1", "type": "coupon_url"},
+                {"url": "https://item.jd.com/10001.html"},
+                {"url": "https://u.jd.com/rich_main"},
+            ],
+            "extracted_tokens": [],
+        },
+        # 同品双链
+        {
+            "source_site": "telegram", "source_channel": "tg", "source_item_id": "ok_dual_same_gid",
+            "platform": "taobao", "title": "可乐", "tutorial_text": "15.6",
+            "extracted_links": [{"url": "https://s.click.taobao.com/same_gid"}],
+            "extracted_tokens": ["￥TOKEN_SAME￥"],
+        },
+    ]
+
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+    res = cleaner.clean_batch_records(docs, mock_col, shared_active_products={}, quiet_sub_logs=True)
+    res_map = {r["source_item_id"]: r for r in res}
+
+    # 1. 多裸链不再前置快筛：必须进入 AI-1 且成功入库
+    assert "ok_many_raw_links" in ai1_called_ids
+    assert res_map["ok_many_raw_links"]["status"] == "success"
+
+    # 2. AI-1 产出 >=3 个 main_candidate：拦截且不浪费转链调用、不误吸邻居
+    assert res_map["col_post_ai1"]["status"] == "failed"
+    assert res_map["col_post_ai1"]["error_code"] == ERR_MULTI_PRODUCT_COLLECTION
+    assert not any(u in converted_urls for u in ("https://u.jd.com/c1", "https://u.jd.com/c2", "https://u.jd.com/c3"))
+    assert res_map["single_neighbor"]["status"] == "success"
+
+    # 3. 转链后同平台 >=2 不同主商品：拦截且不调用 AI-2
+    assert res_map["col_same_plat_2prods"]["status"] == "failed"
+    assert res_map["col_same_plat_2prods"]["error_code"] == ERR_MULTI_PRODUCT_COLLECTION
+    assert "col_same_plat_2prods" not in ai2_called_ids
+
+    # 4. 各种边界单品均零误杀，且无 unit_deal_price
+    assert res_map["ok_2mains_1coupon_1prod"]["status"] == "success"
+    assert res_map["ok_single_rich"]["status"] == "success"
+    assert res_map["ok_dual_same_gid"]["status"] == "success"
+    deal_info = res_map["ok_dual_same_gid"]["product_doc"]["deal_info"]
+    assert "unit_deal_price" not in deal_info
+    assert deal_info["card_highlight"] == "1.3元/瓶"
+
+    # 5. 跨平台比价边界：1 TB + 1 JD (total=2, same_plat=1) 放行；1 TB + 2 JD (total=3) 拦截
+    s3_cross_docs = [
+        {
+            "source_site": "guangdiu", "source_channel": "逛丢", "source_item_id": "cross_2_ok",
+            "platform": "taobao", "title": "比价单品", "tutorial_text": "",
+            "ai_stage1_result": {
+                "main_tip_id": "cross_2_ok", "is_standalone_deal": True, "merged_tip_ids": ["cross_2_ok"],
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": "https://s.click.taobao.com/same_gid", "platform": "taobao", "text_role_hint": "main_candidate"},
+                    {"link_id": "L2", "clean_input": "https://u.jd.com/nb1", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+            },
+        },
+        {
+            "source_site": "haodanku", "source_channel": "好单库", "source_item_id": "cross_3_block",
+            "platform": "taobao", "title": "3平台合集", "tutorial_text": "",
+            "ai_stage1_result": {
+                "main_tip_id": "cross_3_block", "is_standalone_deal": True, "merged_tip_ids": ["cross_3_block"],
+                "extracted_targets": [
+                    {"link_id": "L1", "clean_input": "https://s.click.taobao.com/same_gid", "platform": "taobao", "text_role_hint": "main_candidate"},
+                    {"link_id": "L2", "clean_input": "https://u.jd.com/nb1", "platform": "jd", "text_role_hint": "main_candidate"},
+                    {"link_id": "L3", "clean_input": "https://u.jd.com/rich_main", "platform": "jd", "text_role_hint": "main_candidate"},
+                ],
+            },
+        },
+    ]
+    s3_out, _ = cleaner.process_convert_unit(s3_cross_docs, shared_active_products={}, quiet_sub_logs=True)
+    s3_map = {o["source_item_id"]: o for o in s3_out}
+    assert s3_map["cross_2_ok"]["stage_outcome"] == "advance_to_ai2"
+    assert s3_map["cross_3_block"]["status"] == "failed"
+    assert s3_map["cross_3_block"]["error_code"] == ERR_MULTI_PRODUCT_COLLECTION

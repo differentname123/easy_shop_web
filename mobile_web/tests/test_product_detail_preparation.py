@@ -263,7 +263,7 @@ def test_deal_tip_survives_official_detail_refresh_and_cache_hits(prepared):
     sample_tip = {
         "publish_time": "2026-11-12 17:04",
         "deal_price": 19.9,
-        "unit_deal_price": "2.48元/斤",
+        "card_highlight": "2.48元/斤",
         "price_logic": "百亿补贴叠加商品券",
         "coupon_links": [],
         "tutorial_steps": ["1. 直接领券下单"],

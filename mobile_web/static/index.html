@@ -97,7 +97,7 @@
         <div class="goods-body">
           <h4 class="goods-title">{{ item.name }}</h4>
           <div v-if="item.deal_highlight" class="deal-highlight-bar" :title="item.deal_highlight">
-            <span class="deal-highlight-badge">线报</span>
+            <span class="deal-highlight-badge">{{ item.is_deal_tip ? '线报' : '好价' }}</span>
             <span class="deal-highlight-text">{{ item.deal_highlight }}</span>
           </div>
           <div v-else-if="item.has_coupon && item.coupon_amount > 0" class="goods-tags">
@@ -109,7 +109,7 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span v-if="item.has_coupon" class="price-label">{{ item.deal_highlight ? '单件券后' : '券后' }}</span>
+                <span v-if="item.has_coupon" class="price-label">{{ (item.is_deal_tip && item.deal_highlight) ? '单件券后' : '券后' }}</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>
@@ -239,7 +239,7 @@
         <div class="goods-body">
           <h4 class="goods-title">{{ item.name }}</h4>
           <div v-if="item.deal_highlight" class="deal-highlight-bar" :title="item.deal_highlight">
-            <span class="deal-highlight-badge">线报</span>
+            <span class="deal-highlight-badge">{{ item.is_deal_tip ? '线报' : '好价' }}</span>
             <span class="deal-highlight-text">{{ item.deal_highlight }}</span>
           </div>
           <div v-else-if="item.has_coupon && item.coupon_amount > 0" class="goods-tags">
@@ -251,7 +251,7 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span v-if="item.has_coupon" class="price-label">{{ item.deal_highlight ? '单件券后' : '券后' }}</span>
+                <span v-if="item.has_coupon" class="price-label">{{ (item.is_deal_tip && item.deal_highlight) ? '单件券后' : '券后' }}</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>

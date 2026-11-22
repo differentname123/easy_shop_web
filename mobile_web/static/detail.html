@@ -92,14 +92,14 @@
       <span class="deal-tip-time" v-if="dealTip.publish_time">{{ dealTip.publish_time }} 爆料</span>
     </div>
 
-    <div class="deal-price-box" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.unit_deal_price">
+    <div class="deal-price-box" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.card_highlight">
       <div class="deal-price-row">
         <template v-if="dealTip.deal_price !== null && dealTip.deal_price !== undefined">
           <span class="deal-price-lbl">线报参考价</span>
           <span class="deal-price-yen">¥</span>
           <span class="deal-price-num">{{ formatMoney(dealTip.deal_price) }}</span>
         </template>
-        <span class="deal-unit-pill" v-if="dealTip.unit_deal_price">{{ dealTip.unit_deal_price }}</span>
+        <span class="deal-unit-pill" v-if="dealTip.card_highlight">{{ dealTip.card_highlight }}</span>
       </div>
     </div>
 

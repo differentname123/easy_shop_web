@@ -92,6 +92,18 @@
     3. **横向对齐淘宝与京东**：
        - 淘宝 (`test_tb_api.py`)：从两段式加密串 `<26位动态盐值前缀>-<19~21位稳定密文后缀>` 中提取 `-` 之后的稳定密文后缀作为 `goods_id` (`product_id`)，完整加密串保留在 `goods_sign`；
        - 京东 (`test_jd_api.py`)：从 100% 必返的京东官方 CDN 主图 URL (`360buyimg.com/.../jfs/.../<parent_hash>/<file_stem>.jpg`) 中提取 `<parent_hash>_<file_stem>` 作为跨接口恒定的 `goods_id` (`product_id`)，完整 50 位加密 `itemId` 保留在 `goods_sign`。
+
+十、【2026-11-23 实测补充：批量对齐容错与下架品二义性陷阱】
+  1. **`pdd.ddk.goods.search` 20 批量与单条查卡实测结论**：
+     - ✅ 支持 `goods_sign_list` 单次最多传 **20 个** `goods_sign` 批量查询（实测 5/5 按 `goods_sign` 精准对齐，不按 `goods_id` 对齐）。
+     - ✅ **混入坏数据不连坐**：批量中混入伪造 `goods_sign` 时正常商品仍返回 4/5，不报错也不影响同批其他商品。
+     - ✅ 作为单品输入传入 `keyword` 时：除分享短链/长链外，实测直接传入有效裸 `goods_sign` 也可命中 `total_count=1`。
+  2. **三大致命二义性陷阱（严禁凭表象误判）**：
+     - ⚠️ **陷阱 A（假 `goods_sign` 传给 `goods.search(keyword=...)` 退化为关键词搜索）**：传入不存在的伪造 `goods_sign` 字符串调 `goods.search(keyword=...)` 会返回 `total_count=1000` 的多条模糊搜索结果（而非报错），必须死守 `total_count == 1` 才允许认领，否则必须拦截。
+     - ⚠️ **陷阱 B（下架短链返回 `total_count=1` + 有效 `goods_sign` 但标题价格全空）**：实测对已下架 `p.pinduoduo.com` 短链（如 `lA2knOwN`）调 `goods.search` 会返回 `total_count=1`、带着 `goods_sign`，但 `goods_name=None`。严禁因字段缺失静默丢弃 `goods_sign`（否则后续会误重试 3 轮或错走 `zs.unit.url.gen` 并写成“详情限流/波动”）；**必须保留 `goods_sign` 调 1 次 `pdd.ddk.goods.detail`**，由 `goods.detail` 给出终局裁判：
+       * 已下架/无推广：`[50001:40001] 商品非多多进宝商品`；
+       * `goods_sign` 格式非法/损坏：`[50001:10002] goodsSign解析错误`。
+     - ⚠️ **陷阱 C（生链接口不校验下架，“转链成功”≠“商品在架”）**：实测对已下架的 `off_sign` 调 `pdd.ddk.goods.promotion.url.generate` 仍返回 1 条推广链，对已下架短链和 `goods.html?goods_id=...` 调 `zs.unit.url.gen` 也同样能返回 `short_url`。因此严禁把 `zs.unit` 或生链成功当作商品存活实证，**`pdd.ddk.goods.detail` 是拼多多商品存活的唯一权威裁判**。
 ================================================================================
 """
 

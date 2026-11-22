@@ -17,28 +17,33 @@
     （加密 `itemId` 拼接到 `item.jd.com` 后浏览器无法打开 [404]，且传入转链接口必报 `2001104 商品不在推广中`）。
   - ❌ 严禁使用个人 `jd_app_key` 直连京东官方榜单：京东生成的加密 `itemId` 与调用方 `app_key` 强绑定，
     用个人 `jd_app_key` 拿到的榜单 `itemId` 传给折淘客转链接口会有 30%~40% 报 `2001104` 或 `2001917`。
+  - ⚠️ 【2026-11-23 实测纠偏与补充】：
+    * 个人 `jd_app_key` 直连 `jd.union.open.goods.rank.query` 实测连续 5 页均可用（146–170ms），返回字段与前 20 条商品与折淘客 `rank_query` 20/20 完全一致；
+    * 本轮拿个人榜单前 20 个 `itemId` 传给折淘客 `goods_query`（20/20）、`byunionid_get`（10/10）、`api_detail`（5/5）均通过，但鉴于历史存在跨 `app_key` 不认风险且折淘客榜单不占 `1000` 池（54/54=100%），推荐以折淘客为主力、解除死锁后将官方直连榜单作为灾备兜底；
+    * 个人 `myself_jd_app_key` 的 `jd.union.open.goods.query` 即使过了零点（00:57、当天 0 调用）仍报 `code=2000 (pin for api Limited)`，证实基础账号该接口日配额为 0，`byunionid.get` 报 `403` 无权限。
 
 二、【功能 2：全网关键词搜索 (`api_quanwang.ashx`)】
   - ✅ 可用：`type=2`, `youquan=1`, `sort="new"`，返回加密 `tao_id` 及 `item_url` (`https://jingfen.jd.com/detail/{tao_id}.html`)。
-  - ❌ 不可用搜索词长度：搜索词 `q` 长度 `< 4` 个字符（如 `"可乐"`、`"纸巾"`）会被折淘客上游直接报错拒绝。
-  - ✅ 必选补齐规则：当 `len(query) < 4` 时必须倍增补齐（`while len(query) < 4: query += query`，如 `"可乐"` -> `"可乐可乐"`）。
+  - ⚠️ 【2026-11-23 实测更新】：早期短关键词（如 `"纸巾"`/`"可乐"`）曾被拒，2026-11-23 实测 2 字符 `"纸巾"` 已可直接返回结果；支持 `u.jd.com`、`jCommand`、加密 ID 查询；**不支持** `union-click.jd.com` 长链（报 `301: 关键词参数输入错误`）与纯数字 SKU；且当 ZTK `goods_query` 公共池拥堵触发 `1000` 时，`api_quanwang` 会同步退化返回假空结果 `301: 无符合条件的数据`。
 
 三、【功能 3：单品详情查询 (`api_detail.ashx`) 与 `301: 对应宝贝已下架` 二义性裁决规范】
-  - ✅ 可用入参：传入加密 `tao_id` / `itemId`（无论来自关键词搜索还是实时榜单），`type=1`，
-    均可返回完整详情、轮播图 `small_images`（`|` 分隔）与权威 `https://jingfen.jd.com/detail/{id}.html` 链接。
-  - ❌ 不可用入参：纯数字旧版 SKU ID（如 `"100012043978"`），接口直接报错 `{"status": 301, "content": "对应宝贝已下架"}`。
-  - ⚠️ 【核心二义性问题与完备裁决方案】：
-    当 `api_detail.ashx` 返回 `{"status": 301, "content": "对应宝贝已下架"}` 时存在二义性——
-    既可能是单 `ZTK_APPKEY` 触发折淘客频控伪装报错，也可能是商品真正取消了京东联盟推广（例如 `oxXpYeb9FgS3eszB2h2f3eszB2h2fX_3TYrAutPKopeY0fpzO`）。
-    必须执行以下两步交叉裁决（已在 `jd_client.py` + `jd_adapter.py` + `product_service.py` 闭环落地）：
-    1. **多 Key 轮询防误判**：先在 `ZTK_APPKEY_LIST` 所有 Key 间自动故障切换；若仅单 Key 限流，备用 Key 直接返回 `status=200`。
-    2. **官方转链探针终局裁决**：若全部 Key 均返回 `301: 对应宝贝已下架`，调用 `open_jing_union_open_promotion_byunionid_get.ashx`
-       探测 `https://jingfen.jd.com/detail/{id}.html`：
-       - 若转链返回 `code=200`（成功生成短链/口令）-> 证明商品仍在推广，详情 `301` 纯属频控（返回 `RATE_LIMIT`，保留并启用本地缓存兜底）；
-       - 若转链返回京东联盟官方内层码 `2001104`（`商品不在推广中`）或 `2001920` -> 100% 确诊商品已取消推广（返回 `PRODUCT_OFF_PROMOTION`，
-         立即从 `DETAIL_CACHE`/`MATERIAL_CACHE`/`RECOMMEND_CACHE`/`SEARCH_CACHE` 及 MongoDB `products` 集合物理驱逐，并加入 `OFF_PROMOTION_CACHE` 防复活黑名单）。
-  - ❌ 严禁在转链时无条件预调 `api_detail.ashx`：`api_detail.ashx` 与 `api_quanwang.ashx` 共享单 `ZTK_APPKEY` 的 `1000` 频控池，
-    而加密 ID 本身即可直接一步转链，无需浪费详情配额。
+  - ✅ 【2026-11-23 实测：超预期全格式支持与高抗压】：
+    传入 `tao_id` 参数，`type=1`，实测**直接支持以下 6 种格式**返回完整详情、轮播图 `small_images` 与 `https://jingfen.jd.com/detail/{tao_id}.html`：
+    1. 50 位加密 `itemId` / `tao_id`（含跨 `app_key` 官方榜单解密 `itemId`）；
+    2. 京粉详情页链接 `https://jingfen.jd.com/detail/{id}.html`；
+    3. 推广短链 `https://u.jd.com/xxx`（**包括落地页是纯数字 SKU 的活跃推广短链如 `oO99YvK`**）；
+    4. 联盟推广长链 `https://union-click.jd.com/jdc?...`；
+    5. 完整京口令 (`jCommand`)；
+    6. 精简京口令 (`jShortCommand`)。
+    单把 `ZTK_APPKEY` 实测连续 80 次并发（50.9 QPS）零报错，且**在折淘客 `goods_query` 公共池爆发 `1000` 限流期间（23:18 实测 3 Key 全挂）仍保持 57–68ms 100% 稳定可用（独立故障域），严禁与 `goods_query` 共享同一冷却开关互相误杀**。
+  - ❌ 不可用入参：
+    1. 纯数字旧版 SKU ID（如 `"100012043978"`），接口直接报错 `{"status": 301, "content": "对应宝贝已下架"}`。
+    2. 34 位主图指纹（如 `"6a0eae0eF1e13f63b_00833203205e8c7e"`）：2026-11-23 实测仍复现串货，误将 `"0083320320"` 当数字 SKU 返回无关商品 `"研华PCA-6114P12-0B"`，严禁传入 `api_detail.ashx`！
+  - ⚠️ 【2026-11-23 重大二义性纠偏（旧假设已推翻）】：
+    * **已证实旧裁决逻辑存在致命误判**：`jd_adapter.py` 原先用“`api_detail` 返回 `301: 对应宝贝已下架` 时调 `byunionid_get`，若转链成功就判定 `api_detail` 被限流并拉下全局冷却锁 `mark_catalog_rate_limited()`”。
+    * **2026-11-23 真实反例**：对未入折淘客精选库或已停推商品加密 ID `YRQafyCEaFDJag78gSKrJagzasiirQ_3bnREOlDJSyoYeHEIH` 交叉实测——`api_detail` 返回 `301: 对应宝贝已下架`，`goods_query` 正常返回 `code=200, data=[]`（确实无商品卡），**但 `byunionid_get` 依然返回 `code=200` 并成功生成 `clickURL`/`shortURL`！**
+    * **新裁决铁律**：`byunionid_get == 200` 只能证明“能生链”，**绝不能反推出 `api_detail` 被限流**，更严禁据此锁死全局冷却！多 Key 轮询全部 `301: 对应宝贝已下架` 后，应使用 `goods_query(itemIds=...)` 区分真实 `ZTK_301 ... 1000` 限流 vs `code=200, data=[]` 无卡/下架。
+  - ❌ 严禁在转链时无条件预调 `api_detail.ashx`：`api_detail.ashx` 与 `api_quanwang.ashx` 在无需查卡的纯会场转链时不应额外浪费详情请求。
 
 四、【功能 4：统一推广转链 (`open_jing_union_open_promotion_byunionid_get.ashx`)】
   - ✅ 可用 `materialId` 格式（以下 3 种格式实测均 100% 一步转链成功）：
@@ -92,6 +97,26 @@
     4. **严禁拿主图哈希 `goods_id` 直接请求 `api_detail.ashx`（防串货铁律）**：
        - 实测发现：若将 34 位十六进制主图指纹（如 `6ab9c932F86c506ae_0083320320b195ad`）误当作 `tao_id` 传给折淘客 `api_detail.ashx`，折淘客底层会将其下划线后的十进制数字段（如 `0083320320` -> SKU `83320320`）当作普通数字 SKU 解析，从而返回完全无关的工业品（如“西门子PLC”或“编码器”），导致严重的详情页串货与数据库污染！
        - 防护闭环：前端跳转必须同时透传真实的 `goods_id` 与 50 位 `goods_sign`；后端服务层遇到仅带 `goods_id`（或 `goods_sign == goods_id`）的请求时，必须先通过 `SIGN_BY_ID_CACHE` 或 MongoDB `product_id` 索引反查还原出 50 位真实 `goods_sign`；且 `jd_adapter._fetch_item` 必须硬性拦截 `is_jd_image_key(target_id)` 并校验返回主图指纹一致性。
+
+九、【2026-11-23 实测补充：`goods_query` 20 批量对齐、`tkl_piliang` 格式边界、多 Key 共享池与好单库现状】
+  1. **折淘客 `open_jing_union_open_goods_query.ashx`（全网实时查询与 20 批量查卡）**：
+     - ✅ 仅支持 `GET`（实测 `POST` 报错 `301: appkey不能为空`）。
+     - ✅ **`itemIds` 批量上限硬约束 = 20 个**（传 20 个 `340ms` 返回 `20/20`；传 30 个报 `code=400: 入参itemIds集合一次最多支持查询20个`；过长还可能触发 IIS `maxQueryString` 返回非 JSON）。
+     - ✅ **批量对齐唯一真源 = `oriItemId`**：批量响应不保证顺序一致，且返回的 `itemId` 会被京东重加密加盐（实测 0/9 字节匹配输入），绝不能用 `itemId` 或位置下标对齐！必须使用官方原样回传的 `oriItemId` 对齐（实测 9/9 及跨 Key 20/20 实现 100% 精准对齐）。
+     - ✅ **混入坏数据不连坐**：批量中夹带伪造 50 位假 ID、纯数字 SKU 或乱码字符串时，正常商品仍全部返回且 `code=200`。
+     - ✅ **`keyword` 入参兼容**：除关键词外，直接传入 `u.jd.com` 短链（实测落地为纯数字 SKU 的活跃短链如 `oO99YvK` 命中率 ~85% [6/7]）、`union-click.jd.com`、`jCommand`、`jShortCommand`、加密 `itemId` 均可查询；纯数字 SKU 或其 `item.jd.com` 链接报 `301: 不支持数字id转链`。
+  2. **折淘客 `open_gaoyongzhuanlian_tkl_piliang.ashx`（批量解析转链）**：
+     - ✅ 支持链接格式：`jingfen.jd.com/detail/{id}.html`、`u.jd.com`、`union-click.jd.com`（同时返回短链、加密 `tao_id` 与价格佣金卡）。
+     - ❌ 不支持格式：裸加密 `itemId`、`jCommand`、`jShortCommand`（直接报 `301: 很抱歉！转链失败！！！`）。
+     - ⚠️ **空 `tao_id` 二义性陷阱**：会场/优惠券页、已下架/无推广短链（如 `u.jd.com/o19hsre`）、以及折淘客后端公共池拥堵期，均会返回 `status=200, tao_id="", quanhou_jiage="0"`，**严禁看到空 `tao_id` 就盲目触发全局限流冷却锁**！
+  3. **多 `ZTK_APPKEY` 独立与共享池真实边界（2026-11-23 实测）**：
+     - 京东 `:20000` 全部 6 个接口均**不需要 `sid`**，配置的所有 `ZTK_APPKEY` 全部独立可用；单 Key 正常时段实测 `goods_query` 265 次（~11–22 QPS）、`tkl_piliang` 45 次（17 QPS）、`api_detail` 80 次（50.9 QPS）均零限流。
+     - 同一商品用 3 把 Key 查到的 `callerItemId` 前缀一致，表明 3 把 Key 在折淘客侧共用底层京东联盟应用池：单 Key 累计限流可切 Key 救活，但遇折淘客公共池拥堵时会**全 Key 同时报 `1000`**（且此时 `api_quanwang` 假空、`tkl_piliang` 丢商品卡），而 **`api_detail`、`byunionid_get`、`rank_query` 全程 100% 稳定存活**，因此严禁共享冷却锁互相连坐！
+  4. **好单库京东可用性核验（Git 历史至今 + 14 候选接口实测）**：
+     - ❌ 好单库历史从未提供 `jd_item_detail` / `jd_goods_detail` / `jd_item_list`（v2/v3 均 404）；唯一详情回退接口 `GET v2/v3/jd_goods_search` 在 2026-11-22–23 多时段、双 Key 实测均 100% 返回 `code=0: 数据异常 (请求异常被拦截，open.jd.com listId=533)`（加 Key 无效）。
+     - ✅ 可用：`POST v3/get_jditems_link`（支持加密 ID / `jingfen` / `u.jd.com` / `union-click` / `jCommand` / 会场 URL，但不支持个人 `positionId` 与纯数字 SKU）与 `GET v2/jd_hot_rank`（热销榜）100% 正常；`v2/wire_report_new` 线报源正常。
+  5. **非联盟官方领券短链 (`3.cn` / `coupon.m.jd.com`)**：
+     - `byunionid_get` 与好单库 `get_jditems_link` 均报错 `2001927: 优惠券非联盟渠道券`，必须通过零配额 HTTP 重定向解包直接识别官方领券页。
 ================================================================================
 """
 

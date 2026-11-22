@@ -25,6 +25,7 @@ from infrastructure.ai_api.json_parser import parse_llm_json
 from infrastructure.ai_api.model_api import generate_content
 from infrastructure.runtime_io import load_prompt_cached
 from models.product import strip_ecommerce_tokens_and_urls
+from services.deal_cleaning.text_sanitizer import sanitize_card_highlight
 
 MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
 PROMPT_FILE_PATH = MOBILE_WEB_DIR / "prompt" / "商品数据结构化清洗.txt"
@@ -271,7 +272,6 @@ def build_deal_product_desc(product: Dict[str, Any]) -> str:
         ("官方标题参考", official_name),
         ("官方日常价", act_str),
         ("优惠方式", _clean_deal_text(deal_info.get("price_logic"))),
-        ("折算参考", _clean_deal_text(deal_info.get("unit_deal_price"))),
         ("购买步骤", _clean_deal_text(deal_info.get("tutorial_text"))),
         ("原始爆料文案", _clean_deal_text(deal_info.get("original_copywriting"))),
     ]
@@ -319,8 +319,8 @@ def _check_single_item(format_info, index):
     if not isinstance(format_info, dict):
         return False, f"元素[{index}] 必须是对象"
     prefix = f"元素[{index}](sku_id={format_info.get('sku_id')})"
-    if set(format_info) != {"sku_id", "price", "core_entities", "decision_keywords", "pricing_basis"}:
-        return False, f"{prefix} 必须且只能包含 sku_id、price、core_entities、decision_keywords、pricing_basis"
+    if set(format_info) != {"sku_id", "price", "core_entities", "decision_keywords", "pricing_basis", "card_highlight"}:
+        return False, f"{prefix} 必须且只能包含 sku_id、price、core_entities、decision_keywords、pricing_basis、card_highlight"
 
     price = format_info["price"]
     if type(price) not in (int, float) or not math.isfinite(price) or price <= 0:
@@ -366,6 +366,19 @@ def _check_single_item(format_info, index):
             return False, f"{prefix} pricing_basis.total_value ({total_value}) 必须等于各层 value 的乘积 ({total})"
     if not _clean_stripped_str(pricing, "base_unit") or pricing["base_unit"] != structure[-1]["unit"]:
         return False, f"{prefix} pricing_basis.base_unit 必须与最后一层 unit 一致"
+
+    raw_hl = format_info["card_highlight"]
+    if raw_hl is None:
+        format_info["card_highlight"] = None
+    elif isinstance(raw_hl, str):
+        try:
+            raw_hl.encode("utf-8")
+        except UnicodeEncodeError:
+            return False, f"{prefix} card_highlight 必须是合法 UTF-8 字符串"
+        cleaned_hl = sanitize_card_highlight(raw_hl)
+        format_info["card_highlight"] = cleaned_hl or None
+    else:
+        return False, f"{prefix} card_highlight 必须为 null 或字符串"
     return True, ""
 
 
@@ -918,7 +931,6 @@ def run_deal_format_round(
             "deal_info.is_deal_tip": 1,
             "deal_info.clean_title": 1,
             "deal_info.deal_price": 1,
-            "deal_info.unit_deal_price": 1,
             "deal_info.price_logic": 1,
             "deal_info.tutorial_text": 1,
             "deal_info.original_copywriting": 1,
