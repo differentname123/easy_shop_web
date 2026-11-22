@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """折淘客渠道订单与高佣转链协议（支持 ZTK_APPKEY_LIST 自动轮询切换，与 scripts/test_tb_api.py 对齐）。"""
+import re
 import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -11,8 +12,10 @@ from infrastructure.api_governance import (
 )
 from infrastructure.http_utils import (
     SHANGHAI,
+    clean_text,
     error_dict as _error,
     execute_with_key_failover,
+    normalize_http_url,
     parse_appkey_list,
 )
 from infrastructure.transport import create_http_session
@@ -22,6 +25,10 @@ ZTK_CHANNEL_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl.
 ZTK_CHANNEL_PILIANG_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian_tkl_piliang.ashx"
 ZTK_PUBLISHER_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_publisher_get.ashx"
 ZTK_INVITECODE_GET_URL = "https://api.zhetaoke.com:10001/api/open_sc_invitecode_get.ashx"
+ZTK_TB_QUANWANG_URL = "https://api.zhetaoke.com:10001/api/api_quanwang.ashx"
+ZTK_TB_DETAIL_URL = "https://api.zhetaoke.com:10001/api/api_detail.ashx"
+ZTK_TB_GAOYONG_URL = "https://api.zhetaoke.com:10001/api/open_gaoyongzhuanlian.ashx"
+ZTK_TB_SHANGPIN_ID_URL = "https://api.zhetaoke.com:10001/api/open_shangpin_id.ashx"
 TRUSTED_TOP_HOSTS = frozenset(("eco.taobao.com", "gw.api.taobao.com"))
 ORDER_RESPONSE_ROOTS = ("tbk_sc_order_details_get_response", "tbk_order_details_get_response")
 TRUSTED_ORDER_METHODS = frozenset(("taobao.tbk.sc.order.details.get", "taobao.tbk.order.details.get"))
@@ -327,11 +334,31 @@ class ZtkClient:
                 if status_code != 200 or not content or not isinstance(content, list):
                     msg_text = err_msg or "折淘客渠道转链未返回有效物料"
                     if is_unauthorized:
-                        return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {msg_text}", need_auth=True)
+                        return _error(
+                            "AUTH_REQUIRED",
+                            f"折淘客渠道授权失效: {msg_text}",
+                            need_auth=True,
+                            deterministic_all_keys=True,
+                        )
                     if "不支持数字id" in msg_text.lower():
-                        return _error("UNSUPPORTED_TB_NUMERIC_ID", f"折淘客渠道转链失败: {msg_text}")
+                        return _error(
+                            "UNSUPPORTED_TB_NUMERIC_ID",
+                            f"折淘客渠道转链失败: {msg_text}",
+                            deterministic_all_keys=True,
+                        )
 
                     if "商品id解析错误" in msg_text.lower() or "error tkl" in msg_text.lower():
+                        try:
+                            GLOBAL_QUOTA_PACER.pace(
+                                "ztk_tb_piliang",
+                                current_key,
+                                0.35,
+                                http_session=self.http,
+                                foreground_max_wait=3.0,
+                                background_max_wait=12.0,
+                            )
+                        except QuotaPaceBacklogError:
+                            return _error("QUOTA_PACE_BACKLOG", "淘宝文案解析请求过于频繁，请稍后重试")
                         p_body = self._get_response(
                             ZTK_CHANNEL_PILIANG_URL,
                             params={
@@ -361,9 +388,27 @@ class ZtkClient:
                                         status_code = 200
                                         content = rel_body["content"]
                                     else:
-                                        rel_err = str(rel_body.get("content") or rel_body.get("msg") or "").strip()
-                                        if "relationid" in rel_err.lower() or "无效的relation" in rel_err.lower():
-                                            return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {rel_err}", need_auth=True)
+                                        rel_err = str(
+                                            rel_body.get("content") if isinstance(rel_body.get("content"), str) else (rel_body.get("msg") or "")
+                                        ).strip()
+                                        rel_lower = rel_err.lower()
+                                        is_key_or_sid_err = "appkey" in rel_lower or "sid" in rel_lower
+                                        if not is_key_or_sid_err and (
+                                            "relationid" in rel_lower
+                                            or "relation_id" in rel_lower
+                                            or "无效的relation" in rel_lower
+                                            or any(k in rel_err for k in ("未授权", "未备案", "渠道关系无效", "渠道失效", "无效的渠道"))
+                                        ):
+                                            return _error(
+                                                "AUTH_REQUIRED",
+                                                f"折淘客渠道授权失效: {rel_err}",
+                                                need_auth=True,
+                                                deterministic_all_keys=True,
+                                            )
+                                        msg_text = rel_err or "折淘客二跳渠道转链失败"
+                                else:
+                                    is_key_or_sid_err = False
+                                    msg_text = "折淘客二跳渠道转链响应无效"
                             else:
                                 c_item = dict(p_body)
                                 c_item.setdefault("pict_url", c_item.get("pic") or "")
@@ -374,8 +419,8 @@ class ZtkClient:
                                 content = [c_item]
 
                     if status_code != 200 or not content or not isinstance(content, list):
-                        if "error tkl" in msg_text.lower():
-                            return _error("INVALID_TKL", f"折淘客渠道转链失败: {msg_text}")
+                        if "error tkl" in msg_text.lower() and not is_key_or_sid_err:
+                            return _error("INVALID_TKL", f"折淘客渠道转链失败: {msg_text}", deterministic_all_keys=True)
                         return _error("UPSTREAM_ERROR", f"折淘客渠道转链失败: {msg_text}")
 
                 if not content or not isinstance(content[0], dict):
@@ -426,46 +471,71 @@ class ZtkClient:
             return _error("INVALID_IDENTITY", "渠道核验需要站内 UID")
 
         def _check_once(current_key):
-            params = {
-                "appkey": current_key,
-                "sid": self._sid_for_key(current_key),
-                "relation_app": "common",
-                "info_type": 1,
-                "external_id": clean_uid,
-                "page_no": 1,
-                "page_size": 100,
-            }
             try:
-                body = self._get_response(ZTK_PUBLISHER_GET_URL, params=params)
-                if isinstance(body, dict) and body.get("status") == "error":
-                    return body
-                if not isinstance(body, dict):
-                    return _error("PROTOCOL_ERROR", "折淘客渠道核验响应不是对象")
-                if "error_response" in body or body.get("status") in (301, 1000):
-                    return _error("UPSTREAM_ERROR", "折淘客渠道核验接口返回业务错误")
-                resp_data = (body.get("tbk_sc_publisher_info_get_response") or {}).get("data")
-                if not isinstance(resp_data, dict):
-                    return _error("PROTOCOL_ERROR", "折淘客渠道核验缺少结果封套")
-                inviter_list = resp_data.get("inviter_list")
-                records = []
-                if isinstance(inviter_list, dict):
-                    raw_map = inviter_list.get("map_data", [])
-                    records = [raw_map] if isinstance(raw_map, dict) else (raw_map if isinstance(raw_map, list) else [])
-                elif isinstance(inviter_list, list):
-                    records = inviter_list
+                cur_sid = self._sid_for_key(current_key)
+                all_matches = []
+                total_count = 0
+                for page_no in range(1, 11):
+                    try:
+                        GLOBAL_QUOTA_PACER.pace(
+                            "ztk_tb_channel", current_key, 0.25,
+                            http_session=self.http, foreground_max_wait=2.0, background_max_wait=10.0,
+                        )
+                    except QuotaPaceBacklogError:
+                        return _error("QUOTA_PACE_BACKLOG", "折淘客渠道核验请求过于频繁")
+                    params = {
+                        "appkey": current_key,
+                        "sid": cur_sid,
+                        "relation_app": "common",
+                        "info_type": 1,
+                        "external_id": clean_uid,
+                        "page_no": page_no,
+                        "page_size": 100,
+                    }
+                    body = self._get_response(ZTK_PUBLISHER_GET_URL, params=params)
+                    if isinstance(body, dict) and body.get("status") == "error":
+                        return body
+                    if not isinstance(body, dict):
+                        return _error("PROTOCOL_ERROR", "折淘客渠道核验响应不是对象")
+                    if "error_response" in body or str(body.get("status") or "") in ("301", "1000"):
+                        err_detail = clean_text(
+                            body.get("content")
+                            if isinstance(body.get("content"), str)
+                            else (body.get("msg") or (body.get("error_response") or {}).get("sub_msg") or (body.get("error_response") or {}).get("msg"))
+                        )
+                        return _error("UPSTREAM_ERROR", f"折淘客渠道核验接口返回业务错误: {err_detail}" if err_detail else "折淘客渠道核验接口返回业务错误")
+                    resp_data = (body.get("tbk_sc_publisher_info_get_response") or {}).get("data")
+                    if not isinstance(resp_data, dict):
+                        return _error("PROTOCOL_ERROR", "折淘客渠道核验缺少结果封套")
+                    inviter_list = resp_data.get("inviter_list")
+                    records = []
+                    if isinstance(inviter_list, dict):
+                        raw_map = inviter_list.get("map_data", [])
+                        records = [raw_map] if isinstance(raw_map, dict) else (raw_map if isinstance(raw_map, list) else [])
+                    elif isinstance(inviter_list, list):
+                        records = inviter_list
 
-                # 折淘客中继在未命中特定 external_id 时可能返回该 sid 下的全量渠道记录，需按站内 UID 精确过滤
-                matches = [
-                    r for r in records
-                    if isinstance(r, dict)
-                    and str(r.get("external_id") or "").strip() == clean_uid
-                    and str(r.get("relation_id") or "").strip() not in ("", "0")
-                ]
-                relations = {str(r["relation_id"]).strip() for r in matches}
+                    # 折淘客中继在未命中特定 external_id 时可能返回该 sid 下的全量渠道记录，需按站内 UID 精确过滤
+                    matches = [
+                        r for r in records
+                        if isinstance(r, dict)
+                        and str(r.get("external_id") or "").strip() == clean_uid
+                        and str(r.get("relation_id") or "").strip() not in ("", "0")
+                    ]
+                    if matches:
+                        all_matches.extend(matches)
+                        break
+
+                    raw_total = resp_data.get("total_count")
+                    total_count = int(raw_total) if raw_total is not None and str(raw_total).isdigit() else 0
+                    if not records or (total_count > 0 and page_no * 100 >= total_count) or (total_count == 0 and len(records) < 100):
+                        break
+
+                relations = {str(r["relation_id"]).strip() for r in all_matches}
                 if len(relations) > 1:
                     return _error("AMBIGUOUS_IDENTITY", "官方返回多个渠道身份，需要人工核验")
                 if relations:
-                    matched = matches[0]
+                    matched = all_matches[0]
                     identity = {"relation_id": next(iter(relations)), "external_id": clean_uid}
                     if matched.get("account_name"):
                         identity["account_name"] = str(matched["account_name"]).strip()
@@ -476,8 +546,10 @@ class ZtkClient:
                         "is_authorized": True,
                         "bind": 1,
                         "identity": identity,
-                        "records": matches,
+                        "records": all_matches,
                     }
+                if total_count > 1000:
+                    return _error("INCOMPLETE_IDENTITY", "渠道备案总数超过分页上限，无法确认备案状态")
                 return {
                     "status": "success",
                     "is_authorized": False,
@@ -527,3 +599,218 @@ class ZtkClient:
             "inviterCode": code, "src": "pub", "app": "common", "externalId": clean_uid,
         })
         return {"status": "success", "auth_url": url, "short_url": "", "we_app_info": {}}
+
+    def search_tb_goods(self, keyword: str, page: int = 1, page_size: int = 20, sort: str = "new", has_coupon: bool = False, pid: str = ""):
+        """折淘客淘宝全网搜索备用通道 (api_quanwang.ashx, 需 appkey、sid 与 4 段式 pid)。"""
+        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
+            return _error("CONFIG_ERROR", "折淘客淘宝搜索缺少 appkey 或 sid")
+        kw = clean_text(keyword)
+        if not kw:
+            return _error("INVALID_ARGUMENT", "请输入搜索关键词")
+        clean_pid = clean_text(pid)
+        pg = max(1, int(page or 1))
+        sz = max(1, min(100, int(page_size or 20)))
+
+        def _search_once(current_key):
+            try:
+                GLOBAL_QUOTA_PACER.pace("ztk_tb_catalog", current_key, 0.25, http_session=self.http, foreground_max_wait=2.0, background_max_wait=10.0)
+            except QuotaPaceBacklogError:
+                return _error("QUOTA_PACE_BACKLOG", "折淘客淘宝搜索请求过于频繁")
+            try:
+                params = {
+                    "appkey": current_key,
+                    "sid": self._sid_for_key(current_key),
+                    "q": kw,
+                    "page": pg,
+                    "page_size": sz,
+                    "sort": clean_text(sort) or "new",
+                    "youquan": 1 if has_coupon else 0,
+                }
+                if clean_pid:
+                    params["pid"] = clean_pid
+                body = self._get_response(
+                    ZTK_TB_QUANWANG_URL,
+                    params=params,
+                )
+                if isinstance(body, dict) and body.get("status") == "error":
+                    return body
+                if not isinstance(body, dict):
+                    return _error("PROTOCOL_ERROR", "折淘客淘宝搜索响应不是对象")
+                if body.get("status") != 200:
+                    msg = clean_text(body.get("content") or body.get("msg"))
+                    if any(w in msg for w in ("频", "上限", "次数", "限流")):
+                        return _error("RATE_LIMIT", msg or "折淘客淘宝搜索限流")
+                    return _error("UPSTREAM_ERROR", msg or "折淘客淘宝搜索返回业务错误")
+                rows = body.get("content") or []
+                if not isinstance(rows, list):
+                    return _error("PROTOCOL_ERROR", "折淘客淘宝搜索结果格式无效")
+                return {
+                    "status": "success",
+                    "data": rows,
+                    "page": pg,
+                    "page_size": sz,
+                    "has_more": len(rows) >= sz,
+                }
+            except Exception:
+                return _error("NETWORK_ERROR", "折淘客淘宝搜索通信失败")
+
+        return self._run_with_key_failover(_search_once)
+
+    def get_tb_goods_detail(self, item_id: str):
+        """折淘客淘宝单品详情备用通道 (api_detail.ashx)。"""
+        if not self.appkey_list:
+            return _error("CONFIG_ERROR", "折淘客淘宝详情缺少 appkey")
+        tid = clean_text(item_id)
+        if not tid:
+            return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
+
+        def _detail_once(current_key):
+            try:
+                GLOBAL_QUOTA_PACER.pace("ztk_tb_catalog", current_key, 0.25, http_session=self.http, foreground_max_wait=2.0, background_max_wait=10.0)
+            except QuotaPaceBacklogError:
+                return _error("QUOTA_PACE_BACKLOG", "折淘客淘宝详情请求过于频繁")
+            try:
+                body = self._get_response(
+                    ZTK_TB_DETAIL_URL,
+                    params={"appkey": current_key, "tao_id": tid},
+                )
+                if isinstance(body, dict) and body.get("status") == "error":
+                    return body
+                if not isinstance(body, dict):
+                    return _error("PROTOCOL_ERROR", "折淘客淘宝详情响应不是对象")
+                if body.get("status") != 200:
+                    msg = clean_text(body.get("content") or body.get("msg"))
+                    if any(w in msg for w in ("频", "上限", "次数", "限流")):
+                        return _error("RATE_LIMIT", msg or "折淘客淘宝详情限流")
+                    if "下架" in msg:
+                        return _error("UPSTREAM_ERROR", msg)
+                    return _error("NOT_FOUND" if "未找到" in msg else "UPSTREAM_ERROR", msg or "折淘客淘宝详情查询失败")
+                rows = body.get("content")
+                if not isinstance(rows, list) or not rows:
+                    return _error("NOT_FOUND", "折淘客未找到该淘宝商品详情")
+                valid_rows = [r for r in rows if isinstance(r, dict) and clean_text(r.get("tao_id"))]
+                if not valid_rows:
+                    return _error("NOT_FOUND", "折淘客未找到有效淘宝商品详情")
+                return {"status": "success", "data": valid_rows}
+            except Exception:
+                return _error("NETWORK_ERROR", "折淘客淘宝详情通信失败")
+
+        return execute_with_key_failover(self, _detail_once, round_robin=True)
+
+    def convert_gaoyong_url(self, item_id: str, pid: str, relation_id: str = "", signurl: int = 5):
+        """折淘客高佣转链直连通道 (open_gaoyongzhuanlian.ashx, 按 num_iid 转链且含短链与淘口令)。"""
+        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
+            return _error("CONFIG_ERROR", "折淘客高佣转链缺少 appkey 或 sid")
+        tid = clean_text(item_id)
+        clean_pid = clean_text(pid)
+        rel = clean_text(relation_id)
+        if not tid or not clean_pid:
+            return _error("INVALID_ARGUMENT", "折淘客高佣转链缺少商品标识或 PID")
+
+        def _conv_once(current_key):
+            params = {
+                "appkey": current_key,
+                "sid": self._sid_for_key(current_key),
+                "pid": clean_pid,
+                "num_iid": tid,
+                "signurl": signurl,
+            }
+            if rel:
+                params["relation_id"] = rel
+            try:
+                GLOBAL_QUOTA_PACER.pace("ztk_tb_channel", current_key, 0.25, http_session=self.http, foreground_max_wait=3.0, background_max_wait=12.0)
+            except QuotaPaceBacklogError:
+                return _error("QUOTA_PACE_BACKLOG", "折淘客高佣转链请求过于频繁")
+            try:
+                body = self._get_response(ZTK_TB_GAOYONG_URL, params=params)
+                if isinstance(body, dict) and body.get("status") == "error":
+                    return body
+                if not isinstance(body, dict):
+                    return _error("PROTOCOL_ERROR", "折淘客高佣转链响应不是对象")
+                if body.get("status") != 200 or not isinstance(body.get("content"), list) or not body["content"]:
+                    msg = clean_text(body.get("content") if isinstance(body.get("content"), str) else (body.get("msg") or body.get("error_msg")))
+                    msg_l = msg.lower()
+                    is_key_or_sid_err = "appkey" in msg_l or "sid" in msg_l
+                    if not is_key_or_sid_err and (
+                        "relationid" in msg_l
+                        or "relation_id" in msg_l
+                        or "无效的relation" in msg_l
+                        or (bool(rel) and bool(re.search(r"(?:用户|推手|渠道).{0,12}(?:未授权|未备案|失效|无效)", msg)))
+                    ):
+                        return _error("AUTH_REQUIRED", f"折淘客渠道授权失效: {msg}", need_auth=True, deterministic_all_keys=True)
+                    return _error("UPSTREAM_ERROR", msg or "折淘客高佣转链失败")
+                c = body["content"][0]
+                if not isinstance(c, dict):
+                    return _error("PROTOCOL_ERROR", "折淘客高佣转链内容格式无效")
+                target_url = normalize_http_url(c.get("coupon_click_url") or c.get("item_url"))
+                short_url = normalize_http_url(c.get("shorturl"))
+                tpwd = clean_text(c.get("tkl"))
+                if not target_url and not short_url:
+                    return _error("PROTOCOL_ERROR", "折淘客高佣转链未返回有效链接")
+                return {
+                    "status": "success",
+                    "title": c.get("title") or c.get("tao_title") or "淘宝精选商品",
+                    "final_price": str(c.get("quanhou_jiage") or c.get("size") or "0.00"),
+                    "commission_rate": str(c.get("tkrate3") or "0"),
+                    "commission_amount": str(c.get("tkfee3") or "0.00"),
+                    "is_channel": bool(rel),
+                    "pid": clean_pid,
+                    "relation_id": rel,
+                    "url": target_url or short_url,
+                    "final_link": short_url or target_url,
+                    "short_url": short_url or target_url,
+                    "mobile_url": target_url or short_url,
+                    "tpwd": tpwd,
+                    "raw": c,
+                }
+            except Exception:
+                return _error("NETWORK_ERROR", "折淘客高佣转链通信失败")
+
+        return self._run_with_key_failover(_conv_once)
+
+    def resolve_item_id(self, content: str, pid: str = ""):
+        """折淘客淘宝口令/链接转商品ID接口 (open_shangpin_id.ashx, 需 appkey、sid 与可选 4 段式 pid)。"""
+        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
+            return _error("CONFIG_ERROR", "折淘客口令解ID缺少 appkey 或 sid")
+        text = clean_text(content)
+        if not text:
+            return _error("INVALID_ARGUMENT", "缺少口令或商品链接")
+        clean_pid = clean_text(pid)
+
+        def _resolve_once(current_key):
+            try:
+                GLOBAL_QUOTA_PACER.pace(
+                    "ztk_tb_channel", current_key, 0.25,
+                    http_session=self.http, foreground_max_wait=2.0, background_max_wait=10.0,
+                )
+            except QuotaPaceBacklogError:
+                return _error("QUOTA_PACE_BACKLOG", "折淘客解ID请求过于频繁")
+            try:
+                params = {"appkey": current_key, "sid": self._sid_for_key(current_key), "content": text}
+                if clean_pid:
+                    params["pid"] = clean_pid
+                body = self._get_response(
+                    ZTK_TB_SHANGPIN_ID_URL,
+                    params=params,
+                )
+                if isinstance(body, dict) and body.get("status") == "error":
+                    return body
+                if not isinstance(body, dict):
+                    return _error("PROTOCOL_ERROR", "折淘客解ID响应不是对象")
+                iid = clean_text(body.get("item_id"))
+                if iid and iid != "0":
+                    return {"status": "success", "item_id": iid, "raw": body}
+                msg = clean_text(body.get("content") if isinstance(body.get("content"), str) else (body.get("msg") or ""))
+                if any(w in msg for w in ("频", "上限", "次数", "限流")):
+                    return _error("RATE_LIMIT", msg or "折淘客解ID限流")
+                status_val = str(body.get("status") or "")
+                msg_l = msg.lower()
+                if ("appkey" in msg_l or "sid" in msg_l) or (
+                    status_val in ("301", "1000") and not any(w in msg for w in ("未找到", "无结果", "解析失败"))
+                ):
+                    return _error("UPSTREAM_ERROR", msg or "折淘客解ID业务错误")
+                return _error("NOT_FOUND", msg or "折淘客未能解析出淘宝商品ID")
+            except Exception:
+                return _error("NETWORK_ERROR", "折淘客解ID通信失败")
+
+        return self._run_with_key_failover(_resolve_once)

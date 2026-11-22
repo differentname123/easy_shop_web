@@ -19,9 +19,8 @@ import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-
 from adapters import get_adapter
+from infrastructure.transport import create_http_session
 from models.deal_constants import (
     DEAL_FORMAL_EXPIRY_HOURS,
     DEFAULT_AI_TIMEOUT_SECONDS,
@@ -191,11 +190,7 @@ class DealPoolCleaner:
             return self.unwrap_http_session
         with self._cache_lock:
             if self._shared_unwrap_session is None:
-                sess = requests.Session()
-                adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32)
-                sess.mount("http://", adapter)
-                sess.mount("https://", adapter)
-                self._shared_unwrap_session = sess
+                self._shared_unwrap_session = create_http_session(pool_connections=16, pool_maxsize=32)
             return self._shared_unwrap_session
 
     def _can_run_live_unwrap(self) -> bool:

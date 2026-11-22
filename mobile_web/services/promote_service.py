@@ -26,6 +26,7 @@ from cache import (
     PROMOTION_CACHE,
     SIGN_BY_ID_CACHE,
     cache_product_detail,
+    is_valid_detail_cache_entry,
     make_detail_snapshot,
     snapshot_detail_deadline,
 )
@@ -40,11 +41,13 @@ class PromoteService:
         self.user_service = user_service
 
     def _resolve_product_ref(self, ref: ProductRef) -> ProductRef:
-        if ref.platform in ("taobao", "jd") and ref.goods_id:
+        upgraded_from_id = False
+        if ref.platform in ("taobao", "jd", "pdd") and ref.goods_id:
             if not ref.goods_sign or ref.goods_sign == ref.goods_id or (ref.platform == "jd" and is_jd_image_key(ref.goods_sign)):
                 cached_sign = SIGN_BY_ID_CACHE.get((ref.platform, ref.goods_id))
                 if isinstance(cached_sign, str) and cached_sign.strip():
                     ref = ProductRef(ref.platform, ref.goods_id, cached_sign.strip())
+                    upgraded_from_id = True
         if ref.goods_sign:
             try:
                 doc = self.repo.get_product_identity(ref.goods_sign, platform=ref.platform)
@@ -56,32 +59,46 @@ class PromoteService:
                             raw_gid = pid
                     goods_id = (
                         raw_gid
-                        or ref.goods_id
+                        or (ref.goods_id if upgraded_from_id else "")
                         or (extract_canonical_goods_id(ref.platform, ref.goods_sign) if ref.platform in ("taobao", "jd") else "")
                     )
                     doc_sign = str(doc.get("goods_sign") or "").strip() or ref.goods_sign
+                    if (
+                        raw_gid
+                        and doc_sign
+                        and raw_gid != doc_sign
+                        and not (ref.platform == "jd" and is_jd_image_key(doc_sign))
+                        and not (ref.platform == "pdd" and doc_sign.isdigit())
+                    ):
+                        SIGN_BY_ID_CACHE.set((ref.platform, raw_gid), doc_sign)
                     return ProductRef(ref.platform, goods_id, doc_sign)
             except Exception as exc:
                 logger.warning(
                     "❌ 【转链身份解析降级】读取商品身份缓存未成功，已降级使用原始参数继续转链 | 平台[%s] Sign[%s] 异常<%s>",
                     ref.platform, ref.goods_sign, format_exc_summary(exc),
                 )
-            # 若内存 DETAIL_CACHE 已持有经服务端验证的同平台商品详情，直接补齐权威 goods_id
+            # 若内存 DETAIL_CACHE 已持有经服务端验证的同平台 Sign 详情，直接补齐权威 goods_id
             try:
-                for dkey in ref.cache_keys():
-                    entry = DETAIL_CACHE.get(dkey)
-                    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
-                        cached_data = entry[1].get("data") or {}
-                        cached_gid = clean_product_id(cached_data.get("goods_id") or cached_data.get("product_id"))
-                        if cached_gid:
-                            return ProductRef(ref.platform, cached_gid, ref.goods_sign)
+                entry = DETAIL_CACHE.get(("detail", ref.platform, "", "sign", ref.goods_sign))
+                if is_valid_detail_cache_entry(entry):
+                    cached_data = entry[1].get("data") or {}
+                    cached_sign = str(cached_data.get("goods_sign") or "").strip()
+                    cached_gid = clean_product_id(cached_data.get("goods_id") or cached_data.get("product_id"))
+                    if cached_gid and (not cached_sign or cached_sign == ref.goods_sign):
+                        if (
+                            cached_gid != ref.goods_sign
+                            and not (ref.platform == "jd" and is_jd_image_key(ref.goods_sign))
+                            and not (ref.platform == "pdd" and ref.goods_sign.isdigit())
+                        ):
+                            SIGN_BY_ID_CACHE.set((ref.platform, cached_gid), ref.goods_sign)
+                        return ProductRef(ref.platform, cached_gid, ref.goods_sign)
             except Exception:
                 pass
             if ref.platform in ("taobao", "jd"):
                 sign = ref.goods_sign or ref.goods_id
                 gid = ref.goods_id or extract_canonical_goods_id(ref.platform, sign)
                 return ProductRef(ref.platform, gid, sign)
-            return ProductRef(ref.platform, "", ref.goods_sign)
+            return ProductRef(ref.platform, ref.goods_id if upgraded_from_id else "", ref.goods_sign)
         if ref.platform in ("taobao", "jd"):
             sign = ref.goods_sign or ref.goods_id
             gid = extract_canonical_goods_id(ref.platform, ref.goods_id or sign)
@@ -144,9 +161,11 @@ class PromoteService:
             return None
         kind = "sign" if ref.goods_sign else "id"
         item = self.repo.get_product_detail(ref.key, platform=ref.platform, key_type=kind)
-        if not isinstance(item, dict) and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd"):
+        if not isinstance(item, dict) and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd", "pdd"):
             item = self.repo.get_product_detail(ref.goods_id, platform=ref.platform, key_type="id")
         if not isinstance(item, dict) or normalize_platform(item.get("platform")) != ref.platform:
+            return None
+        if item.get("is_off_promotion") is True or item.get("superseded_by"):
             return None
         if ref.platform != "pdd":
             gid = str(item.get("goods_id") or item.get("product_id") or "").strip()
@@ -188,12 +207,19 @@ class PromoteService:
         try:
             for dkey in ref.cache_keys():
                 entry = DETAIL_CACHE.get(dkey)
-                if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
-                    detail_url = (entry[1].get("data") or {}).get("product_url")
-                    if isinstance(detail_url, str) and detail_url.strip():
-                        clean_detail_url = detail_url.strip()
-                        MATERIAL_CACHE.set(cache_key, clean_detail_url)
-                        return clean_detail_url
+                if not is_valid_detail_cache_entry(entry):
+                    continue
+                cached_data = entry[1].get("data") or {}
+                cached_sign = str(cached_data.get("goods_sign") or "").strip()
+                if ref.goods_sign and (
+                    cached_sign != ref.goods_sign if dkey[3] == "id" else (cached_sign and cached_sign != ref.goods_sign)
+                ):
+                    continue
+                detail_url = cached_data.get("product_url")
+                if isinstance(detail_url, str) and detail_url.strip():
+                    clean_detail_url = detail_url.strip()
+                    MATERIAL_CACHE.set(cache_key, clean_detail_url)
+                    return clean_detail_url
         except Exception:
             pass
         if isinstance(cached, str) and cached:
@@ -231,10 +257,17 @@ class PromoteService:
         try:
             for dkey in ref.cache_keys():
                 entry = DETAIL_CACHE.get(dkey)
-                if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], dict):
-                    c_url = extract_fn(entry[1].get("data") or {})
-                    if isinstance(c_url, str) and c_url:
-                        return c_url, entry[1].get("data")
+                if not is_valid_detail_cache_entry(entry):
+                    continue
+                cached_data = entry[1].get("data") or {}
+                cached_sign = str(cached_data.get("goods_sign") or "").strip()
+                if ref.goods_sign and (
+                    cached_sign != ref.goods_sign if dkey[3] == "id" else (cached_sign and cached_sign != ref.goods_sign)
+                ):
+                    continue
+                c_url = extract_fn(cached_data)
+                if isinstance(c_url, str) and c_url:
+                    return c_url, cached_data
         except Exception:
             pass
         try:
@@ -273,6 +306,9 @@ class PromoteService:
             if isinstance(det, dict) and det.get("status") == "success" and isinstance(det.get("data"), dict):
                 detail_data = det["data"]
                 self._seed_resolved_product(ref.platform, detail_data, persist_db=True)
+                detail_url = str(detail_data.get("product_url") or "").strip()
+                if detail_url and ref.key:
+                    MATERIAL_CACHE.set((ref.platform, "sign" if ref.goods_sign else "id", ref.key), detail_url)
                 extracted = extract_fn(detail_data)
                 return extracted if isinstance(extracted, str) else ""
         except Exception as exc:
@@ -391,7 +427,17 @@ class PromoteService:
     _NON_FALLBACK_PRODUCT_ERRORS = frozenset({
         "PRODUCT_OFF_PROMOTION",
         "UNSUPPORTED_JD_NUMERIC_SKU",
+        "UNSUPPORTED_TB_NUMERIC_ID",
+        "UNSUPPORTED_TB_PORTAL_PAGE",
         "UNSUPPORTED_PDD_ID_ONLY_URL",
+        "UNRESOLVED_PDD_INPUT",
+        "UNSAFE_REDIRECT",
+        "UNTRUSTED_GATEWAY",
+        "PRODUCT_IDENTITY_MISMATCH",
+        "AMBIGUOUS_IDENTITY",
+        "INVALID_PDD_URL",
+        "INVALID_TKL",
+        "INVALID_IDENTITY",
         "MATERIAL_URL_REQUIRED",
         "INVALID_ARGUMENT",
         "CONFIG_ERROR",
@@ -784,7 +830,7 @@ class PromoteService:
                             trusted_coupon_url=product["coupon_url"],
                             **adapter_kwargs,
                         )
-                        if isinstance(upgraded, dict) and upgraded.get("status") == "success":
+                        if isinstance(upgraded, dict) and upgraded.get("status") == "success" and not upgraded.get("is_fallback"):
                             for k in ("url", "final_link", "mobile_url", "short_url", "click_url", "j_command", "j_short_command", "promotion_token", "coupon_url"):
                                 if upgraded.get(k):
                                     data[k] = upgraded[k]

@@ -200,8 +200,8 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
                 return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
 
             if "open_gaoyongzhuanlian_tkl_piliang.ashx" in url:
-                # 模拟首个轮询命中的 ztk_k2 频控返回空 tao_id，自动故障切换至 ztk_k1 返回真实加密 tao_id 与商品详情
-                if params.get("appkey") == "ztk_k2":
+                # 模拟首个轮询命中的 ztk_k1 频控返回空 tao_id，自动故障切换至 ztk_k2 返回真实加密 tao_id 与商品详情
+                if params.get("appkey") == "ztk_k1":
                     payload = {"status": 200, "result_url": "https://u.jd.com/s1", "tao_id": "", "title": ""}
                 else:
                     payload = {
@@ -237,7 +237,7 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     assert res_prod["product"]["name"] == "越峰花茉莉飘雪花茶浓香型袋装50克"
     assert res_prod["product"]["price"] == 15.8
     piliang_keys = [k for u, k, _ in calls if "piliang" in u]
-    assert piliang_keys == ["ztk_k2", "ztk_k1"]
+    assert piliang_keys == ["ztk_k1", "ztk_k2"]
 
     # 2) 纯京口令（无 URL）：byunionid_get 转出 shortURL 后，向 piliang 透传该 shortURL 而非裸口令（防 301 转链失败）
     calls.clear()
@@ -916,6 +916,99 @@ def test_universal_convert_with_logged_in_uid_seeds_public_detail_cache(monkeypa
     )
     assert cached_public is not None
     assert cached_public[1]["data"]["name"] == "维达超韧抽纸"
+
+
+# ==============================================================================
+# 6. Wave A：防抖动误杀下架、有界熔断冷却、PDD Sign 缓存升级与解包会话复用
+# ==============================================================================
+def test_retry_on_off_promotion_does_not_confirm_off_on_network_retry():
+    from adapters.base import BasePlatformAdapter
+
+    class _DummyAdapter(BasePlatformAdapter):
+        platform_code = "demo"
+        platform_name = "演示"
+        def get_recommend_goods(self, *a, **k): return {}
+        def search_goods(self, *a, **k): return {}
+        def get_goods_detail(self, *a, **k): return {}
+        def convert_promotion_url(self, *a, **k): return {}
+        def check_authority(self, *a, **k): return {}
+        def generate_authority_url(self, *a, **k): return {}
+        def fetch_increment_orders(self, *a, **k): return {}
+
+    adp = _DummyAdapter()
+    is_off = lambda r: r.get("error_code") == "PRODUCT_OFF_PROMOTION"
+
+    # 第一次疑似下架，第二次变成网络抖动 -> 绝不可 confirmed_off=True
+    calls = [
+        {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION"},
+        {"status": "error", "error_code": "NETWORK_ERROR"},
+    ]
+    res1, off1 = adp._retry_on_off_promotion(lambda: calls.pop(0), is_off, delay=0)
+    assert off1 is False
+    assert res1["error_code"] == "NETWORK_ERROR"
+
+    # 两次均确认下架 -> confirmed_off=True
+    calls2 = [
+        {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION"},
+        {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION"},
+    ]
+    res2, off2 = adp._retry_on_off_promotion(lambda: calls2.pop(0), is_off, delay=0)
+    assert off2 is True
+    assert res2["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+
+def test_upstream_cooldown_registry_bounded_and_mock_safe(monkeypatch):
+    from infrastructure.api_governance import UpstreamCooldownRegistry
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr("infrastructure.api_governance.time.monotonic", lambda: clock["now"])
+    reg = UpstreamCooldownRegistry(max_entries=16)
+
+    mock_sess = MagicMock()
+    reg.mark_cooling("jd", "hdk", "jd_goods_search", 300.0, http_session=mock_sess)
+    assert reg.is_cooling("jd", "hdk", "jd_goods_search", http_session=mock_sess) is False
+
+    # 强制或无 mock_sess 标记后，冷却期间跳过，到期自动恢复
+    reg.mark_cooling("jd", "hdk", "jd_goods_search", 60.0, force=True)
+    assert reg.is_cooling("jd", "hdk", "jd_goods_search") is True
+    assert reg.remaining_seconds("jd", "hdk", "jd_goods_search") == pytest.approx(60.0)
+    clock["now"] += 61.0
+    assert reg.is_cooling("jd", "hdk", "jd_goods_search") is False
+
+    for i in range(25):
+        reg.mark_cooling("jd", "hdk", f"op_{i}", 60.0, force=True)
+    assert len(reg._entries) <= 16
+
+
+def test_pdd_sign_cache_upgrade_and_non_fallback_errors_and_unwrap_session():
+    from models.product import ProductRef
+    from services.deal_pool_cleaner import DealPoolCleaner
+    from services.product_service import ProductService
+
+    SIGN_BY_ID_CACHE.clear()
+    SIGN_BY_ID_CACHE.set(("pdd", "833182837312"), "E9X2Y5ff1NRgMvVRwfDBZIMCUINV0l6ycw_JJxlgUX5h")
+
+    upgraded = ProductService._upgrade_ref_sign(ProductRef("pdd", "833182837312", ""))
+    assert upgraded.goods_sign == "E9X2Y5ff1NRgMvVRwfDBZIMCUINV0l6ycw_JJxlgUX5h"
+
+    mock_repo = MagicMock()
+    mock_repo.get_product_identity.return_value = None
+    svc = PromoteService(product_repo=mock_repo, user_service=MagicMock())
+    resolved = svc._resolve_product_ref(ProductRef("pdd", "833182837312", ""))
+    assert resolved.goods_sign == "E9X2Y5ff1NRgMvVRwfDBZIMCUINV0l6ycw_JJxlgUX5h"
+    assert "UNSUPPORTED_TB_NUMERIC_ID" in PromoteService._NON_FALLBACK_PRODUCT_ERRORS
+    assert "INVALID_PDD_URL" in PromoteService._NON_FALLBACK_PRODUCT_ERRORS
+    assert "INVALID_TKL" in PromoteService._NON_FALLBACK_PRODUCT_ERRORS
+
+    from infrastructure.transport import _TRACKED_SESSIONS
+
+    cleaner = DealPoolCleaner(ai_batch_size=1, ai_max_workers=1, convert_max_workers=1)
+    try:
+        sess = cleaner._get_unwrap_session()
+        assert sess in _TRACKED_SESSIONS
+    finally:
+        cleaner.close()
+
 
 
 

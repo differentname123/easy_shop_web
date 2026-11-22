@@ -26,6 +26,7 @@ from models.deal_constants import (
     ERR_ADAPTER_OFF_PROMOTION,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
     ERR_AI2_MAIN_DEAD_ONLY_FILLER,
+    ERR_AI2_PRICE_INTEGRITY,
     ERR_AI2_PRODUCT_MISMATCH,
     ERR_AI2_VIRTUAL_OR_JUNK,
     ERR_AI_MAX_RETRIES_EXCEEDED,
@@ -89,19 +90,50 @@ _AFFILIATE_MAIN_DOMAIN_HINTS = (
     "yangkeduo.com/",
 )
 
+# 仅向 AI-2 暴露货品核验与量级/折扣参考必需字段；剔除与 activity_price 重复的 price、
+# 已扣入 activity_price 且易诱发二次扣券的 coupon_amount，以及提示词未使用的佣金/销量噪声。
 _AI2_OFFICIAL_PRODUCT_KEYS = (
     "title",
-    "price",
     "original_price",
     "activity_price",
-    "coupon_amount",
     "shop_name",
-    "commission_rate",
-    "commission_amount",
     "category",
     "brand",
-    "sales_tip",
 )
+
+_RAW_NUM_RE = re.compile(r"(?<!\d)(\d+(?:\.\d{1,2})?)(?!\d)")
+
+
+def _detect_ai2_price_leakage(
+    deal_price: Optional[float],
+    source_text: str,
+    product_card: Dict[str, Any],
+    stage1_deal_price: Optional[Any] = None,
+) -> Optional[str]:
+    """检测 AI-2 是否二次扣减官方自带券，或用官方在售价覆写原文明确价格（仅当 deal_price 无法源自原文数值时触发）。"""
+    if deal_price is None:
+        return None
+    dp = round(float(deal_price), 2)
+    raw_nums = {round(float(m.group(1)), 2) for m in _RAW_NUM_RE.finditer(source_text or "")}
+    if any(abs(dp - n) <= 0.05 for n in raw_nums):
+        return None
+    for k in range(2, 25):
+        if any(abs(dp - round(n * k, 2)) <= 0.05 for n in raw_nums):
+            return None
+    off_act = round(float(product_card.get("activity_price") or product_card.get("price") or 0.0), 2)
+    off_cpn = round(float(product_card.get("coupon_amount") or 0.0), 2)
+    if off_act > 0 and off_cpn > 0 and abs(dp - round(off_act - off_cpn, 2)) <= 0.02:
+        return f"二次扣减官方自带券({off_act}-{off_cpn}={dp}，原文未出现该价)"
+    if (
+        off_act > 0
+        and abs(dp - off_act) <= 0.02
+        and isinstance(stage1_deal_price, (int, float))
+        and not isinstance(stage1_deal_price, bool)
+        and float(stage1_deal_price) > 0
+        and abs(dp - round(float(stage1_deal_price), 2)) > 0.05
+    ):
+        return f"违规用官方在售价({off_act})覆盖原文价格({round(float(stage1_deal_price), 2)})"
+    return None
 
 
 def load_neighbor_docs(
@@ -1130,7 +1162,9 @@ def run_stage3_concurrent_conversions(
     ztk_key_count = len(getattr(getattr(jd_adapter, "client", None), "appkey_list", ()) or ())
     jd_lane_cap = min(max(1, ztk_key_count), 2) if ztk_key_count > 0 else 1
     jd_lane_count = min(cleaner.convert_max_workers, jd_lane_cap, len(jd_targets))
-    other_slots = 0 if not other_targets else min(max(1, cleaner.convert_max_workers - jd_lane_count), len(other_targets))
+    other_cap = 6
+    other_budget = max(1, cleaner.convert_max_workers - jd_lane_count)
+    other_slots = 0 if not other_targets else min(other_budget, other_cap, len(other_targets))
     worker_slots = max(1, other_slots + jd_lane_count)
 
     if not quiet_sub_logs:
@@ -1422,7 +1456,12 @@ def process_ai1_unit(
 
         saved_ai1 = doc.get("ai_stage1_result")
         if (
-            doc.get("clean_error_code") in (ERR_ADAPTER_CONVERT_FAILED, ERR_ADAPTER_CONFIG_ERROR, ERR_AI_TIMEOUT_RETRY)
+            doc.get("clean_error_code") in (
+                ERR_ADAPTER_CONVERT_FAILED,
+                ERR_ADAPTER_CONFIG_ERROR,
+                ERR_AI_TIMEOUT_RETRY,
+                ERR_AI2_PRICE_INTEGRITY,
+            )
             and isinstance(saved_ai1, dict)
             and not saved_ai1.get("_from_fallback")
             and saved_ai1.get("is_standalone_deal") is not False
@@ -2222,6 +2261,32 @@ def process_ai2_unit(
                     deal_price = round(val, 2)
             except Exception:
                 pass
+
+        price_leak_reason = _detect_ai2_price_leakage(
+            deal_price,
+            f"{s2_inp.get('combined_raw_text') or ''}\n{draft_copy_by_id.get(mid) or ''}\n{raw_title}",
+            product_card,
+            stage1_deal_price=ai1_res.get("deal_price"),
+        )
+        if price_leak_reason:
+            cleaner.stats_ai_retries_scheduled += 1
+            outcomes_by_id[mid] = _build_retry_or_max_outcome(
+                doc=doc,
+                site=site,
+                channel=channel,
+                mid=mid,
+                raw_title=raw_title,
+                ai1_res=ai1_res,
+                conv_summary=conv_summary_for_db,
+                ai2_res=ai2_res,
+                stage=CLEAN_STAGE_NEED_AI2,
+                retry_err_code=ERR_AI2_PRICE_INTEGRITY,
+                max_err_code=ERR_AI2_PRICE_INTEGRITY,
+                retry_msg=f"AI-2 价格校验异常({price_leak_reason})，跳过本轮并累加重试 ({{new_retries}}/{{max_retries}})",
+                max_msg=f"AI-2 连续 {{new_retries}} 次价格校验异常({price_leak_reason})，达最大重试上限({{max_retries}}次)放弃",
+                candidate_count=len(conv_list),
+            )
+            continue
 
         unit_deal_price = normalize_inline_spaces(str(ai2_res.get("unit_deal_price") or "")).strip() or None
         price_logic = normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None

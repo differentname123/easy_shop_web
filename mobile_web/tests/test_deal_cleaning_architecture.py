@@ -11,8 +11,12 @@ from unittest.mock import MagicMock
 
 from models.deal_constants import (
     CLEAN_STAGE_DONE,
+    CLEAN_STAGE_NEED_AI2,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
+    ERR_AI2_PRICE_INTEGRITY,
     ERR_UNSUPPORTED_PLATFORM,
+    MAX_CLEAN_RETRIES,
+    PROMPT_STAGE2_PATH,
     UPSTREAM_DISAPPEARED,
 )
 from repositories.deal_raw_pool_repo import DealRawPoolRepository, parse_publish_time_epoch
@@ -241,14 +245,22 @@ def test_daemon_mode_preserves_rich_product_fields_while_keeping_ai2_prompt_lean
     ai2_out, _ = cleaner.process_ai2_unit([doc_ai2], raw_col=None, quiet_sub_logs=True)
     assert len(ai2_out) == 1 and ai2_out[0]["status"] == "success"
 
-    # LLM 输入负载精简（不膨胀）
+    # LLM 输入负载精简（不膨胀、且屏蔽诱发二次扣券的 price / coupon_amount 等字段）
     sent_off = captured_ai2_inputs[0]["converted_links"][0]["official_product"]
+    assert set(sent_off.keys()) == {"title", "original_price", "activity_price", "shop_name", "category", "brand"}
+    assert "price" not in sent_off
+    assert "coupon_amount" not in sent_off
+    assert "commission_rate" not in sent_off
+    assert "commission_amount" not in sent_off
+    assert "sales_tip" not in sent_off
     assert "desc" not in sent_off
     assert "specs" not in sent_off
     assert "carousel_images" not in sent_off
 
     # 正式表落盘产物完整保留全部富字段与 tutorial_score
     pdoc = ai2_out[0]["product_doc"]
+    assert pdoc["price"] == 39.9
+    assert pdoc["coupon_amount"] == 10.0
     assert pdoc["desc"] == "加厚亲肤无香精超韧系列长描述"
     assert pdoc["detail_tags"] == ["京东自营", "破损包赔"]
     assert pdoc["service_guarantees"] == ["7天无理由退货", "闪电发货"]
@@ -647,3 +659,193 @@ def test_generate_pool_summary_single_facet_aggregation_and_empty_edge():
     assert empty_summary["by_source_site"] == []
     assert empty_summary["by_clean_error_code"] == {}
     assert empty_summary["by_platform"] == {}
+
+
+def _make_stage2_price_test_doc(
+    *,
+    tip_id: str,
+    raw_text: str,
+    official_price: float,
+    original_price: float,
+    coupon_amount: float = 0.0,
+    stage1_deal_price: float | None = None,
+    retry_count: int = 0,
+):
+    return {
+        "source_site": "haodanku",
+        "source_channel": "好单库_测试",
+        "source_item_id": tip_id,
+        "platform": "jd",
+        "title": raw_text.splitlines()[0],
+        "tutorial_text": raw_text,
+        "clean_retry_count": retry_count,
+        "ai_stage1_result": {
+            "main_tip_id": tip_id,
+            "merged_tip_ids": [tip_id],
+            "deal_price": stage1_deal_price,
+            "combined_raw_text": f"{raw_text}\n商品/活动链接: [#L1]",
+            "tutorial_score": 85,
+            "extracted_targets": [
+                {"link_id": "L1", "clean_input": "https://u.jd.com/item1", "platform": "jd", "text_role_hint": "main_candidate"}
+            ],
+        },
+        "converted_links": [
+            {
+                "link_id": "L1",
+                "clean_input": "https://u.jd.com/item1",
+                "text_role_hint": "main_candidate",
+                "convert_status": "product",
+                "platform": "jd",
+                "goods_id": f"GID_{tip_id}",
+                "goods_sign": f"GS_{tip_id}",
+                "my_promo_link": "https://u.jd.com/promo1",
+                "my_promo_token": "",
+                "official_product": {
+                    "title": "测试商品标准品名",
+                    "price": official_price,
+                    "original_price": original_price,
+                    "activity_price": official_price,
+                    "coupon_amount": coupon_amount,
+                    "shop_name": "官方旗舰店",
+                    "category": "食品饮料",
+                    "brand": "伊利",
+                },
+            }
+        ],
+    }
+
+
+def test_ai2_price_integrity_guard_blocks_double_coupon_and_official_overwrite():
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
+
+    # 1. 还原 1656363：原文 到手【59.9元】，official activity_price=69.9, coupon=30.0，AI-2 错扣成 39.9 -> 拦截重试
+    doc_double_sub = _make_stage2_price_test_doc(
+        tip_id="1656363",
+        raw_text="伊利 纯牛奶200ml*24盒*2箱\n折29.9/箱！！到手【59.9元】",
+        official_price=69.9,
+        original_price=99.9,
+        coupon_amount=30.0,
+        stage1_deal_price=59.9,
+    )
+    # 2. 还原 1656363 达重试上限：二次扣官方券属 100% 确定性错算，达上限后 Fail-Closed 为 failed
+    doc_double_sub_max = _make_stage2_price_test_doc(
+        tip_id="1656363_max",
+        raw_text="伊利 纯牛奶200ml*24盒*2箱\n折29.9/箱！！到手【59.9元】",
+        official_price=69.9,
+        original_price=99.9,
+        coupon_amount=30.0,
+        stage1_deal_price=59.9,
+        retry_count=MAX_CLEAN_RETRIES - 1,
+    )
+    # 3. 还原 14319776 / 2779234：原文 券后30.4元，official activity_price=25.39，AI-2 错抄官价 25.39 -> 拦截重试
+    doc_overwrite = _make_stage2_price_test_doc(
+        tip_id="14319776",
+        raw_text="2026秋上册 初中必刷题\n原价33.4元 【券后30.4元】包邮",
+        official_price=25.39,
+        original_price=33.4,
+        coupon_amount=3.0,
+        stage1_deal_price=30.4,
+    )
+    # 4. 还原无数字价线报（stage1_deal_price=None）且已达重试上限：即使官价穿透也不误杀整条有效商品
+    doc_no_price_max = _make_stage2_price_test_doc(
+        tip_id="1660044_max",
+        raw_text="蔬果园 修复发膜500g\n部分地区特价叠加限免优惠",
+        official_price=39.9,
+        original_price=39.9,
+        coupon_amount=0.0,
+        stage1_deal_price=None,
+        retry_count=MAX_CLEAN_RETRIES - 1,
+    )
+
+    mock_returns = {
+        "1656363": {"main_tip_id": "1656363", "is_valid_deal": True, "main_link_id": "L1", "deal_price": 39.9, "quality_score": 90},
+        "1656363_max": {"main_tip_id": "1656363_max", "is_valid_deal": True, "main_link_id": "L1", "deal_price": 39.9, "quality_score": 90},
+        "14319776": {"main_tip_id": "14319776", "is_valid_deal": True, "main_link_id": "L1", "deal_price": 25.39, "quality_score": 90},
+        "1660044_max": {"main_tip_id": "1660044_max", "is_valid_deal": True, "main_link_id": "L1", "deal_price": 39.9, "quality_score": 90},
+    }
+    cleaner.run_ai_stage2_batch = lambda inputs, quiet_sub_logs=False: {
+        it["main_tip_id"]: mock_returns[it["main_tip_id"]] for it in inputs
+    }
+
+    outcomes, _ = cleaner.process_ai2_unit(
+        [doc_double_sub, doc_double_sub_max, doc_overwrite, doc_no_price_max],
+        raw_col=None,
+        quiet_sub_logs=True,
+    )
+    by_id = {o["source_item_id"]: o for o in outcomes}
+
+    assert by_id["1656363"]["status"] == "retry_pending"
+    assert by_id["1656363"]["clean_stage"] == CLEAN_STAGE_NEED_AI2
+    assert by_id["1656363"]["error_code"] == ERR_AI2_PRICE_INTEGRITY
+    assert by_id["1656363_max"]["status"] == "failed"
+    assert by_id["1656363_max"]["error_code"] == ERR_AI2_PRICE_INTEGRITY
+    assert by_id["14319776"]["status"] == "retry_pending"
+    assert by_id["14319776"]["clean_stage"] == CLEAN_STAGE_NEED_AI2
+    assert by_id["14319776"]["error_code"] == ERR_AI2_PRICE_INTEGRITY
+    assert by_id["1660044_max"]["status"] == "success"
+
+    # 无数字到手价若 AI-2 合规返回 deal_price=None，应正常放行入库
+    doc_no_price_ok = _make_stage2_price_test_doc(
+        tip_id="1660044_ok",
+        raw_text="蔬果园 修复发膜500g\n部分地区特价叠加限免优惠",
+        official_price=39.9,
+        original_price=39.9,
+    )
+    cleaner.run_ai_stage2_batch = lambda inputs, quiet_sub_logs=False: {
+        "1660044_ok": {"main_tip_id": "1660044_ok", "is_valid_deal": True, "main_link_id": "L1", "deal_price": None, "quality_score": 82}
+    }
+    ok_out, _ = cleaner.process_ai2_unit([doc_no_price_ok], raw_col=None, quiet_sub_logs=True)
+    assert ok_out[0]["status"] == "success"
+    assert ok_out[0]["deal_price"] is None
+
+
+def test_ai2_price_integrity_guard_has_no_false_positives_on_valid_deals():
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
+
+    # (a) 原文价格确实等于官方在售价 69.9 -> 允许放行
+    doc_same_as_official = _make_stage2_price_test_doc(
+        tip_id="ok_same",
+        raw_text="伊利 纯牛奶 200ml*24盒*2箱\n到手【69.9元】",
+        official_price=69.9,
+        original_price=99.9,
+        coupon_amount=30.0,
+    )
+    # (b) 多件乘积 拍4件 10.8/件 -> 43.2 即使恰好等于 official activity_price 43.2 -> 允许放行
+    doc_multi_product = _make_stage2_price_test_doc(
+        tip_id="ok_mult",
+        raw_text="颐莲 面膜洁面精华\n拍4件，10.8/件",
+        official_price=43.2,
+        original_price=69.0,
+        coupon_amount=20.0,
+    )
+    # (c) 券后6.25 淘金币抵扣1.55 -> 4.70 与 act-cpn=4.80 差 0.10 > 0.02 -> 允许放行
+    doc_coin_calc = _make_stage2_price_test_doc(
+        tip_id="ok_coin",
+        raw_text="饭巢火锅底料180g\n【券后6.25元】右上角淘金币抵扣1.55",
+        official_price=9.8,
+        original_price=14.8,
+        coupon_amount=5.0,
+    )
+
+    mock_returns = {
+        "ok_same": {"main_tip_id": "ok_same", "is_valid_deal": True, "main_link_id": "L1", "deal_price": 69.9, "quality_score": 88},
+        "ok_mult": {"main_tip_id": "ok_mult", "is_valid_deal": True, "main_link_id": "L1", "deal_price": 43.2, "quality_score": 88},
+        "ok_coin": {"main_tip_id": "ok_coin", "is_valid_deal": True, "main_link_id": "L1", "deal_price": 4.7, "quality_score": 88},
+    }
+    cleaner.run_ai_stage2_batch = lambda inputs, quiet_sub_logs=False: {
+        it["main_tip_id"]: mock_returns[it["main_tip_id"]] for it in inputs
+    }
+
+    outcomes, _ = cleaner.process_ai2_unit([doc_same_as_official, doc_multi_product, doc_coin_calc], raw_col=None, quiet_sub_logs=True)
+    assert [o["status"] for o in outcomes] == ["success", "success", "success"]
+    assert [o["deal_price"] for o in outcomes] == [69.9, 43.2, 4.7]
+
+
+def test_stage2_prompt_contract_removes_misleading_fields_and_example_artifacts():
+    with open(PROMPT_STAGE2_PATH, "r", encoding="utf-8") as fh:
+        prompt_text = fh.read()
+    assert '"coupon_amount"' not in prompt_text
+    assert "coupon_amount 为 0" not in prompt_text
+    assert "附实付图" not in prompt_text
+    assert "价格唯一真源" in prompt_text
+    assert "严禁二次扣减" in prompt_text

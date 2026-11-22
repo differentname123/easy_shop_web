@@ -2,6 +2,7 @@
 """跨平台客户端与适配器的公共解析、时间转换与折淘客多 Key 容灾工具。"""
 import html as html_lib
 import math
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -62,9 +63,9 @@ def normalize_http_url(value: Any) -> str:
 
 
 def parse_carousel_images(raw_images: Any, primary_image: str = "") -> List[str]:
-    """解析折淘客/通用商品轮播图列表（支持竖线分隔字符串或列表），自动去重并校验 HTTP URL。"""
+    """解析折淘客/通用商品轮播图列表（支持竖线、逗号分隔或列表），自动去重并校验 HTTP URL。"""
     if isinstance(raw_images, str):
-        candidates = raw_images.split("|")
+        candidates = re.split(r"\||,(?=\s*(?:https?:)?//)", raw_images)
     elif isinstance(raw_images, (list, tuple)):
         candidates = list(raw_images)
     else:
@@ -266,7 +267,10 @@ def execute_with_key_failover(
         if last_result is not None and callable(should_ignore_error) and should_ignore_error(result, last_result):
             continue
         last_result = result
-        if result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR", "RATE_LIMIT", "TIMEOUT", "QUOTA_PACE_BACKLOG"):
+        if (
+            result.get("error_code") not in ("UPSTREAM_ERROR", "NETWORK_ERROR", "RATE_LIMIT", "TIMEOUT", "QUOTA_PACE_BACKLOG")
+            or result.get("deterministic_all_keys") is True
+        ):
             return result
         if callable(should_stop_early) and should_stop_early(result):
             return result

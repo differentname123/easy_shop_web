@@ -99,9 +99,12 @@ def test_official_detail_batch_parameter_and_strict_shape():
 
 def test_settings_capabilities_are_independent_and_disabled_is_instance_state():
     a = TaobaoAdapter(settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_adzone_id="123"))
-    assert a.active and a.capabilities["detail"] and a.capabilities["search"]
-    assert not a.capabilities["orders"] and not a.capabilities["recommend"]
-    assert a.get_recommend_goods()["error_code"] == "CONFIG_ERROR"
+    assert a.active and a.capabilities["detail"] and a.capabilities["search"] and a.capabilities["recommend"]
+    assert not a.capabilities["orders"]
+    a_no_az = TaobaoAdapter(settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s"))
+    assert a_no_az.active and a_no_az.capabilities["detail"]
+    assert not a_no_az.capabilities["search"] and not a_no_az.capabilities["recommend"] and not a_no_az.capabilities["orders"]
+    assert a_no_az.get_recommend_goods()["error_code"] == "CONFIG_ERROR"
     assert a.fetch_increment_orders(1, 2)["order_list"] == []
     assert not TaobaoAdapter(settings=SimpleNamespace(taobao_enabled=False)).active
 
@@ -841,4 +844,213 @@ def test_reload_or_refresh_tb_credentials_never_treats_user_nick_as_session(monk
     assert res == {"session_key": "6100_valid_old_session"}
     persisted = json.loads(cfg.read_text(encoding="utf-8"))
     assert persisted["taobao_session"] == "6100_valid_old_session"
+
+
+def test_tb_official_material_recommend_primary_and_hdk_fallback_with_detail_sink():
+    """验证官方 taobao.tbk.dg.material.recommend 可独立作为榜单首选（无需 HDK），并在 HDK 失败时兜底及填充 detail_sink。"""
+    raw_map = {
+        "item_id": "opaque_rec_1",
+        "item_basic_info": {"title": "官方精选抽纸", "pict_url": "https://img.alicdn.com/a.jpg", "shop_title": "官方旗舰店"},
+        "price_promotion_info": {"zk_final_price": "29.90", "final_promotion_price": "19.90", "coupon_amount": "10.00"},
+        "publish_info": {"income_rate": "8.5"},
+    }
+    post = Mock(return_value=reply({"tbk_dg_material_recommend_response": {"result_list": {"map_data": [raw_map]}, "total_count": 30}}))
+    off = tb_client.TaobaoClient("k", "s", adzone_id="123", http_session=SimpleNamespace(post=post))
+    adapter_no_hdk = TaobaoAdapter(settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_adzone_id="123"), official_client=off)
+    sinks = []
+    rec = adapter_no_hdk.get_recommend_goods(5, offset=0, limit=10, detail_sink=sinks.append)
+    assert rec["status"] == "success" and rec["_provider"] == "tb_official_recommend"
+    assert rec["data"][0]["name"] == "官方精选抽纸"
+    assert rec["data"][0]["price"] == 19.9
+    assert len(sinks) == 1 and sinks[0].data["name"] == "官方精选抽纸"
+    assert post.call_args.kwargs["data"]["material_id"] == "3756"
+
+    # 当配置了 HDK 但 HDK 失败时，自动平滑降级到 tb_official_recommend
+    hdk = Mock()
+    hdk.get_ranked_ids.return_value = {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "HDK限流"}
+    adapter_with_hdk = make_adapter(off, hdk=hdk)
+    rec_fb = adapter_with_hdk.get_recommend_goods(1, offset=0, limit=10)
+    assert rec_fb["status"] == "success" and rec_fb["_provider"] == "tb_official_recommend"
+    assert post.call_args.kwargs["data"]["material_id"] == "13366"
+
+
+def test_tb_multi_source_search_detail_promotion_failover_and_truncated_suffix_guard():
+    """验证淘宝多源有序降级：搜索 TOP->ZTK->HDK，详情 TOP->ZTK->HDK + 19位残缺后缀拦截，转链 TOP->ZTK渠道->ZTK高佣。"""
+    # 1. 截断 19 位淘口令/加密后缀在查详情前即返回 INVALID_IDENTITY，不打 TOP 50001
+    off_mock = Mock()
+    adapter_guard = make_adapter(off_mock)
+    bad_suffix = adapter_guard.get_goods_detail("NOokyrnFzby6RAz2upW")
+    assert bad_suffix["status"] == "error" and bad_suffix["error_code"] == "INVALID_IDENTITY"
+    off_mock.get_goods_details.assert_not_called()
+
+    # 2. 搜索降级：TOP 报错 -> ZTK api_quanwang -> HDK supersearch
+    off_err = Mock()
+    off_err.search_goods.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "error_msg": "TOP搜索失败"}
+    ztk_get = Mock(side_effect=[
+        reply({"status": 200, "content": [{"tao_id": "z1-ab", "title": "ZTK抽纸", "pict_url": "https://img.test/z.jpg", "size": "29.9", "quanhou_jiage": "19.9", "coupon_info_money": "10", "tkrate3": "5", "tkfee3": "1.0"}]}),
+        reply({"status": 301, "content": "限流"}),
+    ])
+    ztk = ZtkClient("ztk_k", "ztk_sid", http_session=SimpleNamespace(get=ztk_get), appkey_list=("ztk_k",))
+    hdk_get = Mock(return_value=reply({"code": 1, "data": [{"itemid": "hdk_1", "itemtitle": "HDK抽纸", "itempic": "https://img.test/h.jpg", "itemprice": "30", "itemendprice": "20", "couponmoney": "10", "tkrates": "6", "tkmoney": "1.2"}]}))
+    hdk = HdkClient("hdk_k", http_session=SimpleNamespace(get=hdk_get))
+    a_multi = TaobaoAdapter(
+        settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_adzone_id="123", tb_channel_pid="mm_1_2_3", ztk_appkey="ztk_k", ztk_sid="ztk_sid", hdk_api_key="hdk_k"),
+        official_client=off_err, ztk_client=ztk, hdk_client=hdk,
+    )
+    sr_ztk = a_multi.search_goods("抽纸")
+    assert sr_ztk["status"] == "success" and sr_ztk["_provider"] == "ztk_tb_search"
+    assert sr_ztk["data"][0]["name"] == "ZTK抽纸"
+    sr_hdk = a_multi.search_goods("抽纸")
+    assert sr_hdk["status"] == "success" and sr_hdk["_provider"] == "hdk_tb_search"
+    assert sr_hdk["data"][0]["name"] == "HDK抽纸"
+
+    # 3. 详情降级：TOP 网络异常 -> ZTK api_detail -> HDK item_detail
+    off_err.get_goods_details.return_value = {"status": "error", "error_code": "NETWORK_ERROR", "error_msg": "timeout"}
+    ztk_det_http = Mock(side_effect=[
+        reply({"status": 200, "content": [{"tao_id": "673231015690", "title": "ZTK详情抽纸", "pict_url": "https://img.test/zd.jpg", "size": "29.9", "quanhou_jiage": "19.9", "coupon_info_money": "10"}]}),
+        reply({"status": 301, "content": "频次上限"}),
+    ])
+    ztk_det = ZtkClient("ztk_k", "ztk_sid", http_session=SimpleNamespace(get=ztk_det_http), appkey_list=("ztk_k",))
+    hdk_det_http = Mock(return_value=reply({"code": 1, "data": {"itemid": "673231015690", "itemtitle": "HDK详情抽纸", "itempic": "https://img.test/hd.jpg", "itemprice": "29.9", "itemendprice": "19.9", "couponmoney": "10"}}))
+    a_det = TaobaoAdapter(
+        settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_adzone_id="123", tb_channel_pid="mm_1_2_3", ztk_appkey="ztk_k", ztk_sid="ztk_sid", hdk_api_key="hdk_k"),
+        official_client=off_err, ztk_client=ztk_det, hdk_client=HdkClient("hdk_k", http_session=SimpleNamespace(get=hdk_det_http)),
+    )
+    d1 = a_det.get_goods_detail("673231015690", goods_id="673231015690")
+    assert d1["status"] == "success" and d1["_provider"] == "ztk_tb_detail"
+    assert d1["data"]["name"] == "ZTK详情抽纸"
+    d2 = a_det.get_goods_detail("673231015690", goods_id="673231015690")
+    assert d2["status"] == "success" and d2["_provider"] == "hdk_tb_detail"
+    assert d2["data"]["name"] == "HDK详情抽纸"
+
+    # 4. 转链 elif 修复：TOP 失败后依次降级到 ztk_tb_promote -> ztk_tb_gaoyong
+    ztk_conv_get = Mock(side_effect=[
+        reply({"status": 301, "content": "渠道口令转链限流"}),
+        reply({"status": 200, "content": [{"coupon_click_url": "https://uland.taobao.com/gy?e=1", "shorturl": "https://s.click.taobao.com/gy", "tkl": "￥高佣保底￥"}]}),
+    ])
+    ztk_conv = ZtkClient("ztk_k", "ztk_sid", http_session=SimpleNamespace(get=ztk_conv_get), appkey_list=("ztk_k",))
+    a_conv = TaobaoAdapter(
+        settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_adzone_id="123", tb_channel_pid="mm_1_2_3", ztk_appkey="ztk_k", ztk_sid="ztk_sid"),
+        official_client=off_err, ztk_client=ztk_conv,
+    )
+    conv_res = a_conv.convert_promotion_url("673231015690", goods_id="673231015690")
+    assert conv_res["status"] == "success" and conv_res["_provider"] == "ztk_tb_gaoyong"
+    assert conv_res["promotion_token"] == "￥高佣保底￥"
+
+
+def test_ztk_publisher_pagination_session_cooldown_and_resolve_item_id():
+    """验证 ZTK 渠道备案自动翻页、24h TOP Session 冷却退避及 open_shangpin_id 独立解链。"""
+    from infrastructure.api_governance import GLOBAL_PROVIDER_COOLDOWN
+
+    GLOBAL_PROVIDER_COOLDOWN.reset()
+    # 1. check_publisher_relation 第1页未命中但 total_count=150，自动翻第2页命中
+    p1 = {"tbk_sc_publisher_info_get_response": {"data": {"total_count": 150, "inviter_list": {"map_data": [{"external_id": "other", "relation_id": "111"}]}}}}
+    p2 = {"tbk_sc_publisher_info_get_response": {"data": {"total_count": 150, "inviter_list": {"map_data": [{"external_id": "u_target", "relation_id": "999888"}]}}}}
+    ztk_get = Mock(side_effect=[reply(p1), reply(p2), reply({"item_id": "673231015690"})])
+    ztk = ZtkClient("ztk_k", "ztk_sid", http_session=SimpleNamespace(get=ztk_get), appkey_list=("ztk_k",))
+    auth = ztk.check_publisher_relation("u_target")
+    assert auth["status"] == "success" and auth["is_authorized"] is True
+    assert auth["identity"]["relation_id"] == "999888"
+
+    # 2. open_shangpin_id.ashx + resolve_product_from_link
+    off_ok = Mock()
+    off_ok.get_goods_details.return_value = {"status": "success", "data": [official_item(sign="enc_resolved", input_id="673231015690")]}
+    a_link = TaobaoAdapter(
+        settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_adzone_id="123", tb_channel_pid="mm_1_2_3", ztk_appkey="ztk_k", ztk_sid="ztk_sid"),
+        official_client=off_ok, ztk_client=ztk,
+    )
+    resolved = a_link.resolve_product_from_link("89￥ABCD1234EFGH￥:// CZ0001")
+    assert resolved["status"] == "success" and resolved["item_id"] == "673231015690"
+    assert resolved["product"]["name"] == "官方标题"
+
+    # 3. 真实 HTTP 会话下 TOP Session 27 错触发 300s 冷却，二次核验跳过官方直走 ZTK
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("infrastructure.api_governance.is_real_requests_session", lambda _s: True)
+        off_sess = Mock()
+        off_sess.http_session = SimpleNamespace()
+        off_sess.session_key = "expired_24h"
+        off_sess.try_refresh_session.return_value = ""
+        off_sess.check_authority.return_value = {"status": "error", "error_code": "27", "error_msg": "invalid-sessionkey"}
+        ztk2 = Mock()
+        ztk2.appkey_list = ("ztk_k",)
+        ztk2.sid = "ztk_sid"
+        ztk2.check_publisher_relation.return_value = {"status": "success", "is_authorized": True, "bind": 1, "identity": {"external_id": "u_target", "relation_id": "999888"}}
+        a_cool = TaobaoAdapter(
+            settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_session="expired_24h", tb_channel_pid="mm_1_2_3", ztk_appkey="ztk_k", ztk_sid="ztk_sid"),
+            official_client=off_sess, ztk_client=ztk2,
+        )
+        r1 = a_cool.check_authority("u_target")
+        r2 = a_cool.check_authority("u_target")
+        assert r1["status"] == "success" and r2["status"] == "success"
+        assert off_sess.check_authority.call_count == 1
+        assert ztk2.check_publisher_relation.call_count == 2
+
+
+def test_tb_detail_mismatch_hdk_status_retry_promo_id_and_carousel():
+    """验证淘宝详情防串货/空壳过滤、HDK 报错映射、空 data 重试、加密选品优先及逗号轮播图解析。"""
+    from infrastructure.http_utils import parse_carousel_images
+    from models.product import ProductRef
+
+    # 1. ZTK 详情返回其他商品（含空壳与错配）绝不伪造请求方的 goods_sign
+    row_payload = {"status": 200, "content": [{"tao_id": "", "title": "", "pict_url": ""}, {"tao_id": "OTHER_ENC_SIGN", "num_iid": "999888", "title": "串货商品", "pict_url": "https://img/x.jpg"}]}
+    ztk_get = Mock(side_effect=[reply(row_payload), reply(row_payload)])
+    ztk_cli = ZtkClient("ztk_k", "ztk_sid", http_session=SimpleNamespace(get=ztk_get), appkey_list=("ztk_k",))
+    ztk_raw = ztk_cli.get_tb_goods_detail("REQ_ENC_A")
+    assert ztk_raw["status"] == "success" and ztk_raw["data"][0]["tao_id"] == "OTHER_ENC_SIGN"
+
+    off_err = Mock()
+    off_err.get_goods_details.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "error_msg": "top fail"}
+    a_mismatch = make_adapter(official=off_err, ztk=ztk_cli, hdk=Mock(appkey_list=()))
+    det_res = a_mismatch.get_goods_detail("REQ_ENC_A", goods_sign="REQ_ENC_A")
+    assert det_res["status"] == "error" and det_res["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
+
+    # 2. HDK 精选“下架”映射 NOT_FOUND（非 PRODUCT_OFF_PROMOTION），“未授权”映射 UPSTREAM_PROVIDER_UNAUTHORIZED（非 AUTH_REQUIRED）
+    hdk_get = Mock(side_effect=[
+        reply({"code": 0, "msg": "该商品已下架"}),
+        reply({"code": 0, "msg": "淘宝账号未授权"}),
+    ])
+    hdk_cli = HdkClient(api_key="hdk_k", http_session=SimpleNamespace(get=hdk_get))
+    r_not_found = hdk_cli.get_tb_goods_detail("673231015690")
+    assert r_not_found["status"] == "error" and r_not_found["error_code"] == "NOT_FOUND" and r_not_found.get("hdk_not_found") is True
+    r_unauth = hdk_cli.get_tb_goods_detail("673231015690")
+    assert r_unauth["status"] == "error" and r_unauth["error_code"] == "UPSTREAM_PROVIDER_UNAUTHORIZED"
+
+    # 3. _retry_on_off_promotion 遇到 TOP status=success 但 data=[] 时也会触发一次重试
+    calls = {"n": 0}
+
+    def _top_call():
+        calls["n"] += 1
+        return {"status": "success", "data": []} if calls["n"] == 1 else {"status": "success", "data": [{"name": "ok"}]}
+
+    retried, confirmed_off = a_mismatch._retry_on_off_promotion(_top_call, is_off_fn=lambda r: r.get("status") != "success" or not r.get("data"))
+    assert calls["n"] == 2 and retried["data"][0]["name"] == "ok" and confirmed_off is False
+
+    # 4. _preferred_tb_promo_id 优先非纯数字、非截断 goods_sign
+    assert TaobaoAdapter._preferred_tb_promo_id(ProductRef("taobao", "673231015690", "enc_real_sign_XYZ")) == "enc_real_sign_XYZ"
+    assert TaobaoAdapter._preferred_tb_promo_id(ProductRef("taobao", "673231015690", "")) == "673231015690"
+
+    # 5. HDK "0.00" 售价回退 itemprice，及 parse_carousel_images 支持逗号分隔多图且保留 OSS 参数内逗号
+    hdk_norm = a_mismatch._normalize_hdk_tb_detail({
+        "itemid": "673231015690",
+        "itemtitle": "维达抽纸",
+        "itempic": "https://img/p.jpg",
+        "taobao_image": "https://img/1.jpg?x-oss-process=image/resize,w_800,https://img/2.jpg|//img/3.jpg",
+        "itemprice": "29.90",
+        "itemendprice": "0.00",
+        "couponmoney": "0",
+        "tkrates": "10.0",
+    })
+    assert hdk_norm["price"] == 29.9
+    assert hdk_norm["carousel_images"] == [
+        "https://img/p.jpg",
+        "https://img/1.jpg?x-oss-process=image/resize,w_800",
+        "https://img/2.jpg",
+        "https://img/3.jpg",
+    ]
+    assert parse_carousel_images("https://a.com/1.jpg?x=1,2,https://a.com/2.jpg") == [
+        "https://a.com/1.jpg?x=1,2",
+        "https://a.com/2.jpg",
+    ]
+
+
 

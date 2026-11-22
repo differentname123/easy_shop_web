@@ -139,7 +139,7 @@ class ProductService:
                 ref.platform, ref.key, format_exc_summary(exc),
             )
 
-    def _offer_products(self, items, channel_type=None, snapshots=(), adapter=None):
+    def _offer_products(self, items, channel_type=None, snapshots=(), adapter=None, skip_sign_and_prefetch: bool = False):
         # 转链所需公开映射先发布，不能被可丢弃的后台摘要写入或预取开关阻断；同时过滤已在防复活黑名单中的下架商品。
         valid_items = []
         adapter_cache = {}
@@ -150,7 +150,15 @@ class ProductService:
             if is_product_off_promotion(ref.platform, ref.goods_id, ref.goods_sign):
                 continue
             valid_items.append(item)
-            if ref.goods_id and ref.goods_sign and ref.goods_id != ref.goods_sign:
+            if skip_sign_and_prefetch:
+                continue
+            if (
+                ref.goods_id
+                and ref.goods_sign
+                and ref.goods_id != ref.goods_sign
+                and not (ref.platform == "jd" and is_jd_image_key(ref.goods_sign))
+                and not (ref.platform == "pdd" and ref.goods_sign.isdigit())
+            ):
                 SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), ref.goods_sign)
             url = item.get("product_url")
             if ref.key and isinstance(url, str) and url.strip():
@@ -181,6 +189,8 @@ class ProductService:
                     ):
                         continue
                     MATERIAL_CACHE.set(cache_key, clean_url)
+        if skip_sign_and_prefetch:
+            return
         if self.prefetcher is not None:
             try:
                 self.prefetcher.offer_products(valid_items, channel_type=channel_type, snapshots=snapshots)
@@ -306,12 +316,13 @@ class ProductService:
             ]
             result["data"] = self._overlay_deal_card_info(plat, items)
             SEARCH_CACHE.set(cache_key, result)
-            # 搜索物料链接也保留到摘要库，不能依赖可关闭的详情预取来补映射。
-            if getattr(adapter, "requires_material_url", False) is True:
+            # 搜索物料链接也保留到摘要库，不能依赖可关闭的详情预取来补映射；hdk_pdd_search 仅作只读展示兜底，不写摘要/ID映射。
+            is_hdk_pdd = (plat == "pdd" and result.get("_provider") == "hdk_pdd_search")
+            if getattr(adapter, "requires_material_url", False) is True and not is_hdk_pdd:
                 materials = [item for item in items if item.get("product_url")]
                 if materials:
                     self._save_summary_in_background(materials, None)
-            self._offer_products(items, adapter=adapter)
+            self._offer_products(items, adapter=adapter, skip_sign_and_prefetch=is_hdk_pdd)
         else:
             logger.warning(
                 "%s 【商品搜索失败】按关键词检索平台联盟商品失败 | 平台[%s] 关键词[%s] 页码[%s] 失败原因<%s> 排查方向<请检查上游搜索接口配额、关键词合法性或网关连通性>",
@@ -401,14 +412,14 @@ class ProductService:
                 return doc
         doc = self.repo.get_product_detail(ref.key, platform=ref.platform,
                                            key_type="sign" if ref.goods_sign else "id", **options)
-        if doc is None and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd"):
+        if doc is None and ref.goods_sign and ref.goods_id and ref.platform in ("taobao", "jd", "pdd"):
             doc = self.repo.get_product_detail(ref.goods_id, platform=ref.platform,
                                                key_type="id", **options)
         return doc
 
     @staticmethod
     def _upgrade_ref_sign(ref: ProductRef, item: Optional[dict] = None) -> ProductRef:
-        if ref.platform not in ("taobao", "jd") or not ref.goods_id:
+        if ref.platform not in ("taobao", "jd", "pdd") or not ref.goods_id:
             return ref
         needs_upgrade = (
             not ref.goods_sign
@@ -443,27 +454,6 @@ class ProductService:
             return _LoadedDetail({"status": "error", "error_code": "cancelled"})
         public = deepcopy(public) if public is not None else {"status": "success", "data": deepcopy(snapshot.data)}
         public["data"] = deepcopy(snapshot.data)
-        if (
-            requested_ref
-            and requested_ref.goods_id
-            and snapshot.ref.goods_id
-            and snapshot.ref.goods_id != requested_ref.goods_id
-        ):
-            try:
-                self.repo.mark_product_superseded(
-                    snapshot.ref.platform,
-                    requested_ref.goods_id,
-                    snapshot.ref.goods_id,
-                    requested_ref.goods_sign,
-                )
-                evict_product_from_caches(
-                    snapshot.ref.platform,
-                    goods_id=requested_ref.goods_id,
-                    goods_sign=requested_ref.goods_sign,
-                    blacklist=False,
-                )
-            except Exception as exc:
-                logger.warning("【商品身份迁移联动异常】%s", format_exc_summary(exc))
         if not self._has_valid_images(snapshot.data):
             try:
                 if self.repo.upsert_home_products([snapshot.data]) > 0:
@@ -476,6 +466,27 @@ class ProductService:
             written = self.repo.upsert_product_detail(dict(snapshot.data, detail_updated_at=snapshot.fetched_at)) is True
             if written:
                 clear_product_off_promotion(snapshot.ref.platform, snapshot.ref.goods_id, snapshot.ref.goods_sign)
+                if (
+                    requested_ref
+                    and requested_ref.goods_id
+                    and snapshot.ref.goods_id
+                    and snapshot.ref.goods_id != requested_ref.goods_id
+                ):
+                    try:
+                        self.repo.mark_product_superseded(
+                            snapshot.ref.platform,
+                            requested_ref.goods_id,
+                            snapshot.ref.goods_id,
+                            requested_ref.goods_sign,
+                        )
+                        evict_product_from_caches(
+                            snapshot.ref.platform,
+                            goods_id=requested_ref.goods_id,
+                            goods_sign=requested_ref.goods_sign,
+                            blacklist=False,
+                        )
+                    except Exception as exc:
+                        logger.warning("【商品身份迁移联动异常】%s", format_exc_summary(exc))
         except Exception as exc:
             written = False
             logger.warning(
@@ -575,6 +586,7 @@ class ProductService:
 
     def get_goods_detail(self, platform="pdd", goods_id_or_sign="", goods_id=None,
                          goods_sign=None, uid=None, **kwargs) -> Dict[str, Any]:
+        _visited = set(kwargs.pop("_superseded_visited", ()))
         plat = normalize_platform(platform)
         adapter = get_adapter(plat)
         unavailable = self._capability_error(adapter, "detail")
@@ -594,19 +606,36 @@ class ProductService:
         ref = self._upgrade_ref_sign(ref, item)
         if isinstance(item, dict) and item.get("superseded_by"):
             superseded_id = str(item.get("superseded_by") or "").strip()
-            if superseded_id and superseded_id != ref.goods_id:
+            has_usable_sign = bool(
+                ref.goods_sign and not (plat == "jd" and is_jd_image_key(ref.goods_sign))
+            )
+            current_ids = {
+                cid for cid in (ref.goods_id, str(item.get("goods_id") or item.get("product_id") or "").strip())
+                if cid
+            }
+            if superseded_id and superseded_id not in current_ids and superseded_id not in _visited and len(_visited) < 2:
                 logger.info(
                     "【商品身份透明转发】请求商品已被新主键替代，无缝跳转新商品 | 平台[%s] 旧商品[%s] 新商品[%s]",
                     plat, ref.goods_id, superseded_id,
                 )
-                return self.get_goods_detail(
+                fwd = self.get_goods_detail(
                     platform=plat,
                     goods_id_or_sign=superseded_id,
                     goods_id=superseded_id,
                     goods_sign=None,
                     uid=uid,
+                    _superseded_visited=_visited | current_ids,
                     **kwargs
                 )
+                if isinstance(fwd, dict) and fwd.get("status") == "success":
+                    return fwd
+                if not has_usable_sign:
+                    return fwd
+            if has_usable_sign:
+                item = None
+            else:
+                evict_product_from_caches(plat, ref.goods_id, ref.goods_sign)
+                return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}
         if isinstance(item, dict) and item.get("is_off_promotion") is True:
             evict_product_from_caches(plat, ref.goods_id, ref.goods_sign)
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}

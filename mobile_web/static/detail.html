@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261122-2">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261122-2"></script>
-  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261122-2">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261122-3">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261122-3"></script>
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261122-3">
 </head>
 <body>
 <div id="app" class="detail-container" v-cloak>
@@ -92,8 +92,8 @@
       <span class="deal-tip-time" v-if="dealTip.publish_time">{{ dealTip.publish_time }} 爆料</span>
     </div>
 
-    <div class="deal-price-box" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.unit_deal_price || dealTip.price_logic">
-      <div class="deal-price-row" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.unit_deal_price">
+    <div class="deal-price-box" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.unit_deal_price">
+      <div class="deal-price-row">
         <template v-if="dealTip.deal_price !== null && dealTip.deal_price !== undefined">
           <span class="deal-price-lbl">线报参考价</span>
           <span class="deal-price-yen">¥</span>
@@ -101,7 +101,6 @@
         </template>
         <span class="deal-unit-pill" v-if="dealTip.unit_deal_price">{{ dealTip.unit_deal_price }}</span>
       </div>
-      <div class="deal-logic-text" v-if="dealTip.price_logic">💡 怎么买：{{ dealTip.price_logic }}</div>
     </div>
 
     <div class="deal-aux-list" v-if="dealTip.coupon_links && dealTip.coupon_links.length">
@@ -267,9 +266,15 @@
     </div>
   </div>
 
-  <!-- 线报实拍/订单参考图大图预览 -->
-  <div class="deal-img-lightbox" v-if="previewImageUrl" @click="closeImagePreview">
-    <img :src="previewImageUrl" referrerpolicy="no-referrer" alt="线报参考图预览" />
+  <!-- 线报实拍/订单参考图大图预览（支持左右滑动切换） -->
+  <div class="deal-img-lightbox" v-if="previewImageUrl">
+    <button type="button" class="deal-lightbox-close" @click="closeImagePreview" aria-label="关闭预览">×</button>
+    <div class="deal-lightbox-track" ref="previewTrackRef" @scroll="onPreviewScroll">
+      <div class="deal-lightbox-slide" v-for="(imgUrl, pIdx) in previewImages" :key="'pv_' + pIdx" @click="closeImagePreview">
+        <img :src="imgUrl" referrerpolicy="no-referrer" alt="线报参考图预览" />
+      </div>
+    </div>
+    <span class="deal-lightbox-counter" v-if="previewImages.length > 1">{{ previewIndex + 1 }} / {{ previewImages.length }}</span>
   </div>
 
   <!-- ==================== 全局高质感智能加载器与省钱话术轮播 ==================== -->
@@ -298,10 +303,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261122-2"></script>
-<script src="/static/js/session.js?v=ux-20261122-2"></script>
-<script src="/static/js/format.js?v=ux-20261122-2"></script>
-<script src="/static/js/browser.js?v=ux-20261122-2"></script>
-<script src="/static/js/detail.js?v=ux-20261122-2"></script>
+<script src="/static/js/api.js?v=ux-20261122-3"></script>
+<script src="/static/js/session.js?v=ux-20261122-3"></script>
+<script src="/static/js/format.js?v=ux-20261122-3"></script>
+<script src="/static/js/browser.js?v=ux-20261122-3"></script>
+<script src="/static/js/detail.js?v=ux-20261122-3"></script>
 </body>
 </html>

@@ -9,6 +9,12 @@ import hashlib
 import json
 import time
 
+from infrastructure.api_governance import (
+    GLOBAL_QUOTA_PACER,
+    GLOBAL_UPSTREAM_HEALTH,
+    QuotaPaceBacklogError,
+    is_real_requests_session,
+)
 from infrastructure.logging_utils import logger
 from infrastructure.transport import create_http_session
 
@@ -104,9 +110,32 @@ def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeo
 
     params["sign"] = hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
 
-    # 4. 发起 HTTP POST 请求 (连接池复用)
+    # 4. 发起 HTTP POST 请求 (连接池复用 + 全局配额错峰)
+    session = http_session if http_session is not None else _PDD_SESSION
+    is_real = is_real_requests_session(session)
+    t0 = time.perf_counter()
     try:
-        session = http_session if http_session is not None else _PDD_SESSION
+        GLOBAL_QUOTA_PACER.pace(
+            "pdd_official",
+            str(client_id or "default"),
+            0.08,
+            http_session=session,
+            foreground_max_wait=2.0,
+            background_max_wait=10.0,
+        )
+    except QuotaPaceBacklogError:
+        GLOBAL_UPSTREAM_HEALTH.record_call(
+            "pdd",
+            "pdd_official",
+            str(api_type),
+            outcome="rate_limit",
+            latency_ms=0.0,
+            error_code="QUOTA_PACE_BACKLOG",
+            allow_persist=is_real,
+        )
+        raise PddApiError("拼多多请求过于频繁，请稍后重试", error_code="QUOTA_PACE_BACKLOG")
+
+    try:
         response = session.post(
             url,
             json=params,
@@ -116,8 +145,19 @@ def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeo
         response.raise_for_status()
         result = response.json()
     except Exception as e:
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        GLOBAL_UPSTREAM_HEALTH.record_call(
+            "pdd",
+            "pdd_official",
+            str(api_type),
+            outcome="error",
+            latency_ms=dt_ms,
+            error_code="NETWORK_ERROR",
+            allow_persist=is_real,
+        )
         raise PddApiError(f"拼多多网络请求层崩溃: {str(e)}", error_code="NETWORK_ERROR")
 
+    dt_ms = (time.perf_counter() - t0) * 1000.0
     # 5. 网关级与业务级错误校验拦截
     if "error_response" in result:
         err_resp = result["error_response"]
@@ -126,12 +166,36 @@ def call_pdd_api(client_id, client_secret, api_type, business_params=None, timeo
         error_code = err_resp.get("error_code", "")
         sub_code = err_resp.get("sub_code", "")
         full_error = f"[{error_code}:{sub_code}] {error_msg} - {sub_msg}".strip(" -:")
+        err_text_lower = f"{error_msg} {sub_msg}".lower()
+        is_rate_limit = (
+            str(error_code) in ("50002", "70031", "70032")
+            or any(kw in err_text_lower for kw in ("频次", "限流", "qps"))
+        )
+        mapped_code = "RATE_LIMIT" if is_rate_limit else str(error_code or "")
+        GLOBAL_UPSTREAM_HEALTH.record_call(
+            "pdd",
+            "pdd_official",
+            str(api_type),
+            outcome="rate_limit" if is_rate_limit else "error",
+            latency_ms=dt_ms,
+            error_code=mapped_code or str(sub_code or "UPSTREAM_ERROR"),
+            error_msg=str(error_msg or "")[:120],
+            allow_persist=is_real,
+        )
         raise PddApiError(
             f"PDD网关拒绝: {full_error}",
-            error_code=str(error_code or ""),
+            error_code=mapped_code,
             sub_code=str(sub_code or ""),
         )
 
+    GLOBAL_UPSTREAM_HEALTH.record_call(
+        "pdd",
+        "pdd_official",
+        str(api_type),
+        outcome="success",
+        latency_ms=dt_ms,
+        allow_persist=is_real,
+    )
     return result
 
 def clean_goods_item(raw_data, source_type=""):
@@ -144,9 +208,10 @@ def clean_goods_item(raw_data, source_type=""):
     min_group_price = raw_data.get("min_group_price", 0)
     coupon_discount = raw_data.get("coupon_discount", 0)
     promotion_rate = raw_data.get("promotion_rate", 0)
+    effective_coupon = 0 if raw_data.get("has_coupon") is False else coupon_discount
 
-    # 计算预估佣金（分）
-    estimated_commission = int((min_group_price - coupon_discount) * promotion_rate / 1000) if promotion_rate > 0 else 0
+    # 计算预估佣金（分），防止券额异常大于拼团价算出负佣金
+    estimated_commission = int(max(0, min_group_price - effective_coupon) * promotion_rate / 1000) if promotion_rate > 0 else 0
 
     return {
         "goods_id": raw_data.get("goods_id", 0),
@@ -297,7 +362,11 @@ def convert_pdd_url(client_id, client_secret, pid, source_url, uid=None, http_se
         return {"status": "error", "error_code": "PROMOTION_FAILED", "error_msg": "接口返回正常但未包含可用的跳转链接"}
     except Exception as e:
         err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
-        return {"status": "error", "error_code": err_code, "error_msg": f"转链失败: {str(e)}"}
+        sub_code = str(getattr(e, "sub_code", "") or "").strip()
+        out = {"status": "error", "error_code": err_code, "error_msg": f"转链失败: {str(e)}"}
+        if sub_code:
+            out["sub_code"] = sub_code
+        return out
 
 def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=None, search_id=None, http_session=None, **kwargs):
     """
@@ -323,11 +392,23 @@ def generate_goods_promotion_url(client_id, client_secret, pid, goods_sign, uid=
             return {"status": "success", "data": url_list[0]}
         return {"status": "error", "error_msg": "未能生成推广链接"}
     except Exception as e:
-        sub_code = str(getattr(e, "sub_code", "") or "").strip()
-        msg = str(e)
-        if sub_code in ("40001", "40002") or any(k in msg for k in ("商品非多多客商品", "商品已下架", "商品不存在")):
+        if _is_pdd_off_promotion_error(e):
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
-        return {"status": "error", "error_msg": f"生成商品推广链接异常: {str(e)}"}
+        err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
+        sub_code = str(getattr(e, "sub_code", "") or "").strip()
+        out = {"status": "error", "error_code": err_code, "error_msg": f"生成商品推广链接异常: {str(e)}"}
+        if sub_code:
+            out["sub_code"] = sub_code
+        return out
+
+def _is_pdd_off_promotion_error(exc: Exception) -> bool:
+    """确认拼多多网关明确返回商品下架或退出多多进宝推广。"""
+    sub_code = str(getattr(exc, "sub_code", "") or "").strip()
+    msg = str(exc)
+    return sub_code in ("40001", "40002") or any(
+        k in msg for k in ("商品非多多客商品", "商品已下架", "非多多进宝商品", "不在推广", "商品不存在")
+    )
+
 
 def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash_gift_id=None, uid=None, http_session=None, **kwargs):
     """
@@ -352,14 +433,18 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
             if url_list:
                 return {"status": "success", "link_type": "多多礼金秒杀", "data": url_list[0]}
         except Exception as exc:
+            if _is_pdd_off_promotion_error(exc):
+                return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
             strategy_errors.append(str(exc))  # 继续降级，但失败时保留明确的授权错误证据
 
-    # 策略 2：尝试获取官方超级红包卡券池链接
+    # 策略 2：尝试获取官方超级红包卡券池链接（启用小程序卡片与 schema 唤醒参数）
     try:
         hb_params = {
             "p_id_list": [pid],
             "channel_type": 23,
             "generate_short_url": True,
+            "generate_we_app": True,
+            "generate_schema_url": True,
             "diy_sp_red_packet_param": {"goods_sign": goods_sign},
             "custom_parameters": custom_params
         }
@@ -368,6 +453,8 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
         if hb_url_list:
             return {"status": "success", "link_type": "官方超级红包", "data": hb_url_list[0]}
     except Exception as exc:
+        if _is_pdd_off_promotion_error(exc):
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
         strategy_errors.append(str(exc))
 
     # 策略 3：标准兜底推广
@@ -380,53 +467,41 @@ def generate_smart_promotion_url(client_id, client_secret, pid, goods_sign, cash
         fallback_res["strategy_errors"] = strategy_errors
     return fallback_res
 
-def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_id=None, uid=None, http_session=None, **kwargs):
-    """
-    [基础函数] 统一单品详情查询器：
-    - 优先根据 goods_sign 直连官方 Detail 接口；
-    - 仅有 goods_id 时，自动执行 “转短链 -> 关键词截胡搜索” 的双跨策略。
-    """
-    if not goods_sign and not goods_id:
-        return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "必须提供 goods_sign 或 goods_id 其中之一"}
 
-    custom_params = make_custom_parameters(uid=uid)
-
-    # 路径 A：标准 goods_sign 查询
-    if goods_sign:
+def _get_goods_detail_by_sign(client_id, client_secret, pid, goods_sign, custom_params, extra_kwargs, http_session=None):
+    try:
+        params = {
+            "goods_sign": goods_sign,
+            "pid": pid,
+            "custom_parameters": custom_params,
+        }
+        params.update(extra_kwargs)
         try:
-            params = {
-                "goods_sign": goods_sign,
-                "pid": pid,
-                "custom_parameters": custom_params
-            }
-            params.update(kwargs)
-            try:
+            res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params, http_session=http_session)
+        except Exception as first_err:
+            if custom_params is not None and ("60001" in str(first_err) or "授权备案" in str(first_err)):
+                params.pop("custom_parameters", None)
                 res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params, http_session=http_session)
-            except Exception as first_err:
-                if custom_params is not None and ("60001" in str(first_err) or "授权备案" in str(first_err)):
-                    params.pop("custom_parameters", None)
-                    res = call_pdd_api(client_id, client_secret, "pdd.ddk.goods.detail", params, http_session=http_session)
-                else:
-                    raise
-            detail_resp = res.get("goods_detail_response")
-            if not isinstance(detail_resp, dict):
-                return {"status": "error", "error_code": "PROTOCOL_ERROR", "error_msg": "Detail 接口响应缺少 goods_detail_response"}
-            goods_list = detail_resp.get("goods_details", [])
-            if not isinstance(goods_list, list):
-                return {"status": "error", "error_code": "PROTOCOL_ERROR", "error_msg": "Detail 接口 goods_details 字段无效"}
-            if goods_list:
-                cleaned = clean_goods_item(goods_list[0], source_type="detail_api")
-                return {"status": "success", "data": cleaned}
+            else:
+                raise
+        detail_resp = res.get("goods_detail_response")
+        if not isinstance(detail_resp, dict):
+            return {"status": "error", "error_code": "PROTOCOL_ERROR", "error_msg": "Detail 接口响应缺少 goods_detail_response"}
+        goods_list = detail_resp.get("goods_details", [])
+        if not isinstance(goods_list, list):
+            return {"status": "error", "error_code": "PROTOCOL_ERROR", "error_msg": "Detail 接口 goods_details 字段无效"}
+        if goods_list:
+            cleaned = clean_goods_item(goods_list[0], source_type="detail_api")
+            return {"status": "success", "data": cleaned}
+        return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
+    except Exception as e:
+        if _is_pdd_off_promotion_error(e):
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
-        except Exception as e:
-            sub_code = str(getattr(e, "sub_code", "") or "").strip()
-            msg = str(e)
-            if sub_code in ("40001", "40002") or any(k in msg for k in ("商品非多多客商品", "商品已下架", "商品不存在")):
-                return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
-            err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
-            return {"status": "error", "error_code": err_code, "error_msg": f"Detail 查询失败: {str(e)}"}
+        err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
+        return {"status": "error", "error_code": err_code, "error_msg": f"Detail 查询失败: {str(e)}"}
 
-    # 路径 B：goods_id 降级策略（通过短链反查）
+
+def _get_goods_detail_by_numeric_id(client_id, client_secret, pid, goods_id, uid, custom_params, http_session=None):
     try:
         source_url = f"https://mobile.pinduoduo.com/goods.html?goods_id={goods_id}"
         zs_res = convert_pdd_url(client_id, client_secret, pid=pid, source_url=source_url, uid=uid, http_session=http_session)
@@ -453,6 +528,79 @@ def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_
     except Exception as e:
         err_code = str(getattr(e, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
         return {"status": "error", "error_code": err_code, "error_msg": f"goods_id 反查中断: {str(e)}"}
+
+
+def get_goods_detail(client_id, client_secret, pid=None, goods_sign=None, goods_id=None, uid=None, http_session=None, **kwargs):
+    """
+    [基础函数] 统一单品详情查询器：
+    - 优先根据 goods_sign 直连官方 Detail 接口（剔除适配器内部标记如 allow_fallback，避免污染官方参数）；
+    - 仅有 goods_id 时，自动执行 “转短链 -> 关键词截胡搜索” 的双跨策略。
+    """
+    if not goods_sign and not goods_id:
+        return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "必须提供 goods_sign 或 goods_id 其中之一"}
+
+    custom_params = make_custom_parameters(uid=uid)
+    extra_kwargs = dict(kwargs)
+    for internal_key in ("allow_fallback", "trusted_product_url", "promoter_id", "coupon_url"):
+        extra_kwargs.pop(internal_key, None)
+
+    if goods_sign:
+        return _get_goods_detail_by_sign(
+            client_id, client_secret, pid, goods_sign, custom_params, extra_kwargs, http_session=http_session
+        )
+    return _get_goods_detail_by_numeric_id(
+        client_id, client_secret, pid, goods_id, uid, custom_params, http_session=http_session
+    )
+
+
+def search_goods_by_sign_list(client_id, client_secret, pid, goods_sign_list, *, uid=None, http_session=None):
+    """
+    [备用详情] 当 pdd.ddk.goods.detail 触发限流时，使用 pdd.ddk.goods.search 的 goods_sign_list 参数批量反查单品信息。
+    """
+    signs = [str(s).strip() for s in (goods_sign_list or []) if isinstance(s, str) and str(s).strip()]
+    if not signs:
+        return {"status": "error", "error_code": "INVALID_ARGUMENT", "error_msg": "goods_sign_list 不能为空"}
+    params = {
+        "pid": pid,
+        "goods_sign_list": signs[:20],
+        "page": 1,
+        "page_size": max(10, min(100, len(signs))),
+        "custom_parameters": make_custom_parameters(uid=uid) if uid else None,
+    }
+    try:
+        try:
+            res = call_pdd_api(
+                client_id,
+                client_secret,
+                "pdd.ddk.goods.search",
+                params,
+                http_session=http_session,
+            )
+        except Exception as first_exc:
+            is_unauth = str(getattr(first_exc, "sub_code", "") or "") == "60001" or "60001" in str(first_exc)
+            if uid and is_unauth:
+                params["custom_parameters"] = None
+                res = call_pdd_api(
+                    client_id,
+                    client_secret,
+                    "pdd.ddk.goods.search",
+                    params,
+                    http_session=http_session,
+                )
+            else:
+                raise
+        goods_list = (res.get("goods_search_response") or {}).get("goods_list") or []
+        cleaned = [
+            item for raw_item in goods_list
+            for item in (clean_goods_item(raw_item, source_type="search_sign_list"),)
+            if item is not None
+        ]
+        return {"status": "success", "data": cleaned}
+    except Exception as exc:
+        if _is_pdd_off_promotion_error(exc):
+            return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已下架或无推广计划"}
+        err_code = str(getattr(exc, "error_code", "") or "").strip() or "UPSTREAM_ERROR"
+        return {"status": "error", "error_code": err_code, "error_msg": f"Sign 列表反查失败: {exc}"}
 
 def query_increment_orders(client_id, client_secret, start_time, end_time, page=1, page_size=50, http_session=None, **kwargs):
     """

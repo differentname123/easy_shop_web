@@ -243,3 +243,206 @@ def test_extract_ztk_item_fields_symmetric_commission():
     assert f2["commission_amount"] == 10.0
     assert f2["commission_rate"] == 20.0
 
+
+def test_superseded_unsets_goods_sign_and_prevents_inplace_overwrite_or_poisoned_cache(monkeypatch):
+    import datetime
+    from copy import deepcopy
+    from repositories.product_repo import ProductRepository
+    from tests.test_product_repository import MemoryCollection
+
+    class _SupersededMemoryCol(MemoryCollection):
+        def update_many(self, query, update):
+            matched = modified = 0
+            for d in self.docs:
+                if self.matches(d, query):
+                    matched += 1
+                    d.update(deepcopy(update.get("$set", {})))
+                    for k in update.get("$unset", {}):
+                        d.pop(k, None)
+                    modified += 1
+            return SimpleNamespace(matched_count=matched, modified_count=modified)
+
+    clear_all_caches()
+    col = _SupersededMemoryCol()
+    repo = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda _n: col))
+    old_id = "6aca4d10F381a5657_0944320320d0cf17"
+    new_id = "6afa7967F50cc2d4e_0083320320eaa21c"
+    shared_sign = "VA02aBx1VAhDTydqHEVYFDkWYwJrd29XEl57X3x_FShUUD5OADxfbyFQA1RlZF5tC"
+
+    col.docs.append({
+        "platform": "jd",
+        "product_id": old_id,
+        "goods_id": old_id,
+        "goods_sign": shared_sign,
+        "name": "海天厨房调料组合套装",
+        "activity_price": 18.9,
+        "price": 18.9,
+        "original_price": 18.9,
+        "default_promotion": {"final_link": "https://u.jd.com/old_seasoning"},
+        "default_promotion_expires_at": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2),
+    })
+
+    # 1. mark_product_superseded 必须同时注销 goods_sign 与历史推广链接缓存
+    assert repo.mark_product_superseded("jd", old_id, new_id, shared_sign) is True
+    retired_doc = next(d for d in col.docs if d["product_id"] == old_id)
+    assert retired_doc["superseded_by"] == new_id
+    assert retired_doc["is_off_promotion"] is True
+    assert "goods_sign" not in retired_doc
+    assert "default_promotion" not in retired_doc
+
+    # 2. 用新主键 + 相同 goods_sign 写入详情时，必须新建文档，绝不原地覆写旧商品文档
+    assert repo.upsert_product_detail({
+        "platform": "jd",
+        "goods_id": new_id,
+        "goods_sign": shared_sign,
+        "name": "联想ThinkPad笔记本",
+        "price": 10775.7,
+        "original_price": 11175.7,
+        "image_url": f"https://img14.360buyimg.com/pop/jfs/t1/1/2/3/4/{new_id.replace('_', '/')}.jpg",
+    }) is True
+    assert len(col.docs) == 2
+    assert retired_doc["name"] == "海天厨房调料组合套装"
+    assert retired_doc["superseded_by"] == new_id
+    active_new = next(d for d in col.docs if d["product_id"] == new_id)
+    assert active_new["name"] == "联想ThinkPad笔记本"
+
+    # 3. 即使模拟历史脏库中旧/退场文档仍残留 goods_sign，save_promotion_link_cache(only_if_exists=True)
+    # 与 get_promotion_link_cache 也绝不覆写、绝不误读失效或 superseded 文档的毒化缓存
+    col.docs.append({
+        "platform": "jd",
+        "product_id": "legacy_poison_id",
+        "goods_id": "legacy_poison_id",
+        "goods_sign": "LEGACY_SIGN",
+        "name": "历史损坏商品",
+        "activity_price": 9.9,
+        "superseded_by": "nonexistent_target",
+        "is_off_promotion": False,
+        "default_promotion": {"final_link": "https://u.jd.com/poisoned"},
+        "default_promotion_expires_at": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2),
+    })
+    assert repo.get_promotion_link_cache("jd", goods_id="legacy_poison_id", goods_sign="LEGACY_SIGN") is None
+    repo.save_promotion_link_cache(
+        "jd",
+        {"final_link": "https://u.jd.com/should_not_attach"},
+        goods_id="fresh_other_id",
+        goods_sign="LEGACY_SIGN",
+        only_if_exists=True,
+    )
+    poison_doc = next(d for d in col.docs if d.get("goods_sign") == "LEGACY_SIGN")
+    assert poison_doc["product_id"] == "legacy_poison_id"
+    assert poison_doc["default_promotion"]["final_link"] == "https://u.jd.com/poisoned"
+
+    # 4. ProductService.get_goods_detail 遇到悬空或自指 superseded_by 时，若传入有效 goods_sign，自动回源重建真实商品
+    col.docs.append({
+        "platform": "jd",
+        "product_id": old_id + "_legacy",
+        "goods_id": old_id + "_legacy",
+        "goods_sign": "G6QDzEKCKU5wE4ebWFK3wE4ebcI4vQ_3lzC2xxOIoDavPIXww",
+        "name": "错误覆盖商品",
+        "activity_price": 10775.7,
+        "superseded_by": "missing_new_target",
+        "is_off_promotion": False,
+        "detail_updated_at": datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5),
+    })
+    fake_adapter = SimpleNamespace(
+        active=True,
+        platform_code="jd",
+        platform_name="京东",
+        capabilities={"detail": True},
+        resolve_product_ref=lambda raw="", goods_id=None, goods_sign=None: ProductRef("jd", goods_id or "", goods_sign or raw),
+        get_goods_detail=lambda *a, **kw: {
+            "status": "success",
+            "data": {
+                "platform": "jd",
+                "goods_id": old_id + "_legacy",
+                "goods_sign": "G6QDzEKCKU5wE4ebWFK3wE4ebcI4vQ_3lzC2xxOIoDavPIXww",
+                "name": "海天厨房调料组合套装12件套",
+                "price": 18.9,
+                "original_price": 18.9,
+                "image_url": "https://img14.360buyimg.com/pop/jfs/t20271010/538421/18/9854/219374/6aca4d10F381a5657/0944320320d0cf17.jpg",
+                "carousel_images": ["https://img14.360buyimg.com/pop/jfs/t20271010/538421/18/9854/219374/6aca4d10F381a5657/0944320320d0cf17.jpg"],
+            },
+        },
+    )
+    monkeypatch.setattr("services.product_service.get_adapter", lambda plat: fake_adapter)
+    svc = ProductService(product_repo=repo)
+    recovered = svc.get_goods_detail(
+        platform="jd",
+        goods_id=old_id + "_legacy",
+        goods_sign="G6QDzEKCKU5wE4ebWFK3wE4ebcI4vQ_3lzC2xxOIoDavPIXww",
+    )
+    assert recovered["status"] == "success"
+    assert recovered["data"]["name"] == "海天厨房调料组合套装12件套"
+    clear_all_caches()
+
+
+def test_commit_snapshot_order_superseded_cycle_mark_empty_and_resolve_ref_isolation(monkeypatch):
+    """验证迁移先写后标、superseded_by 环/自指断路、空新ID拦截与 PromoteService 防缓存投毒。"""
+    import datetime
+    from cache import DETAIL_CACHE, SIGN_BY_ID_CACHE, make_detail_snapshot
+    from repositories.product_repo import ProductRepository
+    from services.promote_service import PromoteService
+    from tests.test_product_repository import MemoryCollection
+
+    clear_all_caches()
+    col = MemoryCollection()
+    repo = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda _n: col))
+
+    # 1. mark_product_superseded 空 new_goods_id 绝不落库标记 superseded_by=""
+    col.docs.append({"platform": "jd", "product_id": "OLD_1", "goods_sign": "OLD_SIGN"})
+    assert repo.mark_product_superseded("jd", "OLD_1", "", "OLD_SIGN") is False
+    assert "superseded_by" not in col.docs[0]
+
+    # 2. _commit_snapshot: 当 upsert_product_detail 返回 False 或无有效图片时，绝不提前软下架 requested_ref
+    svc = ProductService(product_repo=repo)
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    snap_ok = make_detail_snapshot({
+        "platform": "jd", "goods_id": "NEW_ID", "goods_sign": "NEW_SIGN", "name": "新品",
+        "price": 19.9, "image_url": "https://img.jd.com/1.jpg", "carousel_images": ["https://img.jd.com/1.jpg"],
+    }, now_dt, "jd")
+    mark_calls = []
+    monkeypatch.setattr(repo, "mark_product_superseded", lambda *a, **kw: mark_calls.append(a) or True)
+    monkeypatch.setattr(repo, "upsert_product_detail", lambda *a, **kw: False)
+    svc._commit_snapshot(snap_ok, requested_ref=ProductRef("jd", "OLD_1", "OLD_SIGN"))
+    assert mark_calls == []
+
+    snap_no_img = make_detail_snapshot({
+        "platform": "jd", "goods_id": "NEW_ID", "goods_sign": "NEW_SIGN", "name": "无图新品", "price": 19.9,
+    }, now_dt, "jd")
+    monkeypatch.setattr(repo, "upsert_product_detail", lambda *a, **kw: True)
+    svc._commit_snapshot(snap_no_img, requested_ref=ProductRef("jd", "OLD_1", "OLD_SIGN"))
+    assert mark_calls == []
+
+    # 3. get_goods_detail 遇到 A->B->A 循环与 A->A 自指绝不 RecursionError，安全退化为下架错误
+    col.docs = [
+        {"platform": "jd", "product_id": "CYC_A", "name": "环A", "price": 9.9, "superseded_by": "CYC_B"},
+        {"platform": "jd", "product_id": "CYC_B", "name": "环B", "price": 9.9, "superseded_by": "CYC_A"},
+        {"platform": "jd", "product_id": "SELF_A", "name": "自指", "price": 9.9, "superseded_by": "SELF_A"},
+    ]
+    monkeypatch.setattr("services.product_service.get_adapter", lambda _p: SimpleNamespace(
+        active=True, platform_code="jd", platform_name="京东", capabilities={"detail": True},
+        resolve_product_ref=lambda raw="", goods_id=None, goods_sign=None: ProductRef("jd", goods_id or raw, goods_sign or ""),
+    ))
+    cyc_res = svc.get_goods_detail("jd", "CYC_A", goods_id="CYC_A")
+    assert cyc_res["status"] == "error" and cyc_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+    self_res = svc.get_goods_detail("jd", "SELF_A", goods_id="SELF_A")
+    assert self_res["status"] == "error" and self_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    # 4. PromoteService._resolve_product_ref: 传入 goods_sign 时，绝不让未验证客户端 goods_id 写入 SIGN_BY_ID_CACHE，也不跨读 id DETAIL_CACHE
+    clear_all_caches()
+    DETAIL_CACHE.set(
+        ("detail", "pdd", "", "id", "WRONG_CLIENT_ID"),
+        (time_future := datetime.datetime.now(datetime.timezone.utc).timestamp() + 3600,
+         {"status": "success", "data": {"platform": "pdd", "goods_id": "WRONG_CLIENT_ID", "goods_sign": "OTHER_SIGN", "name": "错品"}}),
+    )
+    assert time_future > 0
+    col.docs = [{"platform": "pdd", "product_id": "SIGN_REAL_1", "goods_sign": "SIGN_REAL_1"}]
+    promo_svc = PromoteService(product_repo=repo, user_service=SimpleNamespace())
+    resolved = promo_svc._resolve_product_ref(ProductRef("pdd", "WRONG_CLIENT_ID", "SIGN_REAL_1"))
+    assert resolved.goods_sign == "SIGN_REAL_1"
+    assert resolved.goods_id == ""
+    assert SIGN_BY_ID_CACHE.get(("pdd", "WRONG_CLIENT_ID")) is None
+    clear_all_caches()
+
+
+

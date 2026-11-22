@@ -21,7 +21,7 @@
 """
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 import contextvars
 from datetime import datetime, timezone
@@ -170,6 +170,112 @@ class UpstreamQuotaPacer:
 
 
 GLOBAL_QUOTA_PACER = UpstreamQuotaPacer()
+
+
+class UpstreamCooldownRegistry:
+    """线程安全的有界供应商/端点故障冷却注册表：避免已知限流或被风控通道持续空转，到期自动放行恢复。"""
+
+    def __init__(self, max_entries: int = 256) -> None:
+        self._lock = threading.Lock()
+        self._max_entries = max(16, int(max_entries or 256))
+        self._entries: OrderedDict[Tuple[str, str, str], Tuple[float, str]] = OrderedDict()
+
+    @staticmethod
+    def _key(platform: str, provider: str, operation: str = "") -> Tuple[str, str, str]:
+        return (
+            str(platform or "").strip().lower(),
+            str(provider or "").strip().lower(),
+            str(operation or "").strip().lower(),
+        )
+
+    @staticmethod
+    def _should_skip_state(http_session: Any = None, *, force: bool = False) -> bool:
+        if force:
+            return False
+        if http_session is not None and not is_real_requests_session(http_session):
+            return True
+        return False
+
+    def is_cooling(
+        self,
+        platform: str,
+        provider: str,
+        operation: str = "",
+        *,
+        http_session: Any = None,
+        force: bool = False,
+    ) -> bool:
+        return self.remaining_seconds(
+            platform,
+            provider,
+            operation,
+            http_session=http_session,
+            force=force,
+        ) > 0.0
+
+    def remaining_seconds(
+        self,
+        platform: str,
+        provider: str,
+        operation: str = "",
+        *,
+        http_session: Any = None,
+        force: bool = False,
+    ) -> float:
+        if self._should_skip_state(http_session, force=force):
+            return 0.0
+        key = self._key(platform, provider, operation)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return 0.0
+            until, _ = entry
+            now = time.monotonic()
+            if now >= until:
+                self._entries.pop(key, None)
+                return 0.0
+            self._entries.move_to_end(key)
+            return until - now
+
+    def mark_cooling(
+        self,
+        platform: str,
+        provider: str,
+        operation: str = "",
+        duration_sec: float = 300.0,
+        *,
+        reason: str = "",
+        http_session: Any = None,
+        force: bool = False,
+    ) -> None:
+        if self._should_skip_state(http_session, force=force):
+            return
+        dur = max(0.0, float(duration_sec or 0.0))
+        if dur <= 0.0 or not math.isfinite(dur):
+            return
+        key = self._key(platform, provider, operation)
+        until = time.monotonic() + dur
+        with self._lock:
+            prev = self._entries.get(key)
+            if prev is not None and prev[0] >= until:
+                until = prev[0]
+                reason = reason or prev[1]
+            self._entries[key] = (until, str(reason or "")[:120])
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self, platform: str, provider: str, operation: str = "") -> None:
+        key = self._key(platform, provider, operation)
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+GLOBAL_PROVIDER_COOLDOWN = UpstreamCooldownRegistry()
 
 
 def is_valid_product_card(product: Any) -> bool:
@@ -518,6 +624,8 @@ def execute_provider_chain(
     - 若后续供应商均失败，但此前已有 `degraded_product`（带可用推广链接），保底返回该 `degraded_product`。
     """
     best_degraded: Optional[Dict[str, Any]] = None
+    saw_catalog_cooling = False
+    saw_provider_cooling = False
     last_result: Dict[str, Any] = {
         "status": "error",
         "error_code": "NO_PROVIDER_AVAILABLE",
@@ -536,24 +644,47 @@ def execute_provider_chain(
             }
             continue
         if not isinstance(res, dict) or res.get("status") == "skipped":
+            if isinstance(res, dict) and res.get("reason") in ("provider_cooling", "tb_official_session_cooling"):
+                saw_provider_cooling = True
             continue
         res.setdefault("_provider", prov_name)
+        if res.get("catalog_cooling") is True:
+            saw_catalog_cooling = True
         if res.get("status") == "success":
             if res.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT or res.get("detail_lookup_failed"):
                 if best_degraded is None:
-                    best_degraded = res
-                elif res.get("catalog_cooling") is True and not best_degraded.get("catalog_cooling"):
+                    best_degraded = (
+                        {**res, "catalog_cooling": True}
+                        if (saw_catalog_cooling and not res.get("catalog_cooling"))
+                        else res
+                    )
+                elif (res.get("catalog_cooling") is True or saw_catalog_cooling) and not best_degraded.get("catalog_cooling"):
                     best_degraded = {**best_degraded, "catalog_cooling": True}
                 continue
             return res
 
         err_code = str(res.get("error_code") or "").strip().upper()
-        if best_degraded is not None and res.get("catalog_cooling") is True and not best_degraded.get("catalog_cooling"):
+        if best_degraded is not None and (res.get("catalog_cooling") is True or saw_catalog_cooling) and not best_degraded.get("catalog_cooling"):
             best_degraded = {**best_degraded, "catalog_cooling": True}
         last_result = res
         if err_code in NON_FALLBACK_DETERMINISTIC_ERRORS:
+            if best_degraded is not None and err_code != "PRODUCT_OFF_PROMOTION":
+                return best_degraded
             return res
 
     if best_degraded is not None:
         return best_degraded
+    if last_result.get("error_code") == "NO_PROVIDER_AVAILABLE" and saw_provider_cooling:
+        return {
+            "status": "error",
+            "error_code": "RATE_LIMIT",
+            "error_msg": f"{platform}.{operation} 供应商处于频控冷却中，请稍后再试",
+            "provider_cooling": True,
+        }
+    if (
+        saw_catalog_cooling
+        and last_result.get("catalog_cooling") is not True
+        and str(last_result.get("error_code") or "").strip().upper() not in NON_FALLBACK_DETERMINISTIC_ERRORS
+    ):
+        return {**last_result, "catalog_cooling": True}
     return last_result

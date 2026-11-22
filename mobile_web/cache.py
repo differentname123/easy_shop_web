@@ -18,7 +18,7 @@ from config import (
     CACHE_MAX_PROMOTION,
     PRODUCT_DETAIL_TTL,
 )
-from models.product import DetailSnapshot, ProductRef, resolve_item_identity
+from models.product import DetailSnapshot, ProductRef, is_jd_image_key, resolve_item_identity
 
 _DETAIL_CACHE_LOCK = threading.RLock()
 
@@ -228,7 +228,13 @@ def cache_product_detail(
 ) -> dict:
     item = result.get("data") or {}
     ref = ProductRef(platform, item.get("goods_id") or item.get("product_id"), item.get("goods_sign"))
-    if ref.goods_id and ref.goods_sign and ref.goods_id != ref.goods_sign:
+    if (
+        ref.goods_id
+        and ref.goods_sign
+        and ref.goods_id != ref.goods_sign
+        and not (ref.platform == "jd" and is_jd_image_key(ref.goods_sign))
+        and not (ref.platform == "pdd" and ref.goods_sign.isdigit())
+    ):
         SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), ref.goods_sign)
     url = item.get("product_url")
     if isinstance(url, str) and url.strip():

@@ -7,23 +7,35 @@ import time
 from typing import Any, Dict, Optional
 import requests
 
-from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH, is_real_requests_session
+from infrastructure.api_governance import (
+    GLOBAL_PROVIDER_COOLDOWN,
+    GLOBAL_QUOTA_PACER,
+    GLOBAL_UPSTREAM_HEALTH,
+    QuotaPaceBacklogError,
+    is_real_requests_session,
+)
 from infrastructure.http_utils import (
     clean_text,
     error_dict as _error,
     execute_with_key_failover,
+    normalize_http_url,
     parse_appkey_list,
 )
-from infrastructure.jd_client import resolve_jd_short_url
+from infrastructure.jd_client import product_url as jd_product_url, resolve_jd_short_url
 from infrastructure.logging_utils import get_app_logger
 from infrastructure.transport import create_http_session
+from models.product import extract_canonical_goods_id
 
 logger = get_app_logger(__name__)
 
 HDK_SALES_URL = "https://v2.api.haodanku.com/sales_list"
+HDK_V2_API_BASE = "https://v2.api.haodanku.com"
 HDK_DEFAULT_API_BASE = "https://v3.api.haodanku.com"
 HDK_RATE_LIMIT_KEYWORDS = (
-    "频次", "频率", "超限", "上限", "次数", "限制", "频繁", "请稍后", "并发", "额度", "500",
+    "频次", "频率", "超限", "上限", "次数", "限制", "频繁", "请稍后", "并发", "额度",
+)
+HDK_BLOCKED_KEYWORDS = (
+    "被拦截", "非法访问", "风控", "listid=533",
 )
 
 
@@ -136,15 +148,36 @@ class HdkClient:
         *,
         params: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
+        base_url: Optional[str] = None,
+        platform_hint: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not self.appkey_list and not self.api_key:
             return _error("CONFIG_ERROR", "好单库缺少 API Key 配置")
-        url = f"{self.api_base}/{path.lstrip('/')}"
+        clean_base = clean_text(base_url).rstrip("/") or self.api_base
+        url = f"{clean_base}/{path.lstrip('/')}"
         is_real = is_real_requests_session(self.http)
-        plat = "jd" if ("jd" in path.lower() or "jing" in path.lower()) else "taobao"
+        op_key = path.lstrip("/").lower()
+        plat = platform_hint or (
+            "pdd" if "pdd" in op_key else ("jd" if ("jd" in op_key or "jing" in op_key) else "taobao")
+        )
+        if GLOBAL_PROVIDER_COOLDOWN.is_cooling(plat, "hdk", op_key, http_session=self.http):
+            return {"status": "skipped", "reason": "provider_cooling"}
 
         def _do_single_request(current_key: str) -> Dict[str, Any]:
             t0 = time.monotonic()
+            try:
+                GLOBAL_QUOTA_PACER.pace(
+                    "hdk_api",
+                    current_key,
+                    0.25,
+                    http_session=self.http,
+                    foreground_max_wait=2.5,
+                    background_max_wait=12.0,
+                )
+            except QuotaPaceBacklogError:
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="rate_limit", latency_ms=0.0, error_code="QUOTA_PACE_BACKLOG", allow_persist=is_real)
+                return _error("QUOTA_PACE_BACKLOG", "好单库接口请求过于频繁")
+
             clean_p = {k: v for k, v in (params or {}).items() if v is not None}
             clean_d = {k: v for k, v in (data or {}).items() if v is not None}
             if method.upper() == "POST":
@@ -153,28 +186,37 @@ class HdkClient:
                 clean_p.setdefault("apikey", current_key)
             try:
                 if method.upper() == "POST":
-                    resp = self.http.post(url, params=clean_p or None, data=clean_d or None, timeout=self.timeout)
+                    resp = self.http.post(
+                        url, params=clean_p or None, data=clean_d or None, timeout=self.timeout, allow_redirects=False
+                    )
                 else:
-                    resp = self.http.get(url, params=clean_p, timeout=self.timeout)
+                    resp = self.http.get(
+                        url, params=clean_p, timeout=self.timeout, allow_redirects=False
+                    )
+                if 300 <= getattr(resp, "status_code", 200) < 400:
+                    dt_ms = (time.monotonic() - t0) * 1000.0
+                    GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="error", latency_ms=dt_ms, error_code="UNSAFE_REDIRECT", allow_persist=is_real)
+                    return _error("UNSAFE_REDIRECT", "好单库接口重定向被拒绝")
                 if hasattr(resp, "raise_for_status"):
                     resp.raise_for_status()
                 payload = resp.json() if callable(getattr(resp, "json", None)) else {}
             except requests.exceptions.Timeout:
                 dt_ms = (time.monotonic() - t0) * 1000.0
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="TIMEOUT", allow_persist=is_real)
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="error", latency_ms=dt_ms, error_code="TIMEOUT", allow_persist=is_real)
                 return _error("TIMEOUT", "好单库接口请求超时")
             except requests.exceptions.RequestException as exc:
                 dt_ms = (time.monotonic() - t0) * 1000.0
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="NETWORK_ERROR", allow_persist=is_real)
-                return _error("NETWORK_ERROR", f"好单库网络请求失败: {exc}")
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="error", latency_ms=dt_ms, error_code="NETWORK_ERROR", allow_persist=is_real)
+                # RequestException 常携带包含 apikey 的完整 GET URL，严禁原样回显
+                return _error("NETWORK_ERROR", f"好单库网络请求失败 ({type(exc).__name__})")
             except Exception as exc:
                 dt_ms = (time.monotonic() - t0) * 1000.0
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
-                return _error("PROTOCOL_ERROR", f"好单库响应解析失败: {exc}")
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
+                return _error("PROTOCOL_ERROR", f"好单库响应解析失败 ({type(exc).__name__})")
 
             dt_ms = (time.monotonic() - t0) * 1000.0
             if not isinstance(payload, dict):
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="error", latency_ms=dt_ms, error_code="PROTOCOL_ERROR", allow_persist=is_real)
                 return _error("PROTOCOL_ERROR", "好单库返回非 JSON 字典")
 
             code = payload.get("code")
@@ -183,24 +225,35 @@ class HdkClient:
             err_detail = f"{msg} ({sub_msg})" if (msg and sub_msg and sub_msg != msg) else (msg or sub_msg)
 
             if code in (200, 1, "200", "1"):
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
                 return {"status": "success", "data": payload.get("data"), "raw": payload}
 
             err_msg_lower = err_detail.lower()
+            if any(kw in err_msg_lower for kw in HDK_BLOCKED_KEYWORDS):
+                GLOBAL_PROVIDER_COOLDOWN.mark_cooling(
+                    plat, "hdk", op_key, 300.0, reason=err_detail[:80], http_session=self.http,
+                )
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="rate_limit", latency_ms=dt_ms, error_code="HDK_BLOCKED_533", error_msg=err_detail[:120], allow_persist=is_real)
+                return _error("RATE_LIMIT", msg or "好单库触发上游风控拦截，已冷却退避", hdk_blocked=True, deterministic_all_keys=True, sub_msg=payload.get("sub_msg"))
             if any(kw in err_detail for kw in HDK_RATE_LIMIT_KEYWORDS) or "429" in err_msg_lower:
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="rate_limit", latency_ms=dt_ms, error_code="RATE_LIMIT", error_msg=err_detail[:120], allow_persist=is_real)
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="rate_limit", latency_ms=dt_ms, error_code="RATE_LIMIT", error_msg=err_detail[:120], allow_persist=is_real)
                 return _error("RATE_LIMIT", msg or "好单库接口调用频次超限", sub_msg=payload.get("sub_msg"))
             if "未授权" in err_detail or "授权" in err_detail or "绑定" in err_detail:
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="AUTH_REQUIRED", error_msg=err_detail[:120], allow_persist=is_real)
-                return _error("AUTH_REQUIRED", msg or "好单库尚未绑定推客账号", sub_msg=payload.get("sub_msg"))
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="degraded", latency_ms=dt_ms, error_code="UPSTREAM_PROVIDER_UNAUTHORIZED", error_msg=err_detail[:120], allow_persist=is_real)
+                return _error("UPSTREAM_PROVIDER_UNAUTHORIZED", msg or "好单库尚未绑定推客账号", sub_msg=payload.get("sub_msg"))
             if "下架" in err_detail or "不在推广" in err_detail:
-                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="degraded", latency_ms=dt_ms, error_code="PRODUCT_OFF_PROMOTION", error_msg=err_detail[:120], allow_persist=is_real)
-                return _error("PRODUCT_OFF_PROMOTION", msg or "该商品不在推广中或已下架")
-            GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", path, outcome="error", latency_ms=dt_ms, error_code=f"HDK_{code}", error_msg=err_detail[:120], allow_persist=is_real)
+                GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="degraded", latency_ms=dt_ms, error_code="NOT_FOUND", error_msg=err_detail[:120], allow_persist=is_real)
+                return _error("NOT_FOUND", msg or "好单库未收录该商品或已下架", not_found=True, hdk_not_found=True)
+            GLOBAL_UPSTREAM_HEALTH.record_call(plat, "hdk", op_key, outcome="error", latency_ms=dt_ms, error_code=f"HDK_{code}", error_msg=err_detail[:120], allow_persist=is_real)
             return _error("UPSTREAM_ERROR", err_detail or f"好单库返回错误码 {code}", upstream_code=code, sub_msg=payload.get("sub_msg"))
 
         if self.appkey_list:
-            res = execute_with_key_failover(self, _do_single_request, round_robin=True)
+            res = execute_with_key_failover(
+                self,
+                _do_single_request,
+                round_robin=True,
+                should_stop_early=lambda r: bool(isinstance(r, dict) and r.get("hdk_blocked") is True),
+            )
             self.api_key = self.appkey
             return res
         return _do_single_request(self.api_key)
@@ -242,13 +295,44 @@ class HdkClient:
             "has_more": len(items) >= size,
         }
 
+    def get_jd_hot_rank(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """京东热销实时榜单兜底 (v2/jd_hot_rank)。"""
+        cur_page = max(1, int(page or 1))
+        size = min(100, max(1, int(page_size or 20)))
+        res = self._request(
+            "GET",
+            "jd_hot_rank",
+            base_url=HDK_V2_API_BASE,
+            platform_hint="jd",
+            params={"min_id": cur_page, "back": size},
+        )
+        if res.get("status") != "success":
+            return res
+        rows = res.get("data")
+        items = rows if isinstance(rows, list) else []
+        return {
+            "status": "success",
+            "data": items,
+            "total_count": len(items),
+            "page": cur_page,
+            "page_size": size,
+            "has_more": len(items) >= size,
+        }
+
     def get_goods_detail(
         self,
         goods_id_or_sign: str,
         *,
         union_id: Optional[str] = None,
+        allow_single_url_match: bool = False,
+        expected_sku: str = "",
     ) -> Dict[str, Any]:
-        """通过加密 itemId 或数字 SKU 反查商品完整卡片详情 (复用 id=50 搜索接口精准匹配)。"""
+        """通过加密 itemId、数字 SKU 或推广链接反查京东商品完整卡片（ID 查询严格校验身份防串货）。"""
         target = clean_text(goods_id_or_sign)
         if not target:
             return _error("INVALID_ARGUMENT", "商品标识不能为空")
@@ -259,11 +343,29 @@ class HdkClient:
         if not rows:
             return _error("NOT_FOUND", "好单库未找到该商品详情", not_found=True)
         matched = next(
-            (row for row in rows if clean_text(row.get("skuid")) == target or clean_text(row.get("itemid")) == target),
+            (
+                row for row in rows
+                if isinstance(row, dict)
+                and (clean_text(row.get("skuid")) == target or clean_text(row.get("itemid")) == target)
+            ),
             None,
         )
-        if not matched and len(rows) == 1:
-            matched = rows[0]
+        exp_sku = clean_text(expected_sku)
+        if (
+            not matched
+            and allow_single_url_match
+            and target.startswith(("http://", "https://"))
+            and len(rows) == 1
+            and isinstance(rows[0], dict)
+        ):
+            r0 = rows[0]
+            if exp_sku:
+                r0_sku = clean_text(r0.get("skuid"))
+                r0_item = clean_text(r0.get("itemid"))
+                if r0_sku == exp_sku or r0_item == exp_sku:
+                    matched = r0
+            else:
+                matched = r0
         if not matched:
             return _error("PRODUCT_IDENTITY_MISMATCH", "好单库搜索返回与目标商品身份不一致")
         return {"status": "success", "data": matched}
@@ -311,8 +413,8 @@ class HdkClient:
         data = res.get("data")
         if not isinstance(data, dict):
             return _error("PROTOCOL_ERROR", "好单库转链返回数据异常")
-        short = clean_text(data.get("short_url"))
-        click = clean_text(data.get("click_url"))
+        short = jd_product_url(data.get("short_url") or "")
+        click = jd_product_url(data.get("click_url") or "")
         if not short and not click:
             return _error("PROTOCOL_ERROR", "好单库未返回有效推广短链")
         return {
@@ -360,18 +462,100 @@ class HdkClient:
         data = res.get("data")
         if not isinstance(data, dict):
             return _error("PROTOCOL_ERROR", "好单库淘宝转链返回数据异常")
-        click_url = clean_text(data.get("coupon_click_url") or data.get("item_url"))
-        short_url = clean_text(data.get("coupon_click_url") or data.get("item_url"))
+        click_url = normalize_http_url(data.get("coupon_click_url") or data.get("item_url"))
+        short_url = normalize_http_url(data.get("coupon_click_url") or data.get("item_url"))
         taoword = clean_text(data.get("taoword") or data.get("new_model"))
-        if not click_url and not taoword:
-            return _error("PROTOCOL_ERROR", "好单库未返回有效淘宝推广链接或口令")
+        if not click_url and not short_url:
+            return _error("PROTOCOL_ERROR", "好单库未返回有效淘宝推广链接")
         return {
             "status": "success",
             "final_link": short_url or click_url,
             "url": click_url or short_url,
-            "short_url": short_url,
-            "click_url": click_url,
+            "short_url": short_url or click_url,
+            "click_url": click_url or short_url,
             "tpwd": taoword,
             "taoword": taoword,
             "raw": data,
+        }
+
+    def search_tb_goods(self, keyword: str, *, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """好单库淘宝全网超级搜索 (v2/supersearch, 淘宝搜索第3级保底)。"""
+        kw = clean_text(keyword)
+        if not kw:
+            return _error("INVALID_ARGUMENT", "请输入搜索关键词")
+        cur_page = max(1, int(page or 1))
+        size = min(100, max(1, int(page_size or 20)))
+        api_back = next((b for b in (10, 20, 50, 100) if b >= size), 100)
+        res = self._request(
+            "GET",
+            "supersearch",
+            base_url=HDK_V2_API_BASE,
+            platform_hint="taobao",
+            params={"keyword": kw, "back": api_back, "min_id": cur_page, "tb_p": cur_page},
+        )
+        if res.get("status") != "success":
+            return res
+        rows = res.get("data")
+        raw_list = rows if isinstance(rows, list) else []
+        items = raw_list[:size]
+        return {
+            "status": "success",
+            "data": items,
+            "total_count": len(items),
+            "page": cur_page,
+            "page_size": size,
+            "has_more": len(raw_list) > size or len(raw_list) >= api_back,
+        }
+
+    def get_tb_goods_detail(self, item_id: str) -> Dict[str, Any]:
+        """好单库淘宝单品详情兜底 (v2/item_detail)。"""
+        tid = clean_text(item_id)
+        if not tid:
+            return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
+        res = self._request(
+            "GET",
+            "item_detail",
+            base_url=HDK_V2_API_BASE,
+            platform_hint="taobao",
+            params={"itemid": tid},
+        )
+        if res.get("status") != "success":
+            return res
+        raw_data = res.get("data")
+        if isinstance(raw_data, list):
+            raw_data = raw_data[0] if raw_data else None
+        if not isinstance(raw_data, dict) or not clean_text(raw_data.get("itemid")):
+            return _error("NOT_FOUND", "好单库未找到该淘宝商品详情", not_found=True)
+        returned_id = clean_text(raw_data.get("itemid"))
+        req_canon = extract_canonical_goods_id("taobao", tid)
+        ret_canon = extract_canonical_goods_id("taobao", returned_id)
+        if returned_id != tid and not (req_canon and ret_canon and req_canon == ret_canon):
+            return _error("PRODUCT_IDENTITY_MISMATCH", "好单库淘宝详情返回与请求商品不一致")
+        return {"status": "success", "data": raw_data}
+
+    def search_pdd_goods(self, keyword: str, *, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+        """好单库拼多多商品搜索备用通道 (v2/pdd_goods_search, 注意返回佣金比例已为百分比)。"""
+        kw = clean_text(keyword)
+        if not kw:
+            return _error("INVALID_ARGUMENT", "请输入搜索关键词")
+        cur_page = max(1, int(page or 1))
+        size = min(100, max(1, int(page_size or 20)))
+        res = self._request(
+            "GET",
+            "pdd_goods_search",
+            base_url=HDK_V2_API_BASE,
+            platform_hint="pdd",
+            params={"keyword": kw, "back": size, "min_id": cur_page},
+        )
+        if res.get("status") != "success":
+            return res
+        rows = res.get("data")
+        items = rows if isinstance(rows, list) else []
+        return {
+            "status": "success",
+            "data": items,
+            "total_count": len(items),
+            "page": cur_page,
+            "page_size": size,
+            "has_more": len(items) >= size,
         }

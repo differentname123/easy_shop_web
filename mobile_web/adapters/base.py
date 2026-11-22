@@ -187,14 +187,14 @@ class BasePlatformAdapter(ABC):
         *,
         delay: float = 0.15,
     ) -> Tuple[Dict[str, Any], bool]:
-        """短暂退避重试一次，确认商品是否确实已下架或停止推广。"""
+        """短暂退避重试一次，仅当二次响应仍明确符合下架/停推证据时才确认下架，避免网络抖动误杀。"""
         res = call_fn()
-        if res.get("status") == "success" or not is_off_fn(res):
+        if not is_off_fn(res):
             return res, False
         if delay > 0:
             time.sleep(delay)
         retry_res = call_fn()
-        if retry_res.get("status") == "success" and retry_res.get("data"):
+        if not is_off_fn(retry_res):
             return retry_res, False
         return retry_res, True
 

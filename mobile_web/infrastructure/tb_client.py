@@ -211,6 +211,9 @@ def clean_tb_goods_item(raw_item: dict, source_type: str = "") -> Optional[Dict[
     rate = _number(_text(pub.get("income_rate")).replace("%", ""))
     if not pub.get("income_rate") and _text(income.get("commission_rate")).endswith("%"):
         rate = _number(_text(income["commission_rate"])[:-1])
+    comm_amount = _number(income.get("commission_amount"), _number(pub.get("commission_amount")))
+    if comm_amount <= 0 and final > 0 and rate > 0:
+        comm_amount = round(final * rate / 100.0, 2)
     return {
         # An opaque input echo proves the requested Sign, not an original ID.
         "goods_id": input_id if input_id.isdigit() and input_id != item_id else "",
@@ -224,7 +227,7 @@ def clean_tb_goods_item(raw_item: dict, source_type: str = "") -> Optional[Dict[
         "carousel_images": images or ([picture] if picture else []),
         "price": round(max(0, final), 2), "original_price": round(max(original, final), 2),
         "coupon_amount": round(max(0, coupon), 2), "has_coupon": coupon > 0,
-        "commission_amount": _number(income.get("commission_amount"), _number(pub.get("commission_amount"))),
+        "commission_amount": comm_amount,
         "commission_rate": rate, "sales_tip": _text(base.get("tk_total_sales") or base.get("volume") or base.get("annual_vol") or "0"),
         "mall_name": base.get("shop_title") or "", "provcity": base.get("provcity") or "",
         "click_url": normalize_http_url(pub.get("click_url")),
@@ -308,6 +311,67 @@ def search_tb_material_upgrade(
         "page": biz_params["page_no"],
         "page_size": biz_params["page_size"],
         "has_more": biz_params["page_no"] * biz_params["page_size"] < total if total is not None else len(raw_list) >= biz_params["page_size"],
+        "data": items,
+    }
+
+
+def get_tb_material_recommend(
+    app_key: str,
+    app_secret: str,
+    adzone_id: str,
+    *,
+    material_id: int = 3756,
+    page_no: int = 1,
+    page_size: int = 20,
+    http_session: Optional[Any] = None,
+    _api_call: Any = None,
+) -> Dict[str, Any]:
+    """使用官方物料精选推荐接口 (taobao.tbk.dg.material.recommend) 获取高佣热销榜单。"""
+    az = str(adzone_id or "").strip()
+    if not app_key or not app_secret or not az:
+        return _error("CONFIG_ERROR", "淘宝物料推荐缺少 app_key、app_secret 或 adzone_id")
+    pg = max(1, int(page_no))
+    sz = max(1, min(100, int(page_size)))
+    biz_params = {
+        "adzone_id": az,
+        "material_id": int(material_id),
+        "page_no": pg,
+        "page_size": sz,
+    }
+    res = (
+        _api_call(app_key=app_key, app_secret=app_secret, method="taobao.tbk.dg.material.recommend", biz_params=biz_params)
+        if _api_call is not None
+        else call_tb_api(app_key=app_key, app_secret=app_secret, method="taobao.tbk.dg.material.recommend", biz_params=biz_params, http_session=http_session)
+    )
+    if res.get("status") != "success":
+        err_code = str(res.get("error_code") or "")
+        err_msg = str(res.get("error_msg") or "")
+        if err_code == "50001" or "无结果" in err_msg:
+            return {"status": "success", "total_count": 0, "page": pg, "page_size": sz, "has_more": False, "data": []}
+        return res
+    body = res.get("data")
+    resp_body = body.get("tbk_dg_material_recommend_response") if isinstance(body, dict) else None
+    if not isinstance(resp_body, dict) or "result_list" not in resp_body:
+        return _error("PROTOCOL_ERROR", "淘宝物料推荐响应缺少结果列表")
+    raw_list = _list(resp_body.get("result_list"), "map_data")
+    items = [
+        cleaned for item in raw_list if isinstance(item, dict)
+        for cleaned in (clean_tb_goods_item(item, source_type="tbk_recommend"),)
+        if cleaned is not None
+    ]
+    raw_total = resp_body.get("total_count")
+    try:
+        parsed_total = int(raw_total) if raw_total is not None and str(raw_total).strip() != "" else None
+    except (TypeError, ValueError):
+        parsed_total = None
+    total = parsed_total if parsed_total is not None else len(items)
+    has_more = bool(items) and (pg * sz < parsed_total if parsed_total is not None else len(raw_list) >= sz)
+    return {
+        "status": "success",
+        "total_count": total,
+        "page": pg,
+        "page_size": sz,
+        "has_more": has_more,
         "data": items,
     }
 
@@ -553,6 +617,19 @@ class TaobaoClient:
         return search_tb_material_upgrade(self.app_key, self.app_secret, self.adzone_id,
                                          keyword=keyword, page=page, page_size=page_size,
                                          _api_call=self._call, **kwargs)
+
+    def get_material_recommend(self, material_id=3756, page_no=1, page_size=20):
+        if not self.adzone_id:
+            return _error("CONFIG_ERROR", "淘宝物料推荐缺少广告位 adzone_id")
+        return get_tb_material_recommend(
+            self.app_key,
+            self.app_secret,
+            self.adzone_id,
+            material_id=material_id,
+            page_no=page_no,
+            page_size=page_size,
+            _api_call=self._call,
+        )
 
     def get_goods_details(self, item_ids, **kwargs):
         return get_tb_goods_details(self.app_key, self.app_secret, item_ids, _api_call=self._call, **kwargs)

@@ -723,7 +723,10 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(self.repo.get_product_identity(" SAME ", "tb"), {
             "platform": "taobao", "product_id": "AB", "goods_sign": "SAME",
         })
-        self.assertEqual(self.col.queries[-1], {"platform": "taobao", "goods_sign": "SAME"})
+        self.assertEqual(
+            self.col.queries[-1],
+            {"platform": "taobao", "goods_sign": "SAME", "superseded_by": {"$exists": False}},
+        )
         self.assertEqual(self.col.projections[-1], {"_id": 0, "platform": 1, "product_id": 1, "goods_id": 1, "goods_sign": 1})
         self.assertEqual(self.repo.get_product_identity("OLD", "jd")["goods_id"], "LEGACY")
         self.assertIsNone(self.repo.get_product_identity("SAME", "jd"))
@@ -830,6 +833,7 @@ class TestProductRepository(unittest.TestCase):
                     self.assertEqual(result["_expires_at"], now + 60)
                     self.assertEqual(self.col.projections[-1], {
                         "_id": 0, "default_promotion": 1, "default_promotion_expires_at": 1,
+                        "is_off_promotion": 1, "superseded_by": 1,
                     })
                     result["nested"]["value"] = 2
                     self.assertEqual(self.col.docs[0]["default_promotion"]["nested"]["value"], 1)
@@ -1991,6 +1995,90 @@ class TestProductRepository(unittest.TestCase):
             self.assertEqual(beef_ids[:4], [f"FMT_BEEF_{i}" for i in range(4)])
         finally:
             self.repo._force_meili_enabled = None
+
+    def test_formal_upsert_and_identity_update_protect_official_jd_sign_and_clear_superseded(self):
+        from repositories.product_repo import upsert_cleaned_products_to_formal_table
+
+        official_sign = "G6QDzEKCKU5wE4ebWFK3wE4ebcI4vQ_3lzC2xxOIoDavPIXww"
+        hdk_priv_sign = "VA02aBx1VAhDTydqHEVYFDkWYwJrd29XEl57X3x_FShUUD5OADxfbyFQA1RlZF5tC"
+
+        # 1. _identity_update: 非官方 JD 密文仅放 $setOnInsert，官方加密串放 $set
+        upd_hdk, ins_hdk = self.repo._identity_update("jd", "IMG_HASH_1", hdk_priv_sign)
+        self.assertNotIn("goods_sign", upd_hdk)
+        self.assertEqual(ins_hdk["goods_sign"], hdk_priv_sign)
+        upd_off, _ = self.repo._identity_update("jd", "IMG_HASH_1", official_sign)
+        self.assertEqual(upd_off["goods_sign"], official_sign)
+
+        # 2. upsert_cleaned_products_to_formal_table: 保护既有官方 JD goods_sign 不被 HDK 覆盖，并复活清理旧失效字段
+        self.col.docs = [{
+            "platform": "jd",
+            "product_id": "IMG_HASH_1",
+            "goods_sign": official_sign,
+            "is_off_promotion": True,
+            "superseded_by": "WRONG_TARGET",
+            "off_promotion_reason": "superseded",
+            "off_promotion_at": datetime.datetime(2026, 11, 1),
+        }]
+        captured_ops = []
+
+        def _fake_bulk(ops, ordered=False):
+            captured_ops.extend(ops)
+            for op in ops:
+                self.col.update_one(op._filter, op._doc, upsert=op._upsert)
+            return type("BulkRes", (), {"upserted_count": 0, "modified_count": 1, "matched_count": 1})()
+
+        self.col.bulk_write = _fake_bulk
+        with patch("infrastructure.search_meili.is_meili_available", return_value=False):
+            upsert_cleaned_products_to_formal_table(self.col, [{
+                "platform": "jd",
+                "product_id": "IMG_HASH_1",
+                "goods_sign": hdk_priv_sign,
+                "name": "海天调料",
+                "price": 18.9,
+                "deal_info": {"is_deal_tip": True, "quality_score": 85, "deal_price": 18.9},
+            }])
+        self.assertEqual(self.col.docs[0]["goods_sign"], official_sign)
+        self.assertIs(self.col.docs[0]["is_off_promotion"], False)
+        self.assertEqual(
+            set(captured_ops[0]._doc.get("$unset", {})),
+            {"superseded_by", "off_promotion_reason", "off_promotion_at"},
+        )
+
+        # 3. upsert_product_detail 重写带有悬空 superseded_by 的记录时精确 $unset 之；正常写仍只含 $set
+        self.col.docs = [{
+            "platform": "jd",
+            "product_id": "IMG_HASH_1",
+            "goods_sign": official_sign,
+            "is_off_promotion": True,
+            "superseded_by": "IMG_HASH_1",
+            "off_promotion_reason": "superseded",
+        }]
+        ok = self.repo.upsert_product_detail({
+            "platform": "jd",
+            "goods_id": "IMG_HASH_1",
+            "goods_sign": official_sign,
+            "name": "海天调料",
+            "price": 18.9,
+            "image_url": "https://img.jd.com/1.jpg",
+        })
+        self.assertTrue(ok)
+        self.assertIs(self.col.docs[0]["is_off_promotion"], False)
+        self.assertEqual(
+            set(self.col.write_calls[-1][1].get("$unset", {})),
+            {"superseded_by", "off_promotion_reason", "off_promotion_at"},
+        )
+        self.col.docs = [{"platform": "jd", "product_id": "IMG_HASH_2", "goods_sign": official_sign}]
+        ok_clean = self.repo.upsert_product_detail({
+            "platform": "jd",
+            "goods_id": "IMG_HASH_2",
+            "goods_sign": official_sign,
+            "name": "纯净商品",
+            "price": 9.9,
+            "image_url": "https://img.jd.com/2.jpg",
+        })
+        self.assertTrue(ok_clean)
+        self.assertEqual(set(self.col.write_calls[-1][1]), {"$set"})
+
 
 
 if __name__ == "__main__":

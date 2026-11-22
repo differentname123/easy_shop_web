@@ -175,17 +175,25 @@
     };
     const brokenDealImages = ref({});
     const previewImageUrl = ref('');
+    const previewTrackRef = ref(null);
+    const previewIndex = ref(0);
     const isCopywritingExpanded = ref(false);
     const dealTip = computed(() => {
       const tip = goods.value?.deal_tip;
       return tip && typeof tip === 'object' ? tip : null;
     });
     const hasDealGuide = computed(() => Boolean(
-      dealTip.value && (dealTip.value.price_logic || (Array.isArray(dealTip.value.tutorial_steps) && dealTip.value.tutorial_steps.length)),
+      dealTip.value && Array.isArray(dealTip.value.tutorial_steps) && dealTip.value.tutorial_steps.length,
     ));
     const dealShareImages = computed(() => {
       const list = dealTip.value?.share_images;
       return Array.isArray(list) ? list.filter(u => typeof u === 'string' && u && !brokenDealImages.value[u]) : [];
+    });
+    const previewImages = computed(() => {
+      if (!previewImageUrl.value) return [];
+      return dealShareImages.value.includes(previewImageUrl.value)
+        ? dealShareImages.value
+        : [previewImageUrl.value];
     });
     const isLongCopywriting = computed(() => {
       const text = dealTip.value?.original_copywriting || '';
@@ -194,11 +202,35 @@
     const onDealImageError = url => {
       if (url) brokenDealImages.value = { ...brokenDealImages.value, [url]: true };
     };
+    const schedulePreviewScroll = fn => {
+      if (typeof global.requestAnimationFrame === 'function') global.requestAnimationFrame(fn);
+      else if (typeof global.setTimeout === 'function') global.setTimeout(fn, 0);
+    };
     const openImagePreview = url => {
-      if (url) previewImageUrl.value = url;
+      if (!url) return;
+      const idx = dealShareImages.value.indexOf(url);
+      previewIndex.value = idx >= 0 ? idx : 0;
+      previewImageUrl.value = url;
+      schedulePreviewScroll(() => {
+        if (!previewTrackRef.value) return;
+        const width = previewTrackRef.value.clientWidth || global.innerWidth || 0;
+        if (width > 0) previewTrackRef.value.scrollLeft = previewIndex.value * width;
+      });
     };
     const closeImagePreview = () => {
       previewImageUrl.value = '';
+      previewIndex.value = 0;
+    };
+    const onPreviewScroll = () => {
+      if (!previewTrackRef.value) return;
+      const width = previewTrackRef.value.clientWidth || global.innerWidth;
+      if (!width) return;
+      const maxIdx = Math.max(0, previewImages.value.length - 1);
+      const nextIdx = Math.min(maxIdx, Math.max(0, Math.round(previewTrackRef.value.scrollLeft / width)));
+      previewIndex.value = nextIdx;
+      if (previewImages.value[nextIdx]) {
+        previewImageUrl.value = previewImages.value[nextIdx];
+      }
     };
     const toggleCopywritingExpand = () => {
       isCopywritingExpanded.value = !isCopywritingExpanded.value;
@@ -586,8 +618,8 @@
     };
     return {
       ...browser, goods, carouselRef, currentImgIndex, carouselList, detailGalleryList, hasNoAvailableImages, onProductImageError, isLoggedIn, uid,
-      dealTip, hasDealGuide, dealShareImages, previewImageUrl, isCopywritingExpanded, isLongCopywriting,
-      onDealImageError, openImagePreview, closeImagePreview, toggleCopywritingExpand,
+      dealTip, hasDealGuide, dealShareImages, previewImageUrl, previewTrackRef, previewIndex, previewImages, isCopywritingExpanded, isLongCopywriting,
+      onDealImageError, openImagePreview, closeImagePreview, onPreviewScroll, toggleCopywritingExpand,
       copyDealTutorial, copyDealCopywriting, copyDealAuxItem, openDealAuxItem,
       isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, commandModal, closeCommandModal, copyCommandFromModal,
       onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail,

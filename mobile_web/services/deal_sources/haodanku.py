@@ -14,6 +14,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set
 
+from infrastructure.jd_client import is_encrypted_jd_item_id
 from models.product import extract_all_tokens
 
 from .base import BaseDealSource, FetchContext, FetchResult
@@ -111,7 +112,7 @@ class HaodankuSource(BaseDealSource):
                         http_status=getattr(resp, "status_code", None),
                         request_url=safe_url,
                         elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
-                        detail_errors=[{"error": str(exc), "error_type": type(exc).__name__}],
+                        detail_errors=[{"error": type(exc).__name__, "error_type": type(exc).__name__}],
                     )
                 break
 
@@ -229,13 +230,14 @@ class HaodankuSource(BaseDealSource):
                             if platform_code == "taobao":
                                 target_u = f"https://item.taobao.com/item.htm?id={sub_item_id}"
                                 _add_link({"label": "淘宝商品", "url": target_u, "type": "tb_numeric", "platform": "taobao"})
+                                content_lines.append(target_u)
                             elif platform_code == "jd":
-                                target_u = f"https://item.jd.com/{sub_item_id}.html"
-                                _add_link({"label": "京东商品", "url": target_u, "type": "jd_numeric", "platform": "jd"})
+                                # 京东联盟已禁纯数字 SKU 直接转链，跳过不构造无效购买链
+                                pass
                             else:
                                 target_u = sub_item_id
                                 _add_link({"label": "商品ID", "url": target_u, "type": "item_id", "platform": platform_code or "unknown"})
-                            content_lines.append(target_u)
+                                content_lines.append(target_u)
                         elif (
                             platform_code == "taobao"
                             and len(sub_item_id) == 11
@@ -248,7 +250,8 @@ class HaodankuSource(BaseDealSource):
                             content_lines.append(tok_wrapped)
                         elif (
                             (platform_code == "taobao" and re.match(r"^[A-Za-z0-9_-]{20,}$", sub_item_id))
-                            or (platform_code != "taobao" and re.match(r"^[A-Za-z0-9_-]{8,}$", sub_item_id))
+                            or (platform_code == "jd" and is_encrypted_jd_item_id(sub_item_id))
+                            or (platform_code not in ("taobao", "jd") and re.match(r"^[A-Za-z0-9_-]{8,}$", sub_item_id))
                         ):
                             if platform_code == "taobao":
                                 ed_url = f"https://uland.taobao.com/item/edetail?id={sub_item_id}"

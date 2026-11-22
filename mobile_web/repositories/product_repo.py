@@ -35,6 +35,7 @@ from models.product import (
     utc_millis,
 )
 from config import PROMOTION_LINK_TTL, logger
+from infrastructure.jd_client import is_encrypted_jd_item_id
 from infrastructure.search_meili import (
     is_meili_available,
     search_products,
@@ -85,6 +86,7 @@ def upsert_cleaned_products_to_formal_table(
                     "_id": 0,
                     "platform": 1,
                     "product_id": 1,
+                    "goods_sign": 1,
                     "deal_info.is_deal_tip": 1,
                     "deal_info.quality_score": 1,
                     "deal_info.deal_price": 1,
@@ -129,11 +131,24 @@ def upsert_cleaned_products_to_formal_table(
             **best_doc,
             "updated_at": now,
             "last_clean_source": "deal_pool",
+            "is_off_promotion": False,
         }
         if len(best_doc.get("carousel_images") or []) > 1 and float(best_doc.get("commission_amount") or 0.0) > 0:
             set_fields["detail_updated_at"] = now
 
         ex_record = existing_map.get((plat, pid))
+        new_sign = str(set_fields.get("goods_sign") or "").strip()
+        if not new_sign:
+            set_fields.pop("goods_sign", None)
+        elif plat == "jd":
+            ex_sign = str((ex_record or {}).get("goods_sign") or "").strip()
+            if is_jd_image_key(new_sign) or new_sign.isdigit() or (
+                ex_sign and is_encrypted_jd_item_id(ex_sign) and not is_encrypted_jd_item_id(new_sign)
+            ):
+                set_fields.pop("goods_sign", None)
+        elif plat == "pdd" and new_sign.isdigit():
+            set_fields.pop("goods_sign", None)
+
         ex_di = (ex_record or {}).get("deal_info") if isinstance((ex_record or {}).get("deal_info"), dict) else {}
         ex_score = int(ex_di.get("quality_score") or 0)
         ex_deal_updated = _to_naive_utc(ex_di.get("updated_at"))
@@ -180,6 +195,11 @@ def upsert_cleaned_products_to_formal_table(
 
         update_spec: Dict[str, Any] = {
             "$set": set_fields,
+            "$unset": {
+                "superseded_by": "",
+                "off_promotion_reason": "",
+                "off_promotion_at": "",
+            },
             "$setOnInsert": {
                 "created_at": now,
                 "source": "deal_pool",
@@ -340,7 +360,7 @@ class ProductRepository(BaseRepository):
             insert_set["product_id"] = goods_sign
 
         if goods_sign:
-            if platform == "jd" and is_jd_image_key(goods_sign):
+            if platform == "jd" and (is_jd_image_key(goods_sign) or not is_encrypted_jd_item_id(goods_sign)):
                 insert_set["goods_sign"] = goods_sign
             else:
                 update_set["goods_sign"] = goods_sign
@@ -1031,7 +1051,11 @@ class ProductRepository(BaseRepository):
             return None
         try:
             return self.col.find_one(
-                {"platform": self._platform(platform), "goods_sign": sign},
+                {
+                    "platform": self._platform(platform),
+                    "goods_sign": sign,
+                    "superseded_by": {"$exists": False},
+                },
                 {"_id": 0, "platform": 1, "product_id": 1, "goods_id": 1, "goods_sign": 1},
             )
         except Exception as e:
@@ -1297,6 +1321,8 @@ class ProductRepository(BaseRepository):
             if mapped is not None:
                 filter_spec, update = mapped
                 platform, goods_id, goods_sign = self._identity(item)
+                if goods_id:
+                    filter_spec = {"platform": platform, "product_id": goods_id}
                 dedup_key = (platform, goods_id or goods_sign)
                 ops_by_key[dedup_key] = UpdateOne(filter_spec, update, upsert=True)
         operations = list(ops_by_key.values())
@@ -1347,22 +1373,58 @@ class ProductRepository(BaseRepository):
         if source_time is None or source_time > now:
             return False
         try:
+            platform, goods_id, goods_sign = self._identity(detail)
             mapped = self._build_product_update(detail, detail=True)
             if mapped is None:
                 return False
             filter_spec, update = mapped
             update["$set"]["detail_updated_at"] = source_time
-            # 身份读取不走详情可展示条件，摘要/推广身份裸记录也必须参与 CAS。
+            if goods_id and goods_sign and goods_id != goods_sign:
+                find_filter = {
+                    "platform": platform,
+                    "$or": [
+                        {"product_id": goods_id},
+                        {
+                            "goods_sign": goods_sign,
+                            "superseded_by": {"$exists": False},
+                            "$or": [
+                                {"product_id": goods_sign},
+                                {"product_id": {"$exists": False}},
+                                {"product_id": ""},
+                            ],
+                        },
+                    ],
+                }
+                insert_filter = {"platform": platform, "product_id": goods_id}
+            elif not goods_id and goods_sign:
+                find_filter = {"platform": platform, "goods_sign": goods_sign, "superseded_by": {"$exists": False}}
+                insert_filter = {"platform": platform, "goods_sign": goods_sign, "superseded_by": {"$exists": False}}
+            else:
+                find_filter = {
+                    "platform": platform,
+                    "$or": [
+                        {"product_id": goods_id},
+                        {
+                            "goods_sign": goods_id,
+                            "superseded_by": {"$exists": False},
+                            "$or": [
+                                {"product_id": {"$exists": False}},
+                                {"product_id": ""},
+                            ],
+                        },
+                    ],
+                }
+                insert_filter = {"platform": platform, "product_id": goods_id}
+            # 身份读取不走详情可展示条件，单次查询匹配自身主键或未迁走的裸Sign占位记录。
             collection = self.col
             inserted_id = None
             for _ in range(self._DETAIL_CAS_ATTEMPTS):
-                doc = collection.find_one(filter_spec, {"_id": 1, "detail_updated_at": 1})
+                doc = collection.find_one(find_filter, {"_id": 1, "detail_updated_at": 1, "superseded_by": 1})
                 if doc is None:
-                    # 只有身份条件参与 upsert；匹配并发创建的文档时绝不覆盖其字段。
                     insert_doc = {**update["$setOnInsert"], **update["$set"]}
                     try:
                         result = collection.update_one(
-                            filter_spec, {"$setOnInsert": insert_doc}, upsert=True,
+                            insert_filter, {"$setOnInsert": insert_doc}, upsert=True,
                         )
                     except DuplicateKeyError:
                         # 另一线程可能已创建/补齐可信 ID；下轮按身份重读，预算有限。
@@ -1383,10 +1445,17 @@ class ProductRepository(BaseRepository):
                 # 用所读原值（而非归一化后的值）做条件；null 与缺字段也必须区分。
                 old_time = ({"$eq": doc["detail_updated_at"], "$exists": True}
                             if "detail_updated_at" in doc else {"$exists": False})
+                update_doc: Dict[str, Any] = {"$set": update["$set"]}
+                if doc.get("superseded_by"):
+                    update_doc["$unset"] = {
+                        "superseded_by": "",
+                        "off_promotion_reason": "",
+                        "off_promotion_at": "",
+                    }
                 try:
                     result = collection.update_one(
                         {"_id": doc["_id"], "detail_updated_at": old_time},
-                        {"$set": update["$set"]}, upsert=False,
+                        update_doc, upsert=False,
                     )
                 except DuplicateKeyError:
                     continue
@@ -1444,9 +1513,13 @@ class ProductRepository(BaseRepository):
 
         try:
             doc = self.col.find_one(filter_spec, {
-                "_id": 0, "default_promotion": 1, "default_promotion_expires_at": 1,
+                "_id": 0,
+                "default_promotion": 1,
+                "default_promotion_expires_at": 1,
+                "is_off_promotion": 1,
+                "superseded_by": 1,
             })
-            if not doc:
+            if not doc or doc.get("is_off_promotion") is True or doc.get("superseded_by"):
                 return None
             promo_data = doc.get("default_promotion")
             expiry = doc.get("default_promotion_expires_at")
@@ -1522,8 +1595,23 @@ class ProductRepository(BaseRepository):
 
         try:
             if only_if_exists:
-                if gid and gsign:
-                    filter_spec = {"platform": platform, "$or": [{"product_id": gid}, {"goods_sign": gsign}]}
+                if gid and gsign and gid != gsign:
+                    filter_spec = {
+                        "platform": platform,
+                        "superseded_by": {"$exists": False},
+                        "is_off_promotion": {"$ne": True},
+                        "$or": [
+                            {"product_id": gid},
+                            {"goods_sign": gsign, "product_id": gsign},
+                            {"goods_sign": gsign, "product_id": {"$exists": False}},
+                        ],
+                    }
+                else:
+                    filter_spec = {
+                        **filter_spec,
+                        "superseded_by": {"$exists": False},
+                        "is_off_promotion": {"$ne": True},
+                    }
                 self.col.update_one(filter_spec, {"$set": update_set}, upsert=False)
             else:
                 self.col.update_one(
@@ -1593,7 +1681,7 @@ class ProductRepository(BaseRepository):
         old_id = self._real_goods_id(old_goods_id)
         new_id = self._real_goods_id(new_goods_id)
         old_sign = str(old_goods_sign or "").strip()
-        if not old_id and not old_sign:
+        if not new_id or (not old_id and not old_sign):
             return False
         if old_id == new_id:
             return False
@@ -1619,7 +1707,7 @@ class ProductRepository(BaseRepository):
                         "superseded_by": new_id,
                         "off_promotion_at": now_utc,
                     },
-                    "$unset": {"default_promotion": "", "default_promotion_expires_at": ""},
+                    "$unset": {"goods_sign": "", "default_promotion": "", "default_promotion_expires_at": ""},
                 },
             )
             raw_mod = getattr(res, "modified_count", 0)

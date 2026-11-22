@@ -291,15 +291,18 @@ class DetailPrefetcher:
                 cursor = first_res.get("next_cursor")
                 max_limit = getattr(adapter, "recommendation_limit", None) or self.max_rank_limit
 
-                # 后续页：仅拉取榜单商品摘要并直接入库，绝不投递单品详情预取任务，保障外部接口配额与队列安全
+                # 后续页：拉取榜单摘要直接入库；淘宝若自带随行详情快照 (detail_sink) 则一并复用落库，不额外消耗详情接口配额
                 while has_more and next_offset < max_limit:
                     if self._stop_event.is_set():
                         return
                     paging = {"cursor": cursor} if cursor else {}
+                    page_limit = min(50, max_limit - next_offset) if platform["code"] == "pdd" else PAGE_LIMIT
+                    page_snapshots = []
+                    collect_snapshots = page_snapshots.append if platform["code"] == "taobao" else None
                     try:
                         page_res = get_recommend(
-                            channel_type=ch_type, offset=next_offset, limit=PAGE_LIMIT,
-                            uid=None, detail_sink=None, **paging,
+                            channel_type=ch_type, offset=next_offset, limit=page_limit,
+                            uid=None, detail_sink=collect_snapshots, **paging,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -328,6 +331,21 @@ class DetailPrefetcher:
                                 "❌ 【榜单摘要入库异常】平台[%s] 频道[%s] 批量入库失败 | 数量[%d] 异常<%s>",
                                 platform["code"], ch_type, len(valid_items), format_exc_summary(exc),
                             )
+                    if page_snapshots and callable(getattr(self.service, "prefetch_product_detail", None)):
+                        for snap in page_snapshots:
+                            if not isinstance(snap, DetailSnapshot) or not snap.ref.key:
+                                continue
+                            if is_product_off_promotion(platform["code"], snap.ref.goods_id, snap.ref.goods_sign):
+                                continue
+                            try:
+                                self.service.prefetch_product_detail(
+                                    snap.ref,
+                                    snapshot=snap,
+                                    refresh_ahead_seconds=self.interval_seconds + 30,
+                                    stop_event=self._stop_event,
+                                )
+                            except Exception:
+                                pass
 
                     has_more = bool(page_res.get("has_more"))
                     new_offset = page_res.get("next_offset")

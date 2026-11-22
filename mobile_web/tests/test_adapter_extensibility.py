@@ -48,8 +48,8 @@ def test_register_provider_failover_and_prepend_across_all_platforms():
         for item in GLOBAL_UPSTREAM_HEALTH.snapshot_local().get("endpoints", [])
     )
 
-    # 2. TaobaoAdapter：未配置好单库导致 recommend 能力关闭，注册第三方榜单后立即激活该能力
-    tb = TaobaoAdapter(settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_adzone_id="123"))
+    # 2. TaobaoAdapter：未配置 adzone_id 与好单库导致 recommend 能力关闭，注册第三方榜单后立即激活该能力
+    tb = TaobaoAdapter(settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s"))
     assert tb.capabilities["recommend"] is False
     assert tb.get_recommend_goods()["error_code"] == "CONFIG_ERROR"
 

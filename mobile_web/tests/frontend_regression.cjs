@@ -640,18 +640,18 @@ test('formatSales produces universal sales text across multi-platform formats', 
   assert.equal(shop.formatSales(null), '');
 });
 
-test('goods card layout focuses on platform badge, title, exclusive highlight/coupon, and price without commission noise', () => {
+test('goods card layout focuses on platform badge, prominent highlight/coupon, and final price without clutter', () => {
   const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
   const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   const css = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
 
-  // No hardcoded "已拼" in index.html or detail.html
+  // No hardcoded "已拼" in index.html or detail.html; detail keeps formatSales while thumbnail cards focus solely on image/title/highlight/price
   assert.ok(!indexHtml.includes("'已拼 '"), 'index.html no longer hardcodes 已拼');
   assert.ok(!detailHtml.includes('已拼 {{'), 'detail.html no longer hardcodes 已拼');
-
-  // Both index.html and detail.html use formatSales
-  assert.ok(indexHtml.includes('formatSales(item.sales_tip)'), 'index.html uses formatSales');
-  assert.ok(detailHtml.includes('formatSales(goods.sales_tip)'), 'detail.html uses formatSales');
+  assert.ok(detailHtml.includes('formatSales(goods.sales_tip)'), 'detail.html still uses formatSales');
+  assert.equal(indexHtml.includes('meta-row'), false, 'index.html removes .meta-row from thumbnail cards');
+  assert.equal(indexHtml.includes('sales_tip'), false, 'index.html removes sales_tip from thumbnail cards');
+  assert.equal(indexHtml.includes('item.original_price'), false, 'index.html removes original_price from thumbnail cards');
 
   // Platform badges preserved on Home & Boom grids, while redundant action button, time badge, and commission UI are removed
   assert.equal((indexHtml.match(/<div class="goods-thumb-wrap">[\s\S]*?class="plat-badge"/g) || []).length, 2,
@@ -664,6 +664,8 @@ test('goods card layout focuses on platform badge, title, exclusive highlight/co
   assert.equal(indexHtml.includes('rebate-tag'), false, 'index.html removes product-level commission tags');
   assert.equal(css.includes('.goods-action-btn'), false, 'CSS removes dead goods-action-btn');
   assert.equal(css.includes('.rebate-tag'), false, 'CSS removes dead rebate-tag');
+  assert.equal(css.includes('.meta-row'), false, 'CSS removes dead .meta-row');
+  assert.ok(css.includes('font-size: 13px;') && css.includes('-webkit-line-clamp: 2;'), 'CSS enlarges deal-highlight-text to prominent 2-line badge');
   assert.ok(css.includes('.goods-footer'), 'CSS defines goods-footer layout');
   assert.ok(css.includes('.coupon-tag .tag-badge'), 'CSS defines dual-tone coupon badge');
 });
@@ -3338,11 +3340,20 @@ test('converged QA fixes: logout cleanup, missing detail guard, group_help token
   assert.ok(detailCss.includes('height: 420px;'));
 });
 
-test('detail hasDealGuide collapses redundant original_copywriting only when price_logic or tutorial_steps exist', async () => {
-  const hWithPriceLogic = harness({ url: 'https://shop.test/detail?goods_id=D_GUIDE_1&platform=taobao', useRealVue: true });
-  hWithPriceLogic.load('detail');
-  const init1 = hWithPriceLogic.mounted[0]();
-  await hWithPriceLogic.finish(0, {
+test('detail hasDealGuide reflects tutorial_steps only, removes redundant 怎么买, supports swipeable lightbox and full-bleed gallery', async () => {
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const detailCss = fs.readFileSync(path.join(root, 'static', 'css', 'detail.css'), 'utf8');
+  assert.equal(detailHtml.includes('deal-logic-text'), false, 'detail.html removes redundant price_logic block');
+  assert.equal(detailHtml.includes('怎么买'), false, 'detail.html removes redundant 怎么买 copy');
+  assert.ok(detailHtml.includes('class="deal-lightbox-track" ref="previewTrackRef" @scroll="onPreviewScroll"'));
+  assert.ok(detailCss.includes('.deal-lightbox-track') && detailCss.includes('scroll-snap-type: x mandatory;'));
+  assert.match(detailCss, /\.detail-gallery-flow\s*\{[^}]*margin:\s*8px 0 0;[^}]*padding:\s*0;[^}]*border-radius:\s*0;/);
+  assert.match(detailCss, /\.detail-img-full\s*\{[^}]*width:\s*100%;[^}]*display:\s*block;[^}]*margin-bottom:\s*0;[^}]*border-radius:\s*0;/);
+
+  const hOnlyPriceLogic = harness({ url: 'https://shop.test/detail?goods_id=D_GUIDE_1&platform=taobao', useRealVue: true });
+  hOnlyPriceLogic.load('detail');
+  const init1 = hOnlyPriceLogic.mounted[0]();
+  await hOnlyPriceLogic.finish(0, {
     status: 'success',
     data: {
       goods_id: 'D_GUIDE_1',
@@ -3357,14 +3368,11 @@ test('detail hasDealGuide collapses redundant original_copywriting only when pri
     },
   });
   await init1;
-  assert.equal(hWithPriceLogic.page.hasDealGuide.value, true);
-  assert.equal(hWithPriceLogic.page.isCopywritingExpanded.value, false);
-  hWithPriceLogic.page.toggleCopywritingExpand();
-  assert.equal(hWithPriceLogic.page.isCopywritingExpanded.value, true);
-  hWithPriceLogic.page.copyDealCopywriting();
+  assert.equal(hOnlyPriceLogic.page.hasDealGuide.value, false, 'unrendered price_logic alone never collapses copywriting');
+  hOnlyPriceLogic.page.copyDealCopywriting();
   await flush();
-  assert.equal(hWithPriceLogic.copied.at(-1), '原始线报长文案1');
-  hWithPriceLogic.page.dispose();
+  assert.equal(hOnlyPriceLogic.copied.at(-1), '原始线报长文案1');
+  hOnlyPriceLogic.page.dispose();
 
   const hWithSteps = harness({ url: 'https://shop.test/detail?goods_id=D_GUIDE_2&platform=pdd', useRealVue: true });
   hWithSteps.load('detail');
@@ -3377,14 +3385,39 @@ test('detail hasDealGuide collapses redundant original_copywriting only when pri
       name: '测试线报商品2',
       price: 29.9,
       deal_tip: {
-        price_logic: '',
+        price_logic: '有教程时折叠原文',
         tutorial_steps: ['1. 先领券下单'],
         original_copywriting: '原始线报长文案2',
+        share_images: ['https://img.test/s1.jpg', 'https://img.test/s2.jpg', 'https://img.test/s3.jpg'],
       },
     },
   });
   await init2;
   assert.equal(hWithSteps.page.hasDealGuide.value, true);
+  assert.equal(hWithSteps.page.isCopywritingExpanded.value, false);
+  hWithSteps.page.toggleCopywritingExpand();
+  assert.equal(hWithSteps.page.isCopywritingExpanded.value, true);
+
+  // Swipeable deal lightbox opens at clicked index, updates on horizontal scroll, and resets cleanly on close
+  hWithSteps.page.previewTrackRef.value = { clientWidth: 390, scrollLeft: 0 };
+  hWithSteps.page.openImagePreview('https://img.test/s2.jpg');
+  assert.deepEqual([...hWithSteps.page.previewImages.value], ['https://img.test/s1.jpg', 'https://img.test/s2.jpg', 'https://img.test/s3.jpg']);
+  assert.equal(hWithSteps.page.previewIndex.value, 1);
+  assert.equal(hWithSteps.page.previewImageUrl.value, 'https://img.test/s2.jpg');
+  const scrollTimer = [...hWithSteps.timers.values()].find(t => t.delay === 0);
+  assert.ok(scrollTimer);
+  scrollTimer.callback();
+  assert.equal(hWithSteps.page.previewTrackRef.value.scrollLeft, 390);
+
+  hWithSteps.page.previewTrackRef.value.scrollLeft = 780;
+  hWithSteps.page.onPreviewScroll();
+  assert.equal(hWithSteps.page.previewIndex.value, 2);
+  assert.equal(hWithSteps.page.previewImageUrl.value, 'https://img.test/s3.jpg');
+
+  hWithSteps.page.closeImagePreview();
+  assert.equal(hWithSteps.page.previewIndex.value, 0);
+  assert.equal(hWithSteps.page.previewImageUrl.value, '');
+  assert.deepEqual([...hWithSteps.page.previewImages.value], []);
   hWithSteps.page.dispose();
 
   const hOnlyCopy = harness({ url: 'https://shop.test/detail?goods_id=D_ONLY_COPY&platform=jd', useRealVue: true });
