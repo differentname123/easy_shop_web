@@ -54,6 +54,28 @@ def generate_tb_sign(params: dict, app_secret: str) -> str:
     return hashlib.md5(query_str.encode("utf-8")).hexdigest().upper()
 
 
+def _all_full_tb_encrypted_ids(raw_item_id: Any) -> bool:
+    """判断传入的淘宝 item_id 是否全为合法完整加密 ID（<prefix>-<suffix>）。"""
+    raw = str(raw_item_id or "").strip()
+    if not raw:
+        return False
+    parts = [p.strip() for p in raw.split(",")]
+    if not parts or any(not p for p in parts):
+        return False
+    for part in parts:
+        if "-" not in part:
+            return False
+        prefix, suffix = part.split("-", 1)
+        if (
+            len(prefix) < 15
+            or len(suffix) < 12
+            or not all(c.isalnum() or c == "_" for c in prefix)
+            or not all(c.isalnum() or c == "_" for c in suffix)
+        ):
+            return False
+    return True
+
+
 def call_tb_api(
     app_key: str,
     app_secret: str,
@@ -139,6 +161,15 @@ def call_tb_api(
             )
         elif sub_code_str == "50001" and method == "taobao.tbk.dg.material.optional.upgrade":
             logger.debug("【淘宝接口无结果】接口[%s] 返回空结果 [50001]", method)
+        elif (
+            sub_code_str == "50001"
+            and method == "taobao.tbk.item.info.upgrade.get"
+            and _all_full_tb_encrypted_ids(biz_params.get("item_id"))
+        ):
+            logger.debug(
+                "【淘宝商品已下架或无推广】接口[%s] 返回空结果 [50001] (完整加密ID，属正常业务下架)",
+                method,
+            )
         else:
             logger.warning(
                 "❌ 【淘宝网关异常】淘宝开放平台返回业务错误 | 接口[%s] 错误码[%s] | 详情<%s> | 排查方向<请检查TOP应用权限、SessionKey有效期或请求参数>",

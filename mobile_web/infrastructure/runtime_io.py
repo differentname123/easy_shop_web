@@ -201,7 +201,7 @@ def bootstrap_script(
             configure_transport(dns_mode=st.pdd_dns_mode, trust_env=st.pdd_trust_env)
         except Exception:
             pass
-    return configure_named_logger(
+    target_logger = configure_named_logger(
         logger_name,
         log_path=log_path,
         max_bytes=max_bytes,
@@ -210,3 +210,16 @@ def bootstrap_script(
         fmt=fmt,
         datefmt=datefmt,
     )
+    if logger_name != "mobile_web":
+        app_logger = logging.getLogger("mobile_web")
+        if not any(getattr(h, "_mobile_web_handler", False) for h in app_logger.handlers):
+            for prev_h in tuple(getattr(app_logger, "_script_bridge_handlers", ()) or ()):
+                app_logger.removeHandler(prev_h)
+            bridged_handlers = list(target_logger.handlers)
+            for h in bridged_handlers:
+                if h not in app_logger.handlers:
+                    app_logger.addHandler(h)
+            app_logger._script_bridge_handlers = bridged_handlers
+            app_logger.setLevel(max(level, logging.WARNING))
+            app_logger.propagate = False
+    return target_logger

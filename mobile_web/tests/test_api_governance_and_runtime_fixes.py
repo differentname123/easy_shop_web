@@ -979,6 +979,71 @@ def test_pdd_sign_cache_upgrade_and_non_fallback_errors_and_unwrap_session():
         cleaner.close()
 
 
+def test_bootstrap_script_routes_mobile_web_warnings_to_script_stdout_not_stderr(tmp_path, capsys, monkeypatch):
+    from infrastructure.api_governance import get_process_role, set_process_role
+    from infrastructure.runtime_io import bootstrap_script
+
+    monkeypatch.delenv("WEB_LOG_DIR", raising=False)
+    app_logger = logging.getLogger("mobile_web")
+    script_logger_name = f"test_script_logger_{os.getpid()}_{int(time.time() * 1000)}"
+    script_logger = logging.getLogger(script_logger_name)
+
+    orig_handlers = list(app_logger.handlers)
+    orig_level = app_logger.level
+    orig_propagate = app_logger.propagate
+    has_bridge_attr = hasattr(app_logger, "_script_bridge_handlers")
+    orig_bridge = getattr(app_logger, "_script_bridge_handlers", None)
+    orig_role = get_process_role()
+    log_file = tmp_path / "script.log"
+
+    try:
+        # Ensure clean slate for test (no _mobile_web_handler from prior Web tests)
+        app_logger.handlers = [h for h in orig_handlers if not getattr(h, "_mobile_web_handler", False)]
+        capsys.readouterr()
+
+        target = bootstrap_script(
+            "test_role",
+            script_logger_name,
+            log_path=log_file,
+            configure_network=False,
+        )
+        assert target is script_logger
+
+        sub_logger = logging.getLogger("mobile_web.tb_client")
+        sub_logger.info("suppressed info log")
+        sub_logger.warning("hello warn")
+
+        for h in target.handlers:
+            h.flush()
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert "hello warn" in captured.out
+        assert "suppressed info log" not in captured.out
+
+        file_text = log_file.read_text(encoding="utf-8")
+        assert "hello warn" in file_text
+        assert "suppressed info log" not in file_text
+    finally:
+        for h in list(script_logger.handlers):
+            script_logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        if hasattr(script_logger, "_named_logger_sig"):
+            delattr(script_logger, "_named_logger_sig")
+        app_logger.handlers = orig_handlers
+        app_logger.setLevel(orig_level)
+        app_logger.propagate = orig_propagate
+        if has_bridge_attr:
+            app_logger._script_bridge_handlers = orig_bridge
+        elif hasattr(app_logger, "_script_bridge_handlers"):
+            delattr(app_logger, "_script_bridge_handlers")
+        set_process_role(orig_role)
+
+
+
 
 
 

@@ -129,7 +129,7 @@
      - `open_gaoyongzhuanlian_tkl.ashx`：实测直接传入裸加密 `item_id` 即可一步转链（不一定需要补全 `uland` 前缀），同时也接受 `uland`/`item.taobao.com/{加密id}`/`s.click`/口令；不支持混排长文案、数字 ID 与 `wh_alimama` 会场链（均报 `301: 商品ID解析错误` 或 `不支持数字id`）。
      - `open_gaoyongzhuanlian_tkl_piliang.ashx`：**不支持**裸加密 `item_id`（报 `301: 转链失败`），支持 `uland`/`s.click`/口令/混排长文案；对带 `wh_alimama=true` 的联盟会场页（2026-11-23 13:14 拉取真实库内 `pages.tmall.com/wow/z/lianmeng/default/route?wh_alimama=true` 与 `pages-fast.m.taobao.com/...&wh_alimama=true` 实测）返回 `status=200, tao_id=""` 并附带含 `ali_trackid`（或 `s.click.taobao.com`）的推广会场直链，而不带 `wh_alimama=true` 的普通 `pages-fast.m.taobao.com/wow/bz/jingmi/...` 活动页则报 `301`——代码不得仅因 `tao_id` 为空而丢弃有效会场推广链！
      - 折淘客淘宝 `api_detail.ashx`：支持裸加密 `item_id` 与 `uland` 链接，但对 **19 位剥离后缀** 与 **已下架加密 ID** 均返回 `status=200` 且带 1 条 `tao_id=""` 的占位空记录（二义性陷阱！调用方必须校验 `tao_id` 非空，否则不可当作有效详情）。
-     - TOP 官方 `taobao.tbk.item.info.upgrade.get`：实测支持最多 **20 个**加密 `item_id` 批量查询；通过 **`input_item_iid`** 与入参 **5/5 100% 精准对齐**；批量中混入下架 ID 或伪造假 ID 时均仅剔除坏项（返回 4/5），**不连坐同批正常商品**；对下架 ID、19 位后缀及 URL 入参均返回 `50001: 无结果`。
+     - TOP 官方 `taobao.tbk.item.info.upgrade.get`：实测支持最多 **20 个**加密 `item_id` 批量查询；通过 **`input_item_iid`** 与入参 **5/5 100% 精准对齐**；批量中混入下架 ID 或伪造假 ID 时均仅剔除坏项（返回 4/5），**不连坐同批正常商品**；对下架 ID、19 位后缀及 URL 入参均返回 `50001: 无结果`（`tb_client.call_tb_api` 仅当 `item_id` 全为合法完整 `<prefix>-<suffix>` 加密 ID 返 `50001` 时按正常业务下架记录 `DEBUG` 静默日志，若传入截断后缀/数字 ID 或遇 `40001`/权限/网络错误仍严格打印 `❌ 【淘宝网关异常】`）。
      - 好单库淘宝 `v2/item_detail`：实测支持有效加密 `item_id` 返回 `code=200`，下架 ID 或 19 位后缀返回 `该宝贝详情不存在`，纯数字 ID 返回 `暂不支持搜索`。
   3. **当前账户授权与跨天复测终局备注（2026-11-23 13:05，+11.5h 复测）**：
      - `taobao_session`（24 小时短效）跨天仍报 `27:invalid-sessionkey` 且未配置 `taobao_refresh_token`，确认永久失效直至重新授权；正式备案核验与邀请码依赖折淘客 90 天长效 `sid` 完成；

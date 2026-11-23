@@ -752,26 +752,39 @@ def test_tb_top_errors_enforce_fail_closed_red_cross_policy(monkeypatch):
         ),
     )
 
-    def _call(method, body):
+    def _call(method, body, item_id="123456"):
         http = SimpleNamespace(post=Mock(return_value=reply(body)))
         return tb_client.call_tb_api(
             "app_key",
             "app_secret",
             method,
-            {"item_id": "123456"},
+            {"item_id": item_id},
             http_session=http,
         )
 
-    # 详情接口返回 50001 / 40001 / 应用级错误 -> 可能存在传参截断或内部调用问题，一律打 ❌
-    for err_body in (
-        {"error_response": {"code": 15, "msg": "Remote service error", "sub_code": "50001", "sub_msg": "无结果"}},
-        {"error_response": {"code": 15, "msg": "Remote service error", "sub_code": "40001", "sub_msg": "内部调用失败"}},
-        {"error_response": {"code": 11, "msg": "Insufficient isv permissions", "sub_code": "invalid-appkey", "sub_msg": "无效AppKey"}},
+    err_50001 = {"error_response": {"code": 15, "msg": "Remote service error", "sub_code": "50001", "sub_msg": "无结果"}}
+    # 详情接口：纯数字ID / 截断19位后缀返 50001，或 40001 / 应用级错误 -> 存在传参截断或内部/权限问题，仍严格打 ❌
+    for item_id, err_body in (
+        ("123456", err_50001),
+        ("5n9p6DJF6yr3QZWzFNY", err_50001),
+        ("123456", {"error_response": {"code": 15, "msg": "Remote service error", "sub_code": "40001", "sub_msg": "内部调用失败"}}),
+        ("123456", {"error_response": {"code": 11, "msg": "Insufficient isv permissions", "sub_code": "invalid-appkey", "sub_msg": "无效AppKey"}}),
     ):
         records.clear()
-        res = _call("taobao.tbk.item.info.upgrade.get", err_body)
+        res = _call("taobao.tbk.item.info.upgrade.get", err_body, item_id=item_id)
         assert res["status"] == "error"
         assert any("❌ 【淘宝网关异常】" in msg for _, msg in records)
+
+    # 详情接口：完整合法加密 ID（单条或逗号批量）返 50001 无结果 -> 属正常下架/停推，仅打 DEBUG、不打 ❌
+    full_enc_1 = "WqPZ75y2fotwAOaztaMPhQta-7y5e70phOjGZ3KV9hVb"
+    full_enc_2 = "BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY"
+    for valid_item_id in (full_enc_1, f"{full_enc_1},{full_enc_2}"):
+        records.clear()
+        res_off = _call("taobao.tbk.item.info.upgrade.get", err_50001, item_id=valid_item_id)
+        assert res_off["status"] == "error"
+        assert res_off["error_code"] == "50001"
+        assert any(lvl == "DEBUG" for lvl, _ in records)
+        assert all("❌" not in msg for _, msg in records)
 
     # 搜索接口 50001 与官方 24h SessionKey 自动切通道 -> 确定无需运维介入，绝不打 ❌
     records.clear()
