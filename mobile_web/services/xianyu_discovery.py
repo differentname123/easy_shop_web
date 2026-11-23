@@ -24,11 +24,12 @@ import os
 import time
 import unicodedata
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from pymongo import UpdateOne
 
 from adapters import get_adapter, normalize_platform
+from models.product import ProductRef
 from infrastructure.ai_api.json_parser import parse_llm_json as string_to_object
 from infrastructure.ai_api.model_api import generate_content
 from infrastructure.api_governance import api_caller_context
@@ -566,14 +567,78 @@ def _rank_category_candidates(
     return top_unit, ranked
 
 
+def _batch_verify_live_activity_prices(
+    items: Sequence[Tuple[str, str, str, float]],
+) -> Dict[Tuple[str, str], Optional[float]]:
+    """按平台合并每批 <=20 条调用 adapter.batch_get_goods_details 批量官方验价，单条坏/下架不影响同批正常项。"""
+    results: Dict[Tuple[str, str], Optional[float]] = {}
+    if not items:
+        return results
+    grouped: Dict[str, List[Tuple[str, str, str, float, ProductRef]]] = defaultdict(list)
+    seen: Set[Tuple[str, str]] = set()
+    for platform, product_id, goods_sign, fallback_price in items:
+        plat = normalize_platform(platform)
+        pid = str(product_id or "").strip()
+        gsign = str(goods_sign or "").strip()
+        key = (plat, pid)
+        if not pid or key in seen:
+            continue
+        seen.add(key)
+        ref = ProductRef(plat, pid, gsign or None)
+        grouped[plat].append((pid, gsign, ref.key, float(fallback_price or 0.0), ref))
+
+    for plat, entries in grouped.items():
+        try:
+            adapter = get_adapter(plat)
+            batch_fn = getattr(adapter, "batch_get_goods_details", None)
+        except Exception as exc:
+            logger.warning(f"⚠️ [官方批量验价获取适配器异常] [{plat.upper()}] 沿用入库价 | 异常={exc}")
+            for pid, _gs, _rk, fb_p, _ref in entries:
+                results[(plat, pid)] = round(fb_p, 2) if fb_p > 0 else None
+            continue
+
+        if not callable(batch_fn):
+            for pid, gs, _rk, fb_p, _ref in entries:
+                results[(plat, pid)] = _verify_live_activity_price(plat, pid, gs, fb_p)
+            continue
+
+        for idx in range(0, len(entries), 20):
+            chunk = entries[idx:idx + 20]
+            try:
+                with api_caller_context("background"):
+                    batch_map = batch_fn([e[4] for e in chunk]) or {}
+            except Exception as exc:
+                logger.warning(f"⚠️ [官方批量验价异常] [{plat.upper()}] 沿用入库价 | 异常={exc}")
+                for pid, _gs, _rk, fb_p, _ref in chunk:
+                    results[(plat, pid)] = round(fb_p, 2) if fb_p > 0 else None
+                continue
+
+            for pid, _gs, ref_key, fb_p, _ref in chunk:
+                res = batch_map.get(ref_key) or batch_map.get(pid)
+                if isinstance(res, dict):
+                    if str(res.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION":
+                        logger.warning(f"🚫 [官方验价淘汰] [{plat.upper()}:{pid}] 商品已下架或取消推广，跳过该候选")
+                        results[(plat, pid)] = None
+                        continue
+                    if res.get("status") == "success" and isinstance(res.get("data"), dict):
+                        live_p = _num(res["data"].get("activity_price") or res["data"].get("price"), 0.0)
+                        if live_p > 0:
+                            results[(plat, pid)] = round(live_p, 2)
+                            continue
+                results[(plat, pid)] = round(fb_p, 2) if fb_p > 0 else None
+    return results
+
+
 def _pick_verified_candidate_from_category(
     cat_name: str,
     raw_items: List[Tuple[Dict[str, Any], Dict[str, Any], float]],
     source_type: str = SOURCE_TYPE_OFFICIAL,
+    prefetched_prices: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
+    ranked_override: Optional[Tuple[str, List[Dict[str, Any]]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """从单个类别选出 1 个通过官方价格校验（正式源）或时效校验（线报源）的待比价候选商品。"""
     src_type = _normalize_source_type(source_type)
-    top_unit, ranked = _rank_category_candidates(raw_items)
+    top_unit, ranked = ranked_override if ranked_override is not None else _rank_category_candidates(raw_items)
     if not ranked:
         return None
 
@@ -589,7 +654,10 @@ def _pick_verified_candidate_from_category(
         plat = normalize_platform(doc.get("platform") or "pdd")
         pid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
         gsign = str(doc.get("goods_sign") or "").strip()
-        live_price = _verify_live_activity_price(plat, pid, gsign, cand["db_activity_price"])
+        if prefetched_prices is not None and (plat, pid) in prefetched_prices:
+            live_price = prefetched_prices[(plat, pid)]
+        else:
+            live_price = _verify_live_activity_price(plat, pid, gsign, cand["db_activity_price"])
         if live_price is None or live_price <= 0:
             continue
         if live_price > cand["db_activity_price"] * 1.30:
@@ -777,11 +845,35 @@ def select_round_candidates_for_source(
     top_preview = ", ".join(f"{k}({len(v)}款/已比{cat_eval_counts.get(k, 0)}次)" for k, v in sorted_cats[:12])
     target_desc = "全部" if max_categories <= 0 else str(max_categories)
 
+    preranked_by_cat: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
+    prefetched_prices: Optional[Dict[Tuple[str, str], Optional[float]]] = None
+    if src_type == SOURCE_TYPE_OFFICIAL and sorted_cats:
+        batch_scan_limit = min(len(sorted_cats), max_categories * 2) if max_categories > 0 else len(sorted_cats)
+        verify_items: List[Tuple[str, str, str, float]] = []
+        for cat_name, raw_items in sorted_cats[:batch_scan_limit]:
+            top_unit, ranked = _rank_category_candidates(raw_items)
+            preranked_by_cat[cat_name] = (top_unit, ranked)
+            if ranked:
+                doc0 = ranked[0]["doc"]
+                plat0 = normalize_platform(doc0.get("platform") or "pdd")
+                pid0 = str(doc0.get("product_id") or doc0.get("goods_id") or "").strip()
+                gsign0 = str(doc0.get("goods_sign") or "").strip()
+                if pid0:
+                    verify_items.append((plat0, pid0, gsign0, ranked[0]["db_activity_price"]))
+        if verify_items:
+            prefetched_prices = _batch_verify_live_activity_prices(verify_items)
+
     candidates: List[Dict[str, Any]] = []
     for cat_name, raw_items in sorted_cats:
         if max_categories > 0 and len(candidates) >= max_categories:
             break
-        picked = _pick_verified_candidate_from_category(cat_name, raw_items, source_type=src_type)
+        picked = _pick_verified_candidate_from_category(
+            cat_name,
+            raw_items,
+            source_type=src_type,
+            prefetched_prices=prefetched_prices,
+            ranked_override=preranked_by_cat.get(cat_name),
+        )
         if picked is not None:
             candidates.append(picked)
 

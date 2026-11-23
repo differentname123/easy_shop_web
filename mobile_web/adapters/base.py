@@ -37,7 +37,15 @@ DEFAULT_HOT_CHANNELS = (
 
 class BasePlatformAdapter(ABC):
     """
-    电商导购联盟适配器抽象基类
+    电商导购联盟适配器抽象基类（8 大最小底层基础模块契约入口，详见 `mobile_web/adapters/README.md`）：
+    ① get_recommend_goods        榜单推荐
+    ② search_goods               全网关键词搜索
+    ③ get_goods_detail / batch_get_goods_details  单品与 20 批量权威查卡
+    ④ resolve_product_from_link  外部链接/口令/文案解析（API 优先、按需解包）
+    ⑤ convert_promotion_url      专属推广转链（区分匿名站长 vs 个人归因）
+    ⑥ resolve_and_convert_universal  万能转链组合唯一入口（④ + ⑤）
+    ⑦ check_authority / generate_authority_url  推手渠道备案核验与引导码
+    ⑧ fetch_increment_orders     增量返利订单同步
     """
     platform_code: str = ""
     platform_name: str = ""
@@ -50,6 +58,7 @@ class BasePlatformAdapter(ABC):
     requires_material_url: bool = False
     supports_coupon_enrichment: bool = False
     preserves_known_coupons_across_rank: bool = False
+    batch_detail_includes_gallery: bool = True
     default_promoter_id: str = ""
     order_window_seconds: int = 23 * 3600
     capabilities = None
@@ -269,6 +278,38 @@ class BasePlatformAdapter(ABC):
         :return: {"status": "success", "data": Dict}
         """
         pass
+
+    def batch_get_goods_details(
+        self,
+        refs: Sequence[ProductRef],
+        **kwargs,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        底层最小模块 ③ 批量查卡契约（单批最多 20 条，按请求 key 精确对齐且坏项不连坐）：
+        - 默认兜底：逐条调用 `get_goods_detail`；
+        - TB (`item.info.upgrade`) / JD (`goods_query` / `HDK`) 返回完整多图轮播 (`batch_detail_includes_gallery = True`)；
+        - PDD (`pdd.ddk.goods.search(goods_sign_list)`) 不返回 `goods_gallery_urls` (`batch_detail_includes_gallery = False`)，仅用于 20 批量实时价格/促销状态核验，不得直接用于详情页图库缓存与预取。
+        :return: Dict[ref.key, {"status": "success"|"error", "data": ProductDetail, ...}]
+        """
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        for item_ref in refs or ():
+            resolved = self.resolve_product_ref(
+                goods_id_or_sign=item_ref.key,
+                goods_id=item_ref.goods_id,
+                goods_sign=item_ref.goods_sign,
+            )
+            key = resolved.key or item_ref.key
+            if not key:
+                continue
+            if key in outcomes:
+                continue
+            outcomes[key] = self.get_goods_detail(
+                goods_id_or_sign=resolved.goods_sign or resolved.goods_id,
+                goods_id=resolved.goods_id or None,
+                goods_sign=resolved.goods_sign or None,
+                **kwargs,
+            )
+        return outcomes
 
     @abstractmethod
     def convert_promotion_url(

@@ -670,3 +670,213 @@ def test_seed_pulls_full_rank_summaries_without_fetching_extra_details():
     finally:
         worker.stop()
 
+
+def test_worker_batches_same_platform_snapshotless_tasks_and_product_service_batch_prefetch(monkeypatch):
+    """验证 DetailPrefetcher 同平台 <=20 批量聚合与 ProductService.prefetch_product_details_batch 单条失败隔离。"""
+    from cache import clear_all_caches
+    from repositories.product_repo import ProductRepository
+    from services.product_service import ProductService
+
+    # 1. DetailPrefetcher 将同平台无快照任务聚合成批、跨平台与带快照任务不混批
+    batch_sizes = []
+
+    class BatchService:
+        def __init__(self):
+            self.prefetcher = None
+            self.single_calls = []
+
+        def prefetch_product_detail(self, ref, **kwargs):
+            self.single_calls.append((ref.platform, ref.goods_id, kwargs.get("snapshot") is not None))
+            return DetailPrefetchResult("ready", next_check_at=2000)
+
+        def prefetch_product_details_batch(self, refs, **kwargs):
+            batch_sizes.append((refs[0].platform, [r.goods_id for r in refs]))
+            return {r.key: DetailPrefetchResult("ready", next_check_at=2000) for r in refs}
+
+    svc = BatchService()
+    worker = DetailPrefetcher(svc, seed_enabled=False, clock=Clock(1000))
+    # 未启动 worker 前不能入队，先直接构造运行并在停止状态前先挂起？用 start + 条件批量入队
+    with worker._condition:
+        worker._accepting = True
+        for i in range(4):
+            worker._offer_detail(ProductRef("jd", f"jd_{i}", f"jd_sign_{i}"))
+        worker._offer_detail(ProductRef("pdd", "pdd_0", "pdd_sign_0"))
+    worker.start()
+    idle(worker)
+    worker.stop()
+    assert ("jd", [f"jd_{i}" for i in range(4)]) in batch_sizes
+    assert any(c[:2] == ("pdd", "pdd_0") for c in svc.single_calls)
+
+    # 2. ProductService.prefetch_product_details_batch 隔离坏项/下架并写入正常项
+    clear_all_caches()
+    docs = {}
+
+    class MemRepo:
+        def __init__(self):
+            self.upserted = []
+            self.deleted = []
+
+        def get_product_detail(self, key, platform="jd", **_kw):
+            return docs.get((platform, key))
+
+        def get_known_goods_sign(self, platform, goods_id):
+            return None
+
+        def upsert_product_detail(self, item, only_if_newer=False):
+            self.upserted.append(item)
+            return True
+
+        def delete_product(self, platform, goods_id=None, goods_sign=None):
+            self.deleted.append((platform, goods_id, goods_sign))
+            return 1
+
+    repo = MemRepo()
+    psvc = ProductService(product_repo=repo)
+    fake_adapter = SimpleNamespace(
+        active=True,
+        platform_name="京东",
+        capabilities={"detail": True},
+        batch_get_goods_details=lambda refs, **_kw: {
+            refs[0].key: {
+                "status": "success",
+                "data": {
+                    "platform": "jd",
+                    "platform_name": "京东",
+                    "goods_id": "ok_img_1",
+                    "goods_sign": "sign_ok_1",
+                    "name": "批量正常商品",
+                    "image_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/ok.jpg",
+                    "price": 19.9,
+                },
+            },
+            refs[1].key: {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "下架"},
+        },
+    )
+    monkeypatch.setattr("services.product_service.get_adapter", lambda _plat: fake_adapter)
+    res_map = psvc.prefetch_product_details_batch([
+        ProductRef("jd", "ok_img_1", "sign_ok_1"),
+        ProductRef("jd", "off_img_2", "sign_off_2"),
+    ])
+    assert res_map["sign_ok_1"].status == "ready"
+    assert res_map["sign_off_2"].status == "skipped"
+    assert res_map["sign_off_2"].error_code == "PRODUCT_OFF_PROMOTION"
+    assert len(repo.upserted) == 1 and repo.upserted[0]["goods_id"] == "ok_img_1"
+    assert ("jd", "off_img_2", "sign_off_2") in repo.deleted
+    clear_all_caches()
+
+
+def test_prefetch_skips_batch_when_batch_detail_lacks_gallery_and_skips_cacheable_false(monkeypatch):
+    """验证 batch_detail_includes_gallery=False 时预取改走单品详情，且 cacheable=False 不写入详情缓存/DB。"""
+    from cache import clear_all_caches
+    from services.product_service import ProductService
+
+    clear_all_caches()
+
+    class MemRepo:
+        def __init__(self):
+            self.docs = {}
+            self.upserted = []
+
+        def get_product_detail(self, key, platform="pdd", **_kw):
+            return self.docs.get((platform, key))
+
+        def get_known_goods_sign(self, platform, goods_id):
+            return None
+
+        def upsert_product_detail(self, item, only_if_newer=False):
+            self.upserted.append(item)
+            self.docs[(item.get("platform", "pdd"), item.get("goods_id"))] = item
+            return True
+
+        def upsert_home_products(self, items, channel_type=None):
+            return 0
+
+        def delete_product(self, platform, goods_id=None, goods_sign=None):
+            return 0
+
+        def get_deal_tip_view(self, pid, platform="pdd"):
+            return ("not_found", None)
+
+    repo = MemRepo()
+    psvc = ProductService(product_repo=repo)
+    single_calls = []
+
+    def _forbid_batch(*_args, **_kwargs):
+        raise AssertionError("batch_get_goods_details must not run when batch_detail_includes_gallery is False")
+
+    def _single_detail(goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **_kw):
+        single_calls.append((goods_id, goods_sign))
+        return {
+            "status": "success",
+            "data": {
+                "platform": "pdd",
+                "platform_name": "拼多多",
+                "goods_id": goods_id or "101",
+                "goods_sign": goods_sign or "SIGN_101",
+                "name": "多图拼多多商品",
+                "image_url": "https://img.pddpic.com/a.jpg",
+                "carousel_images": [
+                    "https://img.pddpic.com/a.jpg",
+                    "https://img.pddpic.com/b.jpg",
+                    "https://img.pddpic.com/c.jpg",
+                ],
+                "price": 19.9,
+            },
+        }
+
+    pdd_adapter = SimpleNamespace(
+        active=True,
+        platform_name="拼多多",
+        capabilities={"detail": True},
+        batch_detail_includes_gallery=False,
+        resolve_product_ref=lambda goods_id_or_sign="", goods_id=None, goods_sign=None: ProductRef("pdd", goods_id or "", goods_sign or ""),
+        batch_get_goods_details=_forbid_batch,
+        get_goods_detail=_single_detail,
+    )
+    monkeypatch.setattr("services.product_service.get_adapter", lambda _plat: pdd_adapter)
+
+    res_map = psvc.prefetch_product_details_batch([
+        ProductRef("pdd", "101", "SIGN_101"),
+        ProductRef("pdd", "102", "SIGN_102"),
+    ])
+    assert res_map["SIGN_101"].status == "ready"
+    assert res_map["SIGN_102"].status == "ready"
+    assert len(single_calls) == 2
+    assert len(repo.upserted) == 2
+    assert len(repo.upserted[0]["carousel_images"]) == 3
+
+    # 2. cacheable=False（如限流降级 goods.search 无图库结果）可直接返回展示，但不得持久化或写入内存详情缓存
+    clear_all_caches()
+    repo.upserted.clear()
+    fallback_calls = 0
+
+    def _non_cacheable_detail(**_kw):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return {
+            "status": "success",
+            "cacheable": False,
+            "_provider": "pdd_goods_search_sign_detail",
+            "data": {
+                "platform": "pdd",
+                "platform_name": "拼多多",
+                "goods_id": "202",
+                "goods_sign": "SIGN_202",
+                "name": "限流降级单图商品",
+                "image_url": "https://img.pddpic.com/only1.jpg",
+                "carousel_images": ["https://img.pddpic.com/only1.jpg"],
+                "price": 9.9,
+            },
+        }
+
+    pdd_adapter.get_goods_detail = _non_cacheable_detail
+    first = psvc.get_goods_detail(platform="pdd", goods_id="202", goods_sign="SIGN_202")
+    second = psvc.get_goods_detail(platform="pdd", goods_id="202", goods_sign="SIGN_202")
+    assert first["status"] == "success" and first["data"]["name"] == "限流降级单图商品"
+    assert second["status"] == "success"
+    assert fallback_calls == 2
+    assert len(repo.upserted) == 0
+    clear_all_caches()
+
+
+

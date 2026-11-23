@@ -4,7 +4,7 @@
 2. 京东平台：高配额全网搜索、详情反查及专属转链支持。
 """
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 import requests
 
 from infrastructure.api_governance import (
@@ -21,7 +21,7 @@ from infrastructure.http_utils import (
     normalize_http_url,
     parse_appkey_list,
 )
-from infrastructure.jd_client import product_url as jd_product_url, resolve_jd_short_url
+from infrastructure.jd_client import is_encrypted_jd_item_id, product_url as jd_product_url, resolve_jd_short_url
 from infrastructure.logging_utils import get_app_logger
 from infrastructure.transport import create_http_session
 from models.product import extract_canonical_goods_id
@@ -266,33 +266,35 @@ class HdkClient:
         page_size: int = 20,
         union_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """全网京东联盟在推商品搜索 (接口 id=50: v3/jd_goods_search)。"""
+        """全网京东联盟在推商品搜索 (接口 id=50: v3/jd_goods_search；back 必须从 1,2,5,10,20,30,50 离散值选取)。"""
         kw = clean_text(keyword)
         if not kw:
             return _error("INVALID_ARGUMENT", "搜索关键词不能为空")
         uid = clean_text(union_id) or self.union_id
         cur_page = max(1, int(page or 1))
-        size = min(100, max(1, int(page_size or 20)))
+        size = min(50, max(1, int(page_size or 20)))
+        api_back = next((b for b in (1, 2, 5, 10, 20, 30, 50) if b >= size), 50)
         params = {
             "keyword": kw,
             "min_id": cur_page,
             "page": cur_page,
-            "back": size,
-            "page_size": size,
+            "back": api_back,
+            "page_size": api_back,
             "union_id": uid or None,
         }
         res = self._request("GET", "jd_goods_search", params=params)
         if res.get("status") != "success":
             return res
         rows = res.get("data")
-        items = rows if isinstance(rows, list) else []
+        raw_list = rows if isinstance(rows, list) else []
+        items = raw_list[:size]
         return {
             "status": "success",
             "data": items,
             "total_count": len(items),
             "page": cur_page,
             "page_size": size,
-            "has_more": len(items) >= size,
+            "has_more": len(raw_list) > size or len(raw_list) >= api_back,
         }
 
     def get_jd_hot_rank(
@@ -332,10 +334,23 @@ class HdkClient:
         allow_single_url_match: bool = False,
         expected_sku: str = "",
     ) -> Dict[str, Any]:
-        """通过加密 itemId、数字 SKU 或推广链接反查京东商品完整卡片（ID 查询严格校验身份防串货）。"""
+        """通过加密 itemId 或推广链接反查京东商品完整卡片（ID 查询严格校验身份，严防退化返多条爆品串货）。"""
         target = clean_text(goods_id_or_sign)
         if not target:
             return _error("INVALID_ARGUMENT", "商品标识不能为空")
+        if "," in target and not target.startswith(("http://", "https://")):
+            return _error("INVALID_ARGUMENT", "单品详情查询不支持逗号拼接多ID，请改用批量接口")
+        # 50 位标准 JD 加密 ID 严格走 itemIds= 参数，禁止走 keyword=（实测 keyword= 会对未命中密文回显原ID并返回无关爆品）
+        if is_encrypted_jd_item_id(target):
+            b_res = self.batch_get_goods_details([target], union_id=union_id)
+            if b_res.get("status") != "success":
+                return b_res
+            b_rows = b_res.get("data") or []
+            if not b_rows:
+                return _error("NOT_FOUND", "好单库未找到该商品详情", not_found=True)
+            if len(b_rows) == 1 and isinstance(b_rows[0], dict):
+                return {"status": "success", "data": b_rows[0]}
+            return _error("PRODUCT_IDENTITY_MISMATCH", "好单库搜索返回与目标商品身份不一致")
         search_res = self.search_goods(target, page=1, page_size=10, union_id=union_id)
         if search_res.get("status") != "success":
             return search_res
@@ -364,11 +379,54 @@ class HdkClient:
                 r0_item = clean_text(r0.get("itemid"))
                 if r0_sku == exp_sku or r0_item == exp_sku:
                     matched = r0
+                elif (
+                    exp_sku.isdigit()
+                    and not (r0_sku and r0_sku.isdigit())
+                    and not (r0_item and r0_item.isdigit())
+                    and clean_text(r0.get("goodsname") or r0.get("itemtitle") or r0.get("skuName"))
+                    and normalize_http_url(r0.get("itempic") or r0.get("jd_image") or r0.get("white_image"))
+                ):
+                    # 好单库 v3/jd_goods_search 返回的 skuid/itemid 全为50位加密串（不含纯数字SKU）；
+                    # 仅当双方皆为纯数字 SKU 时拒绝错配，对加密返回+有效图片标题的唯一单品放行。
+                    matched = r0
             else:
                 matched = r0
         if not matched:
             return _error("PRODUCT_IDENTITY_MISMATCH", "好单库搜索返回与目标商品身份不一致")
         return {"status": "success", "data": matched}
+
+    def batch_get_goods_details(
+        self,
+        item_ids: Sequence[str],
+        *,
+        union_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """批量查卡（GET v3/jd_goods_search，itemIds 单次硬上限 20 个；混入假 ID 不连坐）。"""
+        clean_ids = []
+        seen = set()
+        for raw_id in item_ids or ():
+            cid = clean_text(raw_id)
+            if not cid or cid.isdigit() or "," in cid or cid in seen:
+                continue
+            seen.add(cid)
+            clean_ids.append(cid)
+            if len(clean_ids) >= 20:
+                break
+        if not clean_ids:
+            return _error("INVALID_ARGUMENT", "批量详情查询缺少有效的加密商品ID")
+        uid = clean_text(union_id) or self.union_id
+        params = {
+            "itemIds": ",".join(clean_ids),
+            "min_id": 1,
+            "back": 20,
+            "union_id": uid or None,
+        }
+        res = self._request("GET", "jd_goods_search", params=params)
+        if res.get("status") != "success":
+            return res
+        rows = res.get("data")
+        items = [r for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)]
+        return {"status": "success", "data": items, "total_count": len(items)}
 
     def resolve_short_url(
         self,

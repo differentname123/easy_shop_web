@@ -279,6 +279,7 @@ class DealRawPoolRepository:
             pcol.create_index([("updated_at", -1)], background=True)
             pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.quality_score", -1), ("updated_at", -1)], background=True)
             pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.updated_at", 1)], background=True)
+            pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.last_seen_at", 1)], background=True)
             self._indexes_ready = True
         except Exception as e:
             logger.warning("初始化集合索引时发生异常（稍后自动重试）: %s", e)
@@ -295,7 +296,10 @@ class DealRawPoolRepository:
             res = self.formal_col.update_many(
                 {
                     "deal_info.is_deal_tip": True,
-                    "deal_info.updated_at": {"$lt": cutoff},
+                    "$or": [
+                        {"deal_info.last_seen_at": {"$lt": cutoff}},
+                        {"deal_info.last_seen_at": {"$exists": False}, "deal_info.updated_at": {"$lt": cutoff}},
+                    ],
                 },
                 {
                     "$set": {
@@ -453,19 +457,34 @@ class DealRawPoolRepository:
         if refresh_publish_time and ids:
             try:
                 id_variants = list(set(ids + [int(i) for i in ids if i.isdigit()]))
+                base_match = {
+                    "deal_info.source_site": site,
+                    "$or": [
+                        {"deal_info.source_item_id": {"$in": id_variants}},
+                        {"deal_info.merged_tip_ids": {"$in": id_variants}},
+                    ],
+                }
+                # 仍在榜好价仅续命 last_seen_at + publish_ts，不动 deal_info.updated_at，避免每 30 分钟引发全库云同步与搜索索引风暴
                 self.formal_col.update_many(
-                    {
-                        "deal_info.source_site": site,
-                        "$or": [
-                            {"deal_info.source_item_id": {"$in": id_variants}},
-                            {"deal_info.merged_tip_ids": {"$in": id_variants}},
-                        ],
-                    },
+                    {**base_match, "deal_info.is_deal_tip": True},
                     {
                         "$set": {
                             "deal_info.publish_ts": now_ts,
-                            "deal_info.updated_at": now,
+                            "deal_info.last_seen_at": now,
+                        }
+                    },
+                )
+                # 仅已失效重回榜单的好价复活时，才同步更新 deal_info.updated_at 触发增量同步
+                self.formal_col.update_many(
+                    {**base_match, "deal_info.is_deal_tip": {"$ne": True}},
+                    {
+                        "$set": {
                             "deal_info.is_deal_tip": True,
+                            "deal_info.expired_at": None,
+                            "deal_info.expire_reason": None,
+                            "deal_info.publish_ts": now_ts,
+                            "deal_info.last_seen_at": now,
+                            "deal_info.updated_at": now,
                         }
                     },
                 )
@@ -520,16 +539,27 @@ class DealRawPoolRepository:
             res["raw_expired"] = int(getattr(raw_res, "modified_count", 0) or 0)
 
             # 2. 清理正式表中属于该频道的好价标
-            formal_query: Dict[str, Any] = {
-                "deal_info.source_site": source_site,
-                "deal_info.is_deal_tip": True,
-                "deal_info.updated_at": {"$lt": sweep_start_time},
-            }
+            and_clauses: List[Dict[str, Any]] = [
+                {"deal_info.source_site": source_site},
+                {"deal_info.is_deal_tip": True},
+                {
+                    "$or": [
+                        {"deal_info.last_seen_at": {"$lt": sweep_start_time}},
+                        {
+                            "deal_info.last_seen_at": {"$exists": False},
+                            "deal_info.updated_at": {"$lt": sweep_start_time},
+                        },
+                    ]
+                },
+            ]
             if channel:
-                formal_query["$or"] = [
-                    {"deal_info.source_channel": channel},
-                    {"deal_info.seen_channels": channel},
-                ]
+                and_clauses.append({
+                    "$or": [
+                        {"deal_info.source_channel": channel},
+                        {"deal_info.seen_channels": channel},
+                    ]
+                })
+            formal_query: Dict[str, Any] = {"$and": and_clauses}
             formal_res = self.formal_col.update_many(
                 formal_query,
                 {

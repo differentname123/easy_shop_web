@@ -3,7 +3,7 @@
 import html
 import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from infrastructure.logging_utils import get_app_logger
 
@@ -47,6 +47,7 @@ from models.product import (
 _JD_SHORT_URL_RE = re.compile(r"https?://u\.jd\.com/[A-Za-z0-9_-]+")
 _JD_UNION_CLICK_URL_RE = re.compile(r"https?://union-click\.jd\.com/[^\s<>'\"（）()【】]+")
 _JD_NUMERIC_ITEM_URL_RE = re.compile(r"^https?://(?:item|item\.m)\.jd\.com/(?:product/)?(\d+)\.html(?:\?.*)?$", re.IGNORECASE)
+_JD_JCOMMAND_RE = re.compile(r"[！!][^！!\s\r\n]{4,}[！!]")
 
 
 JD_ORDER_STATUS = {
@@ -70,8 +71,14 @@ _is_encrypted_jd_item_id = is_encrypted_jd_item_id
 
 
 def _verified_jd_cipher_pair(requested_id, returned_id):
-    """请求与上游返回均为标准京东联盟双段加密 itemId 时，证实由京东联盟解密自同一 SKU（兼容跨 Key 重签名与商家换主图）。"""
-    return _is_encrypted_jd_item_id(requested_id) and _is_encrypted_jd_item_id(returned_id)
+    """同应用密钥池下动态时间戳重加盐身份匹配（rsplit("_", 1)[1] 后缀一致，允许前缀微调）；跨密钥池且主图变更须由 goods_query(oriItemId) 另行确证。"""
+    if not (_is_encrypted_jd_item_id(requested_id) and _is_encrypted_jd_item_id(returned_id)):
+        return False
+    if requested_id == returned_id:
+        return True
+    _, req_suffix = requested_id.rsplit("_", 1)
+    _, ret_suffix = returned_id.rsplit("_", 1)
+    return bool(req_suffix and req_suffix == ret_suffix)
 
 
 def _rank_coupon(purchase, base_price):
@@ -738,7 +745,7 @@ class JdAdapter(BasePlatformAdapter):
                 self._normalize_hdk_summary,
                 skip_invalid_rows=True,
             )))
-        if not self._has_ztk_catalog and self._has_jd_official and hasattr(self.client, "get_rank_goods_direct"):
+        if self._has_jd_official and hasattr(self.client, "get_rank_goods_direct"):
             base.append(("jd_official_rank", lambda: _paged_rank(
                 lambda pg, sz: self.client.get_rank_goods_direct(sort_val, page=pg, page_size=sz),
                 self._summary,
@@ -777,13 +784,15 @@ class JdAdapter(BasePlatformAdapter):
                     return _error("PROTOCOL_ERROR", "京东搜索商品身份或字段无效", data=[])
             return {**res, "data": data}
 
+        clean_kw = _text(keyword)
         base = []
         if self._has_ztk_catalog and hasattr(self.client, "query_union_goods"):
             base.append(("ztk_jd_goods_query", lambda: _wrap_search(
                 self.client.query_union_goods(keyword=keyword, page=page, page_size=page_size),
                 self._normalize_union_goods_summary,
             )))
-        if self._has_ztk_catalog:
+        # api_quanwang 实测搜索词不能少于 2 个字：>=2 字排第 2 梯队；1 字词优先让好单库搜索，实在无备用再走 api_quanwang
+        if self._has_ztk_catalog and len(clean_kw) >= 2:
             base.append(("ztk_jd_quanwang", lambda: _wrap_search(
                 self.client.search_goods(keyword, page=page, page_size=page_size),
                 self._summary,
@@ -794,10 +803,10 @@ class JdAdapter(BasePlatformAdapter):
                 self._normalize_hdk_summary,
                 skip_invalid_rows=True,
             )))
-        if not self._has_ztk_catalog and self._has_jd_official and hasattr(self.client, "query_union_goods_direct"):
-            base.append(("jd_official_goods_query", lambda: _wrap_search(
-                self.client.query_union_goods_direct(keyword=keyword, page=page, page_size=page_size),
-                self._normalize_union_goods_summary,
+        if self._has_ztk_catalog and len(clean_kw) < 2:
+            base.append(("ztk_jd_quanwang", lambda: _wrap_search(
+                self.client.search_goods(keyword, page=page, page_size=page_size),
+                self._summary,
             )))
 
         providers = self._compose_providers(
@@ -849,6 +858,32 @@ class JdAdapter(BasePlatformAdapter):
             return result
         return self._verify_detail_match(result.get("data"), ref, target_id)
 
+    def _try_union_query_detail(self, ref: ProductRef, target_id: str) -> Dict[str, Any]:
+        if not _is_encrypted_jd_item_id(target_id):
+            return {"status": "skipped", "reason": "union_goods_query_requires_encrypted_id"}
+        raw_res = self._guard_provider_result(self.client.query_union_goods(item_ids=target_id))
+        if raw_res.get("status") != "success":
+            return raw_res
+        rows = raw_res.get("data") or []
+        if not rows:
+            return _error("NOT_FOUND", "京东联盟详情未命中该加密商品", union_query_empty=True)
+        ori_matches = [
+            row for row in rows
+            if isinstance(row, dict) and clean_product_id(row.get("oriItemId")) == target_id
+        ]
+        if len(ori_matches) == 1:
+            matched = {"status": "success", "data": ori_matches[0]}
+        elif any(isinstance(row, dict) and clean_product_id(row.get("oriItemId")) for row in rows):
+            return _error("PRODUCT_IDENTITY_MISMATCH", "京东详情未证实请求商品身份")
+        else:
+            matched = self._verify_detail_match(rows, ref, target_id)
+        if matched.get("status") != "success":
+            return matched
+        try:
+            return {"status": "success", "data": self._normalize_union_goods_detail(matched["data"])}
+        except (ValueError, TypeError):
+            return _error("PROTOCOL_ERROR", "京东联盟详情字段无效")
+
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):
         unavailable = self._available("detail")
         if unavailable:
@@ -861,26 +896,7 @@ class JdAdapter(BasePlatformAdapter):
             return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU，不能直接使用主图哈希 ID")
 
         ztk_rate_limit_res: Optional[Dict[str, Any]] = None
-
-        def _detail_via_union_query(fetch_fn):
-            nonlocal ztk_rate_limit_res
-            if not _is_encrypted_jd_item_id(target_id):
-                return {"status": "skipped", "reason": "union_goods_query_requires_encrypted_id"}
-            raw_res = self._guard_provider_result(fetch_fn(target_id))
-            if raw_res.get("status") != "success":
-                if raw_res.get("error_code") == "RATE_LIMIT" or raw_res.get("catalog_cooling") is True:
-                    ztk_rate_limit_res = ztk_rate_limit_res or raw_res
-                return raw_res
-            rows = raw_res.get("data") or []
-            if not rows:
-                return _error("NOT_FOUND", "京东联盟详情未命中该加密商品")
-            matched = self._verify_detail_match(rows, ref, target_id)
-            if matched.get("status") != "success":
-                return matched
-            try:
-                return {"status": "success", "data": self._normalize_union_goods_detail(matched["data"])}
-            except (ValueError, TypeError):
-                return _error("PROTOCOL_ERROR", "京东联盟详情字段无效")
+        state = {"saw_301_off": False, "union_empty": False, "hdk_rate_limit": False}
 
         def _detail_via_ztk():
             nonlocal ztk_rate_limit_res
@@ -888,26 +904,8 @@ class JdAdapter(BasePlatformAdapter):
                 return {"status": "skipped", "reason": "non_official_jd_item_id"}
             result = self._fetch_item(ref)
             if result.get("status") != "success":
-                if (result.get("ztk_ambiguous_301") is True
-                        and _is_encrypted_jd_item_id(target_id)
-                        and self.default_promoter_id):
-                    # 【交叉探针裁决】：折淘客 api_detail.ashx 返回 301 时，用官方转链探针区分限流 vs 停推。
-                    probe = self.client.convert_promotion_link(
-                        f"https://jingfen.jd.com/detail/{target_id}.html",
-                        self.default_promoter_id,
-                    )
-                    if probe.get("status") == "success":
-                        if hasattr(self.client, "mark_catalog_rate_limited"):
-                            self.client.mark_catalog_rate_limited()
-                        confirmed_rl = _error(
-                            "RATE_LIMIT",
-                            "京东详情接口触发临时频控，商品仍在正常推广中",
-                            catalog_cooling=self._is_ztk_catalog_cooling() or True,
-                        )
-                        ztk_rate_limit_res = confirmed_rl
-                        return confirmed_rl
-                    if probe.get("jd_off_promotion") is True:
-                        return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
+                if result.get("ztk_ambiguous_301") is True:
+                    state["saw_301_off"] = True
                 if result.get("error_code") == "RATE_LIMIT" or result.get("catalog_cooling") is True:
                     ztk_rate_limit_res = ztk_rate_limit_res or result
                 return result
@@ -916,11 +914,23 @@ class JdAdapter(BasePlatformAdapter):
             except (ValueError, TypeError):
                 return _error("PROTOCOL_ERROR", "京东详情字段无效")
 
+        def _detail_via_union_query():
+            nonlocal ztk_rate_limit_res
+            res = self._try_union_query_detail(ref, target_id)
+            if res.get("status") != "success":
+                if res.get("union_query_empty") is True:
+                    state["union_empty"] = True
+                if res.get("error_code") == "RATE_LIMIT" or res.get("catalog_cooling") is True:
+                    ztk_rate_limit_res = ztk_rate_limit_res or res
+            return res
+
         def _detail_via_hdk():
             if target_id.isdigit():
                 return {"status": "skipped", "reason": "hdk_requires_encrypted_id"}
             res = self._guard_provider_result(self.hdk.get_goods_detail(target_id))
             if res.get("status") != "success":
+                if res.get("error_code") in ("RATE_LIMIT", "QUOTA_PACE_BACKLOG", "NETWORK_ERROR", "TIMEOUT"):
+                    state["hdk_rate_limit"] = True
                 return res
             raw_item = res.get("data") or {}
             try:
@@ -929,18 +939,15 @@ class JdAdapter(BasePlatformAdapter):
                 return _error("PROTOCOL_ERROR", f"好单库详情解析失败: {exc}")
 
         base = []
-        if self._has_ztk_catalog and hasattr(self.client, "query_union_goods"):
-            base.append(("ztk_jd_goods_query_detail", lambda: _detail_via_union_query(
-                lambda tid: self.client.query_union_goods(item_ids=tid)
-            )))
+        # 1. 首选独立 50.9 QPS 且不受选品库 1000 限流连坐的 api_detail.ashx
         if self._has_ztk_catalog:
             base.append(("ztk_jd_detail", _detail_via_ztk))
+        # 2. 备选折淘客 goods_query(itemIds=)，兼作 301 下架 vs 1000 限流的权威交叉校验
+        if self._has_ztk_catalog and hasattr(self.client, "query_union_goods"):
+            base.append(("ztk_jd_goods_query_detail", _detail_via_union_query))
+        # 3. 第三梯队好单库 v3/jd_goods_search（受深夜 533 冷却保护）
         if self.hdk is not None and hasattr(self.hdk, "get_goods_detail"):
             base.append(("hdk_jd_detail", _detail_via_hdk))
-        if not self._has_ztk_catalog and self._has_jd_official and hasattr(self.client, "query_union_goods_direct"):
-            base.append(("jd_official_goods_query_detail", lambda: _detail_via_union_query(
-                lambda tid: self.client.query_union_goods_direct(item_ids=tid)
-            )))
 
         providers = self._compose_providers(
             "detail",
@@ -952,15 +959,199 @@ class JdAdapter(BasePlatformAdapter):
             **kwargs,
         )
         res = self._execute_capability("detail", providers, allow_persist=self._is_real_http())
-        if (
-            res.get("status") != "success"
-            and ztk_rate_limit_res is not None
-            and res.get("error_code") != "PRODUCT_OFF_PROMOTION"
-        ):
-            if (res.get("catalog_cooling") is True or self._is_ztk_catalog_cooling()) and not ztk_rate_limit_res.get("catalog_cooling"):
-                return {**ztk_rate_limit_res, "catalog_cooling": True}
-            return ztk_rate_limit_res
+        if res.get("status") != "success":
+            if ztk_rate_limit_res is not None and res.get("error_code") != "PRODUCT_OFF_PROMOTION":
+                if (res.get("catalog_cooling") is True or self._is_ztk_catalog_cooling()) and not ztk_rate_limit_res.get("catalog_cooling"):
+                    return {**ztk_rate_limit_res, "catalog_cooling": True}
+                return ztk_rate_limit_res
+            if state["saw_301_off"] and state["union_empty"] and not state["hdk_rate_limit"]:
+                return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
         return res
+
+    def batch_get_goods_details(
+        self,
+        refs: Sequence[ProductRef],
+        **kwargs,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        京东 20 批量权威查卡（首选 ZTK goods_query itemIds<=20 靠 oriItemId 精准对齐；
+        坏 ID/下架 ID 不连坐；限流时退回独立 api_detail 或按主图指纹对齐好单库）。
+        """
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        ordered_refs: List[ProductRef] = []
+        seen_keys = set()
+        for raw_ref in refs or ():
+            r = self.resolve_product_ref(
+                goods_id_or_sign=raw_ref.key,
+                goods_id=raw_ref.goods_id,
+                goods_sign=raw_ref.goods_sign,
+            )
+            key = r.key or raw_ref.key
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ordered_refs.append(r)
+        if not ordered_refs:
+            return outcomes
+
+        unavailable = self._available("detail")
+        if unavailable:
+            for r in ordered_refs:
+                outcomes[r.key] = dict(unavailable)
+            return outcomes
+
+        enc_refs: List[ProductRef] = []
+        single_fallback_refs: List[ProductRef] = []
+        for r in ordered_refs:
+            tid = r.goods_sign or r.goods_id
+            if not tid or "://" in tid or tid.startswith("//"):
+                outcomes[r.key] = _error("INVALID_ARGUMENT", "京东需要商品ID而非未经核验的请求URL")
+            elif is_jd_image_key(tid):
+                outcomes[r.key] = _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU，不能直接使用主图哈希 ID")
+            elif _is_encrypted_jd_item_id(tid):
+                enc_refs.append(r)
+            else:
+                single_fallback_refs.append(r)
+
+        def _chunk_via_union_query(chunk: List[ProductRef]):
+            raw_res = self._guard_provider_result(
+                self.client.query_union_goods(item_ids=[r.goods_sign or r.goods_id for r in chunk])
+            )
+            if raw_res.get("status") != "success":
+                return {}, raw_res
+            rows = raw_res.get("data") or []
+            by_ori: Dict[str, Dict[str, Any]] = {}
+            by_id: Dict[str, Dict[str, Any]] = {}
+            by_img: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                ori = clean_product_id(row.get("oriItemId"))
+                rid = _item_id(row)
+                if ori:
+                    by_ori[ori] = row
+                if rid:
+                    by_id[rid] = row
+                img_u = _pick(row.get("pict_url"), row.get("imageUrl"))
+                if not img_u and isinstance(row.get("imageInfo"), dict):
+                    imgs = row["imageInfo"].get("imageList") or []
+                    if imgs and isinstance(imgs[0], dict):
+                        img_u = imgs[0].get("url")
+                img_k = extract_jd_image_key(img_u)
+                if img_k:
+                    by_img.setdefault(img_k, []).append(row)
+            matched_map: Dict[str, Dict[str, Any]] = {}
+            for r in chunk:
+                tid = r.goods_sign or r.goods_id
+                cand = by_ori.get(tid) or by_id.get(tid)
+                if cand is None and is_jd_image_key(r.goods_id):
+                    img_hits = by_img.get(r.goods_id) or []
+                    if len(img_hits) == 1:
+                        cand = img_hits[0]
+                if cand is not None:
+                    try:
+                        matched_map[r.key] = {
+                            "status": "success",
+                            "data": self._normalize_union_goods_detail(cand),
+                            "_provider": "ztk_jd_goods_query_batch",
+                        }
+                    except (ValueError, TypeError):
+                        pass
+            return matched_map, None
+
+        for i in range(0, len(enc_refs), 20):
+            chunk = enc_refs[i:i + 20]
+            union_clean_empty = False
+            union_err: Optional[Dict[str, Any]] = None
+            if self._has_ztk_catalog and hasattr(self.client, "query_union_goods"):
+                hit_map, union_err = _chunk_via_union_query(chunk)
+                outcomes.update(hit_map)
+                if union_err is None:
+                    union_clean_empty = True
+
+            unresolved = [r for r in chunk if r.key not in outcomes]
+            if unresolved and self.hdk is not None and hasattr(self.hdk, "batch_get_goods_details"):
+                img_anchored = [r for r in unresolved if is_jd_image_key(r.goods_id)]
+                if img_anchored:
+                    hdk_b = self._guard_provider_result(
+                        self.hdk.batch_get_goods_details([r.goods_sign or r.goods_id for r in img_anchored])
+                    )
+                    if hdk_b.get("status") == "success":
+                        by_img_hdk: Dict[str, List[Dict[str, Any]]] = {}
+                        for row in hdk_b.get("data") or []:
+                            if not isinstance(row, dict):
+                                continue
+                            ik = extract_jd_image_key(_pick(row.get("itempic"), row.get("jd_image"), row.get("white_image")))
+                            if ik:
+                                by_img_hdk.setdefault(ik, []).append(row)
+                        for r in img_anchored:
+                            cands = by_img_hdk.get(r.goods_id) or []
+                            if len(cands) == 1:
+                                try:
+                                    outcomes[r.key] = {
+                                        "status": "success",
+                                        "data": self._normalize_hdk_detail(cands[0]),
+                                        "_provider": "hdk_jd_batch_detail",
+                                    }
+                                except Exception:
+                                    pass
+
+            for r in chunk:
+                if r.key in outcomes:
+                    continue
+                if union_clean_empty and union_err is None:
+                    # 批量官方查询已经干净执行且该项缺席：再问独立 api_detail 与好单库确认，绝不重复撞 goods_query
+                    det = self._fetch_item(r) if self._has_ztk_catalog else {"status": "skipped"}
+                    if det.get("status") == "success":
+                        try:
+                            outcomes[r.key] = {"status": "success", "data": self._detail(det["data"]), "_provider": "ztk_jd_detail"}
+                            continue
+                        except (ValueError, TypeError):
+                            pass
+                    if not (r.goods_sign or r.goods_id).isdigit() and self.hdk is not None and hasattr(self.hdk, "get_goods_detail"):
+                        hdk_det = self._guard_provider_result(self.hdk.get_goods_detail(r.goods_sign or r.goods_id))
+                        if hdk_det.get("status") == "success" and isinstance(hdk_det.get("data"), dict):
+                            try:
+                                outcomes[r.key] = {
+                                    "status": "success",
+                                    "data": self._normalize_hdk_detail(hdk_det["data"]),
+                                    "_provider": "hdk_jd_detail",
+                                }
+                                continue
+                            except Exception:
+                                pass
+                        if hdk_det.get("error_code") in ("RATE_LIMIT", "QUOTA_PACE_BACKLOG", "NETWORK_ERROR", "TIMEOUT"):
+                            outcomes[r.key] = hdk_det
+                            continue
+                    if det.get("ztk_ambiguous_301") is True:
+                        outcomes[r.key] = _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
+                        continue
+                    outcomes[r.key] = det if det.get("status") == "error" else _error("NOT_FOUND", "京东联盟详情未命中该加密商品")
+                else:
+                    det_single = self.get_goods_detail(
+                        r.goods_sign or r.goods_id,
+                        goods_id=r.goods_id or None,
+                        goods_sign=r.goods_sign or None,
+                        **kwargs,
+                    )
+                    if (
+                        det_single.get("status") != "success"
+                        and union_err is not None
+                        and union_err.get("error_code") == "RATE_LIMIT"
+                        and det_single.get("error_code") != "PRODUCT_OFF_PROMOTION"
+                    ):
+                        det_single = dict(union_err)
+                    outcomes[r.key] = det_single
+
+        for r in single_fallback_refs:
+            outcomes[r.key] = self.get_goods_detail(
+                r.goods_sign or r.goods_id,
+                goods_id=r.goods_id or None,
+                goods_sign=r.goods_sign or None,
+                **kwargs,
+            )
+
+        return outcomes
 
     def convert_promotion_url(self, goods_id_or_sign="", uid=None, **kwargs):
         unavailable = self._available("promotion")
@@ -1152,11 +1343,12 @@ class JdAdapter(BasePlatformAdapter):
 
     def resolve_product_from_link(self, raw_text: str, *, allow_hdk: bool = True, unwrap_fn: Any = None) -> Dict[str, Any]:
         """
-        京东独立底层能力：按原始分享链接/短链/文案解析商品身份与官方详情卡（单向降级、零乒乓）：
+        京东底层模块 ④：按原始分享链接/短链/文案解析商品身份与官方详情卡（API 优先、按需解包、零乒乓）：
         1. 拦截纯数字 SKU / item.jd.com/{digits}.html；
         2. 加密 itemId / jingfen.jd.com 详情链直查 `get_goods_detail`；
-        3. 明确官方领券/活动会场链接直接正向实证 `is_venue=True` 止损；
-        4. `u.jd.com` / `union-click.jd.com`：先走 118ms `ztk_jd_goods_query(keyword=url)` -> 再走 0 配额 `resolve_jd_short_url` -> 再走 HDK `jd_goods_search(url)`（已做 533 冷却熔断）。
+        3. 明确官方领券/活动会场/店铺链接（`coupon` / `pro` / `shop` / `mall`）直接正向实证 `is_venue=True`（0 重定向）；
+        4. `u.jd.com` / `union-click.jd.com` **先直接走 API 查卡**（50.9 QPS `api_detail` -> `goods_query` -> HDK `v3/jd_goods_search`）；
+           全部查无单品卡时，最后才走 0 配额 `resolve_jd_short_url` 解包兜底区分会场/店铺 vs 纯数字单品。
         """
         text = _text(raw_text)
         if not text:
@@ -1181,13 +1373,21 @@ class JdAdapter(BasePlatformAdapter):
 
         is_venue = False
         venue_url = ""
-        if not target_id and not anchor_url and is_jd_official_venue_url(text):
+        if not target_id and not anchor_url:
             cand_urls = [u.rstrip(".,!?)];'\"") for u in URL_RE.findall(text)]
-            cand_venue = next((u for u in cand_urls if is_jd_official_venue_url(u)), "")
+            cand_venue = next(
+                (
+                    u for u in cand_urls
+                    if is_jd_official_venue_url(u)
+                    or any(h in u.lower() for h in ("shop.m.jd.com/", "mall.jd.com/"))
+                ),
+                "",
+            )
             cand_venue_base = cand_venue.split("#", 1)[0] if cand_venue else ""
             if cand_venue_base and product_url(cand_venue_base):
                 sku_param_m = re.search(r"[?&](?:sku|mainSku|skuId)=([A-Za-z0-9_]+)", cand_venue_base, re.IGNORECASE)
-                if sku_param_m:
+                # 仅非纯数字加密 sku（通天塔单品模板）才转查单品；pro.m.jd.com 会场带纯数字 sku 仍判为官方会场
+                if sku_param_m and not sku_param_m.group(1).isdigit():
                     target_id = sku_param_m.group(1)
                 else:
                     is_venue = True
@@ -1198,6 +1398,8 @@ class JdAdapter(BasePlatformAdapter):
         detail_catalog_cooling = False
         known_single_item = False
         is_numeric_sku = bool(target_id and target_id.isdigit())
+        had_explicit_enc_id = bool(target_id and not is_numeric_sku)
+        jcmd_match = _JD_JCOMMAND_RE.search(text)
 
         # 路径 1：已知加密商品 ID -> 直接走统一详情降级链
         if target_id and not is_numeric_sku:
@@ -1212,81 +1414,60 @@ class JdAdapter(BasePlatformAdapter):
                     if det.get("catalog_cooling") is True:
                         detail_catalog_cooling = True
 
-        # 路径 2：u.jd.com / union-click.jd.com -> 有序单向反查，绝不回头套娃
-        if product_card is None and not is_venue and anchor_url and not (target_id and not is_numeric_sku):
-            # 2a. 零配额短链轻量跳转/HDK 先行解包：识别会场/店铺主页直接止损，识别加密 sku 精准查卡，数字 SKU 不浪费详情配额
-            unwrap = (
-                unwrap_fn(anchor_url)
-                if callable(unwrap_fn)
-                else self._resolve_short_url_safe(anchor_url, allow_hdk=allow_hdk)
-            )
-            if isinstance(unwrap, dict) and unwrap.get("status") == "success" and isinstance(unwrap.get("data"), dict):
-                ud = unwrap["data"]
-                u_sku = _text(ud.get("sku_id"))
-                if ud.get("is_venue") and not u_sku:
-                    is_venue = True
-                    venue_url = anchor_url
-                elif u_sku:
-                    target_id = u_sku
-                    is_numeric_sku = u_sku.isdigit()
-                    if is_numeric_sku:
-                        known_single_item = True
-                    else:
-                        det = self.get_goods_detail(u_sku)
-                        if isinstance(det, dict):
-                            if det.get("status") == "success" and isinstance(det.get("data"), dict):
-                                product_card = det["data"]
-                            elif det.get("error_code") == "PRODUCT_OFF_PROMOTION":
-                                return det
-                            elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
-                                detail_lookup_failed = True
-                                if det.get("catalog_cooling") is True:
-                                    detail_catalog_cooling = True
+        # 路径 2：u.jd.com / union-click.jd.com / 京口令 -> 4步直线查卡（api_detail -> goods_query -> HDK -> 按需HTTP解包）
+        if product_card is None and not is_venue and not had_explicit_enc_id and (anchor_url or jcmd_match):
+            lookup_target = anchor_url or (jcmd_match.group(0) if jcmd_match else "")
+            # 2a. 独立 api_detail.ashx 原生支持 u.jd.com / union-click / 京口令（301仅单key早停且不直接判下架）
+            if self._has_ztk_catalog and hasattr(self.client, "get_goods_detail") and lookup_target:
+                ad_res = self._guard_provider_result(self.client.get_goods_detail(lookup_target))
+                if ad_res.get("status") == "success":
+                    ad_rows = ad_res.get("data") or []
+                    if isinstance(ad_rows, list) and len(ad_rows) == 1 and isinstance(ad_rows[0], dict):
+                        row = ad_rows[0]
+                        if _material_url(row) or row.get("tao_id"):
+                            try:
+                                product_card = self._detail(row)
+                                target_id = product_card.get("goods_sign") or product_card.get("goods_id") or target_id
+                            except Exception:
+                                product_card = None
+                elif ad_res.get("error_code") == "RATE_LIMIT":
+                    detail_lookup_failed = True
 
-            # 2b. 折淘客 :20000 京东联盟官方全网查询直接支持 u.jd.com（118-243ms，不占选品库 1.35s 池）
+            # 2b. 折淘客 :20000 京东联盟全网查询 (goods_query)
+            if product_card is None and self._has_ztk_catalog and hasattr(self.client, "query_union_goods"):
+                uq_kw = (short_match.group(0) if short_match else anchor_url) if anchor_url else (jcmd_match.group(0) if jcmd_match else "")
+                if uq_kw:
+                    uq = self._guard_provider_result(
+                        self.client.query_union_goods(keyword=uq_kw, page=1, page_size=2)
+                    )
+                    if uq.get("status") == "success":
+                        uq_rows = uq.get("data") if isinstance(uq.get("data"), list) else []
+                        if (
+                            len(uq_rows) == 1
+                            and isinstance(uq_rows[0], dict)
+                            and not uq.get("has_more")
+                            and uq.get("total_count") in (None, 1)
+                        ):
+                            try:
+                                product_card = self._normalize_union_goods_detail(uq_rows[0])
+                                target_id = product_card.get("goods_sign") or product_card.get("goods_id") or target_id
+                            except Exception:
+                                product_card = None
+                    elif uq.get("error_code") == "RATE_LIMIT" or uq.get("catalog_cooling") is True:
+                        detail_lookup_failed = True
+                        if uq.get("catalog_cooling") is True:
+                            detail_catalog_cooling = True
+
+            # 2c. 仍缺详情 -> 调好单库 v3/jd_goods_search 按原始短/长链直接单品查询
             if (
                 product_card is None
-                and not is_venue
-                and not (target_id and not is_numeric_sku)
-                and short_match
-                and self._has_ztk_catalog
-                and hasattr(self.client, "query_union_goods")
-            ):
-                uq = self._guard_provider_result(
-                    self.client.query_union_goods(keyword=short_match.group(0), page=1, page_size=2)
-                )
-                uq_rows = uq.get("data") if (uq.get("status") == "success" and isinstance(uq.get("data"), list)) else []
-                uq_single = uq_rows[0] if (
-                    len(uq_rows) == 1
-                    and isinstance(uq_rows[0], dict)
-                    and not uq.get("has_more")
-                    and uq.get("total_count") in (None, 1)
-                ) else None
-                if uq_single is not None and is_numeric_sku and target_id:
-                    row_sku = _text(uq_single.get("skuId"))
-                    if row_sku and row_sku != target_id:
-                        uq_single = None
-                if uq_single is not None:
-                    try:
-                        product_card = self._normalize_union_goods_detail(uq_single)
-                        target_id = product_card.get("goods_sign") or product_card.get("goods_id") or target_id
-                    except Exception:
-                        product_card = None
-
-            # 2c. 仍缺详情且未判定会场 -> 若配了 HDK 且支持详情，按原始链接查 1 次 HDK（allow_single_url_match=True）
-            if (
-                product_card is None
-                and not is_venue
-                and not (target_id and not is_numeric_sku)
+                and anchor_url
                 and allow_hdk
                 and self.hdk is not None
                 and hasattr(self.hdk, "get_goods_detail")
             ):
-                hdk_kwargs = {"allow_single_url_match": True}
-                if is_numeric_sku and target_id:
-                    hdk_kwargs["expected_sku"] = target_id
                 hdk_det = self._guard_provider_result(
-                    self.hdk.get_goods_detail(anchor_url, **hdk_kwargs)
+                    self.hdk.get_goods_detail(anchor_url, allow_single_url_match=True)
                 )
                 if hdk_det.get("status") == "success" and isinstance(hdk_det.get("data"), dict):
                     try:
@@ -1296,6 +1477,36 @@ class JdAdapter(BasePlatformAdapter):
                         product_card = None
                 elif hdk_det.get("error_code") == "PRODUCT_OFF_PROMOTION":
                     return hdk_det
+
+            # 2d. 以上直查 API 均未拿出单品卡 -> 仅此时才轻量 HTTP 解包识别会场 / 通天塔加密 sku / 纯数字落地页
+            if product_card is None and not is_venue and anchor_url:
+                unwrap = (
+                    unwrap_fn(anchor_url)
+                    if callable(unwrap_fn)
+                    else self._resolve_short_url_safe(anchor_url, allow_hdk=allow_hdk)
+                )
+                if isinstance(unwrap, dict) and unwrap.get("status") == "success" and isinstance(unwrap.get("data"), dict):
+                    ud = unwrap["data"]
+                    u_sku = _text(ud.get("sku_id"))
+                    if ud.get("is_venue"):
+                        is_venue = True
+                        venue_url = anchor_url
+                    elif u_sku:
+                        target_id = u_sku
+                        is_numeric_sku = u_sku.isdigit()
+                        if is_numeric_sku:
+                            known_single_item = True
+                        else:
+                            det = self.get_goods_detail(u_sku)
+                            if isinstance(det, dict):
+                                if det.get("status") == "success" and isinstance(det.get("data"), dict):
+                                    product_card = det["data"]
+                                elif det.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                                    return det
+                                elif det.get("error_code") in ("RATE_LIMIT", "UPSTREAM_ERROR", "NETWORK_ERROR"):
+                                    detail_lookup_failed = True
+                                    if det.get("catalog_cooling") is True:
+                                        detail_catalog_cooling = True
 
         mat_url = ""
         if venue_url:
@@ -1315,6 +1526,7 @@ class JdAdapter(BasePlatformAdapter):
             "venue_url": venue_url,
             "product": product_card,
             "target_id": target_id,
+            "is_explicit_id": had_explicit_enc_id,
             "is_numeric_sku": bool(target_id and target_id.isdigit()),
             "known_single_item": known_single_item or bool(product_card),
             "anchor_url": anchor_url,
@@ -1342,7 +1554,6 @@ class JdAdapter(BasePlatformAdapter):
             and self.hdk is not None
             and hasattr(self.hdk, "convert_promotion_link")
         )
-        prefer_hdk_during_cooldown = self._is_ztk_catalog_cooling() and hdk_eligible
 
         def _try_ztk():
             nonlocal last_err
@@ -1391,32 +1602,23 @@ class JdAdapter(BasePlatformAdapter):
                 last_err = hdk_res
             return None
 
-        if prefer_hdk_during_cooldown:
+        if self._has_ztk_catalog:
+            res = _try_ztk()
+            if res is not None:
+                return res
+        if hdk_eligible:
             res = _try_hdk()
             if res is not None:
                 return res
-            if self._has_ztk_catalog:
-                res = _try_ztk()
-                if res is not None:
-                    return res
-        else:
-            if self._has_ztk_catalog:
-                res = _try_ztk()
-                if res is not None:
-                    return res
-            if hdk_eligible:
-                res = _try_hdk()
-                if res is not None:
-                    return res
 
         return last_err or _error("PROMOTION_FAILED", "暂未能生成京东推广链接")
 
     def resolve_and_convert_universal(self, raw_text: str, uid=None, **kwargs):
         """
-        京东万能转链与详情反查（组合 `resolve_product_from_link` + 多源推广转链，彻底消灭跨供应商乒乓）：
-        1. 先由 `resolve_product_from_link` 单向有序解析会场实证或完整商品卡片；
-        2. 明确会场或已解析单品：直接二合一推广转链（折淘客 `byunionid_get` -> 公共兜底好单库 `get_jditems_link`）；
-        3. 纯京口令/混合文案或未出卡短链：原样透传 `byunionid_get` + `tkl_piliang` (+ 必要时 `api_quanwang`) 兜底；
+        京东万能转链与详情反查（极简 4 步直线链路：api_detail -> goods_query -> HDK -> byunionid_get）：
+        1. 先由 `resolve_product_from_link` 单向有序解析会场实证或官方商品卡片（独立池 api_detail 支持短链/京口令）；
+        2. 明确会场或带链接/加密ID的已解析单品：直接二合一推广转链（折淘客 `byunionid_get` -> 公共兜底好单库 `get_jditems_link`）；
+        3. 裸京口令 / 混排文案 / 前置未出卡短链：原样透传 `byunionid_get`（失败兜底好单库），若新产出 u.jd.com 短链再补 1 次 `api_detail` 反查详情；
         4. 始终输出确定性四态 `resolution_kind`（未拿卡未知单品严格标记 `degraded_product`）。
         """
         if not self.active:
@@ -1438,16 +1640,6 @@ class JdAdapter(BasePlatformAdapter):
         is_personal = self._is_personal_promoter(uid, promoter)
 
         def _do_resolve():
-            if (
-                get_caller_context() == "background"
-                and self._is_ztk_catalog_cooling()
-                and not is_jd_official_venue_url(text)
-            ):
-                return _error(
-                    "RATE_LIMIT",
-                    "京东选品库处于短时频控冷却中，暂跳过避免空转",
-                    catalog_cooling=True,
-                )
             unwrap_memo: Dict[str, Any] = {}
 
             def _memo_unwrap(u: str):
@@ -1466,6 +1658,7 @@ class JdAdapter(BasePlatformAdapter):
             product_card = resolved.get("product")
             extracted_encrypted_id = _text(resolved.get("target_id")) if not resolved.get("is_numeric_sku") else ""
             anchor_url = _text(resolved.get("anchor_url"))
+            has_url_or_explicit_id = bool(anchor_url or resolved.get("is_explicit_id"))
             detail_lookup_failed = bool(resolved.get("detail_lookup_failed"))
             detail_catalog_cooling = bool(resolved.get("detail_catalog_cooling"))
 
@@ -1474,7 +1667,7 @@ class JdAdapter(BasePlatformAdapter):
             if b_match and not is_confirmed_venue:
                 fallback_title = b_match.group(1).strip()
 
-            # A. 明确会场/官方领券页：直接正向转链，标 COUPON_OR_VENUE，不再浪费详情/piliang 配额
+            # A. 明确会场/官方领券页：直接正向转链，标 COUPON_OR_VENUE，不再浪费详情配额
             if is_confirmed_venue and resolved.get("material_url"):
                 conv = self._convert_material_url_with_fallback(
                     resolved["material_url"],
@@ -1495,8 +1688,8 @@ class JdAdapter(BasePlatformAdapter):
                 )
                 return stamp_universal_resolution(conv, verified_coupon_or_venue=True)
 
-            # B. 已经从链接成功解析出官方商品卡片：优先保留原短链/权威物料链，绝不用纯数字 item.jd.com 覆盖 u.jd.com
-            if product_card is not None:
+            # B. 从链接/加密ID解析出官方商品卡片：直接走 byunionid_get -> HDK 二合一转链
+            if product_card is not None and has_url_or_explicit_id:
                 card_url = product_url(product_card.get("product_url"))
                 if card_url and _JD_NUMERIC_ITEM_URL_RE.match(card_url):
                     card_url = ""
@@ -1515,6 +1708,26 @@ class JdAdapter(BasePlatformAdapter):
                         uid=uid,
                         sub_union_id=kwargs.get("sub_union_id"),
                     )
+                    if (
+                        conv.get("status") != "success"
+                        and conv.get("error_code") not in (
+                            "PRODUCT_OFF_PROMOTION", "RATE_LIMIT", "QUOTA_PACE_BACKLOG",
+                            "NETWORK_ERROR", "TIMEOUT", "CONFIG_ERROR",
+                        )
+                        and card_url
+                        and card_url != mat_url
+                    ):
+                        # 旧短链内嵌过期券 (如 2001917) 失败时，自动回退已查得的纯净 jingfen 商品链重转
+                        conv = self._convert_material_url_with_fallback(
+                            card_url,
+                            promoter,
+                            is_personal=is_personal,
+                            clean_coupon=used_coupon,
+                            goods_id=product_card.get("goods_id") or "",
+                            goods_sign=product_card.get("goods_sign") or extracted_encrypted_id,
+                            uid=uid,
+                            sub_union_id=kwargs.get("sub_union_id"),
+                        )
                     if conv.get("status") == "success":
                         conv.update(
                             title=product_card.get("name") or fallback_title,
@@ -1525,8 +1738,10 @@ class JdAdapter(BasePlatformAdapter):
                         return stamp_universal_resolution(conv)
                     if conv.get("error_code") == "PRODUCT_OFF_PROMOTION":
                         return conv
+                    if anchor_url and (mat_url == anchor_url or card_url == anchor_url):
+                        return conv
 
-            # C. 裸京口令 / 混排文案 / 前置均未出卡的短链：走 ZTK 万能解析转链通道（含 byunionid + tkl_piliang + api_quanwang）
+            # C. 裸京口令 / 混排文案 / 前置未出卡短链：直接透传 byunionid_get（失败兜底好单库）
             conv = None
             hdk_mat = anchor_url or resolved.get("material_url")
             can_hdk_fallback = (
@@ -1535,33 +1750,35 @@ class JdAdapter(BasePlatformAdapter):
                 and hasattr(self.hdk, "convert_promotion_link")
                 and bool(hdk_mat)
             )
+            used_coupon_c = jd_coupon_url((product_card or {}).get("coupon_url"))
             if self._has_ztk_catalog:
-                skip_ztk_for_hdk = (
-                    self._is_ztk_catalog_cooling()
-                    and not is_jd_official_venue_url(text)
-                    and can_hdk_fallback
+                material_input = anchor_url or (
+                    f"https://jingfen.jd.com/detail/{text}.html" if _is_encrypted_jd_item_id(text) else text
                 )
-                if not skip_ztk_for_hdk:
-                    material_input = f"https://jingfen.jd.com/detail/{text}.html" if _is_encrypted_jd_item_id(text) else text
-                    short_resolver = (
-                        (lambda u: _memo_unwrap(u) or _error("NOT_FOUND", "解包失败"))
-                        if ((not is_personal and self.hdk is not None) or is_real_requests_session(getattr(self.client, "http", None)))
-                        else None
-                    )
-                    conv = (
-                        self.client.convert_universal_material(material_input, promoter, short_url_resolver=short_resolver)
-                        if short_resolver is not None
-                        else self.client.convert_universal_material(material_input, promoter)
-                    )
-                    if isinstance(conv, dict) and conv.get("status") != "success" and conv.get("jd_off_promotion") is True:
-                        return _error("PRODUCT_OFF_PROMOTION", "该京东商品已取消推广或已下架，请挑选其他好物")
+                short_resolver = (
+                    (lambda u: _memo_unwrap(u) or _error("NOT_FOUND", "解包失败"))
+                    if ((not is_personal and self.hdk is not None) or is_real_requests_session(getattr(self.client, "http", None)))
+                    else None
+                )
+                univ_kwargs: Dict[str, Any] = {}
+                if used_coupon_c:
+                    univ_kwargs["coupon_url"] = used_coupon_c
+                if short_resolver is not None:
+                    univ_kwargs["short_url_resolver"] = short_resolver
+                conv = self.client.convert_universal_material(material_input, promoter, **univ_kwargs)
+                if isinstance(conv, dict) and conv.get("status") != "success" and conv.get("jd_off_promotion") is True:
+                    return _error("PRODUCT_OFF_PROMOTION", "该京东商品已取消推广或已下架，请挑选其他好物")
 
             if (
                 (not isinstance(conv, dict) or conv.get("status") != "success")
                 and can_hdk_fallback
             ):
                 hdk_conv = self._guard_provider_result(
-                    self.hdk.convert_promotion_link(hdk_mat, sub_union_id=kwargs.get("sub_union_id"))
+                    self.hdk.convert_promotion_link(
+                        hdk_mat,
+                        sub_union_id=kwargs.get("sub_union_id"),
+                        **({"coupon_url": used_coupon_c} if used_coupon_c else {}),
+                    )
                 )
                 if hdk_conv.get("status") == "success":
                     cooling_flag = detail_catalog_cooling or self._is_ztk_catalog_cooling() or (
@@ -1570,15 +1787,16 @@ class JdAdapter(BasePlatformAdapter):
                     payload = self._build_promotion_payload(
                         hdk_conv,
                         promoter=promoter,
-                        goods_id=extracted_encrypted_id or "",
-                        goods_sign=extracted_encrypted_id or "",
+                        goods_id=(product_card or {}).get("goods_id") or extracted_encrypted_id or "",
+                        goods_sign=(product_card or {}).get("goods_sign") or extracted_encrypted_id or "",
                         uid=uid,
-                        title=fallback_title,
-                        price=None,
-                        coupon_amount=0.0,
-                        product=None,
-                        detail_lookup_failed=True,
-                        **({"catalog_cooling": True} if cooling_flag else {}),
+                        title=(product_card or {}).get("name") or fallback_title,
+                        price=(product_card or {}).get("price"),
+                        coupon_amount=(product_card or {}).get("coupon_amount") or 0.0,
+                        product=product_card,
+                        **({"coupon_url": used_coupon_c} if used_coupon_c else {}),
+                        **({"detail_lookup_failed": True} if product_card is None else {}),
+                        **({"catalog_cooling": True} if (product_card is None and cooling_flag) else {}),
                     )
                     payload["_provider"] = "hdk_jd_universal"
                     return stamp_universal_resolution(payload)
@@ -1586,8 +1804,6 @@ class JdAdapter(BasePlatformAdapter):
             if not isinstance(conv, dict) or conv.get("status") != "success":
                 return conv if isinstance(conv, dict) else _error("UPSTREAM_ERROR", "京东万能转链失败")
 
-            if conv.get("piliang_throttled"):
-                detail_lookup_failed = True
             detail_catalog_cooling = detail_catalog_cooling or bool(conv.get("catalog_cooling") is True)
             if not extracted_encrypted_id and conv.get("tao_id"):
                 extracted_encrypted_id = _text(conv.get("tao_id"))
@@ -1619,32 +1835,32 @@ class JdAdapter(BasePlatformAdapter):
             is_explicit_venue_url = is_jd_official_venue_url(lower_urls) or bool(conv.get("resolved_venue"))
             short_u_match = _JD_SHORT_URL_RE.search(short or "")
 
-            is_cooling = self._is_ztk_catalog_cooling()
-            if not product_card and not is_explicit_venue_url and not detail_lookup_failed and not is_cooling and short_u_match:
-                qw = self.client.search_goods(short_u_match.group(0), page=1, page_size=5, has_coupon=False)
-                rows = qw.get("data") if isinstance(qw, dict) and qw.get("status") == "success" else None
-                if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
-                    row = dict(rows[0])
-                    if isinstance(row.get("small_images"), str):
-                        row["small_images"] = [
-                            seg.strip()
-                            for seg in row["small_images"].split("|")
-                            if seg.strip().startswith(("http://", "https://", "//"))
-                        ]
-                    try:
-                        cand_card = self._detail(row)
-                        if (cand_card.get("price") or 0) >= 0 and (cand_card.get("goods_id") or cand_card.get("goods_sign")):
-                            product_card = cand_card
-                            resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
-                    except Exception:
-                        pass
-                if (
-                    product_card is None
-                    and conv.get("piliang_empty_tao_id")
-                    and conv.get("known_single_item")
-                    and hasattr(self.client, "mark_catalog_rate_limited")
-                ):
-                    self.client.mark_catalog_rate_limited()
+            # 对新产出的 u.jd.com 短链用独立池 api_detail 补 1 次轻查卡（绝不调 api_quanwang）
+            if (
+                not product_card
+                and not is_explicit_venue_url
+                and not detail_lookup_failed
+                and not extracted_encrypted_id
+                and short_u_match
+                and short_u_match.group(0) != anchor_url
+                and self._has_ztk_catalog
+                and hasattr(self.client, "get_goods_detail")
+            ):
+                ad_new = self._guard_provider_result(self.client.get_goods_detail(short_u_match.group(0)))
+                if ad_new.get("status") == "success":
+                    ad_rows = ad_new.get("data") or []
+                    if isinstance(ad_rows, list) and len(ad_rows) == 1 and isinstance(ad_rows[0], dict):
+                        row = ad_rows[0]
+                        if _material_url(row) or row.get("tao_id"):
+                            try:
+                                cand_card = self._detail(row)
+                                if (cand_card.get("price") or 0) > 0:
+                                    product_card = cand_card
+                                    resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
+                            except Exception:
+                                pass
+                elif ad_new.get("error_code") == "RATE_LIMIT":
+                    detail_lookup_failed = True
 
             verified_coupon_or_venue = bool(
                 not extracted_encrypted_id
@@ -1672,6 +1888,8 @@ class JdAdapter(BasePlatformAdapter):
                 "coupon_amount": coupon_amount,
                 "product": product_card,
             }
+            if used_coupon_c and conv.get("coupon_applied") is not False:
+                extra_fields["coupon_url"] = used_coupon_c
             if detail_lookup_failed and product_card is None:
                 extra_fields["detail_lookup_failed"] = True
                 if detail_catalog_cooling:

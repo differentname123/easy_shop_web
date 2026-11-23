@@ -976,7 +976,11 @@ def test_ztk_publisher_pagination_session_cooldown_and_resolve_item_id():
         ztk2.sid = "ztk_sid"
         ztk2.check_publisher_relation.return_value = {"status": "success", "is_authorized": True, "bind": 1, "identity": {"external_id": "u_target", "relation_id": "999888"}}
         a_cool = TaobaoAdapter(
-            settings=SimpleNamespace(taobao_enabled=True, tb_app_key="k", tb_app_secret="s", tb_session="expired_24h", tb_channel_pid="mm_1_2_3", ztk_appkey="ztk_k", ztk_sid="ztk_sid"),
+            settings=SimpleNamespace(
+                taobao_enabled=True, tb_app_key="k", tb_app_secret="s",
+                tb_session="expired_24h", tb_refresh_token="refresh_tok_1",
+                tb_channel_pid="mm_1_2_3", ztk_appkey="ztk_k", ztk_sid="ztk_sid",
+            ),
             official_client=off_sess, ztk_client=ztk2,
         )
         r1 = a_cool.check_authority("u_target")
@@ -1063,6 +1067,226 @@ def test_taobao_universal_rejects_cross_platform_and_spoofed_domains():
         assert res["status"] == "error" and res["error_code"] == "INVALID_TAOBAO_URL"
     ztk.convert_channel_url.assert_not_called()
     official.convert_promotion_url.assert_not_called()
+
+
+def test_ztk_dual_sid_pools_tb_batch_details_venue_wh_alimama_and_auth_priority():
+    """验证 ZTK 双 SID 池隔离路由、TB 20 批量查卡（不连坐）、pages-fast/wh_alimama 已转链会场识别及 90d ZTK 授权优先。"""
+    from models.product import ProductRef
+
+    # 1. 双 SID 池隔离路由：高并发走 sid_list，渠道备案/邀请走 publisher_sid_list
+    seen_calls = []
+
+    def _dual_get(url, params=None, timeout=None, allow_redirects=False):
+        seen_calls.append((url, dict(params or {})))
+        if "open_gaoyongzhuanlian.ashx" in url:
+            return reply({
+                "status": 200,
+                "content": [{
+                    "item_url": "https://s.click.taobao.com/gy_ok",
+                    "shorturl": "https://s.click.taobao.com/gy_s",
+                    "tkl": "8￥GYTOK1234￥",
+                    "quanhou_jiage": "19.9",
+                    "tkrate3": "10",
+                }],
+            })
+        if "open_sc_publisher_get.ashx" in url:
+            return reply({
+                "tbk_sc_publisher_info_get_response": {
+                    "data": {
+                        "total_count": 1,
+                        "inviter_list": {
+                            "map_data": [{"external_id": "u_dual", "relation_id": "2999888"}],
+                        },
+                    },
+                },
+            })
+        if "open_sc_invitecode_get.ashx" in url:
+            return reply({"tbk_sc_invitecode_get_response": {"data": {"inviter_code": "PUBINV1"}}})
+        raise AssertionError(f"Unexpected ZTK call: {url}")
+
+    ztk_dual = ZtkClient(
+        "k0", "orig_sid",
+        appkey_list=("k0", "k1", "k2"),
+        sid_list=("orig_sid", "193336", "193338"),
+        publisher_sid_list=("orig_sid", "193334", "193333"),
+        http_session=SimpleNamespace(get=_dual_get),
+    )
+    assert ztk_dual._sid_for_key("k1") == "193336"
+    assert ztk_dual._sid_for_key("k2") == "193338"
+    assert ztk_dual._publisher_sid_for_key("k1") == "193334"
+    assert ztk_dual._publisher_sid_for_key("k2") == "193333"
+    gy_res = ztk_dual.convert_gaoyong_url("673231015690", "mm_1_2_3")
+    auth_res = ztk_dual.check_publisher_relation("u_dual")
+    url_res = ztk_dual.generate_authority_url("u_dual")
+    assert gy_res["status"] == "success"
+    assert auth_res["status"] == "success" and auth_res["identity"]["relation_id"] == "2999888"
+    assert url_res["status"] == "success" and "PUBINV1" in url_res["auth_url"]
+    # 验证 gaoyong 用 sid_list，publisher_info / invitecode 用 publisher_sid_list
+    gy_params = [p for u, p in seen_calls if "open_gaoyongzhuanlian.ashx" in u][0]
+    pub_params = [p for u, p in seen_calls if "open_sc_publisher_get.ashx" in u][0]
+    inv_params = [p for u, p in seen_calls if "open_sc_invitecode_get.ashx" in u][0]
+    assert gy_params["sid"] == {"k0": "orig_sid", "k1": "193336", "k2": "193338"}[gy_params["appkey"]]
+    assert pub_params["sid"] == {"k0": "orig_sid", "k1": "193334", "k2": "193333"}[pub_params["appkey"]]
+    assert inv_params["sid"] == {"k0": "orig_sid", "k1": "193334", "k2": "193333"}[inv_params["appkey"]]
+
+    # 2. TaobaoAdapter.batch_get_goods_details: 20批量靠 input_item_iid 精准对齐，坏/缺失项单查兜底不连坐
+    off_batch = Mock()
+    off_batch.get_goods_details.side_effect = lambda ids: (
+        {"status": "success", "data": [official_item(sign="enc_batch_1", input_id="enc_batch_1")]}
+        if len(ids) > 1
+        else {"status": "error", "error_code": "isv.item-not-exist", "error_msg": "不存在"}
+    )
+    ztk_batch = Mock()
+    ztk_batch.appkey_list = ("k0",)
+    ztk_batch.sid = "orig_sid"
+    ztk_batch.sid_list = ("orig_sid",)
+    ztk_batch.get_tb_goods_detail.return_value = {"status": "error", "error_code": "NOT_FOUND"}
+    hdk_batch = Mock()
+    hdk_batch.appkey_list = ()
+    ad_batch = make_adapter(official=off_batch, ztk=ztk_batch, hdk=hdk_batch)
+    batch_res = ad_batch.batch_get_goods_details([
+        ProductRef("taobao", "c1", goods_sign="enc_batch_1"),
+        ProductRef("taobao", "bad_off", goods_sign="bad_off"),
+    ])
+    assert batch_res["enc_batch_1"]["status"] == "success"
+    assert batch_res["enc_batch_1"]["data"]["name"] == "官方标题"
+    assert batch_res["bad_off"]["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    # 3. pages-fast / wh_alimama=true 官方会场成功转为 s.click 推广链后，判为 verified coupon_or_venue
+    ztk_venue = Mock()
+    ztk_venue.appkey_list = ("k0",)
+    ztk_venue.sid = "orig_sid"
+    ztk_venue.sid_list = ("orig_sid",)
+    ztk_venue.convert_channel_url.return_value = {
+        "status": "success",
+        "title": "淘宝精选活动会场",
+        "final_price": None,
+        "coupon_amount": 0.0,
+        "url": "https://s.click.taobao.com/converted_venue_long",
+        "final_link": "https://s.click.taobao.com/converted_venue_short",
+        "short_url": "https://s.click.taobao.com/converted_venue_short",
+        "tpwd": "8￥VENUEOK1234￥",
+        "tao_id": "",
+        "raw": {},
+    }
+    ad_venue = make_adapter(Mock(), ztk=ztk_venue, hdk=Mock(appkey_list=()), tb_channel_pid="mm_1_2_3")
+    raw_wh_url = "https://pages-fast.m.taobao.com/wow/z/uniapp/1323/page?wh_alimama=true"
+    v_res = ad_venue.resolve_and_convert_universal(raw_wh_url)
+    assert v_res["status"] == "success"
+    assert v_res["resolution_kind"] == "coupon_or_venue"
+    assert not v_res.get("detail_lookup_failed")
+
+    # 4. 无 tb_refresh_token 时，即使配了 tb_session，check_authority 也优先走 90d ztk_tb_auth 避免 24h invalid-sessionkey
+    off_no_rt = Mock()
+    off_no_rt.check_authority.side_effect = AssertionError("must prefer ztk_tb_auth when tb_refresh_token is absent")
+    ztk_auth_pref = Mock()
+    ztk_auth_pref.appkey_list = ("k0",)
+    ztk_auth_pref.sid = "orig_sid"
+    ztk_auth_pref.sid_list = ("orig_sid",)
+    ztk_auth_pref.check_publisher_relation.return_value = {
+        "status": "success", "is_authorized": True, "bind": 1, "identity": {"external_id": "u1", "relation_id": "888777"},
+    }
+    ad_auth_pref = TaobaoAdapter(
+        settings=SimpleNamespace(
+            taobao_enabled=True, tb_app_key="k", tb_app_secret="s",
+            tb_session="stale_24h", tb_channel_pid="mm_1_2_3", ztk_appkey="k0", ztk_sid="orig_sid",
+        ),
+        official_client=off_no_rt, ztk_client=ztk_auth_pref,
+    )
+    ar = ad_auth_pref.check_authority("u1")
+    assert ar["status"] == "success" and ar["identity"]["relation_id"] == "888777"
+    ztk_auth_pref.check_publisher_relation.assert_called_once_with("u1")
+
+    # 5. ZtkClient.convert_channel_url 保留 tkl_piliang 空 tao_id 但含 ali_trackid 的官方会场，并拒绝 err.tmall.com/error 假 200
+    def _venue_piliang_get(url, params=None, timeout=None, allow_redirects=False):
+        tkl_in = (params or {}).get("tkl") or ""
+        if "open_gaoyongzhuanlian_tkl.ashx" in url:
+            return reply({"status": 301, "content": "很抱歉！商品ID解析错误！！！"})
+        if "open_gaoyongzhuanlian_tkl_piliang.ashx" in url:
+            if "404page" in tkl_in:
+                return reply({"status": 200, "tao_id": "", "result_url": "https://err.tmall.com/error1.html?c=404&ali_trackid=2:1"})
+            return reply({"status": 200, "tao_id": "", "result_url": f"{tkl_in}&ali_trackid=2:116341500041"})
+        raise AssertionError(f"Unexpected ZTK call: {url}")
+
+    ztk_vcli = ZtkClient("k0", "orig_sid", http_session=SimpleNamespace(get=_venue_piliang_get))
+    v_ok = ztk_vcli.convert_channel_url(
+        "https://pages.tmall.com/wow/z/lianmeng/default/route?budgetTag=2026012001&wh_alimama=true",
+        "", "mm_1_2_3", allow_public=True,
+    )
+    assert v_ok["status"] == "success" and "ali_trackid=2:116341500041" in v_ok["final_link"]
+    v_404 = ztk_vcli.convert_channel_url(
+        "https://pages-fast.m.taobao.com/wow/z/uniapp/404page?wh_alimama=true",
+        "", "mm_1_2_3", allow_public=True,
+    )
+    assert v_404["status"] == "error"
+
+
+def test_tb_channel_convert_never_fabricates_placeholder_and_auto_rescues_detail():
+    """
+    验证：
+    1. ZtkClient.convert_channel_url 在上游缺标题时严禁捏造 "渠道推广商品"；
+    2. TaobaoAdapter._do_ztk_resolve 遇到缺失标题/价格/图片的残卡时自动调用 get_goods_detail(tao_id) 补全，
+       下架短链透出 PRODUCT_OFF_PROMOTION，拉卡失败则 Fail-Closed 标为 degraded_product。
+    """
+    missing_raw_item = {
+        "status": 200,
+        "content": [{
+            "tao_id": "nV21R9Q5oT7xYzA8bC3dE4fG6hJ7kL9mN",
+            "title": "",
+            "size": "0",
+            "quanhou_jiage": "0",
+            "pic": "",
+            "coupon_click_url": "https://uland.taobao.com/coupon/edetail?e=ok1",
+            "shorturl": "https://s.click.taobao.com/tbOk1",
+            "tkl": "￥okToken123￥",
+        }],
+    }
+    ztk = ZtkClient("ztk_key", "ztk_sid", SimpleNamespace(get=Mock(return_value=reply(missing_raw_item))), appkey_list=("ztk_key",))
+    conv_raw = ztk.convert_channel_url("https://uland.taobao.com/coupon/edetail?e=raw1", "", "mm_1_2_3", allow_public=True)
+    assert conv_raw["status"] == "success"
+    assert conv_raw["title"] == "" and conv_raw["title"] != "渠道推广商品"
+
+    full_detail_card = {
+        "status": "success",
+        "data": {
+            "platform": "taobao",
+            "platform_name": "淘宝/天猫",
+            "goods_id": "6hJ7kL9mN",
+            "goods_sign": "nV21R9Q5oT7xYzA8bC3dE4fG6hJ7kL9mN",
+            "name": "维达超韧抽纸4层24包",
+            "price": 32.9,
+            "original_price": 49.9,
+            "coupon_amount": 5.0,
+            "has_coupon": True,
+            "image_url": "https://img.alicdn.com/vinda.jpg",
+            "carousel_images": ["https://img.alicdn.com/vinda1.jpg", "https://img.alicdn.com/vinda2.jpg"],
+            "mall_name": "维达官方旗舰店",
+            "product_url": "https://uland.taobao.com/item/edetail?id=nV21R9Q5oT7xYzA8bC3dE4fG6hJ7kL9mN",
+        },
+    }
+    ad_rescue = make_adapter(Mock(), ztk=ztk, tb_channel_pid="mm_1_2_3")
+    ad_rescue.get_goods_detail = Mock(return_value=full_detail_card)
+    r_ok = ad_rescue.resolve_and_convert_universal("https://uland.taobao.com/coupon/edetail?e=raw1")
+    assert r_ok["status"] == "success"
+    assert r_ok["resolution_kind"] == "product"
+    assert r_ok["product"]["name"] == "维达超韧抽纸4层24包"
+    assert r_ok["product"]["price"] == 32.9
+    ad_rescue.get_goods_detail.assert_called_once()
+
+    ad_off = make_adapter(Mock(), ztk=ztk, tb_channel_pid="mm_1_2_3")
+    ad_off.get_goods_detail = Mock(return_value={"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "已下架"})
+    r_off = ad_off.resolve_and_convert_universal("https://uland.taobao.com/coupon/edetail?e=raw1")
+    assert r_off["status"] == "error" and r_off["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    ad_deg = make_adapter(Mock(), ztk=ztk, tb_channel_pid="mm_1_2_3")
+    ad_deg.get_goods_detail = Mock(return_value={"status": "error", "error_code": "RATE_LIMIT", "error_msg": "rate limited"})
+    r_deg = ad_deg.resolve_and_convert_universal("https://uland.taobao.com/coupon/edetail?e=raw1")
+    assert r_deg["status"] == "success"
+    assert r_deg["resolution_kind"] == "degraded_product"
+    assert r_deg["detail_lookup_failed"] is True
+    assert r_deg["product"] is None
+
+
 
 
 

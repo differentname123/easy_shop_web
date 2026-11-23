@@ -57,6 +57,7 @@ class Settings:
     ztk_appkey_list: tuple = field(default=(), repr=False)
     ztk_sid: str = field(default="", repr=False)
     ztk_sid_list: tuple = field(default=(), repr=False)
+    ztk_publisher_sid_list: tuple = field(default=(), repr=False)
     detail_prefetch_enabled: bool = True
     detail_prefetch_interval_seconds: int = 300
     group_help_worker_enabled: Optional[bool] = None
@@ -222,6 +223,13 @@ def load_settings(config_file=None, *, require_credentials=True) -> Settings:
     )
     ztk_sid_list = explicit_sids if explicit_sids else primary_sids
     ztk_sid = ztk_sid_list[0] if ztk_sid_list else ""
+    explicit_pub_sids = _parse_key_entries(
+        values.get("zhetaoke_publisher_sid_list", None),
+        None,
+        "zhetaoke_publisher_sid_list",
+        "zhetaoke_publisher_sid_list",
+    )
+    ztk_publisher_sid_list = explicit_pub_sids if explicit_pub_sids else ztk_sid_list
 
     hdk_api_key_list = _parse_key_entries(
         values.get("haodanku_api_key", ""),
@@ -348,7 +356,8 @@ def load_settings(config_file=None, *, require_credentials=True) -> Settings:
         tb_channel_adzone_id=text("taobao_channel_adzone_id").strip(),
         hdk_tb_name=text("hdk_tb_name").strip(),
         hdk_api_key=hdk_api_key, hdk_api_key_list=hdk_api_key_list,
-        ztk_appkey=ztk_appkey, ztk_appkey_list=ztk_appkey_list, ztk_sid=ztk_sid, ztk_sid_list=ztk_sid_list,
+        ztk_appkey=ztk_appkey, ztk_appkey_list=ztk_appkey_list,
+        ztk_sid=ztk_sid, ztk_sid_list=ztk_sid_list, ztk_publisher_sid_list=ztk_publisher_sid_list,
         jd_enabled=jd_enabled, jd_union_id=jd_union_id, jd_position_id=jd_position_id,
         jd_app_key=jd_app_key, jd_app_secret=jd_app_secret, jd_api_base=jd_api_base,
         meilisearch_url=meilisearch_url, meilisearch_key=meilisearch_key,

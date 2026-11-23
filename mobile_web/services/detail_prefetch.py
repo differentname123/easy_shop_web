@@ -15,7 +15,7 @@ from cache import is_product_off_promotion
 from config import logger
 from infrastructure.api_governance import api_caller_context
 from infrastructure.logging_utils import format_exc_summary
-from models.product import DetailSnapshot, ProductRef
+from models.product import DetailPrefetchResult, DetailSnapshot, ProductRef
 
 
 WORKER_COUNT = 1
@@ -111,11 +111,18 @@ class DetailPrefetcher:
         self._batch_persist_errors = {}
         self._batch_off_promotion = 0
 
+    def _inflight_tasks(self):
+        if self._inflight is None:
+            return ()
+        if isinstance(self._inflight, tuple):
+            return self._inflight
+        return (self._inflight,)
+
     def stats(self):
         """返回脱离内部状态的只读统计快照；不暴露任何商品或用户身份。"""
         with self._condition:
             return {"admitted": self._admitted, "seed_cycles": self._seed_cycles,
-                    "queued": len(self._pending), "inflight": int(self._inflight is not None),
+                    "queued": len(self._pending), "inflight": len(self._inflight_tasks()),
                     "accepting": self._accepting, "completed": dict(self._completed)}
 
     def _log_stats(self, phase, *, admitted=None):
@@ -137,7 +144,7 @@ class DetailPrefetcher:
 
     def _has_capacity(self):
         # 在途任务也计入总容量，整个协调器至多保有128个任务。
-        return len(self._pending) + (self._inflight is not None) < self._capacity
+        return len(self._pending) + len(self._inflight_tasks()) < self._capacity
 
     def start(self):
         with self._condition:
@@ -185,12 +192,15 @@ class DetailPrefetcher:
         """调用者持有 condition；不做任何外部 I/O。"""
         key = _snapshot_key(snapshot) if snapshot is not None else _primary_key(ref)
         queued = self._pending.get(key)
-        running = self._inflight if isinstance(self._inflight, _DetailTask) and self._inflight.key == key else None
+        running = next(
+            (t for t in self._inflight_tasks() if isinstance(t, _DetailTask) and t.key == key),
+            None,
+        )
         if snapshot is None:
             if queued is not None or running is not None:
                 return 0
             # 只匹配主标识，不拿普通候选里的 ID/Sign 建立未经核验的别名。
-            for task in (*self._pending.values(), self._inflight):
+            for task in (*self._pending.values(), *self._inflight_tasks()):
                 if isinstance(task, _DetailTask) and task.snapshot is not None and _primary_key(task.ref) == key:
                     return 0
         else:
@@ -356,6 +366,82 @@ class DetailPrefetcher:
                     next_offset = new_offset
                     cursor = page_res.get("next_cursor")
 
+    def _record_detail_outcome(self, task, result, snapshot=None, last_exc_summary=""):
+        now = self._wall_clock()
+        next_check = getattr(result, "next_check_at", 0)
+        err_code = str(getattr(result, "error_code", "") or "").strip()
+        err_msg = str(getattr(result, "error_msg", "") or "").strip()
+        err_upper = err_code.upper()
+        status = getattr(result, "status", "error")
+        if (
+            (status == "ready" or err_upper == "PRODUCT_OFF_PROMOTION")
+            and isinstance(next_check, (int, float))
+            and not isinstance(next_check, bool)
+            and math.isfinite(next_check)
+        ):
+            until = max(now, next_check)
+        elif err_upper in ("RATE_LIMIT", "QUOTA_EXCEEDED", "429"):
+            until = now + RATE_LIMIT_COOLDOWN_SECONDS
+        else:
+            until = now + FAILURE_COOLDOWN_SECONDS
+        with self._condition:
+            # 执行期间收到的新版本留在 pending；完成旧任务绝不 pop 新任务。
+            for key in {task.key, _primary_key(task.ref)}:
+                self._cooldowns[key] = (until, _source_version(snapshot))
+                self._cooldowns.move_to_end(key)
+            while len(self._cooldowns) > COOLDOWN_CAPACITY:
+                self._cooldowns.popitem(last=False)
+        status = status if status in _COMPLETION_STATUSES else "error"
+        if last_exc_summary:
+            err_code = err_code or "INTERNAL_ERROR"
+            err_msg = err_msg or last_exc_summary
+        return status, err_code, err_msg
+
+    def _execute_detail_batch(self, tasks):
+        with api_caller_context("background"):
+            try:
+                outcomes = self.service.prefetch_product_details_batch(
+                    [t.ref for t in tasks],
+                    refresh_ahead_seconds=self.interval_seconds + 30,
+                    stop_event=self._stop_event,
+                ) or {}
+            except Exception as exc:
+                exc_summary = format_exc_summary(exc)
+                logger.warning(
+                    "❌ 【详情预取批量异常】执行同平台批量预取任务时发生异常，不影响在线服务 | 平台[%s] 异常<%s>",
+                    tasks[0].ref.platform if tasks else "", exc_summary,
+                )
+                return [
+                    self._record_detail_outcome(
+                        t,
+                        DetailPrefetchResult("error", error_code="INTERNAL_ERROR", error_msg=exc_summary),
+                        last_exc_summary=exc_summary,
+                    )
+                    for t in tasks
+                ]
+            recorded = []
+            for t in tasks:
+                if self._stop_event.is_set():
+                    recorded.append(("stopped", "", ""))
+                    continue
+                res = outcomes.get(t.ref.key)
+                if res is None:
+                    res = DetailPrefetchResult("error", error_code="UPSTREAM_ERROR", error_msg="批量预取未返回结果")
+                snap = getattr(res, "snapshot", None)
+                if getattr(res, "status", "") == "persist_failed" and snap is not None and not self._stop_event.is_set():
+                    try:
+                        res = self.service.prefetch_product_detail(
+                            snap.ref,
+                            snapshot=snap,
+                            refresh_ahead_seconds=self.interval_seconds + 30,
+                            stop_event=self._stop_event,
+                        )
+                        snap = getattr(res, "snapshot", None) or snap
+                    except Exception:
+                        pass
+                recorded.append(self._record_detail_outcome(t, res, snap))
+            return recorded
+
     def _execute_detail(self, task):
         with api_caller_context("background"):
             return self._execute_detail_inner(task)
@@ -392,35 +478,7 @@ class DetailPrefetcher:
                         break
             if self._stop_event.wait(self._retry_backoff):
                 return "stopped", "", ""
-        now = self._wall_clock()
-        next_check = getattr(result, "next_check_at", 0)
-        err_code = str(getattr(result, "error_code", "") or "").strip()
-        err_msg = str(getattr(result, "error_msg", "") or "").strip()
-        err_upper = err_code.upper()
-        status = getattr(result, "status", "error")
-        if (
-            (status == "ready" or err_upper == "PRODUCT_OFF_PROMOTION")
-            and isinstance(next_check, (int, float))
-            and not isinstance(next_check, bool)
-            and math.isfinite(next_check)
-        ):
-            until = max(now, next_check)
-        elif err_upper in ("RATE_LIMIT", "QUOTA_EXCEEDED", "429"):
-            until = now + RATE_LIMIT_COOLDOWN_SECONDS
-        else:
-            until = now + FAILURE_COOLDOWN_SECONDS
-        with self._condition:
-            # 执行期间收到的新版本留在 pending；完成旧任务绝不 pop 新任务。
-            for key in {task.key, _primary_key(task.ref)}:
-                self._cooldowns[key] = (until, _source_version(snapshot))
-                self._cooldowns.move_to_end(key)
-            while len(self._cooldowns) > COOLDOWN_CAPACITY:
-                self._cooldowns.popitem(last=False)
-        status = status if status in _COMPLETION_STATUSES else "error"
-        if last_exc_summary:
-            err_code = err_code or "INTERNAL_ERROR"
-            err_msg = err_msg or last_exc_summary
-        return status, err_code, err_msg
+        return self._record_detail_outcome(task, result, snapshot, last_exc_summary)
 
     def _execute(self, task):
         if isinstance(task, _SummaryTask):
@@ -434,6 +492,25 @@ class DetailPrefetcher:
                 )
                 return "summary_error", "PERSIST_FAILED", format_exc_summary(exc)
         return self._execute_detail(task)
+
+    def _pop_same_platform_batch_locked(self, first_task, max_batch: int = PAGE_LIMIT):
+        batch = [first_task]
+        if (
+            not isinstance(first_task, _DetailTask)
+            or first_task.snapshot is not None
+            or not callable(getattr(self.service, "prefetch_product_details_batch", None))
+        ):
+            return batch
+        plat = first_task.ref.platform
+        extra_keys = [
+            k for k, v in self._pending.items()
+            if isinstance(v, _DetailTask) and v.snapshot is None and v.ref.platform == plat
+        ][:max(0, max_batch - 1)]
+        for k in extra_keys:
+            popped = self._pending.pop(k, None)
+            if popped is not None:
+                batch.append(popped)
+        return batch
 
     def _run(self):
         try:
@@ -459,11 +536,15 @@ class DetailPrefetcher:
                         self._condition.wait(timeout)
                         continue
                     _, task = self._pending.popitem(last=False)
-                    self._inflight = task
-                status, err_code, err_msg = ("stopped", "", "")
+                    exec_tasks = self._pop_same_platform_batch_locked(task)
+                    self._inflight = tuple(exec_tasks) if len(exec_tasks) > 1 else exec_tasks[0]
+                task_outcomes = [("stopped", "", "")] * len(exec_tasks)
                 try:
                     if not self._stop_event.is_set():
-                        status, err_code, err_msg = self._execute(task)
+                        if len(exec_tasks) > 1:
+                            task_outcomes = self._execute_detail_batch(exec_tasks)
+                        else:
+                            task_outcomes = [self._execute(exec_tasks[0])]
                 finally:
                     batch_detail_total = 0
                     batch_detail_errors = None
@@ -471,19 +552,20 @@ class DetailPrefetcher:
                     batch_persist_errors = None
                     batch_off_promotion = 0
                     with self._condition:
-                        self._completed[status] += 1
-                        if isinstance(task, _DetailTask):
-                            self._batch_detail_total += 1
-                            plat = task.ref.platform or "unknown"
-                            if status == "persist_failed":
-                                self._batch_persist_errors[plat] = self._batch_persist_errors.get(plat, 0) + 1
-                            elif status == "skipped" and err_code.upper() == "PRODUCT_OFF_PROMOTION":
-                                self._batch_off_promotion += 1
-                            elif status == "error":
-                                tag = f"{plat}[{err_code or 'UNKNOWN'}]"
-                                self._batch_detail_errors[tag] = self._batch_detail_errors.get(tag, 0) + 1
-                                if err_msg and tag not in self._batch_detail_reasons:
-                                    self._batch_detail_reasons[tag] = err_msg[:120]
+                        for done_task, (status, err_code, err_msg) in zip(exec_tasks, task_outcomes):
+                            self._completed[status] += 1
+                            if isinstance(done_task, _DetailTask):
+                                self._batch_detail_total += 1
+                                plat = done_task.ref.platform or "unknown"
+                                if status == "persist_failed":
+                                    self._batch_persist_errors[plat] = self._batch_persist_errors.get(plat, 0) + 1
+                                elif status == "skipped" and err_code.upper() == "PRODUCT_OFF_PROMOTION":
+                                    self._batch_off_promotion += 1
+                                elif status == "error":
+                                    tag = f"{plat}[{err_code or 'UNKNOWN'}]"
+                                    self._batch_detail_errors[tag] = self._batch_detail_errors.get(tag, 0) + 1
+                                    if err_msg and tag not in self._batch_detail_reasons:
+                                        self._batch_detail_reasons[tag] = err_msg[:120]
                         self._inflight = None
                         batch_finished = not self._pending
                         if batch_finished:

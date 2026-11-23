@@ -4,7 +4,7 @@ import html as html_lib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from infrastructure.logging_utils import get_app_logger
@@ -71,8 +71,11 @@ class TaobaoAdapter(BasePlatformAdapter):
             setting("hdk_api_key"), api_key_list=hdk_keys)
         ztk_keys = setting("ztk_appkey_list", ())
         ztk_sids = setting("ztk_sid_list", ())
+        ztk_pub_sids = setting("ztk_publisher_sid_list", ())
         self.ztk = ztk_client if ztk_client is not None else ZtkClient(
-            setting("ztk_appkey"), setting("ztk_sid"), appkey_list=ztk_keys, sid_list=ztk_sids)
+            setting("ztk_appkey"), setting("ztk_sid"),
+            appkey_list=ztk_keys, sid_list=ztk_sids, publisher_sid_list=ztk_pub_sids,
+        )
         pid_val = _text(setting("tb_pid"))
         pid_prefix = _text(setting("tb_pid_prefix"))
         if not pid_prefix and pid_val.startswith("mm_") and len(pid_val.split("_")) == 4:
@@ -93,6 +96,11 @@ class TaobaoAdapter(BasePlatformAdapter):
         has_ztk_channel = bool(has_ztk_key and has_ztk_sid)
         self._ztk_channel_ok = bool(ztk_client is not None or has_ztk_channel)
         self._official_auth_ok = bool(official_client is not None or (self._official_ok and setting("tb_session")))
+        raw_off_rt = getattr(official_client, "refresh_token", "")
+        self._has_tb_refresh_token = bool(
+            _text(setting("tb_refresh_token"))
+            or (raw_off_rt.strip() if isinstance(raw_off_rt, str) else "")
+        )
         self._orders_ok = bool(ztk_client is not None or has_ztk_channel)
         self.tb_name = _text(setting("hdk_tb_name"))
         if self._hdk_ok and self.hdk:
@@ -707,6 +715,20 @@ class TaobaoAdapter(BasePlatformAdapter):
             res["data"] = []
         return res
 
+    def _finalize_official_detail_item(self, raw_item: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(raw_item)
+        echoed = _text(item.get("input_item_iid"))
+        if echoed and not echoed.isdigit():
+            # Keep the proven request identity stable for front-end, Mongo and
+            # detail-cache keys instead of replacing it on every encryption round.
+            item["goods_sign"] = echoed
+            item["goods_id"] = extract_canonical_goods_id(self.platform_code, echoed) or echoed
+        else:
+            canonical = _text(item.get("goods_sign") or item.get("goods_id"))
+            item["goods_sign"] = canonical
+            item["goods_id"] = extract_canonical_goods_id(self.platform_code, canonical) or canonical
+        return item
+
     def _official_detail(self, ref):
         if not ref.key:
             return _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
@@ -735,18 +757,7 @@ class TaobaoAdapter(BasePlatformAdapter):
             if isinstance(raw_data, list) and len(raw_data) == 0:
                 return _error("PRODUCT_OFF_PROMOTION", "该淘宝商品已下架或已停止推广")
             return _error("PRODUCT_IDENTITY_MISMATCH", "官方商品详情未证实请求商品身份")
-        item = dict(items[0])
-        echoed = _text(item.get("input_item_iid"))
-        if echoed and not echoed.isdigit():
-            # Keep the proven request identity stable for front-end, Mongo and
-            # detail-cache keys instead of replacing it on every encryption round.
-            item["goods_sign"] = echoed
-            item["goods_id"] = extract_canonical_goods_id(self.platform_code, echoed) or echoed
-        else:
-            canonical = _text(item.get("goods_sign") or item.get("goods_id"))
-            item["goods_sign"] = canonical
-            item["goods_id"] = extract_canonical_goods_id(self.platform_code, canonical) or canonical
-        return {"status": "success", "data": item}
+        return {"status": "success", "data": self._finalize_official_detail_item(items[0])}
 
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):
         unavailable = self._available("detail")
@@ -815,6 +826,74 @@ class TaobaoAdapter(BasePlatformAdapter):
             **kwargs,
         )
         return self._execute_capability("detail", providers, allow_persist=self._is_real_http())
+
+    def batch_get_goods_details(self, refs: Sequence[ProductRef], uid=None, **kwargs) -> Dict[str, Dict[str, Any]]:
+        """
+        淘宝 20 批量官方查卡：首选官方 tbk.item.info.upgrade.get (<=20 靠 input_item_iid 精准对齐，
+        单条坏/下架 ID 不连坐)，缺失或失败项回退单品 get_goods_detail（ZTK api_detail -> HDK item_detail）。
+        """
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        ordered_refs = []
+        seen_keys = set()
+        for raw_ref in refs or ():
+            r = self.resolve_product_ref(raw_ref.key, raw_ref.goods_id, raw_ref.goods_sign)
+            key = r.key or raw_ref.key
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ordered_refs.append(r)
+        if not ordered_refs:
+            return outcomes
+
+        unavailable = self._available("detail")
+        if unavailable:
+            for r in ordered_refs:
+                outcomes[r.key] = dict(unavailable)
+            return outcomes
+
+        valid_refs = []
+        for r in ordered_refs:
+            if not r.key:
+                outcomes[r.key] = _error("INVALID_ARGUMENT", "缺少淘宝商品标识")
+            elif self._is_truncated_tb_suffix(r.key):
+                outcomes[r.key] = _error("INVALID_IDENTITY", "淘宝商品标识不完整，请提供完整加密标识或数字商品ID")
+            else:
+                valid_refs.append(r)
+
+        if self._official_ok and hasattr(self.official, "get_goods_details"):
+            for i in range(0, len(valid_refs), 20):
+                chunk = valid_refs[i:i + 20]
+                raw_res = self._guard_provider_result(
+                    self.official.get_goods_details([r.key for r in chunk])
+                )
+                if raw_res.get("status") != "success":
+                    continue
+                rows = raw_res.get("data") or []
+                if not isinstance(rows, list):
+                    continue
+                for r in chunk:
+                    matched = [row for row in rows if isinstance(row, dict) and self._matches(row, r)]
+                    if len(matched) == 1:
+                        try:
+                            outcomes[r.key] = {
+                                "status": "success",
+                                "data": self._detail(self._finalize_official_detail_item(matched[0])),
+                                "_provider": "tb_official_detail_batch",
+                            }
+                        except Exception:
+                            pass
+
+        for r in valid_refs:
+            if r.key in outcomes:
+                continue
+            outcomes[r.key] = self.get_goods_detail(
+                r.key,
+                uid=uid,
+                goods_id=r.goods_id or None,
+                goods_sign=r.goods_sign or None,
+                **kwargs,
+            )
+        return outcomes
 
     def _is_unauthorized_error(self, err) -> bool:
         """识别淘宝/折淘客网关抛出的渠道未授权或 relationId 无效错误。"""
@@ -1143,7 +1222,9 @@ class TaobaoAdapter(BasePlatformAdapter):
                 return stamp_universal_resolution(_error("PRODUCT_IDENTITY_MISMATCH", "折淘客万能解析返回与请求淘宝商品不一致"))
             tao_id = raw_tao_id or (text if is_bare_id else "")
             canonical_tao_id = extract_canonical_goods_id(self.platform_code, tao_id) or tao_id
-            title = ztk_fields["title"] or _text(ztk_res.get("title") or "淘宝精选好物")
+            raw_title_val = _text(ztk_fields["title"] or ztk_res.get("title"))
+            raw_title = "" if raw_title_val == "渠道推广商品" else raw_title_val
+            title = raw_title or "淘宝精选好物"
             pict_url = ztk_fields["image_url"]
             gallery = ztk_fields["carousel_images"]
             final_price = ztk_fields["price"]
@@ -1156,7 +1237,15 @@ class TaobaoAdapter(BasePlatformAdapter):
             raw_item_url = ztk_fields["item_url"] or (f"https://uland.taobao.com/item/edetail?id={tao_id}" if tao_id else "")
 
             product_card = None
-            if tao_id and title:
+            detail_lookup_failed = False
+            has_complete_card = bool(
+                tao_id
+                and raw_title
+                and final_price is not None
+                and final_price > 0
+                and (pict_url or gallery)
+            )
+            if has_complete_card:
                 detail_payload = {
                     "platform": self.platform_code,
                     "platform_name": self.platform_name,
@@ -1182,8 +1271,35 @@ class TaobaoAdapter(BasePlatformAdapter):
                     "coupon_info": {},
                 }
                 product_card = ProductDetail(**detail_payload).to_dict(exclude_unset=True)
+            elif tao_id:
+                det = self.get_goods_detail(tao_id, goods_id=canonical_tao_id, goods_sign=tao_id)
+                det_data = det.get("data") if isinstance(det, dict) else None
+                if (
+                    isinstance(det, dict)
+                    and det.get("status") == "success"
+                    and isinstance(det_data, dict)
+                    and (det_data.get("price") or 0) > 0
+                    and _text(det_data.get("name"))
+                ):
+                    product_card = det_data
+                    title = _text(product_card.get("name")) or title
+                    final_price = product_card.get("price") or final_price
+                    coupon_money = product_card.get("coupon_amount", coupon_money)
+                    canonical_tao_id = product_card.get("goods_id") or canonical_tao_id
+                    tao_id = product_card.get("goods_sign") or tao_id
+                elif isinstance(det, dict) and det.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                    return stamp_universal_resolution(det)
+                else:
+                    detail_lookup_failed = True
 
             lower_urls = f"{text} {link} {short_url}".lower()
+            is_converted_link = (
+                bool(link and link.strip() != text.strip())
+                or bool(short_url and short_url.strip() != text.strip())
+                or "s.click.taobao.com" in lower_urls
+                or "ali_trackid=" in lower_urls
+                or "union_lens=" in lower_urls
+            )
             verified_coupon_or_venue = bool(
                 not tao_id
                 and not is_bare_id
@@ -1196,8 +1312,7 @@ class TaobaoAdapter(BasePlatformAdapter):
                         "mo.m.taobao.com",
                     )
                 )
-                and "/wow/z/lianmeng/" not in lower_urls
-                and "wh_alimama=" not in lower_urls
+                and (is_converted_link or ("/wow/z/lianmeng/" not in lower_urls and "wh_alimama=" not in lower_urls))
             )
             payload = {
                 "status": "success",
@@ -1219,6 +1334,7 @@ class TaobaoAdapter(BasePlatformAdapter):
                 "coupon_amount": coupon_money,
                 "link_type": "折淘客渠道淘口令" if (uid and relation_id) else "淘宝高佣淘口令",
                 "product": product_card,
+                **({"detail_lookup_failed": True} if (detail_lookup_failed and product_card is None) else {}),
             }
             return stamp_universal_resolution(
                 payload,
@@ -1237,40 +1353,11 @@ class TaobaoAdapter(BasePlatformAdapter):
                 conv["detail_lookup_failed"] = True
             return stamp_universal_resolution(conv)
 
-        def _do_resolve_item_id_fallback():
-            if not hasattr(self.ztk, "resolve_item_id"):
-                return {"status": "skipped", "reason": "no_resolve_item_id"}
-            resolved = self.resolve_product_from_link(text)
-            if resolved.get("status") != "success":
-                return resolved
-            prod = resolved.get("product") or {}
-            p_ref = self.resolve_product_ref(
-                _text(resolved.get("item_id")),
-                _text(prod.get("goods_id")),
-                _text(prod.get("goods_sign")),
-            )
-            tid = self._preferred_tb_promo_id(p_ref, _text(resolved.get("item_id")))
-            conv = dict(self.convert_promotion_url(
-                tid, uid=uid, identity=identity,
-                goods_id=p_ref.goods_id or None, goods_sign=p_ref.goods_sign or None,
-            ))
-            conv.pop("_provider", None)
-            if conv.get("status") != "success":
-                return stamp_universal_resolution(conv)
-            conv["product"] = prod
-            conv["title"] = prod.get("name") or conv.get("title") or "淘宝精选商品"
-            conv["price"] = prod.get("price")
-            conv["coupon_amount"] = prod.get("coupon_amount", 0.0)
-            return stamp_universal_resolution(conv)
-
         base = []
-        has_link_or_tkl = bool(URL_RE.search(text) or extract_taobao_token_core(text))
         if self._ztk_channel_ready() and self.channel_pid:
             base.append(("ztk_tb_universal", _do_ztk_resolve))
             if official_target_id and self._official_ok and self._search_ok and not (uid and relation_id):
                 base.append(("tb_official_universal", _do_official_id_resolve))
-            if not official_target_id and has_link_or_tkl and hasattr(self.ztk, "resolve_item_id"):
-                base.append(("ztk_tb_resolve_id_universal", _do_resolve_item_id_fallback))
         elif official_target_id and self._official_ok:
             base.append(("tb_official_universal", _do_official_id_resolve))
 
@@ -1344,11 +1431,20 @@ class TaobaoAdapter(BasePlatformAdapter):
         def _auth_via_ztk():
             return self.ztk.check_publisher_relation(uid)
 
+        ztk_ready = self._ztk_channel_ready() and hasattr(self.ztk, "check_publisher_relation")
+        off_ready = self._official_auth_ok and hasattr(self.official, "check_authority")
+        ztk_first = ztk_ready and not self._has_tb_refresh_token
+
         base = []
-        if self._official_auth_ok and hasattr(self.official, "check_authority"):
-            base.append(("tb_official_auth", _auth_via_official))
-        if self._ztk_channel_ready() and hasattr(self.ztk, "check_publisher_relation"):
+        if ztk_first:
             base.append(("ztk_tb_auth", _auth_via_ztk))
+            if off_ready:
+                base.append(("tb_official_auth", _auth_via_official))
+        else:
+            if off_ready:
+                base.append(("tb_official_auth", _auth_via_official))
+            if ztk_ready:
+                base.append(("ztk_tb_auth", _auth_via_ztk))
 
         providers = self._compose_providers("check_authority", base, uid=uid)
         return self._execute_capability("check_authority", providers, allow_persist=self._is_real_http())

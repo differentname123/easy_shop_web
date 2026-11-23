@@ -36,6 +36,10 @@
     5. 完整京口令 (`jCommand`)；
     6. 精简京口令 (`jShortCommand`)。
     单把 `ZTK_APPKEY` 实测连续 80 次并发（50.9 QPS）零报错，且**在折淘客 `goods_query` 公共池爆发 `1000` 限流期间（23:18 实测 3 Key 全挂）仍保持 57–68ms 100% 稳定可用（独立故障域），严禁与 `goods_query` 共享同一冷却开关互相误杀**。
+  - ⚠️ 【2026-11-23 二次实证补全：突发突发脉冲 `301` 窗与 `union-click` 差异】：
+    * **高频连续突发保护**：在真实脚本或并发清洗中若对单 Key 无间隔连续打 `api_detail.ashx`，会触发短时 IP/账户窗口全部 Key 同步返回 `301: 对应宝贝已下架`（`ztk_ambiguous_301=True`）；生产实测 3748 次 `301` 连打满 3 把 Key 并耗尽 `goods_query` 选品池配额。因此客户端必须对 `api_detail` 启用独立微节流（`0.35s/Key`）且遇 `301: 对应宝贝已下架` **第 1 把 Key 立即早停（绝不连打 3 把 Key 放大风控）**。
+    * **`union-click.jd.com` 对 `api_detail` 兼容边界**：部分可转链的 `union-click.jd.com/jdc?...` 会令 `api_detail` 返回 `301`，因此不得凭 `api_detail(u.jd/union-click/京口令)` 返回 `301` 直接短路判为 `PRODUCT_OFF_PROMOTION`，仍需由 `goods_query -> HDK` 或 `byunionid_get` 生成新 `u.jd.com` 后补 1 次 `api_detail` 完成核验。
+    * **可信重定向后缀**：JD 短链真实落地页除 `jd.com`、`3.cn` 外，已实测包含京东国际 `jd.hk` 与京东健康 `yiyaojd.com`（如 `npcitem.jd.hk` / `item.yiyaojd.com`），`_is_trusted_jd_redirect_url` 必须同步放行。
   - ❌ 不可用入参：
     1. 纯数字旧版 SKU ID（如 `"100012043978"`），接口直接报错 `{"status": 301, "content": "对应宝贝已下架"}`。
     2. 34 位主图指纹（如 `"6a0eae0eF1e13f63b_00833203205e8c7e"`）：2026-11-23 实测仍复现串货，误将 `"0083320320"` 当数字 SKU 返回无关商品 `"研华PCA-6114P12-0B"`，严禁传入 `api_detail.ashx`！
@@ -76,10 +80,10 @@
     6. ✅ 京东纯短口令 (`jShortCommand`)
     7. ✅ 本平台生成的完整推广口令文案 (`command_text`，多行含 `u.jd.com` 与短口令)
     8. ✅ 社群混排长促销文案（如 `★京东超级补贴★...[下单链接：https://u.jd.com/xxx]返红包...`，当 `u.jd.com` 短链后紧贴 `]` 或中文且无京口令时，自动剥离非 ASCII 尾缀重试一次折淘客转链）
-  - ✅ 详情反查机制：
-    - 当输入含京粉加密 ID 时，直接调用 `api_detail.ashx` 获取完整详情；
-    - 当输入为 `u.jd.com` 短链、`union-click.jd.com` 长链或京口令时，先由 `open_jing_union_open_promotion_byunionid_get.ashx` 转出专属 `shortURL` 与 `jCommand`，
-      再以 `q=https://u.jd.com/xxx` 调用 `api_quanwang.ashx` (`youquan=0, type=2`) 精准反查出唯一商品（含加密 `tao_id`、主图、券后价、佣金率等）。
+  - ✅ 详情反查与极简 4 步直线链路（2026-11-23 全量线上日志实证简化）：
+    - **已永久淘汰尾端冗余兜底**：生产全量样本统计 `tkl_piliang` 救活率仅 `0.06% (1/1788)` 且缺多图缺券链、`api_quanwang` 兜底救活率 `0.00% (0/468)`，两者均已永久移除；同时去除 `goods_query` 冷却锁对独立 `api_detail` 与 `byunionid_get`（`5212/5213 = 99.98%` 成功）的全局误杀门卫。
+    - **统一查卡 4 步直线**：已知加密 ID / `jingfen` / `u.jd.com` / `union-click` / 京口令（`！...！`，严格排除无链接无口令纯文案）统一走 `api_detail`（独立池） -> `goods_query`（共享 `1000`/`1001` 选品池） -> 好单库 `v3/jd_goods_search` -> 0 配额轻解包（含 `jd.hk`/`yiyaojd.com`）；
+    - **唯一转链出口 `byunionid_get`**：非裸京口令且已获卡直接 `byunionid_get -> HDK`；裸京口令或混排文案原样（优先提取嵌入官网 URL）透传 `byunionid_get -> HDK`，若新产出 `u.jd.com` 短链再补 1 次 `api_detail` 查卡，仍未出卡严格 Fail-Closed 标为 `degraded_product`。
   - ❌ 不可用输入：`https://item.jd.com/{数字SKU}.html` 或无链接/无口令的纯文本标题（直接拦截报错，绝不模糊搜索兜底）。
 
 七、【频控与高可用唯一有效方案 (`ZTK_APPKEY_LIST` 自动故障切换)】
@@ -126,6 +130,25 @@
      - ✅ 稳定可用：`POST v3/get_jditems_link`（支持加密 ID / `jingfen` / `u.jd.com` / `union-click` / `jCommand` / 会场 URL，但不支持个人 `positionId` 与纯数字 SKU）、`GET v2/jd_hot_rank`（热销榜）、`v2/wire_report_new`（线报源）全程 100% 稳定。
   5. **非联盟官方领券短链 (`3.cn` / `coupon.m.jd.com`)**：
      - `byunionid_get` 与好单库 `get_jditems_link` 均报错 `2001927: 优惠券非联盟渠道券`，必须通过零配额 HTTP 重定向解包直接识别官方领券页。
+  6. **【2026-11-23 下午全架构重构实证定版落地】**：
+     - ✅ **官方会场 Host 优先级**：`u.jd.com/o19hsre` 等短链落地至 `pro.m.jd.com` / `prodev.m.jd.com` / `shop.m.jd.com` / `mall.jd.com` 时，即使 URL 携带纯数字 `?sku=100115132399`，`resolve_jd_short_url` 与 `resolve_product_from_link` 仍判为官方会场 (`is_venue=True`)；直连会场链无需 HTTP 解包，可直接通过 `byunionid_get` / HDK `get_jditems_link` 转出推广链。
+     - ✅ **各接口最小搜索字符与离散分页硬约束**：
+       * JD `goods_query` 与 HDK `v3/jd_goods_search` 均支持 1 字符（如 `"水"`）；
+       * ZTK `api_quanwang.ashx` 至少需 **2 个字**（`"水"` 报 `301: 搜索词不能少于2个字`，`"可乐"` 返回 200）；因此 1 字词路由 `HDK` 优先、`>=2` 字保持 `ZTK` 优先；
+       * HDK `v3/jd_goods_search` 的 `back` 参数仅接受离散枚举 **`(1, 2, 5, 10, 20, 30, 50)`**（已统一向上对齐后截断，禁用随意 `back=7`/`back=15`）。
+     - ✅ **榜单与搜索配额清理**：解锁个人 `jd_official_rank`（`goods.rank.query`）作为榜单第 3 灾备源；永久移除日配额为 0 的个人 `jd.union.open.goods.query` (`listId=533`) 搜索/详情分支。
+     - ✅ **故障域隔离与 20 批量标准化**：`api_detail.ashx` 启用独立冷却锁 `("jd", "ztk", "api_detail")`，彻底脱离 `goods_query` 选品库 1000 限流连坐，并在 `get_goods_detail` 中晋升为第 1 主力（50.9 QPS）；`JdAdapter.batch_get_goods_details` 固定以 `<=20` 批量调用 `goods_query(itemIds=...)`，靠 **`oriItemId`** 对齐并仅对缺席/坏项做独立单卡兜底确权。
+     - 🚨 **2026-11-23 17:21 实测新坑（假/损坏 50 位加密 ID 防“指鹿为马”）**：
+       * 对无法解密或伪造的 50 位加密串，`ZTK api_detail.ashx?tao_id=` 与 `HDK v3/jd_goods_search?keyword=` 均会退化为子串关键词匹配返回完全无关商品（且 HDK `?keyword=` 会把入参假 ID 原样回写进 `itemid`/`skuid`）；
+       * 反之，`ZTK goods_query?itemIds=`（返回 `[]`）与 `HDK v3/jd_goods_search?itemIds=`（返回 `[]`）100% 诚实不造假；
+       * 故已将 `HdkClient.get_goods_detail(50位加密ID)` 切换为 `itemIds=` 单项调用，并将 `JdAdapter._verified_jd_cipher_pair` 收紧为加密后缀 (`rsplit("_", 1)[1]`) 一致性校验，跨密钥池且主图变更须由 `goods_query(oriItemId)` 权威确证。
+  7. **【2026-11-24 2小时线上实跑压测与终态补充】**：
+     - ✅ **核心链路生产实证基线**：连续 2 小时真实业务运行，`api_detail` 3,349 次（0 限流、均耗 183ms），`goods_query` 766/766（100%、0 限流），`byunionid_get` 3,235 次（0 限流、均耗 154ms）；1,336 款 JD 商品（含 637 款有券商品）100% 带完整 `coupon_url`、0 缺失、0 坏图/零价。好单库 `v3/jd_goods_search` 偶有全时段 `listId=533` 限流（2 小时 17/17），因一二梯队高命中率被自动隔离消化。
+     - ✅ **旧券短链 `2001917` 回退纯净 `jingfen` 重转**：部分旧 `u.jd.com` 短链（如 `o61KxfW`）内嵌已失效优惠券，`api_detail` 可正常查出完整商品卡与 `https://jingfen.jd.com/detail/{enc_id}.html`，但拿原短链调 `byunionid_get` 会报内层 `code=2001917（优惠券不可购买该商品）`；实测改用已查得的纯净 `jingfen.jd.com/detail/...html` 重转一次 `byunionid_get` 可 100% 成功出新短链。同时 `JdClient._get` 对 `PROMOTION_ROOT` 内层 JSON `code != 200` 严格如实记录监控状态，不再虚记 `success`。
+     - ✅ **新增官方非单品活动域名 & PC 领券重组边界**：
+       * 确认京东外卖 `hour.jd.com`、省钱卡 `mcard.jd.com`、PLUS `plus.m.jd.com`（外层常套 `plogin.m.jd.com`）、直播间 `lives.jd.com` 均属官方非单品活动域，`resolve_jd_short_url` 正向判为 `is_venue=True`；
+       * 京东 PC 领券短链（如 `3.cn/3cuM-vUn` -> `coupon.jd.com/ilink/couponActiveFront/...` / `passport.jd.com?ReturnUrl=...`）可通过白名单 `key`+`roleId` 无损重组为移动端 `https://coupon.m.jd.com/coupons/show.action`；
+       * 对落地为 `pro.m.jd.com/mall/active/...?sku=<非纯数字加密ID>` 的通天塔单品模板，**严禁**在白名单重组时剥离加密 `sku` 冒充无佣金纯会场（仅无 `sku` 或纯数字 `sku` 如 `o19hsre` 才属纯会场）。
 ================================================================================
 """
 

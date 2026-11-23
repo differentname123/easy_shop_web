@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import http.cookiejar
 import logging
 import os
 import socket
@@ -190,7 +191,10 @@ class DealPoolCleaner:
             return self.unwrap_http_session
         with self._cache_lock:
             if self._shared_unwrap_session is None:
-                self._shared_unwrap_session = create_http_session(pool_connections=16, pool_maxsize=32)
+                sess = create_http_session(pool_connections=16, pool_maxsize=32)
+                # 仅复用 TCP/TLS 连接池，禁止保存第三方短链追踪 Cookie 防广告劫持
+                sess.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+                self._shared_unwrap_session = sess
             return self._shared_unwrap_session
 
     def _can_run_live_unwrap(self) -> bool:

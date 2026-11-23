@@ -138,6 +138,21 @@
      - ⚠️ **致命陷阱（代理模式 `sid` 拒绝无 `relation_id` 的公开转链）**：折淘客授权账号分「普通模式」与「代理模式」。实测新补的两个备用 `sid` 在折淘客后台授权为**代理模式**，当不传 `relation_id`（即站长公共转链 / 线报清洗 / 未登录万能转链场景）调用 `open_gaoyongzhuanlian_tkl.ashx` 与 `tkl_piliang` 时，接口只笼统报错 `301: 很抱歉！转链失败！`（`gaoyongzhuanlian.ashx` 才会吐出真正原因：`很抱歉！当前sid类型为代理模式，必须传入用户的relation_id！`）；而传入 `relation_id` 后三把 Key 行为即与主 Key 完全一致。
      - ✅ **无需 `relation_id` 即可三 Key 完全等价的接口**：三组 `(appkey, sid)` 实测指向同一淘宝主账号（`ali_trackid` 前缀均为 `2:116341500041`，`open_sc_publisher_get` 返回结构完全一致），在 `open_dingdanchaxun2.ashx`（拉单）、`open_sc_publisher_get.ashx`（渠道核验与邀请码）、`api_quanwang.ashx`（搜品）、`api_detail.ashx`（详情）、`open_shangpin_id.ashx`、`tkl_piliang(wh_alimama会场)` 及京东 `:20000` 全接口上均 100% 互通可用。
      - ⚠️ **严禁写反下标顺序**：`ZtkClient` 按下标一一配对 `zhetaoke_appkey_list[i] <-> zhetaoke_sid_list[i]`，若顺序错配会立刻报 `301: 授权账号sid过期或者sid和appkey不匹配`；在将代理模式 `sid` 改回普通模式前，严禁将其直接放入公开转链的 `round_robin` 轮询池（否则 2/3 公开转链/线报清洗会失败）。
+  5. **【2026-11-23 16:20+ 三 Key 权限完整实证与双 SID 池架构定版】**：
+     - ✅ **双 SID 池完全实现 3-Key 100% 功能等价**：折淘客同一 `appkey` 下不同用途 `sid` 权限物理隔离、互不共享。通过拆分为两套按下标 1 对 1 对齐的 SID 池（`config.local.json`），3 把 `ZTK_APPKEY` 实现全能力 100% 满血轮询：
+       * **`zhetaoke_sid_list`（高频转链/口令/搜品/订单池）**：主 Key 配普通模式 `sid`，K1 对应 `193336`、K2 对应 `193338`（实测 `tkl(pub)`、`tkl_piliang(pub)`、`gaoyong(pub)`、`tkl(rel)`、`open_dingdanchaxun2`、`api_quanwang` 全部 100% 通过）；
+       * **`zhetaoke_publisher_sid_list`（推手备案/邀请码专池）**：主 Key 配主 `sid`，K1 对应 `193334`、K2 对应 `193333`（实测 `open_sc_publisher_get`、`open_sc_invitecode_get`、`open_dingdanchaxun2` 全部 100% 通过；因其为代理模式，不混入公开转链池）；
+       * **备用池外记录**：`193337`(K1) 与 `193339`(K2) 仅通订单与 `api_quanwang`，留档备查不入主力池。
+     - ✅ **会场转链与授权优先级**：
+       * `pages.tmall.com/wow/...&wh_alimama=true`、`mo.m.taobao.com`、`uland.taobao.com/quan` 实测由 `tkl_piliang` 返回 `status=200, tao_id=""` + 含 `ali_trackid=2:...` 的有效推广直链（无效/404 页面会返 `err.tmall.com/error1.html?c=404` 必须拒绝）；`ZtkClient.convert_channel_url` 现保留前者有效会场链并拒绝错误跳转，`TaobaoAdapter.resolve_and_convert_universal` 正向确认为 `coupon_or_venue`；
+       * 正式移出 `open_shangpin_id.ashx` (`0/58` 救活率) 于万能转链兜底链（仅保留 `resolve_product_from_link` 工具）；
+       * `check_authority` 在未配置 `taobao_refresh_token` 时优先走 90 天长效 `ztk_tb_auth`（跳过已过期的 24h `taobao_session` `27` 报错），`TaobaoAdapter.batch_get_goods_details` 通过 TOP `item.info.upgrade.get(<=20)` 的 `input_item_iid` 对齐且单个坏 ID 不连坐。
+  6. **【2026-11-23 缺卡防假卡铁律：禁止捏造 `"渠道推广商品"` 占位符 + 自动详情抢救】**：
+     - ⚠️ 部分淘宝二合一/渠道转链响应只返 `tao_id` 与推广链接但缺失标题/价格/图片；严禁底层 `ZtkClient.convert_channel_url` 捏造假标题 `"渠道推广商品"` 或 `0.00` 假价；
+     - ✅ `TaobaoAdapter._do_ztk_resolve` 强制校验完整性（`tao_id + 非空原标题 + price > 0 + 主图/轮播图`），缺任一项即自动调 `get_goods_detail(tao_id)` 补全；确证下架返回 `PRODUCT_OFF_PROMOTION`，查无详情严格 Fail-Closed 标为 `degraded_product`。
+  7. **【2026-11-24 2小时线上实跑压测与终态确认】**：
+     - ✅ 连续 2 小时真实运行：`ztk_tb_universal` 3,537/3,645（97.04%、0 限流），HDK+TOP 推荐榜单 230/230（100%），订单同步 83/83（100%）；正式库 2,994 款淘宝商品 **0 假标题（`"渠道推广商品"`）、0 零价、0 缺图**。
+     - ✅ 上层非联盟短链预解包注意：**禁止持久化第三方短链站点 Cookie**（实测部分三方短链站携带追踪 Cookie 多次访问后会概率劫持跳转至无关红包广告页，无 Cookie 重试一次即可稳定还原官方领券/CPS 页）；`wh_alimama=true` 与 `/wow/z/lianmeng/` 维持仅转链产出真实 `ali_trackid` 推广链后才确认为会场，防止漏佣。
 ================================================================================
 """
 

@@ -1342,8 +1342,9 @@ def test_ai1_supplements_union_click_link_when_numeric_jd_present():
 
 
 def test_jd_empty_jcommand_never_skips_piliang_or_misclassified_as_venue():
-    """验证 AGENTS.md 准则三：京东 byunionid_get 即使返回空 jCommand，也严禁跳过 tkl_piliang，严禁误判为会场/纯券。"""
-    from infrastructure.jd_client import JdClient
+    """验证 JD 万能转链彻底移除 tkl_piliang 后纯走 byunionid_get，并在缺卡时严格 Fail-Closed 不误判为纯券/会场。"""
+    import json
+    from infrastructure.jd_client import JdClient, PROMOTION_ROOT
     from adapters.jd_adapter import JdAdapter
 
     client = JdClient(appkey_list=["fake_key"], union_id="123456")
@@ -1355,36 +1356,27 @@ def test_jd_empty_jcommand_never_skips_piliang_or_misclassified_as_venue():
         called_endpoints.append(endpoint)
         if endpoint == "open_jing_union_open_promotion_byunionid_get.ashx":
             return evaluator({
-                "status": 200,
-                "data": {
-                    "code": 200,
-                    "data": {
-                        "shortURL": "https://u.jd.com/myPromo",
-                        "clickURL": "https://union-click.jd.com/jdc?e=1",
-                        "jCommand": "",
-                        "jShortCommand": "",
-                    },
-                },
-            })
-        elif endpoint == "open_gaoyongzhuanlian_tkl_piliang.ashx":
-            return evaluator({
-                "status": 200,
-                "tao_id": "cipher_product_123",
-                "result_url": "https://u.jd.com/myPromo",
-                "result_tkl": "",
-                "pic": "https://img.jd.com/p.jpg",
-                "title": "京东测试牛奶",
+                PROMOTION_ROOT: {
+                    "result": json.dumps({
+                        "code": 200,
+                        "data": {
+                            "shortURL": "https://u.jd.com/myPromo",
+                            "clickURL": "https://union-click.jd.com/jdc?e=1",
+                            "jCommand": "",
+                            "jShortCommand": "",
+                        },
+                    })
+                }
             })
         return {"status": "error"}
 
     client._execute_with_failover = _fake_exec
     res = client.convert_universal_material("https://u.jd.com/oaTdF8d", "3110104129")
 
-    # 必须调用了 piliang，并且成功提取了 tao_id
-    assert "open_gaoyongzhuanlian_tkl_piliang.ashx" in called_endpoints
-    assert res.get("tao_id") == "cipher_product_123"
+    assert called_endpoints == ["open_jing_union_open_promotion_byunionid_get.ashx"]
+    assert res["status"] == "success"
 
-    # 验证 adapter 绝不将普通短链判为 coupon_or_venue
+    # 验证 adapter 在拿不到商品卡且非明确会场时严格 Fail-Closed 为 degraded_product（绝不误判 coupon_or_venue）
     adapter = JdAdapter(
         settings=SimpleNamespace(
             jd_enabled=True,
@@ -1398,14 +1390,23 @@ def test_jd_empty_jcommand_never_skips_piliang_or_misclassified_as_venue():
         ),
         client=client,
     )
-    adapter.get_goods_detail = MagicMock(return_value={
+    adapter.client.query_union_goods = MagicMock(return_value={"status": "success", "data": []})
+    conv_deg = adapter.resolve_and_convert_universal("https://u.jd.com/oaTdF8d")
+    assert conv_deg["status"] == "success"
+    assert conv_deg["resolution_kind"] == "degraded_product"
+    assert conv_deg["detail_lookup_failed"] is True
+
+    # 当新转出短链 myPromo 由独立 api_detail 补查命中时，仍正常输出完整 product 卡
+    adapter.client.get_goods_detail = MagicMock(return_value={
         "status": "success",
-        "data": {
-            "name": "京东测试牛奶",
-            "price": 65.8,
-            "goods_id": "cipher_product_123",
-            "goods_sign": "sign_123",
-        },
+        "data": [{
+            "tao_id": "cipher_product_123",
+            "title": "京东测试牛奶",
+            "quanhou_jiage": "65.8",
+            "size": "65.8",
+            "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/milk.jpg",
+            "item_url": "https://jingfen.jd.com/detail/cipher_product_123.html",
+        }],
     })
     conv_out = adapter.resolve_and_convert_universal("https://u.jd.com/oaTdF8d")
     assert conv_out["status"] == "success"
@@ -2332,16 +2333,15 @@ def test_build_clean_original_copywriting_prepends_title_without_duplication():
 
 def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_cooldown():
     """
-    验证本地 CATALOG_COOLDOWN 冷却期内跳过选品库时：
-    1. 冷却期内非会场 JD 目标直接入口熔断（零 hdk.convert_promotion_link 与零 ZTK byunionid_get/选品库 HTTP），
-       同时纯官方领券/会场白名单仍可正常放行；
-    2. catalog_cooling=True 通过 JdClient -> execute_provider_chain -> JdAdapter -> Stage 3 -> DB 完整传播；
-    3. 单链接及“坏副链+冷却主链”多链接场景（如 haodanku#1659971）均保持原重试次数不被消耗/误杀，
-       并精确排期在冷却结束后重试；
-    4. 非冷却态的真实上游失败依然正常累加 retry_count 并在 3/3 时退出，杜绝无限重试副作用。
+    验证本地选品池冷却期 (`goods_query` 跳过) 的新故障域隔离行为：
+    1. 冷却期内 `goods_query` 共享池保持 0 HTTP 调用，但独立健康的 `byunionid_get` 与官方会场不受阻断；
+    2. 当 `api_detail` 与 HDK 均未拿卡且 `catalog_cooling=True` 时，catalog_cooling=True 通过 Stage 3 -> DB 完整传播；
+    3. 单链接及“坏副链+冷却主链”多链接场景均保持原重试次数不被消耗/误杀，并精确排期在冷却结束后重试；
+    4. 非冷却态的真实上游失败依然正常累加 retry_count 并在 3/3 时终止退出。
     """
     import time
     from adapters.jd_adapter import JdAdapter
+    import json
     from infrastructure.jd_client import JdClient, PROMOTION_ROOT
 
     def _reply(body):
@@ -2360,7 +2360,7 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
                     }
                 }
             })
-        return _reply({"status": 301, "content": "商品未参与推广"})
+        return _reply({"status": 301, "content": "对应宝贝已下架"})
 
     fake_http = SimpleNamespace(get=_fake_get)
     jd_client = JdClient(appkey_list=["jd-k1"], union_id="2035679405", http_session=fake_http)
@@ -2368,7 +2368,6 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
     assert jd_client.is_catalog_cooling() is True
     assert jd_client.catalog_cooldown_remaining() > 50.0
 
-    # Stub HdkClient: returns NOT_FOUND on detail (forcing ZTK fallback which immediately short-circuits on cooldown)
     fake_hdk = MagicMock()
     fake_hdk.get_goods_detail.return_value = {"status": "error", "error_code": "NOT_FOUND", "not_found": True}
     fake_hdk.resolve_short_url.return_value = {"status": "success", "data": {"sku_id": "100012345678", "is_venue": False}}
@@ -2420,7 +2419,6 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
 
     doc_edge = _make_doc("tip_cool_2", 2, "https://union-click.jd.com/jdc?e=edge2")
     doc_zero = _make_doc("tip_cool_0", 0, "https://union-click.jd.com/jdc?e=zero0")
-    # 模拟 haodanku#1659971 多链混合：L1=非冷却失败(3.cn)，L2=冷却跳过(u.jd.com) -> 不得扣减重试次数
     doc_multi = _make_doc(
         "tip_cool_multi_1659971",
         2,
@@ -2436,8 +2434,8 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
         shared_active_products={},
         quiet_sub_logs=True,
     )
-    # 冷却期内：非会场 JD 目标必须做到零 ZTK HTTP 请求、零无谓 hdk.convert_promotion_link 调用
-    assert http_calls == []
+    # 选品池冷却期内：绝不向共享池 open_jing_union_open_goods_query 发起请求
+    assert not any("goods_query" in u for u in http_calls)
     fake_hdk.convert_promotion_link.assert_not_called()
 
     out_map = {o["source_item_id"]: o for o in outcomes}
@@ -2451,12 +2449,10 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
     assert out_map["tip_cool_multi_1659971"]["retry_count"] == 2
     assert out_map["tip_cool_multi_1659971"]["retry_delay_sec"] >= 60.0
 
-    # 冷却期内，官方公共领券/会场白名单仍可正常直通转链不受阻塞
+    # 冷却期内，官方公共领券/会场白名单仍可正常直通转链不受阻塞（走 byunionid_get）
     venue_res = jd_adapter.resolve_and_convert_universal("https://coupon.m.jd.com/coupons/show.action?key=venue1&roleId=1")
     assert venue_res["status"] == "success"
     assert venue_res["resolution_kind"] == "coupon_or_venue"
-    assert fake_hdk.convert_promotion_link.call_count == 1
-    assert http_calls == []
 
     raw_col = MagicMock()
     formal_col = MagicMock()

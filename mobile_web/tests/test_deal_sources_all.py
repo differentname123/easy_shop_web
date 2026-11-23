@@ -1313,10 +1313,21 @@ def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
 
     fixed_now = datetime.datetime(2026, 11, 20, 7, 0, 0, tzinfo=datetime.timezone.utc)
     assert repo.touch_seen("tehuicaicai", ["5513", "5514"], channel="特惠采采_首页精选", refresh_publish_time=True, max_age_days=7.0, at=fixed_now) == 2
-    assert formal_col.update_many.call_count == 1
-    formal_set = formal_col.update_many.call_args[0][1]["$set"]
-    assert formal_set["deal_info.publish_ts"] == fixed_now.timestamp()
-    assert "deal_info.publish_time" not in formal_set
+    assert formal_col.update_many.call_count == 2
+    active_filter, active_upd = formal_col.update_many.call_args_list[0][0]
+    revive_filter, revive_upd = formal_col.update_many.call_args_list[1][0]
+    assert active_filter["deal_info.is_deal_tip"] is True
+    active_set = active_upd["$set"]
+    assert active_set["deal_info.publish_ts"] == fixed_now.timestamp()
+    assert active_set["deal_info.last_seen_at"] == fixed_now.replace(tzinfo=None)
+    assert "deal_info.updated_at" not in active_set
+    assert "deal_info.publish_time" not in active_set
+    assert revive_filter["deal_info.is_deal_tip"] == {"$ne": True}
+    revive_set = revive_upd["$set"]
+    assert revive_set["deal_info.is_deal_tip"] is True
+    assert revive_set["deal_info.publish_ts"] == fixed_now.timestamp()
+    assert revive_set["deal_info.last_seen_at"] == fixed_now.replace(tzinfo=None)
+    assert revive_set["deal_info.updated_at"] == fixed_now.replace(tzinfo=None)
 
     formal_col.update_many.reset_mock()
     assert repo.touch_seen("guangdiu", ["9999"], channel="逛丢_首页实时流", refresh_publish_time=False, at=fixed_now) == 2
@@ -1327,6 +1338,9 @@ def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
     formal_col.update_many.return_value = SimpleNamespace(modified_count=2)
     exp = repo.expire_missing_from_full_sweep(source_site="haodanku", channel="好单库_京东实时线报", sweep_start_time=datetime.datetime(2026, 11, 20, 8, 0, 0))
     assert exp == {"raw_expired": 4, "formal_expired": 2}
+    sweep_q = formal_col.update_many.call_args[0][0]
+    assert "$and" in sweep_q
+    assert any("$or" in clause and {"deal_info.last_seen_at": {"$lt": datetime.datetime(2026, 11, 20, 8, 0, 0)}} in clause["$or"] for clause in sweep_q["$and"])
 
     formal_col.update_many.reset_mock()
     deleted_raw = repo.reset_raw_collection()

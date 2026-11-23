@@ -6,7 +6,7 @@ import threading
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Sequence
 from adapters import get_adapter, normalize_platform
 from infrastructure.http_utils import sanitize_user_error_message
 from infrastructure.logging_utils import format_exc_summary, severity_icon
@@ -14,7 +14,6 @@ from models.product import (
     ProductRef,
     DetailSnapshot,
     DetailPrefetchResult,
-    classify_user_input,
     extract_search_keyword,
     is_jd_image_key,
     utc_millis,
@@ -298,10 +297,9 @@ class ProductService:
         if unavailable:
             return unavailable
         raw_kw = (keyword or "").strip()
-        classified = classify_user_input(raw_kw)
-        if classified["kind"] == "unsupported_url" or (classified["has_link_or_token"] and not classified["keyword"]):
+        if not raw_kw:
             return {"status": "success", "total_count": 0, "page": page, "page_size": page_size, "has_more": False, "data": []}
-        keyword = classified["keyword"] or raw_kw[:60]
+        keyword = raw_kw[:80]
         # 公开关键词检索结果不按用户隔离，跨用户共享以避免同词重复消耗上游额度
         cache_key = (plat, "", keyword, page, page_size)
         cached = SEARCH_CACHE.get(cache_key)
@@ -578,6 +576,10 @@ class ProductService:
                 return _LoadedDetail({"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"})
             if isinstance(deal_tip, dict) and deal_tip and not detail_payload.get("deal_tip"):
                 detail_payload["deal_tip"] = deepcopy(deal_tip)
+            if result.get("cacheable") is False:
+                public_res = deepcopy(result)
+                public_res["data"] = detail_payload
+                return _LoadedDetail(public_res, snapshot=None, persisted=False, retryable=True)
             try:
                 snapshot = self._make_snapshot(detail_payload, utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), ref.platform)
             except ValueError:
@@ -685,6 +687,40 @@ class ProductService:
             return self._apply_deal_tip(plat, sanitized_err, ref)
         return self._apply_deal_tip(plat, loaded.public, ref)
 
+    def _finalize_prefetch_loaded(
+        self,
+        ref: ProductRef,
+        loaded: _LoadedDetail,
+        refresh_ahead_seconds: float,
+        fallback_snapshot: Optional[DetailSnapshot] = None,
+    ) -> DetailPrefetchResult:
+        if loaded.snapshot and self._snapshot_deadline(loaded.snapshot) <= time.time():
+            return DetailPrefetchResult("skipped")
+        if loaded.persisted and loaded.snapshot:
+            return DetailPrefetchResult(
+                "ready",
+                loaded.snapshot,
+                next_check_at=self._snapshot_deadline(loaded.snapshot) - refresh_ahead_seconds,
+            )
+        if loaded.public.get("status") == "success" and loaded.snapshot:
+            return DetailPrefetchResult("persist_failed", loaded.snapshot, retryable=True)
+        err_code = str(loaded.public.get("error_code") or "").strip()
+        err_msg = str(loaded.public.get("error_msg") or "").strip()
+        if err_code.upper() == "PRODUCT_OFF_PROMOTION":
+            self.evict_off_promotion_product(ref)
+            logger.info(
+                "【详情预取下架清理】上游确认商品已停止推广，已自动从缓存与本地库清理 | 平台[%s] 商品[%s]",
+                ref.platform, ref.goods_id or ref.goods_sign,
+            )
+            return DetailPrefetchResult("skipped", error_code="PRODUCT_OFF_PROMOTION", next_check_at=time.time() + 3600)
+        return DetailPrefetchResult(
+            "error",
+            fallback_snapshot if fallback_snapshot is not None else loaded.snapshot,
+            retryable=loaded.retryable,
+            error_code=err_code or "UPSTREAM_ERROR",
+            error_msg=err_msg,
+        )
+
     def prefetch_product_detail(self, ref, snapshot=None, refresh_ahead_seconds=330, stop_event=None):
         """只准备公开详情；内部结果明确区分已入库、确定下架与需告警失败。"""
         if stop_event is not None and stop_event.is_set():
@@ -729,29 +765,150 @@ class ProductService:
                 ref.platform, exc_summary,
             )
             return DetailPrefetchResult("error", snapshot, retryable=True, error_code="INTERNAL_ERROR", error_msg=exc_summary)
-        if loaded.snapshot and self._snapshot_deadline(loaded.snapshot) <= time.time():
-            return DetailPrefetchResult("skipped")
-        if loaded.persisted and loaded.snapshot:
-            return DetailPrefetchResult("ready", loaded.snapshot,
-                                        next_check_at=self._snapshot_deadline(loaded.snapshot) - refresh_ahead_seconds)
-        if loaded.public.get("status") == "success" and loaded.snapshot:
-            return DetailPrefetchResult("persist_failed", loaded.snapshot, retryable=True)
-        err_code = str(loaded.public.get("error_code") or "").strip()
-        err_msg = str(loaded.public.get("error_msg") or "").strip()
-        if err_code.upper() == "PRODUCT_OFF_PROMOTION":
-            self.evict_off_promotion_product(ref)
-            logger.info(
-                "【详情预取下架清理】上游确认商品已停止推广，已自动从缓存与本地库清理 | 平台[%s] 商品[%s]",
-                ref.platform, ref.goods_id or ref.goods_sign,
-            )
-            return DetailPrefetchResult("skipped", error_code="PRODUCT_OFF_PROMOTION", next_check_at=time.time() + 3600)
-        return DetailPrefetchResult(
-            "error",
-            loaded.snapshot,
-            retryable=loaded.retryable,
-            error_code=err_code or "UPSTREAM_ERROR",
-            error_msg=err_msg,
-        )
+        return self._finalize_prefetch_loaded(ref, loaded, refresh_ahead_seconds, fallback_snapshot=snapshot)
+
+    def prefetch_product_details_batch(
+        self,
+        refs: Sequence[ProductRef],
+        *,
+        stop_event=None,
+        refresh_ahead_seconds: float = 330,
+        deal_tips: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, DetailPrefetchResult]:
+        """
+        同平台批量详情预取：先本地库/内存缓存与下架黑名单短路，剩余待刷新商品按每批 <=20
+        委托 `adapter.batch_get_goods_details`，结果逐条提交快照并严格隔离单条失败。
+        """
+        outcomes: Dict[str, DetailPrefetchResult] = {}
+        if not refs:
+            return outcomes
+        if stop_event is not None and stop_event.is_set():
+            for raw_ref in refs:
+                if raw_ref.key:
+                    outcomes[raw_ref.key] = DetailPrefetchResult("skipped")
+            return outcomes
+
+        pending_by_plat: Dict[str, List[tuple]] = {}
+        seen_orig_keys = set()
+        for raw_ref in refs:
+            orig_key = raw_ref.key
+            if not orig_key or orig_key in seen_orig_keys:
+                continue
+            seen_orig_keys.add(orig_key)
+            if is_product_off_promotion(raw_ref.platform, raw_ref.goods_id, raw_ref.goods_sign):
+                outcomes[orig_key] = DetailPrefetchResult("skipped", error_code="PRODUCT_OFF_PROMOTION")
+                continue
+            try:
+                adapter = get_adapter(raw_ref.platform)
+                if self._capability_error(adapter, "detail"):
+                    outcomes[orig_key] = DetailPrefetchResult("skipped")
+                    continue
+                allowed = getattr(adapter, "can_prefetch_detail", None)
+                if callable(allowed) and allowed(raw_ref) is False:
+                    outcomes[orig_key] = DetailPrefetchResult("skipped")
+                    continue
+                upgraded = self._upgrade_ref_sign(raw_ref)
+                item = self._read_detail(upgraded, strict=True)
+                upgraded = self._upgrade_ref_sign(upgraded, item)
+                if is_product_off_promotion(upgraded.platform, upgraded.goods_id, upgraded.goods_sign):
+                    outcomes[orig_key] = DetailPrefetchResult("skipped", error_code="PRODUCT_OFF_PROMOTION")
+                    continue
+                deadline = self._detail_expires_at(item) if item else 0.0
+                if deadline - time.time() > refresh_ahead_seconds:
+                    saved = self._document_snapshot(item, upgraded.platform)
+                    outcomes[orig_key] = DetailPrefetchResult("ready", saved, next_check_at=deadline - refresh_ahead_seconds)
+                    continue
+                local_deal_tip = item.get("deal_tip") if isinstance(item, dict) else None
+                if not local_deal_tip and isinstance(deal_tips, dict):
+                    local_deal_tip = deal_tips.get(orig_key)
+                cached = self._cached_detail(upgraded)
+                if cached and cached[0] > deadline and cached[0] - time.time() > refresh_ahead_seconds:
+                    seed_data = dict(cached[1]["data"])
+                    if isinstance(local_deal_tip, dict) and local_deal_tip and not seed_data.get("deal_tip"):
+                        seed_data["deal_tip"] = deepcopy(local_deal_tip)
+                    seed = self._make_snapshot(seed_data, datetime.fromtimestamp(cached[0] - PRODUCT_DETAIL_TTL, timezone.utc), upgraded.platform)
+                    loaded = self._commit_snapshot(seed, stop_event=stop_event)
+                    outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
+                    continue
+                pending_by_plat.setdefault(upgraded.platform, []).append((orig_key, upgraded, adapter, local_deal_tip))
+            except Exception as exc:
+                exc_summary = format_exc_summary(exc)
+                outcomes[orig_key] = DetailPrefetchResult("error", retryable=True, error_code="INTERNAL_ERROR", error_msg=exc_summary)
+
+        detail_kwargs = {"allow_fallback": False} if stop_event is not None else {}
+        retryable_codes = {"NETWORK_ERROR", "TIMEOUT", "RATE_LIMIT", "SERVICE_UNAVAILABLE"}
+
+        for plat, entries in pending_by_plat.items():
+            if stop_event is not None and stop_event.is_set():
+                for orig_key, _u, _a, _dt in entries:
+                    outcomes[orig_key] = DetailPrefetchResult("skipped")
+                continue
+            adapter = entries[0][2]
+            batch_fn = getattr(adapter, "batch_get_goods_details", None)
+            use_batch = callable(batch_fn) and getattr(adapter, "batch_detail_includes_gallery", True) is True
+            if not use_batch:
+                for orig_key, upgraded, ad_item, local_deal_tip in entries:
+                    if stop_event is not None and stop_event.is_set():
+                        outcomes[orig_key] = DetailPrefetchResult("skipped")
+                        continue
+                    try:
+                        loaded = self._load_official(upgraded, ad_item, stop_event=stop_event,
+                                                     refresh_ahead_seconds=refresh_ahead_seconds,
+                                                     deal_tip=local_deal_tip)
+                        outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
+                    except Exception as exc:
+                        outcomes[orig_key] = DetailPrefetchResult("error", retryable=True, error_code="INTERNAL_ERROR", error_msg=format_exc_summary(exc))
+                continue
+
+            for idx in range(0, len(entries), 20):
+                chunk_entries = entries[idx:idx + 20]
+                if stop_event is not None and stop_event.is_set():
+                    for orig_key, _u, _a, _dt in chunk_entries:
+                        outcomes[orig_key] = DetailPrefetchResult("skipped")
+                    continue
+                try:
+                    batch_map = batch_fn([e[1] for e in chunk_entries], **detail_kwargs) or {}
+                except Exception as exc:
+                    exc_summary = format_exc_summary(exc)
+                    for orig_key, _u, _a, _dt in chunk_entries:
+                        outcomes[orig_key] = DetailPrefetchResult("error", retryable=True, error_code="INTERNAL_ERROR", error_msg=exc_summary)
+                    continue
+
+                for orig_key, upgraded, _ad_item, local_deal_tip in chunk_entries:
+                    raw_res = batch_map.get(upgraded.key) or batch_map.get(orig_key)
+                    if not isinstance(raw_res, dict):
+                        outcomes[orig_key] = DetailPrefetchResult("error", retryable=True, error_code="UPSTREAM_ERROR", error_msg="批量详情未返回结果")
+                        continue
+                    if raw_res.get("status") != "success" or not raw_res.get("data"):
+                        code = str(raw_res.get("error_code") or "").upper()
+                        loaded = _LoadedDetail(raw_res, retryable=code in retryable_codes)
+                        outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
+                        continue
+                    if normalize_platform(raw_res["data"].get("platform") or plat) != plat:
+                        loaded = _LoadedDetail({"status": "error", "error_msg": "商品返回平台不匹配", "error_code": "product_identity_mismatch"})
+                        outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
+                        continue
+                    detail_payload = dict(raw_res["data"])
+                    if not str(detail_payload.get("name") or "").strip():
+                        loaded = _LoadedDetail({"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"})
+                        outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
+                        continue
+                    if isinstance(local_deal_tip, dict) and local_deal_tip and not detail_payload.get("deal_tip"):
+                        detail_payload["deal_tip"] = deepcopy(local_deal_tip)
+                    if raw_res.get("cacheable") is False:
+                        public_res = deepcopy(raw_res)
+                        public_res["data"] = detail_payload
+                        loaded = _LoadedDetail(public_res, snapshot=None, persisted=False, retryable=True)
+                        outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
+                        continue
+                    try:
+                        snap = self._make_snapshot(detail_payload, utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), plat)
+                        loaded = self._commit_snapshot(snap, None, raw_res, stop_event, requested_ref=upgraded)
+                    except ValueError:
+                        loaded = _LoadedDetail({"status": "error", "error_code": "invalid_product_detail", "error_msg": "平台商品详情身份无效"})
+                    outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
+
+        return outcomes
 
     def get_boom_products(self, platform="all", category=None, keyword=None, sort_by=None,
                           page=1, page_size=20) -> Dict[str, Any]:

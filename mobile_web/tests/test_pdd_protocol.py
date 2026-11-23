@@ -330,6 +330,7 @@ def test_pdd_detail_strips_allow_fallback_forwards_test_flag_and_fails_over_on_r
 
     post, replies = fake_gateway
     adapter = PddAdapter(client_id="c", client_secret="s", pid="pid")
+    assert adapter.batch_detail_includes_gallery is False
 
     # 1. allow_fallback 等内部适配器标志不得透传给官方网关，但测试/透传参数如 test_flag 保留
     replies.append({"goods_detail_response": {"goods_details": [{"goods_id": 101, "goods_sign": "SIGN_1", "goods_name": "拼多多抽纸", "min_group_price": 1990}]}})
@@ -339,7 +340,7 @@ def test_pdd_detail_strips_allow_fallback_forwards_test_flag_and_fails_over_on_r
     assert "allow_fallback" not in sent_json
     assert sent_json["test_flag"] == "true"
 
-    # 2. pdd.ddk.goods.detail 触发 50002 限流 -> 自动降级 pdd_goods_search_sign_detail (goods_sign_list)
+    # 2. pdd.ddk.goods.detail 触发 50002 限流 -> 自动降级 pdd_goods_search_sign_detail (goods_sign_list)，且标记 cacheable=False 不毒化详情缓存
     replies.extend([
         {"error_response": {"error_code": 50002, "error_msg": "请求频次超限"}},
         {"goods_search_response": {"goods_list": [{"goods_id": 102, "goods_sign": "SIGN_RL", "goods_name": "限流降级抽纸", "min_group_price": 2500}]}},
@@ -347,6 +348,7 @@ def test_pdd_detail_strips_allow_fallback_forwards_test_flag_and_fails_over_on_r
     rl_res = adapter.get_goods_detail(goods_sign="SIGN_RL")
     assert rl_res["status"] == "success"
     assert rl_res["_provider"] == "pdd_goods_search_sign_detail"
+    assert rl_res["cacheable"] is False
     assert rl_res["data"]["name"] == "限流降级抽纸"
     assert post.call_args.kwargs["json"]["type"] == "pdd.ddk.goods.search"
     assert json.loads(post.call_args.kwargs["json"]["goods_sign_list"]) == ["SIGN_RL"]
@@ -373,15 +375,13 @@ def test_pdd_search_failover_hdk_and_recommend_60001_and_service_tags(fake_gatew
     hdk_cli = HdkClient(api_key="hdk_k", http_session=SimpleNamespace(get=hdk_get))
     adapter = PddAdapter(client_id="c", client_secret="s", pid="pid", enabled=True, hdk_client=hdk_cli)
 
-    # 1. search_goods 遇 pageSize < 10 报错时自动重试 page_size=10；触发 50002 限流后降级 HDK 且保留 2.88% 佣金比例
+    # 1. search_goods 前置将 page_size < 10 抬升为 10（零多余 3000000 报错往返）；触发 50002 限流后降级 HDK 且保留 2.88% 佣金比例
     replies.extend([
-        {"error_response": {"error_code": 3000000, "error_msg": "pageSize不能小于10"}},
         {"error_response": {"error_code": 50002, "error_msg": "QPS超限"}},
     ])
     sr = adapter.search_goods("抽纸", page=1, page_size=3)
     assert sr["status"] == "success"
     assert sr["_provider"] == "hdk_pdd_search"
-    assert post.call_args_list[-2].kwargs["json"]["page_size"] == "3"
     assert post.call_args.kwargs["json"]["page_size"] == "10"
     assert sr["data"][0]["commission_rate"] == 2.88
     assert sr["data"][0]["price"] == 15.0
@@ -506,6 +506,71 @@ def test_pdd_non_numeric_goods_id_rejected_before_gateway(fake_gateway):
     assert res["status"] == "error" and res["error_code"] == "INVALID_ARGUMENT"
     assert "网关" not in res["error_msg"] and "转链" not in res["error_msg"]
     post.assert_not_called()
+
+
+def test_pdd_batch_details_and_empty_title_off_promotion_no_zs_unit_wash(fake_gateway):
+    """验证 PDD 20 批量查卡不连坐与空标题 total_count==1 经 goods.detail 确证下架（绝不盲走 zs.unit 洗链）。"""
+    from adapters.pdd_adapter import PddAdapter
+    from models.product import ProductRef
+
+    post, replies = fake_gateway
+    adapter = PddAdapter(client_id="c", client_secret="s", pid="pid", enabled=True)
+
+    # 1. 批量 2 个 sign + 1 个无效 sign：batch 返回 2 条，缺失的那条单查返回 40001 确证 PRODUCT_OFF_PROMOTION，互不连坐
+    replies.extend([
+        {
+            "goods_search_response": {
+                "total_count": 2,
+                "goods_list": [
+                    {
+                        "goods_id": 202,
+                        "goods_sign": "SIGN_B",
+                        "goods_name": "商品B",
+                        "min_group_price": 2000,
+                        "coupon_discount": 0,
+                        "promotion_rate": 100,
+                        "goods_thumbnail_url": "https://img/b.jpg",
+                    },
+                    {
+                        "goods_id": 101,
+                        "goods_sign": "SIGN_A",
+                        "goods_name": "商品A",
+                        "min_group_price": 1000,
+                        "coupon_discount": 200,
+                        "promotion_rate": 150,
+                        "goods_thumbnail_url": "https://img/a.jpg",
+                    },
+                ],
+            },
+        },
+        {"error_response": {"error_code": 50001, "sub_code": "40001", "error_msg": "商品非多多客商品"}},
+    ])
+    b_res = adapter.batch_get_goods_details([
+        ProductRef("pdd", "101", goods_sign="SIGN_A"),
+        ProductRef("pdd", "202", goods_sign="SIGN_B"),
+        ProductRef("pdd", "303", goods_sign="SIGN_OFF"),
+    ])
+    assert b_res["SIGN_A"]["status"] == "success" and b_res["SIGN_A"]["data"]["name"] == "商品A"
+    assert b_res["SIGN_B"]["status"] == "success" and b_res["SIGN_B"]["data"]["name"] == "商品B"
+    assert b_res["SIGN_OFF"]["error_code"] == "PRODUCT_OFF_PROMOTION"
+
+    # 2. resolve_and_convert_universal: search 返回 total_count==1 但 goods_name 为空 -> 拿 raw goods_sign 调 goods.detail 确证 40001，不再调用 zs.unit 洗链
+    before_calls = post.call_count
+    replies.extend([
+        {
+            "goods_search_response": {
+                "total_count": 1,
+                "goods_list": [
+                    {"goods_id": 0, "goods_sign": "EMPTY_TITLE_SIGN_1", "goods_name": "", "min_group_price": 0},
+                ],
+            },
+        },
+        {"error_response": {"error_code": 50001, "sub_code": "40001", "error_msg": "该商品已下架"}},
+    ])
+    off_res = adapter.resolve_and_convert_universal("https://mobile.yangkeduo.com/goods.html?ps=OFFITEM")
+    assert off_res["status"] == "error" and off_res["error_code"] == "PRODUCT_OFF_PROMOTION"
+    assert post.call_count == before_calls + 2  # 只有 goods.search + goods.detail，绝未触发 goods.zs.unit.url.gen
+
 
 
 

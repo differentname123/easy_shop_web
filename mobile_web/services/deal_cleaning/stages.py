@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from adapters import platform_name
 from config import PROMOTION_LINK_TTL
 from infrastructure.api_governance import ResolutionKind, api_caller_context
+from infrastructure.jd_client import jd_coupon_url
 from models.deal_constants import (
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
@@ -73,8 +74,10 @@ from services.deal_cleaning.url_venue import (
     _precheck_direct_non_cps_venue_url,
     detect_candidate_platform,
     is_explicit_coupon_target,
+    is_official_cps_http_url,
     is_shop_homepage_url,
     rebuild_clean_official_venue_url,
+    resolve_non_cps_http_url,
     unwrap_to_official_public_venue_url,
 )
 
@@ -699,6 +702,7 @@ def _build_official_product_payload(
         "shop_ratings": dict(product_card.get("shop_ratings") or {}),
         "specs": list(product_card.get("specs") or []),
         "coupon_info": dict(product_card.get("coupon_info") or {}),
+        "coupon_url": jd_coupon_url(product_card.get("coupon_url") or res.get("coupon_url")) if try_plat == "jd" else "",
     }
 
 
@@ -732,7 +736,16 @@ def _extract_product_card_from_conv(
             "shop_ratings": dict(off_prod.get("shop_ratings") or {}),
             "specs": list(off_prod.get("specs") or []),
             "coupon_info": dict(off_prod.get("coupon_info") or {}),
+            "coupon_url": str(
+                off_prod.get("coupon_url") or (main_conv.get("promo_payload") or {}).get("coupon_url") or ""
+            ).strip(),
         }
+    elif product_card and not product_card.get("coupon_url"):
+        fallback_cpn = str(
+            off_prod.get("coupon_url") or (main_conv.get("promo_payload") or {}).get("coupon_url") or ""
+        ).strip()
+        if fallback_cpn:
+            product_card["coupon_url"] = fallback_cpn
     return product_card, adapter_res
 
 
@@ -900,19 +913,171 @@ def convert_single_target(
                 cleaner._set_anchor_cache_locked(ck, out)
         return copy.deepcopy(out)
 
+    orig_input = clean_input
+    effective_input = clean_input
+
+    # 统一前置处理所有非官方联盟 HTTP 入口（3.cn / llipin.cn / kurl07.cn / t.cn / 店铺等）：
+    # 免费解包分流 venue / cps_redirect / numeric_item / dead(0重试) / transient(可重试)
+    is_non_cps_http = (
+        orig_input.lower().startswith(("http://", "https://"))
+        and not is_official_cps_http_url(orig_input)
+    )
+    if is_non_cps_http:
+        pre_plats = [plat] if plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
+        with cleaner._cache_lock:
+            for p_tag in pre_plats:
+                hit_k = next(
+                    (k for k in AnchorConversionCache.build_keys(p_tag, orig_input) if k in cleaner.anchor_cache),
+                    None,
+                )
+                if hit_k is not None:
+                    entry = cleaner._get_anchor_cache_locked(hit_k)
+                    if entry is not None:
+                        cached = copy.deepcopy(entry)
+                        cached["link_id"] = link_id
+                        cached["text_role_hint"] = role_hint
+                        c_st = cached.get("convert_status")
+                        if c_st == "coupon_or_activity" or (
+                            c_st == "product"
+                            and isinstance((cached.get("adapter_res") or {}).get("product"), dict)
+                            and (cached.get("adapter_res") or {}).get("product")
+                        ) or cached.get("error_code") in (
+                            ERR_UNSUPPORTED_PLATFORM,
+                            ERR_JD_NUMERIC_SKU,
+                            ERR_TB_NUMERIC_ID,
+                            ERR_PDD_NUMERIC_ID,
+                        ):
+                            cleaner.stats_cache_hits += 1
+                            return cached
+
+        if cleaner._can_run_live_unwrap():
+            pre_res = resolve_non_cps_http_url(
+                orig_input,
+                http_session=cleaner._get_unwrap_session(),
+                resolver=cleaner.unwrap_resolver,
+            )
+            pre_kind = pre_res.get("kind")
+            pre_url = str(pre_res.get("url") or orig_input).strip()
+            pre_reason = str(pre_res.get("reason") or "")
+            if pre_kind == "venue":
+                venue_plat = detect_candidate_platform(
+                    pre_url,
+                    plat if plat in ("jd", "taobao", "pdd") else "unknown",
+                )
+                out = {
+                    "link_id": link_id,
+                    "clean_input": orig_input,
+                    "text_role_hint": role_hint,
+                    "convert_status": "coupon_or_activity",
+                    "resolution_kind": ResolutionKind.COUPON_OR_VENUE,
+                    "platform": venue_plat,
+                    "goods_id": "",
+                    "goods_sign": "",
+                    "error_code": "OK_DIRECT_COUPON",
+                    "error_msg": "",
+                    "official_product": None,
+                    "my_promo_link": pre_url,
+                    "my_promo_token": None,
+                    "adapter_res": {},
+                }
+                with cleaner._cache_lock:
+                    for p_tag in set(pre_plats) | ({venue_plat} if venue_plat in ("jd", "taobao", "pdd") else set()):
+                        for ck in AnchorConversionCache.build_keys(p_tag, orig_input):
+                            cleaner._set_anchor_cache_locked(ck, out)
+                return copy.deepcopy(out)
+            if pre_kind == "cps_redirect":
+                effective_input = pre_url
+                plat = detect_candidate_platform(
+                    effective_input,
+                    plat if plat in ("jd", "taobao", "pdd") else "unknown",
+                )
+            elif pre_kind in ("numeric_item", "dead"):
+                if pre_kind == "numeric_item":
+                    num_plat = detect_candidate_platform(
+                        pre_url,
+                        plat if plat in ("jd", "taobao", "pdd") else "unknown",
+                    )
+                    term_code = (
+                        ERR_JD_NUMERIC_SKU if num_plat == "jd"
+                        else ERR_TB_NUMERIC_ID if num_plat == "taobao"
+                        else ERR_PDD_NUMERIC_ID if num_plat == "pdd"
+                        else ERR_UNSUPPORTED_PLATFORM
+                    )
+                    term_msg = f"非联盟直链跳转至纯数字商品页，不支持转链: {pre_url[:80]}"
+                    out_plat = num_plat
+                else:
+                    term_code = ERR_UNSUPPORTED_PLATFORM
+                    term_msg = f"非联盟直链经免费解包确认失效或非白名单({pre_reason})"
+                    out_plat = plat
+                out = {
+                    "link_id": link_id,
+                    "clean_input": orig_input,
+                    "text_role_hint": role_hint,
+                    "convert_status": "failed",
+                    "resolution_kind": ResolutionKind.ERROR,
+                    "platform": out_plat,
+                    "goods_id": "",
+                    "goods_sign": "",
+                    "error_code": term_code,
+                    "error_msg": term_msg,
+                    "official_product": None,
+                    "my_promo_link": None,
+                    "my_promo_token": None,
+                    "adapter_res": {},
+                }
+                with cleaner._cache_lock:
+                    for p_tag in pre_plats:
+                        for ck in AnchorConversionCache.build_keys(p_tag, orig_input):
+                            cleaner._set_anchor_cache_locked(ck, out)
+                return copy.deepcopy(out)
+            else:
+                return {
+                    "link_id": link_id,
+                    "clean_input": orig_input,
+                    "text_role_hint": role_hint,
+                    "convert_status": "failed",
+                    "resolution_kind": ResolutionKind.ERROR,
+                    "platform": plat,
+                    "goods_id": "",
+                    "goods_sign": "",
+                    "error_code": ERR_ADAPTER_CONVERT_FAILED,
+                    "error_msg": f"非联盟短链解包网络暂态异常，待下轮重试({pre_reason})",
+                    "official_product": None,
+                    "my_promo_link": None,
+                    "my_promo_token": None,
+                    "adapter_res": {},
+                }
+        elif not _is_official_ecommerce_http_url(orig_input):
+            out = {
+                "link_id": link_id,
+                "clean_input": orig_input,
+                "text_role_hint": role_hint,
+                "convert_status": "failed",
+                "resolution_kind": ResolutionKind.ERROR,
+                "platform": plat,
+                "goods_id": "",
+                "goods_sign": "",
+                "error_code": ERR_UNSUPPORTED_PLATFORM,
+                "error_msg": "第三方短链未命中官方公共领券白名单",
+                "official_product": None,
+                "my_promo_link": None,
+                "my_promo_token": None,
+                "adapter_res": {},
+            }
+            with cleaner._cache_lock:
+                for p_tag in pre_plats:
+                    for ck in AnchorConversionCache.build_keys(p_tag, orig_input):
+                        cleaner._set_anchor_cache_locked(ck, out)
+            return copy.deepcopy(out)
+
     platforms_to_try = [plat] if plat in ("jd", "taobao", "pdd") else ["taobao", "jd", "pdd"]
     last_failed: Optional[Dict[str, Any]] = None
     pending_failed_cache: List[Tuple[List[str], Dict[str, Any]]] = []
     had_cache_miss = False
     any_detail_lookup_failed = False
 
-    is_external_http_shortlink = (
-        clean_input.lower().startswith(("http://", "https://"))
-        and not _is_official_ecommerce_http_url(clean_input)
-    )
-
     for try_plat in platforms_to_try:
-        cache_keys = AnchorConversionCache.build_keys(try_plat, clean_input)
+        cache_keys = AnchorConversionCache.build_keys(try_plat, orig_input)
         with cleaner._cache_lock:
             hit_key = next((k for k in cache_keys if k in cleaner.anchor_cache), None)
             if hit_key is not None:
@@ -934,29 +1099,6 @@ def convert_single_target(
                     last_failed = cached
                     continue
 
-        if is_external_http_shortlink:
-            had_cache_miss = True
-            out = {
-                "link_id": link_id,
-                "clean_input": clean_input,
-                "text_role_hint": role_hint,
-                "convert_status": "failed",
-                "resolution_kind": ResolutionKind.ERROR,
-                "platform": try_plat,
-                "goods_id": "",
-                "goods_sign": "",
-                "error_code": ERR_UNSUPPORTED_PLATFORM,
-                "error_msg": "第三方短链未命中官方公共领券白名单",
-                "official_product": None,
-                "my_promo_link": None,
-                "my_promo_token": None,
-                "adapter_res": {},
-            }
-            for p_tag in platforms_to_try:
-                pending_failed_cache.append((AnchorConversionCache.build_keys(p_tag, clean_input), out))
-            last_failed = out
-            break
-
         adapter = cleaner.adapters.get(try_plat)
         if not adapter:
             continue
@@ -964,11 +1106,11 @@ def convert_single_target(
 
         try:
             with api_caller_context("background"):
-                res = adapter.resolve_and_convert_universal(clean_input)
+                res = adapter.resolve_and_convert_universal(effective_input)
         except Exception as exc:
             out = {
                 "link_id": link_id,
-                "clean_input": clean_input,
+                "clean_input": orig_input,
                 "text_role_hint": role_hint,
                 "convert_status": "failed",
                 "resolution_kind": ResolutionKind.ERROR,
@@ -1005,7 +1147,7 @@ def convert_single_target(
             if goods_id and goods_sign and isinstance(product_card, dict) and (promo_link or promo_token):
                 out = {
                     "link_id": link_id,
-                    "clean_input": clean_input,
+                    "clean_input": orig_input,
                     "text_role_hint": role_hint,
                     "convert_status": "product",
                     "resolution_kind": ResolutionKind.PRODUCT,
@@ -1028,13 +1170,13 @@ def convert_single_target(
             # 通道 1（Fail-Closed 正向实证）：仅当上游明确标定 resolution_kind=='coupon_or_venue' 且产出新链/新口令时才认领 OK_COUPON
             if not is_degraded_product:
                 is_verified_venue = res.get("resolution_kind") == ResolutionKind.COUPON_OR_VENUE
-                is_new_station_link = _is_verified_station_promo_link(clean_input, promo_link)
-                is_new_token = bool(promo_token) and promo_token != clean_input
+                is_new_station_link = _is_verified_station_promo_link(effective_input, promo_link)
+                is_new_token = bool(promo_token) and promo_token != effective_input
                 rebuilt_promo = rebuild_clean_official_venue_url(promo_link) if promo_link else None
                 if is_verified_venue and (is_new_station_link or is_new_token):
                     out = {
                         "link_id": link_id,
-                        "clean_input": clean_input,
+                        "clean_input": orig_input,
                         "text_role_hint": role_hint,
                         "convert_status": "coupon_or_activity",
                         "resolution_kind": ResolutionKind.COUPON_OR_VENUE,
@@ -1056,7 +1198,7 @@ def convert_single_target(
                     venue_plat = detect_candidate_platform(rebuilt_promo, try_plat)
                     out = {
                         "link_id": link_id,
-                        "clean_input": clean_input,
+                        "clean_input": orig_input,
                         "text_role_hint": role_hint,
                         "convert_status": "coupon_or_activity",
                         "resolution_kind": ResolutionKind.COUPON_OR_VENUE,
@@ -1072,7 +1214,7 @@ def convert_single_target(
                     }
                     with cleaner._cache_lock:
                         for p_tag in {try_plat, venue_plat}:
-                            for ck in AnchorConversionCache.build_keys(p_tag, clean_input):
+                            for ck in AnchorConversionCache.build_keys(p_tag, orig_input):
                                 cleaner._set_anchor_cache_locked(ck, out)
                     return copy.deepcopy(out)
 
@@ -1101,7 +1243,7 @@ def convert_single_target(
 
         out = {
             "link_id": link_id,
-            "clean_input": clean_input,
+            "clean_input": orig_input,
             "text_role_hint": role_hint,
             "convert_status": "failed",
             "resolution_kind": ResolutionKind.DEGRADED_PRODUCT if is_degraded_product else ResolutionKind.ERROR,
@@ -1120,12 +1262,12 @@ def convert_single_target(
             pending_failed_cache.append((cache_keys, out))
         last_failed = out
 
-    # 通道 2：安全重定向解包 -> 官方无佣金公共领券/会场白名单（非详情限流场景下执行）
+    # 通道 2：官方短链经 Adapter 仍未产出有效转链或被回显拦截时，再试安全解包识别官方无佣金会场（非详情限流场景）
     if had_cache_miss and not any_detail_lookup_failed:
-        rebuilt_venue_url = rebuild_clean_official_venue_url(clean_input)
+        rebuilt_venue_url = rebuild_clean_official_venue_url(effective_input)
         if not rebuilt_venue_url and cleaner._can_run_live_unwrap():
             rebuilt_venue_url = unwrap_to_official_public_venue_url(
-                clean_input,
+                effective_input,
                 http_session=cleaner._get_unwrap_session(),
                 resolver=cleaner.unwrap_resolver,
             )
@@ -1136,7 +1278,7 @@ def convert_single_target(
             )
             out = {
                 "link_id": link_id,
-                "clean_input": clean_input,
+                "clean_input": orig_input,
                 "text_role_hint": role_hint,
                 "convert_status": "coupon_or_activity",
                 "resolution_kind": ResolutionKind.COUPON_OR_VENUE,
@@ -1153,7 +1295,7 @@ def convert_single_target(
             with cleaner._cache_lock:
                 for p_tag in set(platforms_to_try) | {venue_plat}:
                     if p_tag in ("jd", "taobao", "pdd"):
-                        for ck in AnchorConversionCache.build_keys(p_tag, clean_input):
+                        for ck in AnchorConversionCache.build_keys(p_tag, orig_input):
                             cleaner._set_anchor_cache_locked(ck, out)
             return copy.deepcopy(out)
 
@@ -2720,6 +2862,19 @@ def process_ai2_unit(
             "coupon_info": product_card.get("coupon_info") or {},
             "deal_info": deal_info,
         }
+        clean_cpn_url = (
+            jd_coupon_url(
+                product_card.get("coupon_url")
+                or adapter_res.get("coupon_url")
+                or (main_conv.get("promo_payload") or {}).get("coupon_url")
+            )
+            if plat == "jd"
+            else ""
+        )
+        if clean_cpn_url:
+            product_doc["coupon_url"] = clean_cpn_url
+        else:
+            product_doc.pop("coupon_url", None)
 
         if quality_score < QUALIFIED_DEAL_MIN_SCORE:
             outcomes_by_id[mid] = {

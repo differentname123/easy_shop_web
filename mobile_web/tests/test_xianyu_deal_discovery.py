@@ -244,9 +244,15 @@ def test_category_eval_count_rotation_official_price_filter_and_1to1_interleave(
             return 59.9  # 较入库价 19.9 暴涨 >30%，即使该类别仅 1 款商品也必须因优惠失效淘汰
         return fallback_price
 
+    def _fake_batch_verify(items):
+        return {
+            (sched.normalize_platform(plat), str(pid)): _fake_verify_live_price(plat, pid, gsign, fb_p)
+            for plat, pid, gsign, fb_p in items
+        }
+
     with patch.object(sched, "ProductRepository", return_value=fake_repo), patch.object(
         sched, "_verify_live_activity_price", side_effect=_fake_verify_live_price
-    ):
+    ), patch.object(sched, "_batch_verify_live_activity_prices", side_effect=_fake_batch_verify):
         off_cands = sched.select_round_candidates_for_source(
             db=fake_db,
             hours_window=72,
@@ -891,4 +897,30 @@ def test_xianyu_discovery_transient_llm_outage_never_blacklists_candidate(monkey
     assert len(records) == 1
     assert records[0]["xianyu_audit_trail"]["llm_aborted"] is True
     fake_eval_col.update_one.assert_not_called()
+
+
+def test_xianyu_batch_verify_live_activity_prices_chunks_of_20(monkeypatch):
+    """验证官方批量验价按每批 <=20 条聚合调用 adapter.batch_get_goods_details 并隔离下架商品。"""
+    calls = []
+
+    class FakeAdapter:
+        def batch_get_goods_details(self, refs):
+            calls.append(len(refs))
+            out = {}
+            for r in refs:
+                if r.goods_id == "p_off":
+                    out[r.key] = {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION"}
+                else:
+                    out[r.key] = {"status": "success", "data": {"price": 25.5}}
+            return out
+
+    monkeypatch.setattr(sched, "get_adapter", lambda _plat: FakeAdapter())
+    items = [("jd", f"p_{i}", f"sign_{i}", 20.0) for i in range(24)]
+    items.append(("jd", "p_off", "sign_off", 20.0))
+    res = sched._batch_verify_live_activity_prices(items)
+    assert calls == [20, 5]
+    assert res[("jd", "p_0")] == 25.5
+    assert res[("jd", "p_23")] == 25.5
+    assert res[("jd", "p_off")] is None
+
 

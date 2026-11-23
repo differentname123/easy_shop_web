@@ -27,11 +27,12 @@ from adapters import get_adapter  # noqa: E402
 from adapters.jd_adapter import _is_encrypted_jd_item_id  # noqa: E402
 from infrastructure.api_governance import set_process_role  # noqa: E402
 from infrastructure.logging_utils import configure_console_encoding  # noqa: E402
-from models.product import utc_millis  # noqa: E402
+from models.product import ProductRef, utc_millis  # noqa: E402
 from repositories.product_repo import ProductRepository  # noqa: E402
 
 
 BACKOFF_SCHEDULE = (0.0, 4.0, 8.0, 15.0, 20.0)
+BATCH_SIZE = 20
 
 
 def build_query(*, only_recommend: bool, include_missing_coupon_url: bool) -> dict:
@@ -129,41 +130,60 @@ def main(argv=None) -> int:
         }
         started = time.perf_counter()
 
-        for idx, doc in enumerate(candidates, start=1):
-            sign = str(doc.get("goods_sign") or "").strip()
-            gid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
-            res = None
+        for batch_start in range(0, len(candidates), BATCH_SIZE):
+            chunk = candidates[batch_start:batch_start + BATCH_SIZE]
+            chunk_entries = []
+            for doc in chunk:
+                sign = str(doc.get("goods_sign") or "").strip()
+                gid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
+                ref = ProductRef("jd", gid or sign, goods_sign=sign)
+                chunk_entries.append((gid, sign, ref))
+
+            chunk_results = {}
+            pending_refs = [ref for _gid, _sign, ref in chunk_entries]
             for delay in BACKOFF_SCHEDULE:
+                if not pending_refs:
+                    break
                 if delay > 0:
                     time.sleep(delay)
-                res = adapter.get_goods_detail(sign, goods_id=gid or None, goods_sign=sign)
-                if res.get("error_code") != "RATE_LIMIT":
+                batch_res = adapter.batch_get_goods_details(pending_refs) or {}
+                next_pending = []
+                for ref in pending_refs:
+                    res = batch_res.get(ref.key)
+                    if isinstance(res, dict) and res.get("error_code") == "RATE_LIMIT":
+                        next_pending.append(ref)
+                    if res is not None:
+                        chunk_results[ref.key] = res
+                pending_refs = next_pending
+                if not pending_refs:
                     break
 
-            stats["checked"] += 1
-            if isinstance(res, dict) and res.get("status") == "success" and isinstance(res.get("data"), dict):
-                data = dict(res["data"])
-                now = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
-                repo.upsert_product_detail(dict(data, detail_updated_at=now))
-                if data.get("coupon_url") or float(data.get("coupon_amount") or 0.0) > 0:
-                    stats["found_coupon"] += 1
+            for gid, sign, ref in chunk_entries:
+                res = chunk_results.get(ref.key)
+                stats["checked"] += 1
+                if isinstance(res, dict) and res.get("status") == "success" and isinstance(res.get("data"), dict):
+                    data = dict(res["data"])
+                    now = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
+                    repo.upsert_product_detail(dict(data, detail_updated_at=now))
+                    if data.get("coupon_url") or float(data.get("coupon_amount") or 0.0) > 0:
+                        stats["found_coupon"] += 1
+                    else:
+                        stats["zero_coupon"] += 1
+                elif isinstance(res, dict) and res.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                    repo.delete_product("jd", goods_id=gid or None, goods_sign=sign)
+                    stats["off_promotion_deleted"] += 1
+                elif isinstance(res, dict) and res.get("error_code") == "RATE_LIMIT":
+                    stats["rate_limited"] += 1
                 else:
-                    stats["zero_coupon"] += 1
-            elif isinstance(res, dict) and res.get("error_code") == "PRODUCT_OFF_PROMOTION":
-                repo.delete_product("jd", goods_id=gid or None, goods_sign=sign)
-                stats["off_promotion_deleted"] += 1
-            elif isinstance(res, dict) and res.get("error_code") == "RATE_LIMIT":
-                stats["rate_limited"] += 1
-            else:
-                stats["other_error"] += 1
+                    stats["other_error"] += 1
 
-            if idx % 25 == 0 or idx == len(candidates):
-                elapsed = time.perf_counter() - started
-                print(
-                    f"  [{idx}/{len(candidates)}] 耗时 {elapsed:.1f}s | "
-                    f"发现优惠券:{stats['found_coupon']} 无券:{stats['zero_coupon']} "
-                    f"下架清理:{stats['off_promotion_deleted']} 限流未决:{stats['rate_limited']} 其他失败:{stats['other_error']}"
-                )
+            idx = min(batch_start + len(chunk), len(candidates))
+            elapsed = time.perf_counter() - started
+            print(
+                f"  [{idx}/{len(candidates)}] 耗时 {elapsed:.1f}s | "
+                f"发现优惠券:{stats['found_coupon']} 无券:{stats['zero_coupon']} "
+                f"下架清理:{stats['off_promotion_deleted']} 限流未决:{stats['rate_limited']} 其他失败:{stats['other_error']}"
+            )
             if args.pace > 0 and idx < len(candidates):
                 time.sleep(args.pace)
 

@@ -36,7 +36,7 @@
 三、【功能 2：全网关键词搜索 (`pdd.ddk.goods.search`)】
   - ✅ 可用：支持关键词、商品标题或 `zs.unit.url.gen` 生成的拼多多短链搜索。
   - ❌ 不可用（参数范围铁律）：`page_size < 10` 或 `page_size > 100` 必报 `参数校验失败：pageSize的取值范围是10-100！`
-    （哪怕在短链反查或小页预览场景，传给上游网关的 `page_size` 也必须 `>= 10`）。
+    * **2026-11-23 简化落地**：`PddAdapter._search_via_pdd_official` 不再先发 `page_size < 10` 等报 `3000000` 再二次重发，改为**请求前直接设置 `gateway_size = max(10, size)`** 一次成型并在客户端切片 [:size]，减少 50% 网关往返。
   - ❌ 不可用：传入未备案 `custom_parameters` 会直接报错 `60001`（需省略或自动降级为不传 `custom_parameters`）。
 
 四、【功能 3：商品详情 (`pdd.ddk.goods.detail`)】
@@ -107,6 +107,17 @@
   3. **2026-11-23 13:05（+11.5h 跨天复测终局确认）**：
      - 昨晚失败的 3 条 PDD 短链（`jCWkMvem` 农夫山泉茶π、`lA2knOwN` 百事可乐、`raskeiLy` 东鹏特饮）跨天复测仍 3/3 返回 `goods.search: total_count=1, goods_name=None` + `goods.detail: [50001:40001] 商品非多多进宝商品`，100% 确认为永久停推/非进宝商品而非临时风控；纯数字 `goods_id` 链接仍报 `40009`；
      - 隔夜前台连续实跑 `goods.detail` 4579/4579、`goods.recommend.get` 1989/1989、`order.list.increment.get` 45/45 零报错，全程高度稳定。
+  4. **【2026-11-23 下午 1 字搜索、20 批量与空标题定版落地】**：
+     - ✅ **关键词支持 1 个字**：`pdd.ddk.goods.search` 实测支持 1 字符（如 `"水"`），`page_size` 仍须满足 `[10, 100]`（适配器层自动向上兼容抬升并截断）。
+     - ✅ **标准 20 批量接口 (`PddAdapter.batch_get_goods_details`)**：分片传 `goods_sign_list`（上限 20）调用 `goods.search`，严格按 `goods_sign` / `goods_id` 对齐；缺席或仅含数字 `goods_id` 条目逐条回退 `pdd.ddk.goods.detail` 经 `40001` 独立确证下架，单条损坏不连坐正常商品。
+     - ⚠️ **实测发现 `goods.search(goods_sign_list)` 与 `goods.detail` 的字段差异及详情预取铁律**：
+       * 真实对照返回确认：`pdd.ddk.goods.detail` 返回完整高清 `goods_gallery_urls`（实测 4~10 张）、`video_urls`、`material_list`、`mall_img_url`、`cat_id`；而 `pdd.ddk.goods.search(goods_sign_list<=20)` **完全不返回这 5 个字段（`goods_gallery_urls` 恒缺失）**；
+       * `pdd.ddk.goods.detail` 实测**不支持**传入 `goods_sign_list` 批量查询，传入即报 `[50001:10002] 业务服务错误 - 缺少商品搜索条件(goodsId与goodsSign为空)`；
+       * 因此 `PddAdapter.batch_detail_includes_gallery = False`：`PddAdapter.batch_get_goods_details` 仅适用于不依赖图库的 20 批量实时核价/优惠券与在架状态校验（如 `xianyu_discovery`），**详情预取 (`ProductService.prefetch_product_details_batch`) 必须对 PDD 逐条走 `pdd.ddk.goods.detail`**，否则会把 1 张首图覆盖进 `carousel_images` 并刷出 `detail_updated_at` 毒化详情页；同理，单品 `get_goods_detail` 触发限流回退 `pdd_goods_search_sign_detail` 时必须标 `cacheable=False`，绝不落库或写入 `PRODUCT_DETAIL_CACHE`。
+     - ✅ **空标题 `total_count=1` 收口**：`PddAdapter.resolve_product_from_link` 在 `goods.search` 命中 `total_count=1` 但因无 `goods_name` 被摘要过滤时，保留唯一 `raw_goods_sign` 并调用 1 次 `goods.detail`，若返 `40001` 则直接终局报错 `PRODUCT_OFF_PROMOTION`，不再盲走 `zs.unit.url.gen` 洗链。
+  5. **【2026-11-24 2小时线上实跑压测与终态确认】**：
+     - ✅ 连续 2 小时真实运行：推荐榜单 `goods.recommend.get` 399/399（100%）、搜索前置 `max(10, size)` 彻底实现 **0 次 `3000000: pageSize` 报错**、详情 `goods.detail`（Web 端 904/904 = 100%，全端 1,016 次均耗 136ms）、三层推广转链 99/99（100%）、订单同步 8/8（100%）；正式库 1,001 款 PDD 商品 **0 坏数据**，且推荐流动态盐轮换的 `goods_sign` 由仓储层静默刷新而不推进 `updated_at`。
+     - ✅ 非单品品牌特卖会场链接（如 `mobile.yangkeduo.com/tandy_vase.html?...&__rp_name=xbrand_special_sale`）调用 `goods.search` 不返回唯一单品（`total_count != 1`），按协议保持拦截不猜单品。
 ================================================================================
 """
 

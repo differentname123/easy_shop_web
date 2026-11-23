@@ -166,7 +166,7 @@ def test_pdd_search_page_size_contract():
         "goods_search_response": {"goods_list": [{"goods_id": 1, "goods_name": "商品"}], "total_count": 3}
     }) as call:
         result = PddAdapter().search_goods("商品", page=1, page_size=1)
-    assert call.call_args.args[-1]["page_size"] == 1
+    assert call.call_args.args[-1]["page_size"] == 10
     assert result["page_size"] == 1
     assert len(result["data"]) == 1
     assert result["has_more"] is True

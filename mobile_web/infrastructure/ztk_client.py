@@ -94,9 +94,19 @@ def parse_order_response(body):
 
 
 class ZtkClient:
-    def __init__(self, appkey="", sid="", http_session=None, timeout=(3.0, 12.0), signurl=2, appkey_list=None, sid_list=None):
+    def __init__(self, appkey="", sid="", http_session=None, timeout=(3.0, 12.0), signurl=2, appkey_list=None, sid_list=None, publisher_sid_list=None):
         self.appkey_list = parse_appkey_list(appkey, appkey_list)
         self.appkey = self.appkey_list[0] if self.appkey_list else ""
+        self.sid_list = self._parse_sid_entries(sid, sid_list)
+        self.sid = self.sid_list[0] if self.sid_list else ""
+        parsed_pub_sids = self._parse_sid_entries("", publisher_sid_list)
+        self.publisher_sid_list = parsed_pub_sids if parsed_pub_sids else self.sid_list
+        self._active_key_index = 0
+        self.http = http_session or create_http_session(pool_connections=16, pool_maxsize=32)
+        self.timeout, self.signurl = timeout, signurl
+
+    @staticmethod
+    def _parse_sid_entries(fallback_sid="", sid_list=None) -> tuple:
         if isinstance(sid_list, (list, tuple)) and sid_list:
             explicit_sids = [
                 part.strip()
@@ -107,23 +117,25 @@ class ZtkClient:
             ]
         else:
             explicit_sids = list(parse_appkey_list(sid_list))
-        parsed_sids = explicit_sids if explicit_sids else list(parse_appkey_list(sid))
-        self.sid_list = tuple(parsed_sids)
-        self.sid = self.sid_list[0] if self.sid_list else ""
-        self._active_key_index = 0
-        self.http = http_session or create_http_session(pool_connections=16, pool_maxsize=32)
-        self.timeout, self.signurl = timeout, signurl
+        parsed = explicit_sids if explicit_sids else list(parse_appkey_list(fallback_sid))
+        return tuple(parsed)
 
-    def _sid_for_key(self, current_key: str) -> str:
-        if self.sid_list:
+    def _sid_from_pool(self, current_key: str, pool: tuple) -> str:
+        if pool:
             try:
                 idx = self.appkey_list.index(current_key)
-                if idx < len(self.sid_list):
-                    return self.sid_list[idx]
+                if idx < len(pool):
+                    return pool[idx]
             except ValueError:
                 pass
-            return self.sid_list[0]
+            return pool[0]
         return str(self.sid or "").strip()
+
+    def _sid_for_key(self, current_key: str) -> str:
+        return self._sid_from_pool(current_key, self.sid_list)
+
+    def _publisher_sid_for_key(self, current_key: str) -> str:
+        return self._sid_from_pool(current_key, self.publisher_sid_list or self.sid_list)
 
     def _get_response(self, url, **kwargs):
         response = self.http.get(url, timeout=self.timeout, allow_redirects=False, **kwargs)
@@ -136,8 +148,9 @@ class ZtkClient:
             # One documented mode returns a bare signed gateway URL.
             return getattr(response, "text", "").strip()
 
-    def _run_with_key_failover(self, action):
-        all_keys_have_paired_sid = len(self.appkey_list) > 1 and len(self.sid_list) >= len(self.appkey_list)
+    def _run_with_key_failover(self, action, *, use_publisher_pool: bool = False, should_stop_early=None):
+        pool = self.publisher_sid_list if use_publisher_pool else self.sid_list
+        all_keys_have_paired_sid = len(self.appkey_list) > 1 and len(pool) >= len(self.appkey_list)
         return execute_with_key_failover(
             self,
             action,
@@ -145,6 +158,7 @@ class ZtkClient:
                 "sid和appkey不匹配" in str(res.get("error_msg") or "")
                 or "sid过期" in str(res.get("error_msg") or "")
             ),
+            should_stop_early=should_stop_early,
             round_robin=all_keys_have_paired_sid,
         )
 
@@ -370,6 +384,24 @@ class ZtkClient:
                             },
                         )
                         p_tao_id = str(p_body.get("tao_id") or "").strip() if isinstance(p_body, dict) else ""
+                        p_res_url = str(p_body.get("result_url") or "").strip() if isinstance(p_body, dict) else ""
+                        p_res_lower = p_res_url.lower()
+                        is_valid_public_venue = bool(
+                            not relation_id
+                            and not p_tao_id
+                            and isinstance(p_body, dict)
+                            and p_body.get("status") == 200
+                            and p_res_url
+                            and "err.tmall.com/error" not in p_res_lower
+                            and any(trk in p_res_lower for trk in ("ali_trackid=", "s.click.taobao.com", "union_lens="))
+                            and any(dom in p_res_lower for dom in (
+                                "pages.tmall.com/wow/",
+                                "pages-fast.m.taobao.com/wow/",
+                                "uland.taobao.com/quan",
+                                "mo.m.taobao.com",
+                                "s.click.taobao.com",
+                            ))
+                        )
                         if isinstance(p_body, dict) and p_body.get("status") == 200 and p_tao_id:
                             if relation_id:
                                 rel_body = self._get_response(
@@ -417,11 +449,27 @@ class ZtkClient:
                                 c_item.setdefault("item_url", f"https://uland.taobao.com/item/edetail?id={p_tao_id}")
                                 status_code = 200
                                 content = [c_item]
+                        elif is_valid_public_venue:
+                            c_item = dict(p_body)
+                            c_item.setdefault("pict_url", c_item.get("pic") or "")
+                            c_item.setdefault("tkl", c_item.get("result_tkl") or "")
+                            c_item.setdefault("coupon_click_url", p_res_url)
+                            if not str(c_item.get("item_url") or "").strip():
+                                c_item["item_url"] = p_res_url
+                            if not str(c_item.get("title") or "").strip():
+                                c_item["title"] = "淘宝精选活动会场"
+                            status_code = 200
+                            content = [c_item]
 
                     if status_code != 200 or not content or not isinstance(content, list):
                         if "error tkl" in msg_text.lower() and not is_key_or_sid_err:
                             return _error("INVALID_TKL", f"折淘客渠道转链失败: {msg_text}", deterministic_all_keys=True)
-                        return _error("UPSTREAM_ERROR", f"折淘客渠道转链失败: {msg_text}")
+                        is_det_item_err = not is_key_or_sid_err and "商品id解析错误" in msg_text.lower()
+                        return _error(
+                            "UPSTREAM_ERROR",
+                            f"折淘客渠道转链失败: {msg_text}",
+                            **({"deterministic_all_keys": True} if is_det_item_err else {}),
+                        )
 
                 if not content or not isinstance(content[0], dict):
                     return _error("PROTOCOL_ERROR", "折淘客渠道转链内容列表为空或格式无效")
@@ -435,7 +483,7 @@ class ZtkClient:
                 short_url2 = str(c.get("shorturl2") or "").strip()
                 if short_url2.startswith("//"):
                     short_url2 = "https:" + short_url2
-                title = c.get("title") or c.get("tao_title") or "渠道推广商品"
+                title = str(c.get("title") or c.get("tao_title") or "").strip()
                 tpwd = str(c.get("tkl") or "").strip()
                 return {
                     "status": "success",
@@ -464,7 +512,7 @@ class ZtkClient:
         通过折淘客 90 天长效 sid 调用 open_sc_publisher_get.ashx 核验推手淘宝渠道备案关系。
         当本地自用型 TOP 应用的 24h taobao_session 过期时，提供无缝长效渠道核验能力。
         """
-        if not self.appkey_list or not (self.sid_list or str(self.sid or "").strip()):
+        if not self.appkey_list or not (self.publisher_sid_list or self.sid_list or str(self.sid or "").strip()):
             return _error("CONFIG_ERROR", "折淘客渠道核验缺少 appkey 或 sid")
         clean_uid = str(uid or "").strip()
         if not clean_uid:
@@ -472,7 +520,7 @@ class ZtkClient:
 
         def _check_once(current_key):
             try:
-                cur_sid = self._sid_for_key(current_key)
+                cur_sid = self._publisher_sid_for_key(current_key)
                 all_matches = []
                 total_count = 0
                 for page_no in range(1, 11):
@@ -560,7 +608,7 @@ class ZtkClient:
             except Exception:
                 return _error("NETWORK_ERROR", "折淘客渠道核验通信失败")
 
-        return self._run_with_key_failover(_check_once)
+        return self._run_with_key_failover(_check_once, use_publisher_pool=True)
 
     def generate_authority_url(self, uid: str, inviter_code: str = ""):
         """
@@ -570,11 +618,11 @@ class ZtkClient:
         if not clean_uid:
             return _error("INVALID_IDENTITY", "授权链接需要站内 UID")
         code = str(inviter_code or "").strip()
-        if not code and self.appkey_list and (self.sid_list or str(self.sid or "").strip()):
+        if not code and self.appkey_list and (self.publisher_sid_list or self.sid_list or str(self.sid or "").strip()):
             def _fetch_code(current_key):
                 params = {
                     "appkey": current_key,
-                    "sid": self._sid_for_key(current_key),
+                    "sid": self._publisher_sid_for_key(current_key),
                     "relation_app": "common",
                     "code_type": 1,
                 }
@@ -590,7 +638,7 @@ class ZtkClient:
                 except Exception:
                     return _error("NETWORK_ERROR", "折淘客邀请码通信失败")
 
-            res = self._run_with_key_failover(_fetch_code)
+            res = self._run_with_key_failover(_fetch_code, use_publisher_pool=True)
             if isinstance(res, dict) and res.get("status") == "success":
                 code = res.get("inviter_code") or ""
         if not code:

@@ -357,7 +357,8 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(summary["$set"]["activity_price"], 0)
         self.assertEqual(summary["$set"]["commission_amount"], 0)
         self.assertEqual(summary["$set"]["platform"], "taobao")
-        self.assertEqual(summary["$set"]["source"], "taobao_recommend_stream")
+        self.assertEqual(summary["$setOnInsert"]["source"], "taobao_recommend_stream")
+        self.assertNotIn("source", summary["$set"])
 
     def test_detail_roundtrip_preserves_real_provider_fields(self):
         detail = {
@@ -2174,6 +2175,102 @@ class TestProductRepository(unittest.TestCase):
         self.assertTrue(ok_clean)
         self.assertEqual(set(self.col.write_calls[-1][1]), {"$set"})
 
+    def test_upsert_home_products_skips_unchanged_silent_rotates_sign_and_preserves_deal_source(self):
+        old_enc_sign = "2JQRZRHbk3IIkCiQD6m6IkSVn4BiaQ_3SD7sm6WTHRz0i9pLt"
+        new_enc_sign = "9KXRZRHbk3IIkCiQAAAAAkBBBBBBBQ_3SD7sm6WTHRz0i9pLt"
+        # 1. 首次写入含完整字段 + 线报商品（source="deal_pool"）
+        first_count = self.repo.upsert_home_products([{
+            "platform": "jd",
+            "goods_id": "IMG_HOME_1",
+            "goods_sign": old_enc_sign,
+            "name": "测试推荐品",
+            "price": 19.9,
+            "original_price": 29.9,
+            "coupon_amount": 10.0,
+            "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1",
+            "image_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/a.jpg",
+            "commission_rate": 5.0,
+            "commission_amount": 1.0,
+            "sales_tip": "100",
+            "brand": "品牌A",
+            "category": "食品",
+            "mall_name": "自营店",
+        }], channel_type=5)
+        self.assertEqual(first_count, 1)
+        self.assertEqual(self.col.docs[0]["source"], "jd_recommend_stream")
+        ts_initial = self.col.docs[0]["updated_at"]
+
+        # 2. 二次写入完全相同内容 -> 返回 0，不写库也不更新 updated_at
+        writes_before = len(self.col.write_calls)
+        second_count = self.repo.upsert_home_products([{
+            "platform": "jd",
+            "goods_id": "IMG_HOME_1",
+            "goods_sign": old_enc_sign,
+            "name": "测试推荐品",
+            "price": 19.9,
+            "original_price": 29.9,
+            "coupon_amount": 10.0,
+            "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1",
+            "image_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/a.jpg",
+            "commission_rate": 5.0,
+            "commission_amount": 1.0,
+            "sales_tip": "100",
+            "brand": "品牌A",
+            "category": "食品",
+            "mall_name": "自营店",
+        }], channel_type=5)
+        self.assertEqual(second_count, 0)
+        self.assertEqual(len(self.col.write_calls), writes_before)
+        self.assertEqual(self.col.docs[0]["updated_at"], ts_initial)
+
+        # 3. 仅动态加盐 goods_sign 轮换 -> 静默刷新 goods_sign，但绝不推进 updated_at（防止触发云同步/Meilisearch风暴）
+        import time as _time
+        _time.sleep(0.01)
+        self.repo.upsert_home_products([{
+            "platform": "jd",
+            "goods_id": "IMG_HOME_1",
+            "goods_sign": new_enc_sign,
+            "name": "测试推荐品",
+            "price": 19.9,
+            "original_price": 29.9,
+            "coupon_amount": 10.0,
+            "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1",
+            "image_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/a.jpg",
+            "commission_rate": 5.0,
+            "commission_amount": 1.0,
+            "sales_tip": "100",
+            "brand": "品牌A",
+            "category": "食品",
+            "mall_name": "自营店",
+        }], channel_type=5)
+        self.assertEqual(self.col.docs[0]["goods_sign"], new_enc_sign)
+        self.assertEqual(self.col.docs[0]["updated_at"], ts_initial)
+        self.assertEqual(set(self.col.write_calls[-1][1]["$set"].keys()), {"goods_sign"})
+
+        # 4. 已存在 deal_pool 线报商品价格变动时 -> 正常更新价格与 updated_at，但绝不篡改 source="deal_pool"
+        self.col.docs[0]["source"] = "deal_pool"
+        _time.sleep(0.01)
+        fourth_count = self.repo.upsert_home_products([{
+            "platform": "jd",
+            "goods_id": "IMG_HOME_1",
+            "goods_sign": new_enc_sign,
+            "name": "测试推荐品",
+            "price": 15.9,
+            "original_price": 29.9,
+            "coupon_amount": 14.0,
+            "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1",
+            "image_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/a.jpg",
+            "commission_rate": 5.0,
+            "commission_amount": 0.8,
+            "sales_tip": "100",
+            "brand": "品牌A",
+            "category": "食品",
+            "mall_name": "自营店",
+        }], channel_type=5)
+        self.assertEqual(fourth_count, 1)
+        self.assertEqual(self.col.docs[0]["activity_price"], 15.9)
+        self.assertEqual(self.col.docs[0]["source"], "deal_pool")
+        self.assertGreater(self.col.docs[0]["updated_at"], ts_initial)
 
 
 if __name__ == "__main__":

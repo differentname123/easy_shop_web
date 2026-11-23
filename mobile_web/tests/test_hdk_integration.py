@@ -499,6 +499,8 @@ def test_jd_adapter_universal_resolve_via_hdk():
     }
     ztk_fast = Mock()
     ztk_fast.appkey_list = ("ztk_key",)
+    ztk_fast.get_goods_detail.return_value = {"status": "error", "error_code": "NOT_FOUND"}
+    ztk_fast.query_union_goods.return_value = {"status": "success", "data": [], "total_count": 0}
     adapter_fast = JdAdapter(
         settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
         client=ztk_fast,
@@ -514,7 +516,10 @@ def test_jd_adapter_universal_resolve_via_hdk():
         assert r_fast["product"]["name"] == "维达超韧抽纸3层100抽*24包"
         assert r_fast["product"]["price"] == 29.90
         assert r_fast["product"]["coupon_amount"] == 10.0
-    ztk_fast.get_goods_detail.assert_not_called()
+    assert [c.args[0] for c in ztk_fast.get_goods_detail.call_args_list] == [
+        "https://u.jd.com/oFast1",
+        "https://union-click.jd.com/jdc?e=fast2",
+    ]
     ztk_fast.convert_universal_material.assert_not_called()
 
     # 回退场景：HDK 查卡返回 NOT_FOUND -> 解包 u.jd.com 拿加密 sku -> ZTK 详情兜底 -> HDK 原生转链
@@ -537,19 +542,24 @@ def test_jd_adapter_universal_resolve_via_hdk():
     }
     ztk_client = Mock()
     ztk_client.appkey_list = ("ztk_key",)
-    ztk_client.get_goods_detail.return_value = {
-        "status": "success",
-        "data": [{
-            "skuId": "10003",
-            "tao_id": enc_id,
-            "title": "维达超韧抽纸3层100抽*24包",
-            "pict_url": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/vinda.jpg",
-            "size": "39.90",
-            "quanhou_jiage": "29.90",
-            "coupon_info_money": "10.00",
-            "coupon_id": "https://coupon.jd.com/vinda_coupon",
-        }],
-    }
+    ztk_client.query_union_goods.return_value = {"status": "success", "data": [], "total_count": 0}
+    ztk_client.get_goods_detail.side_effect = [
+        {"status": "error", "error_code": "NOT_FOUND"},
+        {
+            "status": "success",
+            "data": [{
+                "skuId": "10003",
+                "tao_id": enc_id,
+                "title": "维达超韧抽纸3层100抽*24包",
+                "pict_url": "https://img14.360buyimg.com/n1/s800x800_jfs/t1/vinda.jpg",
+                "size": "39.90",
+                "quanhou_jiage": "29.90",
+                "coupon_info_money": "10.00",
+                "coupon_id": "https://coupon.jd.com/vinda_coupon",
+            }],
+        },
+    ]
+    ztk_client.convert_promotion_link.return_value = {"status": "error", "error_code": "RATE_LIMIT"}
     ztk_client.convert_universal_material.return_value = {
         "status": "error",
         "error_code": "RATE_LIMIT",
@@ -570,7 +580,10 @@ def test_jd_adapter_universal_resolve_via_hdk():
     assert res["product"]["name"] == "维达超韧抽纸3层100抽*24包"
     assert res["product"]["price"] == 29.90
     assert res["product"]["coupon_amount"] == 10.0
-    ztk_client.get_goods_detail.assert_called_once_with(enc_id)
+    assert [c.args[0] for c in ztk_client.get_goods_detail.call_args_list] == [
+        "https://u.jd.com/oGP72oi",
+        enc_id,
+    ]
 
 
 def test_hdk_agents_md_rule3_compliance():
@@ -916,6 +929,8 @@ def test_jd_adapter_numeric_sku_from_shortlink_preserves_shorturl_and_skips_deta
         "promoter_id": "2035679405",
     }
     ztk_client = Mock()
+    ztk_client.get_goods_detail.return_value = {"status": "error", "error_code": "NOT_FOUND"}
+    ztk_client.query_union_goods.return_value = {"status": "success", "data": [], "total_count": 0}
     ztk_client.convert_universal_material.return_value = {
         "status": "error",
         "error_code": "RATE_LIMIT",
@@ -929,9 +944,9 @@ def test_jd_adapter_numeric_sku_from_shortlink_preserves_shorturl_and_skips_deta
     res = adapter.resolve_and_convert_universal("https://u.jd.com/462xWY1")
 
     assert res["status"] == "success"
-    # 严禁拿纯数字 SKU 100293139120 去白打详情接口（仅允许传入原短链查 HDK）
+    # 严禁拿纯数字 SKU 100293139120 去白打详情接口（仅允许传入原短链查 API）
     assert [c.args[0] for c in hdk_mock.get_goods_detail.call_args_list] == ["https://u.jd.com/462xWY1"]
-    ztk_client.get_goods_detail.assert_not_called()
+    assert [c.args[0] for c in ztk_client.get_goods_detail.call_args_list] == ["https://u.jd.com/462xWY1"]
     # 必须传原始短链给转链接口，而非纯数字 SKU
     hdk_mock.convert_promotion_link.assert_called_once()
     assert hdk_mock.convert_promotion_link.call_args.args[0] == "https://u.jd.com/462xWY1"
@@ -1039,13 +1054,18 @@ def test_jd_personal_promoter_skips_hdk_without_health_errors_and_preserves_posi
 
     res_univ = adapter.resolve_and_convert_universal("https://u.jd.com/someone1", uid="u_12345678", promoter_id="999999")
     assert res_univ["status"] == "success"
-    assert res_univ["_provider"] == "ztk_jd_universal"
+    assert res_univ["_provider"] == "ztk_jd_byunionid"
     assert res_univ["promoter_id"] == "999999"
+
+    res_jcmd = adapter.resolve_and_convert_universal("！JCMD123456！", uid="u_12345678", promoter_id="999999")
+    assert res_jcmd["status"] == "success"
+    assert res_jcmd["_provider"] == "ztk_jd_universal"
+    assert res_jcmd["promoter_id"] == "999999"
 
     hdk_mock.convert_promotion_link.assert_not_called()
     hdk_mock.resolve_short_url.assert_not_called()
-    ztk_client.convert_promotion_link.assert_called_once()
-    assert ztk_client.convert_promotion_link.call_args.args[1] == "999999"
+    assert ztk_client.convert_promotion_link.call_count == 2
+    assert all(c.args[1] == "999999" for c in ztk_client.convert_promotion_link.call_args_list)
     ztk_client.convert_universal_material.assert_called_once()
     assert ztk_client.convert_universal_material.call_args.args[1] == "999999"
 
@@ -1258,6 +1278,7 @@ def test_hdk_shop_homepage_venue_and_off_promotion_short_circuit():
     ztk_mock = Mock()
     ztk_mock.appkey_list = ("ztk_k",)
     ztk_mock.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
+    ztk_mock.query_union_goods.return_value = {"status": "success", "data": [], "total_count": 0}
     ztk_mock.convert_promotion_link.return_value = {"status": "error", "jd_off_promotion": True, "error_msg": "不在推广中"}
     hdk_mock = Mock()
     hdk_mock.get_goods_detail.return_value = {"status": "error", "error_code": "NOT_FOUND", "not_found": True}

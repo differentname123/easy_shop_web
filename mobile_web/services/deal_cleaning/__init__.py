@@ -41,7 +41,9 @@ from services.deal_cleaning.url_venue import (
     _precheck_direct_non_cps_venue_url,
     detect_candidate_platform,
     is_explicit_coupon_target,
+    is_official_cps_http_url,
     rebuild_clean_official_venue_url,
+    resolve_non_cps_http_url,
     unwrap_to_official_public_venue_url,
 )
 from services.deal_cleaning.workers import (
@@ -75,6 +77,7 @@ __all__ = [
     "fallback_stage2_evaluate",
     "format_raw_message_for_ai1",
     "is_explicit_coupon_target",
+    "is_official_cps_http_url",
     "load_neighbor_docs",
     "normalize_inline_spaces",
     "process_ai1_unit",
@@ -82,6 +85,7 @@ __all__ = [
     "process_convert_unit",
     "query_active_formal_products",
     "rebuild_clean_official_venue_url",
+    "resolve_non_cps_http_url",
     "run_ai_stage1_batch",
     "run_ai_stage2_batch",
     "run_stage3_concurrent_conversions",

@@ -2,7 +2,7 @@
 """拼多多边界：SDK 调用、原始字段转换、商品标识与推广降级策略。"""
 import html as html_lib
 import re
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlencode
 from adapters.base import BasePlatformAdapter
 from infrastructure.api_governance import (
@@ -62,6 +62,7 @@ class PddAdapter(BasePlatformAdapter):
     platform_name = "拼多多"
     requires_authorized_promotion = True
     recommendation_limit = 400
+    batch_detail_includes_gallery = False
 
     def __init__(self, client_id=None, client_secret=None, pid=None, enabled=None, settings=None, **overrides):
         super().__init__()
@@ -347,24 +348,13 @@ class PddAdapter(BasePlatformAdapter):
     def _search_via_pdd_official(self, keyword, page=1, page_size=20, uid=None, **kwargs) -> Dict[str, Any]:
         try:
             size = max(1, min(100, int(page_size or 20)))
-            gateway_size = size
+            gateway_size = max(10, size)
             params = {"keyword": keyword, "pid": self.pid, "page": page, "page_size": gateway_size,
                       "custom_parameters": make_custom_parameters(uid=uid) if uid else None, **kwargs}
             try:
                 res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
             except Exception as first_exc:
-                if size < 10 and ("pageSize" in str(first_exc) or "3000000" in str(first_exc)):
-                    gateway_size = 10
-                    params["page_size"] = 10
-                    try:
-                        res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
-                    except Exception as retry_exc:
-                        if uid and self._is_unauthorized_error(retry_exc):
-                            params["custom_parameters"] = None
-                            res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
-                        else:
-                            raise
-                elif uid and self._is_unauthorized_error(first_exc):
+                if uid and self._is_unauthorized_error(first_exc):
                     params["custom_parameters"] = None
                     res = call_pdd_api(self.client_id, self.client_secret, "pdd.ddk.goods.search", params)
                 else:
@@ -372,9 +362,14 @@ class PddAdapter(BasePlatformAdapter):
             response = res.get("goods_search_response", {})
             raw_items = response.get("goods_list", [])
             items = []
+            raw_goods_signs = []
             for item in raw_items:
                 if not item:
                     continue
+                if isinstance(item, dict):
+                    gs = str(item.get("goods_sign") or "").strip()
+                    if gs:
+                        raw_goods_signs.append(gs)
                 try:
                     items.append(self._normalize_goods_summary(clean_goods_item(item, source_type="pdd_search")))
                 except (ValueError, TypeError):
@@ -387,6 +382,7 @@ class PddAdapter(BasePlatformAdapter):
                 "page": page, "page_size": size, "list_id": response.get("list_id", ""),
                 "has_more": has_more,
                 "data": items,
+                "raw_goods_signs": raw_goods_signs,
             }
         except Exception as exc:
             logger.debug(
@@ -441,25 +437,25 @@ class PddAdapter(BasePlatformAdapter):
             res["data"] = []
         return res
 
+    def _normalize_and_verify_pdd_detail(self, raw_data: Dict[str, Any], ref: ProductRef) -> Dict[str, Any]:
+        try:
+            item = self._normalize_goods(raw_data)
+        except (ValueError, TypeError):
+            return _error("PRODUCT_OFF_PROMOTION", "该拼多多商品已下架或无推广计划")
+        if ref.goods_sign and not item.get("goods_sign"):
+            item["goods_sign"] = ref.goods_sign
+        if not ref.goods_sign and ref.goods_id and not item.get("goods_id"):
+            return _error("PRODUCT_OFF_PROMOTION", "该拼多多商品已下架或无推广计划")
+        if ref.goods_id and item.get("goods_id") and item.get("goods_id") != ref.goods_id:
+            return {"status": "error", "error_msg": "商品 ID 反查结果不匹配", "error_code": "product_identity_mismatch"}
+        return {"status": "success", "data": item}
+
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs) -> Dict[str, Any]:
         unavailable = self._available("detail")
         if unavailable:
             return unavailable
         ref = self.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
         detail_rate_limited = False
-
-        def _normalize_and_verify_detail(raw_data):
-            try:
-                item = self._normalize_goods(raw_data)
-            except (ValueError, TypeError):
-                return _error("PRODUCT_OFF_PROMOTION", "该拼多多商品已下架或无推广计划")
-            if ref.goods_sign and not item.get("goods_sign"):
-                item["goods_sign"] = ref.goods_sign
-            if not ref.goods_sign and ref.goods_id and not item.get("goods_id"):
-                return _error("PRODUCT_OFF_PROMOTION", "该拼多多商品已下架或无推广计划")
-            if ref.goods_id and item.get("goods_id") and item.get("goods_id") != ref.goods_id:
-                return {"status": "error", "error_msg": "商品 ID 反查结果不匹配", "error_code": "product_identity_mismatch"}
-            return {"status": "success", "data": item}
 
         def _detail_via_pdd():
             nonlocal detail_rate_limited
@@ -488,7 +484,7 @@ class PddAdapter(BasePlatformAdapter):
                     if code in ("RATE_LIMIT", "QUOTA_PACE_BACKLOG"):
                         detail_rate_limited = True
                     return _error(code, res.get("error_msg", "未查询到官方商品详情"))
-                return _normalize_and_verify_detail(res["data"])
+                return self._normalize_and_verify_pdd_detail(res["data"], ref)
             except Exception as exc:
                 logger.debug(
                     "【拼多多接口异常】查询商品详情异常，交由上层服务处理 | 商品[%s] 异常<%s>",
@@ -519,7 +515,10 @@ class PddAdapter(BasePlatformAdapter):
             )
             if not matched:
                 return _error("NOT_FOUND", "Sign 列表反查未命中目标商品")
-            return _normalize_and_verify_detail(matched)
+            verified = self._normalize_and_verify_pdd_detail(matched, ref)
+            if verified.get("status") == "success":
+                verified["cacheable"] = False
+            return verified
 
         base = []
         if self._has_official_creds() and self.pid:
@@ -535,6 +534,78 @@ class PddAdapter(BasePlatformAdapter):
             **kwargs,
         )
         return self._execute_capability("detail", providers, allow_persist=self._is_real_http())
+
+    def batch_get_goods_details(self, refs: Sequence[ProductRef], uid=None, **kwargs) -> Dict[str, Dict[str, Any]]:
+        """
+        拼多多 20 批量查卡：按每批 <=20 个 goods_sign 调用 pdd.ddk.goods.search(goods_sign_list)
+        严格按 goods_sign / goods_id 精准对齐，未命中或无 sign 项独立回退 pdd.ddk.goods.detail（绝不连坐正常项）。
+        注意：`pdd.ddk.goods.search` 不返回 `goods_gallery_urls`（`batch_detail_includes_gallery = False`），
+        仅用于 20 批量实时价格/优惠/下架核验；完整详情页预取由 `ProductService` 回退单品 `get_goods_detail`。
+        """
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        ordered_refs: List[ProductRef] = []
+        seen_keys = set()
+        for raw_ref in refs or ():
+            r = self.resolve_product_ref(raw_ref.key, raw_ref.goods_id, raw_ref.goods_sign)
+            key = r.key or raw_ref.key
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ordered_refs.append(r)
+        if not ordered_refs:
+            return outcomes
+
+        unavailable = self._available("detail")
+        if unavailable:
+            for r in ordered_refs:
+                outcomes[r.key] = dict(unavailable)
+            return outcomes
+
+        sign_refs = [r for r in ordered_refs if r.goods_sign]
+        if self._has_official_creds() and self.pid:
+            for i in range(0, len(sign_refs), 20):
+                chunk = sign_refs[i:i + 20]
+                res = search_goods_by_sign_list(
+                    self.client_id,
+                    self.client_secret,
+                    self.pid,
+                    [r.goods_sign for r in chunk],
+                    uid=uid,
+                )
+                if res.get("status") != "success":
+                    continue
+                rows = res.get("data") or []
+                for r in chunk:
+                    matched = next(
+                        (
+                            row for row in rows
+                            if isinstance(row, dict)
+                            and (
+                                row.get("goods_sign") == r.goods_sign
+                                or (r.goods_id and clean_product_id(row.get("goods_id")) == r.goods_id)
+                            )
+                        ),
+                        None,
+                    )
+                    if matched is None:
+                        continue
+                    verified = self._normalize_and_verify_pdd_detail(matched, r)
+                    if verified.get("status") == "success":
+                        outcomes[r.key] = {**verified, "_provider": "pdd_goods_search_sign_batch"}
+                    elif verified.get("error_code") == "product_identity_mismatch":
+                        outcomes[r.key] = verified
+
+        for r in ordered_refs:
+            if r.key in outcomes:
+                continue
+            outcomes[r.key] = self.get_goods_detail(
+                r.key,
+                uid=uid,
+                goods_id=r.goods_id or None,
+                goods_sign=r.goods_sign or None,
+                **kwargs,
+            )
+        return outcomes
 
     def _resolve_goods_id(self, goods_id_or_sign: str, kwargs: dict) -> tuple:
         ref = self.resolve_product_ref(goods_id_or_sign, kwargs.get("goods_id"), kwargs.get("goods_sign"))
@@ -773,23 +844,40 @@ class PddAdapter(BasePlatformAdapter):
                 }
             hits = search_res.get("data") or []
             total_cnt = int(search_res.get("total_count") or 0)
-            if len(hits) != 1 or total_cnt != 1:
-                return {
-                    "status": "error",
-                    "error_code": "UNRESOLVED_PDD_INPUT",
-                    "error_msg": "该链接未能唯一定位到具体拼多多商品，请确认粘贴的是单品分享链接",
-                    "is_ambiguous": bool(len(hits) > 1 or total_cnt > 1),
-                    "extracted_url": extracted_url,
-                }
-            first_hit = hits[0]
-            sign_val = first_hit.get("goods_sign") or sign_val
-            id_val = first_hit.get("goods_id") or id_val
-            product_detail = first_hit
-            if sign_val:
-                det_res = self.get_goods_detail(goods_sign=sign_val, goods_id=id_val or None, uid=None)
+            raw_signs = [s for s in (search_res.get("raw_goods_signs") or []) if isinstance(s, str) and s.strip()]
+            if not hits and total_cnt == 1 and len(raw_signs) == 1:
+                det_res = self.get_goods_detail(goods_sign=raw_signs[0], uid=None)
                 if det_res.get("status") == "success" and isinstance(det_res.get("data"), dict):
                     product_detail = det_res["data"]
+                    sign_val = product_detail.get("goods_sign") or raw_signs[0]
                     id_val = product_detail.get("goods_id") or id_val
+                else:
+                    return det_res if det_res.get("status") == "error" else {
+                        "status": "error",
+                        "error_code": "PRODUCT_OFF_PROMOTION",
+                        "error_msg": "该拼多多商品已下架或无推广计划",
+                        "extracted_url": extracted_url,
+                    }
+            else:
+                if len(hits) != 1 or total_cnt != 1:
+                    return {
+                        "status": "error",
+                        "error_code": "UNRESOLVED_PDD_INPUT",
+                        "error_msg": "该链接未能唯一定位到具体拼多多商品，请确认粘贴的是单品分享链接",
+                        "is_ambiguous": bool(len(hits) > 1 or total_cnt > 1),
+                        "extracted_url": extracted_url,
+                    }
+                first_hit = hits[0]
+                sign_val = first_hit.get("goods_sign") or sign_val
+                id_val = first_hit.get("goods_id") or id_val
+                product_detail = first_hit
+                if sign_val:
+                    det_res = self.get_goods_detail(goods_sign=sign_val, goods_id=id_val or None, uid=None)
+                    if det_res.get("status") == "success" and isinstance(det_res.get("data"), dict):
+                        product_detail = det_res["data"]
+                        id_val = product_detail.get("goods_id") or id_val
+                    elif det_res.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                        return det_res
 
         return {
             "status": "success",

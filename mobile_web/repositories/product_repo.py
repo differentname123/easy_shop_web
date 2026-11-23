@@ -133,6 +133,8 @@ def upsert_cleaned_products_to_formal_table(
             "last_clean_source": "deal_pool",
             "is_off_promotion": False,
         }
+        if not str(set_fields.get("coupon_url") or "").strip():
+            set_fields.pop("coupon_url", None)
         if len(best_doc.get("carousel_images") or []) > 1 and float(best_doc.get("commission_amount") or 0.0) > 0:
             set_fields["detail_updated_at"] = now
 
@@ -176,6 +178,7 @@ def upsert_cleaned_products_to_formal_table(
 
         if is_fresh_existing and ex_score > new_score and not price_improved:
             protected_high_score += 1
+            set_fields["deal_info.last_seen_at"] = now
         else:
             has_numeric_dp = (
                 isinstance(deal_info.get("deal_price"), (int, float))
@@ -183,6 +186,7 @@ def upsert_cleaned_products_to_formal_table(
                 and float(deal_info["deal_price"]) > 0
             )
             deal_info["updated_at"] = now
+            deal_info["last_seen_at"] = now
             deal_info["expired_at"] = None
             deal_info["need_reformat"] = has_numeric_dp
             deal_info["format_status"] = "pending" if has_numeric_dp else "skipped"
@@ -497,7 +501,7 @@ class ProductRepository(BaseRepository):
         if item.get("source") is not None:
             update_set["source"] = item["source"]
         elif not detail:
-            update_set["source"] = f"{platform}_recommend_stream"
+            insert_set["source"] = f"{platform}_recommend_stream"
         if not detail and isinstance(channel_type, int) and not isinstance(channel_type, bool):
             update_set["channel_type"] = channel_type
 
@@ -1387,6 +1391,55 @@ class ProductRepository(BaseRepository):
             out["deal_publish_time"] = ov["deal_publish_time"]
         return out
 
+    @staticmethod
+    def _home_values_equal(old_val: Any, new_val: Any) -> bool:
+        """宽松精确比对首页摘要字段（处理 Mongo float/int/Decimal128 类型等价）。"""
+        if isinstance(old_val, bool) or isinstance(new_val, bool):
+            return type(old_val) is type(new_val) and old_val == new_val
+        if isinstance(old_val, (int, float, Decimal128)) and isinstance(new_val, (int, float, Decimal128)):
+            try:
+                old_f = float(old_val.to_decimal() if isinstance(old_val, Decimal128) else old_val)
+                new_f = float(new_val.to_decimal() if isinstance(new_val, Decimal128) else new_val)
+                return math.isfinite(old_f) and math.isfinite(new_f) and abs(old_f - new_f) <= 1e-4
+            except (TypeError, ValueError, OverflowError):
+                return False
+        return old_val == new_val
+
+    @classmethod
+    def _classify_home_product_update(
+        cls,
+        existing_doc: Optional[Dict[str, Any]],
+        filter_spec: Dict[str, Any],
+        update: Dict[str, Any],
+        goods_id: str,
+    ) -> Optional[UpdateOne]:
+        """
+        区分“商用字段/状态真变更”与“纯动态 goods_sign 轮换”，消除 5 分钟推荐流无效 updated_at 写风暴：
+        - 新商品、身份升级、任意商用/状态字段变化、或首次补齐 goods_sign -> 完整更新（推进 updated_at）；
+        - 仅动态盐 goods_sign 轮换 -> 本地静默刷新 goods_sign，不写 updated_at（0 云同步 / 0 Meili 重建）；
+        - 商用字段与 goods_sign 均未变化 -> 完全跳过。
+        """
+        if existing_doc is None or (goods_id and str(existing_doc.get("product_id") or "").strip() != goods_id):
+            return UpdateOne(filter_spec, update, upsert=True)
+
+        update_set = update.get("$set") or {}
+        for field, new_val in update_set.items():
+            if field in ("updated_at", "goods_sign"):
+                continue
+            if field not in existing_doc or not cls._home_values_equal(existing_doc.get(field), new_val):
+                return UpdateOne(filter_spec, update, upsert=True)
+
+        new_sign = update_set.get("goods_sign")
+        old_sign = existing_doc.get("goods_sign")
+        filling_missing_sign = bool(new_sign and not str(old_sign or "").strip())
+        if filling_missing_sign:
+            return UpdateOne(filter_spec, update, upsert=True)
+
+        if "goods_sign" in update_set and new_sign != old_sign:
+            return UpdateOne(filter_spec, {"$set": {"goods_sign": new_sign}}, upsert=False)
+
+        return None
+
     def upsert_home_products(
         self,
         goods_list: List[Dict[str, Any]],
@@ -1426,7 +1479,7 @@ class ProductRepository(BaseRepository):
                         for it in goods_list
                     ]
 
-        ops_by_key = {}
+        pending_by_key: Dict[Tuple[str, str], Tuple[Dict[str, Any], Dict[str, Any], str, str, str]] = {}
         for item in effective_list:
             if not isinstance(item, dict):
                 continue
@@ -1437,8 +1490,62 @@ class ProductRepository(BaseRepository):
                 if goods_id:
                     filter_spec = {"platform": platform, "product_id": goods_id}
                 dedup_key = (platform, goods_id or goods_sign)
-                ops_by_key[dedup_key] = UpdateOne(filter_spec, update, upsert=True)
-        operations = list(ops_by_key.values())
+                pending_by_key[dedup_key] = (filter_spec, update, platform, goods_id, goods_sign)
+        if not pending_by_key:
+            return 0
+
+        existing_by_plat_pid: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        existing_by_plat_sign: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        prequery_failed = False
+        try:
+            keys_by_plat: Dict[str, Dict[str, List[str]]] = {}
+            proj_fields: Dict[str, int] = {"_id": 0, "platform": 1, "product_id": 1, "goods_sign": 1, "is_off_promotion": 1}
+            for _filter_spec, update, plat, gid, gsign in pending_by_key.values():
+                bucket = keys_by_plat.setdefault(plat, {"pids": [], "signs": []})
+                if gid:
+                    bucket["pids"].append(gid)
+                elif gsign:
+                    bucket["pids"].append(gsign)
+                    bucket["signs"].append(gsign)
+                for field in (update.get("$set") or {}):
+                    if field != "updated_at":
+                        proj_fields[field] = 1
+            for plat, id_bucket in keys_by_plat.items():
+                or_clauses = []
+                if id_bucket["pids"]:
+                    or_clauses.append({"product_id": {"$in": list(dict.fromkeys(id_bucket["pids"]))}})
+                if id_bucket["signs"]:
+                    or_clauses.append({"goods_sign": {"$in": list(dict.fromkeys(id_bucket["signs"]))}})
+                if not or_clauses:
+                    continue
+                query = {"platform": plat, "$or": or_clauses} if len(or_clauses) > 1 else {"platform": plat, **or_clauses[0]}
+                for doc in self.col.find(query, proj_fields):
+                    if not isinstance(doc, dict):
+                        continue
+                    doc_plat = str(doc.get("platform") or plat)
+                    doc_pid = str(doc.get("product_id") or "").strip()
+                    doc_sign = str(doc.get("goods_sign") or "").strip()
+                    if doc_pid:
+                        existing_by_plat_pid[(doc_plat, doc_pid)] = doc
+                    if doc_sign:
+                        existing_by_plat_sign[(doc_plat, doc_sign)] = doc
+        except Exception as e:
+            prequery_failed = True
+            logger.debug("【商品摘要比对预查降级】跳过无变更过滤，直写批量更新: %s", format_exc_summary(e))
+
+        operations: List[UpdateOne] = []
+        for filter_spec, update, plat, gid, gsign in pending_by_key.values():
+            if prequery_failed:
+                operations.append(UpdateOne(filter_spec, update, upsert=True))
+                continue
+            existing_doc = (
+                existing_by_plat_pid.get((plat, gid))
+                if gid
+                else (existing_by_plat_pid.get((plat, gsign)) or existing_by_plat_sign.get((plat, gsign)))
+            )
+            op = self._classify_home_product_update(existing_doc, filter_spec, update, gid)
+            if op is not None:
+                operations.append(op)
 
         if not operations:
             return 0

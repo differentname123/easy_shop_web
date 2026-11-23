@@ -148,7 +148,7 @@ def test_search_exact_script_parameters_public_url_and_missing_only_price_fallba
     assert "raw" not in str(first) and "jCommand" not in str(first)
     call = http.get.call_args
     assert call.args == (DEFAULT_API_BASE + "/api_quanwang.ashx",)
-    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "纸纸纸纸",
+    assert call.kwargs["params"] == {"appkey": "test-ztk-key", "unionId": "10001", "q": "纸纸",
                                      "page": 2, "page_size": 3, "sort": "new", "youquan": 0, "type": 2}
     assert a.search_goods("足够长关键词")["data"][0]["price"] == 20.5
     assert http.get.call_args.kwargs["params"]["q"] == "足够长关键词"
@@ -180,18 +180,31 @@ def test_detail_requires_unique_matching_supplier_identity(content):
 
 
 def test_detail_allows_rank_item_opaque_id_mapped_to_supplier_material_url():
-    # 模拟真实折淘客对于榜单商品的返回：请求参数为榜单混淆ID，返回单品详情的tao_id为物料长ID，但具备官方item_url
+    # 模拟真实折淘客对于榜单商品的返回：请求参数为榜单混淆ID，返回单品详情的tao_id为不同密钥池物料长ID：
+    # 1. 携带同主图 CDN 指纹时 api_detail 可直接跨密钥池放行；或无主图时由 goods_query 凭 oriItemId 确证；
+    # 2. 若无主图/同后缀且 goods_query 亦未命中，严禁放行无关物料长ID（防 api_detail 子串误搜串货）。
+    from models.product import extract_jd_image_key
+
     rank_item_id = "Wl4yEImIlQsfIguVL32ZfIguVL32Z4_3QWdizpmh42cklzdJw"
     material_tao_id = "ejQ4e41VT9804VHJskns04VH3HCuxQ_3vbTPlrXEzwgtTJU5x"
     supplier_item_url = f"https://jingfen.jd.com/detail/{material_tao_id}.html"
+    detail_img = "https://img14.360buyimg.com/pop/jfs/t1/550472/38/9362/180494/6ae3f40fF84b3cfef/0083320320005d73.jpg"
+    detail_row = item(material_tao_id, item_url=supplier_item_url, pict_url=detail_img)
+    img_key = extract_jd_image_key(detail_img)
+    assert img_key == "6ae3f40fF84b3cfef_0083320320005d73"
     empty_union = wrapped("jd_union_open_goods_query_response", {"code": 200, "data": []}, field="result", string=True)
+
     http = route_http({
         "/open_jing_union_open_goods_query.ashx": empty_union,
-        "/api_detail.ashx": {"status": 200, "content": [item(material_tao_id, item_url=supplier_item_url)]},
+        "/api_detail.ashx": {"status": 200, "content": [detail_row]},
     })
     a = adapter(client(http))
-    result = a.get_goods_detail(rank_item_id)
-    assert result["data"]["goods_id"] == rank_item_id
+    # 无主图且不同后缀+goods_query空：严格拒收防幻觉
+    assert a.get_goods_detail(rank_item_id)["error_code"] == "NOT_FOUND"
+    # 同主图 CDN 指纹：跨密钥池安全放行并刷新官方物料链
+    result = a.get_goods_detail(rank_item_id, goods_id=img_key, goods_sign=rank_item_id)
+    assert result["status"] == "success"
+    assert result["data"]["goods_id"] == img_key
     assert result["data"]["goods_sign"] == rank_item_id
     assert result["data"]["product_url"] == supplier_item_url
 
@@ -423,9 +436,19 @@ def test_numeric_scope_config_fingerprint_and_failure_has_no_owner_fallback():
 
 
 def test_appkey_list_failover_rescues_rate_limited_key_and_updates_active_cursor():
-    # 当 Key 1 触发折淘客 301 频控限制时，自动切换到 Key 2 重试成功，并将 Key 1 冷却隔离 60s（哪怕轮询游标绕回索引 0 也跳过）
-    http = http_for(
+    # api_detail 遇 301 对应宝贝已下架时第 1 把 Key 立即早停不连打；遇显式频控(1000/429)才自动切 Key 2 并冷却 Key 1
+    short_301_http = http_for(
         {"status": 301, "content": "对应宝贝已下架"},
+        {"status": 200, "content": [item("should-not-call")]},
+    )
+    c_early = JdClient(["key-1", "key-2"], "10001", "test-jd-key", "test-jd-secret", http_session=short_301_http)
+    early_res = c_early.get_goods_detail("opaque-material")
+    assert early_res["status"] == "error" and early_res.get("ztk_ambiguous_301") is True
+    assert short_301_http.get.call_count == 1
+    assert c_early._key_cooldown_until == {}
+
+    http = http_for(
+        {"status": 301, "content": "今日调用次数已达1000上限"},
         {"status": 200, "content": [item("opaque-material")]},
         {"status": 200, "content": [item("second-item")]},
         {"status": 200, "content": [item("third-item")]},
@@ -433,7 +456,7 @@ def test_appkey_list_failover_rescues_rate_limited_key_and_updates_active_cursor
     c = JdClient(["key-1", "key-2"], "10001", "test-jd-key", "test-jd-secret", http_session=http)
     assert c.appkey_list == ("key-1", "key-2")
 
-    # 第一次请求（游标 0）：Key 1 返回 301 失败 -> 自动切换 Key 2 成功，且 Key 1（索引 0）进入冷却隔离
+    # 第一次请求（游标 0）：Key 1 返回显式频控 -> 自动切换 Key 2 成功，且 Key 1（索引 0）进入冷却隔离
     res1 = c.get_goods_detail("opaque-material")
     assert res1["status"] == "success"
     assert http.get.call_count == 2
@@ -522,24 +545,22 @@ def test_jd_detail_301_rate_limit_vs_off_promotion_arbitration_and_eviction():
     clear_all_caches()
     off_promo_id = "oxXpYeb9FgS3eszB2h2f3eszB2h2fX_3TYrAutPKopeY0fpzO"
     empty_union = wrapped("jd_union_open_goods_query_response", {"code": 200, "data": []}, field="result", string=True)
-    # 场景1：api_detail.ashx 返回 301 对应宝贝已下架，但转链探针返回 200 成功 -> 判定为 RATE_LIMIT（非真实下架）
+    # 场景1：api_detail.ashx 返回 301 对应宝贝已下架，且 goods_query 返回 1000 限流 -> 判定为 RATE_LIMIT（绝不调 byunionid 猜限流）
     http_rate_limited = route_http({
-        "/open_jing_union_open_goods_query.ashx": empty_union,
+        "/open_jing_union_open_goods_query.ashx": {"status": 301, "content": "请求频率超限(1000)"},
         "/api_detail.ashx": {"status": 301, "content": "对应宝贝已下架"},
-        "/open_jing_union_open_promotion_byunionid_get.ashx": wrapped(PROMOTION_ROOT, {"code": 200, "data": {
-            "shortURL": "https://u.jd.com/stillalive", "clickURL": "https://union-click.jd.com/alive",
-            "jCommand": "口令", "jShortCommand": "短口令"}}, field="result", string=True),
+        "/open_jing_union_open_promotion_byunionid_get.ashx": AssertionError("get_goods_detail must never probe byunionid_get"),
     })
     a_alive = adapter(client(http_rate_limited))
     res_alive = a_alive.get_goods_detail(off_promo_id, allow_fallback=False)
     assert res_alive["status"] == "error"
     assert res_alive["error_code"] == "RATE_LIMIT"
 
-    # 场景2：api_detail.ashx 返回 301 对应宝贝已下架，且转链探针返回 2001104 商品不在推广中 -> 确诊 PRODUCT_OFF_PROMOTION
+    # 场景2：api_detail.ashx 返回 301 对应宝贝已下架，且 goods_query 返回 code=200 data=[] -> 交叉实锤 PRODUCT_OFF_PROMOTION
     http_off_promo = route_http({
         "/open_jing_union_open_goods_query.ashx": empty_union,
         "/api_detail.ashx": {"status": 301, "content": "对应宝贝已下架"},
-        "/open_jing_union_open_promotion_byunionid_get.ashx": wrapped(PROMOTION_ROOT, {"code": 2001104, "message": "2001104_您的账号无权限访问，原因：商品不在推广中", "data": None}, field="result", string=True),
+        "/open_jing_union_open_promotion_byunionid_get.ashx": AssertionError("get_goods_detail must never probe byunionid_get"),
     })
     a_dead = adapter(client(http_off_promo))
     res_dead = a_dead.get_goods_detail(off_promo_id)
@@ -557,7 +578,6 @@ def test_jd_detail_301_rate_limit_vs_off_promotion_arbitration_and_eviction():
         http_off_promo2 = route_http({
             "/open_jing_union_open_goods_query.ashx": empty_union,
             "/api_detail.ashx": {"status": 301, "content": "对应宝贝已下架"},
-            "/open_jing_union_open_promotion_byunionid_get.ashx": wrapped(PROMOTION_ROOT, {"code": 2001104, "message": "2001104_您的账号无权限访问，原因：商品不在推广中", "data": None}, field="result", string=True),
         })
         a_dead.client = client(http_off_promo2)
         svc_res = svc.get_goods_detail(platform="jd", goods_id=off_promo_id, goods_sign=off_promo_id)
@@ -617,37 +637,27 @@ def test_jd_image_key_never_calls_upstream_detail_and_service_upgrades_sign():
 
 
 def test_jd_universal_convert_passes_raw_text_directly_and_never_falls_back_to_keyword_search():
-    # 1. 前置 goods.query 未命中时，混排文案原样透传给 JdClient.convert_universal_material，单品接口失败时自动透传给 open_gaoyongzhuanlian_tkl_piliang.ashx
+    # 1. 混排文案先从文本精准提取内嵌 u.jd.com URL，4步直线转链：前置未出卡 -> byunionid_get 直转 -> 补 1 次 api_detail(newshort) 拿全卡（0 次 tkl_piliang / api_quanwang）
     empty_union = wrapped("jd_union_open_goods_query_response", {"code": 200, "data": []}, field="result", string=True)
-    promo_replies = iter([
-        {
-            "jd_union_open_promotion_byunionid_get_response": {
-                "result": json.dumps({"code": 4002512, "message": "您的1个链接未遵循京粉格式，请调整后重试"}),
-            },
+    promo_ok = {
+        "jd_union_open_promotion_byunionid_get_response": {
+            "result": json.dumps({
+                "code": 200,
+                "data": {
+                    "shortURL": "https://u.jd.com/newshort",
+                    "clickURL": "https://union-click.jd.com/jdc?e=new",
+                    "jCommand": "12:/领5元优惠券！抢购可口可乐330ml*24！ ！ABCD1234EFGH！ CA1234",
+                    "jShortCommand": "！ABCD1234EFGH！ CA1234",
+                },
+            }),
         },
-        {
-            "jd_union_open_promotion_byunionid_get_response": {
-                "result": json.dumps({
-                    "code": 200,
-                    "data": {
-                        "shortURL": "https://u.jd.com/newshort",
-                        "clickURL": "https://union-click.jd.com/jdc?e=new",
-                        "jCommand": "12:/领5元优惠券！抢购可口可乐330ml*24！ ！ABCD1234EFGH！ CA1234",
-                        "jShortCommand": "！ABCD1234EFGH！ CA1234",
-                    },
-                }),
-            },
-        },
-    ])
-    s = route_http({
-        "/open_jing_union_open_goods_query.ashx": empty_union,
-        "/open_jing_union_open_promotion_byunionid_get.ashx": lambda _u, _p: next(promo_replies),
-        "/open_gaoyongzhuanlian_tkl_piliang.ashx": {
-            "status": 200,
-            "plat": "2",
+    }
+    coke_detail = {
+        "status": 200,
+        "content": [{
             "tao_id": "wAQEbTBpySSwDZcuvK0xwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC",
             "title": "可口可乐330ml*24",
-            "pic": "https://img14.360buyimg.com/pop/jfs/t1/523108/39/14102/81368/6ab9c932F86c506ae/0083320320b195ad.jpg",
+            "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/523108/39/14102/81368/6ab9c932F86c506ae/0083320320b195ad.jpg",
             "size": "49.2",
             "quanhou_jiage": "44.28",
             "coupon_info_money": "4.92",
@@ -655,8 +665,17 @@ def test_jd_universal_convert_passes_raw_text_directly_and_never_falls_back_to_k
             "tkfee3": "1.77",
             "nick": "可口可乐京东自营旗舰店",
             "volume": "20000",
-            "result_url": "https://u.jd.com/newshort",
-        },
+            "item_url": "https://jingfen.jd.com/detail/wAQEbTBpySSwDZcuvK0xwDZcuvK0xQ_3ioMtBxPdPEEdaHrjC.html",
+        }],
+    }
+    detail_replies = iter([
+        {"status": 301, "content": "对应宝贝已下架"},
+        coke_detail,
+    ])
+    s = route_http({
+        "/api_detail.ashx": lambda _u, _p: next(detail_replies),
+        "/open_jing_union_open_goods_query.ashx": empty_union,
+        "/open_jing_union_open_promotion_byunionid_get.ashx": promo_ok,
     })
     a = adapter(client(s))
     mixed_text = "★京东超级补贴★ 可口可乐330ml*24 售价：49.2元[下单链接：https://u.jd.com/oldshort]返2元红包！"
@@ -666,10 +685,13 @@ def test_jd_universal_convert_passes_raw_text_directly_and_never_falls_back_to_k
     assert res["promotion_token"] == "！ABCD1234EFGH！ CA1234"
     assert res["product"]["name"] == "可口可乐330ml*24"
     assert s.get.call_count == 4
-    assert s.get.call_args_list[0].args[0].endswith("/open_jing_union_open_goods_query.ashx")
-    assert s.get.call_args_list[1].args[0].endswith("/open_jing_union_open_promotion_byunionid_get.ashx")
-    assert s.get.call_args_list[2].args[0].endswith("/open_gaoyongzhuanlian_tkl_piliang.ashx")
-    assert s.get.call_args_list[3].args[0].endswith("/open_jing_union_open_promotion_byunionid_get.ashx")
+    assert s.get.call_args_list[0].args[0].endswith("/api_detail.ashx")
+    assert s.get.call_args_list[1].args[0].endswith("/open_jing_union_open_goods_query.ashx")
+    assert s.get.call_args_list[2].args[0].endswith("/open_jing_union_open_promotion_byunionid_get.ashx")
+    assert s.get.call_args_list[2].kwargs["params"]["materialId"] == "https://u.jd.com/oldshort"
+    assert s.get.call_args_list[3].args[0].endswith("/api_detail.ashx")
+    assert s.get.call_args_list[3].kwargs["params"]["tao_id"] == "https://u.jd.com/newshort"
+    assert not any("tkl_piliang" in c.args[0] or "api_quanwang" in c.args[0] for c in s.get.call_args_list)
 
     # 2. 当转链失败（如仅含商品标题无链接/口令）时，直接返回错误，绝不调用 search_goods 模糊搜索顶替商品
     c_fail = Mock()
@@ -793,15 +815,16 @@ def test_merchant_main_image_update_preserves_detail_and_coupon_via_verified_cip
     new_img_url = f"https://img14.360buyimg.com/pop/jfs/t1/550000/2/300/400/{new_img_key.replace('_', '/')}.jpg"
 
     req_sign = "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g"
+    same_pool_resalt = "IwQNjSHMMam3HPzzzzzz3HPxmHnuvQ_cIOf4YLZawohplFr3g"
     resalted_cipher = "Ip4ZpZqBj5GQZVLMtk0dQZVturRAQ4_3NM1doJsxx4B57H48G"
     coupon_link = "https://coupon.m.jd.com/coupons/show.action?linkKey=AAROH_xIpeffAs_-naABEFoeyXTPnH86"
 
-    # 1. 商家更换主图且折淘客跨 Key 重加密 tao_id：请求与返回均为标准京东联盟双段密文 ID，正常提取 4 元优惠券
+    # 1a. 同池重加盐且商家更换主图（prefix[:14]+suffix 一致）：api_detail 直接放行并更新 4 元优惠券
     c = Mock()
     c.get_goods_detail.return_value = {
         "status": "success",
         "data": [item(
-            resalted_cipher,
+            same_pool_resalt,
             title="可口可乐500ml*24瓶整箱",
             size="64",
             quanhou_jiage="60",
@@ -809,7 +832,7 @@ def test_merchant_main_image_update_preserves_detail_and_coupon_via_verified_cip
             coupon_info="满28元减4元",
             coupon_id=coupon_link,
             pict_url=new_img_url,
-            item_url=f"https://jingfen.jd.com/detail/{resalted_cipher}.html",
+            item_url=f"https://jingfen.jd.com/detail/{same_pool_resalt}.html",
         )],
     }
     a = adapter(c)
@@ -835,12 +858,48 @@ def test_merchant_main_image_update_preserves_detail_and_coupon_via_verified_cip
     assert detail_res["data"]["goods_id"] == new_img_key
     assert detail_res["data"]["goods_sign"] == req_sign
 
-    # 2. get_goods_detail 遇 301 频控且转链探针成功时直接裁决为 RATE_LIMIT，不再额外撞 api_quanwang 消耗 1000 配额
+    # 1b. 跨密钥池重加密 + 主图同时变更：api_detail 拒猜，由 goods_query 凭 oriItemId==req_sign 权威确证；伪造假 ID 严格拒收
+    c_cross = Mock()
+    c_cross.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [item("WaTNAju9LsLL7rmn1wRVL7rmn1wRVT_sweEl8DJRszhniFt6P", title="误搜遥控器", pict_url=new_img_url)],
+    }
+    c_cross.query_union_goods.return_value = {
+        "status": "success",
+        "data": [{
+            "oriItemId": req_sign,
+            "itemId": resalted_cipher,
+            "skuId": 100088,
+            "skuName": "可口可乐500ml*24瓶整箱",
+            "materialUrl": f"item.jd.com/{resalted_cipher}.html",
+            "imageInfo": {"imageList": [{"url": new_img_url}]},
+            "priceInfo": {"price": 64.0, "lowestCouponPrice": 60.0},
+            "couponInfo": {"couponList": [{"discount": 4.0, "quota": 28.0, "link": coupon_link, "useEndTime": 4102415999000, "isBest": 1}]},
+            "commissionInfo": {"commissionShare": 5.0, "couponCommission": 3.0},
+            "shopInfo": {"shopName": "可口可乐京东自营"},
+            "comments": 10000,
+        }],
+    }
+    cross_res = adapter(c_cross).get_goods_detail(req_sign, goods_id=old_img_key, goods_sign=req_sign)
+    assert cross_res["status"] == "success" and cross_res["_provider"] == "ztk_jd_goods_query_detail"
+    assert cross_res["data"]["name"] == "可口可乐500ml*24瓶整箱"
+
+    c_fake = Mock()
+    c_fake.get_goods_detail.return_value = {
+        "status": "success",
+        "data": [item("WaTNAju9LsLL7rmn1wRVL7rmn1wRVT_sweEl8DJRszhniFt6P", title="误搜遥控器", pict_url=new_img_url)],
+    }
+    c_fake.query_union_goods.return_value = {"status": "success", "data": [], "total_count": 0}
+    fake_det = adapter(c_fake).get_goods_detail(req_sign, goods_id=old_img_key, goods_sign=req_sign)
+    assert fake_det["status"] == "error" and fake_det["error_code"] == "NOT_FOUND"
+
+    # 2. get_goods_detail 遇 301 下架且 goods_query 返回 1000 限流时裁决为 RATE_LIMIT（不再调 byunionid 猜限流或撞 api_quanwang）
     c_rl = Mock()
     c_rl.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
-    c_rl.convert_promotion_link.return_value = {"status": "success", "short_url": "https://u.jd.com/probe_cola"}
+    c_rl.query_union_goods.return_value = {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "1000 limit"}
     resilient = adapter(c_rl).get_goods_detail(req_sign, goods_id=old_img_key, goods_sign=req_sign)
     assert resilient["status"] == "error" and resilient["error_code"] == "RATE_LIMIT"
+    c_rl.convert_promotion_link.assert_not_called()
     c_rl.search_goods.assert_not_called()
 
     # 3. 防串货红线不变：若上游退化返回非标准加密 ID（如误解析成数字 SKU '6'）且主图冲突，严格拒绝
@@ -1004,28 +1063,31 @@ def test_search_material_urls_saved_even_without_detail_prefetch(monkeypatch, pr
 
 
 def test_jd_client_catalog_cooldown_short_circuits_catalog_only():
-    """选品库突发冷却开启后，api_detail / api_quanwang / tkl_piliang 零 HTTP 立即熔断，不影响 byunionid_get。"""
+    """选品库突发冷却开启后，api_quanwang / tkl_piliang 零 HTTP 立即熔断；独立的 api_detail (50.9 QPS) 与 byunionid_get 不受连坐。"""
     http = http_for(
+        {"status": 200, "content": [{"tao_id": "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g", "title": "商品", "wlprice": "19.9", "pict_url": "https://img14.360buyimg.com/a.jpg"}]},
         wrapped(PROMOTION_ROOT, {"code": 200, "data": {"shortURL": "https://u.jd.com/ok"}}, field="result", string=True),
     )
     cli = client(http)
     cli.mark_catalog_rate_limited(60.0, force=True)
     assert cli.is_catalog_cooling() is True
 
-    det = cli.get_goods_detail("IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g")
     srch = cli.search_goods("抽纸")
-    assert det["error_code"] == "RATE_LIMIT" and det.get("catalog_cooling") is True
     assert srch["error_code"] == "RATE_LIMIT" and srch.get("catalog_cooling") is True
     assert http.get.call_count == 0
+
+    det = cli.get_goods_detail("IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g")
+    assert det["status"] == "success"
+    assert http.get.call_count == 1
 
     promo = cli.convert_promotion_link("https://jingfen.jd.com/detail/IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g.html", "88")
     assert promo["status"] == "success"
     assert promo["short_url"] == "https://u.jd.com/ok"
-    assert http.get.call_count == 1
+    assert http.get.call_count == 2
 
 
 def test_jd_client_catalog_cooldown_stepped_backoff_and_reset_on_success():
-    """连续限流冷却按 65s -> 120s -> 240s -> 300s 阶梯退避；同一冷却窗内不重复递增；任一选品库成功即归零复位。"""
+    """连续限流冷却按 65s -> 120s -> 240s -> 300s 阶梯退避；同一冷却窗内不重复递增；api_quanwang / tkl_piliang 成功即归零复位。"""
     http = http_for(
         {"status": 200, "content": [{"tao_id": "IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g", "title": "商品", "wlprice": "19.9", "pict_url": "https://img14.360buyimg.com/a.jpg"}]},
     )
@@ -1041,7 +1103,7 @@ def test_jd_client_catalog_cooldown_stepped_backoff_and_reset_on_success():
         assert cli._catalog_cooldown_streak == idx + 1
         cli._catalog_cooldown_until = 0.0
 
-    res = cli.get_goods_detail("IwQNjSHMMam3HPxmHnuv3HPxmHnuvQ_cIOf4YLZawohplFr3g")
+    res = cli.search_goods("抽纸")
     assert res["status"] == "success"
     assert cli._catalog_cooldown_streak == 0
 
@@ -1280,7 +1342,7 @@ def test_jd_short_url_coupon_timestamps_cooling_preservation_and_uid_fail_closed
     assert conv_hdk["status"] == "success" and conv_hdk["final_link"] == "https://u.jd.com/hdkok"
     assert ztk_promo_cli.convert_promotion_link.call_count == 0
 
-    # 5. resolve_and_convert_universal: 传入 uid 且无有效推广位时宁缺毋滥；冷却期 HDK 失败后降级 ZTK
+    # 5. resolve_and_convert_universal: 传入 uid 且无有效推广位时宁缺毋滥；冷却期仍优先 ZTK byunionid_get（独立池不连坐），失败才降级 HDK
     a_no_prom = JdAdapter(
         settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="", ztk_appkey="k1"),
         client=rl_cli, hdk_client=hdk_promo_cli,
@@ -1293,13 +1355,13 @@ def test_jd_short_url_coupon_timestamps_cooling_preservation_and_uid_fail_closed
         is_catalog_cooling=lambda: True,
         convert_promotion_link=Mock(return_value={"status": "success", "short_url": "https://u.jd.com/ztkfb"}),
     )
-    hdk_fail = Mock(
+    hdk_unused = Mock(
         appkey_list=("hk1",),
-        convert_promotion_link=Mock(return_value={"status": "error", "error_code": "UPSTREAM_ERROR", "error_msg": "hdk fail"}),
+        convert_promotion_link=Mock(return_value={"status": "success", "short_url": "https://u.jd.com/hdkfb"}),
     )
     a_cool_fb = JdAdapter(
         settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="k1"),
-        client=cool_ztk_ok, hdk_client=hdk_fail,
+        client=cool_ztk_ok, hdk_client=hdk_unused,
     )
     fb_res = a_cool_fb._convert_material_url_with_fallback(
         f"https://jingfen.jd.com/detail/{official_sign}.html",
@@ -1308,18 +1370,39 @@ def test_jd_short_url_coupon_timestamps_cooling_preservation_and_uid_fail_closed
         goods_sign=official_sign,
     )
     assert fb_res["status"] == "success" and fb_res["final_link"] == "https://u.jd.com/ztkfb"
-    assert hdk_fail.convert_promotion_link.call_count == 1
     assert cool_ztk_ok.convert_promotion_link.call_count == 1
+    assert hdk_unused.convert_promotion_link.call_count == 0
+
+    cool_ztk_err = Mock(
+        appkey_list=("k1",),
+        is_catalog_cooling=lambda: True,
+        convert_promotion_link=Mock(return_value={"status": "error", "error_code": "UPSTREAM_ERROR"}),
+    )
+    a_hdk_fb = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="k1"),
+        client=cool_ztk_err, hdk_client=hdk_unused,
+    )
+    hdk_res = a_hdk_fb._convert_material_url_with_fallback(
+        f"https://jingfen.jd.com/detail/{official_sign}.html",
+        "88",
+        is_personal=False,
+        goods_sign=official_sign,
+    )
+    assert hdk_res["status"] == "success" and hdk_res["final_link"] == "https://u.jd.com/hdkfb"
+    assert hdk_unused.convert_promotion_link.call_count == 1
 
 
 def test_jd_universal_domain_guard_and_foreground_vs_background_cooling():
     from infrastructure.api_governance import api_caller_context
+    from infrastructure.jd_client import _is_trusted_jd_redirect_url
     from models.product import JD_DOMAINS, url_matches_domains
 
-    # 1. 官方域名匹配严谨且拒绝伪域名、淘宝/拼多多跨平台域名
+    # 1. 官方域名匹配严谨且拒绝伪域名、淘宝/拼多多跨平台域名，可信重定向含 jd.hk / yiyaojd.com
     assert url_matches_domains("https://u.jd.com/oOUaUwq", JD_DOMAINS) is True
     assert url_matches_domains("https://coupon.m.jd.com/coupons/show.action?key=1", JD_DOMAINS) is True
     assert url_matches_domains("https://eviljd.com/123.html", JD_DOMAINS) is False
+    assert _is_trusted_jd_redirect_url("https://npcitem.jd.hk/100234.html") is True
+    assert _is_trusted_jd_redirect_url("https://item.yiyaojd.com/100234.html") is True
 
     ztk_guard = Mock()
     ad_guard = JdAdapter(settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="k1"), client=ztk_guard)
@@ -1328,26 +1411,27 @@ def test_jd_universal_domain_guard_and_foreground_vs_background_cooling():
         assert err["status"] == "error" and err["error_code"] == "INVALID_JD_URL"
     ztk_guard.convert_universal_material.assert_not_called()
 
-    # 2. 冷却期内：background 上下文保持零 HTTP 入口熔断；foreground 依然放行 :20000 官方查询 + byunionid_get
+    # 2. 选品池 cooling 期间：background 与 foreground 均不再全局连坐拦截独立池 api_detail + byunionid_get，同时跳过 goods_query 共享池
     enc_id = "G6QDzEKCKU5wE4ebWFK3wE4ebcI4vQ_3lzC2xxOIoDavPIXww"
-    union_row = {
-        "itemId": enc_id,
-        "skuId": 100088,
-        "skuName": "维达抽纸整箱24包",
-        "materialUrl": f"item.jd.com/{enc_id}.html",
-        "imageInfo": {"imageList": [{"url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/vinda.jpg"}]},
-        "priceInfo": {"price": 39.9, "lowestCouponPrice": 29.9},
-        "couponInfo": {"couponList": []},
-        "commissionInfo": {"commissionShare": 6.5, "couponCommission": 1.94},
-        "shopInfo": {"shopName": "维达旗舰店"},
-        "comments": 10000,
+    api_row = {
+        "tao_id": enc_id,
+        "title": "维达抽纸整箱24包",
+        "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/vinda.jpg",
+        "size": "39.9",
+        "quanhou_jiage": "29.9",
+        "coupon_info_money": "10",
+        "tkrate3": "6.5",
+        "tkfee3": "1.94",
+        "nick": "维达旗舰店",
+        "volume": "10000",
+        "item_url": f"https://jingfen.jd.com/detail/{enc_id}.html",
     }
     calls = []
 
     def _cooling_get(url, params=None, **_kw):
         calls.append(url)
-        if "open_jing_union_open_goods_query" in url:
-            return reply({"jd_union_open_goods_query_response": {"result": json.dumps({"code": 200, "totalCount": 1, "data": [union_row]})}})
+        if "api_detail.ashx" in url:
+            return reply({"status": 200, "content": [api_row]})
         if "byunionid_get" in url:
             return reply({PROMOTION_ROOT: {"result": json.dumps({"code": 200, "data": {"shortURL": "https://u.jd.com/fgOk1", "clickURL": "https://union-click.jd.com/fgOk1"}})}})
         raise AssertionError(f"Catalog pool must stay skipped while cooling: {url}")
@@ -1358,22 +1442,24 @@ def test_jd_universal_domain_guard_and_foreground_vs_background_cooling():
 
     with api_caller_context("background"):
         bg_res = ad_fg.resolve_and_convert_universal("https://u.jd.com/oGP72oi")
-    assert bg_res["status"] == "error" and bg_res["error_code"] == "RATE_LIMIT" and bg_res.get("catalog_cooling") is True
-    assert calls == []
+    assert bg_res["status"] == "success" and bg_res["resolution_kind"] == "product"
+    assert bg_res["final_link"] == "https://u.jd.com/fgOk1"
 
     fg_res = ad_fg.resolve_and_convert_universal("https://u.jd.com/oGP72oi")
     assert fg_res["status"] == "success"
     assert fg_res["resolution_kind"] == "product"
     assert fg_res["final_link"] == "https://u.jd.com/fgOk1"
     assert fg_res["product"]["name"] == "维达抽纸整箱24包"
+    assert any("api_detail.ashx" in u for u in calls)
+    assert not any("goods_query.ashx" in u or "api_quanwang.ashx" in u or "tkl_piliang.ashx" in u for u in calls)
 
-    # 3. 冷却期前台个人推广位且 :20000 未命中时，仍经 byunionid_get 保底返回可用 degraded_product（不打 tkl_piliang）
+    # 3. 冷却期且 api_detail 返回 301 + 跳过 goods_query 时，仍经 byunionid_get 保底返回 degraded_product（带 catalog_cooling=True，不打 tkl_piliang/goods_query）
     calls.clear()
 
     def _cooling_deg_get(url, params=None, **_kw):
         calls.append(url)
-        if "open_jing_union_open_goods_query" in url:
-            return reply({"jd_union_open_goods_query_response": {"result": json.dumps({"code": 200, "totalCount": 0, "data": []})}})
+        if "api_detail.ashx" in url:
+            return reply({"status": 301, "content": "对应宝贝已下架"})
         if "byunionid_get" in url:
             return reply({PROMOTION_ROOT: {"result": json.dumps({"code": 200, "data": {"shortURL": "https://u.jd.com/fgDeg1", "clickURL": "https://union-click.jd.com/fgDeg1", "jCommand": "！CMD1234567890！"}})}})
         raise AssertionError(f"Unexpected catalog call while cooling: {url}")
@@ -1385,8 +1471,286 @@ def test_jd_universal_domain_guard_and_foreground_vs_background_cooling():
     assert deg_res["status"] == "success"
     assert deg_res["resolution_kind"] == "degraded_product"
     assert deg_res["detail_lookup_failed"] is True
+    assert not any("goods_query.ashx" in u or "tkl_piliang" in u or "api_quanwang" in u for u in calls)
     assert deg_res["final_link"] == "https://u.jd.com/fgDeg1"
-    assert not any("tkl_piliang" in u for u in calls)
+    assert not any("tkl_piliang" in u or "api_quanwang" in u for u in calls)
+
+
+def test_jd_batch_get_goods_details_aligns_via_ori_item_id_and_isolates_bad_ids():
+    """验证京东 20 批量查卡靠 oriItemId 精准对齐（无视重加密与乱序）、坏 ID 不连坐，并拦截主图指纹 ID。"""
+    from models.product import ProductRef
+
+    id_a = "2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w"
+    id_b = "YRQafyCEaFDJag78gSKrJagzasiirQ_3bnREOlDJSyoYeHEIH"
+    bad_id = "FAKEID00000000000000000000000Q_300000000000000000"
+    img_id = "6ae3f40fF84b3cfef_0083320320005d73"
+
+    re_salted_b = "NEWPREFIX_re_salted_BBBBBBBBBBQ_3newSaltB000000000"
+    re_salted_a = "NEWPREFIX_re_salted_AAAAAAAAAQ_3newSaltA000000000"
+
+    def _batch_get(url, params=None, **_kw):
+        if "open_jing_union_open_goods_query" in url:
+            assert params.get("itemIds") == f"{id_a},{id_b},{bad_id}"
+            return reply({
+                "jd_union_open_goods_query_response": {
+                    "result": json.dumps({
+                        "code": 200,
+                        "totalCount": 2,
+                        # 刻意倒序 + 重写 itemId 密文，仅靠 oriItemId 对齐
+                        "data": [
+                            {
+                                "oriItemId": id_b,
+                                "itemId": re_salted_b,
+                                "skuId": 2002,
+                                "skuName": "商品B真品",
+                                "materialUrl": f"item.jd.com/{re_salted_b}.html",
+                                "imageInfo": {"imageList": [{"url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/b.jpg"}]},
+                                "priceInfo": {"price": 59.9, "lowestCouponPrice": 49.9},
+                                "couponInfo": {"couponList": []},
+                                "commissionInfo": {"commissionShare": 10.0, "couponCommission": 4.99},
+                                "shopInfo": {"shopName": "店B"},
+                                "comments": 500,
+                            },
+                            {
+                                "oriItemId": id_a,
+                                "itemId": re_salted_a,
+                                "skuId": 1001,
+                                "skuName": "商品A真品",
+                                "materialUrl": f"item.jd.com/{re_salted_a}.html",
+                                "imageInfo": {"imageList": [{"url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/a.jpg"}]},
+                                "priceInfo": {"price": 29.9, "lowestCouponPrice": 19.9},
+                                "couponInfo": {"couponList": []},
+                                "commissionInfo": {"commissionShare": 8.0, "couponCommission": 1.59},
+                                "shopInfo": {"shopName": "店A"},
+                                "comments": 800,
+                            },
+                        ],
+                    }),
+                },
+            })
+        if "api_detail.ashx" in url:
+            return reply({"status": 301, "content": "对应宝贝已下架"})
+        raise AssertionError(f"Unexpected call: {url}")
+
+    hdk_stub = SimpleNamespace(
+        get_goods_detail=Mock(return_value={"status": "error", "error_code": "NOT_FOUND"}),
+        batch_get_goods_details=Mock(return_value={"status": "success", "data": []}),
+    )
+    cli = JdClient(appkey_list=("k1",), union_id="2035679405", http_session=SimpleNamespace(get=_batch_get))
+    ad = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88", ztk_appkey="k1"),
+        client=cli,
+        hdk_client=hdk_stub,
+    )
+
+    refs = [
+        ProductRef("jd", id_a, goods_sign=id_a),
+        ProductRef("jd", id_b, goods_sign=id_b),
+        ProductRef("jd", bad_id, goods_sign=bad_id),
+        ProductRef("jd", img_id, goods_sign=""),
+    ]
+    res_map = ad.batch_get_goods_details(refs)
+    assert res_map[id_a]["status"] == "success"
+    assert res_map[id_a]["data"]["name"] == "商品A真品"
+    assert res_map[id_b]["status"] == "success"
+    assert res_map[id_b]["data"]["name"] == "商品B真品"
+    # 混入的坏 ID 被确认下架，不影响 A/B；主图指纹 ID 被就地拒绝
+    assert res_map[bad_id]["error_code"] == "PRODUCT_OFF_PROMOTION"
+    assert res_map[img_id]["error_code"] == "INVALID_ARGUMENT"
+
+
+def test_jd_api_detail_independent_from_catalog_cooldown_o19hsre_venue_and_hdk_back_enum():
+    """验证 api_detail 独立故障域不被 catalog_cooling 连坐、pro.m.jd.com?sku=数字 判会场、HDK back 对齐合法离散枚举。"""
+    from infrastructure.jd_client import resolve_jd_short_url
+    from infrastructure.hdk_client import HdkClient
+
+    # 1. api_detail 不受 mark_catalog_rate_limited 影响
+    detail_row = {
+        "tao_id": "2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w",
+        "title": "独立详情商品",
+        "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/a.jpg",
+        "size": "39.9",
+        "quanhou_jiage": "29.9",
+        "coupon_info_money": "10",
+        "tkrate3": "5",
+        "tkfee3": "1.5",
+        "item_url": "https://jingfen.jd.com/detail/2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w.html",
+    }
+    s_det = route_http({"/api_detail.ashx": {"status": 200, "content": [detail_row]}})
+    cli_det = JdClient(appkey_list=("k1",), union_id="2035679405", http_session=s_det)
+    cli_det.mark_catalog_rate_limited(60.0, force=True)
+    assert cli_det.search_goods("可乐")["error_code"] == "RATE_LIMIT"
+    assert cli_det.get_goods_detail("https://u.jd.com/oO99YvK")["status"] == "success"
+
+    # 2. o19hsre 落地 pro.m.jd.com?sku=纯数字 时，官方会场 Host 优先级高于参数 ?sku=，判为 is_venue=True
+    def _unwrap_get(url, allow_redirects=False, timeout=5.0, **_kw):
+        if "u.jd.com/o19hsre" in url:
+            return SimpleNamespace(
+                status_code=302,
+                headers={"Location": "https://pro.m.jd.com/mall/active/2ABC/index.html?sku=100115132399"},
+                close=Mock(),
+            )
+        return SimpleNamespace(status_code=200, headers={}, url=url, close=Mock())
+
+    u_res = resolve_jd_short_url("https://u.jd.com/o19hsre", http_session=SimpleNamespace(get=_unwrap_get))
+    assert u_res["status"] == "success"
+    assert u_res["data"]["is_venue"] is True
+    assert u_res["data"]["sku_id"] == "100115132399"
+
+    # 3. HDK v3/jd_goods_search back 参数严格对齐 (1, 2, 5, 10, 20, 30, 50) 并按原始 page_size 截断
+    observed_back = []
+
+    def _hdk_get(url, params=None, timeout=5.0, allow_redirects=False, **_kw):
+        observed_back.append(params.get("back"))
+        rows = [
+            {
+                "itemid": f"enc_id_{i}",
+                "skuid": f"enc_id_{i}",
+                "goodsname": f"商品{i}",
+                "itempic": f"https://img14.360buyimg.com/n1/s800x800_jfs/t1/1/2/3/p{i}.jpg",
+                "itemprice": "20",
+                "itemendprice": "15",
+            }
+            for i in range(int(params.get("back") or 1))
+        ]
+        return SimpleNamespace(status_code=200, json=Mock(return_value={"code": 200, "data": rows}), raise_for_status=Mock())
+
+    hdk_cli = HdkClient(api_key="hdk_test_key", http_session=SimpleNamespace(get=_hdk_get))
+    sr = hdk_cli.search_goods("抽纸", page=1, page_size=7)
+    assert sr["status"] == "success"
+    assert observed_back == [10]
+    assert len(sr["data"]) == 7
+
+
+def test_jd_jcommand_direct_lookup_vs_plain_copywriting_skip(monkeypatch):
+    """验证完整/带前缀京口令直走独立 api_detail，纯文案无链接无口令绝不乱搜；且 1001 频控识别生效。"""
+    enc = "2JQgZkZ2nGOIkKfYjWWTIkKfYjWWTQ_3SD7M7MGcugkXyuI4w"
+    det_row = {
+        "tao_id": enc,
+        "title": "京口令测试商品",
+        "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/jcmd.jpg",
+        "size": "59.9",
+        "quanhou_jiage": "49.9",
+        "coupon_info_money": "10",
+        "item_url": f"https://jingfen.jd.com/detail/{enc}.html",
+    }
+    calls = []
+
+    def _get(url, params=None, **_kw):
+        calls.append((url, dict(params or {})))
+        if "api_detail.ashx" in url:
+            return reply({"status": 200, "content": [det_row]})
+        return reply({"status": 301, "content": "无数据"})
+
+    cli = JdClient(appkey_list=("k1",), union_id="2035679405", http_session=SimpleNamespace(get=_get))
+    ad = adapter(cli)
+    r_jcmd = ad.resolve_product_from_link("17！Z6cyKDGdIYPpSnpI！ CA1234")
+    assert r_jcmd["status"] == "success"
+    assert r_jcmd["product"]["name"] == "京口令测试商品"
+    assert len(calls) == 1 and calls[0][1]["tao_id"] == "！Z6cyKDGdIYPpSnpI！"
+
+    calls.clear()
+    r_plain = ad.resolve_product_from_link("【京东】纯推广文案无链接无口令")
+    assert r_plain["status"] == "success" and r_plain["product"] is None
+    assert calls == []
+
+    # 验证 1001 显式频控关键字触发 RATE_LIMIT 与冷却
+    cli_rl = JdClient(
+        appkey_list=("k1",),
+        union_id="2035679405",
+        http_session=SimpleNamespace(get=Mock(return_value=reply({"status": 301, "content": "错误码1001调用受限"}))),
+    )
+    monkeypatch.setattr("infrastructure.jd_client.is_real_requests_session", lambda _s: True)
+    rl_res = cli_rl.query_union_goods(keyword="可乐")
+    assert rl_res["error_code"] == "RATE_LIMIT"
+    assert rl_res.get("ztk_explicit_rate_limit") is True
+    assert cli_rl.is_catalog_cooling() is True
+
+
+def test_jd_shortlink_2001917_fallback_to_clean_jingfen_and_venue_markers_and_health(monkeypatch):
+    """验证：(1) u.jd.com 报 2001917 且已拿纯净 jingfen 卡时自动回退重转；(2) hour/mcard/lives/plus 登录跳转判会场；(3) byunionid_get 内层报错不虚记 success。"""
+    from infrastructure.api_governance import GLOBAL_UPSTREAM_HEALTH
+    from infrastructure.jd_client import resolve_jd_short_url
+
+    enc = "2JQRZRHbk3IIkCiQD6m6IkSVn4BiaQ_3SD7sm6WTHRz0i9pLt"
+    clean_jf = f"https://jingfen.jd.com/detail/{enc}.html"
+    by_calls = []
+
+    def _get(url, params=None, **_kw):
+        p = dict(params or {})
+        if "api_detail.ashx" in url:
+            return reply({
+                "status": 200,
+                "content": [{
+                    "tao_id": enc,
+                    "title": "麻六记酸辣粉178g*6",
+                    "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/254098/2/4826/191226/676e23c3F2d243c6d/6d28386d3896746b.jpg",
+                    "size": "36.9",
+                    "quanhou_jiage": "36.9",
+                    "tkrate3": "2",
+                    "tkfee3": "0.74",
+                    "item_url": clean_jf,
+                }],
+            })
+        if "byunionid_get.ashx" in url:
+            by_calls.append(p.get("materialId"))
+            if p.get("materialId") == "https://u.jd.com/o61KxfW":
+                return reply(wrapped(PROMOTION_ROOT, {"code": 2001917, "message": "优惠券不可购买该商品"}, field="result", string=True))
+            if p.get("materialId") == "https://u.jd.com/bad400":
+                return reply(wrapped(PROMOTION_ROOT, {"code": 400, "message": "参数错误"}, field="result", string=True))
+            if p.get("materialId") == clean_jf:
+                return reply(wrapped(
+                    PROMOTION_ROOT,
+                    {"code": 200, "data": {"shortURL": "https://u.jd.com/cleanOk", "clickURL": "https://union-click.jd.com/ok", "jCommand": "！CLEAN！"}},
+                    field="result",
+                    string=True,
+                ))
+        raise AssertionError(f"unexpected call: {url} {p}")
+
+    GLOBAL_UPSTREAM_HEALTH.reset()
+    monkeypatch.setattr("infrastructure.jd_client.is_real_requests_session", lambda _s: True)
+    cli = JdClient(appkey_list=("k1",), union_id="2035679405", http_session=SimpleNamespace(get=_get))
+    ad = adapter(cli)
+    res = ad.resolve_and_convert_universal("https://u.jd.com/o61KxfW")
+    assert res["status"] == "success"
+    assert res["resolution_kind"] == "product"
+    assert res["final_link"] == "https://u.jd.com/cleanOk"
+    assert res["product"]["name"] == "麻六记酸辣粉178g*6"
+    assert by_calls == ["https://u.jd.com/o61KxfW", clean_jf]
+    bad400_res = cli.convert_universal_material("https://u.jd.com/bad400", "77")
+    assert bad400_res["status"] == "error"
+
+    snap = GLOBAL_UPSTREAM_HEALTH.snapshot_local()
+    by_stat = next(
+        (ep for ep in snap["endpoints"] if ep["provider"] == "ztk_jd" and "byunionid_get" in ep["operation"]),
+        None,
+    )
+    assert by_stat is not None
+    assert by_stat["total_calls"] == 3
+    assert by_stat["success_calls"] == 1
+    assert by_stat["degraded_calls"] == 1
+    assert by_stat["error_calls"] == 1
+
+    # 官方非单品活动域名与 plogin+plus.m.jd.com 正向判会场
+    for dest in (
+        "https://hour.jd.com/aggregationChannelPub/channel?channelId=13376",
+        "https://mcard.jd.com/?cardIdEnc=abc",
+        "https://lives.jd.com/?rid=14633",
+        "https://plogin.m.jd.com/login/nopassword?appid=300&returnurl=https%3A%2F%2Fplus.m.jd.com%2Findex",
+    ):
+        sess = SimpleNamespace(
+            get=lambda url, _dest=dest, **_kw: SimpleNamespace(
+                status_code=302,
+                headers={"Location": _dest},
+                close=Mock(),
+            ) if "u.jd.com" in url else SimpleNamespace(status_code=200, headers={}, url=url, close=Mock())
+        )
+        u_res = resolve_jd_short_url("https://u.jd.com/vtest", http_session=sess)
+        assert u_res["status"] == "success"
+        assert u_res["data"]["is_venue"] is True, dest
+
+
+
 
 
 

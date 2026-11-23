@@ -95,6 +95,10 @@ JD_OFFICIAL_VENUE_URL_MARKERS = (
     "pro.m.jd.com",
     "prodev.m.jd.com",
     "h5.m.jd.com",
+    "hour.jd.com",
+    "mcard.jd.com",
+    "plus.m.jd.com",
+    "lives.jd.com",
     "jdcoupon",
     "u_act_p=coupon",
 )
@@ -104,6 +108,12 @@ def is_jd_official_venue_url(text: str) -> bool:
     """判断文本/URL是否命中京东官方公开领券/活动会场域名白名单。"""
     lower = str(text or "").lower()
     return any(marker in lower for marker in JD_OFFICIAL_VENUE_URL_MARKERS)
+
+
+_JD_EMBEDDED_URL_RE = re.compile(
+    r"https?://(?:u\.jd\.com|union-click\.jd\.com|jingfen\.jd\.com|pro(?:dev)?\.m\.jd\.com)/[^\s<>'\"（）()【】\[\]]+",
+    re.IGNORECASE,
+)
 
 
 def is_encrypted_jd_item_id(value) -> bool:
@@ -116,7 +126,7 @@ def is_encrypted_jd_item_id(value) -> bool:
 
 
 def _is_trusted_jd_redirect_url(candidate: Any) -> bool:
-    """校验短链跳转/落地 URL 必须为合法无凭证且属于 jd.com / 3.cn 官方域名（防止 SSRF）。"""
+    """校验短链跳转/落地 URL 必须为合法无凭证且属于 jd.com / jd.hk / yiyaojd.com / 3.cn 官方域名（防止 SSRF）。"""
     if not isinstance(candidate, str):
         return False
     raw = candidate.strip()
@@ -132,7 +142,10 @@ def _is_trusted_jd_redirect_url(candidate: Any) -> bool:
         and bool(host)
         and parts.username is None
         and parts.password is None
-        and (host == "jd.com" or host.endswith(".jd.com") or host == "3.cn" or host.endswith(".3.cn"))
+        and any(
+            host == suf or host.endswith("." + suf)
+            for suf in ("jd.com", "jd.hk", "yiyaojd.com", "3.cn")
+        )
     )
 
 
@@ -249,38 +262,52 @@ def resolve_jd_short_url(short_url: str, *, http_session: Optional[Any] = None) 
         if path_m:
             sku_id = path_m.group(1)
 
-    if not sku_id and "returnurl" in qs_lower:
+    ret_base_dest = ""
+    ret_host = ""
+    if "returnurl" in qs_lower:
         ret_url = unquote(qs_lower["returnurl"][0])
         try:
             ret_parts = urlsplit(ret_url)
         except ValueError:
             ret_parts = None
         if ret_parts is not None:
-            ret_qs = {k.lower(): v for k, v in parse_qs(ret_parts.query).items()}
-            for r_key in ("sku", "mainsku", "skuid"):
-                r_cand = (ret_qs.get(r_key) or [""])[0].strip()
-                if r_cand and re.match(r"^[A-Za-z0-9_]+$", r_cand):
-                    sku_id = r_cand
-                    break
+            ret_host = (ret_parts.hostname or "").lower()
+            ret_base_dest = f"{ret_parts.scheme}://{ret_host}{ret_parts.path}"
             if not sku_id:
-                ret_host = (ret_parts.hostname or "").lower()
-                ret_path_m = re.search(r"/(?:product|item)/(\d+)\.html", ret_parts.path, re.IGNORECASE)
-                if not ret_path_m and ret_host in _item_hosts:
-                    ret_path_m = re.search(r"^/(\d+)\.html$", ret_parts.path, re.IGNORECASE)
-                if ret_path_m:
-                    sku_id = ret_path_m.group(1)
+                ret_qs = {k.lower(): v for k, v in parse_qs(ret_parts.query).items()}
+                for r_key in ("sku", "mainsku", "skuid"):
+                    r_cand = (ret_qs.get(r_key) or [""])[0].strip()
+                    if r_cand and re.match(r"^[A-Za-z0-9_]+$", r_cand):
+                        sku_id = r_cand
+                        break
+                if not sku_id:
+                    ret_path_m = re.search(r"/(?:product|item)/(\d+)\.html", ret_parts.path, re.IGNORECASE)
+                    if not ret_path_m and ret_host in _item_hosts:
+                        ret_path_m = re.search(r"^/(\d+)\.html$", ret_parts.path, re.IGNORECASE)
+                    if ret_path_m:
+                        sku_id = ret_path_m.group(1)
 
-    is_venue = False
-    if not sku_id:
-        base_dest = f"{parts.scheme}://{host}{path}"
-        is_venue = (
-            is_jd_official_venue_url(base_dest)
-            or host in ("shop.m.jd.com", "mall.jd.com")
-            or (
-                host == "jingfen.jd.com"
-                and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url)
+    base_dest = f"{parts.scheme}://{host}{path}"
+    is_official_venue_host = (
+        is_jd_official_venue_url(base_dest)
+        or host in ("shop.m.jd.com", "mall.jd.com")
+        or (
+            host == "jingfen.jd.com"
+            and (path == "/item" or "union-activity" in dest_url or "union_page_id" in dest_url)
+        )
+        or (
+            host in ("plogin.m.jd.com", "passport.jd.com")
+            and bool(ret_base_dest)
+            and (
+                is_jd_official_venue_url(ret_base_dest)
+                or ret_host in ("shop.m.jd.com", "mall.jd.com")
             )
         )
+    )
+    # 带非纯数字加密 sku（通天塔单品模板）保留按单品查卡；
+    # 若落地页本身已是 pro/prodev/shop/mall 等官方会场且仅带纯数字 sku，实为会场页，绝不能误判成单品！
+    has_encrypted_babel_sku = bool(sku_id and not sku_id.isdigit())
+    is_venue = bool(is_official_venue_host and not has_encrypted_babel_sku)
 
     res_payload = {
         "status": "success",
@@ -439,6 +466,7 @@ class JdClient:
         self._catalog_cooldown_streak = 0
 
     _MIN_KEY_DISPATCH_INTERVAL_SEC = 0.22
+    _API_DETAIL_KEY_DISPATCH_INTERVAL_SEC = 0.35
     _DETAIL_KEY_DISPATCH_INTERVAL_SEC = 1.35
     _CATALOG_BURST_COOLDOWN_SEC = 65.0
     _CATALOG_COOLDOWN_STEPS_SEC = (65.0, 120.0, 240.0, 300.0)
@@ -446,18 +474,18 @@ class JdClient:
     _MAX_DETAIL_KEY_PACE_WAIT_SEC = 3.0
     _MAX_BG_PACE_WAIT_SEC = 12.0
     _SHARED_CATALOG_QUOTA_ENDPOINTS = (
-        "api_detail.ashx",
+        "open_jing_union_open_goods_query.ashx",
         "api_quanwang.ashx",
         "open_gaoyongzhuanlian_tkl_piliang.ashx",
     )
 
     def is_catalog_cooling(self) -> bool:
-        """折淘客京东选品库 (tkl_piliang / api_detail / api_quanwang) 是否处于短时频控冷却窗口内。"""
+        """折淘客京东选品查询共享池 (`goods_query` / `api_quanwang` / `tkl_piliang`) 是否处于短时频控冷却窗口内。"""
         with self._catalog_cooldown_lock:
             return time.monotonic() < self._catalog_cooldown_until
 
     def catalog_cooldown_remaining(self) -> float:
-        """返回折淘客京东选品库当前剩余冷却秒数（未处于冷却期时返回 0.0）。"""
+        """返回折淘客京东选品查询共享池当前剩余冷却秒数（未处于冷却期时返回 0.0）。"""
         with self._catalog_cooldown_lock:
             return max(0.0, self._catalog_cooldown_until - time.monotonic())
 
@@ -472,7 +500,7 @@ class JdClient:
         *,
         force: bool = False,
     ) -> None:
-        """确证触发折淘客短时突发限流后开启全局选品库冷却窗口（带上限的阶梯退避），避免多 Key/并发自伤雪崩。"""
+        """确证触发折淘客短时突发限流后开启选品查询共享池冷却窗口（带上限的阶梯退避），绝不连坐 api_detail / byunionid_get。"""
         if not force and not is_real_requests_session(self.http):
             return
         with self._catalog_cooldown_lock:
@@ -491,19 +519,30 @@ class JdClient:
                 )
 
     def _pace_real_http_by_key(self, kwargs, *, url=""):
-        """委托 GLOBAL_QUOTA_PACER 按单 appkey 预约发包时间槽；详情/搜索/批量解析共享折淘客 1000 限流池统一节流。"""
+        """委托 GLOBAL_QUOTA_PACER 按单 appkey 预约发包时间槽；独立隔离 api_detail 池、选品查询共享池与通用推广池。"""
         params = kwargs.get("params")
         appkey = str(params.get("appkey") or "") if isinstance(params, dict) else ""
         if not appkey:
             return 0.0
         url_str = str(url or "")
-        is_catalog_pool = any(ep in url_str for ep in self._SHARED_CATALOG_QUOTA_ENDPOINTS)
+        if "api_detail.ashx" in url_str:
+            pool_name = "ztk_jd_api_detail"
+            interval = self._API_DETAIL_KEY_DISPATCH_INTERVAL_SEC
+            fg_wait = self._MAX_DETAIL_KEY_PACE_WAIT_SEC
+        elif any(ep in url_str for ep in self._SHARED_CATALOG_QUOTA_ENDPOINTS):
+            pool_name = "ztk_jd_catalog"
+            interval = self._DETAIL_KEY_DISPATCH_INTERVAL_SEC
+            fg_wait = self._MAX_DETAIL_KEY_PACE_WAIT_SEC
+        else:
+            pool_name = "ztk_jd_general"
+            interval = self._MIN_KEY_DISPATCH_INTERVAL_SEC
+            fg_wait = self._MAX_KEY_PACE_WAIT_SEC
         return GLOBAL_QUOTA_PACER.pace(
-            "ztk_jd_catalog" if is_catalog_pool else "ztk_jd_general",
+            pool_name,
             appkey,
-            self._DETAIL_KEY_DISPATCH_INTERVAL_SEC if is_catalog_pool else self._MIN_KEY_DISPATCH_INTERVAL_SEC,
+            interval,
             http_session=self.http,
-            foreground_max_wait=self._MAX_DETAIL_KEY_PACE_WAIT_SEC if is_catalog_pool else self._MAX_KEY_PACE_WAIT_SEC,
+            foreground_max_wait=fg_wait,
             background_max_wait=self._MAX_BG_PACE_WAIT_SEC,
         )
 
@@ -550,6 +589,28 @@ class JdClient:
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="degraded", latency_ms=dt_ms, error_code=f"ZTK_{st_str}", error_msg=str(body.get("content") or "")[:80], allow_persist=is_real)
             elif op_name == "open_gaoyongzhuanlian_tkl_piliang" and not str(body.get("tao_id") or "").strip():
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="degraded", latency_ms=dt_ms, error_code="ZTK_EMPTY_TAO_ID", error_msg="status=200 with empty tao_id", allow_persist=is_real)
+            elif PROMOTION_ROOT in body:
+                inner = _extract_union_result(body, (PROMOTION_ROOT,), ("result",))
+                if inner.get("status") == "success":
+                    GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
+                else:
+                    inner_err = str(inner.get("error_code") or "UPSTREAM_ERROR")
+                    inner_msg = str(inner.get("error_msg") or "")
+                    outcome = (
+                        "rate_limit" if inner_err == "RATE_LIMIT"
+                        else "degraded" if (inner.get("jd_off_promotion") or "2001917" in inner_msg)
+                        else "error"
+                    )
+                    GLOBAL_UPSTREAM_HEALTH.record_call(
+                        "jd",
+                        "ztk_jd",
+                        op_name,
+                        outcome=outcome,
+                        latency_ms=dt_ms,
+                        error_code=inner_err,
+                        error_msg=inner_msg[:80],
+                        allow_persist=is_real,
+                    )
             else:
                 GLOBAL_UPSTREAM_HEALTH.record_call("jd", "ztk_jd", op_name, outcome="success", latency_ms=dt_ms, allow_persist=is_real)
                 if is_catalog_pool:
@@ -667,7 +728,7 @@ class JdClient:
             query = keyword.strip()
             if not query:
                 raise ValueError
-            while len(query) < 4:
+            while len(query) < 2:
                 query += query
         except (TypeError, ValueError, AttributeError, OverflowError):
             return _error("INVALID_ARGUMENT", "京东搜索关键词或分页无效")
@@ -706,13 +767,19 @@ class JdClient:
     def get_goods_detail(self, goods_id):
         if not isinstance(goods_id, str) or not goods_id.strip():
             return _error("INVALID_ARGUMENT", "京东详情缺少商品ID")
+        if GLOBAL_PROVIDER_COOLDOWN.is_cooling("jd", "ztk", "api_detail", http_session=self.http):
+            return _error("RATE_LIMIT", "京东详情接口处于短暂冷却中")
         res = self._execute_with_failover(
             "api_detail.ashx",
             {"unionId": self.union_id, "tao_id": goods_id, "type": 1},
             self._content,
+            extra_stop_early=lambda r: bool(isinstance(r, dict) and r.get("ztk_ambiguous_301") is True),
         )
         if res.get("ztk_explicit_rate_limit"):
-            self.mark_catalog_rate_limited()
+            GLOBAL_PROVIDER_COOLDOWN.mark_cooling(
+                "jd", "ztk", "api_detail", 65.0,
+                reason="api_detail_explicit_rate_limit", http_session=self.http,
+            )
         return res
 
     def _content(self, body, page=None, size=None):
@@ -721,7 +788,7 @@ class JdClient:
         if str(body.get("status")) != "200":
             c_msg = str(body.get("content") or "")
             if str(body.get("status")) == "301":
-                if any(kw in c_msg for kw in ("1000", "频繁", "频控", "上限", "超限")):
+                if any(kw in c_msg for kw in ("1000", "1001", "频繁", "频控", "上限", "超限")):
                     return _error("RATE_LIMIT", "京东选品库接口触发频控", ztk_explicit_rate_limit=True)
                 if "下架" in c_msg:
                     return _error("UPSTREAM_ERROR", "京东商品接口返回业务错误", ztk_ambiguous_301=True)
@@ -731,44 +798,43 @@ class JdClient:
         return (self._catalog_page(body["content"], page, size, body) if page is not None else
                 {"status": "success", "data": body["content"]})
 
-    def convert_promotion_link(self, material_url, promoter_id, coupon_url=None):
-        promoter = canonical_promoter_id(promoter_id)
-        material = product_url(material_url)
-        if not promoter or not material:
-            return _error("INVALID_ARGUMENT", "京东转链缺少有效物料URL或数字推广ID")
+    @staticmethod
+    def _evaluate_byunionid_body(body, promoter: str):
+        if body.get("status") == "error":
+            return body
+        if isinstance(body, dict) and str(body.get("status")) == "301":
+            content_msg = str(body.get("content") or "").strip()
+            if "数字id" in content_msg or "数字ID" in content_msg:
+                return _error(
+                    "UNSUPPORTED_JD_NUMERIC_SKU",
+                    "京东联盟接口已不支持纯数字商品ID转链，请粘贴 u.jd.com 短链、京口令或京粉链接",
+                )
+        result = _result(body, PROMOTION_ROOT, "result")
+        if result["status"] != "success":
+            return result
+        result = result["data"]
+        if str(result.get("code")) != "200" or not isinstance(result.get("data"), dict):
+            return _error("PROTOCOL_ERROR", "京东转链结果无效")
+        source = result["data"]
+        data = {
+            "short_url": product_url(source.get("shortURL")),
+            "click_url": product_url(source.get("clickURL")),
+            "j_command": source.get("jCommand") if isinstance(source.get("jCommand"), str) else "",
+            "j_short_command": source.get("jShortCommand") if isinstance(source.get("jShortCommand"), str) else "",
+        }
+        if not (data["short_url"] or data["click_url"]):
+            return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
+        return {"status": "success", "promoter_id": promoter, **data}
+
+    def _convert_byunionid(self, material: str, promoter: str, coupon_url=None):
         clean_coupon = jd_coupon_url(coupon_url)
-
-        def _evaluate(body):
-            if body.get("status") == "error":
-                return body
-            if isinstance(body, dict) and str(body.get("status")) == "301":
-                content_msg = str(body.get("content") or "").strip()
-                if "数字id" in content_msg or "数字ID" in content_msg:
-                    return _error(
-                        "UNSUPPORTED_JD_NUMERIC_SKU",
-                        "京东联盟接口已不支持纯数字商品ID转链，请粘贴 u.jd.com 短链、京口令或京粉链接",
-                    )
-            result = _result(body, PROMOTION_ROOT, "result")
-            if result["status"] != "success":
-                return result
-            result = result["data"]
-            if str(result.get("code")) != "200" or not isinstance(result.get("data"), dict):
-                return _error("PROTOCOL_ERROR", "京东转链结果无效")
-            source = result["data"]
-            data = {"short_url": product_url(source.get("shortURL")),
-                    "click_url": product_url(source.get("clickURL")),
-                    "j_command": source.get("jCommand") if isinstance(source.get("jCommand"), str) else "",
-                    "j_short_command": source.get("jShortCommand") if isinstance(source.get("jShortCommand"), str) else ""}
-            if not (data["short_url"] or data["click_url"]):
-                return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
-            return {"status": "success", "promoter_id": promoter, **data}
-
         base_params = {"unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter}
+        evaluator = lambda body: self._evaluate_byunionid_body(body, promoter)
         if clean_coupon:
             coupon_res = self._execute_with_failover(
                 "open_jing_union_open_promotion_byunionid_get.ashx",
                 {**base_params, "couponUrl": clean_coupon},
-                _evaluate,
+                evaluator,
             )
             if coupon_res.get("status") == "success":
                 return {**coupon_res, "coupon_applied": True}
@@ -783,183 +849,62 @@ class JdClient:
         plain_res = self._execute_with_failover(
             "open_jing_union_open_promotion_byunionid_get.ashx",
             base_params,
-            _evaluate,
+            evaluator,
         )
         if clean_coupon and isinstance(plain_res, dict) and plain_res.get("status") == "success":
             return {**plain_res, "coupon_applied": False}
         return plain_res
 
-    def convert_universal_material(self, raw_material, promoter_id, *, short_url_resolver=None):
+    def convert_promotion_link(self, material_url, promoter_id, coupon_url=None):
+        promoter = canonical_promoter_id(promoter_id)
+        material = product_url(material_url)
+        if not promoter or not material:
+            return _error("INVALID_ARGUMENT", "京东转链缺少有效物料URL或数字推广ID")
+        return self._convert_byunionid(material, promoter, coupon_url=coupon_url)
+
+    def convert_universal_material(self, raw_material, promoter_id, *, coupon_url=None, short_url_resolver=None):
         """
-        京东万能转链协议入口（对齐 scripts/test_jd_api.py 基准规范 六）：
-        支持直接传入 u.jd.com 短链、京口令文案（含 ！...！）、jingfen.jd.com 详情链或加密 itemId。
+        京东万能转链唯一出口：纯走独立稳定的 `byunionid_get`（100% 不受选品池限流影响），
+        原生支持 u.jd.com、union-click、jingfen、pro.m.jd.com 会场、裸加密 ID、京口令及混排文案，
+        支持可选二合一 `coupon_url`（券失效自动去券重转），必要时附带 0 配额短链解包；不再调用 tkl_piliang。
         """
         promoter = canonical_promoter_id(promoter_id)
         material = str(raw_material or "").strip()
         if not promoter or not material or any(ord(c) < 32 and c not in "\r\n\t" for c in material):
             return _error("INVALID_ARGUMENT", "京东万能转链缺少有效口令/链接或数字推广ID")
 
-        def _evaluate(body):
-            if body.get("status") == "error":
-                return body
-            if isinstance(body, dict) and str(body.get("status")) == "301":
-                content_msg = str(body.get("content") or "").strip()
-                if "数字id" in content_msg or "数字ID" in content_msg:
-                    return _error(
-                        "UNSUPPORTED_JD_NUMERIC_SKU",
-                        "京东联盟接口已不支持纯数字商品ID转链，请粘贴 u.jd.com 短链、京口令或京粉链接",
-                    )
-            result = _result(body, PROMOTION_ROOT, "result")
-            if result["status"] != "success":
-                return result
-            result = result["data"]
-            if str(result.get("code")) != "200" or not isinstance(result.get("data"), dict):
-                return _error("PROTOCOL_ERROR", "京东转链结果无效")
-            source = result["data"]
-            data = {
-                "short_url": product_url(source.get("shortURL")),
-                "click_url": product_url(source.get("clickURL")),
-                "j_command": source.get("jCommand") if isinstance(source.get("jCommand"), str) else "",
-                "j_short_command": source.get("jShortCommand") if isinstance(source.get("jShortCommand"), str) else "",
-            }
-            if not (data["short_url"] or data["click_url"]):
-                return _error("PROTOCOL_ERROR", "京东未返回有效推广链接")
-            return {"status": "success", "promoter_id": promoter, **data}
+        if not material.lower().startswith(("http://", "https://")):
+            m_emb = _JD_EMBEDDED_URL_RE.search(material)
+            if m_emb:
+                material = m_emb.group(0).rstrip(".,!?)];'\"")
 
-        primary_res = self._execute_with_failover(
-            "open_jing_union_open_promotion_byunionid_get.ashx",
-            {"unionId": self.union_id, "materialId": material, "chainType": "3", "positionId": promoter},
-            _evaluate,
-        )
+        primary_res = self._convert_byunionid(material, promoter, coupon_url=coupon_url)
         if (
-            primary_res.get("error_code") in ("UNSUPPORTED_JD_NUMERIC_SKU", "CONFIG_ERROR", "UNSAFE_REDIRECT")
+            primary_res.get("status") != "success"
+            or primary_res.get("error_code") in ("UNSUPPORTED_JD_NUMERIC_SKU", "CONFIG_ERROR", "UNSAFE_REDIRECT")
             or primary_res.get("jd_off_promotion") is True
         ):
             return primary_res
 
-        primary_ok = primary_res.get("status") == "success"
-        known_single_item = False
-        if primary_ok:
-            lower_mat = material.lower()
-            is_known_jingfen_or_venue = (
-                "jingfen.jd.com/detail/" in lower_mat
-                or is_jd_official_venue_url(lower_mat)
-            )
-            if is_known_jingfen_or_venue:
-                return primary_res
-
-            # Zero-quota short-URL unwrap before hitting rate-limited tkl_piliang:
-            # catches shop/venue pages (0 catalog calls) and Babel encrypted SKUs (skip tkl_piliang -> 1 api_detail call).
-            if callable(short_url_resolver) and primary_res.get("short_url"):
-                try:
-                    unwrap_res = short_url_resolver(primary_res["short_url"])
-                except Exception:
-                    unwrap_res = None
-                if isinstance(unwrap_res, dict) and unwrap_res.get("status") == "success":
-                    u_data = unwrap_res.get("data") or {}
-                    u_sku = str(u_data.get("sku_id") or "").strip()
-                    if u_data.get("is_venue") and not u_sku:
-                        primary_res["resolved_venue"] = True
-                        return primary_res
-                    if u_sku and is_encrypted_jd_item_id(u_sku):
-                        primary_res["tao_id"] = u_sku
-                        return primary_res
-                    if u_sku:
-                        known_single_item = True
-                        primary_res["known_single_item"] = True
-
-        piliang_empty_tao_id_hits = 0
-
-        def _evaluate_piliang(body):
-            nonlocal piliang_empty_tao_id_hits
-            if body.get("status") == "error":
-                return body
-            if str(body.get("status")) != "200":
-                c_msg = str(body.get("content") or "")
-                if str(body.get("status")) == "301" and any(kw in c_msg for kw in ("1000", "频繁", "频控", "上限", "超限")):
-                    return _error("RATE_LIMIT", "京东批量转链触发频控", ztk_explicit_rate_limit=True)
-                return _error("UPSTREAM_ERROR", "京东批量文案转链未成功")
-            p_tao_id = str(body.get("tao_id") or "").strip()
-            p_res_url = product_url(body.get("result_url"))
-            p_res_tkl = str(body.get("result_tkl") or "").strip()
-            # 当 primary_res 已成功获取短链时，调用 piliang 的唯一目的是拿加密 tao_id 与商品详情；
-            # 若单 Key 因频控返回空 tao_id，触发多 Key 轮询切换至健康 Key
-            if primary_ok and not p_tao_id:
-                piliang_empty_tao_id_hits += 1
-                return _error("UPSTREAM_ERROR", "京东批量转链未返回商品ID")
-            if not (p_tao_id or p_res_url):
-                return _error("UPSTREAM_ERROR", "京东批量文案转链未解析出商品")
-            raw_item = None
-            if p_tao_id:
-                raw_item = dict(body)
-                raw_item.setdefault("pict_url", raw_item.get("pic") or "")
-                raw_item.setdefault("shop_title", raw_item.get("nick") or "")
-                if is_encrypted_jd_item_id(p_tao_id):
-                    raw_item.setdefault("item_url", f"https://jingfen.jd.com/detail/{p_tao_id}.html")
-            return {
-                "status": "success",
-                "promoter_id": promoter,
-                "tao_id": p_tao_id,
-                "short_url": p_res_url,
-                "click_url": p_res_url,
-                "j_command": p_res_tkl,
-                "j_short_command": p_res_tkl,
-                "raw_item": raw_item,
-            }
-
-        piliang_tkl = (
-            (primary_res.get("short_url") or material)
-            if primary_ok
-            else material
-        )
-        empty_threshold = max(1, min(2, len(self.appkey_list)))
-        piliang_res = self._execute_with_failover(
-            "open_gaoyongzhuanlian_tkl_piliang.ashx",
-            {"unionId": self.union_id, "positionId": promoter, "tkl": piliang_tkl, "signurl": 5},
-            _evaluate_piliang,
-            extra_stop_early=lambda _r: piliang_empty_tao_id_hits >= empty_threshold,
-        )
-        if piliang_res.get("ztk_explicit_rate_limit"):
-            self.mark_catalog_rate_limited()
-        if primary_ok:
-            if piliang_res.get("status") == "success":
-                if piliang_res.get("tao_id"):
-                    primary_res["tao_id"] = piliang_res["tao_id"]
-                if piliang_res.get("raw_item"):
-                    primary_res["raw_item"] = piliang_res["raw_item"]
-                if not primary_res.get("j_command") and piliang_res.get("j_command"):
-                    primary_res["j_command"] = piliang_res["j_command"]
-                if not primary_res.get("j_short_command") and piliang_res.get("j_short_command"):
-                    primary_res["j_short_command"] = piliang_res["j_short_command"]
-            elif (
-                piliang_res.get("catalog_cooling") is True
-                or piliang_res.get("error_code") in ("RATE_LIMIT", "QUOTA_PACE_BACKLOG")
-            ):
-                primary_res["piliang_throttled"] = True
-                if piliang_res.get("catalog_cooling") is True:
-                    primary_res["catalog_cooling"] = True
-            elif piliang_empty_tao_id_hits >= empty_threshold:
-                primary_res["piliang_empty_tao_id"] = True
+        lower_mat = material.lower()
+        if "jingfen.jd.com/detail/" in lower_mat or is_jd_official_venue_url(lower_mat):
             return primary_res
 
-        if piliang_res.get("status") != "success":
-            return primary_res
-
-        p_tid = piliang_res.get("tao_id") or ""
-        target_for_cmd = piliang_res.get("short_url") or (
-            f"https://jingfen.jd.com/detail/{p_tid}.html" if is_encrypted_jd_item_id(p_tid) else ""
-        )
-        if target_for_cmd:
-            cmd_res = self._execute_with_failover(
-                "open_jing_union_open_promotion_byunionid_get.ashx",
-                {"unionId": self.union_id, "materialId": target_for_cmd, "chainType": "3", "positionId": promoter},
-                _evaluate,
-            )
-            if cmd_res.get("status") == "success":
-                cmd_res["tao_id"] = piliang_res.get("tao_id", "")
-                cmd_res["raw_item"] = piliang_res.get("raw_item")
-                return cmd_res
-        return piliang_res
+        if callable(short_url_resolver) and primary_res.get("short_url"):
+            try:
+                unwrap_res = short_url_resolver(primary_res["short_url"])
+            except Exception:
+                unwrap_res = None
+            if isinstance(unwrap_res, dict) and unwrap_res.get("status") == "success":
+                u_data = unwrap_res.get("data") or {}
+                u_sku = str(u_data.get("sku_id") or "").strip()
+                if u_data.get("is_venue") and not u_sku:
+                    primary_res["resolved_venue"] = True
+                elif u_sku and is_encrypted_jd_item_id(u_sku):
+                    primary_res["tao_id"] = u_sku
+                elif u_sku:
+                    primary_res["known_single_item"] = True
+        return primary_res
 
     def query_union_goods(self, keyword=None, item_ids=None, page=1, page_size=20):
         """折淘客 :20000 京东联盟全网官方商品查询（支持关键词搜索、加密 itemIds 详情或 u.jd.com 短链直查）。"""
@@ -973,7 +918,7 @@ class JdClient:
                 clean_text(x) for x in raw_list
                 if clean_text(x) and not clean_text(x).isdigit() and not is_jd_image_key(clean_text(x))
             ]
-            ids_str = ",".join(id_list[:100])
+            ids_str = ",".join(id_list[:20])
         else:
             ids_str = ""
         if not kw and not ids_str:
@@ -998,7 +943,7 @@ class JdClient:
                 c_msg = clean_text(body.get("content"))
                 if "数字id" in c_msg.lower():
                     return _error("UNSUPPORTED_JD_NUMERIC_SKU", "京东联盟接口不支持纯数字SKU查询")
-                if any(k in c_msg for k in ("1000", "频繁", "频控", "上限", "超限")):
+                if any(k in c_msg for k in ("1000", "1001", "频繁", "频控", "上限", "超限")):
                     return _error("RATE_LIMIT", c_msg or "折淘客京东商品查询触发频控", ztk_explicit_rate_limit=True)
             result = _extract_union_result(body, GOODS_QUERY_ROOTS, ("result", "queryResult"))
             if result["status"] != "success":
@@ -1215,7 +1160,7 @@ class JdClient:
                 clean_text(x) for x in raw_list
                 if clean_text(x) and not clean_text(x).isdigit() and not is_jd_image_key(clean_text(x))
             ]
-            ids_str = ",".join(id_list[:100])
+            ids_str = ",".join(id_list[:20])
         else:
             ids_str = ""
         if not kw and not ids_str:

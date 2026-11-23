@@ -1654,6 +1654,234 @@ def test_ai2_partial_coupon_drop_backfills_missing_distinct_coupon_and_html_unes
     assert cpns[1]["url"] == direct_cpn_2
 
 
+def test_unified_non_cps_pre_unwrap_and_jd_coupon_url_preservation():
+    """
+    验证：
+    1. 所有非官方 CPS 链接（3.cn / llipin.cn / 店铺等）统一走 resolve_non_cps_http_url 免费解包并五态分流；
+    2. 京东 coupon_url 在 Stage 2 -> official_product -> _extract_product_card_from_conv -> product_doc -> upsert_formal_product 全链保留且只增不抹；
+    3. upsert_formal_product 写入 deal_info.last_seen_at。
+    """
+    import requests
+    from repositories.product_repo import upsert_cleaned_products_to_formal_table
+    from services.deal_cleaning.stages import _build_official_product_payload, _extract_product_card_from_conv
+    from services.deal_cleaning.url_venue import is_official_cps_http_url, resolve_non_cps_http_url
+
+    assert is_official_cps_http_url("https://u.jd.com/abc") is True
+    assert is_official_cps_http_url("https://pro.m.jd.com/mall/active/x/index.html") is True
+    assert is_official_cps_http_url("https://3.cn/109-ABC") is False
+    assert is_official_cps_http_url("https://llipin.cn/xyz") is False
+
+    class _PreUnwrapSession:
+        def get(self, url, **_kw):
+            if url == "https://3.cn/valid-venue":
+                return _FakeResponse(status_code=302, headers={"Location": "https://coupon.m.jd.com/coupons/show.action?key=vk1&roleId=vr1&utm_source=x"})
+            if url == "https://3.cn/valid-cps":
+                return _FakeResponse(status_code=302, headers={"Location": "https://u.jd.com/redirectedItem"})
+            if url == "https://3.cn/truncated":
+                return _FakeResponse(status_code=302, headers={"Location": "https://www.jd.com/"})
+            if url == "https://3.cn/num-item":
+                return _FakeResponse(status_code=302, headers={"Location": "https://item.jd.com/100123456.html"})
+            if url == "https://llipin.cn/tb-uland":
+                return _FakeResponse(status_code=302, headers={"Location": "https://uland.taobao.com/coupon/edetail?e=tb123"})
+            if url == "https://3.cn/net-timeout":
+                raise requests.ReadTimeout("timed out")
+            return _FakeResponse(status_code=404)
+
+    sess = _PreUnwrapSession()
+    assert resolve_non_cps_http_url("https://3.cn/valid-venue", http_session=sess, resolver=_public_dns_resolver) == {
+        "kind": "venue",
+        "url": "https://coupon.m.jd.com/coupons/show.action?key=vk1&roleId=vr1",
+        "reason": "unwrapped_venue",
+    }
+    assert resolve_non_cps_http_url("https://3.cn/valid-cps", http_session=sess, resolver=_public_dns_resolver) == {
+        "kind": "cps_redirect",
+        "url": "https://u.jd.com/redirectedItem",
+        "reason": "cps_redirect",
+    }
+    assert resolve_non_cps_http_url("https://3.cn/truncated", http_session=sess, resolver=_public_dns_resolver)["kind"] == "dead"
+    assert resolve_non_cps_http_url("https://3.cn/404", http_session=sess, resolver=_public_dns_resolver)["kind"] == "dead"
+    assert resolve_non_cps_http_url("https://3.cn/num-item", http_session=sess, resolver=_public_dns_resolver)["kind"] == "numeric_item"
+    assert resolve_non_cps_http_url("https://llipin.cn/tb-uland", http_session=sess, resolver=_public_dns_resolver) == {
+        "kind": "cps_redirect",
+        "url": "https://uland.taobao.com/coupon/edetail?e=tb123",
+        "reason": "cps_redirect",
+    }
+    assert resolve_non_cps_http_url("https://3.cn/net-timeout", http_session=sess, resolver=_public_dns_resolver)["kind"] == "transient"
+
+    cleaner = DealPoolCleaner(
+        ai_batch_size=2,
+        ai_max_workers=1,
+        convert_max_workers=1,
+        unwrap_http_session=sess,
+        unwrap_resolver=_public_dns_resolver,
+    )
+    jd_seen = []
+    tb_seen = []
+    cleaner.adapters = {
+        "jd": SimpleNamespace(
+            resolve_and_convert_universal=lambda inp: jd_seen.append(inp) or {
+                "status": "success",
+                "goods_id": "6aa94c3fF12b4d4bf_0a023203205f693f",
+                "goods_sign": "enc_jd_sign_1",
+                "final_link": "https://u.jd.com/myPromoted1",
+                "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1",
+                "product": {
+                    "platform": "jd",
+                    "goods_id": "6aa94c3fF12b4d4bf_0a023203205f693f",
+                    "goods_sign": "enc_jd_sign_1",
+                    "name": "JD测试商品",
+                    "price": 29.9,
+                    "coupon_amount": 10.0,
+                    "coupon_url": "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1",
+                    "mall_name": "京东自营",
+                },
+            }
+        ),
+        "taobao": SimpleNamespace(
+            resolve_and_convert_universal=lambda inp: tb_seen.append(inp) or {"status": "error"}
+        ),
+        "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _u: {"status": "error"}),
+    }
+
+    r_venue = cleaner.convert_single_target({"link_id": "V", "clean_input": "https://3.cn/valid-venue", "platform": "jd"})
+    assert r_venue["convert_status"] == "coupon_or_activity" and r_venue["error_code"] == "OK_DIRECT_COUPON"
+    assert jd_seen == []
+
+    r_dead = cleaner.convert_single_target({"link_id": "D", "clean_input": "https://3.cn/truncated", "platform": "jd"})
+    assert r_dead["convert_status"] == "failed" and r_dead["error_code"] == "ERR_UNSUPPORTED_PLATFORM"
+    assert jd_seen == []
+
+    r_num = cleaner.convert_single_target({"link_id": "N", "clean_input": "https://3.cn/num-item", "platform": "jd"})
+    assert r_num["convert_status"] == "failed" and r_num["error_code"] == "ERR_JD_NUMERIC_SKU"
+    assert jd_seen == []
+
+    r_trans = cleaner.convert_single_target({"link_id": "T", "clean_input": "https://3.cn/net-timeout", "platform": "jd"})
+    assert r_trans["convert_status"] == "failed" and r_trans["error_code"] == "ERR_ADAPTER_CONVERT_FAILED"
+
+    r_cps = cleaner.convert_single_target({"link_id": "C", "clean_input": "https://3.cn/valid-cps", "platform": "jd"})
+    assert r_cps["convert_status"] == "product"
+    assert r_cps["clean_input"] == "https://3.cn/valid-cps"
+    assert jd_seen == ["https://u.jd.com/redirectedItem"]
+    assert r_cps["official_product"]["coupon_url"] == "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1"
+
+    cleaner.convert_single_target({"link_id": "LL", "clean_input": "https://llipin.cn/tb-uland", "platform": "unknown"})
+    assert tb_seen == ["https://uland.taobao.com/coupon/edetail?e=tb123"]
+
+    # 2. coupon_url 保留与 upsert_formal_product 只增不抹 + last_seen_at
+    card_restored, _ = _extract_product_card_from_conv({
+        "official_product": r_cps["official_product"],
+        "promo_payload": {},
+        "adapter_res": {},
+    })
+    assert card_restored["coupon_url"] == "https://coupon.m.jd.com/coupons/show.action?key=k1&roleId=r1"
+
+    mock_col = MagicMock()
+    mock_col.find.return_value = []
+    mock_col.bulk_write.return_value = SimpleNamespace(upserted_count=1, modified_count=0, matched_count=0)
+    upsert_cleaned_products_to_formal_table(
+        mock_col,
+        [
+            {
+                "platform": "jd",
+                "product_id": "6aa94c3fF12b4d4bf_0a023203205f693f",
+                "goods_id": "6aa94c3fF12b4d4bf_0a023203205f693f",
+                "name": "测试JD",
+                "price": 29.9,
+                "deal_info": {"quality_score": 88, "is_deal_tip": True, "deal_price": 29.9},
+            }
+        ],
+    )
+    op = mock_col.bulk_write.call_args[0][0][0]
+    set_doc = op._doc["$set"]
+    assert "coupon_url" not in set_doc
+    assert "deal_info.last_seen_at" in set_doc and "deal_info.updated_at" in set_doc
+
+
+def test_pc_coupon_jd_unwrap_encrypted_pro_babel_guard_and_cookie_hijack_resilience():
+    """验证：(1) PC 端 coupon.jd.com / passport.jd.com 无损重组为 coupon.m.jd.com；(2) 带加密 sku 的 pro.m.jd.com 拒削假会场；(3) 三方短链禁止存 Cookie 且偶发广告劫持可自愈。"""
+    from services.deal_cleaning.url_venue import rebuild_clean_official_venue_url, resolve_non_cps_http_url
+
+    # 1. PC 端 coupon.jd.com 与 passport.jd.com?ReturnUrl=... 规范重组为移动端官方领券页
+    pc_coupon = (
+        "https://coupon.jd.com/ilink/couponActiveFront/front_index.action"
+        "?key=349a3d6a167848b6b2b9eb35855ea734&roleId=3436187100&to=mall.jd.com/index-20046.html"
+    )
+    passport_wrapped = (
+        "https://passport.jd.com/new/login.aspx?ReturnUrl="
+        "https%3A%2F%2Fcoupon.jd.com%2FcouponActiveFront%2Ffront_index.action"
+        "%3Fkey%3D349a3d6a167848b6b2b9eb35855ea734%26roleId%3D3436187100"
+    )
+    expected_m_coupon = "https://coupon.m.jd.com/coupons/show.action?key=349a3d6a167848b6b2b9eb35855ea734&roleId=3436187100"
+    assert rebuild_clean_official_venue_url(pc_coupon) == expected_m_coupon
+    assert rebuild_clean_official_venue_url(passport_wrapped) == expected_m_coupon
+
+    # 2. 通天塔加密单品 (?sku=非纯数字) 严禁剥参冒充无佣金纯会场；纯数字 ?sku= 与无 sku 纯会场保持放行
+    babel_item_url = "https://pro.m.jd.com/mall/active/2eh7EHbxrCQQzeYugUVcz99VSq98/index.html?sku=BFQ9J8Um1Iww9XIN0cCIw9XIhUJuKQ_3hj3LwOTXs8Gd4sVbN&q=xxx"
+    assert rebuild_clean_official_venue_url(babel_item_url) is None
+    assert (
+        rebuild_clean_official_venue_url("https://pro.m.jd.com/mall/active/2ABC/index.html?sku=100115132399")
+        == "https://pro.m.jd.com/mall/active/2ABC/index.html"
+    )
+
+    # 3. 三方短链首次被随机劫持到陌生域名 -> 自动免费复核 1 次救活；官网 3.cn -> jd 首页不重试
+    calls = []
+
+    class _HijackThenCouponSession:
+        def __init__(self):
+            self.n = 0
+
+        def get(self, url, **_kw):
+            calls.append(url)
+            if url == "https://s.c1ns.cn/flaky":
+                self.n += 1
+                if self.n == 1:
+                    return _FakeResponse(status_code=302, headers={"Location": "http://ad.third.cn/hb"})
+                return _FakeResponse(status_code=302, headers={"Location": "https://coupon.m.jd.com/coupons/show.action?linkKey=OK123"})
+            if url == "http://ad.third.cn/hb":
+                return _FakeResponse(status_code=200, headers={})
+            if url == "https://3.cn/dead-home":
+                return _FakeResponse(status_code=302, headers={"Location": "https://www.jd.com/"})
+            return _FakeResponse(status_code=404)
+
+    hijack_res = resolve_non_cps_http_url(
+        "https://s.c1ns.cn/flaky",
+        http_session=_HijackThenCouponSession(),
+        resolver=_public_dns_resolver,
+    )
+    assert hijack_res == {
+        "kind": "venue",
+        "url": "https://coupon.m.jd.com/coupons/show.action?linkKey=OK123",
+        "reason": "unwrapped_venue",
+    }
+    assert calls.count("https://s.c1ns.cn/flaky") == 2
+
+    calls.clear()
+    dead_home_res = resolve_non_cps_http_url(
+        "https://3.cn/dead-home",
+        http_session=_HijackThenCouponSession(),
+        resolver=_public_dns_resolver,
+    )
+    assert dead_home_res["kind"] == "dead" and dead_home_res["reason"] == "platform_homepage"
+    assert calls == ["https://3.cn/dead-home"]
+
+    # 4. DealPoolCleaner 默认解包 Session 禁存任何第三方 Cookie (响应头 Set-Cookie 被 CookiePolicy 拦截)
+    cleaner = DealPoolCleaner(ai_batch_size=1, ai_max_workers=1, convert_max_workers=1)
+    try:
+        sess = cleaner._get_unwrap_session()
+        import http.client
+        import urllib.request
+        req = urllib.request.Request("https://s.c1ns.cn/u5hhj")
+        hdrs = http.client.HTTPMessage()
+        hdrs.add_header("Set-Cookie", "c1n=abc123; Path=/")
+        raw_resp = SimpleNamespace(info=lambda: hdrs)
+        sess.cookies.extract_cookies(raw_resp, req)
+        assert len(sess.cookies) == 0
+    finally:
+        cleaner.close()
+
+
+
+
 
 
 

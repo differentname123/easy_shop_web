@@ -219,10 +219,9 @@ def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circ
     repo_rl = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda name: col_rl))
     rl_client = Mock()
     rl_client.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
-    rl_client.convert_promotion_link.side_effect = [
-        {"status": "success", "short_url": "https://u.jd.com/probe1"},
-        {"status": "success", "promoter_id": "88", "short_url": "https://u.jd.com/plain_ok", "click_url": "", "j_command": "口令", "j_short_command": "口令"},
-    ]
+    rl_client.convert_promotion_link.return_value = {
+        "status": "success", "promoter_id": "88", "short_url": "https://u.jd.com/plain_ok", "click_url": "", "j_command": "口令", "j_short_command": "口令",
+    }
     rl_adapter = JdAdapter(SimpleNamespace(jd_enabled=True, jd_position_id="88"), client=rl_client)
     repo_rl.upsert_home_products([rl_adapter._summary({
         "itemId": enc_sign, "skuName": "芬达橙味500ml*24瓶", "wlprice": "49.90", "imageUrl": jd_img,
@@ -233,6 +232,7 @@ def test_unchecked_jd_rank_item_enriches_once_on_convert_and_prefetch_short_circ
         assert rl_res["status"] == "success"
         assert rl_res["final_link"] == "https://u.jd.com/plain_ok"
         rl_client.get_goods_detail.assert_called_once()
+        rl_client.convert_promotion_link.assert_called_once()
         rl_client.search_goods.assert_not_called()
     clear_all_caches()
 

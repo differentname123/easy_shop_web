@@ -163,18 +163,29 @@ def test_upstream_health_monitoring_endpoint():
 
 
 # ==============================================================================
-# 2. 京东 u.jd.com / union-click 单品保留 tkl_piliang 补全详情 + 多 Key 轮询防空 tao_id + 无“抢购”单品防误判 OK_COUPON
+# 2. 京东 4 步直线链路（api_detail 独立池/301单Key早停 -> goods_query -> HDK -> byunionid_get + 新短链补查，彻底移除 tkl_piliang / api_quanwang）
 # ==============================================================================
 def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_jingfen_or_venue():
     from adapters.jd_adapter import JdAdapter
     from infrastructure.jd_client import JdClient, PROMOTION_ROOT
 
     calls = []
+    enc_tea = "BFQsJ9uP57Tw9XUt2BLLw9XwJs1PWQ_3hj3gPHIC2A97hgSPd"
+    tea_row = {
+        "tao_id": enc_tea,
+        "title": "越峰花茉莉飘雪花茶浓香型袋装50克",
+        "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/568869/28/6699/278367/6aedce51F01fd44fe/00834e64e62f0766.jpg",
+        "size": "15.8",
+        "quanhou_jiage": "15.8",
+        "nick": "越峰花茶叶京东自营旗舰店",
+        "item_url": f"https://jingfen.jd.com/detail/{enc_tea}.html",
+    }
 
     class _FakeHttp:
         def get(self, url, **kw):
             params = kw.get("params") or {}
-            calls.append((url, params.get("appkey"), params.get("materialId") or params.get("tkl") or params.get("q")))
+            target_arg = params.get("materialId") or params.get("tao_id") or params.get("tkl") or params.get("q")
+            calls.append((url, params.get("appkey"), target_arg))
             if "open_jing_union_open_promotion_byunionid_get.ashx" in url:
                 mat = str(params.get("materialId") or "")
                 j_cmd = (
@@ -199,22 +210,16 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
                 }
                 return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
 
-            if "open_gaoyongzhuanlian_tkl_piliang.ashx" in url:
-                # 模拟首个轮询命中的 ztk_k1 频控返回空 tao_id，自动故障切换至 ztk_k2 返回真实加密 tao_id 与商品详情
-                if params.get("appkey") == "ztk_k1":
-                    payload = {"status": 200, "result_url": "https://u.jd.com/s1", "tao_id": "", "title": ""}
-                else:
-                    payload = {
-                        "status": 200,
-                        "result_url": "https://u.jd.com/s2",
-                        "tao_id": "BFQsJ9uP57Tw9XUt2BLLw9XwJs1PWQ_3hj3gPHIC2A97hgSPd",
-                        "title": "越峰花茉莉飘雪花茶浓香型袋装50克",
-                        "pic": "https://img14.360buyimg.com/pop/jfs/t1/568869/28/6699/278367/6aedce51F01fd44fe/00834e64e62f0766.jpg",
-                        "size": "15.8",
-                        "quanhou_jiage": "15.8",
-                        "nick": "越峰花茶叶京东自营旗舰店",
-                    }
-                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: payload)
+            if "api_detail.ashx" in url:
+                tid = str(params.get("tao_id") or "")
+                # 模拟 union-click 长链或未出卡旧链返回 301（单Key早停），新转出短链 officialShort1、oGP72oi 与裸京口令直接出全卡
+                if (
+                    "oGP72oi" in tid
+                    or "officialShort1" in tid
+                    or "AC8yV1DP031LLfr6" in tid
+                ):
+                    return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 200, "content": [dict(tea_row)]})
+                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 301, "content": "对应宝贝已下架"})
 
             return SimpleNamespace(
                 status_code=200,
@@ -230,48 +235,36 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     )
     adapter = JdAdapter(client=client, jd_enabled=True, jd_position_id="10001")
 
-    # 1) 非选品库、无“抢购”字样的普通京东单品：通过 tkl_piliang 多 Key 轮询直接拿到完整商品卡
+    # 1) u.jd.com 直查 api_detail 拿全卡 -> byunionid_get 直转，0 次 tkl_piliang / api_quanwang
     res_prod = adapter.resolve_and_convert_universal("https://u.jd.com/oGP72oi", promoter_id="10001")
     assert res_prod["status"] == "success"
     assert res_prod["resolution_kind"] == "product"
     assert res_prod["product"]["name"] == "越峰花茉莉飘雪花茶浓香型袋装50克"
     assert res_prod["product"]["price"] == 15.8
-    piliang_keys = [k for u, k, _ in calls if "piliang" in u]
-    assert piliang_keys == ["ztk_k1", "ztk_k2"]
+    assert not any("tkl_piliang" in u or "api_quanwang" in u for u, _, _ in calls)
 
-    # 2) 纯京口令（无 URL）：byunionid_get 转出 shortURL 后，向 piliang 透传该 shortURL 而非裸口令（防 301 转链失败）
+    # 2) 纯京口令：api_detail 直接支持京口令查卡，再经 byunionid_get 归因转链
     calls.clear()
     res_jcmd = adapter.resolve_and_convert_universal("11:/越峰花茉莉飘雪花茶！AC8yV1DP031LLfr6！ CA1393", promoter_id="10001")
     assert res_jcmd["status"] == "success"
     assert res_jcmd["resolution_kind"] == "product"
-    piliang_tkls = [mat for u, _, mat in calls if "piliang" in u]
-    assert piliang_tkls and all(t == "https://u.jd.com/officialShort1" for t in piliang_tkls)
+    assert not any("tkl_piliang" in u or "api_quanwang" in u for u, _, _ in calls)
 
-    # 2b) 原始长 union-click.jd.com 链接：同样优先透传 byunionid_get 转出的 shortURL (u.jd.com) 给 piliang，避免 ZTK 拒识长链报 301
+    # 2b) union-click 长链遇 api_detail 301 第 1 把 Key 立即早停 -> byunionid_get 生成新 shortURL -> 补 1 次 api_detail(officialShort1) 救回全卡
     calls.clear()
     res_uc = adapter.resolve_and_convert_universal("https://union-click.jd.com/jdc?e=618%7Cpc%7C&p=abcLong", promoter_id="10001")
     assert res_uc["status"] == "success"
     assert res_uc["resolution_kind"] == "product"
-    uc_piliang_tkls = [mat for u, _, mat in calls if "piliang" in u]
-    assert uc_piliang_tkls and all(t == "https://u.jd.com/officialShort1" for t in uc_piliang_tkls)
+    assert res_uc["product"]["name"] == "越峰花茉莉飘雪花茶浓香型袋装50克"
+    uc_detail_calls = [mat for u, _, mat in calls if "api_detail" in u]
+    assert "https://u.jd.com/officialShort1" in uc_detail_calls
+    assert not any("tkl_piliang" in u or "api_quanwang" in u for u, _, _ in calls)
 
-    # 3) 纯领券短链（jCommand 为空）：它到底是什么，以实网结果为准，不能靠 mock 想象。
-    #    2026-11-20 实网验证（真实 ztk Key + 真实站点）：
-    #      · u.jd.com/oa0INNe（本用例的券短链）连跑 3 次稳定 = degraded_product（无 name/price，detail_lookup_failed=True）
-    #      · 真实数据里的券链接 u.jd.com/5reWTig（取自特惠采采 material_info.coupon_urls）同样 = degraded_product
-    #      · 真实下单短链 u.jd.com/oGpSC4R / ogpfg4F = product，带真实商品名与价格（如 49.9）
-    #    也就是说：券短链本身拿不到商品卡，"拿不到卡就不可能被标成 product"；旧断言 coupon_or_venue 也是错的。
-    #    这里锁住真正的不变量：无商品卡 → 绝不标 product，且不凭空编造商品卡。
-    #    （新语义下券短链也会去 piliang 试解析，不再用"口令为空"短路，所以 piliang 会被调用，这是有意的。）
+    # 3) 拿不到卡的短链严格 Fail-Closed（绝不标成 product 或误判为 coupon_or_venue）
     class _NoCardHttp(_FakeHttp):
         def get(self, url, **kw):
-            if "open_gaoyongzhuanlian_tkl_piliang.ashx" in url:
-                calls.append((url, kw.get("params", {}).get("appkey"), kw.get("params", {}).get("tkl")))
-                return SimpleNamespace(
-                    status_code=200,
-                    raise_for_status=lambda: None,
-                    json=lambda: {"status": 301, "content": "无符合条件的数据"},
-                )
+            if "api_detail" in url:
+                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 301, "content": "对应宝贝已下架"})
             return super().get(url, **kw)
 
     calls.clear()
@@ -281,37 +274,16 @@ def test_jd_convert_enriches_u_jd_via_piliang_with_key_failover_and_skips_only_j
     res_cpn = adapter.resolve_and_convert_universal("https://u.jd.com/oa0INNe", promoter_id="10001")
     assert res_cpn["status"] == "success"
     assert res_cpn["product"] in (None, {})
-    assert res_cpn["resolution_kind"] != "product", "没有商品卡时绝不能标成 product"
-    assert res_cpn["resolution_kind"] in ("coupon_or_venue", "degraded_product")
-    assert any("piliang" in u for u, _, _ in calls), "券短链也应尝试 piliang 解析（不再按口令为空短路）"
-
-    # 4) 若 tkl_piliang 空 tao_id，自动回退一次精确短链 api_quanwang(q=short_u, youquan=0)；若仍无数据则稳健标记 degraded_product
-    class _AllThrottledHttp(_FakeHttp):
-        def get(self, url, **kw):
-            if "open_gaoyongzhuanlian_tkl_piliang.ashx" in url:
-                calls.append((url, kw.get("params", {}).get("appkey"), kw.get("params", {}).get("tkl")))
-                return SimpleNamespace(
-                    status_code=200,
-                    raise_for_status=lambda: None,
-                    json=lambda: {"status": 200, "result_url": "https://u.jd.com/s1", "tao_id": ""},
-                )
-            return super().get(url, **kw)
-
-    calls.clear()
-    adapter.client = JdClient(appkey="ztk_k1", union_id="10001", http_session=_AllThrottledHttp(), appkey_list=("ztk_k1", "ztk_k2"))
-    res_deg = adapter.resolve_and_convert_universal("https://u.jd.com/oGP72oi", promoter_id="10001")
-    assert res_deg["status"] == "success"
-    assert res_deg["resolution_kind"] == "degraded_product"
-    assert res_deg.get("detail_lookup_failed") is True
-    assert res_deg["title"] == "京东精选推广好物"
-    assert any("api_quanwang" in u and q == "https://u.jd.com/officialShort1" for u, _, q in calls)
+    assert res_cpn["resolution_kind"] == "degraded_product"
+    assert res_cpn.get("detail_lookup_failed") is True
+    assert not any("tkl_piliang" in u or "api_quanwang" in u for u, _, _ in calls)
 
 
 def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recovery():
-    """验证真实退化恢复链路：
-    1. tkl_piliang 全局返回空 tao_id 时，3-key 池最多尝试 2 次即早停，不浪费第 3 把 Key；
-    2. HDK 解包官方短链返回加密 sku_id -> api_detail 拿全量商品卡（以及 is_venue=True -> coupon_or_venue）；
-    3. 落地仅为数字 SKU 时，唯一匹配 api_quanwang(q=short_u)（剥离残缺 |h 后缀）救回商品卡，且 len != 1 时严禁误用。
+    """验证 4 步直线链路退化恢复：
+    1. api_detail 返回 301 在 3-key 池只调 1 把 Key 立即早停；
+    2. HDK 解包返回加密 sku_id -> api_detail 拿全量商品卡（is_venue=True -> coupon_or_venue）；
+    3. 全程 0 次 tkl_piliang 与 0 次 api_quanwang：新短链补查 api_detail 命中得 product，未命中严格 degraded_product。
     """
     from adapters.jd_adapter import JdAdapter
     from infrastructure.jd_client import JdClient, PROMOTION_ROOT
@@ -336,9 +308,7 @@ def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recove
                         }
                     },
                 )
-            if "tkl_piliang" in url:
-                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 200, "tao_id": "", "content": "https://u.jd.com/p"})
-            if "api_detail" in url:
+            if "api_detail" in url and str(params.get("tao_id") or "") == enc_sku:
                 return SimpleNamespace(
                     status_code=200,
                     raise_for_status=lambda: None,
@@ -354,9 +324,9 @@ def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recove
                         }],
                     },
                 )
-            return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 301, "content": "无符合条件的数据"})
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 301, "content": "对应宝贝已下架"})
 
-    # 1 & 2a: union-click + HDK 零配额先行解包返回加密 sku -> 跳过 tkl_piliang，直接 api_detail 拿全卡
+    # 1 & 2a: union-click 首个 301 只打 1 把 Key -> HDK 解包加密 sku -> api_detail 拿全卡
     hdk_enc = SimpleNamespace(
         resolve_short_url=lambda _u: {"status": "success", "data": {"sku_id": enc_sku, "is_venue": False}},
         convert_promotion_link=lambda *_a, **_kw: {"status": "error", "error_code": "NOT_SUPPORTED"},
@@ -368,10 +338,9 @@ def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recove
     assert res_enc["resolution_kind"] == "product"
     assert res_enc["product"]["name"] == "美的燃气灶A3"
     assert res_enc["product"]["price"] == 488.81
-    piliang_calls = [c for c in calls if "tkl_piliang" in c[0]]
-    assert len(piliang_calls) == 0
+    assert not any("tkl_piliang" in c[0] or "api_quanwang" in c[0] for c in calls)
 
-    # 2b: union-click 会场 -> HDK 先行解包 is_venue=True 识别为 coupon_or_venue，同样 0 次 tkl_piliang
+    # 2b: union-click 会场 -> HDK 解包 is_venue=True 识别为 coupon_or_venue
     calls.clear()
     hdk_venue = SimpleNamespace(
         resolve_short_url=lambda _u: {"status": "success", "data": {"sku_id": "", "is_venue": True}},
@@ -382,25 +351,23 @@ def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recove
     res_venue = ad2.resolve_and_convert_universal("https://union-click.jd.com/jdc?e=&p=JF8B_VENUE", promoter_id="88")
     assert res_venue["status"] == "success"
     assert res_venue["resolution_kind"] == "coupon_or_venue"
-    assert [c for c in calls if "tkl_piliang" in c[0]] == []
+    assert not any("tkl_piliang" in c[0] or "api_quanwang" in c[0] for c in calls)
 
-    # 3: 数字 SKU 解包后：3-key tkl_piliang 空 tao_id 第 2 次早停，随后走 Fallback B api_quanwang(q=short_u) 仅 len==1 时采信并清洗 |h；len==2 严格拒绝
-    class _QuanwangHttp(_EarlyStopHttp):
-        def __init__(self, row_count):
-            self.row_count = row_count
-
+    # 3: 新转出短链 shortOk 由独立池 api_detail 补查 1 次即救回；依然缺失则严格 Fail-Closed degraded_product（0 次 tkl_piliang/api_quanwang）
+    class _NewShortRescueHttp(_EarlyStopHttp):
         def get(self, url, **kw):
-            if "api_quanwang" in url:
+            params = kw.get("params") or {}
+            if "api_detail" in url and str(params.get("tao_id") or "") == "https://u.jd.com/shortOk":
                 row = {
                     "tao_id": "xPQNgratvgsxvGGtlMZ7xvG7SFJilQ_3LZQS3mHtarEqceyab",
                     "title": "欧贝拉亚麻籽油500ml",
                     "pict_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/4/6af414c4Fef8155cc/0083320320b2df3d.jpg",
-                    "small_images": "https://img14.360buyimg.com/a.jpg|h",
+                    "small_images": "https://img14.360buyimg.com/a.jpg",
                     "quanhou_jiage": "45.4",
                     "size": "45.4",
                     "item_url": "https://jingfen.jd.com/detail/xPQNgratvgsxvGGtlMZ7xvG7SFJilQ_3LZQS3mHtarEqceyab.html",
                 }
-                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 200, "content": [dict(row) for _ in range(self.row_count)]})
+                return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"status": 200, "content": [row]})
             return super().get(url, **kw)
 
     hdk_num = SimpleNamespace(
@@ -409,7 +376,7 @@ def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recove
     )
     calls.clear()
     ad_num1 = JdAdapter(
-        client=JdClient(union_id="2035679405", appkey_list=("k1", "k2", "k3"), http_session=_QuanwangHttp(1)),
+        client=JdClient(union_id="2035679405", appkey_list=("k1", "k2", "k3"), http_session=_NewShortRescueHttp()),
         jd_enabled=True,
         jd_position_id="88",
         hdk_client=hdk_num,
@@ -419,10 +386,11 @@ def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recove
     assert res_num1["resolution_kind"] == "product"
     assert res_num1["product"]["name"] == "欧贝拉亚麻籽油500ml"
     assert res_num1["product"]["carousel_images"] == ["https://img14.360buyimg.com/a.jpg"]
-    assert len([c for c in calls if "tkl_piliang" in c[0]]) == 2
+    assert not any("tkl_piliang" in c[0] or "api_quanwang" in c[0] for c in calls)
 
+    calls.clear()
     ad_num2 = JdAdapter(
-        client=JdClient(union_id="2035679405", appkey_list=("k1", "k2"), http_session=_QuanwangHttp(2)),
+        client=JdClient(union_id="2035679405", appkey_list=("k1", "k2", "k3"), http_session=_EarlyStopHttp()),
         jd_enabled=True,
         jd_position_id="88",
         hdk_client=hdk_num,
@@ -431,6 +399,7 @@ def test_jd_universal_piliang_empty_tao_id_early_stop_and_hdk_or_quanwang_recove
     assert res_num2["status"] == "success"
     assert res_num2["resolution_kind"] == "degraded_product"
     assert res_num2["product"] is None
+    assert not any("tkl_piliang" in c[0] or "api_quanwang" in c[0] for c in calls)
 
 
 # ==============================================================================
