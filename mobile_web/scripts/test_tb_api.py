@@ -134,6 +134,10 @@
   3. **当前账户授权与跨天复测终局备注（2026-11-23 13:05，+11.5h 复测）**：
      - `taobao_session`（24 小时短效）跨天仍报 `27:invalid-sessionkey` 且未配置 `taobao_refresh_token`，确认永久失效直至重新授权；正式备案核验与邀请码依赖折淘客 90 天长效 `sid` 完成；
      - 淘宝 TOP `click.extract` / `tpwd.convert`（`11:isv.permission-api-package-limit`）、TOP 纯数字 ID（`-4003`）、下架加密 ID `ZmBGQ5...`（`50001`）、折淘客无配对 `sid` 备用 Key（`301: sid和appkey不匹配`）、死口令 `(VmoT6VKtWRC)/ AC01` 与死短链 `m.tb.cn/h.RlVPExq` 跨天 100% 原样复现，确认为永久规则/权限/失效，绝非临时风控。
+  4. **多 `sid` 授权模式陷阱与按位对齐铁律（2026-11-23 14:58 实测 3 Key + 3 `sid`）**：
+     - ⚠️ **致命陷阱（代理模式 `sid` 拒绝无 `relation_id` 的公开转链）**：折淘客授权账号分「普通模式」与「代理模式」。实测新补的两个备用 `sid` 在折淘客后台授权为**代理模式**，当不传 `relation_id`（即站长公共转链 / 线报清洗 / 未登录万能转链场景）调用 `open_gaoyongzhuanlian_tkl.ashx` 与 `tkl_piliang` 时，接口只笼统报错 `301: 很抱歉！转链失败！`（`gaoyongzhuanlian.ashx` 才会吐出真正原因：`很抱歉！当前sid类型为代理模式，必须传入用户的relation_id！`）；而传入 `relation_id` 后三把 Key 行为即与主 Key 完全一致。
+     - ✅ **无需 `relation_id` 即可三 Key 完全等价的接口**：三组 `(appkey, sid)` 实测指向同一淘宝主账号（`ali_trackid` 前缀均为 `2:116341500041`，`open_sc_publisher_get` 返回结构完全一致），在 `open_dingdanchaxun2.ashx`（拉单）、`open_sc_publisher_get.ashx`（渠道核验与邀请码）、`api_quanwang.ashx`（搜品）、`api_detail.ashx`（详情）、`open_shangpin_id.ashx`、`tkl_piliang(wh_alimama会场)` 及京东 `:20000` 全接口上均 100% 互通可用。
+     - ⚠️ **严禁写反下标顺序**：`ZtkClient` 按下标一一配对 `zhetaoke_appkey_list[i] <-> zhetaoke_sid_list[i]`，若顺序错配会立刻报 `301: 授权账号sid过期或者sid和appkey不匹配`；在将代理模式 `sid` 改回普通模式前，严禁将其直接放入公开转链的 `round_robin` 轮询池（否则 2/3 公开转链/线报清洗会失败）。
 ================================================================================
 """
 
