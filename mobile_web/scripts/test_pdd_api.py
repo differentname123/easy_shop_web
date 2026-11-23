@@ -104,6 +104,9 @@
        * 已下架/无推广：`[50001:40001] 商品非多多进宝商品`；
        * `goods_sign` 格式非法/损坏：`[50001:10002] goodsSign解析错误`。
      - ⚠️ **陷阱 C（生链接口不校验下架，“转链成功”≠“商品在架”）**：实测对已下架的 `off_sign` 调 `pdd.ddk.goods.promotion.url.generate` 仍返回 1 条推广链，对已下架短链和 `goods.html?goods_id=...` 调 `zs.unit.url.gen` 也同样能返回 `short_url`。因此严禁把 `zs.unit` 或生链成功当作商品存活实证，**`pdd.ddk.goods.detail` 是拼多多商品存活的唯一权威裁判**。
+  3. **2026-11-23 13:05（+11.5h 跨天复测终局确认）**：
+     - 昨晚失败的 3 条 PDD 短链（`jCWkMvem` 农夫山泉茶π、`lA2knOwN` 百事可乐、`raskeiLy` 东鹏特饮）跨天复测仍 3/3 返回 `goods.search: total_count=1, goods_name=None` + `goods.detail: [50001:40001] 商品非多多进宝商品`，100% 确认为永久停推/非进宝商品而非临时风控；纯数字 `goods_id` 链接仍报 `40009`；
+     - 隔夜前台连续实跑 `goods.detail` 4579/4579、`goods.recommend.get` 1989/1989、`order.list.increment.get` 45/45 零报错，全程高度稳定。
 ================================================================================
 """
 
