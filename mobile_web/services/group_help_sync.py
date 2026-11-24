@@ -460,11 +460,14 @@ class GroupHelpExporter:
                 refreshed += 1
 
         queue_items.sort(key=lambda it: (int(it.get("remain_people") or 1), -int(it.get("exported_at") or 0)))
-        self._save_state(state, now=current_ts)
-        atomic_write_json(
-            self.queue_file,
-            {"updated_at": int(current_ts), "pending_count": len(queue_items), "tasks": queue_items},
-        )
+        queue_changed = bool(exported_new or refreshed or completed_via_flag or withdrawn)
+        if queue_changed or not self.state_file.is_file():
+            self._save_state(state, now=current_ts)
+        if queue_changed or not self.queue_file.is_file():
+            atomic_write_json(
+                self.queue_file,
+                {"updated_at": int(current_ts), "pending_count": len(queue_items), "tasks": queue_items},
+            )
 
         remote_stats = self._sync_remote_miaozhuli(now=current_ts)
         stats = {

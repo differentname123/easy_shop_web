@@ -80,6 +80,8 @@ ST_MONGO="❌ 未通过"
 ST_AI="⚠️ 未检测"
 ST_MEILI="⏭️ 未启用"
 ST_WEB="❌ 未运行"
+ST_GH_IMP="⏭️ 未启用"
+ST_GH_EXP="⏭️ 未启用"
 ST_NGINX="⚠️ 未检测"
 ST_HTTPS="⚠️ 未配置"
 ST_LOCAL_HTTP="❌ 未检测"
@@ -177,6 +179,7 @@ WEB_PORT="$(read_cfg web_port 8001)"
 MEILI_ENABLED="$(read_cfg meilisearch_enabled true)"
 MEILI_URL="$(read_cfg meilisearch_url http://127.0.0.1:7700)"
 MEILI_KEY="$(read_cfg meilisearch_key easyshop2026)"
+GH_SYNC_RAW="$(read_cfg group_help_external_sync_enabled __UNSET__)"
 
 # ------------------------------------------------------------------------------
 # 3. 无损自检（配置 / MongoDB / 云端 AI）
@@ -396,6 +399,78 @@ else
 fi
 
 # ------------------------------------------------------------------------------
+# 5b. 管理独立多人团外部采集与外发辅助服务（低耦合，可随时通过配置或 systemctl 一键停用）
+# ------------------------------------------------------------------------------
+log_step "5b. 管理独立多人团外部采集与外发服务 (低耦合可选)"
+sync_group_help_worker() {
+  local unit_name="$1"
+  local desc="$2"
+  local script_path="$3"
+  local unit_file="/etc/systemd/system/${unit_name}"
+  local desired="${GH_SYNC_RAW,,}"
+  local result_status=""
+
+  if [[ "${desired}" == "false" || "${desired}" == "0" || "${desired}" == "no" || "${desired}" == "off" ]]; then
+    if [[ -f "${unit_file}" ]] || systemctl list-unit-files "${unit_name}" 2>/dev/null | grep -q "${unit_name}"; then
+      systemctl disable --now "${unit_name}" >/dev/null 2>&1 || systemctl stop "${unit_name}" >/dev/null 2>&1 || true
+    fi
+    result_status="⏭️ 已按配置停用 (group_help_external_sync_enabled=false)"
+  elif [[ "${desired}" != "__unset__" && "${desired}" != "true" && "${desired}" != "1" && "${desired}" != "yes" && "${desired}" != "on" ]]; then
+    result_status="⚠️ 配置值无效 (group_help_external_sync_enabled=${GH_SYNC_RAW})"
+  elif [[ -f "${unit_file}" && "${desired}" == "__unset__" ]] && ! systemctl is-enabled --quiet "${unit_name}" 2>/dev/null; then
+    systemctl stop "${unit_name}" >/dev/null 2>&1 || true
+    result_status="⏭️ 已手动停用 (保留当前禁用状态)"
+  else
+    local tmp_unit
+    tmp_unit="$(mktemp /tmp/gh_unit.XXXXXX)"
+    cat > "${tmp_unit}" << EOF
+[Unit]
+Description=${desc}
+After=network-online.target mongod.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${VENV_PY} ${script_path}
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${tmp_unit}"
+    if [[ ! -f "${unit_file}" ]] || ! cmp -s "${tmp_unit}" "${unit_file}"; then
+      mv -f "${tmp_unit}" "${unit_file}"
+      systemctl daemon-reload
+    else
+      rm -f "${tmp_unit}"
+    fi
+    systemctl enable "${unit_name}" >/dev/null 2>&1 || true
+    if systemctl restart "${unit_name}" 2>/dev/null; then
+      sleep 1
+      if systemctl is-active --quiet "${unit_name}"; then
+        result_status="✅ active (running)"
+      else
+        result_status="⚠️ 启动后退出 (journalctl -u ${unit_name} -n 30)"
+      fi
+    else
+      result_status="⚠️ 启动失败 (不影响商城主站)"
+    fi
+  fi
+  printf -v "$4" '%s' "${result_status}"
+}
+
+sync_group_help_worker "group_help_importer.service" "EasyShop PDD Group Help External Importer" "${APP_DIR}/scripts/group_help_importer.py" ST_GH_IMP
+sync_group_help_worker "group_help_exporter.service" "EasyShop PDD Group Help Exporter" "${APP_DIR}/scripts/group_help_exporter.py" ST_GH_EXP
+echo "ℹ️ 拼团采集: ${ST_GH_IMP}"
+echo "ℹ️ 拼团外发: ${ST_GH_EXP}"
+
+# ------------------------------------------------------------------------------
 # 6. 配置 Nginx 与可选 HTTPS 证书（不覆盖已配好的 443 证书）
 # ------------------------------------------------------------------------------
 log_step "6. 检查 / 部署 Nginx 规则与 HTTPS"
@@ -505,6 +580,8 @@ echo "  MongoDB 数据库   : ${ST_MONGO}"
 echo "  云端 AI 识图     : ${ST_AI}"
 echo "  Meilisearch 搜索 : ${ST_MEILI}"
 echo "  商城后端服务     : ${ST_WEB}"
+echo "  拼团外部采集     : ${ST_GH_IMP}"
+echo "  拼团自动外发     : ${ST_GH_EXP}"
 echo "  后端健康接口     : ${ST_LOCAL_HTTP}"
 echo "  Nginx 服务       : ${ST_NGINX}"
 echo "  HTTPS 证书       : ${ST_HTTPS}"

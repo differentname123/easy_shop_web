@@ -23,6 +23,8 @@ MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
 if str(MOBILE_WEB_DIR) not in sys.path:
     sys.path.insert(0, str(MOBILE_WEB_DIR))
 
+from infrastructure.logging_utils import format_exc_summary
+from infrastructure.mongo import close_shared_db
 from infrastructure.runtime_io import bootstrap_script, install_shutdown_signals, interruptible_sleep
 from services.group_help_sync import DEFAULT_BRIDGE_DIR, GroupHelpExporter, MiaozhuliPublisher
 
@@ -30,7 +32,7 @@ from services.group_help_sync import DEFAULT_BRIDGE_DIR, GroupHelpExporter, Miao
 # 【运维直改配置区】：海报外发桥接常用参数
 # ==============================================================================
 EXPORTER_CONFIG: Dict[str, Any] = {
-    "interval_seconds": 15,                 # 后台轮询间隔秒数
+    "interval_seconds": 30,                 # 后台轮询间隔秒数
     "limit": 30,                            # 单轮最多导出的在架海报数量
     "enable_remote_sync": True,             # 是否自动向秒助力同步口令拼团
     "bridge_dir": str(DEFAULT_BRIDGE_DIR),  # 外发工作目录
@@ -86,12 +88,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         interval = max(5, int(args.interval))
         log.info("海报外发桥接脚本已启动，bridge_dir=%s, interval=%ss", bridge_path, interval)
         while not stop_event.is_set():
-            exporter.run_once()
+            try:
+                exporter.run_once()
+            except Exception as exc:
+                log.warning("[PDD-EXPORTER] 本轮轮询异常，将在下个周期重试: %s", format_exc_summary(exc))
             if interruptible_sleep(stop_event, interval):
                 break
         return 0
     finally:
         exporter.close()
+        close_shared_db()
 
 
 if __name__ == "__main__":

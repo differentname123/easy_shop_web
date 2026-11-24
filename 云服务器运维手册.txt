@@ -249,6 +249,22 @@ cd /root/easy_shop_web && git pull origin main && systemctl restart mobile_web.s
   }
 ```
 
+### 4. 多人团外部采集与自动外发（独立低耦合辅助服务，可随时一键下线）
+* 为了与商城主服务 `mobile_web.service` 完全解耦，`deploy.sh` 会自动将外部采集与外发作为**两个独立 systemd 服务**托管在云端：
+  * `group_help_importer.service` ➔ 运行 `mobile_web/scripts/group_help_importer.py`（每 600 秒从外部站采集在拼团并自动清理满员/失效团）
+  * `group_help_exporter.service` ➔ 运行 `mobile_web/scripts/group_help_exporter.py`（每 30 秒将站内新发拼团同步外发到秒助力并维护导出队列）
+* **日常查看日志：**
+  ```bash
+  journalctl -u group_help_importer.service -n 50 --no-pager
+  journalctl -u group_help_exporter.service -n 50 --no-pager
+  ```
+* **以后自有用户规模起来后如何彻底停用（零影响主站）：**
+  * **方式 A（推荐，随配置同步永久生效）**：在 `config.local.json` 中加上 `"group_help_external_sync_enabled": false`，上传后跑一次 `bash /root/easy_shop_web/mobile_web/deploy/deploy.sh` 即可自动停止并取消开机自启（不会触发重装）；
+  * **方式 B（服务器端直接停用）**：执行下面一条命令后，后续无参数跑 `deploy.sh` 也会保留该禁用状态：
+    ```bash
+    systemctl disable --now group_help_importer.service group_help_exporter.service
+    ```
+
 ---
 
 ## 五、 本地 MongoDB 数据库服务运维
@@ -300,7 +316,7 @@ mongorestore --uri="mongodb://localUser:localPassword123@localhost:27017/crawler
 ### 2. 本次上线加固涉及的改动文件清单
 | 文件路径 | 改动内容与作用 |
 | :--- | :--- |
-| **`mobile_web/deploy/deploy.sh`** *(本次新增)* | 幂等一键部署与日常发版脚本：支持 `--init` 首次安装免 Docker Meilisearch / Nginx / Certbot，`--force-nginx` 更新 Nginx 时自动保留并重挂已有 HTTPS 证书及启用 `HTTP/2`，日常无参一键拉码更新并输出完整状态验收面板 |
+| **`mobile_web/deploy/deploy.sh`** *(本次新增)* | 幂等一键部署与日常发版脚本：支持 `--init` 首次安装免 Docker Meilisearch / Nginx / Certbot，`--force-nginx` 更新 Nginx 时自动保留并重挂已有 HTTPS 证书及启用 `HTTP/2`，独立托管 `group_help_importer.service` / `group_help_exporter.service`（支持 `"group_help_external_sync_enabled": false` 一键下线），日常无参一键拉码更新并输出完整状态验收面板 |
 | **`mobile_web/main.py`** | 非 `DEBUG` 模式自动关闭 `/docs` `/redoc` `/openapi.json`；CORS 收紧为 `www.shop.easyeverything.cn` / `shop.easyeverything.cn` 与本地调试白名单 |
 | **`mobile_web/static/index.html`**<br>**`mobile_web/static/detail.html`**<br>**`mobile_web/static/group_help.html`** | 全站页脚补齐「成都东部新区便易屋信息技术咨询经营部 · `蜀ICP备2026073570号-1`」并链向工信部；统一全站静态版本号为 `ux-20261124-2` |
 | **`mobile_web/static/css/style.css`**<br>**`mobile_web/static/css/group_help.css`** | 新增 `.site-icp-footer` 页脚样式，确保不被底部固定导航栏遮挡 |

@@ -20,6 +20,8 @@ MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
 if str(MOBILE_WEB_DIR) not in sys.path:
     sys.path.insert(0, str(MOBILE_WEB_DIR))
 
+from infrastructure.logging_utils import format_exc_summary
+from infrastructure.mongo import close_shared_db
 from infrastructure.runtime_io import bootstrap_script, install_shutdown_signals, interruptible_sleep
 from services.group_help_sync import (
     ACDOG_API_URL,
@@ -64,19 +66,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger=log,
     )
 
-    if args.once:
-        importer.run_once()
-        return 0
+    try:
+        if args.once:
+            importer.run_once()
+            return 0
 
-    stop_event = threading.Event()
-    install_shutdown_signals(stop_event, logger=log)
-    interval = max(15, int(args.interval))
-    log.info("外部多人团采集脚本已启动，轮询间隔=%ss，pages=%s (0=全量获取)", interval, importer.pages)
-    while not stop_event.is_set():
-        importer.run_once()
-        if interruptible_sleep(stop_event, interval):
-            break
-    return 0
+        stop_event = threading.Event()
+        install_shutdown_signals(stop_event, logger=log)
+        interval = max(15, int(args.interval))
+        log.info("外部多人团采集脚本已启动，轮询间隔=%ss，pages=%s (0=全量获取)", interval, importer.pages)
+        while not stop_event.is_set():
+            try:
+                importer.run_once()
+            except Exception as exc:
+                log.warning("[PDD-IMPORTER] 本轮采集异常，将在下个周期重试: %s", format_exc_summary(exc))
+            if interruptible_sleep(stop_event, interval):
+                break
+        return 0
+    finally:
+        close_shared_db()
 
 
 if __name__ == "__main__":

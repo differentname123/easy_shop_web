@@ -1897,6 +1897,33 @@ def test_group_help_exporter_miaozhuli_remote_sync_and_db_audit(tmp_path):
     assert fail_rec["attempts"] == 1
 
 
+def test_group_help_exporter_skips_redundant_disk_writes_when_idle(tmp_path):
+    """空队列稳态轮询不应反复刷写 export_state.json 与 outbound_queue.json。"""
+    exporter_mod = _load_mobile_script("group_help_exporter")
+    GroupHelpExporter = exporter_mod.GroupHelpExporter
+
+    assert exporter_mod.EXPORTER_CONFIG["interval_seconds"] >= 30
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    bridge_dir = tmp_path / "bridge"
+    poster_dir = tmp_path / "posters"
+    exporter = GroupHelpExporter(
+        repo=repo,
+        bridge_dir=bridge_dir,
+        poster_dir=poster_dir,
+        enable_remote_sync=False,
+    )
+
+    exporter.run_once(now=1795000000.0)
+    assert exporter.state_file.is_file()
+    assert exporter.queue_file.is_file()
+    first_state = exporter.state_file.read_text(encoding="utf-8")
+    first_queue = exporter.queue_file.read_text(encoding="utf-8")
+
+    exporter.run_once(now=1795000300.0)
+    assert exporter.state_file.read_text(encoding="utf-8") == first_state
+    assert exporter.queue_file.read_text(encoding="utf-8") == first_queue
+
+
 def test_external_group_sync_consistent_with_sources_except_user_takedown():
     """验证铁律：除了用户手动下架或反馈下架的团，外部采集团始终与外部网站源状态保持一致。
     1. 外部源活跃在售的团（在拼多多24小时内），即使本地曾因旧TTL过期，重新轮询时也恢复为 active；
