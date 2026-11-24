@@ -113,7 +113,7 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 0, "备注": "来源chatgpt_web"},
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 0, "备注": "来源gemini_web"},
     {"model_name": "gpt-6-codex-luna-max", "权重": 5, "备注": "来源codex 付费"},
-    {"model_name": "antigravity-3.8-flash-high", "权重": 5, "备注": "来源antigravity 本地客户端"},
+    # {"model_name": "antigravity-3.8-flash-high", "权重": 5, "备注": "来源antigravity 本地客户端"},
 ]
 LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web"},
@@ -126,7 +126,7 @@ LOW_MODEL_LIST = [
     {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "权重": 0, "备注": "来源aistudio_web"},
     {"model_name": "gpt-6-codex-luna", "权重": 0.5, "备注": "来源codex 免费"},
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web"},
-    {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
+    # {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
 ]
 
 TEXT_EXTENSIONS = {
