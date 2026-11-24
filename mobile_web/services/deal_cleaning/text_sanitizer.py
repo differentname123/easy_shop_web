@@ -11,6 +11,13 @@ from models.deal_constants import format_timestamp_cn
 from models.product import strip_ecommerce_tokens_and_urls
 
 _MATH_ALPHANUM_RE = re.compile(r"[\U0001D400-\U0001D7FF]+")
+_COMPETITOR_ZZZDM_JIFEN_RE = re.compile(
+    r"(?:小编补充\s*[:：]\s*)?返\s*\d+(?:\.\d+)?\s*值得买积分"
+    r"(?:[，,\s]*(?:补贴后)?(?:低至|折合?|折)\s*\d+(?:\.\d+)?\s*元(?:/[^\s，,。\n|]+)?)*[。！!~～]?"
+)
+_TG_ZZZDM_BOT_MARKER_RE = re.compile(
+    r"(?m)^[ \t]*(?:值率\s*[:：]\s*值\s*[:：]\s*\d+|商家\s*[:：]\s*\[[^\]]+\])"
+)
 _CARD_HIGHLIGHT_FLUFF = frozenset({
     "好价推荐",
     "超值优惠",
@@ -55,11 +62,33 @@ def clean_coupon_label(label: str) -> str:
 
 
 def _strip_collector_prefixes(text: str) -> str:
-    """剥离采集源站伪标签头（如 折淘客 / 来源采集群 / 拔草哦合集头）。"""
+    """剥离采集源站伪标签头（如 折淘客 / 来源采集群 / 拔草哦合集头 / 逛丢榜标签）。"""
     out = re.sub(r"【来源采集群:\s*(?:【[^】]*】)?[^】]*】\s*", "", text)
     out = re.sub(r"【折淘客[^】]*】", "", out)
     out = re.sub(r"【[^】]*拔草哦[^】]*】\s*", "", out)
+    out = re.sub(r"【逛丢(?:热门|风云榜|好价)】\s*", "", out)
     return out
+
+
+def _strip_competitor_platform_noise(text: str, *, strip_polluted_bot_price: bool = False) -> str:
+    """精确剥离竞品导购站（值得买积分、TG 机器人值率/空领券/分割线等）非电商平台噪音，严防误删正规优惠。"""
+    if not text:
+        return ""
+    out = str(text)
+    had_zzzdm_jifen = bool(_COMPETITOR_ZZZDM_JIFEN_RE.search(out))
+    is_tg_zzzdm_bot = bool(_TG_ZZZDM_BOT_MARKER_RE.search(out))
+
+    out = _COMPETITOR_ZZZDM_JIFEN_RE.sub("", out)
+    # 仅清理剥离积分后残余的空壳 `小编补充：` 行；含实质购买提示的内容完整保留
+    out = re.sub(r"(?m)^[ \t]*小编补充\s*[:：][ \t]*$", "", out)
+    out = re.sub(r"(?m)^[ \t]*值率\s*[:：]\s*值\s*[:：]\s*\d+\s*不值\s*[:：]\s*\d+.*$", "", out)
+    out = re.sub(r"(?m)^[ \t]*领券\s*[:：]\s*\[无需领券\][ \t]*$", "", out)
+    out = re.sub(r"(?m)^[ \t]*-{10,}[ \t]*$", "", out)
+    if strip_polluted_bot_price and had_zzzdm_jifen and is_tg_zzzdm_bot:
+        out = re.sub(r"(?m)^[ \t]*价格\s*[:：][^\n]*$", "", out)
+
+    kept_lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
+    return "\n".join(kept_lines).strip()
 
 
 def sanitize_clean_tutorial_step(text: str) -> str:
@@ -85,11 +114,12 @@ def sanitize_card_highlight(raw_val: Any) -> str:
 
 
 def sanitize_polished_copywriting(text: str) -> str:
-    """对微整形后的文案执行确定性无链校验，杜绝残留占位符或链接。"""
+    """对微整形后的文案执行确定性无链校验与竞品噪声清理，杜绝残留占位符、链接与竞品积分水印。"""
     out = normalize_inline_spaces(str(text or "")).strip()
     if not out:
         return ""
     out = _strip_collector_prefixes(out)
+    out = _strip_competitor_platform_noise(out, strip_polluted_bot_price=False)
     out = strip_ecommerce_tokens_and_urls(out, preserve_newlines=True)
     kept_lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
     return "\n".join(kept_lines).strip()
@@ -144,8 +174,9 @@ def build_clean_original_copywriting(
     if not out:
         return ""
 
-    # 1. 剥离爬虫/聚合源站内部拼接伪标签
+    # 1. 剥离爬虫/聚合源站内部拼接伪标签与竞品平台积分/水印噪音
     out = _strip_collector_prefixes(out)
+    out = _strip_competitor_platform_noise(out, strip_polluted_bot_price=True)
     out = re.sub(r"\[[^\]]*(?:图片|附图|晒单图|外链)\s*[:：]\s*https?://[^\]]*\]", "", out)
     out = re.sub(r"\[(?:群聊晒单/)?教程图片(?:\s*[:：][^\]]*)?\]", "", out)
     out = re.sub(r"\[口令\s*[:：][^\]]*\]", "", out)
@@ -287,6 +318,8 @@ def assemble_combined_text_and_images(
                 extracted_images.append(im_u)
 
     combined = "\n".join(text_blocks).strip()
+    combined = _strip_collector_prefixes(combined)
+    combined = _strip_competitor_platform_noise(combined, strip_polluted_bot_price=True)
 
     replace_jobs: List[Tuple[str, str, str]] = []
     for tgt in norm_targets or []:

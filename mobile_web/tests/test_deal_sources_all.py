@@ -1524,5 +1524,93 @@ def test_haodanku_preserves_prefixed_coupon_urls_for_llm_and_links():
     assert u2 in ext_urls
 
 
+def test_deal_pipeline_respects_allow_empty_ok_from_baicaio_hour_list(monkeypatch, tmp_path):
+    """验证 ListDetailDealSource.allow_empty_ok 透传至 deal_pipeline：正常空榜不得记为 empty_warning。"""
+    from services.deal_pipeline import run_fetch_stage
+    from services.deal_sources import BaicaioSource, ChannelConfig
+
+    _patch_pipeline_log_paths(monkeypatch, tmp_path)
+
+    empty_hour_html = '<html><body><ul class="list mt-20"></ul></body></html>'
+    sess = MagicMock()
+    sess.get.return_value = _mk_resp(200, empty_hour_html)
+    sess.close = MagicMock()
+
+    ch_empty_ok = ChannelConfig(
+        name="白菜哦_小时榜",
+        site_key="baicaio",
+        default_url="https://www.baicaio.com/hour/",
+        params={"mode": "hour"},
+        fetch_mode="full_sweep",
+        max_pages=1,
+        sleep_after=0.0,
+    )
+    repo = MagicMock()
+    repo.col = MagicMock()
+    repo.col.count_documents.return_value = 0
+    repo.get_existing_detailed_ids.return_value = set()
+    repo.save_batch.return_value = {"inserted": 0, "updated": 0}
+    repo.touch_seen.return_value = None
+    repo.generate_pool_summary.return_value = {"total_records": 0}
+
+    tracker = {}
+    res_ok = run_fetch_stage(
+        repo=repo,
+        channels=[ch_empty_ok],
+        channel_last_run={},
+        source_registry={"baicaio": BaicaioSource()},
+        session_factory=lambda _c: sess,
+        channel_health_tracker=tracker,
+    )
+    rep_ok = res_ok["tasks"][0]
+    assert rep_ok["status"] == "success"
+    assert rep_ok["consecutive_failures"] == 0
+
+    # 对照：当 allow_empty_ok=False 且未报错（如其它插件 status="ok" 但 0 条记录）仍必须报 empty_warning；
+    # 当模板失效导致 BaicaioSource allow_empty_ok=False 时，ListDetailDealSource 判 status="error" 且 consecutive_failures == 1
+    broken_html = "<html><body><div>changed template</div></body></html>"
+    sess_broken = MagicMock()
+    sess_broken.get.return_value = _mk_resp(200, broken_html)
+    sess_broken.close = MagicMock()
+    tracker2 = {}
+    res_broken = run_fetch_stage(
+        repo=repo,
+        channels=[ch_empty_ok],
+        channel_last_run={},
+        source_registry={"baicaio": BaicaioSource()},
+        session_factory=lambda _c: sess_broken,
+        channel_health_tracker=tracker2,
+    )
+    rep_broken = res_broken["tasks"][0]
+    assert rep_broken["status"] == "error"
+    assert rep_broken["consecutive_failures"] == 1
+
+    class _OkEmptySource(BaseDealSource):
+        site_key = "baicaio"
+
+        def fetch(self, ctx: FetchContext) -> FetchResult:
+            return FetchResult(
+                status="ok",
+                http_status=200,
+                request_url=ctx.channel.default_url,
+                elapsed_ms=1.0,
+                raw_list_count=0,
+                allow_empty_ok=False,
+            )
+
+    tracker3 = {}
+    res_warn = run_fetch_stage(
+        repo=repo,
+        channels=[ch_empty_ok],
+        channel_last_run={},
+        source_registry={"baicaio": _OkEmptySource()},
+        session_factory=lambda _c: sess_broken,
+        channel_health_tracker=tracker3,
+    )
+    rep_warn = res_warn["tasks"][0]
+    assert rep_warn["status"] == "empty_warning"
+    assert rep_warn["consecutive_failures"] == 1
+
+
 
 

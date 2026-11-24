@@ -97,6 +97,7 @@ class FetchResult:
     touch_ids: List[str] = field(default_factory=list)
     sweep_completed: bool = False
     rate_limited: bool = False
+    allow_empty_ok: bool = False
     detail_errors: List[Dict[str, Any]] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -117,6 +118,7 @@ class FetchResult:
             "touch_ids": list(self.touch_ids),
             "sweep_completed": self.sweep_completed,
             "rate_limited": self.rate_limited,
+            "allow_empty_ok": self.allow_empty_ok,
             "detail_errors": list(self.detail_errors),
             "records": self.records,
         }

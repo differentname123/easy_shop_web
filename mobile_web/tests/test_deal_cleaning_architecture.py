@@ -1134,3 +1134,185 @@ def test_multi_product_collection_guard_post_ai1_and_post_convert_no_false_posit
     assert s3_map["cross_2_ok"]["stage_outcome"] == "advance_to_ai2"
     assert s3_map["cross_3_block"]["status"] == "failed"
     assert s3_map["cross_3_block"]["error_code"] == ERR_MULTI_PRODUCT_COLLECTION
+
+
+def test_competitor_noise_stripping_preserves_legitimate_platform_benefits():
+    """验证竞品积分/水印清洗：精准剥离值得买积分、TG 值率与逛丢前缀，零误删正规积分/返卡/教程与壳行。"""
+    from services.deal_cleaning.text_sanitizer import (
+        assemble_combined_text_and_images,
+        build_clean_original_copywriting,
+        sanitize_polished_copywriting,
+    )
+
+    # 1) zzzdm 含值得买积分 + 有用名额补充 -> 只去积分部分，保留名额与真实实付价
+    doc_zzz = {
+        "source_site": "zzzdm",
+        "source_item_id": "e76qb3qk",
+        "title": "【京东】某品牌口罩 50只",
+        "tutorial_text": (
+            "京东此款目前活动售价19.9元，领5元券，实付低至12.39元。\n"
+            "小编补充：返 5 值得买积分，补贴后低至 11.89 元，折 2.38 元/件\n"
+            "新增400名额！速冲！\n"
+            "购买链接: https://u.jd.com/oOkQmWD"
+        ),
+        "extracted_links": [{"url": "https://u.jd.com/oOkQmWD"}],
+        "extracted_tokens": [],
+    }
+    copy_zzz = build_clean_original_copywriting(["e76qb3qk"], {"e76qb3qk": doc_zzz}, [], doc=doc_zzz)
+    assert "值得买积分" not in copy_zzz
+    assert "11.89" not in copy_zzz
+    assert "实付低至12.39元" in copy_zzz
+    assert "新增400名额！速冲！" in copy_zzz
+
+    comb_zzz, _ = assemble_combined_text_and_images(
+        ["e76qb3qk"],
+        [{"link_id": "L1", "raw_span": "https://u.jd.com/oOkQmWD", "clean_input": "https://u.jd.com/oOkQmWD"}],
+        {"e76qb3qk": doc_zzz},
+        doc_zzz,
+    )
+    assert "值得买积分" not in comb_zzz
+    assert "[#L1]" in comb_zzz
+    assert "新增400名额！速冲！" in comb_zzz
+
+    # 2) TG_真正值得买 含值得买积分 + 被污染 bot 价格行 + 值率 + 领券:[无需领券] -> 仅当含积分污染才剥 bot 价格行，保留真实正文价格
+    doc_tg_polluted = {
+        "source_site": "telegram",
+        "source_item_id": "zzzdm_399932",
+        "title": "徽六 潜香600 六安瓜片绿茶",
+        "tutorial_text": (
+            "徽六 潜香600 六安瓜片绿茶\n"
+            "下单2件，实付低至130元。\n"
+            "小编补充：返180值得买积分，补贴后低至112.00元，补贴后折56.00元/件\n"
+            "价格：56.0元 (比上次发布低35%)\n"
+            "商家：[京东]\n"
+            "值率：值: 6 不值: 0\n"
+            "领券：[满360减187 (https://u.jd.com/og4nZP7)]\n"
+            "------------------------------"
+        ),
+        "extracted_links": [{"url": "https://u.jd.com/og4nZP7"}],
+        "extracted_tokens": [],
+    }
+    copy_tg_pol = build_clean_original_copywriting(
+        ["zzzdm_399932"], {"zzzdm_399932": doc_tg_polluted}, [], doc=doc_tg_polluted
+    )
+    assert "值得买积分" not in copy_tg_pol
+    assert "112.00" not in copy_tg_pol
+    assert "价格：56.0元" not in copy_tg_pol
+    assert "值率：" not in copy_tg_pol
+    assert "实付低至130元" in copy_tg_pol
+    assert "满360减187" in copy_tg_pol
+
+    # 3) TG_真正值得买 不含值得买积分 -> 保留 价格： 行，仅剥值率 / 无需领券 / 分割线
+    doc_tg_clean = {
+        "source_site": "telegram",
+        "source_item_id": "zzzdm_399924",
+        "title": "360 车载充气泵",
+        "tutorial_text": (
+            "360 车载有线充气泵，实付低至27.45元。\n"
+            "价格：27.45元 (低于常卖价)\n"
+            "商家：[拼多多]\n"
+            "值率：值: 8 不值: 0\n"
+            "领券：[无需领券]\n"
+            "------------------------------"
+        ),
+        "extracted_links": [],
+        "extracted_tokens": [],
+    }
+    copy_tg_clean = build_clean_original_copywriting(
+        ["zzzdm_399924"], {"zzzdm_399924": doc_tg_clean}, [], doc=doc_tg_clean
+    )
+    assert "价格：27.45元" in copy_tg_clean
+    assert "值率：" not in copy_tg_clean
+    assert "无需领券" not in copy_tg_clean
+
+    # 4) 逛丢标签水印剥离，但保留其余全部正文与 shell 行（结构问题2不误动）
+    polished = sanitize_polished_copywriting(
+        "【逛丢热门】维达抽纸24包\n领券\n抢购\nPLUS会员1积分兑111-11券\n入会领100积分，确认收货兑换积分返30猫卡\n返45元京东E卡\n好评返现5元\n小编补充：点击右下角逛一逛领随机券"
+    )
+    assert "【逛丢热门】" not in polished
+    assert "PLUS会员1积分兑111-11券" in polished
+    assert "入会领100积分" in polished
+    assert "兑换积分返30猫卡" in polished
+    assert "返45元京东E卡" in polished
+    assert "好评返现5元" in polished
+    assert "小编补充：点击右下角逛一逛领随机券" in polished
+    assert "领券\n抢购" in polished
+
+
+def test_ai2_batch_swap_guard_high_price_and_score_breakdown_sum():
+    """验证 AI-2 批内串位护栏、10万-100万高价保留、score_breakdown 严格求和与默认 ai2_batch_size=6。"""
+    from models.deal_constants import CLEAN_STAGE_NEED_AI2, ERR_AI_TIMEOUT_RETRY
+    from services.deal_cleaning.stages import _is_ai2_suspected_batch_swap
+
+    cleaner_default = DealPoolCleaner(ai_max_workers=1, convert_max_workers=1)
+    assert cleaner_default.ai2_batch_size == 6
+
+    # 1) 批内串位拦截正反验证
+    swap_payload = {"is_valid_deal": True, "clean_title": "欧巴兰美瞳半年抛2片大直径彩色隐形眼镜"}
+    assert _is_ai2_suspected_batch_swap(
+        swap_payload,
+        "【百补专属】KIMTRUE且初无花果卸妆油",
+        "且初无花果卸妆油",
+        [{"official_product": {"title": "KIMTRUE且初无花果卸妆油150ml", "shop_name": "KIMTRUE旗舰店", "brand": "且初"}}],
+    ) is True
+    assert _is_ai2_suspected_batch_swap(
+        {"is_valid_deal": True, "clean_title": "且初无花果卸妆油 150ml"},
+        "【百补专属】KIMTRUE且初无花果卸妆油",
+        "且初无花果卸妆油",
+        [{"official_product": {"title": "KIMTRUE且初无花果卸妆油150ml", "shop_name": "KIMTRUE旗舰店", "brand": "且初"}}],
+    ) is False
+
+    # 2) process_ai2_unit 端到端验证：串位走 retry_pending；正常高价(301010)与分项和重算生效
+    cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
+    docs = [
+        {
+            "source_site": "xuandan",
+            "source_channel": "选单网",
+            "source_item_id": "swap_1",
+            "title": "KIMTRUE且初无花果卸妆油",
+            "ai_stage1_result": {"combined_raw_text": "KIMTRUE且初无花果卸妆油 [#L1]", "merged_tip_ids": ["swap_1"], "extracted_targets": []},
+            "full_conv_list": [{"link_id": "L1", "text_role_hint": "main_candidate", "convert_status": "product", "platform": "taobao", "goods_id": "G1", "official_product": {"title": "且初无花果卸妆油", "shop_name": "且初旗舰店", "brand": "且初", "price": 59.0, "activity_price": 59.0}, "my_promo_link": "https://s.click.taobao.com/g1"}],
+        },
+        {
+            "source_site": "zzzdm",
+            "source_channel": "值值得买",
+            "source_item_id": "lux_1",
+            "title": "VERTU Signature 手机 301010元",
+            "ai_stage1_result": {"combined_raw_text": "VERTU Signature 手机 实付301010元 [#L1]", "merged_tip_ids": ["lux_1"], "extracted_targets": []},
+            "full_conv_list": [{"link_id": "L1", "text_role_hint": "main_candidate", "convert_status": "product", "platform": "taobao", "goods_id": "G2", "official_product": {"title": "VERTU Signature 手机", "shop_name": "VERTU旗舰店", "brand": "VERTU", "price": 301010.0, "activity_price": 301010.0}, "my_promo_link": "https://s.click.taobao.com/g2"}],
+        },
+    ]
+    cleaner.run_ai_stage2_batch = lambda *_a, **_kw: {
+        "swap_1": {
+            "main_tip_id": "swap_1",
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "clean_title": "欧巴兰美瞳半年抛2片大直径彩色隐形眼镜",
+            "deal_price": 7.09,
+            "quality_score": 88,
+        },
+        "lux_1": {
+            "main_tip_id": "lux_1",
+            "is_valid_deal": True,
+            "main_link_id": "L1",
+            "clean_title": "VERTU Signature 手机",
+            "deal_price": 301010.0,
+            "card_highlight": "到手301010元",
+            "tutorial_steps": ["1. 下单1件，实付301010元"],
+            "quality_score": 94,  # 故意偏离分项和 91，验证确定性重算
+            "score_breakdown": {"match_score": 27, "completeness_score": 25, "price_clarity_score": 19, "tutorial_and_image_score": 20},
+        },
+    }
+    raw_col = MagicMock()
+    raw_col.find.return_value = []
+    outcomes, _ = cleaner.process_ai2_unit(docs, raw_col=raw_col, quiet_sub_logs=True)
+    out_map = {o["source_item_id"]: o for o in outcomes}
+
+    assert out_map["swap_1"]["status"] == "retry_pending"
+    assert out_map["swap_1"]["clean_stage"] == CLEAN_STAGE_NEED_AI2
+    assert out_map["swap_1"]["error_code"] == ERR_AI_TIMEOUT_RETRY
+
+    assert out_map["lux_1"]["status"] == "success"
+    assert out_map["lux_1"]["deal_price"] == 301010.0
+    assert out_map["lux_1"]["quality_score"] == 91
+    assert out_map["lux_1"]["product_doc"]["deal_info"]["quality_score"] == 91

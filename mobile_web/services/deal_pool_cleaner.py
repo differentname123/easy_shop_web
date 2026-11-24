@@ -99,7 +99,7 @@ class DealPoolCleaner:
     ):
         self.use_ai = True
         self.ai_batch_size = max(1, ai_batch_size)
-        self.ai2_batch_size = max(1, ai2_batch_size if ai2_batch_size is not None else 10)
+        self.ai2_batch_size = max(1, ai2_batch_size if ai2_batch_size is not None else 6)
         self.ai_max_workers = max(1, ai_max_workers)
         self.convert_max_workers = max(1, convert_max_workers)
         self.ai_timeout = max(10.0, float(ai_timeout))

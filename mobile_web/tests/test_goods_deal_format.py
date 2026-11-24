@@ -532,3 +532,12 @@ def test_run_format_round_skips_unchanged_success_with_zero_writes():
     assert counts["success"] == 0 and counts["skipped"] == 0
     mgr.update.assert_not_called()
 
+
+def test_goods_formatter_prompts_align_card_highlight_without_weakening_pricing_basis():
+    """验证 GoodsFormatter 线报组合提示词同时包含高光防微观单位与 pricing_basis 物理量隔离规则。"""
+    combined = gif.build_deal_prompt_text()
+    assert "元/斤" in combined
+    assert "元/g" in combined and "严禁" in combined
+    assert "仅作用于 `card_highlight`" in combined
+    assert "pricing_basis" in combined and "base_unit" in combined
+

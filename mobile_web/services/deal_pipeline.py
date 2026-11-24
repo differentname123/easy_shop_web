@@ -474,7 +474,7 @@ def run_fetch_stage(
                         ch_state["consecutive_failures"] += 1
                         ch_state["total_errors"] += 1
                         status_label = "error"
-                    elif raw_list_cnt == 0 and http_status == 200 and cnt == 0:
+                    elif raw_list_cnt == 0 and http_status == 200 and cnt == 0 and not res_dict.get("allow_empty_ok"):
                         ch_state["consecutive_failures"] += 1
                         status_label = "empty_warning"
                     else:

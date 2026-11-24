@@ -107,6 +107,48 @@ _AI2_OFFICIAL_PRODUCT_KEYS = (
 )
 
 _RAW_NUM_RE = re.compile(r"(?<!\d)(\d+(?:\.\d{1,2})?)(?!\d)")
+_OVERLAP_ZH_SEG_RE = re.compile(r"[\u4e00-\u9fff]+")
+_OVERLAP_ALNUM_RE = re.compile(r"[a-z][a-z0-9]{1,}|[0-9]{2,}[a-z]+")
+
+
+def _extract_ai2_overlap_tokens(text: str) -> Set[str]:
+    """提取用于 AI-2 批内串位校验的轻量中文 2-gram 与英文数字词元集合。"""
+    if not text:
+        return set()
+    low = str(text).lower()
+    toks: Set[str] = set()
+    for seg in _OVERLAP_ZH_SEG_RE.findall(low):
+        if len(seg) >= 2:
+            for idx in range(len(seg) - 1):
+                toks.add(seg[idx : idx + 2])
+    for alnum in _OVERLAP_ALNUM_RE.findall(low):
+        toks.add(alnum)
+    return toks
+
+
+def _is_ai2_suspected_batch_swap(
+    ai2_res: Dict[str, Any],
+    combined_raw_text: str,
+    raw_title: str,
+    conv_list: List[Dict[str, Any]],
+) -> bool:
+    """检测 AI-2 输出的有效 clean_title 是否与本条原文/全部官标信息零重合（防批内 ID 串位）。"""
+    if not isinstance(ai2_res, dict) or not ai2_res.get("is_valid_deal"):
+        return False
+    out_toks = _extract_ai2_overlap_tokens(str(ai2_res.get("clean_title") or ""))
+    if len(out_toks) < 3:
+        return False
+    src_parts: List[str] = [str(combined_raw_text or ""), str(raw_title or "")]
+    for c in conv_list or []:
+        op = c.get("official_product") if isinstance(c, dict) else None
+        if isinstance(op, dict):
+            src_parts.append(str(op.get("title") or ""))
+            src_parts.append(str(op.get("shop_name") or ""))
+            src_parts.append(str(op.get("brand") or ""))
+    src_toks = _extract_ai2_overlap_tokens(" ".join(src_parts))
+    if len(src_toks) < 3:
+        return False
+    return len(out_toks & src_toks) == 0
 
 
 def _count_distinct_ai1_main_candidates(targets: List[Dict[str, Any]]) -> int:
@@ -471,12 +513,12 @@ def _normalize_ai1_item(
     )
 
     raw_dp = ai1_res.get("deal_price")
-    if isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and 0.1 <= raw_dp <= 100000:
+    if isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and 0.1 <= raw_dp <= 1000000:
         ai1_res["deal_price"] = round(float(raw_dp), 2)
     elif isinstance(raw_dp, str):
         try:
             val = float(re.sub(r"[^\d.]", "", raw_dp))
-            ai1_res["deal_price"] = round(val, 2) if 0.1 <= val <= 100000 else None
+            ai1_res["deal_price"] = round(val, 2) if 0.1 <= val <= 1000000 else None
         except Exception:
             ai1_res["deal_price"] = None
     else:
@@ -2401,6 +2443,37 @@ def process_ai2_unit(
             )
             continue
 
+        if _is_ai2_suspected_batch_swap(
+            ai2_res,
+            str(s2_inp.get("combined_raw_text") or ""),
+            raw_title,
+            conv_list,
+        ):
+            logger.warning(
+                "🚨 [AI-2 批内串位拦截] %s#%s clean_title=%s 与原文/官标零重合，触发重审",
+                site,
+                mid,
+                str(ai2_res.get("clean_title") or "")[:40],
+            )
+            cleaner.stats_ai_retries_scheduled += 1
+            outcomes_by_id[mid] = _build_retry_or_max_outcome(
+                doc=doc,
+                site=site,
+                channel=channel,
+                mid=mid,
+                raw_title=raw_title,
+                ai1_res=ai1_res,
+                conv_summary=conv_summary_for_db,
+                ai2_res=ai2_res,
+                stage=CLEAN_STAGE_NEED_AI2,
+                retry_err_code=ERR_AI_TIMEOUT_RETRY,
+                max_err_code=ERR_AI_MAX_RETRIES_EXCEEDED,
+                retry_msg="AI-2 疑发生批内串位(clean_title 与原文/官标零重合)，触发重审 ({new_retries}/{max_retries})",
+                max_msg="AI-2 连续 {new_retries} 次疑发生批内串位，达最大重试上限({max_retries}次)放弃",
+                candidate_count=len(conv_list),
+            )
+            continue
+
         link_map = {c["link_id"]: c for c in conv_list}
         is_valid = bool(ai2_res.get("is_valid_deal"))
         main_lid = str(ai2_res.get("main_link_id") or "").strip()
@@ -2447,11 +2520,6 @@ def process_ai2_unit(
             }
             continue
 
-        try:
-            quality_score = int(float(ai2_res.get("quality_score") or 0))
-        except Exception:
-            quality_score = 0
-        quality_score = max(0, min(100, quality_score))
         raw_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
         breakdown_caps = {
             "match_score": 30,
@@ -2469,6 +2537,15 @@ def process_ai2_unit(
             elif not isinstance(bval, bool):
                 score_breakdown[bk] = bval
 
+        if all(k in score_breakdown for k in breakdown_caps):
+            quality_score = sum(score_breakdown[k] for k in breakdown_caps)
+        else:
+            try:
+                quality_score = int(float(ai2_res.get("quality_score") or 0))
+            except Exception:
+                quality_score = 0
+            quality_score = max(0, min(100, quality_score))
+
         source_bonus = SOURCE_REPUTATION_BONUS.get(f"{site}:{channel}") or SOURCE_REPUTATION_BONUS.get(site, 0)
         if source_bonus > 0 and quality_score >= QUALIFIED_DEAL_MIN_SCORE:
             raw_base_score = quality_score
@@ -2485,12 +2562,12 @@ def process_ai2_unit(
 
         raw_deal_p = ai2_res.get("deal_price")
         deal_price: Optional[float] = None
-        if isinstance(raw_deal_p, (int, float)) and 0 < float(raw_deal_p) < 100000:
+        if isinstance(raw_deal_p, (int, float)) and 0 < float(raw_deal_p) < 1000000:
             deal_price = round(float(raw_deal_p), 2)
         elif isinstance(raw_deal_p, str):
             try:
                 val = float(re.sub(r"[^\d.]", "", raw_deal_p))
-                if 0 < val < 100000:
+                if 0 < val < 1000000:
                     deal_price = round(val, 2)
             except Exception:
                 pass

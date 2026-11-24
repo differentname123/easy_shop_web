@@ -65,7 +65,7 @@ SCHEDULER_CONFIG: Dict[str, Any] = {
     "fetch_tick_seconds": 15,                # 调度心跳检测周期（秒），支持各频道独立配置任意秒数间隔
     "clean_limit": DEFAULT_CLEAN_WINDOW,     # 单批清洗最大抽取条数（默认 200）
     "ai_batch_size": 10,                     # AI-1 拆解打包条数（默认 10 条/批）
-    "ai2_batch_size": 10,                    # AI-2 终审打包条数（默认 10 条/批）
+    "ai2_batch_size": 6,                     # AI-2 终审打包条数（默认 6 条/批，降低批内串位风险）
     "ai_workers": 10,                        # AI 并发线程数
     "convert_workers": 20,                   # 官方转链并发线程数
     "ai_timeout": DEFAULT_AI_TIMEOUT_SECONDS,
@@ -319,7 +319,7 @@ def main() -> int:
     )
     cleaner = DealPoolCleaner(
         ai_batch_size=int(cfg["ai_batch_size"]),
-        ai2_batch_size=int(cfg.get("ai2_batch_size", 10)),
+        ai2_batch_size=int(cfg.get("ai2_batch_size", 6)),
         ai_max_workers=int(cfg["ai_workers"]),
         convert_max_workers=int(cfg["convert_workers"]),
         ai_timeout=float(cfg["ai_timeout"]),

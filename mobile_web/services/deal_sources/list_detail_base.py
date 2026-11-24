@@ -327,6 +327,7 @@ class ListDetailDealSource(BaseDealSource):
             touch_ids=sorted(touch_ids),
             sweep_completed=bool(full_sweep and list_res.reached_end and raw_list_count > 0 and not rate_limited),
             rate_limited=rate_limited,
+            allow_empty_ok=bool(list_res.allow_empty_ok),
             detail_errors=detail_errors,
         )
         self.after_fetch(ctx, result)
