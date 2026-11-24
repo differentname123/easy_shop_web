@@ -41,7 +41,10 @@ class _MemoryCursor:
         else:
             specs = list(key_or_list)
         for key, dir_val in reversed(specs):
-            self.docs.sort(key=lambda d: (d.get(key) is not None, d.get(key)), reverse=(dir_val < 0))
+            self.docs.sort(
+                key=lambda d, k=key: (0, 0) if d.get(k) is None else (1, d.get(k)),
+                reverse=(dir_val < 0),
+            )
         return self
 
     def skip(self, n):
@@ -96,6 +99,8 @@ class _MemoryCollection:
                 if "$gte" in v and not (val is not None and val >= v["$gte"]):
                     return False
                 if "$in" in v and val not in v["$in"]:
+                    return False
+                if "$nin" in v and val in v["$nin"]:
                     return False
                 if "$ne" in v and val == v["$ne"]:
                     return False
@@ -179,6 +184,48 @@ class _MemoryCollection:
 
     def count_documents(self, query):
         return sum(1 for d in self.docs if self._match(d, query))
+
+    @classmethod
+    def _eval_expr(cls, doc, expr):
+        if isinstance(expr, str) and expr.startswith("$"):
+            return cls._get_field(doc, expr[1:])
+        if isinstance(expr, dict):
+            if "$ifNull" in expr:
+                field_expr, fallback = expr["$ifNull"]
+                val = cls._eval_expr(doc, field_expr)
+                return cls._eval_expr(doc, fallback) if val is None else val
+            if "$in" in expr:
+                needle_expr, haystack_expr = expr["$in"]
+                return cls._eval_expr(doc, needle_expr) in cls._eval_expr(doc, haystack_expr)
+            if "$cond" in expr:
+                cond_expr, then_expr, else_expr = expr["$cond"]
+                return cls._eval_expr(doc, then_expr) if cls._eval_expr(doc, cond_expr) else cls._eval_expr(doc, else_expr)
+        return expr
+
+    def aggregate(self, pipeline):
+        docs = [deepcopy(d) for d in self.docs]
+        for stage in pipeline:
+            if "$match" in stage:
+                docs = [d for d in docs if self._match(d, stage["$match"])]
+            elif "$addFields" in stage:
+                for d in docs:
+                    for k, expr in stage["$addFields"].items():
+                        d[k] = self._eval_expr(d, expr)
+            elif "$sort" in stage:
+                for key, dir_val in reversed(list(stage["$sort"].items())):
+                    docs.sort(
+                        key=lambda d, k=key: (0, 0) if d.get(k) is None else (1, d.get(k)),
+                        reverse=(dir_val < 0),
+                    )
+            elif "$skip" in stage:
+                docs = docs[int(stage["$skip"]) :]
+            elif "$limit" in stage:
+                docs = docs[: int(stage["$limit"])]
+            elif "$project" in stage:
+                docs = [self._project_doc(d, stage["$project"]) for d in docs]
+            else:
+                raise NotImplementedError(f"Unsupported aggregate stage: {list(stage.keys())}")
+        return docs
 
     def find_one_and_update(self, query, update, projection=None, return_document=None):
         for d in self.docs:
@@ -2078,6 +2125,444 @@ def test_group_help_preserves_exported_targets_expires_pending_confirm_and_block
     with pytest.raises(GroupHelpPermissionError) as exc_info:
         svc.submit_poster_image(_make_poster_image_bytes(short_url), viewer_uid="u_stranger_2")
     assert exc_info.value.status_code == 403 and exc_info.value.error_code == "owner_only"
+
+
+def test_search_groups_always_prioritizes_local_user_groups_over_external():
+    """验证本平台用户自主发布的多人团在所有筛选/搜索/分页场景下始终排在外部采集团之前。"""
+    from models.group_help import (
+        ENTRY_TYPE_POSTER,
+        SOURCE_USER_TEXT,
+        SOURCE_USER_UPLOAD,
+    )
+
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    now = 1_795_500_000.0
+
+    # 1. 外部采集团：最新发布、0点击、仅差1人（如果按旧排序会霸占最顶部）
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": "tok_ExtAcdog01",
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "清风抽纸原木24包",
+            "group_price": 19.9,
+            "remain_people": 1,
+            "created_at": now - 10,
+            "expires_at": now + 36000,
+        },
+        now=now,
+        check_similar=False,
+    )
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": "tok_ExtMiao01",
+            "entry_type": "token",
+            "source": "miaozhuli",
+            "goods_name": "清风抽纸软抽20包",
+            "group_price": 16.9,
+            "remain_people": 1,
+            "created_at": now - 5,
+            "expires_at": now + 36000,
+        },
+        now=now,
+        check_similar=False,
+    )
+
+    # 2. 本平台用户口令团：有 2 次点击，差 1 人
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": "tok_LocalTxt01",
+            "entry_type": "token",
+            "source": SOURCE_USER_TEXT,
+            "goods_name": "清风抽纸手帕纸",
+            "group_price": 12.9,
+            "remain_people": 1,
+            "created_at": now - 200,
+            "expires_at": now + 36000,
+        },
+        now=now,
+        check_similar=False,
+    )
+    for _ in range(2):
+        repo.increment_click("tok_LocalTxt01", now=now)
+
+    # 3. 本平台用户海报团：有 5 次点击，还差 3 人，发布较早 -> 仍必须压过所有外部团
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": "3495229659187888001",
+            "entry_type": ENTRY_TYPE_POSTER,
+            "source": SOURCE_USER_UPLOAD,
+            "goods_name": "清风抽纸整箱装",
+            "group_price": 29.9,
+            "remain_people": 3,
+            "created_at": now - 500,
+            "expires_at": now + 36000,
+        },
+        now=now,
+        check_similar=False,
+    )
+    for _ in range(5):
+        repo.increment_click("3495229659187888001", now=now)
+
+    # 4. 历史缺失 source 字段的存量用户团：有 4 次点击，差 2 人 -> 同样视为本平台用户团
+    repo.col.docs.append(
+        {
+            "group_order_id": "3495229659187888002",
+            "entry_type": ENTRY_TYPE_POSTER,
+            "parse_status": PARSE_STATUS_PARSED,
+            "group_status": GROUP_STATUS_ACTIVE,
+            "goods_name": "清风抽纸历史存量团",
+            "group_price": 24.9,
+            "remain_people": 2,
+            "click_count": 4,
+            "created_at": now - 400,
+            "expires_at": now + 36000,
+        }
+    )
+
+    # 5. 已过期的一个本平台团与一个外部团（用于验证 filter_mode="all"）
+    repo.col.docs.extend(
+        [
+            {
+                "group_order_id": "tok_LocalExp01",
+                "source": SOURCE_USER_TEXT,
+                "parse_status": PARSE_STATUS_PARSED,
+                "group_status": GROUP_STATUS_EXPIRED,
+                "goods_name": "清风已过期本地团",
+                "remain_people": 1,
+                "click_count": 3,
+                "created_at": now - 600,
+                "expires_at": now - 10,
+            },
+            {
+                "group_order_id": "tok_ExtExp01",
+                "source": "acdog",
+                "parse_status": PARSE_STATUS_PARSED,
+                "group_status": GROUP_STATUS_EXPIRED,
+                "goods_name": "清风已过期外部团",
+                "remain_people": 1,
+                "click_count": 0,
+                "created_at": now - 100,
+                "expires_at": now - 10,
+            },
+        ]
+    )
+
+    # (a) 默认大厅列表 (active)：3 个本平台团全在 2 个外部团前面，且本平台内部按 click_count ASC
+    res_active = repo.search_groups(filter_mode="active", limit=20, now=now)
+    assert [it["group_order_id"] for it in res_active["items"]] == [
+        "tok_LocalTxt01",         # local, clicks=2
+        "3495229659187888002",    # local (legacy missing source), clicks=4
+        "3495229659187888001",    # local, clicks=5
+        "tok_ExtMiao01",          # external, clicks=0, newer
+        "tok_ExtAcdog01",         # external, clicks=0, older
+    ]
+
+    # (b) 多页分页连续性 (limit=2)：跨页顺序稳定且无遗漏重复
+    p1 = repo.search_groups(filter_mode="active", offset=0, limit=2, now=now)
+    p2 = repo.search_groups(filter_mode="active", offset=2, limit=2, now=now)
+    p3 = repo.search_groups(filter_mode="active", offset=4, limit=2, now=now)
+    assert p1["has_more"] is True and p2["has_more"] is True and p3["has_more"] is False
+    paged_ids = [it["group_order_id"] for it in (p1["items"] + p2["items"] + p3["items"])]
+    assert paged_ids == [it["group_order_id"] for it in res_active["items"]]
+
+    # (c) 仅差 1 人 (almost)：本平台差 1 人团（2点击）排在外部差 1 人团（0点击）前面
+    res_almost = repo.search_groups(filter_mode="almost", limit=20, now=now)
+    assert [it["group_order_id"] for it in res_almost["items"]] == [
+        "tok_LocalTxt01",
+        "tok_ExtMiao01",
+        "tok_ExtAcdog01",
+    ]
+
+    # (d) 关键词搜索：同样遵循本平台团优先
+    res_kw = repo.search_groups(keyword="清风", filter_mode="active", limit=20, now=now)
+    assert [it["group_order_id"] for it in res_kw["items"]] == [
+        "tok_LocalTxt01",
+        "3495229659187888002",
+        "3495229659187888001",
+        "tok_ExtMiao01",
+        "tok_ExtAcdog01",
+    ]
+
+    # (e) 全部模式 (all)：active 状态在前（本地先于外部），expired 状态在后（本地先于外部）
+    res_all = repo.search_groups(filter_mode="all", limit=20, now=now)
+    assert [it["group_order_id"] for it in res_all["items"]] == [
+        "tok_LocalTxt01",
+        "3495229659187888002",
+        "3495229659187888001",
+        "tok_ExtMiao01",
+        "tok_ExtAcdog01",
+        "tok_LocalExp01",
+        "tok_ExtExp01",
+    ]
+
+
+def test_local_user_groups_not_blocked_overwritten_or_duplicated_by_external_sources(tmp_path):
+    """验证：外部团不拦截本平台同款匹配、不覆盖/不重复回流本平台用户团，本平台用户再提交外部团可升格为本平台优先团。"""
+    from models.group_help import (
+        GROUP_STATUS_PENDING_CONFIRM,
+        SOURCE_USER_TEXT,
+        SOURCE_USER_UPLOAD,
+    )
+
+    import time as _time
+    GroupHelpImporter = _load_mobile_script("group_help_importer").GroupHelpImporter
+    repo = GroupHelpRepository(db_instance=_MemoryDB())
+    now = _time.time()
+
+    # 1. 大厅已有一个外部 acdog 采集的农夫山泉团（还有另一个外部团）
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": "tok_ExtWater01",
+            "entry_type": "token",
+            "source": "acdog",
+            "goods_name": "农夫山泉饮用天然水550ml*24瓶",
+            "group_price": 19.9,
+            "total_people": 3,
+            "remain_people": 1,
+            "share_text": "快来拼团 ⇥ExtWater01⇤",
+            "share_code": "ExtWater01",
+            "created_at": now - 60,
+            "expires_at": now + 36000,
+        },
+        now=now,
+        check_similar=False,
+    )
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": "tok_ExtOther99",
+            "entry_type": "token",
+            "source": "miaozhuli",
+            "goods_name": "维达抽纸18包",
+            "group_price": 18.8,
+            "total_people": 2,
+            "remain_people": 1,
+            "share_text": "快来拼团 ⇥ExtOther99⇤",
+            "share_code": "ExtOther99",
+            "created_at": now - 30,
+            "expires_at": now + 36000,
+        },
+        now=now,
+        check_similar=False,
+    )
+
+    svc = GroupHelpService(repo=repo, poster_dir=tmp_path / "posters")
+
+    # 2. 本平台用户 A 发布同款同价农夫山泉 -> 绝不被外部 acdog 团截流为 pending_confirm，必须直接 active 上架并排第一
+    res_u1 = svc.submit_text_group(
+        share_text="快来帮我拼 ⇥LocalWater1⇤",
+        goods_name="农夫山泉饮用天然水550ml*24瓶",
+        group_price=19.9,
+        total_people=3,
+        remain_people=2,
+        publisher_nick="本平台团长A",
+        viewer_uid="u_local_a",
+    )
+    assert res_u1["data"]["group_status"] == GROUP_STATUS_ACTIVE
+    assert res_u1["data"]["matched_group_order_id"] == ""
+    assert res_u1["data"]["source"] == SOURCE_USER_TEXT
+
+    # 3. 本平台用户 B 再发同款同价农夫山泉 -> 正确匹配到本平台用户 A 的团（而非外部 acdog 团）
+    res_u2 = svc.submit_text_group(
+        share_text="快来帮我拼 ⇥LocalWater2⇤",
+        goods_name="农夫山泉饮用天然水550ml*24瓶",
+        group_price=19.9,
+        total_people=3,
+        remain_people=2,
+        viewer_uid="u_local_b",
+    )
+    assert res_u2["data"]["group_status"] == GROUP_STATUS_PENDING_CONFIRM
+    assert res_u2["data"]["matched_group_order_id"] == "tok_LocalWater1"
+
+    # 4. 本平台用户 C 上传带口令的海报团（数字 group_order_id + share_code="PosterCode99"）
+    poster_gid = "3510310577796999001"
+    repo.create_or_refresh_initial_group(
+        {
+            "group_order_id": poster_gid,
+            "entry_type": "poster",
+            "source": SOURCE_USER_UPLOAD,
+            "share_text": "拼多多 ⇥PosterCode99⇤",
+            "share_code": "PosterCode99",
+            "poster_path": str(tmp_path / "posters" / f"{poster_gid}.jpg"),
+            "owner_token": "tok_poster_own",
+            "created_at": now,
+        }
+    )
+    repo.mark_parse_succeeded(
+        poster_gid,
+        {
+            "goods_name": "蓝月亮洗衣液3kg",
+            "group_price": 29.9,
+            "total_people": 3,
+            "remain_people": 2,
+            "remaining_seconds": 36000,
+        },
+        now=now + 1,
+    )
+
+    # 5. 外部秒助力回流同步：同时抓回了用户 A 的口令团和用户 C 海报附带的口令
+    #    - 绝不可覆盖用户 A 的 remain_people=2 / total_people=3 / publisher_nick / source
+    #    - 绝不可为用户 C 的 PosterCode99 生成重复的 tok_PosterCode99 外部记录
+    class _FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, params=None, headers=None, timeout=12):
+        if (params or {}).get("page", 1) != 1:
+            return _FakeResp({"items": []})
+        if "acdog" in url:
+            return _FakeResp(
+                {
+                    "items": [
+                        {
+                            "id": "ext1",
+                            "platform": "pdd",
+                            "rawText": "快来拼团 ⇥ExtWater01⇤",
+                            "coreCode": "ExtWater01",
+                            "price": 19.9,
+                            "titleDisplay": "农夫山泉饮用天然水550ml*24瓶",
+                            "groupSize": 3,
+                            "spotsLeft": 1,
+                            "status": "active",
+                            "createdAt": int((now - 60) * 1000),
+                            "expiresAt": int((now + 36000) * 1000),
+                        }
+                    ]
+                }
+            )
+        return _FakeResp(
+            {
+                "items": [
+                    {
+                        "id": 900,
+                        "nick": "秒助原团",
+                        "title": "维达抽纸18包",
+                        "share_text": "快来拼团 ⇥ExtOther99⇤",
+                        "price": 18.8,
+                        "team_size": 2,
+                        "status": "active",
+                        "marks": {"full": 0, "expire": 0},
+                        "time_left": 36000,
+                    },
+                    {
+                        "id": 901,
+                        "nick": "秒助匿名号",
+                        "title": "农夫山泉（被回流修改）",
+                        "share_text": "秒助力 ⇥LocalWater1⇤",
+                        "price": 19.9,
+                        "team_size": 2,
+                        "status": "active",
+                        "marks": {"full": 0, "expire": 0},
+                        "time_left": 18000,
+                    },
+                    {
+                        "id": 902,
+                        "nick": "秒助回流",
+                        "title": "蓝月亮洗衣液3kg",
+                        "share_text": "秒助力 ⇥PosterCode99⇤",
+                        "price": 29.9,
+                        "team_size": 3,
+                        "status": "active",
+                        "marks": {"full": 0, "expire": 0},
+                        "time_left": 18000,
+                    },
+                ]
+            }
+        )
+
+    importer = GroupHelpImporter(repo=repo, http_get=_fake_get, pages=1)
+    imp_res = importer.run_once(now=now + 60)
+    assert imp_res["sources"]["acdog"]["upserted"] == 0
+    assert imp_res["sources"]["acdog"]["unchanged"] == 1
+    assert imp_res["sources"]["miaozhuli"]["upserted"] == 0
+    assert imp_res["sources"]["miaozhuli"]["unchanged"] == 3
+    assert imp_res["offline_synced"] == 0
+
+    u1_after = repo.get_by_group_order_id("tok_LocalWater1")
+    assert u1_after["source"] == SOURCE_USER_TEXT
+    assert u1_after["remain_people"] == 2
+    assert u1_after["total_people"] == 3
+    assert u1_after["goods_name"] == "农夫山泉饮用天然水550ml*24瓶"
+    assert u1_after["publisher_nick"] == "本平台团长A"
+    assert repo.get_by_group_order_id("tok_PosterCode99") is None
+
+    # 6. 本平台用户 D 通过口令发布一个此前由 acdog 采集的在架团 -> 自动升格为 user_text 并签发 owner_token
+    res_upgrade = svc.submit_text_group(
+        share_text="快来帮我拼 ⇥ExtWater01⇤",
+        goods_name="农夫山泉饮用天然水550ml*24瓶",
+        group_price=19.9,
+        total_people=3,
+        remain_people=1,
+        viewer_uid="u_local_d",
+    )
+    assert res_upgrade["data"]["source"] == SOURCE_USER_TEXT
+    assert res_upgrade.get("owner_token")
+
+    # 升格后防劫持校验依然生效（路人再次提交同一口令必须报错）
+    with pytest.raises(ValueError, match="已在大厅中存在"):
+        svc.submit_text_group(
+            share_text="恶意篡改 ⇥ExtWater01⇤",
+            goods_name="篡改商品名",
+            group_price=1.0,
+            viewer_uid="u_stranger",
+        )
+
+    # 7. 本平台用户 E 对一个此前由外部采集入库的数字团单补传真实海报 -> 升格为 user_upload 并签发 owner_token
+    ext_num_gid = "3510310577796999002"
+    ext_short_url = "https://file-link.pinduoduo.com/extnum2"
+    repo.upsert_parsed_group(
+        {
+            "group_order_id": ext_num_gid,
+            "entry_type": "link",
+            "source": "acdog",
+            "goods_name": "外部链接采集商品",
+            "group_price": 39.9,
+            "total_people": 3,
+            "remain_people": 1,
+            "created_at": now - 120,
+            "expires_at": now + 36000,
+        },
+        now=now,
+        check_similar=False,
+    )
+    poster_svc = GroupHelpService(
+        repo=repo,
+        poster_dir=tmp_path / "posters",
+        http_get=lambda *a, **k: SimpleNamespace(
+            status_code=307,
+            headers={"Location": f"https://mobile.yangkeduo.com/group7.html?group_order_id={ext_num_gid}"},
+            text="",
+        ),
+        ai_generator=lambda *a, **k: {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "is_group_poster": True,
+                    "is_compliant": True,
+                    "goods_name": "用户补传海报名",
+                    "keywords": ["补传"],
+                    "group_price": 39.9,
+                    "total_people": 3,
+                    "remain_people": 2,
+                    "remaining_seconds": 36000,
+                }
+            ),
+        },
+    )
+    up_ext_poster = poster_svc.submit_poster_image(_make_poster_image_bytes(ext_short_url), viewer_uid="u_local_e")
+    assert up_ext_poster.get("owner_token")
+    assert up_ext_poster["data"]["source"] == SOURCE_USER_UPLOAD
+    poster_svc.process_pending_batch(batch_size=2)
+    assert repo.get_by_group_order_id(ext_num_gid)["source"] == SOURCE_USER_UPLOAD
+
+    # 最终大厅排序：所有本平台团（含刚升格的 tok_ExtWater01 与 ext_num_gid）全排在仅剩的外部团 tok_ExtOther99 之前
+    hall_ids = [it["group_order_id"] for it in repo.search_groups(limit=20)["items"]]
+    assert hall_ids[-1] == "tok_ExtOther99"
+    assert set(hall_ids[:-1]) == {"tok_LocalWater1", poster_gid, "tok_ExtWater01", ext_num_gid}
 
 
 

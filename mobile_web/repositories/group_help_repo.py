@@ -12,10 +12,13 @@ from models.group_help import (
     EXPORT_STATUS_FAILED,
     EXPORT_STATUS_SUCCESS,
     EXPORT_TARGET_MIAOZHULI,
+    EXTERNAL_GROUP_SOURCES,
     GROUP_STATUS_ACTIVE,
     GROUP_STATUS_EXPIRED,
     GROUP_STATUS_FULL,
     GROUP_STATUS_PENDING_CONFIRM,
+    LOCAL_GROUP_QUERY_SOURCES,
+    LOCAL_GROUP_SOURCES,
     MAX_PARSE_ATTEMPTS,
     OFFLINE_REASON_UPSTREAM_MISSING,
     PARSE_STATUS_FAILED,
@@ -24,6 +27,7 @@ from models.group_help import (
     SOURCE_USER_TEXT,
     SOURCE_USER_UPLOAD,
     is_highly_similar_goods,
+    is_local_group_source,
     validate_and_normalize_parsed_poster,
     extract_pdd_share_token,
 )
@@ -99,6 +103,10 @@ class GroupHelpRepository(BaseRepository):
                 "offline_reason": "",
                 "updated_at": now,
             }
+            if not str(existing.get("owner_token") or "").strip() and str(data.get("owner_token") or "").strip():
+                set_fields["owner_token"] = str(data["owner_token"]).strip()
+            if not str(existing.get("owner_uid") or "").strip() and str(data.get("owner_uid") or "").strip():
+                set_fields["owner_uid"] = str(data["owner_uid"]).strip()
             if str(data.get("share_text") or "").strip():
                 set_fields["share_text"] = str(data.get("share_text") or "").strip()
                 set_fields["share_code"] = str(data.get("share_code") or "")
@@ -191,6 +199,7 @@ class GroupHelpRepository(BaseRepository):
                     "group_status": GROUP_STATUS_ACTIVE,
                     "expires_at": {"$gt": current_ts},
                     "remain_people": {"$gt": 0},
+                    "source": {"$in": list(LOCAL_GROUP_QUERY_SOURCES)},
                 },
                 {"_id": 0},
             )
@@ -390,20 +399,39 @@ class GroupHelpRepository(BaseRepository):
         safe_limit = max(1, min(50, int(limit)))
 
         total = self.col.count_documents(query)
-        cursor = (
-            self.col.find(query, {"_id": 0})
-            .sort(
-                [
-                    ("group_status", ASCENDING),
-                    ("click_count", ASCENDING),
-                    ("remain_people", ASCENDING),
-                    ("created_at", DESCENDING),
-                ]
-            )
-            .skip(safe_offset)
-            .limit(safe_limit)
-        )
-        items = list(cursor)
+        pipeline = [
+            {"$match": query},
+            {
+                "$addFields": {
+                    "_source_rank": {
+                        "$cond": [
+                            {
+                                "$in": [
+                                    {"$ifNull": ["$source", ""]},
+                                    [*LOCAL_GROUP_SOURCES, ""],
+                                ]
+                            },
+                            0,
+                            1,
+                        ]
+                    }
+                }
+            },
+            {
+                "$sort": {
+                    "group_status": ASCENDING,
+                    "_source_rank": ASCENDING,
+                    "click_count": ASCENDING,
+                    "remain_people": ASCENDING,
+                    "created_at": DESCENDING,
+                    "group_order_id": ASCENDING,
+                }
+            },
+            {"$skip": safe_offset},
+            {"$limit": safe_limit},
+            {"$project": {"_id": 0, "_source_rank": 0}},
+        ]
+        items = list(self.col.aggregate(pipeline))
 
         pending_count = self.col.count_documents(
             {
@@ -592,15 +620,14 @@ class GroupHelpRepository(BaseRepository):
             if is_user_takedown:
                 return existing, False, None
 
-            incoming_source = str(data.get("source") or SOURCE_USER_TEXT)
-            existing_source = str(
-                existing.get("source") or (SOURCE_USER_UPLOAD if existing.get("poster_path") else SOURCE_USER_TEXT)
-            )
-            # 外部采集不得覆盖真实用户上传的海报与归属信息
-            if preserve_local_takedown and existing_source == SOURCE_USER_UPLOAD and incoming_source != SOURCE_USER_UPLOAD:
+            incoming_source = str(data.get("source") or SOURCE_USER_TEXT).strip() or SOURCE_USER_TEXT
+            existing_is_local = is_local_group_source(existing.get("source"))
+            incoming_is_local = is_local_group_source(incoming_source)
+            # 外部采集不得覆盖本平台用户自主上传/发布的拼团记录与归属信息
+            if preserve_local_takedown and existing_is_local and not incoming_is_local:
                 return existing, False, None
 
-            is_external_source = incoming_source in ("acdog", "miaozhuli")
+            is_external_source = incoming_source in EXTERNAL_GROUP_SOURCES
 
             # 拼多多物理生命周期（24小时）绝对拦截
             if pdd_physical_expires <= current_ts:
@@ -641,6 +668,12 @@ class GroupHelpRepository(BaseRepository):
                 "remain_people": max(1, int(data.get("remain_people") if data.get("remain_people") is not None else (existing.get("remain_people") or 1))),
                 "updated_at": current_ts,
             }
+            if not existing_is_local and incoming_is_local:
+                update_fields["source"] = incoming_source
+                if not str(existing.get("owner_token") or "").strip() and str(data.get("owner_token") or "").strip():
+                    update_fields["owner_token"] = str(data["owner_token"]).strip()
+                if not str(existing.get("owner_uid") or "").strip() and str(data.get("owner_uid") or "").strip():
+                    update_fields["owner_uid"] = str(data["owner_uid"]).strip()
             if should_relist:
                 update_fields["group_status"] = GROUP_STATUS_ACTIVE
                 update_fields["offline_reason"] = ""
@@ -665,6 +698,19 @@ class GroupHelpRepository(BaseRepository):
 
         if expires_at <= current_ts:
             raise ValueError("该拼团已超过有效期，未录入")
+
+        incoming_source = str(data.get("source") or SOURCE_USER_TEXT).strip() or SOURCE_USER_TEXT
+        incoming_share_code = str(data.get("share_code") or "").strip()
+        if preserve_local_takedown and not is_local_group_source(incoming_source) and incoming_share_code:
+            local_same_code = self.col.find_one(
+                {
+                    "share_code": incoming_share_code,
+                    "source": {"$in": list(LOCAL_GROUP_QUERY_SOURCES)},
+                },
+                {"_id": 0},
+            )
+            if local_same_code is not None:
+                return local_same_code, False, None
 
         matched_doc: Optional[Dict[str, Any]] = None
         if check_similar:
@@ -759,7 +805,7 @@ class GroupHelpRepository(BaseRepository):
         active_external_keys: Set[str],
         *,
         now: Optional[float] = None,
-        sources: Tuple[str, ...] = ("acdog", "miaozhuli"),
+        sources: Tuple[str, ...] = EXTERNAL_GROUP_SOURCES,
     ) -> int:
         """两站皆无时自动下架：如果外部采集的活跃团在所有外部源中均已消失，则自动下架（从大厅隐藏）。
 
@@ -855,7 +901,7 @@ class GroupHelpRepository(BaseRepository):
         target_name = str(target or EXPORT_TARGET_MIAOZHULI).strip()
 
         query: Dict[str, Any] = {
-            "source": {"$in": [SOURCE_USER_UPLOAD, SOURCE_USER_TEXT]},
+            "source": {"$in": list(LOCAL_GROUP_SOURCES)},
             "parse_status": PARSE_STATUS_PARSED,
             "group_status": GROUP_STATUS_ACTIVE,
             "expires_at": {"$gt": current_ts},

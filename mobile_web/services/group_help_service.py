@@ -39,6 +39,7 @@ from models.group_help import (
     GroupHelpPermissionError,
     format_group_doc,
     is_allowed_pdd_url,
+    is_local_group_source,
     is_relist_feedback,
     is_takedown_feedback,
     is_valid_group_order_id,
@@ -331,6 +332,7 @@ class GroupHelpService:
         now = time.time()
         existing = self.repo.get_by_group_order_id(gid)
         issued_owner_token = ""
+        upgrading_external = False
         clean_uid = str(viewer_uid or "").strip()
 
         if existing is not None:
@@ -361,6 +363,9 @@ class GroupHelpService:
                         "message": "该拼团已在互助大厅展示，无需重复上传",
                         "data": self._format_with_matched_group(existing, now=now),
                     }
+            elif not self._has_owner_binding(existing) and not is_local_group_source(existing.get("source")):
+                issued_owner_token = secrets.token_hex(12)
+                upgrading_external = True
             elif self._is_group_owner(existing, owner_token=owner_token, viewer_uid=clean_uid) and owner_token:
                 issued_owner_token = str(owner_token).strip()
         else:
@@ -377,7 +382,7 @@ class GroupHelpService:
             "poster_path": str(poster_path),
             "created_at": now,
         }
-        if existing is None:
+        if existing is None or upgrading_external:
             record_input["owner_token"] = issued_owner_token
             record_input["owner_uid"] = clean_uid
 
@@ -458,6 +463,7 @@ class GroupHelpService:
 
         existing = self.repo.get_by_group_order_id(gid)
         issued_owner_token = ""
+        upgrading_external = False
         if existing is not None:
             orig_status = str(existing.get("group_status") or "")
             if float(existing.get("expires_at") or 0) <= now or orig_status == GROUP_STATUS_EXPIRED:
@@ -466,8 +472,16 @@ class GroupHelpService:
                 raise ValueError("该拼团已被标记满员，如需继续拼单请在详情页点击「未满恢复」")
             is_owner = self._is_group_owner(existing, owner_token=owner_token, viewer_uid=clean_uid)
             if not is_owner:
-                raise ValueError("该拼团口令/链接已在大厅中存在，请直接搜索参团或在详情页反馈人数变化")
-            if owner_token:
+                if (
+                    not is_local_group_source(existing.get("source"))
+                    and not self._has_owner_binding(existing)
+                    and orig_status == GROUP_STATUS_ACTIVE
+                ):
+                    upgrading_external = True
+                    issued_owner_token = secrets.token_hex(12)
+                else:
+                    raise ValueError("该拼团口令/链接已在大厅中存在，请直接搜索参团或在详情页反馈人数变化")
+            elif owner_token:
                 issued_owner_token = str(owner_token).strip()
         else:
             issued_owner_token = secrets.token_hex(12)
@@ -478,7 +492,7 @@ class GroupHelpService:
             "poster_path": "",
             "created_at": now,
         }
-        if existing is None:
+        if existing is None or upgrading_external:
             record_input["owner_token"] = issued_owner_token
             record_input["owner_uid"] = clean_uid
 

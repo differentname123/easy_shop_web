@@ -22,6 +22,17 @@ ENTRY_TYPE_TOKEN = "token"
 
 SOURCE_USER_UPLOAD = "user_upload"
 SOURCE_USER_TEXT = "user_text"
+LOCAL_GROUP_SOURCES = (SOURCE_USER_UPLOAD, SOURCE_USER_TEXT)
+LOCAL_GROUP_QUERY_SOURCES = (SOURCE_USER_UPLOAD, SOURCE_USER_TEXT, None, "")
+EXTERNAL_GROUP_SOURCES = ("acdog", "miaozhuli")
+
+
+def is_local_group_source(source: Any) -> bool:
+    """判断拼团记录是否来自本平台用户自主发布（缺省历史记录亦视为本平台用户团）。"""
+    if source is None:
+        return True
+    clean = str(source).strip()
+    return clean == "" or clean in LOCAL_GROUP_SOURCES
 
 EXPORT_STATUS_SUCCESS = "success"
 EXPORT_STATUS_FAILED = "failed"
