@@ -125,7 +125,7 @@ After=network.target
 Type=simple
 ExecStart=/opt/meilisearch/meilisearch \
   --http-addr 127.0.0.1:7700 \
-  --db-path /data/meili_data \
+  --db-path /data/meili_data/data.ms \
   --master-key easyshop2026 \
   --max-indexing-memory 268435456 \
   --no-analytics

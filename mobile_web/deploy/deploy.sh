@@ -27,6 +27,7 @@ NGINX_ENABLED="/etc/nginx/sites-enabled/shop.easyeverything.cn.conf"
 MEILI_BIN="/opt/meilisearch/meilisearch"
 MEILI_VERSION="v1.12.8"
 
+ORIG_ARGS=("$@")
 DO_INIT=0
 DO_SYNC_MEILI=0
 SKIP_PULL=0
@@ -115,16 +116,28 @@ fi
 if [[ "${SKIP_PULL}" -eq 0 ]]; then
   log_step "1. 拉取 GitHub 最新代码 (main)"
   cd "${REPO_ROOT}"
+  SELF_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+  BEFORE_SHA="$(sha256sum "${SELF_PATH}" 2>/dev/null | awk '{print $1}' || true)"
+  PULL_OK=0
   if git pull origin main; then
     ST_GIT="✅ 已同步 ($(git rev-parse --short HEAD 2>/dev/null || echo 'unknown'))"
+    PULL_OK=1
   else
     echo "⚠️ 直连 GitHub 失败，尝试国内镜像通道 ghfast.top..."
     if git pull https://ghfast.top/https://github.com/differentname123/easy_shop_web.git main; then
       ST_GIT="✅ 镜像同步 ($(git rev-parse --short HEAD 2>/dev/null || echo 'unknown'))"
+      PULL_OK=1
     else
       echo "❌ 拉取代码失败，请检查网络或本地未提交修改"
       ST_GIT="❌ 拉取失败"
       CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
+    fi
+  fi
+  if [[ "${PULL_OK}" -eq 1 ]]; then
+    AFTER_SHA="$(sha256sum "${SELF_PATH}" 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -n "${BEFORE_SHA}" && -n "${AFTER_SHA}" && "${BEFORE_SHA}" != "${AFTER_SHA}" ]]; then
+      echo "ℹ️ 检测到 deploy.sh 自身已更新，正无缝切换为新版脚本继续执行..."
+      exec bash "${SELF_PATH}" --skip-pull ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     fi
   fi
 else
@@ -228,6 +241,10 @@ else
     fi
 
     if [[ -x "${MEILI_BIN}" ]]; then
+      mkdir -p /data/meili_data
+      if [[ -d /data/meili_data/data.ms && ! -f /data/meili_data/data.ms/VERSION ]]; then
+        rmdir /data/meili_data/data.ms 2>/dev/null || true
+      fi
       MEILI_KEY_OPT=""
       if [[ -n "${MEILI_KEY}" ]]; then
         MEILI_KEY_OPT="--master-key ${MEILI_KEY}"
@@ -239,7 +256,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${MEILI_BIN} --http-addr 127.0.0.1:7700 --db-path /data/meili_data ${MEILI_KEY_OPT} --max-indexing-memory 268435456 --no-analytics
+ExecStart=${MEILI_BIN} --http-addr 127.0.0.1:7700 --db-path /data/meili_data/data.ms ${MEILI_KEY_OPT} --max-indexing-memory 268435456 --no-analytics
 Restart=always
 RestartSec=5
 

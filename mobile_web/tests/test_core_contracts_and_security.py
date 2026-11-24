@@ -327,6 +327,7 @@ class TestApiSecurityRoutes(unittest.TestCase):
             "--init",
             "sync_meilisearch.py",
             "ssl_certificate",
+            "--db-path /data/meili_data/data.ms",
             "--max-indexing-memory 268435456",
             "journalctl -u meilisearch.service",
             "--resolve",
