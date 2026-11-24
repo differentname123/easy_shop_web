@@ -1335,12 +1335,10 @@ def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
 
     formal_col.update_many.reset_mock()
     raw_col.update_many.return_value = SimpleNamespace(modified_count=4)
-    formal_col.update_many.return_value = SimpleNamespace(modified_count=2)
     exp = repo.expire_missing_from_full_sweep(source_site="haodanku", channel="好单库_京东实时线报", sweep_start_time=datetime.datetime(2026, 11, 20, 8, 0, 0))
-    assert exp == {"raw_expired": 4, "formal_expired": 2}
-    sweep_q = formal_col.update_many.call_args[0][0]
-    assert "$and" in sweep_q
-    assert any("$or" in clause and {"deal_info.last_seen_at": {"$lt": datetime.datetime(2026, 11, 20, 8, 0, 0)}} in clause["$or"] for clause in sweep_q["$and"])
+    # 全量巡视只收敛初步表待清洗任务，不在拉取阶段立即摘除正式表好价标（由维护线程统一按TTL超期失效）
+    assert exp == {"raw_expired": 4, "formal_expired": 0}
+    assert formal_col.update_many.call_count == 0
 
     formal_col.update_many.reset_mock()
     deleted_raw = repo.reset_raw_collection()

@@ -499,13 +499,13 @@ class DealRawPoolRepository:
         channel: str,
         sweep_start_time: datetime.datetime,
     ) -> Dict[str, int]:
-        """【全量巡视 Fail-Closed 失效清除机制】：
-        对执行全量拉取 (full_sweep=True) 的站点或频道，未在本次拉取列表中出现的历史商品（last_seen_at < sweep_start_time），
-        代表上游已下架或失效：
+        """【全量巡视初步表任务收敛】：
+        对执行全量拉取 (full_sweep=True) 的站点或频道，未在本次拉取列表中出现的历史记录：
         1. 初步表 deal_raw_tips：处于 pending 状态的记录直接置为 cleaned_failed，
            错误码 UPSTREAM_DISAPPEARED，避免无效消耗下游 AI 算力与转链请求；
-        2. 正式表 products：属于该站点对应频道的在架好价商品 (deal_info.is_deal_tip=True)，
-           若 updated_at < sweep_start_time，立即摘除好价标 (is_deal_tip=False) 并记录 expired_at。
+        2. 正式表 products：严格遵守单一职责与时间超期原则，不在拉取阶段立即摘除好价标或下架。
+           在榜商品由 touch_seen / upsert 刷新 last_seen_at，不在榜商品时间自然停滞老化，
+           统一由后台维护线程 MaintenanceWorker 调用 expire_stale_formal_deals 依据超期时间窗口统一做平滑失效。
         """
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         now_naive = now_dt.replace(tzinfo=None)
@@ -537,48 +537,12 @@ class DealRawPoolRepository:
                 },
             )
             res["raw_expired"] = int(getattr(raw_res, "modified_count", 0) or 0)
-
-            # 2. 清理正式表中属于该频道的好价标
-            and_clauses: List[Dict[str, Any]] = [
-                {"deal_info.source_site": source_site},
-                {"deal_info.is_deal_tip": True},
-                {
-                    "$or": [
-                        {"deal_info.last_seen_at": {"$lt": sweep_start_time}},
-                        {
-                            "deal_info.last_seen_at": {"$exists": False},
-                            "deal_info.updated_at": {"$lt": sweep_start_time},
-                        },
-                    ]
-                },
-            ]
-            if channel:
-                and_clauses.append({
-                    "$or": [
-                        {"deal_info.source_channel": channel},
-                        {"deal_info.seen_channels": channel},
-                    ]
-                })
-            formal_query: Dict[str, Any] = {"$and": and_clauses}
-            formal_res = self.formal_col.update_many(
-                formal_query,
-                {
-                    "$set": {
-                        "deal_info.is_deal_tip": False,
-                        "deal_info.expired_at": now_naive,
-                        "deal_info.updated_at": now_naive,
-                        "deal_info.expire_reason": "full_sweep_disappeared",
-                    }
-                },
-            )
-            res["formal_expired"] = int(getattr(formal_res, "modified_count", 0) or 0)
-            if res["raw_expired"] or res["formal_expired"]:
+            if res["raw_expired"]:
                 logger.info(
-                    "  🧹 [全量巡视-失效清除] 站点 [%s] 频道 [%s]: 清理初步表待清洗 %d 条, 摘除正式表失效好价 %d 条",
+                    "  🧹 [全量巡视-初步表收敛] 站点 [%s] 频道 [%s]: 清理初步表待清洗 %d 条 (正式库在架好价按时间超期由维护线程统一管理)",
                     source_site,
                     channel,
                     res["raw_expired"],
-                    res["formal_expired"],
                 )
         except Exception as e:
             logger.warning("全量巡视失效清除异常 [%s - %s]: %s", source_site, channel, e)
