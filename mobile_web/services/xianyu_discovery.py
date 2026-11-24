@@ -3,9 +3,9 @@ r"""
 闲鱼高性价比商品探测与比价核心服务（定时任务由 scripts/run_xianyu_deal_discovery_scheduler.py 调度）。
 ================================================================================
 核心流程：
-  1. 【候选商品选拔（双源各最多 20 个，按类别已比价次数升序轮转，1:1 交替）】：
-     - `official`（正式官方商品）：72h 时效窗口内、尚未比价过，并通过官方接口实时校验价格未失效暴涨；
-     - `deal_tip`（线报爆料商品）：48h 时效窗口内、尚未比价过且清洗价格一致；
+  1. 【候选商品选拔（双源各最多 20 个，按类别已比价次数升序轮转，1:1 交替，且仅入选可靠商品）】：
+     - `official`（正式官方商品）：72h 时效窗口内、满足商品可靠性要求、尚未比价过，并通过官方接口实时校验价格未失效暴涨；
+     - `deal_tip`（线报爆料商品）：48h 时效窗口内、满足商品可靠性要求（来源可靠或价格核验可靠）、尚未比价过且清洗价格一致；
   2. 【逐商品一气呵成串行闭环】：
      - 第 1 次大模型调用：判断比价资格并提取主/备搜索关键字；
      - 闲鱼小号搜索概览并按 `item_id` 增量保存至 `xianyu_items`（绝不覆盖已有详情）；
@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from pymongo import UpdateOne
 
 from adapters import get_adapter, normalize_platform
-from models.product import ProductRef
+from models.product import ProductRef, is_product_reliable, reliable_product_mongo_filter
 from infrastructure.ai_api.json_parser import parse_llm_json as string_to_object
 from infrastructure.ai_api.model_api import generate_content
 from infrastructure.api_governance import api_caller_context
@@ -420,9 +420,11 @@ def _parse_deal_time_utc(val: Any, default_tz: datetime.timezone = _CN_TZ) -> Op
 
 
 def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.datetime) -> Optional[Dict[str, Any]]:
-    """校验线报商品时效性与清洗状态，组装统一候选视图文档。"""
+    """校验线报商品时效性、可靠性与清洗状态，组装统一候选视图文档。"""
     di = doc.get("deal_info")
     if not isinstance(di, dict) or not di.get("is_deal_tip"):
+        return None
+    if not is_product_reliable(doc):
         return None
     if di.get("format_status") != "success" or di.get("need_reformat") is True:
         return None
@@ -740,6 +742,7 @@ def select_round_candidates_for_source(
         query = {
             "$and": [
                 {"deal_info.is_deal_tip": True},
+                reliable_product_mongo_filter(),
                 {"deal_info.format_status": "success"},
                 {"deal_info.need_reformat": {"$ne": True}},
                 {"deal_info.deal_price": {"$type": "number", "$gt": 0}},
@@ -750,6 +753,8 @@ def select_round_candidates_for_source(
             **repo._SUMMARY_PROJECTION,
             "channel_type": 1,
             "deal_info.is_deal_tip": 1,
+            "deal_info.source_is_reliable": 1,
+            "deal_info.price_is_reliable": 1,
             "deal_info.clean_title": 1,
             "deal_info.deal_price": 1,
             "deal_info.format_deal_price": 1,
@@ -771,16 +776,24 @@ def select_round_candidates_for_source(
         query = {
             "$and": [
                 repo._boom_content_filter(),
+                reliable_product_mongo_filter(),
                 {
                     "format_status": "success",
                     "$or": [{"updated_at": {"$gte": cutoff_dt}}, {"updated_at": {"$gte": cutoff_str}}],
                 },
             ]
         }
-        projection = {**repo._COST_PERFORMANCE_PROJECTION, "channel_type": 1}
+        projection = {
+            **repo._COST_PERFORMANCE_PROJECTION,
+            "channel_type": 1,
+            "deal_info.is_deal_tip": 1,
+            "deal_info.source_is_reliable": 1,
+            "deal_info.price_is_reliable": 1,
+        }
         raw_docs = [
             {**d, "source_type": SOURCE_TYPE_OFFICIAL}
             for d in repo.col.find(query, projection).sort([("updated_at", -1)])
+            if is_product_reliable(d)
         ]
 
     eval_col = db.get_collection(EVAL_COLLECTION_NAME)

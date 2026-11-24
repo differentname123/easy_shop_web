@@ -36,6 +36,9 @@ def _make_sample_deal_doc(
     publish_time: str = "2026-11-12 12:00:00",
     need_reformat: bool = False,
     format_status: str = "success",
+    source_is_reliable=False,
+    price_is_reliable=True,
+    category_name: str = "面部精华油",
 ):
     return {
         "platform": "pdd",
@@ -49,6 +52,8 @@ def _make_sample_deal_doc(
         "updated_at": datetime.datetime(2026, 11, 12, 5, 0, 0, tzinfo=datetime.timezone.utc),
         "deal_info": {
             "is_deal_tip": True,
+            "source_is_reliable": source_is_reliable,
+            "price_is_reliable": price_is_reliable,
             "clean_title": "瑷尔博士2.0摇醒精华油30ml*2瓶",
             "deal_price": deal_price,
             "format_deal_price": format_deal_price,
@@ -60,7 +65,7 @@ def _make_sample_deal_doc(
             "format_info": {
                 "sku_id": f"{product_id}_deal",
                 "price": format_deal_price,
-                "core_entities": [{"name": "面部精华油", "score": 10}],
+                "core_entities": [{"name": category_name, "score": 10}],
                 "decision_keywords": [
                     {"attribute_name": "品牌", "attribute_value": "瑷尔博士", "score": 10},
                     {"attribute_name": "版本", "attribute_value": "2.0摇醒", "score": 9},
@@ -206,6 +211,14 @@ def test_build_deal_tip_virtual_doc_shelf_life_and_snapshot():
 
     doc_mismatch = _make_sample_deal_doc(deal_price=55.0, format_deal_price=66.0)
     assert sched._build_deal_tip_virtual_doc(doc_mismatch, cutoff_utc=cutoff_48h) is None
+
+    # 可靠性拦截：仅当来源可靠或价格核验可靠之一为 True 时才可通过，(F,F) 与 (F,None) 一律拦截
+    doc_src_rel = _make_sample_deal_doc(source_is_reliable=True, price_is_reliable=False)
+    assert sched._build_deal_tip_virtual_doc(doc_src_rel, cutoff_utc=cutoff_48h) is not None
+    doc_unreliable_ff = _make_sample_deal_doc(source_is_reliable=False, price_is_reliable=False)
+    assert sched._build_deal_tip_virtual_doc(doc_unreliable_ff, cutoff_utc=cutoff_48h) is None
+    doc_unreliable_fn = _make_sample_deal_doc(source_is_reliable=False, price_is_reliable=None)
+    assert sched._build_deal_tip_virtual_doc(doc_unreliable_fn, cutoff_utc=cutoff_48h) is None
 
 
 def test_category_eval_count_rotation_official_price_filter_and_1to1_interleave():
@@ -922,5 +935,109 @@ def test_xianyu_batch_verify_live_activity_prices_chunks_of_20(monkeypatch):
     assert res[("jd", "p_0")] == 25.5
     assert res[("jd", "p_23")] == 25.5
     assert res[("jd", "p_off")] is None
+
+
+def test_select_round_candidates_filters_unreliable_products():
+    """验证闲鱼比价候选选拔（线报与官方双源）均在 Mongo 查询条件与内存筛选中强制仅入选可靠商品。"""
+    expected_reliable_filter = sched.reliable_product_mongo_filter()
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    recent_pub = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1) 线报源：仅来源可靠(T,F)与价格核验可靠(F,T)通过，(F,F) 被过滤
+    deal_docs = [
+        _make_sample_deal_doc(
+            product_id="deal_unreliable",
+            category_name="面霜",
+            publish_time=recent_pub,
+            source_is_reliable=False,
+            price_is_reliable=False,
+        ),
+        _make_sample_deal_doc(
+            product_id="deal_src_ok",
+            category_name="精华液",
+            publish_time=recent_pub,
+            source_is_reliable=True,
+            price_is_reliable=False,
+        ),
+        _make_sample_deal_doc(
+            product_id="deal_price_ok",
+            category_name="防晒霜",
+            publish_time=recent_pub,
+            source_is_reliable=False,
+            price_is_reliable=True,
+        ),
+    ]
+    fake_eval_col = MagicMock()
+    fake_eval_col.aggregate.return_value = []
+    fake_eval_col.find.return_value = []
+    fake_db = MagicMock()
+    fake_db.get_collection.return_value = fake_eval_col
+
+    fake_repo = MagicMock()
+    fake_repo._SUMMARY_PROJECTION = {"name": 1}
+    fake_repo._COST_PERFORMANCE_PROJECTION = {"name": 1}
+    fake_repo._boom_content_filter.return_value = {}
+    fake_deal_cursor = MagicMock()
+    fake_deal_cursor.sort.return_value = deal_docs
+    fake_repo.col.find.return_value = fake_deal_cursor
+
+    with patch.object(sched, "ProductRepository", return_value=fake_repo):
+        deal_cands = sched.select_round_candidates_for_source(
+            db=fake_db,
+            hours_window=48,
+            max_categories=20,
+            source_type=sched.SOURCE_TYPE_DEAL_TIP,
+        )
+
+    assert [c["product_id"] for c in deal_cands] == ["deal_src_ok", "deal_price_ok"]
+    deal_query, deal_proj = fake_repo.col.find.call_args.args
+    assert expected_reliable_filter in deal_query["$and"]
+    assert deal_proj["deal_info.is_deal_tip"] == 1
+    assert deal_proj["deal_info.source_is_reliable"] == 1
+    assert deal_proj["deal_info.price_is_reliable"] == 1
+
+    # 2) 官方源：纯官方商品与附带可靠线报的商品通过，附带不可靠活跃线报的商品被排除
+    off_pure = _make_sample_official_doc(product_id="off_pure", category_name="抽纸", name="维达抽纸24包")
+    off_with_reliable_deal = _make_sample_official_doc(
+        product_id="off_rel_deal", category_name="洗衣液", name="蓝月亮洗衣液"
+    )
+    off_with_reliable_deal["deal_info"] = {
+        "is_deal_tip": True,
+        "source_is_reliable": True,
+        "price_is_reliable": False,
+    }
+    off_with_unreliable_deal = _make_sample_official_doc(
+        product_id="off_unrel_deal", category_name="牙膏", name="云南白药牙膏"
+    )
+    off_with_unreliable_deal["deal_info"] = {
+        "is_deal_tip": True,
+        "source_is_reliable": False,
+        "price_is_reliable": False,
+    }
+
+    fake_off_cursor = MagicMock()
+    fake_off_cursor.sort.return_value = [off_pure, off_with_reliable_deal, off_with_unreliable_deal]
+    fake_repo.col.find.reset_mock()
+    fake_repo.col.find.return_value = fake_off_cursor
+
+    with patch.object(sched, "ProductRepository", return_value=fake_repo), patch.object(
+        sched, "_batch_verify_live_activity_prices", side_effect=lambda items: {(sched.normalize_platform(p), str(pid)): fb for p, pid, _gs, fb in items}
+    ), patch.object(
+        sched, "_verify_live_activity_price", side_effect=lambda _p, _pid, _gs, fb: fb
+    ):
+        off_cands = sched.select_round_candidates_for_source(
+            db=fake_db,
+            hours_window=72,
+            max_categories=20,
+            source_type=sched.SOURCE_TYPE_OFFICIAL,
+        )
+
+    assert [c["product_id"] for c in off_cands] == ["off_pure", "off_rel_deal"]
+    off_query, off_proj = fake_repo.col.find.call_args.args
+    assert expected_reliable_filter in off_query["$and"]
+    assert off_proj["deal_info.is_deal_tip"] == 1
+    assert off_proj["deal_info.source_is_reliable"] == 1
+    assert off_proj["deal_info.price_is_reliable"] == 1
+
 
 
