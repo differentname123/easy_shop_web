@@ -15,9 +15,6 @@ from pymongo.errors import DuplicateKeyError
 from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
-from models.cost_performance import (
-    rank_products_by_cost_performance,
-)
 from models.deal_constants import (
     DEAL_INFO_PROTECTION_HOURS,
     format_timestamp_cn,
@@ -26,9 +23,9 @@ from models.deal_constants import (
 from models.product import (
     _BARE_YUAN_TAG_RE,
     clean_product_id,
-    extract_search_keyword,
     get_source_site_name,
     is_jd_image_key,
+    is_product_reliable,
     normalize_jd_material_url,
     normalize_platform,
     resolve_item_identity,
@@ -39,7 +36,11 @@ from infrastructure.jd_client import is_encrypted_jd_item_id
 from infrastructure.search_meili import (
     is_meili_available,
     search_products,
-    select_relevant_candidates,
+)
+from services.boom_search import (
+    build_boom_filter_query,
+    rank_boom_cost_performance,
+    query_boom_products_page,
 )
 
 
@@ -57,14 +58,14 @@ def upsert_cleaned_products_to_formal_table(
     product_docs: List[Dict[str, Any]],
 ) -> Dict[str, int]:
     """
-    【Stage 5：高分好价商品晋升入正式表 `products`（含质量评分防覆盖保护）】
+    【Stage 5：高分好价商品晋升入正式表 `products`（含来源可靠性与质量评分防覆盖保护）】
     - 严格以唯一索引 `{"platform": plat, "product_id": pid}` 作为过滤条件；
     - 顶层商品属性 (`name`, `price`, `original_price`, `activity_price` 等) 始终保持官方最新数据；
-    - 高分保护法则：
-      1) 同批次多条线报命中同一商品时，按 `deal_info.quality_score` 最高者胜出；
-      2) 若 `products` 表中该商品已有 `deal_info.is_deal_tip == True` 且 `updated_at` 在 12 小时保鲜期内，
-         仅当新线报 `quality_score >= 已有 deal_info.quality_score`（或价格明显更低 <98%）时才更新 `deal_info` 内容，
-         防止低分简陋线报覆盖高分精品线报。
+    - 替换保护法则：
+      1) 同批次多条线报命中同一商品时，高可靠来源无条件优先，同级别按 `deal_info.quality_score` 最高者胜出；
+      2) 若 `products` 表中该商品已有 `deal_info.is_deal_tip == True` 且 `updated_at` 在 12 小时保鲜期内：
+         高可靠来源可无条件覆盖非高可靠来源，非高可靠来源不可覆盖高可靠来源；
+         同级别仅当新线报 `quality_score >= 已有 deal_info.quality_score`（或价格明显更低 <98%）时才更新 `deal_info` 内容。
     """
     if not product_docs:
         return {"upserted": 0, "modified": 0, "matched": 0, "protected_high_score": 0, "total_ops": 0}
@@ -88,6 +89,7 @@ def upsert_cleaned_products_to_formal_table(
                     "product_id": 1,
                     "goods_sign": 1,
                     "deal_info.is_deal_tip": 1,
+                    "deal_info.source_is_reliable": 1,
                     "deal_info.quality_score": 1,
                     "deal_info.deal_price": 1,
                     "deal_info.updated_at": 1,
@@ -104,7 +106,10 @@ def upsert_cleaned_products_to_formal_table(
     for (plat, pid), docs_for_item in grouped_by_pid.items():
         docs_sorted = sorted(
             docs_for_item,
-            key=lambda x: int((x.get("deal_info") or {}).get("quality_score") or 0),
+            key=lambda x: (
+                bool((x.get("deal_info") or {}).get("source_is_reliable")),
+                int((x.get("deal_info") or {}).get("quality_score") or 0),
+            ),
         )
         best_doc = deepcopy(docs_sorted[-1])
         deal_info = deepcopy(best_doc.pop("deal_info", {}) or {})
@@ -176,7 +181,14 @@ def upsert_cleaned_products_to_formal_table(
         )
         price_improved = bool(new_dp is not None and ex_dp is not None and new_dp < ex_dp * 0.98)
 
-        if is_fresh_existing and ex_score > new_score and not price_improved:
+        ex_reliable = bool(ex_di.get("source_is_reliable"))
+        new_reliable = bool(deal_info.get("source_is_reliable"))
+        deal_info["source_is_reliable"] = new_reliable
+        should_protect = is_fresh_existing and (
+            ex_reliable if new_reliable != ex_reliable else (ex_score > new_score and not price_improved)
+        )
+
+        if should_protect:
             protected_high_score += 1
             set_fields["deal_info.last_seen_at"] = now
         else:
@@ -272,6 +284,7 @@ class ProductRepository(BaseRepository):
             "deal_info.format_status", "deal_info.need_reformat", "deal_info.format_info",
             "deal_info.publish_ts", "deal_info.publish_time",
             "deal_info.source_site", "deal_info.source_site_name",
+            "deal_info.source_is_reliable", "deal_info.price_is_reliable",
         ), 1),
     }
     _COST_PERFORMANCE_PROJECTION = {
@@ -542,17 +555,7 @@ class ProductRepository(BaseRepository):
         category: Optional[str] = None,
         keyword: Optional[str] = None,
     ) -> Dict[str, Any]:
-        filter_query: Dict[str, Any] = {}
-        if platform and self._platform(platform) != "all":
-            filter_query["platform"] = self._platform(platform)
-        if category and category.strip() and category != "全部":
-            filter_query["category"] = category.strip()
-        if keyword and keyword.strip():
-            raw_kw = keyword.strip()
-            cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
-            safe_kw = re.escape(cleaned_kw)
-            filter_query["name"] = {"$regex": safe_kw, "$options": "i"}
-        return filter_query
+        return build_boom_filter_query(platform=platform, category=category, keyword=keyword)
 
     def rank_boom_products_by_cost_performance(
         self,
@@ -561,67 +564,21 @@ class ProductRepository(BaseRepository):
         keyword: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        查询爆单库候选商品并委托纯领域性价比引擎 (`models.cost_performance`) 分层排序。
+        查询爆单库候选商品并委托 `services.boom_search` 执行可靠优先与性价比分组排序。
         """
-        filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
-        raw_docs = None
-        cleaned_kw = ""
-        if keyword and keyword.strip():
-            raw_kw = keyword.strip()
-            cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
-
-        if cleaned_kw and self._is_meili_searchable():
-            try:
-                meili_hits = search_products(
-                    keyword=cleaned_kw,
-                    platform=platform,
-                    category=category,
-                    limit=min(1000, self._MAX_COST_PERFORMANCE_CANDIDATES),
-                    only_active_boom=True,
-                )
-                if meili_hits is not None:
-                    doc_keys = [(h.get("platform"), h.get("product_id")) for h in meili_hits]
-                    or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
-                    if or_clauses:
-                        mongo_docs = list(self.col.find({"$and": [{"$or": or_clauses}, self._boom_content_filter()]}, self._COST_PERFORMANCE_PROJECTION))
-                        docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
-                        raw_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
-                    else:
-                        raw_docs = []
-            except Exception as meili_exc:
-                logger.warning("⚠️ 【Meilisearch性价比候选检索降级】: %s", format_exc_summary(meili_exc))
-                raw_docs = None
-
-        if raw_docs is None:
-            cursor = (
-                self.col.find(
-                    {"$and": [filter_query, self._boom_content_filter()]},
-                    self._COST_PERFORMANCE_PROJECTION,
-                )
-                .sort([("updated_at", -1)])
-                .limit(self._MAX_COST_PERFORMANCE_CANDIDATES)
-                .max_time_ms(2000)
-            )
-            raw_docs = list(cursor)
-
-        now_ts = time.time()
-        if cleaned_kw and raw_docs:
-            buckets = select_relevant_candidates(cleaned_kw, raw_docs, min_primary=1)
-            ranked: List[Dict[str, Any]] = []
-            for bucket in buckets:
-                ranked.extend(
-                    rank_products_by_cost_performance(
-                        bucket,
-                        normalize_summary=self._normalize_doc_summary,
-                        now_ts=now_ts,
-                    )
-                )
-            return ranked
-
-        return rank_products_by_cost_performance(
-            raw_docs,
+        return rank_boom_cost_performance(
+            self.col,
+            platform=platform,
+            category=category,
+            keyword=keyword,
+            projection=self._COST_PERFORMANCE_PROJECTION,
+            boom_filter=self._boom_content_filter(),
+            max_candidates=self._MAX_COST_PERFORMANCE_CANDIDATES,
             normalize_summary=self._normalize_doc_summary,
-            now_ts=now_ts,
+            search_fn=search_products,
+            meili_enabled=self._is_meili_searchable(),
+            now_ts=time.time(),
+            logger=logger,
         )
 
     def query_boom_products(
@@ -634,141 +591,29 @@ class ProductRepository(BaseRepository):
         page_size: int = 20,
     ) -> Dict[str, Any]:
         """
-        分页查询爆单库商品（支持 cost_performance 性价比全局分组排序及 latest 游标探测分页）
+        分页查询爆单库商品（统一委托 `services.boom_search` 执行可靠优先分级、性价比排序与默认游标分页）。
         """
         page = max(1, min(50, int(page or 1)))
         page_size = max(1, min(50, int(page_size or 20)))
-        skip = (page - 1) * page_size
-
-        if sort_by == "cost_performance" and keyword and keyword.strip():
-            try:
-                sorted_items = self.rank_boom_products_by_cost_performance(
-                    platform=platform, category=category, keyword=keyword,
-                )
-                page_items = sorted_items[skip : skip + page_size]
-                has_more = (skip + page_size) < len(sorted_items)
-                return {
-                    "status": "success",
-                    "total_count": len(sorted_items),
-                    "page": page,
-                    "page_size": page_size,
-                    "has_more": has_more,
-                    "data": page_items,
-                }
-            except Exception as e:
-                logger.error(
-                    "❌ 【爆品库查询失败】按性价比查询本地爆单商品列表时发生异常 | 平台[%s] 分类[%s] 关键词[%s] 排序[%s] 页码[%d] 异常<%s> 排查方向<请检查MongoDB连接状态、查询超时(2000ms)或format_info结构>",
-                    self._platform(platform) if platform else "all",
-                    category or "全部",
-                    keyword or "-",
-                    sort_by,
-                    page,
-                    format_exc_summary(e),
-                )
-                return {
-                    "status": "error",
-                    "error_msg": str(e),
-                    "total_count": 0,
-                    "page": page,
-                    "page_size": page_size,
-                    "has_more": False,
-                    "data": [],
-                }
-
-        filter_query = self._build_boom_filter_query(platform=platform, category=category, keyword=keyword)
-
-        if keyword and keyword.strip() and self._is_meili_searchable():
-            try:
-                raw_kw = keyword.strip()
-                cleaned_kw = extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]
-                fetch_limit = min(500, max(100, (skip + page_size) * 4))
-                meili_hits = search_products(
-                    keyword=cleaned_kw,
-                    platform=platform,
-                    category=category,
-                    sort_by=sort_by,
-                    limit=fetch_limit,
-                    offset=0,
-                    only_active_boom=True,
-                )
-                if meili_hits is not None:
-                    if not meili_hits:
-                        return {
-                            "status": "success",
-                            "total_count": 0,
-                            "page": page,
-                            "page_size": page_size,
-                            "has_more": False,
-                            "data": [],
-                        }
-                    has_named_hits = any(isinstance(h, dict) and h.get("name") for h in meili_hits)
-                    if has_named_hits:
-                        buckets = select_relevant_candidates(cleaned_kw, meili_hits, min_primary=1)
-                        ordered_hits = [h for bucket in buckets for h in bucket]
-                        paged_hits = ordered_hits[skip : skip + page_size + 10]
-                        slice_has_tail = len(ordered_hits) > (skip + len(paged_hits))
-                    else:
-                        ordered_hits = meili_hits
-                        paged_hits = meili_hits[skip : skip + page_size + 1]
-                        slice_has_tail = False
-                    doc_keys = [(h.get("platform"), h.get("product_id")) for h in paged_hits]
-                    or_clauses = [{"platform": p, "product_id": pid} for p, pid in doc_keys if p and pid]
-                    if or_clauses:
-                        mongo_docs = list(self.col.find({"$and": [{"$or": or_clauses}, self._boom_content_filter()]}, self._SUMMARY_PROJECTION))
-                        docs_map = {(d.get("platform"), d.get("product_id")): d for d in mongo_docs}
-                        ordered_docs = [docs_map[(p, pid)] for p, pid in doc_keys if (p, pid) in docs_map]
-                        has_more = len(ordered_docs) > page_size or slice_has_tail
-                        items = [self._normalize_doc_summary(doc) for doc in ordered_docs[:page_size]]
-                        return {
-                            "status": "success",
-                            "total_count": len(ordered_hits) if has_named_hits else len(items),
-                            "page": page,
-                            "page_size": page_size,
-                            "has_more": has_more,
-                            "data": items,
-                        }
-                    return {
-                        "status": "success",
-                        "total_count": 0,
-                        "page": page,
-                        "page_size": page_size,
-                        "has_more": False,
-                        "data": [],
-                    }
-            except Exception as meili_exc:
-                logger.warning("⚠️ 【Meilisearch商品检索降级】: %s", format_exc_summary(meili_exc))
-
-        sort_mapping = {
-            "latest": [("updated_at", -1)],
-            "save_desc": [("saved_price", -1), ("updated_at", -1)],
-            "price_asc": [("activity_price", 1)],
-            "price_desc": [("activity_price", -1)],
-        }
-        sort_spec = sort_mapping.get(sort_by, [("updated_at", -1)])
-
         try:
-            cursor = (
-                self.col.find(
-                    {"$and": [filter_query, self._boom_content_filter()]},
-                    self._SUMMARY_PROJECTION,
-                )
-                .sort(sort_spec)
-                .skip(skip)
-                .limit(page_size + 1)
-                .max_time_ms(2000)
+            return query_boom_products_page(
+                self.col,
+                platform=platform,
+                category=category,
+                keyword=keyword,
+                sort_by=sort_by,
+                page=page,
+                page_size=page_size,
+                summary_projection=self._SUMMARY_PROJECTION,
+                cost_perf_projection=self._COST_PERFORMANCE_PROJECTION,
+                boom_filter=self._boom_content_filter(),
+                max_cost_perf_candidates=self._MAX_COST_PERFORMANCE_CANDIDATES,
+                normalize_summary=self._normalize_doc_summary,
+                search_fn=search_products,
+                meili_enabled=self._is_meili_searchable(),
+                now_ts=time.time(),
+                logger=logger,
             )
-            raw_docs = list(cursor)
-            has_more = len(raw_docs) > page_size
-            items = [self._normalize_doc_summary(doc) for doc in raw_docs[:page_size]]
-
-            return {
-                "status": "success",
-                "total_count": len(items) if keyword else (skip + len(raw_docs)),
-                "page": page,
-                "page_size": page_size,
-                "has_more": has_more,
-                "data": items,
-            }
         except Exception as e:
             logger.error(
                 "❌ 【爆品库查询失败】分页查询本地爆单商品列表时发生数据库异常 | 平台[%s] 分类[%s] 关键词[%s] 排序[%s] 页码[%d] 异常<%s> 排查方向<请检查MongoDB连接状态、查询超时(2000ms)或正则表达式性能>",
@@ -834,6 +679,7 @@ class ProductRepository(BaseRepository):
             "deal_source": deal_source,
             "deal_source_name": deal_source_name,
             "is_deal_tip": is_active_deal,
+            "is_reliable": is_product_reliable(doc),
             "deal_highlight": deal_highlight,
             "deal_publish_time": deal_publish_time,
             "name": doc.get("name", "未命名商品"),
@@ -1040,6 +886,14 @@ class ProductRepository(BaseRepository):
         ):
             return None
 
+        raw_price_rel = deal_info.get("price_is_reliable")
+        price_is_reliable = raw_price_rel if isinstance(raw_price_rel, bool) else None
+        price_reliability_reason = (
+            str(deal_info.get("price_reliability_reason") or "").strip()
+            if price_is_reliable is not None
+            else ""
+        )
+
         return {
             "is_deal_tip": bool(deal_info.get("is_deal_tip")),
             "publish_time": publish_time,
@@ -1050,6 +904,9 @@ class ProductRepository(BaseRepository):
             "tutorial_steps": tutorial_steps,
             "original_copywriting": original_copywriting,
             "share_images": share_images,
+            "source_is_reliable": bool(deal_info.get("source_is_reliable")),
+            "price_is_reliable": price_is_reliable,
+            "price_reliability_reason": price_reliability_reason,
         }
 
     def _normalize_doc(self, doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -1339,6 +1196,8 @@ class ProductRepository(BaseRepository):
                     "deal_info.format_info": 1,
                     "deal_info.publish_ts": 1,
                     "deal_info.publish_time": 1,
+                    "deal_info.source_is_reliable": 1,
+                    "deal_info.price_is_reliable": 1,
                 },
             )
             overlays: Dict[str, Dict[str, Any]] = {}
@@ -1354,10 +1213,11 @@ class ProductRepository(BaseRepository):
                     activity_price=act_p if act_p > 0 else None,
                 )
                 pub_time = self._format_deal_datetime(get_deal_publish_ts(di)) if is_active_deal else ""
-                if not highlight and not pub_time:
+                if not highlight and not pub_time and not is_active_deal:
                     continue
                 entry = {
                     "is_deal_tip": is_active_deal,
+                    "is_reliable": is_product_reliable(doc),
                     "deal_highlight": highlight,
                     "deal_publish_time": pub_time,
                 }
@@ -1385,6 +1245,10 @@ class ProductRepository(BaseRepository):
         out = dict(item)
         if ov.get("is_deal_tip") is True:
             out["is_deal_tip"] = True
+        if "is_reliable" in ov:
+            out["is_reliable"] = bool(ov.get("is_reliable"))
+        elif out.get("is_deal_tip") is not True and "is_reliable" not in out:
+            out["is_reliable"] = True
         if ov.get("deal_highlight") and not str(out.get("deal_highlight") or "").strip():
             out["deal_highlight"] = ov["deal_highlight"]
         if ov.get("deal_publish_time") and not str(out.get("deal_publish_time") or "").strip():

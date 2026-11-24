@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from infrastructure.http_utils import clean_money
 from infrastructure.logging_utils import format_exc_summary, get_app_logger
 from infrastructure.settings import get_settings
+from models.product import is_product_reliable
 
 logger = get_app_logger("search_meili")
 
@@ -32,7 +33,7 @@ _LAST_AVAILABILITY_CHECK = 0.0
 _IS_AVAILABLE = False
 _AVAILABILITY_CACHE_TTL = 10.0  # 健康检测缓存 10 秒，避免高频 I/O 阻塞主线程
 
-MEILI_SCHEMA_VERSION = 2
+MEILI_SCHEMA_VERSION = 3
 DEFAULT_MEILI_SYNC_INTERVAL_SECONDS = 120.0
 DEFAULT_MEILI_SYNC_INITIAL_DELAY_SECONDS = 5.0
 _ACTIVE_PRODUCTS_QUERY: Dict[str, Any] = {
@@ -238,6 +239,7 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "saved_price": saved_price,
         "is_off_promotion": bool(doc.get("is_off_promotion") is True or doc.get("superseded_by")),
         "is_deal_tip": is_deal_tip,
+        "is_reliable": is_product_reliable(doc),
         "channel_type": channel_type,
         "image_url": str(doc.get("image_url") or "").strip(),
         "updated_at": ts,
@@ -366,8 +368,8 @@ def ensure_index_configured(force: bool = False) -> bool:
 
             index.update_settings({
                 "searchableAttributes": ["core_entity", "core_entity_alias", "brand", "name"],
-                "filterableAttributes": ["platform", "category", "is_off_promotion", "is_deal_tip", "channel_type"],
-                "sortableAttributes": ["updated_at", "activity_price", "price", "saved_price"],
+                "filterableAttributes": ["platform", "category", "is_off_promotion", "is_deal_tip", "is_reliable", "channel_type"],
+                "sortableAttributes": ["is_reliable", "updated_at", "activity_price", "price", "saved_price"],
                 "rankingRules": ["words", "typo", "proximity", "attribute", "sort", "exactness"],
                 "typoTolerance": {"enabled": False},
                 "localizedAttributes": [{"attributePatterns": ["*"], "locales": ["cmn"]}],
@@ -422,12 +424,12 @@ def search_products(
             filter_exprs.append("(channel_type IS NOT NULL OR is_deal_tip = true)")
 
         sort_mapping = {
-            "latest": ["updated_at:desc"],
-            "price_asc": ["activity_price:asc"],
-            "price_desc": ["activity_price:desc"],
-            "save_desc": ["saved_price:desc"],
+            "latest": ["is_reliable:desc", "updated_at:desc"],
+            "price_asc": ["is_reliable:desc", "activity_price:asc"],
+            "price_desc": ["is_reliable:desc", "activity_price:desc"],
+            "save_desc": ["is_reliable:desc", "saved_price:desc"],
         }
-        sort_rule = sort_mapping.get(sort_by)
+        sort_rule = sort_mapping.get(sort_by) or ["is_reliable:desc", "updated_at:desc"]
 
         search_params: Dict[str, Any] = {
             "limit": max(1, min(1000, limit)),

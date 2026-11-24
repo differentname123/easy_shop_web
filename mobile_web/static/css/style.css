@@ -426,6 +426,23 @@ body {
 .plat-badge.taobao { background: #ff5000; }
 .plat-badge.jd { background: #e1251b; }
 
+.verified-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.92) 0%, rgba(5, 150, 105, 0.92) 100%);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1.2;
+  letter-spacing: 0.2px;
+  backdrop-filter: blur(2px);
+  box-shadow: 0 1px 3px rgba(5, 150, 105, 0.25);
+  pointer-events: none;
+}
+
 .goods-body {
   padding: 6px 8px 8px;
   display: flex;

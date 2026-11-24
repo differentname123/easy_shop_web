@@ -39,6 +39,39 @@ def get_source_site_name(source_site: Optional[str]) -> str:
     return SOURCE_SITE_NAMES.get(code, code)
 
 
+def is_product_reliable(doc: Optional[Dict[str, Any]]) -> bool:
+    """商品可靠性唯一真源：无活跃线报必可靠；有活跃线报则来源可靠或价格判定可靠任一满足即可靠。"""
+    if not isinstance(doc, dict):
+        return False
+    deal_info = doc.get("deal_info")
+    if not isinstance(deal_info, dict) or deal_info.get("is_deal_tip") is not True:
+        return True
+    return bool(
+        deal_info.get("source_is_reliable") is True
+        or deal_info.get("price_is_reliable") is True
+    )
+
+
+def reliable_product_mongo_filter() -> Dict[str, Any]:
+    """与 `is_product_reliable(doc) is True` 严格等价的 MongoDB 查询过滤条件。"""
+    return {
+        "$or": [
+            {"deal_info.is_deal_tip": {"$ne": True}},
+            {"deal_info.source_is_reliable": True},
+            {"deal_info.price_is_reliable": True},
+        ]
+    }
+
+
+def unreliable_product_mongo_filter() -> Dict[str, Any]:
+    """与 `is_product_reliable(doc) is False` 严格等价的 MongoDB 查询过滤条件。"""
+    return {
+        "deal_info.is_deal_tip": True,
+        "deal_info.source_is_reliable": {"$ne": True},
+        "deal_info.price_is_reliable": {"$ne": True},
+    }
+
+
 _TB_CURRENCY_OR_EMOJI_CHARS = r"￥¥$€₴£¢💲🗝🔑🔐"
 _TB_WRAP_CHARS = _TB_CURRENCY_OR_EMOJI_CHARS + r"()（）/【】「」《》~|💰👉📲📦🎁"
 _SHARE_CODE_PREFIXES = r"(?:CZ|CA|AC|ZH|MF|HU|TG|AA|SY|YD|TK|MU|CB)"

@@ -260,6 +260,10 @@ class MemoryCollection:
         self.queries.append(deepcopy(query))
         return list(dict.fromkeys(doc.get(field) for doc in self.docs if self.matches(doc, query)))
 
+    def count_documents(self, query, **_kwargs):
+        self.queries.append(deepcopy(query))
+        return sum(1 for doc in self.docs if self.matches(doc, query))
+
     def update_one(self, query, update, upsert=False):
         with self.lock:
             self.write_calls.append((deepcopy(query), deepcopy(update), upsert))
@@ -615,12 +619,11 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual([row["product_id"] for row in page2["data"]], ["6", "8"])
         self.assertFalse(page2["has_more"])
         self.assertEqual(page2["total_count"], 4)
+        self.assertIn(("skip", 2), self.col.cursor_calls)
         keyword = self.repo.query_boom_products(keyword="商品", page=2, page_size=2)
-        self.assertEqual(keyword["total_count"], 2)
+        self.assertEqual([row["product_id"] for row in keyword["data"]], ["6", "8"])
+        self.assertEqual(keyword["total_count"], 4)
         self.assertFalse(keyword["has_more"])
-        self.assertEqual(self.col.cursor_calls[-4:], [
-            ("sort", [("updated_at", -1)]), ("skip", 2), ("limit", 3), ("max_time_ms", 2000),
-        ])
 
     def test_categories_use_same_content_filter_and_platform_scope(self):
         self.col.docs = [
@@ -711,6 +714,7 @@ class TestProductRepository(unittest.TestCase):
                 "deal_info.format_status", "deal_info.need_reformat", "deal_info.format_info",
                 "deal_info.publish_ts", "deal_info.publish_time",
                 "deal_info.source_site", "deal_info.source_site_name",
+                "deal_info.source_is_reliable", "deal_info.price_is_reliable",
             ), 1),
         })
         for heavy_field in ("deal_info.original_copywriting", "deal_info.tutorial_steps", "deal_info.coupon_links"):
@@ -1161,20 +1165,21 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual([item["product_id"] for item in page1["data"]], ["P3", "P2"])
         self.assertTrue(page1["has_more"])
         self.assertEqual(page1["total_count"], 3)
-        self.assertEqual(len(self.col.queries), queries_before + 1)
+        queries_after_p1 = len(self.col.queries)
+        self.assertGreater(queries_after_p1, queries_before)
 
         # 第二页直接命中 BOOM_SORT_CACHE，不再查询数据库
         page2 = service.get_boom_products(platform="pdd", keyword="商品", page=2, page_size=2)
         self.assertEqual([item["product_id"] for item in page2["data"]], ["P1"])
         self.assertFalse(page2["has_more"])
         self.assertEqual(page2["total_count"], 3)
-        self.assertEqual(len(self.col.queries), queries_before + 1)
+        self.assertEqual(len(self.col.queries), queries_after_p1)
 
         # 淘汰单个商品时同步从 BOOM_SORT_CACHE 中剔除该商品且不触发重新查库
         evict_product_from_caches("pdd", goods_id="P1")
         after_evict = service.get_boom_products(platform="pdd", keyword="商品", page=1, page_size=10)
         self.assertEqual([item["product_id"] for item in after_evict["data"]], ["P3", "P2"])
-        self.assertEqual(len(self.col.queries), queries_before + 1)
+        self.assertEqual(len(self.col.queries), queries_after_p1)
 
     def test_deal_tip_normalization_and_boom_visibility(self):
         now = datetime.datetime(2026, 11, 12, 10, 0, 0)
@@ -1231,16 +1236,20 @@ class TestProductRepository(unittest.TestCase):
         }
         self.col.docs = [deal_doc, plain_doc, non_bool_deal_doc]
 
-        # 1. 严选好价列表同时接纳榜单商品与 deal_info.is_deal_tip == True 的线报商品，排除非布尔脏记录，且列表摘要不夹带重字段 deal_tip
+        # 1. 严选好价列表同时接纳榜单商品与 deal_info.is_deal_tip == True 的线报商品，排除非布尔脏记录，
+        #    可靠商品（无线报或来源/价格可靠）排在未验证/不可靠线报之前，且列表摘要不夹带重字段 deal_tip
         boom_res = self.repo.query_boom_products()
-        self.assertEqual([item["product_id"] for item in boom_res["data"]], ["TB-DEAL-1", "PDD-PLAIN-1"])
+        self.assertEqual([item["product_id"] for item in boom_res["data"]], ["PDD-PLAIN-1", "TB-DEAL-1"])
         self.assertNotIn("deal_tip", boom_res["data"][0])
-        self.assertTrue(boom_res["data"][0]["is_deal_tip"])
-        self.assertEqual(boom_res["data"][0]["deal_highlight"], "3.11元/斤")
-        self.assertEqual(boom_res["data"][0]["deal_publish_time"], "2026-11-12 17:04")
-        self.assertFalse(boom_res["data"][1]["is_deal_tip"])
-        self.assertEqual(boom_res["data"][1]["deal_highlight"], "")
-        self.assertEqual(boom_res["data"][1]["deal_publish_time"], "")
+        self.assertNotIn("deal_tip", boom_res["data"][1])
+        self.assertFalse(boom_res["data"][0]["is_deal_tip"])
+        self.assertTrue(boom_res["data"][0]["is_reliable"])
+        self.assertEqual(boom_res["data"][0]["deal_highlight"], "")
+        self.assertEqual(boom_res["data"][0]["deal_publish_time"], "")
+        self.assertTrue(boom_res["data"][1]["is_deal_tip"])
+        self.assertFalse(boom_res["data"][1]["is_reliable"])
+        self.assertEqual(boom_res["data"][1]["deal_highlight"], "3.11元/斤")
+        self.assertEqual(boom_res["data"][1]["deal_publish_time"], "2026-11-12 17:04")
         self.assertEqual(sorted(self.repo.get_categories()), ["家清", "食品"])
 
         # 2. 详情反查返回脱敏后的极简 deal_tip 白名单，UTC 时间转为北京时间展示，内部源字段与已废弃 unit_deal_price / filler_links 绝不外泄
@@ -1271,6 +1280,44 @@ class TestProductRepository(unittest.TestCase):
         after_refresh = self.repo.get_product_detail("TB-DEAL-1", platform="taobao")
         self.assertEqual(after_refresh["desc"], "官方刷新详情")
         self.assertEqual(after_refresh["deal_tip"]["deal_price"], 24.9)
+
+    def test_deal_tip_exposes_reliability_fields(self):
+        self.col.docs = [
+            {
+                "platform": "jd",
+                "product_id": "JD-REL-1",
+                "goods_id": "JD-REL-1",
+                "name": "测试高可靠来源线报商品",
+                "activity_price": 29.9,
+                "price": 39.9,
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "deal_price": 19.9,
+                    "tutorial_steps": ["1. 下单立减"],
+                    "source_is_reliable": True,
+                    "price_is_reliable": False,
+                    "price_reliability_reason": "依赖88VIP专享折扣",
+                },
+            },
+            {
+                "platform": "pdd",
+                "product_id": "PDD-NO-TIP",
+                "goods_id": "PDD-NO-TIP",
+                "name": "纯官方商品",
+                "activity_price": 15.0,
+                "price": 19.9,
+                "channel_type": 5,
+            },
+        ]
+        deal_detail = self.repo.get_product_detail("JD-REL-1", platform="jd")
+        tip = deal_detail["deal_tip"]
+        self.assertIsNotNone(tip)
+        self.assertIs(tip["source_is_reliable"], True)
+        self.assertIs(tip["price_is_reliable"], False)
+        self.assertEqual(tip["price_reliability_reason"], "依赖88VIP专享折扣")
+
+        plain_detail = self.repo.get_product_detail("PDD-NO-TIP", platform="pdd")
+        self.assertIsNone(plain_detail["deal_tip"])
 
     def test_cost_performance_treats_stale_price_or_need_reformat_items_as_unformatted(self):
         now = datetime.datetime(2026, 11, 12, 12, 0, 0)
@@ -1429,6 +1476,7 @@ class TestProductRepository(unittest.TestCase):
                 },
                 "deal_info": {
                     "is_deal_tip": True,
+                    "price_is_reliable": True,
                     "publish_time": "2026-11-12 20:00:00",
                     "deal_price": 50.0,
                     "format_deal_price": 50.0,
@@ -1447,6 +1495,7 @@ class TestProductRepository(unittest.TestCase):
                 "activity_price": 39.9, "updated_at": fixed_now_utc - datetime.timedelta(minutes=20),
                 "deal_info": {
                     "is_deal_tip": True,
+                    "price_is_reliable": True,
                     "publish_time": "2026-11-12T02:10:00Z",
                     "deal_price": 25.0,
                     "format_deal_price": 25.0,
@@ -1480,6 +1529,7 @@ class TestProductRepository(unittest.TestCase):
                 },
                 "deal_info": {
                     "is_deal_tip": True,
+                    "price_is_reliable": True,
                     "publish_time": "2026-11-12 09:00:00",
                     "deal_price": 50.0,
                     "format_deal_price": 50.0,
@@ -1503,6 +1553,7 @@ class TestProductRepository(unittest.TestCase):
                 },
                 "deal_info": {
                     "is_deal_tip": True,
+                    "price_is_reliable": True,
                     "publish_time": "2026-11-12 21:00:00",
                     "deal_price": 19.9,
                     "format_deal_price": 19.9,
@@ -1526,6 +1577,7 @@ class TestProductRepository(unittest.TestCase):
                 },
                 "deal_info": {
                     "is_deal_tip": True,
+                    "price_is_reliable": True,
                     "publish_time": "2026-11-12 21:30:00",
                     "deal_price": 35.0,
                     "format_deal_price": 29.9,
@@ -1544,6 +1596,7 @@ class TestProductRepository(unittest.TestCase):
                 "activity_price": 29.9, "updated_at": fixed_now_utc - datetime.timedelta(minutes=5),
                 "deal_info": {
                     "is_deal_tip": True,
+                    "price_is_reliable": True,
                     "publish_time": "2026-11-12 07:00:00",
                     "deal_price": 19.9,
                     "format_deal_price": 19.9,

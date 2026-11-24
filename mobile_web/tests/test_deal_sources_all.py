@@ -86,6 +86,12 @@ def test_catalog_and_registry_completeness():
     assert by_name["特惠采采_首页精选"].fetch_mode == "full_sweep"
     assert by_name["特惠采采_首页精选"].use_fetch_time_as_publish_time is True
     assert by_name["特惠采采_首页精选"].expire_missing_on_sweep is True
+    assert by_name["特惠采采_首页精选"].source_is_reliable is True
+    assert all(
+        ch.source_is_reliable is False
+        for ch in DEFAULT_CHANNEL_CONFIGS
+        if ch.name != "特惠采采_首页精选"
+    )
 
     # #2 逛丢
     assert by_name["逛丢_首页实时流"].interval_seconds == 180
@@ -1610,5 +1616,77 @@ def test_deal_pipeline_respects_allow_empty_ok_from_baicaio_hour_list(monkeypatc
     assert rep_warn["consecutive_failures"] == 1
 
 
+def test_deal_pipeline_and_repo_persist_source_is_reliable(monkeypatch, tmp_path):
+    """验证 ChannelConfig.source_is_reliable 随 Stage 1 拉取与 save_batch 准确落盘至 deal_raw_tips。"""
+    from repositories.deal_raw_pool_repo import DealRawPoolRepository
+    from services.deal_pipeline import run_fetch_stage
+    from services.deal_sources import BaseDealSource, ChannelConfig, FetchContext, FetchResult
+
+    _patch_pipeline_log_paths(monkeypatch, tmp_path)
+
+    class _DummySource(BaseDealSource):
+        site_key = "dummy_rel"
+
+        def fetch(self, ctx: FetchContext) -> FetchResult:
+            return FetchResult(
+                status="ok",
+                http_status=200,
+                request_url=ctx.channel.default_url,
+                elapsed_ms=1.0,
+                raw_list_count=1,
+                records=[
+                    {
+                        "source_site": ctx.channel.site_key,
+                        "source_item_id": f"{ctx.channel.name}_1",
+                        "title": "维达抽纸 9.9元包邮",
+                        "tutorial_text": "直接下单：https://u.jd.com/abc123",
+                        "extracted_links": [{"url": "https://u.jd.com/abc123", "platform": "jd"}],
+                        "has_full_detail": True,
+                    }
+                ],
+            )
+
+    raw_col = MagicMock()
+    raw_col.bulk_write.return_value = SimpleNamespace(upserted_count=1, modified_count=0)
+    raw_col.find.return_value.sort.return_value.limit.return_value = []
+    formal_col = MagicMock()
+    fake_db = SimpleNamespace(get_collection=lambda name: raw_col if name == "deal_raw_tips" else formal_col)
+    repo = DealRawPoolRepository(db_instance=fake_db)
+    repo._indexes_ready = True
+
+    ch_reliable = ChannelConfig(
+        name="高可靠频道",
+        site_key="dummy_rel",
+        default_url="https://rel.test",
+        source_is_reliable=True,
+        sleep_after=0.0,
+    )
+    ch_normal = ChannelConfig(
+        name="普通频道",
+        site_key="dummy_rel",
+        default_url="https://norm.test",
+        sleep_after=0.0,
+    )
+
+    sess = MagicMock()
+    sess.close = MagicMock()
+    run_fetch_stage(
+        repo=repo,
+        channels=[ch_reliable, ch_normal],
+        channel_last_run={},
+        source_registry={"dummy_rel": _DummySource()},
+        session_factory=lambda _c: sess,
+        channel_health_tracker={},
+    )
+
+    persisted_by_id = {}
+    for call in raw_col.bulk_write.call_args_list:
+        for op in call[0][0]:
+            persisted_by_id[op._filter["source_item_id"]] = op._doc["$set"]["source_is_reliable"]
+
+    assert persisted_by_id == {
+        "高可靠频道_1": True,
+        "普通频道_1": False,
+    }
 
 

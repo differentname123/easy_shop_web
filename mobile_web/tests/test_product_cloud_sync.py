@@ -501,3 +501,54 @@ def test_cloud_sync_off_promotion_superseded_deal_expiry_and_cloud_only_pullback
     assert rep2["written_ops"] == 0
     assert cloud_col.bulk_write_calls == writes_before
 
+
+def test_sync_detects_and_merges_reliability_field_changes():
+    """验证 deal_info 中的 source_is_reliable / price_is_reliable / price_reliability_reason 变更可触发增量上云。"""
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    base_deal = {
+        "is_deal_tip": True,
+        "quality_score": 85,
+        "source_item_id": "tip_rel_sync_1",
+        "deal_price": 19.9,
+        "clean_title": "测试可靠性同步商品",
+        "updated_at": now,
+        "format_status": "success",
+        "format_updated_at": now,
+        "source_is_reliable": False,
+        "price_is_reliable": True,
+        "price_reliability_reason": "公开券下单无特殊门槛",
+    }
+    local_doc = {
+        "_id": "l_rel_1",
+        "platform": "jd",
+        "product_id": "REL_SYNC_1",
+        "name": "测试可靠性同步商品",
+        "price": 29.9,
+        "activity_price": 24.9,
+        "updated_at": now,
+        "deal_info": dict(base_deal),
+    }
+    cloud_doc = copy.deepcopy(local_doc)
+
+    # 1. 云端来源与价格可靠性变更时，即使 updated_at 与评分完全相同也必须触发 deal_info_changed
+    local_doc["deal_info"]["source_is_reliable"] = True
+    local_doc["deal_info"]["price_is_reliable"] = False
+    local_doc["deal_info"]["price_reliability_reason"] = "需跨品凑单退凑"
+
+    local_col = _FakeSyncCollection([local_doc])
+    cloud_col = _FakeSyncCollection([cloud_doc])
+    r1 = sync_mod.run_sync_round(local_col, cloud_col, window_days=3.0)
+    assert r1["planned_sync_count"] == 1
+    assert r1["reason_breakdown"] == {"deal_info_changed": 1}
+
+    synced_di = cloud_col.docs[0]["deal_info"]
+    assert synced_di["source_is_reliable"] is True
+    assert synced_di["price_is_reliable"] is False
+    assert synced_di["price_reliability_reason"] == "需跨品凑单退凑"
+
+    # 2. 二次同步幂等，不再触发写库
+    r2 = sync_mod.run_sync_round(local_col, cloud_col, window_days=3.0)
+    assert r2["planned_sync_count"] == 0
+    assert r2["written_ops"] == 0
+
+

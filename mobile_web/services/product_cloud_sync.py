@@ -118,6 +118,9 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "deal_info.is_deal_tip": 1,
     "deal_info.expired_at": 1,
     "deal_info.source_item_id": 1,
+    "deal_info.source_is_reliable": 1,
+    "deal_info.price_is_reliable": 1,
+    "deal_info.price_reliability_reason": 1,
     "deal_info.quality_score": 1,
     "deal_info.deal_price": 1,
     "deal_info.updated_at": 1,
@@ -299,6 +302,9 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             to_utc_millis(deal_info.get("updated_at")),
             str(deal_info.get("format_status") or ""),
             to_utc_millis(deal_info.get("format_updated_at")),
+            bool(deal_info.get("source_is_reliable")),
+            deal_info.get("price_is_reliable") if isinstance(deal_info.get("price_is_reliable"), bool) else None,
+            str(deal_info.get("price_reliability_reason") or "").strip(),
         )
 
     return {

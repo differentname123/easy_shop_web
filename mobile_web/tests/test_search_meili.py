@@ -66,7 +66,21 @@ class TestSearchMeili(unittest.TestCase):
         self.assertEqual(res["saved_price"], 6.5)
         self.assertFalse(res["is_off_promotion"])
         self.assertTrue(res["is_deal_tip"])
+        self.assertFalse(res["is_reliable"])
         self.assertEqual(res["channel_type"], 1)
+        self.assertEqual(MEILI_SCHEMA_VERSION, 3)
+
+        self.assertTrue(format_meili_doc({
+            "platform": "pdd", "product_id": "P_NO_DEAL", "name": "官方商品", "channel_type": 5,
+        })["is_reliable"])
+        self.assertTrue(format_meili_doc({
+            "platform": "jd", "product_id": "J_SRC_REL", "name": "高可靠来源线报",
+            "deal_info": {"is_deal_tip": True, "source_is_reliable": True, "price_is_reliable": False},
+        })["is_reliable"])
+        self.assertTrue(format_meili_doc({
+            "platform": "jd", "product_id": "J_PRICE_REL", "name": "高可靠价格线报",
+            "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": True},
+        })["is_reliable"])
 
     def test_format_meili_doc_invalid(self):
         """测试不合法或缺失关键字段的文档安全返回 None"""
@@ -125,7 +139,7 @@ class TestSearchMeili(unittest.TestCase):
         self.assertIn('platform = "pdd"', params["filter"])
         self.assertIn('category = "饮料"', params["filter"])
         self.assertIn("NOT is_off_promotion = true", params["filter"])
-        self.assertEqual(params["sort"], ["activity_price:asc"])
+        self.assertEqual(params["sort"], ["is_reliable:desc", "activity_price:asc"])
         self.assertEqual(params["limit"], 10)
         self.assertEqual(params["matchingStrategy"], "all")
         self.assertNotIn("rankingScoreThreshold", params)
@@ -159,6 +173,8 @@ class TestSearchMeili(unittest.TestCase):
         self.assertEqual(cfg["searchableAttributes"], ["core_entity", "core_entity_alias", "brand", "name"])
         self.assertNotIn("mall_name", cfg["searchableAttributes"])
         self.assertNotIn("category", cfg["searchableAttributes"])
+        self.assertIn("is_reliable", cfg["filterableAttributes"])
+        self.assertIn("is_reliable", cfg["sortableAttributes"])
         self.assertEqual(cfg["typoTolerance"], {"enabled": False})
         self.assertEqual(cfg["localizedAttributes"], [{"attributePatterns": ["*"], "locales": ["cmn"]}])
         self.assertIn("鲜牛肉", cfg["synonyms"])

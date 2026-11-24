@@ -155,6 +155,7 @@ def query_active_formal_products(
                 "price": 1,
                 "deal_source": 1,
                 "deal_info.source_site": 1,
+                "deal_info.source_is_reliable": 1,
                 "deal_info.quality_score": 1,
                 "deal_info.deal_price": 1,
                 "deal_info.tutorial_steps": 1,
@@ -179,6 +180,7 @@ def query_active_formal_products(
                     "tutorial_steps_count": t_cnt,
                     "tutorial_score": int(di.get("tutorial_score") or di.get("quality_score") or 75),
                     "source_site": str(di.get("source_site") or d.get("deal_source") or ""),
+                    "source_is_reliable": bool(di.get("source_is_reliable")),
                 }
     except Exception as e:
         logger.warning("查询正式表已清洗活跃商品集合异常: %s", e)
@@ -190,8 +192,12 @@ def should_upgrade_existing_deal(
     ai1_res: Dict[str, Any],
     doc: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
-    """判断新线报是否满足库内同款商品择优升级条件（>=5% 价格突破或 >=15 分教程质量提升）。"""
-    _ = doc
+    """判断新线报是否满足库内同款商品替换条件：高可靠来源优先于非高可靠来源，同级别按 >=5% 价格突破或 >=15 分教程质量提升。"""
+    ex_reliable = bool(ex_info.get("source_is_reliable"))
+    new_reliable = bool((doc or {}).get("source_is_reliable"))
+    if new_reliable != ex_reliable:
+        return (True, "高可靠来源线报覆盖非高可靠来源") if new_reliable else (False, "")
+
     new_dp = ai1_res.get("deal_price")
     ex_dp = ex_info.get("deal_price")
     new_score = int(ai1_res.get("tutorial_score") or 0)

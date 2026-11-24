@@ -2468,7 +2468,6 @@ def process_ai2_unit(
 
         stage2_inputs.append({
             "main_tip_id": mid,
-            "source_site": site,
             "is_group_stream": bool(doc.get("is_group_stream")),
             "combined_raw_text": combined_raw_for_ai2,
             "draft_copywriting": draft_copywriting,
@@ -2687,6 +2686,17 @@ def process_ai2_unit(
         price_logic = normalize_inline_spaces(str(ai2_res.get("price_logic") or "")).strip() or None
         card_highlight = sanitize_card_highlight(ai2_res.get("card_highlight"))
         clean_title = normalize_inline_spaces(str(ai2_res.get("clean_title") or product_card.get("name") or raw_title)).strip()
+
+        raw_price_reliable = ai2_res.get("price_is_reliable")
+        price_is_reliable: Optional[bool] = (
+            raw_price_reliable if isinstance(raw_price_reliable, bool) else None
+        )
+        price_reliability_reason = (
+            normalize_inline_spaces(str(ai2_res.get("price_reliability_reason") or "")).strip()[:120]
+            if price_is_reliable is not None
+            else ""
+        )
+        source_is_reliable = bool(doc.get("source_is_reliable"))
 
         def _is_other_known_platform(c: Dict[str, Any]) -> bool:
             c_p = str(c.get("platform") or "").strip().lower()
@@ -2968,6 +2978,9 @@ def process_ai2_unit(
             "expire_time": doc.get("expire_time"),
             "deal_price": deal_price,
             "price_logic": price_logic,
+            "price_is_reliable": price_is_reliable,
+            "price_reliability_reason": price_reliability_reason,
+            "source_is_reliable": source_is_reliable,
             "official_price": round(official_price, 2),
             "raw_tip_title": raw_title or str(product_card.get("name") or ""),
             "original_copywriting": original_copywriting,

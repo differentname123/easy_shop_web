@@ -685,6 +685,7 @@ class DealRawPoolRepository:
 
             core_fields = {
                 "source_channel": channel,
+                "source_is_reliable": bool(rec.get("source_is_reliable")),
                 "source_url": source_url or source_detail_url,
                 "source_list_page_url": source_list_page_url,
                 "source_detail_url": source_detail_url,

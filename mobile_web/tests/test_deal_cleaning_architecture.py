@@ -1316,3 +1316,114 @@ def test_ai2_batch_swap_guard_high_price_and_score_breakdown_sum():
     assert out_map["lux_1"]["deal_price"] == 301010.0
     assert out_map["lux_1"]["quality_score"] == 91
     assert out_map["lux_1"]["product_doc"]["deal_info"]["quality_score"] == 91
+
+
+def test_ai2_blind_input_and_independent_price_reliability():
+    """验证 AI-2 输入物理盲审（不传 source_site / source_is_reliable）、双字段完全解耦及 Fail-Closed 解析。"""
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
+    captured_inputs = []
+
+    docs = [
+        # Case 1: 高可靠来源 + AI 判价格不可靠 -> 不被淘汰、不强行改 True
+        {
+            "source_site": "tehuicaicai",
+            "source_channel": "特惠采采_首页精选",
+            "source_is_reliable": True,
+            "source_item_id": "decouple_rel_false",
+            "title": "某品牌洗衣液 凑单实付 19.9元",
+            "ai_stage1_result": {"combined_raw_text": "某品牌洗衣液 凑单退凑实付19.9元 [#L1]", "merged_tip_ids": ["decouple_rel_false"], "extracted_targets": []},
+            "full_conv_list": [{"link_id": "L1", "text_role_hint": "main_candidate", "convert_status": "product", "platform": "jd", "goods_id": "J1", "official_product": {"title": "某品牌洗衣液", "shop_name": "官方旗舰店", "brand": "某品牌", "price": 49.9, "activity_price": 39.9}, "my_promo_link": "https://u.jd.com/j1"}],
+        },
+        # Case 2: 非高可靠来源 + AI 判价格可靠
+        {
+            "source_site": "guangdiu",
+            "source_channel": "逛丢_首页实时流",
+            "source_is_reliable": False,
+            "source_item_id": "decouple_norm_true",
+            "title": "某品牌抽纸 19.9元",
+            "ai_stage1_result": {"combined_raw_text": "某品牌抽纸 直降到手19.9元 [#L1]", "merged_tip_ids": ["decouple_norm_true"], "extracted_targets": []},
+            "full_conv_list": [{"link_id": "L1", "text_role_hint": "main_candidate", "convert_status": "product", "platform": "jd", "goods_id": "J2", "official_product": {"title": "某品牌抽纸", "shop_name": "官方旗舰店", "brand": "某品牌", "price": 24.9, "activity_price": 22.9}, "my_promo_link": "https://u.jd.com/j2"}],
+        },
+        # Case 3: AI 返回非布尔字符串 -> Fail-Closed 为 None + ""
+        {
+            "source_site": "guangdiu",
+            "source_channel": "逛丢_首页实时流",
+            "source_is_reliable": False,
+            "source_item_id": "fail_closed_str",
+            "title": "某品牌牙膏 9.9元",
+            "ai_stage1_result": {"combined_raw_text": "某品牌牙膏 到手9.9元 [#L1]", "merged_tip_ids": ["fail_closed_str"], "extracted_targets": []},
+            "full_conv_list": [{"link_id": "L1", "text_role_hint": "main_candidate", "convert_status": "product", "platform": "jd", "goods_id": "J3", "official_product": {"title": "某品牌牙膏", "shop_name": "官方旗舰店", "brand": "某品牌", "price": 19.9, "activity_price": 12.9}, "my_promo_link": "https://u.jd.com/j3"}],
+        },
+    ]
+
+    def _fake_ai2(stage2_inputs, quiet_sub_logs=False):
+        captured_inputs.extend(stage2_inputs)
+        return {
+            "decouple_rel_false": {
+                "main_tip_id": "decouple_rel_false",
+                "is_valid_deal": True,
+                "main_link_id": "L1",
+                "clean_title": "某品牌洗衣液",
+                "deal_price": 19.9,
+                "card_highlight": "到手19.9元",
+                "tutorial_steps": ["1. 加购并凑单可退商品实付19.9元"],
+                "price_is_reliable": False,
+                "price_reliability_reason": "需跨品凑单合并付款后再退凑单",
+                "quality_score": 82,
+            },
+            "decouple_norm_true": {
+                "main_tip_id": "decouple_norm_true",
+                "is_valid_deal": True,
+                "main_link_id": "L1",
+                "clean_title": "某品牌抽纸",
+                "deal_price": 19.9,
+                "card_highlight": "到手19.9元",
+                "tutorial_steps": ["1. 直接下单到手19.9元"],
+                "price_is_reliable": True,
+                "price_reliability_reason": "官方直降可稳定达成" + ("！" * 130),
+                "quality_score": 80,
+            },
+            "fail_closed_str": {
+                "main_tip_id": "fail_closed_str",
+                "is_valid_deal": True,
+                "main_link_id": "L1",
+                "clean_title": "某品牌牙膏",
+                "deal_price": 9.9,
+                "card_highlight": "到手9.9元",
+                "tutorial_steps": ["1. 下单9.9元"],
+                "price_is_reliable": "true",
+                "price_reliability_reason": "非法非布尔值不应保留此原因",
+                "quality_score": 78,
+            },
+        }
+
+    cleaner.run_ai_stage2_batch = _fake_ai2
+    raw_col = MagicMock()
+    raw_col.find.return_value = []
+    outcomes, _ = cleaner.process_ai2_unit(docs, raw_col=raw_col, quiet_sub_logs=True)
+    out_map = {o["source_item_id"]: o for o in outcomes}
+
+    # 1. AI-2 物理盲审：禁止传入 source_site 与 source_is_reliable
+    assert len(captured_inputs) == 3
+    for inp in captured_inputs:
+        assert "source_site" not in inp
+        assert "source_is_reliable" not in inp
+
+    # 2. 正交解耦与 Fail-Closed
+    di_1 = out_map["decouple_rel_false"]["product_doc"]["deal_info"]
+    assert out_map["decouple_rel_false"]["status"] == "success"
+    assert di_1["is_deal_tip"] is True
+    assert di_1["source_is_reliable"] is True
+    assert di_1["price_is_reliable"] is False
+    assert di_1["price_reliability_reason"] == "需跨品凑单合并付款后再退凑单"
+
+    di_2 = out_map["decouple_norm_true"]["product_doc"]["deal_info"]
+    assert di_2["source_is_reliable"] is False
+    assert di_2["price_is_reliable"] is True
+    assert len(di_2["price_reliability_reason"]) == 120
+
+    di_3 = out_map["fail_closed_str"]["product_doc"]["deal_info"]
+    assert di_3["source_is_reliable"] is False
+    assert di_3["price_is_reliable"] is None
+    assert di_3["price_reliability_reason"] == ""
+

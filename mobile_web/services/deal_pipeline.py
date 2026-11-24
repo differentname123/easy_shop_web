@@ -357,6 +357,7 @@ def run_fetch_stage(
                         if isinstance(hm, dict) and "sub_channel" not in hm:
                             hm["sub_channel"] = orig_ch
                     r["source_channel"] = task_name
+                    r["source_is_reliable"] = bool(ch.source_is_reliable)
                     if ch.use_fetch_time_as_publish_time:
                         r["publish_ts"] = fetch_ts
                         r.pop("publish_time", None)

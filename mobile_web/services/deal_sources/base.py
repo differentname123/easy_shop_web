@@ -40,6 +40,7 @@ class ChannelConfig:
     sleep_after: float = 0.3                   # 本频道抓完后安全休眠（秒）
     rate_limit_cooldown_seconds: int = 300     # 触发 429/403/验证码后的同站冷却秒数
     max_age_days: float = 2.0                  # 爆料有效保鲜期（天）
+    source_is_reliable: bool = False           # True 表示该频道为高可靠来源（仅标识来源可靠性，与价格/教程判定独立）
     network_mode: str = "direct"               # "direct" (直连不走系统代理) | "proxy" (走系统/环境变量代理)
     close_connection: bool = False             # True 时携带 Connection: close 规避老站点 Keep-Alive 断连
     description: str = ""                      # 频道说明

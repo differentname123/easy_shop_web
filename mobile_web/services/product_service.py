@@ -14,11 +14,11 @@ from models.product import (
     ProductRef,
     DetailSnapshot,
     DetailPrefetchResult,
-    extract_search_keyword,
     is_jd_image_key,
     utc_millis,
 )
 from repositories.product_repo import ProductRepository
+from services.boom_search import resolve_boom_sort
 from cache import (
     RECOMMEND_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
     MATERIAL_CACHE, SIGN_BY_ID_CACHE,
@@ -203,7 +203,7 @@ class ProductService:
             self._save_summary_in_background(valid_items, channel_type)
 
     def _overlay_deal_card_info(self, plat: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """将正式表已入库活跃线报的缩略图亮点与发布时间叠加到首页列表摘要（失败时降级原样返回）。"""
+        """将正式表已入库活跃线报的缩略图亮点、发布时间与可靠性标志叠加到首页列表摘要（失败或无覆盖能力时降级原样返回）。"""
         if not items or not hasattr(self.repo, "get_deal_card_overlays"):
             return items
         try:
@@ -215,11 +215,21 @@ class ProductService:
                     if k:
                         keys.append(k)
             overlays = self.repo.get_deal_card_overlays(plat, keys) if keys else None
-            if isinstance(overlays, dict) and overlays:
-                return [ProductRepository.apply_deal_card_overlay(it, overlays) for it in items]
+            overlaid = (
+                [ProductRepository.apply_deal_card_overlay(it, overlays) for it in items]
+                if isinstance(overlays, dict) and overlays
+                else items
+            )
+            return [
+                (
+                    {**it, "is_reliable": it.get("is_deal_tip") is not True}
+                    if isinstance(it, dict) and "is_reliable" not in it
+                    else it
+                )
+                for it in overlaid
+            ]
         except Exception:
-            pass
-        return items
+            return items
 
     def get_home_recommendations(self, channel_type=5, offset=0, limit=20, uid=None,
                                  platform="pdd", force_refresh=False, cursor=None) -> Dict[str, Any]:
@@ -915,14 +925,7 @@ class ProductService:
         plat = normalize_platform(platform, "all")
         page = max(1, min(50, int(page or 1)))
         page_size = max(1, min(50, int(page_size or 20)))
-        raw_kw = keyword.strip() if keyword and keyword.strip() else ""
-        kw_key = (extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]) if raw_kw else ""
-
-        # 无搜索词时商品跨品类无可比性，统一使用最新上架排序；有搜索词时默认使用性价比排序
-        if not kw_key:
-            effective_sort = "latest" if sort_by in (None, "", "cost_performance") else sort_by
-        else:
-            effective_sort = "cost_performance" if sort_by in (None, "") else sort_by
+        kw_key, effective_sort = resolve_boom_sort(keyword, sort_by)
 
         if effective_sort == "cost_performance" and kw_key and hasattr(self.repo, "rank_boom_products_by_cost_performance"):
             cat_key = category.strip() if category and category.strip() and category.strip() != "全部" else ""
