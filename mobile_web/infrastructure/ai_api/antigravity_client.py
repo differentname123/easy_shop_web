@@ -61,7 +61,8 @@ EXCLUDED_MAIN_ACCOUNTS: set[str] = {
 DEFAULT_MAX_CONCURRENCY_PER_ACCOUNT: int = 4
 
 SUB_ACCOUNT_POOL: List[str] = [
-    "just4mike@usa.com",  # Google AI Pro   (支持: Argon / 3.8-Flash)
+    "lourdesvega5@yahoo.com",       # Google AI Pro   (支持: 3.8-Flash)
+    # "just4mike@usa.com",          # Google AI Pro   (已封禁)
     # "richard.nowak@usa.com",        # Google AI Ultra (支持: Argon / 3.8-Flash，与大号同家庭组)
 ]
 
