@@ -241,14 +241,34 @@ else
     fi
 
     if [[ -x "${MEILI_BIN}" ]]; then
+      echo "ℹ️ 准备启动 Meilisearch 前置诊断与清理..."
+      systemctl stop meilisearch.service 2>/dev/null || true
+      systemctl reset-failed meilisearch.service 2>/dev/null || true
+
+      echo "  - 二进制版本: $("${MEILI_BIN}" --version 2>&1 || echo 'unknown')"
+      echo "  - 磁盘空间  : $(df -h /data / 2>/dev/null | tail -n +2 | tr '\n' ';' | sed 's/  */ /g')"
+      echo "  - 可用内存  : $(free -m 2>/dev/null | awk '/Mem:/ {printf "total=%sMB used=%sMB avail=%sMB", $2, $3, $7}' || echo 'unknown')"
+      echo "  - 7700端口  : $(ss -tlnp 2>/dev/null | grep 7700 || echo '空闲')"
+
       mkdir -p /data/meili_data
-      if [[ -d /data/meili_data/data.ms && ! -f /data/meili_data/data.ms/VERSION ]]; then
-        rmdir /data/meili_data/data.ms 2>/dev/null || true
+      echo "  - /data/meili_data 现存内容:"
+      ls -la /data/meili_data 2>/dev/null || true
+
+      if [[ -d /data/meili_data/data.ms ]]; then
+        CUR_VER="$(cat /data/meili_data/data.ms/VERSION 2>/dev/null || true)"
+        echo "  - data.ms/VERSION: ${CUR_VER:-<缺失>}"
+        if [[ -z "${CUR_VER}" || "${CUR_VER}" != 1.12.* ]]; then
+          echo "⚠️ 检测到未初始化或版本不匹配的残留 /data/meili_data/data.ms，正在彻底清理重建..."
+          rm -rf /data/meili_data/data.ms
+        fi
       fi
+
       MEILI_KEY_OPT=""
       if [[ -n "${MEILI_KEY}" ]]; then
         MEILI_KEY_OPT="--master-key ${MEILI_KEY}"
       fi
+      echo "  - 启动参数  : --http-addr 127.0.0.1:7700 --db-path /data/meili_data/data.ms (key_bytes=${#MEILI_KEY}) --max-indexing-memory 268435456 --no-analytics"
+
       cat > /etc/systemd/system/meilisearch.service << EOF
 [Unit]
 Description=Meilisearch Lightweight Search Engine
@@ -256,6 +276,9 @@ After=network.target
 
 [Service]
 Type=simple
+WorkingDirectory=/data/meili_data
+LimitNOFILE=65536
+Environment=MEILI_ENV=development
 ExecStart=${MEILI_BIN} --http-addr 127.0.0.1:7700 --db-path /data/meili_data/data.ms ${MEILI_KEY_OPT} --max-indexing-memory 268435456 --no-analytics
 Restart=always
 RestartSec=5
@@ -265,11 +288,15 @@ WantedBy=multi-user.target
 EOF
       chmod 600 /etc/systemd/system/meilisearch.service
       systemctl daemon-reload
-      systemctl enable --now meilisearch.service
-      systemctl restart meilisearch.service
+      MEILI_START_TS="$(date '+%Y-%m-%d %H:%M:%S')"
+      systemctl enable meilisearch.service
+      systemctl start meilisearch.service
 
-      for _ in $(seq 1 15); do
+      for sec in $(seq 1 15); do
         if check_meili_health; then
+          break
+        fi
+        if [[ "${sec}" -ge 3 ]] && ! systemctl is-active --quiet meilisearch.service; then
           break
         fi
         sleep 1
@@ -301,8 +328,24 @@ PYEOF
     ST_MEILI="${ST_MEILI} [索引商品数: ${MEILI_DOCS}]"
   else
     echo "❌ Meilisearch (127.0.0.1:7700) 未启动或不可用（如为首次部署请带 --init 参数）"
-    echo "--- Meilisearch 最近启动日志 ---"
-    journalctl -u meilisearch.service -n 20 --no-pager 2>/dev/null || true
+    systemctl stop meilisearch.service 2>/dev/null || true
+    echo "--- Meilisearch 首次启动完整日志 (since ${MEILI_START_TS:-5 minutes ago}) ---"
+    journalctl -u meilisearch.service --since "${MEILI_START_TS:-5 minutes ago}" --no-pager 2>/dev/null || true
+    echo "--- Meilisearch 服务状态 ---"
+    systemctl status meilisearch.service --no-pager 2>/dev/null || true
+    echo "--- /data/meili_data 目录详情 ---"
+    ls -la /data/meili_data /data/meili_data/data.ms 2>/dev/null || true
+    if [[ -x "${MEILI_BIN}" ]]; then
+      echo "--- Meilisearch 3秒前台直跑探测输出 (临时目录, 隔离17700端口) ---"
+      DIAG_DIR="/tmp/meili_diag_$$"
+      rm -rf "${DIAG_DIR}"
+      MEILI_DIAG_ARGS=(--http-addr 127.0.0.1:17700 --db-path "${DIAG_DIR}" --max-indexing-memory 268435456 --no-analytics)
+      if [[ -n "${MEILI_KEY:-}" ]]; then
+        MEILI_DIAG_ARGS+=(--master-key "${MEILI_KEY}")
+      fi
+      MEILI_ENV=development timeout 3 "${MEILI_BIN}" "${MEILI_DIAG_ARGS[@]}" 2>&1 || true
+      rm -rf "${DIAG_DIR}"
+    fi
     ST_MEILI="❌ 未运行 (当前业务会自动降级回 MongoDB 搜索)"
     if [[ "${DO_INIT}" -eq 1 ]]; then
       CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
