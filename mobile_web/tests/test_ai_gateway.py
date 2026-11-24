@@ -502,3 +502,135 @@ def test_encode_image_for_llm_preserves_dimensions_and_edge_cases(tmp_path):
     tiny_out, tiny_mime = model_api._encode_image_for_llm(tiny, "image/png")
     assert tiny_mime == "image/png"
     assert tiny_out == tiny_raw
+
+
+def test_antigravity_quarantine_skips_dead_account_in_zero_ms(monkeypatch, tmp_path):
+    import os
+    import infrastructure.ai_api.antigravity_client as ag
+
+    lock_dir = tmp_path / "locks"
+    sb_root = tmp_path / "sandboxes"
+    sb_dir = sb_root / "mock_sub_at_example.com"
+    tok_file = sb_dir / ".gemini" / "jetski-standalone-oauth-token"
+    tok_file.parent.mkdir(parents=True, exist_ok=True)
+    tok_file.write_text(json.dumps({"token": {"refresh_token": "tok_v1_0123456789abcd"}}), encoding="utf-8")
+
+    monkeypatch.setattr(ag, "GLOBAL_LOCK_DIR", lock_dir)
+    monkeypatch.setattr(ag, "SANDBOX_ROOT_DIR", sb_root)
+    monkeypatch.setattr(ag, "sync_all_known_accounts_to_sandboxes", lambda: {"mock_sub@example.com": sb_dir})
+
+    rpc_calls = []
+
+    def _fake_post_rpc(worker_self, method, payload, retry_discovery=True, timeout=None):
+        rpc_calls.append(method)
+        if method == "StartCascade":
+            return {"cascadeId": "cid-1"}
+        if method == "WaitForConversationFullyIdle":
+            raise RuntimeError("PERMISSION_DENIED (code 403): This service has been disabled for violation of Terms of Service.")
+        return {}
+
+    monkeypatch.setattr(ag.AntigravityClient, "_post_rpc_inner", _fake_post_rpc)
+    monkeypatch.setattr(ag.AntigravityClient, "_wait_for_stagger_slot", lambda self: None)
+
+    pool1 = ag.AntigravityPoolClient(account_pool=["mock_sub@example.com"])
+    with pytest.raises(RuntimeError):
+        pool1.ask_with_usage("hello", model="antigravity-3.8-flash-high")
+    assert rpc_calls.count("StartCascade") == 1
+
+    # Fresh pool instance skips immediately with SlotAcquireTimeoutError and 0 RPC calls
+    rpc_calls.clear()
+    pool2 = ag.AntigravityPoolClient(account_pool=["mock_sub@example.com"])
+    with pytest.raises(ag.SlotAcquireTimeoutError):
+        pool2.ask_with_usage("hello again", model="antigravity-3.8-flash-high")
+    assert rpc_calls == []
+
+    # Direct pre-acquired fd check must not leak concurrency semaphore/slot
+    direct = pool2._get_worker("mock_sub@example.com")
+    pre_fd = direct.try_claim_idle_slot()
+    assert pre_fd is not None
+    with pytest.raises(ag.SlotAcquireTimeoutError):
+        direct.ask_with_usage("direct", _pre_acquired_fd=pre_fd)
+    fds = [direct.try_claim_idle_slot() for _ in range(direct._max_concurrency)]
+    assert all(fd is not None for fd in fds)
+    for fd in fds:
+        direct._unlock_fd(fd)
+        os.close(fd)
+        direct._concurrency_sem.release()
+
+    # Auto-clear when refresh_token changes
+    tok_file.write_text(json.dumps({"token": {"refresh_token": "tok_v2_newtoken9999"}}), encoding="utf-8")
+    assert direct.is_quarantined() is None
+
+
+def test_antigravity_stagger_before_send_and_disable_telemetry_flag(monkeypatch, tmp_path):
+    import infrastructure.ai_api.antigravity_client as ag
+
+    lock_dir = tmp_path / "locks"
+    sb_root = tmp_path / "sandboxes"
+    sb_dir = sb_root / "stagger_at_example.com"
+    sb_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(ag, "GLOBAL_LOCK_DIR", lock_dir)
+    monkeypatch.setattr(ag, "SANDBOX_ROOT_DIR", sb_root)
+
+    call_order = []
+
+    def _fake_stagger(client_self):
+        call_order.append("stagger")
+
+    def _fake_post_rpc(client_self, method, payload, retry_discovery=True, timeout=None):
+        call_order.append(method)
+        if method == "StartCascade":
+            return {"cascadeId": "cid-stagger"}
+        if method == "WaitForConversationFullyIdle":
+            return {"timedOut": False}
+        if method == "GetCascadeTrajectory":
+            return {
+                "trajectory": {
+                    "steps": [
+                        {
+                            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                            "plannerResponse": {"response": "ok"},
+                            "metadata": {"modelUsage": {"inputTokens": 2, "outputTokens": 1}},
+                        }
+                    ]
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(ag.AntigravityClient, "_wait_for_stagger_slot", _fake_stagger)
+    monkeypatch.setattr(ag.AntigravityClient, "_post_rpc_inner", _fake_post_rpc)
+
+    client = ag.AntigravityClient(sub_account_email="stagger@example.com")
+    reply, _ = client.ask_with_usage("test order", model="antigravity-3.8-flash-high")
+    assert reply == "ok"
+    assert call_order.index("stagger") == call_order.index("SendUserCascadeMessage") - 1
+    assert call_order.index("StartCascade") < call_order.index("stagger")
+
+    # Verify --disable_telemetry passed when spawning language_server.exe
+    fake_ls = tmp_path / "language_server.exe"
+    fake_ls.write_bytes(b"")
+    spawned_args = []
+
+    class FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def _fake_popen(args, **kwargs):
+        spawned_args.append(list(args))
+        (sb_dir / "language_server_sandbox.log").write_text(
+            "Language server listening on random port at 55555 for HTTP\nAuth succeeded\n",
+            encoding="utf-8",
+        )
+        return FakeProc()
+
+    monkeypatch.setattr(ag, "DEFAULT_LS_BIN", fake_ls)
+    monkeypatch.setattr(ag.AntigravityClient, "_detect_ide_version", staticmethod(lambda: "2.34.0"))
+    monkeypatch.setattr(ag.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(ag.AntigravityClient, "_verify_and_bind_connection", lambda self, **kw: (55555, "tok"))
+
+    port, _ = client._start_sandbox_or_headless_server(sandbox_dir=sb_dir)
+    assert port == 55555
+    assert len(spawned_args) == 1
+    assert "--disable_telemetry" in spawned_args[0]

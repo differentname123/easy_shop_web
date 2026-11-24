@@ -108,6 +108,32 @@ class SlotAcquireTimeoutError(TimeoutError):
     is_slot_busy = True
 
 
+FAILED_ACCOUNT_COOLDOWN_SECONDS: float = 90.0
+# 防止已确认 403 TOS_VIOLATION / VALIDATION_REQUIRED / #3501 / invalid_grant 的封禁或失效账号反复撞击接口
+FATAL_ACCOUNT_QUARANTINE_SECONDS: float = 24 * 3600.0
+
+
+def _is_fatal_account_error(exc: Exception) -> bool:
+    """判断是否为账号级致命封禁/失效错误（403 ToS 封禁、需验证、无订阅 #3501、OAuth 吊销）。"""
+    msg = str(exc).lower()
+    if any(
+        marker in msg
+        for marker in (
+            "tos_violation",
+            "this service has been disabled",
+            "validation_required",
+            "verify your account",
+            "invalid_grant",
+            "#3501",
+            "error 3501",
+        )
+    ):
+        return True
+    if "permission_denied" in msg and "403" in msg:
+        return True
+    return False
+
+
 def _sanitize_email_dirname(email: str) -> str:
     """将邮箱名转换为安全的文件夹名称。"""
     clean = email.strip().lower().replace("@", "_at_")
@@ -378,6 +404,89 @@ class AntigravityClient:
         """返回经 Google 云端 GetUserStatus 实名验证过的当前连接邮箱。"""
         return self._verified_email
 
+    def _quarantine_file_path(self) -> Path:
+        """返回当前账号跨进程致命熔断状态文件路径。"""
+        return GLOBAL_LOCK_DIR / f"ag_quarantine_{self._lock_key}.json"
+
+    def _current_refresh_token_prefix(self) -> str:
+        """读取当前沙箱 token 的 refresh_token 前 16 位，用于检测用户是否更换了新登录态。"""
+        if not self.sub_account_email:
+            return ""
+        token_path = SANDBOX_ROOT_DIR / self._lock_key / ".gemini" / "jetski-standalone-oauth-token"
+        if not token_path.exists():
+            return ""
+        try:
+            data = json.loads(token_path.read_text(encoding="utf-8"))
+            rt = str(((data.get("token") or {}).get("refresh_token")) or "").strip()
+            return rt[:16]
+        except Exception:
+            return ""
+
+    def is_quarantined(self) -> Optional[str]:
+        """若当前账号处于跨进程致命熔断期内，返回熔断原因；否则（含过期或已换新 Token）返回 None。"""
+        q_path = self._quarantine_file_path()
+        if not q_path.exists():
+            return None
+        try:
+            data = json.loads(q_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        until = float(data.get("until") or 0.0)
+        if time.time() >= until:
+            try:
+                q_path.unlink()
+            except OSError:
+                pass
+            return None
+        stored_prefix = str(data.get("refresh_token_prefix") or "").strip()
+        if stored_prefix:
+            cur_prefix = self._current_refresh_token_prefix()
+            if cur_prefix and cur_prefix != stored_prefix:
+                try:
+                    q_path.unlink()
+                except OSError:
+                    pass
+                return None
+        return str(data.get("reason") or "account quarantined")
+
+    def mark_quarantined(self, reason: str, ttl_seconds: float = FATAL_ACCOUNT_QUARANTINE_SECONDS) -> None:
+        """将当前账号写入跨进程致命熔断隔离文件（原子写盘，防止多进程并发损坏）。"""
+        GLOBAL_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        q_path = self._quarantine_file_path()
+        payload = json.dumps(
+            {
+                "email": self.sub_account_email or self._lock_key,
+                "until": time.time() + max(60.0, float(ttl_seconds)),
+                "reason": str(reason)[:300],
+                "refresh_token_prefix": self._current_refresh_token_prefix(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+        )
+        tmp_path = q_path.with_name(f"{q_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, q_path)
+        except OSError:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            try:
+                q_path.write_text(payload, encoding="utf-8")
+            except OSError:
+                pass
+
+    def clear_quarantine(self) -> None:
+        """解除当前账号的跨进程致命熔断状态。"""
+        try:
+            self._quarantine_file_path().unlink()
+        except OSError:
+            pass
+
     @staticmethod
     def _try_lock_fd(fd: int) -> bool:
         """尝试对文件描述符第 0 字节加非阻塞排他锁（OS 内核级锁，进程退出自动释放）。"""
@@ -440,7 +549,6 @@ class AntigravityClient:
         """
         if pre_acquired_fd is not None:
             try:
-                self._wait_for_stagger_slot()
                 yield
             finally:
                 self._unlock_fd(pre_acquired_fd)
@@ -468,7 +576,6 @@ class AntigravityClient:
                             f"等待 Antigravity 本地文件锁槽位超过 {effective_timeout:.1f}s，立即切换其他模型"
                         )
                     time.sleep(random.uniform(0.08, 0.16))
-            self._wait_for_stagger_slot()
             yield
         finally:
             if locked_fd is not None:
@@ -748,6 +855,7 @@ class AntigravityClient:
             args = [
                 str(DEFAULT_LS_BIN),
                 "--standalone",
+                "--disable_telemetry",
                 "--override_ide_name", "antigravity",
                 "--subclient_type", "hub",
                 "--override_ide_version", ide_version,
@@ -1013,6 +1121,7 @@ class AntigravityClient:
         """调用本地官方 LanguageServerService ConnectRPC 接口（强制直连 127.0.0.1，不经过外部代理）。"""
         if apply_rate_limit:
             with self._acquire_account_slot():
+                self._wait_for_stagger_slot()
                 return self._post_rpc_inner(method, payload, retry_discovery=retry_discovery, timeout=timeout)
         return self._post_rpc_inner(method, payload, retry_discovery=retry_discovery, timeout=timeout)
 
@@ -1096,6 +1205,22 @@ class AntigravityClient:
         full_prompt = f"{system_prompt.strip()}\n\n{prompt}" if system_prompt else prompt
         req_timeout = float(timeout) if timeout is not None else self.timeout
 
+        q_reason = self.is_quarantined()
+        if q_reason:
+            if _pre_acquired_fd is not None:
+                self._unlock_fd(_pre_acquired_fd)
+                try:
+                    os.close(_pre_acquired_fd)
+                except OSError:
+                    pass
+                self._concurrency_sem.release()
+            err = SlotAcquireTimeoutError(
+                f"本地 Antigravity 账号 ({self.sub_account_email or 'default'}) 已熔断隔离: {q_reason}"
+            )
+            setattr(err, "account_email", self._verified_email or self.sub_account_email or "desktop")
+            setattr(err, "sandbox_port", self._http_port)
+            raise err
+
         try:
             with self._acquire_account_slot(
                 pre_acquired_fd=_pre_acquired_fd,
@@ -1140,6 +1265,7 @@ class AntigravityClient:
                     if media:
                         send_payload["media"] = media
 
+                    self._wait_for_stagger_slot()
                     self._post_rpc_inner(
                         "SendUserCascadeMessage",
                         send_payload,
@@ -1205,6 +1331,8 @@ class AntigravityClient:
                         except Exception:
                             pass
         except Exception as exc:
+            if _is_fatal_account_error(exc):
+                self.mark_quarantined(str(exc)[:300])
             setattr(exc, "account_email", self._verified_email or self.sub_account_email or "desktop")
             setattr(exc, "sandbox_port", self._http_port)
             raise
@@ -1327,6 +1455,7 @@ class AntigravityPoolClient:
         self.max_concurrency_per_account = max(1, int(max_concurrency_per_account))
         self._pool_lock = threading.Lock()
         self._workers: Dict[str, AntigravityClient] = {}
+        self._worker_cooldown_until: Dict[str, float] = {}
         self._thread_local = threading.local()
 
         known_sandboxes = sync_all_known_accounts_to_sandboxes()
@@ -1392,7 +1521,32 @@ class AntigravityPoolClient:
         wait_started = time.perf_counter()
 
         while chosen_worker is None:
-            shuffled = list(candidates)
+            now_ts = time.perf_counter()
+            quarantined_reasons: List[str] = []
+            non_quarantined: List[AntigravityClient] = []
+            for w in candidates:
+                q_reason = w.is_quarantined()
+                if q_reason:
+                    quarantined_reasons.append(q_reason)
+                else:
+                    non_quarantined.append(w)
+
+            if not non_quarantined:
+                raise SlotAcquireTimeoutError(
+                    f"本地 Antigravity 账号池所有小号均已熔断隔离，立即切换其他模型 ({quarantined_reasons[0][:120]})"
+                )
+
+            with self._pool_lock:
+                active_candidates = [
+                    w for w in non_quarantined
+                    if self._worker_cooldown_until.get(w.sub_account_email or "", 0.0) <= now_ts
+                ]
+            if not active_candidates:
+                raise SlotAcquireTimeoutError(
+                    "本地 Antigravity 账号池所有小号均处于异常冷却期，立即切换其他模型"
+                )
+
+            shuffled = list(active_candidates)
             random.shuffle(shuffled)
             if last_failed and len(shuffled) > 1:
                 shuffled.sort(key=lambda w: 1 if w.sub_account_email == last_failed else 0)
@@ -1411,6 +1565,7 @@ class AntigravityPoolClient:
                     )
                 time.sleep(random.uniform(0.08, 0.16))
 
+        worker_email = chosen_worker.sub_account_email or ""
         try:
             reply, usage = chosen_worker.ask_with_usage(
                 prompt=prompt,
@@ -1421,9 +1576,19 @@ class AntigravityPoolClient:
                 _pre_acquired_fd=claimed_fd,
             )
             self._thread_local.last_failed_email = None
+            if worker_email:
+                with self._pool_lock:
+                    self._worker_cooldown_until.pop(worker_email, None)
             return reply, usage
         except Exception as exc:
-            self._thread_local.last_failed_email = chosen_worker.sub_account_email
+            self._thread_local.last_failed_email = worker_email or None
+            is_fatal = _is_fatal_account_error(exc)
+            if is_fatal:
+                chosen_worker.mark_quarantined(str(exc)[:300])
+            if worker_email:
+                cd_seconds = FATAL_ACCOUNT_QUARANTINE_SECONDS if is_fatal else FAILED_ACCOUNT_COOLDOWN_SECONDS
+                with self._pool_lock:
+                    self._worker_cooldown_until[worker_email] = time.perf_counter() + cd_seconds
             if not getattr(exc, "account_email", None):
                 setattr(exc, "account_email", chosen_worker.sub_account_email)
             raise
@@ -1474,6 +1639,20 @@ class AntigravityPoolClient:
         rows: List[Dict[str, Any]] = []
         for email in self.account_pool:
             w = self._get_worker(email)
+            q_reason = w.is_quarantined()
+            if q_reason:
+                rows.append(
+                    {
+                        "email": email,
+                        "status": f"🚫 已熔断隔离 ({q_reason[:80]})",
+                        "tier": "Quarantined",
+                        "pid": None,
+                        "port": None,
+                        "supports_argon": False,
+                        "supports_flash": False,
+                    }
+                )
+                continue
             try:
                 info = w.get_active_account_info()
                 rows.append(
