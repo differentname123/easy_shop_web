@@ -113,6 +113,13 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 0, "备注": "来源chatgpt_web"},
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 0, "备注": "来源gemini_web"},
     {"model_name": "gpt-6-codex-luna-max", "权重": 5, "备注": "来源codex 付费"},
+    # --------------------------------------------------------------------------
+    # ⚠️ [2026-11-25 已停用 Antigravity 本地模型] 取消注释恢复权重前必读！
+    # 实证记录：just4mike@usa.com（38h / 4并发高峰6h死）与 lourdesvega5@yahoo.com
+    # （0 warmup + --disable_telemetry 对照下，4并发仅存活 3h11m）均因 403 TOS_VIOLATION 被封。
+    # 详见 antigravity_client.py 顶部复盘：重启前必须先去掉 DeleteCascadeTrajectory 触发的
+    # 320次 [voice-rap] 403、停用第三方工具残缺 OAuth 改用官方登录归档、并将单号并发降回 1。
+    # --------------------------------------------------------------------------
     # {"model_name": "antigravity-3.8-flash-high", "权重": 5, "备注": "来源antigravity 本地客户端"},
 ]
 LOW_MODEL_LIST = [
@@ -126,6 +133,7 @@ LOW_MODEL_LIST = [
     {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "权重": 0, "备注": "来源aistudio_web"},
     {"model_name": "gpt-6-codex-luna", "权重": 0.5, "备注": "来源codex 免费"},
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web"},
+    # ⚠️ 同 MEDIUM_MODEL_LIST：2026-11-25 已停用。重启前必先阅读 antigravity_client.py 顶部复盘并完成 P0 改造。
     # {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
 ]
 

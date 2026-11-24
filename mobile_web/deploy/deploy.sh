@@ -401,9 +401,15 @@ fi
 log_step "6. 检查 / 部署 Nginx 规则与 HTTPS"
 if command -v nginx >/dev/null 2>&1; then
   mkdir -p /var/www/html
-  if [[ "${FORCE_NGINX}" -eq 1 ]] || [[ "${DO_INIT}" -eq 1 && ( ! -f "${NGINX_AVAIL}" || -z "$(grep -s 'ssl_certificate' "${NGINX_AVAIL}" || true)" ) ]]; then
+  HAD_SSL=0
+  NGINX_BAK=""
+  if grep -qs "ssl_certificate" "${NGINX_AVAIL}" 2>/dev/null; then
+    HAD_SSL=1
+  fi
+  if [[ "${FORCE_NGINX}" -eq 1 ]] || [[ "${DO_INIT}" -eq 1 && ( ! -f "${NGINX_AVAIL}" || "${HAD_SSL}" -eq 0 ) ]]; then
     if [[ -f "${NGINX_AVAIL}" ]]; then
-      cp "${NGINX_AVAIL}" "${NGINX_AVAIL}.bak.$(date +%Y%m%d%H%M%S)"
+      NGINX_BAK="${NGINX_AVAIL}.bak.$(date +%Y%m%d%H%M%S)"
+      cp "${NGINX_AVAIL}" "${NGINX_BAK}"
     fi
     cp "${NGINX_SRC}" "${NGINX_AVAIL}"
     rm -f /etc/nginx/sites-enabled/default
@@ -415,13 +421,39 @@ if command -v nginx >/dev/null 2>&1; then
     echo "⚠️ 未找到 ${NGINX_AVAIL}（首次配置请加上 --init 参数）"
   fi
 
-  if [[ -n "${CERTBOT_EMAIL}" ]] && [[ -f "${NGINX_AVAIL}" ]] && ! grep -q "ssl_certificate" "${NGINX_AVAIL}"; then
-    if ! command -v certbot >/dev/null 2>&1; then
-      echo "ℹ️ 正在安装 Certbot..."
-      apt-get update && apt-get install -y certbot python3-certbot-nginx
+  if [[ -f "${NGINX_AVAIL}" ]] && ! grep -q "ssl_certificate" "${NGINX_AVAIL}"; then
+    if [[ -n "${CERTBOT_EMAIL}" ]]; then
+      if ! command -v certbot >/dev/null 2>&1; then
+        echo "ℹ️ 正在安装 Certbot..."
+        apt-get update && apt-get install -y certbot python3-certbot-nginx
+      fi
+      certbot --nginx --non-interactive --agree-tos -m "${CERTBOT_EMAIL}" \
+        -d www.shop.easyeverything.cn -d shop.easyeverything.cn || true
+    elif [[ -d /etc/letsencrypt/live/www.shop.easyeverything.cn ]] && command -v certbot >/dev/null 2>&1; then
+      echo "ℹ️ 检测到已有 Let's Encrypt 证书，正自动重新挂载 HTTPS 到新 Nginx 配置..."
+      certbot install --nginx --non-interactive --cert-name www.shop.easyeverything.cn --redirect || \
+        certbot --nginx --non-interactive --keep-until-expiring --redirect \
+          -d www.shop.easyeverything.cn -d shop.easyeverything.cn || true
     fi
-    certbot --nginx --non-interactive --agree-tos -m "${CERTBOT_EMAIL}" \
-      -d www.shop.easyeverything.cn -d shop.easyeverything.cn || true
+  fi
+
+  # 若原本已配置 HTTPS 证书，但此次未能自动重挂，则立即回滚保护线上 443
+  if [[ "${HAD_SSL}" -eq 1 && -n "${NGINX_BAK}" && -f "${NGINX_BAK}" ]] && ! grep -q "ssl_certificate" "${NGINX_AVAIL}"; then
+    echo "⚠️ 自动重挂 HTTPS 证书未完成，已自动恢复原 Nginx 配置以保护线上 443 服务"
+    cp -f "${NGINX_BAK}" "${NGINX_AVAIL}"
+  fi
+
+  # 为已挂载的 443 SSL 监听安全启用 HTTP/2（先测 nginx -t，不兼容则自动回退）
+  if [[ -f "${NGINX_AVAIL}" ]] && grep -q "ssl_certificate" "${NGINX_AVAIL}" && grep -Eq 'listen[[:space:]]+(\[::\]:)?443[[:space:]]+ssl([[:space:]]+ipv6only=on)?;' "${NGINX_AVAIL}"; then
+    HTTP2_BAK="$(mktemp /tmp/nginx_http2_bak.XXXXXX)"
+    cp "${NGINX_AVAIL}" "${HTTP2_BAK}"
+    sed -E -i 's/(listen[[:space:]]+(\[::\]:)?443[[:space:]]+ssl)([[:space:]]+ipv6only=on)?;/\1 http2\3;/g' "${NGINX_AVAIL}"
+    if nginx -t >/dev/null 2>&1; then
+      echo "ℹ️ 已为 443 HTTPS 自动启用 HTTP/2 多路复用"
+    else
+      cp -f "${HTTP2_BAK}" "${NGINX_AVAIL}"
+    fi
+    rm -f "${HTTP2_BAK}"
   fi
 
   if nginx -t >/dev/null 2>&1; then

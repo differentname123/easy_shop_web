@@ -97,7 +97,7 @@ class UserService:
                 mask_phone(phone) if isinstance(phone, str) and phone.strip() else "-",
                 format_exc_summary(e),
             )
-            return {"status": "error", "error_msg": f"系统异常: {str(e)}"}
+            return {"status": "error", "error_msg": "系统繁忙，请稍后重试"}
 
     def get_user_info(self, uid: str) -> Dict[str, Any]:
         """按已鉴权的权威 uid 获取用户信息及各平台授权状态（手机号脱敏）"""

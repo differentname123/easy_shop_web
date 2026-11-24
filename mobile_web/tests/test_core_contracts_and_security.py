@@ -301,12 +301,16 @@ class TestApiSecurityRoutes(unittest.TestCase):
             "www.shop.easyeverything.cn",
             "shop.easyeverything.cn",
             "limit_req_zone",
+            "easyshop_heavy",
+            "rate=2r/s",
             "limit_conn_zone",
+            "$easyshop_hsts",
             "/api/system/upstream-health",
             "docs|redoc|openapi",
             "location /api/",
         ):
             self.assertIn(expected, nginx_text)
+        self.assertNotIn("includeSubDomains", active_nginx_directives)
 
         for html_path in (
             mobile_web_dir / "static" / "index.html",
@@ -327,6 +331,9 @@ class TestApiSecurityRoutes(unittest.TestCase):
             "--init",
             "sync_meilisearch.py",
             "ssl_certificate",
+            "HAD_SSL",
+            "certbot install --nginx",
+            "http2",
             "--db-path /data/meili_data/data.ms",
             "rm -rf /data/meili_data/data.ms",
             "WorkingDirectory=/data/meili_data",
@@ -338,6 +345,17 @@ class TestApiSecurityRoutes(unittest.TestCase):
             "systemctl restart mobile_web.service",
         ):
             self.assertIn(marker, deploy_text)
+
+    def test_user_service_sanitizes_unexpected_exception_message(self):
+        from services.user_service import UserService
+
+        bad_repo = MagicMock()
+        bad_repo.register_or_login.side_effect = RuntimeError("mongodb://124.220.169.204:27017 auth failed")
+        svc = UserService(user_repo=bad_repo)
+        res = svc.register_or_login("13800138000", "secret123")
+        self.assertEqual(res["status"], "error")
+        self.assertNotIn("27017", res["error_msg"])
+        self.assertNotIn("124.220.169.204", res["error_msg"])
 
 
 if __name__ == "__main__":
