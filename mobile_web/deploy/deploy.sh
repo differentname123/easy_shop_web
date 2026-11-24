@@ -194,7 +194,7 @@ fi
 # ------------------------------------------------------------------------------
 log_step "4. 检查 / 部署 Meilisearch 全文搜索服务"
 check_meili_health() {
-  curl -sf --max-time 2 "http://127.0.0.1:7700/health" 2>/dev/null | grep -q '"available"'
+  curl --noproxy '*' -sf --max-time 2 "http://127.0.0.1:7700/health" 2>/dev/null | grep -q '"available"'
 }
 
 if [[ "${MEILI_ENABLED}" != "true" ]]; then
@@ -228,6 +228,10 @@ else
     fi
 
     if [[ -x "${MEILI_BIN}" ]]; then
+      MEILI_KEY_OPT=""
+      if [[ -n "${MEILI_KEY}" ]]; then
+        MEILI_KEY_OPT="--master-key ${MEILI_KEY}"
+      fi
       cat > /etc/systemd/system/meilisearch.service << EOF
 [Unit]
 Description=Meilisearch Lightweight Search Engine
@@ -235,12 +239,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${MEILI_BIN} \\
-  --http-addr 127.0.0.1:7700 \\
-  --db-path /data/meili_data \\
-  --master-key ${MEILI_KEY} \\
-  --max-indexing-memory 256Mb \\
-  --no-analytics
+ExecStart=${MEILI_BIN} --http-addr 127.0.0.1:7700 --db-path /data/meili_data ${MEILI_KEY_OPT} --max-indexing-memory 268435456 --no-analytics
 Restart=always
 RestartSec=5
 
@@ -285,6 +284,8 @@ PYEOF
     ST_MEILI="${ST_MEILI} [索引商品数: ${MEILI_DOCS}]"
   else
     echo "❌ Meilisearch (127.0.0.1:7700) 未启动或不可用（如为首次部署请带 --init 参数）"
+    echo "--- Meilisearch 最近启动日志 ---"
+    journalctl -u meilisearch.service -n 20 --no-pager 2>/dev/null || true
     ST_MEILI="❌ 未运行 (当前业务会自动降级回 MongoDB 搜索)"
     if [[ "${DO_INIT}" -eq 1 ]]; then
       CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
@@ -385,7 +386,7 @@ fi
 # ------------------------------------------------------------------------------
 # 7. 本机端到端抽检与状态总览面板
 # ------------------------------------------------------------------------------
-HEALTH_BODY="$(curl -sf --max-time 3 "http://127.0.0.1:${WEB_PORT}/health" 2>/dev/null || true)"
+HEALTH_BODY="$(curl --noproxy '*' -sf --max-time 3 "http://127.0.0.1:${WEB_PORT}/health" 2>/dev/null || true)"
 if echo "${HEALTH_BODY}" | grep -q '"ok"'; then
   ST_LOCAL_HTTP="✅ /health 正常"
 else
@@ -393,8 +394,13 @@ else
   CRITICAL_ERRORS=$((CRITICAL_ERRORS + 1))
 fi
 
-NGINX_HOME_CODE="$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 -H "Host: www.shop.easyeverything.cn" "http://127.0.0.1/" 2>/dev/null || echo "000")"
-NGINX_DOCS_CODE="$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 -H "Host: www.shop.easyeverything.cn" "http://127.0.0.1/docs" 2>/dev/null || echo "000")"
+if grep -qs "ssl_certificate" "${NGINX_AVAIL}" /etc/nginx/sites-enabled/*.conf 2>/dev/null; then
+  NGINX_HOME_CODE="$(curl --noproxy '*' -sk -o /dev/null -w "%{http_code}" --max-time 3 --resolve "www.shop.easyeverything.cn:443:127.0.0.1" "https://www.shop.easyeverything.cn/" 2>/dev/null || echo "000")"
+  NGINX_DOCS_CODE="$(curl --noproxy '*' -sk -o /dev/null -w "%{http_code}" --max-time 3 --resolve "www.shop.easyeverything.cn:443:127.0.0.1" "https://www.shop.easyeverything.cn/docs" 2>/dev/null || echo "000")"
+else
+  NGINX_HOME_CODE="$(curl --noproxy '*' -s -o /dev/null -w "%{http_code}" --max-time 3 -H "Host: www.shop.easyeverything.cn" "http://127.0.0.1/" 2>/dev/null || echo "000")"
+  NGINX_DOCS_CODE="$(curl --noproxy '*' -s -o /dev/null -w "%{http_code}" --max-time 3 -H "Host: www.shop.easyeverything.cn" "http://127.0.0.1/docs" 2>/dev/null || echo "000")"
+fi
 
 echo ""
 echo "============================================================"

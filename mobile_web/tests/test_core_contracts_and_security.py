@@ -327,7 +327,9 @@ class TestApiSecurityRoutes(unittest.TestCase):
             "--init",
             "sync_meilisearch.py",
             "ssl_certificate",
-            "--max-indexing-memory 256Mb",
+            "--max-indexing-memory 268435456",
+            "journalctl -u meilisearch.service",
+            "--resolve",
             "systemctl restart mobile_web.service",
         ):
             self.assertIn(marker, deploy_text)

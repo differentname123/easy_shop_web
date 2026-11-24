@@ -127,7 +127,7 @@ ExecStart=/opt/meilisearch/meilisearch \
   --http-addr 127.0.0.1:7700 \
   --db-path /data/meili_data \
   --master-key easyshop2026 \
-  --max-indexing-memory 256Mb \
+  --max-indexing-memory 268435456 \
   --no-analytics
 Restart=always
 RestartSec=5
