@@ -20,7 +20,7 @@
   - ⚠️ 【2026-11-23 实测纠偏与补充】：
     * 个人 `jd_app_key` 直连 `jd.union.open.goods.rank.query` 实测连续 5 页均可用（146–170ms），返回字段与前 20 条商品与折淘客 `rank_query` 20/20 完全一致；
     * 本轮拿个人榜单前 20 个 `itemId` 传给折淘客 `goods_query`（20/20）、`byunionid_get`（10/10）、`api_detail`（5/5）均通过，但鉴于历史存在跨 `app_key` 不认风险且折淘客榜单不占 `1000` 池（54/54=100%），推荐以折淘客为主力、解除死锁后将官方直连榜单作为灾备兜底；
-    * 个人 `myself_jd_app_key` 的 `jd.union.open.goods.query`、`jingfen.query`、`material.query`、`promotiongoodsinfo.query`、`bigfield.query` 即使过了零点且当日 0 调用（00:57 与 13:05 跨天实测）仍 100% 报 `code=2000: 已达接口调用上限，请0点后再试 (pin for api Limited, listId=533)`，证实基础账号查品/选品日配额为 0；`byunionid.get` 与 `bysubunionid.get` 永久报 `403: 无访问权限`；`common.get` 报 `2001701: 不支持siteId用于此种方式推广`（未配独立媒体 `siteId`）；仅 `goods.rank.query` 与 `order.row.query` 100% 正常（隔夜订单 45/45 零错）。
+    * 个人 `myself_jd_app_key` 的 `jd.union.open.goods.query`、`jingfen.query`、`material.query`、`promotiongoodsinfo.query`、`bigfield.query` 即使过了零点且当日 0 调用（00:57 与 13:05 跨天实测）仍 100% 报 `code=2000: 已达接口调用上限，请0点后再试 (pin for api Limited, listId=533)`，证实基础账号查品/选品日配额为 0；`byunionid.get`、`bysubunionid.get` 与 `jd.union.open.coupon.query` 永久报 `403: 无访问权限`；`common.get` 报 `2001701: 不支持siteId用于此种方式推广`（未配独立媒体 `siteId`）；仅 `goods.rank.query` 与 `order.row.query` 100% 正常（隔夜订单 45/45 零错）。
 
 二、【功能 2：全网关键词搜索 (`api_quanwang.ashx`)】
   - ✅ 可用：`type=2`, `youquan=1`, `sort="new"`，返回加密 `tao_id` 及 `item_url` (`https://jingfen.jd.com/detail/{tao_id}.html`)。
@@ -35,7 +35,11 @@
     4. 联盟推广长链 `https://union-click.jd.com/jdc?...`；
     5. 完整京口令 (`jCommand`)；
     6. 精简京口令 (`jShortCommand`)。
-    单把 `ZTK_APPKEY` 实测连续 80 次并发（50.9 QPS）零报错，且**在折淘客 `goods_query` 公共池爆发 `1000` 限流期间（23:18 实测 3 Key 全挂）仍保持 57–68ms 100% 稳定可用（独立故障域），严禁与 `goods_query` 共享同一冷却开关互相误杀**。
+    单把 `ZTK_APPKEY` 实测连续 80 次并发（50.9 QPS）零报错，且在夜间局部 `1000` 限流期间（23:18 实测）仍保持 57–68ms 稳定可用，因此底层的冷却锁仍保持独立隔离，不因局部 `goods_query` 限流误杀健康 `api_detail`。
+  - 🚨 【2026-11-24 白天高峰全量日志与对照实测纠偏：`1001` 全局拥堵期 `api_detail` 与 `goods_query` 同步受波及】：
+    * **白天高峰潮汐规律**：`00:00–08:30`（5,661 目标）与白天波谷（如 `12:07`、`13:55`、`14:21`）均保持 100% 畅通（单批 298–529 个目标仅数十秒全通）；但在工作高峰期（如 `09:30–12:06`、`13:02–13:52`、`14:01`），折淘客 `:20000` 后端共享京东查询池会触发全网 **`1001` 拥堵**（甚至停发 4 分钟后仅发 4 个也立即报错）。
+    * **伪装症状**：在 `1001` 全局拥堵期（区别于单 Key 局部 `1000`），`goods_query` 全部报 `status=301: ...1001`，而 **`api_detail` 会与 `goods_query` 同步瘫痪，并将所有在售合法商品统一伪装成 `301: 对应宝贝已下架`**（14:02 实测 3 Key 全部 0/15，而 13:55 与 14:21 波谷同一批商品立刻 20/20 返回 `200 OK`）。
+    * 唯一在白天 `1001` 拥堵期全程保持 100% 稳定的仅 `byunionid_get`（1027/1027）、`rank_query`（80/80）与 `jingfen_query`。
   - ⚠️ 【2026-11-23 二次实证补全：突发突发脉冲 `301` 窗与 `union-click` 差异】：
     * **高频连续突发保护**：在真实脚本或并发清洗中若对单 Key 无间隔连续打 `api_detail.ashx`，会触发短时 IP/账户窗口全部 Key 同步返回 `301: 对应宝贝已下架`（`ztk_ambiguous_301=True`）；生产实测 3748 次 `301` 连打满 3 把 Key 并耗尽 `goods_query` 选品池配额。因此客户端必须对 `api_detail` 启用独立微节流（`0.35s/Key`）且遇 `301: 对应宝贝已下架` **第 1 把 Key 立即早停（绝不连打 3 把 Key 放大风控）**。
     * **`union-click.jd.com` 对 `api_detail` 兼容边界**：部分可转链的 `union-click.jd.com/jdc?...` 会令 `api_detail` 返回 `301`，因此不得凭 `api_detail(u.jd/union-click/京口令)` 返回 `301` 直接短路判为 `PRODUCT_OFF_PROMOTION`，仍需由 `goods_query -> HDK` 或 `byunionid_get` 生成新 `u.jd.com` 后补 1 次 `api_detail` 完成核验。
@@ -86,9 +90,11 @@
     - **唯一转链出口 `byunionid_get`**：非裸京口令且已获卡直接 `byunionid_get -> HDK`；裸京口令或混排文案原样（优先提取嵌入官网 URL）透传 `byunionid_get -> HDK`，若新产出 `u.jd.com` 短链再补 1 次 `api_detail` 查卡，仍未出卡严格 Fail-Closed 标为 `degraded_product`。
   - ❌ 不可用输入：`https://item.jd.com/{数字SKU}.html` 或无链接/无口令的纯文本标题（直接拦截报错，绝不模糊搜索兜底）。
 
-七、【频控与高可用唯一有效方案 (`ZTK_APPKEY_LIST` 自动故障切换)】
+七、【频控与高可用唯一有效方案 (`ZTK_APPKEY_LIST` 自动故障切换 · 含池边界纠偏)】
   - ❌ 已证伪：同一 `appkey` 下用 `open_jing_union_open_goods_query.ashx` 给 `api_quanwang.ashx` / `api_detail.ashx` 兜底（共享同一 `1000` 限流计数器，救活率 0% 且双倍消耗配额）。
-  - ✅ 唯一有效：折淘客频控绑定在单个 `ZTK_APPKEY` 上，不限制 IP 与 `JD_UNION_ID`。使用 `ZTK_APPKEY_LIST` 多 Key 轮询与自动故障切换，救活率 100%。
+  - ⚠️ 【2026-11-24 白天实测边界纠偏】：多 `ZTK_APPKEY` 轮询仅对“单把 Key 自身 QPS 超频”有效；在**折淘客后端共享京东查询池触发全网 `1001` 拥堵**时完全无效，换绑另一个人的京东 `unionId` 申请第 4 把免费折淘客 Key 也依然受同一池限制！
+    * **对照组实证（2026-11-24 14:02 拥堵期 vs 14:22 畅通期）**：使用未在折淘客授权的虚假 `unionId="1000000001"` 调用 `goods_query`，在 `14:02` 直接先被 `1001` 拦截（尚未进入 `unionId` 授权校验），仅在 `14:22` 池恢复后才走到 `请先进行京东授权`；虚假 `appkey` 则最先报 `appkey不正确`。
+    * **密文池实证**：传入空 `unionId=""` 调 `rank_query` 与真实 `unionId` 产出的 `itemId` 属于同一加密池（同前缀/后缀），而同一真实 `unionId` 直连个人 `jd_app_key` 产出的 `itemId` 为完全不同密文；且 3 把 `ZTK_APPKEY` 查 `goods_query` 返回完全相同的 `callerItemId`。证明折淘客 `:20000` 使用的是折淘客服务端共享的企业级京东联盟应用池；真正独立方案只能是接入**另一家独立第三方平台**或升级自有 **有真实 `goods.query` 配额的京东官方 `app_key`**。
 
 八、【商品唯一标识 (`product_id` / `goods_id`) 与动态调用令牌 (`goods_sign`) 职责解耦铁律（防重复入库核心基准）】
   - ❌ 为什么不能把京东加密 `itemId` / `tao_id` 直接作为数据库唯一主键 `product_id`？
@@ -149,6 +155,24 @@
        * 确认京东外卖 `hour.jd.com`、省钱卡 `mcard.jd.com`、PLUS `plus.m.jd.com`（外层常套 `plogin.m.jd.com`）、直播间 `lives.jd.com` 均属官方非单品活动域，`resolve_jd_short_url` 正向判为 `is_venue=True`；
        * 京东 PC 领券短链（如 `3.cn/3cuM-vUn` -> `coupon.jd.com/ilink/couponActiveFront/...` / `passport.jd.com?ReturnUrl=...`）可通过白名单 `key`+`roleId` 无损重组为移动端 `https://coupon.m.jd.com/coupons/show.action`；
        * 对落地为 `pro.m.jd.com/mall/active/...?sku=<非纯数字加密ID>` 的通天塔单品模板，**严禁**在白名单重组时剥离加密 `sku` 冒充无佣金纯会场（仅无 `sku` 或纯数字 `sku` 如 `o19hsre` 才属纯会场）。
+  8. **【2026-11-24 14h 白天高峰全量运行实证与上层流控优化】**：
+     - ✅ **全量数据零错零丢验证**：`08:00–14:02` 流入 1,403 条京东线报，1,257 条已在波谷窗口自动复活入库，仅 1 条因重试耗尽丢失（丢失率 `0.07%`），0 假卡/0 串货/0 误判纯券。
+     - ⚠️ **上层阻塞实证**：白天 `1001` 拥堵期（如 `09:30–12:06`）若不加熔断，后台仍会持续打空转重试（2.5 小时共打出 20,059 次 JD 目标），将同一批待转链中的**淘宝/拼多多新线报等待延迟从正常的 `9.3s` 中位数拖慢至 `132.3s`（P95 达 `262.4s`，慢 ~14 倍）**；上层 `services/deal_cleaning/stages.py` 已接入“连续 3 条 JD 处于 `catalog_cooling` 降级态时快速熔断本批剩余京东目标（仍放行免费本地白名单与淘/拼并发）”保护。
+     - ✅ **未编码 `plogin returnurl` 截断修复**：部分线报中的 `plogin.m.jd.com?...&returnurl=https://coupon.m.jd.com/coupons/show.action?key=...&roleId=...` 未对 `&roleId` 做百分号转义，`services/deal_cleaning/url_venue.py` 已兜底完整保留后缀并经白名单重建还原纯净领券链接。
+  9. **【2026-11-24 15:00 实时 `1001` 宕机期全候选京东详情通道摸排与证伪清单（防后续重复踩坑）】**：
+     - ❌ **已剔除旧通道与主力 `1001` 100% 同生共死（15:00:43–15:05:34 同秒实测，严禁加回）**：
+       * `goods_query`（3 Key 全 `0/3`、`0/8`，报 `301: ...1001`）；
+       * `api_quanwang`（`u.jd` `0/3`、`enc_id` `0/8`，伪装 `301: 无符合条件的数据`；且传未授权假 `unionId` 时与 `api_detail` 吐出一字不差的同一句拒绝提示，证实共池）；
+       * `tkl_piliang`（`u.jd` `0/3`、`jingfen` `0/3`、库内真品 `0/8`，虽因 `byunionid_get` 存活而返回 `status=200` 与短链，但商品卡字段全空：`tao_id=""`、`quanhou_jiage=0`、`title=""`；且平时亦永久缺多图 `small_images` 与 `coupon_url`）。
+     - ⚠️ **`api_detail.ashx` 在 `1001` 期间的“短时缓存假象”陷阱**：对几分钟内刚热过的少数加密 `itemId`，`api_detail` 偶发命中折淘客本地短缓存返回 `200`（且 `coupon_url` 缺失，如 `15:03->15:05` 刚查过的 2/10 命中），但所有未缓存加密 `itemId`（`0/8` 库内新商品 + `0/5` 未见 `jingfen` 商品 = `0/13`）及 `u.jd.com`（`0/3`）均回源撞 `1001` 伪装为 `301: 对应宝贝已下架`；排查 `1001` 时严禁拿刚热过的旧加密 ID 误判 `api_detail` 正常。
+     - ❌ **折淘客其余文档/隐藏接口与备用域名证伪**：
+       * `open_jing_goods_detail_get.ashx`（折京客文档“京东商品详情[简版]”）：官方已永久下架（全入参返回 `301: 很抱歉！该接口已经下架，暂时无法使用！`）；
+       * `open_jd_union_open_goods_bigfield_query.ashx`（文档“京东商品详情[详情图版]”，`content=<加密ID或jingfen URL>&sceneId=1`）：**唯一在 `1001` 期保持 `200 OK`（`8/8`）的单品接口**，但仅返回图文详情 `baseBigFieldInfo.wdis`、轮播图、类目与 `skuName`，**无价格、无优惠券、无佣金**，且不认 `u.jd.com`/`union-click`（报 `code=441`），不可用于商品查卡；
+       * `api_all.ashx` / `api_videos.ashx` / `open_jing_goods_list.ashx`：实测忽略 `tao_id`/`q` 入参，只返回固定精选列表（`0/3` 匹配），无法按任意商品反查；
+       * 备用域名 `api.zhetaoke.cn:20000`：DNS 实测与 `api.zhetaoke.com` 解析到**完全相同的单个 IP (`111.198.53.170`)**，`15:00:43` 同步报 `1001`/假空/丢卡，无独立配额池。
+     - ❌ **好单库其余京东接口与网页直抓证伪**：
+       * 好单库 `v3/jd_ratesurl` 与 `v2/v3/jd_item_detail` 均 404 (`not found uri`)；`v2/v3/get_jditems_link` 仅返 `short_url`/`click_url` 无商品卡；`v3/jd_goods_search` 高峰期除 `listId=533` 外亦会出现 `code=0: 网络超时`（已在第 3 梯队带 300s 冷却自动候命）；
+       * 网页直抓 `jingfen.jd.com/detail/{id}.html` 与 `item.m.jd.com/product/{sku}.html` 均直接 302 跳转至京东反爬风控页 `cfe.m.jd.com/privatedomain/risk_handler/`（`京东验证 / JDR_shields`），且无联盟佣金与券链，彻底不可行。
 ================================================================================
 """
 

@@ -1364,6 +1364,24 @@ def convert_single_target(
     }
 
 
+_JD_BATCH_OUTAGE_PROBE_LIMIT = 3
+
+
+def _is_free_local_jd_target(c_inp: str) -> bool:
+    """判断无需消耗 ZTK API 配额即可在本地极速确定的 JD 链接（纯白名单领券/纯数字 item.jd.com）。"""
+    if not c_inp or _precheck_direct_non_cps_venue_url(c_inp) is not None:
+        return True
+    if not c_inp.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        parts = urlsplit(c_inp)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    path = (parts.path or "").rstrip("/").lower()
+    return host in ("item.jd.com", "item.m.jd.com") and path.endswith(".html")
+
+
 def run_stage3_concurrent_conversions(
     cleaner: Any,
     unique_targets: List[Tuple[Dict[str, Any], str]],
@@ -1392,6 +1410,11 @@ def run_stage3_concurrent_conversions(
             other_targets.append(it)
 
     jd_adapter = cleaner.adapters.get("jd")
+    jd_circuit_lock = threading.Lock()
+    jd_cooling_degraded_streak = 0
+    jd_batch_short_circuit = threading.Event()
+    jd_short_circuited_cnt = 0
+
     ztk_key_count = len(getattr(getattr(jd_adapter, "client", None), "appkey_list", ()) or ())
     jd_lane_cap = min(max(1, ztk_key_count), 2) if ztk_key_count > 0 else 1
     jd_lane_count = min(cleaner.convert_max_workers, jd_lane_cap, len(jd_targets))
@@ -1429,11 +1452,30 @@ def run_stage3_concurrent_conversions(
                 worker_slots,
             )
 
-    def _conv_worker(item: Tuple[Dict[str, Any], str]) -> None:
+    def _conv_worker(item: Tuple[Dict[str, Any], str], *, is_jd_item: bool = False) -> None:
+        nonlocal jd_cooling_degraded_streak
         tgt, def_plat = item
         c_inp = strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
         try:
             res = cleaner.convert_single_target(tgt, default_plat=def_plat)
+            if is_jd_item and isinstance(res, dict):
+                jd_client = getattr(jd_adapter, "client", None)
+                jd_cooling_now = bool(
+                    res.get("catalog_cooling") is True
+                    or (callable(getattr(jd_client, "is_catalog_cooling", None)) and jd_client.is_catalog_cooling())
+                )
+                is_cooling_degraded = bool(
+                    res.get("convert_status") == "failed"
+                    and res.get("resolution_kind") == ResolutionKind.DEGRADED_PRODUCT
+                    and jd_cooling_now
+                )
+                with jd_circuit_lock:
+                    if is_cooling_degraded:
+                        jd_cooling_degraded_streak += 1
+                        if jd_cooling_degraded_streak >= _JD_BATCH_OUTAGE_PROBE_LIMIT:
+                            jd_batch_short_circuit.set()
+                    elif res.get("convert_status") == "product":
+                        jd_cooling_degraded_streak = 0
             err_msg = str((res or {}).get("error_msg") or "")
             err_code = str((res or {}).get("error_code") or "")
             if "商品详情反查" not in err_msg and any(
@@ -1457,19 +1499,57 @@ def run_stage3_concurrent_conversions(
             _record_done()
 
     if total_targets == 1:
-        _conv_worker(unique_targets[0])
+        _conv_worker(unique_targets[0], is_jd_item=bool(jd_targets))
         return
 
     jd_iter = iter(jd_targets)
     jd_iter_lock = threading.Lock()
 
     def _jd_lane_runner() -> None:
+        nonlocal jd_short_circuited_cnt
         while True:
             with jd_iter_lock:
                 jd_it = next(jd_iter, None)
             if jd_it is None:
                 break
-            _conv_worker(jd_it)
+            if jd_batch_short_circuit.is_set():
+                tgt, _def_plat = jd_it
+                c_inp = strip_markdown_link_wrapper(str(tgt.get("clean_input") or ""))
+                if not _is_free_local_jd_target(c_inp):
+                    role_hint = ROLE_HINT_NORMALIZE_MAP.get(
+                        str(tgt.get("text_role_hint") or "").strip().lower(),
+                        "main_candidate",
+                    )
+                    deferred_now = False
+                    with cleaner._cache_lock:
+                        c_keys = AnchorConversionCache.build_keys("jd", c_inp)
+                        if not any(k in cleaner.anchor_cache for k in c_keys):
+                            deferred_out = {
+                                "link_id": str(tgt.get("link_id") or ""),
+                                "clean_input": c_inp,
+                                "text_role_hint": role_hint,
+                                "convert_status": "failed",
+                                "resolution_kind": ResolutionKind.DEGRADED_PRODUCT,
+                                "platform": "jd",
+                                "goods_id": "",
+                                "goods_sign": "",
+                                "error_code": ERR_ADAPTER_CONVERT_FAILED,
+                                "error_msg": "京东查询池处于拥堵冷却期，本批快速熔断待探针恢复后重试",
+                                "official_product": None,
+                                "my_promo_link": None,
+                                "my_promo_token": None,
+                                "adapter_res": {},
+                                "catalog_cooling": True,
+                            }
+                            for ck in c_keys:
+                                cleaner._set_anchor_cache_locked(ck, deferred_out)
+                            deferred_now = True
+                    if deferred_now:
+                        with jd_circuit_lock:
+                            jd_short_circuited_cnt += 1
+                    _record_done()
+                    continue
+            _conv_worker(jd_it, is_jd_item=True)
 
     with ThreadPoolExecutor(max_workers=worker_slots) as pool:
         futures = [pool.submit(_jd_lane_runner) for _ in range(jd_lane_count)]
@@ -1479,6 +1559,12 @@ def run_stage3_concurrent_conversions(
                 fut.result()
             except Exception:
                 pass
+
+    if jd_short_circuited_cnt > 0 and not quiet_sub_logs:
+        logger.info(
+            "⚡ [Stage 3-JD拥堵熔断] 京东查询池处于冷却拥堵期，已快速延后本批剩余 %d 个京东目标（释放通道防阻塞淘/拼）",
+            jd_short_circuited_cnt,
+        )
 
 
 def run_ai_stage2_batch(

@@ -2480,3 +2480,163 @@ def test_jd_catalog_cooldown_skips_preserve_retry_count_and_schedule_after_coold
     )
     assert fail_outcomes[0]["status"] == "failed"
     assert fail_outcomes[0]["retry_count"] == 3
+
+
+def test_stage3_jd_outage_batch_short_circuits_without_blocking_other_platforms():
+    """
+    验证 Stage 3 京东拥堵期批内快速熔断与跨平台隔离：
+    - Case A: `catalog_cooling=True` 且连续 3 次探针返回 `degraded_product` 时，立即熔断本批剩余京东目标（10 条最多调用 <=4 次），
+      全部置为 `retry_pending`（不消耗 `retry_count=0`，`retry_delay_sec >= 115.0`），同批淘宝线报照常推进，且暂态缓存批末清空；
+    - Case B: 仅 `goods_query` 冷却但 `api_detail` 健康出卡时，熔断器不误触发（6/6 全成）；
+    - Case C: 非冷却态的真实上游失败不触发批内熔断（5/5 正常调用）。
+    """
+    import threading
+    from infrastructure.jd_client import JdClient
+
+    cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=4)
+    try:
+        call_lock = threading.Lock()
+        jd_calls = []
+
+        def _make_doc(mid: str, plat: str, url: str):
+            return {
+                "source_site": "guangdiu",
+                "source_channel": "latest",
+                "source_item_id": mid,
+                "platform": plat,
+                "title": f"测试商品_{mid}",
+                "clean_retry_count": 0,
+                "ai_stage1_result": {
+                    "main_tip_id": mid,
+                    "is_standalone_deal": True,
+                    "merged_tip_ids": [mid],
+                    "extracted_targets": [
+                        {"link_id": "L1", "clean_input": url, "platform": plat, "text_role_hint": "main_candidate"}
+                    ],
+                },
+            }
+
+        def _tb_success(raw_inp: str):
+            idx = raw_inp.rsplit("/", 1)[-1]
+            return {
+                "status": "success",
+                "resolution_kind": "product",
+                "goods_id": f"tb_id_{idx}",
+                "goods_sign": f"tb_sign_{idx}",
+                "final_link": f"https://s.click.taobao.com/{idx}",
+                "url": f"https://s.click.taobao.com/{idx}",
+                "promotion_token": "8(AbCdEf12345)/",
+                "price": 19.9,
+                "coupon_amount": 5.0,
+                "product": {
+                    "name": f"淘宝好物_{idx}",
+                    "price": 19.9,
+                    "original_price": 24.9,
+                    "activity_price": 19.9,
+                    "coupon_amount": 5.0,
+                    "image_url": "https://img.alicdn.com/test.jpg",
+                    "mall_name": "淘宝店",
+                },
+            }
+
+        # Case A: 拥堵冷却期连撞 3 条 degraded_product -> 快速熔断，不阻塞同批淘宝
+        jd_client = JdClient(appkey_list=["jd-k1", "jd-k2"], union_id="2035679405")
+        jd_client.mark_catalog_rate_limited(120.0, force=True)
+
+        def _jd_outage_resolve(raw_inp, **_kw):
+            with call_lock:
+                jd_calls.append(raw_inp)
+            return {
+                "status": "error",
+                "error_code": "UPSTREAM_ERROR",
+                "error_msg": "商品详情反查触发临时限流或网络波动",
+                "resolution_kind": "degraded_product",
+                "detail_lookup_failed": True,
+                "catalog_cooling": True,
+            }
+
+        cleaner.adapters = {
+            "jd": SimpleNamespace(client=jd_client, resolve_and_convert_universal=_jd_outage_resolve),
+            "taobao": SimpleNamespace(resolve_and_convert_universal=_tb_success),
+            "pdd": SimpleNamespace(resolve_and_convert_universal=lambda _x: {"status": "error"}),
+        }
+        docs_a = [_make_doc(f"jd_out_{i}", "jd", f"https://union-click.jd.com/jdc?e=out_{i}") for i in range(10)]
+        docs_a.extend([
+            _make_doc("tb_ok_1", "taobao", "https://s.click.taobao.com/tb1"),
+            _make_doc("tb_ok_2", "taobao", "https://s.click.taobao.com/tb2"),
+        ])
+        outcomes_a, _ = cleaner.process_convert_unit(docs_a, formal_col=None, shared_active_products={}, quiet_sub_logs=True)
+        out_a_map = {o["source_item_id"]: o for o in outcomes_a}
+
+        assert len(jd_calls) <= 4
+        for i in range(10):
+            o = out_a_map[f"jd_out_{i}"]
+            assert o["status"] == "retry_pending"
+            assert o["retry_count"] == 0
+            assert o["retry_delay_sec"] >= 115.0
+        assert out_a_map["tb_ok_1"]["stage_outcome"] == "advance_to_ai2"
+        assert out_a_map["tb_ok_2"]["stage_outcome"] == "advance_to_ai2"
+        assert not any(
+            isinstance(v, dict) and v.get("error_code") == ERR_ADAPTER_CONVERT_FAILED
+            for v in cleaner.anchor_cache.values()
+        )
+
+        # Case B: 仅 goods_query 冷却但 api_detail 健康出卡 -> 熔断器不误触发
+        jd_calls.clear()
+        cleaner.anchor_cache.clear()
+
+        def _jd_healthy_despite_cooling(raw_inp, **_kw):
+            with call_lock:
+                jd_calls.append(raw_inp)
+            suffix = raw_inp.split("ok_")[-1]
+            return {
+                "status": "success",
+                "resolution_kind": "product",
+                "goods_id": f"6ae3f40fF84b3cfef_0083320320005d{suffix}",
+                "goods_sign": f"WaTNAKMKRwCL7reFMJ6k_enc{suffix}",
+                "final_link": f"https://u.jd.com/ok{suffix}",
+                "url": f"https://u.jd.com/ok{suffix}",
+                "promotion_token": f"3!token{suffix}!",
+                "price": 29.9,
+                "coupon_amount": 0.0,
+                "product": {
+                    "name": f"京东好物_{suffix}",
+                    "price": 29.9,
+                    "original_price": 29.9,
+                    "activity_price": 29.9,
+                    "coupon_amount": 0.0,
+                    "image_url": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/6ae3f40fF84b3cfef/0083320320005d73.jpg",
+                    "mall_name": "京东自营",
+                },
+            }
+
+        cleaner.adapters["jd"] = SimpleNamespace(client=jd_client, resolve_and_convert_universal=_jd_healthy_despite_cooling)
+        docs_b = [_make_doc(f"jd_ok_{i}", "jd", f"https://union-click.jd.com/jdc?e=ok_{i}") for i in range(6)]
+        outcomes_b, _ = cleaner.process_convert_unit(docs_b, formal_col=None, shared_active_products={}, quiet_sub_logs=True)
+        assert len(jd_calls) == 6
+        assert all(o["stage_outcome"] == "advance_to_ai2" for o in outcomes_b)
+
+        # Case C: 非冷却态真实上游失败 -> 不触发批内熔断（5/5 正常执行并累加重试）
+        jd_calls.clear()
+        cleaner.anchor_cache.clear()
+        jd_client._catalog_cooldown_until = 0.0
+        assert jd_client.is_catalog_cooling() is False
+
+        def _jd_non_cooling_fail(raw_inp, **_kw):
+            with call_lock:
+                jd_calls.append(raw_inp)
+            return {
+                "status": "error",
+                "error_code": "UPSTREAM_ERROR",
+                "error_msg": "单个商品查卡临时超时",
+                "resolution_kind": "degraded_product",
+                "detail_lookup_failed": True,
+            }
+
+        cleaner.adapters["jd"] = SimpleNamespace(client=jd_client, resolve_and_convert_universal=_jd_non_cooling_fail)
+        docs_c = [_make_doc(f"jd_nc_{i}", "jd", f"https://union-click.jd.com/jdc?e=nc_{i}") for i in range(5)]
+        outcomes_c, _ = cleaner.process_convert_unit(docs_c, formal_col=None, shared_active_products={}, quiet_sub_logs=True)
+        assert len(jd_calls) == 5
+        assert all(o["status"] == "retry_pending" and o["retry_count"] == 1 for o in outcomes_c)
+    finally:
+        cleaner.close()

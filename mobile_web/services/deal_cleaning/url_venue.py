@@ -147,7 +147,13 @@ def rebuild_clean_official_venue_url(raw_input: str, _allow_login_unwrap: bool =
     if _allow_login_unwrap and host in ("plogin.m.jd.com", "passport.jd.com"):
         for k, v in parse_qsl(parts.query, keep_blank_values=False):
             if k.strip().lower() == "returnurl" and v.strip():
-                return rebuild_clean_official_venue_url(unquote(v.strip()), _allow_login_unwrap=False)
+                rebuilt = rebuild_clean_official_venue_url(unquote(v.strip()), _allow_login_unwrap=False)
+                if rebuilt:
+                    return rebuilt
+        # 部分线报源未对内嵌 returnurl 做 URL 转义，直接保留后缀整串做白名单二次重组
+        raw_ret_m = re.search(r"(?:^|&)returnurl=(https?://.+)$", parts.query, re.IGNORECASE)
+        if raw_ret_m:
+            return rebuild_clean_official_venue_url(unquote(raw_ret_m.group(1).strip()), _allow_login_unwrap=False)
         return None
 
     def _pick_allowed_params(canonical_map: Dict[str, str]) -> Tuple[List[Tuple[str, str]], Dict[str, str]]:

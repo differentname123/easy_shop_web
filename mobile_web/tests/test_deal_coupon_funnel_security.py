@@ -1815,6 +1815,23 @@ def test_pc_coupon_jd_unwrap_encrypted_pro_babel_guard_and_cookie_hijack_resilie
     assert rebuild_clean_official_venue_url(pc_coupon) == expected_m_coupon
     assert rebuild_clean_official_venue_url(passport_wrapped) == expected_m_coupon
 
+    # 1b. plogin.m.jd.com 内嵌未 URL 编码的 coupon.m.jd.com?key=...&roleId=... 不应被外层 parse_qsl 截断
+    plogin_unencoded_coupon = (
+        "https://plogin.m.jd.com/login/login?appid=2193&czLogin=1&returnurl="
+        "https://coupon.m.jd.com/coupons/show.action"
+        "?key=c7mac7s0o1aa4271b9d90c445226c4c7&roleId=3485579506&jump_from=1_05_37_01&czyl=1&zdmcode=abc"
+    )
+    assert (
+        rebuild_clean_official_venue_url(plogin_unencoded_coupon)
+        == "https://coupon.m.jd.com/coupons/show.action?key=c7mac7s0o1aa4271b9d90c445226c4c7&roleId=3485579506"
+    )
+    assert (
+        rebuild_clean_official_venue_url(
+            "https://plogin.m.jd.com/login/login?appid=2193&returnurl=https://evil.example.com/?key=1&roleId=2"
+        )
+        is None
+    )
+
     # 2. 通天塔加密单品 (?sku=非纯数字) 严禁剥参冒充无佣金纯会场；纯数字 ?sku= 与无 sku 纯会场保持放行
     babel_item_url = "https://pro.m.jd.com/mall/active/2eh7EHbxrCQQzeYugUVcz99VSq98/index.html?sku=BFQ9J8Um1Iww9XIN0cCIw9XIhUJuKQ_3hj3LwOTXs8Gd4sVbN&q=xxx"
     assert rebuild_clean_official_venue_url(babel_item_url) is None
