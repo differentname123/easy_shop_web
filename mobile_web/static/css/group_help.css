@@ -1492,6 +1492,31 @@ body {
   }
 }
 
+/* 全站合规 ICP 备案号页脚 */
+.site-icp-footer {
+  margin-top: auto;
+  padding: 14px 12px 18px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #8f959e;
+}
+
+.site-icp-footer a {
+  color: #8f959e;
+  text-decoration: none;
+}
+
+.site-icp-footer a:hover {
+  color: #646a73;
+  text-decoration: underline;
+}
+
+.site-icp-footer .icp-sep {
+  margin: 0 6px;
+  opacity: 0.7;
+}
+
 
 
 

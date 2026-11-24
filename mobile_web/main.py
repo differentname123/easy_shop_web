@@ -35,6 +35,14 @@ from api.group_help import router as group_help_router, group_help_worker
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 GROUP_HELP_ENABLED = True  # 多人团互助独立模块总开关，置为 False 即可一键下线
+_ALLOWED_CORS_ORIGINS = (
+    "https://www.shop.easyeverything.cn",
+    "https://shop.easyeverything.cn",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8001",
+    "http://localhost:8000",
+    "http://localhost:8001",
+)
 
 
 @asynccontextmanager
@@ -174,14 +182,23 @@ def _html_page(filename: str, fallback: str):
 
 
 def create_app() -> FastAPI:
+    enable_docs = str(getattr(settings, "log_level", "INFO") or "INFO").strip().upper() == "DEBUG"
     application = FastAPI(
         title="查券省钱 · 严选好价导购服务",
         description="官方推荐、爆单库、推手授权与带 UID 佣金转链",
         version="2.0.0",
         lifespan=lifespan,
+        docs_url="/docs" if enable_docs else None,
+        redoc_url="/redoc" if enable_docs else None,
+        openapi_url="/openapi.json" if enable_docs else None,
     )
-    application.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
-                               allow_methods=["*"], allow_headers=["*"])
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(_ALLOWED_CORS_ORIGINS),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
     application.add_middleware(GZipMiddleware, minimum_size=500)
 
     @application.exception_handler(PlatformUnavailableError)

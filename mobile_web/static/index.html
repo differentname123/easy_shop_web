@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261124-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261124-2">
   <!-- 离线本地 Vue 3，彻底消除境外 CDN 延迟阻塞，实现 0ms 瞬间加载 -->
-  <script src="/static/js/vue.global.prod.js?v=ux-20261122-3"></script>
+  <script src="/static/js/vue.global.prod.js?v=ux-20261124-2"></script>
 </head>
 <body>
 <div id="app" v-cloak>
@@ -687,6 +687,13 @@
     </div>
   </div>
 
+  <!-- 全站合规 ICP 备案号页脚 -->
+  <div class="site-icp-footer">
+    <span>成都东部新区便易屋信息技术咨询经营部</span>
+    <span class="icp-sep">·</span>
+    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">蜀ICP备2026073570号-1</a>
+  </div>
+
   <!-- 首页轻量添加到手机桌面引导浮条（点 ✕ 关闭后不再自动打扰） -->
   <div class="a2hs-banner" v-if="showDesktopBanner && !isStandalone && currentTab === 'home'">
     <div class="a2hs-banner-left" @click="triggerAddToDesktop">
@@ -846,12 +853,12 @@
 </div>
 
 <!-- 引入前端核心驱动脚本 -->
-<script src="/static/js/api.js?v=ux-20261122-3"></script>
-<script src="/static/js/session.js?v=ux-20261122-3"></script>
-<script src="/static/js/format.js?v=ux-20261122-3"></script>
-<script src="/static/js/browser.js?v=ux-20261122-3"></script>
-<script src="/static/js/feeds.js?v=ux-20261122-3"></script>
-<script src="/static/js/account.js?v=ux-20261122-3"></script>
-<script src="/static/js/app.js?v=ux-20261122-3"></script>
+<script src="/static/js/api.js?v=ux-20261124-2"></script>
+<script src="/static/js/session.js?v=ux-20261124-2"></script>
+<script src="/static/js/format.js?v=ux-20261124-2"></script>
+<script src="/static/js/browser.js?v=ux-20261124-2"></script>
+<script src="/static/js/feeds.js?v=ux-20261124-2"></script>
+<script src="/static/js/account.js?v=ux-20261124-2"></script>
+<script src="/static/js/app.js?v=ux-20261124-2"></script>
 </body>
 </html>

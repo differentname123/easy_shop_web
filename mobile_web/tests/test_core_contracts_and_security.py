@@ -250,6 +250,88 @@ class TestApiSecurityRoutes(unittest.TestCase):
             is_explicit_coupon_target({"clean_input": "https://mobile.yangkeduo.com/duo_coupon_landing.html?goods_id=1"})
         )
 
+    def test_production_docs_disabled_and_cors_allowlist_enforced(self):
+        self.assertEqual(self.client.get("/docs").status_code, 404)
+        self.assertEqual(self.client.get("/redoc").status_code, 404)
+        self.assertEqual(self.client.get("/openapi.json").status_code, 404)
+
+        allowed_resp = self.client.get(
+            "/health",
+            headers={"Origin": "https://www.shop.easyeverything.cn"},
+        )
+        self.assertEqual(allowed_resp.status_code, 200)
+        self.assertEqual(
+            allowed_resp.headers.get("access-control-allow-origin"),
+            "https://www.shop.easyeverything.cn",
+        )
+
+        denied_resp = self.client.get(
+            "/health",
+            headers={"Origin": "https://evil.example.com"},
+        )
+        self.assertEqual(denied_resp.status_code, 200)
+        self.assertIsNone(denied_resp.headers.get("access-control-allow-origin"))
+
+    def test_deploy_nginx_configs_icp_footers_and_manual_hygiene(self):
+        from pathlib import Path
+
+        mobile_web_dir = Path(__file__).resolve().parent.parent
+        deploy_dir = mobile_web_dir / "deploy"
+        nginx_conf = deploy_dir / "mobile_web.nginx.conf"
+
+        self.assertTrue(nginx_conf.is_file(), f"missing nginx config: {nginx_conf}")
+        for removed in ("fail2ban", "nginx", "portal", "portal.html", "mobile_web.prod.service"):
+            self.assertFalse((deploy_dir / removed).exists(), f"redundant path should be removed: {removed}")
+
+        nginx_text = nginx_conf.read_text(encoding="utf-8")
+        self.assertEqual(nginx_text.count("{"), nginx_text.count("}"), "unbalanced braces in mobile_web.nginx.conf")
+
+        first_server_idx = nginx_text.index("\nserver {")
+        top_directives = "\n".join(
+            line for line in nginx_text[:first_server_idx].splitlines() if line.strip() and not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("server_tokens", top_directives)
+
+        active_nginx_directives = "\n".join(
+            line for line in nginx_text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("server_name www.easyeverything.cn", active_nginx_directives)
+
+        for expected in (
+            "www.shop.easyeverything.cn",
+            "shop.easyeverything.cn",
+            "limit_req_zone",
+            "limit_conn_zone",
+            "/api/system/upstream-health",
+            "docs|redoc|openapi",
+            "location /api/",
+        ):
+            self.assertIn(expected, nginx_text)
+
+        for html_path in (
+            mobile_web_dir / "static" / "index.html",
+            mobile_web_dir / "static" / "detail.html",
+            mobile_web_dir / "static" / "group_help.html",
+        ):
+            html_text = html_path.read_text(encoding="utf-8")
+            self.assertIn("蜀ICP备2026073570号-1", html_text, str(html_path))
+            self.assertIn("https://beian.miit.gov.cn/", html_text, str(html_path))
+
+        deploy_sh = deploy_dir / "deploy.sh"
+        self.assertTrue(deploy_sh.is_file(), f"missing deploy script: {deploy_sh}")
+        raw_bytes = deploy_sh.read_bytes()
+        self.assertNotIn(b"\r\n", raw_bytes, "deploy.sh must use LF line endings")
+        deploy_text = raw_bytes.decode("utf-8")
+        self.assertTrue(deploy_text.startswith("#!/usr/bin/env bash"))
+        for marker in (
+            "--init",
+            "sync_meilisearch.py",
+            "ssl_certificate",
+            "--max-indexing-memory 256Mb",
+            "systemctl restart mobile_web.service",
+        ):
+            self.assertIn(marker, deploy_text)
+
 
 if __name__ == "__main__":
     unittest.main()

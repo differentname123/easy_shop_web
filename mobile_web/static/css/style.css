@@ -2485,3 +2485,28 @@ body {
     border-radius: 0 0 16px 16px;
   }
 }
+
+/* ================== 全站合规 ICP 备案号页脚 ================== */
+.site-icp-footer {
+  margin-top: auto;
+  padding: 14px 12px 18px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.site-icp-footer a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.site-icp-footer a:hover {
+  color: var(--text-sub);
+  text-decoration: underline;
+}
+
+.site-icp-footer .icp-sep {
+  margin: 0 6px;
+  opacity: 0.7;
+}
