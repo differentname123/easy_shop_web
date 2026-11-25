@@ -39,6 +39,8 @@ OFF_PROMOTION_CACHE = ThreadSafeTTLCache(maxsize=2048, ttl=1800)
 # 每次对外返回前用这份 60 秒投影结果覆盖，保证线报合入后最迟一分钟可见。
 # 条目值为 (found, deal_tip)：found=False 表示正式表无此文档，此时不改写详情 payload。
 DEAL_TIP_CACHE = ThreadSafeTTLCache(maxsize=4096, ttl=60)
+# 万能转链异步收集入库短去重缓存（10 分钟内同一商品不重复写库）
+UNIVERSAL_COLLECT_DEDUP = ThreadSafeTTLCache(maxsize=2048, ttl=600)
 
 
 def is_product_off_promotion(platform: str, goods_id: str = "", goods_sign: str = "") -> bool:
@@ -299,3 +301,4 @@ def clear_all_caches():
     SIGN_BY_ID_CACHE.clear()
     OFF_PROMOTION_CACHE.clear()
     DEAL_TIP_CACHE.clear()
+    UNIVERSAL_COLLECT_DEDUP.clear()

@@ -10,6 +10,65 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
 _BARE_YUAN_TAG_RE = re.compile(r"^\d+(?:\.\d+)?元$")
+USER_STATS_DIM_MAX_SCORE = 10.0
+USER_STATS_DIM_HALF_SATURATION = 5.0
+USER_STATS_DIM_DEFAULT_WEIGHT = 1.0
+USER_STATS_DIM_WEIGHTS: Dict[str, float] = {
+    "valid_orders": 10.0,
+}
+_STATS_INT_STR_RE = re.compile(r"^[+-]?\d+$")
+
+
+def _coerce_stats_int(value: Any) -> Optional[int]:
+    """将 user_stats 单字段安全转换为整数；排除布尔、日期及非整数字串。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) else None
+    to_decimal = getattr(value, "to_decimal", None)
+    if callable(to_decimal):
+        try:
+            dec_val = float(to_decimal())
+            return int(dec_val) if math.isfinite(dec_val) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if _STATS_INT_STR_RE.fullmatch(text):
+            try:
+                return int(text)
+            except ValueError:
+                return None
+    return None
+
+
+def compute_user_stats_score(
+    user_stats: Any,
+    *,
+    max_per_dim: float = USER_STATS_DIM_MAX_SCORE,
+    half_saturation: float = USER_STATS_DIM_HALF_SATURATION,
+    dim_weights: Optional[Dict[str, float]] = None,
+) -> float:
+    """
+    汇总 user_stats 内全部可转整数的维度评分：
+    默认各维度权重 1（单维上限 10 分），`valid_orders` 权重 10（上限 100 分）；
+    每一正整数维度按 `weight * 10 * n / (n + 5)` 单调递减增益趋近上限，防单维刷量且兼容新增整数字段。
+    """
+    if not isinstance(user_stats, dict) or not user_stats:
+        return 0.0
+    cap = max(0.0, float(max_per_dim))
+    k = max(1e-9, float(half_saturation))
+    weights = USER_STATS_DIM_WEIGHTS if dim_weights is None else dim_weights
+    total = 0.0
+    for key, raw_val in user_stats.items():
+        n = _coerce_stats_int(raw_val)
+        if n is not None and n > 0:
+            w = float(weights.get(str(key), USER_STATS_DIM_DEFAULT_WEIGHT))
+            if w > 0:
+                total += w * cap * (n / (n + k))
+    return round(total, 4)
 
 
 def normalize_platform(platform: Optional[str], default: str = "pdd") -> str:

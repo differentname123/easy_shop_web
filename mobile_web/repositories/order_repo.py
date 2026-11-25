@@ -2,7 +2,7 @@
 """订单持久化及全量聚合；平台状态解释由服务提供，不在仓储猜测。"""
 from datetime import datetime, timedelta, timezone
 import math
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Sequence
 from pymongo import UpdateOne
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
@@ -25,6 +25,7 @@ class OrderRepository(BaseRepository):
             self.col.create_index([("platform", 1), ("promoter_uid", 1), ("order_pay_time", -1)])
             self.col.create_index([("platform", 1), ("promoter_uid", 1), ("order_time", -1), ("order_sn", -1)])
             self.col.create_index([("order_modify_at", -1)])
+            self.col.create_index([("platform", 1), ("goods_id", 1), ("is_refund", 1), ("is_invalid", 1)])
             return True
         except Exception as exc:
             logger.warning(
@@ -215,3 +216,40 @@ class OrderRepository(BaseRepository):
             "refund_count": int(stats.get("refund_count", 0)),
             "order_list": [self._format_order(doc) for doc in facet.get("order_list", [])],
         }
+
+    def count_valid_orders_by_goods_ids(self, platform: str, goods_ids: Sequence[str]) -> Dict[str, int]:
+        """精确统计指定商品当前未退款且未失效的有效订单笔数（兼容整型/Int64 与字符串 goods_id）；无有效订单返回 0。"""
+        unique_ids = list(dict.fromkeys(str(g or "").strip() for g in (goods_ids or ()) if str(g or "").strip()))
+        if not unique_ids:
+            return {}
+        match_candidates: List[Any] = []
+        seen_candidates = set()
+        for gid in unique_ids:
+            if ("str", gid) not in seen_candidates:
+                seen_candidates.add(("str", gid))
+                match_candidates.append(gid)
+            if gid.isdigit():
+                num = int(gid)
+                if ("int", num) not in seen_candidates:
+                    seen_candidates.add(("int", num))
+                    match_candidates.append(num)
+        plat = normalize_platform(platform)
+        pipeline = [
+            {
+                "$match": {
+                    "platform": plat,
+                    "goods_id": {"$in": match_candidates},
+                    "is_refund": {"$ne": True},
+                    "is_invalid": {"$ne": True},
+                }
+            },
+            {"$group": {"_id": "$goods_id", "valid_orders": {"$sum": 1}}},
+        ]
+        counts: Dict[str, int] = {gid: 0 for gid in unique_ids}
+        for row in self.col.aggregate(pipeline):
+            if not isinstance(row, dict):
+                continue
+            gid = str(row.get("_id") or "").strip()
+            if gid in counts:
+                counts[gid] = counts.get(gid, 0) + max(0, int(row.get("valid_orders") or 0))
+        return counts

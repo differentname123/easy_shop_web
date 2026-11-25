@@ -4,12 +4,14 @@ import math
 import hashlib
 import json
 import re
+import threading
 import time
 from copy import deepcopy
 from typing import Dict, Any, Optional
 from adapters import get_adapter, PlatformUnavailableError
 from infrastructure.http_utils import sanitize_user_error_message
 from infrastructure.logging_utils import format_exc_summary, severity_icon
+from infrastructure.search_meili import is_meili_available, sync_single_product
 from models.product import (
     ProductRef,
     classify_user_input,
@@ -17,6 +19,7 @@ from models.product import (
     extract_canonical_goods_id,
     is_jd_image_key,
     normalize_platform,
+    resolve_item_identity,
 )
 from models.user import normalize_promoter_id
 from repositories.product_repo import ProductRepository
@@ -25,6 +28,7 @@ from cache import (
     MATERIAL_CACHE,
     PROMOTION_CACHE,
     SIGN_BY_ID_CACHE,
+    UNIVERSAL_COLLECT_DEDUP,
     cache_product_detail,
     is_valid_detail_cache_entry,
     make_detail_snapshot,
@@ -33,6 +37,7 @@ from cache import (
 from config import PROMOTION_LINK_TTL, logger
 
 _UID_PATTERN = re.compile(r"^u_[0-9a-f]{8}$")
+_UNIVERSAL_COLLECT_SEM = threading.BoundedSemaphore(4)
 
 
 class PromoteService:
@@ -714,6 +719,122 @@ class PromoteService:
         except Exception:
             pass
 
+    @staticmethod
+    def _is_persistable_universal_product(data: Dict[str, Any], product: Optional[Dict[str, Any]]) -> bool:
+        """四道准入校验（Fail-Closed）：仅将明确单品、有完整标题/主图/非负价格且未下架的结果入库。"""
+        if not isinstance(data, dict) or data.get("resolution_kind") != "product":
+            return False
+        if not isinstance(product, dict) or product.get("is_off_promotion") is True:
+            return False
+        gid = clean_product_id(product.get("goods_id") or product.get("product_id"))
+        gsign = str(product.get("goods_sign") or "").strip()
+        if not gid and not gsign:
+            return False
+        name = product.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if not str(product.get("image_url") or "").strip():
+            return False
+        raw_price = product.get("activity_price") if product.get("activity_price") is not None else product.get("price")
+        if raw_price is None or isinstance(raw_price, bool):
+            return False
+        try:
+            price_val = float(raw_price)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(price_val) and price_val >= 0.0
+
+    def _persist_universal_product_sync(
+        self,
+        platform: str,
+        product: Dict[str, Any],
+        promo_data: Dict[str, Any],
+        *,
+        is_public: bool,
+    ) -> None:
+        upsert_fn = getattr(self.repo, "upsert_universal_collected_product", None)
+        if not callable(upsert_fn):
+            return
+        from datetime import datetime, timezone
+        from models.product import utc_millis
+
+        fetched_at = utc_millis(datetime.fromtimestamp(time.time(), timezone.utc))
+        snapshot = make_detail_snapshot(product, fetched_at, platform)
+        payload = dict(snapshot.data, detail_updated_at=fetched_at)
+        saved_doc = upsert_fn(payload)
+        if not isinstance(saved_doc, dict):
+            return
+
+        if is_public and self._cacheable(promo_data) and self._public_attribution(promo_data):
+            save_promo_fn = getattr(self.repo, "save_promotion_link_cache", None)
+            if callable(save_promo_fn):
+                expires_at = time.time() + PROMOTION_LINK_TTL
+                source_deadline = promo_data.get("expires_at")
+                if (
+                    isinstance(source_deadline, (int, float))
+                    and not isinstance(source_deadline, bool)
+                    and math.isfinite(source_deadline)
+                    and source_deadline > time.time()
+                ):
+                    expires_at = min(expires_at, source_deadline)
+                save_promo_fn(
+                    platform=snapshot.ref.platform,
+                    data=self._link_data(promo_data),
+                    goods_id=snapshot.ref.goods_id or None,
+                    goods_sign=snapshot.ref.goods_sign or None,
+                    goods_key=snapshot.ref.key,
+                    expires_at=expires_at,
+                    only_if_exists=True,
+                )
+
+        if is_meili_available():
+            sync_single_product(saved_doc)
+
+    def _persist_universal_product_bg(
+        self,
+        platform: str,
+        product: Dict[str, Any],
+        promo_data: Dict[str, Any],
+        *,
+        is_public: bool,
+    ) -> None:
+        if not self._is_persistable_universal_product(promo_data, product):
+            return
+        upsert_fn = getattr(self.repo, "upsert_universal_collected_product", None)
+        if not callable(upsert_fn) or type(self.repo).__name__ == "MagicMock":
+            return
+        plat, gid, gsign = resolve_item_identity(product, default_platform=platform)
+        pid = gid or gsign
+        if not plat or not pid:
+            return
+        dedup_key = (plat, pid)
+        if UNIVERSAL_COLLECT_DEDUP.get(dedup_key) is not None:
+            return
+        UNIVERSAL_COLLECT_DEDUP.set(dedup_key, 1)
+        if not _UNIVERSAL_COLLECT_SEM.acquire(blocking=False):
+            return
+
+        prod_copy = deepcopy(product)
+        promo_copy = deepcopy(promo_data)
+
+        def _worker():
+            try:
+                self._persist_universal_product_sync(
+                    plat, prod_copy, promo_copy, is_public=is_public
+                )
+            except Exception as exc:
+                logger.warning(
+                    "⚠️ 【万能转链入库异常】异步收集商品入库失败，已忽略以保护转链主流程 | 平台[%s] 商品[%s] 异常<%s>",
+                    plat, pid, format_exc_summary(exc),
+                )
+            finally:
+                _UNIVERSAL_COLLECT_SEM.release()
+
+        try:
+            threading.Thread(target=_worker, name="bg-universal-collect", daemon=True).start()
+        except Exception:
+            _UNIVERSAL_COLLECT_SEM.release()
+
     def universal_convert(
         self,
         raw_text: str,
@@ -843,6 +964,12 @@ class PromoteService:
                             for k in ("url", "final_link", "mobile_url", "short_url", "click_url", "j_command", "j_short_command", "promotion_token", "coupon_url"):
                                 if upgraded.get(k):
                                     data[k] = upgraded[k]
+                    self._persist_universal_product_bg(
+                        detected_plat,
+                        product,
+                        data,
+                        is_public=(not active_uid and not personal_fallback),
+                    )
 
                 cmd_kwargs = {
                     "title": data.get("title") or (product or {}).get("name") or "精选高性价比好物",

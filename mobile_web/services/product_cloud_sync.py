@@ -57,6 +57,8 @@ NEVER_OVERWRITE_FIELDS = frozenset({
     "default_promotion",
     "default_promotion_updated_at",
     "default_promotion_expires_at",
+    "user_stats",
+    "user_stats_score",
 })
 
 FORMAT_FAMILY_FIELDS = frozenset({
@@ -126,6 +128,7 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "deal_info.updated_at": 1,
     "deal_info.format_status": 1,
     "deal_info.format_updated_at": 1,
+    "is_user_collected": 1,
 }
 
 _LOCAL_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
@@ -320,6 +323,7 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "deal_ready": deal_ready,
         "deal_expired": deal_expired,
         "deal_sig": deal_sig,
+        "is_user_collected": bool(doc.get("is_user_collected") is True),
     }
 
 
@@ -400,6 +404,8 @@ def build_product_merge_operation(
             if not fmt_ready or key in ("format_error", "format_retry_count"):
                 continue
         if key == "deal_info" and not (deal_ready or deal_expired_sync):
+            continue
+        if key == "is_user_collected" and value is not True:
             continue
         if key == "channel_type":
             if not (isinstance(value, int) and not isinstance(value, bool)):

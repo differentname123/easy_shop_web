@@ -3,13 +3,17 @@
 首页接口路由：拼多多进宝官方推荐与关键词检索
 """
 from typing import Optional
-from fastapi import APIRouter, Query, Depends
+from fastapi import APIRouter, Query, Depends, Request
 from auth import get_optional_uid
+from repositories.favorite_repo import FavoriteRepository
 from services.product_service import ProductService
+from services.product_stats_service import ProductStatsBuffer, extract_actor_key
 from adapters import get_all_platforms, require_adapter
 
 router = APIRouter(prefix="/api/home", tags=["首页推荐与搜索"])
 product_service = ProductService()
+product_stats_buffer = ProductStatsBuffer(lambda: getattr(product_service, "repo", None))
+favorite_repo = FavoriteRepository()
 
 
 @router.get("/platforms")
@@ -67,6 +71,7 @@ def search_goods(
 
 @router.get("/detail")
 def get_goods_detail(
+    request: Request,
     goods_sign: Optional[str] = Query(None, max_length=128, description="商品Sign"),
     goods_id: Optional[str] = Query(None, max_length=64, description="商品ID"),
     platform: str = Query("pdd", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台标识"),
@@ -76,10 +81,34 @@ def get_goods_detail(
     获取官方商品完整规范化详情 (含多张高清实拍轮播图、满减优惠、店铺与服务保障)
     """
     key = goods_sign or goods_id or ""
-    return product_service.get_goods_detail(
+    res = product_service.get_goods_detail(
         platform=platform,
         goods_id_or_sign=key,
         goods_id=goods_id,
         goods_sign=goods_sign,
         uid=current_uid
     )
+    if isinstance(res, dict) and res.get("status") == "success" and isinstance(res.get("data"), dict):
+        data = res["data"]
+        plat = data.get("platform") or platform
+        pid = str(data.get("product_id") or data.get("goods_id") or data.get("goods_sign") or "").strip()
+        if pid:
+            product_stats_buffer.record(
+                plat,
+                pid,
+                "view",
+                extract_actor_key(request, current_uid),
+            )
+        if current_uid and pid and (
+            favorite_repo._db is not None or type(getattr(product_service, "repo", None)).__name__ == "ProductRepository"
+        ):
+            try:
+                is_fav = favorite_repo.is_favorited(current_uid, plat, pid)
+                if not is_fav:
+                    gsign = str(data.get("goods_sign") or "").strip()
+                    if gsign and gsign != pid:
+                        is_fav = favorite_repo.is_favorited(current_uid, plat, gsign)
+                res = dict(res, data=dict(data, is_favorited=is_fav))
+            except Exception:
+                pass
+    return res

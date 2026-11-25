@@ -13,6 +13,9 @@
     const detailError = ref(false);
     const detailErrorMsg = ref('');
     const isOffPromotion = ref(false);
+    const isFavorited = ref(false);
+    const isFavoriteBusy = ref(false);
+    const priceFeedbackChoice = ref('');
     const canOperateDetail = computed(() => Boolean(goods.value && !isOffPromotion.value));
     const syncDocumentTitle = () => {
       if (!global.document) return;
@@ -281,12 +284,120 @@
       const inv = session.pendingInvite ? session.pendingInvite() : '';
       global.location.href = inv ? `/?${new URLSearchParams({ tab: 'user', invite_code: inv })}` : '/?tab=user';
     };
+    const PRICE_FEEDBACK_STORAGE_KEY = 'easy_shop_price_feedback_v1';
+    const PRICE_FEEDBACK_TTL_MS = 24 * 3600 * 1000;
+    const currentProductStatsIdentity = () => {
+      const target = goods.value || requested;
+      if (!target) return { platform: '', product_id: '', goods_sign: '' };
+      const id = shop.goodsIdentity(target);
+      const pid = String(goods.value?.product_id || id.goods_id || id.goods_sign || '').trim();
+      return { platform: id.platform, product_id: pid, goods_sign: id.goods_sign || '' };
+    };
+    const sendGoodsAction = action => {
+      const { platform, product_id } = currentProductStatsIdentity();
+      if (!platform || !product_id || !api?.post) return;
+      const token = session.token ? session.token() : '';
+      try {
+        Promise.resolve(api.post('/api/goods/action', { platform, product_id, action }, { token, keepalive: true })).catch(() => {});
+      } catch (_) {}
+    };
+    const readPriceFeedbackStore = () => {
+      try {
+        const raw = JSON.parse(global.localStorage?.getItem(PRICE_FEEDBACK_STORAGE_KEY) || '{}');
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+        const now = Date.now();
+        const cleaned = {};
+        for (const [k, v] of Object.entries(raw)) {
+          if (v && typeof v === 'object' && (v.choice === 'buyable' || v.choice === 'unbuyable') && Number(v.ts) > now - PRICE_FEEDBACK_TTL_MS) {
+            cleaned[k] = v;
+          }
+        }
+        return cleaned;
+      } catch (_) {
+        return {};
+      }
+    };
+    const loadPriceFeedback = () => {
+      const { platform, product_id } = currentProductStatsIdentity();
+      if (!platform || !product_id) { priceFeedbackChoice.value = ''; return; }
+      const store = readPriceFeedbackStore();
+      priceFeedbackChoice.value = store[`${platform}:${product_id}`]?.choice || '';
+    };
+    const submitPriceFeedback = action => {
+      if (!canOperateDetail.value || (action !== 'buyable' && action !== 'unbuyable')) return;
+      const { platform, product_id } = currentProductStatsIdentity();
+      if (!platform || !product_id) return;
+      if (priceFeedbackChoice.value) {
+        browser.showToast('您已反馈过该商品，感谢参与');
+        return;
+      }
+      priceFeedbackChoice.value = action;
+      try {
+        const store = readPriceFeedbackStore();
+        store[`${platform}:${product_id}`] = { choice: action, ts: Date.now() };
+        const entries = Object.entries(store).sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0)).slice(0, 100);
+        global.localStorage?.setItem(PRICE_FEEDBACK_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+      } catch (_) {}
+      browser.showToast('感谢反馈');
+      sendGoodsAction(action);
+    };
+    const handleToggleFavorite = async () => {
+      if (!canOperateDetail.value || isFavoriteBusy.value) return;
+      await restoreIdentity();
+      if (disposed) return;
+      const token = session.token ? session.token() : '';
+      if (!isLoggedIn.value || !token) {
+        browser.showToast('请先登录后使用收藏');
+        goToRegister();
+        return;
+      }
+      const { platform, product_id, goods_sign } = currentProductStatsIdentity();
+      if (!platform || (!product_id && !goods_sign)) return;
+      isFavoriteBusy.value = true;
+      try {
+        if (isFavorited.value) {
+          const res = await api.post('/api/favorites/remove', { platform, product_id, goods_sign }, { token });
+          if (res.status === 401) { invalidateSession(); return; }
+          if (res.ok && res.data?.status === 'success') {
+            isFavorited.value = false;
+            browser.showToast('已移出收藏');
+          } else {
+            browser.showToast(res.data?.detail || res.data?.error_msg || '移除收藏失败');
+          }
+        } else {
+          const dealPrice = dealTip.value && Number(dealTip.value.deal_price) > 0 ? Number(dealTip.value.deal_price) : null;
+          const payload = {
+            platform,
+            product_id,
+            goods_sign,
+            name: goods.value?.name || '',
+            image_url: carouselList.value[0] || goods.value?.image_url || '',
+            price: dealPrice !== null ? dealPrice : Number(goods.value?.price || 0),
+          };
+          const res = await api.post('/api/favorites/add', payload, { token });
+          if (res.status === 401) { invalidateSession(); return; }
+          if (res.ok && res.data?.status === 'success') {
+            isFavorited.value = true;
+            browser.showToast('已加入收藏');
+          } else {
+            browser.showToast(res.data?.detail || res.data?.error_msg || '加入收藏失败');
+          }
+        }
+      } catch (_) {
+        browser.showToast('操作失败，请稍后重试');
+      } finally {
+        isFavoriteBusy.value = false;
+      }
+    };
     const handleShareDetail = () => {
       if (!canOperateDetail.value || !goods.value) return;
       const origin = (global.location && global.location.origin) || '';
       const inv = isLoggedIn.value ? (myInviteCode.value || (session.myInviteCode ? session.myInviteCode() : '')) : '';
       const shareText = shop.buildDetailShareText(goods.value, origin, inv);
-      if (shareText) browser.copyText(shareText, '✅ 好价分享文案已复制，快发给微信好友吧！');
+      if (shareText) {
+        browser.copyText(shareText, '✅ 好价分享文案已复制，快发给微信好友吧！');
+        sendGoodsAction('share');
+      }
     };
     const goBack = () => {
       if (global.history.length > 1) return global.history.back();
@@ -340,8 +451,14 @@
       isOffPromotion.value = false;
       try {
         const params = new URLSearchParams(requested);
-        const { ok, data } = await api.get(`/api/home/detail?${params}`);
+        const token = session.token ? session.token() : '';
+        let { ok, status, data } = await api.get(`/api/home/detail?${params}`, token ? { token } : undefined);
         if (generation !== detailGeneration) return;
+        if (status === 401 && token) {
+          invalidateSession();
+          ({ ok, status, data } = await api.get(`/api/home/detail?${params}`));
+          if (generation !== detailGeneration) return;
+        }
         if (ok && data.status === 'success' && data.data) {
           const detail = data.data;
           const prevBroken = brokenProductImages.value;
@@ -365,9 +482,13 @@
             service_guarantees: detail.service_guarantees || goods.value?.service_guarantees,
             deal_tip: detail.deal_tip !== undefined ? detail.deal_tip : (goods.value?.deal_tip || null),
           };
+          if (detail.is_favorited !== undefined) {
+            isFavorited.value = Boolean(detail.is_favorited);
+          }
           syncDocumentTitle();
           syncOuterSnapshots(goods.value, false);
           persistCurrentSummary(goods.value);
+          loadPriceFeedback();
           if (carouselList.value.length === 0 && data.source === 'database_fallback') {
             detailError.value = true;
             detailErrorMsg.value = '商品图片暂未加载成功，请点击重新获取';
@@ -602,6 +723,7 @@
       await loadDeepDetail();
       browser.stopSmartLoading();
       await identity;
+      loadPriceFeedback();
       resumePendingAuthorization();
       // Promotion conversion is deliberately triggered only by a user action.
     };
@@ -622,6 +744,7 @@
       onDealImageError, openImagePreview, closeImagePreview, onPreviewScroll, toggleCopywritingExpand,
       copyDealTutorial, copyDealCopywriting, copyDealAuxItem, openDealAuxItem,
       isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, commandModal, closeCommandModal, copyCommandFromModal,
+      isFavorited, isFavoriteBusy, handleToggleFavorite, priceFeedbackChoice, submitPriceFeedback,
       onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,

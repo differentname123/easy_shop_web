@@ -33,7 +33,7 @@ _LAST_AVAILABILITY_CHECK = 0.0
 _IS_AVAILABLE = False
 _AVAILABILITY_CACHE_TTL = 10.0  # 健康检测缓存 10 秒，避免高频 I/O 阻塞主线程
 
-MEILI_SCHEMA_VERSION = 3
+MEILI_SCHEMA_VERSION = 4
 DEFAULT_MEILI_SYNC_INTERVAL_SECONDS = 120.0
 DEFAULT_MEILI_SYNC_INITIAL_DELAY_SECONDS = 5.0
 _ACTIVE_PRODUCTS_QUERY: Dict[str, Any] = {
@@ -239,6 +239,7 @@ def format_meili_doc(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "saved_price": saved_price,
         "is_off_promotion": bool(doc.get("is_off_promotion") is True or doc.get("superseded_by")),
         "is_deal_tip": is_deal_tip,
+        "is_user_collected": bool(doc.get("is_user_collected") is True),
         "is_reliable": is_product_reliable(doc),
         "channel_type": channel_type,
         "image_url": str(doc.get("image_url") or "").strip(),
@@ -368,7 +369,7 @@ def ensure_index_configured(force: bool = False) -> bool:
 
             index.update_settings({
                 "searchableAttributes": ["core_entity", "core_entity_alias", "brand", "name"],
-                "filterableAttributes": ["platform", "category", "is_off_promotion", "is_deal_tip", "is_reliable", "channel_type"],
+                "filterableAttributes": ["platform", "category", "is_off_promotion", "is_deal_tip", "is_user_collected", "is_reliable", "channel_type"],
                 "sortableAttributes": ["is_reliable", "updated_at", "activity_price", "price", "saved_price"],
                 "rankingRules": ["words", "typo", "proximity", "attribute", "sort", "exactness"],
                 "typoTolerance": {"enabled": False},
@@ -421,7 +422,7 @@ def search_products(
         if category and category.strip() and category.strip() != "全部":
             filter_exprs.append(f'category = "{_escape_filter_val(category.strip())}"')
         if only_active_boom:
-            filter_exprs.append("(channel_type IS NOT NULL OR is_deal_tip = true)")
+            filter_exprs.append("(channel_type IS NOT NULL OR is_deal_tip = true OR is_user_collected = true)")
 
         sort_mapping = {
             "latest": ["is_reliable:desc", "updated_at:desc"],
@@ -451,6 +452,26 @@ def search_products(
             keyword, platform, format_exc_summary(e),
         )
         return None
+
+
+def sync_single_product(doc: Dict[str, Any]) -> bool:
+    """将单条新增/更新商品尽力实时推送到 Meilisearch；失败不影响业务且由定时差量兜底。"""
+    if not is_meili_available():
+        return False
+    meili_doc = format_meili_doc(doc)
+    if meili_doc is None:
+        return False
+    client = get_meili_client()
+    if not client:
+        return False
+    try:
+        if not _INDEX_CONFIGURED:
+            ensure_index_configured()
+        client.index(INDEX_NAME).add_documents([meili_doc])
+        return True
+    except Exception as exc:
+        logger.debug("⚠️ 【Meilisearch单条推送跳过】商品[%s] 异常<%s>", meili_doc.get("id"), format_exc_summary(exc))
+        return False
 
 
 def _extract_item_search_fields(item: Dict[str, Any]) -> Tuple[str, str, List[str], List[str]]:

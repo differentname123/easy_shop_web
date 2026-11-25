@@ -67,6 +67,11 @@ def offline_resources_and_registry(tmp_path):
             reset_fn = getattr(api_order_mod.order_service, "reset_state", None)
             if callable(reset_fn):
                 reset_fn()
+        api_home_mod = sys.modules.get("api.home")
+        if api_home_mod is not None and hasattr(api_home_mod, "product_stats_buffer"):
+            reset_stats = getattr(api_home_mod.product_stats_buffer, "reset_state", None)
+            if callable(reset_stats):
+                reset_stats()
         if not had_playwright:
             for mod_name in list(sys.modules):
                 if mod_name == "playwright" or mod_name.startswith("playwright."):

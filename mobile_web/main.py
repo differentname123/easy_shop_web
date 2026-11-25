@@ -32,6 +32,7 @@ from api.user import router as user_router
 from api.promote import router as promote_router
 from api.order import router as order_router, order_service
 from api.group_help import router as group_help_router, group_help_worker
+from api.favorite import router as favorite_router
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 GROUP_HELP_ENABLED = True  # 多人团互助独立模块总开关，置为 False 即可一键下线
@@ -51,7 +52,7 @@ async def lifespan(app: FastAPI):
     configure_logging(settings)
     configure_transport(dns_mode=settings.pdd_dns_mode, trust_env=settings.pdd_trust_env)
 
-    from api.home import product_service
+    from api.home import product_service, product_stats_buffer
     from api.goods import product_service as goods_service
 
     services = tuple(dict.fromkeys((product_service, goods_service)))
@@ -138,9 +139,11 @@ async def lifespan(app: FastAPI):
             meili_sync_worker = MeiliSyncWorker(lambda: getattr(product_service, "repo", None))
             app.state.meili_sync_worker = meili_sync_worker
             meili_sync_worker.start()
+        product_stats_buffer.start()
         yield
     finally:
         warmup_stop.set()
+        await asyncio.to_thread(product_stats_buffer.stop)
         if meili_sync_worker is not None:
             await asyncio.to_thread(meili_sync_worker.stop)
             app.state.meili_sync_worker = None
@@ -260,7 +263,7 @@ def create_app() -> FastAPI:
             )
         return response
 
-    for router in (home_router, goods_router, user_router, promote_router, order_router):
+    for router in (home_router, goods_router, user_router, promote_router, order_router, favorite_router):
         application.include_router(router)
     if GROUP_HELP_ENABLED:
         application.include_router(group_help_router)
@@ -295,6 +298,10 @@ def create_app() -> FastAPI:
     @application.get("/detail", response_class=HTMLResponse)
     def detail_page():
         return _html_page("detail.html", "商品详情页构建中...")
+
+    @application.get("/favorites", response_class=HTMLResponse)
+    def favorites_page():
+        return _html_page("favorites.html", "我的收藏页面正在构建中...")
 
     if GROUP_HELP_ENABLED:
         @application.get("/group_help", response_class=HTMLResponse)

@@ -29,7 +29,10 @@ class MemoryCursor:
     def sort(self, spec):
         self.calls.append(("sort", spec))
         for key, direction in reversed(spec):
-            self.docs.sort(key=lambda doc: (doc.get(key) is not None, doc.get(key)), reverse=direction < 0)
+            self.docs.sort(
+                key=lambda doc, k=key: (0, 0) if doc.get(k) is None else (1, doc.get(k)),
+                reverse=direction < 0,
+            )
         return self
 
     def skip(self, count):
@@ -545,6 +548,8 @@ class TestProductRepository(unittest.TestCase):
             ([("platform", 1), ("activity_price", 1)], {"background": True}),
             ([("saved_price", -1), ("updated_at", -1)], {"background": True}),
             ([("platform", 1), ("saved_price", -1), ("updated_at", -1)], {"background": True}),
+            ([("user_stats_score", -1), ("updated_at", -1)], {"background": True}),
+            ([("platform", 1), ("user_stats_score", -1), ("updated_at", -1)], {"background": True}),
         ])
 
     def test_displayable_content_requires_name_and_known_valid_price(self):
@@ -707,7 +712,7 @@ class TestProductRepository(unittest.TestCase):
                 "activity_price", "price", "original_price", "saved_price", "coupon_amount", "has_coupon",
                 "commission_rate", "commission_amount", "sales_tip", "image_url", "mall_name", "updated_at",
                 "product_url", "coupon_url",
-                "deal_source", "deal_source_name",
+                "deal_source", "deal_source_name", "user_stats_score",
                 "format_status", "need_reformat", "format_activity_price", "format_info",
                 "deal_info.is_deal_tip", "deal_info.card_highlight",
                 "deal_info.deal_price", "deal_info.format_deal_price",

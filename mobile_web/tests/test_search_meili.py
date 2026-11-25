@@ -66,9 +66,13 @@ class TestSearchMeili(unittest.TestCase):
         self.assertEqual(res["saved_price"], 6.5)
         self.assertFalse(res["is_off_promotion"])
         self.assertTrue(res["is_deal_tip"])
+        self.assertFalse(res["is_user_collected"])
         self.assertFalse(res["is_reliable"])
         self.assertEqual(res["channel_type"], 1)
-        self.assertEqual(MEILI_SCHEMA_VERSION, 3)
+        self.assertEqual(MEILI_SCHEMA_VERSION, 4)
+        self.assertTrue(format_meili_doc({
+            "platform": "pdd", "product_id": "P_UC", "name": "万能转链品", "is_user_collected": True,
+        })["is_user_collected"])
 
         self.assertTrue(format_meili_doc({
             "platform": "pdd", "product_id": "P_NO_DEAL", "name": "官方商品", "channel_type": 5,
@@ -174,6 +178,7 @@ class TestSearchMeili(unittest.TestCase):
         self.assertNotIn("mall_name", cfg["searchableAttributes"])
         self.assertNotIn("category", cfg["searchableAttributes"])
         self.assertIn("is_reliable", cfg["filterableAttributes"])
+        self.assertIn("is_user_collected", cfg["filterableAttributes"])
         self.assertIn("is_reliable", cfg["sortableAttributes"])
         self.assertEqual(cfg["typoTolerance"], {"enabled": False})
         self.assertEqual(cfg["localizedAttributes"], [{"attributePatterns": ["*"], "locales": ["cmn"]}])

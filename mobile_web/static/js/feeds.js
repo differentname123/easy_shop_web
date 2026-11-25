@@ -34,7 +34,7 @@
     const boomPlatform = ref('all');
     const boomSearchKeyword = ref('');
     const activeBoomKeyword = ref('');
-    const boomSortBy = ref('latest');
+    const boomSortBy = ref('score');
     const boomGoodsList = ref([]);
     const boomLoading = ref(false);
     const boomHasMore = ref(true);
@@ -272,12 +272,13 @@
         const cached = JSON.parse(global.sessionStorage.getItem(key('boom_return_state', 'all')) || 'null');
         if (cached && cached.scope === getScope() && Array.isArray(cached.list) && cached.list.length > 0) {
           const restoredKeyword = cached.keyword || '';
+          if (!restoredKeyword && cached.sortBy === 'latest') return false;
           boomPlatform.value = cached.platform || 'all';
           activeBoomKeyword.value = restoredKeyword;
           if (restoredKeyword || !boomSearchKeyword.value) {
             boomSearchKeyword.value = restoredKeyword;
           }
-          boomSortBy.value = activeBoomKeyword.value ? (cached.sortBy || 'cost_performance') : 'latest';
+          boomSortBy.value = activeBoomKeyword.value ? (cached.sortBy || 'cost_performance') : 'score';
           boomGoodsList.value = [...cached.list];
           boomPage = cached.page || 1;
           boomHasMore.value = cached.hasMore !== false;
@@ -373,7 +374,7 @@
     };
     const onSearchBoom = () => {
       activeBoomKeyword.value = boomSearchKeyword.value.trim();
-      boomSortBy.value = activeBoomKeyword.value ? 'cost_performance' : 'latest';
+      boomSortBy.value = activeBoomKeyword.value ? 'cost_performance' : 'score';
       global.scrollTo(0, 0);
       return loadBoomGoods(true);
     };

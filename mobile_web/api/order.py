@@ -6,9 +6,10 @@ from typing import Optional
 from fastapi import APIRouter, Query, Depends, HTTPException, status
 from services.order_service import OrderService
 from auth import get_current_uid
+from api.home import product_service
 
 router = APIRouter(prefix="/api/order", tags=["订单与收益"])
-order_service = OrderService()
+order_service = OrderService(product_repo=product_service.repo)
 
 
 @router.post("/sync_and_query")

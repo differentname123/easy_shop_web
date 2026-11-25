@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="format-detection" content="telephone=no">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="theme-color" content="#e02e24">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="查券省钱">
+  <title>我的收藏 - 查券省钱</title>
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261125-1">
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261125-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261125-1"></script>
+  <style>
+    .fav-page { padding-top: calc(48px + var(--safe-top)); padding-bottom: 32px; min-height: 100vh; background: var(--bg-page); max-width: 540px; margin: 0 auto; }
+    .fav-list { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+    .fav-card { background: #fff; border-radius: 10px; padding: 10px; display: flex; gap: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); align-items: stretch; }
+    .fav-card.off { opacity: 0.65; }
+    .fav-thumb { width: 88px; height: 88px; border-radius: 8px; object-fit: cover; flex-shrink: 0; background: #f5f5f5; }
+    .fav-body { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: space-between; }
+    .fav-title { font-size: 13px; color: var(--text-main); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; }
+    .fav-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .fav-diff-tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+    .fav-diff-tag.down { background: #f6ffed; color: #389e0d; border: 1px solid #b7eb8f; }
+    .fav-diff-tag.up { background: #fff7e6; color: #d46b08; border: 1px solid #ffd591; }
+    .fav-off-tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #f3f4f6; color: #6b7280; }
+    .fav-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; gap: 8px; }
+    .fav-price { font-size: 16px; font-weight: 700; color: var(--primary-color); }
+    .fav-remove-btn { font-size: 12px; padding: 4px 10px; border-radius: 14px; border: 1px solid #e5e7eb; background: #fff; color: var(--text-sub); cursor: pointer; }
+    .fav-empty { text-align: center; padding: 48px 20px; color: var(--text-muted); font-size: 14px; }
+    .fav-more-btn { display: block; width: calc(100% - 20px); margin: 4px auto 12px; padding: 10px; border-radius: 8px; border: 1px solid #e5e7eb; background: #fff; color: var(--text-main); font-size: 13px; cursor: pointer; }
+  </style>
+</head>
+<body>
+<div id="app" class="fav-page" v-cloak>
+  <header class="detail-nav-bar">
+    <button class="detail-nav-btn" @click="goBack">
+      <svg style="width:20px;height:20px;fill:currentColor" viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+      <span>返回</span>
+    </button>
+    <span class="detail-nav-title">我的收藏<span v-if="isLoggedIn && total > 0"> ({{ total }})</span></span>
+    <button class="detail-nav-btn" @click="goHome">
+      <span>首页</span>
+    </button>
+  </header>
+
+  <div class="fav-empty" v-if="!loading && !isLoggedIn">
+    <div style="margin-bottom:14px;">登录后即可查看和管理你收藏的商品</div>
+    <button class="btn-primary-block" style="max-width:200px;margin:0 auto;" @click="goToLogin">去登录</button>
+  </div>
+
+  <div class="fav-empty" v-else-if="loading && items.length === 0">正在加载我的收藏...</div>
+
+  <div class="fav-empty" v-else-if="!loading && items.length === 0">
+    <div style="margin-bottom:14px;">还没有收藏商品，去首页逛逛好价吧</div>
+    <button class="btn-primary-block" style="max-width:200px;margin:0 auto;" @click="goHome">去逛好价</button>
+  </div>
+
+  <div class="fav-list" v-else>
+    <div class="fav-card" :class="{ off: item.is_off_promotion }" v-for="item in items" :key="item.platform + ':' + item.product_id">
+      <img :src="item.product?.image_url || '/static/icons/icon-192.png?v=20261111-1'" class="fav-thumb" referrerpolicy="no-referrer" loading="lazy" @click="openDetail(item)" />
+      <div class="fav-body">
+        <div>
+          <div class="fav-title" @click="openDetail(item)">
+            <span class="plat-badge" :class="item.platform" style="position:static;margin-right:4px;font-size:10px">{{ item.product?.platform_name || item.platform }}</span>
+            {{ item.product?.name || '商品暂不可用' }}
+          </div>
+          <div class="fav-tags">
+            <span class="fav-off-tag" v-if="item.live_status === 'off_promotion'">已下架</span>
+            <span class="fav-off-tag" v-else-if="item.live_status === 'missing'">信息待刷新</span>
+            <span class="fav-diff-tag down" v-if="item.price_diff !== null && item.price_diff < 0">比收藏时降 ¥{{ formatMoney(Math.abs(item.price_diff)) }}</span>
+            <span class="fav-diff-tag up" v-else-if="item.price_diff !== null && item.price_diff > 0">比收藏时涨 ¥{{ formatMoney(item.price_diff) }}</span>
+          </div>
+        </div>
+        <div class="fav-footer">
+          <span class="fav-price" v-if="item.current_price !== null && item.current_price !== undefined">¥{{ formatMoney(item.current_price) }}</span>
+          <span class="fav-price" style="color:var(--text-muted);font-size:12px;" v-else-if="item.collected_price">收藏时 ¥{{ formatMoney(item.collected_price) }}</span>
+          <span v-else></span>
+          <button type="button" class="fav-remove-btn" @click="removeItem(item)">移出</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <button type="button" class="fav-more-btn" v-if="hasMore && !loading" @click="loadMore">加载更多</button>
+
+  <div class="site-icp-footer">
+    <span>成都东部新区便易屋信息技术咨询经营部</span>
+    <span class="icp-sep">·</span>
+    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">蜀ICP备2026073570号-1</a>
+  </div>
+
+  <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>
+</div>
+
+<script src="/static/js/api.js?v=ux-20261125-1"></script>
+<script src="/static/js/session.js?v=ux-20261125-1"></script>
+<script src="/static/js/format.js?v=ux-20261125-1"></script>
+<script src="/static/js/browser.js?v=ux-20261125-1"></script>
+<script src="/static/js/favorites.js?v=ux-20261125-1"></script>
+</body>
+</html>

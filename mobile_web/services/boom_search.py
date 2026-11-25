@@ -27,6 +27,7 @@ from models.product import (
 )
 
 BOOM_SORT_SPEC_MAP: Dict[str, List[Tuple[str, int]]] = {
+    "score": [("user_stats_score", -1), ("updated_at", -1)],
     "latest": [("updated_at", -1)],
     "save_desc": [("saved_price", -1), ("updated_at", -1)],
     "price_asc": [("activity_price", 1)],
@@ -39,7 +40,7 @@ def resolve_boom_sort(keyword: Optional[str], sort_by: Optional[str]) -> Tuple[s
     raw_kw = keyword.strip() if isinstance(keyword, str) and keyword.strip() else ""
     kw_key = (extract_search_keyword(raw_kw, max_length=60) or raw_kw[:60]) if raw_kw else ""
     if not kw_key:
-        effective_sort = "latest" if sort_by in (None, "", "cost_performance") else str(sort_by)
+        effective_sort = "score" if sort_by in (None, "", "cost_performance") else str(sort_by)
     else:
         effective_sort = "cost_performance" if sort_by in (None, "") else str(sort_by)
     return kw_key, effective_sort
@@ -382,7 +383,7 @@ def query_boom_products_page(
     platform: str = "all",
     category: Optional[str] = None,
     keyword: Optional[str] = None,
-    sort_by: str = "latest",
+    sort_by: str = "score",
     page: int = 1,
     page_size: int = 20,
     summary_projection: Dict[str, Any],
@@ -459,7 +460,7 @@ def query_boom_products_page(
         }
 
     filter_query = build_boom_filter_query(platform=platform, category=category)
-    sort_spec = BOOM_SORT_SPEC_MAP.get(sort_by, [("updated_at", -1)])
+    sort_spec = BOOM_SORT_SPEC_MAP.get(sort_by, BOOM_SORT_SPEC_MAP["score"])
     page_docs, has_more, approx_total = paginate_boom_browse_mongo(
         col,
         base_filter={"$and": [filter_query, boom_filter]},

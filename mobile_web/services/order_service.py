@@ -13,6 +13,7 @@ from models.order import normalize_order_fields
 from models.user import normalize_promoter_id
 from repositories.order_repo import OrderRepository
 from repositories.order_sync_repo import OrderSyncRepository
+from repositories.product_repo import ProductRepository
 from repositories.user_repo import UserRepository
 from config import ORDER_SYNC_INTERVAL, ORDER_SYNC_MAX_PAGES, logger
 
@@ -24,11 +25,13 @@ _PAGE_SIZE = 50
 class OrderService:
     def __init__(self, order_repo: Optional[OrderRepository] = None,
                  sync_repo: Optional[OrderSyncRepository] = None,
-                 user_repo: Optional[UserRepository] = None):
+                 user_repo: Optional[UserRepository] = None,
+                 product_repo: Optional[ProductRepository] = None):
         # 仓储构造均为惰性；测试必须显式注入检查点与身份仓储替身。
         self.repo = order_repo if order_repo is not None else OrderRepository()
         self.sync_repo = sync_repo if sync_repo is not None else OrderSyncRepository()
         self.user_repo = user_repo if user_repo is not None else UserRepository()
+        self.product_repo = product_repo
         # 运行态游标与锁归属于服务实例（只记录已持久化确认的水位与冷却窗口）
         self._last_sync_timestamp: Dict[str, float] = {}
         self._last_sync_attempt: Dict[str, float] = {}
@@ -106,6 +109,31 @@ class OrderService:
         return {"start_time": start_time, "end_time": min(start_time + window_seconds, target_end),
                 "target_end": target_end, "page": 1, "cursor": None}
 
+    def _sync_product_valid_order_counts(self, platform: str, orders: list) -> None:
+        """订单同步入库后，顺带精确重算本批变动商品的有效订单数（剔除退款/失效）并覆盖写回商品表。"""
+        if self.product_repo is None:
+            return
+        count_fn = getattr(self.repo, "count_valid_orders_by_goods_ids", None)
+        write_fn = getattr(self.product_repo, "bulk_set_valid_orders", None)
+        if not callable(count_fn) or not callable(write_fn):
+            return
+        goods_ids = list(dict.fromkeys(
+            str(o.get("goods_id") or "").strip()
+            for o in (orders or ())
+            if isinstance(o, dict) and str(o.get("goods_id") or "").strip()
+        ))
+        if not goods_ids:
+            return
+        try:
+            counts = count_fn(platform, goods_ids)
+            if counts:
+                write_fn(platform, counts)
+        except Exception as exc:
+            logger.warning(
+                "⚠️ 【订单计数回写异常】同步商品有效下单数失败，已忽略以保护订单同步主链路 | 平台[%s] 异常<%s>",
+                platform, format_exc_summary(exc),
+            )
+
     def _sync_platform_orders_bg(self, platform: str, end_time: int, auto_continue: bool = False) -> None:
         """每次最多处理分页预算；后台线程触发时自动续传追平最近23h时间切片。"""
         sync_started = time.perf_counter()
@@ -182,6 +210,7 @@ class OrderService:
                             error = "订单未完整入库"
                             break
                         processed += len(normalized)
+                        self._sync_product_valid_order_counts(platform, normalized)
                     next_state = deepcopy(state)
                     if has_more:
                         next_state["pending"].update(page=pending["page"] + 1,

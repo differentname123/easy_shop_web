@@ -9,7 +9,7 @@ import math
 import re
 import time
 from copy import deepcopy
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Sequence, Tuple
 from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError
 from bson.decimal128 import Decimal128
@@ -23,6 +23,7 @@ from models.deal_constants import (
 from models.product import (
     _BARE_YUAN_TAG_RE,
     clean_product_id,
+    compute_user_stats_score,
     get_source_site_name,
     is_jd_image_key,
     is_product_reliable,
@@ -261,6 +262,8 @@ class ProductRepository(BaseRepository):
             self.col.create_index([("platform", 1), ("activity_price", 1)], background=True)
             self.col.create_index([("saved_price", -1), ("updated_at", -1)], background=True)
             self.col.create_index([("platform", 1), ("saved_price", -1), ("updated_at", -1)], background=True)
+            self.col.create_index([("user_stats_score", -1), ("updated_at", -1)], background=True)
+            self.col.create_index([("platform", 1), ("user_stats_score", -1), ("updated_at", -1)], background=True)
             return True
         except Exception as e:
             logger.warning(
@@ -277,7 +280,7 @@ class ProductRepository(BaseRepository):
             "category", "activity_price", "price", "original_price", "saved_price",
             "coupon_amount", "has_coupon", "commission_rate", "commission_amount",
             "sales_tip", "image_url", "mall_name", "updated_at", "product_url", "coupon_url",
-            "deal_source", "deal_source_name",
+            "deal_source", "deal_source_name", "user_stats_score",
             "format_status", "need_reformat", "format_activity_price", "format_info",
             "deal_info.is_deal_tip", "deal_info.card_highlight",
             "deal_info.deal_price", "deal_info.format_deal_price",
@@ -341,11 +344,13 @@ class ProductRepository(BaseRepository):
         content_filter["$or"] = [
             {"channel_type": {"$exists": True, "$ne": None}},
             {"deal_info.is_deal_tip": True},
+            {"is_user_collected": True},
         ]
         content_filter["$expr"]["$let"]["in"]["$and"].append({
             "$or": [
                 {"$in": [{"$type": "$channel_type"}, ["int", "long"]]},
                 {"$eq": ["$deal_info.is_deal_tip", True]},
+                {"$eq": ["$is_user_collected", True]},
             ]
         })
         return content_filter
@@ -586,7 +591,7 @@ class ProductRepository(BaseRepository):
         platform: str = "all",
         category: Optional[str] = None,
         keyword: Optional[str] = None,
-        sort_by: str = "latest",
+        sort_by: str = "score",
         page: int = 1,
         page_size: int = 20,
     ) -> Dict[str, Any]:
@@ -670,6 +675,15 @@ class ProductRepository(BaseRepository):
             activity_price=activity_price if activity_price > 0 else None,
         )
         deal_publish_time = self._format_deal_datetime(get_deal_publish_ts(deal_info)) if is_active_deal else ""
+        raw_stats_score = doc.get("user_stats_score")
+        stats_score = (
+            round(float(raw_stats_score), 4)
+            if isinstance(raw_stats_score, (int, float))
+            and not isinstance(raw_stats_score, bool)
+            and math.isfinite(float(raw_stats_score))
+            and float(raw_stats_score) > 0
+            else 0.0
+        )
         return {
             "platform": platform,
             "platform_name": platform_name(platform),
@@ -698,6 +712,7 @@ class ProductRepository(BaseRepository):
             "coupon_url": str(doc.get("coupon_url") or "").strip(),
             "mall_name": doc.get("mall_name") or "",
             "updated_at": updated_at_str,
+            "user_stats_score": stats_score,
         }
 
     @classmethod
@@ -1808,3 +1823,185 @@ class ProductRepository(BaseRepository):
                 plat, old_id or old_sign, new_id, format_exc_summary(e),
             )
             return False
+
+    def _refresh_user_stats_scores(self, filters: Sequence[Dict[str, Any]]) -> int:
+        """根据最新 user_stats 重算受影响商品的 user_stats_score；得分为 0 时清理该字段。"""
+        if not filters:
+            return 0
+        filter_list = [f for f in filters if isinstance(f, dict) and f]
+        if not filter_list:
+            return 0
+        score_ops: List[UpdateOne] = []
+        seen_keys = set()
+        proj = {"_id": 0, "platform": 1, "product_id": 1, "user_stats": 1, "user_stats_score": 1}
+        for idx in range(0, len(filter_list), 200):
+            chunk = filter_list[idx : idx + 200]
+            query = chunk[0] if len(chunk) == 1 else {"$or": chunk}
+            for doc in self.col.find(query, proj):
+                if not isinstance(doc, dict):
+                    continue
+                plat = self._platform(doc.get("platform") or "")
+                pid = str(doc.get("product_id") or "").strip()
+                if not plat or not pid or (plat, pid) in seen_keys:
+                    continue
+                seen_keys.add((plat, pid))
+                score = compute_user_stats_score(doc.get("user_stats"))
+                cur_raw = doc.get("user_stats_score")
+                has_cur = "user_stats_score" in doc and cur_raw is not None
+                if score > 0:
+                    if (
+                        has_cur
+                        and isinstance(cur_raw, (int, float))
+                        and not isinstance(cur_raw, bool)
+                        and abs(float(cur_raw) - score) < 1e-9
+                    ):
+                        continue
+                    upd: Dict[str, Any] = {"$set": {"user_stats_score": score}}
+                else:
+                    if not has_cur:
+                        continue
+                    upd = {"$unset": {"user_stats_score": ""}}
+                score_ops.append(UpdateOne({"platform": plat, "product_id": pid}, upd, upsert=False))
+        if not score_ops:
+            return 0
+        modified_total = 0
+        for idx in range(0, len(score_ops), 500):
+            res = self.col.bulk_write(score_ops[idx : idx + 500], ordered=False)
+            modified_total += int(getattr(res, "modified_count", 0) or 0)
+        return modified_total
+
+    def recompute_user_stats_scores(self, filter_query: Optional[Dict[str, Any]] = None) -> int:
+        """全量或按条件重算商品 user_stats_score（新增 user_stats 维度后可直接调用重算）。"""
+        query = filter_query or {"$or": [{"user_stats": {"$exists": True}}, {"user_stats_score": {"$exists": True}}]}
+        return self._refresh_user_stats_scores([query])
+
+    def bulk_inc_user_stats(self, batch: Dict[Tuple[str, str], Dict[str, int]]) -> int:
+        """批量原子累加商品互动计数并即时重算 user_stats_score；绝不新建裸文档或修改 updated_at。"""
+        if not batch:
+            return 0
+        from services.product_stats_service import ALLOWED_PRODUCT_ACTIONS
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ops: List[UpdateOne] = []
+        touched_filters: List[Dict[str, Any]] = []
+        for (raw_plat, raw_pid), counts in batch.items():
+            plat = self._platform(raw_plat)
+            pid = str(raw_pid or "").strip()
+            if not plat or not pid or not isinstance(counts, dict):
+                continue
+            inc_doc: Dict[str, int] = {}
+            for act, cnt in counts.items():
+                if act in ALLOWED_PRODUCT_ACTIONS and isinstance(cnt, int) and not isinstance(cnt, bool) and cnt > 0:
+                    inc_doc[f"user_stats.{act}"] = cnt
+            if not inc_doc:
+                continue
+            flt = {"platform": plat, "product_id": pid}
+            touched_filters.append(flt)
+            ops.append(
+                UpdateOne(
+                    flt,
+                    {"$inc": inc_doc, "$set": {"user_stats.updated_at": now_utc}},
+                    upsert=False,
+                )
+            )
+        if not ops:
+            return 0
+        res = self.col.bulk_write(ops, ordered=False)
+        self._refresh_user_stats_scores(touched_filters)
+        return int(getattr(res, "modified_count", 0) or 0)
+
+    def bulk_set_valid_orders(self, platform: str, counts_by_goods_id: Dict[str, int]) -> int:
+        """由订单同步精确覆写商品有效下单数并重算 user_stats_score；绝不新建裸文档或改 updated_at。"""
+        if not counts_by_goods_id:
+            return 0
+        plat = self._platform(platform)
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ops: List[UpdateOne] = []
+        touched_filters: List[Dict[str, Any]] = []
+        for raw_gid, raw_cnt in counts_by_goods_id.items():
+            gid = str(raw_gid or "").strip()
+            if not gid:
+                continue
+            cnt = max(0, int(raw_cnt or 0))
+            if plat == "jd":
+                flt: Dict[str, Any] = {
+                    "platform": "jd",
+                    "$or": [
+                        {"product_id": gid},
+                        {"product_url": f"https://item.jd.com/{gid}.html"},
+                    ],
+                }
+            else:
+                flt = {"platform": plat, "product_id": gid}
+            touched_filters.append(flt)
+            ops.append(
+                UpdateOne(
+                    flt,
+                    {"$set": {"user_stats.valid_orders": cnt, "user_stats.updated_at": now_utc}},
+                    upsert=False,
+                )
+            )
+        if not ops:
+            return 0
+        res = self.col.bulk_write(ops, ordered=False)
+        self._refresh_user_stats_scores(touched_filters)
+        return int(getattr(res, "modified_count", 0) or 0)
+
+    def upsert_universal_collected_product(self, product_detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """将万能转链验证通过的完整单品卡安全入库并标记 is_user_collected=True，绝不覆盖原有榜单/线报属性。"""
+        if not isinstance(product_detail, dict) or product_detail.get("is_off_promotion") is True:
+            return None
+        platform, goods_id, goods_sign = self._identity(product_detail)
+        pid = goods_id or goods_sign
+        if not platform or not pid:
+            return None
+
+        name = product_detail.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        raw_img = str(product_detail.get("image_url") or "").strip()
+        if not raw_img:
+            return None
+        raw_price = self._first_present(product_detail, "activity_price", "price")
+        try:
+            price_val = self._amount_float(raw_price) if raw_price is not None else None
+        except (TypeError, ValueError, OverflowError):
+            price_val = None
+        if price_val is None or not math.isfinite(price_val) or price_val < 0:
+            return None
+
+        detail_payload = dict(product_detail)
+        detail_payload.setdefault("detail_updated_at", datetime.datetime.now(datetime.timezone.utc))
+        self.upsert_product_detail(detail_payload)
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        res = self.col.update_one(
+            {"platform": platform, "product_id": pid},
+            {"$set": {"is_user_collected": True, "updated_at": now_utc}},
+            upsert=False,
+        )
+        if getattr(res, "matched_count", 0) == 0:
+            return None
+        self.col.update_one(
+            {
+                "platform": platform,
+                "product_id": pid,
+                "$or": [{"source": {"$exists": False}}, {"source": ""}, {"source": None}],
+            },
+            {"$set": {"source": "universal_collect"}},
+            upsert=False,
+        )
+        saved = self.col.find_one({"platform": platform, "product_id": pid})
+        if isinstance(saved, dict):
+            saved = dict(saved)
+            saved.pop("_id", None)
+            return saved
+        return {
+            **detail_payload,
+            "platform": platform,
+            "product_id": pid,
+            "goods_id": goods_id,
+            "goods_sign": goods_sign,
+            "is_user_collected": True,
+            "updated_at": now_utc,
+        }

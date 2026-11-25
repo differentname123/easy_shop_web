@@ -172,12 +172,13 @@ def test_search_reliable_first_without_l3_noise_promotion():
 
 
 def test_product_service_resolve_boom_sort_consistency():
-    """验证 ProductService.get_boom_products 与 resolve_boom_sort 统一口径，无搜索词兜底 latest，有词默认 cost_performance。"""
+    """验证 ProductService.get_boom_products 与 resolve_boom_sort 统一口径，无搜索词兜底 score，有词默认 cost_performance。"""
     from services.boom_search import resolve_boom_sort
     from services.product_service import ProductService
 
-    assert resolve_boom_sort("", None) == ("", "latest")
-    assert resolve_boom_sort("   ", "cost_performance") == ("", "latest")
+    assert resolve_boom_sort("", None) == ("", "score")
+    assert resolve_boom_sort("   ", "cost_performance") == ("", "score")
+    assert resolve_boom_sort("   ", "latest") == ("", "latest")
     assert resolve_boom_sort("抽纸", None) == ("抽纸", "cost_performance")
     assert resolve_boom_sort("抽纸", "price_asc") == ("抽纸", "price_asc")
 
@@ -185,7 +186,7 @@ def test_product_service_resolve_boom_sort_consistency():
     repo, _col = _mk_repo([
         {
             "platform": "jd", "product_id": "UNREL_CHEAP", "name": "维达抽纸24包",
-            "activity_price": 9.9, "updated_at": t0,
+            "activity_price": 9.9, "updated_at": t0, "user_stats_score": 25.0,
             "format_status": "success", "format_activity_price": 9.9,
             "format_info": {"price": 9.9, "pricing_basis": {"base_unit": "包", "total_value": 24}},
             "deal_info": {
@@ -207,6 +208,24 @@ def test_product_service_resolve_boom_sort_consistency():
         search_res = svc.get_boom_products(keyword="抽纸", page=1, page_size=10)
     assert [x["product_id"] for x in search_res["data"]] == ["REL_NORMAL", "UNREL_CHEAP"]
     assert [x["is_reliable"] for x in search_res["data"]] == [True, False]
+
+    # 无搜索词默认浏览：先可靠池按 user_stats_score 降序 -> 同池零分按更新时间降序 -> 不可靠池兜底
+    repo2, _ = _mk_repo([
+        {"platform": "pdd", "product_id": "ZERO_NEW", "name": "新品无互动", "activity_price": 10.0, "channel_type": 5, "updated_at": t0},
+        {"platform": "pdd", "product_id": "ZERO_OLD", "name": "旧品无互动", "activity_price": 10.0, "channel_type": 5, "updated_at": t0 - datetime.timedelta(minutes=2)},
+        {"platform": "pdd", "product_id": "HOT_LOW", "name": "低分互动品", "activity_price": 10.0, "channel_type": 5, "updated_at": t0 - datetime.timedelta(hours=1), "user_stats_score": 2.8},
+        {"platform": "pdd", "product_id": "HOT_HIGH", "name": "高分互动品", "activity_price": 10.0, "channel_type": 5, "updated_at": t0 - datetime.timedelta(hours=2), "user_stats_score": 11.4},
+        {
+            "platform": "jd", "product_id": "UNREL_HOT", "name": "不可靠高分品", "activity_price": 10.0,
+            "updated_at": t0, "user_stats_score": 30.0,
+            "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": False},
+        },
+    ])
+    svc2 = ProductService(product_repo=repo2)
+    default_res = svc2.get_boom_products(page=1, page_size=10)
+    assert [x["product_id"] for x in default_res["data"]] == [
+        "HOT_HIGH", "HOT_LOW", "ZERO_NEW", "ZERO_OLD", "UNREL_HOT"
+    ]
 
 
 def test_home_overlay_exposes_is_reliable_consistently():

@@ -1670,6 +1670,13 @@ test('boom state snapshot is scoped to session and restores platform, sort, keyw
   assert.equal(restored.boomSearchKeyword.value, '纸巾');
   assert.equal(restored.boomGoodsList.value.length, 1);
   assert.equal(restored.boomGoodsList.value[0].goods_id, 'B1');
+
+  // 旧版缓存的 latest 无词快照不再阻断 score 默认排序
+  h.context.sessionStorage.setItem(
+    h.feedKey('boom_return_state', 'all'),
+    JSON.stringify({ scope: h.session.scope(), platform: 'all', keyword: '', sortBy: 'latest', list: [{ goods_id: 'STALE' }], page: 1 }),
+  );
+  assert.equal(h.makeFeeds().restoreBoomState(), false);
 });
 
 test('syncAndQueryOrders schedules bounded follow-up polling when sync_status is running and stops on completion or logout', async () => {
@@ -1851,16 +1858,16 @@ test('boom tab uses latest sort without search and automatically switches to cos
   );
 
   const h = harness(), feed = h.makeFeeds();
-  // 1. 无搜索时默认使用 latest 排序
-  assert.equal(feed.boomSortBy.value, 'latest');
+  // 1. 无搜索时默认使用 score 排序
+  assert.equal(feed.boomSortBy.value, 'score');
   const initialLoad = feed.loadBoomGoods(true);
-  assert.equal(new URL(h.requests[0].url, 'https://shop.test').searchParams.get('sort_by'), 'latest');
-  await h.finish(0, goodsResponse('boom-latest-1', false));
+  assert.equal(new URL(h.requests[0].url, 'https://shop.test').searchParams.get('sort_by'), 'score');
+  await h.finish(0, goodsResponse('boom-score-1', false));
   await initialLoad;
 
-  // 未搜索时点击性价比排序会提示先搜索，保持 latest
+  // 未搜索时点击性价比排序会提示先搜索，保持 score
   assert.equal(feed.switchBoomSort('cost_performance'), false);
-  assert.equal(feed.boomSortBy.value, 'latest');
+  assert.equal(feed.boomSortBy.value, 'score');
   assert.equal(h.toasts.at(-1), '请先搜索商品后再按性价比排序');
 
   // 2. 搜索时自动切换为 cost_performance 排序
@@ -1873,11 +1880,11 @@ test('boom tab uses latest sort without search and automatically switches to cos
   await h.finish(1, goodsResponse('boom-cp-1', false));
   await searchLoad;
 
-  // 3. 清空搜索时自动切回 latest 排序
+  // 3. 清空搜索时自动切回 score 排序
   const clearLoad = feed.clearBoomSearch();
-  assert.equal(feed.boomSortBy.value, 'latest');
-  assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('sort_by'), 'latest');
-  await h.finish(2, goodsResponse('boom-latest-2', false));
+  assert.equal(feed.boomSortBy.value, 'score');
+  assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('sort_by'), 'score');
+  await h.finish(2, goodsResponse('boom-score-2', false));
   await clearLoad;
 });
 
@@ -2306,7 +2313,11 @@ test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, de
   assert.equal(hDetail.context.localStorage.getItem('easy_shop_pending_invite'), 'INV_SHARER', 'guest session.clear preserves pending invite');
   assert.equal(hDetail.context.document.title, '【好价 ¥19.90】农夫山泉矿泉水24瓶 - 查券省钱');
   await hDetail.page.handleShareDetail();
-  assert.equal(hDetail.requests.length, 1, 'sharing detail page copies site link without triggering promote/convert');
+  assert.ok(!hDetail.requests.some(r => r.url.includes('/api/promote/convert')), 'sharing detail page copies site link without triggering promote/convert');
+  assert.equal(hDetail.requests.length, 2, 'sharing detail page only adds lightweight share action telemetry');
+  assert.ok(hDetail.requests[1].url.includes('/api/goods/action'));
+  assert.equal(JSON.parse(hDetail.requests[1].options.body).action, 'share');
+  await hDetail.finish(1, { status: 'success' });
   assert.ok(hDetail.copied.at(-1).includes('https://shop.test/detail?'));
   assert.ok(hDetail.copied.at(-1).includes('goods_id=G100'));
   assert.ok(hDetail.copied.at(-1).includes('（立减¥5.00）'));
@@ -2890,7 +2901,7 @@ test('group_help Chinese IME guard, slow boot draft preservation, and uniform as
   // 3. 静态模板 JS/CSS 版本与图标版本全站 100% 统一（含 detail.css 与 manifest.json）
   const versions = new Set();
   const iconVersions = new Set();
-  for (const pageName of ['index.html', 'detail.html', 'group_help.html']) {
+  for (const pageName of ['index.html', 'detail.html', 'group_help.html', 'favorites.html']) {
     const html = fs.readFileSync(path.join(root, 'static', pageName), 'utf8');
     const urls = [...html.matchAll(/(?:src|href)="(\/static\/(?:js|css)\/[^"]+)"/g)].map(m => new URL(m[1], 'https://offline.test'));
     assert.ok(urls.length >= 2, `${pageName} has static js/css urls`);
@@ -3525,6 +3536,90 @@ test('QA surgical fixes: group_help copyShareText/firstPosterExampleUrl/smartPar
   assert.ok(styleCss.includes('.tab-user .user-profile-header,'));
   assert.ok(groupHelpCss.includes('text-overflow: ellipsis;'));
 });
+
+test('detail price feedback, share tracking, and single-list favorites UI contracts', async () => {
+  const h = harness({
+    url: 'https://shop.test/detail?platform=pdd&goods_id=1001',
+    saved: { easy_shop_token: 'tok-fav-1', easy_shop_uid: 'u_11112222' },
+  });
+  h.load('detail');
+  const initPromise = h.mounted[0]();
+  await flush();
+  // request[0]: /api/user/info, request[1]: /api/home/detail
+  await h.finish(0, { status: 'success', user: { uid: 'u_11112222', phone: '13800138000', invite_code: 'INV_1' } });
+  await h.finish(1, {
+    status: 'success',
+    data: { platform: 'pdd', product_id: '1001', goods_id: '1001', goods_sign: 'SIGN_1', name: '收藏测试商品', price: 19.9, image_url: 'https://img.test/1.jpg', is_favorited: false },
+  });
+  await initPromise;
+  assert.equal(h.page.isFavorited.value, false);
+
+  // 点击收藏 -> POST /api/favorites/add
+  const togglePromise = h.page.handleToggleFavorite();
+  await flush();
+  await h.finish(2, { status: 'success', data: { is_favorited: true, already_exists: false } });
+  await togglePromise;
+  assert.equal(h.page.isFavorited.value, true);
+
+  // 点击能买到 -> 本地防重 + POST /api/goods/action
+  h.page.submitPriceFeedback('buyable');
+  await flush();
+  assert.equal(h.page.priceFeedbackChoice.value, 'buyable');
+  assert.ok(h.requests[3].url.includes('/api/goods/action'));
+  assert.equal(JSON.parse(h.requests[3].options.body).action, 'buyable');
+  await h.finish(3, { status: 'success' });
+
+  // 24小时内再次点买不到被本地拦截
+  h.page.submitPriceFeedback('unbuyable');
+  assert.equal(h.page.priceFeedbackChoice.value, 'buyable');
+  assert.equal(h.requests.length, 4);
+
+  // 点击分享 -> 上报 share
+  h.page.handleShareDetail();
+  await flush();
+  assert.ok(h.requests[4].url.includes('/api/goods/action'));
+  assert.equal(JSON.parse(h.requests[4].options.body).action, 'share');
+  await h.finish(4, { status: 'success' });
+  h.page.dispose();
+
+  // 独立收藏页控制器 & 静态合规校验
+  const hFav = harness({
+    url: 'https://shop.test/favorites',
+    saved: { easy_shop_token: 'tok-fav-1', easy_shop_uid: 'u_11112222' },
+  });
+  hFav.load('favorites');
+  const favCtrl = hFav.context.EasyShop.createFavoritesController({
+    ref: hFav.context.Vue.ref,
+    api: hFav.api,
+    session: hFav.session,
+    browser: hFav.context.EasyShop.createBrowserTools({ ref: hFav.context.Vue.ref }),
+  });
+  const favInit = favCtrl.initialize();
+  await flush();
+  await hFav.finish(0, { status: 'success', user: { uid: 'u_11112222', phone: '13800138000' } });
+  await hFav.finish(1, {
+    status: 'success',
+    data: {
+      items: [{ platform: 'pdd', product_id: '1001', collected_price: 25.0, current_price: 19.9, price_diff: -5.1, live_status: 'online', is_off_promotion: false, product: { name: '收藏商品A', goods_sign: 'SIGN_1' } }],
+      total: 1, page: 1, page_size: 20, has_more: false,
+    },
+  });
+  await favInit;
+  assert.equal(favCtrl.items.value.length, 1);
+  const remPromise = favCtrl.removeItem(favCtrl.items.value[0]);
+  await flush();
+  await hFav.finish(2, { status: 'success', data: { is_favorited: false, removed: true } });
+  await remPromise;
+  assert.equal(favCtrl.items.value.length, 0);
+  favCtrl.dispose();
+
+  const favHtml = fs.readFileSync(path.join(root, 'static', 'favorites.html'), 'utf8');
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  assert.ok(favHtml.includes('蜀ICP备2026073570号-1'));
+  assert.ok(favHtml.includes('https://beian.miit.gov.cn/'));
+  assert.ok(indexHtml.includes('/favorites'));
+});
+
 
 
 
