@@ -21,7 +21,7 @@ from infrastructure.http_utils import (
     normalize_http_url,
     parse_appkey_list,
 )
-from infrastructure.jd_client import is_encrypted_jd_item_id, product_url as jd_product_url, resolve_jd_short_url
+from infrastructure.jd_client import product_url as jd_product_url, resolve_jd_short_url
 from infrastructure.logging_utils import get_app_logger
 from infrastructure.transport import create_http_session
 from models.product import extract_canonical_goods_id
@@ -331,17 +331,22 @@ class HdkClient:
         goods_id_or_sign: str,
         *,
         union_id: Optional[str] = None,
+        allow_keyword_search: bool = False,
         allow_single_url_match: bool = False,
         expected_sku: str = "",
     ) -> Dict[str, Any]:
-        """通过加密 itemId 或推广链接反查京东商品完整卡片（ID 查询严格校验身份，严防退化返多条爆品串货）。"""
+        """通过商品加密ID或显式授权的推广链接反查京东商品卡片（非URL标识默认仅走精确 itemIds=，严防关键词模糊退化串货）。"""
         target = clean_text(goods_id_or_sign)
         if not target:
             return _error("INVALID_ARGUMENT", "商品标识不能为空")
-        if "," in target and not target.startswith(("http://", "https://")):
+        is_http_url = target.startswith(("http://", "https://"))
+        if "," in target and not is_http_url:
             return _error("INVALID_ARGUMENT", "单品详情查询不支持逗号拼接多ID，请改用批量接口")
-        # 50 位标准 JD 加密 ID 严格走 itemIds= 参数，禁止走 keyword=（实测 keyword= 会对未命中密文回显原ID并返回无关爆品）
-        if is_encrypted_jd_item_id(target):
+        # 默认仅走精确 itemIds= 入口；仅当调用方显式允许（或传入受控 URL 且启用单链接匹配）时才允许走 keyword= 搜索
+        use_keyword_search = bool(allow_keyword_search) or (allow_single_url_match and is_http_url)
+        if not use_keyword_search:
+            if is_http_url:
+                return _error("INVALID_ARGUMENT", "URL详情查询需显式启用关键词解析")
             b_res = self.batch_get_goods_details([target], union_id=union_id)
             if b_res.get("status") != "success":
                 return b_res

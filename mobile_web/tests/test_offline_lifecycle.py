@@ -242,11 +242,16 @@ def test_structured_logging_denoising_and_aggregation(monkeypatch):
         assert client.get("/static/css/style.css").status_code == 200
         assert client.get("/").status_code == 200
         assert client.get("/nonexistent-route").status_code == 404
+        assert client.get("/wp-admin/").status_code == 404
+        assert client.get("/api/nonexistent-route").status_code == 404
 
     assert not any("/health" in m for m in info_msgs), "健康检查正常请求不应刷屏 INFO"
     assert any("/health" in m for m in debug_msgs)
+    assert any("【未命中路径】" in m and "/nonexistent-route" in m for m in debug_msgs)
+    assert any("【未命中路径】" in m and "/wp-admin/" in m for m in debug_msgs)
+    assert not any("/wp-admin/" in m or "接口[GET /nonexistent-route]" in m for m in warn_msgs), "公网扫描路径 404 不应刷屏 WARNING"
     assert any("【HTTP请求】" in m and "接口[GET /]" in m for m in info_msgs)
-    assert any("【HTTP请求告警】" in m and "状态[404]" in m and "排查方向<" in m for m in warn_msgs)
+    assert any("【HTTP请求告警】" in m and "GET /api/nonexistent-route" in m and "状态[404]" in m and "排查方向<" in m for m in warn_msgs)
 
     promo_info, promo_warn = [], []
     monkeypatch.setattr(

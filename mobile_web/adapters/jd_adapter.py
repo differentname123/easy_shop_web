@@ -884,6 +884,18 @@ class JdAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             return _error("PROTOCOL_ERROR", "京东联盟详情字段无效")
 
+    def _normalize_verified_hdk_detail(self, raw_item: Any, ref: ProductRef) -> Dict[str, Any]:
+        """归一化好单库详情并强制校验主图指纹（防串货/张冠李戴）。"""
+        if not isinstance(raw_item, dict):
+            return _error("PROTOCOL_ERROR", "好单库详情返回格式无效")
+        try:
+            detail = self._normalize_hdk_detail(raw_item)
+        except Exception as exc:
+            return _error("PROTOCOL_ERROR", f"好单库详情解析失败: {exc}")
+        if is_jd_image_key(ref.goods_id) and clean_product_id(detail.get("goods_id")) != ref.goods_id:
+            return _error("PRODUCT_IDENTITY_MISMATCH", "好单库详情主图指纹与请求商品不一致")
+        return {"status": "success", "data": detail}
+
     def get_goods_detail(self, goods_id_or_sign="", uid=None, goods_id=None, goods_sign=None, **kwargs):
         unavailable = self._available("detail")
         if unavailable:
@@ -896,7 +908,7 @@ class JdAdapter(BasePlatformAdapter):
             return _error("INVALID_ARGUMENT", "京东详情接口需要加密 itemId (goods_sign) 或数字 SKU，不能直接使用主图哈希 ID")
 
         ztk_rate_limit_res: Optional[Dict[str, Any]] = None
-        state = {"saw_301_off": False, "union_empty": False, "hdk_rate_limit": False}
+        state = {"saw_301_off": False, "union_empty": False, "hdk_rate_limit": False, "hdk_identity_mismatch": False}
 
         def _detail_via_ztk():
             nonlocal ztk_rate_limit_res
@@ -931,12 +943,13 @@ class JdAdapter(BasePlatformAdapter):
             if res.get("status") != "success":
                 if res.get("error_code") in ("RATE_LIMIT", "QUOTA_PACE_BACKLOG", "NETWORK_ERROR", "TIMEOUT"):
                     state["hdk_rate_limit"] = True
+                elif res.get("error_code") == "PRODUCT_IDENTITY_MISMATCH":
+                    state["hdk_identity_mismatch"] = True
                 return res
-            raw_item = res.get("data") or {}
-            try:
-                return {"status": "success", "data": self._normalize_hdk_detail(raw_item)}
-            except Exception as exc:
-                return _error("PROTOCOL_ERROR", f"好单库详情解析失败: {exc}")
+            verified = self._normalize_verified_hdk_detail(res.get("data"), ref)
+            if verified.get("status") != "success" and verified.get("error_code") == "PRODUCT_IDENTITY_MISMATCH":
+                state["hdk_identity_mismatch"] = True
+            return verified
 
         base = []
         # 1. 首选独立 50.9 QPS 且不受选品库 1000 限流连坐的 api_detail.ashx
@@ -964,7 +977,12 @@ class JdAdapter(BasePlatformAdapter):
                 if (res.get("catalog_cooling") is True or self._is_ztk_catalog_cooling()) and not ztk_rate_limit_res.get("catalog_cooling"):
                     return {**ztk_rate_limit_res, "catalog_cooling": True}
                 return ztk_rate_limit_res
-            if state["saw_301_off"] and state["union_empty"] and not state["hdk_rate_limit"]:
+            if (
+                state["saw_301_off"]
+                and state["union_empty"]
+                and not state["hdk_rate_limit"]
+                and not state["hdk_identity_mismatch"]
+            ):
                 return _error("PRODUCT_OFF_PROMOTION", "该商品已取消推广或已下架，请挑选其他好物")
         return res
 
@@ -1111,15 +1129,20 @@ class JdAdapter(BasePlatformAdapter):
                     if not (r.goods_sign or r.goods_id).isdigit() and self.hdk is not None and hasattr(self.hdk, "get_goods_detail"):
                         hdk_det = self._guard_provider_result(self.hdk.get_goods_detail(r.goods_sign or r.goods_id))
                         if hdk_det.get("status") == "success" and isinstance(hdk_det.get("data"), dict):
-                            try:
+                            verified = self._normalize_verified_hdk_detail(hdk_det["data"], r)
+                            if verified.get("status") == "success":
                                 outcomes[r.key] = {
                                     "status": "success",
-                                    "data": self._normalize_hdk_detail(hdk_det["data"]),
+                                    "data": verified["data"],
                                     "_provider": "hdk_jd_detail",
                                 }
                                 continue
-                            except Exception:
-                                pass
+                            if verified.get("error_code") == "PRODUCT_IDENTITY_MISMATCH":
+                                outcomes[r.key] = verified
+                                continue
+                        elif hdk_det.get("error_code") == "PRODUCT_IDENTITY_MISMATCH":
+                            outcomes[r.key] = hdk_det
+                            continue
                         if hdk_det.get("error_code") in ("RATE_LIMIT", "QUOTA_PACE_BACKLOG", "NETWORK_ERROR", "TIMEOUT"):
                             outcomes[r.key] = hdk_det
                             continue
@@ -1458,16 +1481,20 @@ class JdAdapter(BasePlatformAdapter):
                         if uq.get("catalog_cooling") is True:
                             detail_catalog_cooling = True
 
-            # 2c. 仍缺详情 -> 调好单库 v3/jd_goods_search 按原始短/长链直接单品查询
+            # 2c. 仍缺详情 -> 仅用干净 u.jd.com 短链调好单库 v3/jd_goods_search（绝不把 union-click 超长参数喂给好单库以免切出假 ID）
             if (
                 product_card is None
-                and anchor_url
+                and short_match
                 and allow_hdk
                 and self.hdk is not None
                 and hasattr(self.hdk, "get_goods_detail")
             ):
                 hdk_det = self._guard_provider_result(
-                    self.hdk.get_goods_detail(anchor_url, allow_single_url_match=True)
+                    self.hdk.get_goods_detail(
+                        short_match.group(0),
+                        allow_keyword_search=True,
+                        allow_single_url_match=True,
+                    )
                 )
                 if hdk_det.get("status") == "success" and isinstance(hdk_det.get("data"), dict):
                     try:
@@ -1658,6 +1685,7 @@ class JdAdapter(BasePlatformAdapter):
             product_card = resolved.get("product")
             extracted_encrypted_id = _text(resolved.get("target_id")) if not resolved.get("is_numeric_sku") else ""
             anchor_url = _text(resolved.get("anchor_url"))
+            had_input_short_url = bool(_JD_SHORT_URL_RE.match(anchor_url))
             has_url_or_explicit_id = bool(anchor_url or resolved.get("is_explicit_id"))
             detail_lookup_failed = bool(resolved.get("detail_lookup_failed"))
             detail_catalog_cooling = bool(resolved.get("detail_catalog_cooling"))
@@ -1781,6 +1809,42 @@ class JdAdapter(BasePlatformAdapter):
                     )
                 )
                 if hdk_conv.get("status") == "success":
+                    hdk_short_m = _JD_SHORT_URL_RE.search(hdk_conv.get("short_url") or "")
+                    if (
+                        product_card is None
+                        and not had_input_short_url
+                        and hdk_short_m
+                        and hdk_short_m.group(0) != anchor_url
+                        and hasattr(self.hdk, "get_goods_detail")
+                    ):
+                        hdk_det = self._guard_provider_result(
+                            self.hdk.get_goods_detail(
+                                hdk_short_m.group(0),
+                                allow_keyword_search=True,
+                                allow_single_url_match=True,
+                            )
+                        )
+                        if hdk_det.get("status") == "success" and isinstance(hdk_det.get("data"), dict):
+                            try:
+                                cand_card = self._normalize_hdk_detail(hdk_det["data"])
+                                if (cand_card.get("price") or 0) > 0:
+                                    product_card = cand_card
+                                    card_coupon = jd_coupon_url(product_card.get("coupon_url"))
+                                    if card_coupon and not used_coupon_c:
+                                        hdk_cpn = self._guard_provider_result(
+                                            self.hdk.convert_promotion_link(
+                                                hdk_short_m.group(0),
+                                                sub_union_id=kwargs.get("sub_union_id"),
+                                                coupon_url=card_coupon,
+                                            )
+                                        )
+                                        if hdk_cpn.get("status") == "success":
+                                            hdk_conv = hdk_cpn
+                                            used_coupon_c = card_coupon
+                            except Exception:
+                                pass
+                        elif hdk_det.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                            return hdk_det
                     cooling_flag = detail_catalog_cooling or self._is_ztk_catalog_cooling() or (
                         isinstance(conv, dict) and conv.get("catalog_cooling") is True
                     )
@@ -1861,6 +1925,60 @@ class JdAdapter(BasePlatformAdapter):
                                 pass
                 elif ad_new.get("error_code") == "RATE_LIMIT":
                     detail_lookup_failed = True
+
+            # 对非 u.jd.com 入口（如 union-click 长链）新洗出的干净 u.jd.com 短链，若仍缺卡则交由 HDK 查正卡（避免直喂长链切出假 ID）
+            if (
+                not product_card
+                and not is_explicit_venue_url
+                and not had_input_short_url
+                and short_u_match
+                and short_u_match.group(0) != anchor_url
+                and not is_personal
+                and self.hdk is not None
+                and hasattr(self.hdk, "get_goods_detail")
+            ):
+                hdk_new = self._guard_provider_result(
+                    self.hdk.get_goods_detail(
+                        short_u_match.group(0),
+                        allow_keyword_search=True,
+                        allow_single_url_match=True,
+                    )
+                )
+                if hdk_new.get("status") == "success" and isinstance(hdk_new.get("data"), dict):
+                    try:
+                        cand_card = self._normalize_hdk_detail(hdk_new["data"])
+                        if (cand_card.get("price") or 0) > 0:
+                            product_card = cand_card
+                            resolved_id = product_card.get("goods_sign") or product_card.get("goods_id") or resolved_id
+                    except Exception:
+                        pass
+                elif hdk_new.get("error_code") == "PRODUCT_OFF_PROMOTION":
+                    return hdk_new
+
+            if product_card is not None:
+                detail_lookup_failed = False
+                card_coupon = jd_coupon_url(product_card.get("coupon_url"))
+                if card_coupon and not used_coupon_c and short_u_match:
+                    cpn_conv = self._convert_material_url_with_fallback(
+                        short_u_match.group(0),
+                        promoter,
+                        is_personal=is_personal,
+                        clean_coupon=card_coupon,
+                        goods_id=product_card.get("goods_id") or "",
+                        goods_sign=product_card.get("goods_sign") or resolved_id,
+                        uid=uid,
+                        sub_union_id=kwargs.get("sub_union_id"),
+                    )
+                    if isinstance(cpn_conv, dict) and cpn_conv.get("status") == "success" and cpn_conv.get("coupon_url"):
+                        conv = dict(conv)
+                        for k in ("short_url", "click_url"):
+                            if cpn_conv.get(k):
+                                conv[k] = cpn_conv[k]
+                        for k in ("j_command", "j_short_command"):
+                            if cpn_conv.get(k):
+                                conv[k] = cpn_conv[k]
+                        conv["coupon_applied"] = True
+                        used_coupon_c = card_coupon
 
             verified_coupon_or_venue = bool(
                 not extracted_encrypted_id

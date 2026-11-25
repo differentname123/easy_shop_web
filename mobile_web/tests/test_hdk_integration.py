@@ -86,18 +86,30 @@ def test_hdk_get_goods_detail_exact_id_matching():
     })
     client = HdkClient(api_key="test_key", union_id="2035679405", http_session=session)
 
-    # 精确匹配 skuid
-    res1 = client.get_goods_detail("10001")
+    # 1. 默认 allow_keyword_search=False：严禁走 keyword= 模糊搜索（即使传入 65 位截取垃圾串也不撞关键词）
+    garbage_65 = "FksWAG0KH1McVAAKVVpYFxJSXzI4RwILDnF7UjU_V1FCZyl6GlhUXA5KJFJROEsXB"
+    session_empty = Mock()
+    session_empty.get.return_value = _mock_response(200, {"code": 200, "data": []})
+    client_strict = HdkClient(api_key="test_key", union_id="2035679405", http_session=session_empty)
+    res_garbage = client_strict.get_goods_detail(garbage_65)
+    assert res_garbage["status"] == "error" and res_garbage["error_code"] == "NOT_FOUND"
+    assert session_empty.get.call_args.kwargs["params"]["itemIds"] == garbage_65
+    assert "keyword" not in session_empty.get.call_args.kwargs["params"]
+
+    # 默认模式下纯数字与未授权 URL 也直接拦截，绝不退化走 keyword=
+    assert client.get_goods_detail("10001")["error_code"] == "INVALID_ARGUMENT"
+    assert client.get_goods_detail("https://u.jd.com/abc")["error_code"] == "INVALID_ARGUMENT"
+
+    # 2. 显式开启 allow_keyword_search=True 时才允许走 keyword= 并执行精确 ID 校验
+    res1 = client.get_goods_detail("10001", allow_keyword_search=True)
     assert res1["status"] == "success"
     assert res1["data"]["goodsname"] == "目标商品"
 
-    # 精确匹配 itemid
-    res2 = client.get_goods_detail("target_item")
+    res2 = client.get_goods_detail("target_item", allow_keyword_search=True)
     assert res2["status"] == "success"
     assert res2["data"]["goodsname"] == "目标商品"
 
-    # 匹配不符合返回 PRODUCT_IDENTITY_MISMATCH
-    res3 = client.get_goods_detail("non_existent_id")
+    res3 = client.get_goods_detail("non_existent_id", allow_keyword_search=True)
     assert res3["status"] == "error"
     assert res3["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
 
@@ -506,21 +518,38 @@ def test_jd_adapter_universal_resolve_via_hdk():
         client=ztk_fast,
         hdk_client=hdk_fast,
     )
-    for fast_url in ("https://u.jd.com/oFast1", "https://union-click.jd.com/jdc?e=fast2"):
-        r_fast = adapter_fast.resolve_and_convert_universal(fast_url)
-        assert r_fast["status"] == "success"
-        assert r_fast["_provider"] == "hdk_jd_promotion"
-        assert r_fast["resolution_kind"] == "product"
-        assert r_fast["final_link"] == "https://u.jd.com/vinda_promoted"
-        assert r_fast["goods_sign"] == enc_id
-        assert r_fast["product"]["name"] == "维达超韧抽纸3层100抽*24包"
-        assert r_fast["product"]["price"] == 29.90
-        assert r_fast["product"]["coupon_amount"] == 10.0
+    r_short = adapter_fast.resolve_and_convert_universal("https://u.jd.com/oFast1")
+    assert r_short["status"] == "success"
+    assert r_short["_provider"] == "hdk_jd_promotion"
+    assert r_short["resolution_kind"] == "product"
+    assert r_short["final_link"] == "https://u.jd.com/vinda_promoted"
+    assert r_short["goods_sign"] == enc_id
+    assert r_short["product"]["name"] == "维达超韧抽纸3层100抽*24包"
+    assert r_short["product"]["price"] == 29.90
+    assert r_short["product"]["coupon_amount"] == 10.0
+    ztk_fast.convert_universal_material.assert_not_called()
+
+    # union-click 超长链严禁直喂 HDK 查卡：先经转链产出干净 u.jd.com 短链，再用短链向 HDK 取正卡并补绑优惠券
+    r_uc = adapter_fast.resolve_and_convert_universal("https://union-click.jd.com/jdc?e=fast2")
+    assert r_uc["status"] == "success"
+    assert r_uc["_provider"] == "hdk_jd_universal"
+    assert r_uc["resolution_kind"] == "product"
+    assert r_uc["final_link"] == "https://u.jd.com/vinda_promoted"
+    assert r_uc["goods_sign"] == enc_id
+    assert r_uc["product"]["name"] == "维达超韧抽纸3层100抽*24包"
+    assert r_uc["product"]["price"] == 29.90
+    assert r_uc["product"]["coupon_amount"] == 10.0
+    assert [c.args[0] for c in hdk_fast.get_goods_detail.call_args_list] == [
+        "https://u.jd.com/oFast1",
+        "https://u.jd.com/vinda_promoted",
+    ]
     assert [c.args[0] for c in ztk_fast.get_goods_detail.call_args_list] == [
         "https://u.jd.com/oFast1",
         "https://union-click.jd.com/jdc?e=fast2",
     ]
-    ztk_fast.convert_universal_material.assert_not_called()
+    assert [c.args[0] for c in ztk_fast.convert_universal_material.call_args_list] == [
+        "https://union-click.jd.com/jdc?e=fast2",
+    ]
 
     # 回退场景：HDK 查卡返回 NOT_FOUND -> 解包 u.jd.com 拿加密 sku -> ZTK 详情兜底 -> HDK 原生转链
     hdk_mock = Mock()
@@ -1532,6 +1561,148 @@ def test_hdk_sku_mismatch_url_guard_tb_paging_transient_keyword_and_jd_sub_item_
     by_id = {d["source_item_id"]: d for d in fetched.records}
     assert not any(lk.get("type") == "encrypted_id" for lk in by_id["w_priv"]["extracted_links"])
     assert any(lk.get("type") == "encrypted_id" and lk.get("url") == official_sign for lk in by_id["w_off"]["extracted_links"])
+
+
+def test_hdk_prevents_milk_to_iphone_hallucination_and_normalizes_union_click(monkeypatch):
+    """线上真实故障回归：
+    1. 65位截取垃圾串传入 HdkClient.get_goods_detail 默认仅走 itemIds=（绝不走 keyword=），查无返回 NOT_FOUND，
+       ProductService 自动回退本地缓存展示牛奶，不串货、不删商品、不触发 mark_product_superseded；
+    2. 即便好单库返回主图不一致商品（如 iPhone 17），JdAdapter 单品与批量通道均拦截为 PRODUCT_IDENTITY_MISMATCH，
+       且当 ZTK 报 301 + 空选品库时绝不误判为 PRODUCT_OFF_PROMOTION；
+    3. 拥堵期 union-click 超长链跳过直喂 HDK，先由 byunionid_get 洗出干净 u.jd.com 再问 HDK 取正卡并补绑券。
+    """
+    from cache import clear_all_caches
+    from services.product_service import ProductService
+
+    clear_all_caches()
+    milk_gid = "6af7c9d6F11c57296_008332032035bffe"
+    bad_65_sign = "FksWAG0KH1McVAAKVVpYFxJSXzI4RwILDnF7UjU_V1FCZyl6GlhUXA5KJFJROEsXB"
+    milk_img = "https://img14.360buyimg.com/pop/jfs/t1/575397/22/6756/268951/6af7c9d6F11c57296/008332032035bffe.jpg"
+    iphone_img = "https://img14.360buyimg.com/pop/jfs/t20271123/591412/4/3327/79742/6b03dbaaFe7f703eb/0944320320923908.jpg"
+
+    # 1. 真实 HdkClient 收到 65 位垃圾串时：默认只打 itemIds=（返回空 -> NOT_FOUND），ProductService 降级本地牛奶缓存
+    sess = Mock()
+    sess.get.return_value = _mock_response(200, {"code": 200, "data": []})
+    hdk_cli = HdkClient(api_key="hdk_k1", union_id="2035679405", http_session=sess)
+    ztk_mock = Mock()
+    ztk_mock.appkey_list = ("ztk_k1",)
+    ztk_mock.get_goods_detail.return_value = {"status": "error", "error_code": "NOT_FOUND"}
+    ztk_mock.query_union_goods.return_value = {"status": "success", "data": [], "total_count": 0}
+    adapter = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_mock,
+        hdk_client=hdk_cli,
+    )
+    repo = Mock()
+    repo.get_product_detail.return_value = {
+        "platform": "jd",
+        "product_id": milk_gid,
+        "goods_id": milk_gid,
+        "goods_sign": bad_65_sign,
+        "name": "伊利严选牧场纯牛奶",
+        "price": 79.2,
+        "original_price": 109.2,
+        "image_url": milk_img,
+        "carousel_images": [milk_img],
+        "detail_updated_at": None,
+    }
+    repo.get_deal_tip_view.return_value = ("not_found", None)
+    svc = ProductService(product_repo=repo)
+    with monkeypatch.context() as mp:
+        mp.setattr("services.product_service.get_adapter", lambda _p: adapter)
+        detail_res = svc.get_goods_detail(platform="jd", goods_id=milk_gid, goods_sign=bad_65_sign)
+    assert detail_res["status"] == "success"
+    assert detail_res["source"] == "database_fallback"
+    assert detail_res["data"]["name"] == "伊利严选牧场纯牛奶"
+    assert sess.get.call_args.kwargs["params"]["itemIds"] == bad_65_sign
+    assert "keyword" not in sess.get.call_args.kwargs["params"]
+    repo.mark_product_superseded.assert_not_called()
+    repo.delete_product.assert_not_called()
+
+    # 2. 即便 HDK mock 吐出 iPhone 17，单品与批量均报 PRODUCT_IDENTITY_MISMATCH，且 ZTK 301 + 空选品库时绝不误判下架
+    official_sign = "ZITd4R7EoRN7RAymya697RmQQzirRT_3DFaNk7Z4Ejv1nM351"
+    hdk_hallucinate = Mock()
+    hdk_hallucinate.get_goods_detail.return_value = {
+        "status": "success",
+        "data": {
+            "itemid": official_sign,
+            "skuid": official_sign,
+            "goodsname": "Apple/苹果 iPhone 17 256GB",
+            "itempic": iphone_img,
+            "itemprice": "5999",
+            "itemendprice": "5999",
+        },
+    }
+    ztk_301 = Mock()
+    ztk_301.appkey_list = ("ztk_k1",)
+    ztk_301.get_goods_detail.return_value = {"status": "error", "error_code": "UPSTREAM_ERROR", "ztk_ambiguous_301": True}
+    ztk_301.query_union_goods.return_value = {"status": "success", "data": [], "total_count": 0}
+    ad_guard = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_301,
+        hdk_client=hdk_hallucinate,
+    )
+    single_err = ad_guard.get_goods_detail(official_sign, goods_id=milk_gid, goods_sign=official_sign)
+    assert single_err["status"] == "error"
+    assert single_err["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
+    batch_res = ad_guard.batch_get_goods_details([ProductRef("jd", milk_gid, official_sign)])
+    assert batch_res[official_sign]["status"] == "error"
+    assert batch_res[official_sign]["error_code"] == "PRODUCT_IDENTITY_MISMATCH"
+
+    # 3. 拥堵期 union-click 超长链：绝不直接喂给 HDK，先洗出干净 u.jd.com 再用短链查正卡并补绑券
+    uc_url = "https://union-click.jd.com/jdc?e=&p=JF8BARE_MILK_LONG"
+    coupon_u = "https://coupon.m.jd.com/coupons/show.action?linkKey=MILK_COUPON"
+    ztk_congestion = Mock()
+    ztk_congestion.appkey_list = ("ztk_k1",)
+    ztk_congestion.get_goods_detail.return_value = {"status": "error", "error_code": "RATE_LIMIT", "error_msg": "1001"}
+    ztk_congestion.query_union_goods.return_value = {"status": "error", "error_code": "RATE_LIMIT", "catalog_cooling": True}
+    ztk_congestion.is_catalog_cooling.return_value = True
+    ztk_congestion.convert_universal_material.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/oCleanShort1",
+        "click_url": "https://union-click.jd.com/jdc?e=clean1",
+        "j_command": "！MILK1！",
+    }
+    ztk_congestion.convert_promotion_link.return_value = {
+        "status": "success",
+        "short_url": "https://u.jd.com/oCleanCoupon2",
+        "click_url": "https://union-click.jd.com/jdc?e=clean2",
+        "j_command": "！MILK2！",
+        "coupon_applied": True,
+    }
+    hdk_clean = Mock()
+    hdk_clean.get_goods_detail.return_value = {
+        "status": "success",
+        "data": {
+            "itemid": official_sign,
+            "skuid": official_sign,
+            "goodsname": "伊利严选牧场纯牛奶",
+            "itempic": milk_img,
+            "itemprice": "109.2",
+            "itemendprice": "79.2",
+            "couponmoney": "30",
+            "couponurl": coupon_u,
+        },
+    }
+    ad_uc = JdAdapter(
+        settings=SimpleNamespace(jd_enabled=True, jd_union_id="2035679405", jd_position_id="88"),
+        client=ztk_congestion,
+        hdk_client=hdk_clean,
+    )
+    res_uc = ad_uc.resolve_and_convert_universal(uc_url)
+    assert res_uc["status"] == "success"
+    assert res_uc["resolution_kind"] == "product"
+    assert res_uc["goods_id"] == milk_gid
+    assert res_uc["goods_sign"] == official_sign
+    assert res_uc["coupon_url"] == coupon_u
+    assert res_uc["final_link"] == "https://u.jd.com/oCleanCoupon2"
+    hdk_clean.get_goods_detail.assert_called_once_with(
+        "https://u.jd.com/oCleanShort1",
+        allow_keyword_search=True,
+        allow_single_url_match=True,
+    )
+    clear_all_caches()
+
 
 
 

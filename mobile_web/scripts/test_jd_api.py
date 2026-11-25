@@ -179,6 +179,14 @@
         * 截至 `02:04` 统计：`15:45` 后新入 `1,975` 条 JD 线报中 `1,753` 条成功入库（含 **`121` 条通过延后轮次自动复活**），`ERR_ADAPTER_CONVERT_FAILED` 仅 `11` 条——逐条深夜复测仅 **`1` 条（`oa5A0d5`，真实丢失率 `0.05%`）** 为可用商品超时丢单，其余 `10` 条均为失效/无卡/非推广链；
         * `products` 库内 `5,118` 款 JD 商品做到 **`0` 零价、`0` 缺图、`0` `plogin` 残留**，`2,584` 款有券商品 **100% 携带顶层 `coupon_url`（0 缺失）**（注意：`ZTK api_detail` 查出的单品其 `coupon_url` 统一存入文档顶层 `product_doc["coupon_url"]`，仅 `goods_query` 路径会同时写入嵌套 `coupon_info.coupon_url`，统计与消费时切勿只看嵌套 `coupon_info` 误判漏券）。
       - ⚠️ **好单库持续 `533` 期间的轻量副作用**：当好单库 `v3/jd_goods_search` 整天及过零点仍处 `listId=533`（`RATE_LIMIT`）冷却时，极少数本就停推的 `u.jd.com`（如 `oDeDNl5` -> 停推 SKU）或跳转搜索页的短链（如 `og554rO` -> `so.m.jd.com/ware/search.action`）因缺乏第三梯队交叉否定，会按 `degraded_product` 重试 3 轮后才以 `ERR_ADAPTER_CONVERT_FAILED` 退出（10h 仅 4 条，零误入库）。
+  11. **【2026-11-25 `union-click` 喂好单库切片假 ID 引发“牛奶变 iPhone 17”串货根因实证与架构修复】**：
+      - 🚨 **生产实证暗坑（双环连爆）**：
+        1. 将 `union-click.jd.com/jdc?e=&p=...` 超长推广链直接传给好单库 `v3/jd_goods_search?keyword=` 时，好单库返回正确的商品图文价格，**但会在 `itemid`/`skuid` 字段从入参 `p=` 密文中截取一段含 `_` 的子串**（如 65 位 `FksWAG0K..._V1FCZ...`，生产库实查 74 条非标准 `goods_sign` 中 69 条为原文硬截子串）；而先经 `byunionid_get` 转成干净 `u.jd.com` 短链后再传好单库，实测 `6/6`（含牛奶/猫粮/生姜/鼠标/沐浴露/羊毛被）100% 返回标准官方加密 `itemid`；
+        2. 后续详情刷新若将该 65 位截取串再传入 `HdkClient.get_goods_detail()`，旧逻辑因仅拦截 50 位标准密文而放行 65 位串落入 `keyword=` 搜索；好单库 `keyword=` 未命中时不仅吐出 Apple iPhone 17 / vivo / 红米等无关热销数码，还将入参的 65 位垃圾串原样回填进返回行的 `itemid`/`skuid`，骗过等值校验后进一步误触发 `mark_product_superseded()` 将牛奶软下架迁移到 iPhone 17。
+      - ✅ **定型修复契约（零长度硬编码假设）**：
+        1. `HdkClient.get_goods_detail()` 新增显式 `allow_keyword_search: bool = False`（Fail-Closed 默认）：所有非 URL 标识（不论长度）默认一律只走 `itemIds=`（实测传 65 位垃圾串干净返回 `0` 条 -> `NOT_FOUND`）；仅当调用方显式传 `allow_keyword_search=True`（或对 `http(s)://` URL 启用 `allow_single_url_match=True`）时才走 `keyword=`；
+        2. `JdAdapter.resolve_product_from_link` 第 2c 步绝不把 `union-click.jd.com` 直接喂给好单库，改为仅吃干净 `u.jd.com` 短链；`resolve_and_convert_universal` 对非 `u.jd.com` 入口（如 `union-click`）在 `byunionid_get` 洗出干净 `u.jd.com` 短链后若仍缺卡，再调用好单库拿官方正卡及 `goods_sign`，若发现新官方 `coupon_url` 自动再补绑一次二合一券转链（实测牛奶 `union-click` 一步救回官方 `goods_sign`、`u.jd.com` 推广链及二合一 `coupon_url`）；
+        3. `JdAdapter._normalize_verified_hdk_detail` 对 `get_goods_detail` / `batch_get_goods_details` 的好单库单品返回强制校验主图指纹一致性（对不上报 `PRODUCT_IDENTITY_MISMATCH`），且 `PRODUCT_IDENTITY_MISMATCH` 严禁在 `get_goods_detail` / `batch_get_goods_details` 中被转判为 `PRODUCT_OFF_PROMOTION` 误删商品。
 ================================================================================
 """
 

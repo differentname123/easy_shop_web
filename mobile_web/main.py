@@ -233,6 +233,11 @@ def create_app() -> FastAPI:
                 "❌ 【HTTP请求异常】接口返回服务端错误 | 客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms] 排查方向<请检查服务端异常日志或下游依赖状态>",
                 client, request.method, req_path, status_code, duration,
             )
+        elif status_code == 404 and not path_only.startswith("/api/"):
+            logger.debug(
+                "【未命中路径】客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms]",
+                client, request.method, req_path, status_code, duration,
+            )
         elif status_code >= 400:
             logger.warning(
                 "【HTTP请求告警】接口返回客户端或鉴权错误 | 客户端[%s] 接口[%s %s] 状态[%d] 耗时[%.1fms] 排查方向<请检查请求参数、登录Token或访问路径>",

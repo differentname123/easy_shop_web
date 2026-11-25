@@ -32,7 +32,7 @@
 - **输入**：`ProductRef` 或 `(goods_id_or_sign, goods_id, goods_sign)`。JD 必须使用 50 位加密 `goods_sign` 或数字 SKU（**严禁传入 34 位主图指纹**）；TB 必须使用完整 46 位 `<prefix>-<suffix>` 加密 `goods_sign`；PDD 首选 `goods_sign`。
 - **输出**：`{"status": "success", "data": ProductDetail}`；确证下架/停推返回 `error_code="PRODUCT_OFF_PROMOTION"`。
 - **平台执行链**：
-  - **JD**：**ZTK `api_detail`（独立通道 + 0.35s/Key 微节流 + 遇 `301: 对应宝贝已下架` 第 1 把 Key 立即早停，绝不与 `goods_query` 选品池 `1000`/`1001` 限流连坐；可信重定向覆盖 `jd.com`/`jd.hk`/`yiyaojd.com`/`3.cn`）** -> ZTK `goods_query(itemIds=...)` -> HDK `v3/jd_goods_search`。当 `api_detail` 报 `301` 且 `goods_query` 为空且 HDK 未触发限流时，交叉确证 `PRODUCT_OFF_PROMOTION`；*已永久删除拿 `byunionid_get` 反推 `api_detail` 限流的伪探测。*
+  - **JD**：**ZTK `api_detail`（独立通道 + 0.35s/Key 微节流 + 遇 `301: 对应宝贝已下架` 第 1 把 Key 立即早停，绝不与 `goods_query` 选品池 `1000`/`1001` 限流连坐；可信重定向覆盖 `jd.com`/`jd.hk`/`yiyaojd.com`/`3.cn`）** -> ZTK `goods_query(itemIds=...)` -> HDK `v3/jd_goods_search`（`HdkClient.get_goods_detail` 默认 `allow_keyword_search=False` 严禁非 URL 标识落入 `keyword=` 模糊搜索，且对好单库返回强制核验主图指纹一致性）。当 `api_detail` 报 `301` 且 `goods_query` 为空且 HDK 未触发限流与 `PRODUCT_IDENTITY_MISMATCH` 时，交叉确证 `PRODUCT_OFF_PROMOTION`；*已永久删除拿 `byunionid_get` 反推 `api_detail` 限流的伪探测。*
   - **TB**：TOP `tbk.item.info.upgrade.get` -> ZTK `api_detail`（强制校验返回 `tao_id` 非空并匹配目标身份） -> HDK `v2/item_detail`。
   - **PDD**：官方 `pdd.ddk.goods.detail` -> 限流时自动回退 `pdd.ddk.goods.search(goods_sign_list=[sign])`（标记 `cacheable=False`，不写入详情缓存与 `detail_updated_at`）。
 
@@ -48,7 +48,7 @@
 - **输入**：原始链接、短链或混排分享文案。
 - **输出**：结构化解析结果（含 `is_venue`、`product` 卡、目标 `target_id` / `goods_sign` / `goods_id`、`material_url` 等）。
 - **核心策略（API 优先、零无意义重定向）**：
-  - **JD**：明确会场域名（`pro.m.jd.com` / `prodev.m.jd.com` / `shop.m.jd.com` / `mall.jd.com` / `coupon.m.jd.com`，即使携带纯数字 `?sku=` 如 `o19hsre` 亦属会场）直接正向实证 `is_venue=True`（0 重定向）；`u.jd.com` / `union-click` / 京口令（`！...！`）**统一走 `api_detail` -> `goods_query` -> HDK `v3/jd_goods_search` -> 0 配额 `resolve_jd_short_url` 解包**（非裸标题纯文案不触发查询，且 `api_detail` 返回 `301` 不直接短路停推）。
+  - **JD**：明确会场域名（`pro.m.jd.com` / `prodev.m.jd.com` / `shop.m.jd.com` / `mall.jd.com` / `coupon.m.jd.com`，即使携带纯数字 `?sku=` 如 `o19hsre` 亦属会场）直接正向实证 `is_venue=True`（0 重定向）；`u.jd.com` / `union-click` / 京口令（`！...！`）**统一走 `api_detail` -> `goods_query` -> HDK `v3/jd_goods_search`（仅干净 `u.jd.com` 短链显式 `allow_keyword_search=True`，绝不直喂 `union-click` 长链以免切出假 ID） -> 0 配额 `resolve_jd_short_url` 解包**（非裸标题纯文案不触发查询，且 `api_detail` 返回 `301` 不直接短路停推）。
   - **TB**：作为纯口令/短链解 ID 辅助工具保留；日常万能转链已停用救活率 `0/58` 的 `open_shangpin_id`。
   - **PDD**：严格校验官方域名，`goods.search(page_size>=10)` 命中 `total_count == 1` 后调用 `goods.detail` 补全详情；当 `total_count == 1` 但 `goods_name` 为空时，保留唯一 `raw_goods_sign` 交 `goods.detail` 终局裁决 `PRODUCT_OFF_PROMOTION` (`40001`)，**严禁跳过直接送 `zs.unit.url.gen` 洗链**。
 
@@ -64,7 +64,7 @@
 - **核心原则（Fail-Closed & 宁缺毋滥）**：
   - 严禁在失败时截取标题调用关键词搜索“指鹿为马”；
   - 四态确定性标记 `resolution_kind`：`product`（完整实证单品卡）、`coupon_or_venue`（明确会场/官方券页，仅正向实证允许）、`degraded_product`（转链成功但暂未拿到商品卡，禁止判作纯券或写入永久误分类缓存）、`rejected`（跨平台/数字直链/空文本/停推等）。
-  - **JD**：`resolve_product_from_link` 拿卡/会场实证（含 `hour.jd.com` / `mcard.jd.com` / `plus.m.jd.com` / `lives.jd.com` 官方活动域正向会场判定） -> `byunionid_get` 唯一转链主出口（`99.98%` 独立稳定，不受选品池冷却阻塞；公共回退 HDK `get_jditems_link`；若旧 `u.jd.com` 短链因内嵌过期券报 `2001917` 等可恢复业务错且已查出不同纯净 `jingfen` 商品链时，自动回退纯净商品链重转一次），对裸京口令或新产出 `u.jd.com` 仅补 1 次 `api_detail` 轻查卡；**已永久移除 `tkl_piliang` (`0.06%`)、`api_quanwang` (`0.00%`) 与选品冷却门卫**。
+  - **JD**：`resolve_product_from_link` 拿卡/会场实证（含 `hour.jd.com` / `mcard.jd.com` / `plus.m.jd.com` / `lives.jd.com` 官方活动域正向会场判定） -> `byunionid_get` 唯一转链主出口（`99.98%` 独立稳定，不受选品池冷却阻塞；公共回退 HDK `get_jditems_link`；若旧 `u.jd.com` 短链因内嵌过期券报 `2001917` 等可恢复业务错且已查出不同纯净 `jingfen` 商品链时，自动回退纯净商品链重转一次），对裸京口令或新产出 `u.jd.com` 补 1 次 `api_detail` 轻查卡；非 `u.jd.com` 入口（如 `union-click` 长链）在洗出干净 `u.jd.com` 后若仍缺卡再按短链交由 HDK 拿官方正卡并补绑券；**已永久移除 `tkl_piliang` (`0.06%`)、`api_quanwang` (`0.00%`) 与选品冷却门卫**。
   - **TB**：主通道 `open_gaoyongzhuanlian_tkl`（遇混排长文案自动升级 `tkl_piliang`），`ZtkClient.convert_channel_url` **严禁伪造 `"渠道推广商品"`/`0.00` 占位卡片**；`TaobaoAdapter` 强制校验完整卡字段（`tao_id + 非空原标题 + price > 0 + 主图/轮播图`），缺卡自动回查 `get_goods_detail(tao_id)` 补全或明确 `PRODUCT_OFF_PROMOTION` / Fail-Closed `degraded_product`。`pages-fast.m.taobao.com/wow/`、`mo.m.taobao.com`、`uland.taobao.com/quan` 等在 ZTK 成功转出推广链且无 `tao_id` 时正向确认为 `coupon_or_venue`（**仍拒绝未转换成功的原始 `/wow/z/lianmeng/` 与 `wh_alimama=` 页面**）。已移除 `open_shangpin_id` (`0/58`) 兜底。
   - **PDD**：复用 `resolve_product_from_link`；仅对合法但搜索未收录的非 `40009`/非下架/非多结果分享短链走 `zs.unit.url.gen` 洗链并标为 `degraded_product`。
   - **线报清理统一前置分流 (`deal_cleaning/url_venue.py::resolve_non_cps_http_url`)**：所有非官方 CPS HTTP 入口（`3.cn`、`llipin.cn`、`kurl07.cn`、`t.cn` 等）统一前置免费 SSRF 安全解包分流为 `venue` / `cps_redirect` / `numeric_item` / `dead(0重试)` / `transient(重试)`，且正式入库与云同步仅靠结构化字段更新 `deal_info.updated_at`（在榜心跳只续命 `last_seen_at` + `publish_ts`）。
