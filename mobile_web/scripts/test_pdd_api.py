@@ -118,6 +118,23 @@
   5. **【2026-11-24 2小时线上实跑压测与终态确认】**：
      - ✅ 连续 2 小时真实运行：推荐榜单 `goods.recommend.get` 399/399（100%）、搜索前置 `max(10, size)` 彻底实现 **0 次 `3000000: pageSize` 报错**、详情 `goods.detail`（Web 端 904/904 = 100%，全端 1,016 次均耗 136ms）、三层推广转链 99/99（100%）、订单同步 8/8（100%）；正式库 1,001 款 PDD 商品 **0 坏数据**，且推荐流动态盐轮换的 `goods_sign` 由仓储层静默刷新而不推进 `updated_at`。
      - ✅ 非单品品牌特卖会场链接（如 `mobile.yangkeduo.com/tandy_vase.html?...&__rp_name=xbrand_special_sale`）调用 `goods.search` 不返回唯一单品（`total_count != 1`），按协议保持拦截不猜单品。
+
+十一、【2026-11-25 实测沉淀：超级红包抵扣不可查、达人礼金(56)/超级补贴(58) 协议与权限边界】
+  1. **超级红包 (`channel_type=23`) 抵扣金额无法预查（千人千面 + 强买家态）**：
+     - ❌ **全链路不可获取**：302 跳转 URL（`duo_theme_activity.html?__page=duo_eleven`）不含任何抵扣金额；落地页拉取 `spDiscountMoney` 走强登录态私有接口 `/api/jinbao/sp_redpacket/query_goods_detail_redpacket` 与 `query_red_packet_detail/v2`（无买家 `PDDAccessToken` 必返 HTTP `424` / `40001`）。
+     - ❌ **官方与聚合 API 均无该字段**：`goods.detail` / `goods.search` / `rp.prom.url.generate` 及第三方聚合均不返回超红抵扣额；其本质为买家个人超红账户余额（每周日 24 点清零，下单前在商详兑换，按账号画像动态计算），不存在全员统一的固定超红到手价。
+     - ✅ **可用合规信号**：`activity_tags` 包含 `15614` 代表商品命中超红「加倍抵扣」池（`17356` 为「精选好价」），可用于引导文案但严禁虚构固定抵后价。
+     - ⚠️ **`extra_coupon_amount` 不可重复扣减陷阱**：实测 19 款热销品中 18/19 款 `extra_coupon_amount == coupon_discount`（如 `1800 / 500 / 500` 对应 5 元福利券、真实券后 `¥13.0`），严禁叠加重复扣减。
+  2. **“限时秒杀 / 专品加补券”免抽红包直减页的官方生链协议**：
+     - ✅ 通过 `pdd.ddk.rp.prom.url.generate` 传入未公开 `channel_type` + **`ext_params={"goods_sign": goods_sign}`**（传 `diy_sp_red_packet_param` 会被忽略、无法置顶单品），支持透传 `custom_parameters`：
+       * `channel_type=56`：达人礼金 C 端 / 拼多多限时秒杀（`__page=duo_cash_gift_v2`, `st=170`, `cpsSign=DRC_...`, `traffic=xsljapi`）；对应 B 端为 `channel_type=55`（`talent-goods-library.html`, `st=169`）。
+       * `channel_type=58`：超级补贴 C 端（`__page=duo_super_subsidy`, `st=175`, `cpsSign=SPSC_...`, `traffic=cbapi`）；对应 B 端为 `channel_type=57`（`duo_buid_super_subsidy.html`, `st=174`）。
+       * `channel_type=59`：天降惊喜券 / 限时折扣价（`__page=ddjb_act_coupon_adv`, `st=168`, `cpsSign=ZXMP_...`）；其余支持 `ext_params={"goods_sign": ...}` 置顶的 C 端频道：`38`（跨店满减）、`46`（大促会场）、`51`（新代理扶持）；`13`（一元购）用 `diy_one_yuan_param`，`42`（超红 9.9）用 `diy_sp_red_packet_param`。
+  3. **为什么生出同款 `ct=56`/`ct=58` 链接却无顶部“专品加补券”（账号权限边界与上线红线）**：
+     - 落地页拉取顶部“爆通用券 / 专品加补券”的接口 `/api/jinbao/lijin/query_cpa_lijin_info` 与 `query_super_subsidy_lijin_info` 仅传 `{pid, cpsSign}`，不存在漏传 URL 参数。
+     - 当推手 `duo_id` 未获定向/特权补贴资格时（实测账号 `41675195` 为 V0 等级、`GMV=0`、`/level-right` 显示定向增长补贴需 V3/V4、`user_info` 返回 `hasAuthPrivilegeSubsidyAuth=false`、B 端 `ct=55` 全品 `cashGiftCouponAmount=0`、B 端 `ct=57` 全品 `推广补贴¥0`、且 `ct=50/52/53/54/62/63` 网关报 `duoid未开通活动权限`），后端返错误码 `5/6` 或 `hasActivityAuth=false`，前端触发 `showNoCouponUI=true` 隐藏顶部券栏、退化回原券后价（不如 `ct=23` 超级红包）。
+     - 🚨 **上线切换红线**：在 `duo_id` 获得 `hasAuthPrivilegeSubsidyAuth`（达人礼金/超级补贴白名单）前，严禁将默认转链主策略从 `channel_type=23` 切到 `56`/`58`；获权后直接切 `channel_type=56` + `ext_params={"goods_sign": goods_sign}` 即可全自动生成免抽红包直减链。
+     - ⚠️ **测试环境避坑**：`duo_cash_gift_v2` 顶部专品加补券栏仅在手机拼多多 App 客户端下发，PC 网页版打开连有权限账号的链接也只显示普通券后价，验价必须在手机 App 实测。
 ================================================================================
 """
 
