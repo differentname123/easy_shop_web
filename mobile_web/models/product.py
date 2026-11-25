@@ -89,6 +89,7 @@ SOURCE_SITE_NAMES: Dict[str, str] = {
     "niuza": "牛杂网",
     "zdzdm": "真的值得买",
     "baicaio": "白菜哦",
+    "user_submit": "用户爆料",
 }
 
 

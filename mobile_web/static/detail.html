@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261125-1">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261125-1"></script>
-  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261125-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261126-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261126-1"></script>
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261126-1">
 </head>
 <body>
 <div id="app" class="detail-container" v-cloak>
@@ -95,6 +95,14 @@
         <button type="button" class="price-feedback-btn" :class="{ active: priceFeedbackChoice === 'unbuyable', muted: priceFeedbackChoice === 'buyable' }" @click="submitPriceFeedback('unbuyable')">👎 买不到</button>
       </div>
     </div>
+
+    <div class="detail-submit-row" v-if="!dealTip && canOperateDetail" @click="goToSubmitDeal">
+      <span class="detail-submit-hint">
+        <span class="detail-submit-tag">共创</span>
+        <span>发现更低凑单价或隐藏券？</span>
+      </span>
+      <button type="button" class="detail-submit-pill">✍️ 去补充好价 ›</button>
+    </div>
   </div>
 
   <!-- ==================== 线报好价卡片（有线报信息时统一展示，无则完全不渲染） ==================== -->
@@ -103,7 +111,10 @@
       <span class="deal-tip-badge" :style="dealTip.is_deal_tip === false ? 'background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb;' : ''">
         {{ dealTip.is_deal_tip === false ? '🕒 历史好价' : '🔥 线报好价' }}
       </span>
-      <span class="deal-tip-time" v-if="dealTip.publish_time">{{ dealTip.publish_time }} 爆料</span>
+      <div class="deal-tip-header-right">
+        <span class="deal-tip-time" v-if="dealTip.publish_time">{{ dealTip.publish_time }} 爆料</span>
+        <button type="button" class="deal-tip-submit-link" v-if="canOperateDetail" @click="goToSubmitDeal">✍️ 补充更低价 ›</button>
+      </div>
     </div>
 
     <div class="deal-price-box" v-if="(dealTip.deal_price !== null && dealTip.deal_price !== undefined) || dealTip.card_highlight">
@@ -332,10 +343,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261125-1"></script>
-<script src="/static/js/session.js?v=ux-20261125-1"></script>
-<script src="/static/js/format.js?v=ux-20261125-1"></script>
-<script src="/static/js/browser.js?v=ux-20261125-1"></script>
-<script src="/static/js/detail.js?v=ux-20261125-1"></script>
+<script src="/static/js/api.js?v=ux-20261126-1"></script>
+<script src="/static/js/session.js?v=ux-20261126-1"></script>
+<script src="/static/js/format.js?v=ux-20261126-1"></script>
+<script src="/static/js/browser.js?v=ux-20261126-1"></script>
+<script src="/static/js/detail.js?v=ux-20261126-1"></script>
 </body>
 </html>

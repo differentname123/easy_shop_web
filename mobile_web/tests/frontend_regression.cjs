@@ -3620,6 +3620,126 @@ test('detail price feedback, share tracking, and single-list favorites UI contra
   assert.ok(indexHtml.includes('/favorites'));
 });
 
+test('detail goToSubmitDeal and standalone submit_deal controller + HTML contracts', async () => {
+  // 1. 详情页仅增加克制的触发入口，我的页挂上「我的爆料」查看入口
+  const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  const submitHtml = fs.readFileSync(path.join(root, 'static', 'submit_deal.html'), 'utf8');
+  assert.ok(indexHtml.includes("window.location.href='/submit_deal'"));
+  assert.ok(detailHtml.includes('goToSubmitDeal'));
+  assert.ok(submitHtml.includes('onSelectImages'));
+  assert.ok(submitHtml.includes('我的爆料记录'));
+  assert.ok(submitHtml.includes('蜀ICP备2026073570号-1'));
+  assert.ok(submitHtml.includes('https://beian.miit.gov.cn/'));
+
+  const hDetail = harness({
+    url: 'https://shop.test/detail?platform=jd&goods_id=1001001',
+    saved: { easy_shop_token: 'tok-sub-1', easy_shop_uid: 'u_sub_1' },
+  });
+  hDetail.load('detail');
+  const dInit = hDetail.mounted[0]();
+  await flush();
+  await hDetail.finish(0, { status: 'success', user: { uid: 'u_sub_1', phone: '13800138000' } });
+  await hDetail.finish(1, {
+    status: 'success',
+    data: { platform: 'jd', product_id: '1001001', goods_id: '1001001', goods_sign: 'S_1001', name: '抽纸', price: 59.9 },
+  });
+  await dInit;
+  await hDetail.page.goToSubmitDeal();
+  assert.ok(hDetail.context.location.href.startsWith('/submit_deal?'));
+  assert.ok(hDetail.context.location.href.includes('platform=jd'));
+  assert.ok(hDetail.context.location.href.includes('goods_id=1001001'));
+  hDetail.page.dispose();
+
+  // 2. submit_deal 控制器校验、图片列表删除、投稿提交与状态回流
+  const hSub = harness({
+    url: 'https://shop.test/submit_deal?platform=jd&product_id=1001001&goods_id=1001001&goods_sign=S_1001',
+    saved: { easy_shop_token: 'tok-sub-1', easy_shop_uid: 'u_sub_1' },
+  });
+  hSub.load('submit_deal');
+  const subCtrl = hSub.context.EasyShop.createSubmitDealController({
+    ref: hSub.context.Vue.ref,
+    computed: hSub.context.Vue.computed,
+    api: hSub.api,
+    session: hSub.session,
+    browser: hSub.context.EasyShop.createBrowserTools({ ref: hSub.context.Vue.ref }),
+  });
+  const subInit = subCtrl.initialize();
+  await flush();
+  await hSub.finish(0, { status: 'success', user: { uid: 'u_sub_1', phone: '13800138000' } });
+  await flush();
+  await hSub.finish(1, { status: 'success', data: { platform: 'jd', product_id: '1001001', goods_id: '1001001', name: '维达抽纸', price: 59.9 } });
+  await hSub.finish(2, { status: 'success', data: { items: [], can_submit: true, strikes: 0 } });
+  await subInit;
+
+  assert.equal(subCtrl.hasAnchorParams.value, true);
+  assert.equal(subCtrl.goods.value.name, '维达抽纸');
+  // 客户端基础必填校验（价格 <= 0 或文案为空不发请求）
+  subCtrl.dealPrice.value = '0';
+  subCtrl.tutorialText.value = '购买步骤';
+  await subCtrl.handleSubmit();
+  assert.equal(hSub.requests.length, 3);
+
+  subCtrl.dealPrice.value = '29.9';
+  subCtrl.tutorialText.value = '   ';
+  await subCtrl.handleSubmit();
+  assert.equal(hSub.requests.length, 3);
+
+  // 模拟选择截图并移除其中一张后携带剩余截图提交
+  subCtrl.selectedImages.value = [
+    { id: 'img_1', preview: 'data:image/jpeg;base64,AAA=', base64: 'data:image/jpeg;base64,AAA=' },
+    { id: 'img_2', preview: 'data:image/jpeg;base64,BBB=', base64: 'data:image/jpeg;base64,BBB=' },
+  ];
+  subCtrl.removeImage(0);
+  assert.equal(subCtrl.selectedImages.value.length, 1);
+
+  subCtrl.tutorialText.value = '先在详情页领满50减20补贴券，配合红包拍下实付29.9元';
+  const submitP = subCtrl.handleSubmit();
+  await flush();
+  assert.equal(hSub.requests[3].url, '/api/deals/submit');
+  assert.deepEqual(JSON.parse(hSub.requests[3].options.body).images_base64, ['data:image/jpeg;base64,BBB=']);
+  await hSub.finish(3, { status: 'success', data: { tip_id: 'us_123', state: 'pending', message: '提交成功' } });
+  await flush();
+  assert.ok(hSub.requests[4].url.startsWith('/api/deals/my_submissions?limit=30'));
+  await hSub.finish(4, {
+    status: 'success',
+    data: { items: [{ tip_id: 'us_123', title: '维达抽纸', deal_price: 29.9, image_count: 1, state: 'published', state_label: '已收录上架', reason: '已上架', platform: 'jd', product_id: '1001001' }], can_submit: true },
+  });
+  await submitP;
+  assert.equal(subCtrl.dealPrice.value, '');
+  assert.equal(subCtrl.selectedImages.value.length, 0);
+  assert.equal(subCtrl.submissions.value.length, 1);
+
+  subCtrl.openSubmittedDetail(subCtrl.submissions.value[0]);
+  assert.ok(hSub.context.location.href.startsWith('/detail?'));
+  assert.ok(hSub.context.location.href.includes('goods_id=1001001'));
+  subCtrl.dispose();
+
+  // 3. 从「我的 -> 我的爆料」无锚点打开 /submit_deal 查看全部个人投稿记录
+  const hMyList = harness({
+    url: 'https://shop.test/submit_deal',
+    saved: { easy_shop_token: 'tok-sub-1', easy_shop_uid: 'u_sub_1' },
+  });
+  hMyList.load('submit_deal');
+  const listCtrl = hMyList.context.EasyShop.createSubmitDealController({
+    ref: hMyList.context.Vue.ref,
+    computed: hMyList.context.Vue.computed,
+    api: hMyList.api,
+    session: hMyList.session,
+    browser: hMyList.context.EasyShop.createBrowserTools({ ref: hMyList.context.Vue.ref }),
+  });
+  const listInit = listCtrl.initialize();
+  await flush();
+  await hMyList.finish(0, { status: 'success', user: { uid: 'u_sub_1', phone: '13800138000' } });
+  await flush();
+  assert.equal(hMyList.requests.length, 2);
+  await hMyList.finish(1, { status: 'success', data: { items: [{ tip_id: 'us_x', title: '记录A', state: 'rejected', state_label: '未通过', reason: '依据不足' }] } });
+  await listInit;
+  assert.equal(listCtrl.hasAnchorParams.value, false);
+  assert.equal(listCtrl.submissions.value.length, 1);
+  listCtrl.dispose();
+});
+
 
 
 

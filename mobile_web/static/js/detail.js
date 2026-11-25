@@ -399,6 +399,25 @@
         sendGoodsAction('share');
       }
     };
+    const goToSubmitDeal = async () => {
+      if (!canOperateDetail.value || !goods.value) return;
+      await restoreIdentity();
+      if (disposed) return;
+      const token = session.token ? session.token() : '';
+      if (!isLoggedIn.value || !token) {
+        browser.showToast('请先登录后提交好价爆料');
+        goToRegister();
+        return;
+      }
+      persistCurrentSummary(goods.value);
+      const { platform, product_id, goods_sign } = currentProductStatsIdentity();
+      const params = new URLSearchParams();
+      params.set('platform', platform || goods.value.platform || requested?.platform || 'pdd');
+      if (product_id) params.set('product_id', product_id);
+      if (goods.value?.goods_id) params.set('goods_id', String(goods.value.goods_id));
+      if (goods_sign) params.set('goods_sign', goods_sign);
+      global.location.href = `/submit_deal?${params.toString()}`;
+    };
     const goBack = () => {
       if (global.history.length > 1) return global.history.back();
       try {
@@ -745,7 +764,7 @@
       copyDealTutorial, copyDealCopywriting, copyDealAuxItem, openDealAuxItem,
       isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, commandModal, closeCommandModal, copyCommandFromModal,
       isFavorited, isFavoriteBusy, handleToggleFavorite, priceFeedbackChoice, submitPriceFeedback,
-      onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail,
+      onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail, goToSubmitDeal,
       authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
       retryLoadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,

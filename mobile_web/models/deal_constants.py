@@ -269,3 +269,6 @@ def format_timestamp_cn(val: Any, *, fmt: str = "%Y-%m-%d %H:%M") -> str:
     if ts is None:
         return ""
     return datetime.datetime.fromtimestamp(ts, tz=CN_TZ).strftime(fmt)
+
+
+USER_SUBMIT_SITE = "user_submit"

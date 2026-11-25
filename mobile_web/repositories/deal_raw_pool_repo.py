@@ -23,6 +23,7 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
+    USER_SUBMIT_SITE,
     DEAL_FORMAL_EXPIRY_HOURS,
     DEAL_MAX_CLEAN_AGE_DAYS,
     DEAL_RAW_TTL_DAYS,
@@ -264,6 +265,10 @@ class DealRawPoolRepository:
             )
             col.create_index(
                 [("stage_lease_until_ts", 1), ("stage_lease_owner", 1)],
+                background=True,
+            )
+            col.create_index(
+                [("source_site", 1), ("submitted_by_uid", 1), ("first_seen_at", -1)],
                 background=True,
             )
             col.create_index(
@@ -667,16 +672,29 @@ class DealRawPoolRepository:
                 set_fields["clean_cutoff_ts"] = clean_cutoff_ts
                 set_fields["clean_max_age_days"] = channel_max_age
 
+            requested_stage = str(rec.get("clean_stage") or "").strip()
+            initial_stage = (
+                requested_stage
+                if (
+                    initial_status == "pending"
+                    and requested_stage in (CLEAN_STAGE_NEED_AI1, CLEAN_STAGE_NEED_CONVERT, CLEAN_STAGE_NEED_AI2)
+                )
+                else (CLEAN_STAGE_NEED_AI1 if initial_status == "pending" else CLEAN_STAGE_DONE)
+            )
             set_on_insert: Dict[str, Any] = {
                 "source_site": site,
                 "source_item_id": item_id,
                 "first_seen_at": now,
                 "clean_status": initial_status,
-                "clean_stage": CLEAN_STAGE_NEED_AI1 if initial_status == "pending" else CLEAN_STAGE_DONE,
+                "clean_stage": initial_stage,
                 "clean_retry_count": 0,
                 "clean_max_age_days": channel_max_age,
                 "clean_cutoff_ts": clean_cutoff_ts,
             }
+            if isinstance(rec.get("ai_stage1_result"), dict) and initial_status == "pending":
+                set_on_insert["ai_stage1_result"] = rec["ai_stage1_result"]
+            if isinstance(rec.get("converted_links"), list) and initial_status == "pending":
+                set_on_insert["converted_links"] = rec["converted_links"]
             if parsed_pub_ts is None:
                 set_on_insert["publish_ts"] = pub_ts
             if is_expired_over_age and initial_status == "cleaned_failed":
@@ -708,6 +726,8 @@ class DealRawPoolRepository:
                 "has_full_detail": has_full_detail,
                 "quality_signals": quality_signals,
             }
+            if rec.get("submitted_by_uid"):
+                core_fields["submitted_by_uid"] = str(rec["submitted_by_uid"]).strip()
             if parsed_pub_ts is not None:
                 core_fields["publish_ts"] = parsed_pub_ts
 
@@ -1229,3 +1249,40 @@ class DealRawPoolRepository:
             "by_platform": {str(r["_id"]): r["count"] for r in by_platform},
             "by_source_site": by_site,
         }
+
+    def list_user_submissions(
+        self,
+        uid: str,
+        limit: int = 30,
+        source_site: str = USER_SUBMIT_SITE,
+    ) -> List[Dict[str, Any]]:
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return []
+        safe_limit = max(1, min(50, int(limit or 30)))
+        return list(
+            self.col.find(
+                {"source_site": source_site, "submitted_by_uid": clean_uid},
+                {
+                    "_id": 0,
+                    "source_item_id": 1,
+                    "title": 1,
+                    "clean_status": 1,
+                    "clean_stage": 1,
+                    "clean_error_code": 1,
+                    "clean_error_msg": 1,
+                    "first_seen_at": 1,
+                    "cleaned_at": 1,
+                    "resolved_platform": 1,
+                    "resolved_product_id": 1,
+                    "resolved_goods_sign": 1,
+                    "resolved_official_title": 1,
+                    "ai_stage1_result.deal_price": 1,
+                    "tutorial_images": 1,
+                    "platform": 1,
+                    "candidate_goods_id": 1,
+                },
+            )
+            .sort([("first_seen_at", -1)])
+            .limit(safe_limit)
+        )

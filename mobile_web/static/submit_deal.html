@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="format-detection" content="telephone=no">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="theme-color" content="#e02e24">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="查券省钱">
+  <title>好价爆料中心 - 查券省钱</title>
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261126-1">
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261126-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261126-1"></script>
+  <style>
+    .submit-deal-page { padding-top: calc(48px + var(--safe-top)); padding-bottom: 36px; min-height: 100vh; background: var(--bg-page); max-width: 540px; margin: 0 auto; }
+    .submit-anchor-card { display: flex; gap: 10px; align-items: center; }
+    .submit-anchor-thumb { width: 72px; height: 72px; border-radius: 8px; object-fit: cover; flex-shrink: 0; background: #f5f5f5; border: 1px solid #f0f0f0; }
+    .submit-anchor-meta { flex: 1; min-width: 0; }
+    .submit-anchor-title { font-size: 13px; font-weight: 600; color: var(--text-main); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .submit-anchor-price { margin-top: 6px; font-size: 12px; color: var(--text-sub); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .submit-anchor-ref-num { color: var(--primary-color); font-weight: 700; font-size: 14px; }
+    .submit-lock-tag { font-size: 10px; background: #f3f4f6; color: #6b7280; padding: 1px 6px; border-radius: 4px; }
+    .submit-field { margin-bottom: 14px; }
+    .submit-label { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; color: var(--text-main); margin-bottom: 6px; }
+    .submit-counter { font-size: 11px; font-weight: 400; color: var(--text-muted); }
+    .submit-input, .submit-textarea { width: 100%; box-sizing: border-box; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; font-size: 14px; color: var(--text-main); background: #fafafa; outline: none; font-family: inherit; }
+    .submit-input:focus, .submit-textarea:focus { border-color: var(--primary-color); background: #ffffff; }
+    .submit-textarea { min-height: 104px; resize: vertical; line-height: 1.55; }
+    .submit-help-note { font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-top: 5px; }
+    .submit-img-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
+    .submit-img-item { position: relative; width: 76px; height: 76px; border-radius: 10px; overflow: hidden; border: 1px solid #e5e7eb; background: #f9fafb; }
+    .submit-img-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .submit-img-del { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; border-radius: 50%; border: none; background: rgba(0, 0, 0, 0.58); color: #fff; font-size: 13px; line-height: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+    .submit-img-add { width: 76px; height: 76px; border-radius: 10px; border: 1.5px dashed #d9d9d9; background: #fafafa; color: var(--text-sub); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; font-size: 11px; cursor: pointer; }
+    .submit-btn-main { width: 100%; border: none; border-radius: 22px; padding: 11px 16px; font-size: 14px; font-weight: 700; color: #fff; background: linear-gradient(135deg, #ff4d4f 0%, #cf1322 100%); box-shadow: 0 4px 12px rgba(207, 19, 34, 0.28); cursor: pointer; }
+    .submit-btn-main:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+    .submit-record-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .submit-record-title { font-size: 14px; font-weight: 700; color: var(--text-main); }
+    .submit-refresh-btn { font-size: 12px; color: var(--primary-color); background: #fff1f0; border: 1px solid #ffccc7; border-radius: 12px; padding: 3px 10px; cursor: pointer; }
+    .submit-record-item { padding: 10px 0; border-top: 1px solid #f2f2f2; }
+    .submit-record-item:first-child { border-top: none; padding-top: 2px; }
+    .submit-record-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .submit-record-name { font-size: 13px; font-weight: 600; color: var(--text-main); line-height: 1.4; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .submit-state-badge { flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .submit-state-badge.pending { background: #fff7e6; color: #d46b08; border: 1px solid #ffd591; }
+    .submit-state-badge.published { background: #f6ffed; color: #389e0d; border: 1px solid #b7eb8f; }
+    .submit-state-badge.duplicate { background: #e6f7ff; color: #096dd9; border: 1px solid #91d5ff; }
+    .submit-state-badge.rejected { background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e; }
+    .submit-record-sub { margin-top: 5px; font-size: 12px; color: var(--text-sub); line-height: 1.45; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .submit-jump-link { color: var(--primary-color); font-weight: 600; flex-shrink: 0; cursor: pointer; white-space: nowrap; }
+    .submit-empty-center { text-align: center; padding: 36px 20px; color: var(--text-sub); font-size: 13px; line-height: 1.6; }
+    .submit-mode-tip { font-size: 12px; color: #595959; background: #fff7f5; border: 1px solid #ffe4de; line-height: 1.5; }
+  </style>
+</head>
+<body>
+<div id="app" class="submit-deal-page" v-cloak>
+  <header class="detail-nav-bar">
+    <button class="detail-nav-btn" @click="goBack">
+      <svg style="width:20px;height:20px;fill:currentColor" viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+      <span>返回</span>
+    </button>
+    <span class="detail-nav-title">{{ hasAnchorParams ? '补充好价爆料' : '我的爆料记录' }}</span>
+    <button class="detail-nav-btn" @click="goHome">
+      <span>首页</span>
+    </button>
+  </header>
+
+  <div class="detail-card-section submit-empty-center" v-if="!checkingAuth && !isLoggedIn">
+    <div style="margin-bottom:14px;">登录后即可查看自己的好价爆料记录并在商品详情页补充攻略</div>
+    <button class="submit-btn-main" style="max-width:200px;margin:0 auto;" @click="goToLogin">去登录</button>
+  </div>
+
+  <template v-else-if="!checkingAuth">
+    <div class="detail-card-section submit-mode-tip" v-if="!hasAnchorParams">
+      💡 如需新增好价爆料，只需进入任意商品详情页点击「✍️ 去补充好价」，系统将自动锁定主商品防出错。
+    </div>
+
+    <template v-else>
+      <div class="detail-card-section submit-empty-center" v-if="loadingGoods && !goods">
+        正在核验商品信息...
+      </div>
+
+      <div class="detail-card-section submit-empty-center" v-else-if="goodsError">
+        <div style="margin-bottom:12px;">{{ goodsError }}</div>
+        <button type="button" class="submit-refresh-btn" @click="goBack">返回上一页</button>
+      </div>
+
+      <template v-else-if="goods">
+        <div class="detail-card-section">
+          <div class="submit-anchor-card">
+            <img :src="goods.image_url || '/static/icons/icon-192.png?v=20261111-1'" class="submit-anchor-thumb" referrerpolicy="no-referrer" :alt="goods.name" />
+            <div class="submit-anchor-meta">
+              <div class="submit-anchor-title">
+                <span class="plat-badge" :class="goods.platform" style="position:static;margin-right:4px;font-size:10px">{{ goods.platform_name || goods.platform }}</span>
+                {{ goods.name }}
+              </div>
+              <div class="submit-anchor-price">
+                <span>当前参考价</span>
+                <span class="submit-anchor-ref-num">¥{{ formatMoney(goods.price) }}</span>
+                <span class="submit-lock-tag">已实名锁定主商品</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <form class="detail-card-section" @submit.prevent="handleSubmit">
+          <div class="submit-field">
+            <label class="submit-label">
+              <span>实际到手价（元）</span>
+            </label>
+            <input
+              v-model="dealPrice"
+              type="number"
+              step="0.01"
+              min="0.01"
+              max="999999"
+              class="submit-input"
+              placeholder="例如：29.9"
+              required
+            />
+          </div>
+
+          <div class="submit-field">
+            <label class="submit-label">
+              <span>购买步骤 / 优惠玩法说明</span>
+              <span class="submit-counter">{{ tutorialText.trim().length }} / 800</span>
+            </label>
+            <textarea
+              v-model="tutorialText"
+              maxlength="800"
+              class="submit-textarea"
+              placeholder="请写清购买步骤或优惠方式（例如：详情页领补贴券、凑单拍1件等）"
+              required
+            ></textarea>
+          </div>
+
+          <div class="submit-field">
+            <label class="submit-label">
+              <span>下单截图 / 教程图片（选填，最多 3 张）</span>
+              <span class="submit-counter">{{ selectedImages.length }} / 3</span>
+            </label>
+            <input
+              ref="imageInputRef"
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/jpg"
+              multiple
+              style="display:none"
+              @change="onSelectImages"
+            />
+            <div class="submit-img-grid">
+              <div class="submit-img-item" v-for="(img, idx) in selectedImages" :key="img.id">
+                <img :src="img.preview" alt="爆料凭证截图" />
+                <button type="button" class="submit-img-del" @click="removeImage(idx)" aria-label="删除图片">×</button>
+              </div>
+              <button type="button" class="submit-img-add" v-if="selectedImages.length < 3" :disabled="compressingImages" @click="triggerImagePicker">
+                <span style="font-size:20px;line-height:1;">{{ compressingImages ? '⏳' : '+' }}</span>
+                <span>{{ compressingImages ? '压缩中' : '传截图' }}</span>
+              </button>
+            </div>
+            <div class="submit-help-note">附带实付下单或领券页面截图更有说服力；系统会自动安全等比压缩体积。</div>
+          </div>
+
+          <div class="submit-field">
+            <label class="submit-label">
+              <span>额外领券链接 / 口令（选填）</span>
+            </label>
+            <input
+              v-model="couponInput"
+              type="text"
+              maxlength="512"
+              class="submit-input"
+              placeholder="选填：仅支持淘宝/天猫/京东/拼多多官方域领券链或口令"
+            />
+          </div>
+
+          <button type="submit" class="submit-btn-main" :disabled="submitting || compressingImages">
+            {{ submitting ? '正在提交核验...' : '提交好价核验' }}
+          </button>
+        </form>
+      </template>
+    </template>
+
+    <div class="detail-card-section">
+      <div class="submit-record-header">
+        <span class="submit-record-title">我的最近爆料 ({{ submissions.length }})</span>
+        <button type="button" class="submit-refresh-btn" :disabled="loadingSubmissions" @click="loadSubmissions">
+          {{ loadingSubmissions ? '刷新中...' : '刷新进度 ↻' }}
+        </button>
+      </div>
+      <div v-if="loadingSubmissions && submissions.length === 0" class="submit-help-note">正在加载记录...</div>
+      <div v-else-if="submissions.length === 0" class="submit-empty-center" style="padding:20px 10px;">
+        <div>还没有爆料记录，去商品详情页点「✍️ 去补充好价」分享你的神价买法吧</div>
+      </div>
+      <div v-else>
+        <div class="submit-record-item" v-for="rec in submissions" :key="rec.tip_id">
+          <div class="submit-record-top">
+            <span class="submit-record-name">
+              <span v-if="rec.deal_price !== null && rec.deal_price !== undefined" style="color:var(--primary-color);margin-right:4px;">¥{{ formatMoney(rec.deal_price) }}</span>
+              <span v-if="rec.image_count > 0" style="font-size:11px;color:#8c8c8c;margin-right:4px;">[{{ rec.image_count }}图]</span>
+              {{ rec.title || '好价爆料' }}
+            </span>
+            <span class="submit-state-badge" :class="rec.state">{{ rec.state_label }}</span>
+          </div>
+          <div class="submit-record-sub">
+            <span>{{ rec.reason }}</span>
+            <span
+              class="submit-jump-link"
+              v-if="rec.platform && rec.product_id"
+              @click="openSubmittedDetail(rec)"
+            >查看商品 ›</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <div class="site-icp-footer">
+    <span>成都东部新区便易屋信息技术咨询经营部</span>
+    <span class="icp-sep">·</span>
+    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">蜀ICP备2026073570号-1</a>
+  </div>
+
+  <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>
+</div>
+
+<script src="/static/js/api.js?v=ux-20261126-1"></script>
+<script src="/static/js/session.js?v=ux-20261126-1"></script>
+<script src="/static/js/format.js?v=ux-20261126-1"></script>
+<script src="/static/js/browser.js?v=ux-20261126-1"></script>
+<script src="/static/js/submit_deal.js?v=ux-20261126-1"></script>
+</body>
+</html>

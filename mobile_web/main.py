@@ -33,6 +33,7 @@ from api.promote import router as promote_router
 from api.order import router as order_router, order_service
 from api.group_help import router as group_help_router, group_help_worker
 from api.favorite import router as favorite_router
+from api.deal_submit import router as deal_submit_router
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 GROUP_HELP_ENABLED = True  # 多人团互助独立模块总开关，置为 False 即可一键下线
@@ -263,7 +264,7 @@ def create_app() -> FastAPI:
             )
         return response
 
-    for router in (home_router, goods_router, user_router, promote_router, order_router, favorite_router):
+    for router in (home_router, goods_router, user_router, promote_router, order_router, favorite_router, deal_submit_router):
         application.include_router(router)
     if GROUP_HELP_ENABLED:
         application.include_router(group_help_router)
@@ -302,6 +303,10 @@ def create_app() -> FastAPI:
     @application.get("/favorites", response_class=HTMLResponse)
     def favorites_page():
         return _html_page("favorites.html", "我的收藏页面正在构建中...")
+
+    @application.get("/submit_deal", response_class=HTMLResponse)
+    def submit_deal_page():
+        return _html_page("submit_deal.html", "好价爆料页面正在构建中...")
 
     if GROUP_HELP_ENABLED:
         @application.get("/group_help", response_class=HTMLResponse)

@@ -886,7 +886,7 @@ class ProductRepository(BaseRepository):
                 u = str(img or "").strip()
                 if u.startswith("//"):
                     u = "https:" + u
-                if u.startswith(("http://", "https://")) and u not in share_images:
+                if u.startswith(("http://", "https://", "/api/deals/image/")) and u not in share_images:
                     share_images.append(u)
 
         card_highlight = cls._resolve_deal_highlight(deal_info)
