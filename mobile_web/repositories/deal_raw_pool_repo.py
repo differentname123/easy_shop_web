@@ -23,6 +23,7 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
+    CLEAN_STAGE_NEED_USER_AUDIT,
     USER_SUBMIT_SITE,
     DEAL_FORMAL_EXPIRY_HOURS,
     DEAL_MAX_CLEAN_AGE_DAYS,
@@ -293,19 +294,24 @@ class DealRawPoolRepository:
         self,
         now_utc: Optional[datetime.datetime] = None,
         max_age_hours: float = DEAL_FORMAL_EXPIRY_HOURS,
+        source_site: Optional[str] = None,
     ) -> int:
         """将超过保鲜窗口未再被任何新线报刷新的好价商品自动摘除实时好价标 (`deal_info.is_deal_tip = False`)。"""
         ref_now = now_utc or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         cutoff = ref_now - datetime.timedelta(hours=max(1.0, float(max_age_hours)))
+        clean_site = str(source_site or "").strip()
+        flt: Dict[str, Any] = {
+            "deal_info.is_deal_tip": True,
+            "$or": [
+                {"deal_info.last_seen_at": {"$lt": cutoff}},
+                {"deal_info.last_seen_at": {"$exists": False}, "deal_info.updated_at": {"$lt": cutoff}},
+            ],
+        }
+        if clean_site:
+            flt["deal_info.source_site"] = clean_site
         try:
             res = self.formal_col.update_many(
-                {
-                    "deal_info.is_deal_tip": True,
-                    "$or": [
-                        {"deal_info.last_seen_at": {"$lt": cutoff}},
-                        {"deal_info.last_seen_at": {"$exists": False}, "deal_info.updated_at": {"$lt": cutoff}},
-                    ],
-                },
+                flt,
                 {
                     "$set": {
                         "deal_info.is_deal_tip": False,
@@ -677,7 +683,12 @@ class DealRawPoolRepository:
                 requested_stage
                 if (
                     initial_status == "pending"
-                    and requested_stage in (CLEAN_STAGE_NEED_AI1, CLEAN_STAGE_NEED_CONVERT, CLEAN_STAGE_NEED_AI2)
+                    and requested_stage in (
+                        CLEAN_STAGE_NEED_AI1,
+                        CLEAN_STAGE_NEED_CONVERT,
+                        CLEAN_STAGE_NEED_AI2,
+                        CLEAN_STAGE_NEED_USER_AUDIT,
+                    )
                 )
                 else (CLEAN_STAGE_NEED_AI1 if initial_status == "pending" else CLEAN_STAGE_DONE)
             )
@@ -867,6 +878,7 @@ class DealRawPoolRepository:
         limit: int,
         lease_seconds: int = 300,
         worker_id: Optional[str] = None,
+        source_site: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """原子认领指定阶段的待处理记录（租约认领机制）。"""
         if limit <= 0:
@@ -904,6 +916,7 @@ class DealRawPoolRepository:
             ],
         })
 
+        clean_site = str(source_site or "").strip()
         base_query: Dict[str, Any] = {
             "clean_status": "pending",
             "clean_stage": stage,
@@ -913,6 +926,8 @@ class DealRawPoolRepository:
                 {"stage_lease_until_ts": {"$lt": round(now_ts, 1)}},
             ],
         }
+        if clean_site:
+            base_query["source_site"] = clean_site
 
         cand_ids = self._select_fair_candidate_ids(base_query, limit)
         if not cand_ids:
@@ -931,6 +946,8 @@ class DealRawPoolRepository:
                 {"stage_lease_until_ts": {"$lt": round(now_ts, 1)}},
             ],
         }
+        if clean_site:
+            claim_filter["source_site"] = clean_site
 
         try:
             upd_res = self.col.update_many(
@@ -953,16 +970,20 @@ class DealRawPoolRepository:
             logger.warning("认领阶段 [%s] 任务发生异常: %s", stage, e)
             return []
 
-    def reclaim_expired_leases(self, now_ts: Optional[float] = None) -> int:
+    def reclaim_expired_leases(self, now_ts: Optional[float] = None, source_site: Optional[str] = None) -> int:
         """显式清扫已过期的租约。"""
         if now_ts is None:
             now_ts = time.time()
+        clean_site = str(source_site or "").strip()
+        flt: Dict[str, Any] = {
+            "clean_status": "pending",
+            "stage_lease_until_ts": {"$exists": True, "$lt": round(now_ts, 1)},
+        }
+        if clean_site:
+            flt["source_site"] = clean_site
         try:
             res = self.col.update_many(
-                {
-                    "clean_status": "pending",
-                    "stage_lease_until_ts": {"$exists": True, "$lt": round(now_ts, 1)},
-                },
+                flt,
                 {"$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""}},
             )
             return int(getattr(res, "modified_count", 0) or 0)
@@ -974,11 +995,14 @@ class DealRawPoolRepository:
         self,
         now_utc: Optional[datetime.datetime] = None,
         site_max_age_map: Optional[Dict[str, float]] = None,
+        source_site: Optional[str] = None,
     ) -> Dict[str, int]:
         """统一保鲜到期与最大重试上限清扫（SSOT）：确保状态切换至 done 并清除残留租约。"""
         ref_now = now_utc or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         now_ts = time.time()
         age_map = dict(site_max_age_map) if site_max_age_map is not None else dict(self.site_max_age_map)
+        clean_site = str(source_site or "").strip()
+        site_cond: List[Dict[str, Any]] = [{"source_site": clean_site}] if clean_site else []
         pending_filter: Dict[str, Any] = {
             "$or": [{"clean_status": "pending"}, {"clean_status": {"$exists": False}}]
         }
@@ -993,6 +1017,7 @@ class DealRawPoolRepository:
                     "$and": [
                         pending_filter,
                         {"clean_cutoff_ts": {"$gt": 0, "$lt": now_ts}},
+                        *site_cond,
                     ]
                 },
                 {
@@ -1010,6 +1035,8 @@ class DealRawPoolRepository:
 
             # 2. 未落盘 clean_cutoff_ts 的历史记录：按站点自定义保鲜期清扫
             for s_key, age_days in age_map.items():
+                if clean_site and s_key != clean_site:
+                    continue
                 s_ts = now_ts - float(age_days) * 86400.0
                 s_dt = ref_now - datetime.timedelta(days=float(age_days))
                 r_site = self.col.update_many(
@@ -1055,6 +1082,7 @@ class DealRawPoolRepository:
                                 {"first_seen_at": {"$lt": fallback_dt}},
                             ]
                         },
+                        *site_cond,
                     ]
                 },
                 {
@@ -1076,6 +1104,7 @@ class DealRawPoolRepository:
                     "$and": [
                         pending_filter,
                         {"clean_retry_count": {"$gte": MAX_CLEAN_RETRIES}},
+                        *site_cond,
                     ]
                 },
                 {

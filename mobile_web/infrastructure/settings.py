@@ -62,6 +62,7 @@ class Settings:
     detail_prefetch_interval_seconds: int = 300
     group_help_worker_enabled: Optional[bool] = None
     order_sync_worker_enabled: Optional[bool] = None
+    deal_submit_worker_enabled: Optional[bool] = None
     jd_enabled: bool = False
     jd_union_id: str = ""
     jd_position_id: str = ""
@@ -323,6 +324,8 @@ def load_settings(config_file=None, *, require_credentials=True) -> Settings:
     group_help_worker_enabled = None if gh_worker_raw is None else _boolean(gh_worker_raw, "web_group_help_worker_enabled")
     os_worker_raw = values.get("web_order_sync_worker_enabled", None)
     order_sync_worker_enabled = None if os_worker_raw is None else _boolean(os_worker_raw, "web_order_sync_worker_enabled")
+    ds_worker_raw = values.get("web_deal_submit_worker_enabled", None)
+    deal_submit_worker_enabled = None if ds_worker_raw is None else _boolean(ds_worker_raw, "web_deal_submit_worker_enabled")
 
     meilisearch_url = text("meilisearch_url", "http://localhost:7700").strip()
     meilisearch_key = text("meilisearch_key", "").strip()
@@ -344,6 +347,7 @@ def load_settings(config_file=None, *, require_credentials=True) -> Settings:
         detail_prefetch_interval_seconds=detail_prefetch_interval_seconds,
         group_help_worker_enabled=group_help_worker_enabled,
         order_sync_worker_enabled=order_sync_worker_enabled,
+        deal_submit_worker_enabled=deal_submit_worker_enabled,
         log_dir=None if log_dir in {"", "-"} else app_path(log_dir), log_level=log_level,
         pdd_dns_mode=dns_mode,
         pdd_trust_env=trust_env,

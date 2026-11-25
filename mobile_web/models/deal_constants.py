@@ -4,7 +4,7 @@ import datetime
 import math
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 # 目录路径计算（单一真源）
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +17,7 @@ DEFAULT_FORMAL_PRODUCTS_COLLECTION = "products"
 PROMPT_DIR = os.path.join(PROJECT_ROOT, "prompt")
 PROMPT_STAGE1_PATH = os.path.join(PROMPT_DIR, "爆料阶段1_原始拆解与转链提纯.txt")
 PROMPT_STAGE2_PATH = os.path.join(PROMPT_DIR, "爆料阶段2_底牌终审与教程评分.txt")
+PROMPT_USER_AUDIT_PATH = os.path.join(PROMPT_DIR, "用户爆料审核与择优对比.txt")
 
 QUALIFIED_DEAL_MIN_SCORE = 60
 DEAL_INFO_PROTECTION_HOURS = 12.0
@@ -68,6 +69,7 @@ def get_default_site_max_age_days_map() -> Dict[str, float]:
 CLEAN_STAGE_NEED_AI1 = "need_ai1"
 CLEAN_STAGE_NEED_CONVERT = "need_convert"
 CLEAN_STAGE_NEED_AI2 = "need_ai2"
+CLEAN_STAGE_NEED_USER_AUDIT = "need_user_audit"
 CLEAN_STAGE_DONE = "done"
 
 DEFAULT_STAGE_POLL_INTERVAL_SECONDS = 3
@@ -94,6 +96,7 @@ DEAL_POOL_LOG_PREFIXES: Tuple[str, ...] = (
 
 # 清洗与转链状态与错误码定义（单一真源）
 OK_SKIPPED_ALREADY_CLEANED = "OK_SKIPPED_ALREADY_CLEANED"
+OK_EXISTING_DEAL_BETTER = "OK_EXISTING_DEAL_BETTER"
 UPSTREAM_DISAPPEARED = "UPSTREAM_DISAPPEARED"
 ERR_NO_ANCHOR = "ERR_NO_ANCHOR"
 ERR_MERGED_INTO_NEIGHBOR = "ERR_MERGED_INTO_NEIGHBOR"
@@ -115,6 +118,7 @@ ERR_LOW_QUALITY_SCORE = "ERR_LOW_QUALITY_SCORE"
 ERR_EXPIRED_OVER_7_DAYS = "ERR_EXPIRED_OVER_7_DAYS"
 ERR_AI_TIMEOUT_RETRY = "ERR_AI_TIMEOUT_RETRY"
 ERR_AI_MAX_RETRIES_EXCEEDED = "ERR_AI_MAX_RETRIES_EXCEEDED"
+ERR_USER_AUDIT_REJECTED = "ERR_USER_AUDIT_REJECTED"
 
 # 多商品合集帖确定性拦截阈值（AI-1 主推商品候选超过 2 个直接拦截，其余由转链真实 goods_id 判定）
 MAX_AI1_MAIN_CANDIDATES = 2
@@ -272,3 +276,9 @@ def format_timestamp_cn(val: Any, *, fmt: str = "%Y-%m-%d %H:%M") -> str:
 
 
 USER_SUBMIT_SITE = "user_submit"
+RELIABLE_SOURCE_SITES: FrozenSet[str] = frozenset({"tehuicaicai", USER_SUBMIT_SITE})
+
+
+def is_reliable_source_site(site: Optional[str]) -> bool:
+    """高可靠好价信源唯一声明：专员严选渠道与核验后的用户爆料天然可信。"""
+    return str(site or "").strip().lower() in RELIABLE_SOURCE_SITES

@@ -552,3 +552,77 @@ def test_sync_detects_and_merges_reliability_field_changes():
     assert r2["written_ops"] == 0
 
 
+def test_sync_protects_cloud_newer_or_reliable_deal_info_while_merging_format():
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    t_old = now - datetime.timedelta(hours=10)
+
+    # 1) 云端有更新的 user_submit 好价，本地为较旧不同线报但有新清洗规格 format_info -> 只合并 format_info，保留云端 deal_info
+    local_old_deal = {
+        "_id": "l_p1",
+        "platform": "jd",
+        "product_id": "PROTECT_CLOUD_DEAL_1",
+        "name": "维达纸巾",
+        "price": 39.9,
+        "activity_price": 39.9,
+        "updated_at": t_old,
+        "format_status": "success",
+        "format_updated_at": now,
+        "format_info": {"spec": {"unit": "包"}},
+        "deal_info": {
+            "is_deal_tip": True,
+            "source_site": "guangdiu",
+            "source_item_id": "gd_old_1",
+            "source_is_reliable": True,
+            "quality_score": 80,
+            "deal_price": 29.9,
+            "updated_at": t_old,
+        },
+    }
+    cloud_newer_deal = {
+        "_id": "c_p1",
+        "platform": "jd",
+        "product_id": "PROTECT_CLOUD_DEAL_1",
+        "name": "维达纸巾",
+        "price": 39.9,
+        "activity_price": 39.9,
+        "updated_at": now,
+        "deal_info": {
+            "is_deal_tip": True,
+            "source_site": "user_submit",
+            "source_item_id": "us_cloud_new_1",
+            "source_is_reliable": True,
+            "quality_score": 88,
+            "deal_price": 22.9,
+            "updated_at": now,
+        },
+    }
+    local_col = _FakeSyncCollection([local_old_deal])
+    cloud_col = _FakeSyncCollection([cloud_newer_deal])
+    rep = sync_mod.run_sync_round(local_col, cloud_col, window_days=3.0)
+    assert rep["reason_breakdown"] == {"format_info_changed": 1}
+    assert cloud_col.docs[0]["format_status"] == "success"
+    assert cloud_col.docs[0]["deal_info"]["source_item_id"] == "us_cloud_new_1"
+    assert cloud_col.docs[0]["deal_info"]["deal_price"] == 22.9
+
+    # 2) 本地对旧线报 gd_old_1 过期摘标时，不得把云端刚收录的新线报 us_cloud_new_1 误覆盖成过期
+    local_old_deal["deal_info"]["is_deal_tip"] = False
+    local_old_deal["deal_info"]["expired_at"] = now
+    local_old_deal["deal_info"]["updated_at"] = now
+    l_fp = sync_mod.extract_sync_fingerprint(local_old_deal)
+    c_fp = sync_mod.extract_sync_fingerprint(cloud_col.docs[0])
+    assert sync_mod.needs_cloud_merge(l_fp, c_fp) == (False, "up_to_date")
+
+    # 3) 云端为高可信线报时，本地低可信线报哪怕时间戳更晚也不能覆盖云端
+    local_unreliable = copy.deepcopy(local_old_deal)
+    local_unreliable["deal_info"] = {
+        "is_deal_tip": True,
+        "source_site": "other",
+        "source_item_id": "low_rel_1",
+        "source_is_reliable": False,
+        "quality_score": 90,
+        "deal_price": 19.9,
+        "updated_at": now + datetime.timedelta(minutes=5),
+    }
+    assert sync_mod.needs_cloud_merge(sync_mod.extract_sync_fingerprint(local_unreliable), c_fp) == (False, "up_to_date")
+
+

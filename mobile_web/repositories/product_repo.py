@@ -90,6 +90,7 @@ def upsert_cleaned_products_to_formal_table(
                     "product_id": 1,
                     "goods_sign": 1,
                     "deal_info.is_deal_tip": 1,
+                    "deal_info.source_item_id": 1,
                     "deal_info.source_is_reliable": 1,
                     "deal_info.quality_score": 1,
                     "deal_info.deal_price": 1,
@@ -113,6 +114,7 @@ def upsert_cleaned_products_to_formal_table(
             ),
         )
         best_doc = deepcopy(docs_sorted[-1])
+        verified_replace_ex_id = str(best_doc.pop("_verified_replace_source_item_id", "") or "").strip()
         deal_info = deepcopy(best_doc.pop("deal_info", {}) or {})
         new_score = int(deal_info.get("quality_score") or 0)
 
@@ -185,8 +187,12 @@ def upsert_cleaned_products_to_formal_table(
         ex_reliable = bool(ex_di.get("source_is_reliable"))
         new_reliable = bool(deal_info.get("source_is_reliable"))
         deal_info["source_is_reliable"] = new_reliable
-        should_protect = is_fresh_existing and (
-            ex_reliable if new_reliable != ex_reliable else (ex_score > new_score and not price_improved)
+        ex_item_id = str(ex_di.get("source_item_id") or "").strip()
+        verified_replace_hit = bool(verified_replace_ex_id and ex_item_id and ex_item_id == verified_replace_ex_id)
+        should_protect = False if verified_replace_hit else (
+            is_fresh_existing and (
+                ex_reliable if new_reliable != ex_reliable else (ex_score > new_score and not price_improved)
+            )
         )
 
         if should_protect:

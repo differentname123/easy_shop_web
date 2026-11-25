@@ -903,7 +903,11 @@ class MeiliSyncWorker:
         self.interval_seconds = max(0.05, float(interval_seconds))
         self.initial_delay_seconds = max(0.0, float(initial_delay_seconds))
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def wake(self) -> None:
+        self._wake_event.set()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -923,6 +927,7 @@ class MeiliSyncWorker:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=5.0)
         self._thread = None
@@ -937,5 +942,7 @@ class MeiliSyncWorker:
                     sync_products_diff(target, stop_event=self._stop_event)
             except Exception as exc:
                 logger.warning("【Meilisearch定时同步】后台同步巡检异常 | 异常<%s>", format_exc_summary(exc))
-            if self._stop_event.wait(timeout=self.interval_seconds):
+            self._wake_event.wait(timeout=self.interval_seconds)
+            self._wake_event.clear()
+            if self._stop_event.is_set():
                 break

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""详情页锚定用户爆料核心服务：官品锁定、安全图片压缩、进入既有流水线及个人记录查询。"""
+"""详情页锚定用户爆料接入服务：官品核实、安全图片压缩、入池唤醒与个人记录查询。"""
 from __future__ import annotations
 
 import base64
@@ -18,26 +18,26 @@ from PIL import Image, ImageOps
 
 Image.MAX_IMAGE_PIXELS = 25_000_000
 
+from adapters import PlatformUnavailableError
 from auth import mask_phone
 from cache_utils import ThreadSafeTTLCache
 from models.deal_constants import (
-    CLEAN_STAGE_NEED_AI2,
+    CLEAN_STAGE_NEED_USER_AUDIT,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
     ERR_AI2_MAIN_DEAD_ONLY_FILLER,
     ERR_AI2_PRODUCT_MISMATCH,
     ERR_AI2_VIRTUAL_OR_JUNK,
     ERR_LOW_QUALITY_SCORE,
+    ERR_USER_AUDIT_REJECTED,
+    OK_EXISTING_DEAL_BETTER,
     OK_SKIPPED_ALREADY_CLEANED,
     USER_SUBMIT_SITE,
+    is_reliable_source_site,
 )
-from models.product import URL_RE, extract_all_tokens, normalize_platform
+from models.product import URL_RE, normalize_platform
 from repositories.deal_raw_pool_repo import DealRawPoolRepository
 from repositories.user_repo import UserRepository
 from services.deal_cleaning.text_sanitizer import normalize_inline_spaces
-from services.deal_cleaning.url_venue import (
-    _is_official_ecommerce_http_url,
-    detect_candidate_platform,
-)
 
 USER_SUBMIT_WINDOW_SECONDS = 600
 USER_SUBMIT_MAX_PER_WINDOW = 5
@@ -72,20 +72,7 @@ class DealSubmitError(Exception):
         self.status_code = status_code
 
 
-def _canonical_product_url(plat: str, gid: str, product_url: str) -> str:
-    clean_u = str(product_url or "").strip()
-    if clean_u.lower().startswith(("http://", "https://")) and _is_official_ecommerce_http_url(clean_u):
-        return clean_u
-    if plat == "jd" and gid and not gid.startswith("jd_img_"):
-        return f"https://item.jd.com/{gid}.html"
-    if plat == "taobao" and gid:
-        return f"https://item.taobao.com/item.htm?id={gid}"
-    if plat == "pdd" and gid:
-        return f"https://mobile.yangkeduo.com/goods.html?goods_id={gid}"
-    return ""
-
-
-def _build_official_product_snapshot(detail_data: Dict[str, Any], canonical_url: str) -> Dict[str, Any]:
+def _build_official_product_snapshot(detail_data: Dict[str, Any], product_url: str) -> Dict[str, Any]:
     price = float(detail_data.get("price") or 0.0)
     original_price = float(detail_data.get("original_price") or price or 0.0)
     return {
@@ -101,7 +88,7 @@ def _build_official_product_snapshot(detail_data: Dict[str, Any], canonical_url:
         "carousel_images": list(detail_data.get("carousel_images") or []),
         "sales_tip": str(detail_data.get("sales_tip") if detail_data.get("sales_tip") is not None else "0"),
         "platform_name": str(detail_data.get("platform_name") or "").strip(),
-        "product_url": canonical_url or str(detail_data.get("product_url") or "").strip(),
+        "product_url": product_url,
         "desc": str(detail_data.get("desc") or ""),
         "detail_tags": list(detail_data.get("detail_tags") or []),
         "service_guarantees": list(detail_data.get("service_guarantees") or []),
@@ -194,7 +181,7 @@ def cleanup_expired_deal_submit_images(image_dir: Optional[Path] = None, now: Op
 
 
 class DealSubmitService:
-    """简洁核心版用户爆料服务。"""
+    """高内聚用户爆料接入服务：只做入参边界校验、官品核实、本地截图管理与进度查询。"""
 
     def __init__(
         self,
@@ -204,18 +191,22 @@ class DealSubmitService:
         user_repo: Optional[UserRepository] = None,
         product_service: Any = None,
         image_dir: Optional[Path] = None,
-        coupon_converter: Optional[Callable[..., Dict[str, Any]]] = None,
     ):
         self._product_service = product_service
         self._product_service_getter = product_service_getter
         self._raw_repo = raw_repo
         self._user_repo = user_repo
-        self._coupon_converter = coupon_converter
-        self._coupon_cleaner: Any = None
-        self._coupon_cleaner_lock = threading.Lock()
+        self._wake_event = threading.Event()
         self.image_dir = Path(image_dir) if image_dir is not None else _DEFAULT_IMAGE_DIR
         self._rate_cache = ThreadSafeTTLCache(maxsize=4096, ttl=USER_SUBMIT_WINDOW_SECONDS)
         self._last_cleanup_ts = 0.0
+
+    @property
+    def wake_event(self):
+        return self._wake_event
+
+    def notify_worker(self) -> None:
+        self._wake_event.set()
 
     @property
     def raw_repo(self) -> DealRawPoolRepository:
@@ -238,100 +229,6 @@ class DealSubmitService:
         from api.home import product_service as shared_ps
 
         return shared_ps
-
-    def _validate_coupon_input(self, coupon_input: str, main_plat: str) -> Dict[str, Any]:
-        clean_cpn = normalize_inline_spaces(str(coupon_input or "")).strip()
-        if not clean_cpn:
-            return {"raw": "", "urls": [], "tokens": []}
-        if len(clean_cpn) > MAX_COUPON_LEN:
-            raise DealSubmitError("优惠券链接或口令过长", error_code="coupon_too_long", status_code=400)
-
-        urls = URL_RE.findall(clean_cpn)
-        tokens = extract_all_tokens(clean_cpn)
-        if not urls and not tokens:
-            raise DealSubmitError(
-                "额外优惠券请填写淘宝/京东/拼多多官方域领券链接或合法口令",
-                error_code="invalid_coupon_input",
-                status_code=400,
-            )
-
-        for u in urls:
-            if not _is_official_ecommerce_http_url(u) or detect_candidate_platform(u, "unknown") == "unsupported_other":
-                raise DealSubmitError(
-                    "仅支持淘宝、天猫、京东、拼多多官方域领券链接",
-                    error_code="unsupported_coupon_domain",
-                    status_code=400,
-                )
-
-        target_input = urls[0] if urls else clean_cpn
-        det_plat = detect_candidate_platform(target_input, main_plat)
-        if det_plat in ("jd", "taobao", "pdd") and det_plat != main_plat:
-            raise DealSubmitError("优惠券所属平台与当前商品不一致", error_code="coupon_platform_mismatch", status_code=400)
-        return {"raw": target_input, "urls": urls, "tokens": tokens}
-
-    def _convert_coupon_target(self, target: Dict[str, Any], default_plat: str) -> Dict[str, Any]:
-        if callable(self._coupon_converter):
-            return self._coupon_converter(target, default_plat=default_plat)
-        with self._coupon_cleaner_lock:
-            if self._coupon_cleaner is None:
-                from services.deal_pool_cleaner import DealPoolCleaner
-
-                self._coupon_cleaner = DealPoolCleaner()
-            cleaner = self._coupon_cleaner
-        return cleaner.convert_single_target(target, default_plat=default_plat)
-
-    def _resolve_coupon_target(
-        self,
-        cpn_target: Dict[str, Any],
-        *,
-        main_plat: str,
-        canonical_pid: str,
-        canonical_gid: str,
-    ) -> Dict[str, Any]:
-        c_res = self._convert_coupon_target(cpn_target, default_plat=main_plat)
-        c_status = str(c_res.get("convert_status") or "")
-        c_plat = normalize_platform(c_res.get("platform") or main_plat)
-        c_gid = str(c_res.get("goods_id") or "").strip()
-        if c_status == "product":
-            same_item = c_plat == main_plat and c_gid in {x for x in (canonical_pid, canonical_gid) if x}
-            if not same_item:
-                raise DealSubmitError(
-                    "额外优惠券链接实际指向其他独立商品，请填写官方领券链接或口令",
-                    error_code="coupon_product_mismatch",
-                    status_code=400,
-                )
-            promo_cpn = str(
-                (c_res.get("promo_payload") or {}).get("coupon_url")
-                or (c_res.get("official_product") or {}).get("coupon_url")
-                or ""
-            ).strip()
-            if not promo_cpn:
-                raise DealSubmitError(
-                    "该链接为商品链接，请在额外券栏填写官方领券链接或口令",
-                    error_code="invalid_coupon_input",
-                    status_code=400,
-                )
-            return {
-                "link_id": c_res.get("link_id") or cpn_target.get("link_id") or "L2",
-                "clean_input": c_res.get("clean_input") or cpn_target.get("clean_input") or "",
-                "text_role_hint": "coupon_candidate",
-                "convert_status": "coupon_or_activity",
-                "platform": c_plat,
-                "goods_id": "",
-                "goods_sign": "",
-                "error_code": "OK_COUPON",
-                "error_msg": "",
-                "official_product": None,
-                "my_promo_link": promo_cpn,
-                "my_promo_token": str(c_res.get("my_promo_token") or ""),
-            }
-        if c_status != "coupon_or_activity":
-            raise DealSubmitError(
-                str(c_res.get("error_msg") or "额外优惠券链接无效或无法识别"),
-                error_code="invalid_coupon_input",
-                status_code=400,
-            )
-        return {k: v for k, v in c_res.items() if k != "adapter_res"}
 
     def _consume_rate_limit(self, uid: str) -> None:
         now = time.time()
@@ -369,6 +266,24 @@ class DealSubmitService:
         file_path = self.image_dir / f"{clean_id}.jpg"
         return file_path if file_path.is_file() else None
 
+    def delete_image_urls(self, image_urls: List[str]) -> int:
+        """安全删除审核驳回投稿关联的本地压缩图。"""
+        removed = 0
+        for raw_u in image_urls or []:
+            u = str(raw_u or "").strip()
+            if not u.startswith("/api/deals/image/"):
+                continue
+            img_id = u.rsplit("/", 1)[-1].strip()
+            path = self.get_image_file_path(img_id)
+            if path is None:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
     def submit_user_deal(
         self,
         *,
@@ -386,9 +301,9 @@ class DealSubmitService:
         if not clean_uid:
             raise DealSubmitError("请先登录后再提交好价爆料", error_code="unauthorized", status_code=401)
 
-        plat = normalize_platform(platform)
-        if plat not in ("pdd", "jd", "taobao"):
-            raise DealSubmitError("暂不支持该商品平台", error_code="unsupported_platform", status_code=400)
+        plat = normalize_platform(platform, default="")
+        if not plat:
+            raise DealSubmitError("缺少商品平台标识", error_code="unsupported_platform", status_code=400)
 
         clean_pid_arg = str(product_id or "").strip()
         clean_gid_arg = str(goods_id or "").strip()
@@ -409,11 +324,10 @@ class DealSubmitService:
             raise DealSubmitError("请填写购买步骤或优惠说明", error_code="empty_tutorial", status_code=400)
         if len(clean_tut) > MAX_TUTORIAL_LEN:
             raise DealSubmitError(f"玩法说明不能超过 {MAX_TUTORIAL_LEN} 字", error_code="tutorial_too_long", status_code=400)
-        for bad_u in URL_RE.findall(clean_tut):
-            if not _is_official_ecommerce_http_url(bad_u):
-                raise DealSubmitError("玩法说明内请勿包含站外链接", error_code="unsupported_external_url", status_code=400)
 
-        cpn_info = self._validate_coupon_input(coupon_input, plat)
+        clean_cpn = normalize_inline_spaces(str(coupon_input or "")).strip()
+        if len(clean_cpn) > MAX_COUPON_LEN:
+            raise DealSubmitError("优惠券链接或口令过长", error_code="coupon_too_long", status_code=400)
 
         raw_imgs = list(images_base64 or [])
         if len(raw_imgs) > USER_SUBMIT_MAX_IMAGES:
@@ -426,19 +340,25 @@ class DealSubmitService:
         self._consume_rate_limit(clean_uid)
         compressed_blobs = [normalize_and_compress_deal_image(b64) for b64 in raw_imgs]
 
-        detail_res = self.product_service.get_goods_detail(
-            platform=plat,
-            goods_id_or_sign=lookup_key,
-            goods_id=clean_gid_arg or clean_pid_arg or None,
-            goods_sign=clean_gsign_arg or None,
-            uid=clean_uid,
-        )
+        try:
+            detail_res = self.product_service.get_goods_detail(
+                platform=plat,
+                goods_id_or_sign=lookup_key,
+                goods_id=clean_gid_arg or clean_pid_arg or None,
+                goods_sign=clean_gsign_arg or None,
+                uid=clean_uid,
+            )
+        except PlatformUnavailableError as exc:
+            raise DealSubmitError(str(exc), error_code="unsupported_platform", status_code=400) from exc
+
         if not isinstance(detail_res, dict) or detail_res.get("status") != "success" or not isinstance(detail_res.get("data"), dict):
             err_msg = (detail_res or {}).get("error_msg") if isinstance(detail_res, dict) else ""
-            raise DealSubmitError(err_msg or "未能核实到该商品，请返回详情页重试", error_code="product_not_verified", status_code=400)
+            err_code = (detail_res or {}).get("error_code") if isinstance(detail_res, dict) else ""
+            out_code = "unsupported_platform" if err_code in ("platform_unavailable", "capability_unavailable") else "product_not_verified"
+            raise DealSubmitError(err_msg or "未能核实到该商品，请返回详情页重试", error_code=out_code, status_code=400)
 
         detail_data = detail_res["data"]
-        resolved_plat = normalize_platform(detail_data.get("platform") or plat)
+        resolved_plat = normalize_platform(detail_data.get("platform") or plat, default=plat)
         canonical_pid = str(detail_data.get("product_id") or detail_data.get("goods_id") or detail_data.get("goods_sign") or "").strip()
         canonical_gid = str(detail_data.get("goods_id") or canonical_pid).strip()
         canonical_gsign = str(detail_data.get("goods_sign") or "").strip()
@@ -446,31 +366,29 @@ class DealSubmitService:
         if not canonical_pid or not official_title:
             raise DealSubmitError("商品官方基础信息不完整，暂不支持爆料", error_code="invalid_product_detail", status_code=400)
 
-        cpn_raw = cpn_info["raw"]
-        canonical_url = _canonical_product_url(resolved_plat, canonical_gid, str(detail_data.get("product_url") or ""))
-        official_card = _build_official_product_snapshot(detail_data, canonical_url)
-
+        product_url = str(detail_data.get("product_url") or "").strip()
+        official_card = _build_official_product_snapshot(detail_data, product_url)
         main_anchor_ref = (
             canonical_gsign
             if (resolved_plat == "jd" and canonical_gsign and not canonical_gsign.startswith("jd_img_"))
-            else canonical_gid or canonical_pid
+            else (canonical_gid or canonical_pid)
         )
-        main_target = {
+        main_clean_input = product_url or main_anchor_ref
+        targets: List[Dict[str, Any]] = [{
             "link_id": "L1",
             "raw_span": "[#L1]",
-            "clean_input": canonical_url or main_anchor_ref,
+            "clean_input": main_clean_input,
             "platform": resolved_plat,
             "text_role_hint": "main_candidate",
-        }
-        targets: List[Dict[str, Any]] = [main_target]
+        }]
         extracted_links: List[Dict[str, Any]] = (
-            [{"url": canonical_url, "label": "官方商品"}]
-            if canonical_url
+            [{"url": product_url, "label": "官方商品"}]
+            if product_url
             else [{"item_id": main_anchor_ref, "label": "官方商品"}]
         )
         extracted_tokens: List[str] = []
 
-        main_conv = {
+        converted_links: List[Dict[str, Any]] = [{
             "link_id": "L1",
             "text_role_hint": "main_candidate",
             "convert_status": "product",
@@ -479,40 +397,32 @@ class DealSubmitService:
             "goods_sign": canonical_gsign,
             "my_promo_link": "",
             "my_promo_token": "",
-            "clean_input": canonical_url or main_anchor_ref,
+            "clean_input": main_clean_input,
             "official_product": official_card,
-        }
-        converted_links: List[Dict[str, Any]] = [main_conv]
+        }]
 
-        if cpn_raw:
-            cpn_target = {
+        if clean_cpn:
+            cpn_urls = URL_RE.findall(clean_cpn)
+            cpn_clean_input = cpn_urls[0] if cpn_urls else clean_cpn
+            targets.append({
                 "link_id": "L2",
-                "raw_span": cpn_raw,
-                "clean_input": cpn_raw,
+                "raw_span": clean_cpn,
+                "clean_input": cpn_clean_input,
                 "platform": resolved_plat,
                 "text_role_hint": "coupon_candidate",
-            }
-            converted_links.append(
-                self._resolve_coupon_target(
-                    cpn_target,
-                    main_plat=resolved_plat,
-                    canonical_pid=canonical_pid,
-                    canonical_gid=canonical_gid,
-                )
-            )
-            targets.append(cpn_target)
-            if cpn_info["urls"]:
-                extracted_links.append({"url": cpn_raw, "label": "优惠券"})
+            })
+            if cpn_urls:
+                extracted_links.append({"url": cpn_clean_input, "label": "优惠券"})
             else:
-                extracted_tokens.append(cpn_raw)
+                extracted_tokens.append(cpn_clean_input)
             combined_raw_text = f"主商品：[#L1]\n领券：[#L2]\n到手价：{price_val:.2f}元\n购买玩法：{clean_tut}"
-            tutorial_text_db = f"{clean_tut}\n领券：{cpn_raw}"
+            tutorial_text_db = f"{clean_tut}\n领券：{cpn_clean_input}"
         else:
             combined_raw_text = f"主商品：[#L1]\n到手价：{price_val:.2f}元\n购买玩法：{clean_tut}"
             tutorial_text_db = clean_tut
 
         image_urls = self._persist_compressed_images(compressed_blobs)
-        sig_payload = f"{clean_uid}|{resolved_plat}:{canonical_pid}|{price_val:.2f}|{clean_tut}|{cpn_raw}|{len(image_urls)}"
+        sig_payload = f"{clean_uid}|{resolved_plat}:{canonical_pid}|{price_val:.2f}|{clean_tut}|{clean_cpn}|{len(image_urls)}"
         tip_id = f"us_{hashlib.sha256(sig_payload.encode('utf-8')).hexdigest()[:20]}"
 
         ai_stage1_result = {
@@ -532,7 +442,7 @@ class DealSubmitService:
             "source_site": USER_SUBMIT_SITE,
             "source_channel": "detail_anchor",
             "source_item_id": tip_id,
-            "source_is_reliable": False,
+            "source_is_reliable": is_reliable_source_site(USER_SUBMIT_SITE),
             "is_group_stream": False,
             "has_full_detail": True,
             "platform": resolved_plat,
@@ -548,14 +458,16 @@ class DealSubmitService:
             "extracted_tokens": extracted_tokens,
             "publish_ts": time.time(),
             "submitted_by_uid": clean_uid,
-            "clean_stage": CLEAN_STAGE_NEED_AI2,
+            "clean_stage": CLEAN_STAGE_NEED_USER_AUDIT,
             "ai_stage1_result": ai_stage1_result,
             "converted_links": converted_links,
             "hot_metrics": {"provider_nickname": nick},
         }
         res = self.raw_repo.save_batch([raw_record], task_name=USER_SUBMIT_SITE)
         if res.get("error"):
+            self.delete_image_urls(image_urls)
             raise DealSubmitError("服务暂时不可用，请稍后重试", error_code="db_write_error", status_code=503)
+        self.notify_worker()
 
         return {
             "status": "success",
@@ -580,12 +492,17 @@ class DealSubmitService:
         for row in rows:
             c_status = str(row.get("clean_status") or "pending")
             err_code = str(row.get("clean_error_code") or "")
+            raw_err_msg = str(row.get("clean_error_msg") or "").strip()
             if c_status == "pending":
                 ui_state = "pending"
                 state_label = "核验中"
                 reason = "正在自动核验并入库"
             elif c_status == "cleaned_success":
-                if err_code == OK_SKIPPED_ALREADY_CLEANED:
+                if err_code == OK_EXISTING_DEAL_BETTER:
+                    ui_state = "duplicate"
+                    state_label = "已有更优好价"
+                    reason = (raw_err_msg or "当前商品已有更优好价在架，本次暂未替换")[:80]
+                elif err_code == OK_SKIPPED_ALREADY_CLEANED:
                     ui_state = "duplicate"
                     state_label = "已有同款在架"
                     reason = "该商品近期已有同款好价收录"
@@ -596,7 +513,16 @@ class DealSubmitService:
             else:
                 ui_state = "rejected"
                 state_label = "未通过"
-                reason = _FRIENDLY_ERROR_LABELS.get(err_code) or str(row.get("clean_error_msg") or "未通过核验")[:60]
+                if err_code == ERR_USER_AUDIT_REJECTED:
+                    reason = raw_err_msg[:80] or "图文内容与当前商品无关或未通过安全审核"
+                elif err_code == ERR_AI2_COUPON_FAILED_OR_DROPPED:
+                    reason = (
+                        raw_err_msg[:80]
+                        if raw_err_msg and not raw_err_msg.startswith("AI-2 ")
+                        else _FRIENDLY_ERROR_LABELS[ERR_AI2_COUPON_FAILED_OR_DROPPED]
+                    )
+                else:
+                    reason = _FRIENDLY_ERROR_LABELS.get(err_code) or (raw_err_msg or "未通过核验")[:60]
 
             s1 = row.get("ai_stage1_result") if isinstance(row.get("ai_stage1_result"), dict) else {}
             res_plat = str(row.get("resolved_platform") or row.get("platform") or "").strip()
@@ -617,5 +543,11 @@ class DealSubmitService:
                 "created_at": _iso_or_str(row.get("first_seen_at")),
                 "cleaned_at": _iso_or_str(row.get("cleaned_at")),
             })
-
-        return {"status": "success", "data": {"items": items}}
+        return {
+            "status": "success",
+            "data": {
+                "items": items,
+                "can_submit": True,
+                "strikes": 0,
+            },
+        }

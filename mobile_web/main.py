@@ -22,6 +22,7 @@ from infrastructure.mongo import close_shared_db
 from infrastructure.search_meili import MeiliSyncWorker
 from infrastructure.transport import configure_transport
 from services.detail_prefetch import DetailPrefetcher
+from services.deal_submit_worker import DealSubmitWorker
 from services.order_service import OrderSyncWorker
 
 from config import logger, settings
@@ -65,11 +66,13 @@ async def lifespan(app: FastAPI):
     warmup_thread = None
     order_sync_worker = None
     meili_sync_worker = None
+    deal_submit_worker = None
     gh_worker_started = False
     warmup_stop = threading.Event()
     app.state.detail_prefetcher = None
     app.state.order_sync_worker = None
     app.state.meili_sync_worker = None
+    app.state.deal_submit_worker = None
 
     def warm_connections():
         # 预取关闭时保留旧的首榜预热，但线程及其摘要写入必须随 lifespan 回收。
@@ -140,11 +143,27 @@ async def lifespan(app: FastAPI):
             meili_sync_worker = MeiliSyncWorker(lambda: getattr(product_service, "repo", None))
             app.state.meili_sync_worker = meili_sync_worker
             meili_sync_worker.start()
+        ds_flag = getattr(settings, "deal_submit_worker_enabled", None)
+        deal_submit_worker_on = (
+            ds_flag if ds_flag is not None else (settings.detail_prefetch_enabled or settings.warmup_enabled)
+        )
+        if deal_submit_worker_on:
+            from api.deal_submit import deal_submit_service
+
+            deal_submit_worker = DealSubmitWorker(
+                submit_service=deal_submit_service,
+                on_formal_updated=(meili_sync_worker.wake if meili_sync_worker is not None else None),
+            )
+            app.state.deal_submit_worker = deal_submit_worker
+            deal_submit_worker.start()
         product_stats_buffer.start()
         yield
     finally:
         warmup_stop.set()
         await asyncio.to_thread(product_stats_buffer.stop)
+        if deal_submit_worker is not None:
+            await asyncio.to_thread(deal_submit_worker.stop)
+            app.state.deal_submit_worker = None
         if meili_sync_worker is not None:
             await asyncio.to_thread(meili_sync_worker.stop)
             app.state.meili_sync_worker = None

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from infrastructure.ai_api.json_parser import parse_llm_json
 from infrastructure.ai_api.model_api import generate_content
@@ -56,19 +56,60 @@ class DealAIClient:
     def get_stage2_prompt(self) -> str:
         return self.load_prompt_text(self.stage2_prompt_path)
 
-    def _invoke_model(self, full_prompt: str) -> Any:
+    def _invoke_model(self, full_prompt: str, file_paths: Optional[List[str]] = None) -> Any:
         caller = self.ai_caller or generate_content
-        kwargs = {
+        kwargs: Dict[str, Any] = {
             "prompt": full_prompt,
             "preset_model_group": "low",
             "max_retries_per_model": 1,
             "timeout": self.ai_timeout,
             "stop_on_timeout": True,
         }
+        if file_paths:
+            kwargs["file_paths"] = list(file_paths)
         if self.ai_semaphore is not None:
             with self.ai_semaphore:
                 return caller(**kwargs)
         return caller(**kwargs)
+
+    def call_json_object(
+        self,
+        prompt_template: str,
+        payload: Dict[str, Any],
+        *,
+        file_paths: Optional[List[str]] = None,
+        stage_label: str = "AI-Object",
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """复用统一低档模型组执行单对象图文推理并解析 JSON 字典；失败时返回 (None, 原因)。"""
+        if not prompt_template:
+            return None, "提示词模板为空"
+        payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+        full_prompt = (
+            f"{prompt_template}\n\n"
+            f"==================== 待处理结构化输入数据 ====================\n"
+            f"{payload_json}"
+        )
+        try:
+            resp = self._invoke_model(full_prompt, file_paths=file_paths)
+            resp_text = ""
+            if isinstance(resp, dict):
+                if resp.get("status") != "✅ 成功":
+                    detail = "；".join(str(err) for err in (resp.get("error_history") or []))
+                    return None, detail or str(resp.get("content") or f"{stage_label} 调用未返回成功")
+                resp_text = str(resp.get("content") or "")
+            elif resp:
+                resp_text = str(resp)
+            cleaned_text = resp_text.strip()
+            if not cleaned_text:
+                return None, f"{stage_label} 返回内容为空"
+            parsed = parse_llm_json(cleaned_text)
+            if not isinstance(parsed, dict):
+                return None, f"{stage_label} 未返回合法 JSON 对象"
+            return parsed, ""
+        except Exception as e:
+            err_brief = str(e).splitlines()[0][:200]
+            logger.debug("[%s] 单对象模型调用异常: %s", stage_label, err_brief)
+            return None, err_brief
 
     def call_json_array(
         self,

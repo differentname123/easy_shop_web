@@ -323,8 +323,45 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "deal_ready": deal_ready,
         "deal_expired": deal_expired,
         "deal_sig": deal_sig,
+        "deal_updated_ms": to_utc_millis(deal_info.get("updated_at")),
+        "deal_reliable": bool(deal_info.get("source_is_reliable")),
+        "deal_item_id": str(deal_info.get("source_item_id") or ""),
         "is_user_collected": bool(doc.get("is_user_collected") is True),
     }
+
+
+def _should_protect_cloud_deal(
+    local_fp: Dict[str, Any],
+    cloud_fp: Optional[Dict[str, Any]],
+) -> bool:
+    """保护云端更新鲜或更高可信度的在架好价，不被本地较旧或已过期的线报快照覆盖。"""
+    if cloud_fp is None or not cloud_fp.get("deal_ready"):
+        return False
+
+    l_id = str(local_fp.get("deal_item_id") or "").strip()
+    c_id = str(cloud_fp.get("deal_item_id") or "").strip()
+    l_ms = local_fp.get("deal_updated_ms")
+    c_ms = cloud_fp.get("deal_updated_ms")
+
+    if local_fp.get("deal_ready"):
+        if l_id and c_id and l_id == c_id:
+            return False
+        l_rel = bool(local_fp.get("deal_reliable"))
+        c_rel = bool(cloud_fp.get("deal_reliable"))
+        if c_rel and not l_rel:
+            return True
+        if c_rel == l_rel and c_ms is not None and (l_ms is None or c_ms > l_ms):
+            return True
+        return False
+
+    if local_fp.get("deal_expired"):
+        if l_id and c_id and l_id != c_id:
+            return True
+        if c_ms is not None and l_ms is not None and c_ms > l_ms:
+            return True
+        return False
+
+    return False
 
 
 def needs_cloud_merge(
@@ -355,11 +392,12 @@ def needs_cloud_merge(
         if l_fms == c_fms and local_fp["fmt_sku_count"] != cloud_fp["fmt_sku_count"]:
             return True, "format_info_changed"
 
-    if local_fp["deal_ready"]:
-        if not cloud_fp["deal_ready"] or local_fp["deal_sig"] != cloud_fp["deal_sig"]:
-            return True, "deal_info_changed"
-    elif local_fp.get("deal_expired") and cloud_fp.get("deal_ready"):
-        return True, "deal_info_expired"
+    if not _should_protect_cloud_deal(local_fp, cloud_fp):
+        if local_fp["deal_ready"]:
+            if not cloud_fp["deal_ready"] or local_fp["deal_sig"] != cloud_fp["deal_sig"]:
+                return True, "deal_info_changed"
+        elif local_fp.get("deal_expired") and cloud_fp.get("deal_ready"):
+            return True, "deal_info_expired"
 
     return False, "up_to_date"
 
@@ -391,8 +429,14 @@ def build_product_merge_operation(
     )
 
     fmt_ready = local_fp["fmt_ready"]
-    deal_ready = local_fp["deal_ready"]
-    deal_expired_sync = bool(local_fp.get("deal_expired") and cloud_fp is not None and cloud_fp.get("deal_ready"))
+    protect_cloud_deal = _should_protect_cloud_deal(local_fp, cloud_fp)
+    deal_ready = bool(local_fp["deal_ready"] and not protect_cloud_deal)
+    deal_expired_sync = bool(
+        local_fp.get("deal_expired")
+        and cloud_fp is not None
+        and cloud_fp.get("deal_ready")
+        and not protect_cloud_deal
+    )
 
     set_fields: Dict[str, Any] = {}
     for key, value in local_doc.items():
