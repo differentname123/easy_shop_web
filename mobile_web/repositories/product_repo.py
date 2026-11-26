@@ -234,12 +234,16 @@ def upsert_cleaned_products_to_formal_table(
                 new_site and new_item_id and (not ex_is_active or (ex_site, ex_item_id) != (new_site, new_item_id))
             )
             if is_new_deal_takeover:
-                started_deals.append({
+                started_entry: Dict[str, Any] = {
                     "source_site": new_site,
                     "source_item_id": new_item_id,
                     "started_at": now,
-                })
+                }
                 if ex_is_active and ex_site and ex_item_id:
+                    started_entry["replaces_site"] = ex_site
+                    started_entry["replaces_item_id"] = ex_item_id
+                    if ex_dp is not None:
+                        started_entry["replaces_price"] = ex_dp
                     replaced_deals.append({
                         "old_site": ex_site,
                         "old_item_id": ex_item_id,
@@ -247,6 +251,7 @@ def upsert_cleaned_products_to_formal_table(
                         "new_item_id": new_item_id,
                         "ended_at": now,
                     })
+                started_deals.append(started_entry)
                 ex_stats = (ex_record or {}).get("user_stats")
                 if isinstance(ex_stats, dict) and ("buyable" in ex_stats or "unbuyable" in ex_stats):
                     set_fields["user_stats.buyable"] = 0

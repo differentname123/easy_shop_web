@@ -1489,15 +1489,6 @@ body {
   }
 }
 
-@media (min-width: 768px) {
-  #group-help-app,
-  .gh-header,
-  .gh-bottom-bar,
-  .gh-sheet {
-    max-width: 760px;
-  }
-}
-
 /* 全站合规 ICP 备案号页脚 */
 .site-icp-footer {
   margin-top: auto;

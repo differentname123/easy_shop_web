@@ -1116,7 +1116,7 @@
         }
       };
 
-      // ==================== 参团一键直达与计数 (keepalive 防丢失 + 微信/手机/电脑全环境直接跳团，绝不弹截图二次阻断) ====================
+      // ==================== 参团一键直达与计数 (keepalive 防丢失 + 微信/手机浏览器全环境直接跳团，绝不弹截图二次阻断) ====================
       let appFallbackTimer = null;
 
       const clearAppFallbackTimer = () => {
@@ -1242,12 +1242,8 @@
         clearAppFallbackTimer();
         recordClick(item.group_order_id);
 
-        const inAppWebView = isInAppWebView();
         const mobileBrowser = isMobileNonWeChat();
-        const willNavigateCurrentTab = !userGesture || inAppWebView || mobileBrowser;
-        if (willNavigateCurrentTab) {
-          rememberReturnGroup(item);
-        }
+        rememberReturnGroup(item);
 
         // 1. 手机系统浏览器（非微信等内置 WebView）且由点击触发：优先唤醒拼多多 App，若未安装则在 800ms 后自动兜底直达 H5 参团页（无需二次点击）
         if (!preferH5Only && userGesture && mobileBrowser && appUrl) {
@@ -1263,17 +1259,9 @@
           return;
         }
 
-        // 2. 微信内置浏览器（含手机微信与电脑微信）、其他内置 WebView 或分享直达自动跳转：拼多多官方 H5 在微信内原生直通，直接当前页访问拼团链接
-        if (willNavigateCurrentTab || typeof global.open !== 'function') {
-          if (h5Url) {
-            global.location.href = h5Url;
-          }
-          return;
-        }
-
-        // 3. 桌面外部浏览器点击触发：新标签页直接打开拼团链接，当前页保留反馈面板
+        // 2. 微信内置浏览器、其他内置 WebView 或降级直达：直接当前页访问拼团 H5 链接
         if (h5Url) {
-          global.open(h5Url, '_blank', 'noopener,noreferrer');
+          global.location.href = h5Url;
         }
       };
 
@@ -1286,11 +1274,6 @@
         ) {
           openDetail(item);
           return;
-        }
-        const userGesture = options.userGesture !== false;
-        const willNavigateCurrentTab = !userGesture || isInAppWebView() || isMobileNonWeChat();
-        if (!selectedGroup.value && !willNavigateCurrentTab) {
-          pushModalHistory(item.group_order_id || '');
         }
         selectedGroup.value = { ...item };
         syncGroupPageTitle(selectedGroup.value);

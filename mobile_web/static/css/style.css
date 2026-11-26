@@ -1,6 +1,6 @@
 /* ==========================================================================
    查券省钱 · 严选好价导购服务 - 专属样式表
-   适配手机屏幕、桌面宽屏多列网格、iOS安全区与微信内置浏览器
+   适配手机屏幕、iOS安全区与微信内置浏览器
    ========================================================================== */
 
 :root {
@@ -2485,66 +2485,6 @@ body {
   cursor: not-allowed;
   filter: grayscale(0.45);
   pointer-events: none;
-}
-
-/* ================== 平板与桌面宽屏自适应多列布局 ================== */
-@media (min-width: 768px) {
-  #app,
-  .top-header,
-  .bottom-tab-bar,
-  .detail-bottom-nav,
-  .detail-nav-bar {
-    max-width: 760px !important;
-  }
-
-  .a2hs-banner {
-    display: none;
-  }
-
-  .back-to-top-btn {
-    right: max(16px, calc(50% - 364px));
-  }
-
-  .goods-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-    padding: 10px 12px;
-  }
-}
-
-@media (min-width: 1080px) {
-  #app:not(.detail-container),
-  .top-header,
-  .bottom-tab-bar {
-    max-width: 980px !important;
-  }
-
-  .back-to-top-btn {
-    right: max(16px, calc(50% - 474px));
-  }
-
-  .goods-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 14px;
-    padding: 12px 14px;
-  }
-
-  .tab-user .user-profile-header,
-  .tab-user .universal-convert-card,
-  .tab-user .auth-reg-card,
-  .tab-user .stats-card,
-  .tab-user .order-section-card,
-  .tab-user .auth-card,
-  .tab-user .menu-list,
-  .tab-user .section-title {
-    max-width: 680px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-
-  .tab-user .user-profile-header {
-    border-radius: 0 0 16px 16px;
-  }
 }
 
 /* ================== 全站合规 ICP 备案号页脚 ================== */

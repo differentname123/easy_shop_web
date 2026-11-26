@@ -767,21 +767,3 @@
   border-radius: 14px;
   pointer-events: none;
 }
-
-@media (min-width: 768px) {
-  .hero-carousel {
-    padding-top: 0;
-    height: 420px;
-    background: #ffffff;
-  }
-
-  .hero-slide img {
-    object-fit: contain;
-  }
-
-  .detail-img-full {
-    max-width: 560px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-}

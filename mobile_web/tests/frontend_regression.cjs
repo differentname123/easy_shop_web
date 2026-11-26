@@ -2488,7 +2488,8 @@ test('group_help detail-first & 1-click join UX: hall card opens detail, WeChat 
   assert.equal(hDesktop.page.uploadResultModal.value.visible, true);
   hDesktop.page.chooseJoinMatchedGroup();
   assert.equal(hDesktop.page.uploadResultModal.value.visible, false);
-  assert.equal(hDesktop.opened.at(-1), sampleGroup.h5_join_url, 'clicking join matched group directly opens group URL in 1 click');
+  assert.equal(hDesktop.opened.length, 0, 'unified mobile-first jump never pops a desktop-only tab');
+  assert.equal(hDesktop.context.location.href, sampleGroup.h5_join_url, 'clicking join matched group directly navigates to group URL in 1 click');
 
   // 5. DOM 模板守卫与静态零微信敏感词校验：大厅列表卡片点击必须绑定 openDetail(item)，绝不可绑定 directJoinGroup
   const forbidden = /返利|返现|打钱|提现红包|购物补贴|折合到手|自动存入钱包|随时提现/;
@@ -3192,12 +3193,11 @@ test('Wave 4B frontend fixes: poster_url badge & CSS, cross-origin tok_ routing,
     assert.ok(groupHelpCss.includes(cls), `group_help.css defines ${cls}`);
   }
 
-  // 2. index.html empty vs error mutually exclusive; detail.html uses external detail.css; style.css responsive alignment
+  // 2. index.html empty vs error mutually exclusive; detail.html uses external detail.css
   assert.ok(indexHtml.includes('v-if="!homeLoading && homeError && homeGoodsList.length === 0"'));
   assert.equal(detailHtml.includes('<style>'), false);
   assert.ok(detailHtml.includes('/static/css/detail.css?v='));
   assert.ok(fs.existsSync(path.join(root, 'static', 'css', 'detail.css')));
-  assert.ok(styleCss.includes('#app:not(.detail-container)'));
 
   // 3. cross-origin tok_ share route
   const hFmt = harness();
@@ -3367,7 +3367,6 @@ test('converged QA fixes: logout cleanup, missing detail guard, group_help token
   assert.ok(groupHelpHtml.includes('href="/?tab=home&reset=1"'));
   assert.ok(styleCss.includes('.a2hs-banner ~ .back-to-top-btn'));
   assert.equal(styleCss.includes('margin: -24px 12px 12px;'), false);
-  assert.ok(detailCss.includes('height: 420px;'));
 });
 
 test('detail hasDealGuide reflects tutorial_steps only, removes redundant 怎么买, supports swipeable lightbox and full-bleed gallery', async () => {
@@ -3557,7 +3556,6 @@ test('QA surgical fixes: group_help copyShareText/firstPosterExampleUrl/smartPar
   assert.ok(detailHtml.includes('券减 ¥{{ formatMoney(goods.coupon_amount) }}'));
   assert.ok(groupHelpHtml.includes('firstPosterExampleUrl'));
   assert.ok(groupHelpHtml.includes('aria-label="关闭"'));
-  assert.ok(styleCss.includes('.tab-user .user-profile-header,'));
   assert.ok(groupHelpCss.includes('text-overflow: ellipsis;'));
 });
 
@@ -3928,18 +3926,21 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
   hGh.page.onTextShareInput();
   assert.equal(hGh.page.textSubmitModal.value.goods_name, '可口可乐500ml*5瓶');
 
-  // 5. browser.js: desktop opens external purchase URL in new tab without overwriting current page
+  // 5. browser.js: unified current-tab jump regardless of non-mobile UA or schema_url (no desktop-only popup branch)
   const hDesk = harness({ url: 'https://shop.test/detail?platform=jd&goods_id=100' });
   hDesk.context.navigator.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36';
   const deskOpened = [];
-  hDesk.context.open = (...args) => { deskOpened.push(args); return { closed: false }; };
+  hDesk.context.open = (...args) => { deskOpened.push(args); return null; };
   const deskBrowser = hDesk.context.EasyShop.createBrowserTools({ ref: hDesk.context.Vue.ref });
-  deskBrowser.jumpToLink({ final_link: 'https://u.jd.com/desk123' });
-  const deskTimer = [...hDesk.timers.values()].find(t => t.delay === 400);
-  assert.ok(deskTimer);
-  deskTimer.callback();
-  assert.deepEqual(deskOpened, [['https://u.jd.com/desk123', '_blank', 'noopener']]);
-  assert.equal(hDesk.context.location.href, 'https://shop.test/detail?platform=jd&goods_id=100');
+  deskBrowser.jumpToLink({
+    final_link: 'https://mobile.yangkeduo.com/duo_coupon_landing.html?goods_id=100',
+    schema_url: 'pinduoduo://com.xunmeng.pinduoduo/duo_coupon_landing.html',
+  });
+  const jumpTimer = [...hDesk.timers.values()].find(t => t.delay === 400);
+  assert.ok(jumpTimer);
+  jumpTimer.callback();
+  assert.equal(deskOpened.length, 0);
+  assert.equal(hDesk.context.location.href, 'https://mobile.yangkeduo.com/duo_coupon_landing.html?goods_id=100');
 
   // 6. feeds.js: non-back-forward visit to clean "/" drops stale home_search_keyword and loads hot list
   const hCleanHome = harness({
@@ -3963,7 +3964,13 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
   assert.ok(detailHtml.includes('is-standalone-error'));
 
   const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+  const detailCss = fs.readFileSync(path.join(root, 'static', 'css', 'detail.css'), 'utf8');
+  const groupHelpCss = fs.readFileSync(path.join(root, 'static', 'css', 'group_help.css'), 'utf8');
   assert.ok(styleCss.includes('var(--safe-bottom) + 84px'));
+  assert.equal(styleCss.includes('@media (min-width:'), false, 'style.css keeps single mobile-first layout without desktop breakpoints');
+  assert.equal(detailCss.includes('@media (min-width:'), false, 'detail.css keeps single mobile-first layout without desktop breakpoints');
+  assert.equal(groupHelpCss.includes('@media (min-width:'), false, 'group_help.css keeps single mobile-first layout without desktop breakpoints');
+  assert.ok(groupHelpCss.includes('@media (max-width: 390px)'), 'group_help.css retains narrow-phone adaptation');
 
   const nginxConf = fs.readFileSync(path.join(root, 'deploy', 'mobile_web.nginx.conf'), 'utf8');
   assert.ok(nginxConf.includes('deals/submit'));
@@ -3971,8 +3978,8 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
 
   for (const htmlName of ['index.html', 'detail.html', 'favorites.html', 'submit_deal.html', 'group_help.html']) {
     const content = fs.readFileSync(path.join(root, 'static', htmlName), 'utf8');
-    assert.ok(content.includes('?v=ux-20261126-2'), `${htmlName} bumped asset version`);
-    assert.ok(!content.includes('?v=ux-20261126-1'), `${htmlName} has no stale asset version`);
+    assert.ok(content.includes('?v=ux-20261126-5'), `${htmlName} bumped asset version`);
+    assert.ok(!content.includes('?v=ux-20261126-4'), `${htmlName} has no stale asset version`);
   }
 });
 

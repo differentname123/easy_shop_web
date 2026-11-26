@@ -312,11 +312,15 @@ def _make_png_b64(width: int = 2000, height: int = 1000, color=(220, 60, 40, 255
 def _make_audit_gen(
     *,
     is_valid: bool = True,
+    evidence_supports_claims: Optional[bool] = None,
     reject_reason: str = "",
     should_replace: bool = True,
     decision_reason: str = "综合图文评审通过",
+    observed_image_evidence: str = "图片清晰展示商品及对应价格证据",
     capture_calls: Optional[List[Dict[str, Any]]] = None,
 ):
+    eff_evidence = is_valid if evidence_supports_claims is None else evidence_supports_claims
+
     def _gen(**kwargs):
         if capture_calls is not None:
             copied = dict(kwargs)
@@ -328,6 +332,8 @@ def _make_audit_gen(
             "status": "✅ 成功",
             "content": json.dumps(
                 {
+                    "observed_image_evidence": observed_image_evidence,
+                    "evidence_supports_claims": eff_evidence,
                     "is_content_valid": is_valid,
                     "content_reject_reason": reject_reason,
                     "should_replace_existing": should_replace,
@@ -348,11 +354,28 @@ def test_core_input_validation_extensible_platform_and_rate_limit(tmp_path):
 
     prompt_text = Path(PROMPT_USER_AUDIT_PATH).read_text(encoding="utf-8")
     assert prompt_text.strip()
+    assert "observed_image_evidence" in prompt_text
+    assert "evidence_supports_claims" in prompt_text
     assert "不要求必须真实付款完成" in prompt_text
     assert "无论新价格更低，还是比旧价格更高" in prompt_text
     assert "同价防抄袭保护" in prompt_text
     assert "政治敏感" in prompt_text and "色情低俗" in prompt_text
-    for banned_example in ("某品牌", "凡士林", "微信号", "QQ号", "0.01元"):
+    for banned_example in (
+        "某品牌",
+        "凡士林",
+        "微信号",
+        "QQ号",
+        "0.01元",
+        "可乐",
+        "10.9",
+        "8.9",
+        "2元",
+        "红包",
+        "拍两件",
+        "15元",
+        "百亿补贴",
+        "淘金币",
+    ):
         assert banned_example not in prompt_text
 
     db, raw_repo, _, ps, svc = _make_harness(
@@ -1599,3 +1622,149 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
     assert formal_col.find_one({"product_id": "p_same_deal"})["user_stats"] == {"buyable": 5, "unbuyable": 2}
     assert formal_col.find_one({"product_id": "p_protected"})["user_stats"] == {"buyable": 4, "unbuyable": 1}
     assert "user_stats" not in formal_col.find_one({"product_id": "p_brand_new"})
+
+
+def test_evidence_fail_closed_and_incidental_replacement_trace(tmp_path):
+    """验证 Fail-Closed 证据硬门禁，以及无需新表即可顺手留存替代方向与对比快照。"""
+    db, raw_repo, _, _, svc = _make_harness(
+        image_dir=tmp_path / "imgs",
+        initial_products=[
+            {
+                "platform": "jd",
+                "product_id": "1001001",
+                "goods_id": "1001001",
+                "name": "维达抽纸",
+                "price": 59.9,
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "source_site": "guangdiu",
+                    "source_item_id": "old_gd_1",
+                    "source_is_reliable": False,
+                    "quality_score": 80,
+                    "deal_price": 19.9,
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=1),
+                },
+            }
+        ],
+    )
+    cleaner = DealPoolCleaner(ai_batch_size=4, convert_max_workers=1)
+
+    # 先放一条在架旧爆料 A（在 raw 中存在，与 formal 中的在架 deal 对应）
+    raw_repo.col.docs.append(
+        {
+            "source_site": "guangdiu",
+            "source_item_id": "old_gd_1",
+            "resolved_platform": "jd",
+            "resolved_product_id": "1001001",
+            "clean_status": "cleaned_success",
+            "clean_stage": "done",
+            "first_seen_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=3),
+            "display_started_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=3),
+        }
+    )
+
+    # 1) 模型缺 evidence_supports_claims 布尔字段 -> Fail-Closed 返回 ok=False（走重试）
+    from services.deal_submit_worker import _evaluate_audit_payload
+    from services.deal_cleaning.ai_client import DealAIClient
+
+    bad_ai = DealAIClient(
+        ai_caller=lambda **_kw: {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {"is_content_valid": True, "should_replace_existing": True, "decision_reason": "缺证据字段"},
+                ensure_ascii=False,
+            ),
+        }
+    )
+    res_missing = _evaluate_audit_payload(bad_ai, {"new_submission": {}}, existing_deal=None, image_paths=[])
+    assert res_missing["ok"] is False
+
+    # 2) 模型口头返回 is_content_valid=True 但 evidence_supports_claims=False -> 代码门禁强制拒绝并记录对比信息
+    res_bad = svc.submit_user_deal(
+        uid="u_alice",
+        platform="jd",
+        product_id="1001001",
+        deal_price=15.9,
+        tutorial_text="实付15.9元",
+        images_base64=[_make_png_b64(320, 240, color=(20, 120, 200, 255))],
+    )
+    tid_bad = res_bad["data"]["tip_id"]
+    worker_bad = DealSubmitWorker(
+        svc,
+        cleaner=cleaner,
+        ai_generator=_make_audit_gen(
+            is_valid=True,
+            evidence_supports_claims=False,
+            reject_reason="",
+            should_replace=True,
+            observed_image_evidence="截图仅展示19.9元，未见15.9元抵扣凭证",
+            decision_reason="图片仅展示19.9元且缺少额外优惠凭证",
+        ),
+        remote_image_fetcher=lambda _u: _make_png_bytes(),
+    )
+    assert worker_bad.run_once()["rejected"] == 1
+    doc_bad = raw_repo.col.find_one({"source_item_id": tid_bad})
+    assert doc_bad["clean_status"] == "cleaned_failed"
+    assert doc_bad["user_audit_result"]["passed"] is False
+    assert doc_bad["user_audit_result"]["evidence_supports_claims"] is False
+    assert doc_bad["user_audit_result"]["compared_existing_site"] == "guangdiu"
+    assert doc_bad["user_audit_result"]["compared_existing_item_id"] == "old_gd_1"
+    assert doc_bad["user_audit_result"]["compared_existing_price"] == 19.9
+    assert "19.9元" in doc_bad["user_audit_result"]["observed_image_evidence"]
+
+    # 3) 证据成立并替换旧爆料 old_gd_1 -> 双向顺手记录 replaced_by_* 与 replaces_* + replaces_price
+    res_good = svc.submit_user_deal(
+        uid="u_alice",
+        platform="jd",
+        product_id="1001001",
+        deal_price=15.9,
+        tutorial_text="截图见15.9元结算页",
+        images_base64=[_make_png_b64(320, 240, color=(40, 180, 90, 255))],
+    )
+    tid_good = res_good["data"]["tip_id"]
+    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
+        stage2_inputs[0]["main_tip_id"]: {
+            "main_tip_id": stage2_inputs[0]["main_tip_id"],
+            "is_valid_deal": True,
+            "reject_reason": None,
+            "main_link_id": "L1",
+            "clean_title": "维达抽纸",
+            "deal_price": 15.9,
+            "price_logic": "券后",
+            "card_highlight": "15.9元",
+            "coupon_links": [],
+            "tutorial_steps": ["1. 下单15.9"],
+            "quality_score": 88,
+            "price_is_reliable": True,
+            "price_reliability_reason": "有效",
+        }
+    }
+    worker_good = DealSubmitWorker(
+        svc,
+        cleaner=cleaner,
+        ai_generator=_make_audit_gen(
+            is_valid=True,
+            evidence_supports_claims=True,
+            should_replace=True,
+            observed_image_evidence="结算页实付15.9元",
+            decision_reason="证据充分且价格低于在架旧爆料，予以替换",
+        ),
+        remote_image_fetcher=lambda _u: _make_png_bytes(),
+    )
+    assert worker_good.run_once()["published"] == 1
+
+    old_after = raw_repo.col.find_one({"source_site": "guangdiu", "source_item_id": "old_gd_1"})
+    new_after = raw_repo.col.find_one({"source_item_id": tid_good})
+    assert old_after["replaced_by_site"] == USER_SUBMIT_SITE
+    assert old_after["replaced_by_item_id"] == tid_good
+    assert new_after["replaces_site"] == "guangdiu"
+    assert new_after["replaces_item_id"] == "old_gd_1"
+    assert new_after["replaces_price"] == 19.9
+    assert "display_end_reason" not in old_after
+
+    hist = raw_repo.list_product_deal_history("jd", "1001001")
+    hist_by_id = {h["source_item_id"]: h for h in hist}
+    assert hist_by_id[tid_good]["replaces_item_id"] == "old_gd_1"
+    assert hist_by_id[tid_good]["replaces_price"] == 19.9
+    assert hist_by_id[tid_good]["user_audit_result"]["observed_image_evidence"] == "结算页实付15.9元"
+    assert hist_by_id[tid_bad]["user_audit_result"]["compared_existing_item_id"] == "old_gd_1"

@@ -216,7 +216,7 @@ def _evaluate_audit_payload(
     image_paths: List[str],
     prompt_path: str = PROMPT_USER_AUDIT_PATH,
 ) -> Dict[str, Any]:
-    """复用统一低档模型组客户端执行多模态图文审查与对比，异常一律 Fail-Closed。"""
+    """复用统一低档模型组客户端执行多模态图文审查与对比，异常或证据不一致一律 Fail-Closed。"""
     try:
         prompt_tpl = load_prompt_cached(prompt_path).strip()
         if not prompt_tpl:
@@ -231,21 +231,32 @@ def _evaluate_audit_payload(
             return {"ok": False, "error": err or "多模态审核调用未成功"}
         if not isinstance(parsed.get("is_content_valid"), bool):
             return {"ok": False, "error": "审核模型未返回合法布尔判定 is_content_valid"}
+        if not isinstance(parsed.get("evidence_supports_claims"), bool):
+            return {"ok": False, "error": "审核模型未返回合法布尔判定 evidence_supports_claims"}
 
-        is_valid = bool(parsed["is_content_valid"])
+        evidence_ok = bool(parsed["evidence_supports_claims"])
+        is_valid = bool(parsed["is_content_valid"]) and evidence_ok
+        reject_reason = str(parsed.get("content_reject_reason") or "").strip()[:120]
+        decision_reason = str(parsed.get("decision_reason") or "").strip()[:120]
         if not is_valid:
             should_replace = False
+            if not reject_reason:
+                reject_reason = decision_reason or "图片证据未能充分支撑所声明的到手价或关键优惠条件"
         elif existing_deal is None:
             should_replace = True
+            reject_reason = ""
         else:
             should_replace = parsed.get("should_replace_existing") is True
+            reject_reason = ""
 
         return {
             "ok": True,
+            "observed_image_evidence": str(parsed.get("observed_image_evidence") or "").strip()[:400],
+            "evidence_supports_claims": evidence_ok,
             "is_content_valid": is_valid,
-            "content_reject_reason": str(parsed.get("content_reject_reason") or "").strip()[:120],
+            "content_reject_reason": reject_reason,
             "should_replace_existing": bool(should_replace),
-            "decision_reason": str(parsed.get("decision_reason") or "").strip()[:120],
+            "decision_reason": decision_reason,
         }
     except Exception as exc:
         return {"ok": False, "error": format_exc_summary(exc)}
@@ -633,18 +644,27 @@ class DealSubmitWorker:
             )
             return "retry"
 
+        audit_record: Dict[str, Any] = {
+            **audit_res,
+            "compared_existing_site": str(existing_deal.get("source_site") or "") if existing_deal else "",
+            "compared_existing_item_id": str(existing_deal.get("source_item_id") or "") if existing_deal else "",
+            "compared_existing_price": existing_deal.get("deal_price") if existing_deal else None,
+        }
+
         if not audit_res.get("is_content_valid"):
+            audit_record["passed"] = False
             reject_msg = audit_res.get("content_reject_reason") or "图文内容与当前商品无关或未通过内容审查"
             self._mark_permanent_failed(
                 repo,
                 doc,
                 error_code=ERR_USER_AUDIT_REJECTED,
                 error_msg=reject_msg,
-                extra_set={"user_audit_result": audit_res},
+                extra_set={"user_audit_result": audit_record},
             )
             return "rejected"
 
         if existing_deal is not None and not audit_res.get("should_replace_existing"):
+            audit_record["passed"] = True
             now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             decision_msg = audit_res.get("decision_reason") or "当前商品已有同价有效好价在架，本次暂未替换"
             repo.col.update_many(
@@ -656,23 +676,18 @@ class DealSubmitWorker:
                         "clean_error_code": OK_EXISTING_DEAL_BETTER,
                         "clean_error_msg": decision_msg,
                         "cleaned_at": now_utc,
-                        "user_audit_result": audit_res,
+                        "user_audit_result": audit_record,
                     },
                     "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                 },
             )
             return "skipped_existing"
 
-        compared_id = existing_deal["source_item_id"] if existing_deal else ""
-        checkpoint = {
-            **audit_res,
-            "passed": True,
-            "compared_existing_item_id": compared_id,
-        }
-        doc["user_audit_result"] = checkpoint
+        audit_record["passed"] = True
+        doc["user_audit_result"] = audit_record
         repo.col.update_many(
             self._doc_filter(doc),
-            {"$set": {"user_audit_result": checkpoint}},
+            {"$set": {"user_audit_result": audit_record}},
         )
         return "ready"
 

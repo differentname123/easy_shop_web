@@ -1416,6 +1416,10 @@ class DealRawPoolRepository:
                     "display_ended_at": 1,
                     "replaced_by_site": 1,
                     "replaced_by_item_id": 1,
+                    "replaces_site": 1,
+                    "replaces_item_id": 1,
+                    "replaces_price": 1,
+                    "user_audit_result": 1,
                     "ai_stage1_result.deal_price": 1,
                     "tutorial_images": 1,
                 },
@@ -1441,10 +1445,18 @@ def record_deal_display_transitions(
         started_at = item.get("started_at")
         if not (s_site and s_id and started_at):
             continue
+        set_doc: Dict[str, Any] = {"display_started_at": started_at}
+        rep_site = str(item.get("replaces_site") or "").strip()
+        rep_id = str(item.get("replaces_item_id") or "").strip()
+        if rep_site and rep_id:
+            set_doc["replaces_site"] = rep_site
+            set_doc["replaces_item_id"] = rep_id
+            if item.get("replaces_price") is not None:
+                set_doc["replaces_price"] = item["replaces_price"]
         ops.append(
             UpdateOne(
                 {"source_site": s_site, "source_item_id": s_id},
-                {"$set": {"display_started_at": started_at}},
+                {"$set": set_doc},
                 upsert=False,
             )
         )
