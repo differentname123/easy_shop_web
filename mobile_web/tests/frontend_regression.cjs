@@ -653,18 +653,24 @@ test('goods card layout focuses on platform badge, prominent highlight/coupon, a
   assert.equal(indexHtml.includes('sales_tip'), false, 'index.html removes sales_tip from thumbnail cards');
   assert.equal(indexHtml.includes('item.original_price'), false, 'index.html removes original_price from thumbnail cards');
 
-  // Platform badges preserved on Home & Boom grids, while redundant action button, time badge, and commission UI are removed
+  // Platform badges preserved on Home & Boom grids, with unified price label and card commission pills
   assert.equal((indexHtml.match(/<div class="goods-thumb-wrap">[\s\S]*?class="plat-badge"/g) || []).length, 2,
     'both Home and Boom product cards preserve platform badge');
   assert.equal((indexHtml.match(/v-else-if="item\.has_coupon && item\.coupon_amount > 0"/g) || []).length, 2,
     'both Home and Boom product cards render exclusive deal-highlight or coupon tag');
+  assert.equal((indexHtml.match(/<span class="price-label">价格<\/span>/g) || []).length, 2,
+    'both Home and Boom product cards display unified 价格 label');
+  assert.equal((indexHtml.match(/class="card-commission-pill"/g) || []).length, 2,
+    'both Home and Boom product cards render commission pill');
+  assert.ok(!indexHtml.includes('单件券后') && !indexHtml.includes('预估佣 '), 'index.html removes legacy 券后/预估佣 labels');
   assert.equal(indexHtml.includes('goods-action-btn'), false, 'index.html removes redundant goods-action-btn');
   assert.equal(indexHtml.includes('deal-time-badge'), false, 'index.html removes deal-time-badge');
-  assert.equal(indexHtml.includes('预估推广佣金'), false, 'index.html hides product-level commission labels');
-  assert.equal(indexHtml.includes('rebate-tag'), false, 'index.html removes product-level commission tags');
+  assert.equal(indexHtml.includes('预估推广佣金'), false, 'index.html hides legacy product-level commission labels');
+  assert.equal(indexHtml.includes('rebate-tag'), false, 'index.html removes legacy commission tags');
   assert.equal(css.includes('.goods-action-btn'), false, 'CSS removes dead goods-action-btn');
   assert.equal(css.includes('.rebate-tag'), false, 'CSS removes dead rebate-tag');
   assert.equal(css.includes('.meta-row'), false, 'CSS removes dead .meta-row');
+  assert.ok(css.includes('.card-commission-pill'), 'CSS defines .card-commission-pill');
   assert.ok(css.includes('font-size: 13px;') && css.includes('-webkit-line-clamp: 2;'), 'CSS enlarges deal-highlight-text to prominent 2-line badge');
   assert.ok(css.includes('.goods-footer'), 'CSS defines goods-footer layout');
   assert.ok(css.includes('.coupon-tag .tag-badge'), 'CSS defines dual-tone coupon badge');
@@ -864,13 +870,14 @@ test('account order statistics preserve zero and never fall back to profile plac
   }
 });
 
-test('detail highlights price, original price, and coupon cleanly without commission/redundant price cards', () => {
+test('detail highlights price, original price, coupon and estimated commission cleanly without redundant price cards', () => {
   const source = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   const formatMoney = harness().context.EasyShop.formatMoney;
   const priceStrip = source.match(/<div class="price-strip-main">([\s\S]*?)<\/div>/)?.[1] || '';
   assert.ok(priceStrip.includes('formatMoney(goods.price)'));
   assert.ok(priceStrip.includes('formatMoney(goods.original_price)'));
   assert.ok(priceStrip.includes('formatMoney(goods.coupon_amount)'));
+  assert.ok(priceStrip.includes('commission-pill-detail') && priceStrip.includes('佣金 ¥{{ formatMoney(goods.commission_amount) }}'));
   assert.equal(vm.runInNewContext('formatMoney(goods.price)', {
     formatMoney, goods: { price: 10, commission_amount: 30 },
   }), '10.00');
@@ -3528,8 +3535,13 @@ test('QA surgical fixes: group_help copyShareText/firstPosterExampleUrl/smartPar
   const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
   const groupHelpCss = fs.readFileSync(path.join(root, 'static', 'css', 'group_help.css'), 'utf8');
 
-  assert.ok(indexHtml.includes("item.deal_highlight ? '单件券后' : '券后'"));
-  assert.ok(indexHtml.includes('本页面不提供提现或资金账本。\', 6000)'));
+  assert.ok(indexHtml.includes('<span class="price-label">价格</span>'));
+  assert.ok(!indexHtml.includes('单件券后'));
+  assert.ok(indexHtml.includes('openCommissionHelp'));
+  assert.ok(indexHtml.includes('平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。'));
+  assert.ok(detailHtml.includes('openCommissionHelp'));
+  assert.ok(detailHtml.includes('佣金结算与常见问题'));
+  assert.ok(styleCss.includes('.faq-section'));
   assert.ok(detailHtml.includes('券减 ¥{{ formatMoney(goods.coupon_amount) }}'));
   assert.ok(groupHelpHtml.includes('firstPosterExampleUrl'));
   assert.ok(groupHelpHtml.includes('aria-label="关闭"'));
@@ -3627,8 +3639,31 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   const submitHtml = fs.readFileSync(path.join(root, 'static', 'submit_deal.html'), 'utf8');
   assert.ok(indexHtml.includes("window.location.href='/submit_deal'"));
   assert.ok(detailHtml.includes('goToSubmitDeal'));
+  assert.ok(detailHtml.includes('爆料最新价'));
+  assert.ok(detailHtml.includes('佣金'));
+  assert.ok(!detailHtml.includes('补充更低价'));
   assert.ok(submitHtml.includes('onSelectImages'));
   assert.ok(submitHtml.includes('我的爆料记录'));
+  assert.ok(submitHtml.includes('人工审查'));
+  assert.ok(submitHtml.includes('佣金'));
+  assert.ok(submitHtml.includes('submit-commission-pill'));
+  assert.ok(submitHtml.includes('爆料佣金'));
+  assert.ok(!submitHtml.includes('预估佣金'));
+  assert.ok(submitHtml.includes('openCommissionHelp'));
+  assert.ok(submitHtml.includes('isCommissionHelpOpen'));
+  assert.ok(submitHtml.includes('toggleRecordOrders'));
+  assert.ok(submitHtml.includes('隐私'));
+
+  // 持久佣金说明弹窗交互：点开常驻不自动消失，仅手动关闭
+  const bTools = harness().context.EasyShop.createBrowserTools({ ref: v => ({ value: v }) });
+  assert.equal(bTools.isCommissionHelpOpen.value, false);
+  bTools.openCommissionHelp();
+  assert.equal(bTools.isCommissionHelpOpen.value, true);
+  assert.ok(Array.isArray(bTools.commissionFaqSections) && bTools.commissionFaqSections.length >= 3);
+  bTools.closeCommissionHelp();
+  assert.equal(bTools.isCommissionHelpOpen.value, false);
+  assert.ok(submitHtml.includes('必填，1~3 张'));
+  assert.ok(submitHtml.includes('无需真实付款'));
   assert.ok(submitHtml.includes('蜀ICP备2026073570号-1'));
   assert.ok(submitHtml.includes('https://beian.miit.gov.cn/'));
 
@@ -3685,6 +3720,11 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   await subCtrl.handleSubmit();
   assert.equal(hSub.requests.length, 3);
 
+  // 未上传至少 1 张截图时被客户端拦截，不发送提交请求
+  subCtrl.tutorialText.value = '先在详情页领券再拍下实付29.9元';
+  await subCtrl.handleSubmit();
+  assert.equal(hSub.requests.length, 3);
+
   // 模拟选择截图并移除其中一张后携带剩余截图提交
   subCtrl.selectedImages.value = [
     { id: 'img_1', preview: 'data:image/jpeg;base64,AAA=', base64: 'data:image/jpeg;base64,AAA=' },
@@ -3703,12 +3743,49 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   assert.ok(hSub.requests[4].url.startsWith('/api/deals/my_submissions?limit=30'));
   await hSub.finish(4, {
     status: 'success',
-    data: { items: [{ tip_id: 'us_123', title: '维达抽纸', deal_price: 29.9, image_count: 1, state: 'published', state_label: '已收录上架', reason: '已上架', platform: 'jd', product_id: '1001001' }], can_submit: true },
+    data: {
+      summary: {
+        displayed_count: 1,
+        active_count: 1,
+        valid_order_count: 2,
+        settled_order_count: 1,
+        excluded_refund_invalid_count: 1,
+        excluded_channel_count: 1,
+        estimated_commission_yuan: 4.98,
+        settled_commission_yuan: 2.49,
+        after_sale_order_count: 0,
+      },
+      items: [{
+        tip_id: 'us_123',
+        title: '维达抽纸',
+        deal_price: 29.9,
+        image_count: 1,
+        state: 'published',
+        state_label: '已收录上架',
+        reason: '已上架',
+        platform: 'jd',
+        product_id: '1001001',
+        display_started_at: '2026-11-26T00:00:00+00:00',
+        display_status: 'active',
+        display_duration_text: '3小时',
+        commission_stats: {
+          valid_order_count: 2,
+          estimated_commission_yuan: 4.98,
+          settled_commission_yuan: 2.49,
+          recent_orders: [{ order_sn: '2026****0001', order_time_str: '11-26 08:10', commission_yuan: 2.49, order_status_desc: '已结算', bucket: 'settled' }],
+        },
+      }],
+      can_submit: true,
+    },
   });
   await submitP;
   assert.equal(subCtrl.dealPrice.value, '');
   assert.equal(subCtrl.selectedImages.value.length, 0);
   assert.equal(subCtrl.submissions.value.length, 1);
+  assert.equal(subCtrl.dealSummary.value.estimated_commission_yuan, 4.98);
+  assert.equal(subCtrl.dealSummary.value.valid_order_count, 2);
+  subCtrl.toggleRecordOrders('us_123');
+  assert.equal(subCtrl.expandedOrdersMap.value.us_123, true);
 
   subCtrl.openSubmittedDetail(subCtrl.submissions.value[0]);
   assert.ok(hSub.context.location.href.startsWith('/detail?'));

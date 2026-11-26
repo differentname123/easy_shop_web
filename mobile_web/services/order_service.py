@@ -117,11 +117,18 @@ class OrderService:
         write_fn = getattr(self.product_repo, "bulk_set_valid_orders", None)
         if not callable(count_fn) or not callable(write_fn):
             return
-        goods_ids = list(dict.fromkeys(
-            str(o.get("goods_id") or "").strip()
-            for o in (orders or ())
-            if isinstance(o, dict) and str(o.get("goods_id") or "").strip()
-        ))
+        raw_ids: list[str] = []
+        for o in orders or ():
+            if not isinstance(o, dict):
+                continue
+            if platform == "jd":
+                cgid = str(o.get("canonical_goods_id") or "").strip()
+                if cgid:
+                    raw_ids.append(cgid)
+            gid = str(o.get("goods_id") or "").strip()
+            if gid:
+                raw_ids.append(gid)
+        goods_ids = list(dict.fromkeys(raw_ids))
         if not goods_ids:
             return
         try:

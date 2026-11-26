@@ -55,6 +55,30 @@
     .submit-jump-link { color: var(--primary-color); font-weight: 600; flex-shrink: 0; cursor: pointer; white-space: nowrap; }
     .submit-empty-center { text-align: center; padding: 36px 20px; color: var(--text-sub); font-size: 13px; line-height: 1.6; }
     .submit-mode-tip { font-size: 12px; color: #595959; background: #fff7f5; border: 1px solid #ffe4de; line-height: 1.5; }
+    .submit-reward-banner { display: flex; align-items: flex-start; gap: 8px; background: linear-gradient(135deg, #fff9ec 0%, #fff2dc 100%); border: 1px solid #ffdca3; font-size: 12px; color: #7a4100; line-height: 1.55; }
+    .submit-reward-icon { font-size: 17px; line-height: 1.3; flex-shrink: 0; }
+    .submit-reward-text { flex: 1; min-width: 0; }
+    .submit-privacy-tip { color: #ad4e00; font-weight: 600; }
+    .submit-commission-pill { font-size: 10px; font-weight: 700; color: #b45309; background: #fffbeb; border: 1px solid #fde68a; padding: 1px 6px; border-radius: 4px; }
+    .submit-summary-box { background: linear-gradient(135deg, #fffdf7 0%, #fff7e6 100%); border: 1px solid #ffe2a8; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
+    .submit-summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
+    .submit-summary-val { font-size: 16px; font-weight: 800; color: #cf1322; line-height: 1.25; }
+    .submit-summary-val.settled { color: #389e0d; }
+    .submit-summary-val.muted { color: #595959; }
+    .submit-summary-lbl { font-size: 11px; color: #8c6d3f; margin-top: 2px; }
+    .submit-summary-note { margin-top: 8px; padding-top: 7px; border-top: 1px dashed #f3d79b; font-size: 11px; color: #7a5c2e; line-height: 1.45; }
+    .submit-attr-panel { margin-top: 7px; background: #fafafa; border: 1px solid #f0f0f0; border-radius: 8px; padding: 7px 10px; font-size: 11px; color: #595959; line-height: 1.5; }
+    .submit-attr-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .submit-alive-tag { font-weight: 700; color: #d46b08; }
+    .submit-alive-tag.active { color: #389e0d; }
+    .submit-attr-metrics { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .submit-attr-money { color: #cf1322; font-weight: 700; }
+    .submit-orders-btn { border: 1px solid #ffd591; background: #fff7e6; color: #d46b08; border-radius: 10px; padding: 1px 8px; font-size: 11px; cursor: pointer; margin-left: auto; }
+    .submit-orders-list { margin-top: 6px; padding-top: 6px; border-top: 1px dashed #e5e7eb; display: flex; flex-direction: column; gap: 5px; }
+    .submit-order-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 11px; color: #595959; }
+    .submit-order-sn { color: #8c8c8c; font-family: monospace; }
+    .submit-order-comm { font-weight: 700; color: #cf1322; white-space: nowrap; }
+    .submit-order-comm.after-sale { color: #d46b08; }
   </style>
 </head>
 <body>
@@ -64,20 +88,20 @@
       <svg style="width:20px;height:20px;fill:currentColor" viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
       <span>返回</span>
     </button>
-    <span class="detail-nav-title">{{ hasAnchorParams ? '补充好价爆料' : '我的爆料记录' }}</span>
+    <span class="detail-nav-title">{{ hasAnchorParams ? '爆料最新好价' : '我的爆料记录' }}</span>
     <button class="detail-nav-btn" @click="goHome">
       <span>首页</span>
     </button>
   </header>
 
   <div class="detail-card-section submit-empty-center" v-if="!checkingAuth && !isLoggedIn">
-    <div style="margin-bottom:14px;">登录后即可查看自己的好价爆料记录并在商品详情页补充攻略</div>
+    <div style="margin-bottom:14px;">登录后即可提交好价爆料，采纳展示期间他人跟买可享丰厚佣金奖励</div>
     <button class="submit-btn-main" style="max-width:200px;margin:0 auto;" @click="goToLogin">去登录</button>
   </div>
 
   <template v-else-if="!checkingAuth">
     <div class="detail-card-section submit-mode-tip" v-if="!hasAnchorParams">
-      💡 如需新增好价爆料，只需进入任意商品详情页点击「✍️ 去补充好价」，系统将自动锁定主商品防出错。
+      💡 进入任意商品详情页点「✍️ 爆料最新价」即可提交攻略：审查采纳后的有效展示期间（72小时），其他拼友看到你的爆料并下单，你将获得丰厚佣金奖励！
     </div>
 
     <template v-else>
@@ -102,9 +126,17 @@
               <div class="submit-anchor-price">
                 <span>当前参考价</span>
                 <span class="submit-anchor-ref-num">¥{{ formatMoney(goods.price) }}</span>
+                <span class="submit-commission-pill" v-if="Number(goods.commission_amount) > 0" role="button" tabindex="0" style="cursor:pointer" @click="openCommissionHelp">佣金 ¥{{ formatMoney(goods.commission_amount) }} ?</span>
                 <span class="submit-lock-tag">已实名锁定主商品</span>
               </div>
             </div>
+          </div>
+        </div>
+
+        <div class="detail-card-section submit-reward-banner">
+          <span class="submit-reward-icon">💰</span>
+          <div class="submit-reward-text">
+            <strong>爆料采纳赚高额佣金：</strong>你的爆料通过审查上架后，有效展示期间（72小时内）只要其他拼友看到你的攻略并购买该商品，你就能获得丰厚佣金奖励！价格越真实、步骤越清晰越稳赚。
           </div>
         </div>
 
@@ -134,14 +166,14 @@
               v-model="tutorialText"
               maxlength="800"
               class="submit-textarea"
-              placeholder="请写清购买步骤或优惠方式（例如：详情页领补贴券、凑单拍1件等）"
+              placeholder="请写清购买步骤或当前最新优惠方式（如领券位置、满减凑单或实际买法）"
               required
             ></textarea>
           </div>
 
           <div class="submit-field">
             <label class="submit-label">
-              <span>下单截图 / 教程图片（选填，最多 3 张）</span>
+              <span>价格证明截图（必填，1~3 张）</span>
               <span class="submit-counter">{{ selectedImages.length }} / 3</span>
             </label>
             <input
@@ -162,7 +194,7 @@
                 <span>{{ compressingImages ? '压缩中' : '传截图' }}</span>
               </button>
             </div>
-            <div class="submit-help-note">附带实付下单或领券页面截图更有说服力；系统会自动安全等比压缩体积。</div>
+            <div class="submit-help-note">只需上传 1 张能看到当前实际到手价的截图即可（如结算页、购物车优惠预览、领券弹窗或已付订单页，无需真实付款也能提交）。<span class="submit-privacy-tip">⚠️ 温馨提示：截图将随攻略公开展示，上传前请自行裁切或打码隐藏收货地址、手机号、姓名等个人隐私信息。</span>提交后将进入人工审查。</div>
           </div>
 
           <div class="submit-field">
@@ -179,7 +211,7 @@
           </div>
 
           <button type="submit" class="submit-btn-main" :disabled="submitting || compressingImages">
-            {{ submitting ? '正在提交核验...' : '提交好价核验' }}
+            {{ submitting ? '正在提交审查...' : '提交人工审查' }}
           </button>
         </form>
       </template>
@@ -188,13 +220,35 @@
     <div class="detail-card-section">
       <div class="submit-record-header">
         <span class="submit-record-title">我的最近爆料 ({{ submissions.length }})</span>
-        <button type="button" class="submit-refresh-btn" :disabled="loadingSubmissions" @click="loadSubmissions">
-          {{ loadingSubmissions ? '刷新中...' : '刷新进度 ↻' }}
-        </button>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <button type="button" class="commission-help-link" style="margin-left:0;" @click="openCommissionHelp">佣金说明 ?</button>
+          <button type="button" class="submit-refresh-btn" :disabled="loadingSubmissions" @click="loadSubmissions">
+            {{ loadingSubmissions ? '刷新中...' : '刷新进度 ↻' }}
+          </button>
+        </div>
+      </div>
+      <div class="submit-summary-box" v-if="dealSummary.displayed_count > 0 || dealSummary.valid_order_count > 0">
+        <div class="submit-summary-grid">
+          <div>
+            <div class="submit-summary-val">¥{{ formatMoney(dealSummary.estimated_commission_yuan) }}</div>
+            <div class="submit-summary-lbl">爆料佣金 ({{ dealSummary.valid_order_count }}单)</div>
+          </div>
+          <div>
+            <div class="submit-summary-val settled">¥{{ formatMoney(dealSummary.settled_commission_yuan) }}</div>
+            <div class="submit-summary-lbl">已结算佣金 ({{ dealSummary.settled_order_count }}单)</div>
+          </div>
+          <div>
+            <div class="submit-summary-val muted">{{ dealSummary.excluded_refund_invalid_count }} / {{ dealSummary.excluded_channel_count }}</div>
+            <div class="submit-summary-lbl">剔除退失效 / 渠道单</div>
+          </div>
+        </div>
+        <div class="submit-summary-note">
+          归因说明：仅统计爆料展示期间经站长默认链接成交的有效订单，已自动排除退款、失效、未付款及他人自购/个人推广渠道单（<span v-if="dealSummary.after_sale_order_count > 0">另有 {{ dealSummary.after_sale_order_count }} 笔售后核验中暂未计入，</span>最终金额以平台结算为准）。
+        </div>
       </div>
       <div v-if="loadingSubmissions && submissions.length === 0" class="submit-help-note">正在加载记录...</div>
       <div v-else-if="submissions.length === 0" class="submit-empty-center" style="padding:20px 10px;">
-        <div>还没有爆料记录，去商品详情页点「✍️ 去补充好价」分享你的神价买法吧</div>
+        <div>还没有爆料记录，去商品详情页点「✍️ 爆料最新价」分享最新真实到手价和买法吧</div>
       </div>
       <div v-else>
         <div class="submit-record-item" v-for="rec in submissions" :key="rec.tip_id">
@@ -214,6 +268,46 @@
               @click="openSubmittedDetail(rec)"
             >查看商品 ›</span>
           </div>
+          <div class="submit-attr-panel" v-if="rec.display_started_at && rec.commission_stats">
+            <div class="submit-attr-top">
+              <span class="submit-alive-tag" :class="{ active: rec.display_status === 'active' }">
+                {{ rec.display_status === 'active' ? '展示中' : (rec.display_status === 'replaced' ? '已被替代下线' : '已过期下线') }}
+                · 存活 {{ rec.display_duration_text || '不足1分钟' }}
+              </span>
+              <span v-if="rec.display_started_str">
+                {{ rec.display_started_str }} ~ {{ rec.display_status === 'active' ? '至今' : (rec.display_ended_str || '') }}
+              </span>
+            </div>
+            <div class="submit-attr-metrics">
+              <span>有效 {{ rec.commission_stats.valid_order_count }} 笔</span>
+              <span class="submit-attr-money">佣金 ¥{{ formatMoney(rec.commission_stats.estimated_commission_yuan) }}</span>
+              <span>已结算 ¥{{ formatMoney(rec.commission_stats.settled_commission_yuan) }}</span>
+              <span v-if="rec.commission_stats.after_sale_order_count > 0" style="color:#d46b08;">售后中 {{ rec.commission_stats.after_sale_order_count }} 笔</span>
+              <span v-if="rec.commission_stats.excluded_refund_invalid_count > 0">已剔除退款/失效 {{ rec.commission_stats.excluded_refund_invalid_count }} 笔</span>
+              <span v-if="rec.commission_stats.excluded_channel_count > 0">已剔除渠道单 {{ rec.commission_stats.excluded_channel_count }} 笔</span>
+              <button
+                type="button"
+                class="submit-orders-btn"
+                v-if="rec.commission_stats.recent_orders && rec.commission_stats.recent_orders.length > 0"
+                @click="toggleRecordOrders(rec.tip_id)"
+              >{{ expandedOrdersMap[rec.tip_id] ? '收起明细 ▲' : ('订单明细 (' + rec.commission_stats.recent_orders.length + ') ▼') }}</button>
+            </div>
+            <div v-if="rec.commission_stats.jd_sku_unmapped" style="margin-top:3px;color:#8c8c8c;">
+              该商品暂缺主图指纹或数字 SKU 映射，等待商品详情补全后即可匹配京东订单
+            </div>
+            <div class="submit-orders-list" v-if="expandedOrdersMap[rec.tip_id] && rec.commission_stats.recent_orders && rec.commission_stats.recent_orders.length">
+              <div class="submit-order-row" v-for="(ord, oIdx) in rec.commission_stats.recent_orders" :key="(ord.order_sn || oIdx) + '_' + oIdx">
+                <span>
+                  <span class="submit-order-sn">{{ ord.order_sn }}</span>
+                  <span style="margin-left:5px;">{{ ord.order_time_str }}</span>
+                  <span style="margin-left:5px;">{{ ord.order_status_desc }}</span>
+                </span>
+                <span class="submit-order-comm" :class="{ 'after-sale': ord.bucket === 'after_sale' }">
+                  {{ ord.bucket === 'after_sale' ? '售后待定 ' : '' }}¥{{ formatMoney(ord.commission_yuan) }}
+                </span>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -223,6 +317,27 @@
     <span>成都东部新区便易屋信息技术咨询经营部</span>
     <span class="icp-sep">·</span>
     <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">蜀ICP备2026073570号-1</a>
+  </div>
+
+  <div class="modal-backdrop" v-if="isCommissionHelpOpen" @click.self="closeCommissionHelp">
+    <div class="sheet-dialog">
+      <div class="sheet-header">
+        <span>佣金结算与常见问题</span>
+        <button type="button" class="sheet-close" aria-label="关闭" @click="closeCommissionHelp">×</button>
+      </div>
+      <div class="sheet-scroll-body">
+        <div class="faq-section" v-for="(sec, sIdx) in commissionFaqSections" :key="sIdx">
+          <div class="faq-title">{{ sec.title }}</div>
+          <ul class="faq-list">
+            <li v-for="(item, iIdx) in sec.items" :key="iIdx">{{ item }}</li>
+          </ul>
+        </div>
+        <p class="faq-footnote">商品展示佣金仅供参考，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。</p>
+      </div>
+      <div class="pop-action-btns" style="margin-top:10px;flex-shrink:0;">
+        <button type="button" class="btn-primary-block" @click="closeCommissionHelp">我知道了</button>
+      </div>
+    </div>
   </div>
 
   <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>

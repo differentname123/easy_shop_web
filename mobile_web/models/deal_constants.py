@@ -28,6 +28,7 @@ DEAL_MAX_CLEAN_AGE_DAYS = 2
 # 高质量信源与专员严选渠道信誉加分表 (Source Reputation Bonus)
 SOURCE_REPUTATION_BONUS: Dict[str, int] = {
     "tehuicaicai": 10,  # 特惠采采/惠享购：专员人工严选集采，自带高清白底图与视频教程，信噪比极高
+    "user_submit": 10,  # 已通过全图文审核与AI-2终审的用户实付爆料，与严选渠道同级防轻易覆盖
 }
 MAX_CLEAN_RETRIES = 3
 MAX_ANCHOR_CACHE_SIZE = 8000

@@ -92,6 +92,10 @@
     3. **横向对齐淘宝与京东**：
        - 淘宝 (`test_tb_api.py`)：从两段式加密串 `<26位动态盐值前缀>-<19~21位稳定密文后缀>` 中提取 `-` 之后的稳定密文后缀作为 `goods_id` (`product_id`)，完整加密串保留在 `goods_sign`；
        - 京东 (`test_jd_api.py`)：从 100% 必返的京东官方 CDN 主图 URL (`360buyimg.com/.../jfs/.../<parent_hash>/<file_stem>.jpg`) 中提取 `<parent_hash>_<file_stem>` 作为跨接口恒定的 `goods_id` (`product_id`)，完整 50 位加密 `itemId` 保留在 `goods_sign`。
+    4. **【2026-11-26 三平台主键与订单对齐终态复核】**：
+       - **拼多多**：全库 `7,771 / 7,771` 均为原生数字 `goods_id`，与增量订单 `goods_id` 天然一致（保持现状）；
+       - **淘宝**：19 位后缀经 4 通道（HDK/TOP/折淘客解 ID/高佣转链）`5/5` 100% 恒定且与数字 ID 严格 1-to-1（重定向抓数字 ID 全线 0% 或撞风控），与订单 `extract_canonical_goods_id` 天然对齐（保持现状）；
+       - **京东**：无登录重定向 `u.jd.com` 仅 `6/15 (40%)` 可得 SKU、`jingfen` 首跳存在 `76/8174 (0.93%)` 跨源串踢回首页与 `11.18s` 长尾毛刺，主键维持主图指纹不变；订单侧由 `JdAdapter.normalize_order` 同步保存官方 `order.row.query` 自带的 `goodsInfo.imageUrl` 为 `goods_thumbnail_url` 与 `canonical_goods_id`（主图指纹，实测真实订单 5/5 对齐 `products.product_id`），在保留原始数字 `goods_id` (`skuId`) 的前提下闭环打通爆料佣金归因与有效下单数统计。
 
 十、【2026-11-23 实测补充：批量对齐容错与下架品二义性陷阱】
   1. **`pdd.ddk.goods.search` 20 批量与单条查卡实测结论**：

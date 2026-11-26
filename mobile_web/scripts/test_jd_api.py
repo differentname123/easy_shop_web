@@ -69,8 +69,9 @@
 
 五、【功能 5：增量订单拉取 (`open_jing_union_openz_order_row_query.ashx` 二跳官方网关)】
   - ✅ 可用：折淘客使用 `jd_app_key` + `jd_app_secret` 签名并返回 `https://api.jd.com/routerjson?...`，
-    本地直接请求京东官方网关获取真实订单行。
+    本地直接请求京东官方网关获取真实订单行（或由个人 `jd_app_key` 直连官方 `jd.union.open.order.row.query`）。
   - ⚠️ 协议约束：查询时间窗跨度不得超过 1 小时 (`<= 3600s`)，推荐 `type=3` (按更新时间查询)。
+  - ✅ 【2026-11-26 订单与商品库主图指纹闭环实证】：请求参数固定携带 `fields="goodsInfo,categoryInfo"` 时，京东官方订单行原生返回 `goodsInfo.imageUrl`（官方 `360buyimg.com/jfs/...` 主图）；实测线上真实订单经 `extract_jd_image_key(goodsInfo.imageUrl)` 提取主图指纹后与 `products.product_id` **5/5（100%）精准匹配**。`JdAdapter.normalize_order` 现同步保留 `goods_id`（原始数字 `skuId`，向后兼容）、`goods_thumbnail_url`（`goodsInfo.imageUrl`）与 `canonical_goods_id`（主图指纹），彻底打通京东爆料佣金归因与商品有效下单计数。
 
 六、【功能 6：万能转链与详情反查 (`convert_and_resolve_universal_input` 第一性原理实现：直接原样透传折淘客，零模糊搜索兜底)】
   - ✅ 核心原则：直接将用户输入的原始文本 (`raw_text`) 原样透传给折淘客 `open_jing_union_open_promotion_byunionid_get.ashx` (`chainType=3`)，
@@ -109,6 +110,10 @@
     4. **严禁拿主图哈希 `goods_id` 直接请求 `api_detail.ashx`（防串货铁律）**：
        - 实测发现：若将 34 位十六进制主图指纹（如 `6ab9c932F86c506ae_0083320320b195ad`）误当作 `tao_id` 传给折淘客 `api_detail.ashx`，折淘客底层会将其下划线后的十进制数字段（如 `0083320320` -> SKU `83320320`）当作普通数字 SKU 解析，从而返回完全无关的工业品（如“西门子PLC”或“编码器”），导致严重的详情页串货与数据库污染！
        - 防护闭环：前端跳转必须同时透传真实的 `goods_id` 与 50 位 `goods_sign`；后端服务层遇到仅带 `goods_id`（或 `goods_sign == goods_id`）的请求时，必须先通过 `SIGN_BY_ID_CACHE` 或 MongoDB `product_id` 索引反查还原出 50 位真实 `goods_sign`；且 `jd_adapter._fetch_item` 必须硬性拦截 `is_jd_image_key(target_id)` 并校验返回主图指纹一致性。
+    5. **【2026-11-26 无登录重定向提取数字 SKU 实证结案（终态主键坚持主图指纹）】**：
+       - ❌ **转链后访问 `u.jd.com` 重定向方案证伪**：实测 15 款真实商品调用 `byunionid_get`（中位 `247ms`）+ 跟跳（中位 `394ms`）仅 **`6/15 (40%)`** 落地 `item.jd.com/{sku}.html`（且继续跟跳 `item.m.jd.com` 时 `6/6 = 100%` 触发 `cfe.m.jd.com/privatedomain/risk_handler/` 风控），其余 **`9/15 (60%)`** 路由至通天塔单品模板 `pro.m.jd.com/mall/active/...?sku=<加密串>`，无明文数字 SKU；
+       - ❌ **直访 `jingfen.jd.com/detail/{goods_sign}.html` 首跳 302 不宜作全局主键**：仅读首跳 `Location` 虽可在 50 款串行达 `50/50`（中位 `40ms`，但出现 **`11,183ms`** 长尾尖刺）、100 款 8 线程并发达 `99/100`（中位 `115ms`），但全库 `8,174` 款中仍有 **`76` 条（`0.93%`）非 48/49/55 位跨源加密串 100% 被 302 踢回 `https://www.jd.com`**；且实测提取出的纯数字 SKU 调 `api_detail` / `goods_query` / `byunionid_get` **0/3 全线拒收**；
+       - ✅ **终态定案**：`products.product_id` 维持 `0ms` 纯本地 `360buyimg.com` 主图指纹不变（虽实测 `9/20` 同名异指纹组系商家换主图导致，但全库占比极低且无外部 HTTP/风控雪崩风险）；订单归因与有效下单数统一复用官方 `order.row.query` 自带的 `goodsInfo.imageUrl` 主图指纹 `canonical_goods_id` 精准对齐。
 
 九、【2026-11-23 实测补充：`goods_query` 20 批量对齐、`tkl_piliang` 格式边界、多 Key 共享池与好单库现状】
   1. **折淘客 `open_jing_union_open_goods_query.ashx`（全网实时查询与 20 批量查卡）**：
@@ -674,6 +679,11 @@ def fetch_orders(
         parsed_orders = []
         for o in raw_rows:
             v_code = int(o.get("validCode") or 0)
+            goods_info = o.get("goodsInfo") if isinstance(o.get("goodsInfo"), dict) else {}
+            image_url = str(goods_info.get("imageUrl") or "").strip()
+            if image_url.startswith("//"):
+                image_url = "https:" + image_url
+            canonical_goods_id = extract_jd_canonical_goods_id("", image_url) if image_url else ""
             parsed_orders.append({
                 "order_id": str(o.get("orderId", "")),           # 订单号
                 "row_id": str(o.get("id", "")),                  # 行单号
@@ -684,6 +694,8 @@ def fetch_orders(
                 "status_name": JD_ORDER_STATUS_MAP.get(v_code, f"状态{v_code}"),
                 "sku_id": str(o.get("skuId", "")),               # 商品SKU
                 "sku_name": o.get("skuName", ""),                # 商品名称
+                "image_url": image_url,                          # 官方 goodsInfo.imageUrl 主图
+                "canonical_goods_id": canonical_goods_id,        # 主图 CDN 指纹（对齐 products.product_id）
                 "sku_num": int(o.get("skuNum") or 1),            # 商品数量
                 "price": str(o.get("price") or "0.00"),          # 单价
                 "estimate_cos_price": str(o.get("estimateCosPrice") or "0.00"), # 计佣/实付金额

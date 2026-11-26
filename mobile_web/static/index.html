@@ -110,11 +110,12 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span v-if="item.has_coupon" class="price-label">{{ (item.is_deal_tip && item.deal_highlight) ? '单件券后' : '券后' }}</span>
+                <span class="price-label">价格</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>
             </div>
+            <span v-if="Number(item.commission_amount) > 0" class="card-commission-pill" title="平台参考佣金，以最终成交结算为准">佣金 ¥{{ formatMoney(item.commission_amount) }}</span>
           </div>
         </div>
       </div>
@@ -253,11 +254,12 @@
           <div class="goods-footer">
             <div class="goods-price-box">
               <div class="price-row">
-                <span v-if="item.has_coupon" class="price-label">{{ (item.is_deal_tip && item.deal_highlight) ? '单件券后' : '券后' }}</span>
+                <span class="price-label">价格</span>
                 <span class="price-unit">¥</span>
                 <span class="price-value">{{ formatMoney(item.price) }}</span>
               </div>
             </div>
+            <span v-if="Number(item.commission_amount) > 0" class="card-commission-pill" title="平台参考佣金，以最终成交结算为准">佣金 ¥{{ formatMoney(item.commission_amount) }}</span>
           </div>
         </div>
       </div>
@@ -573,6 +575,7 @@
         <div class="order-sec-title">
           <svg style="width:16px;height:16px;fill:var(--primary-color)" viewBox="0 0 24 24"><path d="M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10H7v-2h10v2zm0-4H7V7h10v2zm0 8H7v-2h10v2z"/></svg>
           我的推广订单
+          <button type="button" class="commission-help-link" @click="openCommissionHelp">规则与常见问题 ?</button>
         </div>
         <button 
           class="btn-sync-orders" 
@@ -680,8 +683,8 @@
         </span>
         <span style="color:var(--primary-color);font-size:13px;font-weight:600">easyeverything98 <span style="font-size:11px;font-weight:normal;opacity:0.8">[点击复制]</span></span>
       </div>
-      <div class="menu-item" @click="showToast('商品佣金为预估，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。', 6000)">
-        <span>订单佣金与平台结算说明</span>
+      <div class="menu-item" @click="openCommissionHelp">
+        <span>佣金结算与常见问题</span>
         <span style="color:var(--text-muted)">›</span>
       </div>
       <div class="menu-item" v-if="userProfile.invite_code" @click="copyText(userProfile.invite_code, '我的专属邀请码已复制')">
@@ -855,6 +858,28 @@
       </div>
     </div>
   </div>
+  <!-- ==================== 佣金结算与常见问题说明弹窗（长期可查） ==================== -->
+  <div class="modal-backdrop" v-if="isCommissionHelpOpen" @click.self="closeCommissionHelp">
+    <div class="sheet-dialog">
+      <div class="sheet-header">
+        <span>佣金结算与常见问题</span>
+        <button type="button" class="sheet-close" aria-label="关闭" @click="closeCommissionHelp">×</button>
+      </div>
+      <div class="sheet-scroll-body">
+        <div class="faq-section" v-for="(sec, sIdx) in commissionFaqSections" :key="sIdx">
+          <div class="faq-title">{{ sec.title }}</div>
+          <ul class="faq-list">
+            <li v-for="(item, iIdx) in sec.items" :key="iIdx">{{ item }}</li>
+          </ul>
+        </div>
+        <p class="faq-footnote">商品展示佣金仅供参考，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。</p>
+      </div>
+      <div class="pop-action-btns" style="margin-top:10px;flex-shrink:0;">
+        <button type="button" class="btn-primary-block" @click="closeCommissionHelp">我知道了</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 轻量 Toast 提示 -->
   <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>
 

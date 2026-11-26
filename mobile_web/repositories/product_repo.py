@@ -90,11 +90,14 @@ def upsert_cleaned_products_to_formal_table(
                     "product_id": 1,
                     "goods_sign": 1,
                     "deal_info.is_deal_tip": 1,
+                    "deal_info.source_site": 1,
                     "deal_info.source_item_id": 1,
                     "deal_info.source_is_reliable": 1,
                     "deal_info.quality_score": 1,
                     "deal_info.deal_price": 1,
                     "deal_info.updated_at": 1,
+                    "user_stats": 1,
+                    "user_stats_score": 1,
                 },
             ):
                 k = (str(ex_doc.get("platform") or ""), str(ex_doc.get("product_id") or ""))
@@ -104,6 +107,8 @@ def upsert_cleaned_products_to_formal_table(
 
     ops = []
     protected_high_score = 0
+    started_deals: List[Dict[str, Any]] = []
+    replaced_deals: List[Dict[str, Any]] = []
 
     for (plat, pid), docs_for_item in grouped_by_pid.items():
         docs_sorted = sorted(
@@ -195,6 +200,11 @@ def upsert_cleaned_products_to_formal_table(
             )
         )
 
+        unset_fields: Dict[str, Any] = {
+            "superseded_by": "",
+            "off_promotion_reason": "",
+            "off_promotion_at": "",
+        }
         if should_protect:
             protected_high_score += 1
             set_fields["deal_info.last_seen_at"] = now
@@ -216,13 +226,40 @@ def upsert_cleaned_products_to_formal_table(
             for dk, dv in deal_info.items():
                 set_fields[f"deal_info.{dk}"] = dv
 
+            new_site = str(deal_info.get("source_site") or "").strip()
+            new_item_id = str(deal_info.get("source_item_id") or "").strip()
+            ex_site = str(ex_di.get("source_site") or "").strip()
+            ex_is_active = bool(ex_di.get("is_deal_tip") is True)
+            is_new_deal_takeover = bool(
+                new_site and new_item_id and (not ex_is_active or (ex_site, ex_item_id) != (new_site, new_item_id))
+            )
+            if is_new_deal_takeover:
+                started_deals.append({
+                    "source_site": new_site,
+                    "source_item_id": new_item_id,
+                    "started_at": now,
+                })
+                if ex_is_active and ex_site and ex_item_id:
+                    replaced_deals.append({
+                        "old_site": ex_site,
+                        "old_item_id": ex_item_id,
+                        "new_site": new_site,
+                        "new_item_id": new_item_id,
+                        "ended_at": now,
+                    })
+                ex_stats = (ex_record or {}).get("user_stats")
+                if isinstance(ex_stats, dict) and ("buyable" in ex_stats or "unbuyable" in ex_stats):
+                    set_fields["user_stats.buyable"] = 0
+                    set_fields["user_stats.unbuyable"] = 0
+                    new_stats_score = compute_user_stats_score({**ex_stats, "buyable": 0, "unbuyable": 0})
+                    if new_stats_score > 0:
+                        set_fields["user_stats_score"] = new_stats_score
+                    elif "user_stats_score" in (ex_record or {}):
+                        unset_fields["user_stats_score"] = ""
+
         update_spec: Dict[str, Any] = {
             "$set": set_fields,
-            "$unset": {
-                "superseded_by": "",
-                "off_promotion_reason": "",
-                "off_promotion_at": "",
-            },
+            "$unset": unset_fields,
             "$setOnInsert": {
                 "created_at": now,
                 "source": "deal_pool",
@@ -250,6 +287,8 @@ def upsert_cleaned_products_to_formal_table(
         "matched": res.matched_count,
         "protected_high_score": protected_high_score,
         "total_ops": len(ops),
+        "started_deals": started_deals,
+        "replaced_deals": replaced_deals,
     }
 
 

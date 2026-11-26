@@ -2089,10 +2089,14 @@ class JdAdapter(BasePlatformAdapter):
             quantity = int(order.get("skuNum")) if order.get("skuNum") is not None else 1
         except (TypeError, ValueError, OverflowError):
             raise ValueError("京东订单数量无效") from None
+        goods_info = order.get("goodsInfo") if isinstance(order.get("goodsInfo"), dict) else {}
+        thumbnail_url = normalize_http_url(goods_info.get("imageUrl"))
+        canonical_goods_id = extract_jd_image_key(thumbnail_url)
         return {
             "platform": self.platform_code, "order_sn": _text(order["id"]),
             "parent_order_sn": _text(order.get("orderId")), "goods_id": _text(order.get("skuId")),
-            "goods_name": _text(order.get("skuName")), "goods_thumbnail_url": "", "goods_quantity": quantity,
+            "canonical_goods_id": canonical_goods_id,
+            "goods_name": _text(order.get("skuName")), "goods_thumbnail_url": thumbnail_url, "goods_quantity": quantity,
             "order_amount_yuan": _money(order.get("estimateCosPrice")) or 0.0,
             "order_amount_basis": "commissionable", "order_time": created, "order_time_basis": "created",
             "order_create_time": created, "order_pay_time": None, "order_pay_time_str": "",

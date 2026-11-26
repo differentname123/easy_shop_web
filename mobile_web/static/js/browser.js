@@ -194,15 +194,45 @@
       safeSetStorage(VALUE_GUIDE_DISMISSED_KEY, '1');
     };
 
+    const isCommissionHelpOpen = ref(false);
+    const openCommissionHelp = () => { isCommissionHelpOpen.value = true; };
+    const closeCommissionHelp = () => { isCommissionHelpOpen.value = false; };
+    const commissionFaqSections = [
+      {
+        title: '怎么通过平台赚佣金？',
+        items: [
+          '自购 / 分享赚：登录并按提示完成平台授权后，通过详情页生成的专属链接或口令下单/分享成交，佣金计入本人推广订单。',
+          '好价爆料赚：在详情页提交真实到手价与凭证截图，审查上架后的有效展示期（72小时）内，其他拼友通过站内默认链接跟买成交，佣金计入爆料人。',
+        ],
+      },
+      {
+        title: '佣金什么时候结算？',
+        items: [
+          '下单付款后先展示当期参考佣金；需等待买家确认收货、度过售后维权期，且对应电商平台完成账期结算后，系统再按平台最终结算金额统一核算。',
+        ],
+      },
+      {
+        title: '为什么有时拿不到佣金或金额变少？',
+        items: [
+          '未登录或未完成对应平台授权：默认链接成交不计入本人自购/分享订单。',
+          '下单链路被覆盖：下单前切去别人分享、直播间、签到页或叠加站外专属红包，归因可能被其他渠道覆盖。',
+          '退单或售后：已退款、取消、未付款、失效订单不计佣；售后中订单暂不计入；用券/红包抵扣后计佣实付变少也会对应变化。',
+          '爆料未生效或他人走专属链接：爆料未上架、超过72小时已下线、已被新爆料替代后的订单，以及他人使用自己专属推广链接下的单，不计入爆料佣金。',
+        ],
+      },
+    ];
+
     const dispose = () => {
       stopSmartLoading();
       global.clearTimeout(toastTimer);
       global.clearTimeout(bannerDelayTimer);
       bannerDelayTimer = null;
+      isCommissionHelpOpen.value = false;
     };
     return {
       toastMessage, smartLoading, showToast, copyText, startSmartLoading, stopSmartLoading, jumpToLink,
       isWeChatBrowser, shouldBlockDirectJump, showValueGuide, dismissValueGuide,
+      isCommissionHelpOpen, openCommissionHelp, closeCommissionHelp, commissionFaqSections,
       isStandalone, desktopGuidePlatform, isDesktopGuideOpen, showDesktopBanner,
       triggerAddToDesktop, dismissDesktopBanner, closeDesktopGuide, dispose,
     };

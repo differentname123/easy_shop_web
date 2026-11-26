@@ -407,6 +407,37 @@ def test_order_missing_actual_never_uses_estimate_and_unknown_numeric_evidence_p
         a.normalize_order({"orderId": "parent"})
 
 
+def test_order_normalizer_extracts_goods_info_thumbnail_and_canonical_image_key():
+    a = adapter()
+    https_row = a.normalize_order({
+        "id": "row_https",
+        "skuId": "100122053502",
+        "validCode": 16,
+        "goodsInfo": {"imageUrl": "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/4/66bde2a7Fb47aa096/69ff34903c83a560.jpg"},
+    })
+    assert https_row["goods_id"] == "100122053502"
+    assert https_row["goods_thumbnail_url"] == "https://img14.360buyimg.com/pop/jfs/t1/1/2/3/4/66bde2a7Fb47aa096/69ff34903c83a560.jpg"
+    assert https_row["canonical_goods_id"] == "66bde2a7Fb47aa096_69ff34903c83a560"
+
+    proto_row = a.normalize_order({
+        "id": "row_proto",
+        "skuId": "10235356702978",
+        "validCode": 17,
+        "goodsInfo": {"imageUrl": "//img10.360buyimg.com/n1/jfs/t1/9/8/7/6aca4d10F381a5657/0944320320d0cf17.jpg"},
+    })
+    assert proto_row["goods_thumbnail_url"] == "https://img10.360buyimg.com/n1/jfs/t1/9/8/7/6aca4d10F381a5657/0944320320d0cf17.jpg"
+    assert proto_row["canonical_goods_id"] == "6aca4d10F381a5657_0944320320d0cf17"
+
+    missing_or_external = [
+        a.normalize_order({"id": "row_no_info", "skuId": "1001", "validCode": 16}),
+        a.normalize_order({"id": "row_bad_cdn", "skuId": "1002", "validCode": 16, "goodsInfo": {"imageUrl": "https://evil.example.com/a/b.jpg"}}),
+    ]
+    assert missing_or_external[0]["goods_thumbnail_url"] == ""
+    assert missing_or_external[0]["canonical_goods_id"] == ""
+    assert missing_or_external[1]["goods_thumbnail_url"] == "https://evil.example.com/a/b.jpg"
+    assert missing_or_external[1]["canonical_goods_id"] == ""
+
+
 @pytest.mark.parametrize("value", ["https://evil.test/p", "https://jd.com.evil.test/p", "https://@item.jd.com/1.html",
                                     "https://item.jd.com:8443/p", "javascript:alert(1)", "https://item.jd.com/1.html#x"])
 def test_supplier_material_url_requires_official_host_and_safe_components(value):

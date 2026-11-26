@@ -18,6 +18,7 @@ from pymongo import UpdateOne
 
 from infrastructure.mongo import gen_db_object
 from infrastructure.runtime_io import append_bounded_jsonl, should_write_runtime_artifact
+from models.product import normalize_platform
 from models.deal_constants import (
     CLEAN_STAGE_DONE,
     CLEAN_STAGE_NEED_AI1,
@@ -273,9 +274,17 @@ class DealRawPoolRepository:
                 background=True,
             )
             col.create_index(
-                [("first_seen_at", 1)],
+                [("resolved_platform", 1), ("resolved_product_id", 1), ("display_started_at", -1), ("first_seen_at", -1)],
+                background=True,
+            )
+            try:
+                col.drop_index("idx_deal_raw_tips_ttl_14d")
+            except Exception:
+                pass
+            col.create_index(
+                [("ttl_at", 1)],
                 expireAfterSeconds=int(DEAL_RAW_TTL_DAYS * 86400),
-                name="idx_deal_raw_tips_ttl_14d",
+                name="idx_deal_raw_tips_ttl_channel_14d",
                 background=True,
             )
 
@@ -310,6 +319,20 @@ class DealRawPoolRepository:
         if clean_site:
             flt["deal_info.source_site"] = clean_site
         try:
+            expiring_keys: List[Tuple[str, str]] = []
+            seen_keys: Set[Tuple[str, str]] = set()
+            for exp_doc in self.formal_col.find(
+                flt,
+                {"_id": 0, "deal_info.source_site": 1, "deal_info.source_item_id": 1},
+            ):
+                di = exp_doc.get("deal_info") if isinstance(exp_doc, dict) else None
+                if not isinstance(di, dict):
+                    continue
+                s_site = str(di.get("source_site") or "").strip()
+                s_id = str(di.get("source_item_id") or "").strip()
+                if s_site and s_id and (s_site, s_id) not in seen_keys:
+                    seen_keys.add((s_site, s_id))
+                    expiring_keys.append((s_site, s_id))
             res = self.formal_col.update_many(
                 flt,
                 {
@@ -320,7 +343,27 @@ class DealRawPoolRepository:
                     }
                 },
             )
-            return int(getattr(res, "modified_count", 0) or 0)
+            modified = int(getattr(res, "modified_count", 0) or 0)
+            if modified > 0 and expiring_keys and self.col is not None:
+                try:
+                    end_ops = [
+                        UpdateOne(
+                            {
+                                "source_site": s_site,
+                                "source_item_id": s_id,
+                                "display_started_at": {"$exists": True},
+                                "display_ended_at": {"$exists": False},
+                            },
+                            {"$set": {"display_ended_at": ref_now}},
+                            upsert=False,
+                        )
+                        for s_site, s_id in expiring_keys
+                    ]
+                    if end_ops:
+                        self.col.bulk_write(end_ops, ordered=False)
+                except Exception as exc_raw:
+                    logger.warning("回写超期好价结束展示时间 (`display_ended_at`) 异常: %s", exc_raw)
+            return modified
         except Exception as e:
             logger.warning("清理超期好价标识 (`deal_info.is_deal_tip`) 异常: %s", e)
             return 0
@@ -702,6 +745,8 @@ class DealRawPoolRepository:
                 "clean_max_age_days": channel_max_age,
                 "clean_cutoff_ts": clean_cutoff_ts,
             }
+            if site != USER_SUBMIT_SITE:
+                set_on_insert["ttl_at"] = now
             if isinstance(rec.get("ai_stage1_result"), dict) and initial_status == "pending":
                 set_on_insert["ai_stage1_result"] = rec["ai_stage1_result"]
             if isinstance(rec.get("converted_links"), list) and initial_status == "pending":
@@ -737,8 +782,16 @@ class DealRawPoolRepository:
                 "has_full_detail": has_full_detail,
                 "quality_signals": quality_signals,
             }
-            if rec.get("submitted_by_uid"):
-                core_fields["submitted_by_uid"] = str(rec["submitted_by_uid"]).strip()
+            for opt_key in (
+                "submitted_by_uid",
+                "resolved_platform",
+                "resolved_product_id",
+                "resolved_goods_sign",
+                "resolved_official_title",
+            ):
+                opt_val = str(rec.get(opt_key) or "").strip()
+                if opt_val:
+                    core_fields[opt_key] = opt_val
             if parsed_pub_ts is not None:
                 core_fields["publish_ts"] = parsed_pub_ts
 
@@ -1302,6 +1355,12 @@ class DealRawPoolRepository:
                     "clean_error_msg": 1,
                     "first_seen_at": 1,
                     "cleaned_at": 1,
+                    "display_started_at": 1,
+                    "display_ended_at": 1,
+                    "replaced_by_site": 1,
+                    "replaced_by_item_id": 1,
+                    "converted_links": 1,
+                    "extracted_links": 1,
                     "resolved_platform": 1,
                     "resolved_product_id": 1,
                     "resolved_goods_sign": 1,
@@ -1315,3 +1374,108 @@ class DealRawPoolRepository:
             .sort([("first_seen_at", -1)])
             .limit(safe_limit)
         )
+
+    def list_product_deal_history(
+        self,
+        platform: str,
+        product_id: str,
+        *,
+        only_displayed: bool = False,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """按商品主键查询全部（或仅实际展示过的）历史爆料记录与展期/替代链。"""
+        plat = normalize_platform(platform, default="")
+        pid = str(product_id or "").strip()
+        if not plat or not pid:
+            return []
+        safe_limit = max(1, min(100, int(limit or 50)))
+        flt: Dict[str, Any] = {"resolved_platform": plat, "resolved_product_id": pid}
+        if only_displayed:
+            flt["display_started_at"] = {"$exists": True}
+        return list(
+            self.col.find(
+                flt,
+                {
+                    "_id": 0,
+                    "source_site": 1,
+                    "source_item_id": 1,
+                    "source_channel": 1,
+                    "resolved_platform": 1,
+                    "resolved_product_id": 1,
+                    "resolved_official_title": 1,
+                    "title": 1,
+                    "clean_status": 1,
+                    "clean_stage": 1,
+                    "clean_error_code": 1,
+                    "clean_error_msg": 1,
+                    "quality_score": 1,
+                    "submitted_by_uid": 1,
+                    "first_seen_at": 1,
+                    "cleaned_at": 1,
+                    "display_started_at": 1,
+                    "display_ended_at": 1,
+                    "replaced_by_site": 1,
+                    "replaced_by_item_id": 1,
+                    "ai_stage1_result.deal_price": 1,
+                    "tutorial_images": 1,
+                },
+            )
+            .sort([("display_started_at", -1), ("first_seen_at", -1)])
+            .limit(safe_limit)
+        )
+
+
+def record_deal_display_transitions(
+    raw_col: Any,
+    started_deals: List[Dict[str, Any]],
+    replaced_deals: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """将正式商品表实际发生的好价上线展示与被替代事件统一回写至 `deal_raw_tips`。"""
+    if raw_col is None or (not started_deals and not replaced_deals):
+        return {"updated": 0}
+
+    ops: List[UpdateOne] = []
+    for item in started_deals or []:
+        s_site = str(item.get("source_site") or "").strip()
+        s_id = str(item.get("source_item_id") or "").strip()
+        started_at = item.get("started_at")
+        if not (s_site and s_id and started_at):
+            continue
+        ops.append(
+            UpdateOne(
+                {"source_site": s_site, "source_item_id": s_id},
+                {"$set": {"display_started_at": started_at}},
+                upsert=False,
+            )
+        )
+
+    for rep in replaced_deals or []:
+        old_site = str(rep.get("old_site") or "").strip()
+        old_id = str(rep.get("old_item_id") or "").strip()
+        new_site = str(rep.get("new_site") or "").strip()
+        new_id = str(rep.get("new_item_id") or "").strip()
+        ended_at = rep.get("ended_at")
+        if not (old_site and old_id and ended_at):
+            continue
+        ops.append(
+            UpdateOne(
+                {"source_site": old_site, "source_item_id": old_id},
+                {
+                    "$set": {
+                        "display_ended_at": ended_at,
+                        "replaced_by_site": new_site,
+                        "replaced_by_item_id": new_id,
+                    }
+                },
+                upsert=False,
+            )
+        )
+
+    if not ops:
+        return {"updated": 0}
+    try:
+        res = raw_col.bulk_write(ops, ordered=False)
+        return {"updated": int(getattr(res, "modified_count", 0) or 0)}
+    except Exception as e:
+        logger.warning("回写爆料展示生命周期状态异常: %s", e)
+        return {"updated": 0}

@@ -76,6 +76,7 @@
       <span class="val">{{ formatMoney(goods.price) }}</span>
       <span class="orig" v-if="goods.original_price && goods.original_price > goods.price">¥{{ formatMoney(goods.original_price) }}</span>
       <span class="coupon-pill-detail" v-if="goods.coupon_amount > 0">券减 ¥{{ formatMoney(goods.coupon_amount) }}</span>
+      <span class="commission-pill-detail" v-if="Number(goods.commission_amount) > 0" role="button" tabindex="0" @click="openCommissionHelp" title="点击查看佣金结算与常见问题">佣金 ¥{{ formatMoney(goods.commission_amount) }} <span class="commission-help-q">?</span></span>
       <span class="plat-badge" :class="goods.platform" style="position:static;margin-left:auto;font-size:10px">
         {{ platformName }}
       </span>
@@ -98,10 +99,10 @@
 
     <div class="detail-submit-row" v-if="!dealTip && canOperateDetail" @click="goToSubmitDeal">
       <span class="detail-submit-hint">
-        <span class="detail-submit-tag">共创</span>
-        <span>发现更低凑单价或隐藏券？</span>
+        <span class="detail-submit-tag">赚佣金</span>
+        <span>爆料被采纳，展示期间他人跟买立得丰厚佣金奖励</span>
       </span>
-      <button type="button" class="detail-submit-pill">✍️ 去补充好价 ›</button>
+      <button type="button" class="detail-submit-pill">✍️ 去爆料最新价 ›</button>
     </div>
   </div>
 
@@ -113,7 +114,7 @@
       </span>
       <div class="deal-tip-header-right">
         <span class="deal-tip-time" v-if="dealTip.publish_time">{{ dealTip.publish_time }} 爆料</span>
-        <button type="button" class="deal-tip-submit-link" v-if="canOperateDetail" @click="goToSubmitDeal">✍️ 补充更低价 ›</button>
+        <button type="button" class="deal-tip-submit-link" v-if="canOperateDetail" @click="goToSubmitDeal">✍️ 爆料最新价 ›</button>
       </div>
     </div>
 
@@ -191,6 +192,14 @@
         <button type="button" class="price-feedback-btn" :class="{ active: priceFeedbackChoice === 'buyable', muted: priceFeedbackChoice === 'unbuyable' }" @click="submitPriceFeedback('buyable')">👍 能买到</button>
         <button type="button" class="price-feedback-btn" :class="{ active: priceFeedbackChoice === 'unbuyable', muted: priceFeedbackChoice === 'buyable' }" @click="submitPriceFeedback('unbuyable')">👎 买不到</button>
       </div>
+    </div>
+
+    <div class="detail-submit-row" v-if="canOperateDetail" @click="goToSubmitDeal">
+      <span class="detail-submit-hint">
+        <span class="detail-submit-tag">赚佣金</span>
+        <span>有更准的新价格或买法？采纳展示期间他人跟买拿丰厚佣金</span>
+      </span>
+      <button type="button" class="detail-submit-pill">✍️ 爆料赚佣 ›</button>
     </div>
 
     <div class="deal-tip-footnote">提示：线报优惠有较强时效性，领券或凑单后实际付款金额请以平台结算页为准。</div>
@@ -333,6 +342,28 @@
       </div>
       <div class="smart-loader-bar">
         <div class="smart-loader-bar-inner"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 佣金结算与常见问题说明弹窗（长期可查） ==================== -->
+  <div class="modal-backdrop" v-if="isCommissionHelpOpen" @click.self="closeCommissionHelp">
+    <div class="sheet-dialog">
+      <div class="sheet-header">
+        <span>佣金结算与常见问题</span>
+        <button type="button" class="sheet-close" aria-label="关闭" @click="closeCommissionHelp">×</button>
+      </div>
+      <div class="sheet-scroll-body">
+        <div class="faq-section" v-for="(sec, sIdx) in commissionFaqSections" :key="sIdx">
+          <div class="faq-title">{{ sec.title }}</div>
+          <ul class="faq-list">
+            <li v-for="(item, iIdx) in sec.items" :key="iIdx">{{ item }}</li>
+          </ul>
+        </div>
+        <p class="faq-footnote">商品展示佣金仅供参考，订单佣金与最终金额以平台结算为准；平台已结算佣金不代表可提现余额，本页面不提供提现或资金账本。</p>
+      </div>
+      <div class="pop-action-btns" style="margin-top:10px;flex-shrink:0;">
+        <button type="button" class="btn-primary-block" @click="closeCommissionHelp">我知道了</button>
       </div>
     </div>
   </div>

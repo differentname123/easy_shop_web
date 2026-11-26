@@ -10,12 +10,13 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin
 
 import requests
 from PIL import Image, ImageOps
 
+from cache import BOOM_SORT_CACHE, clear_cached_deal_tip
 from config import logger
 from infrastructure.logging_utils import format_exc_summary
 from infrastructure.runtime_io import load_prompt_cached
@@ -477,11 +478,22 @@ class DealSubmitWorker:
         repo.col.update_many(self._doc_filter(doc), {"$set": {"converted_links": conv_links}})
         return "ready"
 
-    def _fetch_formal_doc(self, repo: Any, doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _extract_doc_product_key(doc: Dict[str, Any]) -> Tuple[str, str]:
+        """提取用户爆料文档对应的规范化 `(platform, product_id)` 主键。"""
         conv_links = doc.get("converted_links") if isinstance(doc.get("converted_links"), list) else []
         main_link = conv_links[0] if conv_links and isinstance(conv_links[0], dict) else {}
-        plat = normalize_platform(main_link.get("platform") or doc.get("platform") or "", default="")
-        pid = str(main_link.get("goods_id") or doc.get("candidate_goods_id") or "").strip()
+        plat = normalize_platform(
+            doc.get("resolved_platform") or main_link.get("platform") or doc.get("platform") or "",
+            default="",
+        )
+        pid = str(
+            doc.get("resolved_product_id") or main_link.get("goods_id") or doc.get("candidate_goods_id") or ""
+        ).strip()
+        return plat, pid
+
+    def _fetch_formal_doc(self, repo: Any, doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        plat, pid = self._extract_doc_product_key(doc)
         if not plat or not pid:
             return None
         return repo.formal_col.find_one(
@@ -549,6 +561,9 @@ class DealSubmitWorker:
             file_paths.append(str(new_dest))
             new_indices.append(len(file_paths))
 
+        if not new_indices:
+            return None
+
         if isinstance(formal_doc, dict) and isinstance(formal_doc.get("deal_info"), dict):
             ex_di = formal_doc["deal_info"]
             if ex_di.get("is_deal_tip") is True:
@@ -582,11 +597,16 @@ class DealSubmitWorker:
         with tempfile.TemporaryDirectory(prefix="deal_audit_") as tmp_dir_str:
             media = self._collect_audit_media(doc, formal_doc, Path(tmp_dir_str))
             if media is None:
+                missing_msg = (
+                    "上传的截图文件已失效，请重新提交"
+                    if any(str(u or "").strip() for u in (doc.get("tutorial_images") or []))
+                    else "缺少商品实际下单或结算价格截图凭证，请重新提交"
+                )
                 self._mark_permanent_failed(
                     repo,
                     doc,
                     error_code=ERR_USER_AUDIT_REJECTED,
-                    error_msg="上传的截图文件已失效，请重新提交",
+                    error_msg=missing_msg,
                 )
                 return "rejected"
 
@@ -608,14 +628,14 @@ class DealSubmitWorker:
             self._schedule_retry_or_fail(
                 repo,
                 doc,
-                retry_err_msg=str(audit_res.get("error") or "自动审核调用失败"),
+                retry_err_msg=str(audit_res.get("error") or "审查调用暂忙"),
                 max_err_code=ERR_AI_MAX_RETRIES_EXCEEDED,
-                max_err_msg="自动审核服务暂忙，请稍后重新提交",
+                max_err_msg="当前审查人数较多，请稍后重新提交",
             )
             return "retry"
 
         if not audit_res.get("is_content_valid"):
-            reject_msg = audit_res.get("content_reject_reason") or "图文内容与当前商品无关或未通过安全审核"
+            reject_msg = audit_res.get("content_reject_reason") or "图文内容与当前商品无关或未通过内容审查"
             self._mark_permanent_failed(
                 repo,
                 doc,
@@ -627,7 +647,7 @@ class DealSubmitWorker:
 
         if existing_deal is not None and not audit_res.get("should_replace_existing"):
             now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-            decision_msg = audit_res.get("decision_reason") or "当前商品已有更优好价在架，本次暂未替换"
+            decision_msg = audit_res.get("decision_reason") or "当前商品已有同价有效好价在架，本次暂未替换"
             repo.col.update_many(
                 self._doc_filter(doc),
                 {
@@ -642,6 +662,7 @@ class DealSubmitWorker:
                     "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                 },
             )
+            self.submit_service.delete_image_urls(doc.get("tutorial_images") or [])
             return "skipped_existing"
 
         compared_id = existing_deal["source_item_id"] if existing_deal else ""
@@ -673,7 +694,7 @@ class DealSubmitWorker:
         if not outcomes:
             return stats
 
-        has_published = False
+        published_targets: List[Tuple[str, str]] = []
         failed_docs_to_clean_imgs: List[Dict[str, Any]] = []
         for out in outcomes:
             mid = str(out.get("source_item_id") or "").strip()
@@ -682,12 +703,16 @@ class DealSubmitWorker:
             if status == "retry_pending":
                 out["clean_stage"] = CLEAN_STAGE_NEED_USER_AUDIT
             elif status == "success" and isinstance(out.get("product_doc"), dict):
-                has_published = True
+                pdoc = out["product_doc"]
                 stats["published"] += 1
+                t_plat = normalize_platform(pdoc.get("platform") or "", default="")
+                t_pid = str(pdoc.get("product_id") or "").strip()
+                if t_plat and t_pid:
+                    published_targets.append((t_plat, t_pid))
                 audit_meta = src_doc.get("user_audit_result") if isinstance(src_doc.get("user_audit_result"), dict) else {}
                 compared_ex_id = str(audit_meta.get("compared_existing_item_id") or "").strip()
                 if compared_ex_id:
-                    out["product_doc"]["_verified_replace_source_item_id"] = compared_ex_id
+                    pdoc["_verified_replace_source_item_id"] = compared_ex_id
             elif status in ("failed", "low_score"):
                 stats["rejected"] += 1
                 failed_docs_to_clean_imgs.append(src_doc)
@@ -696,11 +721,15 @@ class DealSubmitWorker:
         stats["ai2_processed"] = len(outcomes)
         for fail_doc in failed_docs_to_clean_imgs:
             self.submit_service.delete_image_urls(fail_doc.get("tutorial_images") or [])
-        if has_published and callable(self._on_formal_updated):
-            try:
-                self._on_formal_updated()
-            except Exception as exc:
-                logger.warning("用户爆料上架后唤醒回调异常: %s", format_exc_summary(exc))
+        if published_targets:
+            for t_plat, t_pid in dict.fromkeys(published_targets):
+                clear_cached_deal_tip(t_plat, t_pid)
+            BOOM_SORT_CACHE.clear()
+            if callable(self._on_formal_updated):
+                try:
+                    self._on_formal_updated()
+                except Exception as exc:
+                    logger.warning("用户爆料上架后唤醒回调异常: %s", format_exc_summary(exc))
         return stats
 
     def run_once(self) -> Dict[str, int]:
@@ -715,6 +744,7 @@ class DealSubmitWorker:
         )
         summary = {
             "claimed": len(claimed),
+            "deferred": 0,
             "audited": 0,
             "promoted": 0,
             "rejected": 0,
@@ -727,11 +757,36 @@ class DealSubmitWorker:
         if not claimed:
             return summary
 
+        # 同商品同一批次仅串行处理最早提交的一条，其余释放租约顺延至下一轮，防止同批并发互覆与失实状态回写
+        claimed_sorted = sorted(
+            claimed,
+            key=lambda d: (float(d.get("publish_ts") or 0.0), str(d.get("source_item_id") or "")),
+        )
+        active_docs: List[Dict[str, Any]] = []
+        deferred_docs: List[Dict[str, Any]] = []
+        seen_product_keys: Set[Tuple[str, str]] = set()
+        for doc in claimed_sorted:
+            plat_k, pid_k = self._extract_doc_product_key(doc)
+            if plat_k and pid_k:
+                pkey = (plat_k, pid_k)
+                if pkey in seen_product_keys:
+                    deferred_docs.append(doc)
+                    continue
+                seen_product_keys.add(pkey)
+            active_docs.append(doc)
+
+        for d_doc in deferred_docs:
+            repo.col.update_many(
+                self._doc_filter(d_doc),
+                {"$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""}},
+            )
+        summary["deferred"] = len(deferred_docs)
+
         cleaner = self._get_cleaner()
         ai_client = self._get_audit_ai_client(cleaner)
         ready_docs: List[Dict[str, Any]] = []
 
-        for doc in claimed:
+        for doc in active_docs:
             conv_state = self._ensure_coupon_converted(repo, cleaner, doc)
             if conv_state == "failed":
                 summary["coupon_failed"] += 1
@@ -760,11 +815,20 @@ class DealSubmitWorker:
         return summary
 
     def run_maintenance_once(self) -> None:
-        """仅针对 user_submit 范围执行轻量租约回收、重试封顶与 72h 摘标维护。"""
+        """针对 user_submit 队列执行租约回收、重试封顶、30 天本地截图清理与统一 72 小时好价自动过期。"""
         repo = self.submit_service.raw_repo
         repo.reclaim_expired_leases(source_site=USER_SUBMIT_SITE)
         repo.sweep_expired_and_max_retry(source_site=USER_SUBMIT_SITE)
-        repo.expire_stale_formal_deals(source_site=USER_SUBMIT_SITE)
+        self.submit_service.purge_expired_images()
+        expired = repo.expire_stale_formal_deals(source_site=USER_SUBMIT_SITE)
+        if expired > 0:
+            clear_cached_deal_tip()
+            BOOM_SORT_CACHE.clear()
+            if callable(self._on_formal_updated):
+                try:
+                    self._on_formal_updated()
+                except Exception as exc:
+                    logger.warning("用户好价 72h 过期后唤醒回调异常: %s", format_exc_summary(exc))
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -806,7 +870,7 @@ class DealSubmitWorker:
                 if now_mono - last_maint >= self.maintenance_interval:
                     self.run_maintenance_once()
                     last_maint = now_mono
-                if res["claimed"] >= self.batch_size:
+                if res["claimed"] >= self.batch_size or res.get("deferred", 0) > 0:
                     continue
             except Exception as exc:
                 logger.warning("【用户爆料内置清洗】轮询处理异常: %s", format_exc_summary(exc))

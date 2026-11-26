@@ -5,6 +5,22 @@
   const MAX_IMAGES = 3;
   const MAX_RAW_FILE_BYTES = 8 * 1024 * 1024;
   const MAX_DIM = 1280;
+  const emptyDealSummary = () => ({
+    total_submissions: 0,
+    displayed_count: 0,
+    active_count: 0,
+    valid_order_count: 0,
+    settled_order_count: 0,
+    pending_order_count: 0,
+    after_sale_order_count: 0,
+    excluded_refund_invalid_count: 0,
+    excluded_channel_count: 0,
+    estimated_commission_yuan: 0,
+    settled_commission_yuan: 0,
+    pending_commission_yuan: 0,
+    after_sale_commission_yuan: 0,
+    attribution_error: false,
+  });
 
   function compressImageFile(file) {
     return new Promise((resolve, reject) => {
@@ -68,6 +84,8 @@
     const imageInputRef = ref(null);
     const submitting = ref(false);
     const submissions = ref([]);
+    const dealSummary = ref(emptyDealSummary());
+    const expandedOrdersMap = ref({});
     const loadingSubmissions = ref(false);
     let imgSeq = 0;
     let disposed = false;
@@ -164,6 +182,9 @@
         }
         if (res.ok && res.data?.status === 'success' && res.data?.data) {
           submissions.value = Array.isArray(res.data.data.items) ? res.data.data.items : [];
+          dealSummary.value = res.data.data.summary && typeof res.data.data.summary === 'object'
+            ? { ...emptyDealSummary(), ...res.data.data.summary }
+            : emptyDealSummary();
         }
       } catch (_) {
       } finally {
@@ -219,6 +240,9 @@
       if (!cleanTut) {
         return browser.showToast('请填写购买步骤或优惠说明');
       }
+      if (!selectedImages.value.length) {
+        return browser.showToast('请至少上传 1 张能看到商品实际到手价的截图（结算页或优惠预览图均可）');
+      }
 
       submitting.value = true;
       try {
@@ -241,7 +265,7 @@
           return;
         }
         if (res.ok && res.data?.status === 'success') {
-          browser.showToast(res.data.data?.message || '提交成功，正在核验');
+          browser.showToast(res.data.data?.message || '提交成功，已进入人工审查');
           dealPrice.value = '';
           tutorialText.value = '';
           couponInput.value = '';
@@ -282,6 +306,15 @@
       await Promise.all([loadAnchoredGoods(token), loadSubmissions()]);
     };
 
+    const toggleRecordOrders = tipId => {
+      const key = String(tipId || '').trim();
+      if (!key) return;
+      expandedOrdersMap.value = {
+        ...expandedOrdersMap.value,
+        [key]: !expandedOrdersMap.value[key],
+      };
+    };
+
     const dispose = () => {
       disposed = true;
       browser.dispose();
@@ -303,10 +336,13 @@
       imageInputRef,
       submitting,
       submissions,
+      dealSummary,
+      expandedOrdersMap,
       loadingSubmissions,
       triggerImagePicker,
       removeImage,
       onSelectImages,
+      toggleRecordOrders,
       goHome,
       goBack,
       goToLogin,

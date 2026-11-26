@@ -75,7 +75,7 @@
   - **TB**：未配置长期 `taobao_refresh_token` 时，**首选折淘客 90 天长效 `publisher_sid_list`（`open_sc_publisher_get` / `open_sc_invitecode_get`）** 规避 24h `taobao_session` `27: invalid-sessionkey`；仅当显式配置 `taobao_refresh_token` 时优先官方 TOP 并附带 300s 会话失效冷却。
   - **PDD**：官方 `member.authority.query` & `rp.prom.url.generate[10]`。
 - **增量订单**：
-  - **JD**：**JD 官方直连 `jd.union.open.order.row.query` 优先** -> ZTK 订单网关兜底（窗宽 `<= 3600s`）。
+  - **JD**：**JD 官方直连 `jd.union.open.order.row.query` 优先** -> ZTK 订单网关兜底（窗宽 `<= 3600s`，均携带 `fields="goodsInfo,categoryInfo"`）。`JdAdapter.normalize_order` 在保留原始数字 `goods_id`（`skuId`）的同时，提取官方 `goodsInfo.imageUrl` 写入 `goods_thumbnail_url` 并计算 `canonical_goods_id`（`extract_jd_image_key` 主图指纹），供商品有效下单数统计与爆料佣金归因精准对齐 `products.product_id`。
   - **TB**：ZTK `open_dingdanchaxun2.ashx`（二跳官方签名 HTTPS URL，窗宽 `<= 1200s`）。
   - **PDD**：官方 `pdd.ddk.order.list.increment.get`（窗宽 `<= 86400s`，金额分转元）。
 

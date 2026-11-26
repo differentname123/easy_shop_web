@@ -32,6 +32,9 @@
      - 好单库 `sales_list` 现已同步升级为返回两段式加密 `itemid`，单次最多逗号分隔传 20 个加密 ID 调用 `item.info.upgrade.get`。
   5. ✅ 可用：详情接口 `item_basic_info.item_url` 返回的官方手淘落地页格式固定为：
      `https://uland.taobao.com/item/edetail?id={encrypted_item_id}`。
+  6. ✅ 【2026-11-26 19 位后缀跨源实证与重定向抓数字 ID 证伪结案】：
+     - **19 位后缀实测严格 1-to-1 且跨四通道 100% 恒定**：全库抽检 `10,000 / 11,483` 条淘宝商品 `100%` 为规范 19 位后缀；从好单库实时热榜任取 5 款商品横跨 **好单库（HDK）/ 官方 TOP 搜索 / 折淘客解 ID（`open_shangpin_id`）/ 折淘客高佣转链（`tkl`）** 四通道实测，尽管 26 位前缀每次全部重新加盐变更，但 `-` 后的 19 位后缀 **5/5（100%）四通道字节级完全一致**；抽查库内 5 组“同主图异后缀”记录反查数字 ID，**5/5 组** 底层均为商家独立开品的不同数字 ID，证实 19 位后缀与原生数字 ID 严格一一对应、抗换主图，且与 `TaobaoAdapter.normalize_order` 订单 `item_id` 天然同构对齐；
+     - ❌ **重定向提取数字 ID 全线证伪**：转链后的官方 `uland.taobao.com/coupon/edetail?e=...`（`0/15`）、官方淘口令 `m.tb.cn`（`0/5`）、折淘客 `s.click.taobao.com`（`0/5`）与 `s.tb.cn`（`0/5`）全部落入 `200` JS 壳页，**0% 暴露数字 ID**；不转链直访 `uland.taobao.com/item/edetail?id={goods_sign}` 仅读首跳 302 在第 12 条起全部退化为 `200` `lib-windvane` 空壳 JS 页（仅 `11/25 = 44%`），全跟跳则有 `5/15 (33.3%)` 触发阿里 `baxia / x5sec punish` 风控页；终态坚持 19 位后缀作主键、`goods_sign` 存完整 46 位密文。
 
 二、 热销榜单获取 (get_hot_rank_goods)
   1. ✅ 可用：好单库榜单接口域名必须使用 `https://v2.api.haodanku.com/sales_list`

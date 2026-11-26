@@ -23,7 +23,7 @@ from models.deal_constants import (
     OK_SKIPPED_ALREADY_CLEANED,
     STATS_SNAPSHOT_PATH,
 )
-from repositories.deal_raw_pool_repo import DealRawPoolRepository
+from repositories.deal_raw_pool_repo import DealRawPoolRepository, record_deal_display_transitions
 from repositories.product_repo import upsert_cleaned_products_to_formal_table
 
 logger = logging.getLogger("deal_pool_scheduler")
@@ -273,6 +273,12 @@ def commit_batch_results_to_db(
     if batch_success_product_docs:
         try:
             formal_write_res = upsert_cleaned_products_to_formal_table(formal_col, batch_success_product_docs)
+            if formal_write_res.get("started_deals") or formal_write_res.get("replaced_deals"):
+                record_deal_display_transitions(
+                    raw_col,
+                    formal_write_res.get("started_deals") or [],
+                    formal_write_res.get("replaced_deals") or [],
+                )
         except Exception as e:
             logger.exception("写入正式表 `products` 发生异常: %s", e)
 

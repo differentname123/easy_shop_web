@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import datetime
-import hashlib
 import io
 import math
 import re
@@ -21,6 +20,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000
 from adapters import PlatformUnavailableError
 from auth import mask_phone
 from cache_utils import ThreadSafeTTLCache
+from config import logger, settings
 from models.deal_constants import (
     CLEAN_STAGE_NEED_USER_AUDIT,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
@@ -35,9 +35,12 @@ from models.deal_constants import (
     is_reliable_source_site,
 )
 from models.product import URL_RE, normalize_platform
+from models.user import normalize_promoter_id
 from repositories.deal_raw_pool_repo import DealRawPoolRepository
+from repositories.order_repo import OrderRepository
 from repositories.user_repo import UserRepository
 from services.deal_cleaning.text_sanitizer import normalize_inline_spaces
+from services.deal_commission_service import compute_user_deals_commission_report
 
 USER_SUBMIT_WINDOW_SECONDS = 600
 USER_SUBMIT_MAX_PER_WINDOW = 5
@@ -48,7 +51,8 @@ USER_SUBMIT_MAX_IMAGES = 3
 USER_SUBMIT_MAX_RAW_IMAGE_BYTES = 8 * 1024 * 1024
 USER_SUBMIT_MAX_IMAGE_DIM = 1280
 USER_SUBMIT_IMAGE_JPEG_QUALITY = 82
-USER_SUBMIT_IMAGE_RETENTION_SECONDS = 7 * 86400
+USER_SUBMIT_IMAGE_RETENTION_DAYS = 30
+USER_SUBMIT_IMAGE_MAX_AGE_SECONDS = USER_SUBMIT_IMAGE_RETENTION_DAYS * 86400
 IMAGE_ID_PATTERN = re.compile(r"^dsi_[0-9a-f]{20}$")
 
 _APP_DIR = Path(__file__).resolve().parent.parent
@@ -158,28 +162,6 @@ def normalize_and_compress_deal_image(raw_b64: str) -> bytes:
         raise DealSubmitError("无法识别所选图片，请上传有效的 JPG/PNG/WEBP 图片", error_code="invalid_image", status_code=400) from exc
 
 
-def cleanup_expired_deal_submit_images(image_dir: Optional[Path] = None, now: Optional[float] = None) -> int:
-    """清理超期 7 天的用户投稿本地压缩图。"""
-    target_dir = image_dir or _DEFAULT_IMAGE_DIR
-    if not target_dir.is_dir():
-        return 0
-    cutoff = float(now if now is not None else time.time()) - USER_SUBMIT_IMAGE_RETENTION_SECONDS
-    removed = 0
-    try:
-        for idx, p in enumerate(target_dir.glob("dsi_*.jpg")):
-            if idx >= 200:
-                break
-            try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink(missing_ok=True)
-                    removed += 1
-            except OSError:
-                continue
-    except OSError:
-        return removed
-    return removed
-
-
 class DealSubmitService:
     """高内聚用户爆料接入服务：只做入参边界校验、官品核实、本地截图管理与进度查询。"""
 
@@ -189,6 +171,7 @@ class DealSubmitService:
         product_service_getter: Optional[Callable[[], Any]] = None,
         raw_repo: Optional[DealRawPoolRepository] = None,
         user_repo: Optional[UserRepository] = None,
+        order_repo: Optional[OrderRepository] = None,
         product_service: Any = None,
         image_dir: Optional[Path] = None,
     ):
@@ -196,10 +179,10 @@ class DealSubmitService:
         self._product_service_getter = product_service_getter
         self._raw_repo = raw_repo
         self._user_repo = user_repo
+        self._order_repo = order_repo
         self._wake_event = threading.Event()
         self.image_dir = Path(image_dir) if image_dir is not None else _DEFAULT_IMAGE_DIR
         self._rate_cache = ThreadSafeTTLCache(maxsize=4096, ttl=USER_SUBMIT_WINDOW_SECONDS)
-        self._last_cleanup_ts = 0.0
 
     @property
     def wake_event(self):
@@ -219,6 +202,13 @@ class DealSubmitService:
         if self._user_repo is None:
             self._user_repo = UserRepository()
         return self._user_repo
+
+    @property
+    def order_repo(self) -> OrderRepository:
+        if self._order_repo is None:
+            raw_db = getattr(self._raw_repo, "db", None)
+            self._order_repo = OrderRepository(db_instance=raw_db) if raw_db is not None else OrderRepository()
+        return self._order_repo
 
     @property
     def product_service(self) -> Any:
@@ -248,10 +238,6 @@ class DealSubmitService:
         if not jpeg_blobs:
             return []
         self.image_dir.mkdir(parents=True, exist_ok=True)
-        now = time.time()
-        if now - self._last_cleanup_ts >= 3600:
-            self._last_cleanup_ts = now
-            cleanup_expired_deal_submit_images(self.image_dir, now=now)
         urls: List[str] = []
         for blob in jpeg_blobs:
             img_id = f"dsi_{secrets.token_hex(10)}"
@@ -282,6 +268,37 @@ class DealSubmitService:
                 removed += 1
             except OSError:
                 continue
+        return removed
+
+    def purge_expired_images(
+        self,
+        *,
+        max_age_days: float = USER_SUBMIT_IMAGE_RETENTION_DAYS,
+        now_ts: Optional[float] = None,
+    ) -> int:
+        """定期清理超过保留期（默认 30 天）的本地用户爆料截图，防止磁盘无界增长。"""
+        if not self.image_dir.is_dir():
+            return 0
+        ref_ts = time.time() if now_ts is None else float(now_ts)
+        cutoff_ts = ref_ts - max(0.0, float(max_age_days)) * 86400.0
+        removed = 0
+        try:
+            entries = list(self.image_dir.iterdir())
+        except OSError:
+            return 0
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+                if entry.suffix.lower() != ".jpg" or not IMAGE_ID_PATTERN.fullmatch(entry.stem):
+                    continue
+                if entry.stat().st_mtime < cutoff_ts:
+                    entry.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
+        if removed > 0:
+            logger.info("🧹 已清理超期用户爆料截图 %d 张（保留期 %.0f 天）", removed, float(max_age_days))
         return removed
 
     def submit_user_deal(
@@ -330,6 +347,12 @@ class DealSubmitService:
             raise DealSubmitError("优惠券链接或口令过长", error_code="coupon_too_long", status_code=400)
 
         raw_imgs = list(images_base64 or [])
+        if not raw_imgs:
+            raise DealSubmitError(
+                "请至少上传 1 张包含商品实际下单或结算价格的截图",
+                error_code="missing_proof_image",
+                status_code=400,
+            )
         if len(raw_imgs) > USER_SUBMIT_MAX_IMAGES:
             raise DealSubmitError(f"最多上传 {USER_SUBMIT_MAX_IMAGES} 张截图", error_code="too_many_images", status_code=400)
 
@@ -422,8 +445,7 @@ class DealSubmitService:
             tutorial_text_db = clean_tut
 
         image_urls = self._persist_compressed_images(compressed_blobs)
-        sig_payload = f"{clean_uid}|{resolved_plat}:{canonical_pid}|{price_val:.2f}|{clean_tut}|{clean_cpn}|{len(image_urls)}"
-        tip_id = f"us_{hashlib.sha256(sig_payload.encode('utf-8')).hexdigest()[:20]}"
+        tip_id = f"us_{secrets.token_hex(10)}"
 
         ai_stage1_result = {
             "main_tip_id": tip_id,
@@ -447,6 +469,10 @@ class DealSubmitService:
             "has_full_detail": True,
             "platform": resolved_plat,
             "candidate_goods_id": canonical_pid,
+            "resolved_platform": resolved_plat,
+            "resolved_product_id": canonical_pid,
+            "resolved_goods_sign": canonical_gsign,
+            "resolved_official_title": official_title,
             "title": official_title,
             "price_text": f"¥{price_val:.2f}",
             "price": price_val,
@@ -478,7 +504,7 @@ class DealSubmitService:
                 "product_id": canonical_pid,
                 "deal_price": price_val,
                 "image_count": len(image_urls),
-                "message": "提交成功，系统将在约 10~30 秒内完成核验",
+                "message": "提交成功，已进入人工审查",
             },
         }
 
@@ -487,6 +513,16 @@ class DealSubmitService:
         if not clean_uid:
             raise DealSubmitError("请先登录", error_code="unauthorized", status_code=401)
         rows = self.raw_repo.list_user_submissions(clean_uid, limit=limit, source_site=USER_SUBMIT_SITE)
+        try:
+            default_jd_pos = normalize_promoter_id(getattr(settings, "jd_position_id", "") or "")
+        except ValueError:
+            default_jd_pos = ""
+        attr_by_tid, report_summary = compute_user_deals_commission_report(
+            rows,
+            order_repo=self.order_repo,
+            formal_col=getattr(self.raw_repo, "formal_col", None),
+            default_jd_position_id=default_jd_pos,
+        )
 
         items: List[Dict[str, Any]] = []
         for row in rows:
@@ -495,13 +531,13 @@ class DealSubmitService:
             raw_err_msg = str(row.get("clean_error_msg") or "").strip()
             if c_status == "pending":
                 ui_state = "pending"
-                state_label = "核验中"
-                reason = "正在自动核验并入库"
+                state_label = "人工审查中"
+                reason = "已提交，正在人工审查中"
             elif c_status == "cleaned_success":
                 if err_code == OK_EXISTING_DEAL_BETTER:
                     ui_state = "duplicate"
-                    state_label = "已有更优好价"
-                    reason = (raw_err_msg or "当前商品已有更优好价在架，本次暂未替换")[:80]
+                    state_label = "已有同价好价"
+                    reason = (raw_err_msg or "当前商品已有同价在架好价凭证，本次暂未替换")[:80]
                 elif err_code == OK_SKIPPED_ALREADY_CLEANED:
                     ui_state = "duplicate"
                     state_label = "已有同款在架"
@@ -514,7 +550,7 @@ class DealSubmitService:
                 ui_state = "rejected"
                 state_label = "未通过"
                 if err_code == ERR_USER_AUDIT_REJECTED:
-                    reason = raw_err_msg[:80] or "图文内容与当前商品无关或未通过安全审核"
+                    reason = raw_err_msg[:80] or "图文内容与当前商品无关或未通过内容审查"
                 elif err_code == ERR_AI2_COUPON_FAILED_OR_DROPPED:
                     reason = (
                         raw_err_msg[:80]
@@ -529,8 +565,10 @@ class DealSubmitService:
             res_pid = str(row.get("resolved_product_id") or row.get("candidate_goods_id") or "").strip()
 
             imgs = [str(u).strip() for u in (row.get("tutorial_images") or []) if str(u or "").strip()]
+            tip_id = str(row.get("source_item_id") or "")
+            attr = attr_by_tid.get(tip_id) or {}
             items.append({
-                "tip_id": str(row.get("source_item_id") or ""),
+                "tip_id": tip_id,
                 "title": str(row.get("resolved_official_title") or row.get("title") or "").strip(),
                 "deal_price": s1.get("deal_price"),
                 "state": ui_state,
@@ -542,11 +580,20 @@ class DealSubmitService:
                 "image_count": len(imgs),
                 "created_at": _iso_or_str(row.get("first_seen_at")),
                 "cleaned_at": _iso_or_str(row.get("cleaned_at")),
+                "display_started_at": _iso_or_str(attr.get("display_started_at")),
+                "display_ended_at": _iso_or_str(attr.get("display_ended_at")),
+                "display_started_str": attr.get("display_started_str") or "",
+                "display_ended_str": attr.get("display_ended_str") or "",
+                "display_status": attr.get("display_status") or "none",
+                "display_duration_seconds": int(attr.get("display_duration_seconds") or 0),
+                "display_duration_text": attr.get("display_duration_text") or "",
+                "commission_stats": attr.get("commission_stats"),
             })
         return {
             "status": "success",
             "data": {
                 "items": items,
+                "summary": report_summary,
                 "can_submit": True,
                 "strikes": 0,
             },

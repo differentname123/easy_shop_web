@@ -26,6 +26,9 @@ class OrderRepository(BaseRepository):
             self.col.create_index([("platform", 1), ("promoter_uid", 1), ("order_time", -1), ("order_sn", -1)])
             self.col.create_index([("order_modify_at", -1)])
             self.col.create_index([("platform", 1), ("goods_id", 1), ("is_refund", 1), ("is_invalid", 1)])
+            self.col.create_index([("platform", 1), ("goods_id", 1), ("order_time", -1)])
+            self.col.create_index([("platform", 1), ("canonical_goods_id", 1), ("is_refund", 1), ("is_invalid", 1)])
+            self.col.create_index([("platform", 1), ("canonical_goods_id", 1), ("order_time", -1)])
             return True
         except Exception as exc:
             logger.warning(
@@ -58,6 +61,11 @@ class OrderRepository(BaseRepository):
                 doc["promoter_id"] = normalize_promoter_id(doc["promoter_id"])
             else:
                 doc.pop("promoter_id", None)
+            canonical_gid = str(doc.get("canonical_goods_id") or "").strip()
+            if canonical_gid:
+                doc["canonical_goods_id"] = canonical_gid
+            else:
+                doc.pop("canonical_goods_id", None)
             # 新页缺证据不清掉旧页保存的未知归因，后续绑定仍可安全回填。
             if not doc.get("attribution_identity"):
                 doc.pop("attribution_identity", None)
@@ -81,7 +89,10 @@ class OrderRepository(BaseRepository):
             for key, value in doc.items():
                 if key in ("platform", "order_sn"):
                     continue
-                replacement = {"$cond": [fresh, {"$literal": value}, f"${key}"]}
+                if key == "goods_thumbnail_url" and not value:
+                    replacement = {"$cond": [fresh, {"$ifNull": ["$goods_thumbnail_url", ""]}, "$goods_thumbnail_url"]}
+                else:
+                    replacement = {"$cond": [fresh, {"$literal": value}, f"${key}"]}
                 if key in ("promoter_uid", "attribution_status", "attribution_identity", "promoter_id"):
                     # 已知归属不可被新页的缺字段、未知身份或另一个UID改写。
                     previous = ({"$ifNull": ["$attribution_status", "matched"]}
@@ -217,11 +228,12 @@ class OrderRepository(BaseRepository):
             "order_list": [self._format_order(doc) for doc in facet.get("order_list", [])],
         }
 
-    def count_valid_orders_by_goods_ids(self, platform: str, goods_ids: Sequence[str]) -> Dict[str, int]:
-        """精确统计指定商品当前未退款且未失效的有效订单笔数（兼容整型/Int64 与字符串 goods_id）；无有效订单返回 0。"""
+    @staticmethod
+    def _expand_goods_id_candidates(goods_ids: Sequence[str]) -> tuple[List[str], List[Any]]:
+        """去重规范商品 ID，并同时展开纯数字 ID 的字符串与整型双形态以兼容多平台订单存储。"""
         unique_ids = list(dict.fromkeys(str(g or "").strip() for g in (goods_ids or ()) if str(g or "").strip()))
         if not unique_ids:
-            return {}
+            return [], []
         match_candidates: List[Any] = []
         seen_candidates = set()
         for gid in unique_ids:
@@ -233,23 +245,106 @@ class OrderRepository(BaseRepository):
                 if ("int", num) not in seen_candidates:
                     seen_candidates.add(("int", num))
                     match_candidates.append(num)
+        return unique_ids, match_candidates
+
+    def count_valid_orders_by_goods_ids(self, platform: str, goods_ids: Sequence[str]) -> Dict[str, int]:
+        """精确统计指定商品当前未退款且未失效的有效订单笔数（兼容整型/Int64、字符串 goods_id 及京东 canonical_goods_id）；无有效订单返回 0。"""
+        unique_ids, match_candidates = self._expand_goods_id_candidates(goods_ids)
+        if not unique_ids:
+            return {}
         plat = normalize_platform(platform)
-        pipeline = [
-            {
-                "$match": {
-                    "platform": plat,
-                    "goods_id": {"$in": match_candidates},
-                    "is_refund": {"$ne": True},
-                    "is_invalid": {"$ne": True},
-                }
-            },
-            {"$group": {"_id": "$goods_id", "valid_orders": {"$sum": 1}}},
-        ]
         counts: Dict[str, int] = {gid: 0 for gid in unique_ids}
-        for row in self.col.aggregate(pipeline):
-            if not isinstance(row, dict):
-                continue
-            gid = str(row.get("_id") or "").strip()
-            if gid in counts:
-                counts[gid] = counts.get(gid, 0) + max(0, int(row.get("valid_orders") or 0))
+
+        def _accumulate(match_field: str, values: List[Any]) -> None:
+            pipeline = [
+                {
+                    "$match": {
+                        "platform": plat,
+                        match_field: {"$in": values},
+                        "is_refund": {"$ne": True},
+                        "is_invalid": {"$ne": True},
+                    }
+                },
+                {"$group": {"_id": f"${match_field}", "valid_orders": {"$sum": 1}}},
+            ]
+            for row in self.col.aggregate(pipeline):
+                if not isinstance(row, dict):
+                    continue
+                gid = str(row.get("_id") or "").strip()
+                if gid in counts:
+                    counts[gid] = counts.get(gid, 0) + max(0, int(row.get("valid_orders") or 0))
+
+        if plat != "jd":
+            _accumulate("goods_id", match_candidates)
+            return counts
+
+        numeric_ids = [gid for gid in unique_ids if gid.isdigit()]
+        canonical_ids = [gid for gid in unique_ids if not gid.isdigit()]
+        if numeric_ids:
+            _, numeric_candidates = self._expand_goods_id_candidates(numeric_ids)
+            _accumulate("goods_id", numeric_candidates)
+        if canonical_ids:
+            _accumulate("canonical_goods_id", canonical_ids)
         return counts
+
+    def find_orders_for_deal_attribution(
+        self,
+        platform: str,
+        goods_ids: Sequence[str],
+        *,
+        min_timestamp: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """批量查询指定平台与商品列表在时间下界之后的订单精简快照，供用户爆料展示期佣金归因使用。"""
+        unique_ids, match_candidates = self._expand_goods_id_candidates(goods_ids)
+        if not unique_ids:
+            return []
+        plat = normalize_platform(platform)
+        id_filter: Dict[str, Any] = (
+            {"$or": [{"goods_id": {"$in": match_candidates}}, {"canonical_goods_id": {"$in": unique_ids}}]}
+            if plat == "jd"
+            else {"goods_id": {"$in": match_candidates}}
+        )
+        and_clauses: List[Dict[str, Any]] = [{"platform": plat}, id_filter]
+        if min_timestamp is not None and float(min_timestamp) > 0:
+            ts_floor = int(float(min_timestamp))
+            and_clauses.append({
+                "$or": [
+                    {"order_create_time": {"$gte": ts_floor}},
+                    {"order_time": {"$gte": ts_floor}},
+                    {"order_pay_time": {"$gte": ts_floor}},
+                ]
+            })
+        query: Dict[str, Any] = {"$and": and_clauses}
+        projection = {
+            "_id": 0,
+            "platform": 1,
+            "order_sn": 1,
+            "goods_id": 1,
+            "canonical_goods_id": 1,
+            "goods_thumbnail_url": 1,
+            "goods_quantity": 1,
+            "order_amount_yuan": 1,
+            "promotion_amount_yuan": 1,
+            "estimated_commission_yuan": 1,
+            "settled_commission_yuan": 1,
+            "order_status": 1,
+            "order_status_desc": 1,
+            "is_refund": 1,
+            "is_invalid": 1,
+            "is_settled": 1,
+            "is_after_sale": 1,
+            "refund_tag": 1,
+            "promoter_uid": 1,
+            "attribution_status": 1,
+            "attribution_identity": 1,
+            "promoter_id": 1,
+            "position_id": 1,
+            "sub_union_id": 1,
+            "relation_id": 1,
+            "special_id": 1,
+            "is_self_operated": 1,
+            "order_create_time": 1,
+            "order_time": 1,
+            "order_pay_time": 1,
+        }
+        return list(self.col.find(query, projection))
