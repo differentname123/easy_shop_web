@@ -69,11 +69,7 @@ ANTIGRAVITY_MODEL_NAMES = frozenset({
     "antigravity-3.8-flash-medium",
     "gemini-3.8-flash-medium",
 })
-ANTIGRAVITY_MODEL_ALIASES = ANTIGRAVITY_MODEL_NAMES
 
-# 可选模块级显式覆盖（默认 None；未显式覆盖时实时读取配置文件）
-BASE_URL: Optional[str] = None
-API_KEY: Optional[str] = None
 MODEL_USAGE_JSON_PATH: Optional[Path] = None
 _RUNTIME_OS_NAME = os.name
 
@@ -182,20 +178,9 @@ def _clean_str_list(raw: Any) -> List[str]:
 
 def _extract_secrets_from_config(cfg: Dict[str, Any]) -> Tuple[str, ...]:
     secrets = set()
-    for key_field in ("local_api_key",):
-        val = str(cfg.get(key_field) or "").strip()
-        if val:
-            secrets.add(val)
-    secrets.update(_clean_str_list(cfg.get("local_api_key_list")))
-
-    for prov_block in (cfg.get("ai_providers"),):
-        if isinstance(prov_block, (list, tuple)):
-            for p in prov_block:
-                if isinstance(p, dict):
-                    secrets.update(_clean_str_list(p.get("api_keys")))
-                    single = str(p.get("api_key") or "").strip()
-                    if single:
-                        secrets.add(single)
+    val = str(cfg.get("local_api_key") or "").strip()
+    if val:
+        secrets.add(val)
 
     cloud_cfg = cfg.get("cloud_ai")
     if isinstance(cloud_cfg, dict):
@@ -203,13 +188,6 @@ def _extract_secrets_from_config(cfg: Dict[str, Any]) -> Tuple[str, ...]:
         c_single = str(cloud_cfg.get("api_key") or "").strip()
         if c_single:
             secrets.add(c_single)
-        if isinstance(cloud_cfg.get("providers"), (list, tuple)):
-            for p in cloud_cfg["providers"]:
-                if isinstance(p, dict):
-                    secrets.update(_clean_str_list(p.get("api_keys")))
-                    single = str(p.get("api_key") or "").strip()
-                    if single:
-                        secrets.add(single)
     return tuple(sorted(secrets, key=len, reverse=True))
 
 
@@ -259,8 +237,6 @@ def _get_cached_secrets() -> Iterable[str]:
             cached = _CONFIG_FILE_CACHE["secrets"] or ()
     combined = set(cached)
     combined.update(runtime)
-    if API_KEY:
-        combined.add(str(API_KEY))
     return sorted(combined, key=len, reverse=True)
 
 
@@ -382,63 +358,21 @@ def _is_linux_cloud_runtime(force_cloud: bool = False) -> bool:
     return _RUNTIME_OS_NAME != "nt"
 
 
-def _collect_provider_routes(raw_providers, default_base_url, default_proxy_url, default_keys, all_secrets):
-    model_routes: Dict[str, Dict[str, Any]] = {}
-    provider_models: List[str] = []
-    if isinstance(raw_providers, (list, tuple)):
-        for idx, prov in enumerate(raw_providers):
-            if not isinstance(prov, dict):
-                continue
-            p_name = str(prov.get("name") or f"provider_{idx + 1}").strip()
-            p_url = str(prov.get("base_url") or prov.get("api_url") or default_base_url).strip() or default_base_url
-            p_proxy = str(prov.get("proxy_url") if "proxy_url" in prov else default_proxy_url).strip()
-            p_keys = _clean_str_list(prov.get("api_keys"))
-            p_single = str(prov.get("api_key") or "").strip()
-            if p_single and p_single not in p_keys:
-                p_keys.append(p_single)
-            if not p_keys:
-                p_keys = list(default_keys)
-            all_secrets.update(p_keys)
-            p_models = _clean_str_list(prov.get("models"))
-            for m_name in p_models:
-                if m_name not in provider_models:
-                    provider_models.append(m_name)
-                if m_name not in model_routes:
-                    model_routes[m_name] = {
-                        "base_url": p_url,
-                        "api_keys": p_keys,
-                        "proxy_url": p_proxy,
-                        "pool_id": f"{p_name}:{p_url}",
-                    }
-    return model_routes, provider_models
-
-
 def _resolve_ai_runtime(force_cloud: bool = False, require_keys_on_cloud_block: bool = False) -> Dict[str, Any]:
     global _RUNTIME_SECRETS
     cfg_url = str(get_config("local_api_url", "http://127.0.0.1:8317/v1") or "").strip()
-    local_base_url = str(BASE_URL).strip() if BASE_URL else (cfg_url or "http://127.0.0.1:8317/v1")
+    local_base_url = cfg_url or "http://127.0.0.1:8317/v1"
 
-    cfg_single_key = str(get_config("local_api_key", "") or "").strip()
-    local_single_key = str(API_KEY).strip() if API_KEY else cfg_single_key
-    local_key_list = _clean_str_list(get_config("local_api_key_list", []))
-    if local_single_key and local_single_key not in local_key_list:
-        local_key_list.append(local_single_key)
+    local_single_key = str(get_config("local_api_key", "") or "").strip()
+    local_key_list = [local_single_key] if local_single_key else []
 
     cloud_cfg = get_config("cloud_ai", None)
     all_secrets = set(local_key_list)
-    if API_KEY:
-        all_secrets.add(str(API_KEY))
     if isinstance(cloud_cfg, dict):
         all_secrets.update(_clean_str_list(cloud_cfg.get("api_keys")))
         c_single = str(cloud_cfg.get("api_key") or "").strip()
         if c_single:
             all_secrets.add(c_single)
-        if isinstance(cloud_cfg.get("providers"), (list, tuple)):
-            for p in cloud_cfg["providers"]:
-                if isinstance(p, dict):
-                    all_secrets.update(_clean_str_list(p.get("api_keys")))
-                    if p.get("api_key"):
-                        all_secrets.add(str(p.get("api_key")).strip())
 
     is_cloud_os = _is_linux_cloud_runtime(force_cloud=force_cloud)
     if is_cloud_os and (force_cloud or isinstance(cloud_cfg, dict)):
@@ -453,11 +387,7 @@ def _resolve_ai_runtime(force_cloud: bool = False, require_keys_on_cloud_block: 
             key_list.append(c_single_key)
         proxy_url = str(c_dict.get("proxy_url") or "").strip()
         raw_models = c_dict.get("models", None)
-        raw_providers = c_dict.get("providers", None)
-        model_routes, provider_models = _collect_provider_routes(
-            raw_providers, base_url, proxy_url, key_list, all_secrets
-        )
-        configured_models = raw_models if raw_models not in (None, "", [], {}) else (provider_models or None)
+        configured_models = raw_models if raw_models not in (None, "", [], {}) else None
         raw_cloud_timeout = c_dict.get("timeout")
         cloud_timeout: Optional[float] = None
         if isinstance(raw_cloud_timeout, (int, float)) and not isinstance(raw_cloud_timeout, bool):
@@ -465,7 +395,7 @@ def _resolve_ai_runtime(force_cloud: bool = False, require_keys_on_cloud_block: 
                 cloud_timeout = float(raw_cloud_timeout)
 
         if require_keys_on_cloud_block:
-            if not key_list and not any(r.get("api_keys") for r in model_routes.values()):
+            if not key_list:
                 raise ValueError("检测到 Linux 云端环境（或 --cloud），请在 config.local.json 的 cloud_ai.api_keys 中填入官方 API Key")
             if configured_models is None:
                 raise ValueError("检测到 Linux 云端环境（或 --cloud），请在 config.local.json 的 cloud_ai.models 中填入官方模型名")
@@ -477,18 +407,13 @@ def _resolve_ai_runtime(force_cloud: bool = False, require_keys_on_cloud_block: 
             "default_keys": key_list,
             "default_proxy_url": proxy_url,
             "configured_models": configured_models,
-            "model_routes": model_routes,
+            "model_routes": {},
             "all_secrets": all_secrets,
             "default_timeout": cloud_timeout,
         }
 
-    proxy_url = str(get_config("ai_proxy_url", "") or "").strip()
     raw_models = get_config("ai_models", None)
-    raw_providers = get_config("ai_providers", None)
-    model_routes, provider_models = _collect_provider_routes(
-        raw_providers, local_base_url, proxy_url, local_key_list, all_secrets
-    )
-    configured_models = raw_models if raw_models not in (None, "", [], {}) else (provider_models or None)
+    configured_models = raw_models if raw_models not in (None, "", [], {}) else None
     if (
         is_cloud_os
         and require_keys_on_cloud_block
@@ -506,9 +431,9 @@ def _resolve_ai_runtime(force_cloud: bool = False, require_keys_on_cloud_block: 
         "runtime_mode": "linux_cloud" if is_cloud_os else "windows_local",
         "default_base_url": local_base_url,
         "default_keys": local_key_list,
-        "default_proxy_url": proxy_url,
+        "default_proxy_url": "",
         "configured_models": configured_models,
-        "model_routes": model_routes,
+        "model_routes": {},
         "all_secrets": all_secrets,
         "default_timeout": None,
     }
@@ -1390,7 +1315,6 @@ __all__ = [
     "reset_usage_tracker",
     "reset_ai_cooldowns",
     "setup_logger",
-    "ANTIGRAVITY_MODEL_ALIASES",
     "ANTIGRAVITY_MODEL_NAMES",
 ]
 

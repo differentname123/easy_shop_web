@@ -100,10 +100,9 @@ class FetchResult:
     rate_limited: bool = False
     allow_empty_ok: bool = False
     detail_errors: List[Dict[str, Any]] = field(default_factory=list)
-    extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {
+        return {
             "status": self.status,
             "http_status": self.http_status,
             "request_url": self.request_url,
@@ -123,9 +122,6 @@ class FetchResult:
             "detail_errors": list(self.detail_errors),
             "records": self.records,
         }
-        if self.extra:
-            out.update(self.extra)
-        return out
 
 
 class BaseDealSource(ABC):
@@ -133,8 +129,6 @@ class BaseDealSource(ABC):
 
     site_key: str = ""
     source_key: str = ""
-    default_network_mode: str = "direct"
-    close_connection: bool = False
     troubleshooting: Dict[str, str] = {}
 
     @property

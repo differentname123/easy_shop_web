@@ -438,7 +438,7 @@ def test_order_count_supports_int64_and_user_stats_score_saturation():
 
     # 后续新增任意整数字段后可直接全量重算
     doc1["user_stats"]["custom_extra_counter"] = 5
-    prod_repo.recompute_user_stats_scores()
+    prod_repo._refresh_user_stats_scores([{"$or": [{"user_stats": {"$exists": True}}, {"user_stats_score": {"$exists": True}}]}])
     assert abs(doc1["user_stats_score"] - 5.0) < 1e-9
 
     # 默认严选好价排序：高分品排在时间更新的无互动品之前
@@ -452,7 +452,7 @@ def test_order_count_supports_int64_and_user_stats_score_saturation():
 
 
 def test_universal_collect_preserves_existing_search_caches_and_stays_searchable():
-    from cache import BOOM_SORT_CACHE, CATEGORY_CACHE
+    from cache import BOOM_SORT_CACHE
     from services.product_service import ProductService
 
     prod_col = _FullMemoryProductCollection()
@@ -461,9 +461,7 @@ def test_universal_collect_preserves_existing_search_caches_and_stays_searchable
     prod_svc = ProductService(product_repo=repo)
 
     BOOM_SORT_CACHE.clear()
-    CATEGORY_CACHE.clear()
     BOOM_SORT_CACHE.set(("all", "", "无关词", "cost_performance"), [{"product_id": "OTHER"}])
-    CATEGORY_CACHE.set("all", ["食品"])
 
     card = {
         "platform": "jd",
@@ -482,9 +480,8 @@ def test_universal_collect_preserves_existing_search_caches_and_stays_searchable
         is_public=True,
     )
 
-    # 不清空全站已有查询与类目缓存（靠 120s/600s TTL 自然过期，避免缓存击穿）
+    # 不清空全站已有查询缓存（靠 120s TTL 自然过期，避免缓存击穿）
     assert BOOM_SORT_CACHE.get(("all", "", "无关词", "cost_performance")) == [{"product_id": "OTHER"}]
-    assert CATEGORY_CACHE.get("all") == ["食品"]
 
     # 未命中旧缓存的正常搜索可直接查到该商品
     found = prod_svc.get_boom_products(platform="all", keyword="厨房调料")

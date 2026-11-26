@@ -69,13 +69,6 @@ class FavoriteService:
         doc = col.find_one(query)
         return doc if isinstance(doc, dict) else None
 
-    def check_favorite(self, uid: str, platform: str, product_id: str, goods_sign: str = "") -> Dict[str, Any]:
-        plat, pid, gsign = self._resolve_key(platform, product_id, goods_sign)
-        favorited = self.repo.is_favorited(uid, plat, pid)
-        if not favorited and gsign and gsign != pid:
-            favorited = self.repo.is_favorited(uid, plat, gsign)
-        return {"status": "success", "data": {"is_favorited": favorited}}
-
     def add_favorite(
         self,
         uid: str,

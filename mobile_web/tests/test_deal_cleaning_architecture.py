@@ -603,8 +603,6 @@ def test_generate_pool_summary_single_facet_aggregation_and_empty_edge():
     sample_raw_docs = [
         {"source_site": "guangdiu", "platform": "jd", "has_full_detail": True, "quality_signals": {"has_unique_product_anchor": True}, "clean_status": "cleaned_success"},
         {"source_site": "guangdiu", "platform": "tb", "has_full_detail": True, "quality_signals": {"has_unique_product_anchor": True}, "clean_status": "cleaned_low_score", "clean_error_code": "LOW_SCORE"},
-        {"source_site": "xianbao_fun", "platform": "jd", "has_full_detail": False, "clean_status": "merged_into_parent"},
-        {"source_site": "xianbao_fun", "clean_status": "context_only"},
         {"source_site": "tehuicaicai", "platform": "pdd", "clean_status": "cleaned_failed", "clean_error_code": "OFF_PROMO"},
         {"source_site": "tehuicaicai", "clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_AI1},
         {"source_site": "tehuicaicai", "clean_status": "pending", "clean_stage": CLEAN_STAGE_NEED_CONVERT},
@@ -620,14 +618,12 @@ def test_generate_pool_summary_single_facet_aggregation_and_empty_edge():
     summary = repo.generate_pool_summary()
     assert raw_col.count_calls == 0
     assert raw_col.agg_calls == 1
-    assert summary["total_records"] == 10
+    assert summary["total_records"] == 8
     assert summary["full_detail_records"] == 2
     assert summary["unique_product_anchor_records"] == 2
-    assert summary["unique_product_anchor_ratio"] == 20.0
+    assert summary["unique_product_anchor_ratio"] == 25.0
     assert summary["cleaned_success_records"] == 1
     assert summary["cleaned_low_score_records"] == 1
-    assert summary["merged_into_parent_records"] == 1
-    assert summary["context_only_records"] == 1
     assert summary["cleaned_failed_records"] == 1
     assert summary["pending_clean_records"] == 5
     assert summary["pending_by_stage"] == {
@@ -636,7 +632,7 @@ def test_generate_pool_summary_single_facet_aggregation_and_empty_edge():
         CLEAN_STAGE_NEED_AI2: 2,
     }
     assert summary["by_clean_error_code"] == {"LOW_SCORE": 1, "OFF_PROMO": 1}
-    assert summary["by_platform"] == {"None": 6, "jd": 2, "tb": 1, "pdd": 1}
+    assert summary["by_platform"] == {"None": 5, "jd": 1, "tb": 1, "pdd": 1}
     assert summary["formal_products_total"] == 2
     assert summary["formal_deal_products_count"] == 1
     assert summary["by_source_site"][0]["_id"] == "guangdiu"

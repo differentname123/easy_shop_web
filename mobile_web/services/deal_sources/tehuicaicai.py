@@ -51,8 +51,6 @@ class TehuicaicaiSource(BaseDealSource):
     def fetch(self, ctx: FetchContext) -> FetchResult:
         ch = ctx.channel
         params = ch.params or {}
-        channel_mode = str(params.get("channel") or "home").strip()
-        category_id = params.get("category_id")
         page_size = int(params.get("page_size") or 50)
         max_pages = max(1, int(ch.max_pages or params.get("max_pages") or 15))
         auto_paginate = bool(params.get("auto_paginate", True))
@@ -79,14 +77,9 @@ class TehuicaicaiSource(BaseDealSource):
         t0 = time.perf_counter()
 
         while pages_crawled < max_pages:
-            if channel_mode == "category" and category_id:
-                list_url = f"{self.BASE_API}/public/categories/{category_id}/products/?page={current_page}&page_size={page_size}"
-                web_page_url = f"https://xhhcds.cn/#/category?id={category_id}"
-                sub_channel = f"category_{category_id}"
-            else:
-                list_url = f"{self.BASE_API}/public/home-products/?feed=home&page={current_page}&page_size={page_size}"
-                web_page_url = "https://xhhcds.cn/"
-                sub_channel = "home_products"
+            list_url = f"{self.BASE_API}/public/home-products/?feed=home&page={current_page}&page_size={page_size}"
+            web_page_url = "https://xhhcds.cn/"
+            sub_channel = "home_products"
 
             if not primary_req_url:
                 primary_req_url = list_url

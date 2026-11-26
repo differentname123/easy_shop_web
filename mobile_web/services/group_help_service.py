@@ -2,8 +2,6 @@
 """拼多多多人团互助服务层：同步二维码解码与 307 免登录核验 + 后台定时大模型识图任务。"""
 import hmac
 import io
-import json
-import os
 import re
 import secrets
 import threading
@@ -20,7 +18,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000
 
 from cache_utils import ThreadSafeTTLCache
 from config import logger
-from infrastructure.ai_api.model_api import extract_llm_json
+from infrastructure.ai_api.json_parser import parse_llm_json
 from infrastructure.logging_utils import format_exc_summary
 from infrastructure.runtime_io import load_prompt_cached
 from models.group_help import (
@@ -164,7 +162,7 @@ def extract_json_object(raw_text: str) -> Dict[str, Any]:
     """从大模型输出文本中稳健提取 JSON 字典（支持自动剥离 <think> 思考标签与代码块）。"""
     if not isinstance(raw_text, str) or not raw_text.strip():
         raise ValueError("模型返回内容为空")
-    obj = extract_llm_json(raw_text)
+    obj = parse_llm_json(raw_text)
     if isinstance(obj, dict):
         return obj
     raise ValueError("无法从模型输出中解析合法 JSON 对象")
@@ -830,23 +828,6 @@ class GroupHelpService:
             if updated
             else None
         )
-
-    def submit_feedback(
-        self,
-        group_order_id: str,
-        action: str,
-        remain_people: Optional[int] = None,
-        viewer_uid: Optional[str] = None,
-        owner_token: str = "",
-    ) -> Optional[Dict[str, Any]]:
-        res = self.submit_feedback_detailed(
-            group_order_id=group_order_id,
-            action=action,
-            remain_people=remain_people,
-            viewer_uid=viewer_uid,
-            owner_token=owner_token,
-        )
-        return res["data"] if res else None
 
 
 class GroupHelpWorker:

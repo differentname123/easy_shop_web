@@ -66,7 +66,6 @@ _GUANGDIU_CAPTCHA_MARKERS = (
 _SERVICES_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MOBILE_WEB_ROOT = os.path.dirname(_SERVICES_DIR)
 _RUNTIME_DIR = os.path.join(_MOBILE_WEB_ROOT, "runtime")
-_LEGACY_GUANGDIU_COOKIE_FILE: str = os.path.join(_SERVICES_DIR, "guangdiu_cookies.json")
 DEFAULT_GUANGDIU_COOKIE_FILE: str = os.path.join(_RUNTIME_DIR, "guangdiu_cookies.json")
 
 
@@ -84,12 +83,6 @@ def load_guangdiu_cookies(
     target = DEFAULT_GUANGDIU_COOKIE_FILE if cookie_file is None else str(cookie_file).strip()
     if not target or not hasattr(session, "cookies"):
         return False
-    if (
-        target == DEFAULT_GUANGDIU_COOKIE_FILE
-        and not os.path.exists(target)
-        and os.path.exists(_LEGACY_GUANGDIU_COOKIE_FILE)
-    ):
-        target = _LEGACY_GUANGDIU_COOKIE_FILE
     if not os.path.exists(target):
         return False
     try:
@@ -125,10 +118,7 @@ def save_guangdiu_cookies(
     target = DEFAULT_GUANGDIU_COOKIE_FILE if cookie_file is None else str(cookie_file).strip()
     if not target or not hasattr(session, "cookies"):
         return
-    if not (
-        should_write_runtime_artifact(target, _RUNTIME_DIR)
-        and should_write_runtime_artifact(target, _SERVICES_DIR)
-    ):
+    if not should_write_runtime_artifact(target, _RUNTIME_DIR):
         return
     try:
         from requests.cookies import RequestsCookieJar

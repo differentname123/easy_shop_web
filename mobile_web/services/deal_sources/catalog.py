@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from models.deal_constants import DEAL_MAX_CLEAN_AGE_DAYS
 from .base import ChannelConfig
 
 DEFAULT_CHANNEL_CONFIGS: List[ChannelConfig] = [
@@ -466,25 +465,6 @@ def is_channel_due(
     if last_run_at <= 0:
         return True
     return (current_time - last_run_at) >= max(10, int(channel.interval_seconds))
-
-
-def get_channel_max_age_days(
-    channel_name: str = "",
-    site_key: str = "",
-    default_days: float = float(DEAL_MAX_CLEAN_AGE_DAYS),
-    channels: Optional[List[ChannelConfig]] = None,
-) -> float:
-    """根据频道名称或站点标识获取配置的有效保鲜期（天）。"""
-    pool = channels if channels is not None else DEFAULT_CHANNEL_CONFIGS
-    if channel_name:
-        for c in pool:
-            if c.name == channel_name:
-                return float(c.max_age_days)
-    if site_key:
-        for c in pool:
-            if c.site_key == site_key:
-                return float(c.max_age_days)
-    return float(default_days)
 
 
 def get_site_max_age_days_map(

@@ -296,14 +296,14 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         self.assertEqual(res3["core_entities_raw"], [])
         self.assertEqual(extract_core_entities(None), ([], []))
 
-    @patch("repositories.product_repo.upsert_cleaned_products_to_formal_table")
-    def test_repo_upsert_cleaned_deal_products_ssot(self, mock_upsert_deal):
-        """测试 ProductRepository 作为单一真源入口统一调度好价商品入库"""
-        mock_upsert_deal.return_value = {"upserted": 1, "modified": 0, "matched": 0}
-        product_docs = [{"platform": "pdd", "product_id": "P999", "name": "测试商品"}]
-        res = self.repo.upsert_cleaned_deal_products(product_docs)
-        mock_upsert_deal.assert_called_once_with(self.col, product_docs)
-        self.assertEqual(res["upserted"], 1)
+    @patch("repositories.product_repo.UpdateOne")
+    def test_repo_upsert_cleaned_deal_products_ssot(self, _mock_u1):
+        """测试正式商品库好价线报统一入库中枢"""
+        from repositories.product_repo import upsert_cleaned_products_to_formal_table
+        with patch.object(self.col, "bulk_write", return_value=SimpleNamespace(upserted_count=1, modified_count=0, matched_count=0)):
+            product_docs = [{"platform": "pdd", "product_id": "P999", "name": "测试商品", "deal_info": {"is_deal_tip": True, "source_site": "guangdiu", "source_item_id": "gd_1"}}]
+            res = upsert_cleaned_products_to_formal_table(self.col, product_docs)
+            self.assertEqual(res["upserted"], 1)
 
     def test_format_meili_doc_sync_ts_deterministic_and_naive_utc(self):
         """sync_ts 确定性取更新/格式化相关 UTC 时间最大值，全缺失时固定为 0"""

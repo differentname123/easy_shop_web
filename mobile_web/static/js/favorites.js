@@ -145,7 +145,7 @@
           ref,
           api: shop.createApi(),
           session: shop.createSessionStore(),
-          browser: shop.createBrowserTools({ ref }),
+          browser: shop.createBrowserTools({ ref, enableDesktopBanner: false }),
         });
         onMounted(controller.initialize);
         onUnmounted(controller.dispose);

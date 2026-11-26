@@ -41,9 +41,7 @@ CMD ["python", "-B", "-m", "pytest", "tests", "-q"]
 
 # Default final image: runtime dependencies and application only, no tests/dev tools.
 FROM base AS runtime
-ENV WEB_HOST=0.0.0.0 \
-    WEB_PORT=8000 \
-    WEB_LOG_DIR=-
+ENV WEB_LOG_DIR=-
 EXPOSE 8000
 # Liveness only: this intentionally does not contact Mongo or the PDD API.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

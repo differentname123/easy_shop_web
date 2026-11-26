@@ -9,16 +9,7 @@ settings = get_settings()
 
 # 拼多多、仓储与启动入口消费同一份配置，不回溯仓库父级。
 PDD_CLIENT_ID = settings.pdd_client_id
-PDD_CLIENT_SECRET = settings.pdd_client_secret
-PDD_PID = settings.pdd_pid
-MONGO_HOST = settings.mongo_host
-MONGO_PORT = settings.mongo_port
-MONGO_USER = settings.mongo_user
-MONGO_PASSWORD = settings.mongo_password
 MONGO_DB_NAME = settings.mongo_db_name
-MONGO_AUTH_SOURCE = settings.mongo_auth_source
-WEB_HOST = settings.web_host
-WEB_PORT = settings.web_port
 AUTH_SECRET = settings.auth_secret
 
 # 业务安全与防刷约束常量
@@ -31,5 +22,4 @@ CACHE_MAX_RECOMMEND = 256       # 首页推荐流缓存最大条目
 CACHE_MAX_DETAIL = 2048         # 商品详情缓存最大条目
 CACHE_MAX_SEARCH = 1024         # 搜索缓存最大条目
 CACHE_MAX_PROMOTION = 4096      # 推手专属转链缓存最大条目
-CACHE_MAX_CATEGORY = 32         # 类目缓存最大条目
 

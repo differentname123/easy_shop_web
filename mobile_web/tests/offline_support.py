@@ -23,6 +23,7 @@ _CONFIG = {
     "web_log_dir": "-",
     "web_warmup_enabled": True,
     "web_detail_prefetch_enabled": False,
+    "web_deal_submit_worker_enabled": False,
     "pdd_dns_mode": "off",
     "pdd_trust_env": False,
     # 离线边界必须关掉 Meilisearch：清洗结果写正式表时会调 is_meili_available() 探活，

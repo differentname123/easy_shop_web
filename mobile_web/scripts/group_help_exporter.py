@@ -26,7 +26,7 @@ if str(MOBILE_WEB_DIR) not in sys.path:
 from infrastructure.logging_utils import format_exc_summary
 from infrastructure.mongo import close_shared_db
 from infrastructure.runtime_io import bootstrap_script, install_shutdown_signals, interruptible_sleep
-from services.group_help_sync import DEFAULT_BRIDGE_DIR, GroupHelpExporter, MiaozhuliPublisher
+from services.group_help_sync import DEFAULT_BRIDGE_DIR, GroupHelpExporter
 
 # ==============================================================================
 # 【运维直改配置区】：海报外发桥接常用参数

@@ -10,7 +10,7 @@ import pytest
 
 from models.product import DetailPrefetchResult, DetailSnapshot, ProductRef
 from services.detail_prefetch import (
-    COOLDOWN_CAPACITY, DEFAULT_INTERVAL_SECONDS, PAGE_LIMIT, QUEUE_CAPACITY, WORKER_COUNT,
+    COOLDOWN_CAPACITY, DEFAULT_INTERVAL_SECONDS, PAGE_LIMIT, QUEUE_CAPACITY,
     DetailPrefetcher,
 )
 
@@ -170,7 +170,7 @@ def test_batch_logging_distinguishes_proven_off_promotion_from_real_errors(monke
 
 
 def test_constants_and_explicit_lifecycle_never_start_threads_in_constructor():
-    assert (WORKER_COUNT, QUEUE_CAPACITY, PAGE_LIMIT, DEFAULT_INTERVAL_SECONDS) == (1, 128, 20, 300)
+    assert (QUEUE_CAPACITY, PAGE_LIMIT, DEFAULT_INTERVAL_SECONDS) == (128, 20, 300)
     service = MemoryService()
     before = set(threading.enumerate())
     worker = DetailPrefetcher(service)

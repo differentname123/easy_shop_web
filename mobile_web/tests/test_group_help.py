@@ -894,7 +894,7 @@ def test_duplicate_active_group_matching_and_confirm_publish(tmp_path):
     assert [it["group_order_id"] for it in hall_before["items"]] == [gid_a]
 
     # 用户选择“继续上传我的团” (confirm_publish)
-    published_b = svc.submit_feedback(gid_b, action="confirm_publish")
+    published_b = svc.submit_feedback_detailed(gid_b, action="confirm_publish")["data"]
     assert published_b["group_status"] == GROUP_STATUS_ACTIVE
     assert published_b["matched_group_order_id"] == ""
     assert published_b["matched_group"] is None

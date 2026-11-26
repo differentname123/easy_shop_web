@@ -100,24 +100,6 @@ FORMAT_SUCCESS_FIELDS = frozenset({
     "need_reformat",
 })
 
-# 区块 3：线报好价包（外部爬虫线报：本地 ➔ 云端；真实 user_submit 用户爆料：云端 ➔ 本地，本地测试 user_submit 严禁上云）
-DEAL_FIELDS = frozenset({"deal_info"})
-
-# 区块 4：线上用户互动与热度区（云端唯一主权：云端 ➔ 本地）
-USER_STATS_FIELDS = frozenset({
-    "user_stats",
-    "user_stats_score",
-    "is_user_collected",
-})
-
-# 区块 5：官方软下架 / 替代状态（双向单调收敛）
-OFF_PROMOTION_FIELDS = frozenset({
-    "is_off_promotion",
-    "off_promotion_at",
-    "off_promotion_reason",
-    "superseded_by",
-})
-
 # 兼容旧引用保留（等价于不进入任何同步白名单的本地/运行态临时字段说明）
 NEVER_OVERWRITE_FIELDS = frozenset({
     "_id",
@@ -130,20 +112,6 @@ NEVER_OVERWRITE_FIELDS = frozenset({
     "user_stats",
     "user_stats_score",
 })
-
-FORMAT_FAMILY_FIELDS = frozenset({
-    "format_info",
-    "format_status",
-    "format_updated_at",
-    "format_model",
-    "format_error",
-    "format_retry_count",
-    "format_activity_price",
-    "need_reformat",
-})
-
-CLOUD_LIVE_COMMERCIAL_FIELDS = COMMERCIAL_FIELDS
-CLOUD_LIVE_DETAIL_FIELDS = DETAIL_FIELDS
 
 FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "_id": 0,

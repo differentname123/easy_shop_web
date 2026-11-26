@@ -43,7 +43,6 @@ DEAL_FORMAT_ROUND_LIMIT = 0
 ROUND_INTERVAL_SECONDS = 60
 RECENT_DAYS = 7
 BSON_MAX_INT64 = 2 ** 63 - 1
-COUNT_KEYS = ("success", "failed", "skipped")
 
 _MULTI_SPACE_RE = re.compile(r"\s+")
 

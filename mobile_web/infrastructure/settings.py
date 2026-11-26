@@ -77,8 +77,6 @@ class Settings:
     local_api_url: str = "http://127.0.0.1:8317/v1"
     local_api_key: str = field(default="", repr=False)
     cloud_ai: Dict[str, Any] = field(default_factory=dict, repr=False)
-    xianyu_search_profile_dir: str = ""
-    xianyu_guest_profile_dir: str = ""
 
 
 def app_path(value) -> Path:
@@ -371,8 +369,6 @@ def load_settings(config_file=None, *, require_credentials=True) -> Settings:
         local_api_url=text("local_api_url", "http://127.0.0.1:8317/v1").strip(),
         local_api_key=text("local_api_key").strip(),
         cloud_ai=dict(raw_cloud_ai) if isinstance(raw_cloud_ai, dict) else {},
-        xianyu_search_profile_dir=text("xianyu_search_profile_dir").strip(),
-        xianyu_guest_profile_dir=text("xianyu_guest_profile_dir").strip(),
     )
 
 

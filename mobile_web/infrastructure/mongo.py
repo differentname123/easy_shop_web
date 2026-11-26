@@ -71,27 +71,6 @@ class MongoBase:
         return self.get_collection(collection_name).create_index(keys, unique=unique)
 
 
-def build_mongo_client(
-    uri: str,
-    *,
-    max_pool_size: int = 50,
-    connect_timeout_ms: int = 10000,
-    socket_timeout_ms: int = 60000,
-    compressors: Optional[str] = None,
-) -> MongoClient:
-    """构造带标准 UTC 与超时的原始 PyMongo 客户端，供云同步/维护脚本统一复用。"""
-    kwargs = {
-        "tz_aware": True,
-        "maxPoolSize": max_pool_size,
-        "serverSelectionTimeoutMS": connect_timeout_ms,
-        "connectTimeoutMS": connect_timeout_ms,
-        "socketTimeoutMS": socket_timeout_ms,
-    }
-    if compressors:
-        kwargs["compressors"] = compressors
-    return MongoClient(uri, **kwargs)
-
-
 def gen_db_object(settings=None, *, max_pool_size: int = 50, timeout_ms: int = 5000):
     """与应用常量共用配置，不再独立读取仓库外 JSON。"""
     settings = get_settings() if settings is None else settings

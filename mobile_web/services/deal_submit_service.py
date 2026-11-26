@@ -54,7 +54,6 @@ USER_SUBMIT_MAX_RAW_IMAGE_BYTES = 8 * 1024 * 1024
 USER_SUBMIT_MAX_IMAGE_DIM = 1280
 USER_SUBMIT_IMAGE_JPEG_QUALITY = 82
 USER_SUBMIT_IMAGE_RETENTION_DAYS = 30
-USER_SUBMIT_IMAGE_MAX_AGE_SECONDS = USER_SUBMIT_IMAGE_RETENTION_DAYS * 86400
 IMAGE_ID_PATTERN = re.compile(r"^dsi_[0-9a-f]{20}$")
 
 _APP_DIR = Path(__file__).resolve().parent.parent
@@ -495,7 +494,6 @@ class DealSubmitService:
 
         ai_stage1_result = {
             "main_tip_id": tip_id,
-            "is_standalone_deal": True,
             "merged_tip_ids": [tip_id],
             "deal_price": price_val,
             "tutorial_score": 80,
@@ -511,7 +509,6 @@ class DealSubmitService:
             "source_channel": "detail_anchor",
             "source_item_id": tip_id,
             "source_is_reliable": is_reliable_source_site(USER_SUBMIT_SITE),
-            "is_group_stream": False,
             "has_full_detail": True,
             "platform": resolved_plat,
             "candidate_goods_id": canonical_pid,
@@ -639,7 +636,5 @@ class DealSubmitService:
             "data": {
                 "items": items,
                 "summary": report_summary,
-                "can_submit": True,
-                "strikes": 0,
             },
         }

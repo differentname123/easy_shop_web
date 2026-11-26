@@ -503,8 +503,6 @@ def _match_modifier_head(query_lower: str, entities_lower: Sequence[str], mod_ha
 def partition_search_candidates(
     keyword: str,
     items: Sequence[Dict[str, Any]],
-    *,
-    min_strict: int = 5,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     极简相关性分桶（SSOT）：不修改性价比/时间排序逻辑，仅在排序前净化候选集。
@@ -514,7 +512,6 @@ def partition_search_candidates(
       L2 (secondary_items): 次本体直击 / 本体衍生品包含（如 牛肉 -> 牛肉丸、牛肉辣酱）
       L3 (fallback_items): 仅标题蹭词且本体无关（如狗粮、手机壳、充电线、猫砂）
     """
-    del min_strict
     raw_q = str(keyword or "").strip()
     if not raw_q or not items:
         return list(items), [], []
@@ -624,9 +621,7 @@ def select_relevant_candidates(
     min_primary: int = 5,
 ) -> List[List[Dict[str, Any]]]:
     """返回参与排序的分层候选桶列表：高相关 (L1+L2) 充足时屏蔽 L3 噪音；不足时附带 L3 兜底。"""
-    strict_items, secondary_items, fallback_items = partition_search_candidates(
-        keyword, items, min_strict=min_primary,
-    )
+    strict_items, secondary_items, fallback_items = partition_search_candidates(keyword, items)
     buckets: List[List[Dict[str, Any]]] = []
     if strict_items:
         buckets.append(strict_items)

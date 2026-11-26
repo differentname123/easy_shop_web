@@ -143,11 +143,6 @@ def load_prompt_cached(path: Path | str, *, encoding: str = "utf-8") -> str:
     return text
 
 
-def clear_prompt_cache() -> None:
-    with _PROMPT_CACHE_LOCK:
-        _PROMPT_CACHE.clear()
-
-
 def install_shutdown_signals(
     stop_event: threading.Event,
     *,

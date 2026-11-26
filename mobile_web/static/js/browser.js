@@ -2,7 +2,7 @@
 (function (global) {
   'use strict';
   const shop = global.EasyShop = global.EasyShop || {};
-  shop.createBrowserTools = function ({ ref }) {
+  shop.createBrowserTools = function ({ ref, enableDesktopBanner = true }) {
     const toastMessage = ref('');
     let toastTimer = null;
     let sloganTimer = null;
@@ -151,7 +151,7 @@
     const isStandalone = ref(initialStandalone);
     const desktopGuidePlatform = ref(detectGuidePlatform());
     const isDesktopGuideOpen = ref(false);
-    const canShowBanner = !initialStandalone &&
+    const canShowBanner = enableDesktopBanner && !initialStandalone &&
       safeGetStorage(DESKTOP_INSTALLED_KEY) !== '1' &&
       safeGetStorage(DESKTOP_DISMISSED_KEY) !== '1';
     const elapsedMs = canShowBanner ? getSessionElapsedMs() : 0;
@@ -232,7 +232,7 @@
     };
     return {
       toastMessage, smartLoading, showToast, copyText, startSmartLoading, stopSmartLoading, jumpToLink,
-      isWeChatBrowser, shouldBlockDirectJump, showValueGuide, dismissValueGuide,
+      shouldBlockDirectJump, showValueGuide, dismissValueGuide,
       isCommissionHelpOpen, openCommissionHelp, closeCommissionHelp, commissionFaqSections,
       isStandalone, desktopGuidePlatform, isDesktopGuideOpen, showDesktopBanner,
       triggerAddToDesktop, dismissDesktopBanner, closeDesktopGuide, dispose,

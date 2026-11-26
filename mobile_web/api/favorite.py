@@ -36,21 +36,6 @@ def list_favorites(
     return favorite_service.list_favorites(uid=current_uid, page=page, page_size=page_size)
 
 
-@router.get("/check")
-def check_favorite(
-    platform: str = Query(..., min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$"),
-    product_id: str = Query("", max_length=128),
-    goods_sign: Optional[str] = Query(None, max_length=128),
-    current_uid: str = Depends(get_current_uid),
-):
-    return favorite_service.check_favorite(
-        uid=current_uid,
-        platform=platform,
-        product_id=product_id,
-        goods_sign=goods_sign or "",
-    )
-
-
 @router.post("/add")
 def add_favorite(req: FavoriteAddRequest, current_uid: str = Depends(get_current_uid)):
     return favorite_service.add_favorite(

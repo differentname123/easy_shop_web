@@ -19,9 +19,9 @@ from auth import (
 )
 from cache_utils import ThreadSafeTTLCache
 from infrastructure.http_utils import extract_ztk_item_fields, parse_carousel_images
-from models.order import OrderItem, UserOrderStats
+from models.order import normalize_order_fields
 from models.product import ProductDetail, ProductSummary, normalize_jd_material_url, resolve_item_identity
-from models.user import RegisterOrLoginDTO, UserProfile
+from models.user import RegisterOrLoginDTO
 from repositories.base_repo import BaseRepository
 
 
@@ -67,22 +67,15 @@ class TestDomainModelsAndHelpers(unittest.TestCase):
         self.assertEqual(detail.detail_tags, ["5元优惠券", "官方补贴", "退货包运费"])
 
     def test_order_and_user_models(self):
-        item = OrderItem(
-            order_sn="SN_9999",
-            goods_id="G_123",
-            goods_name="爆款洗衣液",
-            promotion_amount_yuan=5.5,
-            is_settled=True,
+        normalized = normalize_order_fields(
+            {"order_sn": "SN_9999", "order_pay_time": 1234, "promotion_amount_yuan": 5.5},
+            "pdd",
         )
-        stats = UserOrderStats(total_count=1, total_commission=5.5, settled_commission=5.5, order_list=[item])
-        self.assertEqual(stats.total_commission, 5.5)
-        self.assertEqual(len(stats.order_list), 1)
+        self.assertEqual(normalized["order_time"], 1234)
+        self.assertEqual(normalized["order_time_basis"], "paid")
 
         dto = RegisterOrLoginDTO(phone="13800000000", password="securePassword123")
         self.assertEqual(dto.phone, "13800000000")
-        profile = UserProfile(uid="u_test01", phone="138****0000", nickname="超级推手", invite_code="INV_ABC123")
-        self.assertEqual(profile.uid, "u_test01")
-        self.assertIn("****", profile.phone)
 
     def test_missing_collection_name_raises(self):
         class IncompleteRepo(BaseRepository):

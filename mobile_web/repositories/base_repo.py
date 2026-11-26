@@ -22,7 +22,6 @@ class BaseRepository:
     def __init__(self, db_instance=None):
         # 路由/服务装配不触发网络 I/O；真实连接和索引在首次仓储操作时获取。
         self._db = db_instance
-        self._owns_db = False
         self._connection_lock = threading.RLock()
         self._index_state = threading.local()
         self._collection_index_state = None

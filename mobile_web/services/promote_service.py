@@ -496,7 +496,7 @@ class PromoteService:
         user_tag = raw_uid or "匿名"
         err_resp, effective_uid, identity, public_identity, context, need_auth, personal_fallback, auth_ms = (
             self._resolve_user_promotion_context(
-                plat, adapter, raw_uid, goods_tag=goods_tag, total_started=total_started, log_errors=True
+                plat, adapter, raw_uid, goods_tag=goods_tag, log_errors=True
             )
         )
         if err_resp is not None:
@@ -579,7 +579,6 @@ class PromoteService:
         raw_uid: str,
         *,
         goods_tag: str = "url",
-        total_started: float = 0.0,
         log_errors: bool = False,
     ):
         """统一解析推手推广位身份；当个人身份缺失/失效时统一降级至站长推广位保底（绝不白白丢单）。"""
@@ -903,7 +902,7 @@ class PromoteService:
         elif adapter is not None and callable(resolve_fn):
             err_resp, effective_uid, identity, public_identity, context, need_auth, personal_fallback, _ = (
                 self._resolve_user_promotion_context(
-                    detected_plat, adapter, raw_uid, total_started=total_started, log_errors=False
+                    detected_plat, adapter, raw_uid, log_errors=False
                 )
             )
             if err_resp is not None:

@@ -54,14 +54,3 @@ def list_boom_goods(
         page=page,
         page_size=page_size,
     )
-
-
-@router.get("/categories")
-def get_categories(
-    platform: str = Query("all", min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$", description="平台代码"),
-):
-    """
-    获取爆单库现存分类列表
-    """
-    cats = product_service.get_boom_categories(platform=platform)
-    return {"status": "success", "data": cats}

@@ -2,7 +2,7 @@
 """拼多多多人团互助独立路由模块：上传二维码图片、搜索列表、详情查询、跳转计数与用户共创状态反馈。"""
 import asyncio
 import base64
-from typing import Optional, Tuple
+from typing import Tuple
 from fastapi import APIRouter, Path, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from auth import extract_viewer_auth_soft

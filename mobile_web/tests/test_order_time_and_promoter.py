@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from models.order import OrderItem, normalize_order_fields
+from models.order import normalize_order_fields
 from services import order_service as module
 from tests.test_order_sync_protocol import (
     Adapter, MemoryCollection, MemoryOrders, MemorySyncRepository, MemoryUserRepository,
@@ -77,9 +77,6 @@ def test_jd_created_time_and_zero_amounts_are_not_relabelled_as_paid():
     assert not row["is_refund"] and not row["is_settled"] and not row["is_invalid"]
     for key in ("order_amount_yuan", "promotion_amount_yuan", "estimated_commission_yuan", "settled_commission_yuan"):
         assert row[key] == 0
-    dto = OrderItem(**row)
-    assert dto.order_time == 1000 and dto.order_pay_time is None
-    assert dto.order_amount_basis == "commissionable"
 
 
 def test_page_local_identity_cache_includes_misses_but_refreshes_next_page(monkeypatch):

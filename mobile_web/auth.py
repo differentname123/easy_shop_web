@@ -2,7 +2,7 @@
 """
 用户认证鉴权与密码安全核心模块
 - 基于 HMAC-SHA256 的轻量有界时效性访问令牌 (Token)
-- PBKDF2 密码哈希与平滑向后兼容旧哈希校验
+- PBKDF2-SHA256 密码哈希与校验
 - FastAPI 标准 Depends(get_current_uid) 鉴权依赖注入
 """
 import hmac
@@ -61,16 +61,15 @@ def verify_access_token(token: Optional[str]) -> Optional[str]:
 
 async def get_current_uid(
     authorization: Optional[str] = Header(None, alias="Authorization"),
-    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
     token: Optional[str] = Query(None, description="登录鉴权令牌"),
 ) -> str:
     """
     FastAPI 统一身份鉴权依赖项
-    依次从 Authorization 请求头、X-Auth-Token 头或 URL Query token 参数提取令牌并验证。
+    依次从 Authorization 请求头或 URL Query token 参数提取令牌并验证。
     通过后返回权威 uid，未通过抛出标准 401 未认证异常。
     """
     raw_token = None
-    for candidate in (authorization, x_auth_token, token):
+    for candidate in (authorization, token):
         if isinstance(candidate, str) and candidate.strip():
             raw_token = candidate.strip()
             break
@@ -93,11 +92,10 @@ async def get_current_uid(
 
 async def get_optional_uid(
     authorization: Optional[str] = Header(None, alias="Authorization"),
-    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
     token: Optional[str] = Query(None, description="登录鉴权令牌"),
 ) -> Optional[str]:
     """允许匿名，但提供失效凭据时不能静默退回匿名归因。"""
-    raw_token = next((value.strip() for value in (authorization, x_auth_token, token)
+    raw_token = next((value.strip() for value in (authorization, token)
                       if isinstance(value, str) and value.strip()), None)
     if raw_token is None:
         return None
@@ -113,7 +111,6 @@ def extract_viewer_auth_soft(request: Request) -> Tuple[Optional[str], bool]:
     """提取可选登录身份与令牌过期标记；失效令牌仅返回 (None, True)，不阻断公开请求。"""
     raw_token = (
         request.headers.get("Authorization")
-        or request.headers.get("X-Auth-Token")
         or request.query_params.get("token")
         or ""
     ).strip()

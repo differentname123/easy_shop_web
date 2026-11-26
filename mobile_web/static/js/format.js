@@ -10,40 +10,6 @@
     const number = Number(value);
     return (Number.isFinite(number) ? number : 0).toFixed(2);
   };
-  shop.formatDealTime = (rawTime, nowMs = Date.now()) => {
-    const raw = String(rawTime || '').trim();
-    if (!raw) return '';
-    const pad2 = n => String(n).padStart(2, '0');
-    const cnOffsetMs = 8 * 3600 * 1000;
-    let targetMs = NaN;
-    const localMatch = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
-    if (localMatch) {
-      const y = Number(localMatch[1]);
-      const m = Number(localMatch[2]);
-      const d = Number(localMatch[3]);
-      const hh = Number(localMatch[4]);
-      const mm = Number(localMatch[5]);
-      const ss = Number(localMatch[6] || 0);
-      targetMs = Date.UTC(y, m - 1, d, hh, mm, ss) - cnOffsetMs;
-    } else {
-      const parsed = Date.parse(raw);
-      if (Number.isFinite(parsed)) targetMs = parsed;
-    }
-    if (!Number.isFinite(targetMs)) return '';
-    const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
-    const diffMin = Math.floor((now - targetMs) / 60000);
-    if (diffMin >= -5 && diffMin < 1) return '刚刚';
-    if (diffMin >= 1 && diffMin < 60) return `${diffMin}分钟前`;
-    const targetCn = new Date(targetMs + cnOffsetMs);
-    const nowCn = new Date(now + cnOffsetMs);
-    const hhmm = `${pad2(targetCn.getUTCHours())}:${pad2(targetCn.getUTCMinutes())}`;
-    const targetDayMs = Date.UTC(targetCn.getUTCFullYear(), targetCn.getUTCMonth(), targetCn.getUTCDate());
-    const nowDayMs = Date.UTC(nowCn.getUTCFullYear(), nowCn.getUTCMonth(), nowCn.getUTCDate());
-    const dayDiff = Math.round((nowDayMs - targetDayMs) / 86400000);
-    if (dayDiff === 0) return `今天 ${hhmm}`;
-    if (dayDiff === 1) return `昨天 ${hhmm}`;
-    return `${pad2(targetCn.getUTCMonth() + 1)}-${pad2(targetCn.getUTCDate())} ${hhmm}`;
-  };
   shop.formatSales = salesTip => {
     if (!salesTip || salesTip === '0') return '';
     let text = String(salesTip).trim();

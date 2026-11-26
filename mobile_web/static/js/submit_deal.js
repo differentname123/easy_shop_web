@@ -372,7 +372,7 @@
           computed,
           api: shop.createApi(),
           session: shop.createSessionStore(),
-          browser: shop.createBrowserTools({ ref }),
+          browser: shop.createBrowserTools({ ref, enableDesktopBanner: false }),
         });
         onMounted(ctrl.initialize);
         onUnmounted(ctrl.dispose);

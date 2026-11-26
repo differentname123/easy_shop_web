@@ -78,7 +78,8 @@ class MemoryProducts:
 
     def get_known_coupon_overlays(self, platform, keys): return {}
     def get_deal_card_overlays(self, platform, keys): return {}
-    def get_categories(self, **kwargs): return ["日用"]
+    def bulk_inc_user_stats(self, batch): return 0
+    def get_user_favorite_keys(self, uid): return set()
 
     def _promotion_key(self, platform, goods_id=None, goods_sign=None, goods_key=None):
         key = goods_sign or goods_id or goods_key

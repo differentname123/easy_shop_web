@@ -93,12 +93,7 @@
       const boomSearchInputRef = ref(null);
       feeds = shop.createFeeds({ ref, api,
         getScope: session.scope, showToast: browser.showToast });
-      const resolveImeModelRef = key => {
-        if (key === 'boom') return feeds.boomSearchKeyword;
-        if (key === 'universal') return account.universalInput;
-        if (key === 'nickname') return account.formNickname;
-        return feeds.homeSearchKeyword;
-      };
+      const resolveImeModelRef = key => (key === 'nickname' ? account.formNickname : feeds.homeSearchKeyword);
       const isUiEvent = ev => Boolean(ev && typeof ev === 'object' && ('target' in ev || 'type' in ev || 'preventDefault' in ev));
       const smartSearch = async (sourceTab, fromUiEvent = false) => {
         const inputRef = sourceTab === 'boom' ? feeds.boomSearchKeyword : feeds.homeSearchKeyword;
@@ -420,8 +415,8 @@
         onSearchHome, onSearchBoom, clearHomeSearch, clearBoomSearch,
         currentTab, onClickHomeTab, isHeaderHidden, showBackToTop, scrollToTop,
         pullDistance, pullStatus, isRefreshing, isTransitioning, pullText, executeRefresh,
-        formatPhone: shop.formatPhone, formatMoney: shop.formatMoney, formatSales: shop.formatSales,
-        formatDealTime: shop.formatDealTime, goodsKey: shop.goodsKey, openGoodsDetail,
+        formatPhone: shop.formatPhone, formatMoney: shop.formatMoney,
+        goodsKey: shop.goodsKey, openGoodsDetail,
       };
     },
   }).mount('#app');

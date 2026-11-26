@@ -3120,7 +3120,7 @@ test('simplified search routing, goHome reset, single detail retry, honest degra
   // HTML templates preserve single detail retry guard & degraded banner
   const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
   const indexHtml = fs.readFileSync(path.join(root, 'static', 'index.html'), 'utf8');
-  assert.ok(detailHtml.includes('v-if="!isOffPromotion && !detailError"'));
+  assert.ok(detailHtml.includes('v-if="!detailError"'));
   assert.ok(indexHtml.includes("universalResult.resolution_kind === 'degraded_product'"));
   assert.ok(indexHtml.includes('universal-degraded-tip'));
 });
@@ -3978,8 +3978,8 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
 
   for (const htmlName of ['index.html', 'detail.html', 'favorites.html', 'submit_deal.html', 'group_help.html']) {
     const content = fs.readFileSync(path.join(root, 'static', htmlName), 'utf8');
-    assert.ok(content.includes('?v=ux-20261126-5'), `${htmlName} bumped asset version`);
-    assert.ok(!content.includes('?v=ux-20261126-4'), `${htmlName} has no stale asset version`);
+    assert.ok(content.includes('?v=ux-20261126-6'), `${htmlName} bumped asset version`);
+    assert.ok(!content.includes('?v=ux-20261126-5'), `${htmlName} has no stale asset version`);
   }
 });
 

@@ -18,7 +18,6 @@ from infrastructure.logging_utils import format_exc_summary
 from models.product import DetailPrefetchResult, DetailSnapshot, ProductRef
 
 
-WORKER_COUNT = 1
 QUEUE_CAPACITY = 128
 PAGE_LIMIT = 20
 DEFAULT_INTERVAL_SECONDS = 300

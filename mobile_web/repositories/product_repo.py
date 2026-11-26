@@ -21,12 +21,12 @@ from models.deal_constants import (
     get_deal_publish_ts,
 )
 from models.product import (
-    _BARE_YUAN_TAG_RE,
     clean_product_id,
     compute_user_stats_score,
     get_source_site_name,
     is_jd_image_key,
     is_product_reliable,
+    normalize_detail_tags,
     normalize_jd_material_url,
     normalize_platform,
     resolve_item_identity,
@@ -39,7 +39,6 @@ from infrastructure.search_meili import (
     search_products,
 )
 from services.boom_search import (
-    build_boom_filter_query,
     rank_boom_cost_performance,
     query_boom_products_page,
 )
@@ -340,21 +339,7 @@ class ProductRepository(BaseRepository):
             "deal_info.source_is_reliable", "deal_info.price_is_reliable",
         ), 1),
     }
-    _COST_PERFORMANCE_PROJECTION = {
-        **_SUMMARY_PROJECTION,
-        "format_info": 1,
-        "format_status": 1,
-        "need_reformat": 1,
-        "format_activity_price": 1,
-        "deal_info.is_deal_tip": 1,
-        "deal_info.publish_ts": 1,
-        "deal_info.publish_time": 1,
-        "deal_info.deal_price": 1,
-        "deal_info.format_deal_price": 1,
-        "deal_info.format_status": 1,
-        "deal_info.need_reformat": 1,
-        "deal_info.format_info": 1,
-    }
+    _COST_PERFORMANCE_PROJECTION = _SUMMARY_PROJECTION
 
     @staticmethod
     def _displayable_content_filter() -> Dict[str, Any]:
@@ -603,14 +588,6 @@ class ProductRepository(BaseRepository):
                     else:
                         update_set[key] = deepcopy(item[key])
         return self._identity_filter(platform, goods_id, goods_sign), {"$set": update_set, "$setOnInsert": insert_set}
-
-    def _build_boom_filter_query(
-        self,
-        platform: str = "all",
-        category: Optional[str] = None,
-        keyword: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        return build_boom_filter_query(platform=platform, category=category, keyword=keyword)
 
     def rank_boom_products_by_cost_performance(
         self,
@@ -991,17 +968,7 @@ class ProductRepository(BaseRepository):
         main_img = result["image_url"]
         if not clean_gallery and isinstance(main_img, str) and main_img.startswith(("http://", "https://")):
             clean_gallery = [main_img]
-        raw_tags = doc.get("detail_tags") or []
-        clean_tags: List[str] = []
-        if isinstance(raw_tags, list):
-            for tag in raw_tags:
-                t = str(tag or "").strip()
-                if not t:
-                    continue
-                if _BARE_YUAN_TAG_RE.match(t):
-                    t = f"{t}优惠券"
-                if t not in clean_tags:
-                    clean_tags.append(t)
+        clean_tags = normalize_detail_tags(doc.get("detail_tags") or [])
         result.update({
             "desc": doc.get("desc") or "",
             "brand_name": result["brand"],
@@ -1027,7 +994,7 @@ class ProductRepository(BaseRepository):
 
     def get_product_detail(
         self, goods_id_or_sign: str, platform: str = "pdd", key_type: Optional[str] = None,
-        *, strict: bool = False, **kwargs
+        *, strict: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """按平台隔离查询；strict=True 传播数据库故障，避免后台误判缺失后请求平台。"""
         key = str(goods_id_or_sign).strip() if goods_id_or_sign is not None else ""
@@ -1109,26 +1076,6 @@ class ProductRepository(BaseRepository):
         if doc is None:
             return "missing", None
         return "ok", self._extract_deal_tip(doc)
-
-    def get_categories(self, platform: str = "all") -> List[str]:
-        """获取类目列表"""
-        filter_query = {}
-        if platform and self._platform(platform) != "all":
-            filter_query["platform"] = self._platform(platform)
-        try:
-            cats = self.col.distinct("category", {"$and": [filter_query, self._boom_content_filter()]})
-            result = []
-            for c in cats:
-                text = str(c).strip() if c is not None else ""
-                if text and len(text) <= 20 and not text.startswith("未知"):
-                    result.append(text)
-            return result
-        except Exception as e:
-            logger.warning(
-                "❌ 【商品类目读取降级】查询本地爆品库分类列表失败，已降级返回默认分类 | 平台[%s] 异常<%s> 排查方向<请检查MongoDB连接状态或distinct聚合性能>",
-                self._platform(platform) if platform else "all", format_exc_summary(e),
-            )
-            return ["全部", "食品", "美妆", "百货", "数码", "服饰"]
 
     def get_known_coupon_overlays(self, platform: str, keys: List[Any]) -> Dict[str, Dict[str, Any]]:
         """批量读取本地库中已探明的优惠券与券后价快照，防止无券榜单轮询把已知优惠券抹零。"""
@@ -1493,14 +1440,6 @@ class ProductRepository(BaseRepository):
                 channel_type if channel_type is not None else "-", len(operations), format_exc_summary(e),
             )
             return 0
-
-    def upsert_cleaned_deal_products(self, product_docs: List[Dict[str, Any]]) -> Dict[str, int]:
-        """
-        【单一真源 SSOT · 正式商品库好价线报统一入库中枢】
-        将完成 AI 清洗与官方转链的高分好价商品晋升入库到正式表 (`products`)；
-        Meilisearch 搜索索引由后台唯一 `MeiliSyncWorker` 周期性双向差量对齐，不在此做分散双写。
-        """
-        return upsert_cleaned_products_to_formal_table(self.col, product_docs)
 
     _DETAIL_CAS_ATTEMPTS = 4
 
@@ -1919,11 +1858,6 @@ class ProductRepository(BaseRepository):
             res = self.col.bulk_write(score_ops[idx : idx + 500], ordered=False)
             modified_total += int(getattr(res, "modified_count", 0) or 0)
         return modified_total
-
-    def recompute_user_stats_scores(self, filter_query: Optional[Dict[str, Any]] = None) -> int:
-        """全量或按条件重算商品 user_stats_score（新增 user_stats 维度后可直接调用重算）。"""
-        query = filter_query or {"$or": [{"user_stats": {"$exists": True}}, {"user_stats_score": {"$exists": True}}]}
-        return self._refresh_user_stats_scores([query])
 
     def bulk_inc_user_stats(self, batch: Dict[Tuple[str, str], Dict[str, int]]) -> int:
         """批量原子累加商品互动计数并即时重算 user_stats_score；绝不新建裸文档或修改 updated_at。"""

@@ -26,7 +26,6 @@
       return { ok: response.ok, status: response.status, data };
     };
     return {
-      request,
       get: (path, options) => request(path, options),
       post: (path, body, options = {}) => request(path, { ...options, method: 'POST', body }),
     };

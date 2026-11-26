@@ -607,42 +607,6 @@ body {
   font-weight: 600;
 }
 
-.gh-detail-top {
-  display: flex;
-  gap: 12px;
-  margin-bottom: 14px;
-  align-items: flex-start;
-}
-
-.gh-detail-poster {
-  width: 88px;
-  height: 88px;
-  border-radius: 10px;
-  object-fit: cover;
-  object-position: center 18%;
-  border: 1px solid var(--gh-border);
-  flex-shrink: 0;
-  cursor: zoom-in;
-}
-
-.gh-detail-meta {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.gh-detail-title {
-  font-size: 16px;
-  font-weight: 800;
-  line-height: 1.45;
-  color: var(--gh-text-main);
-  word-break: break-all;
-  white-space: normal;
-  user-select: text;
-}
-
 .gh-detail-price-row {
   display: flex;
   align-items: center;
@@ -1265,17 +1229,6 @@ body {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
-}
-
-/* 弹窗与详情内无截断完整商品名称与完整文案 */
-.gh-goods-title-full {
-  font-size: 14.5px;
-  font-weight: 700;
-  color: var(--gh-text-main);
-  line-height: 1.45;
-  word-break: break-all;
-  white-space: normal;
-  margin: 4px 0 6px;
 }
 
 .gh-ellipsis-tip {

@@ -6,8 +6,6 @@
 :root {
   --primary-color: #e02e24; /* 拼多多/电商主色 */
   --primary-light: #fff0f0;
-  --primary-dark: #b81b12;
-  --accent-gold: #ff9900;
   --accent-gradient: linear-gradient(135deg, #ff4142 0%, #ff6b35 100%);
   --bg-page: #f6f7f9;
   --bg-card: #ffffff;
@@ -936,31 +934,6 @@ body {
   opacity: 0.6;
 }
 
-.order-stats-strip {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  background: #fbfbfb;
-  border-radius: 8px;
-  padding: 10px 0;
-  text-align: center;
-  margin-bottom: 12px;
-}
-
-.order-stat-col .val {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--text-main);
-}
-.order-stat-col .val.comm { color: var(--primary-color); }
-.order-stat-col .val.settled { color: #52c41a; }
-.order-stat-col .val.refund { color: #fa8c16; }
-
-.order-stat-col .lbl {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 2px;
-}
-
 .order-filter-tabs {
   display: flex;
   gap: 8px;
@@ -1080,12 +1053,6 @@ body {
   font-weight: 600;
 }
 
-.auth-icon {
-  width: 24px;
-  height: 24px;
-  border-radius: 4px;
-}
-
 .auth-status-badge {
   font-size: 11px;
   padding: 2px 8px;
@@ -1128,16 +1095,6 @@ body {
   cursor: pointer;
   text-align: center;
   text-decoration: none;
-}
-
-.btn-secondary {
-  background: #f0f2f5;
-  color: var(--text-main);
-  border: 1px solid var(--border-light);
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 12px;
-  cursor: pointer;
 }
 
 /* 菜单列表 */
@@ -1311,89 +1268,6 @@ body {
   margin: 4px 2px 2px;
 }
 
-/* 商品多图横向轮播查看器 */
-.carousel-wrap {
-  position: relative;
-  width: 100%;
-  border-radius: 8px;
-  overflow: hidden;
-  background: #f0f0f0;
-  margin-bottom: 12px;
-}
-
-.carousel-scroller {
-  display: flex;
-  overflow-x: auto;
-  scroll-snap-type: x mandatory;
-  scrollbar-width: none;
-}
-.carousel-scroller::-webkit-scrollbar {
-  display: none;
-}
-
-.carousel-slide {
-  flex: 0 0 100%;
-  width: 100%;
-  padding-top: 100%;
-  position: relative;
-  scroll-snap-align: start;
-}
-
-.carousel-img {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.carousel-badge {
-  position: absolute;
-  bottom: 8px;
-  right: 8px;
-  background: rgba(0,0,0,0.55);
-  color: #fff;
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  backdrop-filter: blur(2px);
-}
-
-/* 详情文本信息 */
-.detail-price-box {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-
-.detail-title {
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--text-main);
-  margin-bottom: 8px;
-}
-
-.detail-desc {
-  font-size: 12px;
-  color: var(--text-sub);
-  line-height: 1.5;
-  background: #f9f9f9;
-  padding: 8px 10px;
-  border-radius: 6px;
-  margin-bottom: 10px;
-}
-
-.detail-meta-row {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-bottom: 12px;
-}
-
 .pop-action-btns {
   display: flex;
   flex-direction: column;
@@ -1452,46 +1326,6 @@ body {
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }
-}
-
-.detail-loading-box {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 8px 0;
-  color: var(--primary-color);
-  font-size: 12px;
-  font-weight: 500;
-  background: #fff0f0;
-  border-radius: 6px;
-  margin-bottom: 10px;
-}
-
-.spinner-dot {
-  width: 12px;
-  height: 12px;
-  border: 2px solid #ffccc7;
-  border-top-color: var(--primary-color);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.btn-lock-auth {
-  background: #fff7e6;
-  color: #d46b08;
-  border: 1px dashed #ffd591;
-  width: 100%;
-  padding: 10px 0;
-  border-radius: 24px;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  text-align: center;
 }
 
 /* =============================================================================
@@ -2477,14 +2311,6 @@ body {
 .universal-retry-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
-}
-
-/* 详情页失效/加载异常时底部操作按钮禁用态 */
-.detail-bottom-nav button:disabled {
-  opacity: 0.42;
-  cursor: not-allowed;
-  filter: grayscale(0.45);
-  pointer-events: none;
 }
 
 /* ================== 全站合规 ICP 备案号页脚 ================== */

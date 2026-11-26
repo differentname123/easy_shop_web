@@ -6,21 +6,22 @@
   const DEFAULT_ORDER_THUMB = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="%23f1f5f9"/><path d="M20 22h24l-2 22H22L20 22zm7 0v-2a5 5 0 0 1 10 0v2" fill="none" stroke="%2394a3b8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   shop.createAccount = function ({ ref, api, session, getPlatforms = () => [], copyText = () => {}, showToast, onSearchKeyword = null, shouldBlockDirectJump = () => false, onLoginSuccess = null, onAuthorizedSuccess = null }) {
     const emptyProfile = () => ({ uid: '', phone: '', nickname: '未登录', avatar: DEFAULT_AVATAR,
-      invite_code: '', invited_by: null, auth_status: {} });
-    const emptyOrders = () => ({ total_count: 0, total_commission: 0, settled_commission: 0, refund_commission: 0, refund_count: 0, order_list: [] });
-    const isLoggedIn = ref(false), uid = ref(''), userPhone = ref(''), userProfile = ref(emptyProfile());
+      invite_code: '', auth_status: {} });
+    const emptyOrders = () => ({ total_commission: 0, settled_commission: 0, refund_commission: 0, refund_count: 0, order_list: [] });
+    const isLoggedIn = ref(false), uid = ref(''), userProfile = ref(emptyProfile());
     const isRegisterMode = ref(false), formPhone = ref(''), formPassword = ref(''), formNickname = ref(''), formInviteCode = ref('');
     const isSubmittingAuth = ref(false), isAuthModalOpen = ref(false), currentAuthInfo = ref(null), isCheckingAuth = ref(false);
     const orderPlatform = ref('pdd'), orderDays = ref(7), isSyncingOrders = ref(false), userOrdersData = ref(emptyOrders());
     const orderMessage = ref('');
     let orderGeneration = 0, authGeneration = 0, universalGeneration = 0, disposed = false, authSnapshot = null, orderPollTimer = null;
+    let universalSuggestedPlatform = '';
     const universalInput = ref(''), universalPlatform = ref('auto'), universalLoading = ref(false);
-    const universalResult = ref(null), universalError = ref(''), universalSuggestedKeyword = ref(''), universalSuggestedPlatform = ref('');
+    const universalResult = ref(null), universalError = ref(''), universalSuggestedKeyword = ref('');
     const clearUniversalConvert = () => {
       universalGeneration += 1;
       universalInput.value = '';
       universalResult.value = null;
-      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform.value = '';
+      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform = '';
       universalLoading.value = false;
     };
     const stopOrderPoll = () => {
@@ -39,7 +40,7 @@
     const orderTimeText = order => order.order_time_str || (order.order_time_basis !== 'created' && order.order_pay_time_str) || '未提供';
     const applyUser = user => {
       userProfile.value = { ...emptyProfile(), ...user, avatar: user.avatar || DEFAULT_AVATAR };
-      uid.value = user.uid; userPhone.value = user.phone; isLoggedIn.value = true;
+      uid.value = user.uid; isLoggedIn.value = true;
     };
     const closeAccountAuth = () => {
       authGeneration += 1; authSnapshot = null; recheck.stop();
@@ -48,7 +49,7 @@
     const handleLogout = (notify = true) => {
       const wasLoggedIn = isLoggedIn.value;
       session.clear(); orderGeneration += 1; stopOrderPoll(); closeAccountAuth();
-      isLoggedIn.value = false; uid.value = ''; userPhone.value = ''; userProfile.value = emptyProfile();
+      isLoggedIn.value = false; uid.value = ''; userProfile.value = emptyProfile();
       userOrdersData.value = emptyOrders(); isSyncingOrders.value = false; orderMessage.value = '';
       if (notify || wasLoggedIn) {
         clearUniversalConvert();
@@ -222,7 +223,7 @@
       }
       const generation = ++universalGeneration;
       universalLoading.value = true;
-      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform.value = '';
+      universalError.value = ''; universalSuggestedKeyword.value = ''; universalSuggestedPlatform = '';
       universalResult.value = null;
       try {
         const token = session.token();
@@ -249,7 +250,7 @@
           invalidSession();
         } else {
           const msg = data.error_msg || data.detail || '未能解析或转换该内容，请检查输入格式';
-          universalError.value = msg; universalSuggestedKeyword.value = data.suggested_keyword || ''; universalSuggestedPlatform.value = data.suggested_platform || '';
+          universalError.value = msg; universalSuggestedKeyword.value = data.suggested_keyword || ''; universalSuggestedPlatform = data.suggested_platform || '';
         }
       } catch (_) {
         if (!disposed && generation === universalGeneration) {
@@ -284,7 +285,7 @@
         else if (global.location) global.location.href = link;
       }
     };
-    const searchUniversalKeyword = () => { if (universalSuggestedKeyword.value && typeof onSearchKeyword === 'function') onSearchKeyword(universalSuggestedKeyword.value, universalSuggestedPlatform.value); };
+    const searchUniversalKeyword = () => { if (universalSuggestedKeyword.value && typeof onSearchKeyword === 'function') onSearchKeyword(universalSuggestedKeyword.value, universalSuggestedPlatform); };
     const shareSiteInvite = () => {
       const origin = (global.location && global.location.origin) || '';
       const code = isLoggedIn.value ? (userProfile.value.invite_code || (session.myInviteCode ? session.myInviteCode() : '') || '') : '';
@@ -302,14 +303,14 @@
       if (el.src !== DEFAULT_ORDER_THUMB) el.src = DEFAULT_ORDER_THUMB;
     };
     return {
-      isLoggedIn, uid, userPhone, userProfile, isRegisterMode, formPhone, formPassword, formNickname, formInviteCode,
+      isLoggedIn, uid, userProfile, isRegisterMode, formPhone, formPassword, formNickname, formInviteCode,
       isSubmittingAuth, handleRegisterOrLogin, handleLogout, fetchUserInfo, shareSiteInvite,
       isAuthModalOpen, currentAuthInfo, isCheckingAuth, handleCheckAndGetAuth, handleRecheckAuth, closeAccountAuth, openAccountAuth,
-      refreshAuthorization: recheck.refresh, resumePendingAuthorization, platformName, supportsPlatform, requiresAuthorization,
+      refreshAuthorization: recheck.refresh, resumePendingAuthorization, supportsPlatform, requiresAuthorization,
       orderAmountLabel, orderTimeLabel, orderTimeText,
       orderPlatform, orderDays, orderMessage, isSyncingOrders, userOrdersData, syncAndQueryOrders, switchOrderDays,
       switchOrderPlatform, initializeOrderPlatform,
-      universalInput, universalPlatform, universalLoading, universalResult, universalError, universalSuggestedKeyword, universalSuggestedPlatform,
+      universalInput, universalPlatform, universalLoading, universalResult, universalError, universalSuggestedKeyword,
       handleUniversalConvert, clearUniversalConvert, copyUniversalCommand, copyUniversalShortLink, buyUniversalProduct, searchUniversalKeyword,
       orderKey: order => shop.orderKey({ ...order, platform: order.platform || orderPlatform.value }),
       defaultAvatar: DEFAULT_AVATAR, handleAvatarError, defaultOrderThumb: DEFAULT_ORDER_THUMB, handleOrderThumbError,

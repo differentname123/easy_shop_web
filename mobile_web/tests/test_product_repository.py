@@ -601,12 +601,10 @@ class TestProductRepository(unittest.TestCase):
         self.assertIsNone(self.repo.get_product_detail("SIGN"))
         identity = self.repo.get_product_identity("SIGN")
         self.assertEqual(identity, {"platform": "pdd", "product_id": "00123", "goods_sign": "SIGN"})
-        self.assertEqual(self.repo.get_categories(), [])
         self.repo.upsert_home_products([{"goods_id": "00123", "name": "后补商品", "price": 0, "category": "食品"}], channel_type=5)
         self.assertEqual(len(self.col.docs), 1)
         self.assertEqual(self.repo.query_boom_products()["data"][0]["price"], 0)
         self.assertEqual(self.repo.get_product_detail("SIGN", key_type="sign")["goods_id"], "00123")
-        self.assertEqual(self.repo.get_categories(), ["食品"])
         self.assertIsNotNone(self.repo.get_promotion_link_cache("pdd", goods_id="00123"))
 
     def test_content_filter_runs_before_pagination_and_keeps_count_semantics(self):
@@ -630,24 +628,21 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(keyword["total_count"], 4)
         self.assertFalse(keyword["has_more"])
 
-    def test_categories_use_same_content_filter_and_platform_scope(self):
+    def test_boom_products_use_content_filter_and_platform_scope(self):
         self.col.docs = [
-            {"platform": "pdd", "name": "商品", "activity_price": 0, "category": "食品", "channel_type": 5},
-            {"platform": "pdd", "name": "缺价", "category": "推广裸类", "channel_type": 5},
-            {"platform": "pdd", "price": 0, "category": "无名类", "channel_type": 5},
-            {"platform": "pdd", "name": "无类", "price": 1, "category": " ", "channel_type": 5},
-            {"platform": "pdd", "name": "占位类", "price": 1, "category": "未知标签_1", "channel_type": 5},
-            {"platform": "pdd", "name": "超长类", "price": 1, "category": "这是一个超过二十个字符长度的异常脏数据分类名", "channel_type": 5},
-            {"platform": "taobao", "name": "另一平台", "price": "3", "category": "美妆", "channel_type": 1},
+            {"platform": "pdd", "product_id": "p1", "name": "商品", "activity_price": 0, "category": "食品", "channel_type": 5},
+            {"platform": "pdd", "product_id": "p2", "name": "缺价", "category": "推广裸类", "channel_type": 5},
+            {"platform": "pdd", "product_id": "p3", "price": 0, "category": "无名类", "channel_type": 5},
+            {"platform": "taobao", "product_id": "t1", "name": "另一平台", "price": "3", "category": "美妆", "channel_type": 1},
         ]
-        self.assertEqual(set(self.repo.get_categories()), {"食品", "美妆"})
-        self.assertEqual(self.repo.get_categories("pdd"), ["食品"])
-        self.assertEqual(self.repo.get_categories("tb"), ["美妆"])
-        self.assertEqual(self.col.queries[-1]["$and"][0], {"platform": "taobao"})
-        self.assertEqual(self.col.queries[-1]["$and"][1], self.repo._boom_content_filter())
+        self.assertEqual([item["product_id"] for item in self.repo.query_boom_products(platform="pdd")["data"]], ["p1"])
+        self.assertEqual([item["product_id"] for item in self.repo.query_boom_products(platform="tb")["data"]], ["t1"])
+        inner_clauses = self.col.queries[-1]["$and"][0]["$and"]
+        self.assertEqual(inner_clauses[0], {"platform": "taobao"})
+        self.assertEqual(inner_clauses[1], self.repo._boom_content_filter())
 
-    def test_boom_products_and_categories_only_query_ranking_data_excluding_search_and_detail_only_records(self):
-        # 1. 搜索摘要入库 (channel_type=None) 与单商品详情入库均不得进入爆单推广或爆单分类
+    def test_boom_products_only_query_ranking_data_excluding_search_and_detail_only_records(self):
+        # 1. 搜索摘要入库 (channel_type=None) 与单商品详情入库均不得进入爆单推广
         self.repo.upsert_home_products([{
             "platform": "jd", "goods_id": "search-jd-1", "name": "京东搜索商品",
             "price": 39.9, "category": "搜索专属类目", "product_url": "https://item.jd.com/search-jd-1.html",
@@ -657,7 +652,6 @@ class TestProductRepository(unittest.TestCase):
             "price": 59.9, "category": "详情专属类目",
         })
         self.assertEqual(self.repo.query_boom_products()["data"], [])
-        self.assertEqual(self.repo.get_categories(), [])
         # 但详情缓存与物料链接反查仍可正常命中
         self.assertEqual(self.repo.get_product_detail("search-jd-1", platform="jd")["name"], "京东搜索商品")
         self.assertEqual(self.repo.get_product_detail("detail-tb-1", platform="taobao")["name"], "淘宝详情预取或散查商品")
@@ -670,7 +664,6 @@ class TestProductRepository(unittest.TestCase):
                     "activity_price": 9.9, "category": "脏频道类目", "channel_type": invalid_channel,
                 }]
                 self.assertEqual(self.repo.query_boom_products()["data"], [])
-                self.assertEqual(self.repo.get_categories(), [])
 
         # 3. 榜单商品 (channel_type=1 或 5) 可被爆单推广和分类正常查询，且后续详情入库或搜索更新不会抹除其榜单属性
         self.col.docs = []
@@ -689,7 +682,6 @@ class TestProductRepository(unittest.TestCase):
         boom_items = self.repo.query_boom_products()["data"]
         self.assertEqual([item["product_id"] for item in boom_items], ["rank-pdd-1"])
         self.assertEqual(boom_items[0]["price"], 18.9)
-        self.assertEqual(self.repo.get_categories(), ["百货"])
 
     def test_list_projection_preserves_complete_summary_but_not_rich_or_cache_fields(self):
         doc = {
@@ -1255,7 +1247,6 @@ class TestProductRepository(unittest.TestCase):
         self.assertFalse(boom_res["data"][1]["is_reliable"])
         self.assertEqual(boom_res["data"][1]["deal_highlight"], "3.11元/斤")
         self.assertEqual(boom_res["data"][1]["deal_publish_time"], "2026-11-12 17:04")
-        self.assertEqual(sorted(self.repo.get_categories()), ["家清", "食品"])
 
         # 2. 详情反查返回脱敏后的极简 deal_tip 白名单，UTC 时间转为北京时间展示，内部源字段与已废弃 unit_deal_price / filler_links 绝不外泄
         detail = self.repo.get_product_detail("TB-DEAL-1", platform="taobao")
@@ -1940,14 +1931,14 @@ class TestProductRepository(unittest.TestCase):
         self.assertEqual(len(col.queries), 0)
 
     def test_deal_datetime_and_timestamp_treat_naive_datetime_as_utc_and_naive_str_as_cn(self):
-        from models.cost_performance import parse_deal_publish_timestamp
+        from models.deal_constants import coerce_unix_timestamp
 
         naive_utc_dt = datetime.datetime(2026, 11, 21, 3, 30, 0)
         aware_utc_dt = datetime.datetime(2026, 11, 21, 3, 30, 0, tzinfo=datetime.timezone.utc)
         self.assertEqual(ProductRepository._format_deal_datetime(naive_utc_dt), "2026-11-21 11:30")
-        self.assertEqual(parse_deal_publish_timestamp(naive_utc_dt), aware_utc_dt.timestamp())
+        self.assertEqual(coerce_unix_timestamp(naive_utc_dt), aware_utc_dt.timestamp())
         self.assertEqual(
-            parse_deal_publish_timestamp("2026-11-21 11:30:00"),
+            coerce_unix_timestamp("2026-11-21 11:30:00"),
             aware_utc_dt.timestamp(),
         )
 

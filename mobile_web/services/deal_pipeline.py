@@ -132,7 +132,6 @@ def run_fetch_stage(
     cycle_num: int = 1,
     max_new_details_per_channel: Optional[int] = None,
     channel_health_tracker: Optional[Dict[str, Dict[str, Any]]] = None,
-    latest_clean_report: Optional[Dict[str, Any]] = None,
     channels: Optional[List[ChannelConfig]] = None,
     channel_last_run: Optional[Dict[str, float]] = None,
     site_cooldown_until: Optional[Dict[str, float]] = None,
@@ -668,7 +667,6 @@ def run_fetch_stage(
         fetch_elapsed_s=fetch_elapsed_s,
         task_reports=task_reports,
         cycle_error_paths=cycle_error_paths,
-        clean_report=latest_clean_report or {},
         pool_summary=summary,
     )
 
@@ -692,7 +690,6 @@ def build_and_log_cycle_ops_report(
     fetch_elapsed_s: float,
     task_reports: List[Dict[str, Any]],
     cycle_error_paths: List[Dict[str, Any]],
-    clean_report: Dict[str, Any],
     pool_summary: Dict[str, Any],
 ) -> Dict[str, Any]:
     """生成每轮综合运维报告并写入文件。"""
@@ -793,7 +790,6 @@ def build_and_log_cycle_ops_report(
         "formal_products_total": pool_summary.get("formal_products_total", 0),
         "formal_deal_products_count": pool_summary.get("formal_deal_products_count", 0),
         "site_health_matrix": site_matrix,
-        "clean_stage_summary": clean_report,
         "error_paths_count": len(cycle_error_paths),
         "error_paths": cycle_error_paths[:30],
     }

@@ -17,7 +17,7 @@ import logging
 import os
 import socket
 import threading
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from adapters import get_adapter
@@ -33,7 +33,6 @@ from repositories.product_repo import upsert_cleaned_products_to_formal_table
 from services.deal_cleaning.ai_client import DealAIClient
 from services.deal_cleaning.cache_state import (
     AnchorConversionCache,
-    query_active_formal_products,
     should_upgrade_existing_deal,
 )
 from services.deal_cleaning.stages import (
@@ -48,16 +47,8 @@ from services.deal_cleaning.stages import (
     run_stage3_concurrent_conversions as _run_stage3_concurrent_conversions_impl,
 )
 from services.deal_cleaning.text_sanitizer import (
-    assemble_combined_text_and_images,
     build_clean_original_copywriting,
-    clean_coupon_label,
-    extract_doc_images,
-    format_raw_message_for_ai1,
-    normalize_inline_spaces,
     sanitize_card_highlight,
-    sanitize_clean_tutorial_step,
-    sanitize_polished_copywriting,
-    strip_markdown_link_wrapper,
 )
 from services.deal_cleaning.url_venue import (
     _is_safe_public_http_url,
@@ -97,7 +88,6 @@ class DealPoolCleaner:
         allow_bisect: bool = True,
         ai_caller: Optional[Callable[..., Any]] = None,
     ):
-        self.use_ai = True
         self.ai_batch_size = max(1, ai_batch_size)
         self.ai2_batch_size = max(1, ai2_batch_size if ai2_batch_size is not None else 6)
         self.ai_max_workers = max(1, ai_max_workers)
@@ -126,15 +116,7 @@ class DealPoolCleaner:
         self._shared_unwrap_session: Optional[requests.Session] = None
 
         self.stats_cache_hits = 0
-        self.stats_ai1_calls = 0
         self.stats_ai1_model_hits = 0
-        self.stats_ai1_fallbacks = 0
-        self.stats_ai2_calls = 0
-        self.stats_ai2_model_hits = 0
-        self.stats_ai2_fallbacks = 0
-        self.stats_ai_retries_scheduled = 0
-        self.stats_early_terminated_post_stage3 = 0
-        self.stats_deal_upgrades_post_stage3 = 0
         self.last_batch_stage_timings: Dict[str, float] = {}
 
     @property
@@ -281,7 +263,6 @@ class DealPoolCleaner:
         selected_docs: List[Dict[str, Any]],
         formal_col=None,
         shared_active_products: Any = None,
-        shared_lock: Optional[threading.Lock] = None,
         quiet_sub_logs: bool = False,
     ) -> Tuple[List[Dict[str, Any]], float]:
         return _process_convert_unit_impl(
@@ -289,7 +270,6 @@ class DealPoolCleaner:
             selected_docs,
             formal_col=formal_col,
             shared_active_products=shared_active_products,
-            shared_lock=shared_lock,
             quiet_sub_logs=quiet_sub_logs,
         )
 
@@ -314,7 +294,6 @@ class DealPoolCleaner:
         raw_col,
         formal_col=None,
         shared_active_products: Any = None,
-        shared_lock: Optional[threading.Lock] = None,
         quiet_sub_logs: bool = False,
     ) -> List[Dict[str, Any]]:
         return _clean_batch_records_impl(
@@ -323,31 +302,14 @@ class DealPoolCleaner:
             raw_col,
             formal_col=formal_col,
             shared_active_products=shared_active_products,
-            shared_lock=shared_lock,
             quiet_sub_logs=quiet_sub_logs,
         )
 
     # 文本处理与判定纯静态委托（供测试与上层调用）
-    _strip_markdown_link_wrapper = staticmethod(strip_markdown_link_wrapper)
-    _normalize_inline_spaces = staticmethod(normalize_inline_spaces)
-    _clean_coupon_label = staticmethod(clean_coupon_label)
-    _extract_doc_images = staticmethod(extract_doc_images)
-    _format_raw_message_for_ai1 = staticmethod(format_raw_message_for_ai1)
-    _assemble_combined_text_and_images = staticmethod(assemble_combined_text_and_images)
-    _sanitize_clean_tutorial_step = staticmethod(sanitize_clean_tutorial_step)
     _sanitize_card_highlight = staticmethod(sanitize_card_highlight)
-    _sanitize_polished_copywriting = staticmethod(sanitize_polished_copywriting)
     _is_explicit_coupon_target = staticmethod(is_explicit_coupon_target)
     _build_clean_original_copywriting = staticmethod(build_clean_original_copywriting)
     _should_upgrade_existing_deal = staticmethod(should_upgrade_existing_deal)
-
-    @classmethod
-    def _lookup_active_formal_products(
-        cls,
-        formal_col,
-        pid_keys: Optional[Iterable[Tuple[str, str]]] = None,
-    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        return query_active_formal_products(formal_col, pid_keys=pid_keys)
 
 
 __all__ = [

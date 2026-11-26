@@ -183,7 +183,7 @@ class UserService:
                         "error_msg": "平台渠道身份与当前用户不符"}
             if (not force and saved.get("is_authorized") is True and self._auth_is_fresh(saved)
                     and identity_matches and self._identity_complete(adapter, identity)):
-                return dict(self._authorized_response(uid, plat, adapter.platform_name, saved.get("bind", 0)),
+                return dict(self._authorized_response(plat, adapter.platform_name, saved.get("bind", 0)),
                             identity=UserRepository.clean_platform_identity(identity))
             negative_fresh = (saved.get("is_authorized") is False
                               and self._auth_is_fresh(saved, AUTH_NEGATIVE_STATUS_TTL))
@@ -242,7 +242,7 @@ class UserService:
                 plat, uid, "已授权" if authorized else "未授权", remote_ms,
             )
             if authorized:
-                return dict(self._authorized_response(uid, plat, adapter.platform_name, bind), identity=identity)
+                return dict(self._authorized_response(plat, adapter.platform_name, bind), identity=identity)
             return {"status": "success", "platform": plat, "platform_name": adapter.platform_name,
                     "is_authorized": False, "bind": bind, "identity": {}, "authorization_status": "unauthorized"}
         except Exception as exc:
@@ -315,7 +315,7 @@ class UserService:
             return {"status": "error", "platform": plat, "error_msg": "生成授权链接失败，请稍后重试"}
 
     @staticmethod
-    def _authorized_response(uid: str, platform: str, name: str, bind) -> Dict[str, Any]:
+    def _authorized_response(platform: str, name: str, bind) -> Dict[str, Any]:
         return {
             "status": "success", "platform": platform, "platform_name": name,
             "is_authorized": True, "bind": bind,

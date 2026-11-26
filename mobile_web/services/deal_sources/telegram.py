@@ -57,7 +57,6 @@ def _extract_tg_title(clean_text: str, tg_channel: str, msg_id: str) -> str:
 class TelegramChannelSource(BaseDealSource):
     site_key = "telegram"
     source_key = "telegram"
-    default_network_mode = "proxy"
     troubleshooting = {
         "endpoint": "https://t.me/s/{tg_channel}",
         "http_403_429": "Telegram 网页预览限流：请调大 interval_seconds。",

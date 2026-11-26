@@ -187,7 +187,6 @@ class BaicaioSource(ListDetailDealSource):
             pages_crawled=pages_crawled,
             reached_end=True,
             allow_empty_ok=(mode == "hour" and "list mt-20" in list_html),
-            extra_state={"mode": mode},
         )
 
     def parse_detail_record(

@@ -666,18 +666,18 @@ def test_deal_max_clean_age_days_is_2_days():
 def test_channel_specific_max_age_days_configuration_and_behavior():
     """验证渠道级保鲜期灵活配置：特惠采采享 7 天长保鲜期，逛丢等常规站保持 2 天。"""
     import datetime
+    from models.deal_constants import resolve_deal_max_age_days
     from services.deal_sources.catalog import (
         DEFAULT_CHANNEL_CONFIGS,
-        get_channel_max_age_days,
         get_site_max_age_days_map,
     )
 
     # 1. 验证配置读取与映射
-    assert get_channel_max_age_days(channel_name="特惠采采_首页精选") == 7.0
-    assert get_channel_max_age_days(site_key="tehuicaicai") == 7.0
-    assert get_channel_max_age_days(channel_name="逛丢_首页实时流") == 2.0
-    assert get_channel_max_age_days(site_key="guangdiu") == 2.0
-    assert get_channel_max_age_days(channel_name="未知频道", default_days=2.0) == 2.0
+    assert resolve_deal_max_age_days(channel_name="特惠采采_首页精选") == 7.0
+    assert resolve_deal_max_age_days(site_key="tehuicaicai") == 7.0
+    assert resolve_deal_max_age_days(channel_name="逛丢_首页实时流") == 2.0
+    assert resolve_deal_max_age_days(site_key="guangdiu") == 2.0
+    assert resolve_deal_max_age_days(channel_name="未知频道", default_days=2.0) == 2.0
 
     site_map = get_site_max_age_days_map(DEFAULT_CHANNEL_CONFIGS)
     assert site_map.get("tehuicaicai") == 7.0
@@ -755,7 +755,7 @@ def test_channel_specific_max_age_days_configuration_and_behavior():
 
 
 
-def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_real_deals():
+def test_pure_jd_coupon_only_routed_to_skipped_without_touching_real_deals():
     captured_ops = []
 
     class _DummyCol:
@@ -766,22 +766,20 @@ def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_
     repo = DealRawPoolRepository(db_instance=SimpleNamespace(get_collection=lambda _n: _DummyCol()))
     repo._indexes_ready = True
 
-    ztk_coupon_1 = {
-        "source_site": "zhetaoke",
+    coupon_1 = {
+        "source_site": "guangdiu",
         "source_item_id": "xb_5001",
-        "is_group_stream": True,
         "title": "速度防身，京东自营生鲜满199减100神券",
-        "tutorial_text": "速度防身领券 https://coupon.m.jd.com/coupons/show.action?key=c3m6c1sbo2a740939106&roleId=123456\n[群聊晒单/教程图片: https://img.zhetaoke.com/pic1.jpg]",
+        "tutorial_text": "速度防身领券 https://coupon.m.jd.com/coupons/show.action?key=c3m6c1sbo2a740939106&roleId=123456\n[教程图片: https://img.example.com/pic1.jpg]",
         "extracted_links": [
             {"url": "https://coupon.m.jd.com/coupons/show.action?key=c3m6c1sbo2a740939106&roleId=123456", "platform": "jd"}
         ],
         "extracted_tokens": [],
         "has_full_detail": True,
     }
-    ztk_coupon_login_wrap = {
-        "source_site": "zhetaoke",
+    coupon_login_wrap = {
+        "source_site": "guangdiu",
         "source_item_id": "xb_5002",
-        "is_group_stream": True,
         "title": "PLUS补贴券防身",
         "tutorial_text": "https://plogin.m.jd.com/cgi-bin/m/tmauth?returnurl=https%3A%2F%2Fcoupon.m.jd.com%2Fcoupons%2Fshow.action%3FlinkKey%3DAAROH_xIpeffAs_-naABEFoe",
         "extracted_links": [
@@ -796,7 +794,6 @@ def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_
     non_group_pure_coupon = {
         "source_site": "xianbao_fun",
         "source_item_id": "xbf_5003",
-        "is_group_stream": False,
         "title": "京东领券防身",
         "tutorial_text": "先领 https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999",
         "extracted_links": [{"url": "https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999", "platform": "jd"}],
@@ -804,9 +801,8 @@ def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_
         "has_full_detail": True,
     }
     coupon_plus_product = {
-        "source_site": "zhetaoke",
+        "source_site": "guangdiu",
         "source_item_id": "xb_5004",
-        "is_group_stream": True,
         "title": "领券买维达抽纸24包19.9元",
         "tutorial_text": "先领券 https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999\n再拍主商品 https://u.jd.com/oGtS1YL",
         "extracted_links": [
@@ -817,9 +813,8 @@ def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_
         "has_full_detail": True,
     }
     coupon_plus_naked_tb_token = {
-        "source_site": "zhetaoke",
+        "source_site": "guangdiu",
         "source_item_id": "xb_5005",
-        "is_group_stream": True,
         "title": "领券拍百补商品",
         "tutorial_text": "领券 https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999\n口令 ￥AbCdEfGh123￥",
         "extracted_links": [{"url": "https://coupon.m.jd.com/coupons/show.action?key=abc&roleId=999", "platform": "jd"}],
@@ -827,31 +822,28 @@ def test_pure_jd_coupon_only_routed_to_context_only_or_skipped_without_touching_
         "has_full_detail": True,
     }
 
-    assert _is_pure_jd_coupon_only_record(ztk_coupon_1) is True
-    assert _is_pure_jd_coupon_only_record(ztk_coupon_login_wrap) is True
+    assert _is_pure_jd_coupon_only_record(coupon_1) is True
+    assert _is_pure_jd_coupon_only_record(coupon_login_wrap) is True
     assert _is_pure_jd_coupon_only_record(coupon_plus_product) is False
     assert _is_pure_jd_coupon_only_record(coupon_plus_naked_tb_token) is False
 
     res = repo.save_batch(
-        [ztk_coupon_1, ztk_coupon_login_wrap, non_group_pure_coupon, coupon_plus_product, coupon_plus_naked_tb_token],
+        [coupon_1, coupon_login_wrap, non_group_pure_coupon, coupon_plus_product, coupon_plus_naked_tb_token],
         task_name="coupon_filter_test",
     )
-    assert res["context_only_saved"] == 2
-    assert res["skipped_no_signal"] == 1
-    assert len(captured_ops) == 4
+    assert res["skipped_no_signal"] == 3
+    assert len(captured_ops) == 2
     status_by_id = {
         op._doc["$setOnInsert"]["source_item_id"]: op._doc["$setOnInsert"]["clean_status"]
         for op in captured_ops
     }
     assert status_by_id == {
-        "xb_5001": "context_only",
-        "xb_5002": "context_only",
         "xb_5004": "pending",
         "xb_5005": "pending",
     }
 
 
-def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
+def test_retry_reuses_saved_ai1_without_calling_stage1():
     cleaner = DealPoolCleaner(ai_batch_size=2, ai_max_workers=1, convert_max_workers=1)
 
     fake_jd_adapter = MagicMock()
@@ -906,33 +898,25 @@ def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
     cleaner.run_ai_stage1_batch = _unexpected_stage1
     cleaner.run_ai_stage2_batch = _fake_stage2
 
-    neighbor_coupon_doc = {
-        "source_site": "zhetaoke",
-        "source_channel": "zhetaoke_group_1",
-        "source_item_id": "xb_100",
-        "is_group_stream": True,
-        "source_url": "https://zhetaoke.example/msg/xb_100",
-        "title": "维达满39减20神券",
-        "tutorial_text": "先领20元防身券 https://coupon.m.jd.com/coupons/show.action?key=vd20&roleId=111",
-    }
     main_retry_doc = {
-        "source_site": "zhetaoke",
-        "source_channel": "zhetaoke_group_1",
-        "source_item_id": "xb_101",
-        "is_group_stream": True,
-        "source_url": "https://zhetaoke.example/msg/xb_101",
+        "source_site": "guangdiu",
+        "source_channel": "逛丢_首页实时流",
+        "source_item_id": "gd_101",
+        "source_url": "https://guangdiu.example/detail/gd_101",
         "platform": "jd",
         "title": "维达抽纸24包19.9元",
-        "tutorial_text": "领楼上券拍维达抽纸19.9元 https://u.jd.com/other_prod",
-        "extracted_links": [{"url": "https://u.jd.com/other_prod", "platform": "jd"}],
+        "tutorial_text": "先领20元防身券 https://coupon.m.jd.com/coupons/show.action?key=vd20&roleId=111\n再拍维达抽纸19.9元 https://u.jd.com/other_prod",
+        "extracted_links": [
+            {"url": "https://coupon.m.jd.com/coupons/show.action?key=vd20&roleId=111", "platform": "jd"},
+            {"url": "https://u.jd.com/other_prod", "platform": "jd"},
+        ],
         "extracted_tokens": [],
         "clean_retry_count": 1,
         "clean_error_code": ERR_AI_TIMEOUT_RETRY,
         "ai_stage1_result": {
-            "main_tip_id": "xb_101",
-            "is_standalone_deal": True,
-            "merged_tip_ids": ["xb_100", "xb_101"],
-            "combined_raw_text": "先领20元防身券 [#L1]\n领楼上券拍维达抽纸19.9元 [#L2]",
+            "main_tip_id": "gd_101",
+            "merged_tip_ids": ["gd_101"],
+            "combined_raw_text": "先领20元防身券 [#L1]\n再拍维达抽纸19.9元 [#L2]",
             "extracted_images": [],
             "extracted_targets": [
                 {
@@ -955,20 +939,14 @@ def test_zhetaoke_group_retry_reuses_saved_ai1_and_hydrates_merged_neighbors():
     }
 
     raw_col = MagicMock()
-    raw_col.find.return_value = [neighbor_coupon_doc]
-
     results = cleaner.clean_batch_records([main_retry_doc], raw_col, shared_active_products={}, quiet_sub_logs=True)
     assert ai1_calls["n"] == 0  # Reused saved_ai1 without re-calling AI-1!
     assert results[0]["status"] == "success"
-    raw_col.find.assert_called_once_with(
-        {"source_site": "zhetaoke", "source_item_id": {"$in": ["xb_100"]}},
-        {"raw_payload": 0},
-    )
+    raw_col.find.assert_not_called()
     deal_info = results[0]["product_doc"]["deal_info"]
     assert "先领20元防身券" in deal_info["original_copywriting"]
-    assert "领楼上券拍维达抽纸19.9元" in deal_info["original_copywriting"]
-    assert "https://zhetaoke.example/msg/xb_100" in deal_info["merged_source_urls"]
-    assert "https://zhetaoke.example/msg/xb_101" in deal_info["merged_source_urls"]
+    assert "再拍维达抽纸19.9元" in deal_info["original_copywriting"]
+    assert deal_info["merged_source_urls"] == ["https://guangdiu.example/detail/gd_101"]
 
 
 def test_convert_single_target_admits_own_promo_and_rejects_failed_or_echo():

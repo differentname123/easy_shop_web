@@ -96,7 +96,6 @@ class EmpireDealSource(ListDetailDealSource):
     """发现值得买 (`kiees`) 与 牛杂网 (`niuza`) 共享抓取实现。"""
 
     base_url: str = ""
-    close_connection: bool = True
 
     def fetch_list_cards(self, ctx: FetchContext, t0: float) -> ListPhaseResult:
         ch = ctx.channel
@@ -166,7 +165,6 @@ class EmpireDealSource(ListDetailDealSource):
             pages_crawled=pages_crawled,
             reached_end=reached_end,
             rate_limited=rate_limited,
-            extra_state={"mode": mode},
         )
 
     def parse_detail_record(

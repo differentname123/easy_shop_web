@@ -305,7 +305,6 @@ def build_deal_record(
     explicit_platform: Optional[str] = None,
     source_list_page_url: str = "",
     source_detail_url: str = "",
-    is_group_stream: bool = False,
     has_full_detail: bool = True,
 ) -> Dict[str, Any]:
     """构造向下游输出的统一标准化线报记录 (`DealRawRecord`)。"""
@@ -352,7 +351,6 @@ def build_deal_record(
         "source_url": primary_source_url,
         "source_list_page_url": list_page_url,
         "source_detail_url": detail_page_url,
-        "is_group_stream": bool(is_group_stream),
         "fetched_at": utc_now_iso(),
         "platform": platform,
         "candidate_goods_id": jd_image_key or "",

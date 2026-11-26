@@ -256,18 +256,9 @@ def test_registered_test_platform_uses_existing_core_flow_and_routes(monkeypatch
         home.product_service.wait_for_background_writes()
 
 
-def test_category_cache_and_long_keyword_search_routes():
-    from cache import CATEGORY_CACHE
+def test_long_keyword_search_routes():
     from main import app
     from models.product import extract_search_keyword
-
-    CATEGORY_CACHE.clear()
-    mock_repo = MagicMock()
-    mock_repo.get_categories.return_value = ["食品", "数码"]
-    service = ProductService(product_repo=mock_repo)
-    assert service.get_boom_categories(platform="pdd") == ["食品", "数码"]
-    assert service.get_boom_categories(platform="pdd") == ["食品", "数码"]
-    assert mock_repo.get_categories.call_count == 1
 
     share_text = "67￥ HU293 2026abcd ￥ https://m.tb.cn/h.xxx CZ0001 【淘宝】农夫山泉饮用天然水550ml*24瓶整箱装家庭囤货实惠装大容量"
     cleaned = extract_search_keyword(share_text)

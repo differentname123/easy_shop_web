@@ -168,7 +168,7 @@ class UserRepository(BaseRepository):
     ) -> Dict[str, Any]:
         """
         手机号注册登录一体化：
-        - 若手机号已存在：校验密码，成功则登录并平滑升级旧哈希；
+        - 若手机号已存在：校验密码，成功则登录；
         - 若手机号未存在：当 mode == 'login' 时明确报错拦截，避免输错手机号静默注册空白新账号；否则注册新账号并登录。
         """
         phone = str(phone).strip()

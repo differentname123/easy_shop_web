@@ -1240,7 +1240,7 @@ def test_repo_stops_perpetual_refetch_of_terminal_failures_and_allows_relisted_d
     find_query = raw_col.find.call_args[0][0]
     assert "$or" in find_query
     statuses = find_query["$or"][0]["clean_status"]["$in"]
-    assert {"pending", "cleaned_success", "cleaned_low_score", "merged_into_parent"}.issubset(set(statuses))
+    assert {"pending", "cleaned_success", "cleaned_low_score"}.issubset(set(statuses))
     assert find_query["$or"][1] == {"clean_status": "cleaned_failed", "clean_error_code": {"$ne": "UPSTREAM_DISAPPEARED"}}
 
     # 2. save_batch 仅重置因 UPSTREAM_DISAPPEARED 下架后重新上榜的记录，严禁把确定性失败洗回 pending

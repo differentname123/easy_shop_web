@@ -8,7 +8,6 @@ from .json_parser import extract_llm_json, parse_llm_json, string_to_object
 from .model_api import generate_content, get_combined_model_usage, reset_ai_cooldowns
 
 _LAZY_ANTIGRAVITY_ATTRS = frozenset({
-    "ANTIGRAVITY_MODEL_ALIASES",
     "SUB_ACCOUNT_EMAIL",
     "SUB_ACCOUNT_POOL",
     "AntigravityClient",

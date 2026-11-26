@@ -7,7 +7,6 @@ from .base import BaseDealSource, ChannelConfig, DealChannelConfig, FetchContext
 from .catalog import (
     DEFAULT_CHANNEL_CONFIGS,
     get_active_channels,
-    get_channel_max_age_days,
     get_site_max_age_days_map,
     is_channel_due,
 )
@@ -70,7 +69,6 @@ __all__ = [
     "DEFAULT_CHANNEL_CONFIGS",
     "get_active_channels",
     "is_channel_due",
-    "get_channel_max_age_days",
     "get_site_max_age_days_map",
     "get_source",
     "list_sources",

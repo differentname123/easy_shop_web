@@ -35,7 +35,6 @@ from models.deal_constants import (
     ERR_EMPTY_PRODUCT_IDENTITY,
     ERR_JD_NUMERIC_SKU,
     ERR_LOW_QUALITY_SCORE,
-    ERR_MERGED_INTO_NEIGHBOR,
     ERR_MULTI_PRODUCT_COLLECTION,
     ERR_NO_ANCHOR,
     ERR_PDD_NUMERIC_ID,
@@ -230,86 +229,17 @@ def _detect_ai2_price_leakage(
     return None
 
 
-def load_neighbor_docs(
-    raw_col,
-    site: str,
-    merged_tip_ids: List[str],
-    current_doc: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Dict[str, Any]]:
-    """根据 merged_tip_ids 从初步表加载关联邻居文档供去链清洗使用。"""
-    tip_map: Dict[str, Dict[str, Any]] = {}
-    if current_doc:
-        mid = str(current_doc.get("source_item_id") or "")
-        if mid:
-            tip_map[mid] = current_doc
-    needed = [tid for tid in merged_tip_ids if tid and tid not in tip_map]
-    if needed and raw_col is not None:
-        try:
-            for nd in raw_col.find(
-                {"source_site": site, "source_item_id": {"$in": needed}},
-                {"raw_payload": 0},
-            ):
-                ntid = str(nd.get("source_item_id") or "").strip()
-                if ntid:
-                    tip_map[ntid] = nd
-        except Exception as e:
-            logger.warning("补查邻居消息文档异常 (%s: %s): %s", site, needed, e)
-    return tip_map
-
-
-def build_stage1_task_input(doc: Dict[str, Any], raw_col) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
-    """构造单条记录的 Stage 1 AI 输入，群聊流额外合并同群 ±3 分钟邻居上下文。"""
+def build_stage1_task_input(doc: Dict[str, Any], raw_col=None) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """构造单条独立线报记录的 Stage 1 AI 输入。"""
     site = str(doc.get("source_site") or "")
     main_tip_id = str(doc.get("source_item_id") or "")
-    is_group_stream = bool(doc.get("is_group_stream") or (site == "zhetaoke" and main_tip_id.startswith("xb_")))
-    group_id = str(doc.get("group_id") or (doc.get("hot_metrics") or {}).get("group_id") or "").strip()
-    pub_ts = doc.get("publish_ts")
-    if not isinstance(pub_ts, (int, float)):
-        pub_ts = parse_publish_time_epoch(doc.get("publish_time"))
-
-    neighbor_docs: List[Dict[str, Any]] = [doc]
-    if is_group_stream and group_id and raw_col is not None and isinstance(pub_ts, (int, float)):
-        try:
-            cursor = (
-                raw_col.find(
-                    {
-                        "source_site": site,
-                        "group_id": group_id,
-                        "publish_ts": {"$gte": float(pub_ts) - 180.0, "$lte": float(pub_ts) + 180.0},
-                    },
-                    {"raw_payload": 0},
-                )
-                .sort([("publish_ts", 1), ("source_item_id", 1)])
-                .limit(7)
-            )
-            fetched_neighbors = list(cursor)
-            if fetched_neighbors:
-                if not any(str(d.get("source_item_id")) == main_tip_id for d in fetched_neighbors):
-                    fetched_neighbors.append(doc)
-                fetched_neighbors.sort(
-                    key=lambda x: (
-                        float(x.get("publish_ts") or pub_ts),
-                        str(x.get("source_item_id") or ""),
-                    )
-                )
-                neighbor_docs = fetched_neighbors
-        except Exception as e:
-            logger.warning("查询同群 [%s] 相邻 ±3 分钟消息异常: %s", group_id, e)
-
-    tip_map: Dict[str, Dict[str, Any]] = {}
-    raw_messages: List[Dict[str, Any]] = []
-    for nd in neighbor_docs:
-        tid = str(nd.get("source_item_id") or "")
-        if not tid or tid in tip_map:
-            continue
-        tip_map[tid] = nd
-        raw_messages.append(format_raw_message_for_ai1(nd, is_target=(tid == main_tip_id)))
+    tip_map: Dict[str, Dict[str, Any]] = {main_tip_id: doc} if main_tip_id else {}
+    raw_messages = [format_raw_message_for_ai1(doc, is_target=True)]
 
     return {
         "main_tip_id": main_tip_id,
         "source_site": site,
         "source_channel": str(doc.get("source_channel") or ""),
-        "is_group_stream": is_group_stream,
         "raw_messages": raw_messages,
     }, tip_map
 
@@ -320,7 +250,6 @@ def fallback_stage1_extract(doc: Dict[str, Any], fail_reason: str = "AI1_TIMEOUT
     msg = format_raw_message_for_ai1(doc, is_target=True)
     return {
         "main_tip_id": main_tip_id,
-        "is_standalone_deal": True,
         "merged_tip_ids": [main_tip_id],
         "combined_raw_text": msg["content"].strip(),
         "extracted_images": extract_doc_images(doc),
@@ -568,7 +497,6 @@ def run_ai_stage1_batch(
     prompt_tpl = cleaner._get_stage1_prompt()
 
     def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        cleaner.stats_ai1_calls += 1
         return cleaner._call_ai_json_array(prompt_tpl, chunk, "AI-Stage1")
 
     def _normalize_mid(raw_mid: Any) -> str:
@@ -634,7 +562,6 @@ def run_ai_stage1_batch(
         orig_doc = docs_by_tip_id.get(mid) or {}
         ai1_res = results_by_id.get(mid)
         if not isinstance(ai1_res, dict) or "extracted_targets" not in ai1_res:
-            cleaner.stats_ai1_fallbacks += 1
             results_by_id[mid] = fallback_stage1_extract(orig_doc)
             continue
 
@@ -686,7 +613,6 @@ def run_ai_stage1_batch(
                 logger.warning("[AI-1 单条隔离重提异常] %s#%s: %s", str(orig_doc.get("source_site") or ""), mid, str(exc)[:160])
 
             if not rescued:
-                cleaner.stats_ai1_fallbacks += 1
                 results_by_id[mid] = fallback_stage1_extract(orig_doc, fail_reason="AI1_HALLUCINATED_LINK")
                 continue
 
@@ -1585,7 +1511,6 @@ def run_ai_stage2_batch(
     prompt_tpl = cleaner._get_stage2_prompt()
 
     def _worker(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        cleaner.stats_ai2_calls += 1
         return cleaner._call_ai_json_array(prompt_tpl, chunk, "AI-Stage2")
 
     def _ingest_arr(arr: List[Dict[str, Any]]) -> None:
@@ -1783,16 +1708,9 @@ def process_ai1_unit(
             )
             and isinstance(saved_ai1, dict)
             and not saved_ai1.get("_from_fallback")
-            and saved_ai1.get("is_standalone_deal") is not False
             and saved_ai1.get("extracted_targets")
         ):
-            extra_mids = [
-                str(tid or "").strip()
-                for tid in (saved_ai1.get("merged_tip_ids") or [])
-                if str(tid or "").strip() and str(tid or "").strip() != mid
-            ]
-            site = str(doc.get("source_site") or "")
-            neighbor_maps_by_id[mid] = load_neighbor_docs(raw_col, site, extra_mids, current_doc=doc)
+            neighbor_maps_by_id[mid] = {mid: doc}
             continue
 
         s1_inp, tip_map = build_stage1_task_input(doc, raw_col)
@@ -1826,33 +1744,6 @@ def process_ai1_unit(
                 ai1_results[mid] = copy.deepcopy(saved_ai1)
     t_ai1_elapsed = round(time.perf_counter() - t_ai1_start, 2)
 
-    # 邻居碎片吸收判定
-    absorbed_by_neighbor: Dict[str, str] = {}
-    active_parent_ids: Set[str] = set()
-    sorted_ai1_items = sorted(
-        ai1_results.items(),
-        key=lambda kv: (
-            len((kv[1] or {}).get("extracted_targets") or []),
-            len((kv[1] or {}).get("merged_tip_ids") or []),
-        ),
-        reverse=True,
-    )
-    for mid, ai1_res in sorted_ai1_items:
-        if ai1_res.get("_from_fallback") or not ai1_res.get("is_standalone_deal", True) or mid in absorbed_by_neighbor:
-            continue
-        if _count_distinct_ai1_main_candidates(ai1_res.get("extracted_targets") or []) > MAX_AI1_MAIN_CANDIDATES:
-            continue
-        for m_tid in ai1_res.get("merged_tip_ids") or []:
-            m_tid_str = str(m_tid or "").strip()
-            if (
-                m_tid_str
-                and m_tid_str != mid
-                and m_tid_str not in absorbed_by_neighbor
-                and m_tid_str not in active_parent_ids
-            ):
-                absorbed_by_neighbor[m_tid_str] = mid
-                active_parent_ids.add(mid)
-
     for doc in selected_docs:
         mid = str(doc.get("source_item_id") or "")
         if not mid or mid in outcomes_by_id:
@@ -1863,32 +1754,7 @@ def process_ai1_unit(
         raw_title = str(doc.get("title") or "").strip()
         ai1_res = ai1_results.get(mid) or {}
 
-        if mid in absorbed_by_neighbor or ai1_res.get("is_standalone_deal") is False:
-            parent_id = absorbed_by_neighbor.get(mid) or ""
-            outcomes_by_id[mid] = {
-                "status": "merged_into_parent",
-                "stage_outcome": "merged_into_parent",
-                "error_code": ERR_MERGED_INTO_NEIGHBOR,
-                "error_msg": f"群聊连续碎片已合并入相邻主线报 {parent_id}".strip(),
-                "merged_into_tip_id": parent_id,
-                "source_site": site,
-                "source_site_name": site_name,
-                "deal_source": site,
-                "deal_source_name": site_name,
-                "source_channel": channel,
-                "source_item_id": mid,
-                "title": raw_title,
-                "ai_stage1_result": ai1_res,
-                "converted_links": [],
-                "ai_stage2_result": None,
-                "quality_score": 0,
-                "candidate_count": 0,
-                "attempt_errors": [],
-            }
-            continue
-
         if ai1_res.get("_from_fallback"):
-            cleaner.stats_ai_retries_scheduled += 1
             outcomes_by_id[mid] = _build_retry_or_max_outcome(
                 doc=doc,
                 site=site,
@@ -1982,7 +1848,6 @@ def process_convert_unit(
     selected_docs: List[Dict[str, Any]],
     formal_col=None,
     shared_active_products: Any = None,
-    shared_lock: Optional[threading.Lock] = None,
     quiet_sub_logs: bool = False,
 ) -> Tuple[List[Dict[str, Any]], float]:
     """阶段二/官方转链核验单元：去重并发转链、暂态降级重试、统一在库去重/择优升级。"""
@@ -1995,7 +1860,7 @@ def process_convert_unit(
     unique_target_map: Dict[Tuple[str, str], Tuple[Dict[str, Any], str]] = {}
     for doc in selected_docs:
         ai1_res = doc.get("ai_stage1_result") or {}
-        if ai1_res.get("_from_fallback") or ai1_res.get("is_standalone_deal") is False:
+        if ai1_res.get("_from_fallback"):
             continue
         def_plat = str(doc.get("platform") or "unknown")
         for tgt in (ai1_res.get("extracted_targets") or [])[:8]:
@@ -2089,7 +1954,6 @@ def process_convert_unit(
                 is_local_cooling_only = bool(transient_failed_convs) and any(
                     c.get("catalog_cooling") is True for c in transient_failed_convs
                 )
-                cleaner.stats_ai_retries_scheduled += 1
                 retry_msg_tpl = (
                     f"京东选品库处于本地冷却窗口，延后重试（不消耗重试次数 {{new_retries}}/{{max_retries}}）: {transient_err['error_msg']}"
                     if is_local_cooling_only
@@ -2160,7 +2024,6 @@ def process_convert_unit(
                 c.get("catalog_cooling") is True for c in transient_main_convs
             )
             if transient_main_err is not None and (is_local_cooling_only or (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES):
-                cleaner.stats_ai_retries_scheduled += 1
                 retry_msg_tpl = (
                     f"京东选品库处于本地冷却窗口，延后重试（不消耗重试次数 {{new_retries}}/{{max_retries}}）: {transient_main_err['error_msg']}"
                     if is_local_cooling_only
@@ -2220,7 +2083,6 @@ def process_convert_unit(
             c.get("catalog_cooling") is True for c in transient_degraded_convs
         )
         if transient_degraded is not None and (is_local_cooling_only or (int(doc.get("clean_retry_count") or 0) + 1) < MAX_CLEAN_RETRIES):
-            cleaner.stats_ai_retries_scheduled += 1
             retry_msg_tpl = (
                 f"京东选品库处于本地冷却窗口，延后重试（不消耗重试次数 {{new_retries}}/{{max_retries}}）: {transient_degraded.get('error_msg') or ''}"
                 if is_local_cooling_only
@@ -2285,11 +2147,7 @@ def process_convert_unit(
 
     batch_pids = {cand[7] for cand in surviving_candidates if cand[7] is not None}
     if isinstance(shared_active_products, dict):
-        if shared_lock is not None:
-            with shared_lock:
-                active_formal_products = {pid: dict(shared_active_products[pid]) for pid in batch_pids if pid in shared_active_products}
-        else:
-            active_formal_products = shared_active_products
+        active_formal_products = {pid: dict(shared_active_products[pid]) for pid in batch_pids if pid in shared_active_products} if batch_pids else shared_active_products
     elif formal_col is not None and batch_pids:
         active_formal_products = query_active_formal_products(formal_col, pid_keys=batch_pids)
     else:
@@ -2308,7 +2166,6 @@ def process_convert_unit(
         if single_main_pid is not None and ex_info_s3 is not None:
             should_upgrade, upgrade_reason = should_upgrade_existing_deal(ex_info_s3, ai1_res, doc)
             if should_upgrade:
-                cleaner.stats_deal_upgrades_post_stage3 += 1
                 if not quiet_sub_logs:
                     logger.info(
                         "✨ [Stage 3 择优升级] (%s:%s): %s -> 推进 AI-2",
@@ -2325,7 +2182,6 @@ def process_convert_unit(
             merged_tids = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
             if mid not in merged_tids:
                 merged_tids.insert(0, mid)
-            cleaner.stats_early_terminated_post_stage3 += 1
             post_stage3_db_early_count += 1
             clean_copy = sanitize_polished_copywriting(str(ai1_res.get("combined_raw_text") or raw_title))
             outcomes_by_id[mid] = _build_early_terminated_outcome(
@@ -2414,16 +2270,11 @@ def process_ai2_unit(
 
     for doc in selected_docs:
         mid = str(doc.get("source_item_id") or "")
-        site = str(doc.get("source_site") or "")
         ai1_res = doc.get("ai_stage1_result") or {}
-        conv_list = doc.get("full_conv_list") or doc.get("converted_links") or doc.get("stage3_converted_links") or []
+        conv_list = doc.get("full_conv_list") or doc.get("converted_links") or []
 
-        merged_tids_for_copy = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
-        if mid not in merged_tids_for_copy:
-            merged_tids_for_copy.insert(0, mid)
-        tip_map_for_copy = (neighbor_maps_by_id.get(mid) if neighbor_maps_by_id else None) or load_neighbor_docs(
-            raw_col, site, merged_tids_for_copy, current_doc=doc
-        )
+        merged_tids_for_copy = [mid] if mid else []
+        tip_map_for_copy = (neighbor_maps_by_id.get(mid) if neighbor_maps_by_id else None) or ({mid: doc} if mid else {})
         draft_copywriting = build_clean_original_copywriting(
             merged_tids_for_copy,
             tip_map_for_copy,
@@ -2468,7 +2319,6 @@ def process_ai2_unit(
 
         stage2_inputs.append({
             "main_tip_id": mid,
-            "is_group_stream": bool(doc.get("is_group_stream")),
             "combined_raw_text": combined_raw_for_ai2,
             "draft_copywriting": draft_copywriting,
             "share_image_count": len(ai1_res.get("extracted_images") or []),
@@ -2497,19 +2347,16 @@ def process_ai2_unit(
         channel = str(doc.get("source_channel") or "")
         raw_title = str(doc.get("title") or "").strip()
         ai1_res = doc.get("ai_stage1_result") or {}
-        conv_list = doc.get("full_conv_list") or doc.get("converted_links") or doc.get("stage3_converted_links") or []
+        conv_list = doc.get("full_conv_list") or doc.get("converted_links") or []
         s2_inp = s2_input_map.get(mid) or {}
         ai2_res = ai2_results.get(mid)
         if not isinstance(ai2_res, dict) or "is_valid_deal" not in ai2_res:
-            cleaner.stats_ai2_fallbacks += 1
             ai2_res = fallback_stage2_evaluate(s2_inp)
         else:
-            cleaner.stats_ai2_model_hits += 1
             ai2_res["_from_fallback"] = False
 
         conv_summary_for_db = [{k: v for k, v in c.items() if k != "adapter_res"} for c in conv_list]
         if ai2_res.get("_from_fallback"):
-            cleaner.stats_ai_retries_scheduled += 1
             outcomes_by_id[mid] = _build_retry_or_max_outcome(
                 doc=doc,
                 site=site,
@@ -2540,7 +2387,6 @@ def process_ai2_unit(
                 mid,
                 str(ai2_res.get("clean_title") or "")[:40],
             )
-            cleaner.stats_ai_retries_scheduled += 1
             outcomes_by_id[mid] = _build_retry_or_max_outcome(
                 doc=doc,
                 site=site,
@@ -2664,7 +2510,6 @@ def process_ai2_unit(
             stage1_deal_price=ai1_res.get("deal_price"),
         )
         if price_leak_reason:
-            cleaner.stats_ai_retries_scheduled += 1
             outcomes_by_id[mid] = _build_retry_or_max_outcome(
                 doc=doc,
                 site=site,
@@ -2918,12 +2763,8 @@ def process_ai2_unit(
             if img_u and img_u != official_img and img_u not in user_share_images:
                 user_share_images.append(img_u)
 
-        merged_tip_ids = [str(x).strip() for x in (ai1_res.get("merged_tip_ids") or [mid]) if str(x or "").strip()]
-        if mid not in merged_tip_ids:
-            merged_tip_ids.insert(0, mid)
-        tip_map = (neighbor_maps_by_id.get(mid) if neighbor_maps_by_id else None) or load_neighbor_docs(
-            raw_col, site, merged_tip_ids, current_doc=doc
-        )
+        merged_tip_ids = [mid] if mid else []
+        tip_map = (neighbor_maps_by_id.get(mid) if neighbor_maps_by_id else None) or ({mid: doc} if mid else {})
         merged_source_urls: List[str] = []
         for m_tid in merged_tip_ids:
             nd = tip_map.get(m_tid) or {}
@@ -3148,7 +2989,6 @@ def clean_batch_records(
     raw_col,
     formal_col=None,
     shared_active_products: Any = None,
-    shared_lock: Optional[threading.Lock] = None,
     quiet_sub_logs: bool = False,
 ) -> List[Dict[str, Any]]:
     """串联执行 AI-1 -> 官方转链 -> AI-2 单窗口完整清洗闭环。"""
@@ -3185,7 +3025,6 @@ def clean_batch_records(
             adv_to_convert,
             formal_col=formal_col,
             shared_active_products=shared_active_products,
-            shared_lock=shared_lock,
             quiet_sub_logs=quiet_sub_logs,
         )
         conv_map = {str(r.get("source_item_id") or ""): r for r in conv_outcomes}

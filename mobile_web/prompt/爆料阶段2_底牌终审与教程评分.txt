@@ -19,8 +19,7 @@
 ```json
 [
   {
-    "main_tip_id": "xb_76711587",
-    "is_group_stream": true,
+    "main_tip_id": "tip_76711587",
     "combined_raw_text": "领200-20补贴卷： [#L1]\n【某品牌商品及规格】拍1件： [#L2]\n凑单： [#L3]\n（可退）\n主商品到手29.9亓，折2.49亓/件！",
     "draft_copywriting": "领200-20补贴卷：\n【某品牌商品及规格】拍1件：\n凑单：\n（可退）\n主商品到手29.9亓，折2.49亓/件！",
     "share_image_count": 1,

@@ -195,11 +195,6 @@ def extract_sku_unit_entries(doc: Dict[str, Any]) -> List[Tuple[float, str, Dict
     return [parse_pricing_basis_entry(sku_price, sku_fmt) for sku_price, sku_fmt in raw_sku_list]
 
 
-def parse_deal_publish_timestamp(val: Any) -> Optional[float]:
-    """将已存储线报发布时间归一化为秒级 Unix 时间戳（委托单一真源 coerce_unix_timestamp）。"""
-    return coerce_unix_timestamp(val)
-
-
 def extract_fresh_deal_unit_entries(
     doc: Dict[str, Any],
     *,

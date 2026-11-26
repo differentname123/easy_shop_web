@@ -26,9 +26,9 @@
         global.document.title = '商品详情 - 查券省钱';
       }
     };
-    const commandModal = ref({ visible: false, text: '', token: '', link: '', wechatGuide: false });
+    const commandModal = ref({ visible: false, text: '', wechatGuide: false });
     const closeCommandModal = () => {
-      commandModal.value = { visible: false, text: '', token: '', link: '', wechatGuide: false };
+      commandModal.value = { visible: false, text: '', wechatGuide: false };
     };
     const copyCommandFromModal = () => {
       if (!commandModal.value.text) return;
@@ -264,8 +264,6 @@
         commandModal.value = {
           visible: true,
           text: content,
-          token,
-          link: url,
           wechatGuide: Boolean(url),
         };
         browser.copyText(content, url ? `口令已复制，请打开${platformName.value} App 使用` : '口令已复制，请打开对应 App 使用');
@@ -508,8 +506,6 @@
             ...(goods.value || {}), ...detail,
             image_url: nextImageUrl,
             carousel_images: (Array.isArray(detail.carousel_images) && detail.carousel_images.length) ? detail.carousel_images : prevImages,
-            specs: detail.specs || goods.value?.specs,
-            service_guarantees: detail.service_guarantees || goods.value?.service_guarantees,
             deal_tip: detail.deal_tip !== undefined ? detail.deal_tip : (goods.value?.deal_tip || null),
           };
           if (detail.is_favorited !== undefined) {
@@ -632,8 +628,6 @@
           commandModal.value = {
             visible: true,
             text: content,
-            token: info.promotion_token || info.j_short_command || info.we_app_web_view_short_url || '',
-            link: info.short_url || info.final_link || '',
             wechatGuide: true,
           };
           browser.copyText(content, `口令已复制，请打开${platformName.value} App 领券下单`);
@@ -654,8 +648,6 @@
         commandModal.value = {
           visible: true,
           text: content,
-          token: info.promotion_token || info.j_short_command || info.we_app_web_view_short_url || '',
-          link: info.short_url || info.final_link || '',
           wechatGuide: false,
         };
         browser.copyText(content, successTip || `推广口令与链接已复制，可前往${platformName.value}使用`);
@@ -778,7 +770,7 @@
       isDeepLoading, detailError, detailErrorMsg, isOffPromotion, canOperateDetail, commandModal, closeCommandModal, copyCommandFromModal,
       isFavorited, isFavoriteBusy, handleToggleFavorite, priceFeedbackChoice, submitPriceFeedback,
       onCarouselScroll, goHome, goBack, goToRegister, handleShareDetail, goToSubmitDeal,
-      authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, refreshAuthorization, resumePendingAuthorization, platformName,
+      authModal, closeAuthModal, handleProceedWithoutAuth, handleGoToAuth, resumePendingAuthorization, platformName,
       retryLoadDeepDetail, handleJumpToBuy, handleCopyPromoteLink, initialize, dispose,
       formatMoney: shop.formatMoney, formatSales: shop.formatSales,
     };
@@ -787,7 +779,7 @@
   createApp({
     setup() {
       const controller = shop.createDetailController({
-        ref, computed, api: shop.createApi(), session: shop.createSessionStore(), browser: shop.createBrowserTools({ ref }),
+        ref, computed, api: shop.createApi(), session: shop.createSessionStore(), browser: shop.createBrowserTools({ ref, enableDesktopBanner: false }),
       });
       onMounted(controller.initialize);
       onUnmounted(controller.dispose);

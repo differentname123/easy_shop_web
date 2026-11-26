@@ -17,7 +17,7 @@ def register_or_login(req: RegisterOrLoginDTO):
     """
     推手手机号注册与登录一体化接口
     - 手机号不存在：自动注册新账号，绑定邀请码，签发专属 auth_token 与 UID；
-    - 手机号已存在：校验密码并登录，平滑升级密码哈希，返回 auth_token 与脱敏手机号。
+    - 手机号已存在：校验密码并登录，返回 auth_token 与脱敏手机号。
     """
     res = user_service.register_or_login(
         phone=req.phone,

@@ -103,26 +103,10 @@ def commit_batch_results_to_db(
                             "resolved_official_title": r["official_title"],
                             "merged_tip_ids": r.get("merged_tip_ids") or [s_id],
                         },
-                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": "", "stage3_converted_links": ""},
+                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                     },
                 )
             )
-            for m_tid in r.get("merged_tip_ids") or []:
-                if m_tid != s_id:
-                    raw_status_ops.append(
-                        UpdateOne(
-                            {"source_site": s_site, "source_item_id": m_tid, "clean_status": {"$in": ["pending", "context_only"]}},
-                            {
-                                "$set": {
-                                    "clean_status": "merged_into_parent",
-                                    "clean_stage": CLEAN_STAGE_DONE,
-                                    "merged_into_tip_id": s_id,
-                                    "cleaned_at": now_utc,
-                                },
-                                "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": "", "stage3_converted_links": ""},
-                            },
-                        )
-                    )
         elif r["status"] == "early_terminated":
             batch_early_terminated_results.append(r)
             raw_status_ops.append(
@@ -141,40 +125,7 @@ def commit_batch_results_to_db(
                             "resolved_official_title": r.get("official_title") or "",
                             "merged_tip_ids": r.get("merged_tip_ids") or [s_id],
                         },
-                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": "", "stage3_converted_links": ""},
-                    },
-                )
-            )
-            for m_tid in r.get("merged_tip_ids") or []:
-                if m_tid != s_id:
-                    raw_status_ops.append(
-                        UpdateOne(
-                            {"source_site": s_site, "source_item_id": m_tid, "clean_status": {"$in": ["pending", "context_only"]}},
-                            {
-                                "$set": {
-                                    "clean_status": "merged_into_parent",
-                                    "clean_stage": CLEAN_STAGE_DONE,
-                                    "merged_into_tip_id": s_id,
-                                    "cleaned_at": now_utc,
-                                },
-                                "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": "", "stage3_converted_links": ""},
-                            },
-                        )
-                    )
-        elif r["status"] == "merged_into_parent":
-            raw_status_ops.append(
-                UpdateOne(
-                    {"source_site": s_site, "source_item_id": s_id},
-                    {
-                        "$set": {
-                            **common_ai_fields,
-                            "clean_status": "merged_into_parent",
-                            "clean_stage": CLEAN_STAGE_DONE,
-                            "merged_into_tip_id": r.get("merged_into_tip_id") or "",
-                            "clean_error_code": r["error_code"],
-                            "clean_error_msg": r["error_msg"],
-                        },
-                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": "", "stage3_converted_links": ""},
+                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                     },
                 )
             )
@@ -227,7 +178,7 @@ def commit_batch_results_to_db(
                             "resolved_goods_sign": r.get("goods_sign"),
                             "resolved_official_title": r.get("official_title"),
                         },
-                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": "", "stage3_converted_links": ""},
+                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                     },
                 )
             )
@@ -247,7 +198,7 @@ def commit_batch_results_to_db(
                     {"source_site": s_site, "source_item_id": s_id},
                     {
                         "$set": fail_set,
-                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": "", "stage3_converted_links": ""},
+                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                     },
                 )
             )
@@ -375,7 +326,6 @@ class StageWorker(threading.Thread):
         self.quiet_sub_logs = quiet_sub_logs
         self.worker_id = f"{name}_{os.getpid()}_{threading.get_ident()}"
         self.total_processed = 0
-        self.total_advanced = 0
 
     def _compute_safe_lease(self, limit: int) -> int:
         if limit <= 0:
@@ -448,7 +398,6 @@ class StageWorker(threading.Thread):
                         for o in outcomes
                         if o.get("stage_outcome") in ("advance_to_convert", "advance_to_ai2", "success")
                     )
-                    self.total_advanced += adv_count
                     if self.downstream_event is not None and adv_count > 0:
                         self.downstream_event.set()
             except Exception as e:

@@ -124,7 +124,6 @@ def test_favorites_routes_require_auth_and_enforce_isolation(monkeypatch):
 
     with TestClient(app) as client:
         assert client.get("/api/favorites/list").status_code == 401
-        assert client.get("/api/favorites/check?platform=pdd&product_id=101").status_code == 401
         assert client.post("/api/favorites/add", json={"platform": "pdd", "product_id": "101"}).status_code == 401
         assert client.post("/api/favorites/remove", json={"platform": "pdd", "product_id": "101"}).status_code == 401
 
@@ -137,11 +136,6 @@ def test_favorites_routes_require_auth_and_enforce_isolation(monkeypatch):
         assert r_add.json()["data"]["is_favorited"] is True
 
         # 用户 B 看不到也删不掉用户 A 的收藏
-        r_check_b = client.get(
-            "/api/favorites/check?platform=pdd&product_id=101",
-            headers={"Authorization": f"Bearer {tok_b}"},
-        )
-        assert r_check_b.json()["data"]["is_favorited"] is False
         r_list_b = client.get("/api/favorites/list", headers={"Authorization": f"Bearer {tok_b}"})
         assert r_list_b.json()["data"]["total"] == 0
 
@@ -152,11 +146,8 @@ def test_favorites_routes_require_auth_and_enforce_isolation(monkeypatch):
         )
         assert r_rem_b.json()["data"]["removed"] is False
 
-        r_check_a = client.get(
-            "/api/favorites/check?platform=pdd&product_id=101",
-            headers={"Authorization": f"Bearer {tok_a}"},
-        )
-        assert r_check_a.json()["data"]["is_favorited"] is True
+        r_list_a = client.get("/api/favorites/list", headers={"Authorization": f"Bearer {tok_a}"})
+        assert r_list_a.json()["data"]["total"] == 1
 
 
 def test_favorites_idempotent_add_remove_and_live_product_join(monkeypatch):

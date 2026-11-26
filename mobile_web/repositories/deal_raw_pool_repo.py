@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pymongo import UpdateOne
 
-from infrastructure.mongo import gen_db_object
+from infrastructure.mongo import get_shared_db
 from infrastructure.runtime_io import append_bounded_jsonl, should_write_runtime_artifact
 from models.product import normalize_platform
 from models.deal_constants import (
@@ -148,8 +148,7 @@ def has_potential_product_signal(record: Dict[str, Any]) -> Tuple[bool, List[str
 def _is_pure_jd_coupon_only_record(record: Dict[str, Any]) -> bool:
     """
     识别“整条消息仅包含京东官方原生领券链接 (`coupon.m.jd.com`) 且不含任何其他商品链接或口令”的纯防身领券广播：
-    - 群聊流 (`is_group_stream=True`) 中将其存为 `context_only`；
-    - 独立帖流 (`is_group_stream=False`) 中无具体主商品可直接跳过。
+    无具体主商品可直接跳过 (`skipped_no_signal`)，不写入清洗队列。
     """
     tokens = record.get("extracted_tokens") or []
     if any(str(tk or "").strip() for tk in tokens):
@@ -225,7 +224,7 @@ class DealRawPoolRepository:
     @property
     def db(self):
         if self._db is None:
-            self._db = gen_db_object()
+            self._db = get_shared_db()
         return self._db
 
     @property
@@ -252,10 +251,6 @@ class DealRawPoolRepository:
             )
             col.create_index([("clean_error_code", 1)], background=True)
             col.create_index([("quality_score", -1)], background=True)
-            col.create_index(
-                [("source_site", 1), ("is_group_stream", 1), ("group_id", 1), ("publish_ts", 1)],
-                background=True,
-            )
             col.create_index(
                 [("quality_signals.has_unique_product_anchor", 1), ("clean_status", 1)],
                 background=True,
@@ -421,7 +416,7 @@ class DealRawPoolRepository:
         channel: str = "",
     ) -> Set[str]:
         """获取某站点已落盘且无需重复拉取详情的 `source_item_id` 集合：
-        包含 pending、cleaned_success、cleaned_low_score、merged_into_parent 以及所有终态 cleaned_failed；
+        包含 pending、cleaned_success、cleaned_low_score 以及所有终态 cleaned_failed；
         仅放行因上次全量巡视暂离榜单 (`UPSTREAM_DISAPPEARED`) 而下架的记录，使其重新上榜时可被再次抓取。
         """
         try:
@@ -429,7 +424,7 @@ class DealRawPoolRepository:
                 "source_site": source_site,
                 "has_full_detail": True,
                 "$or": [
-                    {"clean_status": {"$in": ["pending", "cleaned_success", "cleaned_low_score", "merged_into_parent"]}},
+                    {"clean_status": {"$in": ["pending", "cleaned_success", "cleaned_low_score"]}},
                     {"clean_status": "cleaned_failed", "clean_error_code": {"$ne": UPSTREAM_DISAPPEARED}},
                 ],
             }
@@ -613,12 +608,11 @@ class DealRawPoolRepository:
     ) -> Dict[str, int]:
         """【Stage 1：源站拉取入初步表 `deal_raw_tips`】"""
         if not records:
-            return {"inserted": 0, "updated": 0, "skipped_no_signal": 0, "context_only_saved": 0, "total": 0}
+            return {"inserted": 0, "updated": 0, "skipped_no_signal": 0, "total": 0}
 
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         ops = []
         skipped_no_signal = 0
-        context_only_saved = 0
 
         # 仅当此前因全量巡视暂离榜单 (UPSTREAM_DISAPPEARED) 而下架的记录重新出现时，才将其重置为 pending 重新清洗；
         # 其余确定性失败（如已停止推广、纯数字SKU、券链失效、货不对板、低分等）严禁重复洗库。
@@ -650,7 +644,6 @@ class DealRawPoolRepository:
                         "$unset": {
                             "ai_stage1_result": "",
                             "converted_links": "",
-                            "stage3_converted_links": "",
                             "ai_stage2_result": "",
                             "next_retry_after_ts": "",
                             "stage_lease_owner": "",
@@ -671,9 +664,7 @@ class DealRawPoolRepository:
 
             has_full_detail = bool(rec.get("has_full_detail", True))
             quality_signals = evaluate_quality_signals(rec)
-            is_group_stream = bool(rec.get("is_group_stream"))
             hot_metrics = rec.get("hot_metrics") if isinstance(rec.get("hot_metrics"), dict) else {}
-            group_id = str(hot_metrics.get("group_id") or "").strip()
             channel = str(rec.get("source_channel") or "").strip()
             raw_pub = rec.get("publish_ts") if rec.get("publish_ts") is not None else rec.get("publish_time")
             parsed_pub_ts = parse_publish_time_epoch(raw_pub)
@@ -692,12 +683,8 @@ class DealRawPoolRepository:
             has_signal = bool(quality_signals["has_unique_product_anchor"])
             is_pure_coupon = has_full_detail and _is_pure_jd_coupon_only_record(rec)
             if has_full_detail and (not has_signal or is_pure_coupon):
-                if is_group_stream:
-                    initial_status = "context_only"
-                    context_only_saved += 1
-                else:
-                    skipped_no_signal += 1
-                    continue
+                skipped_no_signal += 1
+                continue
             elif is_expired_over_age:
                 initial_status = "cleaned_failed"
             else:
@@ -763,8 +750,6 @@ class DealRawPoolRepository:
                 "source_url": source_url or source_detail_url,
                 "source_list_page_url": source_list_page_url,
                 "source_detail_url": source_detail_url,
-                "is_group_stream": is_group_stream,
-                "group_id": group_id,
                 "fetched_at": rec.get("fetched_at") or "",
                 "platform": rec.get("platform") or "unknown",
                 "candidate_goods_id": rec.get("candidate_goods_id") or "",
@@ -819,7 +804,7 @@ class DealRawPoolRepository:
                 ops.append(UpdateOne(filter_spec, update_doc, upsert=False))
 
         if not ops:
-            return {"inserted": 0, "updated": 0, "skipped_no_signal": skipped_no_signal, "context_only_saved": context_only_saved, "total": 0}
+            return {"inserted": 0, "updated": 0, "skipped_no_signal": skipped_no_signal, "total": 0}
 
         try:
             res = self.col.bulk_write(ops, ordered=False)
@@ -827,7 +812,6 @@ class DealRawPoolRepository:
                 "inserted": res.upserted_count,
                 "updated": res.modified_count,
                 "skipped_no_signal": skipped_no_signal,
-                "context_only_saved": context_only_saved,
                 "total": len(ops),
             }
         except Exception as e:
@@ -837,7 +821,6 @@ class DealRawPoolRepository:
                 "inserted": 0,
                 "updated": 0,
                 "skipped_no_signal": skipped_no_signal,
-                "context_only_saved": context_only_saved,
                 "total": len(ops),
                 "error": str(e),
             }
@@ -1213,12 +1196,6 @@ class DealRawPoolRepository:
                                     "cleaned_low_score_docs": {
                                         "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_low_score"]}, 1, 0]}
                                     },
-                                    "merged_neighbor_docs": {
-                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "merged_into_parent"]}, 1, 0]}
-                                    },
-                                    "context_only_docs": {
-                                        "$sum": {"$cond": [{"$eq": ["$clean_status", "context_only"]}, 1, 0]}
-                                    },
                                     "cleaned_failed_docs": {
                                         "$sum": {"$cond": [{"$eq": ["$clean_status", "cleaned_failed"]}, 1, 0]}
                                     },
@@ -1296,8 +1273,6 @@ class DealRawPoolRepository:
         unique_anchor_docs = int(totals.get("unique_anchor_docs") or 0)
         cleaned_success_docs = int(totals.get("cleaned_success_docs") or 0)
         cleaned_low_score_docs = int(totals.get("cleaned_low_score_docs") or 0)
-        merged_neighbor_docs = int(totals.get("merged_neighbor_docs") or 0)
-        context_only_docs = int(totals.get("context_only_docs") or 0)
         cleaned_failed_docs = int(totals.get("cleaned_failed_docs") or 0)
         pending_clean_docs = int(totals.get("pending_clean_docs") or 0)
 
@@ -1321,8 +1296,6 @@ class DealRawPoolRepository:
             "unique_product_anchor_ratio": round(unique_anchor_docs * 100.0 / max(1, total_docs), 1),
             "cleaned_success_records": cleaned_success_docs,
             "cleaned_low_score_records": cleaned_low_score_docs,
-            "merged_into_parent_records": merged_neighbor_docs,
-            "context_only_records": context_only_docs,
             "cleaned_failed_records": cleaned_failed_docs,
             "pending_clean_records": pending_clean_docs,
             "formal_products_total": formal_total_products,

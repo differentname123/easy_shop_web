@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Sequence
-from adapters import get_adapter, normalize_platform
+from adapters import get_adapter
 from infrastructure.http_utils import sanitize_user_error_message
 from infrastructure.logging_utils import format_exc_summary, severity_icon
 from models.product import (
@@ -15,12 +15,13 @@ from models.product import (
     DetailSnapshot,
     DetailPrefetchResult,
     is_jd_image_key,
+    normalize_platform,
     utc_millis,
 )
 from repositories.product_repo import ProductRepository
 from services.boom_search import resolve_boom_sort
 from cache import (
-    RECOMMEND_CACHE, SEARCH_CACHE, CATEGORY_CACHE, BOOM_SORT_CACHE,
+    RECOMMEND_CACHE, SEARCH_CACHE, BOOM_SORT_CACHE,
     MATERIAL_CACHE, SIGN_BY_ID_CACHE,
     cache_deal_tip,
     cache_product_detail,
@@ -30,8 +31,6 @@ from cache import (
     get_cached_product_detail,
     has_valid_product_images,
     is_product_off_promotion,
-    is_valid_detail_cache_entry,
-    is_valid_image_url,
     make_detail_snapshot,
     parse_detail_deadline,
     snapshot_detail_deadline,
@@ -341,11 +340,9 @@ class ProductService:
             )
         return result
 
-    _is_valid_image_url = staticmethod(is_valid_image_url)
     _has_valid_images = staticmethod(has_valid_product_images)
     _parse_detail_deadline = staticmethod(parse_detail_deadline)
     _snapshot_deadline = staticmethod(snapshot_detail_deadline)
-    _valid_cache_entry = staticmethod(is_valid_detail_cache_entry)
     _cache_detail = staticmethod(cache_product_detail)
     _cached_detail = staticmethod(get_cached_product_detail)
 
@@ -354,10 +351,6 @@ class ProductService:
         if not has_valid_product_images(item):
             return 0.0
         return parse_detail_deadline(item.get("detail_updated_at"))
-
-    @classmethod
-    def _detail_is_fresh(cls, item: dict) -> bool:
-        return time.time() < cls._detail_expires_at(item)
 
     @staticmethod
     def _database_detail(item: dict, source: str) -> dict:
@@ -455,7 +448,7 @@ class ProductService:
             return None
         return self._make_snapshot(item, datetime.fromtimestamp(deadline - PRODUCT_DETAIL_TTL, timezone.utc), platform)
 
-    def _commit_snapshot(self, snapshot, uid=None, public=None, stop_event=None, requested_ref=None):
+    def _commit_snapshot(self, snapshot, public=None, stop_event=None, requested_ref=None):
         raw_deadline = self._parse_detail_deadline(snapshot.fetched_at)
         if raw_deadline <= time.time():
             return _LoadedDetail({"status": "error", "error_code": "expired_detail", "error_msg": "详情快照已过期"})
@@ -524,7 +517,7 @@ class ProductService:
         public = self._cache_detail(snapshot.ref.platform, public, deadline, None)
         return _LoadedDetail(public, snapshot, persisted=written, retryable=not written)
 
-    def _singleflight(self, ref, uid, kwargs, load, stop_event=None):
+    def _singleflight(self, ref, kwargs, load, stop_event=None):
         # 防并发击穿锁按平台与商品唯一标识聚合，同一瞬间多用户访问同款商品仅发起单次上游请求
         key = (ref.platform, "", "sign" if ref.goods_sign else "id", ref.key,
                ref.goods_id if ref.goods_sign else "", json.dumps(kwargs, sort_keys=True, default=str))
@@ -594,8 +587,8 @@ class ProductService:
                 snapshot = self._make_snapshot(detail_payload, utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), ref.platform)
             except ValueError:
                 return _LoadedDetail({"status": "error", "error_code": "invalid_product_detail", "error_msg": "平台商品详情身份无效"})
-            return self._commit_snapshot(snapshot, None, result, stop_event, requested_ref=ref)
-        return self._singleflight(ref, uid, kwargs, load, stop_event)
+            return self._commit_snapshot(snapshot, result, stop_event, requested_ref=ref)
+        return self._singleflight(ref, kwargs, load, stop_event)
 
     def get_goods_detail(self, platform="pdd", goods_id_or_sign="", goods_id=None,
                          goods_sign=None, uid=None, **kwargs) -> Dict[str, Any]:
@@ -913,7 +906,7 @@ class ProductService:
                         continue
                     try:
                         snap = self._make_snapshot(detail_payload, utc_millis(datetime.fromtimestamp(time.time(), timezone.utc)), plat)
-                        loaded = self._commit_snapshot(snap, None, raw_res, stop_event, requested_ref=upgraded)
+                        loaded = self._commit_snapshot(snap, raw_res, stop_event, requested_ref=upgraded)
                     except ValueError:
                         loaded = _LoadedDetail({"status": "error", "error_code": "invalid_product_detail", "error_msg": "平台商品详情身份无效"})
                     outcomes[orig_key] = self._finalize_prefetch_loaded(upgraded, loaded, refresh_ahead_seconds)
@@ -968,13 +961,3 @@ class ProductService:
         if result.get("status") == "success":
             self._offer_products(result.get("data") or [])
         return result
-
-    def get_boom_categories(self, platform="all") -> List[str]:
-        plat = normalize_platform(platform, "all")
-        cached = CATEGORY_CACHE.get(plat)
-        if cached is not None:
-            return cached
-        categories = self.repo.get_categories(platform=plat)
-        if categories:
-            CATEGORY_CACHE.set(plat, categories)
-        return categories

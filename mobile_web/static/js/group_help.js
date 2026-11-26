@@ -18,14 +18,13 @@
     setup() {
       const api = shop.createApi();
       const session = shop.createSessionStore();
-      const browser = shop.createBrowserTools({ ref });
+      const browser = shop.createBrowserTools({ ref, enableDesktopBanner: false });
       const ime = shop.createImeGuard();
 
       const keyword = ref('');
       const activeKeyword = ref('');
       const filterMode = ref('active'); // 'active' | 'almost' | 'mine'
       const items = ref([]);
-      const total = ref(0);
       const hasMore = ref(false);
       const loading = ref(false);
       const submittingFeedback = ref(false);
@@ -39,7 +38,6 @@
       const searchInputRef = ref(null);
       const showOnboardGuide = ref(true);
 
-      const authToken = ref('');
       const viewerGuard = ref({
         logged_in: false,
         uid: '',
@@ -80,14 +78,9 @@
         }
       };
 
-      const currentToken = () => {
-        const tok = String(session.token() || '').trim();
-        authToken.value = tok;
-        return tok;
-      };
+      const currentToken = () => String(session.token() || '').trim();
 
       const clearExpiredAuth = () => {
-        authToken.value = '';
         session.clear();
       };
 
@@ -517,7 +510,6 @@
           if (res.ok && json.status === 'success' && json.data) {
             const list = json.data.items || [];
             items.value = reset ? list : items.value.concat(list);
-            total.value = Number(json.data.total || 0);
             hasMore.value = Boolean(json.data.has_more);
             if (json.data.viewer_guard) {
               applyViewerGuard(json.data.viewer_guard);
@@ -1341,7 +1333,6 @@
           const json = res.data || {};
           if (res.ok && json.status === 'success' && json.user && json.user.auth_token) {
             const u = json.user;
-            authToken.value = String(u.auth_token);
             session.saveUser(u);
             session.clearPendingInvite();
             const nextAction = authModal.value.pendingAction;
@@ -1470,7 +1461,6 @@
             if (idx !== -1) {
               if (json.data.group_status !== 'active') {
                 items.value.splice(idx, 1);
-                total.value = Math.max(0, total.value - 1);
               } else {
                 items.value[idx] = json.data;
               }
@@ -1725,7 +1715,6 @@
         activeKeyword,
         filterMode,
         items,
-        total,
         hasMore,
         localPendingCount,
         loading,
@@ -1746,7 +1735,6 @@
         helpModal,
         creditWarnModal,
         authModal,
-        openAuthModal,
         closeAuthModal,
         submitInlineAuth,
         uploadResultModal,
@@ -1796,7 +1784,6 @@
         chooseJoinMatchedGroup,
         choosePublishOwnGroup,
         onMyGroupCardClick,
-        directJoinGroup,
         jumpToApp,
         jumpToH5,
         requestFeedback,
