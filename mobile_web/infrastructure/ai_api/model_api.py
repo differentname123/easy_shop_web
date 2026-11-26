@@ -99,20 +99,26 @@ _IMAGE_COMPRESS_MIN_BYTES = 8192
 _IMAGE_JPEG_QUALITY = 85
 
 HIGH_MODEL_LIST = [
-    {"model_name": "gpt-6.1-sol-max", "权重": 90, "备注": "来源codex 订阅账号 (占组内总权重 90%)"},
+    {"model_name": "gemini-aistudio-3.1-pro-preview", "无附件权重": 40, "有附件权重": 40, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-web-3.1-pro-thinking-max", "无附件权重": 35, "有附件权重": 35, "备注": "来源gemini_web"},
+    {"model_name": "gemini-aistudio-4-hydrogen", "无附件权重": 25, "有附件权重": 25, "备注": "来源aistudio_web"},
+    # {"model_name": "gpt-6-astra-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 订阅账号"},
+    {"model_name": "gpt-6.1-sol-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 订阅账号 (暂无可用号先置0，补号后恢复)"},
+    # {"model_name": "antigravity-argon-high", "无附件权重": 0, "有附件权重": 0, "备注": "来源antigravity 本地客户端"},
+    # {"model_name": "claude-antigravity-opus-4-6-thinking", "无附件权重": 0, "有附件权重": 0, "备注": "来源antigravity"},
 ]
 MEDIUM_MODEL_LIST = [
-    {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 4, "备注": "来源gemini_web"},
-    {"model_name": "gemini-web-3.1-pro-thinking-max", "权重": 4, "备注": "来源gemini_web"},
-    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 0.5, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.8-flash", "权重": 2, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-4-hydrogen", "权重": 1, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-api-key-4-hydrogen", "权重": 0, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-api-key-3.8-flash", "权重": 0, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-api-key-3.6-flash", "权重": 0, "备注": "来源api key aistudio"},
-    {"model_name": "gpt-5.6-max", "权重": 0, "备注": "来源chatgpt_web"},
-    {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 0, "备注": "来源gemini_web"},
-    {"model_name": "gpt-6-codex-luna-max", "权重": 5, "备注": "来源codex 付费"},
+    {"model_name": "gemini-web-3.8-flash-thinking-max", "无附件权重": 28, "有附件权重": 28, "备注": "来源gemini_web"},
+    {"model_name": "gemini-aistudio-3.8-flash", "无附件权重": 22, "有附件权重": 24, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.1-pro-preview", "无附件权重": 22, "有附件权重": 18, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-4-hydrogen", "无附件权重": 20, "有附件权重": 18, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-web-3.1-pro-thinking-max", "无附件权重": 8, "有附件权重": 12, "备注": "来源gemini_web"},
+    {"model_name": "gemini-aistudio-api-key-4-hydrogen", "无附件权重": 0, "有附件权重": 0, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.8-flash", "无附件权重": 0, "有附件权重": 0, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.6-flash", "无附件权重": 0, "有附件权重": 0, "备注": "来源api key aistudio"},
+    {"model_name": "gpt-5.6-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源chatgpt_web"},
+    {"model_name": "gemini-web-3.5-flash-lite-thinking", "无附件权重": 0, "有附件权重": 0, "备注": "来源gemini_web"},
+    {"model_name": "gpt-6-codex-luna-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 付费 (暂无可用号先置0，补号后恢复)"},
     # --------------------------------------------------------------------------
     # ⚠️ [2026-11-25 已停用 Antigravity 本地模型] 取消注释恢复权重前必读！
     # 实证记录：just4mike@usa.com（38h / 4并发高峰6h死）与 lourdesvega5@yahoo.com
@@ -120,21 +126,21 @@ MEDIUM_MODEL_LIST = [
     # 详见 antigravity_client.py 顶部复盘：重启前必须先去掉 DeleteCascadeTrajectory 触发的
     # 320次 [voice-rap] 403、停用第三方工具残缺 OAuth 改用官方登录归档、并将单号并发降回 1。
     # --------------------------------------------------------------------------
-    # {"model_name": "antigravity-3.8-flash-high", "权重": 5, "备注": "来源antigravity 本地客户端"},
+    # {"model_name": "antigravity-3.8-flash-high", "无附件权重": 0, "有附件权重": 0, "备注": "来源antigravity 本地客户端"},
 ]
 LOW_MODEL_LIST = [
-    {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web"},
-    {"model_name": "gemini-aistudio-api-key-2.5-flash-lite", "权重": 0.1, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-api-key-2.5-flash", "权重": 0.05, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-api-key-3.1-flash-lite", "权重": 0.5, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-api-key-3.5-flash-lite", "权重": 0.5, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-3.5-flash-lite", "权重": 0.2, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.1-flash-lite", "权重": 0.2, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "权重": 0, "备注": "来源aistudio_web"},
-    {"model_name": "gpt-6-codex-luna", "权重": 0.5, "备注": "来源codex 免费"},
-    {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web"},
+    {"model_name": "gemini-web-3.5-flash-lite-thinking", "无附件权重": 36, "有附件权重": 44, "备注": "来源gemini_web"},
+    {"model_name": "gemini-aistudio-3.5-flash-lite", "无附件权重": 16, "有附件权重": 18, "备注": "来源aistudio_web"},
+    {"model_name": "gpt-5.6-max", "无附件权重": 12, "有附件权重": 0, "备注": "来源chatgpt_web (带图易触发/files 429故有附件置0)"},
+    {"model_name": "gemini-aistudio-api-key-3.5-flash-lite", "无附件权重": 12, "有附件权重": 11, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.1-flash-lite", "无附件权重": 12, "有附件权重": 11, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-3.1-flash-lite", "无附件权重": 6, "有附件权重": 6, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "无附件权重": 2, "有附件权重": 6, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-api-key-2.5-flash-lite", "无附件权重": 2, "有附件权重": 2, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-2.5-flash", "无附件权重": 2, "有附件权重": 2, "备注": "来源api key aistudio"},
+    {"model_name": "gpt-6-codex-luna", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 免费 (暂无可用号先置0，补号后恢复)"},
     # ⚠️ 同 MEDIUM_MODEL_LIST：2026-11-25 已停用。重启前必先阅读 antigravity_client.py 顶部复盘并完成 P0 改造。
-    # {"model_name": "antigravity-3.8-flash-medium", "权重": 1, "备注": "来源antigravity 本地客户端 (与 gpt-5.6-max / gemini-web 同权重=1)"},
+    # {"model_name": "antigravity-3.8-flash-medium", "无附件权重": 0, "有附件权重": 0, "备注": "来源antigravity 本地客户端"},
 ]
 
 TEXT_EXTENSIONS = {
@@ -675,8 +681,29 @@ def reset_ai_cooldowns() -> None:
         _MODEL_CONSECUTIVE_FAILS.clear()
 
 
-def _select_models(model, fallback_model_list, preset_model_group, configured_models=None) -> List[str]:
-    """显式模型保留指定备用链；自动选择时支持分层 dict 配置并优先跳过冷却中模型。"""
+def _resolve_model_weight(item: Dict[str, Any], has_attachment: bool = False) -> float:
+    """解析模型配置项的生效权重：优先使用无附件权重/有附件权重，兼容旧版单一权重。"""
+    has_split = "无附件权重" in item or "有附件权重" in item
+    if has_split:
+        if "无附件权重" not in item or "有附件权重" not in item:
+            raise ValueError(f"模型 {item.get('model_name', '<unknown>')} 必须同时配置 无附件权重 和 有附件权重")
+        weight = item["有附件权重"] if has_attachment else item["无附件权重"]
+    else:
+        weight = item.get("权重")
+    if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+            or not math.isfinite(weight) or weight < 0):
+        raise ValueError(f"模型 {item.get('model_name', '<unknown>')} 的权重必须是有限的非负数")
+    return float(weight)
+
+
+def _select_models(
+    model,
+    fallback_model_list,
+    preset_model_group,
+    configured_models=None,
+    has_attachment: bool = False,
+) -> List[str]:
+    """显式模型保留指定备用链；自动选择时按附件状态解析分层 dict 权重，剔除零权模型并优先跳过冷却中模型。"""
     if model is not None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model 必须是非空字符串或 None")
@@ -736,19 +763,16 @@ def _select_models(model, fallback_model_list, preset_model_group, configured_mo
         if not isinstance(item, dict):
             raise ValueError("预制模型组中的每个元素必须是 dict")
         name = item.get("model_name")
-        weight = item.get("权重")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("预制模型组中的 model_name 必须是非空字符串")
         if name in seen:
             raise ValueError(f"预制模型组包含重复模型：{name}")
-        if (isinstance(weight, bool) or not isinstance(weight, (int, float))
-                or not math.isfinite(weight) or weight < 0):
-            raise ValueError(f"模型 {name} 的权重必须是有限的非负数")
+        weight = _resolve_model_weight(item, has_attachment=has_attachment)
         seen.add(name)
         if weight > max_weight:
             max_weight = weight
         if weight > 0:
-            positive_weights_map[name] = float(weight)
+            positive_weights_map[name] = weight
 
     if max_weight <= 0 or not positive_weights_map:
         raise ValueError("预制模型组至少需要一个权重大于 0 的模型")
@@ -995,11 +1019,15 @@ def generate_content(
             require_keys_on_cloud_block=(model is None),
         )
         metrics["runtime_mode"] = runtime["runtime_mode"]
+        if file_paths is not None and not isinstance(file_paths, (list, tuple)):
+            raise ValueError("file_paths 必须是文件路径列表或 None")
+        paths = list(file_paths or [])
         models = _select_models(
             model,
             fallback_model_list,
             preset_model_group,
             configured_models=runtime["configured_models"],
+            has_attachment=bool(paths),
         )
         selected_model = models[0]
         if type(max_retries_per_model) is not int or max_retries_per_model < 1:
@@ -1007,10 +1035,6 @@ def generate_content(
         if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                 or not math.isfinite(timeout) or timeout <= 0):
             raise ValueError("timeout 必须是有限的正数")
-        if file_paths is not None and not isinstance(file_paths, (list, tuple)):
-            raise ValueError("file_paths 必须是文件路径列表或 None")
-
-        paths = list(file_paths or [])
         needs_openai = any(m not in ANTIGRAVITY_MODEL_NAMES for m in models)
         needs_antigravity = any(m in ANTIGRAVITY_MODEL_NAMES for m in models)
 

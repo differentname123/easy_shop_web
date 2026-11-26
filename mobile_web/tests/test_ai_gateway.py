@@ -634,3 +634,79 @@ def test_antigravity_stagger_before_send_and_disable_telemetry_flag(monkeypatch,
     assert port == 55555
     assert len(spawned_args) == 1
     assert "--disable_telemetry" in spawned_args[0]
+
+
+def test_unified_percentage_model_lists_and_attachment_aware_selection(monkeypatch, tmp_path):
+    import pytest
+    from PIL import Image
+    import infrastructure.ai_api.model_api as model_api
+
+    model_api.reset_ai_cooldowns()
+
+    for group in (model_api.HIGH_MODEL_LIST, model_api.MEDIUM_MODEL_LIST, model_api.LOW_MODEL_LIST):
+        assert len(group) > 0
+        for entry in group:
+            assert "无附件权重" in entry
+            assert "有附件权重" in entry
+        assert sum(m["无附件权重"] for m in group) == 100
+        assert sum(m["有附件权重"] for m in group) == 100
+
+    low_by_name = {m["model_name"]: m for m in model_api.LOW_MODEL_LIST}
+    med_by_name = {m["model_name"]: m for m in model_api.MEDIUM_MODEL_LIST}
+    high_by_name = {m["model_name"]: m for m in model_api.HIGH_MODEL_LIST}
+    assert low_by_name["gpt-5.6-max"]["无附件权重"] > 0
+    assert low_by_name["gpt-5.6-max"]["有附件权重"] == 0
+    assert high_by_name["gpt-6.1-sol-max"]["无附件权重"] == 0
+    assert high_by_name["gpt-6.1-sol-max"]["有附件权重"] == 0
+    assert med_by_name["gpt-6-codex-luna-max"]["无附件权重"] == 0
+    assert med_by_name["gpt-6-codex-luna-max"]["有附件权重"] == 0
+    assert low_by_name["gpt-6-codex-luna"]["无附件权重"] == 0
+    assert low_by_name["gpt-6-codex-luna"]["有附件权重"] == 0
+
+    no_att = model_api._select_models(None, None, "low", has_attachment=False)
+    with_att = model_api._select_models(None, None, "low", has_attachment=True)
+    assert "gpt-5.6-max" in no_att
+    assert "gpt-5.6-max" not in with_att
+    assert "gpt-6-codex-luna" not in no_att
+    assert "gpt-6-codex-luna" not in with_att
+
+    img_path = tmp_path / "sample.png"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(img_path, format="PNG")
+
+    cfg_path = tmp_path / "ai_att_cfg.json"
+    cfg_path.write_text(
+        json.dumps({"local_api_url": "http://127.0.0.1:8317/v1", "local_api_key": "sk-local-key"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WEB_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("AI_RUNTIME_MODE", "local")
+    monkeypatch.setenv("WEB_LOG_DIR", "-")
+
+    split_models = [
+        {"model_name": "text-only-model", "无附件权重": 100, "有附件权重": 0},
+        {"model_name": "vision-only-model", "无附件权重": 0, "有附件权重": 100},
+    ]
+    monkeypatch.setattr(model_api, "LOW_MODEL_LIST", split_models)
+    calls, _ = _install_fake_openai(monkeypatch, model_api, lambda kw: (kw["model"], "ok"))
+
+    res_text = model_api.generate_content("no attach", preset_model_group="low")
+    assert res_text["status"] == "✅ 成功"
+    assert res_text["metrics"]["model_used"] == "text-only-model"
+
+    res_att = model_api.generate_content("with attach", file_paths=[str(img_path)], preset_model_group="low")
+    assert res_att["status"] == "✅ 成功"
+    assert res_att["metrics"]["model_used"] == "vision-only-model"
+    assert [c["model"] for c in calls] == ["text-only-model", "vision-only-model"]
+
+    # Legacy 权重 compatibility + partial attachment-key validation
+    legacy_models = [
+        {"model_name": "legacy-active", "权重": 10},
+        {"model_name": "legacy-zero", "权重": 0},
+    ]
+    monkeypatch.setattr(model_api, "LOW_MODEL_LIST", legacy_models)
+    assert model_api._select_models(None, None, "low", has_attachment=True) == ["legacy-active"]
+
+    with pytest.raises(ValueError):
+        model_api._select_models(
+            None, None, "low", configured_models=[{"model_name": "broken", "无附件权重": 100}], has_attachment=False
+        )
