@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import base64
 import datetime
+import hashlib
 import io
 import math
+import os
 import re
 import secrets
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from PIL import Image, ImageOps
 
@@ -240,9 +242,25 @@ class DealSubmitService:
         self.image_dir.mkdir(parents=True, exist_ok=True)
         urls: List[str] = []
         for blob in jpeg_blobs:
-            img_id = f"dsi_{secrets.token_hex(10)}"
-            (self.image_dir / f"{img_id}.jpg").write_bytes(blob)
-            urls.append(f"/api/deals/image/{img_id}")
+            digest = hashlib.sha256(blob).hexdigest()[:20]
+            img_id = f"dsi_{digest}"
+            target_path = self.image_dir / f"{img_id}.jpg"
+            if target_path.is_file():
+                # 同一内容复用唯一文件并刷新修改时间，防止活跃图被 30 天定时清理误收
+                try:
+                    os.utime(target_path, None)
+                except OSError:
+                    pass
+            else:
+                tmp_path = self.image_dir / f".tmp_{img_id}_{os.getpid()}_{threading.get_ident()}.jpg"
+                try:
+                    tmp_path.write_bytes(blob)
+                    os.replace(tmp_path, target_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+            url = f"/api/deals/image/{img_id}"
+            if url not in urls:
+                urls.append(url)
         return urls
 
     def get_image_file_path(self, image_id: str) -> Optional[Path]:
@@ -252,23 +270,46 @@ class DealSubmitService:
         file_path = self.image_dir / f"{clean_id}.jpg"
         return file_path if file_path.is_file() else None
 
-    def delete_image_urls(self, image_urls: List[str]) -> int:
-        """安全删除审核驳回投稿关联的本地压缩图。"""
-        removed = 0
-        for raw_u in image_urls or []:
+    @staticmethod
+    def _extract_local_image_ids(raw_urls: Any) -> List[str]:
+        ids: List[str] = []
+        if not isinstance(raw_urls, list):
+            return ids
+        for raw_u in raw_urls:
             u = str(raw_u or "").strip()
             if not u.startswith("/api/deals/image/"):
                 continue
             img_id = u.rsplit("/", 1)[-1].strip()
-            path = self.get_image_file_path(img_id)
-            if path is None:
-                continue
-            try:
-                path.unlink(missing_ok=True)
-                removed += 1
-            except OSError:
-                continue
-        return removed
+            if IMAGE_ID_PATTERN.fullmatch(img_id):
+                ids.append(img_id)
+        return ids
+
+    def _collect_referenced_image_ids(self) -> Optional[Set[str]]:
+        """收集正式表与待审投稿中仍在引用的图片编号；任一库查询失败返回 None (Fail-Closed 放弃清理)。"""
+        repo = self.raw_repo
+        if repo is None:
+            return None
+        protected: Set[str] = set()
+        try:
+            formal_col = getattr(repo, "formal_col", None)
+            if formal_col is not None:
+                for doc in formal_col.find(
+                    {"deal_info.user_share_images": {"$exists": True}},
+                    {"_id": 0, "deal_info.user_share_images": 1},
+                ):
+                    di = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
+                    protected.update(self._extract_local_image_ids(di.get("user_share_images")))
+
+            raw_col = getattr(repo, "col", None)
+            if raw_col is not None:
+                for doc in raw_col.find(
+                    {"source_site": USER_SUBMIT_SITE, "clean_status": "pending"},
+                    {"_id": 0, "tutorial_images": 1},
+                ):
+                    protected.update(self._extract_local_image_ids(doc.get("tutorial_images")))
+        except Exception:
+            return None
+        return protected
 
     def purge_expired_images(
         self,
@@ -276,8 +317,11 @@ class DealSubmitService:
         max_age_days: float = USER_SUBMIT_IMAGE_RETENTION_DAYS,
         now_ts: Optional[float] = None,
     ) -> int:
-        """定期清理超过保留期（默认 30 天）的本地用户爆料截图，防止磁盘无界增长。"""
+        """全站唯一图片清理出口：仅清理超保留期（默认 30 天）且无任何活跃引用的孤儿截图。"""
         if not self.image_dir.is_dir():
+            return 0
+        protected_ids = self._collect_referenced_image_ids()
+        if protected_ids is None:
             return 0
         ref_ts = time.time() if now_ts is None else float(now_ts)
         cutoff_ts = ref_ts - max(0.0, float(max_age_days)) * 86400.0
@@ -292,13 +336,15 @@ class DealSubmitService:
                     continue
                 if entry.suffix.lower() != ".jpg" or not IMAGE_ID_PATTERN.fullmatch(entry.stem):
                     continue
+                if entry.stem in protected_ids:
+                    continue
                 if entry.stat().st_mtime < cutoff_ts:
                     entry.unlink(missing_ok=True)
                     removed += 1
             except OSError:
                 continue
         if removed > 0:
-            logger.info("🧹 已清理超期用户爆料截图 %d 张（保留期 %.0f 天）", removed, float(max_age_days))
+            logger.info("🧹 已清理超期无引用用户爆料截图 %d 张（保留期 %.0f 天）", removed, float(max_age_days))
         return removed
 
     def submit_user_deal(
@@ -491,7 +537,6 @@ class DealSubmitService:
         }
         res = self.raw_repo.save_batch([raw_record], task_name=USER_SUBMIT_SITE)
         if res.get("error"):
-            self.delete_image_urls(image_urls)
             raise DealSubmitError("服务暂时不可用，请稍后重试", error_code="db_write_error", status_code=503)
         self.notify_worker()
 

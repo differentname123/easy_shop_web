@@ -29,6 +29,7 @@ from pymongo import UpdateOne
 
 from infrastructure.runtime_io import atomic_write_json, should_write_runtime_artifact
 from infrastructure.settings import resolve_config_path
+from models.deal_constants import USER_SUBMIT_SITE
 from models.product import clean_product_id, normalize_platform
 from repositories.product_repo import ProductRepository
 
@@ -49,6 +50,75 @@ LOG_DIR = MOBILE_WEB_DIR / "logs"
 LOG_FILE_PATH = LOG_DIR / "product_cloud_sync.log"
 LATEST_SYNC_REPORT_PATH = LOG_DIR / "latest_cloud_sync_report.json"
 
+# ==============================================================================
+# 五区块显式白名单契约（严禁遍历整文档同步，未知扩展字段默认隔离不覆写）
+# ==============================================================================
+# 区块 1A：基础商业商品卡（双向按官方 updated_at 新鲜度收敛）
+COMMERCIAL_FIELDS = frozenset({
+    "name",
+    "image_url",
+    "mall_name",
+    "brand",
+    "category",
+    "price",
+    "original_price",
+    "activity_price",
+    "saved_price",
+    "coupon_amount",
+    "has_coupon",
+    "commission_rate",
+    "commission_amount",
+    "sales_tip",
+    "goods_sign",
+    "product_url",
+    "search_id",
+    "coupon_info",
+    "channel_type",
+    "platform_name",
+    "updated_at",
+})
+
+# 区块 1B：商品详情与多图（双向按 detail_updated_at 新鲜度收敛）
+DETAIL_FIELDS = frozenset({
+    "desc",
+    "carousel_images",
+    "specs",
+    "detail_tags",
+    "unified_tags",
+    "service_guarantees",
+    "shop_ratings",
+    "detail_updated_at",
+})
+
+# 区块 2：商品规格成品包（仅本地规格工厂 ➔ 云端，绝不同步错误/重试状态）
+FORMAT_SUCCESS_FIELDS = frozenset({
+    "format_info",
+    "format_status",
+    "format_updated_at",
+    "format_model",
+    "format_activity_price",
+    "need_reformat",
+})
+
+# 区块 3：线报好价包（外部爬虫线报：本地 ➔ 云端；真实 user_submit 用户爆料：云端 ➔ 本地，本地测试 user_submit 严禁上云）
+DEAL_FIELDS = frozenset({"deal_info"})
+
+# 区块 4：线上用户互动与热度区（云端唯一主权：云端 ➔ 本地）
+USER_STATS_FIELDS = frozenset({
+    "user_stats",
+    "user_stats_score",
+    "is_user_collected",
+})
+
+# 区块 5：官方软下架 / 替代状态（双向单调收敛）
+OFF_PROMOTION_FIELDS = frozenset({
+    "is_off_promotion",
+    "off_promotion_at",
+    "off_promotion_reason",
+    "superseded_by",
+})
+
+# 兼容旧引用保留（等价于不进入任何同步白名单的本地/运行态临时字段说明）
 NEVER_OVERWRITE_FIELDS = frozenset({
     "_id",
     "created_at",
@@ -72,33 +142,8 @@ FORMAT_FAMILY_FIELDS = frozenset({
     "need_reformat",
 })
 
-CLOUD_LIVE_COMMERCIAL_FIELDS = frozenset({
-    "price",
-    "original_price",
-    "activity_price",
-    "saved_price",
-    "coupon_amount",
-    "has_coupon",
-    "commission_rate",
-    "commission_amount",
-    "sales_tip",
-    "goods_sign",
-    "product_url",
-    "search_id",
-    "coupon_info",
-    "updated_at",
-})
-
-CLOUD_LIVE_DETAIL_FIELDS = frozenset({
-    "desc",
-    "carousel_images",
-    "specs",
-    "detail_tags",
-    "unified_tags",
-    "service_guarantees",
-    "shop_ratings",
-    "detail_updated_at",
-})
+CLOUD_LIVE_COMMERCIAL_FIELDS = COMMERCIAL_FIELDS
+CLOUD_LIVE_DETAIL_FIELDS = DETAIL_FIELDS
 
 FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "_id": 0,
@@ -108,6 +153,7 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "updated_at": 1,
     "detail_updated_at": 1,
     "channel_type": 1,
+    "is_off_promotion": 1,
     "format_status": 1,
     "format_updated_at": 1,
     "_fmt_count": {
@@ -119,6 +165,7 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
     },
     "deal_info.is_deal_tip": 1,
     "deal_info.expired_at": 1,
+    "deal_info.source_site": 1,
     "deal_info.source_item_id": 1,
     "deal_info.source_is_reliable": 1,
     "deal_info.price_is_reliable": 1,
@@ -128,6 +175,13 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "deal_info.updated_at": 1,
     "deal_info.format_status": 1,
     "deal_info.format_updated_at": 1,
+    "user_stats.updated_at": 1,
+    "user_stats.buyable": 1,
+    "user_stats.unbuyable": 1,
+    "user_stats.valid_orders": 1,
+    "user_stats.view": 1,
+    "user_stats.share": 1,
+    "user_stats_score": 1,
     "is_user_collected": 1,
 }
 
@@ -273,7 +327,7 @@ def build_recent_local_candidates_query(
 
 
 def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """提取单条商品用于双库状态比对的轻量指纹。"""
+    """提取单条商品用于双库五区块状态比对的轻量指纹。"""
     if not isinstance(doc, dict):
         return None
     platform = normalize_platform(doc.get("platform") or "")
@@ -296,9 +350,12 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     deal_info = doc.get("deal_info") if isinstance(doc.get("deal_info"), dict) else {}
     deal_ready = deal_info.get("is_deal_tip") is True
     deal_expired = (deal_info.get("is_deal_tip") is False) and (deal_info.get("expired_at") is not None)
+    deal_source_site = str(deal_info.get("source_site") or "").strip()
+    is_user_submit_deal = deal_source_site == USER_SUBMIT_SITE
     deal_sig = None
     if deal_ready:
         deal_sig = (
+            deal_source_site,
             str(deal_info.get("source_item_id") or ""),
             int(deal_info.get("quality_score") or 0),
             _number_or_none(deal_info.get("deal_price")),
@@ -310,9 +367,23 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             str(deal_info.get("price_reliability_reason") or "").strip(),
         )
 
+    raw_stats = doc.get("user_stats") if isinstance(doc.get("user_stats"), dict) else {}
+    raw_stats_score = _number_or_none(doc.get("user_stats_score"))
+    has_user_stats = bool(raw_stats) or (raw_stats_score is not None)
+    user_stats_sig = (
+        to_utc_millis(raw_stats.get("updated_at")),
+        raw_stats_score,
+        int(raw_stats.get("buyable") or 0),
+        int(raw_stats.get("unbuyable") or 0),
+        int(raw_stats.get("valid_orders") or 0),
+        int(raw_stats.get("view") or 0),
+        int(raw_stats.get("share") or 0),
+    )
+
     return {
         "platform": platform,
         "product_id": product_id,
+        "is_off_promotion": bool(doc.get("is_off_promotion") is True),
         "updated_ms": to_utc_millis(doc.get("updated_at")),
         "detail_ms": to_utc_millis(doc.get("detail_updated_at")),
         "has_channel_type": has_channel,
@@ -322,10 +393,15 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "fmt_sku_count": fmt_count if fmt_ready else 0,
         "deal_ready": deal_ready,
         "deal_expired": deal_expired,
+        "deal_source_site": deal_source_site,
+        "is_user_submit_deal": is_user_submit_deal,
         "deal_sig": deal_sig,
         "deal_updated_ms": to_utc_millis(deal_info.get("updated_at")),
         "deal_reliable": bool(deal_info.get("source_is_reliable")),
         "deal_item_id": str(deal_info.get("source_item_id") or ""),
+        "has_user_stats": has_user_stats,
+        "user_stats_ms": to_utc_millis(raw_stats.get("updated_at")),
+        "user_stats_sig": user_stats_sig,
         "is_user_collected": bool(doc.get("is_user_collected") is True),
     }
 
@@ -334,9 +410,13 @@ def _should_protect_cloud_deal(
     local_fp: Dict[str, Any],
     cloud_fp: Optional[Dict[str, Any]],
 ) -> bool:
-    """保护云端更新鲜或更高可信度的在架好价，不被本地较旧或已过期的线报快照覆盖。"""
+    """保护云端真实用户爆料以及更新鲜/更高可信度的在架好价，不被本地较旧、低可信或过期快照覆盖。"""
     if cloud_fp is None or not cloud_fp.get("deal_ready"):
         return False
+
+    # 云端正在生效的真实用户爆料由云端全权负责，任何本地爬虫线报不得覆盖
+    if cloud_fp.get("is_user_submit_deal"):
+        return True
 
     l_id = str(local_fp.get("deal_item_id") or "").strip()
     c_id = str(cloud_fp.get("deal_item_id") or "").strip()
@@ -364,49 +444,100 @@ def _should_protect_cloud_deal(
     return False
 
 
+def _is_local_user_submit_only(local_fp: Dict[str, Any]) -> bool:
+    """本地测试 user_submit 产生且无外部频道/官方规格产出的记录，绝不污染云端建档。"""
+    return bool(
+        local_fp.get("is_user_submit_deal")
+        and not local_fp.get("fmt_ready")
+        and not local_fp.get("has_channel_type")
+    )
+
+
+def _should_push_local_commercial(local_fp: Dict[str, Any], cloud_fp: Optional[Dict[str, Any]]) -> bool:
+    if cloud_fp is None:
+        return True
+    l_upd, c_upd = local_fp["updated_ms"], cloud_fp["updated_ms"]
+    return bool(l_upd is not None and (c_upd is None or l_upd > c_upd))
+
+
+def _should_push_local_detail(local_fp: Dict[str, Any], cloud_fp: Optional[Dict[str, Any]]) -> bool:
+    if cloud_fp is None:
+        return True
+    l_det, c_det = local_fp["detail_ms"], cloud_fp["detail_ms"]
+    return bool(l_det is not None and (c_det is None or l_det > c_det))
+
+
+def _should_push_local_format(local_fp: Dict[str, Any], cloud_fp: Optional[Dict[str, Any]]) -> bool:
+    if not local_fp["fmt_ready"]:
+        return False
+    if cloud_fp is None or not cloud_fp["fmt_ready"]:
+        return True
+    l_fms, c_fms = local_fp["fmt_ms"], cloud_fp["fmt_ms"]
+    if l_fms is not None and (c_fms is None or l_fms > c_fms):
+        return True
+    return bool(l_fms == c_fms and local_fp["fmt_sku_count"] != cloud_fp["fmt_sku_count"])
+
+
+def _should_push_local_deal(local_fp: Dict[str, Any], cloud_fp: Optional[Dict[str, Any]]) -> Optional[str]:
+    """返回需要向云端同步的外部线报原因；本地 user_submit 测试爆料永不上云，返回 None。"""
+    if local_fp.get("is_user_submit_deal"):
+        return None
+    if _should_protect_cloud_deal(local_fp, cloud_fp):
+        return None
+    if local_fp["deal_ready"]:
+        if cloud_fp is None or not cloud_fp["deal_ready"] or local_fp["deal_sig"] != cloud_fp["deal_sig"]:
+            return "deal_info_changed"
+    elif cloud_fp is not None and local_fp.get("deal_expired") and cloud_fp.get("deal_ready"):
+        return "deal_info_expired"
+    return None
+
+
 def needs_cloud_merge(
     local_fp: Dict[str, Any],
     cloud_fp: Optional[Dict[str, Any]],
 ) -> Tuple[bool, str]:
-    """判定本地商品是否需要向云端新增或合并更新，并返回原因标签。"""
+    """判定本地商品是否需要向云端新增或按五区块白名单合并更新，并返回原因标签。"""
+    if cloud_fp is not None and cloud_fp.get("is_off_promotion"):
+        return False, "cloud_off_promotion"
+
     if cloud_fp is None:
+        if _is_local_user_submit_only(local_fp):
+            return False, "local_user_submit_isolated"
         return True, "insert"
 
-    l_upd, c_upd = local_fp["updated_ms"], cloud_fp["updated_ms"]
-    if l_upd is not None and (c_upd is None or l_upd > c_upd):
+    if _should_push_local_commercial(local_fp, cloud_fp):
         return True, "newer_updated_at"
 
-    l_det, c_det = local_fp["detail_ms"], cloud_fp["detail_ms"]
-    if l_det is not None and (c_det is None or l_det > c_det):
+    if _should_push_local_detail(local_fp, cloud_fp):
         return True, "newer_detail"
 
     if local_fp["has_channel_type"] and not cloud_fp["has_channel_type"]:
         return True, "fill_channel_type"
 
-    if local_fp["fmt_ready"]:
-        if not cloud_fp["fmt_ready"]:
-            return True, "format_info_changed"
-        l_fms, c_fms = local_fp["fmt_ms"], cloud_fp["fmt_ms"]
-        if l_fms is not None and (c_fms is None or l_fms > c_fms):
-            return True, "format_info_changed"
-        if l_fms == c_fms and local_fp["fmt_sku_count"] != cloud_fp["fmt_sku_count"]:
-            return True, "format_info_changed"
+    if _should_push_local_format(local_fp, cloud_fp):
+        return True, "format_info_changed"
 
-    if not _should_protect_cloud_deal(local_fp, cloud_fp):
-        if local_fp["deal_ready"]:
-            if not cloud_fp["deal_ready"] or local_fp["deal_sig"] != cloud_fp["deal_sig"]:
-                return True, "deal_info_changed"
-        elif local_fp.get("deal_expired") and cloud_fp.get("deal_ready"):
-            return True, "deal_info_expired"
+    deal_reason = _should_push_local_deal(local_fp, cloud_fp)
+    if deal_reason is not None:
+        return True, deal_reason
 
     return False, "up_to_date"
+
+
+def _copy_whitelist_fields(src_doc: Dict[str, Any], allow_fields: Iterable[str]) -> Dict[str, Any]:
+    copied: Dict[str, Any] = {}
+    for field in allow_fields:
+        val = src_doc.get(field)
+        if val is not None:
+            copied[field] = copy.deepcopy(val)
+    return copied
 
 
 def build_product_merge_operation(
     local_doc: Dict[str, Any],
     cloud_fp: Optional[Dict[str, Any]] = None,
 ) -> Optional[UpdateOne]:
-    """按 `(platform, product_id)` 构造幂等合并 `UpdateOne` 操作，严格保护云端专属字段与更新鲜快照。"""
+    """按 `(platform, product_id)` 构造五区块显式白名单 `UpdateOne`（绝不透传未知字段、绝不上传本地 user_submit）。"""
     if not is_valid_syncable_product(local_doc):
         return None
 
@@ -416,62 +547,47 @@ def build_product_merge_operation(
     local_fp = extract_sync_fingerprint(local_doc)
     if local_fp is None:
         return None
-
-    cloud_is_newer_commercial = bool(
-        cloud_fp is not None
-        and cloud_fp["updated_ms"] is not None
-        and (local_fp["updated_ms"] is None or cloud_fp["updated_ms"] > local_fp["updated_ms"])
-    )
-    cloud_is_newer_detail = bool(
-        cloud_fp is not None
-        and cloud_fp["detail_ms"] is not None
-        and (local_fp["detail_ms"] is None or cloud_fp["detail_ms"] > local_fp["detail_ms"])
-    )
-
-    fmt_ready = local_fp["fmt_ready"]
-    protect_cloud_deal = _should_protect_cloud_deal(local_fp, cloud_fp)
-    deal_ready = bool(local_fp["deal_ready"] and not protect_cloud_deal)
-    deal_expired_sync = bool(
-        local_fp.get("deal_expired")
-        and cloud_fp is not None
-        and cloud_fp.get("deal_ready")
-        and not protect_cloud_deal
-    )
+    if cloud_fp is not None and cloud_fp.get("is_off_promotion"):
+        return None
+    if cloud_fp is None and _is_local_user_submit_only(local_fp):
+        return None
 
     set_fields: Dict[str, Any] = {}
-    for key, value in local_doc.items():
-        if key in NEVER_OVERWRITE_FIELDS or key == "_fmt_count":
-            continue
-        if value is None:
-            continue
-        if key in FORMAT_FAMILY_FIELDS:
-            if not fmt_ready or key in ("format_error", "format_retry_count"):
-                continue
-        if key == "deal_info" and not (deal_ready or deal_expired_sync):
-            continue
-        if key == "is_user_collected" and value is not True:
-            continue
-        if key == "channel_type":
-            if not (isinstance(value, int) and not isinstance(value, bool)):
-                continue
-            if cloud_is_newer_commercial and cloud_fp and cloud_fp["has_channel_type"]:
-                continue
-        if cloud_is_newer_commercial and key in CLOUD_LIVE_COMMERCIAL_FIELDS:
-            continue
-        if cloud_is_newer_detail and key in CLOUD_LIVE_DETAIL_FIELDS:
-            continue
 
-        set_fields[key] = copy.deepcopy(value)
+    if cloud_fp is None:
+        set_fields.update(_copy_whitelist_fields(local_doc, COMMERCIAL_FIELDS))
+        set_fields.update(_copy_whitelist_fields(local_doc, DETAIL_FIELDS))
+        if _should_push_local_format(local_fp, None):
+            set_fields.update(_copy_whitelist_fields(local_doc, FORMAT_SUCCESS_FIELDS))
+            set_fields["need_reformat"] = False
+        if _should_push_local_deal(local_fp, None) is not None and isinstance(local_doc.get("deal_info"), dict):
+            set_fields["deal_info"] = copy.deepcopy(local_doc["deal_info"])
+    else:
+        if _should_push_local_commercial(local_fp, cloud_fp):
+            set_fields.update(_copy_whitelist_fields(local_doc, COMMERCIAL_FIELDS))
+        elif local_fp["has_channel_type"] and not cloud_fp["has_channel_type"]:
+            ch = local_doc.get("channel_type")
+            if isinstance(ch, int) and not isinstance(ch, bool):
+                set_fields["channel_type"] = ch
+
+        if _should_push_local_detail(local_fp, cloud_fp):
+            set_fields.update(_copy_whitelist_fields(local_doc, DETAIL_FIELDS))
+
+        if _should_push_local_format(local_fp, cloud_fp):
+            set_fields.update(_copy_whitelist_fields(local_doc, FORMAT_SUCCESS_FIELDS))
+            set_fields["need_reformat"] = False
+
+        if _should_push_local_deal(local_fp, cloud_fp) is not None and isinstance(local_doc.get("deal_info"), dict):
+            set_fields["deal_info"] = copy.deepcopy(local_doc["deal_info"])
+
+    if not set_fields:
+        return None
 
     set_fields["platform"] = platform
     set_fields["product_id"] = product_id
-    if not set_fields.get("goods_id"):
-        set_fields["goods_id"] = product_id
-    if fmt_ready:
-        set_fields["need_reformat"] = False
-
-    if not (set(set_fields.keys()) - {"platform", "product_id", "goods_id"}):
-        return None
+    if cloud_fp is None and not set_fields.get("goods_id"):
+        raw_gid = str(local_doc.get("goods_id") or "").strip()
+        set_fields["goods_id"] = raw_gid or product_id
 
     now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     created_at = local_doc.get("created_at")
@@ -513,11 +629,126 @@ def fetch_cloud_fingerprints_map(
 
 
 def ensure_cloud_products_indexes(cloud_col) -> None:
-    """确保云端 `products` 集合具备核心唯一索引与线报查询索引（幂等后台创建）。"""
+    """确保云端 `products` 集合具备核心唯一索引、线报与互动同步索引（幂等后台创建）。"""
     cloud_col.create_index([("platform", 1), ("product_id", 1)], unique=True, background=True)
     cloud_col.create_index([("updated_at", -1)], background=True)
     cloud_col.create_index([("platform", 1), ("updated_at", -1)], background=True)
     cloud_col.create_index([("deal_info.is_deal_tip", 1), ("updated_at", -1)], background=True)
+    cloud_col.create_index([("user_stats.updated_at", -1)], background=True)
+
+
+def _normalize_value_for_local(value: Any) -> Any:
+    """将云端回流值中的 aware UTC datetime 规范化为本地存储习惯的 naive UTC。"""
+    if isinstance(value, datetime.datetime):
+        return (
+            value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            if value.tzinfo is not None
+            else value
+        )
+    if isinstance(value, dict):
+        return {k: _normalize_value_for_local(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_value_for_local(v) for v in value]
+    return copy.deepcopy(value)
+
+
+def _sync_off_promotion_direction(
+    source_col,
+    target_col,
+    *,
+    window_days: float = DEFAULT_SYNC_WINDOW_DAYS,
+    since_utc: Optional[datetime.datetime] = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
+    direction_label: str = "云端",
+) -> Tuple[int, set[Tuple[str, str]]]:
+    """将源库近期软下架/身份替代状态 (`is_off_promotion=True`) 幂等收敛到目标库 `products`。"""
+    if source_col is None or target_col is None:
+        return 0, set()
+    if since_utc is not None:
+        cutoff = since_utc.replace(tzinfo=datetime.timezone.utc) if since_utc.tzinfo is None else since_utc.astimezone(datetime.timezone.utc)
+    else:
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max(0.001, float(window_days)))
+    cutoff_naive = cutoff.replace(tzinfo=None)
+
+    off_promo_keys: set[Tuple[str, str]] = set()
+    src_docs_by_plat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    try:
+        cursor = source_col.find(
+            {
+                "is_off_promotion": True,
+                "$or": [
+                    {"off_promotion_at": {"$gte": cutoff}},
+                    {"off_promotion_at": {"$gte": cutoff_naive}},
+                    {"updated_at": {"$gte": cutoff}},
+                    {"updated_at": {"$gte": cutoff_naive}},
+                ],
+            },
+            {"_id": 0, "platform": 1, "product_id": 1, "off_promotion_at": 1, "superseded_by": 1, "off_promotion_reason": 1},
+        )
+        for doc in cursor:
+            plat = normalize_platform(doc.get("platform") or "")
+            pid = clean_product_id(doc.get("product_id"))
+            if not plat or not pid or (plat, pid) in off_promo_keys:
+                continue
+            off_promo_keys.add((plat, pid))
+            src_docs_by_plat[plat].append({**doc, "platform": plat, "product_id": pid})
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("⚠️ 读取软下架商品状态失败(%s): %s", direction_label, exc)
+        return 0, off_promo_keys
+
+    if not src_docs_by_plat:
+        return 0, off_promo_keys
+
+    target_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for plat, docs in src_docs_by_plat.items():
+        pids = [d["product_id"] for d in docs]
+        for pid_chunk in _chunked(pids, DEFAULT_QUERY_CHUNK_SIZE):
+            for t_doc in target_col.find(
+                {"platform": plat, "product_id": {"$in": pid_chunk}},
+                {"_id": 0, "platform": 1, "product_id": 1, "is_off_promotion": 1, "superseded_by": 1},
+            ):
+                cp = normalize_platform(t_doc.get("platform") or plat)
+                cpid = clean_product_id(t_doc.get("product_id"))
+                if cp and cpid:
+                    target_state[(cp, cpid)] = t_doc
+
+    ops: List[UpdateOne] = []
+    for plat, docs in src_docs_by_plat.items():
+        for doc in docs:
+            pid = doc["product_id"]
+            t_doc = target_state.get((plat, pid))
+            if t_doc is None:
+                continue
+            sup_val = doc.get("superseded_by")
+            if t_doc.get("is_off_promotion") is True and (not sup_val or t_doc.get("superseded_by") == sup_val):
+                continue
+            set_doc: Dict[str, Any] = {"is_off_promotion": True}
+            if isinstance(doc.get("off_promotion_at"), datetime.datetime):
+                set_doc["off_promotion_at"] = _normalize_value_for_local(doc["off_promotion_at"])
+            if doc.get("off_promotion_reason"):
+                set_doc["off_promotion_reason"] = doc["off_promotion_reason"]
+            if sup_val:
+                set_doc["superseded_by"] = sup_val
+            ops.append(
+                UpdateOne(
+                    {"platform": plat, "product_id": pid},
+                    {"$set": set_doc, "$unset": {"default_promotion": "", "default_promotion_expires_at": ""}},
+                    upsert=False,
+                )
+            )
+
+    synced = 0
+    if ops and not dry_run and callable(getattr(target_col, "bulk_write", None)):
+        eff_batch = max(1, int(batch_size))
+        for i in range(0, len(ops), eff_batch):
+            res = target_col.bulk_write(ops[i : i + eff_batch], ordered=False)
+            synced += int(getattr(res, "modified_count", 0) or 0)
+        if synced > 0 and logger is not None:
+            logger.info("🗑️ [软下架同步] 已将已下架/被替代商品状态收敛至%s `products` %d 条", direction_label, synced)
+    return synced, off_promo_keys
 
 
 def sync_off_promotion_to_cloud(
@@ -531,86 +762,39 @@ def sync_off_promotion_to_cloud(
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[int, set[Tuple[str, str]]]:
     """将本地最近窗口内软下架/身份替代状态 (`is_off_promotion=True`) 幂等传播到云端 `products`。"""
-    if local_col is None or cloud_col is None:
-        return 0, set()
-    if since_utc is not None:
-        cutoff = since_utc.replace(tzinfo=datetime.timezone.utc) if since_utc.tzinfo is None else since_utc.astimezone(datetime.timezone.utc)
-    else:
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max(0.001, float(window_days)))
-    cutoff_naive = cutoff.replace(tzinfo=None)
+    return _sync_off_promotion_direction(
+        local_col,
+        cloud_col,
+        window_days=window_days,
+        since_utc=since_utc,
+        batch_size=batch_size,
+        dry_run=dry_run,
+        logger=logger,
+        direction_label="云端",
+    )
 
-    off_promo_keys: set[Tuple[str, str]] = set()
-    local_docs_by_plat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    try:
-        cursor = local_col.find(
-            {
-                "is_off_promotion": True,
-                "$or": [{"off_promotion_at": {"$gte": cutoff}}, {"off_promotion_at": {"$gte": cutoff_naive}}],
-            },
-            {"_id": 0, "platform": 1, "product_id": 1, "off_promotion_at": 1, "superseded_by": 1, "off_promotion_reason": 1},
-        )
-        for doc in cursor:
-            plat = normalize_platform(doc.get("platform") or "")
-            pid = clean_product_id(doc.get("product_id"))
-            if not plat or not pid or (plat, pid) in off_promo_keys:
-                continue
-            off_promo_keys.add((plat, pid))
-            local_docs_by_plat[plat].append({**doc, "platform": plat, "product_id": pid})
-    except Exception as exc:
-        if logger is not None:
-            logger.warning("⚠️ 读取本地软下架商品状态失败: %s", exc)
-        return 0, off_promo_keys
 
-    if not local_docs_by_plat:
-        return 0, off_promo_keys
-
-    cloud_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for plat, docs in local_docs_by_plat.items():
-        pids = [d["product_id"] for d in docs]
-        for pid_chunk in _chunked(pids, DEFAULT_QUERY_CHUNK_SIZE):
-            for c_doc in cloud_col.find(
-                {"platform": plat, "product_id": {"$in": pid_chunk}},
-                {"_id": 0, "platform": 1, "product_id": 1, "is_off_promotion": 1, "superseded_by": 1},
-            ):
-                cp = normalize_platform(c_doc.get("platform") or plat)
-                cpid = clean_product_id(c_doc.get("product_id"))
-                if cp and cpid:
-                    cloud_state[(cp, cpid)] = c_doc
-
-    ops: List[UpdateOne] = []
-    for plat, docs in local_docs_by_plat.items():
-        for doc in docs:
-            pid = doc["product_id"]
-            c_doc = cloud_state.get((plat, pid))
-            if c_doc is None:
-                continue
-            sup_val = doc.get("superseded_by")
-            if c_doc.get("is_off_promotion") is True and (not sup_val or c_doc.get("superseded_by") == sup_val):
-                continue
-            set_doc: Dict[str, Any] = {"is_off_promotion": True}
-            if isinstance(doc.get("off_promotion_at"), datetime.datetime):
-                set_doc["off_promotion_at"] = doc["off_promotion_at"]
-            if doc.get("off_promotion_reason"):
-                set_doc["off_promotion_reason"] = doc["off_promotion_reason"]
-            if sup_val:
-                set_doc["superseded_by"] = sup_val
-            ops.append(
-                UpdateOne(
-                    {"platform": plat, "product_id": pid},
-                    {"$set": set_doc, "$unset": {"default_promotion": "", "default_promotion_expires_at": ""}},
-                    upsert=False,
-                )
-            )
-
-    synced_cloud = 0
-    if ops and not dry_run and callable(getattr(cloud_col, "bulk_write", None)):
-        eff_batch = max(1, int(batch_size))
-        for i in range(0, len(ops), eff_batch):
-            res = cloud_col.bulk_write(ops[i : i + eff_batch], ordered=False)
-            synced_cloud += int(getattr(res, "modified_count", 0) or 0)
-        if synced_cloud > 0 and logger is not None:
-            logger.info("🗑️ [软下架同步] 已将本地已下架/被替代商品状态同步至云端 `products` %d 条", synced_cloud)
-    return synced_cloud, off_promo_keys
+def sync_off_promotion_from_cloud(
+    local_col,
+    cloud_col,
+    *,
+    window_days: float = DEFAULT_SYNC_WINDOW_DAYS,
+    since_utc: Optional[datetime.datetime] = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[int, set[Tuple[str, str]]]:
+    """将云端最近窗口内确认官方下架/替代状态 (`is_off_promotion=True`) 幂等回流至本地 `products`。"""
+    return _sync_off_promotion_direction(
+        cloud_col,
+        local_col,
+        window_days=window_days,
+        since_utc=since_utc,
+        batch_size=batch_size,
+        dry_run=dry_run,
+        logger=logger,
+        direction_label="本地",
+    )
 
 
 def pull_cloud_only_unformatted_products(
@@ -728,6 +912,268 @@ def pull_cloud_only_unformatted_products(
     return pulled_upserted
 
 
+def build_recent_cloud_candidates_query(
+    window_days: float = DEFAULT_SYNC_WINDOW_DAYS,
+    now_utc: Optional[datetime.datetime] = None,
+    since_utc: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    """构造云端活跃变动商品查询条件，同时覆盖主表、详情、线报与用户互动统计更新时间。"""
+    if since_utc is not None:
+        cutoff = since_utc.replace(tzinfo=datetime.timezone.utc) if since_utc.tzinfo is None else since_utc.astimezone(datetime.timezone.utc)
+    else:
+        days = max(0.001, float(window_days))
+        ref_now = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        if ref_now.tzinfo is None:
+            ref_now = ref_now.replace(tzinfo=datetime.timezone.utc)
+        cutoff = ref_now - datetime.timedelta(days=days)
+
+    time_filter = {
+        "$or": [
+            {"updated_at": {"$gte": cutoff}},
+            {"detail_updated_at": {"$gte": cutoff}},
+            {"deal_info.updated_at": {"$gte": cutoff}},
+            {"user_stats.updated_at": {"$gte": cutoff}},
+        ]
+    }
+    return {"$and": [time_filter, {"is_off_promotion": {"$ne": True}}, ProductRepository._displayable_content_filter()]}
+
+
+def _should_pull_cloud_commercial(cloud_fp: Dict[str, Any], local_fp: Dict[str, Any]) -> bool:
+    c_upd, l_upd = cloud_fp["updated_ms"], local_fp["updated_ms"]
+    return bool(c_upd is not None and (l_upd is None or c_upd > l_upd))
+
+
+def _should_pull_cloud_detail(cloud_fp: Dict[str, Any], local_fp: Dict[str, Any]) -> bool:
+    c_det, l_det = cloud_fp["detail_ms"], local_fp["detail_ms"]
+    return bool(c_det is not None and (l_det is None or c_det > l_det))
+
+
+def _should_pull_cloud_deal(cloud_fp: Dict[str, Any], local_fp: Dict[str, Any]) -> bool:
+    """判定是否将云端线报（尤其真实 user_submit 与过期摘标）单向/优先同步回本地。"""
+    if cloud_fp.get("deal_ready"):
+        if cloud_fp.get("is_user_submit_deal"):
+            return bool((not local_fp.get("deal_ready")) or cloud_fp.get("deal_sig") != local_fp.get("deal_sig"))
+        if cloud_fp.get("deal_sig") == local_fp.get("deal_sig"):
+            return False
+        if not local_fp.get("deal_ready") and not local_fp.get("deal_expired"):
+            return True
+        return _should_protect_cloud_deal(local_fp, cloud_fp)
+
+    if cloud_fp.get("deal_expired") and local_fp.get("deal_ready"):
+        if cloud_fp.get("is_user_submit_deal"):
+            return True
+        c_id = str(cloud_fp.get("deal_item_id") or "").strip()
+        l_id = str(local_fp.get("deal_item_id") or "").strip()
+        if c_id and l_id and c_id == l_id:
+            return True
+        c_ms, l_ms = cloud_fp.get("deal_updated_ms"), local_fp.get("deal_updated_ms")
+        return bool(c_ms is not None and (l_ms is None or c_ms > l_ms))
+
+    return False
+
+
+def _should_pull_cloud_user_stats(cloud_fp: Dict[str, Any], local_fp: Dict[str, Any]) -> bool:
+    if cloud_fp.get("has_user_stats") and cloud_fp.get("user_stats_sig") != local_fp.get("user_stats_sig"):
+        return True
+    if not cloud_fp.get("has_user_stats") and local_fp.get("has_user_stats"):
+        return True
+    return False
+
+
+def needs_local_merge_from_cloud(
+    cloud_fp: Dict[str, Any],
+    local_fp: Optional[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """判定云端商品是否需要回流到本地新增或按五区块白名单更新。"""
+    if cloud_fp.get("is_off_promotion"):
+        return False, "cloud_off_promotion"
+    if local_fp is not None and local_fp.get("is_off_promotion"):
+        return False, "local_off_promotion"
+    if local_fp is None:
+        return True, "cloud_insert"
+    if _should_pull_cloud_commercial(cloud_fp, local_fp):
+        return True, "cloud_newer_updated_at"
+    if cloud_fp["has_channel_type"] and not local_fp["has_channel_type"]:
+        return True, "cloud_fill_channel_type"
+    if _should_pull_cloud_detail(cloud_fp, local_fp):
+        return True, "cloud_newer_detail"
+    if _should_pull_cloud_deal(cloud_fp, local_fp):
+        return True, "cloud_deal_sync"
+    if _should_pull_cloud_user_stats(cloud_fp, local_fp):
+        return True, "cloud_user_stats"
+    if cloud_fp.get("is_user_collected") and not local_fp.get("is_user_collected"):
+        return True, "cloud_user_collected"
+    return False, "up_to_date"
+
+
+def build_local_merge_operation(
+    cloud_doc: Dict[str, Any],
+    local_fp: Optional[Dict[str, Any]] = None,
+) -> Optional[UpdateOne]:
+    """按五区块显式白名单构造云端 ➔ 本地回流 `UpdateOne`（绝不覆盖本地规格包）。"""
+    if not is_valid_syncable_product(cloud_doc):
+        return None
+    if cloud_doc.get("is_off_promotion") is True:
+        return None
+
+    platform = normalize_platform(cloud_doc.get("platform"))
+    product_id = clean_product_id(cloud_doc.get("product_id") or cloud_doc.get("goods_id"))
+    cloud_fp = extract_sync_fingerprint(cloud_doc)
+    if cloud_fp is None:
+        return None
+    if local_fp is not None and local_fp.get("is_off_promotion"):
+        return None
+
+    set_fields: Dict[str, Any] = {}
+    unset_fields: Dict[str, str] = {}
+
+    if local_fp is None:
+        set_fields.update(_normalize_value_for_local(_copy_whitelist_fields(cloud_doc, COMMERCIAL_FIELDS)))
+        set_fields.update(_normalize_value_for_local(_copy_whitelist_fields(cloud_doc, DETAIL_FIELDS)))
+        if (cloud_fp["deal_ready"] or cloud_fp["deal_expired"]) and isinstance(cloud_doc.get("deal_info"), dict):
+            set_fields["deal_info"] = _normalize_value_for_local(cloud_doc["deal_info"])
+        if cloud_fp["has_user_stats"]:
+            if isinstance(cloud_doc.get("user_stats"), dict):
+                set_fields["user_stats"] = _normalize_value_for_local(cloud_doc["user_stats"])
+            if cloud_doc.get("user_stats_score") is not None:
+                set_fields["user_stats_score"] = copy.deepcopy(cloud_doc["user_stats_score"])
+        if cloud_fp["is_user_collected"]:
+            set_fields["is_user_collected"] = True
+    else:
+        if _should_pull_cloud_commercial(cloud_fp, local_fp):
+            set_fields.update(_normalize_value_for_local(_copy_whitelist_fields(cloud_doc, COMMERCIAL_FIELDS)))
+        elif cloud_fp["has_channel_type"] and not local_fp["has_channel_type"]:
+            ch = cloud_doc.get("channel_type")
+            if isinstance(ch, int) and not isinstance(ch, bool):
+                set_fields["channel_type"] = ch
+
+        if _should_pull_cloud_detail(cloud_fp, local_fp):
+            set_fields.update(_normalize_value_for_local(_copy_whitelist_fields(cloud_doc, DETAIL_FIELDS)))
+
+        if _should_pull_cloud_deal(cloud_fp, local_fp) and isinstance(cloud_doc.get("deal_info"), dict):
+            set_fields["deal_info"] = _normalize_value_for_local(cloud_doc["deal_info"])
+
+        if _should_pull_cloud_user_stats(cloud_fp, local_fp):
+            if cloud_fp["has_user_stats"]:
+                if isinstance(cloud_doc.get("user_stats"), dict):
+                    set_fields["user_stats"] = _normalize_value_for_local(cloud_doc["user_stats"])
+                if cloud_doc.get("user_stats_score") is not None:
+                    set_fields["user_stats_score"] = copy.deepcopy(cloud_doc["user_stats_score"])
+                else:
+                    unset_fields["user_stats_score"] = ""
+            else:
+                unset_fields["user_stats"] = ""
+                unset_fields["user_stats_score"] = ""
+
+        if cloud_fp["is_user_collected"] and not local_fp["is_user_collected"]:
+            set_fields["is_user_collected"] = True
+
+    if not set_fields and not unset_fields:
+        return None
+
+    now_naive = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    set_fields["platform"] = platform
+    set_fields["product_id"] = product_id
+    if local_fp is None and not set_fields.get("goods_id"):
+        raw_gid = str(cloud_doc.get("goods_id") or "").strip()
+        set_fields["goods_id"] = raw_gid or product_id
+
+    raw_created = cloud_doc.get("created_at")
+    if isinstance(raw_created, datetime.datetime):
+        created_at = _normalize_value_for_local(raw_created)
+    else:
+        created_at = set_fields.get("updated_at") if isinstance(set_fields.get("updated_at"), datetime.datetime) else now_naive
+
+    update_doc: Dict[str, Any] = {
+        "$set": set_fields,
+        "$setOnInsert": {"created_at": created_at},
+    }
+    if unset_fields:
+        update_doc["$unset"] = unset_fields
+    return UpdateOne({"platform": platform, "product_id": product_id}, update_doc, upsert=True)
+
+
+def sync_cloud_changes_to_local(
+    local_col,
+    cloud_col,
+    *,
+    window_days: float = DEFAULT_SYNC_WINDOW_DAYS,
+    since_utc: Optional[datetime.datetime] = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    exclude_keys: Optional[set[Tuple[str, str]]] = None,
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, int]:
+    """将云端新增品、新鲜官方快照、真实用户爆料、赞踩热度单向/优先回流至本地 `products`。"""
+    stats = {"new": 0, "updated": 0, "planned": 0}
+    if local_col is None or cloud_col is None:
+        return stats
+
+    excluded = exclude_keys or set()
+    query = build_recent_cloud_candidates_query(window_days=window_days, since_utc=since_utc)
+    cloud_fps: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    keys_by_platform: Dict[str, List[str]] = defaultdict(list)
+
+    try:
+        for raw_fp_doc in cloud_col.find(query, FINGERPRINT_PROJECTION):
+            fp = extract_sync_fingerprint(raw_fp_doc)
+            if fp is None:
+                continue
+            key = (fp["platform"], fp["product_id"])
+            if key in excluded or fp.get("is_off_promotion"):
+                continue
+            cloud_fps[key] = fp
+            keys_by_platform[fp["platform"]].append(fp["product_id"])
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("⚠️ 扫描云端变动商品指纹异常: %s", exc)
+        return stats
+
+    if not cloud_fps:
+        return stats
+
+    local_fps = fetch_cloud_fingerprints_map(local_col, keys_by_platform)
+    diff_keys_by_plat: Dict[str, List[str]] = defaultdict(list)
+    for (plat, pid), c_fp in cloud_fps.items():
+        should_pull, _ = needs_local_merge_from_cloud(c_fp, local_fps.get((plat, pid)))
+        if should_pull:
+            diff_keys_by_plat[plat].append(pid)
+
+    stats["planned"] = sum(len(v) for v in diff_keys_by_plat.values())
+    if stats["planned"] <= 0 or dry_run:
+        return stats
+
+    eff_batch = max(1, int(batch_size))
+    pending_ops: List[UpdateOne] = []
+    for plat, pids in diff_keys_by_plat.items():
+        for pid_chunk in _chunked(pids, DEFAULT_QUERY_CHUNK_SIZE):
+            for cloud_doc in cloud_col.find({"platform": plat, "product_id": {"$in": pid_chunk}}):
+                norm_plat = normalize_platform(cloud_doc.get("platform") or plat)
+                norm_pid = clean_product_id(cloud_doc.get("product_id") or cloud_doc.get("goods_id"))
+                op = build_local_merge_operation(cloud_doc, local_fps.get((norm_plat, norm_pid)))
+                if op is None:
+                    continue
+                pending_ops.append(op)
+                if len(pending_ops) >= eff_batch:
+                    res = local_col.bulk_write(pending_ops, ordered=False)
+                    stats["new"] += int(getattr(res, "upserted_count", 0) or 0)
+                    stats["updated"] += int(getattr(res, "modified_count", 0) or 0)
+                    pending_ops.clear()
+
+    if pending_ops:
+        res = local_col.bulk_write(pending_ops, ordered=False)
+        stats["new"] += int(getattr(res, "upserted_count", 0) or 0)
+        stats["updated"] += int(getattr(res, "modified_count", 0) or 0)
+
+    if (stats["new"] > 0 or stats["updated"] > 0) and logger is not None:
+        logger.info(
+            "📥 [云端 ➔ 本地回流] 本地新增=%d条 合并更新=%d条",
+            stats["new"],
+            stats["updated"],
+        )
+    return stats
+
+
 def run_sync_round(
     local_col,
     cloud_col,
@@ -739,9 +1185,9 @@ def run_sync_round(
     logger: Optional[logging.Logger] = None,
     pull_cloud_unformatted: bool = False,
 ) -> Dict[str, Any]:
-    """执行单轮「本地商品库 <-> 云端商品库」检查合并同步。"""
+    """执行单轮「本地商品库 <-> 云端商品库」五区块白名单双向收敛同步。"""
     t0 = time.perf_counter()
-    cloud_off_promotion_synced, off_promo_keys = sync_off_promotion_to_cloud(
+    cloud_off_promotion_synced, local_off_keys = sync_off_promotion_to_cloud(
         local_col,
         cloud_col,
         window_days=window_days,
@@ -750,6 +1196,17 @@ def run_sync_round(
         dry_run=dry_run,
         logger=logger,
     )
+    local_off_promotion_synced, cloud_off_keys = sync_off_promotion_from_cloud(
+        local_col,
+        cloud_col,
+        window_days=window_days,
+        since_utc=since_utc,
+        batch_size=batch_size,
+        dry_run=dry_run,
+        logger=logger,
+    )
+    all_off_keys = local_off_keys | cloud_off_keys
+
     pulled_cloud_only = 0
     if pull_cloud_unformatted:
         pulled_cloud_only = pull_cloud_only_unformatted_products(
@@ -757,7 +1214,7 @@ def run_sync_round(
             cloud_col,
             window_days=window_days,
             batch_size=batch_size,
-            exclude_keys=off_promo_keys,
+            exclude_keys=all_off_keys,
             dry_run=dry_run,
             logger=logger,
         )
@@ -771,6 +1228,8 @@ def run_sync_round(
         if fp is None:
             continue
         key = (fp["platform"], fp["product_id"])
+        if key in all_off_keys:
+            continue
         local_fps[key] = fp
         keys_by_platform[fp["platform"]].append(fp["product_id"])
 
@@ -832,6 +1291,17 @@ def run_sync_round(
             matched_total += int(res.matched_count or 0)
             written_ops_total += len(pending_ops)
 
+    local_pull_stats = sync_cloud_changes_to_local(
+        local_col,
+        cloud_col,
+        window_days=window_days,
+        since_utc=since_utc,
+        batch_size=batch_size,
+        exclude_keys=all_off_keys,
+        dry_run=dry_run,
+        logger=logger,
+    )
+
     elapsed_s = round(time.perf_counter() - t0, 2)
     scope_desc = (
         f"滚动增量(自 {since_utc.astimezone(datetime.timezone.utc).strftime('%H:%M:%S')} UTC)"
@@ -853,15 +1323,19 @@ def run_sync_round(
         "cloud_matched_existing": matched_total,
         "cloud_modified_existing": modified_total,
         "cloud_off_promotion_synced": cloud_off_promotion_synced,
+        "local_off_promotion_synced": local_off_promotion_synced,
         "local_pulled_cloud_unformatted": pulled_cloud_only,
+        "local_synced_from_cloud_planned": local_pull_stats["planned"],
+        "local_synced_from_cloud_new": local_pull_stats["new"],
+        "local_synced_from_cloud_updated": local_pull_stats["updated"],
         "elapsed_seconds": elapsed_s,
     }
 
     if logger is not None:
         mode_tag = "[DRY-RUN 演练]" if dry_run else "[正式合并]"
         logger.info(
-            "%s %s | 本地候选=%d条 | 已一致跳过=%d条 | 待同步=%d条 %s | "
-            "云端新增=%d条 合并更新=%d条 下架清理=%d条 回拉待洗=%d条 | 耗时=%.2fs",
+            "%s %s | 本地候选=%d条 | 已一致跳过=%d条 | 上云待同步=%d条 %s | "
+            "云端新增=%d条 云端更新=%d条 下架推云=%d条 | 云端回流本地:新增=%d条 更新=%d条 下架=%d条 待洗=%d条 | 耗时=%.2fs",
             mode_tag,
             scope_desc,
             total_candidates,
@@ -871,6 +1345,9 @@ def run_sync_round(
             upserted_total,
             modified_total,
             cloud_off_promotion_synced,
+            local_pull_stats["new"],
+            local_pull_stats["updated"],
+            local_off_promotion_synced,
             pulled_cloud_only,
             elapsed_s,
         )

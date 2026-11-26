@@ -209,6 +209,31 @@
       : '';
     return `🎁 发现一个实在好价：「${title}」${priceLabel} ¥${shop.formatMoney(goods.price)}${couponPart}\n👉 点这里看实拍详情直接领券：${shareUrl}`;
   };
+  shop.sanitizeReturnPath = raw => {
+    const s = String(raw || '').trim();
+    if (!s || !s.startsWith('/') || s.startsWith('//') || s.startsWith('/\\') || /[\r\n\0]/.test(s)) {
+      return '';
+    }
+    try {
+      const parsed = new URL(s, 'https://shop.local');
+      if (parsed.origin !== 'https://shop.local') return '';
+      const allowed = new Set(['/', '/detail', '/favorites', '/submit_deal', '/group_help']);
+      if (!allowed.has(parsed.pathname)) return '';
+      return parsed.pathname + parsed.search + parsed.hash;
+    } catch (_) {
+      return '';
+    }
+  };
+  shop.buildUserTabUrl = ({ redirect = '', inviteCode = '', platform = '' } = {}) => {
+    const params = new URLSearchParams({ tab: 'user' });
+    const cleanInv = String(inviteCode || '').trim();
+    if (cleanInv) params.set('invite_code', cleanInv);
+    const cleanPlat = String(platform || '').trim();
+    if (cleanPlat) params.set('platform', cleanPlat);
+    const safeRedirect = shop.sanitizeReturnPath(redirect);
+    if (safeRedirect) params.set('redirect', safeRedirect);
+    return `/?${params.toString()}`;
+  };
   shop.buildSiteShareText = (origin = '', inviteCode = '') => {
     const baseOrigin = String(origin || (global.location && global.location.origin) || '').replace(/\/+$/, '');
     const cleanInvite = String(inviteCode || '').trim();

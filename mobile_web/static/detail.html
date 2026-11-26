@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261126-1">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261126-1"></script>
-  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261126-1">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261126-2">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261126-2"></script>
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261126-2">
 </head>
 <body>
 <div id="app" class="detail-container" v-cloak>
@@ -44,7 +44,7 @@
   </header>
 
   <!-- ==================== 主图/高清多图横向轮播 ==================== -->
-  <div class="hero-carousel">
+  <div class="hero-carousel" v-if="goods || (!detailError && isDeepLoading)">
     <div class="hero-carousel-inner" ref="carouselRef" @scroll="onCarouselScroll">
       <div 
         class="hero-slide" 
@@ -213,11 +213,20 @@
     </div>
   </div>
 
-  <div class="detail-card-section retry-card" v-if="detailError && carouselList.length <= 1">
-    <div class="retry-card-content">
+  <div class="detail-card-section retry-card" :class="{ 'is-standalone-error': !goods }" v-if="detailError && carouselList.length <= 1">
+    <div class="retry-card-content" v-if="goods">
       <span class="retry-msg">{{ detailErrorMsg || '商品详情暂未完整获取，可重试加载' }}</span>
       <button class="retry-btn-inline" v-if="!isOffPromotion" @click="retryLoadDeepDetail">点击重新获取 ↻</button>
       <button class="retry-btn-inline" v-else @click="goBack">返回挑选其他好物 ›</button>
+    </div>
+    <div class="standalone-error-box" v-else>
+      <div class="standalone-error-icon">{{ isOffPromotion ? '📦' : '⚠️' }}</div>
+      <div class="standalone-error-msg">{{ detailErrorMsg || '商品信息暂不可用，请返回挑选其他好物' }}</div>
+      <div class="standalone-error-actions">
+        <button type="button" class="retry-btn-inline" v-if="!isOffPromotion" @click="retryLoadDeepDetail">重新加载 ↻</button>
+        <button type="button" class="retry-btn-inline" @click="goBack">返回上一页</button>
+        <button type="button" class="standalone-home-btn" @click="goHome">去首页逛逛 ›</button>
+      </div>
     </div>
   </div>
 
@@ -239,8 +248,8 @@
     <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">蜀ICP备2026073570号-1</a>
   </div>
 
-  <!-- ==================== 底部固定操作栏（无论登录与否均可领券与复制口令） ==================== -->
-  <footer class="detail-bottom-nav">
+  <!-- ==================== 底部固定操作栏（仅商品有效且未下架时展示） ==================== -->
+  <footer class="detail-bottom-nav" v-if="canOperateDetail">
     <div class="detail-nav-btn-icon" @click="goHome">
       <span class="icon">🏠</span>
       <span>首页</span>
@@ -374,10 +383,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261126-1"></script>
-<script src="/static/js/session.js?v=ux-20261126-1"></script>
-<script src="/static/js/format.js?v=ux-20261126-1"></script>
-<script src="/static/js/browser.js?v=ux-20261126-1"></script>
-<script src="/static/js/detail.js?v=ux-20261126-1"></script>
+<script src="/static/js/api.js?v=ux-20261126-2"></script>
+<script src="/static/js/session.js?v=ux-20261126-2"></script>
+<script src="/static/js/format.js?v=ux-20261126-2"></script>
+<script src="/static/js/browser.js?v=ux-20261126-2"></script>
+<script src="/static/js/detail.js?v=ux-20261126-2"></script>
 </body>
 </html>

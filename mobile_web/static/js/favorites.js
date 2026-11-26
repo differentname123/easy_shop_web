@@ -12,7 +12,11 @@
     let disposed = false;
 
     const goHome = () => { global.location.href = '/?tab=home&reset=1'; };
-    const goToLogin = () => { global.location.href = '/?tab=user'; };
+    const goToLogin = () => {
+      global.location.href = typeof shop.buildUserTabUrl === 'function'
+        ? shop.buildUserTabUrl({ redirect: '/favorites' })
+        : '/?tab=user';
+    };
     const goBack = () => {
       if (global.history.length > 1) return global.history.back();
       global.location.href = '/?tab=user';

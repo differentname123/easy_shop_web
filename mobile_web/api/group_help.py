@@ -297,5 +297,6 @@ def get_group_poster(
         return JSONResponse(
             status_code=404,
             content={"status": "error", "error_code": "poster_not_found", "error_msg": "未找到海报图片"},
+            headers={"Cache-Control": "no-store"},
         )
     return FileResponse(str(path), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})

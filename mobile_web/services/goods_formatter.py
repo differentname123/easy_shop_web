@@ -24,6 +24,7 @@ from pymongo import UpdateOne
 from infrastructure.ai_api.json_parser import parse_llm_json
 from infrastructure.ai_api.model_api import generate_content
 from infrastructure.runtime_io import load_prompt_cached
+from models.deal_constants import USER_SUBMIT_SITE
 from models.product import strip_ecommerce_tokens_and_urls
 from services.deal_cleaning.text_sanitizer import sanitize_card_highlight
 
@@ -213,6 +214,7 @@ def pending_deal_format_query(recent_days: int = RECENT_DAYS) -> Dict[str, Any]:
         "$and": [
             {"updated_at": {"$gte": cutoff_time}},
             {"deal_info.is_deal_tip": True},
+            {"deal_info.source_site": {"$ne": USER_SUBMIT_SITE}},
             {"deal_info.deal_price": {"$type": "number", "$gt": 0}},
             {
                 "$or": [

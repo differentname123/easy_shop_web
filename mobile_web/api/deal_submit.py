@@ -78,5 +78,6 @@ def get_deal_submit_image(
         return JSONResponse(
             status_code=404,
             content={"status": "error", "error_code": "image_not_found", "error_msg": "图片不存在或已失效"},
+            headers={"Cache-Control": "no-store"},
         )
     return FileResponse(str(path), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})

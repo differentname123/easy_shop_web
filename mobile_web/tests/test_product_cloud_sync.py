@@ -626,3 +626,167 @@ def test_sync_protects_cloud_newer_or_reliable_deal_info_while_merging_format():
     assert sync_mod.needs_cloud_merge(sync_mod.extract_sync_fingerprint(local_unreliable), c_fp) == (False, "up_to_date")
 
 
+def test_cloud_sync_five_block_whitelist_user_submit_isolation_and_bidirectional_convergence():
+    """验证五区块白名单同步：本地 user_submit 严格隔离不上云，云端真实爆料/赞踩/下架双向收敛且未知字段互不误覆。"""
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    t_old = now - datetime.timedelta(hours=6)
+
+    local_docs = [
+        # 1. 本地测试生成的 user_submit 独有记录（无官方规格/频道）-> 绝不推往云端
+        {
+            "_id": "l_us_only",
+            "platform": "pdd",
+            "product_id": "9000001",
+            "name": "本地测试用户爆料新品",
+            "price": 19.9,
+            "activity_price": 9.9,
+            "updated_at": now,
+            "deal_info": {
+                "is_deal_tip": True,
+                "source_site": "user_submit",
+                "source_item_id": "us_local_test_1",
+                "source_is_reliable": True,
+                "deal_price": 9.9,
+                "user_share_images": ["/api/deals/image/dsi_11111111111111111111"],
+                "updated_at": now,
+            },
+        },
+        # 2. 本地已有频道热销品，但本地人工测试挂了一条 user_submit + 本地测试 user_stats + 自定义扩展字段 ->
+        #    只能同步合法频道，绝不把本地 user_submit 或本地 test user_stats 推上云
+        {
+            "_id": "l_us_on_existing",
+            "platform": "jd",
+            "product_id": "9000002",
+            "name": "维达抽纸",
+            "price": 29.9,
+            "activity_price": 24.9,
+            "channel_type": 5,
+            "updated_at": t_old,
+            "future_local_only": "keep_local_future",
+            "user_stats": {"buyable": 99, "unbuyable": 88, "updated_at": now},
+            "user_stats_score": 999.0,
+            "deal_info": {
+                "is_deal_tip": True,
+                "source_site": "user_submit",
+                "source_item_id": "us_local_test_2",
+                "source_is_reliable": True,
+                "deal_price": 14.9,
+                "updated_at": now,
+            },
+        },
+        # 3. 本地正常爬虫品，但云端将在下面标记为官方已下架 -> 本地不应复活它，反而应收敛成已下架
+        {
+            "_id": "l_cloud_dead",
+            "platform": "taobao",
+            "product_id": "9000003",
+            "name": "云端刚下架的商品",
+            "price": 39.9,
+            "activity_price": 39.9,
+            "updated_at": now,
+        },
+    ]
+
+    cloud_docs = [
+        # 云端真实存在 9000002，且带有真实用户爆料 + 真实赞踩统计 + 未来新云端字段
+        {
+            "_id": "c_us_real",
+            "platform": "jd",
+            "product_id": "9000002",
+            "name": "维达抽纸",
+            "price": 29.9,
+            "activity_price": 24.9,
+            "updated_at": t_old,
+            "future_cloud_field": "must_never_be_overwritten",
+            "user_stats": {"buyable": 12, "unbuyable": 1, "valid_orders": 5, "updated_at": now},
+            "user_stats_score": 42.5,
+            "deal_info": {
+                "is_deal_tip": True,
+                "source_site": "user_submit",
+                "source_item_id": "us_prod_real_2",
+                "source_is_reliable": True,
+                "deal_price": 16.9,
+                "user_share_images": ["/api/deals/image/dsi_aaaaaaaaaaaaaaaaaaaa"],
+                "updated_at": now,
+            },
+        },
+        # 云端已下架 9000003
+        {
+            "_id": "c_cloud_dead",
+            "platform": "taobao",
+            "product_id": "9000003",
+            "name": "云端刚下架的商品",
+            "price": 39.9,
+            "activity_price": 39.9,
+            "updated_at": t_old,
+            "is_off_promotion": True,
+            "off_promotion_at": now,
+            "off_promotion_reason": "official_off",
+        },
+        # 云端独有新品带真实用户爆料与赞踩 -> 完整回流本地
+        {
+            "_id": "c_new_real",
+            "platform": "pdd",
+            "product_id": "9000004",
+            "name": "云端新品真实用户爆料",
+            "price": 49.9,
+            "activity_price": 39.9,
+            "updated_at": now,
+            "user_stats": {"buyable": 3, "unbuyable": 0, "updated_at": now},
+            "user_stats_score": 10.0,
+            "deal_info": {
+                "is_deal_tip": True,
+                "source_site": "user_submit",
+                "source_item_id": "us_prod_real_4",
+                "source_is_reliable": True,
+                "deal_price": 29.9,
+                "updated_at": now,
+            },
+        },
+    ]
+
+    local_col = _FakeSyncCollection(local_docs)
+    cloud_col = _FakeSyncCollection(cloud_docs)
+
+    rep1 = sync_mod.run_sync_round(local_col, cloud_col, window_days=3.0)
+    assert rep1["local_off_promotion_synced"] == 1
+    assert rep1["local_synced_from_cloud_new"] == 1
+
+    cloud_by_key = {(d["platform"], d["product_id"]): d for d in cloud_col.docs}
+    local_by_key = {(d["platform"], d["product_id"]): d for d in local_col.docs}
+
+    # 1) 本地测试 user_submit 绝不上云
+    assert ("pdd", "9000001") not in cloud_by_key
+
+    # 2) 云端 9000002 的真实 user_submit、user_stats 与未来字段完好无损，仅收下本地补的 channel_type=5；
+    #    同时云端真实 user_submit 与真实 user_stats 已反向收敛回本地（本地 future_local_only 也完好无损）
+    c2 = cloud_by_key[("jd", "9000002")]
+    l2 = local_by_key[("jd", "9000002")]
+    assert c2["channel_type"] == 5
+    assert c2["deal_info"]["source_item_id"] == "us_prod_real_2"
+    assert c2["user_stats"]["buyable"] == 12
+    assert c2["future_cloud_field"] == "must_never_be_overwritten"
+    assert l2["deal_info"]["source_item_id"] == "us_prod_real_2"
+    assert l2["user_stats"]["buyable"] == 12
+    assert l2["user_stats_score"] == 42.5
+    assert l2["future_local_only"] == "keep_local_future"
+
+    # 3) 云端已下架 9000003 收敛回本地且不被复活
+    assert cloud_by_key[("taobao", "9000003")]["is_off_promotion"] is True
+    assert local_by_key[("taobao", "9000003")]["is_off_promotion"] is True
+
+    # 4) 云端独有新品 9000004 回流本地
+    l4 = local_by_key[("pdd", "9000004")]
+    assert l4["deal_info"]["source_item_id"] == "us_prod_real_4"
+    assert l4["user_stats"]["buyable"] == 3
+
+    # 5) 二次运行完全幂等（0 写入）
+    c_writes = cloud_col.bulk_write_calls
+    l_writes = local_col.bulk_write_calls
+    rep2 = sync_mod.run_sync_round(local_col, cloud_col, window_days=3.0)
+    assert rep2["written_ops"] == 0
+    assert rep2["local_synced_from_cloud_planned"] == 0
+    assert rep2["local_off_promotion_synced"] == 0
+    assert cloud_col.bulk_write_calls == c_writes
+    assert local_col.bulk_write_calls == l_writes
+
+

@@ -203,14 +203,33 @@
         else return loadHomeGoods(true);
       } else if (current(generation, scope)) homeLoading.value = false;
     };
+    const isBackForwardNavigation = () => {
+      try {
+        const navEntries = global.performance && typeof global.performance.getEntriesByType === 'function'
+          ? global.performance.getEntriesByType('navigation')
+          : null;
+        if (Array.isArray(navEntries) && navEntries[0] && navEntries[0].type === 'back_forward') {
+          return true;
+        }
+        return Boolean(global.performance && global.performance.navigation && global.performance.navigation.type === 2);
+      } catch (_) {
+        return false;
+      }
+    };
     const initializeHome = params => {
       const isExplicitReset = params.get('reset') === '1';
-      let keyword = isExplicitReset ? '' : (params.get('keyword') || params.get('q') || read('home_search_keyword') || '').trim();
+      const urlKeyword = (params.get('keyword') || params.get('q') || '').trim();
+      const canRestoreStoredSearch = !isExplicitReset && !params.get('tab') && isBackForwardNavigation();
+      let keyword = isExplicitReset ? '' : (urlKeyword || (canRestoreStoredSearch ? (read('home_search_keyword') || '') : '')).trim();
       if (params.get('tab') && params.get('tab') !== 'home') keyword = '';
-      if (isExplicitReset) {
+      if (isExplicitReset || (!keyword && !isBackForwardNavigation())) {
         try {
           global.sessionStorage.removeItem(key('home_search_keyword'));
           global.sessionStorage.removeItem(key('home_search_state'));
+        } catch (_) {}
+      }
+      if (isExplicitReset) {
+        try {
           const url = new URL(global.location.href);
           url.searchParams.delete('reset');
           url.searchParams.delete('tab');

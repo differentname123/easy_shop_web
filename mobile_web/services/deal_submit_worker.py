@@ -340,7 +340,6 @@ class DealSubmitWorker:
                 "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
             },
         )
-        self.submit_service.delete_image_urls(doc.get("tutorial_images") or [])
 
     def _schedule_retry_or_fail(
         self,
@@ -662,7 +661,6 @@ class DealSubmitWorker:
                     "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                 },
             )
-            self.submit_service.delete_image_urls(doc.get("tutorial_images") or [])
             return "skipped_existing"
 
         compared_id = existing_deal["source_item_id"] if existing_deal else ""
@@ -695,7 +693,6 @@ class DealSubmitWorker:
             return stats
 
         published_targets: List[Tuple[str, str]] = []
-        failed_docs_to_clean_imgs: List[Dict[str, Any]] = []
         for out in outcomes:
             mid = str(out.get("source_item_id") or "").strip()
             src_doc = docs_by_id.get(mid) or {}
@@ -715,12 +712,9 @@ class DealSubmitWorker:
                     pdoc["_verified_replace_source_item_id"] = compared_ex_id
             elif status in ("failed", "low_score"):
                 stats["rejected"] += 1
-                failed_docs_to_clean_imgs.append(src_doc)
 
         commit_batch_results_to_db(outcomes, repo.col, repo.formal_col, cycle_num=0)
         stats["ai2_processed"] = len(outcomes)
-        for fail_doc in failed_docs_to_clean_imgs:
-            self.submit_service.delete_image_urls(fail_doc.get("tutorial_images") or [])
         if published_targets:
             for t_plat, t_pid in dict.fromkeys(published_targets):
                 clear_cached_deal_tip(t_plat, t_pid)

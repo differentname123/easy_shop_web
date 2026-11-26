@@ -279,10 +279,21 @@
       const width = carouselRef.value.clientWidth || global.innerWidth;
       currentImgIndex.value = Math.round(carouselRef.value.scrollLeft / width);
     };
+    const currentReturnPath = () => {
+      try {
+        const loc = global.location;
+        return loc ? `${loc.pathname || '/detail'}${loc.search || ''}` : '';
+      } catch (_) {
+        return '';
+      }
+    };
     const goHome = () => { global.location.href = '/?tab=home&reset=1'; };
     const goToRegister = () => {
       const inv = session.pendingInvite ? session.pendingInvite() : '';
-      global.location.href = inv ? `/?${new URLSearchParams({ tab: 'user', invite_code: inv })}` : '/?tab=user';
+      const url = typeof shop.buildUserTabUrl === 'function'
+        ? shop.buildUserTabUrl({ redirect: currentReturnPath(), inviteCode: inv })
+        : (inv ? `/?${new URLSearchParams({ tab: 'user', invite_code: inv })}` : '/?tab=user');
+      global.location.href = url;
     };
     const PRICE_FEEDBACK_STORAGE_KEY = 'easy_shop_price_feedback_v1';
     const PRICE_FEEDBACK_TTL_MS = 24 * 3600 * 1000;
@@ -693,7 +704,9 @@
       const platform = authModal.value.platform;
       closeAuthModal();
       // Keep the user gesture synchronous; the account page owns URL generation and authorization return checks.
-      global.location.href = `/?${new URLSearchParams({ tab: 'user', platform })}`;
+      global.location.href = typeof shop.buildUserTabUrl === 'function'
+        ? shop.buildUserTabUrl({ redirect: currentReturnPath(), platform })
+        : `/?${new URLSearchParams({ tab: 'user', platform })}`;
     };
     const resumePendingAuthorization = () => {
       if (disposed || !isLoggedIn.value || !verifiedSession || !session.isCurrent(verifiedSession)) return;

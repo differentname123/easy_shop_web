@@ -110,28 +110,40 @@
 
     const hasAnchorParams = computed(() => Boolean(rawAnchor.platform && (rawAnchor.product_id || rawAnchor.goods_id || rawAnchor.goods_sign)));
 
+    const currentReturnPath = () => {
+      try {
+        const loc = global.location;
+        return loc ? `${loc.pathname || '/submit_deal'}${loc.search || ''}` : '/submit_deal';
+      } catch (_) {
+        return '/submit_deal';
+      }
+    };
     const goHome = () => { global.location.href = '/?tab=home&reset=1'; };
-    const goToLogin = () => { global.location.href = '/?tab=user'; };
+    const goToLogin = () => {
+      global.location.href = typeof shop.buildUserTabUrl === 'function'
+        ? shop.buildUserTabUrl({ redirect: currentReturnPath() })
+        : '/?tab=user';
+    };
+    const buildDetailUrlFromIdentity = rawObj => {
+      const id = shop.goodsIdentity(rawObj || {});
+      const p = new URLSearchParams();
+      if (id.platform) p.set('platform', id.platform);
+      if (id.goods_id) p.set('goods_id', id.goods_id);
+      if (id.goods_sign) p.set('goods_sign', id.goods_sign);
+      return `/detail?${p.toString()}`;
+    };
     const goBack = () => {
       if (global.history && global.history.length > 1) return global.history.back();
       if (hasAnchorParams.value) {
-        const p = new URLSearchParams();
-        p.set('platform', rawAnchor.platform);
-        if (rawAnchor.goods_id || rawAnchor.product_id) p.set('goods_id', rawAnchor.goods_id || rawAnchor.product_id);
-        if (rawAnchor.goods_sign) p.set('goods_sign', rawAnchor.goods_sign);
-        global.location.href = `/detail?${p.toString()}`;
+        global.location.href = buildDetailUrlFromIdentity(rawAnchor);
         return;
       }
       global.location.href = '/?tab=user';
     };
 
     const openSubmittedDetail = rec => {
-      if (!rec || !rec.platform || !rec.product_id) return;
-      const p = new URLSearchParams();
-      p.set('platform', rec.platform);
-      p.set('goods_id', rec.product_id);
-      if (rec.goods_sign) p.set('goods_sign', rec.goods_sign);
-      global.location.href = `/detail?${p.toString()}`;
+      if (!rec || !rec.platform || (!rec.product_id && !rec.goods_id && !rec.goods_sign)) return;
+      global.location.href = buildDetailUrlFromIdentity(rec);
     };
 
     const triggerImagePicker = () => {
@@ -194,11 +206,7 @@
 
     const loadAnchoredGoods = async token => {
       if (!hasAnchorParams.value) return;
-      const summaryReq = {
-        platform: rawAnchor.platform,
-        goods_id: rawAnchor.goods_id || rawAnchor.product_id,
-        goods_sign: rawAnchor.goods_sign,
-      };
+      const summaryReq = shop.goodsIdentity(rawAnchor);
       try {
         const cached = JSON.parse(global.sessionStorage?.getItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(summaryReq)}`) || 'null');
         if (cached && cached.name) goods.value = cached;
@@ -208,9 +216,9 @@
       goodsError.value = '';
       try {
         const params = new URLSearchParams();
-        params.set('platform', rawAnchor.platform);
-        if (rawAnchor.goods_id || rawAnchor.product_id) params.set('goods_id', rawAnchor.goods_id || rawAnchor.product_id);
-        if (rawAnchor.goods_sign) params.set('goods_sign', rawAnchor.goods_sign);
+        if (summaryReq.platform) params.set('platform', summaryReq.platform);
+        if (summaryReq.goods_id) params.set('goods_id', summaryReq.goods_id);
+        if (summaryReq.goods_sign) params.set('goods_sign', summaryReq.goods_sign);
         const res = await api.get(`/api/home/detail?${params.toString()}`, token ? { token } : undefined);
         if (disposed) return;
         if (res.ok && res.data?.status === 'success' && res.data?.data) {

@@ -1788,7 +1788,7 @@ body {
 }
 
 .a2hs-banner ~ .back-to-top-btn {
-  bottom: calc(var(--tab-height) + var(--safe-bottom) + 74px);
+  bottom: calc(var(--tab-height) + var(--safe-bottom) + 84px);
 }
 
 /* 首页跨平台搜索状态条 */

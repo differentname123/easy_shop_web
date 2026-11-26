@@ -514,6 +514,16 @@ def test_run_format_round_retry_convergence_and_pending_query_filters(monkeypatc
     assert doc_empty_sku_fail["format_retry_count"] == 1
     assert gif._detect_product_price_changes(doc_empty_sku_fail) == (False, set())
 
+    deal_query = gif.pending_deal_format_query()
+    assert ProductMemoryCollection.matches({
+        "updated_at": now_utc,
+        "deal_info": {"is_deal_tip": True, "deal_price": 19.9, "source_site": "guangdiu"},
+    }, deal_query) is True
+    assert ProductMemoryCollection.matches({
+        "updated_at": now_utc,
+        "deal_info": {"is_deal_tip": True, "deal_price": 19.9, "source_site": "user_submit"},
+    }, deal_query) is False
+
 
 def test_run_format_round_skips_unchanged_success_with_zero_writes():
     unchanged_doc = {

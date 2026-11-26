@@ -90,9 +90,11 @@
       const rawTarget = (linkInfo && linkInfo.final_link) || fallbackUrl;
       const target = isSafeWebJumpUrl(rawTarget) ? rawTarget : '';
       const schemaUrl = linkInfo && isSafeSchemaUrl(linkInfo.schema_url) ? linkInfo.schema_url : '';
+      const ua = String(global.navigator?.userAgent || '').toLowerCase();
+      const isMobile = /mobile|android|iphone|ipad|ipod|micromessenger/.test(ua);
       global.setTimeout(() => {
         if (!canNavigate()) return;
-        if (schemaUrl && global.navigator.userAgent.toLowerCase().includes('mobile')) {
+        if (schemaUrl && ua.includes('mobile')) {
           global.location.href = schemaUrl;
           global.setTimeout(() => {
             if (target && canNavigate() && !(global.document && global.document.hidden)) {
@@ -100,6 +102,10 @@
             }
           }, 800);
         } else if (target) {
+          if (!isMobile && !schemaUrl && typeof global.window?.open === 'function') {
+            const opened = global.window.open(target, '_blank', 'noopener');
+            if (opened) return;
+          }
           global.location.href = target;
         }
       }, 400);

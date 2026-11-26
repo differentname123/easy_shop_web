@@ -539,7 +539,8 @@ def test_worker_reuses_convert_and_ai2_with_clean_copy(tmp_path):
     assert out_bad["coupon_failed"] == 1
     assert out_bad["rejected"] == 1
     assert audit_never == []
-    assert svc.get_image_file_path(bad_img_id) is None
+    # 驳回时不再立即删图（统一交由 30 天带引用保护定时清理，避免多人共享同图误删）
+    assert svc.get_image_file_path(bad_img_id) is not None
 
     my_items = svc.get_my_submissions("u_alice")["data"]["items"]
     assert my_items[0]["tip_id"] == res_bad_cpn["data"]["tip_id"]
@@ -601,12 +602,12 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
         remote_image_fetcher=lambda _u: _make_png_bytes(160, 160),
     )
     assert w_rej.run_once()["rejected"] == 1
-    assert svc.get_image_file_path(rej_img_id) is None
+    assert svc.get_image_file_path(rej_img_id) is not None
     assert rej_calls[0]["parent_dir"].exists() is False
     assert rej_calls[0]["file_names"] == ["official_1.jpg", "new_1.jpg", "existing_1.jpg", "existing_2.jpg"]
     assert raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})["deal_info"]["source_item_id"] == "old_tip_1"
 
-    # 2. 现有同价暂不替换：验证展示「已有同价好价」、立即删除未采纳截图且保留现有反馈票数
+    # 2. 现有同价暂不替换：验证展示「已有同价好价」、保留硬盘图片避免误删同图，且保留现有反馈票数
     res_keep = svc.submit_user_deal(
         uid="u_alice",
         platform="jd",
@@ -616,6 +617,7 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
         images_base64=[_make_png_b64(400, 300)],
     )
     keep_img_id = raw_repo.col.find_one({"source_item_id": res_keep["data"]["tip_id"]})["tutorial_images"][0].rsplit("/", 1)[-1]
+    assert keep_img_id == rej_img_id  # 同内容截图复用同一指纹文件名
     w_keep = DealSubmitWorker(
         svc,
         cleaner=cleaner,
@@ -623,7 +625,7 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
         remote_image_fetcher=lambda _u: _make_png_bytes(160, 160),
     )
     assert w_keep.run_once()["skipped_existing"] == 1
-    assert svc.get_image_file_path(keep_img_id) is None
+    assert svc.get_image_file_path(keep_img_id) is not None
     assert raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})["user_stats"] == {"buyable": 1, "unbuyable": 6}
     dup_item = svc.get_my_submissions("u_alice")["data"]["items"][0]
     assert dup_item["tip_id"] == res_keep["data"]["tip_id"]
@@ -746,7 +748,13 @@ def test_screenshot_compression_pipeline_and_cleanup(tmp_path):
     assert e_bad.value.error_code == "invalid_image"
 
     img_dir = tmp_path / "deal_submit_images"
-    db, raw_repo, _, ps, svc = _make_harness(image_dir=img_dir)
+    db, raw_repo, _, ps, svc = _make_harness(
+        initial_users=[
+            {"uid": "u_alice", "phone": "13800138000", "nickname": "阿丽"},
+            {"uid": "u_bob", "phone": "13800138001", "nickname": "阿博"},
+        ],
+        image_dir=img_dir,
+    )
 
     with pytest.raises(DealSubmitError) as e_cnt:
         svc.submit_user_deal(
@@ -785,11 +793,49 @@ def test_screenshot_compression_pipeline_and_cleanup(tmp_path):
     unrelated_path.write_bytes(_make_png_bytes(100, 100))
     os.utime(unrelated_path, (now_ts - 90 * 86400, now_ts - 90 * 86400))
 
+    # 同图内容去重：两次上传相同内容截图应产出同一指纹编号并刷新 mtime；且带活跃引用的图满 30 天仍受保护
+    old_mtime = now_ts - 40 * 86400
+    os.utime(saved_path, (old_mtime, old_mtime))
+    svc.submit_user_deal(
+        uid="u_bob",
+        platform="jd",
+        product_id="1001001",
+        deal_price=28.9,
+        tutorial_text="同图续期验证",
+        images_base64=[big_png_b64, big_png_b64],
+    )
+    saved_id = img_url.rsplit("/", 1)[-1]
+    assert saved_path.stat().st_mtime > now_ts - 60
+
+    # 正式表或待审队列引用的超 30 天文件受白名单保护不被误删；无引用超 30 天孤儿文件被清理
+    protected_formal_id = "dsi_11112222333344445555"
+    protected_formal_path = img_dir / f"{protected_formal_id}.jpg"
+    protected_formal_path.write_bytes(_make_png_bytes(120, 120))
+    os.utime(protected_formal_path, (now_ts - 45 * 86400, now_ts - 45 * 86400))
+    raw_repo.formal_col.docs.append({
+        "platform": "jd",
+        "product_id": "1001001",
+        "deal_info": {"is_deal_tip": True, "user_share_images": [f"/api/deals/image/{protected_formal_id}"]},
+    })
+
     worker_maint = DealSubmitWorker(svc, cleaner=DealPoolCleaner(ai_batch_size=2, convert_max_workers=1))
     worker_maint.run_maintenance_once()
     assert saved_path.exists()
+    assert protected_formal_path.exists()
     assert not expired_path.exists()
     assert unrelated_path.exists()
+
+    # DB 查询异常时 Fail-Closed：绝不盲删文件
+    orphan2_path = img_dir / "dsi_99998888777766665555.jpg"
+    orphan2_path.write_bytes(_make_png_bytes(120, 120))
+    os.utime(orphan2_path, (now_ts - 45 * 86400, now_ts - 45 * 86400))
+    orig_find = raw_repo.formal_col.find
+    raw_repo.formal_col.find = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db down"))
+    try:
+        assert svc.purge_expired_images() == 0
+        assert orphan2_path.exists()
+    finally:
+        raw_repo.formal_col.find = orig_find
 
 
 def test_audit_fail_closed_retry_source_isolation_and_lifespan(monkeypatch, tmp_path):
@@ -881,7 +927,7 @@ def test_audit_fail_closed_retry_source_isolation_and_lifespan(monkeypatch, tmp_
         else:
             assert cur["clean_status"] == "cleaned_failed"
             assert cur["clean_error_code"] == ERR_AI_MAX_RETRIES_EXCEEDED
-            assert svc.get_image_file_path(img_id) is None
+            assert svc.get_image_file_path(img_id) is not None
 
     clear_cached_deal_tip()
     BOOM_SORT_CACHE.clear()
@@ -969,6 +1015,11 @@ def test_http_routes_and_submit_page(monkeypatch, tmp_path):
         img_resp = client.get(img_url)
         assert img_resp.status_code == 200
         assert img_resp.headers["content-type"].startswith("image/jpeg")
+        assert "max-age=86400" in img_resp.headers.get("cache-control", "")
+
+        missing_img_resp = client.get("/api/deals/image/dsi_00000000000000000000")
+        assert missing_img_resp.status_code == 404
+        assert missing_img_resp.headers.get("cache-control") == "no-store"
 
         list_resp = client.get("/api/deals/my_submissions", headers={"Authorization": f"Bearer {token}"})
         assert list_resp.status_code == 200

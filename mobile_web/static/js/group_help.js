@@ -820,10 +820,10 @@
           }
         }
 
-        // 4. 商品名称
-        const buyM = text.match(/拼团购买\s*(.*?)(?:\.\.\.|…|，仅剩|，还差|，剩|$)/);
+        // 4. 商品名称：支持截断在省略号、价格分隔符（,¥ / ，¥ / 拼团价 / 实付 / 元）及人数说明之前
+        const buyM = text.match(/拼团购买\s*(.*?)(?:\.\.\.|…|[,，。\s]+(?:¥|￥|拼团价|实付|[0-9]+(?:\.[0-9]{1,2})?\s*元|[0-9]{1,2}\s*人团|仅剩|还差|剩)|$)/);
         if (buyM && buyM[1].trim()) {
-          let title = buyM[1].trim();
+          let title = buyM[1].replace(/[，,。.\s]+$/, '').trim();
           const suffixM = text.match(/仅剩\s*\d+\s*个名额[。，、\s]+(.+?)$/);
           if (suffixM) {
             const suffix = suffixM[1]

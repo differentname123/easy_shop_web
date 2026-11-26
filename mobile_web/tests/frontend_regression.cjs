@@ -921,7 +921,11 @@ for (const platform of ['taobao', 'pdd']) {
         assert.equal(h.copied.length, 0);
         if (choice === 'auth') {
           assert.equal(h.page.handleGoToAuth(), undefined, 'account navigation is synchronous, not an async authorization request');
-          assert.equal(h.context.location.href, `/?tab=user&platform=${platform}`);
+          const authUrl = new URL(h.context.location.href, 'https://shop.test');
+          assert.equal(authUrl.pathname, '/');
+          assert.equal(authUrl.searchParams.get('tab'), 'user');
+          assert.equal(authUrl.searchParams.get('platform'), platform);
+          assert.equal(authUrl.searchParams.get('redirect'), `/detail?goods_id=A&platform=${platform}`);
           assert.equal(h.copied.length, 0);
           assert.equal(h.context.sessionStorage.getItem('easy_shop_pending_authorization'), null,
             'entering the account page is not an external authorization attempt');
@@ -974,7 +978,11 @@ for (const platform of ['taobao', 'pdd']) {
             assert.equal(h.page.authModal.value.visible, false);
             assert.equal(h.page.authModal.value.pendingInfo, null);
             if (choice === 'auth') {
-              assert.equal(h.context.location.href, `/?tab=user&platform=${platform}`);
+              const authUrl = new URL(h.context.location.href, 'https://shop.test');
+              assert.equal(authUrl.pathname, '/');
+              assert.equal(authUrl.searchParams.get('tab'), 'user');
+              assert.equal(authUrl.searchParams.get('platform'), platform);
+              assert.equal(authUrl.searchParams.get('redirect'), `/detail?goods_id=A&platform=${platform}`);
               assert.deepEqual(h.copied, []);
             } else {
               assert.deepEqual(h.copied, ['station-command-A']);
@@ -2329,7 +2337,11 @@ test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, de
   assert.ok(hDetail.copied.at(-1).includes('goods_id=G100'));
   assert.ok(hDetail.copied.at(-1).includes('（立减¥5.00）'));
   hDetail.page.goToRegister();
-  assert.equal(hDetail.context.location.href, '/?tab=user&invite_code=INV_SHARER');
+  const regUrl = new URL(hDetail.context.location.href, 'https://shop.test');
+  assert.equal(regUrl.pathname, '/');
+  assert.equal(regUrl.searchParams.get('tab'), 'user');
+  assert.equal(regUrl.searchParams.get('invite_code'), 'INV_SHARER');
+  assert.equal(regUrl.searchParams.get('redirect'), '/detail?goods_id=G100&goods_sign=SIGN100&platform=pdd&invite_code=INV_SHARER');
 
   // 4. 主站「我的」页一键分享邀请链接 + 粘贴站内分享文案自动路由直达（不误调电商转链 API）
   const hApp = harness({
@@ -3815,6 +3827,153 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   assert.equal(listCtrl.hasAnchorParams.value, false);
   assert.equal(listCtrl.submissions.value.length, 1);
   listCtrl.dispose();
+});
+
+test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only submit_deal, group_help title parse, desktop jump, clean root reload & nginx contracts', async () => {
+  // 1. format.js: sanitizeReturnPath blocks open redirects / unknown routes and buildUserTabUrl preserves safe return context
+  const hFmt = harness({ url: 'https://shop.test/' });
+  hFmt.load('format');
+  const { sanitizeReturnPath, buildUserTabUrl } = hFmt.context.EasyShop;
+  assert.equal(sanitizeReturnPath('//evil.com/phish'), '');
+  assert.equal(sanitizeReturnPath('/\\evil.com'), '');
+  assert.equal(sanitizeReturnPath('https://evil.com/detail?goods_id=1'), '');
+  assert.equal(sanitizeReturnPath('javascript:alert(1)'), '');
+  assert.equal(sanitizeReturnPath('/admin/secret'), '');
+  assert.equal(sanitizeReturnPath('/detail?platform=pdd&goods_id=1'), '/detail?platform=pdd&goods_id=1');
+  assert.equal(sanitizeReturnPath('/favorites'), '/favorites');
+  assert.equal(sanitizeReturnPath('/submit_deal?platform=jd&product_id=10'), '/submit_deal?platform=jd&product_id=10');
+
+  const userTabUrl = buildUserTabUrl({ redirect: '/detail?platform=jd&goods_id=100', inviteCode: 'INV_1', platform: 'jd' });
+  const parsedUserTab = new URL(userTabUrl, 'https://shop.test');
+  assert.equal(parsedUserTab.searchParams.get('tab'), 'user');
+  assert.equal(parsedUserTab.searchParams.get('invite_code'), 'INV_1');
+  assert.equal(parsedUserTab.searchParams.get('platform'), 'jd');
+  assert.equal(parsedUserTab.searchParams.get('redirect'), '/detail?platform=jd&goods_id=100');
+  assert.equal(buildUserTabUrl({ redirect: '//evil.com' }), '/?tab=user');
+
+  // 2. app.js + account.js: login and target platform authorization return cleanly to safe redirect path; invalid redirect ignored
+  let replacedTarget = '';
+  const hAppLogin = harness({ url: 'https://shop.test/?tab=user&redirect=%2Fdetail%3Fplatform%3Dpdd%26goods_id%3D99' });
+  hAppLogin.context.location.replace = url => { replacedTarget = url; };
+  hAppLogin.load('app');
+  const bootLogin = hAppLogin.mounted[0]();
+  await flush();
+  await hAppLogin.finish(0, { status: 'success', data: platformFixtures });
+  await hAppLogin.finish(1, { status: 'success', data: channelFixtures });
+  await hAppLogin.finish(2, goodsResponse('H1', false));
+  await bootLogin;
+
+  hAppLogin.page.formPhone.value = '13800138000';
+  hAppLogin.page.formPassword.value = 'secret123';
+  const loginReq = hAppLogin.page.handleRegisterOrLogin();
+  await flush();
+  await hAppLogin.finish(3, { status: 'success', user: user('A', 'tok-ret') });
+  await loginReq;
+  const retTimer = [...hAppLogin.timers.values()].find(t => t.delay === 350);
+  assert.ok(retTimer, 'login schedules return redirect timer');
+  retTimer.callback();
+  assert.equal(replacedTarget, '/detail?platform=pdd&goods_id=99');
+
+  // 3. submit_deal.js: PDD sign-only goods match summary cache and never send goods_sign as goods_id
+  const pddSign = 'E9r2SignOnlyTokenForCacheMatchTest1234567890';
+  const hSignSub = harness({
+    url: `https://shop.test/submit_deal?platform=pdd&product_id=${pddSign}&goods_sign=${pddSign}`,
+    saved: { easy_shop_token: 'tok-sign-1', easy_shop_uid: 'u_sign_1' },
+  });
+  hSignSub.context.sessionStorage.setItem(
+    hSignSub.summaryKey({ platform: 'pdd', product_id: pddSign, goods_sign: pddSign }),
+    JSON.stringify({
+      platform: 'pdd', product_id: pddSign, goods_id: '', goods_sign: pddSign, name: '纯Sign测试品', price: 9.9,
+    })
+  );
+  hSignSub.load('submit_deal');
+  const signCtrl = hSignSub.context.EasyShop.createSubmitDealController({
+    ref: hSignSub.context.Vue.ref,
+    computed: hSignSub.context.Vue.computed,
+    api: hSignSub.api,
+    session: hSignSub.session,
+    browser: hSignSub.context.EasyShop.createBrowserTools({ ref: hSignSub.context.Vue.ref }),
+  });
+  const signInit = signCtrl.initialize();
+  await flush();
+  await hSignSub.finish(0, { status: 'success', user: { uid: 'u_sign_1', phone: '13800138000' } });
+  await flush();
+  assert.equal(signCtrl.goods.value.name, '纯Sign测试品', 'PDD sign-only goods hits session summary cache');
+  const detailReqUrl = hSignSub.requests.find(r => r.url.includes('/api/home/detail')).url;
+  const detailParams = new URL(detailReqUrl, 'https://shop.test').searchParams;
+  assert.equal(detailParams.get('goods_sign'), pddSign);
+  assert.equal(detailParams.get('goods_id'), null, 'PDD sign-only request never populates goods_id with goods_sign');
+  await hSignSub.finish(1, { status: 'success', data: { platform: 'pdd', product_id: pddSign, goods_sign: pddSign, name: '纯Sign测试品', price: 9.9 } });
+  await hSignSub.finish(2, { status: 'success', data: { items: [{ tip_id: 't1', platform: 'pdd', product_id: pddSign, goods_sign: pddSign, title: '纯Sign测试品' }] } });
+  await signInit;
+  signCtrl.openSubmittedDetail(signCtrl.submissions.value[0]);
+  const openedParams = new URL(hSignSub.context.location.href, 'https://shop.test').searchParams;
+  assert.equal(openedParams.get('goods_sign'), pddSign);
+  assert.equal(openedParams.get('goods_id'), null);
+  signCtrl.dispose();
+
+  // 4. group_help.js: smartParsePddShareText stops title before ",¥price" suffix while keeping product numbers like 500ml
+  const hGh = harness({ url: 'https://shop.test/group_help' });
+  hGh.load('group_help');
+  hGh.page.openTextSubmitModal();
+  hGh.page.textSubmitModal.value.share_text = '拼团购买测试蓝牙耳机，¥19.9，仅剩1个名额，2人团，⇥AbCd1234⇤';
+  hGh.page.onTextShareInput();
+  assert.equal(hGh.page.textSubmitModal.value.goods_name, '测试蓝牙耳机');
+  assert.equal(hGh.page.textSubmitModal.value.group_price, '19.9');
+  assert.equal(hGh.page.textSubmitModal.value.remain_people, 1);
+  assert.equal(hGh.page.textSubmitModal.value.total_people, 2);
+
+  hGh.page.openTextSubmitModal();
+  hGh.page.textSubmitModal.value.share_text = '拼团购买可口可乐500ml*5瓶，¥6.99，还差2人';
+  hGh.page.onTextShareInput();
+  assert.equal(hGh.page.textSubmitModal.value.goods_name, '可口可乐500ml*5瓶');
+
+  // 5. browser.js: desktop opens external purchase URL in new tab without overwriting current page
+  const hDesk = harness({ url: 'https://shop.test/detail?platform=jd&goods_id=100' });
+  hDesk.context.navigator.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36';
+  const deskOpened = [];
+  hDesk.context.open = (...args) => { deskOpened.push(args); return { closed: false }; };
+  const deskBrowser = hDesk.context.EasyShop.createBrowserTools({ ref: hDesk.context.Vue.ref });
+  deskBrowser.jumpToLink({ final_link: 'https://u.jd.com/desk123' });
+  const deskTimer = [...hDesk.timers.values()].find(t => t.delay === 400);
+  assert.ok(deskTimer);
+  deskTimer.callback();
+  assert.deepEqual(deskOpened, [['https://u.jd.com/desk123', '_blank', 'noopener']]);
+  assert.equal(hDesk.context.location.href, 'https://shop.test/detail?platform=jd&goods_id=100');
+
+  // 6. feeds.js: non-back-forward visit to clean "/" drops stale home_search_keyword and loads hot list
+  const hCleanHome = harness({
+    url: 'https://shop.test/',
+    sessionSaved: { 'easy_shop_home_search_keyword:guest:pdd': JSON.stringify('耳机') },
+  });
+  hCleanHome.load('app');
+  const bootClean = hCleanHome.mounted[0]();
+  await flush();
+  await hCleanHome.finish(0, { status: 'success', data: platformFixtures });
+  await hCleanHome.finish(1, { status: 'success', data: channelFixtures });
+  await hCleanHome.finish(2, goodsResponse('HOT-1', false));
+  await bootClean;
+  assert.equal(hCleanHome.page.homeSearchKeyword.value, '');
+  assert.ok(hCleanHome.requests[2].url.startsWith('/api/home/recommend?'));
+
+  // 7. HTML / CSS / Nginx contracts
+  const detailHtml = fs.readFileSync(path.join(root, 'static', 'detail.html'), 'utf8');
+  assert.ok(detailHtml.includes('v-if="goods || (!detailError && isDeepLoading)"'));
+  assert.ok(detailHtml.includes('v-if="canOperateDetail"'));
+  assert.ok(detailHtml.includes('is-standalone-error'));
+
+  const styleCss = fs.readFileSync(path.join(root, 'static', 'css', 'style.css'), 'utf8');
+  assert.ok(styleCss.includes('var(--safe-bottom) + 84px'));
+
+  const nginxConf = fs.readFileSync(path.join(root, 'deploy', 'mobile_web.nginx.conf'), 'utf8');
+  assert.ok(nginxConf.includes('deals/submit'));
+  assert.ok(nginxConf.includes('location ~ ^/api/(deals/image/dsi_[0-9a-f]+|group_help/poster/[A-Za-z0-9_-]+)$'));
+
+  for (const htmlName of ['index.html', 'detail.html', 'favorites.html', 'submit_deal.html', 'group_help.html']) {
+    const content = fs.readFileSync(path.join(root, 'static', htmlName), 'utf8');
+    assert.ok(content.includes('?v=ux-20261126-2'), `${htmlName} bumped asset version`);
+    assert.ok(!content.includes('?v=ux-20261126-1'), `${htmlName} has no stale asset version`);
+  }
 });
 
 

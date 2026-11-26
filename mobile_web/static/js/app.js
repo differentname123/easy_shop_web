@@ -31,11 +31,41 @@
         }
         return feeds.onSearchHome();
       };
+      let pendingReturnPath = '';
+      let pendingAuthPlatform = '';
+      const consumeReturnPath = (tip = '正在返回原页面...') => {
+        const target = typeof shop.sanitizeReturnPath === 'function' ? shop.sanitizeReturnPath(pendingReturnPath) : '';
+        if (!target) return false;
+        pendingReturnPath = '';
+        pendingAuthPlatform = '';
+        try {
+          const url = new URL(global.location.href);
+          url.searchParams.delete('redirect');
+          global.history.replaceState(global.history.state, '', url.toString());
+        } catch (_) {}
+        if (tip) browser.showToast(tip);
+        global.setTimeout(() => {
+          if (typeof global.location?.replace === 'function') global.location.replace(target);
+          else if (global.location) global.location.href = target;
+        }, 350);
+        return true;
+      };
       const account = shop.createAccount({
         ref, api, session, getPlatforms: () => feeds ? feeds.platforms.value : [],
         copyText: browser.copyText, showToast: browser.showToast,
         onSearchKeyword: jumpToHomeKeywordSearch,
         shouldBlockDirectJump: browser.shouldBlockDirectJump,
+        onLoginSuccess: () => {
+          if (pendingAuthPlatform && pendingReturnPath) return false;
+          return consumeReturnPath('登录成功，正在返回原页面...');
+        },
+        onAuthorizedSuccess: platform => {
+          if (!pendingReturnPath) return false;
+          if (!pendingAuthPlatform || pendingAuthPlatform === platform) {
+            return consumeReturnPath('授权已确认，正在返回原页面...');
+          }
+          return false;
+        },
       });
       let initialized = false;
       let touchStartX = 0;
@@ -278,6 +308,8 @@
       };
       onMounted(async () => {
         const params = new URLSearchParams(global.location.search);
+        pendingReturnPath = typeof shop.sanitizeReturnPath === 'function' ? shop.sanitizeReturnPath(params.get('redirect')) : '';
+        pendingAuthPlatform = (params.get('platform') || '').trim().toLowerCase();
         const urlInvite = params.get('invite_code') || '';
         if (urlInvite && session.savePendingInvite) session.savePendingInvite(urlInvite);
         account.formInviteCode.value = urlInvite || (session.pendingInvite ? session.pendingInvite() : '') || '';
@@ -358,13 +390,22 @@
           global.sessionStorage.removeItem(`easy_shop_last_active_tab:${session.scope()}`);
           const url = new URL(global.location.href);
           if (newTab === 'home') {
+            pendingReturnPath = '';
+            pendingAuthPlatform = '';
             url.searchParams.delete('tab');
+            url.searchParams.delete('redirect');
             if (feeds.activeHomeKeyword.value) url.searchParams.set('keyword', feeds.activeHomeKeyword.value);
             else { url.searchParams.delete('keyword'); url.searchParams.delete('q'); }
           } else {
             url.searchParams.set('tab', newTab);
             url.searchParams.delete('keyword');
             url.searchParams.delete('q');
+            if (newTab !== 'user') {
+              pendingReturnPath = '';
+              pendingAuthPlatform = '';
+              url.searchParams.delete('platform');
+              url.searchParams.delete('redirect');
+            }
           }
           global.history.replaceState({ tab: newTab, scope: session.scope() }, '', url.toString());
         } catch (_) {}
