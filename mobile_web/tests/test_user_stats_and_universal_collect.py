@@ -450,6 +450,45 @@ def test_order_count_supports_int64_and_user_stats_score_saturation():
     # 云同步同样严格保护 user_stats_score 不被覆盖
     assert "user_stats_score" in sync_mod.NEVER_OVERWRITE_FIELDS
 
+    # 4. unbuyable 权重 = -10 真实扣分，最低截断为 0.0 并从库内清理 user_stats_score
+    penalized = compute_user_stats_score({"valid_orders": 1, "unbuyable": 1})
+    assert penalized == 0.0
+    pos_minus_unbuyable = compute_user_stats_score({"valid_orders": 5, "unbuyable": 1})
+    assert abs(pos_minus_unbuyable - (50.0 - 100.0 * (1 / 6))) < 1e-4
+
+    prod_col2 = _FullMemoryProductCollection()
+    prod_col2.docs.append({
+        "platform": "jd",
+        "product_id": "NEG_TEST_1",
+        "name": "扣分测试商品",
+        "activity_price": 19.9,
+        "user_stats": {"valid_orders": 1, "unbuyable": 0},
+        "user_stats_score": 16.6667,
+    })
+    prod_repo2 = ProductRepository(db_instance=SimpleNamespace(get_collection=lambda _: prod_col2))
+    prod_repo2.bulk_inc_user_stats({("jd", "NEG_TEST_1"): {"unbuyable": 1}})
+    assert prod_col2.docs[0]["user_stats"]["unbuyable"] == 1
+    assert "user_stats_score" not in prod_col2.docs[0]
+
+    # 5. extract_actor_key 防伪造 X-Forwarded-For，及 price_feedback 6 小时去重窗口
+    from services.product_stats_service import PRICE_FEEDBACK_DEDUP_TTL_SECONDS, extract_actor_key
+
+    assert PRICE_FEEDBACK_DEDUP_TTL_SECONDS == 21600
+    spoof_req = SimpleNamespace(
+        client=SimpleNamespace(host="203.0.113.99"),
+        headers={"x-forwarded-for": "1.2.3.4", "x-real-ip": "5.6.7.8"},
+    )
+    assert extract_actor_key(spoof_req, uid=None) == "ip:203.0.113.99"
+    proxy_req = SimpleNamespace(
+        client=SimpleNamespace(host="127.0.0.1"),
+        headers={"x-forwarded-for": "1.2.3.4, 9.9.9.9"},
+    )
+    assert extract_actor_key(proxy_req, uid=None) == "ip:9.9.9.9"
+
+    buf = ProductStatsBuffer(repo_provider=lambda: prod_repo2)
+    assert buf.record("jd", "NEG_TEST_1", "buyable", "u:test_u1") is True
+    assert buf.record("jd", "NEG_TEST_1", "unbuyable", "u:test_u1") is False
+
 
 def test_universal_collect_preserves_existing_search_caches_and_stays_searchable():
     from cache import BOOM_SORT_CACHE

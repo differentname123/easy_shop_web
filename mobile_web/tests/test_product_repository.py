@@ -711,7 +711,7 @@ class TestProductRepository(unittest.TestCase):
                 "deal_info.format_status", "deal_info.need_reformat", "deal_info.format_info",
                 "deal_info.publish_ts", "deal_info.publish_time",
                 "deal_info.source_site", "deal_info.source_site_name",
-                "deal_info.source_is_reliable", "deal_info.price_is_reliable",
+                "deal_info.reliability_score", "deal_info.price_is_reliable",
             ), 1),
         })
         for heavy_field in ("deal_info.original_copywriting", "deal_info.tutorial_steps", "deal_info.coupon_links"):
@@ -1290,7 +1290,7 @@ class TestProductRepository(unittest.TestCase):
                     "is_deal_tip": True,
                     "deal_price": 19.9,
                     "tutorial_steps": ["1. 下单立减"],
-                    "source_is_reliable": True,
+                    "reliability_score": 20,
                     "price_is_reliable": False,
                     "price_reliability_reason": "依赖88VIP专享折扣",
                 },
@@ -1308,7 +1308,7 @@ class TestProductRepository(unittest.TestCase):
         deal_detail = self.repo.get_product_detail("JD-REL-1", platform="jd")
         tip = deal_detail["deal_tip"]
         self.assertIsNotNone(tip)
-        self.assertIs(tip["source_is_reliable"], True)
+        self.assertEqual(tip["reliability_score"], 20)
         self.assertIs(tip["price_is_reliable"], False)
         self.assertEqual(tip["price_reliability_reason"], "依赖88VIP专享折扣")
 

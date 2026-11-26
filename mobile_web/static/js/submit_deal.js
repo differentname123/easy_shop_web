@@ -87,6 +87,7 @@
     const dealSummary = ref(emptyDealSummary());
     const expandedOrdersMap = ref({});
     const loadingSubmissions = ref(false);
+    const quotaNotice = ref(null);
     let imgSeq = 0;
     let disposed = false;
 
@@ -124,6 +125,7 @@
         ? shop.buildUserTabUrl({ redirect: currentReturnPath() })
         : '/?tab=user';
     };
+    const goToAuth = () => { goToLogin(); };
     const buildDetailUrlFromIdentity = rawObj => {
       const id = shop.goodsIdentity(rawObj || {});
       const p = new URLSearchParams();
@@ -253,6 +255,7 @@
       }
 
       submitting.value = true;
+      quotaNotice.value = null;
       try {
         const payload = {
           platform: goods.value.platform || rawAnchor.platform,
@@ -273,6 +276,7 @@
           return;
         }
         if (res.ok && res.data?.status === 'success') {
+          quotaNotice.value = null;
           browser.showToast(res.data.data?.message || '提交成功，已进入人工审查');
           dealPrice.value = '';
           tutorialText.value = '';
@@ -280,7 +284,14 @@
           selectedImages.value = [];
           await loadSubmissions();
         } else {
-          browser.showToast(res.data?.error_msg || res.data?.detail || '提交失败，请检查填写内容');
+          const errCode = String(res.data?.error_code || '');
+          const errMsg = res.data?.error_msg || res.data?.detail || '提交失败，请检查填写内容';
+          if (errCode === 'submit_daily_limit_unauth') {
+            quotaNotice.value = { message: errMsg, needAuth: true };
+          } else if (errCode === 'submit_daily_limit_reached') {
+            quotaNotice.value = { message: errMsg, needAuth: false };
+          }
+          browser.showToast(errMsg);
         }
       } catch (_) {
         if (!disposed) browser.showToast('网络繁忙，请稍后再试');
@@ -347,6 +358,7 @@
       dealSummary,
       expandedOrdersMap,
       loadingSubmissions,
+      quotaNotice,
       triggerImagePicker,
       removeImage,
       onSelectImages,
@@ -354,6 +366,7 @@
       goHome,
       goBack,
       goToLogin,
+      goToAuth,
       handleSubmit,
       loadSubmissions,
       openSubmittedDetail,

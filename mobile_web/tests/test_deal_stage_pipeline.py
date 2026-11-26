@@ -396,7 +396,6 @@ def test_cleaner_modular_units_and_clean_batch_records():
         assert len(ai2_out) == 1
         assert ai2_out[0]["stage_outcome"] == "success"
         assert ai2_out[0]["deal_price"] == 19.9
-        assert ai2_out[0]["quality_score"] == 85
 
         # 4. 综合测试 clean_batch_records 驱动
         final_results = cleaner.clean_batch_records(raw_docs, raw_col=None)

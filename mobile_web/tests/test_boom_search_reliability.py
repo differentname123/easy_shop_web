@@ -38,12 +38,14 @@ def test_is_product_reliable_truth_table_and_mongo_filter_equivalence():
     cases = [
         # (doc, expected_reliable)
         ({"platform": "jd", "product_id": "PLAIN", "channel_type": 5}, True),
-        ({"platform": "jd", "product_id": "EXPIRED_TIP", "deal_info": {"is_deal_tip": False, "source_is_reliable": False, "price_is_reliable": False}}, True),
-        ({"platform": "jd", "product_id": "TIP_SRC_T", "deal_info": {"is_deal_tip": True, "source_is_reliable": True, "price_is_reliable": False}}, True),
-        ({"platform": "jd", "product_id": "TIP_PRC_T", "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": True}}, True),
-        ({"platform": "jd", "product_id": "TIP_BOTH_T", "deal_info": {"is_deal_tip": True, "source_is_reliable": True, "price_is_reliable": True}}, True),
-        ({"platform": "jd", "product_id": "TIP_BOTH_F", "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": False}}, False),
-        ({"platform": "jd", "product_id": "TIP_NONE", "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": None}}, False),
+        ({"platform": "jd", "product_id": "EXPIRED_TIP", "deal_info": {"is_deal_tip": False, "reliability_score": 10, "price_is_reliable": False}}, True),
+        ({"platform": "jd", "product_id": "TIP_SRC_T", "deal_info": {"is_deal_tip": True, "reliability_score": 20, "price_is_reliable": False}}, True),
+        ({"platform": "jd", "product_id": "TIP_SRC_30", "deal_info": {"is_deal_tip": True, "reliability_score": 30, "price_is_reliable": False}}, True),
+        ({"platform": "jd", "product_id": "TIP_PRC_T", "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": True}}, True),
+        ({"platform": "jd", "product_id": "TIP_BOTH_T", "deal_info": {"is_deal_tip": True, "reliability_score": 20, "price_is_reliable": True}}, True),
+        ({"platform": "jd", "product_id": "TIP_MID_F", "deal_info": {"is_deal_tip": True, "reliability_score": 15, "price_is_reliable": False}}, False),
+        ({"platform": "jd", "product_id": "TIP_BOTH_F", "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": False}}, False),
+        ({"platform": "jd", "product_id": "TIP_NONE", "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": None}}, False),
         ({"platform": "jd", "product_id": "TIP_MISSING", "deal_info": {"is_deal_tip": True}}, False),
     ]
     rel_flt = reliable_product_mongo_filter()
@@ -65,13 +67,13 @@ def test_browse_default_list_two_stage_pagination_reliable_first():
         {
             "platform": "jd", "product_id": "U1", "name": "不可靠线报最新", "activity_price": 5.0,
             "updated_at": t0 - datetime.timedelta(minutes=1),
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": False},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": False},
         },
         # U2: 不可靠线报（未判定 None，t0-2m，价格 6.0）
         {
             "platform": "jd", "product_id": "U2", "name": "不可靠线报未判定", "activity_price": 6.0,
             "updated_at": t0 - datetime.timedelta(minutes=2),
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": None},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": None},
         },
         # R1: 官方无线报商品（t0-10m，价格 19.9）
         {
@@ -82,13 +84,13 @@ def test_browse_default_list_two_stage_pagination_reliable_first():
         {
             "platform": "jd", "product_id": "R2", "name": "特惠采采严选商品", "activity_price": 29.9,
             "updated_at": t0 - datetime.timedelta(minutes=20),
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": True, "price_is_reliable": False},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 20, "price_is_reliable": False},
         },
         # R3: 价格判定可靠线报（t0-30m，价格 12.0）
         {
             "platform": "taobao", "product_id": "R3", "name": "价格判定可靠线报", "activity_price": 12.0,
             "updated_at": t0 - datetime.timedelta(minutes=30),
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": True},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": True},
         },
     ]
     repo, _col = _mk_repo(docs)
@@ -133,7 +135,7 @@ def test_search_reliable_first_without_l3_noise_promotion():
             "format_status": "success", "format_activity_price": 4999.0,
             "format_info": {"price": 4999.0, "core_entities": [{"name": "手机", "score": 10}], "pricing_basis": {"base_unit": "GB", "total_value": 256}},
             "deal_info": {
-                "is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": False,
+                "is_deal_tip": True, "reliability_score": 10, "price_is_reliable": False,
                 "publish_time": "2026-11-24 19:00:00", "deal_price": 1999.0, "format_deal_price": 1999.0,
                 "format_status": "success", "need_reformat": False,
                 "format_info": {"price": 1999.0, "core_entities": [{"name": "手机", "score": 10}], "pricing_basis": {"base_unit": "GB", "total_value": 256}},
@@ -190,7 +192,7 @@ def test_product_service_resolve_boom_sort_consistency():
             "format_status": "success", "format_activity_price": 9.9,
             "format_info": {"price": 9.9, "pricing_basis": {"base_unit": "包", "total_value": 24}},
             "deal_info": {
-                "is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": False,
+                "is_deal_tip": True, "reliability_score": 10, "price_is_reliable": False,
                 "publish_time": "2026-11-24 17:00:00", "deal_price": 5.0, "format_deal_price": 5.0,
                 "format_status": "success", "need_reformat": False,
                 "format_info": {"price": 5.0, "pricing_basis": {"base_unit": "包", "total_value": 24}},
@@ -218,7 +220,7 @@ def test_product_service_resolve_boom_sort_consistency():
         {
             "platform": "jd", "product_id": "UNREL_HOT", "name": "不可靠高分品", "activity_price": 10.0,
             "updated_at": t0, "user_stats_score": 30.0,
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": False},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": False},
         },
     ])
     svc2 = ProductService(product_repo=repo2)
@@ -237,7 +239,7 @@ def test_home_overlay_exposes_is_reliable_consistently():
             "platform": "jd", "product_id": "JD-REL-TIP", "goods_id": "JD-REL-TIP",
             "name": "可靠线报", "activity_price": 19.9,
             "deal_info": {
-                "is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": True,
+                "is_deal_tip": True, "reliability_score": 10, "price_is_reliable": True,
                 "card_highlight": "到手19.9元", "publish_time": "2026-11-24T10:00:00Z",
             },
         },
@@ -246,7 +248,7 @@ def test_home_overlay_exposes_is_reliable_consistently():
             "platform": "jd", "product_id": "JD-UNREL-BARE", "goods_id": "JD-UNREL-BARE",
             "name": "不可靠无高光线报", "activity_price": 9.9,
             "deal_info": {
-                "is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": False,
+                "is_deal_tip": True, "reliability_score": 10, "price_is_reliable": False,
             },
         },
     ])

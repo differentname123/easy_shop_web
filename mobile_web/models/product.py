@@ -9,12 +9,19 @@ from typing import List, Dict, Any, Optional, Sequence
 from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
+from models.deal_constants import (
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
+    RELIABLE_SCORE_THRESHOLD,
+    resolve_reliability_score,
+)
+
 _BARE_YUAN_TAG_RE = re.compile(r"^\d+(?:\.\d+)?元$")
 USER_STATS_DIM_MAX_SCORE = 10.0
 USER_STATS_DIM_HALF_SATURATION = 5.0
 USER_STATS_DIM_DEFAULT_WEIGHT = 1.0
 USER_STATS_DIM_WEIGHTS: Dict[str, float] = {
     "valid_orders": 10.0,
+    "unbuyable": -10.0,
 }
 _STATS_INT_STR_RE = re.compile(r"^[+-]?\d+$")
 
@@ -53,8 +60,8 @@ def compute_user_stats_score(
 ) -> float:
     """
     汇总 user_stats 内全部可转整数的维度评分：
-    默认各维度权重 1（单维上限 10 分），`valid_orders` 权重 10（上限 100 分）；
-    每一正整数维度按 `weight * 10 * n / (n + 5)` 单调递减增益趋近上限，防单维刷量且兼容新增整数字段。
+    默认各维度权重 1（单维上限 10 分），`valid_orders` 权重 10（上限 100 分），`unbuyable` 权重 -10（负向扣分）；
+    每一正整数维度按 `weight * 10 * n / (n + 5)` 汇总并截断至 `>= 0.0`。
     """
     if not isinstance(user_stats, dict) or not user_stats:
         return 0.0
@@ -66,9 +73,9 @@ def compute_user_stats_score(
         n = _coerce_stats_int(raw_val)
         if n is not None and n > 0:
             w = float(weights.get(str(key), USER_STATS_DIM_DEFAULT_WEIGHT))
-            if w > 0:
+            if w != 0:
                 total += w * cap * (n / (n + k))
-    return round(total, 4)
+    return round(max(0.0, total), 4)
 
 
 def normalize_platform(platform: Optional[str], default: str = "pdd") -> str:
@@ -100,16 +107,17 @@ def get_source_site_name(source_site: Optional[str]) -> str:
 
 
 def is_product_reliable(doc: Optional[Dict[str, Any]]) -> bool:
-    """商品可靠性唯一真源：无活跃线报必可靠；有活跃线报则来源可靠或价格判定可靠任一满足即可靠。"""
+    """商品可靠性唯一真源：无活跃线报必可靠；有活跃线报则可靠分 >= 20 或价格判定可靠任一满足即可靠。"""
     if not isinstance(doc, dict):
         return False
     deal_info = doc.get("deal_info")
     if not isinstance(deal_info, dict) or deal_info.get("is_deal_tip") is not True:
         return True
-    return bool(
-        deal_info.get("source_is_reliable") is True
-        or deal_info.get("price_is_reliable") is True
+    score = resolve_reliability_score(
+        deal_info.get("reliability_score"),
+        default=DEFAULT_NORMAL_RELIABILITY_SCORE,
     )
+    return bool(score >= RELIABLE_SCORE_THRESHOLD or deal_info.get("price_is_reliable") is True)
 
 
 def reliable_product_mongo_filter() -> Dict[str, Any]:
@@ -117,7 +125,7 @@ def reliable_product_mongo_filter() -> Dict[str, Any]:
     return {
         "$or": [
             {"deal_info.is_deal_tip": {"$ne": True}},
-            {"deal_info.source_is_reliable": True},
+            {"deal_info.reliability_score": {"$gte": RELIABLE_SCORE_THRESHOLD}},
             {"deal_info.price_is_reliable": True},
         ]
     }
@@ -127,8 +135,12 @@ def unreliable_product_mongo_filter() -> Dict[str, Any]:
     """与 `is_product_reliable(doc) is False` 严格等价的 MongoDB 查询过滤条件。"""
     return {
         "deal_info.is_deal_tip": True,
-        "deal_info.source_is_reliable": {"$ne": True},
         "deal_info.price_is_reliable": {"$ne": True},
+        "$or": [
+            {"deal_info.reliability_score": {"$lt": RELIABLE_SCORE_THRESHOLD}},
+            {"deal_info.reliability_score": {"$exists": False}},
+            {"deal_info.reliability_score": None},
+        ],
     }
 
 

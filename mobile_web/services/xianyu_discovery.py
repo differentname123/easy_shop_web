@@ -469,7 +469,6 @@ def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.dateti
         "format_status": "success",
         "deal_price_logic": str(di.get("price_logic") or "").strip(),
         "deal_highlight_text": deal_highlight,
-        "deal_quality_score": di.get("quality_score"),
         "deal_publish_time": format_timestamp_cn(pub_utc),
     }
 
@@ -716,7 +715,6 @@ def _pick_verified_candidate_from_category(
         "updated_at": str(w_doc.get("updated_at") or ""),
         "deal_price_logic": str(w_doc.get("deal_price_logic") or ""),
         "deal_highlight_text": str(w_doc.get("deal_highlight_text") or ""),
-        "deal_quality_score": w_doc.get("deal_quality_score"),
         "deal_publish_time": str(w_doc.get("deal_publish_time") or ""),
     }
 
@@ -753,7 +751,7 @@ def select_round_candidates_for_source(
             **repo._SUMMARY_PROJECTION,
             "channel_type": 1,
             "deal_info.is_deal_tip": 1,
-            "deal_info.source_is_reliable": 1,
+            "deal_info.reliability_score": 1,
             "deal_info.price_is_reliable": 1,
             "deal_info.clean_title": 1,
             "deal_info.deal_price": 1,
@@ -763,7 +761,6 @@ def select_round_candidates_for_source(
             "deal_info.need_reformat": 1,
             "deal_info.format_info": 1,
             "deal_info.price_logic": 1,
-            "deal_info.quality_score": 1,
             "deal_info.publish_ts": 1,
             "deal_info.publish_time": 1,
         }
@@ -787,7 +784,7 @@ def select_round_candidates_for_source(
             **repo._COST_PERFORMANCE_PROJECTION,
             "channel_type": 1,
             "deal_info.is_deal_tip": 1,
-            "deal_info.source_is_reliable": 1,
+            "deal_info.reliability_score": 1,
             "deal_info.price_is_reliable": 1,
         }
         raw_docs = [

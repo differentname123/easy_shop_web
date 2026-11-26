@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from models.deal_constants import DEFAULT_RELIABLE_SCORE
+
 from .base import ChannelConfig
 
 DEFAULT_CHANNEL_CONFIGS: List[ChannelConfig] = [
@@ -34,7 +36,7 @@ DEFAULT_CHANNEL_CONFIGS: List[ChannelConfig] = [
         sleep_after=0.3,
         rate_limit_cooldown_seconds=180,
         max_age_days=7.0,
-        source_is_reliable=True,
+        reliability_score=DEFAULT_RELIABLE_SCORE,
         description="特惠采采人工严选 JSON 流，20分钟全量巡视，以拉取时间作为发布时间并自动下架缺失商品",
     ),
 

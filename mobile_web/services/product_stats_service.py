@@ -20,22 +20,30 @@ FLUSH_INTERVAL_SECONDS = 15.0
 FLUSH_BATCH_TRIGGER = 200
 DEDUP_MAX_SIZE = 20000
 DEDUP_TTL_SECONDS = 300
+PRICE_FEEDBACK_DEDUP_TTL_SECONDS = 21600
+_TRUSTED_PROXY_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 def extract_actor_key(request: Any = None, uid: Optional[str] = None) -> str:
-    """提取轻量去重主体标识（已登录用 uid，游客用真实客户端 IP）。"""
+    """提取去重主体标识（已登录用 uid；游客默认取真实连接对端 IP，仅本地可信反向代理才解析转发头）。"""
     clean_uid = str(uid or "").strip()
     if clean_uid:
         return f"u:{clean_uid}"
     if request is None:
         return ""
-    headers = getattr(request, "headers", None)
-    forwarded = headers.get("x-forwarded-for") if headers is not None else None
-    if isinstance(forwarded, str) and forwarded.strip():
-        ip = forwarded.split(",")[0].strip()
-    else:
-        client = getattr(request, "client", None)
-        ip = str(getattr(client, "host", "") or "").strip() or "127.0.0.1"
+    client = getattr(request, "client", None)
+    peer_host = str(getattr(client, "host", "") or "").strip()
+    if peer_host in _TRUSTED_PROXY_HOSTS:
+        headers = getattr(request, "headers", None)
+        real_ip = headers.get("x-real-ip") if headers is not None else None
+        if isinstance(real_ip, str) and real_ip.strip():
+            return f"ip:{real_ip.strip()}"
+        forwarded = headers.get("x-forwarded-for") if headers is not None else None
+        if isinstance(forwarded, str) and forwarded.strip():
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            if parts:
+                return f"ip:{parts[-1]}"
+    ip = peer_host or "127.0.0.1"
     return f"ip:{ip}" if ip else ""
 
 
@@ -53,6 +61,10 @@ class ProductStatsBuffer:
         self._lock = threading.Lock()
         self._pending: Dict[Tuple[str, str], Dict[str, int]] = {}
         self._dedup = ThreadSafeTTLCache(maxsize=DEDUP_MAX_SIZE, ttl=DEDUP_TTL_SECONDS)
+        self._price_feedback_dedup = ThreadSafeTTLCache(
+            maxsize=DEDUP_MAX_SIZE,
+            ttl=PRICE_FEEDBACK_DEDUP_TTL_SECONDS,
+        )
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -69,11 +81,13 @@ class ProductStatsBuffer:
 
         clean_actor = str(actor_key or "").strip()
         if clean_actor:
-            dedup_act = "price_feedback" if act in _PRICE_FEEDBACK_ACTIONS else act
+            is_price_fb = act in _PRICE_FEEDBACK_ACTIONS
+            dedup_act = "price_feedback" if is_price_fb else act
+            dedup_cache = self._price_feedback_dedup if is_price_fb else self._dedup
             dedup_key = (clean_actor, plat, pid, dedup_act)
-            if self._dedup.get(dedup_key) is not None:
+            if dedup_cache.get(dedup_key) is not None:
                 return False
-            self._dedup.set(dedup_key, 1)
+            dedup_cache.set(dedup_key, 1)
 
         should_wake = False
         with self._lock:
@@ -137,6 +151,7 @@ class ProductStatsBuffer:
         with self._lock:
             self._pending.clear()
         self._dedup.clear()
+        self._price_feedback_dedup.clear()
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():

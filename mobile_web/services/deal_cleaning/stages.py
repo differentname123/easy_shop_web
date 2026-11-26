@@ -22,6 +22,7 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI1,
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
     ERR_ADAPTER_CONFIG_ERROR,
     ERR_ADAPTER_CONVERT_FAILED,
     ERR_ADAPTER_OFF_PROMOTION,
@@ -34,7 +35,6 @@ from models.deal_constants import (
     ERR_AI_TIMEOUT_RETRY,
     ERR_EMPTY_PRODUCT_IDENTITY,
     ERR_JD_NUMERIC_SKU,
-    ERR_LOW_QUALITY_SCORE,
     ERR_MULTI_PRODUCT_COLLECTION,
     ERR_NO_ANCHOR,
     ERR_PDD_NUMERIC_ID,
@@ -43,10 +43,9 @@ from models.deal_constants import (
     MAX_AI1_MAIN_CANDIDATES,
     MAX_CLEAN_RETRIES,
     OK_SKIPPED_ALREADY_CLEANED,
-    QUALIFIED_DEAL_MIN_SCORE,
-    SOURCE_REPUTATION_BONUS,
     coerce_unix_timestamp,
     parse_publish_time_epoch,
+    resolve_reliability_score,
 )
 from models.product import _TB_WRAP_CHARS, get_source_site_name
 from services.deal_cleaning.cache_state import (
@@ -191,7 +190,6 @@ def _build_multi_product_failed_outcome(
         "ai_stage1_result": ai1_res,
         "converted_links": conv_summary,
         "ai_stage2_result": None,
-        "quality_score": 0,
         "candidate_count": candidate_count,
         "attempt_errors": attempt_errors,
     }
@@ -255,7 +253,6 @@ def fallback_stage1_extract(doc: Dict[str, Any], fail_reason: str = "AI1_TIMEOUT
         "extracted_images": extract_doc_images(doc),
         "extracted_targets": [],
         "deal_price": None,
-        "tutorial_score": 50,
         "_from_fallback": True,
         "_fallback_reason": fail_reason,
     }
@@ -269,7 +266,6 @@ def fallback_stage2_evaluate(s2_input: Dict[str, Any]) -> Dict[str, Any]:
         "is_valid_deal": False,
         "reject_reason": "AI2_AUDIT_UNAVAILABLE",
         "main_link_id": None,
-        "quality_score": 0,
         "_from_fallback": True,
     }
 
@@ -433,13 +429,6 @@ def _normalize_ai1_item(
 ) -> List[Dict[str, Any]]:
     """规范化单条 Stage 1 模型输出，返回规范后的 `norm_targets` 并就地更新结构化字段。"""
     ai1_res["_from_fallback"] = False
-
-    raw_ts = ai1_res.get("tutorial_score")
-    ai1_res["tutorial_score"] = (
-        int(raw_ts)
-        if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool) and 0 <= raw_ts <= 100
-        else 50
-    )
 
     raw_dp = ai1_res.get("deal_price")
     if isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and 0.1 <= raw_dp <= 1000000:
@@ -1606,7 +1595,6 @@ def _build_retry_or_max_outcome(
         "ai_stage1_result": ai1_res,
         "converted_links": conv_summary,
         "ai_stage2_result": ai2_res,
-        "quality_score": 0,
         "candidate_count": candidate_count,
         "attempt_errors": attempt_errors or [],
     }
@@ -1627,7 +1615,6 @@ def _build_early_terminated_outcome(
     official_title: str,
     official_price: Any,
     deal_price: Any,
-    quality_score: int,
     merged_tids: List[str],
     ai1_res: Dict[str, Any],
     converted_links: List[Dict[str, Any]],
@@ -1657,7 +1644,6 @@ def _build_early_terminated_outcome(
         "official_price": official_price,
         "deal_price": deal_price,
         "title": raw_title,
-        "quality_score": quality_score,
         "merged_tip_ids": merged_tids,
         "ai_stage1_result": ai1_res,
         "converted_links": converted_links,
@@ -1789,7 +1775,6 @@ def process_ai1_unit(
                 "ai_stage1_result": ai1_res,
                 "converted_links": [],
                 "ai_stage2_result": None,
-                "quality_score": 0,
                 "candidate_count": 0,
                 "attempt_errors": [],
             }
@@ -2004,7 +1989,6 @@ def process_convert_unit(
                 "ai_stage1_result": ai1_res,
                 "converted_links": conv_summary_s3,
                 "ai_stage2_result": None,
-                "quality_score": 0,
                 "candidate_count": len(targets),
                 "attempt_errors": attempt_errors,
             }
@@ -2065,7 +2049,6 @@ def process_convert_unit(
                 "ai_stage1_result": ai1_res,
                 "converted_links": conv_summary_s3,
                 "ai_stage2_result": None,
-                "quality_score": 0,
                 "candidate_count": len(targets),
                 "attempt_errors": attempt_errors,
             }
@@ -2186,7 +2169,7 @@ def process_convert_unit(
             clean_copy = sanitize_polished_copywriting(str(ai1_res.get("combined_raw_text") or raw_title))
             outcomes_by_id[mid] = _build_early_terminated_outcome(
                 early_stage="post_stage3_db",
-                error_msg=f"转链唯一商品({c_plat}:{c_gid})已在正式库清洗完毕(12h内)，提前终止跳过AI-2并累加共振",
+                error_msg=f"转链唯一商品({c_plat}:{c_gid})已在正式库有效期内收录，提前终止跳过AI-2并累加共振",
                 site=site,
                 site_name=site_name,
                 channel=channel,
@@ -2198,7 +2181,6 @@ def process_convert_unit(
                 official_title=off_p.get("title") or ex_info_s3.get("official_title") or raw_title,
                 official_price=off_p.get("price") or ex_info_s3.get("official_price"),
                 deal_price=ex_info_s3.get("deal_price"),
-                quality_score=ex_info_s3.get("quality_score", 75),
                 merged_tids=merged_tids,
                 ai1_res=ai1_res,
                 converted_links=conv_summary_s3,
@@ -2445,44 +2427,10 @@ def process_ai2_unit(
                 "ai_stage1_result": ai1_res,
                 "converted_links": conv_summary_for_db,
                 "ai_stage2_result": ai2_res,
-                "quality_score": 0,
                 "candidate_count": len(conv_list),
                 "attempt_errors": [],
             }
             continue
-
-        raw_breakdown = ai2_res.get("score_breakdown") if isinstance(ai2_res.get("score_breakdown"), dict) else {}
-        breakdown_caps = {
-            "match_score": 30,
-            "completeness_score": 30,
-            "price_clarity_score": 20,
-            "tutorial_and_image_score": 20,
-        }
-        score_breakdown: Dict[str, Any] = {}
-        for bk, bval in raw_breakdown.items():
-            if bk in breakdown_caps and not isinstance(bval, bool):
-                try:
-                    score_breakdown[bk] = max(0, min(breakdown_caps[bk], int(float(bval))))
-                except (TypeError, ValueError):
-                    pass
-            elif not isinstance(bval, bool):
-                score_breakdown[bk] = bval
-
-        if all(k in score_breakdown for k in breakdown_caps):
-            quality_score = sum(score_breakdown[k] for k in breakdown_caps)
-        else:
-            try:
-                quality_score = int(float(ai2_res.get("quality_score") or 0))
-            except Exception:
-                quality_score = 0
-            quality_score = max(0, min(100, quality_score))
-
-        source_bonus = SOURCE_REPUTATION_BONUS.get(f"{site}:{channel}") or SOURCE_REPUTATION_BONUS.get(site, 0)
-        if source_bonus > 0 and quality_score >= QUALIFIED_DEAL_MIN_SCORE:
-            raw_base_score = quality_score
-            quality_score = min(100, quality_score + source_bonus)
-            score_breakdown["base_quality_score"] = raw_base_score
-            score_breakdown["source_reputation_bonus"] = source_bonus
 
         plat = str(main_conv.get("platform") or "")
         goods_id = str(main_conv.get("goods_id") or "")
@@ -2541,7 +2489,10 @@ def process_ai2_unit(
             if price_is_reliable is not None
             else ""
         )
-        source_is_reliable = bool(doc.get("source_is_reliable"))
+        reliability_score = resolve_reliability_score(
+            doc.get("reliability_score"),
+            default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+        )
 
         def _is_other_known_platform(c: Dict[str, Any]) -> bool:
             c_p = str(c.get("platform") or "").strip().lower()
@@ -2717,7 +2668,6 @@ def process_ai2_unit(
                     "ai_stage1_result": ai1_res,
                     "converted_links": conv_summary_for_db,
                     "ai_stage2_result": ai2_res,
-                    "quality_score": 0,
                     "candidate_count": len(conv_list),
                     "attempt_errors": [],
                 }
@@ -2794,13 +2744,6 @@ def process_ai2_unit(
         coupon_amount = float(product_card.get("coupon_amount") or adapter_res.get("coupon_amount") or 0.0)
         saved_price = round(max(coupon_amount, max(0.0, original_price - official_activity_price)), 2)
 
-        raw_ai1_tscore = ai1_res.get("tutorial_score")
-        tutorial_score = (
-            int(raw_ai1_tscore)
-            if isinstance(raw_ai1_tscore, (int, float)) and not isinstance(raw_ai1_tscore, bool)
-            else 50
-        )
-
         pub_ts = (
             coerce_unix_timestamp(doc.get("publish_ts"))
             or parse_publish_time_epoch(doc.get("publish_time"))
@@ -2810,9 +2753,6 @@ def process_ai2_unit(
 
         deal_info = {
             "is_deal_tip": True,
-            "quality_score": quality_score,
-            "tutorial_score": tutorial_score,
-            "score_breakdown": score_breakdown,
             "clean_title": clean_title,
             "card_highlight": card_highlight,
             "publish_ts": float(pub_ts),
@@ -2821,7 +2761,7 @@ def process_ai2_unit(
             "price_logic": price_logic,
             "price_is_reliable": price_is_reliable,
             "price_reliability_reason": price_reliability_reason,
-            "source_is_reliable": source_is_reliable,
+            "reliability_score": reliability_score,
             "official_price": round(official_price, 2),
             "raw_tip_title": raw_title or str(product_card.get("name") or ""),
             "original_copywriting": original_copywriting,
@@ -2893,37 +2833,6 @@ def process_ai2_unit(
         else:
             product_doc.pop("coupon_url", None)
 
-        if quality_score < QUALIFIED_DEAL_MIN_SCORE:
-            outcomes_by_id[mid] = {
-                "status": "low_score",
-                "stage_outcome": "low_score",
-                "error_code": ERR_LOW_QUALITY_SCORE,
-                "error_msg": f"综合评分 {quality_score} < {QUALIFIED_DEAL_MIN_SCORE} 分，仅留存初步表不入正式表",
-                "source_site": site,
-                "source_site_name": site_name,
-                "deal_source": site,
-                "deal_source_name": site_name,
-                "source_channel": channel,
-                "source_item_id": mid,
-                "platform": plat,
-                "product_id": goods_id,
-                "goods_sign": goods_sign,
-                "official_title": product_doc["name"],
-                "title": raw_title,
-                "deal_price": deal_price,
-                "official_price": official_price,
-                "quality_score": quality_score,
-                "score_breakdown": score_breakdown,
-                "merged_tip_ids": merged_tip_ids,
-                "original_copywriting": original_copywriting,
-                "ai_stage1_result": ai1_res,
-                "converted_links": conv_summary_for_db,
-                "ai_stage2_result": ai2_res,
-                "candidate_count": len(conv_list),
-                "attempt_errors": [],
-            }
-            continue
-
         _attach_preseeded_default_promotion(
             plat=plat,
             goods_id=goods_id,
@@ -2950,8 +2859,6 @@ def process_ai2_unit(
             "raw_title": raw_title,
             "deal_price": deal_price,
             "official_price": official_price,
-            "quality_score": quality_score,
-            "score_breakdown": score_breakdown,
             "merged_tip_ids": merged_tip_ids,
             "original_copywriting": original_copywriting,
             "ai_stage1_result": ai1_res,
@@ -2972,11 +2879,10 @@ def process_ai2_unit(
     ]
     if not quiet_sub_logs:
         logger.info(
-            "🧠 [AI-2 终审完成] 耗时=%.1fs | 认领=%d款 (入库=%d, 低分=%d, 重试=%d, 淘汰=%d)",
+            "🧠 [AI-2 终审完成] 耗时=%.1fs | 认领=%d款 (入库=%d, 重试=%d, 淘汰=%d)",
             t_ai2_elapsed,
             len(selected_docs),
             sum(1 for o in out_list if o.get("status") == "success"),
-            sum(1 for o in out_list if o.get("status") in ("low_score", "cleaned_low_score")),
             sum(1 for o in out_list if o.get("status") == "retry_pending"),
             sum(1 for o in out_list if o.get("status") in ("failed", "cleaned_failed")),
         )

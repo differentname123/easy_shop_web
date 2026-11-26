@@ -753,7 +753,6 @@ def test_fail_closed_coupon_integrity_and_retention():
     assert res_map["tip_direct_with_failed_anchor"]["status"] == "success"
     assert res_map["tip_direct_with_failed_anchor"]["product_doc"]["deal_info"]["coupon_links"] == []
     assert res_map["tip_direct_with_failed_anchor"]["product_doc"]["deal_info"]["deal_price"] == 6.9
-    assert res_map["tip_direct_with_failed_anchor"]["product_doc"]["deal_info"]["quality_score"] == 94
 
 
 def test_guangdiu_deterministic_coupon_supplement():
@@ -1420,8 +1419,6 @@ def test_shop_homepage_exclusion_empty_coupon_step_rewrite_score_clamp_and_confi
     assert di["coupon_links"] == []
     assert "上方【领券】" not in di["tutorial_steps"][0]
     assert "通过下方购买链接领取会员券" in di["tutorial_steps"][0]
-    assert di["score_breakdown"]["match_score"] == 0
-    assert di["score_breakdown"]["completeness_score"] == 30
 
 
 def test_ai1_verbatim_link_guard_isolated_retry_and_title_dedup():

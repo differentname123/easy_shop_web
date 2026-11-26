@@ -16,9 +16,13 @@ from bson.decimal128 import Decimal128
 from repositories.base_repo import BaseRepository
 from infrastructure.logging_utils import format_exc_summary
 from models.deal_constants import (
-    DEAL_INFO_PROTECTION_HOURS,
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
+    RELIABILITY_TIER_GAP,
+    USER_SUBMIT_SITE,
+    evaluate_deal_replacement,
     format_timestamp_cn,
     get_deal_publish_ts,
+    resolve_reliability_score,
 )
 from models.product import (
     clean_product_id,
@@ -58,20 +62,17 @@ def upsert_cleaned_products_to_formal_table(
     product_docs: List[Dict[str, Any]],
 ) -> Dict[str, int]:
     """
-    【Stage 5：高分好价商品晋升入正式表 `products`（含来源可靠性与质量评分防覆盖保护）】
+    【Stage 5：清洗通过的好价商品晋升入正式表 `products`（统一可靠分与 6 小时/72 小时替换仲裁）】
     - 严格以唯一索引 `{"platform": plat, "product_id": pid}` 作为过滤条件；
     - 顶层商品属性 (`name`, `price`, `original_price`, `activity_price` 等) 始终保持官方最新数据；
-    - 替换保护法则：
-      1) 同批次多条线报命中同一商品时，高可靠来源无条件优先，同级别按 `deal_info.quality_score` 最高者胜出；
-      2) 若 `products` 表中该商品已有 `deal_info.is_deal_tip == True` 且 `updated_at` 在 12 小时保鲜期内：
-         高可靠来源可无条件覆盖非高可靠来源，非高可靠来源不可覆盖高可靠来源；
-         同级别仅当新线报 `quality_score >= 已有 deal_info.quality_score`（或价格明显更低 <98%）时才更新 `deal_info` 内容。
+    - 替换保护法则委托唯一真源 `evaluate_deal_replacement`：
+      1) 同批次多条线报命中同一商品时，按最高 `reliability_score`、其次有效最低 `deal_price` 胜出；
+      2) 若已有有效好价且本次被拦截保护：当现有好价为 `user_submit` 或被更低可靠分（跨级）拦截时，绝不刷新 `deal_info.last_seen_at`。
     """
     if not product_docs:
         return {"upserted": 0, "modified": 0, "matched": 0, "protected_high_score": 0, "total_ops": 0}
 
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    protection_cutoff = now - datetime.timedelta(hours=DEAL_INFO_PROTECTION_HOURS)
 
     grouped_by_pid: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for doc in product_docs:
@@ -91,8 +92,7 @@ def upsert_cleaned_products_to_formal_table(
                     "deal_info.is_deal_tip": 1,
                     "deal_info.source_site": 1,
                     "deal_info.source_item_id": 1,
-                    "deal_info.source_is_reliable": 1,
-                    "deal_info.quality_score": 1,
+                    "deal_info.reliability_score": 1,
                     "deal_info.deal_price": 1,
                     "deal_info.updated_at": 1,
                     "user_stats": 1,
@@ -102,25 +102,30 @@ def upsert_cleaned_products_to_formal_table(
                 k = (str(ex_doc.get("platform") or ""), str(ex_doc.get("product_id") or ""))
                 existing_map[k] = ex_doc
     except Exception as e:
-        logger.warning("查询正式表已有商品评分异常: %s", e)
+        logger.warning("查询正式表已有商品状态异常: %s", e)
 
     ops = []
     protected_high_score = 0
     started_deals: List[Dict[str, Any]] = []
     replaced_deals: List[Dict[str, Any]] = []
 
+    def _batch_rank_key(d: Dict[str, Any]) -> Tuple[int, int, float]:
+        di = d.get("deal_info") or {}
+        r_score = resolve_reliability_score(di.get("reliability_score"), default=DEFAULT_NORMAL_RELIABILITY_SCORE)
+        raw_dp = di.get("deal_price")
+        has_dp = isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and float(raw_dp) > 0
+        return (r_score, 1 if has_dp else 0, -float(raw_dp) if has_dp else 0.0)
+
     for (plat, pid), docs_for_item in grouped_by_pid.items():
-        docs_sorted = sorted(
-            docs_for_item,
-            key=lambda x: (
-                bool((x.get("deal_info") or {}).get("source_is_reliable")),
-                int((x.get("deal_info") or {}).get("quality_score") or 0),
-            ),
-        )
+        docs_sorted = sorted(docs_for_item, key=_batch_rank_key)
         best_doc = deepcopy(docs_sorted[-1])
         verified_replace_ex_id = str(best_doc.pop("_verified_replace_source_item_id", "") or "").strip()
         deal_info = deepcopy(best_doc.pop("deal_info", {}) or {})
-        new_score = int(deal_info.get("quality_score") or 0)
+        new_score = resolve_reliability_score(
+            deal_info.get("reliability_score"),
+            default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+        )
+        deal_info["reliability_score"] = new_score
 
         total_seen_inc = 0
         all_sites: List[str] = []
@@ -164,13 +169,13 @@ def upsert_cleaned_products_to_formal_table(
             set_fields.pop("goods_sign", None)
 
         ex_di = (ex_record or {}).get("deal_info") if isinstance((ex_record or {}).get("deal_info"), dict) else {}
-        ex_score = int(ex_di.get("quality_score") or 0)
-        ex_deal_updated = _to_naive_utc(ex_di.get("updated_at"))
-        is_fresh_existing = bool(
-            ex_di.get("is_deal_tip")
-            and ex_deal_updated is not None
-            and ex_deal_updated >= protection_cutoff
+        ex_score = resolve_reliability_score(
+            ex_di.get("reliability_score"),
+            default=DEFAULT_NORMAL_RELIABILITY_SCORE,
         )
+        ex_deal_updated = _to_naive_utc(ex_di.get("updated_at"))
+        ex_age_hours = (now - ex_deal_updated).total_seconds() / 3600.0 if ex_deal_updated is not None else None
+        ex_is_active = bool(ex_di.get("is_deal_tip") is True)
 
         new_dp = (
             float(deal_info["deal_price"])
@@ -186,18 +191,22 @@ def upsert_cleaned_products_to_formal_table(
             and float(ex_di["deal_price"]) > 0
             else None
         )
-        price_improved = bool(new_dp is not None and ex_dp is not None and new_dp < ex_dp * 0.98)
 
-        ex_reliable = bool(ex_di.get("source_is_reliable"))
-        new_reliable = bool(deal_info.get("source_is_reliable"))
-        deal_info["source_is_reliable"] = new_reliable
         ex_item_id = str(ex_di.get("source_item_id") or "").strip()
         verified_replace_hit = bool(verified_replace_ex_id and ex_item_id and ex_item_id == verified_replace_ex_id)
-        should_protect = False if verified_replace_hit else (
-            is_fresh_existing and (
-                ex_reliable if new_reliable != ex_reliable else (ex_score > new_score and not price_improved)
+        if verified_replace_hit:
+            should_replace = True
+        else:
+            should_replace, _ = evaluate_deal_replacement(
+                existing_active=ex_is_active,
+                existing_reliability_score=ex_score,
+                new_reliability_score=new_score,
+                existing_price=ex_dp,
+                new_price=new_dp,
+                existing_age_hours=ex_age_hours,
+                allow_higher_price_replace=False,
             )
-        )
+        should_protect = not should_replace
 
         unset_fields: Dict[str, Any] = {
             "superseded_by": "",
@@ -206,7 +215,9 @@ def upsert_cleaned_products_to_formal_table(
         }
         if should_protect:
             protected_high_score += 1
-            set_fields["deal_info.last_seen_at"] = now
+            ex_site_protect = str(ex_di.get("source_site") or "").strip()
+            if ex_site_protect != USER_SUBMIT_SITE and (new_score - ex_score) > -RELIABILITY_TIER_GAP:
+                set_fields["deal_info.last_seen_at"] = now
         else:
             has_numeric_dp = (
                 isinstance(deal_info.get("deal_price"), (int, float))
@@ -336,7 +347,7 @@ class ProductRepository(BaseRepository):
             "deal_info.format_status", "deal_info.need_reformat", "deal_info.format_info",
             "deal_info.publish_ts", "deal_info.publish_time",
             "deal_info.source_site", "deal_info.source_site_name",
-            "deal_info.source_is_reliable", "deal_info.price_is_reliable",
+            "deal_info.reliability_score", "deal_info.price_is_reliable",
         ), 1),
     }
     _COST_PERFORMANCE_PROJECTION = _SUMMARY_PROJECTION
@@ -946,7 +957,10 @@ class ProductRepository(BaseRepository):
             "tutorial_steps": tutorial_steps,
             "original_copywriting": original_copywriting,
             "share_images": share_images,
-            "source_is_reliable": bool(deal_info.get("source_is_reliable")),
+            "reliability_score": resolve_reliability_score(
+                deal_info.get("reliability_score"),
+                default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+            ),
             "price_is_reliable": price_is_reliable,
             "price_reliability_reason": price_reliability_reason,
         }
@@ -1208,7 +1222,7 @@ class ProductRepository(BaseRepository):
                     "deal_info.format_info": 1,
                     "deal_info.publish_ts": 1,
                     "deal_info.publish_time": 1,
-                    "deal_info.source_is_reliable": 1,
+                    "deal_info.reliability_score": 1,
                     "deal_info.price_is_reliable": 1,
                 },
             )

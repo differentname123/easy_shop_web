@@ -1592,59 +1592,54 @@ def test_deal_ai1_scoring_and_upgrade_conditions():
         "publish_ts": 1794936000.0,
         "title": "爆料抽纸 9.9包邮",
         "tutorial_text": "拍1件领券立减到手9.9元",
+        "reliability_score": 10,
     }
     ai1_res = {
         "deal_price": 9.9,
-        "tutorial_score": 85,
         "combined_raw_text": "拍1件领券立减到手9.9元",
     }
 
-    # 1. 教程更优升级（库内商品教程分仅 60，新线报 AI-1 评出 85 分高质量教程）
+    # 1. 同级同价不升级（不再因过时的 tutorial_score 替换）
     ex_poor = {
         "platform": "tb",
         "product_id": "111",
-        "tutorial_score": 60,
-        "quality_score": 60,
+        "reliability_score": 10,
         "deal_price": 9.9,
     }
-    should_up, reason = DealPoolCleaner._should_upgrade_existing_deal(ex_poor, ai1_res, raw_doc)
-    assert should_up is True
-    assert "教程补全升级" in reason
+    should_up, _ = DealPoolCleaner._should_upgrade_existing_deal(ex_poor, ai1_res, raw_doc)
+    assert should_up is False
 
-    # 3. 价格突破升级（库内商品虽有 90 分教程，但新线报价格从 50.0 破低到 38.0）
+    # 2. 价格突破升级（库内商品虽有高分，但同级新线报价格从 50.0 破低到 38.0 >=5% 且 >=1元）
     ex_high_score = {
         "platform": "jd",
         "product_id": "222",
-        "tutorial_score": 90,
-        "quality_score": 90,
+        "reliability_score": 10,
         "deal_price": 50.0,
     }
     ai1_cheap = {
         "deal_price": 38.0,
-        "tutorial_score": 80,
     }
     should_up2, reason2 = DealPoolCleaner._should_upgrade_existing_deal(ex_high_score, ai1_cheap, raw_doc)
     assert should_up2 is True
-    assert "价格择优升级" in reason2
+    assert "更低" in reason2
 
-    # 4. 普通重复（库内教程完整，且价格相同、新分未显著超越 -> 安全早停，仅记录时间线）
+    # 3. 价格未达门槛或同价（50.0 -> 49.5 不足 >=5% 且 >=1元 -> 安全早停）
     ai1_dup = {
-        "deal_price": 50.0,
-        "tutorial_score": 75,
+        "deal_price": 49.5,
     }
     should_up3, _ = DealPoolCleaner._should_upgrade_existing_deal(ex_high_score, ai1_dup, raw_doc)
     assert should_up3 is False
 
 
 def test_source_reliability_upgrade_and_formal_upsert_matrix():
-    """验证 Stage 3 与 Stage 5 来源可靠性四象限替换优先级及同批竞态规则。"""
+    """验证 Stage 3 与 Stage 5 数字可靠分（10/20/30）、72h 保护与同批竞态及不续期规则。"""
     import datetime
     from services.deal_cleaning.cache_state import (
         query_active_formal_products,
         should_upgrade_existing_deal,
     )
 
-    # 1. query_active_formal_products 正确透出 deal_info.source_is_reliable
+    # 1. query_active_formal_products 正确透出 deal_info.reliability_score 并覆盖 72h
     formal_find_col = MagicMock()
     formal_find_col.find.return_value = [
         {
@@ -1652,94 +1647,96 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
             "product_id": "P_REL",
             "name": "高可靠商品",
             "price": 99.0,
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": True, "quality_score": 70, "deal_price": 59.0},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 20, "deal_price": 59.0},
         },
         {
             "platform": "jd",
             "product_id": "P_NORM",
             "name": "普通商品",
             "price": 99.0,
-            "deal_info": {"is_deal_tip": True, "quality_score": 95, "deal_price": 49.0},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 10, "deal_price": 49.0},
         },
     ]
     active_map = query_active_formal_products(formal_find_col)
-    assert active_map[("jd", "P_REL")]["source_is_reliable"] is True
-    assert active_map[("jd", "P_NORM")]["source_is_reliable"] is False
+    assert active_map[("jd", "P_REL")]["reliability_score"] == 20
+    assert active_map[("jd", "P_NORM")]["reliability_score"] == 10
 
-    # 2. Stage 3 should_upgrade_existing_deal 四象限真值表
-    ex_norm = {"deal_price": 20.0, "tutorial_score": 95, "quality_score": 95, "source_is_reliable": False}
-    ex_rel = {"deal_price": 50.0, "tutorial_score": 65, "quality_score": 65, "source_is_reliable": True}
+    # 2. Stage 3 should_upgrade_existing_deal 数字层级与价格真值表
+    ex_norm = {"deal_price": 20.0, "reliability_score": 10}
+    ex_rel = {"deal_price": 50.0, "reliability_score": 20}
 
-    # (ex=False, new=True): 即使更贵更低分也无条件覆盖
+    # (ex=10, new=20): 差>=10，即使更贵也无条件覆盖
     up_ft, reason_ft = should_upgrade_existing_deal(
-        ex_norm, {"deal_price": 39.0, "tutorial_score": 60}, {"source_is_reliable": True}
+        ex_norm, {"deal_price": 39.0}, {"reliability_score": 20}
     )
-    assert up_ft is True and "高可靠来源" in reason_ft
+    assert up_ft is True and "可靠分" in reason_ft
 
-    # (ex=True, new=False): 即使便宜一半且高分也保护不降级
+    # (ex=20, new=10): 差<=-10，即使便宜一半在 72h 内也保护不降级
     up_tf, _ = should_upgrade_existing_deal(
-        ex_rel, {"deal_price": 19.0, "tutorial_score": 98}, {"source_is_reliable": False}
+        {**ex_rel, "updated_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=50)},
+        {"deal_price": 19.0},
+        {"reliability_score": 10},
     )
     assert up_tf is False
 
-    # (ex=True, new=True): 同级沿用原价格/评分门槛
+    # (ex=20, new=20): 同级仅价格大幅更低才升级
     up_tt_dup, _ = should_upgrade_existing_deal(
-        ex_rel, {"deal_price": 50.0, "tutorial_score": 70}, {"source_is_reliable": True}
+        ex_rel, {"deal_price": 50.0}, {"reliability_score": 20}
     )
     up_tt_better, _ = should_upgrade_existing_deal(
-        ex_rel, {"deal_price": 40.0, "tutorial_score": 70}, {"source_is_reliable": True}
+        ex_rel, {"deal_price": 40.0}, {"reliability_score": 20}
     )
     assert up_tt_dup is False and up_tt_better is True
 
-    # 3. Stage 5 upsert_cleaned_products_to_formal_table 同批竞态 + 12h 保护四象限
+    # 3. Stage 5 upsert_cleaned_products_to_formal_table 同批竞态 + 72h 保护 + 禁止给 user_submit/高分续期 last_seen_at
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
     fresh_at = now - datetime.timedelta(hours=1)
-    expired_at = now - datetime.timedelta(hours=24)
+    expired_at = now - datetime.timedelta(hours=75)
     stored_docs = [
-        # 库内 12h 内非高可靠 98 分，新来高可靠 70 分 -> 无条件覆写
+        # 库内 10 分，新来 20 分 -> 无条件覆写
         {
             "platform": "jd",
             "product_id": "CASE_FT",
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": False,
-                "quality_score": 98,
+                "source_site": "guangdiu",
+                "reliability_score": 10,
                 "deal_price": 19.9,
                 "updated_at": fresh_at,
             },
         },
-        # 库内 12h 内高可靠 70 分，新来非高可靠 98 分低价 -> 强制保护不覆写
+        # 库内 20 分 (user_submit)，新来 10 分低价 -> 强制保护不覆写，且绝不刷新 last_seen_at
         {
             "platform": "jd",
             "product_id": "CASE_TF",
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": True,
-                "quality_score": 70,
+                "source_site": "user_submit",
+                "reliability_score": 20,
                 "deal_price": 29.9,
                 "updated_at": fresh_at,
             },
         },
-        # 库内 12h 内高可靠 70 分，新来高可靠 90 分 -> 同级高分升级
+        # 库内 20 分，新来同级 20 分更低价 24.9 -> 同级低价升级
         {
             "platform": "jd",
             "product_id": "CASE_TT",
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": True,
-                "quality_score": 70,
+                "source_site": "tehuicaicai",
+                "reliability_score": 20,
                 "deal_price": 29.9,
                 "updated_at": fresh_at,
             },
         },
-        # 库内超 12h 高可靠 -> 过期可被新线报正常覆写
+        # 库内超 72h 高分 -> 过期可被新线报正常覆写
         {
             "platform": "jd",
             "product_id": "CASE_STALE",
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": True,
-                "quality_score": 95,
+                "source_site": "tehuicaicai",
+                "reliability_score": 20,
                 "deal_price": 19.9,
                 "updated_at": expired_at,
             },
@@ -1754,7 +1751,7 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
     )
 
     batch_docs = [
-        # 同批竞态：95 分非高可靠 vs 72 分高可靠 -> 必须高可靠胜出
+        # 同批竞态：10 分 vs 20 分 -> 必须 20 分胜出
         {
             "platform": "jd",
             "product_id": "CASE_BATCH",
@@ -1762,8 +1759,7 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
             "price": 59.0,
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": False,
-                "quality_score": 95,
+                "reliability_score": 10,
                 "deal_price": 19.9,
                 "source_item_id": "norm_1",
             },
@@ -1775,8 +1771,7 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
             "price": 59.0,
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": True,
-                "quality_score": 72,
+                "reliability_score": 20,
                 "deal_price": 25.0,
                 "source_item_id": "rel_1",
             },
@@ -1788,8 +1783,7 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
             "price": 39.0,
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": True,
-                "quality_score": 70,
+                "reliability_score": 20,
                 "deal_price": 24.9,
                 "price_is_reliable": False,
                 "price_reliability_reason": "依赖88VIP专享折扣",
@@ -1802,21 +1796,19 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
             "price": 39.0,
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": False,
-                "quality_score": 98,
+                "reliability_score": 10,
                 "deal_price": 9.9,
             },
         },
         {
             "platform": "jd",
             "product_id": "CASE_TT",
-            "name": "同级高可靠升级",
+            "name": "同级高可靠降价升级",
             "price": 39.0,
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": True,
-                "quality_score": 90,
-                "deal_price": 29.9,
+                "reliability_score": 20,
+                "deal_price": 24.9,
             },
         },
         {
@@ -1826,8 +1818,7 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
             "price": 39.0,
             "deal_info": {
                 "is_deal_tip": True,
-                "source_is_reliable": False,
-                "quality_score": 75,
+                "reliability_score": 10,
                 "deal_price": 22.0,
             },
         },
@@ -1840,18 +1831,16 @@ def test_source_reliability_upgrade_and_formal_upsert_matrix():
     by_pid = {op._filter["product_id"]: op._doc["$set"] for op in captured_ops}
 
     assert by_pid["CASE_BATCH"]["deal_info.source_item_id"] == "rel_1"
-    assert by_pid["CASE_BATCH"]["deal_info.source_is_reliable"] is True
+    assert by_pid["CASE_BATCH"]["deal_info.reliability_score"] == 20
 
-    assert by_pid["CASE_FT"]["deal_info.source_is_reliable"] is True
-    assert by_pid["CASE_FT"]["deal_info.quality_score"] == 70
+    assert by_pid["CASE_FT"]["deal_info.reliability_score"] == 20
     assert by_pid["CASE_FT"]["deal_info.price_is_reliable"] is False
 
-    assert "deal_info.quality_score" not in by_pid["CASE_TF"]
-    assert "deal_info.source_is_reliable" not in by_pid["CASE_TF"]
-    assert "deal_info.last_seen_at" in by_pid["CASE_TF"]
+    assert "deal_info.reliability_score" not in by_pid["CASE_TF"]
+    assert "deal_info.last_seen_at" not in by_pid["CASE_TF"]
 
-    assert by_pid["CASE_TT"]["deal_info.quality_score"] == 90
-    assert by_pid["CASE_STALE"]["deal_info.source_is_reliable"] is False
+    assert by_pid["CASE_TT"]["deal_info.deal_price"] == 24.9
+    assert by_pid["CASE_STALE"]["deal_info.reliability_score"] == 10
 
 
 def test_upsert_cleaned_products_honors_lower_price_improvement():
@@ -1868,7 +1857,7 @@ def test_upsert_cleaned_products_honors_lower_price_improvement():
         "updated_at": now - datetime.timedelta(hours=1),
         "deal_info": {
             "is_deal_tip": True,
-            "quality_score": 95,
+            "reliability_score": 10,
             "deal_price": 199.0,
             "updated_at": now - datetime.timedelta(hours=1),
         },
@@ -1880,7 +1869,7 @@ def test_upsert_cleaned_products_honors_lower_price_improvement():
         captured_ops.extend(ops) or SimpleNamespace(upserted_count=0, modified_count=1, matched_count=1)
     )
 
-    # 新线报质量分 88 (低于库内 95)，但价格从 199 破低到 149 (降低超 2%) -> 必须放行更新 deal_price 而不被高分拦截！
+    # 同级价格从 199 破低到 149 (降低 >=5% 且 >=1元) -> 必须放行更新 deal_price！
     with patch("infrastructure.search_meili.is_meili_available", return_value=False):
         res = upsert_cleaned_products_to_formal_table(
             formal_col,
@@ -1892,7 +1881,7 @@ def test_upsert_cleaned_products_honors_lower_price_improvement():
                     "price": 299.0,
                     "deal_info": {
                         "is_deal_tip": True,
-                        "quality_score": 88,
+                        "reliability_score": 10,
                         "deal_price": 149.0,
                         "tutorial_steps": ["1. 领券", "2. 下单"],
                     },

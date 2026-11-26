@@ -43,7 +43,7 @@ main.py                    HTTP 装配、生命周期、静态页面、日志
 infrastructure/            Mongo、PDD/TOP网关、好单库/折淘客HTTP、配置与日志
 scripts/init_config.py     一次性提取旧配置并初始化私有认证密钥
 api/                       请求校验、认证依赖、调用应用服务
-services/                  业务编排、缓存、授权有效期、后台同步节流
+services/                  业务编排、缓存、授权有效期、后台同步节流；其中好价清洗与用户爆料替换共识见 `services/deal_cleaning/README.md`
 adapters/                  平台 SDK、商品标识、原始字段转换、转链降级
 repositories/              Mongo 持久化、幂等更新、查询和聚合
 models/                    商品身份与现有数据契约

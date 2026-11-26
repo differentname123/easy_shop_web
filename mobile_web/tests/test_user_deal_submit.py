@@ -26,15 +26,15 @@ from auth import create_access_token
 from main import create_app
 from models.deal_constants import (
     CLEAN_STAGE_NEED_USER_AUDIT,
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
+    DEFAULT_RELIABLE_SCORE,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
     ERR_AI_MAX_RETRIES_EXCEEDED,
     ERR_USER_AUDIT_REJECTED,
     MAX_CLEAN_RETRIES,
     OK_EXISTING_DEAL_BETTER,
     PROMPT_USER_AUDIT_PATH,
-    SOURCE_REPUTATION_BONUS,
     USER_SUBMIT_SITE,
-    is_reliable_source_site,
 )
 from models.product import compute_user_stats_score, get_source_site_name
 from repositories.deal_raw_pool_repo import DealRawPoolRepository
@@ -42,8 +42,9 @@ from repositories.product_repo import ProductRepository, upsert_cleaned_products
 from repositories.user_repo import UserRepository
 from services.deal_pool_cleaner import DealPoolCleaner
 from services.deal_submit_service import (
+    USER_SUBMIT_DAILY_LIMIT_AUTHORIZED,
+    USER_SUBMIT_DAILY_LIMIT_UNAUTHORIZED,
     USER_SUBMIT_MAX_IMAGE_DIM,
-    USER_SUBMIT_MAX_PER_WINDOW,
     DealSubmitError,
     DealSubmitService,
     normalize_and_compress_deal_image,
@@ -184,6 +185,12 @@ class _MemCollection:
                 return self._project(d, projection)
         return None
 
+    def insert_one(self, doc: Dict[str, Any]):
+        stored = copy.deepcopy(doc)
+        stored.setdefault("_id", f"mem_{len(self.docs) + 1}")
+        self.docs.append(stored)
+        return SimpleNamespace(inserted_id=stored["_id"])
+
     def find(self, flt: Optional[Dict[str, Any]] = None, projection: Optional[Dict[str, Any]] = None):
         matched = [self._project(d, projection) for d in self.docs if self._matches(d, flt)]
         return _MemCursor(matched)
@@ -314,12 +321,19 @@ def _make_audit_gen(
     is_valid: bool = True,
     evidence_supports_claims: Optional[bool] = None,
     reject_reason: str = "",
-    should_replace: bool = True,
-    decision_reason: str = "综合图文评审通过",
+    price_comparison: str = "cheaper",
+    comparison_reason: str = "综合图文评审通过",
     observed_image_evidence: str = "图片清晰展示商品及对应价格证据",
+    clean_title: str = "维达超韧抽纸",
+    price_logic: str = "券后实付",
+    card_highlight: str = "到手24.9元",
+    coupon_label: str = "50减25优惠券",
+    tutorial_steps: Optional[List[str]] = None,
+    polished_copywriting: str = "真实实拍好价分享",
     capture_calls: Optional[List[Dict[str, Any]]] = None,
 ):
     eff_evidence = is_valid if evidence_supports_claims is None else evidence_supports_claims
+    eff_steps = tutorial_steps if tutorial_steps is not None else ["1. 下单实付好价"]
 
     def _gen(**kwargs):
         if capture_calls is not None:
@@ -336,8 +350,14 @@ def _make_audit_gen(
                     "evidence_supports_claims": eff_evidence,
                     "is_content_valid": is_valid,
                     "content_reject_reason": reject_reason,
-                    "should_replace_existing": should_replace,
-                    "decision_reason": decision_reason,
+                    "price_comparison": price_comparison,
+                    "comparison_reason": comparison_reason,
+                    "clean_title": clean_title,
+                    "price_logic": price_logic,
+                    "card_highlight": card_highlight,
+                    "coupon_label": coupon_label,
+                    "tutorial_steps": eff_steps,
+                    "polished_copywriting": polished_copywriting,
                 },
                 ensure_ascii=False,
             ),
@@ -346,20 +366,28 @@ def _make_audit_gen(
     return _gen
 
 
-def test_core_input_validation_extensible_platform_and_rate_limit(tmp_path):
+def test_core_input_validation_extensible_platform_and_daily_quota(tmp_path):
     assert get_source_site_name(USER_SUBMIT_SITE) == "用户爆料"
-    assert is_reliable_source_site(USER_SUBMIT_SITE) is True
-    assert is_reliable_source_site("tehuicaicai") is True
-    assert is_reliable_source_site("guangdiu") is False
+    assert DEFAULT_NORMAL_RELIABILITY_SCORE == 10
+    assert DEFAULT_RELIABLE_SCORE == 20
 
     prompt_text = Path(PROMPT_USER_AUDIT_PATH).read_text(encoding="utf-8")
     assert prompt_text.strip()
-    assert "observed_image_evidence" in prompt_text
-    assert "evidence_supports_claims" in prompt_text
-    assert "不要求必须真实付款完成" in prompt_text
-    assert "无论新价格更低，还是比旧价格更高" in prompt_text
-    assert "同价防抄袭保护" in prompt_text
-    assert "政治敏感" in prompt_text and "色情低俗" in prompt_text
+    for required_kw in (
+        "observed_image_evidence",
+        "evidence_supports_claims",
+        "不要求必须真实付款完成",
+        "price_comparison",
+        "cheaper",
+        "same",
+        "higher",
+        "card_highlight",
+        "tutorial_steps",
+        "polished_copywriting",
+        "政治敏感",
+        "色情低俗",
+    ):
+        assert required_kw in prompt_text
     for banned_example in (
         "某品牌",
         "凡士林",
@@ -378,14 +406,25 @@ def test_core_input_validation_extensible_platform_and_rate_limit(tmp_path):
     ):
         assert banned_example not in prompt_text
 
-    db, raw_repo, _, ps, svc = _make_harness(
+    db, raw_repo, user_repo, ps, svc = _make_harness(
         initial_users=[
             {"uid": "u_alice", "phone": "13800138000", "nickname": "阿丽"},
-            {"uid": "u_bob", "phone": "13900139000", "nickname": "阿博"},
+            {
+                "uid": "u_bob",
+                "phone": "13900139000",
+                "nickname": "阿博",
+                "auth_status": {"taobao": {"is_authorized": True}, "pdd": {"is_authorized": False}},
+                "reliability_score": 25,
+            },
         ],
         image_dir=tmp_path / "imgs",
     )
+    # 新注册用户默认写入 reliability_score=20
+    reg_user = user_repo.register_or_login("13700137000", "secret123", nickname="新人")
+    assert reg_user["reliability_score"] == 20
+
     proof_img = _make_png_b64(320, 240)
+    proof_img_alt = _make_png_b64(320, 240, color=(40, 120, 200, 255))
 
     with pytest.raises(DealSubmitError) as e_auth:
         svc.submit_user_deal(uid="", platform="jd", product_id="1001001", deal_price=29.9, tutorial_text="先领券下单", images_base64=[proof_img])
@@ -411,7 +450,7 @@ def test_core_input_validation_extensible_platform_and_rate_limit(tmp_path):
     assert e_plat.value.error_code == "unsupported_platform"
     ps.get_goods_detail.side_effect = None
 
-    # 无硬编码三平台限制：未来新增平台只要商品服务核实通过即可自然入池，且玩法含链接/口令不误杀（留给清洗剥离）
+    # 无硬编码三平台限制：未来新增平台只要商品服务核实通过即可自然入池，且默认绑定用户可靠分=20
     ps.get_goods_detail.return_value = _sample_detail_product(plat="vip", pid="vip_9001")
     res_ext = svc.submit_user_deal(
         uid="u_alice",
@@ -429,7 +468,27 @@ def test_core_input_validation_extensible_platform_and_rate_limit(tmp_path):
     assert doc_ext["resolved_platform"] == "vip"
     assert doc_ext["resolved_product_id"] == "vip_9001"
     assert "ttl_at" not in doc_ext
-    assert doc_ext["source_is_reliable"] is True
+    assert doc_ext["reliability_score"] == 20
+    assert "source_is_reliable" not in doc_ext
+    assert doc_ext["clean_stage"] == CLEAN_STAGE_NEED_USER_AUDIT
+    assert len(doc_ext["converted_links"]) == 1
+    assert any(t.get("link_id") == "L2" for t in doc_ext["ai_stage1_result"]["extracted_targets"])
+    pending_view = svc.get_my_submissions("u_alice")["data"]["items"][0]
+    assert pending_view["state_label"] == "人工审查中"
+    assert "人工审查" in pending_view["reason"]
+
+    # 同一用户同一商品存在 pending 爆料时禁止并发重复提交（409 duplicate_pending_submission）
+    with pytest.raises(DealSubmitError) as e_dup_pend:
+        svc.submit_user_deal(
+            uid="u_alice",
+            platform="vip",
+            product_id="vip_9001",
+            deal_price=28.9,
+            tutorial_text="重复提交同一待审商品",
+            images_base64=[proof_img_alt],
+        )
+    assert e_dup_pend.value.status_code == 409
+    assert e_dup_pend.value.error_code == "duplicate_pending_submission"
 
     # 验证非用户爆料渠道（如 guangdiu）写入 ttl_at（14天清理仅针对渠道数据）
     raw_repo.save_batch([{
@@ -441,43 +500,103 @@ def test_core_input_validation_extensible_platform_and_rate_limit(tmp_path):
     }], task_name="guangdiu")
     doc_gd = raw_repo.col.find_one({"source_item_id": "gd_ttl_check"})
     assert doc_gd.get("ttl_at") is not None
-    assert doc_ext["clean_stage"] == CLEAN_STAGE_NEED_USER_AUDIT
-    assert len(doc_ext["converted_links"]) == 1
-    assert any(t.get("link_id") == "L2" for t in doc_ext["ai_stage1_result"]["extracted_targets"])
-    pending_view = svc.get_my_submissions("u_alice")["data"]["items"][0]
-    assert pending_view["state_label"] == "人工审查中"
-    assert "人工审查" in pending_view["reason"]
 
-    # 同一用户 10 分钟最多 USER_SUBMIT_MAX_PER_WINDOW 次（刚才已用 1 次，再补发满额度）
-    for i in range(USER_SUBMIT_MAX_PER_WINDOW - 1):
-        ps.get_goods_detail.return_value = _sample_detail_product(pid=f"p_{i}")
-        res = svc.submit_user_deal(
-            uid="u_alice",
-            platform="jd",
-            product_id=f"p_{i}",
-            deal_price=29.9,
-            tutorial_text=f"领详情页补贴下单实付29.9 {i}",
-            images_base64=[proof_img],
-        )
-        assert res["status"] == "success"
-
-    with pytest.raises(DealSubmitError) as e_lim:
+    # 原图复制校验：若新图与当前正式表/详情页在架或最近失效好价图完全一致，入口直接拒绝（不误杀用户自己曾被驳回的稿件图）
+    ps.get_goods_detail.return_value = {
+        **_sample_detail_product(plat="jd", pid="jd_copy_guard"),
+        "data": {
+            **_sample_detail_product(plat="jd", pid="jd_copy_guard")["data"],
+            "deal_tip": {"is_deal_tip": False, "share_images": list(doc_ext["tutorial_images"])},
+        },
+    }
+    with pytest.raises(DealSubmitError) as e_dup_img:
         svc.submit_user_deal(
             uid="u_alice",
             platform="jd",
-            product_id="p_over",
-            deal_price=29.9,
-            tutorial_text="再多发一条超限",
+            product_id="jd_copy_guard",
+            deal_price=25.9,
+            tutorial_text="复制已有截图测试",
             images_base64=[proof_img],
         )
-    assert e_lim.value.status_code == 429
-    assert e_lim.value.error_code == "submit_rate_limited"
+    assert e_dup_img.value.status_code == 400
+    assert e_dup_img.value.error_code == "duplicate_deal_image"
+
+    # 用户自身被驳回的旧稿件截图不在正式表/deal_tip 中，可自由改图或原图重提
+    raw_repo.col.insert_one({
+        "source_site": USER_SUBMIT_SITE,
+        "source_item_id": "us_rejected_old",
+        "submitted_by_uid": "u_alice",
+        "resolved_platform": "jd",
+        "resolved_product_id": "jd_rej_resubmit",
+        "tutorial_images": list(doc_ext["tutorial_images"]),
+        "clean_status": "cleaned_failed",
+        "first_seen_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+        "publish_ts": datetime.datetime.now(datetime.timezone.utc).timestamp(),
+    })
+    ps.get_goods_detail.return_value = _sample_detail_product(plat="jd", pid="jd_rej_resubmit")
+    # 此时 u_alice 今日已累计：vip_9001(1) + us_rejected_old(2 -> 已达未授权上限 2 条)，先验证被拒后的第 3 条直接触发未授权每日 2 条配额上限
+    with pytest.raises(DealSubmitError) as e_unauth_lim:
+        svc.submit_user_deal(
+            uid="u_alice",
+            platform="jd",
+            product_id="jd_rej_resubmit",
+            deal_price=25.9,
+            tutorial_text="重提被拒稿件",
+            images_base64=[proof_img],
+        )
+    assert e_unauth_lim.value.status_code == 429
+    assert e_unauth_lim.value.error_code == "submit_daily_limit_unauth"
+
+    # 若将 us_rejected_old 改为昨日（跨天），则今日仅 1 条，重提被拒旧图可以顺利通过且配额恰好达 2/天
+    raw_repo.col.update_many(
+        {"source_item_id": "us_rejected_old"},
+        {"$set": {"first_seen_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(days=2)}},
+    )
+    res_rej_retry = svc.submit_user_deal(
+        uid="u_alice",
+        platform="jd",
+        product_id="jd_rej_resubmit",
+        deal_price=25.9,
+        tutorial_text="修正后重提原图",
+        images_base64=[proof_img],
+    )
+    assert res_rej_retry["status"] == "success"
+    assert USER_SUBMIT_DAILY_LIMIT_UNAUTHORIZED == 2
+
+    # 已授权用户 u_bob（淘宝已授权）每日可提交 20 条，且绑定其用户表自定义 reliability_score=25
+    for i in range(USER_SUBMIT_DAILY_LIMIT_AUTHORIZED):
+        ps.get_goods_detail.return_value = _sample_detail_product(pid=f"p_bob_{i}")
+        res_bob = svc.submit_user_deal(
+            uid="u_bob",
+            platform="jd",
+            product_id=f"p_bob_{i}",
+            deal_price=29.9,
+            tutorial_text=f"授权用户下单实付29.9 {i}",
+            images_base64=[proof_img_alt],
+        )
+        assert res_bob["status"] == "success"
+        if i == 0:
+            bob_doc = raw_repo.col.find_one({"source_item_id": res_bob["data"]["tip_id"]})
+            assert bob_doc["reliability_score"] == 25
+
+    ps.get_goods_detail.return_value = _sample_detail_product(pid="p_bob_over")
+    with pytest.raises(DealSubmitError) as e_bob_lim:
+        svc.submit_user_deal(
+            uid="u_bob",
+            platform="jd",
+            product_id="p_bob_over",
+            deal_price=29.9,
+            tutorial_text="超过20条上限",
+            images_base64=[proof_img_alt],
+        )
+    assert e_bob_lim.value.status_code == 429
+    assert e_bob_lim.value.error_code == "submit_daily_limit_reached"
 
 
-def test_worker_reuses_convert_and_ai2_with_clean_copy(tmp_path):
+def test_worker_single_stage_skips_ai2_with_clean_copy(tmp_path):
     db, raw_repo, _, ps, svc = _make_harness(image_dir=tmp_path / "imgs")
 
-    # 1. 提交含链接文案与官方优惠券，确认全程走低档模型组、convert_single_target 与 AI-2 清洗无链接残留
+    # 1. 提交含链接文案与官方优惠券：全程单阶段低档多模态审核与展示规整，彻底跳过冗余 AI-2 调用
     res_cpn = svc.submit_user_deal(
         uid="u_alice",
         platform="jd",
@@ -491,42 +610,40 @@ def test_worker_reuses_convert_and_ai2_with_clean_copy(tmp_path):
     assert svc.wake_event.is_set() is True
 
     cleaner = DealPoolCleaner(ai_batch_size=4, convert_max_workers=2)
+    ai2_Spy = MagicMock(side_effect=AssertionError("user_submit must skip process_ai2_unit!"))
+    cleaner.process_ai2_unit = ai2_Spy
     audit_calls: List[Dict[str, Any]] = []
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-        stage2_inputs[0]["main_tip_id"]: {
-            "main_tip_id": stage2_inputs[0]["main_tip_id"],
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": "L1",
-            "clean_title": "维达超韧抽纸",
-            "deal_price": 24.9,
-            "price_logic": "领券减25",
-            "card_highlight": "24.9元",
-            "coupon_links": [{"link_id": "L2", "label": "50减25优惠券"}],
-            "tutorial_steps": ["1. 先在上方【领券】处领取50减25券，链接 https://u.jd.com/temp123 自动剥离", "2. 下单实付24.9元"],
-            "polished_copywriting": "先点 https://u.jd.com/temp123 领50减25券再下单",
-            "quality_score": 84,
-            "price_is_reliable": True,
-            "price_reliability_reason": "有效官方券",
-        }
-    }
     w_ok = DealSubmitWorker(
         svc,
         cleaner=cleaner,
-        ai_generator=_make_audit_gen(capture_calls=audit_calls),
+        ai_generator=_make_audit_gen(
+            price_comparison="cheaper",
+            clean_title="维达超韧抽纸",
+            price_logic="领券减25",
+            card_highlight="到手24.9元",
+            coupon_label="50减25优惠券",
+            tutorial_steps=["1. 先在上方【领券】处领取50减25券，链接 https://u.jd.com/temp123 自动剥离", "2. 下单实付24.9元"],
+            polished_copywriting="先点 https://u.jd.com/temp123 领50减25券再下单",
+            capture_calls=audit_calls,
+        ),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
     out_ok = w_ok.run_once()
     assert out_ok["published"] == 1
+    assert ai2_Spy.call_count == 0
     assert audit_calls[0]["preset_model_group"] == "low"
 
     formal_doc = raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})
-    assert formal_doc["deal_info"]["source_is_reliable"] is True
+    assert formal_doc["deal_info"]["reliability_score"] == 20
+    assert "source_is_reliable" not in formal_doc["deal_info"]
+    assert "quality_score" not in formal_doc["deal_info"]
+    assert formal_doc["deal_info"]["price_is_reliable"] is True
     assert formal_doc["deal_info"]["coupon_links"][0]["url"] == "https://coupon.m.jd.com/coupons/show.action?key=c1&roleId=999"
+    assert formal_doc["deal_info"]["coupon_links"][0]["label"] == "50减25优惠券"
     assert "https://" not in formal_doc["deal_info"]["tutorial_text"]
     assert "https://" not in formal_doc["deal_info"]["original_copywriting"]
 
-    # 2. 附加优惠券经 convert_single_target 指向异品时，Step A 直接拦截、删图并展示友好原因
+    # 2. 附加优惠券经 convert_single_target 指向异品时，Step A 直接拦截并展示友好原因
     ps.get_goods_detail.return_value = _sample_detail_product(pid="1001002")
     res_bad_cpn = svc.submit_user_deal(
         uid="u_alice",
@@ -552,7 +669,7 @@ def test_worker_reuses_convert_and_ai2_with_clean_copy(tmp_path):
         "my_promo_link": "https://u.jd.com/other_prod",
         "official_product": {"title": "异品", "price": 9.9},
     }
-    audit_never = []
+    audit_never: List[Dict[str, Any]] = []
     w_bad_cpn = DealSubmitWorker(
         svc,
         cleaner=cleaner_bad,
@@ -562,7 +679,6 @@ def test_worker_reuses_convert_and_ai2_with_clean_copy(tmp_path):
     assert out_bad["coupon_failed"] == 1
     assert out_bad["rejected"] == 1
     assert audit_never == []
-    # 驳回时不再立即删图（统一交由 30 天带引用保护定时清理，避免多人共享同图误删）
     assert svc.get_image_file_path(bad_img_id) is not None
 
     my_items = svc.get_my_submissions("u_alice")["data"]["items"]
@@ -593,8 +709,7 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
             "is_deal_tip": True,
             "source_site": "guangdiu",
             "source_item_id": "old_tip_1",
-            "source_is_reliable": True,
-            "quality_score": 92,
+            "reliability_score": 20,
             "deal_price": 32.9,
             "price_logic": "旧券后价",
             "card_highlight": "32.9元",
@@ -604,9 +719,16 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
             "updated_at": now,
         },
     }
-    db, raw_repo, _, ps, svc = _make_harness(initial_products=[existing_prod], image_dir=img_dir)
+    db, raw_repo, _, ps, svc = _make_harness(
+        initial_users=[
+            {"uid": "u_alice", "phone": "13800138000", "nickname": "阿丽", "auth_status": {"taobao": {"is_authorized": True}}},
+            {"uid": "u_bob", "phone": "13900139000", "nickname": "阿博", "auth_status": {"pdd": {"is_authorized": True}}},
+        ],
+        initial_products=[existing_prod],
+        image_dir=img_dir,
+    )
 
-    # 1. 不相关图文驳回：验证删图、不动正式表、临时目录已释放
+    # 1. 不相关图文驳回：验证不动正式表、临时目录已释放
     res_rej = svc.submit_user_deal(
         uid="u_alice",
         platform="jd",
@@ -635,8 +757,8 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
         uid="u_alice",
         platform="jd",
         product_id="1001001",
-        deal_price=35.0,
-        tutorial_text="详情页直接下单35元",
+        deal_price=32.9,
+        tutorial_text="详情页直接下单32.9元",
         images_base64=[_make_png_b64(400, 300)],
     )
     keep_img_id = raw_repo.col.find_one({"source_item_id": res_keep["data"]["tip_id"]})["tutorial_images"][0].rsplit("/", 1)[-1]
@@ -644,7 +766,7 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
     w_keep = DealSubmitWorker(
         svc,
         cleaner=cleaner,
-        ai_generator=_make_audit_gen(is_valid=True, should_replace=False, decision_reason="现有在架价格与步骤均更优"),
+        ai_generator=_make_audit_gen(is_valid=True, price_comparison="same", comparison_reason="现有在架价格与步骤均更优"),
         remote_image_fetcher=lambda _u: _make_png_bytes(160, 160),
     )
     assert w_keep.run_once()["skipped_existing"] == 1
@@ -654,9 +776,8 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
     assert dup_item["tip_id"] == res_keep["data"]["tip_id"]
     assert dup_item["state"] == "duplicate"
     assert dup_item["state_label"] == "已有同价好价"
-    assert "更优" in dup_item["reason"]
 
-    # 3. 验证全图文载荷 + AI-2 暂态超时单阶段续跑（续跑绝不重审）+ 原子防并发替换
+    # 3. 验证全图文载荷 + 单阶段断点续跑（user_audit_result.passed=True 续跑绝不重调模型）+ 原子防并发替换
     res_win = svc.submit_user_deal(
         uid="u_alice",
         platform="jd",
@@ -668,22 +789,24 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
     win_tid = res_win["data"]["tip_id"]
     win_calls: List[Dict[str, Any]] = []
 
-    # 第一轮：AI-2 返回空（触发 retry_pending），应保持在 need_user_audit 且写下通过检查点
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {}
     w_win = DealSubmitWorker(
         svc,
         cleaner=cleaner,
         ai_generator=_make_audit_gen(
             is_valid=True,
-            should_replace=True,
-            decision_reason="价格更优且原有好价多人反馈买不到",
+            price_comparison="cheaper",
+            comparison_reason="新到手价实质更低",
+            clean_title="维达抽纸",
+            price_logic="新补贴券",
+            card_highlight="24.9元",
+            tutorial_steps=["1. 领新券拍下24.9元"],
             capture_calls=win_calls,
         ),
         remote_image_fetcher=lambda _u: _make_png_bytes(160, 160),
     )
-    out_r1 = w_win.run_once()
-    assert out_r1["promoted"] == 1
-    assert out_r1["published"] == 0
+    # 模拟审核刚写下 passed=True 后中断，第二轮从断点续跑直接发布且不再调用 AI
+    win_doc = raw_repo.col.find_one({"source_item_id": win_tid})
+    assert w_win._audit_single_doc(raw_repo, w_win._get_audit_ai_client(), win_doc) == "ready"
     assert len(win_calls) == 1
     assert win_calls[0]["preset_model_group"] == "low"
     assert win_calls[0]["file_names"] == ["official_1.jpg", "new_1.jpg", "existing_1.jpg", "existing_2.jpg"]
@@ -692,49 +815,26 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
     prompt_sent = win_calls[0]["prompt"]
     payload_str = prompt_sent.split("待处理结构化输入数据", 1)[1].split("\n", 1)[1].lstrip("= \n")
     payload_obj = json.loads(payload_str)
+    assert payload_obj["need_price_comparison"] is True
     assert payload_obj["official_product"]["image_attachment_indices"] == [1]
     assert payload_obj["new_submission"]["image_attachment_indices"] == [2]
     assert payload_obj["existing_deal"]["image_attachment_indices"] == [3, 4]
     assert payload_obj["existing_deal"]["original_copywriting"] == "原在架详细文案说明"
-    assert payload_obj["existing_deal"]["unbuyable_count"] == 6
+    assert payload_obj["existing_deal"]["reliability_score"] == 20
 
-    cur_doc = raw_repo.col.find_one({"source_item_id": win_tid})
-    assert cur_doc["clean_status"] == "pending"
-    assert cur_doc["clean_stage"] == CLEAN_STAGE_NEED_USER_AUDIT
-    assert cur_doc["user_audit_result"]["passed"] is True
-    raw_repo.col.update_many({"source_item_id": win_tid}, {"$set": {"next_retry_after_ts": 0}})
-
-    # 第二轮：AI-2 成功，直接复用 user_audit_result 断点（audit 不重调）并替换 old_tip_1
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-        stage2_inputs[0]["main_tip_id"]: {
-            "main_tip_id": stage2_inputs[0]["main_tip_id"],
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": "L1",
-            "clean_title": "维达抽纸",
-            "deal_price": 24.9,
-            "price_logic": "新补贴券",
-            "card_highlight": "24.9元",
-            "coupon_links": [],
-            "tutorial_steps": ["1. 领新券拍下24.9元"],
-            "quality_score": 85,
-            "price_is_reliable": True,
-            "price_reliability_reason": "补贴真实",
-        }
-    }
     out_r2 = w_win.run_once()
     assert out_r2["published"] == 1
     assert len(win_calls) == 1
     updated_prod = raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})
     assert updated_prod["deal_info"]["source_item_id"] == win_tid
     assert updated_prod["deal_info"]["deal_price"] == 24.9
-    assert updated_prod["deal_info"]["source_is_reliable"] is True
+    assert updated_prod["deal_info"]["reliability_score"] == 20
     assert updated_prod["user_stats"] == {"buyable": 0, "unbuyable": 0}
     assert "_verified_replace_source_item_id" not in updated_prod
 
-    # 4. 并发竞态保护：若正式表已被 other_tip_2(95分) 抢先更新，旧对比标记 old_tip_1 不得绕过保护
+    # 4. 并发竞态保护：若正式表已被更高可信度 other_tip_2(reliability_score=30) 抢先更新，旧对比标记 old_tip_1 不得绕过保护
     raw_repo.formal_col.docs[0]["deal_info"]["source_item_id"] = "other_tip_2"
-    raw_repo.formal_col.docs[0]["deal_info"]["quality_score"] = 95
+    raw_repo.formal_col.docs[0]["deal_info"]["reliability_score"] = 30
     race_res = upsert_cleaned_products_to_formal_table(
         raw_repo.formal_col,
         [{
@@ -748,9 +848,8 @@ def test_full_multimodal_media_comparison_and_resume_checkpoint(tmp_path):
                 "is_deal_tip": True,
                 "source_site": USER_SUBMIT_SITE,
                 "source_item_id": "us_stale",
-                "source_is_reliable": True,
-                "deal_price": 24.9,
-                "quality_score": 80,
+                "reliability_score": 20,
+                "deal_price": 19.9,
             },
         }],
     )
@@ -1071,30 +1170,20 @@ def test_deal_display_lifecycle_and_product_history(tmp_path):
         product_id="1001001",
         deal_price=29.9,
         tutorial_text="领券下单29.9元",
-        images_base64=[_make_png_b64(360, 280)],
+        images_base64=[_make_png_b64(360, 280, color=(200, 40, 40, 255))],
     )
     tip_a = res_a["data"]["tip_id"]
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-        stage2_inputs[0]["main_tip_id"]: {
-            "main_tip_id": stage2_inputs[0]["main_tip_id"],
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": "L1",
-            "clean_title": "维达抽纸",
-            "deal_price": 29.9,
-            "price_logic": "券后",
-            "card_highlight": "29.9元",
-            "coupon_links": [],
-            "tutorial_steps": ["1. 下单29.9元"],
-            "quality_score": 82,
-            "price_is_reliable": True,
-            "price_reliability_reason": "有效",
-        }
-    }
     w_a = DealSubmitWorker(
         svc,
         cleaner=cleaner,
-        ai_generator=_make_audit_gen(is_valid=True, should_replace=True),
+        ai_generator=_make_audit_gen(
+            is_valid=True,
+            price_comparison="cheaper",
+            clean_title="维达抽纸",
+            price_logic="券后",
+            card_highlight="到手29.9元",
+            tutorial_steps=["1. 下单29.9元"],
+        ),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
     assert w_a.run_once()["published"] == 1
@@ -1111,30 +1200,21 @@ def test_deal_display_lifecycle_and_product_history(tmp_path):
         product_id="1001001",
         deal_price=23.9,
         tutorial_text="叠加补贴后实付23.9元",
-        images_base64=[_make_png_b64(360, 280)],
+        images_base64=[_make_png_b64(360, 280, color=(40, 120, 200, 255))],
     )
     tip_b = res_b["data"]["tip_id"]
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-        stage2_inputs[0]["main_tip_id"]: {
-            "main_tip_id": stage2_inputs[0]["main_tip_id"],
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": "L1",
-            "clean_title": "维达抽纸",
-            "deal_price": 23.9,
-            "price_logic": "叠加补贴",
-            "card_highlight": "23.9元",
-            "coupon_links": [],
-            "tutorial_steps": ["1. 叠加补贴拍23.9元"],
-            "quality_score": 88,
-            "price_is_reliable": True,
-            "price_reliability_reason": "更优",
-        }
-    }
     w_b = DealSubmitWorker(
         svc,
         cleaner=cleaner,
-        ai_generator=_make_audit_gen(is_valid=True, should_replace=True, decision_reason="价格更优且步骤清晰"),
+        ai_generator=_make_audit_gen(
+            is_valid=True,
+            price_comparison="cheaper",
+            comparison_reason="价格更优且步骤清晰",
+            clean_title="维达抽纸",
+            price_logic="叠加补贴",
+            card_highlight="到手23.9元",
+            tutorial_steps=["1. 叠加补贴拍23.9元"],
+        ),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
     assert w_b.run_once()["published"] == 1
@@ -1154,13 +1234,13 @@ def test_deal_display_lifecycle_and_product_history(tmp_path):
         product_id="1001001",
         deal_price=23.9,
         tutorial_text="同价复投23.9元",
-        images_base64=[_make_png_b64(360, 280)],
+        images_base64=[_make_png_b64(360, 280, color=(40, 180, 90, 255))],
     )
     tip_c = res_c["data"]["tip_id"]
     w_c = DealSubmitWorker(
         svc,
         cleaner=cleaner,
-        ai_generator=_make_audit_gen(is_valid=True, should_replace=False, decision_reason="现有在架已有同价截图凭证"),
+        ai_generator=_make_audit_gen(is_valid=True, price_comparison="same", comparison_reason="现有在架已有同价截图凭证"),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
     assert w_c.run_once()["skipped_existing"] == 1
@@ -1205,27 +1285,10 @@ def test_repeat_submit_same_text_new_image_never_bypasses_audit(tmp_path):
     img1 = raw_repo.col.find_one({"source_item_id": tid1})["tutorial_images"][:]
 
     # 先让第一次提交审核通过并上架
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-        stage2_inputs[0]["main_tip_id"]: {
-            "main_tip_id": stage2_inputs[0]["main_tip_id"],
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": "L1",
-            "clean_title": "维达抽纸",
-            "deal_price": 29.9,
-            "price_logic": "券后",
-            "card_highlight": "29.9元",
-            "coupon_links": [],
-            "tutorial_steps": ["1. 下单29.9"],
-            "quality_score": 82,
-            "price_is_reliable": True,
-            "price_reliability_reason": "有效",
-        }
-    }
     w1 = DealSubmitWorker(
         svc,
         cleaner=cleaner,
-        ai_generator=_make_audit_gen(is_valid=True, should_replace=True),
+        ai_generator=_make_audit_gen(is_valid=True, price_comparison="cheaper"),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
     assert w1.run_once()["published"] == 1
@@ -1267,13 +1330,35 @@ def test_repeat_submit_same_text_new_image_never_bypasses_audit(tmp_path):
     assert raw_repo.col.find_one({"source_item_id": tid2})["clean_status"] == "cleaned_failed"
 
 
-def test_user_submit_reputation_bonus_and_immediate_cache_invalidation(tmp_path):
-    """验证通过审核的用户爆料获 +10 信誉加分（低分仍卡 >=60 门槛），且上架后立即失效相关缓存。"""
+def test_unified_reliability_tiers_6h_protection_and_cache_invalidation(tmp_path):
+    """验证跨级覆盖(差>=10)、低可靠零成本前置跳过、同级6小时涨价保护与满6小时纠偏放行、以及即时缓存失效。"""
     from cache import BOOM_SORT_CACHE, cache_deal_tip, clear_cached_deal_tip, get_cached_deal_tip
 
-    assert SOURCE_REPUTATION_BONUS.get(USER_SUBMIT_SITE) == 10
-    db, raw_repo, _, _, svc = _make_harness(image_dir=tmp_path / "imgs")
-    cleaner = DealPoolCleaner(ai_batch_size=4, convert_max_workers=1)
+    db, raw_repo, _, _, svc = _make_harness(
+        initial_users=[
+            {"uid": "u_alice", "phone": "13800138000", "nickname": "阿丽", "auth_status": {"taobao": {"is_authorized": True}}},
+            {"uid": "u_low", "phone": "13800138001", "nickname": "低分号", "reliability_score": 10, "auth_status": {"taobao": {"is_authorized": True}}},
+            {"uid": "u_trusted", "phone": "13800138002", "nickname": "核心号", "reliability_score": 30, "auth_status": {"taobao": {"is_authorized": True}}},
+        ],
+        initial_products=[
+            {
+                "platform": "jd",
+                "product_id": "1001001",
+                "goods_id": "1001001",
+                "name": "维达抽纸",
+                "price": 59.9,
+                "deal_info": {
+                    "is_deal_tip": True,
+                    "source_site": "guangdiu",
+                    "source_item_id": "gd_10",
+                    "reliability_score": 10,
+                    "deal_price": 19.9,
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=1),
+                },
+            }
+        ],
+        image_dir=tmp_path / "imgs",
+    )
 
     clear_cached_deal_tip()
     BOOM_SORT_CACHE.clear()
@@ -1282,75 +1367,130 @@ def test_user_submit_reputation_bonus_and_immediate_cache_invalidation(tmp_path)
         cache_deal_tip("jd", "9999999", "ok", {"deal_price": 88.0})
         BOOM_SORT_CACHE.set(("all", "desc"), [{"product_id": "1001001"}])
 
-        # 1. AI-2 基础分 72 >= 60：通过加分 +10 -> 正式表落盘 82 分，且缓存立即可见刷新
-        res_pass = svc.submit_user_deal(
+        # 1) 跨级覆盖 (20 vs 10)：即使价格高于普通源，仍立即无条件替换并失效缓存
+        svc.submit_user_deal(
             uid="u_alice",
             platform="jd",
             product_id="1001001",
             deal_price=28.0,
             tutorial_text="领券拍下实付28元",
-            images_base64=[_make_png_b64(360, 260)],
+            images_base64=[_make_png_b64(360, 260, color=(10, 10, 200, 255))],
         )
-        cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-            stage2_inputs[0]["main_tip_id"]: {
-                "main_tip_id": stage2_inputs[0]["main_tip_id"],
-                "is_valid_deal": True,
-                "reject_reason": None,
-                "main_link_id": "L1",
-                "clean_title": "维达抽纸",
-                "deal_price": 28.0,
-                "price_logic": "券后",
-                "card_highlight": "28元",
-                "coupon_links": [],
-                "tutorial_steps": ["1. 下单28元"],
-                "quality_score": 72,
-                "price_is_reliable": True,
-                "price_reliability_reason": "凭证清晰",
-            }
-        }
-        w_ok = DealSubmitWorker(
+        cross_calls: List[Dict[str, Any]] = []
+        w_cross = DealSubmitWorker(
             svc,
-            cleaner=cleaner,
-            ai_generator=_make_audit_gen(is_valid=True, should_replace=True),
+            ai_generator=_make_audit_gen(price_comparison="none", capture_calls=cross_calls),
             remote_image_fetcher=lambda _u: _make_png_bytes(),
         )
-        assert w_ok.run_once()["published"] == 1
+        assert w_cross.run_once()["published"] == 1
+        assert len(cross_calls) == 1
         formal = raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})
-        assert formal["deal_info"]["quality_score"] == 82
+        assert formal["deal_info"]["reliability_score"] == 20
+        assert formal["deal_info"]["deal_price"] == 28.0
         assert get_cached_deal_tip("jd", "1001001") is None
         assert BOOM_SORT_CACHE.get(("all", "desc")) is None
         assert get_cached_deal_tip("jd", "9999999") == ("ok", {"deal_price": 88.0})
 
-        # 2. AI-2 基础分 55 < 60：严选门槛不因来源加分放水，依然淘汰
+        # 2) 低可靠投稿 (10 vs 20)：零成本前置拦截，连多模态 AI 都不调用
         res_low = svc.submit_user_deal(
+            uid="u_low",
+            platform="jd",
+            product_id="1001001",
+            deal_price=15.0,
+            tutorial_text="低可靠投稿尝试覆盖",
+            images_base64=[_make_png_b64(360, 260, color=(20, 200, 10, 255))],
+        )
+        low_calls: List[Dict[str, Any]] = []
+        w_low = DealSubmitWorker(
+            svc,
+            ai_generator=_make_audit_gen(capture_calls=low_calls),
+            remote_image_fetcher=lambda _u: _make_png_bytes(),
+        )
+        assert w_low.run_once()["skipped_existing"] == 1
+        assert low_calls == []
+        assert raw_repo.col.find_one({"source_item_id": res_low["data"]["tip_id"]})["clean_error_code"] == OK_EXISTING_DEAL_BETTER
+
+        # 3) 同级 (20 vs 20) 在 6 小时保护期内涨价 (age=2h)：拦截并友好提示保护期
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        raw_repo.formal_col.update_many(
+            {"platform": "jd", "product_id": "1001001"},
+            {"$set": {"deal_info.updated_at": now_utc - datetime.timedelta(hours=2)}},
+        )
+        res_prot = svc.submit_user_deal(
             uid="u_alice",
             platform="jd",
             product_id="1001001",
-            deal_price=26.0,
-            tutorial_text="低分测试",
-            images_base64=[_make_png_b64(360, 260)],
+            deal_price=35.0,
+            tutorial_text="券失效现价35",
+            images_base64=[_make_png_b64(360, 260, color=(200, 20, 20, 255))],
         )
-        cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-            stage2_inputs[0]["main_tip_id"]: {
-                "main_tip_id": stage2_inputs[0]["main_tip_id"],
-                "is_valid_deal": True,
-                "reject_reason": None,
-                "main_link_id": "L1",
-                "clean_title": "维达抽纸",
-                "deal_price": 26.0,
-                "price_logic": "券后",
-                "card_highlight": "26元",
-                "coupon_links": [],
-                "tutorial_steps": ["1. 26元"],
-                "quality_score": 55,
-                "price_is_reliable": True,
-                "price_reliability_reason": "一般",
-            }
-        }
-        out_low = w_ok.run_once()
-        assert out_low["published"] == 0
-        assert out_low["rejected"] == 1
-        assert raw_repo.col.find_one({"source_item_id": res_low["data"]["tip_id"]})["clean_status"] == "cleaned_low_score"
+        w_prot = DealSubmitWorker(
+            svc,
+            ai_generator=_make_audit_gen(price_comparison="higher", comparison_reason="新截图实付35高于原28"),
+            remote_image_fetcher=lambda _u: _make_png_bytes(),
+        )
+        assert w_prot.run_once()["skipped_existing"] == 1
+        prot_view = svc.get_my_submissions("u_alice")["data"]["items"][0]
+        assert prot_view["tip_id"] == res_prot["data"]["tip_id"]
+        assert prot_view["state_label"] == "未替换在架好价"
+        assert "6小时" in prot_view["reason"]
+
+        # 4) 同级 (20 vs 20) 满 6 小时保护期 (age=7h) 纠偏涨价：放行替换并获奖励资格
+        raw_repo.formal_col.update_many(
+            {"platform": "jd", "product_id": "1001001"},
+            {"$set": {"deal_info.updated_at": now_utc - datetime.timedelta(hours=7)}},
+        )
+        res_corr = svc.submit_user_deal(
+            uid="u_alice",
+            platform="jd",
+            product_id="1001001",
+            deal_price=35.0,
+            tutorial_text="原券已无，最新真实价35元",
+            images_base64=[_make_png_b64(360, 260, color=(150, 80, 20, 255))],
+        )
+        assert DealSubmitWorker(
+            svc,
+            ai_generator=_make_audit_gen(price_comparison="higher", comparison_reason="原券失效最新实证35"),
+            remote_image_fetcher=lambda _u: _make_png_bytes(),
+        ).run_once()["published"] == 1
+        assert raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})["deal_info"]["source_item_id"] == res_corr["data"]["tip_id"]
+
+        # 5) 同级 (20 vs 20) 在 6 小时保护期内明显更低价：立即替换
+        raw_repo.formal_col.update_many(
+            {"platform": "jd", "product_id": "1001001"},
+            {"$set": {"deal_info.updated_at": now_utc - datetime.timedelta(hours=1)}},
+        )
+        res_cheap = svc.submit_user_deal(
+            uid="u_alice",
+            platform="jd",
+            product_id="1001001",
+            deal_price=21.0,
+            tutorial_text="新神券实付21元",
+            images_base64=[_make_png_b64(360, 260, color=(80, 150, 20, 255))],
+        )
+        assert DealSubmitWorker(
+            svc,
+            ai_generator=_make_audit_gen(price_comparison="cheaper", comparison_reason="实付21明显更低"),
+            remote_image_fetcher=lambda _u: _make_png_bytes(),
+        ).run_once()["published"] == 1
+        assert raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})["deal_info"]["source_item_id"] == res_cheap["data"]["tip_id"]
+
+        # 6) 跨级 (30 vs 20) 核心号即使不低价也立即压制替换
+        res_admin = svc.submit_user_deal(
+            uid="u_trusted",
+            platform="jd",
+            product_id="1001001",
+            deal_price=22.0,
+            tutorial_text="核心号实拍更新",
+            images_base64=[_make_png_b64(360, 260, color=(80, 20, 150, 255))],
+        )
+        assert DealSubmitWorker(
+            svc,
+            ai_generator=_make_audit_gen(price_comparison="none"),
+            remote_image_fetcher=lambda _u: _make_png_bytes(),
+        ).run_once()["published"] == 1
+        assert raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})["deal_info"]["source_item_id"] == res_admin["data"]["tip_id"]
+        assert raw_repo.formal_col.find_one({"platform": "jd", "product_id": "1001001"})["deal_info"]["reliability_score"] == 30
     finally:
         clear_cached_deal_tip()
         BOOM_SORT_CACHE.clear()
@@ -1398,32 +1538,12 @@ def test_concurrent_same_product_batch_serialized_by_publish_ts(tmp_path):
     raw_repo.col.update_many({"source_item_id": tid_other}, {"$set": {"publish_ts": 102.0}})
     raw_repo.col.update_many({"source_item_id": tid_second}, {"$set": {"publish_ts": 105.0}})
 
-    price_by_tid = {tid_first: 29.9, tid_second: 29.9, tid_other: 19.9}
     cleaner = DealPoolCleaner(ai_batch_size=4, convert_max_workers=1)
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-        inp["main_tip_id"]: {
-            "main_tip_id": inp["main_tip_id"],
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": "L1",
-            "clean_title": "商品标题",
-            "deal_price": price_by_tid[inp["main_tip_id"]],
-            "price_logic": "券后",
-            "card_highlight": f"{price_by_tid[inp['main_tip_id']]}元",
-            "coupon_links": [],
-            "tutorial_steps": [f"1. 下单{price_by_tid[inp['main_tip_id']]}"],
-            "quality_score": 82,
-            "price_is_reliable": True,
-            "price_reliability_reason": "凭证有效",
-        }
-        for inp in stage2_inputs
-    }
-
     round1_audits: List[Dict[str, Any]] = []
     w1 = DealSubmitWorker(
         svc,
         cleaner=cleaner,
-        ai_generator=_make_audit_gen(is_valid=True, should_replace=True, capture_calls=round1_audits),
+        ai_generator=_make_audit_gen(is_valid=True, price_comparison="cheaper", capture_calls=round1_audits),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
     out1 = w1.run_once()
@@ -1445,8 +1565,8 @@ def test_concurrent_same_product_batch_serialized_by_publish_ts(tmp_path):
         cleaner=cleaner,
         ai_generator=_make_audit_gen(
             is_valid=True,
-            should_replace=False,
-            decision_reason="已有同价在架凭证",
+            price_comparison="same",
+            comparison_reason="已有同价在架凭证",
             capture_calls=round2_audits,
         ),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
@@ -1476,8 +1596,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                 "is_deal_tip": True,
                 "source_site": "guangdiu",
                 "source_item_id": "old_1",
-                "source_is_reliable": False,
-                "quality_score": 70,
+                "reliability_score": 10,
                 "deal_price": 30.0,
                 "updated_at": now,
             },
@@ -1492,8 +1611,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                 "is_deal_tip": True,
                 "source_site": "guangdiu",
                 "source_item_id": "old_2",
-                "source_is_reliable": False,
-                "quality_score": 70,
+                "reliability_score": 10,
                 "deal_price": 20.0,
                 "updated_at": now,
             },
@@ -1507,8 +1625,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                 "is_deal_tip": True,
                 "source_site": USER_SUBMIT_SITE,
                 "source_item_id": "same_1",
-                "source_is_reliable": True,
-                "quality_score": 85,
+                "reliability_score": 20,
                 "deal_price": 25.0,
                 "updated_at": now,
             },
@@ -1522,8 +1639,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                 "is_deal_tip": True,
                 "source_site": USER_SUBMIT_SITE,
                 "source_item_id": "prot_1",
-                "source_is_reliable": True,
-                "quality_score": 95,
+                "reliability_score": 20,
                 "deal_price": 15.0,
                 "updated_at": now,
             },
@@ -1543,8 +1659,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                     "is_deal_tip": True,
                     "source_site": USER_SUBMIT_SITE,
                     "source_item_id": "new_1",
-                    "source_is_reliable": True,
-                    "quality_score": 88,
+                    "reliability_score": 20,
                     "deal_price": 19.9,
                 },
             },
@@ -1558,8 +1673,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                     "is_deal_tip": True,
                     "source_site": USER_SUBMIT_SITE,
                     "source_item_id": "new_2",
-                    "source_is_reliable": True,
-                    "quality_score": 86,
+                    "reliability_score": 20,
                     "deal_price": 12.9,
                 },
             },
@@ -1573,8 +1687,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                     "is_deal_tip": True,
                     "source_site": USER_SUBMIT_SITE,
                     "source_item_id": "same_1",
-                    "source_is_reliable": True,
-                    "quality_score": 86,
+                    "reliability_score": 20,
                     "deal_price": 25.0,
                 },
             },
@@ -1588,8 +1701,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                     "is_deal_tip": True,
                     "source_site": "guangdiu",
                     "source_item_id": "low_1",
-                    "source_is_reliable": False,
-                    "quality_score": 80,
+                    "reliability_score": 10,
                     "deal_price": 16.0,
                 },
             },
@@ -1603,8 +1715,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
                     "is_deal_tip": True,
                     "source_site": USER_SUBMIT_SITE,
                     "source_item_id": "new_5",
-                    "source_is_reliable": True,
-                    "quality_score": 84,
+                    "reliability_score": 20,
                     "deal_price": 9.9,
                 },
             },
@@ -1627,6 +1738,7 @@ def test_feedback_vote_reset_and_user_stats_score_on_takeover():
 def test_evidence_fail_closed_and_incidental_replacement_trace(tmp_path):
     """验证 Fail-Closed 证据硬门禁，以及无需新表即可顺手留存替代方向与对比快照。"""
     db, raw_repo, _, _, svc = _make_harness(
+        initial_users=[{"uid": "u_alice", "phone": "13800138000", "nickname": "阿丽", "auth_status": {"taobao": {"is_authorized": True}}}],
         image_dir=tmp_path / "imgs",
         initial_products=[
             {
@@ -1639,8 +1751,7 @@ def test_evidence_fail_closed_and_incidental_replacement_trace(tmp_path):
                     "is_deal_tip": True,
                     "source_site": "guangdiu",
                     "source_item_id": "old_gd_1",
-                    "source_is_reliable": False,
-                    "quality_score": 80,
+                    "reliability_score": 10,
                     "deal_price": 19.9,
                     "updated_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=1),
                 },
@@ -1671,7 +1782,7 @@ def test_evidence_fail_closed_and_incidental_replacement_trace(tmp_path):
         ai_caller=lambda **_kw: {
             "status": "✅ 成功",
             "content": json.dumps(
-                {"is_content_valid": True, "should_replace_existing": True, "decision_reason": "缺证据字段"},
+                {"is_content_valid": True, "price_comparison": "cheaper", "comparison_reason": "缺证据字段"},
                 ensure_ascii=False,
             ),
         }
@@ -1696,9 +1807,9 @@ def test_evidence_fail_closed_and_incidental_replacement_trace(tmp_path):
             is_valid=True,
             evidence_supports_claims=False,
             reject_reason="",
-            should_replace=True,
+            price_comparison="none",
             observed_image_evidence="截图仅展示19.9元，未见15.9元抵扣凭证",
-            decision_reason="图片仅展示19.9元且缺少额外优惠凭证",
+            comparison_reason="图片仅展示19.9元且缺少额外优惠凭证",
         ),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
@@ -1722,32 +1833,15 @@ def test_evidence_fail_closed_and_incidental_replacement_trace(tmp_path):
         images_base64=[_make_png_b64(320, 240, color=(40, 180, 90, 255))],
     )
     tid_good = res_good["data"]["tip_id"]
-    cleaner.run_ai_stage2_batch = lambda stage2_inputs, quiet_sub_logs=False: {
-        stage2_inputs[0]["main_tip_id"]: {
-            "main_tip_id": stage2_inputs[0]["main_tip_id"],
-            "is_valid_deal": True,
-            "reject_reason": None,
-            "main_link_id": "L1",
-            "clean_title": "维达抽纸",
-            "deal_price": 15.9,
-            "price_logic": "券后",
-            "card_highlight": "15.9元",
-            "coupon_links": [],
-            "tutorial_steps": ["1. 下单15.9"],
-            "quality_score": 88,
-            "price_is_reliable": True,
-            "price_reliability_reason": "有效",
-        }
-    }
     worker_good = DealSubmitWorker(
         svc,
         cleaner=cleaner,
         ai_generator=_make_audit_gen(
             is_valid=True,
             evidence_supports_claims=True,
-            should_replace=True,
+            price_comparison="none",
             observed_image_evidence="结算页实付15.9元",
-            decision_reason="证据充分且价格低于在架旧爆料，予以替换",
+            comparison_reason="证据充分且跨级替换在架旧爆料",
         ),
         remote_image_fetcher=lambda _u: _make_png_bytes(),
     )
@@ -1768,3 +1862,151 @@ def test_evidence_fail_closed_and_incidental_replacement_trace(tmp_path):
     assert hist_by_id[tid_good]["replaces_price"] == 19.9
     assert hist_by_id[tid_good]["user_audit_result"]["observed_image_evidence"] == "结算页实付15.9元"
     assert hist_by_id[tid_bad]["user_audit_result"]["compared_existing_item_id"] == "old_gd_1"
+
+
+def test_official_baseline_virtual_gate_prompt_injection_guard_and_recompressed_image_dedup(tmp_path):
+    """验证空位虚拟官方基线拦截原价占位、防注入完整度 Fail-Closed 门禁及 JPEG 二次重编码防盗图不误杀。"""
+    from PIL import ImageDraw
+    from services.deal_submit_worker import _evaluate_audit_payload
+    from services.deal_cleaning.ai_client import DealAIClient
+
+    prompt_text = Path(PROMPT_USER_AUDIT_PATH).read_text(encoding="utf-8")
+    assert "不可信" in prompt_text
+    assert "official_baseline" in prompt_text
+
+    # 1) 空位虚拟官方基线：30分高信誉账号与20分账号面对无好价商品，同价/更高价均被拦截为「未达优惠门槛」，实质更低价才可发布且不写虚假替换史
+    db, raw_repo, _, ps, svc = _make_harness(
+        initial_users=[
+            {"uid": "u_alice", "phone": "13800138000", "nickname": "阿丽", "auth_status": {"taobao": {"is_authorized": True}}, "reliability_score": 20},
+            {"uid": "u_vip", "phone": "13900139000", "nickname": "达人", "auth_status": {"taobao": {"is_authorized": True}}, "reliability_score": 30},
+        ],
+        initial_products=[
+            {"platform": "jd", "product_id": "1001001", "goods_id": "1001001", "name": "维达抽纸", "price": 59.9},
+        ],
+        image_dir=tmp_path / "imgs",
+    )
+    cleaner = DealPoolCleaner(ai_batch_size=4, convert_max_workers=1)
+
+    res_same = svc.submit_user_deal(
+        uid="u_alice", platform="jd", product_id="1001001", deal_price=59.9,
+        tutorial_text="原价59.9直接买", images_base64=[_make_png_b64(320, 240, color=(100, 100, 100, 255))],
+    )
+    same_calls: List[Dict[str, Any]] = []
+    out_same = DealSubmitWorker(
+        svc, cleaner=cleaner,
+        ai_generator=_make_audit_gen(price_comparison="same", comparison_reason="与官方在售价相同", capture_calls=same_calls),
+        remote_image_fetcher=lambda _u: _make_png_bytes(),
+    ).run_once()
+    assert out_same["skipped_existing"] == 1
+    assert len(same_calls) == 1
+    assert '"source_site": "official_baseline"' in same_calls[0]["prompt"]
+    assert raw_repo.formal_col.find_one({"product_id": "1001001"}).get("deal_info") is None
+    view_same = svc.get_my_submissions("u_alice")["data"]["items"][0]
+    assert view_same["tip_id"] == res_same["data"]["tip_id"]
+    assert view_same["state"] == "duplicate"
+    assert view_same["state_label"] == "未达优惠门槛"
+    assert "官方在售价" in view_same["reason"]
+
+    # 30分达人在空位报高于官方价也不能绕过
+    svc.submit_user_deal(
+        uid="u_vip", platform="jd", product_id="1001001", deal_price=65.0,
+        tutorial_text="65元高于官价", images_base64=[_make_png_b64(320, 240, color=(120, 90, 90, 255))],
+    )
+    out_vip_high = DealSubmitWorker(
+        svc, cleaner=cleaner,
+        ai_generator=_make_audit_gen(price_comparison="higher", comparison_reason="高于官方在售价"),
+        remote_image_fetcher=lambda _u: _make_png_bytes(),
+    ).run_once()
+    assert out_vip_high["skipped_existing"] == 1
+    assert raw_repo.formal_col.find_one({"product_id": "1001001"}).get("deal_info") is None
+
+    # 降价超过5%且>=1元则替换虚拟基线成功上架，且不写出虚假 replaces_* 历史
+    res_lower = svc.submit_user_deal(
+        uid="u_alice", platform="jd", product_id="1001001", deal_price=39.9,
+        tutorial_text="领20券后实付39.9元", images_base64=[_make_png_b64(320, 240, color=(60, 160, 90, 255))],
+    )
+    tid_lower = res_lower["data"]["tip_id"]
+    assert DealSubmitWorker(
+        svc, cleaner=cleaner,
+        ai_generator=_make_audit_gen(price_comparison="cheaper", comparison_reason="低于官方价33%"),
+        remote_image_fetcher=lambda _u: _make_png_bytes(),
+    ).run_once()["published"] == 1
+    doc_lower_raw = raw_repo.col.find_one({"source_item_id": tid_lower})
+    assert "replaces_item_id" not in doc_lower_raw
+    assert raw_repo.formal_col.find_one({"product_id": "1001001"})["deal_info"]["source_item_id"] == tid_lower
+
+    # 2) JPEG 二次有损重编码及转存 PNG 再上传均命中近原图去重；同模板改写价格数字的诚实更新不被误杀
+    # 先构造一张带纹理和文字的真实截图上架正式表
+    base_im = Image.new("RGB", (480, 640), (245, 246, 248))
+    d1 = ImageDraw.Draw(base_im)
+    d1.rectangle([20, 40, 460, 200], fill=(255, 255, 255), outline=(210, 210, 215))
+    d1.text((40, 80), "Product Order Preview", fill=(20, 20, 20))
+    d1.text((40, 140), "TOTAL: 44.00", fill=(220, 30, 30))
+    buf_orig = io.BytesIO()
+    base_im.save(buf_orig, format="JPEG", quality=85)
+    orig_b64 = "data:image/jpeg;base64," + base64.b64encode(buf_orig.getvalue()).decode("ascii")
+
+    ps.get_goods_detail.return_value = _sample_detail_product(plat="jd", pid="1009999", price=59.9)
+    sub_orig = svc.submit_user_deal(
+        uid="u_alice", platform="jd", product_id="1009999", deal_price=44.0,
+        tutorial_text="原实拍44元", images_base64=[orig_b64],
+    )
+    assert DealSubmitWorker(
+        svc, cleaner=cleaner,
+        ai_generator=_make_audit_gen(price_comparison="cheaper"),
+        remote_image_fetcher=lambda _u: _make_png_bytes(),
+    ).run_once()["published"] == 1
+
+    # 把硬盘里存好的 .jpg 读出来，模拟用户右键下载后经浏览器 JPEG 二次重编码 / 转存 PNG 再重传 -> Hash 不同但仍被拦截
+    formal_img_url = raw_repo.formal_col.find_one({"product_id": "1009999"})["deal_info"]["user_share_images"][0]
+    stored_jpg_path = svc.get_image_file_path(formal_img_url.rsplit("/", 1)[-1])
+    stored_bytes = stored_jpg_path.read_bytes()
+    recompressed_b64 = "data:image/jpeg;base64," + base64.b64encode(
+        normalize_and_compress_deal_image(base64.b64encode(stored_bytes).decode("ascii"))
+    ).decode("ascii")
+    png_reexport_buf = io.BytesIO()
+    Image.open(stored_jpg_path).save(png_reexport_buf, format="PNG")
+    png_reexport_b64 = "data:image/png;base64," + base64.b64encode(png_reexport_buf.getvalue()).decode("ascii")
+
+    for dup_payload in (recompressed_b64, png_reexport_b64):
+        with pytest.raises(DealSubmitError) as e_recomp_dup:
+            svc.submit_user_deal(
+                uid="u_vip", platform="jd", product_id="1009999", deal_price=43.0,
+                tutorial_text="二次压缩复用旧图", images_base64=[dup_payload],
+            )
+        assert e_recomp_dup.value.error_code == "duplicate_deal_image"
+
+    # 同版式界面仅真实改动价格区域（如 44.00 -> 39.00，足够文字差分像素）绝不误杀
+    changed_im = base_im.copy()
+    d2 = ImageDraw.Draw(changed_im)
+    d2.rectangle([38, 136, 220, 170], fill=(255, 255, 255))
+    d2.text((40, 140), "NEW TOTAL: 39.00", fill=(220, 30, 30))
+    buf_changed = io.BytesIO()
+    changed_im.save(buf_changed, format="JPEG", quality=85)
+    changed_b64 = "data:image/jpeg;base64," + base64.b64encode(buf_changed.getvalue()).decode("ascii")
+    res_honest_diff = svc.submit_user_deal(
+        uid="u_vip", platform="jd", product_id="1009999", deal_price=39.0,
+        tutorial_text="新低价39元更新", images_base64=[changed_b64],
+    )
+    assert res_honest_diff["status"] == "success"
+
+    # 3) 防提示词注入 Fail-Closed：模型被文本注入诱导返回 passed + 短证据 + 空步骤和空正文 -> 代码强制拒绝该结果
+    hijacked_ai = DealAIClient(
+        ai_caller=lambda **_kw: {
+            "status": "✅ 成功",
+            "content": json.dumps({
+                "observed_image_evidence": "实付1元",
+                "evidence_supports_claims": True,
+                "is_content_valid": True,
+                "content_reject_reason": "",
+                "price_comparison": "cheaper",
+                "tutorial_steps": [],
+                "polished_copywriting": "",
+            }, ensure_ascii=False),
+        }
+    )
+    hijack_res = _evaluate_audit_payload(
+        hijacked_ai, {"new_submission": {}}, existing_deal=None, image_paths=[],
+    )
+    assert hijack_res["ok"] is False
+    assert "缺少完整的视觉证据与规范文案" in hijack_res["error"]

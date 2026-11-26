@@ -25,11 +25,13 @@ from models.deal_constants import (
     CLEAN_STAGE_NEED_AI2,
     CLEAN_STAGE_NEED_CONVERT,
     CLEAN_STAGE_NEED_USER_AUDIT,
+    CN_TZ,
     USER_SUBMIT_SITE,
     DEAL_FORMAL_EXPIRY_HOURS,
     DEAL_MAX_CLEAN_AGE_DAYS,
     DEAL_RAW_TTL_DAYS,
     DEFAULT_FORMAL_PRODUCTS_COLLECTION,
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
     DEFAULT_RAW_COLLECTION_NAME,
     ERROR_LOG_JSONL_PATH,
     ERR_AI_MAX_RETRIES_EXCEEDED,
@@ -42,6 +44,7 @@ from models.deal_constants import (
     get_default_site_max_age_days_map,
     parse_publish_time_epoch,
     resolve_deal_max_age_days,
+    resolve_reliability_score,
 )
 
 logger = logging.getLogger("deal_pool_scheduler")
@@ -250,7 +253,6 @@ class DealRawPoolRepository:
                 background=True,
             )
             col.create_index([("clean_error_code", 1)], background=True)
-            col.create_index([("quality_score", -1)], background=True)
             col.create_index(
                 [("quality_signals.has_unique_product_anchor", 1), ("clean_status", 1)],
                 background=True,
@@ -287,7 +289,7 @@ class DealRawPoolRepository:
             pcol.create_index([("platform", 1), ("product_id", 1)], unique=True, background=True)
             pcol.create_index("goods_sign", background=True)
             pcol.create_index([("updated_at", -1)], background=True)
-            pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.quality_score", -1), ("updated_at", -1)], background=True)
+            pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.reliability_score", -1), ("updated_at", -1)], background=True)
             pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.updated_at", 1)], background=True)
             pcol.create_index([("deal_info.is_deal_tip", 1), ("deal_info.last_seen_at", 1)], background=True)
             self._indexes_ready = True
@@ -746,7 +748,10 @@ class DealRawPoolRepository:
 
             core_fields = {
                 "source_channel": channel,
-                "source_is_reliable": bool(rec.get("source_is_reliable")),
+                "reliability_score": resolve_reliability_score(
+                    rec.get("reliability_score"),
+                    default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+                ),
                 "source_url": source_url or source_detail_url,
                 "source_list_page_url": source_list_page_url,
                 "source_detail_url": source_detail_url,
@@ -1381,7 +1386,7 @@ class DealRawPoolRepository:
                     "clean_stage": 1,
                     "clean_error_code": 1,
                     "clean_error_msg": 1,
-                    "quality_score": 1,
+                    "reliability_score": 1,
                     "submitted_by_uid": 1,
                     "first_seen_at": 1,
                     "cleaned_at": 1,
@@ -1400,6 +1405,58 @@ class DealRawPoolRepository:
             .sort([("display_started_at", -1), ("first_seen_at", -1)])
             .limit(safe_limit)
         )
+
+    def count_user_daily_submissions(
+        self,
+        uid: str,
+        *,
+        now_utc: Optional[datetime.datetime] = None,
+        source_site: str = USER_SUBMIT_SITE,
+    ) -> int:
+        """统计指定用户北京时间当日累计提交的用户爆料数量（含 pending/成功/失败）。"""
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return 0
+        ref_utc = now_utc or datetime.datetime.now(datetime.timezone.utc)
+        if ref_utc.tzinfo is None:
+            ref_utc = ref_utc.replace(tzinfo=datetime.timezone.utc)
+        cn_midnight = ref_utc.astimezone(CN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_day_start = cn_midnight.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        flt = {
+            "source_site": str(source_site or USER_SUBMIT_SITE).strip(),
+            "submitted_by_uid": clean_uid,
+            "first_seen_at": {"$gte": utc_day_start},
+        }
+        count_fn = getattr(self.col, "count_documents", None)
+        if callable(count_fn):
+            return int(count_fn(flt))
+        return sum(1 for _ in self.col.find(flt, {"_id": 1}))
+
+    def has_pending_user_submission(
+        self,
+        uid: str,
+        platform: str,
+        product_id: str,
+        *,
+        source_site: str = USER_SUBMIT_SITE,
+    ) -> bool:
+        """检查用户在同一商品上是否已有处于 pending 审查中的爆料。"""
+        clean_uid = str(uid or "").strip()
+        plat = normalize_platform(platform or "", default="")
+        pid = str(product_id or "").strip()
+        if not clean_uid or not plat or not pid:
+            return False
+        doc = self.col.find_one(
+            {
+                "source_site": str(source_site or USER_SUBMIT_SITE).strip(),
+                "submitted_by_uid": clean_uid,
+                "resolved_platform": plat,
+                "resolved_product_id": pid,
+                "clean_status": "pending",
+            },
+            {"_id": 1},
+        )
+        return doc is not None
 
 
 def record_deal_display_transitions(

@@ -36,7 +36,7 @@ def _make_sample_deal_doc(
     publish_time: str = "2026-11-12 12:00:00",
     need_reformat: bool = False,
     format_status: str = "success",
-    source_is_reliable=False,
+    reliability_score: int = 10,
     price_is_reliable=True,
     category_name: str = "面部精华油",
 ):
@@ -52,7 +52,7 @@ def _make_sample_deal_doc(
         "updated_at": datetime.datetime(2026, 11, 12, 5, 0, 0, tzinfo=datetime.timezone.utc),
         "deal_info": {
             "is_deal_tip": True,
-            "source_is_reliable": source_is_reliable,
+            "reliability_score": reliability_score,
             "price_is_reliable": price_is_reliable,
             "clean_title": "瑷尔博士2.0摇醒精华油30ml*2瓶",
             "deal_price": deal_price,
@@ -61,7 +61,6 @@ def _make_sample_deal_doc(
             "need_reformat": need_reformat,
             "publish_time": publish_time,
             "price_logic": "领券+百亿补贴多人团",
-            "quality_score": 85,
             "format_info": {
                 "sku_id": f"{product_id}_deal",
                 "price": format_deal_price,
@@ -212,12 +211,12 @@ def test_build_deal_tip_virtual_doc_shelf_life_and_snapshot():
     doc_mismatch = _make_sample_deal_doc(deal_price=55.0, format_deal_price=66.0)
     assert sched._build_deal_tip_virtual_doc(doc_mismatch, cutoff_utc=cutoff_48h) is None
 
-    # 可靠性拦截：仅当来源可靠或价格核验可靠之一为 True 时才可通过，(F,F) 与 (F,None) 一律拦截
-    doc_src_rel = _make_sample_deal_doc(source_is_reliable=True, price_is_reliable=False)
+    # 可靠性拦截：仅当可靠分>=20或价格核验可靠之一满足才可通过
+    doc_src_rel = _make_sample_deal_doc(reliability_score=20, price_is_reliable=False)
     assert sched._build_deal_tip_virtual_doc(doc_src_rel, cutoff_utc=cutoff_48h) is not None
-    doc_unreliable_ff = _make_sample_deal_doc(source_is_reliable=False, price_is_reliable=False)
+    doc_unreliable_ff = _make_sample_deal_doc(reliability_score=10, price_is_reliable=False)
     assert sched._build_deal_tip_virtual_doc(doc_unreliable_ff, cutoff_utc=cutoff_48h) is None
-    doc_unreliable_fn = _make_sample_deal_doc(source_is_reliable=False, price_is_reliable=None)
+    doc_unreliable_fn = _make_sample_deal_doc(reliability_score=10, price_is_reliable=None)
     assert sched._build_deal_tip_virtual_doc(doc_unreliable_fn, cutoff_utc=cutoff_48h) is None
 
 
@@ -943,27 +942,27 @@ def test_select_round_candidates_filters_unreliable_products():
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     recent_pub = now_utc.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1) 线报源：仅来源可靠(T,F)与价格核验可靠(F,T)通过，(F,F) 被过滤
+    # 1) 线报源：仅可靠分>=20或价格核验可靠通过，(10,F) 被过滤
     deal_docs = [
         _make_sample_deal_doc(
             product_id="deal_unreliable",
             category_name="面霜",
             publish_time=recent_pub,
-            source_is_reliable=False,
+            reliability_score=10,
             price_is_reliable=False,
         ),
         _make_sample_deal_doc(
             product_id="deal_src_ok",
             category_name="精华液",
             publish_time=recent_pub,
-            source_is_reliable=True,
+            reliability_score=20,
             price_is_reliable=False,
         ),
         _make_sample_deal_doc(
             product_id="deal_price_ok",
             category_name="防晒霜",
             publish_time=recent_pub,
-            source_is_reliable=False,
+            reliability_score=10,
             price_is_reliable=True,
         ),
     ]
@@ -993,7 +992,7 @@ def test_select_round_candidates_filters_unreliable_products():
     deal_query, deal_proj = fake_repo.col.find.call_args.args
     assert expected_reliable_filter in deal_query["$and"]
     assert deal_proj["deal_info.is_deal_tip"] == 1
-    assert deal_proj["deal_info.source_is_reliable"] == 1
+    assert deal_proj["deal_info.reliability_score"] == 1
     assert deal_proj["deal_info.price_is_reliable"] == 1
 
     # 2) 官方源：纯官方商品与附带可靠线报的商品通过，附带不可靠活跃线报的商品被排除
@@ -1003,7 +1002,7 @@ def test_select_round_candidates_filters_unreliable_products():
     )
     off_with_reliable_deal["deal_info"] = {
         "is_deal_tip": True,
-        "source_is_reliable": True,
+        "reliability_score": 20,
         "price_is_reliable": False,
     }
     off_with_unreliable_deal = _make_sample_official_doc(
@@ -1011,7 +1010,7 @@ def test_select_round_candidates_filters_unreliable_products():
     )
     off_with_unreliable_deal["deal_info"] = {
         "is_deal_tip": True,
-        "source_is_reliable": False,
+        "reliability_score": 10,
         "price_is_reliable": False,
     }
 
@@ -1036,7 +1035,7 @@ def test_select_round_candidates_filters_unreliable_products():
     off_query, off_proj = fake_repo.col.find.call_args.args
     assert expected_reliable_filter in off_query["$and"]
     assert off_proj["deal_info.is_deal_tip"] == 1
-    assert off_proj["deal_info.source_is_reliable"] == 1
+    assert off_proj["deal_info.reliability_score"] == 1
     assert off_proj["deal_info.price_is_reliable"] == 1
 
 

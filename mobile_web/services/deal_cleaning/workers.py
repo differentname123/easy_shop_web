@@ -51,7 +51,6 @@ def commit_batch_results_to_db(
             "ai_stage1_result": r.get("ai_stage1_result"),
             "converted_links": r.get("converted_links") or [],
             "ai_stage2_result": r.get("ai_stage2_result"),
-            "quality_score": r.get("quality_score", 0),
         }
         if r.get("original_copywriting"):
             common_ai_fields["original_copywriting"] = r["original_copywriting"]
@@ -158,26 +157,6 @@ def commit_batch_results_to_db(
                     {"source_site": s_site, "source_item_id": s_id},
                     {
                         "$set": retry_set,
-                        "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
-                    },
-                )
-            )
-        elif r["status"] == "low_score":
-            raw_status_ops.append(
-                UpdateOne(
-                    {"source_site": s_site, "source_item_id": s_id},
-                    {
-                        "$set": {
-                            **common_ai_fields,
-                            "clean_status": "cleaned_low_score",
-                            "clean_stage": CLEAN_STAGE_DONE,
-                            "clean_error_code": r["error_code"],
-                            "clean_error_msg": r["error_msg"],
-                            "resolved_platform": r.get("platform"),
-                            "resolved_product_id": r.get("product_id"),
-                            "resolved_goods_sign": r.get("goods_sign"),
-                            "resolved_official_title": r.get("official_title"),
-                        },
                         "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
                     },
                 )

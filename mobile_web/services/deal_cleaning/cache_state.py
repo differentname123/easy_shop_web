@@ -9,9 +9,12 @@ from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from models.deal_constants import (
-    DEAL_INFO_PROTECTION_HOURS,
+    DEAL_FORMAL_EXPIRY_HOURS,
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
     ERR_ADAPTER_CONVERT_FAILED,
     MAX_ANCHOR_CACHE_SIZE,
+    evaluate_deal_replacement,
+    resolve_reliability_score,
 )
 from models.product import extract_taobao_token_core
 
@@ -122,13 +125,13 @@ def query_active_formal_products(
     formal_col,
     pid_keys: Optional[Iterable[Tuple[str, str]]] = None,
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    """精确查询正式库 12h 内活跃好价商品摘要映射。"""
+    """精确查询正式库 72h 有效期内活跃好价商品摘要映射。"""
     active_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
     if formal_col is None:
         return active_map
     try:
         cutoff = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(
-            hours=DEAL_INFO_PROTECTION_HOURS
+            hours=DEAL_FORMAL_EXPIRY_HOURS
         )
         base_q: Dict[str, Any] = {
             "deal_info.is_deal_tip": True,
@@ -155,11 +158,9 @@ def query_active_formal_products(
                 "price": 1,
                 "deal_source": 1,
                 "deal_info.source_site": 1,
-                "deal_info.source_is_reliable": 1,
-                "deal_info.quality_score": 1,
+                "deal_info.reliability_score": 1,
                 "deal_info.deal_price": 1,
-                "deal_info.tutorial_steps": 1,
-                "deal_info.tutorial_score": 1,
+                "deal_info.updated_at": 1,
             },
         )
         for d in cursor:
@@ -167,8 +168,6 @@ def query_active_formal_products(
             pid = str(d.get("product_id") or "").strip()
             if plat and pid:
                 di = d.get("deal_info") if isinstance(d.get("deal_info"), dict) else {}
-                t_steps = di.get("tutorial_steps")
-                t_cnt = len(t_steps) if isinstance(t_steps, list) else (1 if t_steps else 0)
                 active_map[(plat, pid)] = {
                     "platform": plat,
                     "product_id": pid,
@@ -176,11 +175,12 @@ def query_active_formal_products(
                     "official_title": str(d.get("name") or ""),
                     "official_price": d.get("price"),
                     "deal_price": di.get("deal_price"),
-                    "quality_score": int(di.get("quality_score") or 75),
-                    "tutorial_steps_count": t_cnt,
-                    "tutorial_score": int(di.get("tutorial_score") or di.get("quality_score") or 75),
+                    "updated_at": di.get("updated_at"),
                     "source_site": str(di.get("source_site") or d.get("deal_source") or ""),
-                    "source_is_reliable": bool(di.get("source_is_reliable")),
+                    "reliability_score": resolve_reliability_score(
+                        di.get("reliability_score"),
+                        default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+                    ),
                 }
     except Exception as e:
         logger.warning("查询正式表已清洗活跃商品集合异常: %s", e)
@@ -192,27 +192,31 @@ def should_upgrade_existing_deal(
     ai1_res: Dict[str, Any],
     doc: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
-    """判断新线报是否满足库内同款商品替换条件：高可靠来源优先于非高可靠来源，同级别按 >=5% 价格突破或 >=15 分教程质量提升。"""
-    ex_reliable = bool(ex_info.get("source_is_reliable"))
-    new_reliable = bool((doc or {}).get("source_is_reliable"))
-    if new_reliable != ex_reliable:
-        return (True, "高可靠来源线报覆盖非高可靠来源") if new_reliable else (False, "")
+    """委托唯一仲裁函数 `evaluate_deal_replacement` 判断新线报是否具备升级替换已有好价的资格。"""
+    ex_updated = ex_info.get("updated_at")
+    age_hours: Optional[float] = None
+    if isinstance(ex_updated, datetime.datetime):
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        ex_naive = (
+            ex_updated.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            if ex_updated.tzinfo is not None
+            else ex_updated
+        )
+        age_hours = (now_utc - ex_naive).total_seconds() / 3600.0
 
-    new_dp = ai1_res.get("deal_price")
-    ex_dp = ex_info.get("deal_price")
-    new_score = int(ai1_res.get("tutorial_score") or 0)
-    ex_score = int(ex_info.get("tutorial_score") or ex_info.get("quality_score") or 75)
-
-    if (
-        isinstance(new_dp, (int, float))
-        and isinstance(ex_dp, (int, float))
-        and float(ex_dp) > 0
-        and float(new_dp) > 0
-        and float(new_dp) < float(ex_dp) * 0.95
-    ):
-        return True, f"新线报预估价({float(new_dp):.2f}元)显著低于库内旧价格({float(ex_dp):.2f}元)，触发价格择优升级"
-
-    if new_score >= 75 and new_score >= ex_score + 15:
-        return True, f"新线报教程实操分({new_score})显著超越库内现有水平({ex_score})，触发教程补全升级"
-
-    return False, ""
+    should_replace, reason = evaluate_deal_replacement(
+        existing_active=True,
+        existing_reliability_score=resolve_reliability_score(
+            ex_info.get("reliability_score"),
+            default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+        ),
+        new_reliability_score=resolve_reliability_score(
+            (doc or {}).get("reliability_score"),
+            default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+        ),
+        existing_price=ex_info.get("deal_price"),
+        new_price=ai1_res.get("deal_price"),
+        existing_age_hours=age_hours,
+        allow_higher_price_replace=False,
+    )
+    return should_replace, (reason if should_replace else "")

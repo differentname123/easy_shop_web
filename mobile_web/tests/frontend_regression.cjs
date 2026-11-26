@@ -3663,6 +3663,10 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   assert.ok(submitHtml.includes('isCommissionHelpOpen'));
   assert.ok(submitHtml.includes('toggleRecordOrders'));
   assert.ok(submitHtml.includes('隐私'));
+  assert.ok(submitHtml.includes('最终打款'));
+  assert.ok(submitHtml.includes('历史爆料与替换'));
+  assert.ok(submitHtml.includes('quotaNotice'));
+  assert.ok(submitHtml.includes('去完成授权'));
 
   // 持久佣金说明弹窗交互：点开常驻不自动消失，仅手动关闭
   const bTools = harness().context.EasyShop.createBrowserTools({ ref: v => ({ value: v }) });
@@ -3670,6 +3674,7 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   bTools.openCommissionHelp();
   assert.equal(bTools.isCommissionHelpOpen.value, true);
   assert.ok(Array.isArray(bTools.commissionFaqSections) && bTools.commissionFaqSections.length >= 3);
+  assert.ok(bTools.commissionFaqSections.some(sec => sec.items.some(item => item.includes('人工再次审查'))));
   bTools.closeCommissionHelp();
   assert.equal(bTools.isCommissionHelpOpen.value, false);
   assert.ok(submitHtml.includes('必填，1~3 张'));
@@ -3800,6 +3805,23 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   subCtrl.openSubmittedDetail(subCtrl.submissions.value[0]);
   assert.ok(hSub.context.location.href.startsWith('/detail?'));
   assert.ok(hSub.context.location.href.includes('goods_id=1001001'));
+
+  // 2b. 未授权触发 2条/日 上限时展示 quotaNotice 并引导跳转授权
+  subCtrl.dealPrice.value = '29.9';
+  subCtrl.tutorialText.value = '领券实付29.9';
+  subCtrl.selectedImages.value = [{ id: 'img_q', preview: 'data:image/jpeg;base64,BBB=', base64: 'data:image/jpeg;base64,BBB=' }];
+  const quotaP = subCtrl.handleSubmit();
+  await flush();
+  await hSub.finish(5, {
+    status: 'error',
+    error_code: 'submit_daily_limit_unauth',
+    error_msg: '未授权账号每日最多提交 2 条爆料，完成淘宝或拼多多授权后可提升至每日 20 条，或明天再来',
+  }, { status: 429 });
+  await quotaP;
+  assert.equal(subCtrl.quotaNotice.value.needAuth, true);
+  assert.ok(subCtrl.quotaNotice.value.message.includes('每日最多提交 2 条'));
+  subCtrl.goToAuth();
+  assert.ok(hSub.context.location.href.includes('tab=user'));
   subCtrl.dispose();
 
   // 3. 从「我的 -> 我的爆料」无锚点打开 /submit_deal 查看全部个人投稿记录

@@ -79,11 +79,11 @@ class TestSearchMeili(unittest.TestCase):
         })["is_reliable"])
         self.assertTrue(format_meili_doc({
             "platform": "jd", "product_id": "J_SRC_REL", "name": "高可靠来源线报",
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": True, "price_is_reliable": False},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 20, "price_is_reliable": False},
         })["is_reliable"])
         self.assertTrue(format_meili_doc({
             "platform": "jd", "product_id": "J_PRICE_REL", "name": "高可靠价格线报",
-            "deal_info": {"is_deal_tip": True, "source_is_reliable": False, "price_is_reliable": True},
+            "deal_info": {"is_deal_tip": True, "reliability_score": 10, "price_is_reliable": True},
         })["is_reliable"])
 
     def test_format_meili_doc_invalid(self):

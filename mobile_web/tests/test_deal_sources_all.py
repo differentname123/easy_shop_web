@@ -86,9 +86,9 @@ def test_catalog_and_registry_completeness():
     assert by_name["特惠采采_首页精选"].fetch_mode == "full_sweep"
     assert by_name["特惠采采_首页精选"].use_fetch_time_as_publish_time is True
     assert by_name["特惠采采_首页精选"].expire_missing_on_sweep is True
-    assert by_name["特惠采采_首页精选"].source_is_reliable is True
+    assert by_name["特惠采采_首页精选"].reliability_score == 20
     assert all(
-        ch.source_is_reliable is False
+        ch.reliability_score == 10
         for ch in DEFAULT_CHANNEL_CONFIGS
         if ch.name != "特惠采采_首页精选"
     )
@@ -1267,15 +1267,15 @@ def test_repo_stops_perpetual_refetch_of_terminal_failures_and_allows_relisted_d
 
 
 def test_repo_touch_seen_expire_sweep_and_reset_raw_collection():
-    from models.deal_constants import QUALIFIED_DEAL_MIN_SCORE, SOURCE_REPUTATION_BONUS
+    from models.deal_constants import DEFAULT_NORMAL_RELIABILITY_SCORE, DEFAULT_RELIABLE_SCORE
     from models.product import ProductSummary, get_source_site_name
     from repositories.deal_raw_pool_repo import DealRawPoolRepository, evaluate_quality_signals
     from repositories.product_repo import ProductRepository
     from services.deal_sources import build_deal_record
 
-    # 1. 信誉加分与信源中文名映射（仅活跃 12 站点）
-    assert SOURCE_REPUTATION_BONUS.get("tehuicaicai") == 10
-    assert QUALIFIED_DEAL_MIN_SCORE == 60
+    # 1. 可靠分基础等级与信源中文名映射（仅活跃 12 站点）
+    assert DEFAULT_NORMAL_RELIABILITY_SCORE == 10
+    assert DEFAULT_RELIABLE_SCORE == 20
     assert get_source_site_name("tehuicaicai") == "特惠采采"
     assert get_source_site_name("zzzdm") == "值值得买"
     assert get_source_site_name("baicaio") == "白菜哦"
@@ -1616,8 +1616,8 @@ def test_deal_pipeline_respects_allow_empty_ok_from_baicaio_hour_list(monkeypatc
     assert rep_warn["consecutive_failures"] == 1
 
 
-def test_deal_pipeline_and_repo_persist_source_is_reliable(monkeypatch, tmp_path):
-    """验证 ChannelConfig.source_is_reliable 随 Stage 1 拉取与 save_batch 准确落盘至 deal_raw_tips。"""
+def test_deal_pipeline_and_repo_persist_reliability_score(monkeypatch, tmp_path):
+    """验证 ChannelConfig.reliability_score 随 Stage 1 拉取与 save_batch 准确落盘至 deal_raw_tips。"""
     from repositories.deal_raw_pool_repo import DealRawPoolRepository
     from services.deal_pipeline import run_fetch_stage
     from services.deal_sources import BaseDealSource, ChannelConfig, FetchContext, FetchResult
@@ -1658,7 +1658,7 @@ def test_deal_pipeline_and_repo_persist_source_is_reliable(monkeypatch, tmp_path
         name="高可靠频道",
         site_key="dummy_rel",
         default_url="https://rel.test",
-        source_is_reliable=True,
+        reliability_score=20,
         sleep_after=0.0,
     )
     ch_normal = ChannelConfig(
@@ -1682,11 +1682,11 @@ def test_deal_pipeline_and_repo_persist_source_is_reliable(monkeypatch, tmp_path
     persisted_by_id = {}
     for call in raw_col.bulk_write.call_args_list:
         for op in call[0][0]:
-            persisted_by_id[op._filter["source_item_id"]] = op._doc["$set"]["source_is_reliable"]
+            persisted_by_id[op._filter["source_item_id"]] = op._doc["$set"]["reliability_score"]
 
     assert persisted_by_id == {
-        "高可靠频道_1": True,
-        "普通频道_1": False,
+        "高可靠频道_1": 20,
+        "普通频道_1": 10,
     }
 
 

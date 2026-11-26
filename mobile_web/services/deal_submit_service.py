@@ -15,26 +15,25 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
 
 Image.MAX_IMAGE_PIXELS = 25_000_000
 
 from adapters import PlatformUnavailableError
 from auth import mask_phone
-from cache_utils import ThreadSafeTTLCache
 from config import logger, settings
 from models.deal_constants import (
     CLEAN_STAGE_NEED_USER_AUDIT,
+    DEFAULT_RELIABLE_SCORE,
     ERR_AI2_COUPON_FAILED_OR_DROPPED,
     ERR_AI2_MAIN_DEAD_ONLY_FILLER,
     ERR_AI2_PRODUCT_MISMATCH,
     ERR_AI2_VIRTUAL_OR_JUNK,
-    ERR_LOW_QUALITY_SCORE,
     ERR_USER_AUDIT_REJECTED,
     OK_EXISTING_DEAL_BETTER,
     OK_SKIPPED_ALREADY_CLEANED,
     USER_SUBMIT_SITE,
-    is_reliable_source_site,
+    resolve_reliability_score,
 )
 from models.product import URL_RE, normalize_platform
 from models.user import normalize_promoter_id
@@ -44,8 +43,8 @@ from repositories.user_repo import UserRepository
 from services.deal_cleaning.text_sanitizer import normalize_inline_spaces
 from services.deal_commission_service import compute_user_deals_commission_report
 
-USER_SUBMIT_WINDOW_SECONDS = 600
-USER_SUBMIT_MAX_PER_WINDOW = 5
+USER_SUBMIT_DAILY_LIMIT_AUTHORIZED = 20
+USER_SUBMIT_DAILY_LIMIT_UNAUTHORIZED = 2
 MAX_TUTORIAL_LEN = 800
 MAX_COUPON_LEN = 512
 
@@ -64,8 +63,21 @@ _FRIENDLY_ERROR_LABELS: Dict[str, str] = {
     ERR_AI2_VIRTUAL_OR_JUNK: "包含非正常商品或无效引流内容",
     ERR_AI2_COUPON_FAILED_OR_DROPPED: "附带的优惠券链接已失效或无法领券",
     ERR_AI2_MAIN_DEAD_ONLY_FILLER: "仅含凑单参考，未通过独立好价核验",
-    ERR_LOW_QUALITY_SCORE: "综合评分未达到严选标准",
 }
+
+
+def _is_user_channel_authorized(user_doc: Any) -> bool:
+    """校验用户是否已完成淘宝或拼多多渠道授权（解锁每日 20 条爆料额度）。"""
+    if not isinstance(user_doc, dict):
+        return False
+    auth_status = user_doc.get("auth_status")
+    if not isinstance(auth_status, dict):
+        return False
+    for plat_key in ("taobao", "pdd"):
+        ch = auth_status.get(plat_key)
+        if isinstance(ch, dict) and ch.get("is_authorized") is True:
+            return True
+    return False
 
 
 class DealSubmitError(Exception):
@@ -163,6 +175,27 @@ def normalize_and_compress_deal_image(raw_b64: str) -> bytes:
         raise DealSubmitError("无法识别所选图片，请上传有效的 JPG/PNG/WEBP 图片", error_code="invalid_image", status_code=400) from exc
 
 
+def is_near_identical_deal_image(candidate_jpeg_bytes: bytes, existing_img_path: Path) -> bool:
+    """识别经二次 JPEG/PNG 重编码导致字节哈希漂移的原图直接复用（同尺寸下均差<=2.5且显著差异像素<=25，不误杀同模板改价图）。"""
+    if not candidate_jpeg_bytes or not existing_img_path.is_file():
+        return False
+    try:
+        with Image.open(io.BytesIO(candidate_jpeg_bytes)) as cand_im, Image.open(existing_img_path) as ex_im:
+            cand_g = ImageOps.exif_transpose(cand_im).convert("L")
+            ex_g = ImageOps.exif_transpose(ex_im).convert("L")
+            if cand_g.size != ex_g.size:
+                return False
+            hist = ImageChops.difference(cand_g, ex_g).histogram()
+            total = sum(hist)
+            if total <= 0:
+                return False
+            mean_diff = sum(i * c for i, c in enumerate(hist)) / float(total)
+            gt40_pixels = sum(hist[41:])
+            return mean_diff <= 2.5 and gt40_pixels <= 25
+    except Exception:
+        return False
+
+
 class DealSubmitService:
     """高内聚用户爆料接入服务：只做入参边界校验、官品核实、本地截图管理与进度查询。"""
 
@@ -183,7 +216,6 @@ class DealSubmitService:
         self._order_repo = order_repo
         self._wake_event = threading.Event()
         self.image_dir = Path(image_dir) if image_dir is not None else _DEFAULT_IMAGE_DIR
-        self._rate_cache = ThreadSafeTTLCache(maxsize=4096, ttl=USER_SUBMIT_WINDOW_SECONDS)
 
     @property
     def wake_event(self):
@@ -221,19 +253,21 @@ class DealSubmitService:
 
         return shared_ps
 
-    def _consume_rate_limit(self, uid: str) -> None:
-        now = time.time()
-        cutoff = now - USER_SUBMIT_WINDOW_SECONDS
-        key = f"u:{uid}"
-        recent = [t for t in (self._rate_cache.get(key) or []) if t >= cutoff]
-        if len(recent) >= USER_SUBMIT_MAX_PER_WINDOW:
-            self._rate_cache.set(key, recent)
+    def _check_daily_quota(self, clean_uid: str, user_doc: Dict[str, Any]) -> None:
+        daily_used = self.raw_repo.count_user_daily_submissions(clean_uid)
+        if _is_user_channel_authorized(user_doc):
+            if daily_used >= USER_SUBMIT_DAILY_LIMIT_AUTHORIZED:
+                raise DealSubmitError(
+                    f"今日爆料次数已达上限（{USER_SUBMIT_DAILY_LIMIT_AUTHORIZED}条/天），请明天再来",
+                    error_code="submit_daily_limit_reached",
+                    status_code=429,
+                )
+        elif daily_used >= USER_SUBMIT_DAILY_LIMIT_UNAUTHORIZED:
             raise DealSubmitError(
-                "10 分钟内提交次数已达上限，请稍后再试",
-                error_code="submit_rate_limited",
+                f"未授权账号每日最多提交 {USER_SUBMIT_DAILY_LIMIT_UNAUTHORIZED} 条爆料，完成淘宝或拼多多授权后可提升至每日 {USER_SUBMIT_DAILY_LIMIT_AUTHORIZED} 条，或明天再来",
+                error_code="submit_daily_limit_unauth",
                 status_code=429,
             )
-        self._rate_cache.set(key, recent + [now])
 
     def _persist_compressed_images(self, jpeg_blobs: List[bytes]) -> List[str]:
         if not jpeg_blobs:
@@ -405,8 +439,9 @@ class DealSubmitService:
         if not user_doc:
             raise DealSubmitError("账号状态无效，请重新登录", error_code="user_not_found", status_code=401)
 
-        self._consume_rate_limit(clean_uid)
+        self._check_daily_quota(clean_uid, user_doc)
         compressed_blobs = [normalize_and_compress_deal_image(b64) for b64 in raw_imgs]
+        candidate_img_ids = {f"dsi_{hashlib.sha256(blob).hexdigest()[:20]}" for blob in compressed_blobs}
 
         try:
             detail_res = self.product_service.get_goods_detail(
@@ -433,6 +468,45 @@ class DealSubmitService:
         official_title = str(detail_data.get("name") or "").strip()
         if not canonical_pid or not official_title:
             raise DealSubmitError("商品官方基础信息不完整，暂不支持爆料", error_code="invalid_product_detail", status_code=400)
+
+        if self.raw_repo.has_pending_user_submission(clean_uid, resolved_plat, canonical_pid):
+            raise DealSubmitError(
+                "该商品已有你提交的爆料正在审查中，请等待审查结果后再提交",
+                error_code="duplicate_pending_submission",
+                status_code=409,
+            )
+
+        existing_img_ids: Set[str] = set()
+        deal_tip = detail_data.get("deal_tip") if isinstance(detail_data.get("deal_tip"), dict) else {}
+        existing_img_ids.update(self._extract_local_image_ids(deal_tip.get("share_images")))
+        formal_col = getattr(self.raw_repo, "formal_col", None)
+        if formal_col is not None:
+            try:
+                formal_doc = formal_col.find_one(
+                    {"platform": resolved_plat, "product_id": canonical_pid},
+                    {"_id": 0, "deal_info.user_share_images": 1},
+                )
+                if isinstance(formal_doc, dict) and isinstance(formal_doc.get("deal_info"), dict):
+                    existing_img_ids.update(
+                        self._extract_local_image_ids(formal_doc["deal_info"].get("user_share_images"))
+                    )
+            except Exception:
+                pass
+        is_reused_existing_img = bool(candidate_img_ids & existing_img_ids)
+        if not is_reused_existing_img and existing_img_ids:
+            for ex_id in existing_img_ids:
+                ex_path = self.get_image_file_path(ex_id)
+                if ex_path is None:
+                    continue
+                if any(is_near_identical_deal_image(blob, ex_path) for blob in compressed_blobs):
+                    is_reused_existing_img = True
+                    break
+        if is_reused_existing_img:
+            raise DealSubmitError(
+                "请上传新的实拍/最新截图，不可直接复用该商品已有爆料图片",
+                error_code="duplicate_deal_image",
+                status_code=400,
+            )
 
         product_url = str(detail_data.get("product_url") or "").strip()
         official_card = _build_official_product_snapshot(detail_data, product_url)
@@ -496,7 +570,6 @@ class DealSubmitService:
             "main_tip_id": tip_id,
             "merged_tip_ids": [tip_id],
             "deal_price": price_val,
-            "tutorial_score": 80,
             "combined_raw_text": combined_raw_text,
             "extracted_targets": targets,
             "extracted_images": image_urls,
@@ -504,11 +577,15 @@ class DealSubmitService:
         }
 
         nick = str(user_doc.get("nickname") or "").strip() or mask_phone(user_doc.get("phone")) or "热心拼友"
+        user_reliability = resolve_reliability_score(
+            user_doc.get("reliability_score"),
+            default=DEFAULT_RELIABLE_SCORE,
+        )
         raw_record = {
             "source_site": USER_SUBMIT_SITE,
             "source_channel": "detail_anchor",
             "source_item_id": tip_id,
-            "source_is_reliable": is_reliable_source_site(USER_SUBMIT_SITE),
+            "reliability_score": user_reliability,
             "has_full_detail": True,
             "platform": resolved_plat,
             "candidate_goods_id": canonical_pid,
@@ -578,7 +655,12 @@ class DealSubmitService:
             elif c_status == "cleaned_success":
                 if err_code == OK_EXISTING_DEAL_BETTER:
                     ui_state = "duplicate"
-                    state_label = "已有同价好价"
+                    if "无明显优惠" in raw_err_msg or "官方在售价" in raw_err_msg:
+                        state_label = "未达优惠门槛"
+                    elif "6小时" in raw_err_msg or "保护期" in raw_err_msg:
+                        state_label = "未替换在架好价"
+                    else:
+                        state_label = "已有同价好价"
                     reason = (raw_err_msg or "当前商品已有同价在架好价凭证，本次暂未替换")[:80]
                 elif err_code == OK_SKIPPED_ALREADY_CLEANED:
                     ui_state = "duplicate"

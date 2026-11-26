@@ -503,18 +503,17 @@ def test_cloud_sync_off_promotion_superseded_deal_expiry_and_cloud_only_pullback
 
 
 def test_sync_detects_and_merges_reliability_field_changes():
-    """验证 deal_info 中的 source_is_reliable / price_is_reliable / price_reliability_reason 变更可触发增量上云。"""
+    """验证 deal_info 中的 reliability_score / price_is_reliable / price_reliability_reason 变更可触发增量上云。"""
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     base_deal = {
         "is_deal_tip": True,
-        "quality_score": 85,
         "source_item_id": "tip_rel_sync_1",
         "deal_price": 19.9,
         "clean_title": "测试可靠性同步商品",
         "updated_at": now,
         "format_status": "success",
         "format_updated_at": now,
-        "source_is_reliable": False,
+        "reliability_score": 10,
         "price_is_reliable": True,
         "price_reliability_reason": "公开券下单无特殊门槛",
     }
@@ -530,8 +529,8 @@ def test_sync_detects_and_merges_reliability_field_changes():
     }
     cloud_doc = copy.deepcopy(local_doc)
 
-    # 1. 云端来源与价格可靠性变更时，即使 updated_at 与评分完全相同也必须触发 deal_info_changed
-    local_doc["deal_info"]["source_is_reliable"] = True
+    # 1. 云端可靠分与价格可靠性变更时，即使 updated_at 完全相同也必须触发 deal_info_changed
+    local_doc["deal_info"]["reliability_score"] = 20
     local_doc["deal_info"]["price_is_reliable"] = False
     local_doc["deal_info"]["price_reliability_reason"] = "需跨品凑单退凑"
 
@@ -542,7 +541,7 @@ def test_sync_detects_and_merges_reliability_field_changes():
     assert r1["reason_breakdown"] == {"deal_info_changed": 1}
 
     synced_di = cloud_col.docs[0]["deal_info"]
-    assert synced_di["source_is_reliable"] is True
+    assert synced_di["reliability_score"] == 20
     assert synced_di["price_is_reliable"] is False
     assert synced_di["price_reliability_reason"] == "需跨品凑单退凑"
 
@@ -572,8 +571,7 @@ def test_sync_protects_cloud_newer_or_reliable_deal_info_while_merging_format():
             "is_deal_tip": True,
             "source_site": "guangdiu",
             "source_item_id": "gd_old_1",
-            "source_is_reliable": True,
-            "quality_score": 80,
+            "reliability_score": 20,
             "deal_price": 29.9,
             "updated_at": t_old,
         },
@@ -590,8 +588,7 @@ def test_sync_protects_cloud_newer_or_reliable_deal_info_while_merging_format():
             "is_deal_tip": True,
             "source_site": "user_submit",
             "source_item_id": "us_cloud_new_1",
-            "source_is_reliable": True,
-            "quality_score": 88,
+            "reliability_score": 20,
             "deal_price": 22.9,
             "updated_at": now,
         },
@@ -612,18 +609,29 @@ def test_sync_protects_cloud_newer_or_reliable_deal_info_while_merging_format():
     c_fp = sync_mod.extract_sync_fingerprint(cloud_col.docs[0])
     assert sync_mod.needs_cloud_merge(l_fp, c_fp) == (False, "up_to_date")
 
-    # 3) 云端为高可信线报时，本地低可信线报哪怕时间戳更晚也不能覆盖云端
+    # 3) 云端为高可靠分(20/30)时，本地低可靠分(10/20)哪怕时间戳更晚也不能覆盖云端
     local_unreliable = copy.deepcopy(local_old_deal)
     local_unreliable["deal_info"] = {
         "is_deal_tip": True,
         "source_site": "other",
         "source_item_id": "low_rel_1",
-        "source_is_reliable": False,
-        "quality_score": 90,
+        "reliability_score": 10,
         "deal_price": 19.9,
         "updated_at": now + datetime.timedelta(minutes=5),
     }
     assert sync_mod.needs_cloud_merge(sync_mod.extract_sync_fingerprint(local_unreliable), c_fp) == (False, "up_to_date")
+
+    cloud_20 = copy.deepcopy(cloud_newer_deal)
+    cloud_20["deal_info"]["source_site"] = "tehuicaicai"
+    cloud_20["deal_info"]["reliability_score"] = 20
+    local_10 = copy.deepcopy(local_unreliable)
+    local_10.pop("format_status", None)
+    local_10.pop("format_info", None)
+    local_10.pop("format_updated_at", None)
+    assert sync_mod.needs_cloud_merge(
+        sync_mod.extract_sync_fingerprint(local_10),
+        sync_mod.extract_sync_fingerprint(cloud_20),
+    ) == (False, "up_to_date")
 
 
 def test_cloud_sync_five_block_whitelist_user_submit_isolation_and_bidirectional_convergence():

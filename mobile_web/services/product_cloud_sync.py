@@ -29,7 +29,12 @@ from pymongo import UpdateOne
 
 from infrastructure.runtime_io import atomic_write_json, should_write_runtime_artifact
 from infrastructure.settings import resolve_config_path
-from models.deal_constants import USER_SUBMIT_SITE
+from models.deal_constants import (
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
+    RELIABILITY_TIER_GAP,
+    USER_SUBMIT_SITE,
+    resolve_reliability_score,
+)
 from models.product import clean_product_id, normalize_platform
 from repositories.product_repo import ProductRepository
 
@@ -135,10 +140,9 @@ FINGERPRINT_PROJECTION: Dict[str, Any] = {
     "deal_info.expired_at": 1,
     "deal_info.source_site": 1,
     "deal_info.source_item_id": 1,
-    "deal_info.source_is_reliable": 1,
+    "deal_info.reliability_score": 1,
     "deal_info.price_is_reliable": 1,
     "deal_info.price_reliability_reason": 1,
-    "deal_info.quality_score": 1,
     "deal_info.deal_price": 1,
     "deal_info.updated_at": 1,
     "deal_info.format_status": 1,
@@ -320,17 +324,20 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     deal_expired = (deal_info.get("is_deal_tip") is False) and (deal_info.get("expired_at") is not None)
     deal_source_site = str(deal_info.get("source_site") or "").strip()
     is_user_submit_deal = deal_source_site == USER_SUBMIT_SITE
+    deal_reliability_score = resolve_reliability_score(
+        deal_info.get("reliability_score"),
+        default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+    )
     deal_sig = None
     if deal_ready:
         deal_sig = (
             deal_source_site,
             str(deal_info.get("source_item_id") or ""),
-            int(deal_info.get("quality_score") or 0),
+            deal_reliability_score,
             _number_or_none(deal_info.get("deal_price")),
             to_utc_millis(deal_info.get("updated_at")),
             str(deal_info.get("format_status") or ""),
             to_utc_millis(deal_info.get("format_updated_at")),
-            bool(deal_info.get("source_is_reliable")),
             deal_info.get("price_is_reliable") if isinstance(deal_info.get("price_is_reliable"), bool) else None,
             str(deal_info.get("price_reliability_reason") or "").strip(),
         )
@@ -365,7 +372,7 @@ def extract_sync_fingerprint(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "is_user_submit_deal": is_user_submit_deal,
         "deal_sig": deal_sig,
         "deal_updated_ms": to_utc_millis(deal_info.get("updated_at")),
-        "deal_reliable": bool(deal_info.get("source_is_reliable")),
+        "deal_reliability_score": deal_reliability_score,
         "deal_item_id": str(deal_info.get("source_item_id") or ""),
         "has_user_stats": has_user_stats,
         "user_stats_ms": to_utc_millis(raw_stats.get("updated_at")),
@@ -394,11 +401,14 @@ def _should_protect_cloud_deal(
     if local_fp.get("deal_ready"):
         if l_id and c_id and l_id == c_id:
             return False
-        l_rel = bool(local_fp.get("deal_reliable"))
-        c_rel = bool(cloud_fp.get("deal_reliable"))
-        if c_rel and not l_rel:
+        l_score = int(local_fp.get("deal_reliability_score") or DEFAULT_NORMAL_RELIABILITY_SCORE)
+        c_score = int(cloud_fp.get("deal_reliability_score") or DEFAULT_NORMAL_RELIABILITY_SCORE)
+        diff = c_score - l_score
+        if diff >= RELIABILITY_TIER_GAP:
             return True
-        if c_rel == l_rel and c_ms is not None and (l_ms is None or c_ms > l_ms):
+        if diff <= -RELIABILITY_TIER_GAP:
+            return False
+        if c_ms is not None and (l_ms is None or c_ms > l_ms):
             return True
         return False
 

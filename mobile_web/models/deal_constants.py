@@ -18,17 +18,16 @@ PROMPT_STAGE1_PATH = os.path.join(PROMPT_DIR, "爆料阶段1_原始拆解与转�
 PROMPT_STAGE2_PATH = os.path.join(PROMPT_DIR, "爆料阶段2_底牌终审与教程评分.txt")
 PROMPT_USER_AUDIT_PATH = os.path.join(PROMPT_DIR, "用户爆料审核与择优对比.txt")
 
-QUALIFIED_DEAL_MIN_SCORE = 60
-DEAL_INFO_PROTECTION_HOURS = 12.0
+DEFAULT_NORMAL_RELIABILITY_SCORE = 10
+DEFAULT_RELIABLE_SCORE = 20
+RELIABLE_SCORE_THRESHOLD = 20
+RELIABILITY_TIER_GAP = 10
+DEAL_SAME_TIER_PROTECTION_HOURS = 6.0
 DEAL_FORMAL_EXPIRY_HOURS = 72.0
+DEAL_PRICE_CHEAPER_RATIO = 0.05
+DEAL_PRICE_CHEAPER_MIN_DIFF = 1.0
 DEAL_RAW_TTL_DAYS = 14
 DEAL_MAX_CLEAN_AGE_DAYS = 2
-
-# 高质量信源与专员严选渠道信誉加分表 (Source Reputation Bonus)
-SOURCE_REPUTATION_BONUS: Dict[str, int] = {
-    "tehuicaicai": 10,  # 特惠采采/惠享购：专员人工严选集采，自带高清白底图与视频教程，信噪比极高
-    "user_submit": 10,  # 已通过全图文审核与AI-2终审的用户实付爆料，与严选渠道同级防轻易覆盖
-}
 MAX_CLEAN_RETRIES = 3
 MAX_ANCHOR_CACHE_SIZE = 8000
 MAX_JSONL_FILE_BYTES = 10 * 1024 * 1024
@@ -113,7 +112,6 @@ ERR_AI2_PRODUCT_MISMATCH = "ERR_AI2_PRODUCT_MISMATCH"
 ERR_AI2_VIRTUAL_OR_JUNK = "ERR_AI2_VIRTUAL_OR_JUNK"
 ERR_AI2_PRICE_INTEGRITY = "ERR_AI2_PRICE_INTEGRITY"
 ERR_MULTI_PRODUCT_COLLECTION = "ERR_MULTI_PRODUCT_COLLECTION"
-ERR_LOW_QUALITY_SCORE = "ERR_LOW_QUALITY_SCORE"
 ERR_EXPIRED_OVER_7_DAYS = "ERR_EXPIRED_OVER_7_DAYS"
 ERR_AI_TIMEOUT_RETRY = "ERR_AI_TIMEOUT_RETRY"
 ERR_AI_MAX_RETRIES_EXCEEDED = "ERR_AI_MAX_RETRIES_EXCEEDED"
@@ -275,9 +273,75 @@ def format_timestamp_cn(val: Any, *, fmt: str = "%Y-%m-%d %H:%M") -> str:
 
 
 USER_SUBMIT_SITE = "user_submit"
-RELIABLE_SOURCE_SITES: FrozenSet[str] = frozenset({"tehuicaicai", USER_SUBMIT_SITE})
 
 
-def is_reliable_source_site(site: Optional[str]) -> bool:
-    """高可靠好价信源唯一声明：专员严选渠道与核验后的用户爆料天然可信。"""
-    return str(site or "").strip().lower() in RELIABLE_SOURCE_SITES
+def resolve_reliability_score(raw_val: Any, *, default: int = DEFAULT_NORMAL_RELIABILITY_SCORE) -> int:
+    """将任意原始可靠分输入安全规整为整数；非法/布尔/空值回退到 default。"""
+    if raw_val is None or isinstance(raw_val, bool):
+        return int(default)
+    if isinstance(raw_val, (int, float)):
+        num = float(raw_val)
+        return int(round(num)) if math.isfinite(num) else int(default)
+    if isinstance(raw_val, str):
+        text = raw_val.strip()
+        if not text:
+            return int(default)
+        try:
+            num = float(text)
+            return int(round(num)) if math.isfinite(num) else int(default)
+        except ValueError:
+            return int(default)
+    return int(default)
+
+
+def is_substantially_cheaper(new_price: Any, existing_price: Any) -> bool:
+    """判断新价是否较旧价实质降价（同时满足 >= 5% 且 >= 1 元）。"""
+    if new_price is None or existing_price is None or isinstance(new_price, bool) or isinstance(existing_price, bool):
+        return False
+    try:
+        n_val = float(new_price)
+        ex_val = float(existing_price)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(n_val) and math.isfinite(ex_val)) or n_val <= 0 or ex_val <= 0:
+        return False
+    diff = ex_val - n_val
+    return diff + 1e-9 >= DEAL_PRICE_CHEAPER_MIN_DIFF and (diff / ex_val) + 1e-9 >= DEAL_PRICE_CHEAPER_RATIO
+
+
+def evaluate_deal_replacement(
+    *,
+    existing_active: bool,
+    existing_reliability_score: int,
+    new_reliability_score: int,
+    existing_price: Optional[float] = None,
+    new_price: Optional[float] = None,
+    existing_age_hours: Optional[float] = None,
+    allow_higher_price_replace: bool = False,
+    price_relation: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """全仓唯一的好价替换仲裁真源（支持跨级压制与同级 6 小时保护）。"""
+    if not existing_active or (existing_age_hours is not None and existing_age_hours >= DEAL_FORMAL_EXPIRY_HOURS):
+        return True, "当前无有效在架好价，直接发布"
+
+    ex_s = int(existing_reliability_score)
+    new_s = int(new_reliability_score)
+    diff = new_s - ex_s
+    if diff >= RELIABILITY_TIER_GAP:
+        return True, f"新爆料可靠分({new_s})高于现有({ex_s})，跨级直接替换"
+    if diff <= -RELIABILITY_TIER_GAP:
+        return False, f"现有好价可靠分({ex_s})高于新爆料({new_s})，有效期内受保护"
+
+    raw_rel = str(price_relation or "").strip().lower()
+    if raw_rel in ("cheaper", "same", "higher"):
+        rel = raw_rel
+    else:
+        rel = "cheaper" if is_substantially_cheaper(new_price, existing_price) else "same"
+
+    if rel == "cheaper":
+        return True, "新爆料同级价格明显更低，立即替换"
+    if rel == "higher" and allow_higher_price_replace:
+        if existing_age_hours is not None and existing_age_hours >= DEAL_SAME_TIER_PROTECTION_HOURS:
+            return True, "原同级好价已满6小时保护期，新实证价格已替换"
+        return False, "当前商品已有同级别好价在6小时保护期内，更高价暂未替换"
+    return False, "当前商品已有同级别同价或更低价好价在架，本次暂未替换"

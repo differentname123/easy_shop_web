@@ -136,7 +136,8 @@
         <div class="detail-card-section submit-reward-banner">
           <span class="submit-reward-icon">💰</span>
           <div class="submit-reward-text">
-            <strong>爆料采纳赚高额佣金：</strong>你的爆料通过审查上架后，有效展示期间（72小时内）只要其他拼友看到你的攻略并购买该商品，你就能获得丰厚佣金奖励！价格越真实、步骤越清晰越稳赚。
+            <strong>爆料采纳赚高额佣金：</strong>你的爆料通过审查上架后，有效展示期间（72小时内）只要其他拼友看到你的攻略并购买该商品，你就能获得丰厚佣金奖励！价格越真实、步骤越清晰越稳赚。<br>
+            <span style="color:#ad4e00;">审核与打款提示：提交前将先经人工审查，最终打款时还会对历史爆料与替换行为进行人工二次复审；严禁盗用他人截图、P图造假、虚报低价或恶意覆盖他人好价，违者将取消相关佣金并处罚账号。</span>
           </div>
         </div>
 
@@ -152,7 +153,7 @@
               min="0.01"
               max="999999"
               class="submit-input"
-              placeholder="例如：29.9"
+              placeholder="例如：29.9（拍多件请填实付总价并在下方写明件数）"
               required
             />
           </div>
@@ -210,6 +211,13 @@
             />
           </div>
 
+          <div class="submit-help-note" style="margin-bottom:10px;color:#8c6d3f;">
+            ⚠️ 诚信提示：提交将先经人工审查，且最终打款前会再次人工复核历史爆料与替换记录；若存在盗图造假或恶意覆盖等违规行为，必将取消佣金并处罚账号。
+          </div>
+          <div v-if="quotaNotice" style="margin-bottom:10px;padding:9px 12px;background:#fff7e6;border:1px solid #ffd591;border-radius:10px;font-size:12px;color:#7a4100;display:flex;align-items:center;justify-content:space-between;gap:10px;">
+            <span style="flex:1;line-height:1.45;">{{ quotaNotice.message }}</span>
+            <button type="button" v-if="quotaNotice.needAuth" class="submit-refresh-btn" style="flex-shrink:0;" @click="goToAuth">去完成授权</button>
+          </div>
           <button type="submit" class="submit-btn-main" :disabled="submitting || compressingImages">
             {{ submitting ? '正在提交审查...' : '提交人工审查' }}
           </button>
@@ -243,7 +251,7 @@
           </div>
         </div>
         <div class="submit-summary-note">
-          归因说明：仅统计爆料展示期间经站长默认链接成交的有效订单，已自动排除退款、失效、未付款及他人自购/个人推广渠道单（<span v-if="dealSummary.after_sale_order_count > 0">另有 {{ dealSummary.after_sale_order_count }} 笔售后核验中暂未计入，</span>最终金额以平台结算为准）。
+          归因与风控说明：仅统计爆料展示期间经站长默认链接成交的有效订单，已自动排除退款、失效、未付款及他人自购/个人推广渠道单（<span v-if="dealSummary.after_sale_order_count > 0">另有 {{ dealSummary.after_sale_order_count }} 笔售后核验中暂未计入，</span>最终金额以平台结算为准；最终打款前将对历史爆料与替换行为进行人工再次审查，如有盗图造假或恶意覆盖等恶意行为将取消佣金并处罚账号）。
         </div>
       </div>
       <div v-if="loadingSubmissions && submissions.length === 0" class="submit-help-note">正在加载记录...</div>

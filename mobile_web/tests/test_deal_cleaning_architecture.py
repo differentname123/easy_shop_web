@@ -257,7 +257,7 @@ def test_daemon_mode_preserves_rich_product_fields_while_keeping_ai2_prompt_lean
     assert "specs" not in sent_off
     assert "carousel_images" not in sent_off
 
-    # 正式表落盘产物完整保留全部富字段与 tutorial_score
+    # 正式表落盘产物完整保留全部富字段
     pdoc = ai2_out[0]["product_doc"]
     assert pdoc["price"] == 39.9
     assert pdoc["coupon_amount"] == 10.0
@@ -269,7 +269,7 @@ def test_daemon_mode_preserves_rich_product_fields_while_keeping_ai2_prompt_lean
     assert pdoc["coupon_info"] == {"discount": 10}
     assert pdoc["product_url"] == "https://item.jd.com/10001.html"
     assert pdoc["carousel_images"] == ["https://img14.360buyimg.com/c1.jpg", "https://img14.360buyimg.com/c2.jpg"]
-    assert pdoc["deal_info"]["tutorial_score"] == 84
+    assert "tutorial_score" not in pdoc["deal_info"]
 
 
 def test_ai_semaphore_caps_concurrent_llm_requests_across_stages(tmp_path):
@@ -1310,12 +1310,12 @@ def test_ai2_batch_swap_guard_high_price_and_score_breakdown_sum():
 
     assert out_map["lux_1"]["status"] == "success"
     assert out_map["lux_1"]["deal_price"] == 301010.0
-    assert out_map["lux_1"]["quality_score"] == 91
-    assert out_map["lux_1"]["product_doc"]["deal_info"]["quality_score"] == 91
+    assert "quality_score" not in out_map["lux_1"]
+    assert "quality_score" not in out_map["lux_1"]["product_doc"]["deal_info"]
 
 
 def test_ai2_blind_input_and_independent_price_reliability():
-    """验证 AI-2 输入物理盲审（不传 source_site / source_is_reliable）、双字段完全解耦及 Fail-Closed 解析。"""
+    """验证 AI-2 输入物理盲审（不传 source_site / reliability_score）、双字段完全解耦及 Fail-Closed 解析。"""
     cleaner = DealPoolCleaner(ai_batch_size=4, ai_max_workers=1, convert_max_workers=1)
     captured_inputs = []
 
@@ -1324,7 +1324,7 @@ def test_ai2_blind_input_and_independent_price_reliability():
         {
             "source_site": "tehuicaicai",
             "source_channel": "特惠采采_首页精选",
-            "source_is_reliable": True,
+            "reliability_score": 20,
             "source_item_id": "decouple_rel_false",
             "title": "某品牌洗衣液 凑单实付 19.9元",
             "ai_stage1_result": {"combined_raw_text": "某品牌洗衣液 凑单退凑实付19.9元 [#L1]", "merged_tip_ids": ["decouple_rel_false"], "extracted_targets": []},
@@ -1334,7 +1334,7 @@ def test_ai2_blind_input_and_independent_price_reliability():
         {
             "source_site": "guangdiu",
             "source_channel": "逛丢_首页实时流",
-            "source_is_reliable": False,
+            "reliability_score": 10,
             "source_item_id": "decouple_norm_true",
             "title": "某品牌抽纸 19.9元",
             "ai_stage1_result": {"combined_raw_text": "某品牌抽纸 直降到手19.9元 [#L1]", "merged_tip_ids": ["decouple_norm_true"], "extracted_targets": []},
@@ -1344,7 +1344,7 @@ def test_ai2_blind_input_and_independent_price_reliability():
         {
             "source_site": "guangdiu",
             "source_channel": "逛丢_首页实时流",
-            "source_is_reliable": False,
+            "reliability_score": 10,
             "source_item_id": "fail_closed_str",
             "title": "某品牌牙膏 9.9元",
             "ai_stage1_result": {"combined_raw_text": "某品牌牙膏 到手9.9元 [#L1]", "merged_tip_ids": ["fail_closed_str"], "extracted_targets": []},
@@ -1365,7 +1365,6 @@ def test_ai2_blind_input_and_independent_price_reliability():
                 "tutorial_steps": ["1. 加购并凑单可退商品实付19.9元"],
                 "price_is_reliable": False,
                 "price_reliability_reason": "需跨品凑单合并付款后再退凑单",
-                "quality_score": 82,
             },
             "decouple_norm_true": {
                 "main_tip_id": "decouple_norm_true",
@@ -1377,7 +1376,6 @@ def test_ai2_blind_input_and_independent_price_reliability():
                 "tutorial_steps": ["1. 直接下单到手19.9元"],
                 "price_is_reliable": True,
                 "price_reliability_reason": "官方直降可稳定达成" + ("！" * 130),
-                "quality_score": 80,
             },
             "fail_closed_str": {
                 "main_tip_id": "fail_closed_str",
@@ -1389,7 +1387,6 @@ def test_ai2_blind_input_and_independent_price_reliability():
                 "tutorial_steps": ["1. 下单9.9元"],
                 "price_is_reliable": "true",
                 "price_reliability_reason": "非法非布尔值不应保留此原因",
-                "quality_score": 78,
             },
         }
 
@@ -1399,27 +1396,27 @@ def test_ai2_blind_input_and_independent_price_reliability():
     outcomes, _ = cleaner.process_ai2_unit(docs, raw_col=raw_col, quiet_sub_logs=True)
     out_map = {o["source_item_id"]: o for o in outcomes}
 
-    # 1. AI-2 物理盲审：禁止传入 source_site 与 source_is_reliable
+    # 1. AI-2 物理盲审：禁止传入 source_site 与 reliability_score
     assert len(captured_inputs) == 3
     for inp in captured_inputs:
         assert "source_site" not in inp
-        assert "source_is_reliable" not in inp
+        assert "reliability_score" not in inp
 
     # 2. 正交解耦与 Fail-Closed
     di_1 = out_map["decouple_rel_false"]["product_doc"]["deal_info"]
     assert out_map["decouple_rel_false"]["status"] == "success"
     assert di_1["is_deal_tip"] is True
-    assert di_1["source_is_reliable"] is True
+    assert di_1["reliability_score"] == 20
     assert di_1["price_is_reliable"] is False
     assert di_1["price_reliability_reason"] == "需跨品凑单合并付款后再退凑单"
 
     di_2 = out_map["decouple_norm_true"]["product_doc"]["deal_info"]
-    assert di_2["source_is_reliable"] is False
+    assert di_2["reliability_score"] == 10
     assert di_2["price_is_reliable"] is True
     assert len(di_2["price_reliability_reason"]) == 120
 
     di_3 = out_map["fail_closed_str"]["product_doc"]["deal_info"]
-    assert di_3["source_is_reliable"] is False
+    assert di_3["reliability_score"] == 10
     assert di_3["price_is_reliable"] is None
     assert di_3["price_reliability_reason"] == ""
 

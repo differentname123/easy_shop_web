@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""网站服务内置用户爆料单阶段清洗引擎：优惠券核验 + 全图文多模态审核对比 + 标准 AI-2 入库。"""
+"""网站服务内置用户爆料单阶段清洗引擎：优惠券核验 + 全图文单阶段多模态审核对比与直接上架。"""
 from __future__ import annotations
 
 import datetime
@@ -11,18 +11,23 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from PIL import Image, ImageOps
 
+from adapters import platform_name
 from cache import BOOM_SORT_CACHE, clear_cached_deal_tip
 from config import logger
+from infrastructure.jd_client import jd_coupon_url
 from infrastructure.logging_utils import format_exc_summary
 from infrastructure.runtime_io import load_prompt_cached
 from models.deal_constants import (
     CLEAN_STAGE_DONE,
     CLEAN_STAGE_NEED_USER_AUDIT,
+    DEAL_FORMAL_EXPIRY_HOURS,
+    DEFAULT_NORMAL_RELIABILITY_SCORE,
+    DEFAULT_RELIABLE_SCORE,
     DEFAULT_STAGE_LEASE_SECONDS_AI,
     ERR_ADAPTER_CONFIG_ERROR,
     ERR_ADAPTER_CONVERT_FAILED,
@@ -32,11 +37,29 @@ from models.deal_constants import (
     MAX_CLEAN_RETRIES,
     OK_EXISTING_DEAL_BETTER,
     PROMPT_USER_AUDIT_PATH,
+    RELIABILITY_TIER_GAP,
     USER_SUBMIT_SITE,
+    coerce_unix_timestamp,
+    evaluate_deal_replacement,
+    parse_publish_time_epoch,
+    resolve_reliability_score,
 )
-from models.product import normalize_platform
+from models.product import get_source_site_name, normalize_platform
 from services.deal_cleaning.ai_client import DealAIClient
-from services.deal_cleaning.url_venue import _is_safe_public_http_url
+from services.deal_cleaning.stages import _attach_preseeded_default_promotion
+from services.deal_cleaning.text_sanitizer import (
+    clean_coupon_label,
+    normalize_inline_spaces,
+    sanitize_card_highlight,
+    sanitize_clean_tutorial_step,
+    sanitize_polished_copywriting,
+    strip_markdown_link_wrapper,
+)
+from services.deal_cleaning.url_venue import (
+    _is_safe_public_http_url,
+    is_shop_homepage_url,
+    rebuild_clean_official_venue_url,
+)
 from services.deal_cleaning.workers import commit_batch_results_to_db
 from services.deal_submit_service import (
     DealSubmitService,
@@ -126,14 +149,26 @@ def _save_normalized_jpeg(raw_bytes: bytes, dest_path: Path) -> bool:
         return False
 
 
+def _to_naive_utc(dt_val: Any) -> Optional[datetime.datetime]:
+    if not isinstance(dt_val, datetime.datetime):
+        return None
+    if dt_val.tzinfo is not None:
+        return dt_val.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt_val
+
+
 def _extract_existing_deal_snapshot(formal_doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """提取正式商品当前在架线报完整摘要及众包反馈计数供多模态对比；无活跃线报时返回 None。"""
+    """提取正式商品当前有效在架线报摘要供单阶段多模态对比与可靠分仲裁；超过 72h 视为已失效。"""
     if not isinstance(formal_doc, dict):
         return None
     di = formal_doc.get("deal_info")
     if not isinstance(di, dict) or di.get("is_deal_tip") is not True:
         return None
-    stats = formal_doc.get("user_stats") if isinstance(formal_doc.get("user_stats"), dict) else {}
+    upd_naive = _to_naive_utc(di.get("updated_at"))
+    if upd_naive is not None:
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        if (now_utc - upd_naive).total_seconds() / 3600.0 >= DEAL_FORMAL_EXPIRY_HOURS:
+            return None
     coupon_labels = [
         str(c.get("label") or "").strip()
         for c in (di.get("coupon_links") or [])
@@ -148,11 +183,51 @@ def _extract_existing_deal_snapshot(formal_doc: Optional[Dict[str, Any]]) -> Opt
         "original_copywriting": str(di.get("original_copywriting") or "").strip()[:1000],
         "coupon_labels": coupon_labels,
         "has_coupon": bool(di.get("coupon_links")),
-        "quality_score": int(di.get("quality_score") or 0),
         "source_site": str(di.get("source_site") or "").strip(),
-        "source_is_reliable": bool(di.get("source_is_reliable")),
-        "buyable_count": int(stats.get("buyable") or 0),
-        "unbuyable_count": int(stats.get("unbuyable") or 0),
+        "reliability_score": resolve_reliability_score(
+            di.get("reliability_score"),
+            default=DEFAULT_NORMAL_RELIABILITY_SCORE,
+        ),
+        "updated_at": upd_naive,
+    }
+
+
+def _build_official_baseline_snapshot(
+    doc: Dict[str, Any],
+    formal_doc: Optional[Dict[str, Any]],
+    *,
+    new_score: int,
+) -> Optional[Dict[str, Any]]:
+    """当商品暂无有效在架好价时，将官方当前在售价抽象为与投稿同级、永远0小时保护的虚拟对比基线。"""
+    conv_links = doc.get("converted_links") if isinstance(doc.get("converted_links"), list) else []
+    main_link = conv_links[0] if conv_links and isinstance(conv_links[0], dict) else {}
+    off_prod = main_link.get("official_product") if isinstance(main_link.get("official_product"), dict) else {}
+
+    off_price: Optional[float] = None
+    for cand in (
+        off_prod.get("activity_price"),
+        off_prod.get("price"),
+        (formal_doc or {}).get("price") if isinstance(formal_doc, dict) else None,
+    ):
+        if isinstance(cand, (int, float)) and not isinstance(cand, bool) and float(cand) > 0:
+            off_price = round(float(cand), 2)
+            break
+    if off_price is None:
+        return None
+
+    return {
+        "is_official_baseline": True,
+        "source_item_id": "",
+        "deal_price": off_price,
+        "price_logic": "商品官方当前在售价",
+        "card_highlight": f"到手{off_price:g}元",
+        "tutorial_steps": [],
+        "original_copywriting": "",
+        "coupon_labels": [],
+        "has_coupon": False,
+        "source_site": "official_baseline",
+        "reliability_score": int(new_score),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
     }
 
 
@@ -163,6 +238,7 @@ def _build_audit_prompt_payload(
     official_img_indices: List[int],
     new_img_indices: List[int],
     existing_img_indices: List[int],
+    need_price_comparison: bool,
 ) -> Dict[str, Any]:
     conv_links = doc.get("converted_links") if isinstance(doc.get("converted_links"), list) else []
     main_link = conv_links[0] if conv_links and isinstance(conv_links[0], dict) else {}
@@ -179,13 +255,16 @@ def _build_audit_prompt_payload(
     )
     if existing_deal is not None:
         existing_view: Optional[Dict[str, Any]] = {
-            **existing_deal,
-            "image_attachment_indices": existing_img_indices,
+            k: v
+            for k, v in existing_deal.items()
+            if k not in ("updated_at", "is_official_baseline")
         }
+        existing_view["image_attachment_indices"] = existing_img_indices
     else:
         existing_view = None
 
     return {
+        "need_price_comparison": bool(need_price_comparison and existing_deal is not None),
         "official_product": {
             "platform": str(main_link.get("platform") or doc.get("platform") or ""),
             "title": str(off_prod.get("title") or doc.get("title") or ""),
@@ -214,9 +293,10 @@ def _evaluate_audit_payload(
     *,
     existing_deal: Optional[Dict[str, Any]],
     image_paths: List[str],
+    need_price_comparison: bool = False,
     prompt_path: str = PROMPT_USER_AUDIT_PATH,
 ) -> Dict[str, Any]:
-    """复用统一低档模型组客户端执行多模态图文审查与对比，异常或证据不一致一律 Fail-Closed。"""
+    """复用统一低档模型组客户端执行单阶段多模态审核、比价与展示规整，异常或契约缺失一律 Fail-Closed。"""
     try:
         prompt_tpl = load_prompt_cached(prompt_path).strip()
         if not prompt_tpl:
@@ -237,26 +317,58 @@ def _evaluate_audit_payload(
         evidence_ok = bool(parsed["evidence_supports_claims"])
         is_valid = bool(parsed["is_content_valid"]) and evidence_ok
         reject_reason = str(parsed.get("content_reject_reason") or "").strip()[:120]
-        decision_reason = str(parsed.get("decision_reason") or "").strip()[:120]
+        raw_comp = str(parsed.get("price_comparison") or "").strip().lower()
+        comp_reason = str(parsed.get("comparison_reason") or parsed.get("decision_reason") or "").strip()[:120]
+
         if not is_valid:
-            should_replace = False
+            price_comparison = "none"
             if not reject_reason:
-                reject_reason = decision_reason or "图片证据未能充分支撑所声明的到手价或关键优惠条件"
-        elif existing_deal is None:
-            should_replace = True
-            reject_reason = ""
+                reject_reason = comp_reason or "图片证据未能充分支撑所声明的到手价或关键优惠条件"
         else:
-            should_replace = parsed.get("should_replace_existing") is True
             reject_reason = ""
+            if existing_deal is not None and need_price_comparison:
+                if raw_comp not in ("cheaper", "same", "higher"):
+                    return {"ok": False, "error": f"审核模型未返回合法同级价格对比结果: {raw_comp!r}"}
+                price_comparison = raw_comp
+            else:
+                price_comparison = "none"
+
+        raw_steps_val = parsed.get("tutorial_steps")
+        if isinstance(raw_steps_val, list):
+            raw_step_lines = [str(st or "") for st in raw_steps_val]
+        elif isinstance(raw_steps_val, str) and raw_steps_val.strip():
+            raw_step_lines = raw_steps_val.splitlines()
+        else:
+            raw_step_lines = []
+        tutorial_steps = [s for s in (sanitize_clean_tutorial_step(st) for st in raw_step_lines) if s]
+
+        clean_title = normalize_inline_spaces(str(parsed.get("clean_title") or "")).strip()
+        price_logic = normalize_inline_spaces(str(parsed.get("price_logic") or "")).strip()
+        card_highlight = sanitize_card_highlight(parsed.get("card_highlight")) or ""
+        raw_cpn_lbl = str(parsed.get("coupon_label") or "").strip()
+        coupon_label = clean_coupon_label(raw_cpn_lbl) if raw_cpn_lbl else ""
+        polished_copy = sanitize_polished_copywriting(str(parsed.get("polished_copywriting") or ""))
+        observed_evidence = str(parsed.get("observed_image_evidence") or "").strip()[:400]
+
+        # 防注入与结构完整性门禁：宣称审核通过时，必须同时具备非空视觉证据描述及有效步骤/推荐文案，严禁被注入空壳回落泄漏原串
+        if is_valid and (len(observed_evidence) < 8 or (not tutorial_steps and not polished_copy)):
+            return {"ok": False, "error": "审核模型返回通过但缺少完整的视觉证据与规范文案"}
 
         return {
             "ok": True,
-            "observed_image_evidence": str(parsed.get("observed_image_evidence") or "").strip()[:400],
+            "observed_image_evidence": observed_evidence,
             "evidence_supports_claims": evidence_ok,
             "is_content_valid": is_valid,
             "content_reject_reason": reject_reason,
-            "should_replace_existing": bool(should_replace),
-            "decision_reason": decision_reason,
+            "price_comparison": price_comparison,
+            "comparison_reason": comp_reason,
+            "decision_reason": comp_reason,
+            "clean_title": clean_title,
+            "price_logic": price_logic,
+            "card_highlight": card_highlight,
+            "coupon_label": coupon_label,
+            "tutorial_steps": tutorial_steps,
+            "polished_copywriting": polished_copy,
         }
     except Exception as exc:
         return {"ok": False, "error": format_exc_summary(exc)}
@@ -308,11 +420,11 @@ class DealSubmitWorker:
             self._owns_cleaner = True
         return self._cleaner
 
-    def _get_audit_ai_client(self, cleaner: Any) -> DealAIClient:
+    def _get_audit_ai_client(self, cleaner: Optional[Any] = None) -> DealAIClient:
         if self._audit_ai_client is None:
             if self._ai_generator is not None:
                 self._audit_ai_client = DealAIClient(ai_caller=self._ai_generator)
-            elif getattr(cleaner, "ai_client", None) is not None:
+            elif cleaner is not None and getattr(cleaner, "ai_client", None) is not None:
                 self._audit_ai_client = cleaner.ai_client
             else:
                 self._audit_ai_client = DealAIClient()
@@ -384,8 +496,8 @@ class DealSubmitWorker:
             },
         )
 
-    def _ensure_coupon_converted(self, repo: Any, cleaner: Any, doc: Dict[str, Any]) -> str:
-        """步骤 A：如有未转链的附加优惠券，完全复用 cleaner.convert_single_target 核验转链。"""
+    def _ensure_coupon_converted(self, repo: Any, doc: Dict[str, Any]) -> str:
+        """步骤 A：如有未转链的附加优惠券，复用 cleaner.convert_single_target 核验转链；无券时不初始化 cleaner。"""
         s1 = doc.get("ai_stage1_result") if isinstance(doc.get("ai_stage1_result"), dict) else {}
         targets = s1.get("extracted_targets") if isinstance(s1.get("extracted_targets"), list) else []
         conv_links = list(doc.get("converted_links") or [])
@@ -399,6 +511,7 @@ class DealSubmitWorker:
         ]
         if not pending_coupons:
             return "ready"
+        cleaner = self._get_cleaner()
 
         main_link = conv_links[0] if conv_links and isinstance(conv_links[0], dict) else {}
         main_plat = normalize_platform(main_link.get("platform") or doc.get("platform") or "", default="")
@@ -508,7 +621,7 @@ class DealSubmitWorker:
             return None
         return repo.formal_col.find_one(
             {"platform": plat, "product_id": pid},
-            {"_id": 0, "image_url": 1, "deal_info": 1, "user_stats": 1},
+            {"_id": 0, "image_url": 1, "price": 1, "deal_info": 1, "user_stats": 1},
         )
 
     def _materialize_image_to_path(self, raw_url: str, dest_path: Path) -> bool:
@@ -596,13 +709,43 @@ class DealSubmitWorker:
         ai_client: DealAIClient,
         doc: Dict[str, Any],
     ) -> str:
-        """步骤 B：图文全量审核与已有在架好价综合对比；已通过断点则直接复用。"""
+        """步骤 B：零成本跨级前置门禁 + 单阶段多模态图文审核/对比/规整；已通过断点则直接复用。"""
         prior_audit = doc.get("user_audit_result")
         if isinstance(prior_audit, dict) and prior_audit.get("passed") is True:
             return "ready"
 
+        new_score = resolve_reliability_score(
+            doc.get("reliability_score"),
+            default=DEFAULT_RELIABLE_SCORE,
+        )
         formal_doc = self._fetch_formal_doc(repo, doc)
         existing_deal = _extract_existing_deal_snapshot(formal_doc)
+
+        if existing_deal is not None and (new_score - existing_deal["reliability_score"]) <= -RELIABILITY_TIER_GAP:
+            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            msg = f"现有好价可靠分({existing_deal['reliability_score']})高于当前投稿({new_score})，有效期内受保护"
+            repo.col.update_many(
+                self._doc_filter(doc),
+                {
+                    "$set": {
+                        "clean_status": "cleaned_success",
+                        "clean_stage": CLEAN_STAGE_DONE,
+                        "clean_error_code": OK_EXISTING_DEAL_BETTER,
+                        "clean_error_msg": msg,
+                        "cleaned_at": now_utc,
+                    },
+                    "$unset": {"stage_lease_owner": "", "stage_lease_until_ts": ""},
+                },
+            )
+            return "skipped_existing"
+
+        if existing_deal is None:
+            existing_deal = _build_official_baseline_snapshot(doc, formal_doc, new_score=new_score)
+
+        need_price_comparison = bool(
+            existing_deal is not None
+            and abs(new_score - existing_deal["reliability_score"]) < RELIABILITY_TIER_GAP
+        )
 
         with tempfile.TemporaryDirectory(prefix="deal_audit_") as tmp_dir_str:
             media = self._collect_audit_media(doc, formal_doc, Path(tmp_dir_str))
@@ -626,12 +769,14 @@ class DealSubmitWorker:
                 official_img_indices=media["official_indices"],
                 new_img_indices=media["new_indices"],
                 existing_img_indices=media["existing_indices"],
+                need_price_comparison=need_price_comparison,
             )
             audit_res = _evaluate_audit_payload(
                 ai_client,
                 payload,
                 existing_deal=existing_deal,
                 image_paths=media["file_paths"],
+                need_price_comparison=need_price_comparison,
             )
 
         if not audit_res.get("ok"):
@@ -644,8 +789,36 @@ class DealSubmitWorker:
             )
             return "retry"
 
+        s1 = doc.get("ai_stage1_result") if isinstance(doc.get("ai_stage1_result"), dict) else {}
+        new_dp = s1.get("deal_price") if s1.get("deal_price") is not None else doc.get("price")
+
+        ex_age_hours: Optional[float] = None
+        if existing_deal is not None and isinstance(existing_deal.get("updated_at"), datetime.datetime):
+            now_naive = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            ex_age_hours = max(0.0, (now_naive - existing_deal["updated_at"]).total_seconds() / 3600.0)
+
+        should_replace, replace_reason = evaluate_deal_replacement(
+            existing_active=existing_deal is not None,
+            existing_reliability_score=(
+                existing_deal["reliability_score"]
+                if existing_deal is not None
+                else DEFAULT_NORMAL_RELIABILITY_SCORE
+            ),
+            new_reliability_score=new_score,
+            existing_price=existing_deal.get("deal_price") if existing_deal else None,
+            new_price=new_dp,
+            existing_age_hours=ex_age_hours,
+            allow_higher_price_replace=True,
+            price_relation=audit_res.get("price_comparison") if need_price_comparison else None,
+        )
+
         audit_record: Dict[str, Any] = {
             **audit_res,
+            "should_replace_existing": bool(audit_res.get("is_content_valid") and should_replace),
+            "decision_reason": (
+                audit_res.get("comparison_reason")
+                or replace_reason
+            )[:120],
             "compared_existing_site": str(existing_deal.get("source_site") or "") if existing_deal else "",
             "compared_existing_item_id": str(existing_deal.get("source_item_id") or "") if existing_deal else "",
             "compared_existing_price": existing_deal.get("deal_price") if existing_deal else None,
@@ -663,10 +836,13 @@ class DealSubmitWorker:
             )
             return "rejected"
 
-        if existing_deal is not None and not audit_res.get("should_replace_existing"):
+        if existing_deal is not None and not should_replace:
             audit_record["passed"] = True
             now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-            decision_msg = audit_res.get("decision_reason") or "当前商品已有同价有效好价在架，本次暂未替换"
+            if existing_deal.get("is_official_baseline"):
+                decision_msg = "当前爆料价与商品官方在售价无明显优惠（需同口径便宜至少5%且不少于1元），暂未收录"
+            else:
+                decision_msg = replace_reason or audit_record.get("comparison_reason") or "当前商品已有同级有效好价在架，本次暂未替换"
             repo.col.update_many(
                 self._doc_filter(doc),
                 {
@@ -674,7 +850,7 @@ class DealSubmitWorker:
                         "clean_status": "cleaned_success",
                         "clean_stage": CLEAN_STAGE_DONE,
                         "clean_error_code": OK_EXISTING_DEAL_BETTER,
-                        "clean_error_msg": decision_msg,
+                        "clean_error_msg": decision_msg[:120],
                         "cleaned_at": now_utc,
                         "user_audit_result": audit_record,
                     },
@@ -691,45 +867,293 @@ class DealSubmitWorker:
         )
         return "ready"
 
-    def _finalize_with_ai2(
+    @staticmethod
+    def _build_user_submit_outcome(doc: Dict[str, Any]) -> Dict[str, Any]:
+        """直接将单阶段多模态审核产物规整为正式表 `product_doc` 与写库 outcome（跳过冗余 AI-2）。"""
+        site = str(doc.get("source_site") or USER_SUBMIT_SITE).strip()
+        site_name = get_source_site_name(site)
+        channel = str(doc.get("source_channel") or "detail_anchor").strip()
+        mid = str(doc.get("source_item_id") or "").strip()
+        raw_title = str(doc.get("title") or "").strip()
+        s1 = doc.get("ai_stage1_result") if isinstance(doc.get("ai_stage1_result"), dict) else {}
+        conv_list = [c for c in (doc.get("converted_links") or []) if isinstance(c, dict)]
+        main_conv = conv_list[0] if conv_list else {}
+        product_card = main_conv.get("official_product") if isinstance(main_conv.get("official_product"), dict) else {}
+        audit_res = doc.get("user_audit_result") if isinstance(doc.get("user_audit_result"), dict) else {}
+
+        plat = normalize_platform(
+            doc.get("resolved_platform") or main_conv.get("platform") or doc.get("platform") or "",
+            default="",
+        )
+        goods_id = str(
+            doc.get("resolved_product_id") or main_conv.get("goods_id") or doc.get("candidate_goods_id") or ""
+        ).strip()
+        goods_sign = str(doc.get("resolved_goods_sign") or main_conv.get("goods_sign") or "").strip()
+        my_promo_link = str(main_conv.get("my_promo_link") or "")
+        my_promo_token = str(main_conv.get("my_promo_token") or "")
+
+        raw_dp = s1.get("deal_price") if s1.get("deal_price") is not None else doc.get("price")
+        deal_price = round(float(raw_dp), 2) if isinstance(raw_dp, (int, float)) and not isinstance(raw_dp, bool) and float(raw_dp) > 0 else None
+
+        coupon_links: List[Dict[str, Any]] = []
+        seen_cpn_targets: Set[Tuple[str, str]] = set()
+        seen_cpn_venues: Set[str] = set()
+        cpn_label_override = str(audit_res.get("coupon_label") or "").strip()
+        for c_obj in conv_list:
+            lid = str(c_obj.get("link_id") or "").strip()
+            if not lid or lid == "L1" or c_obj.get("convert_status") != "coupon_or_activity":
+                continue
+            c_url = str(c_obj.get("my_promo_link") or "").strip()
+            c_tok = str(c_obj.get("my_promo_token") or "").strip()
+            c_inp = str(c_obj.get("clean_input") or "").strip()
+            if is_shop_homepage_url(c_url) or is_shop_homepage_url(c_inp):
+                continue
+            if not c_url and not c_tok:
+                continue
+            dedup_sig = (c_url, c_tok)
+            if dedup_sig in seen_cpn_targets:
+                continue
+            venue_sigs = {
+                v
+                for v in (
+                    rebuild_clean_official_venue_url(c_inp),
+                    rebuild_clean_official_venue_url(c_url) if c_url else None,
+                )
+                if v
+            }
+            if venue_sigs & seen_cpn_venues:
+                continue
+            seen_cpn_targets.add(dedup_sig)
+            seen_cpn_venues.update(venue_sigs)
+            coupon_links.append({
+                "link_id": lid,
+                "label": clean_coupon_label(cpn_label_override or "优惠券"),
+                "url": c_url,
+                "token": c_tok,
+                "platform": str(c_obj.get("platform") or plat).strip().lower() or plat,
+            })
+
+        raw_steps = audit_res.get("tutorial_steps") if isinstance(audit_res.get("tutorial_steps"), list) else []
+        tutorial_steps = [s for s in (sanitize_clean_tutorial_step(st) for st in raw_steps) if s]
+        raw_copy = str(audit_res.get("polished_copywriting") or "").strip()
+        sanitized_copy = sanitize_polished_copywriting(raw_copy) if raw_copy else ""
+        if not tutorial_steps:
+            fallback_src = sanitized_copy or str(doc.get("tutorial_text") or "")
+            fallback_tut = sanitize_clean_tutorial_step(fallback_src)
+            if fallback_tut:
+                tutorial_steps = [fallback_tut]
+        if not coupon_links:
+            empty_cpn_ui_rewrites = (
+                ("先在上方【领券】处", "通过下方购买链接"),
+                ("在上方【领券】处", "通过下方购买链接"),
+                ("上方【领券】处", "下方购买链接"),
+                ("上方【领券】", "下方购买链接"),
+                ("先在上方领券处", "通过下方购买链接"),
+                ("在上方领券处", "通过下方购买链接"),
+                ("在上方领券", "通过下方购买链接"),
+                ("上方领券处", "下方购买链接"),
+                ("上方领券", "下方购买链接"),
+            )
+            rewritten_steps: List[str] = []
+            for step in tutorial_steps:
+                for old_ph, new_ph in empty_cpn_ui_rewrites:
+                    if old_ph in step:
+                        step = step.replace(old_ph, new_ph)
+                rewritten_steps.append(step)
+            tutorial_steps = rewritten_steps
+        tutorial_text = "\n".join(tutorial_steps)
+
+        clean_title = (
+            normalize_inline_spaces(str(audit_res.get("clean_title") or "")).strip()
+            or normalize_inline_spaces(str(product_card.get("title") or doc.get("resolved_official_title") or raw_title)).strip()
+        )
+        price_logic = normalize_inline_spaces(str(audit_res.get("price_logic") or "")).strip() or None
+        card_highlight = sanitize_card_highlight(audit_res.get("card_highlight"))
+        if not card_highlight and deal_price is not None:
+            card_highlight = f"到手{deal_price:g}元"
+        original_copywriting = (
+            sanitized_copy
+            or normalize_inline_spaces(str(doc.get("tutorial_text") or "")).strip()
+        )
+
+        official_img = str(product_card.get("image_url") or doc.get("image_url") or "").strip()
+        user_share_images: List[str] = []
+        for raw_u in doc.get("tutorial_images") or []:
+            u = strip_markdown_link_wrapper(str(raw_u or "").strip())
+            if u and u != official_img and u not in user_share_images:
+                user_share_images.append(u)
+
+        official_price = float(product_card.get("price") or 0.0)
+        original_price = float(product_card.get("original_price") or official_price)
+        official_activity_price = float(product_card.get("activity_price") or official_price)
+        coupon_amount = float(product_card.get("coupon_amount") or 0.0)
+        saved_price = round(max(coupon_amount, max(0.0, original_price - official_activity_price)), 2)
+
+        pub_ts = (
+            coerce_unix_timestamp(doc.get("publish_ts"))
+            or parse_publish_time_epoch(doc.get("publish_time"))
+            or coerce_unix_timestamp(doc.get("fetched_at"))
+            or time.time()
+        )
+        reliability_score = resolve_reliability_score(
+            doc.get("reliability_score"),
+            default=DEFAULT_RELIABLE_SCORE,
+        )
+        deal_info: Dict[str, Any] = {
+            "is_deal_tip": True,
+            "clean_title": clean_title,
+            "card_highlight": card_highlight,
+            "publish_ts": float(pub_ts),
+            "expire_time": doc.get("expire_time"),
+            "deal_price": deal_price,
+            "price_logic": price_logic,
+            "price_is_reliable": True,
+            "price_reliability_reason": "用户已提供实证截图并通过多模态核验",
+            "reliability_score": reliability_score,
+            "official_price": round(official_price, 2),
+            "raw_tip_title": raw_title or str(product_card.get("title") or ""),
+            "original_copywriting": original_copywriting,
+            "coupon_links": coupon_links,
+            "tutorial_steps": tutorial_steps,
+            "tutorial_text": tutorial_text,
+            "user_share_images": user_share_images,
+            "my_promotion_link": my_promo_link,
+            "my_promotion_token": my_promo_token,
+            "source_site": site,
+            "source_site_name": site_name,
+            "source_channel": channel,
+            "source_item_id": mid,
+            "provider_nickname": str((doc.get("hot_metrics") or {}).get("provider_nickname") or "").strip(),
+            "source_url": str(doc.get("source_detail_url") or doc.get("source_url") or "").strip(),
+            "source_list_page_url": str(doc.get("source_list_page_url") or doc.get("source_url") or "").strip(),
+            "source_detail_url": str(doc.get("source_detail_url") or doc.get("source_url") or "").strip(),
+            "merged_tip_ids": [mid] if mid else [],
+            "merged_source_urls": [],
+            "seen_count": int(doc.get("seen_count") or 1),
+            "seen_channels": doc.get("seen_channels") or ([channel] if channel else []),
+            "hot_metrics": doc.get("hot_metrics") or {},
+        }
+
+        product_doc: Dict[str, Any] = {
+            **product_card,
+            "platform": plat,
+            "platform_name": product_card.get("platform_name") or platform_name(plat),
+            "product_id": goods_id,
+            "goods_id": goods_id,
+            "goods_sign": goods_sign,
+            "deal_source": site,
+            "deal_source_name": site_name,
+            "name": str(product_card.get("title") or product_card.get("name") or clean_title).strip(),
+            "brand": str(product_card.get("brand") or ""),
+            "category": str(product_card.get("category") or ""),
+            "price": round(official_price, 2),
+            "original_price": round(original_price, 2),
+            "activity_price": round(official_activity_price, 2),
+            "saved_price": round(saved_price, 2),
+            "coupon_amount": round(coupon_amount, 2),
+            "has_coupon": coupon_amount > 0,
+            "commission_rate": float(product_card.get("commission_rate") or 0.0),
+            "commission_amount": float(product_card.get("commission_amount") or 0.0),
+            "sales_tip": str(product_card.get("sales_tip") if product_card.get("sales_tip") is not None else "0"),
+            "image_url": official_img,
+            "product_url": str(product_card.get("product_url") or my_promo_link or ""),
+            "mall_name": str(product_card.get("shop_name") or doc.get("mall_name") or ""),
+            "desc": str(product_card.get("desc") or ""),
+            "carousel_images": product_card.get("carousel_images") or ([official_img] if official_img else []),
+            "detail_tags": product_card.get("detail_tags") or [],
+            "service_guarantees": product_card.get("service_guarantees") or [],
+            "shop_ratings": product_card.get("shop_ratings") or {},
+            "specs": product_card.get("specs") or [],
+            "coupon_info": product_card.get("coupon_info") or {},
+            "deal_info": deal_info,
+        }
+        clean_cpn_url = jd_coupon_url(product_card.get("coupon_url")) if plat == "jd" else ""
+        if clean_cpn_url:
+            product_doc["coupon_url"] = clean_cpn_url
+        else:
+            product_doc.pop("coupon_url", None)
+
+        _attach_preseeded_default_promotion(
+            plat=plat,
+            goods_id=goods_id,
+            goods_sign=goods_sign,
+            main_conv=main_conv,
+            adapter_res={},
+            my_promo_link=my_promo_link,
+            my_promo_token=my_promo_token,
+            product_doc=product_doc,
+        )
+
+        compared_ex_id = str(audit_res.get("compared_existing_item_id") or "").strip()
+        if compared_ex_id:
+            product_doc["_verified_replace_source_item_id"] = compared_ex_id
+
+        conv_summary = [
+            {
+                "link_id": c.get("link_id"),
+                "text_role_hint": c.get("text_role_hint"),
+                "convert_status": c.get("convert_status"),
+                "platform": c.get("platform"),
+                "goods_id": c.get("goods_id"),
+                "goods_sign": c.get("goods_sign"),
+                "my_promo_link": c.get("my_promo_link"),
+                "my_promo_token": c.get("my_promo_token"),
+            }
+            for c in conv_list
+        ]
+
+        return {
+            "status": "success",
+            "stage_outcome": "success",
+            "error_code": "OK",
+            "error_msg": "",
+            "source_site": site,
+            "source_channel": channel,
+            "source_item_id": mid,
+            "platform": plat,
+            "product_id": goods_id,
+            "goods_sign": goods_sign,
+            "official_title": product_doc["name"],
+            "raw_title": raw_title,
+            "deal_price": deal_price,
+            "official_price": official_price,
+            "merged_tip_ids": [mid] if mid else [],
+            "original_copywriting": original_copywriting,
+            "ai_stage1_result": s1,
+            "converted_links": conv_summary,
+            "ai_stage2_result": audit_res,
+            "winning_anchor": str(main_conv.get("clean_input") or "")[:100],
+            "winning_anchor_type": main_conv.get("text_role_hint") or "main_candidate",
+            "candidate_count": len(conv_list),
+            "tutorial_img_count": len(user_share_images),
+            "coupon_link_count": len(coupon_links),
+            "product_doc": product_doc,
+        }
+
+    def _publish_ready_docs(
         self,
         repo: Any,
-        cleaner: Any,
         ready_docs: List[Dict[str, Any]],
     ) -> Dict[str, int]:
-        """步骤 C：复用标准 AI-2 终审与正式表写库，确保重试留在本阶段并清理终审失败截图。"""
-        stats = {"ai2_processed": 0, "published": 0, "rejected": 0}
+        """步骤 C：直接将单阶段审核通过的用户爆料晋升正式表并清理缓存（无二次 AI-2 调用）。"""
+        stats = {"published": 0, "rejected": 0}
         if not ready_docs:
             return stats
 
-        docs_by_id = {str(d.get("source_item_id") or "").strip(): d for d in ready_docs}
-        outcomes, _ = cleaner.process_ai2_unit(ready_docs, raw_col=repo.col, quiet_sub_logs=True)
-        if not outcomes:
-            return stats
-
+        outcomes: List[Dict[str, Any]] = []
         published_targets: List[Tuple[str, str]] = []
-        for out in outcomes:
-            mid = str(out.get("source_item_id") or "").strip()
-            src_doc = docs_by_id.get(mid) or {}
-            status = str(out.get("status") or "")
-            if status == "retry_pending":
-                out["clean_stage"] = CLEAN_STAGE_NEED_USER_AUDIT
-            elif status == "success" and isinstance(out.get("product_doc"), dict):
-                pdoc = out["product_doc"]
+        for doc in ready_docs:
+            out = self._build_user_submit_outcome(doc)
+            outcomes.append(out)
+            pdoc = out.get("product_doc")
+            if out.get("status") == "success" and isinstance(pdoc, dict):
                 stats["published"] += 1
                 t_plat = normalize_platform(pdoc.get("platform") or "", default="")
                 t_pid = str(pdoc.get("product_id") or "").strip()
                 if t_plat and t_pid:
                     published_targets.append((t_plat, t_pid))
-                audit_meta = src_doc.get("user_audit_result") if isinstance(src_doc.get("user_audit_result"), dict) else {}
-                compared_ex_id = str(audit_meta.get("compared_existing_item_id") or "").strip()
-                if compared_ex_id:
-                    pdoc["_verified_replace_source_item_id"] = compared_ex_id
-            elif status in ("failed", "low_score"):
-                stats["rejected"] += 1
 
         commit_batch_results_to_db(outcomes, repo.col, repo.formal_col, cycle_num=0)
-        stats["ai2_processed"] = len(outcomes)
         if published_targets:
             for t_plat, t_pid in dict.fromkeys(published_targets):
                 clear_cached_deal_tip(t_plat, t_pid)
@@ -742,7 +1166,7 @@ class DealSubmitWorker:
         return stats
 
     def run_once(self) -> Dict[str, int]:
-        """执行单轮用户爆料单阶段清洗（优惠券转链 -> 全图文多模态审核对比 -> 标准 AI-2 入库）。"""
+        """执行单轮用户爆料单阶段清洗（优惠券转链 -> 全图文单阶段多模态审核对比与直接上架）。"""
         repo = self.submit_service.raw_repo
         claimed = repo.claim_stage_docs(
             CLEAN_STAGE_NEED_USER_AUDIT,
@@ -760,7 +1184,6 @@ class DealSubmitWorker:
             "skipped_existing": 0,
             "coupon_failed": 0,
             "retried": 0,
-            "ai2_processed": 0,
             "published": 0,
         }
         if not claimed:
@@ -791,12 +1214,11 @@ class DealSubmitWorker:
             )
         summary["deferred"] = len(deferred_docs)
 
-        cleaner = self._get_cleaner()
-        ai_client = self._get_audit_ai_client(cleaner)
+        ai_client = self._get_audit_ai_client(self._cleaner)
         ready_docs: List[Dict[str, Any]] = []
 
         for doc in active_docs:
-            conv_state = self._ensure_coupon_converted(repo, cleaner, doc)
+            conv_state = self._ensure_coupon_converted(repo, doc)
             if conv_state == "failed":
                 summary["coupon_failed"] += 1
                 summary["rejected"] += 1
@@ -817,10 +1239,9 @@ class DealSubmitWorker:
             else:
                 summary["retried"] += 1
 
-        ai2_stats = self._finalize_with_ai2(repo, cleaner, ready_docs)
-        summary["ai2_processed"] = ai2_stats["ai2_processed"]
-        summary["published"] = ai2_stats["published"]
-        summary["rejected"] += ai2_stats["rejected"]
+        pub_stats = self._publish_ready_docs(repo, ready_docs)
+        summary["published"] = pub_stats["published"]
+        summary["rejected"] += pub_stats["rejected"]
         return summary
 
     def run_maintenance_once(self) -> None:

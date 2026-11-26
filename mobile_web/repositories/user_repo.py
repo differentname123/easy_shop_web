@@ -20,6 +20,7 @@ from auth import hash_password, verify_password, mask_phone
 from config import logger
 from models.product import normalize_platform
 from models.group_help import PERMANENT_BAN_STRIKES
+from models.deal_constants import DEFAULT_RELIABLE_SCORE
 
 DEFAULT_AVATAR = ""
 
@@ -214,6 +215,7 @@ class UserRepository(BaseRepository):
             "created_at": now,
             "last_login_at": now,
             "last_active_at": now,
+            "reliability_score": DEFAULT_RELIABLE_SCORE,
             "auth_status": {
                 "pdd": {"is_authorized": False, "bind": 0, "updated_at": None},
                 "taobao": {"is_authorized": False, "bind": 0, "updated_at": None},
