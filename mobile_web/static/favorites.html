@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261126-6">
-  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261126-6">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261126-6"></script>
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261127-1">
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261127-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261127-1"></script>
   <style>
     .fav-page { padding-top: calc(48px + var(--safe-top)); padding-bottom: 32px; min-height: 100vh; background: var(--bg-page); max-width: 540px; margin: 0 auto; }
     .fav-list { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
@@ -62,7 +62,7 @@
   </div>
 
   <div class="fav-list" v-else>
-    <div class="fav-card" :class="{ off: item.is_off_promotion }" v-for="item in items" :key="item.platform + ':' + item.product_id">
+    <div class="fav-card" :class="{ off: item.is_off_promotion }" v-for="item in items" :key="item.item_code">
       <img :src="item.product?.image_url || '/static/icons/icon-192.png?v=20261111-1'" class="fav-thumb" referrerpolicy="no-referrer" loading="lazy" @click="openDetail(item)" />
       <div class="fav-body">
         <div>
@@ -98,10 +98,10 @@
   <div class="toast-box" v-if="toastMessage">{{ toastMessage }}</div>
 </div>
 
-<script src="/static/js/api.js?v=ux-20261126-6"></script>
-<script src="/static/js/session.js?v=ux-20261126-6"></script>
-<script src="/static/js/format.js?v=ux-20261126-6"></script>
-<script src="/static/js/browser.js?v=ux-20261126-6"></script>
-<script src="/static/js/favorites.js?v=ux-20261126-6"></script>
+<script src="/static/js/api.js?v=ux-20261127-1"></script>
+<script src="/static/js/session.js?v=ux-20261127-1"></script>
+<script src="/static/js/format.js?v=ux-20261127-1"></script>
+<script src="/static/js/browser.js?v=ux-20261127-1"></script>
+<script src="/static/js/favorites.js?v=ux-20261127-1"></script>
 </body>
 </html>

@@ -29,7 +29,9 @@ from cache import (
     PROMOTION_CACHE,
     SIGN_BY_ID_CACHE,
     UNIVERSAL_COLLECT_DEDUP,
+    cache_deal_tip,
     cache_product_detail,
+    get_cached_deal_tip,
     is_valid_detail_cache_entry,
     make_detail_snapshot,
     snapshot_detail_deadline,
@@ -46,16 +48,44 @@ class PromoteService:
         self.user_service = user_service
 
     def _resolve_product_ref(self, ref: ProductRef) -> ProductRef:
+        def _lookup_db_sign_by_id(plat: str, gid: str) -> str:
+            if not hasattr(self.repo, "get_product_detail"):
+                return ""
+            try:
+                id_doc = self.repo.get_product_detail(gid, platform=plat, key_type="id")
+            except Exception:
+                id_doc = None
+            if isinstance(id_doc, dict) and normalize_platform(id_doc.get("platform", plat)) == plat:
+                doc_sign = str(id_doc.get("goods_sign") or "").strip()
+                if (
+                    doc_sign
+                    and doc_sign != gid
+                    and not (plat == "jd" and is_jd_image_key(doc_sign))
+                    and not (plat == "pdd" and doc_sign.isdigit())
+                ):
+                    SIGN_BY_ID_CACHE.set((plat, gid), doc_sign)
+                    return doc_sign
+            return ""
+
         upgraded_from_id = False
         if ref.platform in ("taobao", "jd", "pdd") and ref.goods_id:
             if not ref.goods_sign or ref.goods_sign == ref.goods_id or (ref.platform == "jd" and is_jd_image_key(ref.goods_sign)):
                 cached_sign = SIGN_BY_ID_CACHE.get((ref.platform, ref.goods_id))
-                if isinstance(cached_sign, str) and cached_sign.strip():
-                    ref = ProductRef(ref.platform, ref.goods_id, cached_sign.strip())
+                resolved_sign = (
+                    cached_sign.strip()
+                    if isinstance(cached_sign, str) and cached_sign.strip()
+                    else _lookup_db_sign_by_id(ref.platform, ref.goods_id)
+                )
+                if resolved_sign:
+                    ref = ProductRef(ref.platform, ref.goods_id, resolved_sign)
                     upgraded_from_id = True
         if ref.goods_sign:
             try:
                 doc = self.repo.get_product_identity(ref.goods_sign, platform=ref.platform)
+                if doc is None and upgraded_from_id and ref.goods_id:
+                    fresh_sign = _lookup_db_sign_by_id(ref.platform, ref.goods_id)
+                    if fresh_sign and fresh_sign != ref.goods_sign:
+                        return ProductRef(ref.platform, ref.goods_id, fresh_sign)
                 if doc and normalize_platform(doc.get("platform", ref.platform)) == ref.platform:
                     raw_gid = clean_product_id(doc.get("goods_id"))
                     if not raw_gid:
@@ -465,6 +495,60 @@ class PromoteService:
                     "error_msg": "平台推广身份尚未正确配置",
                 }
         return {}, None
+
+    def redeem_deal_coupon(self, platform: str, product_id: str, coupon_digest: str) -> Dict[str, Any]:
+        """受控兑换详情页线报附属优惠券链接或口令，不提前在详情接口暴露明文。"""
+        from public_boundary import coupon_link_digest
+
+        plat = normalize_platform(platform, default="")
+        pid = clean_product_id(product_id)
+        dg = str(coupon_digest or "").strip()
+        if not plat or not pid or not dg:
+            return {"status": "error", "error_code": "COUPON_UNAVAILABLE", "error_msg": "该优惠券已失效或暂不可用"}
+
+        deal_tip = None
+        cached = get_cached_deal_tip(plat, pid)
+        if cached is not None:
+            state, deal_tip = cached
+            if state != "ok":
+                deal_tip = None
+        elif hasattr(self.repo, "get_deal_tip_view"):
+            try:
+                res = self.repo.get_deal_tip_view(pid, platform=plat)
+                if isinstance(res, (tuple, list)) and len(res) == 2:
+                    state, deal_tip = res
+                    cache_deal_tip(plat, pid, state, deal_tip)
+                    if state != "ok":
+                        deal_tip = None
+            except Exception as exc:
+                logger.warning(
+                    "❌ 【附属券兑换异常】读取线报视图失败 | 平台[%s] 商品[%s] 异常<%s>",
+                    plat, pid, format_exc_summary(exc),
+                )
+                return {"status": "error", "error_code": "COUPON_UNAVAILABLE", "error_msg": "该优惠券已失效或暂不可用"}
+
+        if isinstance(deal_tip, dict):
+            for entry in deal_tip.get("coupon_links") or []:
+                if not isinstance(entry, dict):
+                    continue
+                url = str(entry.get("url") or "").strip()
+                token = str(entry.get("token") or "").strip()
+                if not url and not token:
+                    continue
+                if coupon_link_digest(url, token) == dg:
+                    entry_plat = normalize_platform(entry.get("platform") or plat, default=plat)
+                    lbl = str(entry.get("label") or "优惠券").strip() or "优惠券"
+                    return {
+                        "status": "success",
+                        "platform": entry_plat,
+                        "label": lbl,
+                        "url": url,
+                        "short_url": url,
+                        "final_link": url,
+                        "promotion_token": token,
+                        "command_text": token or url,
+                    }
+        return {"status": "error", "error_code": "COUPON_UNAVAILABLE", "error_msg": "该优惠券已失效或暂不可用"}
 
     def convert_link(
         self,

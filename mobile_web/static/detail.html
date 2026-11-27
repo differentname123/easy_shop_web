@@ -13,9 +13,9 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png?v=20261111-1">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png?v=20261111-1">
   <link rel="manifest" href="/manifest.json">
-  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261126-6">
-  <script src="/static/js/vue.global.prod.js?v=ux-20261126-6"></script>
-  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261126-6">
+  <link rel="stylesheet" href="/static/css/style.css?v=ux-20261127-1">
+  <script src="/static/js/vue.global.prod.js?v=ux-20261127-1"></script>
+  <link rel="stylesheet" href="/static/css/detail.css?v=ux-20261127-1">
 </head>
 <body>
 <div id="app" class="detail-container" v-cloak>
@@ -136,8 +136,8 @@
           <span class="deal-aux-title">{{ cItem.label }}</span>
         </div>
         <div class="deal-aux-actions">
-          <button class="deal-mini-btn" v-if="cItem.token || cItem.url" @click="copyDealAuxItem(cItem)">{{ cItem.token ? '复制口令' : '复制链接' }}</button>
-          <button class="deal-mini-btn primary" v-if="cItem.url" @click="openDealAuxItem(cItem)">打开 ›</button>
+          <button class="deal-mini-btn" v-if="cItem.coupon_code && (cItem.has_token || cItem.has_url)" @click="copyDealAuxItem(cItem)">{{ cItem.has_token ? '复制口令' : '复制链接' }}</button>
+          <button class="deal-mini-btn primary" v-if="cItem.coupon_code && cItem.has_url" @click="openDealAuxItem(cItem)">打开 ›</button>
         </div>
       </div>
     </div>
@@ -383,10 +383,10 @@
 
 </div>
 
-<script src="/static/js/api.js?v=ux-20261126-6"></script>
-<script src="/static/js/session.js?v=ux-20261126-6"></script>
-<script src="/static/js/format.js?v=ux-20261126-6"></script>
-<script src="/static/js/browser.js?v=ux-20261126-6"></script>
-<script src="/static/js/detail.js?v=ux-20261126-6"></script>
+<script src="/static/js/api.js?v=ux-20261127-1"></script>
+<script src="/static/js/session.js?v=ux-20261127-1"></script>
+<script src="/static/js/format.js?v=ux-20261127-1"></script>
+<script src="/static/js/browser.js?v=ux-20261127-1"></script>
+<script src="/static/js/detail.js?v=ux-20261127-1"></script>
 </body>
 </html>

@@ -117,23 +117,28 @@ def _setup_services(monkeypatch):
 
 
 def test_favorites_routes_require_auth_and_enforce_isolation(monkeypatch):
+    from public_boundary import encode_item_code
+
     _setup_services(monkeypatch)
     app = create_app()
     tok_a = create_access_token("u_aaaaaaaa", ttl=3600)
     tok_b = create_access_token("u_bbbbbbbb", ttl=3600)
+    code_101 = encode_item_code("pdd", "101")
 
     with TestClient(app) as client:
         assert client.get("/api/favorites/list").status_code == 401
-        assert client.post("/api/favorites/add", json={"platform": "pdd", "product_id": "101"}).status_code == 401
-        assert client.post("/api/favorites/remove", json={"platform": "pdd", "product_id": "101"}).status_code == 401
+        assert client.post("/api/favorites/add", json={"item_code": code_101}).status_code == 401
+        assert client.post("/api/favorites/remove", json={"item_code": code_101}).status_code == 401
 
         r_add = client.post(
             "/api/favorites/add",
             headers={"Authorization": f"Bearer {tok_a}"},
-            json={"platform": "pdd", "product_id": "101", "name": "用户A商品", "price": 19.9},
+            json={"item_code": code_101, "name": "用户A商品", "price": 19.9},
         )
         assert r_add.status_code == 200
         assert r_add.json()["data"]["is_favorited"] is True
+        assert r_add.json()["data"]["item_code"] == code_101
+        assert "product_id" not in r_add.json()["data"]
 
         # 用户 B 看不到也删不掉用户 A 的收藏
         r_list_b = client.get("/api/favorites/list", headers={"Authorization": f"Bearer {tok_b}"})
@@ -142,7 +147,7 @@ def test_favorites_routes_require_auth_and_enforce_isolation(monkeypatch):
         r_rem_b = client.post(
             "/api/favorites/remove",
             headers={"Authorization": f"Bearer {tok_b}"},
-            json={"platform": "pdd", "product_id": "101"},
+            json={"item_code": code_101},
         )
         assert r_rem_b.json()["data"]["removed"] is False
 
@@ -151,6 +156,8 @@ def test_favorites_routes_require_auth_and_enforce_isolation(monkeypatch):
 
 
 def test_favorites_idempotent_add_remove_and_live_product_join(monkeypatch):
+    from public_boundary import encode_item_code
+
     _svc, fav_col, prod_col = _setup_services(monkeypatch)
     prod_col.docs.extend([
         {
@@ -181,24 +188,27 @@ def test_favorites_idempotent_add_remove_and_live_product_join(monkeypatch):
     app = create_app()
     tok = create_access_token("u_11223344", ttl=3600)
     headers = {"Authorization": f"Bearer {tok}"}
+    code_jd = encode_item_code("jd", "jd_img_1")
+    code_tb = encode_item_code("taobao", "tb_1")
+    code_pdd_missing = encode_item_code("pdd", "sign_m")
 
     with TestClient(app) as client:
         # 1. 收藏线报商品时优先记录 deal_price=19.9
-        r1 = client.post("/api/favorites/add", headers=headers, json={"platform": "jd", "product_id": "jd_img_1"})
+        r1 = client.post("/api/favorites/add", headers=headers, json={"item_code": code_jd})
         assert r1.status_code == 200
         assert r1.json()["data"]["already_exists"] is False
 
         # 2. 商品降价后再次重复收藏，不覆盖首次 collected_price=19.9
         prod_col.docs[0]["deal_info"]["deal_price"] = 15.9
-        r2 = client.post("/api/favorites/add", headers=headers, json={"platform": "jd", "product_id": "jd_img_1"})
+        r2 = client.post("/api/favorites/add", headers=headers, json={"item_code": code_jd})
         assert r2.status_code == 200
         assert r2.json()["data"]["already_exists"] is True
 
         # 3. 收藏淘宝商品后将其标记下架，并再收藏一件库中不存在的兜底商品
-        client.post("/api/favorites/add", headers=headers, json={"platform": "taobao", "product_id": "tb_1"})
+        client.post("/api/favorites/add", headers=headers, json={"item_code": code_tb})
         prod_col.docs[1]["is_off_promotion"] = True
         client.post("/api/favorites/add", headers=headers, json={
-            "platform": "pdd", "product_id": "pdd_missing", "goods_sign": "sign_m",
+            "item_code": code_pdd_missing,
             "name": "快照商品", "image_url": "https://img.pdd.com/m.jpg", "price": 9.9,
         })
 
@@ -210,28 +220,32 @@ def test_favorites_idempotent_add_remove_and_live_product_join(monkeypatch):
         res = client.get("/api/favorites/list?page=1&page_size=20", headers=headers).json()["data"]
         assert res["total"] == 3
         items = res["items"]
-        assert items[0]["product_id"] == "pdd_missing"
+        assert items[0]["item_code"] == code_pdd_missing
+        assert "product_id" not in items[0]
         assert items[0]["live_status"] == "missing"
         assert items[0]["current_price"] is None
         assert items[0]["product"]["name"] == "快照商品"
+        assert items[0]["product"]["item_code"] == code_pdd_missing
 
-        assert items[1]["product_id"] == "tb_1"
+        assert items[1]["item_code"] == code_tb
         assert items[1]["live_status"] == "off_promotion"
         assert items[1]["is_off_promotion"] is True
         assert items[1]["current_price"] is None
 
-        assert items[2]["product_id"] == "jd_img_1"
+        assert items[2]["item_code"] == code_jd
         assert items[2]["live_status"] == "online"
         assert items[2]["collected_price"] == 19.9
         assert items[2]["current_price"] == 15.9
         assert items[2]["price_diff"] == -4.0
 
         # 4. 幂等移出
-        assert client.post("/api/favorites/remove", headers=headers, json={"platform": "jd", "product_id": "jd_img_1"}).json()["data"]["removed"] is True
-        assert client.post("/api/favorites/remove", headers=headers, json={"platform": "jd", "product_id": "jd_img_1"}).json()["data"]["removed"] is False
+        assert client.post("/api/favorites/remove", headers=headers, json={"item_code": code_jd}).json()["data"]["removed"] is True
+        assert client.post("/api/favorites/remove", headers=headers, json={"item_code": code_jd}).json()["data"]["removed"] is False
 
 
 def test_favorites_500_item_cap(monkeypatch):
+    from public_boundary import encode_item_code
+
     svc, fav_col, _ = _setup_services(monkeypatch)
     for i in range(MAX_FAVORITES_PER_USER):
         fav_col.docs.append({"uid": "u_cap12345", "platform": "pdd", "product_id": f"p_{i}"})
@@ -241,6 +255,6 @@ def test_favorites_500_item_cap(monkeypatch):
         resp = client.post(
             "/api/favorites/add",
             headers={"Authorization": f"Bearer {tok}"},
-            json={"platform": "pdd", "product_id": "overflow_item", "price": 10.0},
+            json={"item_code": encode_item_code("pdd", "overflow_item"), "price": 10.0},
         )
         assert resp.status_code == 400

@@ -629,6 +629,142 @@ class TestProductRepoMeiliIntegration(unittest.TestCase):
         buckets_niche = select_relevant_candidates("iPhone 17", niche_docs, min_primary=5)
         self.assertEqual([d["product_id"] for b in buckets_niche for d in b], ["ACC1"])
 
+    def test_partition_search_candidates_variety_brand_model_and_accessory_isolation(self):
+        """验证品种/米种、子品牌/系列、型号召回修复及跨类目/配件/纯本体隔离。"""
+        # 1. 品种词“稻花香2号”与“稻花香2”：
+        #    即便少数商品将“稻花香2号”误写入次本体，同品类“大米”商品（品种直击或标题共识）也必须全部进入 L1；
+        #    跨类目电饭煲（无品种/品牌共识）隔离在 L3。
+        rice_docs = [
+            {
+                "product_id": "R1_SEC",
+                "name": "五稻田五常大米原粮稻花香2号5kg",
+                "brand": "五稻田",
+                "format_info": {"core_entities": [{"name": "五常大米", "score": 10}, {"name": "稻花香2号", "score": 8}], "decision_keywords": [{"attribute_name": "品种", "attribute_value": "稻花香2号", "score": 8}]},
+            },
+            {
+                "product_id": "R2_DK",
+                "name": "十月稻田原粮稻花香2号2.5kg",
+                "brand": "十月稻田",
+                "format_info": {"core_entities": [{"name": "大米", "score": 10}], "decision_keywords": [{"attribute_name": "品种", "attribute_value": "稻花香2号", "score": 9}]},
+            },
+            {
+                "product_id": "R3_DK",
+                "name": "七鲜特等五常大米5kg 2026新米稻花香2号",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "大米", "score": 10}], "decision_keywords": [{"attribute_name": "品种", "attribute_value": "稻花香2号", "score": 9}]},
+            },
+            {
+                "product_id": "R4_DK_MIZHONG",
+                "name": "十月稻田寒地五常大米10斤 原粮稻花香2号",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "大米", "score": 10}, {"name": "五常大米", "score": 9}], "decision_keywords": [{"attribute_name": "米种", "attribute_value": "稻花香2号", "score": 9}]},
+            },
+            {
+                "product_id": "R5_TRUNC_DK",
+                "name": "猫超臻选五常大米原粮稻花香2号5kg",
+                "brand": "五米常香",
+                "format_info": {"core_entities": [{"name": "大米", "score": 10}], "decision_keywords": [{"attribute_name": "品种", "attribute_value": "稻花香", "score": 10}]},
+            },
+            {
+                "product_id": "COOKER_NOISE",
+                "name": "稻花香2号专用煮饭锅电饭煲4L",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "电饭煲", "score": 10}], "decision_keywords": [{"attribute_name": "适用米种", "attribute_value": "稻花香2号", "score": 6}]},
+            },
+        ]
+        for kw in ("稻花香2号", "稻花香2"):
+            l1, l2, l3 = partition_search_candidates(kw, rice_docs)
+            self.assertEqual([d["product_id"] for d in l1], ["R1_SEC", "R2_DK", "R3_DK", "R4_DK_MIZHONG", "R5_TRUNC_DK"], kw)
+            self.assertEqual(l2, [], kw)
+            self.assertEqual([d["product_id"] for d in l3], ["COOKER_NOISE"], kw)
+            buckets = select_relevant_candidates(kw, rice_docs, min_primary=1)
+            self.assertEqual([d["product_id"] for b in buckets for d in b], ["R1_SEC", "R2_DK", "R3_DK", "R4_DK_MIZHONG", "R5_TRUNC_DK"], kw)
+
+        # 2. 子品牌/系列（平台 brand 为空，系列在 decision_keywords）及跨类目噪音隔离：
+        series_docs = [
+            {
+                "product_id": "T_SEC",
+                "name": "蒙牛特仑苏纯牛奶250ml*12盒",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "牛奶", "score": 10}], "decision_keywords": [{"attribute_name": "系列", "attribute_value": "特仑苏", "score": 9}]},
+            },
+            {
+                "product_id": "T_BRAND",
+                "name": "特仑苏低脂纯牛奶250ml*12盒",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "纯牛奶", "score": 10}], "decision_keywords": [{"attribute_name": "品牌", "attribute_value": "特仑苏", "score": 9}]},
+            },
+            {
+                "product_id": "T_OMIT_DK",
+                "name": "蒙牛特仑苏纯牛奶利乐梦幻盖250ml*10包",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "特仑苏纯牛奶", "score": 10}], "decision_keywords": [{"attribute_name": "品牌", "attribute_value": "蒙牛", "score": 9}]},
+            },
+            {
+                "product_id": "T_PLAIN_MILK_OMIT",
+                "name": "特仑苏全脂纯牛奶250ml*16盒",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "纯牛奶", "score": 10}], "decision_keywords": [{"attribute_name": "脂肪类型", "attribute_value": "全脂", "score": 8}]},
+            },
+            {
+                "product_id": "T_COOKIE_NOISE",
+                "name": "牛乳特仑苏曲奇饼干网红零食",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "曲奇饼干", "score": 10}], "decision_keywords": [{"attribute_name": "口味", "attribute_value": "牛乳特仑苏", "score": 7}]},
+            },
+        ]
+        l1, l2, l3 = partition_search_candidates("特仑苏", series_docs)
+        self.assertEqual([d["product_id"] for d in l1], ["T_SEC", "T_BRAND", "T_OMIT_DK", "T_PLAIN_MILK_OMIT"])
+        self.assertEqual(l2, [])
+        self.assertEqual([d["product_id"] for d in l3], ["T_COOKIE_NOISE"])
+
+        # 3. 型号查询“iPhone 17”与“iphone”：真手机进 L1，适配机型手机壳隔离进 L3
+        iphone_docs = [
+            {
+                "product_id": "IP17_PRO",
+                "name": "Apple/苹果 iPhone 17 Pro 256GB 银色 5G手机",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "手机", "score": 10}], "decision_keywords": [{"attribute_name": "品牌", "attribute_value": "Apple", "score": 10}, {"attribute_name": "型号", "attribute_value": "iPhone 17 Pro", "score": 10}]},
+            },
+            {
+                "product_id": "IP17_OMIT_MODEL",
+                "name": "Apple/苹果 iPhone 17 256GB 白色 移动联通电信5G",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "手机", "score": 10}], "decision_keywords": [{"attribute_name": "品牌", "attribute_value": "Apple", "score": 10}]},
+            },
+            {
+                "product_id": "IP_CASE_NOISE",
+                "name": "适用iPhone 17 Pro Max磁吸手机壳保护壳",
+                "brand": "",
+                "format_info": {"core_entities": [{"name": "手机壳", "score": 10}], "decision_keywords": [{"attribute_name": "适配机型", "attribute_value": "iPhone 17 Pro Max", "score": 9}]},
+            },
+        ]
+        for kw in ("iPhone 17", "iphone"):
+            l1, l2, l3 = partition_search_candidates(kw, iphone_docs)
+            self.assertEqual([d["product_id"] for d in l1], ["IP17_PRO", "IP17_OMIT_MODEL"], kw)
+            self.assertEqual(l2, [], kw)
+            self.assertEqual([d["product_id"] for d in l3], ["IP_CASE_NOISE"], kw)
+
+        # 4. 纯本体词“牛奶”：真牛奶主导 head_entity_hits，杂项品种“牛奶哈密瓜”“牛奶小芋头”绝不漏入 L1/L2
+        milk_docs = [
+            {"product_id": "M1", "name": "伊利纯牛奶250ml*16盒", "format_info": {"core_entities": [{"name": "纯牛奶", "score": 10}]}},
+            {"product_id": "M2", "name": "蒙牛纯牛奶250ml*24盒", "format_info": {"core_entities": [{"name": "纯牛奶", "score": 10}]}},
+            {
+                "product_id": "MELON_NOISE",
+                "name": "现摘新鲜海南牛奶哈密瓜",
+                "format_info": {"core_entities": [{"name": "哈密瓜", "score": 10}], "decision_keywords": [{"attribute_name": "品种", "attribute_value": "牛奶哈密瓜", "score": 8}]},
+            },
+            {
+                "product_id": "TARO_NOISE",
+                "name": "云南农家现挖牛奶小芋头软糯",
+                "format_info": {"core_entities": [{"name": "芋头", "score": 10}], "decision_keywords": [{"attribute_name": "品种", "attribute_value": "牛奶", "score": 7}]},
+            },
+        ]
+        l1, l2, l3 = partition_search_candidates("牛奶", milk_docs)
+        self.assertEqual([d["product_id"] for d in l1], ["M1", "M2"])
+        self.assertEqual(l2, [])
+        self.assertEqual([d["product_id"] for d in l3], ["MELON_NOISE", "TARO_NOISE"])
+
 
 if __name__ == "__main__":
     unittest.main()

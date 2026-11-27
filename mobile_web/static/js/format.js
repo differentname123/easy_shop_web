@@ -30,65 +30,37 @@
     }
     return `已售 ${text}`;
   };
-  shop.goodsIdentity = goods => {
-    const rawPlat = String(goods.platform || 'pdd').toLowerCase();
-    const platform = rawPlat === 'tb' ? 'taobao' : rawPlat;
-    const rawId = String(goods.goods_id || '').trim();
-    const rawSign = String(goods.goods_sign || '').trim();
-    const rawPid = String(goods.product_id || '').trim();
-
-    let gid, sign;
-    if (platform === 'pdd') {
-      gid = rawId || (rawPid && rawPid !== rawSign ? rawPid : '');
-      sign = rawSign || (rawPid && !gid ? rawPid : '');
-    } else {
-      const val = rawId || rawSign || rawPid;
-      gid = rawId || rawPid || val;
-      sign = rawSign || val;
-    }
-    return {
-      platform,
-      goods_id: gid === '0' || gid === 'None' ? '' : gid,
-      goods_sign: sign,
-    };
-  };
-  shop.goodsKey = goods => {
-    const identity = shop.goodsIdentity(goods);
-    return `${identity.platform}:${identity.goods_id ? 'id:' + identity.goods_id : 'sign:' + identity.goods_sign}`;
-  };
+  shop.itemCode = goods => String((typeof goods === 'string' ? goods : goods?.item_code) || '').trim();
+  shop.goodsKey = goods => shop.itemCode(goods);
   shop.mergeGoods = (existing, incoming) => {
     const result = [...existing];
-    const seen = new Set(existing.map(shop.goodsKey));
+    const seen = new Set(existing.map(shop.itemCode).filter(Boolean));
     incoming.forEach(goods => {
-      const identity = shop.goodsIdentity(goods);
-      const key = shop.goodsKey(goods);
-      if ((!identity.goods_id && !identity.goods_sign) || !seen.has(key)) {
+      const code = shop.itemCode(goods);
+      if (!code || !seen.has(code)) {
         result.push(goods);
-        seen.add(key);
+        if (code) seen.add(code);
       }
     });
     return result;
   };
-  shop.matchesGoodsSummary = (summary, requested) => {
-    if (!summary) return false;
-    const cached = shop.goodsIdentity(summary);
-    const target = shop.goodsIdentity(requested);
-    if (cached.platform !== target.platform) return false;
-    if (target.goods_sign) {
-      if (cached.goods_sign === target.goods_sign) return true;
-      if (target.platform !== 'pdd' && target.goods_id && target.goods_id === target.goods_sign && cached.goods_id === target.goods_id) {
-        return true;
-      }
-      return false;
-    }
-    return Boolean(target.goods_id && cached.goods_id === target.goods_id);
+  shop.matchesGoodsSummary = (summary, target) => {
+    const code = shop.itemCode(target);
+    return Boolean(code && shop.itemCode(summary) === code);
+  };
+  shop.buildDetailUrl = (goodsOrCode, { inviteCode = '' } = {}) => {
+    const code = shop.itemCode(goodsOrCode);
+    if (!code) return '';
+    const params = new URLSearchParams({ item: code });
+    const cleanInvite = String(inviteCode || '').trim();
+    if (/^[A-Za-z0-9_-]{3,32}$/.test(cleanInvite)) params.set('invite_code', cleanInvite);
+    return `/detail?${params.toString()}`;
   };
   shop.platformCapability = (platform, capability) => Boolean(platform?.active &&
     (platform.capabilities?.[capability] ?? true));
   shop.orderKey = order => `${order.platform || ''}:${order.order_sn}`;
   shop.promotionPayload = (goods, accountUid) => ({
-    ...shop.goodsIdentity(goods),
-    product_url: goods.product_url || '',
+    item_code: shop.itemCode(goods),
     uid: accountUid || null,
     title: goods.name || '',
     price: goods.price ?? 0,
@@ -147,8 +119,8 @@
           }
         }
         if (parsed.pathname === '/detail') {
-          const hasGoods = Boolean((parsed.searchParams.get('goods_id') || '').trim() || (parsed.searchParams.get('goods_sign') || '').trim());
-          if (hasGoods && (isSameOrigin || !SUPPORTED_LINK_DOMAINS.some(d => parsed.hostname.toLowerCase().includes(d)))) {
+          const itemCode = (parsed.searchParams.get('item') || '').trim();
+          if (itemCode && (isSameOrigin || !SUPPORTED_LINK_DOMAINS.some(d => parsed.hostname.toLowerCase().includes(d)))) {
             return parsed.pathname + parsed.search;
           }
         }
@@ -159,14 +131,9 @@
   shop.buildDetailShareText = (goods, origin = '', inviteCode = '') => {
     if (!goods) return '';
     const baseOrigin = String(origin || (global.location && global.location.origin) || '').replace(/\/+$/, '');
-    const id = shop.goodsIdentity(goods);
-    const params = new URLSearchParams();
-    if (id.platform) params.set('platform', id.platform);
-    if (id.goods_id) params.set('goods_id', id.goods_id);
-    if (id.goods_sign) params.set('goods_sign', id.goods_sign);
-    const cleanInvite = String(inviteCode || '').trim();
-    if (/^[A-Za-z0-9_-]{3,32}$/.test(cleanInvite)) params.set('invite_code', cleanInvite);
-    const shareUrl = `${baseOrigin}/detail?${params.toString()}`;
+    const detailPath = shop.buildDetailUrl(goods, { inviteCode });
+    if (!detailPath) return '';
+    const shareUrl = `${baseOrigin}${detailPath}`;
     const title = String(goods.name || '精选好物').trim().slice(0, 48);
     const priceLabel = goods.has_coupon ? '券后参考价' : '参考价';
     const couponNum = Number(goods.coupon_amount);

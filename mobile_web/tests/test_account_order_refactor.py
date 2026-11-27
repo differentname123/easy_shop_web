@@ -347,6 +347,7 @@ def test_api_days_zero_future_platform_syntax_and_force_protection(monkeypatch):
     with patch("repositories.base_repo.get_shared_db", return_value=MagicMock()):
         from api import order, user, promote
     from auth import get_current_uid
+    from public_boundary import encode_item_code
     app = FastAPI()
     for router in (order.router, user.router, promote.router):
         app.include_router(router)
@@ -362,9 +363,10 @@ def test_api_days_zero_future_platform_syntax_and_force_protection(monkeypatch):
         assert order_mock.call_args.kwargs["days"] == 0
         assert "force_sync" not in order_mock.call_args.kwargs
         assert client.get("/api/user/auth", params={"platform": "future_shop"}).status_code == 200
-        assert client.post("/api/promote/convert", json={"platform": "future_shop", "goods_id": "sku-A"}).status_code == 200
+        assert client.post("/api/promote/convert", json={"item_code": encode_item_code("future_shop", "sku-A")}).status_code == 200
+        assert client.post("/api/promote/convert", json={"platform": "future_shop", "goods_id": "sku-A"}).status_code == 422
         for bad in ("pdd.dot", "$bad", "Upper", "a" * 33):
             assert client.post("/api/order/sync_and_query", params={"platform": bad}).status_code == 422
             assert client.get("/api/user/auth", params={"platform": bad}).status_code == 422
-            assert client.post("/api/promote/convert", json={"platform": bad}).status_code == 422
+            assert client.post("/api/promote/convert", json={"item_code": bad}).status_code in (400, 422)
         assert client.post("/api/order/sync_and_query", params={"days": -1}).status_code == 422

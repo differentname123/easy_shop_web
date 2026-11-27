@@ -50,6 +50,7 @@ def test_database_detail_http_and_cache_do_not_expose_source_metadata(catalog, c
     from fastapi.testclient import TestClient
     from api import home
     from main import create_app
+    from public_boundary import encode_item_code
 
     service, repo, adapter = catalog
     item = detail()["data"]
@@ -58,13 +59,15 @@ def test_database_detail_http_and_cache_do_not_expose_source_metadata(catalog, c
     adapter.get_goods_detail.return_value = {"status": "error"}
     monkeypatch.setattr(home, "product_service", service)
     client = TestClient(create_app())
-    for key in ("goods_id=123", "goods_sign=SIGN_A"):
-        response = client.get(f"/api/home/detail?{key}")
+    for code in (encode_item_code("pdd", "123"), encode_item_code("pdd", "SIGN_A")):
+        response = client.get(f"/api/home/detail?item_code={code}")
         assert response.status_code == 200
         result = response.json()
         assert result["source"] == ("database" if age == 0 else "database_fallback")
         assert "detail_updated_at" not in result["data"]
         assert "expires_at" not in result
+        assert "goods_id" not in result["data"] and "goods_sign" not in result["data"]
+        assert result["data"]["item_code"] == encode_item_code("pdd", "123")
     assert "detail_updated_at" in item
     assert adapter.get_goods_detail.call_count == (0 if age == 0 else 2)
 

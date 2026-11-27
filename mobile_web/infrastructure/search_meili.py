@@ -54,19 +54,30 @@ _SYNC_PROJECTION: Dict[str, int] = {
 
 _INVALID_ID_CHARS_RE = re.compile(r"[^a-zA-Z0-9-_]")
 _PURE_CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
+_BRAND_MODEL_ATTR_KEYS = ("品牌", "系列", "型号", "机型")
+_VARIETY_ATTR_KEYS = ("品种", "米种")
+_EXCLUDED_IDENTITY_ATTR_KEYS = (
+    "适配", "适用", "兼容", "关联", "可选", "用途", "场景",
+    "口味", "风味", "配料", "原料", "馅料", "赠", "非",
+)
+_IDENTITY_PART_SPLIT_RE = re.compile(r"[/／、,，(（)）]+")
+_ASCII_ALNUM_RE = re.compile(r"^[a-z0-9][a-z0-9 ._-]*$")
+
+
+def _iter_fmt_entries(fmt: Any) -> List[Dict[str, Any]]:
+    """统一兼容单规格字典与多 SKU 映射格式的 format_info 节点遍历。"""
+    if not isinstance(fmt, dict):
+        return []
+    if "core_entities" in fmt or "pricing_basis" in fmt or "decision_keywords" in fmt:
+        return [fmt]
+    return [v for v in fmt.values() if isinstance(v, dict)]
 
 
 def _collect_entities_from_fmt(fmt: Any) -> Tuple[List[str], List[str]]:
     """从单个 format_info 节点提取主/次本体名称；任何字段异常均安全忽略。"""
     primary: List[str] = []
     secondary: List[str] = []
-    if not isinstance(fmt, dict):
-        return primary, secondary
-    if "core_entities" in fmt or "pricing_basis" in fmt or "decision_keywords" in fmt:
-        entries = [fmt]
-    else:
-        entries = [v for v in fmt.values() if isinstance(v, dict)]
-    for ent in entries:
+    for ent in _iter_fmt_entries(fmt):
         raw_ces = ent.get("core_entities")
         if not isinstance(raw_ces, list):
             continue
@@ -118,6 +129,117 @@ def extract_core_entities(doc: Any) -> Tuple[List[str], List[str]]:
     primary_set = set(primary)
     secondary = [s for s in dict.fromkeys(sec_candidates) if s not in primary_set]
     return primary, secondary
+
+
+def _collect_identity_attrs_from_fmt(fmt: Any) -> Tuple[List[str], List[str]]:
+    """从 format_info 节点提取商品自身的品牌/系列/型号与品种/米种属性（严格排除适配/适用/口味/原料）。"""
+    brand_model: List[str] = []
+    variety: List[str] = []
+    for ent in _iter_fmt_entries(fmt):
+        raw_dks = ent.get("decision_keywords")
+        if not isinstance(raw_dks, list):
+            continue
+        for dk in raw_dks:
+            if not isinstance(dk, dict):
+                continue
+            an = str(dk.get("attribute_name") or "").strip()
+            av = str(dk.get("attribute_value") or "").strip()
+            if not an or not av:
+                continue
+            if any(ex in an for ex in _EXCLUDED_IDENTITY_ATTR_KEYS):
+                continue
+            if any(ok in an for ok in _BRAND_MODEL_ATTR_KEYS):
+                if av not in brand_model:
+                    brand_model.append(av)
+            elif any(ok in an for ok in _VARIETY_ATTR_KEYS):
+                if av not in variety:
+                    variety.append(av)
+    return brand_model, variety
+
+
+def _extract_dk_identity_attributes(doc: Any) -> Tuple[List[str], List[str]]:
+    """仅从清洗字段 `decision_keywords` 提取商品自身 `(brand_model, variety)`。"""
+    if not isinstance(doc, dict):
+        return [], []
+    brand_model: List[str] = []
+    variety: List[str] = []
+    deal_info = doc.get("deal_info")
+    deal_fmt = deal_info.get("format_info") if isinstance(deal_info, dict) else None
+    for fmt in (doc.get("format_info"), deal_fmt):
+        bm_list, var_list = _collect_identity_attrs_from_fmt(fmt)
+        for val in bm_list:
+            if val not in brand_model:
+                brand_model.append(val)
+        for val in var_list:
+            if val not in variety:
+                variety.append(val)
+    return brand_model, variety
+
+
+def extract_identity_attributes(doc: Any) -> Tuple[List[str], List[str]]:
+    """提取商品自身身份属性 `(brand_model, variety)`，用于品牌/系列/型号/品种精确召回与防配件串扰。"""
+    if not isinstance(doc, dict):
+        return [], []
+    dk_bm, variety = _extract_dk_identity_attributes(doc)
+    brand = str(doc.get("brand") or "").strip()
+    if brand and brand not in dk_bm:
+        return [brand, *dk_bm], variety
+    return dk_bm, variety
+
+
+def _matches_consensus_entity(entities: Sequence[str], consensus: set) -> bool:
+    return any(
+        e == ce or (len(ce) >= 2 and e.endswith(ce))
+        for e in entities
+        for ce in consensus
+    )
+
+
+def _split_identity_parts(vals: Sequence[str]) -> List[str]:
+    parts: List[str] = []
+    for raw in vals:
+        vl = str(raw or "").lower().strip()
+        if not vl:
+            continue
+        if vl not in parts:
+            parts.append(vl)
+        for seg in _IDENTITY_PART_SPLIT_RE.split(vl):
+            clean_seg = seg.strip()
+            if clean_seg and clean_seg not in parts:
+                parts.append(clean_seg)
+    return parts
+
+
+def _match_single_identity_value(qv: str, part: str) -> bool:
+    if part == qv:
+        return True
+    if len(qv) < 2:
+        return False
+    if part.endswith(qv):
+        return True
+    if part.startswith(qv):
+        next_ch = part[len(qv)]
+        if _ASCII_ALNUM_RE.fullmatch(qv):
+            return next_ch in " -_" or next_ch.isalnum()
+        if qv[-1].isdigit():
+            return next_ch in " -_号代款版" or next_ch.isdigit()
+    return False
+
+
+def _matches_identity_list(
+    tokens: Sequence[str],
+    q_variants: Sequence[str],
+    raw_vals: Sequence[str],
+) -> bool:
+    parts = _split_identity_parts(raw_vals)
+    if not parts:
+        return False
+    if len(tokens) >= 2:
+        if any(all(t in p for t in tokens) for p in parts):
+            return True
+        joined = " ".join(parts)
+        return all(t in joined for t in tokens)
+    return any(_match_single_identity_value(qv, p) for qv in q_variants for p in parts)
 
 
 def _expand_cjk_right_suffixes(phrases: Sequence[str]) -> str:
@@ -507,8 +629,8 @@ def partition_search_candidates(
     """
     极简相关性分桶（SSOT）：不修改性价比/时间排序逻辑，仅在排序前净化候选集。
     - 无清洗数据时平滑退化为无容错标题/品牌精准命中（绝不依赖 AI 字段存在）；
-    - 有可选 `core_entities` 时按中文右中心语 (`endswith`) 区分：
-      L1 (strict_items): 主本体直击 / 修饰词+主本体 / 明确品牌匹配 / 品牌词自适应提升
+    - 有可选 `core_entities` 时按中文右中心语 (`endswith`) 与自身身份属性区分：
+      L1 (strict_items): 主本体直击 / 修饰词+主本体 / 明确品牌·系列·型号·品种命中 / 同品类共识提升
       L2 (secondary_items): 次本体直击 / 本体衍生品包含（如 牛肉 -> 牛肉丸、牛肉辣酱）
       L3 (fallback_items): 仅标题蹭词且本体无关（如狗粮、手机壳、充电线、猫砂）
     """
@@ -521,15 +643,22 @@ def partition_search_candidates(
     syn_list = [str(s).strip().lower() for s in DEFAULT_SYNONYMS.get(raw_q, []) if str(s or "").strip()]
     q_variants = list(dict.fromkeys([ql] + syn_list))
 
-    tagged: List[Tuple[Dict[str, Any], int, bool]] = []
+    tagged: List[Tuple[Dict[str, Any], int, bool, List[str], bool]] = []
     head_entity_hits = 0
+    dk_identity_hits = 0
+    bm_hits = 0
+    var_hits = 0
+    bm_entities: set = set()
+    var_entities: set = set()
 
     for item in items:
         if not isinstance(item, dict):
             continue
         name, brand, primary, secondary = _extract_item_search_fields(item)
-        if not name and not brand and not primary and not secondary:
-            tagged.append((item, 1, True))
+        dk_bm_vals, var_vals = _extract_dk_identity_attributes(item)
+        bm_vals = ([brand] if brand and brand not in dk_bm_vals else []) + dk_bm_vals
+        if not name and not brand and not primary and not secondary and not bm_vals and not var_vals:
+            tagged.append((item, 1, True, [], False))
             continue
 
         name_l = name.lower()
@@ -537,6 +666,7 @@ def partition_search_candidates(
         p_l = [p.lower() for p in primary]
         s_l = [s.lower() for s in secondary]
         all_e = p_l + s_l
+        own_all_l = [v.lower() for v in (bm_vals + var_vals)]
 
         if len(tokens) >= 2:
             name_brand_ok = all(t in name_l or t in brand_l for t in tokens)
@@ -545,30 +675,51 @@ def partition_search_candidates(
 
         # Case A: 尚无清洗数据的商品，无缝退化为标题/品牌精准命中
         if not all_e:
-            tagged.append((item, 1 if name_brand_ok else 3, name_brand_ok))
+            tagged.append((item, 1 if name_brand_ok else 3, name_brand_ok, all_e, False))
             continue
+
+        dk_bm_hit = _matches_identity_list(tokens, q_variants, dk_bm_vals)
+        bm_hit = (
+            dk_bm_hit
+            or bool(len(tokens) == 1 and brand_l and (ql == brand_l or (len(ql) >= 2 and ql in brand_l)))
+            or (len(tokens) >= 2 and bool(brand_l) and _matches_identity_list(tokens, q_variants, [brand]))
+        )
+        var_hit = _matches_identity_list(tokens, q_variants, var_vals)
 
         # Case B: 多空格词查询（如 "伊利 纯牛奶"、"iPhone 17"）
         if len(tokens) >= 2:
-            searchable_blob = f"{name_l} {brand_l} {' '.join(all_e)}"
+            searchable_blob = f"{name_l} {brand_l} {' '.join(all_e)} {' '.join(own_all_l)}"
             if not all(t in searchable_blob for t in tokens):
-                tagged.append((item, 3, name_brand_ok))
+                tagged.append((item, 3, name_brand_ok, all_e, False))
                 continue
             head = tokens[-1]
+            tier = 3
+            is_head_ent = False
             if any(e == head or e.endswith(head) for e in p_l):
-                head_entity_hits += 1
-                tagged.append((item, 1, name_brand_ok))
+                tier = 1
+                is_head_ent = True
+            elif bm_hit:
+                tier = 1
             elif any(e == head or e.endswith(head) for e in s_l):
-                head_entity_hits += 1
-                tagged.append((item, 2, name_brand_ok))
+                tier = 2
+                is_head_ent = True
             elif any(head in e for e in all_e):
-                tagged.append((item, 2, name_brand_ok))
-            else:
-                tagged.append((item, 3, name_brand_ok))
+                tier = 2
+            if is_head_ent:
+                head_entity_hits += 1
+            if dk_bm_hit or var_hit:
+                dk_identity_hits += 1
+            if bm_hit:
+                bm_hits += 1
+                bm_entities.update(p_l)
+            if var_hit:
+                var_hits += 1
+                var_entities.update(p_l)
+            tagged.append((item, tier, name_brand_ok, all_e, var_hit))
             continue
 
         # Case C: 单词查询
-        mod_haystack = f"{brand_l} {name_l} {' '.join(all_e)}"
+        mod_haystack = f"{brand_l} {name_l} {' '.join(all_e)} {' '.join(own_all_l)}"
         tier = 3
         is_head_ent = False
 
@@ -582,11 +733,11 @@ def partition_search_candidates(
             len(ql) >= 4
             and len(q_variants) > 1
             and any(e == ql[-2:] or e.endswith(ql[-2:]) for e in p_l)
-            and any(qv in name_l or qv in brand_l for qv in q_variants[1:])
+            and any(qv in name_l or qv in brand_l or qv in " ".join(own_all_l) for qv in q_variants[1:])
         ):
             tier = 1
             is_head_ent = True
-        elif brand_l and (ql == brand_l or (len(ql) >= 2 and ql in brand_l)):
+        elif bm_hit:
             tier = 1
         elif any(e == qv or e.endswith(qv) for qv in q_variants for e in s_l) or _match_modifier_head(ql, s_l, mod_haystack):
             tier = 2
@@ -596,15 +747,39 @@ def partition_search_candidates(
 
         if is_head_ent:
             head_entity_hits += 1
-        tagged.append((item, tier, name_brand_ok))
+        if dk_bm_hit or var_hit:
+            dk_identity_hits += 1
+        if bm_hit:
+            bm_hits += 1
+            bm_entities.update(p_l)
+        if var_hit:
+            var_hits += 1
+            var_entities.update(p_l)
+        tagged.append((item, tier, name_brand_ok, all_e, var_hit))
 
     strict_items: List[Dict[str, Any]] = []
     secondary_items: List[Dict[str, Any]] = []
     fallback_items: List[Dict[str, Any]] = []
-    promote_brand_or_model = head_entity_hits == 0
+    promote_brand_or_model = head_entity_hits == 0 and dk_identity_hits == 0
+    variety_allowed = var_hits > 0 and var_hits >= head_entity_hits
+    active_identity_hits = bm_hits + (var_hits if variety_allowed else 0)
+    is_identity_dominant = active_identity_hits > 0 and active_identity_hits >= head_entity_hits
+    consensus_entities = set(bm_entities)
+    if variety_allowed:
+        consensus_entities.update(var_entities)
 
-    for item, tier, name_brand_ok in tagged:
-        if tier == 1 or (promote_brand_or_model and name_brand_ok):
+    for item, tier, name_brand_ok, item_entities, var_hit in tagged:
+        if (
+            tier == 1
+            or (promote_brand_or_model and name_brand_ok)
+            or (variety_allowed and var_hit)
+            or (
+                is_identity_dominant
+                and name_brand_ok
+                and consensus_entities
+                and _matches_consensus_entity(item_entities, consensus_entities)
+            )
+        ):
             strict_items.append(item)
         elif tier == 2:
             secondary_items.append(item)

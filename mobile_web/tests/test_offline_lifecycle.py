@@ -62,10 +62,13 @@ def test_cold_lifespan_preheat_uses_the_assembled_repository(monkeypatch):
     blocked_start = len(BLOCKED_CALLS)
     started_before = set(threading.enumerate())
     try:
+        from public_boundary import encode_item_code
         with TestClient(create_app()) as client:
             assert upsert_finished.wait(timeout=2), "预热没有使用已装配的内存仓储"
             assert client.get("/health").json()["status"] == "ok"
-            assert client.get("/api/home/recommend").json()["data"] == items
+            assert client.get("/api/home/recommend").json()["data"] == [
+                {"item_code": encode_item_code("pdd", "123"), "platform": "pdd", "name": "仅测试", "price": 10}
+            ]
     finally:
         assert not any(thread not in started_before and thread.name in
                        ("platform-warmup", "bg-upsert-home-products", "product-detail-prefetch")

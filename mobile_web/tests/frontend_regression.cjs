@@ -101,7 +101,7 @@ function harness({ url = 'https://shop.test/', saved = {}, sessionSaved = {}, cl
     fire: (name, event) => [...(listeners.get(name) || [])].forEach(callback => callback(event)),
     load, makeFeeds, makeAccount, finish, summaryKey, feedKey, get page() { return page; } };
 }
-const goodsResponse = (id, hasMore = true) => ({ status: 'success', data: [{ goods_id: id, platform: 'pdd' }], has_more: hasMore });
+const goodsResponse = (id, hasMore = true) => ({ status: 'success', data: [{ item_code: id, platform: 'pdd' }], has_more: hasMore });
 const user = (uid = 'A', token = 'token-A') => ({ uid, phone: '13800000000', nickname: uid, auth_token: token });
 
 test('transport preserves HTTP errors and carries JSON and Bearer credentials', async () => {
@@ -117,24 +117,17 @@ test('transport preserves HTTP errors and carries JSON and Bearer credentials', 
   assert.equal(result.data.detail, 'bad request');
 });
 
-test('format and product identity helpers reject empty-key and cross-platform cache matches', () => {
+test('format and product identity helpers reject empty-key and duplicate item_code matches', () => {
   const { context: { EasyShop: shop } } = harness();
   assert.equal(shop.formatPhone('13800000000'), '138****0000');
   assert.equal(shop.formatMoney('1.2'), '1.20');
   assert.equal(shop.formatMoney('bad'), '0.00');
-  assert.equal(shop.matchesGoodsSummary({ goods_id: 'A', goods_sign: '' }, { goods_id: 'B', goods_sign: '' }), false);
-  assert.equal(shop.matchesGoodsSummary({ goods_id: 'A', platform: 'pdd' }, { goods_id: 'A', platform: 'jd' }), false);
-  assert.equal(shop.matchesGoodsSummary({ product_id: 'A', platform: 'pdd' }, { goods_id: 'A', platform: 'pdd' }), true);
-  const tbId = shop.goodsIdentity({ platform: 'taobao', goods_id: '5n9p6DJF6yr3QZWzFNY', goods_sign: 'BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY' });
-  assert.equal(tbId.goods_id, '5n9p6DJF6yr3QZWzFNY');
-  assert.equal(tbId.goods_sign, 'BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY');
-  assert.equal(
-    shop.matchesGoodsSummary(
-      { platform: 'taobao', goods_id: '5n9p6DJF6yr3QZWzFNY', goods_sign: 'BjGgNQpU6t85xbZdyxiM9xurte-5n9p6DJF6yr3QZWzFNY' },
-      { platform: 'taobao', goods_id: '5n9p6DJF6yr3QZWzFNY', goods_sign: '5n9p6DJF6yr3QZWzFNY' }
-    ),
-    true
-  );
+  assert.equal(shop.matchesGoodsSummary({ item_code: 'p1_A' }, { item_code: 'p1_B' }), false);
+  assert.equal(shop.matchesGoodsSummary({ item_code: 'p1_A' }, { item_code: '' }), false);
+  assert.equal(shop.matchesGoodsSummary({ item_code: 'p1_A', platform: 'pdd' }, { item_code: 'p1_A', platform: 'pdd' }), true);
+  assert.equal(shop.itemCode({ item_code: ' p1_TB_TOKEN ' }), 'p1_TB_TOKEN');
+  assert.equal(shop.buildDetailUrl({ item_code: 'p1_TB_TOKEN' }, { inviteCode: 'INV_1' }), '/detail?item=p1_TB_TOKEN&invite_code=INV_1');
+  assert.equal(shop.buildDetailUrl({ item_code: '' }), '');
 });
 
 test('home reset fetches the new channel during loading and ignores the older response', async () => {
@@ -148,7 +141,7 @@ test('home reset fetches the new channel during loading and ignores the older re
   await h.finish(0, goodsResponse('channel-5'));
   await old;
   assert.equal(feed.currentChannel.value, 1);
-  assert.equal(feed.homeGoodsList.value[0].goods_id, 'channel-1');
+  assert.equal(feed.homeGoodsList.value[0].item_code, 'channel-1');
   const uncached = feed.switchChannel(5);
   assert.equal(h.requests.length, 3, 'stale response did not populate channel 5 cache');
   await h.finish(2, goodsResponse('fresh-5'));
@@ -166,7 +159,7 @@ test('cached channel switching also invalidates an in-flight page append', async
   await h.finish(2, goodsResponse('late-A2'));
   await oldPage;
   assert.equal(feed.homeGoodsList.value.length, 1);
-  assert.equal(feed.homeGoodsList.value[0].goods_id, 'B');
+  assert.equal(feed.homeGoodsList.value[0].item_code, 'B');
   feed.switchChannel(5);
   assert.equal(feed.homeGoodsList.value.length, 1);
 });
@@ -217,7 +210,7 @@ test('business-error pagination retry requests the failed offset instead of endi
 
 test('returning from detail restores the committed list, page and terminal state', () => {
   const h = harness(), feed = h.makeFeeds();
-  h.context.sessionStorage.setItem(h.feedKey('home_search_state'), JSON.stringify({ scope: h.session.scope(), platform: 'pdd', keyword: 'A', list: [{ goods_id: 'A' }], page: 3, offset: 40, hasMore: false, scrollTop: 100 }));
+  h.context.sessionStorage.setItem(h.feedKey('home_search_state'), JSON.stringify({ scope: h.session.scope(), platform: 'pdd', keyword: 'A', list: [{ item_code: 'p1_A' }], page: 3, offset: 40, hasMore: false, scrollTop: 100 }));
   feed.initializeHome(new URLSearchParams('keyword=A'));
   assert.equal(h.requests.length, 0);
   assert.equal(feed.homeSearchKeyword.value, 'A');
@@ -233,7 +226,7 @@ test('boom platform and sort resets supersede pending requests', async () => {
   await h.finish(2, goodsResponse('latest'));
   await h.finish(1, goodsResponse('older'));
   await h.finish(0, goodsResponse('oldest'));
-  assert.equal(feed.boomGoodsList.value[0].goods_id, 'latest');
+  assert.equal(feed.boomGoodsList.value[0].item_code, 'latest');
   const query = new URL(h.requests[2].url, 'https://shop.test').searchParams;
   assert.equal(query.get('platform'), 'pdd');
   assert.equal(query.get('sort_by'), 'price_asc');
@@ -316,43 +309,48 @@ test('opening the account with a saved session queries orders after authenticati
   assert.equal(h.page.userOrdersData.value.order_list[0].order_sn, 'restored-order');
 });
 
-test('homepage card navigation preserves both product keys and the selected platform', () => {
+test('homepage card navigation preserves encrypted item code and omits plaintext product coordinates', () => {
   const h = harness(); h.load('app');
-  h.page.openGoodsDetail({ goods_id: '123', goods_sign: 'signed', platform: 'pdd', name: 'A' });
+  h.page.openGoodsDetail({ item_code: 'p1_PDD_123', platform: 'pdd', name: 'A' });
   const query = new URL(h.context.location.href, 'https://shop.test').searchParams;
-  assert.equal(query.get('goods_id'), '123');
-  assert.equal(query.get('goods_sign'), 'signed');
-  assert.equal(query.get('platform'), 'pdd');
-  assert.equal(JSON.parse(h.context.sessionStorage.getItem(h.summaryKey({ goods_id: '123', platform: 'pdd' }))).name, 'A');
+  assert.equal(query.get('item'), 'p1_PDD_123');
+  assert.equal(query.get('goods_id'), null);
+  assert.equal(query.get('goods_sign'), null);
+  assert.equal(query.get('platform'), null);
+  assert.equal(JSON.parse(h.context.sessionStorage.getItem(h.summaryKey({ item_code: 'p1_PDD_123' }))).name, 'A');
 });
 
 test('detail rejects another product cache and a saved phone alone is not a session', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=B&goods_sign=&platform=pdd&uid=untrusted', saved: { easy_shop_phone: '13800000000', easy_shop_uid: 'old' } });
-  h.context.sessionStorage.setItem(h.summaryKey({ goods_id: 'B', platform: 'pdd' }), JSON.stringify({ goods_id: 'A', goods_sign: '', platform: 'pdd' }));
+  const h = harness({ url: 'https://shop.test/detail?item=p1_B&uid=untrusted', saved: { easy_shop_phone: '13800000000', easy_shop_uid: 'old' } });
+  h.context.sessionStorage.setItem(h.summaryKey({ item_code: 'p1_B' }), JSON.stringify({ item_code: 'p1_A', platform: 'pdd' }));
   h.load('detail'); const init = h.mounted[0](); await flush();
   assert.equal(h.page.goods.value, null);
   assert.equal(h.page.isLoggedIn.value, false);
   assert.equal(h.page.uid.value, '');
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 0);
-  await h.finish(0, { status: 'success', data: { goods_id: 'B', platform: 'pdd', name: 'B' } }); await init;
-  assert.equal(h.page.goods.value.goods_id, 'B');
+  assert.equal(new URL(h.requests[0].url, 'https://shop.test').searchParams.get('item_code'), 'p1_B');
+  await h.finish(0, { status: 'success', data: { item_code: 'p1_B', platform: 'pdd', name: 'B' } }); await init;
+  assert.equal(h.page.goods.value.item_code, 'p1_B');
 });
 
 test('detail uses verified UID, converts only on demand and deduplicates concurrent actions', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A&uid=untrusted', saved: { easy_shop_token: 'token-A', easy_shop_phone: '13800000000', easy_shop_uid: 'A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A&uid=untrusted', saved: { easy_shop_token: 'token-A', easy_shop_phone: '13800000000', easy_shop_uid: 'A' } });
   h.load('detail'); const init = h.mounted[0]();
   const info = h.requests.findIndex(request => request.url === '/api/user/info');
   const detail = h.requests.findIndex(request => request.url.startsWith('/api/home/detail'));
   await h.finish(info, { status: 'success', user: user() });
-  await h.finish(detail, { status: 'success', data: { goods_id: 'A', goods_sign: 'sign-A', platform: 'pdd', name: 'A', price: 10 } }); await init;
+  await h.finish(detail, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A', price: 10 } }); await init;
   assert.equal(h.page.uid.value, 'A');
   assert.equal(h.requests.filter(request => request.options.method === 'POST').length, 0);
   const first = h.page.handleCopyPromoteLink(), second = h.page.handleCopyPromoteLink(); await flush();
   const conversions = h.requests.filter(request => request.url === '/api/promote/convert');
   assert.equal(conversions.length, 1);
-  assert.equal(JSON.parse(conversions[0].options.body).uid, 'A');
-  assert.equal(JSON.parse(conversions[0].options.body).goods_sign, 'sign-A');
+  const convBody = JSON.parse(conversions[0].options.body);
+  assert.equal(convBody.uid, 'A');
+  assert.equal(convBody.item_code, 'p1_A');
+  assert.equal(convBody.goods_id, undefined);
+  assert.equal(convBody.goods_sign, undefined);
   await h.finish(h.requests.indexOf(conversions[0]), { status: 'success', final_link: 'https://buy.test/A', command_text: 'command-A' });
   await Promise.all([first, second]);
   const repeat = h.page.handleCopyPromoteLink(); await flush();
@@ -366,9 +364,9 @@ test('detail uses verified UID, converts only on demand and deduplicates concurr
 });
 
 test('detail fallback links are usable but not cached as a successful activation', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A' });
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(0, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A', product_url: 'https://goods.test/A' } }); await init;
+  await h.finish(0, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A' } }); await init;
   const first = h.page.handleCopyPromoteLink(); await flush();
   await h.finish(1, { status: 'success', is_fallback: true, final_link: 'https://goods.test/A' }); await first;
   const second = h.page.handleCopyPromoteLink(); await flush();
@@ -378,15 +376,15 @@ test('detail fallback links are usable but not cached as a successful activation
 });
 
 test('detail retries retain the summary and ignore superseded detail responses', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
-  h.context.sessionStorage.setItem(h.summaryKey({ goods_id: 'A', platform: 'pdd' }), JSON.stringify({ goods_id: 'A', platform: 'pdd', name: 'summary' }));
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A' });
+  h.context.sessionStorage.setItem(h.summaryKey({ item_code: 'p1_A' }), JSON.stringify({ item_code: 'p1_A', platform: 'pdd', name: 'summary' }));
   h.load('detail'); const init = h.mounted[0]();
   assert.equal(h.page.goods.value.name, 'summary');
   await h.finish(0, { status: 'error' }); await init;
   assert.equal(h.page.goods.value.name, 'summary');
   h.page.retryLoadDeepDetail(); h.page.retryLoadDeepDetail();
-  await h.finish(2, { status: 'success', data: { goods_id: 'A', name: 'latest', carousel_images: ['one', 'two'] } });
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', name: 'stale' } });
+  await h.finish(2, { status: 'success', data: { item_code: 'p1_A', name: 'latest', carousel_images: ['one', 'two'] } });
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', name: 'stale' } });
   assert.equal(h.page.goods.value.name, 'latest');
   assert.equal(h.page.carouselList.value.length, 2);
   assert.equal(h.page.detailError.value, false);
@@ -405,18 +403,17 @@ test('clipboard denial falls back and mobile purchase keeps the web fallback', a
   browser.dispose();
 });
 
-test('sign-only goods retain distinct platform-qualified keys and deduplicate without changing paging offsets', async () => {
+test('sign-only goods retain distinct encrypted keys and deduplicate without changing paging offsets', async () => {
   const h = harness(), feed = h.makeFeeds(), shop = h.context.EasyShop;
-  const first = { goods_id: '', product_id: '', goods_sign: 'sign-A', platform: 'pdd' };
-  const second = { goods_id: '', product_id: '', goods_sign: 'sign-B', platform: 'pdd' };
+  const first = { item_code: 'p1_pdd_sign_A', platform: 'pdd' };
+  const second = { item_code: 'p1_pdd_sign_B', platform: 'pdd' };
   assert.notEqual(shop.goodsKey(first), shop.goodsKey(second));
-  assert.notEqual(shop.goodsKey(first), shop.goodsKey({ ...first, platform: 'jd' }));
-  assert.equal(shop.matchesGoodsSummary(first, { goods_sign: 'sign-A', platform: 'pdd' }), true);
-  assert.equal(shop.matchesGoodsSummary(first, { goods_id: '', goods_sign: '', platform: 'pdd' }), false);
+  assert.equal(shop.matchesGoodsSummary(first, { item_code: 'p1_pdd_sign_A' }), true);
+  assert.equal(shop.matchesGoodsSummary(first, { item_code: '' }), false);
   feed.loadHomeGoods(true);
   await h.finish(0, { status: 'success', data: [first, second], has_more: true });
   feed.loadHomeGoods(false);
-  await h.finish(1, { status: 'success', data: [first, { goods_sign: 'sign-C', platform: 'pdd' }], has_more: true });
+  await h.finish(1, { status: 'success', data: [first, { item_code: 'p1_pdd_sign_C', platform: 'pdd' }], has_more: true });
   assert.equal(feed.homeGoodsList.value.length, 3);
   feed.loadHomeGoods(false);
   assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('offset'), '4');
@@ -426,10 +423,10 @@ test('sign-only goods retain distinct platform-qualified keys and deduplicate wi
 });
 
 test('a removed detail session cannot copy or reuse an old personalized conversion', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A' } }); await init;
   const personalized = h.page.handleCopyPromoteLink(); await flush();
   h.context.localStorage.removeItem('easy_shop_token');
   await h.finish(2, { status: 'success', final_link: 'https://buy.test/personal-A', command_text: 'private-A' });
@@ -519,13 +516,13 @@ test('manual order refresh does not claim an unfinished background sync succeede
   assert.equal(h.toasts.at(-1), '已刷新本地订单，后台同步进行中');
 });
 
-test('summary identity prioritizes a supplied Sign and preserves known zero coupon values', () => {
+test('summary identity uses opaque item_code and preserves known zero coupon values', () => {
   const shop = harness().context.EasyShop;
   assert.equal(shop.matchesGoodsSummary(
-    { goods_id: 'B', goods_sign: 'SIGN_B' }, { goods_id: 'B', goods_sign: 'SIGN_A' }), false);
-  assert.equal(shop.goodsIdentity({ goods_id: '0', goods_sign: 'SIGN_A' }).goods_id, '');
-  assert.notEqual(shop.goodsKey({ goods_id: 'A' }), shop.goodsKey({ goods_sign: 'A' }));
-  assert.equal(shop.promotionPayload({ price: 0, coupon_amount: 0, saved_price: 10 }, '').coupon_amount, 0);
+    { item_code: 'p1_SIGN_B' }, { item_code: 'p1_SIGN_A' }), false);
+  assert.equal(shop.itemCode({ goods_id: '0', goods_sign: 'SIGN_A' }), '');
+  assert.notEqual(shop.goodsKey({ item_code: 'p1_A' }), shop.goodsKey({ item_code: 'p1_B' }));
+  assert.equal(shop.promotionPayload({ item_code: 'p1_A', price: 0, coupon_amount: 0, saved_price: 10 }, '').coupon_amount, 0);
 });
 
 test('scroll anchoring is disabled in CSS and app.js enforces sentinel tab-isolation', () => {
@@ -680,14 +677,14 @@ for (const [field, changed, payloadField] of [
   ['price', 12, 'price'],
   ['name', 'updated title', 'title'],
   ['coupon_amount', 3, 'coupon_amount'],
-  ['product_url', 'https://goods.test/updated-A', 'product_url'],
+  ['item_code', 'p1_B', 'item_code'],
 ]) {
   test(`detail does not merge an in-flight conversion after ${field} changes`, async () => {
-    const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
+    const h = harness({ url: 'https://shop.test/detail?item=p1_A' });
     h.load('detail'); const init = h.mounted[0]();
     await h.finish(0, { status: 'success', data: {
-      goods_id: 'A', goods_sign: 'sign-A', platform: 'pdd', name: 'A', price: 10,
-      coupon_amount: 0, saved_price: 5, product_url: 'https://goods.test/A',
+      item_code: 'p1_A', platform: 'pdd', name: 'A', price: 10,
+      coupon_amount: 0, saved_price: 5,
     } }); await init;
     const first = h.page.handleCopyPromoteLink(); await flush();
     assert.equal(JSON.parse(h.requests[1].options.body).coupon_amount, 0, 'a known zero coupon is preserved');
@@ -710,11 +707,11 @@ for (const [field, changed, payloadField] of [
 
 test('guest purchase and copy ignore share-page UID and stored identity without a verified session', async () => {
   const h = harness({
-    url: 'https://shop.test/detail?goods_id=A&uid=SHARER&shareUid=SHARER',
+    url: 'https://shop.test/detail?item=p1_A&uid=SHARER&shareUid=SHARER',
     saved: { easy_shop_uid: 'OLD-ACCOUNT', easy_shop_phone: '13800000000' },
   });
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(0, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A', price: 10 } }); await init;
+  await h.finish(0, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A', price: 10 } }); await init;
   assert.equal(h.page.isLoggedIn.value, false);
   assert.equal(h.page.uid.value, '');
   assert.equal(h.requests.length, 1, 'viewing a shared page does not trigger conversion');
@@ -732,10 +729,10 @@ test('guest purchase and copy ignore share-page UID and stored identity without 
 });
 
 test('switching the saved token verifies the new account and isolates pending conversion responses', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A&uid=SHARER', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A&uid=SHARER', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A' } }); await init;
   const oldAccount = h.page.handleCopyPromoteLink(); await flush();
   assert.equal(JSON.parse(h.requests[2].options.body).uid, 'A');
   h.context.localStorage.setItem('easy_shop_token', 'token-B');
@@ -755,10 +752,10 @@ test('switching the saved token verifies the new account and isolates pending co
 });
 
 test('changing only the session token does not merge otherwise identical pending payloads', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A' } }); await init;
   const oldToken = h.page.handleCopyPromoteLink(); await flush();
   h.context.localStorage.setItem('easy_shop_token', 'renewed-token-A');
   const renewedToken = h.page.handleCopyPromoteLink(); await flush();
@@ -771,16 +768,15 @@ test('changing only the session token does not merge otherwise identical pending
   assert.deepEqual(h.copied, ['renewed']);
 });
 
-test('conversion business failures retain the original-link fallback and allow the next action to retry', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
+test('conversion business failures never invent a plaintext product_url fallback and allow the next action to retry', async () => {
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A' });
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(0, { status: 'success', data: { goods_id: 'A', name: 'A', price: 0, product_url: 'https://goods.test/A' } }); await init;
+  await h.finish(0, { status: 'success', data: { item_code: 'p1_A', name: 'A', price: 0 } }); await init;
   const failed = h.page.handleCopyPromoteLink(); await flush();
   await h.finish(1, { status: 'error' }, { status: 503 }); await failed;
-  assert.ok(h.copied[0].includes('https://goods.test/A'));
-  assert.equal(h.copied[0], 'https://goods.test/A', 'failure falls back to the plain original URL, never an invented command or token');
+  assert.equal(h.copied.length, 0);
   assert.equal(JSON.parse(h.requests[1].options.body).price, 0, 'known zero price is still sent unchanged');
-  assert.equal(h.page.toastMessage.value.includes('复制'), true);
+  assert.equal(h.page.toastMessage.value, '平台未返回有效推广链接，请稍后重试');
   assert.equal(h.page.smartLoading.value.visible, false);
   const retry = h.page.handleCopyPromoteLink(); await flush();
   assert.equal(h.requests.length, 3);
@@ -791,9 +787,9 @@ test('conversion business failures retain the original-link fallback and allow t
 for (const action of ['copy', 'buy']) {
   for (const status of ['error', 'success']) {
     test(`${action} conversion ${status} without a real URL exposes the backend failure, never a fake fallback`, async () => {
-      const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
+      const h = harness({ url: 'https://shop.test/detail?item=p1_A' });
       h.load('detail'); const init = h.mounted[0]();
-      await h.finish(0, { status: 'success', data: { goods_id: 'A', name: 'A', product_url: '' } }); await init;
+      await h.finish(0, { status: 'success', data: { item_code: 'p1_A', name: 'A' } }); await init;
       const pending = action === 'copy' ? h.page.handleCopyPromoteLink() : h.page.handleJumpToBuy(); await flush();
       await h.finish(1, { status, error_msg: '平台服务暂不可用，请稍后重试' }, { status: status === 'error' ? 503 : 200 }); await pending;
       assert.equal(h.page.toastMessage.value, '平台服务暂不可用，请稍后重试');
@@ -806,9 +802,9 @@ for (const action of ['copy', 'buy']) {
 }
 
 test('network conversion errors do not copy an invalid command and do not block retries', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A' });
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(0, { status: 'success', data: { goods_id: 'A', name: 'A' } }); await init;
+  await h.finish(0, { status: 'success', data: { item_code: 'p1_A', name: 'A' } }); await init;
   const failed = h.page.handleCopyPromoteLink(); await flush();
   h.requests[1].reject(new Error('offline')); await failed;
   assert.equal(h.copied.length, 0);
@@ -821,21 +817,21 @@ test('network conversion errors do not copy an invalid command and do not block 
 });
 
 test('disposing detail invalidates a pending purchase before copy or navigation', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A' });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A' });
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(0, { status: 'success', data: { goods_id: 'A', name: 'A' } }); await init;
+  await h.finish(0, { status: 'success', data: { item_code: 'p1_A', name: 'A' } }); await init;
   const buy = h.page.handleJumpToBuy(); await flush();
   h.page.dispose();
   await h.finish(1, { status: 'success', final_link: 'https://buy.test/late', command_text: 'late' }); await buy;
   assert.equal(h.copied.length, 0);
-  assert.equal(h.context.location.href, 'https://shop.test/detail?goods_id=A');
+  assert.equal(h.context.location.href, 'https://shop.test/detail?item=p1_A');
 });
 
 test('disposing detail while identity restoration is pending prevents conversion, copy and navigation', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
-  h.context.sessionStorage.setItem(h.summaryKey({ goods_id: 'A', platform: 'pdd' }), JSON.stringify({ goods_id: 'A', platform: 'pdd', name: 'A' }));
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A', saved: { easy_shop_token: 'token-A' } });
+  h.context.sessionStorage.setItem(h.summaryKey({ item_code: 'p1_A' }), JSON.stringify({ item_code: 'p1_A', platform: 'pdd', name: 'A' }));
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } });
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A' } });
   const buy = h.page.handleJumpToBuy(), copy = h.page.handleCopyPromoteLink(); await flush();
   assert.equal(h.requests.length, 2, 'both user actions wait for the same pending identity request');
   assert.equal(h.requests[0].url, '/api/user/info');
@@ -847,7 +843,7 @@ test('disposing detail while identity restoration is pending prevents conversion
   assert.equal(h.requests.length, 2, 'actions invoked after disposal also remain inert');
   assert.equal(h.copied.length, 0);
   assert.equal([...h.timers.values()].some(timer => timer.delay === 400), false, 'no navigation is scheduled');
-  assert.equal(h.context.location.href, 'https://shop.test/detail?goods_id=A');
+  assert.equal(h.context.location.href, 'https://shop.test/detail?item=p1_A');
   assert.equal(h.page.smartLoading.value.visible, false);
   assert.equal(h.page.toastMessage.value, '', 'disposed actions do not show failure toasts');
 });
@@ -908,10 +904,10 @@ for (const platform of ['taobao', 'pdd']) {
   for (const action of ['copy', 'buy']) {
     for (const choice of ['proceed', 'auth']) {
       test(`${platform} ${action} shares the auth choices: ${choice} uses no extra request or authorization popup`, async () => {
-        const h = harness({ url: `https://shop.test/detail?goods_id=A&platform=${platform}`, saved: { easy_shop_token: 'token-A' } });
+        const h = harness({ url: `https://shop.test/detail?item=p1_${platform}_A`, saved: { easy_shop_token: 'token-A' } });
         h.load('detail'); const init = h.mounted[0]();
         await h.finish(0, { status: 'success', user: user() });
-        await h.finish(1, { status: 'success', data: { goods_id: 'A', platform, name: 'A' } }); await init;
+        await h.finish(1, { status: 'success', data: { item_code: `p1_${platform}_A`, platform, name: 'A' } }); await init;
         const pending = action === 'copy' ? h.page.handleCopyPromoteLink() : h.page.handleJumpToBuy(); await flush();
         await h.finish(2, { status: 'success', final_link: 'https://buy.test/station-A', command_text: 'station-command-A',
           is_fallback: true, need_auth: true, auth_platform: platform, auth_msg: '尚未完成渠道授权备案' }); await pending;
@@ -925,7 +921,7 @@ for (const platform of ['taobao', 'pdd']) {
           assert.equal(authUrl.pathname, '/');
           assert.equal(authUrl.searchParams.get('tab'), 'user');
           assert.equal(authUrl.searchParams.get('platform'), platform);
-          assert.equal(authUrl.searchParams.get('redirect'), `/detail?goods_id=A&platform=${platform}`);
+          assert.equal(authUrl.searchParams.get('redirect'), `/detail?item=p1_${platform}_A`);
           assert.equal(h.copied.length, 0);
           assert.equal(h.context.sessionStorage.getItem('easy_shop_pending_authorization'), null,
             'entering the account page is not an external authorization attempt');
@@ -951,11 +947,11 @@ for (const platform of ['taobao', 'pdd']) {
     for (const choice of ['proceed', 'auth']) {
       for (const state of ['current', 'switch-token']) {
         test(`real Vue ${platform} ${action} ${choice} handles proxied pending info with ${state} session`, async () => {
-          const original = `https://shop.test/detail?goods_id=A&platform=${platform}`;
+          const original = `https://shop.test/detail?item=p1_${platform}_A`;
           const h = harness({ url: original, saved: { easy_shop_token: 'token-A' }, useRealVue: true });
           h.load('detail'); const init = h.mounted[0]();
           await h.finish(0, { status: 'success', user: user() });
-          await h.finish(1, { status: 'success', data: { goods_id: 'A', platform, name: 'A' } }); await init;
+          await h.finish(1, { status: 'success', data: { item_code: `p1_${platform}_A`, platform, name: 'A' } }); await init;
           const pending = action === 'copy' ? h.page.handleCopyPromoteLink() : h.page.handleJumpToBuy(); await flush();
           const rawInfo = { status: 'success', final_link: 'https://buy.test/station-A', command_text: 'station-command-A',
             need_auth: true, auth_platform: platform, authorization_status: 'unauthorized' };
@@ -982,7 +978,7 @@ for (const platform of ['taobao', 'pdd']) {
               assert.equal(authUrl.pathname, '/');
               assert.equal(authUrl.searchParams.get('tab'), 'user');
               assert.equal(authUrl.searchParams.get('platform'), platform);
-              assert.equal(authUrl.searchParams.get('redirect'), `/detail?goods_id=A&platform=${platform}`);
+              assert.equal(authUrl.searchParams.get('redirect'), `/detail?item=p1_${platform}_A`);
               assert.deepEqual(h.copied, []);
             } else {
               assert.deepEqual(h.copied, ['station-command-A']);
@@ -1048,13 +1044,13 @@ test('platform switching isolates channel caches, cursor state and late page app
   await h.finish(2, { status: 'success', data: [{ channel_type: 5, name: '淘宝适配器实时榜' }, { channel_type: 1, name: '淘宝适配器今日榜' }] });
   const query = new URL(h.requests[3].url, 'https://shop.test').searchParams;
   assert.equal(query.get('platform'), 'taobao'); assert.equal(query.get('offset'), '0'); assert.equal(query.has('cursor'), false);
-  await h.finish(3, { status: 'success', data: [{ goods_sign: 'TB', platform: 'taobao' }], has_more: false, next_offset: 20 }); await taobao;
+  await h.finish(3, { status: 'success', data: [{ item_code: 'p1_TB', platform: 'taobao' }], has_more: false, next_offset: 20 }); await taobao;
   await h.finish(1, goodsResponse('late-PDD')); await old;
-  assert.equal(feed.homeGoodsList.value[0].goods_sign, 'TB');
+  assert.equal(feed.homeGoodsList.value[0].item_code, 'p1_TB');
   const pdd = feed.switchHomePlatform('pdd');
   await h.finish(4, { status: 'success', data: channelFixtures }); await pdd;
   assert.equal(h.requests.length, 5, 'switching back uses only the matching platform cache');
-  assert.equal(feed.homeGoodsList.value[0].goods_id, 'PDD');
+  assert.equal(feed.homeGoodsList.value[0].item_code, 'PDD');
   feed.loadHomeGoods(false);
   const resumed = new URL(h.requests[5].url, 'https://shop.test').searchParams;
   assert.equal(resumed.get('offset'), '20'); assert.equal(resumed.get('cursor'), 'pdd-page-2');
@@ -1108,7 +1104,7 @@ test('catalog and stored search snapshots cannot cross session or platform scope
   feed.switchChannel(5);
   assert.equal(h.requests.length, 3, 'stale displayed state cannot be stamped into the new session cache');
   await h.finish(2, goodsResponse('B-rank', false));
-  assert.equal(feed.homeGoodsList.value[0].goods_id, 'B-rank');
+  assert.equal(feed.homeGoodsList.value[0].item_code, 'B-rank');
   restored.homePlatform.value = 'taobao'; restored.initializeHome(new URLSearchParams('keyword=A'));
   assert.equal(h.requests.length, 4, 'a different platform does not restore PDD search results');
   assert.equal(new URL(h.requests[3].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
@@ -1144,10 +1140,10 @@ test('channels sessionStorage and metadata loading reject a superseded platform 
 });
 
 test('a personalized promotion carries its verified bearer token and copies the server real-token text verbatim', async () => {
-  const h = harness({ url: 'https://shop.test/detail?platform=taobao&goods_sign=TB&uid=SHARER', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_TB&uid=SHARER', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝联盟', name: 'TB' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_TB', platform: 'taobao', platform_name: '淘宝联盟', name: 'TB' } }); await init;
   const copy = h.page.handleCopyPromoteLink(); await flush();
   assert.equal(h.requests[2].options.headers.Authorization, 'Bearer token-A');
   assert.equal(JSON.parse(h.requests[2].options.body).uid, 'A');
@@ -1159,10 +1155,10 @@ test('a personalized promotion carries its verified bearer token and copies the 
 });
 
 test('promotion 401 clears the session and never copies an original-link fallback', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', product_url: 'https://goods.test/A' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd' } }); await init;
   const copy = h.page.handleCopyPromoteLink(); await flush();
   assert.equal(h.requests[2].options.headers.Authorization, 'Bearer token-A');
   await h.finish(2, { detail: 'expired' }, { status: 401 }); await copy;
@@ -1170,10 +1166,10 @@ test('promotion 401 clears the session and never copies an original-link fallbac
 });
 
 test('AUTH_REQUIRED errors without a usable link cannot invent a station command or copy it', async () => {
-  const h = harness({ url: 'https://shop.test/detail?platform=taobao&goods_sign=TB', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_TB', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_TB', platform: 'taobao', platform_name: '淘宝' } }); await init;
   const buy = h.page.handleJumpToBuy(); await flush();
   await h.finish(2, { status: 'error', error_code: 'AUTH_REQUIRED', need_auth: true, auth_platform: 'taobao', auth_msg: '请授权淘宝渠道' }); await buy;
   assert.equal(h.page.authModal.value.visible, true); assert.equal(h.page.authModal.value.platformName, '淘宝');
@@ -1186,11 +1182,11 @@ test('AUTH_REQUIRED errors without a usable link cannot invent a station command
 
 for (const invalidation of ['logout', 'switch-token', 'dispose']) {
   test(`detail pending authorization choices remain inert after ${invalidation}`, async () => {
-    const original = 'https://shop.test/detail?platform=taobao&goods_sign=TB';
+    const original = 'https://shop.test/detail?item=p1_TB';
     const h = harness({ url: original, saved: { easy_shop_token: 'token-A' } });
     h.load('detail'); const init = h.mounted[0]();
     await h.finish(0, { status: 'success', user: user() });
-    await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝' } }); await init;
+    await h.finish(1, { status: 'success', data: { item_code: 'p1_TB', platform: 'taobao', platform_name: '淘宝' } }); await init;
     const copy = h.page.handleCopyPromoteLink(); await flush();
     await h.finish(2, { status: 'success', need_auth: true, auth_platform: 'taobao', final_link: 'https://buy.test/OLD-A', command_text: 'OLD-A' }); await copy;
     if (invalidation === 'logout') h.session.clear();
@@ -1346,15 +1342,15 @@ test('authorization recheck refuses a response for another platform', async () =
 });
 
 test('scheduled purchase navigation checks its session again before app and web jumps', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd' } }); await init;
   const buy = h.page.handleJumpToBuy(); await flush();
   await h.finish(2, { status: 'success', final_link: 'https://buy.test/private-A', schema_url: 'app://private-A', command_text: 'command' }); await buy;
   const navigation = [...h.timers.values()].find(item => item.delay === 400);
   assert.ok(navigation); h.context.localStorage.setItem('easy_shop_token', 'token-B'); navigation.callback();
-  assert.equal(h.context.location.href, 'https://shop.test/detail?goods_id=A');
+  assert.equal(h.context.location.href, 'https://shop.test/detail?item=p1_A');
   assert.equal([...h.timers.values()].some(item => item.delay === 800), false);
 });
 
@@ -1464,10 +1460,10 @@ for (const invalidation of ['logout', 'switch-token', 'dispose']) {
 }
 
 test('detail page restores one pending authorization only after verified identity, without automatic promotion or navigation', async () => {
-  const h = harness({ url: 'https://shop.test/detail?platform=taobao&goods_sign=TB', saved: { easy_shop_token: 'token-A' },
+  const h = harness({ url: 'https://shop.test/detail?item=p1_TB', saved: { easy_shop_token: 'token-A' },
     sessionSaved: { [pendingAuthKey]: pendingAuthorizationFixture() } });
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝' } });
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_TB', platform: 'taobao', platform_name: '淘宝' } });
   assert.equal(h.requests.length, 2, 'pending marker alone does not cause authorization calls');
   await h.finish(0, { status: 'success', user: user() }); await init;
   assert.equal(h.requests.length, 3); assert.equal(new URL(h.requests[2].url, 'https://shop.test').searchParams.get('platform'), 'taobao');
@@ -1482,12 +1478,12 @@ test('detail page restores one pending authorization only after verified identit
 
 for (const invalidation of ['logout', 'switch-token', 'dispose']) {
   test(`late detail authorization-return check cannot restore old state after ${invalidation}`, async () => {
-    const original = 'https://shop.test/detail?platform=taobao&goods_sign=TB';
+    const original = 'https://shop.test/detail?item=p1_TB';
     const h = harness({ url: original, saved: { easy_shop_token: 'token-A' },
       sessionSaved: { [pendingAuthKey]: pendingAuthorizationFixture() } });
     h.load('detail'); const init = h.mounted[0]();
     await h.finish(0, { status: 'success', user: user() });
-    await h.finish(1, { status: 'success', data: { goods_sign: 'TB', platform: 'taobao', platform_name: '淘宝' } }); await init;
+    await h.finish(1, { status: 'success', data: { item_code: 'p1_TB', platform: 'taobao', platform_name: '淘宝' } }); await init;
     const params = new URL(h.requests[2].url, 'https://shop.test').searchParams;
     assert.equal(params.get('force'), 'true'); assert.equal(params.get('check_only'), 'true');
     if (invalidation === 'logout') h.session.clear();
@@ -1509,7 +1505,7 @@ test('feeds pull-to-refresh invalidates channelCache and refreshes page 1 withou
   await h.finish(0, goodsResponse('initial-item'));
   await init;
   assert.equal(feed.homeGoodsList.value.length, 1);
-  assert.equal(feed.homeGoodsList.value[0].goods_id, 'initial-item');
+  assert.equal(feed.homeGoodsList.value[0].item_code, 'initial-item');
 
   // 下拉刷新当前频道
   const refreshPromise = feed.refreshHomeGoods();
@@ -1525,7 +1521,7 @@ test('feeds pull-to-refresh invalidates channelCache and refreshes page 1 withou
   const success = await refreshPromise;
   assert.equal(success, true);
   assert.equal(feed.homeGoodsList.value.length, 1);
-  assert.equal(feed.homeGoodsList.value[0].goods_id, 'refreshed-item-1');
+  assert.equal(feed.homeGoodsList.value[0].item_code, 'refreshed-item-1');
 
   // 验证爆单库下拉刷新第一页
   const boomRefresh = feed.refreshBoomGoods();
@@ -1534,7 +1530,7 @@ test('feeds pull-to-refresh invalidates channelCache and refreshes page 1 withou
   assert.equal(boomUrl.searchParams.get('page'), '1');
   await h.finish(2, goodsResponse('boom-refreshed'));
   await boomRefresh;
-  assert.equal(feed.boomGoodsList.value[0].goods_id, 'boom-refreshed');
+  assert.equal(feed.boomGoodsList.value[0].item_code, 'boom-refreshed');
 });
 
 test('app.js and DOM templates support pull-to-refresh indicator and gesture binding', () => {
@@ -1592,15 +1588,17 @@ test('testJD catalog-only deployment loads shared ranks and search without PDD o
 for (const goodsId of ['10001', 'JD_OPAQUE_MATERIAL_2']) {
   for (const action of ['copy', 'buy']) {
     test(`testJD ${goodsId} ${action} uses shared detail, verified identity and real-token text without auth`, async () => {
-      const original = `https://shop.test/detail?platform=jd&goods_id=${goodsId}&uid=SHARER`;
+      const code = `p1_jd_${goodsId}`;
+      const original = `https://shop.test/detail?item=${code}&uid=SHARER`;
       const h = harness({ url: original, saved: { easy_shop_token: 'token-A' } });
       h.load('detail'); const init = h.mounted[0]();
       await h.finish(0, { status: 'success', user: user() });
-      await h.finish(1, { status: 'success', data: { goods_id: goodsId, platform: 'jd', platform_name: '京东', name: 'JD' } }); await init;
+      await h.finish(1, { status: 'success', data: { item_code: code, platform: 'jd', platform_name: '京东', name: 'JD' } }); await init;
       const pending = action === 'copy' ? h.page.handleCopyPromoteLink() : h.page.handleJumpToBuy(); await flush();
       const request = h.requests[2], body = JSON.parse(request.options.body);
       assert.equal(request.url, '/api/promote/convert'); assert.equal(request.options.headers.Authorization, 'Bearer token-A');
-      assert.equal(body.goods_id, goodsId); assert.equal(body.uid, 'A'); assert.equal(body.platform, 'jd');
+      assert.equal(body.item_code, code); assert.equal(body.uid, 'A');
+      assert.equal(body.goods_id, undefined); assert.equal(body.platform, undefined);
       assert.equal(body.promoter_id, undefined, 'only the server chooses numeric attribution');
       const command = '京东测试文案\n￥JD_REAL_PLATFORM_TOKEN￥\nhttps://buy.test/JD';
       await h.finish(2, { status: 'success', final_link: 'https://buy.test/JD', promotion_token: '￥JD_REAL_PLATFORM_TOKEN￥', command_text: command }); await pending;
@@ -1615,9 +1613,9 @@ for (const goodsId of ['10001', 'JD_OPAQUE_MATERIAL_2']) {
 }
 
 test('testJD missing trusted material stays an explicit error with no fabricated link or authorization', async () => {
-  const h = harness({ url: 'https://shop.test/detail?platform=jd&goods_id=JD_OPAQUE_NO_LINK_3' });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_jd_NO_LINK_3' });
   h.load('detail'); const init = h.mounted[0]();
-  await h.finish(0, { status: 'success', data: { goods_id: 'JD_OPAQUE_NO_LINK_3', platform: 'jd', name: 'JD', product_url: '' } }); await init;
+  await h.finish(0, { status: 'success', data: { item_code: 'p1_jd_NO_LINK_3', platform: 'jd', name: 'JD' } }); await init;
   const pending = h.page.handleCopyPromoteLink(); await flush();
   await h.finish(1, { status: 'error', error_msg: '缺少可信京东物料链接' }); await pending;
   assert.equal(h.page.toastMessage.value, '缺少可信京东物料链接');
@@ -1721,10 +1719,10 @@ test('syncAndQueryOrders schedules bounded follow-up polling when sync_status is
 });
 
 test('detail commandModal stores latest copied promotion command and clears on session invalidation or disposal', async () => {
-  const h = harness({ url: 'https://shop.test/detail?goods_id=A', saved: { easy_shop_token: 'token-A' } });
+  const h = harness({ url: 'https://shop.test/detail?item=p1_A', saved: { easy_shop_token: 'token-A' } });
   h.load('detail'); const init = h.mounted[0]();
   await h.finish(0, { status: 'success', user: user() });
-  await h.finish(1, { status: 'success', data: { goods_id: 'A', platform: 'pdd', name: 'A' } }); await init;
+  await h.finish(1, { status: 'success', data: { item_code: 'p1_A', platform: 'pdd', name: 'A' } }); await init;
   assert.equal(h.page.commandModal.value.text, '');
   assert.equal(h.page.commandModal.value.visible, false);
 
@@ -2077,7 +2075,7 @@ test('smart search auto-routes links/tokens to universal converter, extracts e.t
 
 test('WeChat browser intercepts Taobao jump into command modal while detail disables CTAs on invalid goods, with zero sensitive words', async () => {
   // 1. 失效商品详情页底部操作按钮处于不可操作态 (canOperateDetail === false)
-  const hInvalid = harness({ url: 'https://shop.test/detail?goods_id=INVALID_999&platform=pdd' });
+  const hInvalid = harness({ url: 'https://shop.test/detail?item=p1_INVALID_999' });
   hInvalid.load('detail');
   const initInvalid = hInvalid.mounted[0]();
   await hInvalid.finish(0, { status: 'error', error_code: 'PRODUCT_OFF_PROMOTION', error_msg: '该商品已下架' }, { status: 404 });
@@ -2088,13 +2086,13 @@ test('WeChat browser intercepts Taobao jump into command modal while detail disa
   assert.equal(hInvalid.requests.length, 1, 'disabled detail CTAs never fire promote/convert');
 
   // 2. 微信内置浏览器点击淘宝商品「立即领券下单」时不触发白屏 location 跳转，而是弹出淘口令复制引导窗
-  const hWx = harness({ url: 'https://shop.test/detail?goods_sign=TB_GOODS_1&platform=taobao' });
+  const hWx = harness({ url: 'https://shop.test/detail?item=p1_TB_1' });
   hWx.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) MicroMessenger/8.0.50';
   hWx.load('detail');
   const initWx = hWx.mounted[0]();
   await hWx.finish(0, {
     status: 'success',
-    data: { goods_sign: 'TB_GOODS_1', platform: 'taobao', platform_name: '淘宝', name: '淘宝测试好物', price: 19.9 },
+    data: { item_code: 'p1_TB_1', platform: 'taobao', platform_name: '淘宝', name: '淘宝测试好物', price: 19.9 },
   });
   await initWx;
   assert.equal(hWx.page.canOperateDetail.value, true);
@@ -2316,13 +2314,13 @@ test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, de
 
   // 3. 商品详情页好价分享 & 访客点开分享链接保留 invite_code 直达注册预填
   const hDetail = harness({
-    url: 'https://shop.test/detail?goods_id=G100&goods_sign=SIGN100&platform=pdd&invite_code=INV_SHARER',
+    url: 'https://shop.test/detail?item=p1_G100&invite_code=INV_SHARER',
   });
   hDetail.load('detail');
   const initDetail = hDetail.mounted[0]();
   await hDetail.finish(0, {
     status: 'success',
-    data: { goods_id: 'G100', goods_sign: 'SIGN100', platform: 'pdd', name: '农夫山泉矿泉水24瓶', price: 19.9, has_coupon: true, coupon_amount: 5 },
+    data: { item_code: 'p1_G100', platform: 'pdd', name: '农夫山泉矿泉水24瓶', price: 19.9, has_coupon: true, coupon_amount: 5 },
   });
   await initDetail;
   assert.equal(hDetail.context.localStorage.getItem('easy_shop_pending_invite'), 'INV_SHARER', 'guest session.clear preserves pending invite');
@@ -2332,16 +2330,18 @@ test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, de
   assert.equal(hDetail.requests.length, 2, 'sharing detail page only adds lightweight share action telemetry');
   assert.ok(hDetail.requests[1].url.includes('/api/goods/action'));
   assert.equal(JSON.parse(hDetail.requests[1].options.body).action, 'share');
+  assert.equal(JSON.parse(hDetail.requests[1].options.body).item_code, 'p1_G100');
   await hDetail.finish(1, { status: 'success' });
   assert.ok(hDetail.copied.at(-1).includes('https://shop.test/detail?'));
-  assert.ok(hDetail.copied.at(-1).includes('goods_id=G100'));
+  assert.ok(hDetail.copied.at(-1).includes('item=p1_G100'));
+  assert.equal(hDetail.copied.at(-1).includes('goods_id='), false);
   assert.ok(hDetail.copied.at(-1).includes('（立减¥5.00）'));
   hDetail.page.goToRegister();
   const regUrl = new URL(hDetail.context.location.href, 'https://shop.test');
   assert.equal(regUrl.pathname, '/');
   assert.equal(regUrl.searchParams.get('tab'), 'user');
   assert.equal(regUrl.searchParams.get('invite_code'), 'INV_SHARER');
-  assert.equal(regUrl.searchParams.get('redirect'), '/detail?goods_id=G100&goods_sign=SIGN100&platform=pdd&invite_code=INV_SHARER');
+  assert.equal(regUrl.searchParams.get('redirect'), '/detail?item=p1_G100&invite_code=INV_SHARER');
 
   // 4. 主站「我的」页一键分享邀请链接 + 粘贴站内分享文案自动路由直达（不误调电商转链 API）
   const hApp = harness({
@@ -2373,9 +2373,9 @@ test('viral sharing & deep-linking: ?gid= auto-open and full-group retention, de
   assert.equal(hApp.context.location.href, '/group_help?gid=3495229659187300088');
   assert.equal(hApp.requests.length, reqCountBeforeRoute);
 
-  hApp.page.universalInput.value = '🛒 发现一个好价商品 👉 https://shop.test/detail?goods_id=G100&platform=pdd';
+  hApp.page.universalInput.value = '🛒 发现一个好价商品 👉 https://shop.test/detail?item=p1_G100';
   await hApp.page.handleUniversalConvert();
-  assert.equal(hApp.context.location.href, '/detail?goods_id=G100&platform=pdd');
+  assert.equal(hApp.context.location.href, '/detail?item=p1_G100');
   assert.equal(hApp.requests.length, reqCountBeforeRoute);
 
   // 5. 全站新增分享文案与控制器文件零微信敏感词校验
@@ -2503,20 +2503,20 @@ test('group_help detail-first & 1-click join UX: hall card opens detail, WeChat 
 
 test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting copy, broken-image hiding, WeChat aux guard, and zero-impact ordinary goods', async () => {
   // 1. 普通商品（无 deal_tip）：dealTip 为 null，零额外请求，保持原有详情体验
-  const hPlain = harness({ url: 'https://shop.test/detail?goods_id=PLAIN_1&platform=pdd', useRealVue: true });
+  const hPlain = harness({ url: 'https://shop.test/detail?item=p1_PLAIN_1', useRealVue: true });
   hPlain.load('detail');
   const initPlain = hPlain.mounted[0]();
   await hPlain.finish(0, {
     status: 'success',
-    data: { goods_id: 'PLAIN_1', platform: 'pdd', platform_name: '拼多多', name: '普通纸巾', price: 9.9, deal_tip: null },
+    data: { item_code: 'p1_PLAIN_1', platform: 'pdd', platform_name: '拼多多', name: '普通纸巾', price: 9.9, deal_tip: null },
   });
   await initPlain;
   assert.equal(hPlain.page.dealTip.value, null);
   assert.deepEqual([...hPlain.page.dealShareImages.value], []);
   hPlain.page.dispose();
 
-  // 2. 含线报商品（微信内置浏览器打开淘宝线报商品）：展示线报详情、一键复制教程与话术、损坏外链图自动剔除、凑单链接微信内走口令引导且不发起二次转链
-  const hDeal = harness({ url: 'https://shop.test/detail?goods_sign=TB_DEAL_9&platform=taobao', useRealVue: true });
+  // 2. 含线报商品（微信内置浏览器打开淘宝线报商品）：展示线报详情、一键复制教程与话术、损坏外链图自动剔除、凑单链接微信内走加密 coupon_code 兑换与口令引导
+  const hDeal = harness({ url: 'https://shop.test/detail?item=p1_TB_DEAL_9', useRealVue: true });
   hDeal.context.navigator.userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) MicroMessenger/8.0.50';
   hDeal.load('detail');
   const initDeal = hDeal.mounted[0]();
@@ -2525,7 +2525,7 @@ test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting cop
     deal_price: 24.9,
     unit_deal_price: '3.11元/斤',
     price_logic: '领15元券+拍凑单品满减后主商品约24.9元',
-    coupon_links: [{ label: '15元商品券', url: 'https://uland.taobao.com/quan/detail?sellerId=1&activityId=2', token: '1$CPN123$://', platform: 'taobao' }],
+    coupon_links: [{ label: '15元商品券', coupon_code: 'c1_CPN123', has_url: true, has_token: true, platform: 'taobao' }],
     tutorial_steps: ['1. 先在上方【领券】处领取15元商品券', '2. 加购主商品并自行搭配凑单品一起合并付款'],
     original_copywriting: '立白大师香氛洗衣液8斤好价！香味高级留香久～\n赶紧锁单！',
     share_images: ['https://wx4.sinaimg.cn/mw600/ok.jpg', 'https://wx4.sinaimg.cn/mw600/broken.jpg'],
@@ -2533,8 +2533,7 @@ test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting cop
   await hDeal.finish(0, {
     status: 'success',
     data: {
-      goods_sign: 'TB_DEAL_9',
-      goods_id: 'TB_DEAL_9',
+      item_code: 'p1_TB_DEAL_9',
       platform: 'taobao',
       platform_name: '淘宝',
       name: '立白大师香氛洗衣液8斤',
@@ -2563,13 +2562,35 @@ test('detail deal_tip card unifies tip display, 1-click tutorial/copywriting cop
   await flush();
   assert.equal(hDeal.copied.at(-1), sampleTip.original_copywriting);
 
-  // 微信内点击淘宝领券链接：拦截白屏直跳，复用口令弹窗并复制领券淘口令，绝不发起任何额外后端转链请求
+  // 微信内连续双击淘宝领券链接：合并为单次 coupon_code 兑换请求，弹出微信口令引导
   const reqCountBeforeAux = hDeal.requests.length;
-  hDeal.page.openDealAuxItem(sampleTip.coupon_links[0]);
+  const openAuxP1 = hDeal.page.openDealAuxItem(sampleTip.coupon_links[0]);
+  const openAuxP2 = hDeal.page.openDealAuxItem(sampleTip.coupon_links[0]);
   await flush();
-  assert.equal(hDeal.requests.length, reqCountBeforeAux, 'aux links use default cleaned links/tokens with zero extra API calls');
+  assert.equal(hDeal.requests.length, reqCountBeforeAux + 1, 'concurrent coupon clicks share one in-flight request');
+  assert.equal(hDeal.requests.at(-1).url, '/api/promote/convert');
+  assert.deepEqual(JSON.parse(hDeal.requests.at(-1).options.body), { coupon_code: 'c1_CPN123' });
+  await hDeal.finish(hDeal.requests.length - 1, {
+    status: 'success',
+    url: 'https://uland.taobao.com/quan/detail?sellerId=1&activityId=2',
+    final_link: 'https://uland.taobao.com/quan/detail?sellerId=1&activityId=2',
+    promotion_token: '1$CPN123$://',
+  });
+  await Promise.all([openAuxP1, openAuxP2]);
   assert.equal(hDeal.page.commandModal.value.visible, true);
   assert.equal(hDeal.page.commandModal.value.wechatGuide, true);
+  assert.equal(hDeal.copied.at(-1), '1$CPN123$://');
+
+  // 再次点击同一优惠券直接命中本地 dealAuxPromoCache，不重复发请求
+  await hDeal.page.openDealAuxItem(sampleTip.coupon_links[0]);
+  assert.equal(hDeal.requests.length, reqCountBeforeAux + 1, 'cached coupon_code reuse fires zero extra requests');
+
+  // 点击复制附属券：同步展示口令复制弹窗，避免异步剪贴板在 Safari/微信中被拦截无法手按复制
+  hDeal.page.closeCommandModal();
+  await hDeal.page.copyDealAuxItem(sampleTip.coupon_links[0]);
+  assert.equal(hDeal.page.commandModal.value.visible, true);
+  assert.equal(hDeal.page.commandModal.value.wechatGuide, false);
+  assert.equal(hDeal.page.commandModal.value.text, '1$CPN123$://');
   assert.equal(hDeal.copied.at(-1), '1$CPN123$://');
 
   // 分享好价按钮保持原有精简文案，不拼接长篇线报教程
@@ -2594,7 +2615,7 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
       'easy_shop_home_return_state:guest:pdd',
       'easy_shop_boom_return_state:guest:all',
       'easy_shop_bfcache_sync:guest',
-      'current_goods_summary:guest:pdd:id:G_SYNC',
+      'current_goods_summary:guest:p1_G_SYNC',
       'easy_shop_last_active_tab:guest',
     ]) {
       const v = storageObj.getItem(k);
@@ -2603,7 +2624,7 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
     return out;
   };
 
-  // 1. 首页与严选好价均加载了旧价格 ¥10.0 的商品 G_SYNC
+  // 1. 首页与严选好价均加载了旧价格 ¥10.0 的商品 p1_G_SYNC
   const hApp = harness({ url: 'https://shop.test/' });
   hApp.load('app');
   const boot = hApp.mounted[0]();
@@ -2613,8 +2634,8 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
   await hApp.finish(2, {
     status: 'success',
     data: [
-      { goods_id: 'G_SYNC', goods_sign: 'SIGN_SYNC', platform: 'pdd', name: '心相印抽纸', price: 10.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/old.jpg' },
-      { goods_id: 'G_KEEP', goods_sign: 'SIGN_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
+      { item_code: 'p1_G_SYNC', platform: 'pdd', name: '心相印抽纸', price: 10.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/old.jpg' },
+      { item_code: 'p1_G_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
     ],
     has_more: false,
   });
@@ -2624,8 +2645,8 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
   await hApp.finish(hApp.requests.length - 1, {
     status: 'success',
     data: [
-      { goods_id: 'G_SYNC', goods_sign: 'SIGN_SYNC', platform: 'pdd', name: '心相印抽纸', price: 10.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/old.jpg' },
-      { goods_id: 'G_KEEP', goods_sign: 'SIGN_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
+      { item_code: 'p1_G_SYNC', platform: 'pdd', name: '心相印抽纸', price: 10.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/old.jpg' },
+      { item_code: 'p1_G_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
     ],
     has_more: false,
   });
@@ -2638,7 +2659,7 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
 
   // 2. 详情页拉取到最新真实价格 ¥8.0（含 ¥2.0 优惠券），直接原地更新返回快照并写入一次性 bfcache 同步信标
   const hDetail = harness({
-    url: 'https://shop.test/detail?goods_id=G_SYNC&goods_sign=SIGN_SYNC&platform=pdd',
+    url: 'https://shop.test/detail?item=p1_G_SYNC',
     sessionSaved: sharedSession1,
   });
   hDetail.load('detail');
@@ -2646,8 +2667,7 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
   await hDetail.finish(0, {
     status: 'success',
     data: {
-      goods_id: 'G_SYNC',
-      goods_sign: 'SIGN_SYNC',
+      item_code: 'p1_G_SYNC',
       platform: 'pdd',
       name: '心相印抽纸',
       price: 8.0,
@@ -2687,8 +2707,8 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
   await hApp.finish(hApp.requests.length - 1, {
     status: 'success',
     data: [
-      { goods_id: 'G_SYNC', goods_sign: 'SIGN_SYNC', platform: 'pdd', name: '心相印抽纸', price: 12.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/new8.jpg' },
-      { goods_id: 'G_KEEP', goods_sign: 'SIGN_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
+      { item_code: 'p1_G_SYNC', platform: 'pdd', name: '心相印抽纸', price: 12.0, original_price: 12.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/new8.jpg' },
+      { item_code: 'p1_G_KEEP', platform: 'pdd', name: '维达湿巾', price: 15.0, original_price: 18.0, coupon_amount: 0, has_coupon: false, image_url: 'https://img.test/keep.jpg' },
     ],
     has_more: false,
   });
@@ -2697,7 +2717,7 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
 
   // 4. 若详情页发现商品已下架 (PRODUCT_OFF_PROMOTION)，返回外层列表后自动剔除下架卡片
   const hOff = harness({
-    url: 'https://shop.test/detail?goods_id=G_SYNC&goods_sign=SIGN_SYNC&platform=pdd',
+    url: 'https://shop.test/detail?item=p1_G_SYNC',
     sessionSaved: sharedSession2,
   });
   hOff.load('detail');
@@ -2706,15 +2726,14 @@ test('detail latest price and off-promotion sync back to Home/Boom outer list ca
   await initOff;
   hApp.context.sessionStorage.setItem('easy_shop_bfcache_sync:guest', hOff.context.sessionStorage.getItem('easy_shop_bfcache_sync:guest'));
   hApp.fire('pageshow', { persisted: true });
-  assert.deepEqual([...hApp.page.homeGoodsList.value].map(i => i.goods_id), ['G_KEEP']);
-  assert.deepEqual([...hApp.page.boomGoodsList.value].map(i => i.goods_id), ['G_KEEP']);
+  assert.deepEqual([...hApp.page.homeGoodsList.value].map(i => i.item_code), ['p1_G_KEEP']);
+  assert.deepEqual([...hApp.page.boomGoodsList.value].map(i => i.item_code), ['p1_G_KEEP']);
 });
 
 test('detail broken/missing images never stick across visits: filters 404 slides, exposes retry placeholder, and recovers cleanly on 2nd entry', async () => {
-  const summaryStorageKey = 'current_goods_summary:guest:jd:id:JD_IMG_9';
+  const summaryStorageKey = 'current_goods_summary:guest:p1_JD_IMG_9';
   const initialSummary = JSON.stringify({
-    goods_id: 'JD_IMG_9',
-    goods_sign: 'JD_IMG_9',
+    item_code: 'p1_JD_IMG_9',
     platform: 'jd',
     platform_name: '京东',
     name: '京东洗衣液',
@@ -2724,7 +2743,7 @@ test('detail broken/missing images never stick across visits: filters 404 slides
 
   // 1. 第一次进入详情：摘要携带协议相对地址 //img... 自动补全为 https://；接口拉取失败且图片加载触发 @error
   const h1 = harness({
-    url: 'https://shop.test/detail?goods_id=JD_IMG_9&platform=jd',
+    url: 'https://shop.test/detail?item=p1_JD_IMG_9',
     sessionSaved: { [summaryStorageKey]: initialSummary },
     useRealVue: true,
   });
@@ -2748,7 +2767,7 @@ test('detail broken/missing images never stick across visits: filters 404 slides
   h1.page.dispose();
 
   const h2 = harness({
-    url: 'https://shop.test/detail?goods_id=JD_IMG_9&platform=jd',
+    url: 'https://shop.test/detail?item=p1_JD_IMG_9',
     sessionSaved: sessionForVisit2,
     useRealVue: true,
   });
@@ -2999,11 +3018,11 @@ test('stability guards: Private Mode storage fallback, HTML 413/502 error handli
   assert.equal(hJump.context.location.href, 'pinduoduo://com.xunmeng.pinduoduo/item', 'hidden tab does not redirect away after app wake');
 
   // 4. detail.js: transient /api/user/info network failure resets identityRestore so subsequent buy click retries and succeeds
-  const hDet = harness({ url: 'https://shop.test/detail?goods_id=G1', saved: { easy_shop_token: 'token-A' } });
+  const hDet = harness({ url: 'https://shop.test/detail?item=p1_G1', saved: { easy_shop_token: 'token-A' } });
   hDet.load('detail');
   const initDet = hDet.mounted[0]();
   hDet.requests[0].reject(new Error('network blip'));
-  await hDet.finish(1, { status: 'success', data: { goods_id: 'G1', platform: 'pdd', product_url: 'https://mobile.yangkeduo.com/goods.html?goods_id=G1' } });
+  await hDet.finish(1, { status: 'success', data: { item_code: 'p1_G1', platform: 'pdd' } });
   await initDet;
   assert.equal(hDet.page.isLoggedIn.value, false);
 
@@ -3029,11 +3048,11 @@ test('stability guards: Private Mode storage fallback, HTML 413/502 error handli
   assert.equal(activePollTimers.length, 0, 'idle visitor without local pending uploads never polls /api/group_help/list every 3.5s');
 
   // 6. session.js: /api/user/info HTTP 404 (deleted user after DB reset) clears zombie token so /api/promote/convert runs cleanly as guest
-  const hDead = harness({ url: 'https://shop.test/detail?goods_id=G2', saved: { easy_shop_token: 'zombie-token' } });
+  const hDead = harness({ url: 'https://shop.test/detail?item=p1_G2', saved: { easy_shop_token: 'zombie-token' } });
   hDead.load('detail');
   const initDead = hDead.mounted[0]();
   await hDead.finish(0, { detail: '用户不存在' }, { status: 404 });
-  await hDead.finish(1, { status: 'success', data: { goods_id: 'G2', platform: 'jd', product_url: 'https://jingfen.jd.com/detail/G2.html' } });
+  await hDead.finish(1, { status: 'success', data: { item_code: 'p1_G2', platform: 'jd' } });
   await initDead;
   assert.equal(hDead.session.token(), '', '404 user not found purges zombie token from localStorage');
   const buyClean = hDead.page.handleJumpToBuy();
@@ -3379,13 +3398,13 @@ test('detail hasDealGuide reflects tutorial_steps only, removes redundant 怎么
   assert.match(detailCss, /\.detail-gallery-flow\s*\{[^}]*margin:\s*8px 0 0;[^}]*padding:\s*0;[^}]*border-radius:\s*0;/);
   assert.match(detailCss, /\.detail-img-full\s*\{[^}]*width:\s*100%;[^}]*display:\s*block;[^}]*margin-bottom:\s*0;[^}]*border-radius:\s*0;/);
 
-  const hOnlyPriceLogic = harness({ url: 'https://shop.test/detail?goods_id=D_GUIDE_1&platform=taobao', useRealVue: true });
+  const hOnlyPriceLogic = harness({ url: 'https://shop.test/detail?item=p1_D_GUIDE_1', useRealVue: true });
   hOnlyPriceLogic.load('detail');
   const init1 = hOnlyPriceLogic.mounted[0]();
   await hOnlyPriceLogic.finish(0, {
     status: 'success',
     data: {
-      goods_id: 'D_GUIDE_1',
+      item_code: 'p1_D_GUIDE_1',
       platform: 'taobao',
       name: '测试线报商品1',
       price: 19.9,
@@ -3403,13 +3422,13 @@ test('detail hasDealGuide reflects tutorial_steps only, removes redundant 怎么
   assert.equal(hOnlyPriceLogic.copied.at(-1), '原始线报长文案1');
   hOnlyPriceLogic.page.dispose();
 
-  const hWithSteps = harness({ url: 'https://shop.test/detail?goods_id=D_GUIDE_2&platform=pdd', useRealVue: true });
+  const hWithSteps = harness({ url: 'https://shop.test/detail?item=p1_D_GUIDE_2', useRealVue: true });
   hWithSteps.load('detail');
   const init2 = hWithSteps.mounted[0]();
   await hWithSteps.finish(0, {
     status: 'success',
     data: {
-      goods_id: 'D_GUIDE_2',
+      item_code: 'p1_D_GUIDE_2',
       platform: 'pdd',
       name: '测试线报商品2',
       price: 29.9,
@@ -3449,13 +3468,13 @@ test('detail hasDealGuide reflects tutorial_steps only, removes redundant 怎么
   assert.deepEqual([...hWithSteps.page.previewImages.value], []);
   hWithSteps.page.dispose();
 
-  const hOnlyCopy = harness({ url: 'https://shop.test/detail?goods_id=D_ONLY_COPY&platform=jd', useRealVue: true });
+  const hOnlyCopy = harness({ url: 'https://shop.test/detail?item=p1_D_ONLY_COPY', useRealVue: true });
   hOnlyCopy.load('detail');
   const init3 = hOnlyCopy.mounted[0]();
   await hOnlyCopy.finish(0, {
     status: 'success',
     data: {
-      goods_id: 'D_ONLY_COPY',
+      item_code: 'p1_D_ONLY_COPY',
       platform: 'jd',
       name: '仅原文线报商品',
       price: 39.9,
@@ -3561,7 +3580,7 @@ test('QA surgical fixes: group_help copyShareText/firstPosterExampleUrl/smartPar
 
 test('detail price feedback, share tracking, and single-list favorites UI contracts', async () => {
   const h = harness({
-    url: 'https://shop.test/detail?platform=pdd&goods_id=1001',
+    url: 'https://shop.test/detail?item=p1_1001',
     saved: { easy_shop_token: 'tok-fav-1', easy_shop_uid: 'u_11112222' },
   });
   h.load('detail');
@@ -3571,7 +3590,7 @@ test('detail price feedback, share tracking, and single-list favorites UI contra
   await h.finish(0, { status: 'success', user: { uid: 'u_11112222', phone: '13800138000', invite_code: 'INV_1' } });
   await h.finish(1, {
     status: 'success',
-    data: { platform: 'pdd', product_id: '1001', goods_id: '1001', goods_sign: 'SIGN_1', name: '收藏测试商品', price: 19.9, image_url: 'https://img.test/1.jpg', is_favorited: false },
+    data: { item_code: 'p1_1001', platform: 'pdd', name: '收藏测试商品', price: 19.9, image_url: 'https://img.test/1.jpg', is_favorited: false },
   });
   await initPromise;
   assert.equal(h.page.isFavorited.value, false);
@@ -3579,6 +3598,12 @@ test('detail price feedback, share tracking, and single-list favorites UI contra
   // 点击收藏 -> POST /api/favorites/add
   const togglePromise = h.page.handleToggleFavorite();
   await flush();
+  const addBody = JSON.parse(h.requests[2].options.body);
+  assert.equal(addBody.item_code, 'p1_1001');
+  assert.equal(addBody.name, '收藏测试商品');
+  assert.equal(addBody.goods_id, undefined);
+  assert.equal(addBody.product_id, undefined);
+  assert.equal(addBody.platform, undefined);
   await h.finish(2, { status: 'success', data: { is_favorited: true, already_exists: false } });
   await togglePromise;
   assert.equal(h.page.isFavorited.value, true);
@@ -3588,7 +3613,7 @@ test('detail price feedback, share tracking, and single-list favorites UI contra
   await flush();
   assert.equal(h.page.priceFeedbackChoice.value, 'buyable');
   assert.ok(h.requests[3].url.includes('/api/goods/action'));
-  assert.equal(JSON.parse(h.requests[3].options.body).action, 'buyable');
+  assert.deepEqual(JSON.parse(h.requests[3].options.body), { item_code: 'p1_1001', action: 'buyable' });
   await h.finish(3, { status: 'success' });
 
   // 24小时内再次点买不到被本地拦截
@@ -3600,7 +3625,7 @@ test('detail price feedback, share tracking, and single-list favorites UI contra
   h.page.handleShareDetail();
   await flush();
   assert.ok(h.requests[4].url.includes('/api/goods/action'));
-  assert.equal(JSON.parse(h.requests[4].options.body).action, 'share');
+  assert.deepEqual(JSON.parse(h.requests[4].options.body), { item_code: 'p1_1001', action: 'share' });
   await h.finish(4, { status: 'success' });
   h.page.dispose();
 
@@ -3622,7 +3647,7 @@ test('detail price feedback, share tracking, and single-list favorites UI contra
   await hFav.finish(1, {
     status: 'success',
     data: {
-      items: [{ platform: 'pdd', product_id: '1001', collected_price: 25.0, current_price: 19.9, price_diff: -5.1, live_status: 'online', is_off_promotion: false, product: { name: '收藏商品A', goods_sign: 'SIGN_1' } }],
+      items: [{ item_code: 'p1_1001', platform: 'pdd', collected_price: 25.0, current_price: 19.9, price_diff: -5.1, live_status: 'online', is_off_promotion: false, product: { item_code: 'p1_1001', name: '收藏商品A' } }],
       total: 1, page: 1, page_size: 20, has_more: false,
     },
   });
@@ -3630,6 +3655,7 @@ test('detail price feedback, share tracking, and single-list favorites UI contra
   assert.equal(favCtrl.items.value.length, 1);
   const remPromise = favCtrl.removeItem(favCtrl.items.value[0]);
   await flush();
+  assert.deepEqual(JSON.parse(hFav.requests[2].options.body), { item_code: 'p1_1001' });
   await hFav.finish(2, { status: 'success', data: { is_favorited: false, removed: true } });
   await remPromise;
   assert.equal(favCtrl.items.value.length, 0);
@@ -3683,7 +3709,7 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   assert.ok(submitHtml.includes('https://beian.miit.gov.cn/'));
 
   const hDetail = harness({
-    url: 'https://shop.test/detail?platform=jd&goods_id=1001001',
+    url: 'https://shop.test/detail?item=p1_1001001',
     saved: { easy_shop_token: 'tok-sub-1', easy_shop_uid: 'u_sub_1' },
   });
   hDetail.load('detail');
@@ -3692,18 +3718,18 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   await hDetail.finish(0, { status: 'success', user: { uid: 'u_sub_1', phone: '13800138000' } });
   await hDetail.finish(1, {
     status: 'success',
-    data: { platform: 'jd', product_id: '1001001', goods_id: '1001001', goods_sign: 'S_1001', name: '抽纸', price: 59.9 },
+    data: { item_code: 'p1_1001001', platform: 'jd', name: '抽纸', price: 59.9 },
   });
   await dInit;
   await hDetail.page.goToSubmitDeal();
   assert.ok(hDetail.context.location.href.startsWith('/submit_deal?'));
-  assert.ok(hDetail.context.location.href.includes('platform=jd'));
-  assert.ok(hDetail.context.location.href.includes('goods_id=1001001'));
+  assert.ok(hDetail.context.location.href.includes('item=p1_1001001'));
+  assert.equal(hDetail.context.location.href.includes('goods_id='), false);
   hDetail.page.dispose();
 
   // 2. submit_deal 控制器校验、图片列表删除、投稿提交与状态回流
   const hSub = harness({
-    url: 'https://shop.test/submit_deal?platform=jd&product_id=1001001&goods_id=1001001&goods_sign=S_1001',
+    url: 'https://shop.test/submit_deal?item=p1_1001001',
     saved: { easy_shop_token: 'tok-sub-1', easy_shop_uid: 'u_sub_1' },
   });
   hSub.load('submit_deal');
@@ -3718,7 +3744,8 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   await flush();
   await hSub.finish(0, { status: 'success', user: { uid: 'u_sub_1', phone: '13800138000' } });
   await flush();
-  await hSub.finish(1, { status: 'success', data: { platform: 'jd', product_id: '1001001', goods_id: '1001001', name: '维达抽纸', price: 59.9 } });
+  assert.equal(new URL(hSub.requests[1].url, 'https://shop.test').searchParams.get('item_code'), 'p1_1001001');
+  await hSub.finish(1, { status: 'success', data: { item_code: 'p1_1001001', platform: 'jd', name: '维达抽纸', price: 59.9 } });
   await hSub.finish(2, { status: 'success', data: { items: [], can_submit: true, strikes: 0 } });
   await subInit;
 
@@ -3752,7 +3779,11 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
   const submitP = subCtrl.handleSubmit();
   await flush();
   assert.equal(hSub.requests[3].url, '/api/deals/submit');
-  assert.deepEqual(JSON.parse(hSub.requests[3].options.body).images_base64, ['data:image/jpeg;base64,BBB=']);
+  const subBody = JSON.parse(hSub.requests[3].options.body);
+  assert.equal(subBody.item_code, 'p1_1001001');
+  assert.equal(subBody.goods_id, undefined);
+  assert.equal(subBody.product_id, undefined);
+  assert.deepEqual(subBody.images_base64, ['data:image/jpeg;base64,BBB=']);
   await hSub.finish(3, { status: 'success', data: { tip_id: 'us_123', state: 'pending', message: '提交成功' } });
   await flush();
   assert.ok(hSub.requests[4].url.startsWith('/api/deals/my_submissions?limit=30'));
@@ -3779,7 +3810,7 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
         state_label: '已收录上架',
         reason: '已上架',
         platform: 'jd',
-        product_id: '1001001',
+        item_code: 'p1_1001001',
         display_started_at: '2026-11-26T00:00:00+00:00',
         display_status: 'active',
         display_duration_text: '3小时',
@@ -3804,7 +3835,8 @@ test('detail goToSubmitDeal and standalone submit_deal controller + HTML contrac
 
   subCtrl.openSubmittedDetail(subCtrl.submissions.value[0]);
   assert.ok(hSub.context.location.href.startsWith('/detail?'));
-  assert.ok(hSub.context.location.href.includes('goods_id=1001001'));
+  assert.ok(hSub.context.location.href.includes('item=p1_1001001'));
+  assert.equal(hSub.context.location.href.includes('goods_id='), false);
 
   // 2b. 未授权触发 2条/日 上限时展示 quotaNotice 并引导跳转授权
   subCtrl.dealPrice.value = '29.9';
@@ -3859,21 +3891,21 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
   assert.equal(sanitizeReturnPath('https://evil.com/detail?goods_id=1'), '');
   assert.equal(sanitizeReturnPath('javascript:alert(1)'), '');
   assert.equal(sanitizeReturnPath('/admin/secret'), '');
-  assert.equal(sanitizeReturnPath('/detail?platform=pdd&goods_id=1'), '/detail?platform=pdd&goods_id=1');
+  assert.equal(sanitizeReturnPath('/detail?item=p1_1'), '/detail?item=p1_1');
   assert.equal(sanitizeReturnPath('/favorites'), '/favorites');
-  assert.equal(sanitizeReturnPath('/submit_deal?platform=jd&product_id=10'), '/submit_deal?platform=jd&product_id=10');
+  assert.equal(sanitizeReturnPath('/submit_deal?item=p1_10'), '/submit_deal?item=p1_10');
 
-  const userTabUrl = buildUserTabUrl({ redirect: '/detail?platform=jd&goods_id=100', inviteCode: 'INV_1', platform: 'jd' });
+  const userTabUrl = buildUserTabUrl({ redirect: '/detail?item=p1_100', inviteCode: 'INV_1', platform: 'jd' });
   const parsedUserTab = new URL(userTabUrl, 'https://shop.test');
   assert.equal(parsedUserTab.searchParams.get('tab'), 'user');
   assert.equal(parsedUserTab.searchParams.get('invite_code'), 'INV_1');
   assert.equal(parsedUserTab.searchParams.get('platform'), 'jd');
-  assert.equal(parsedUserTab.searchParams.get('redirect'), '/detail?platform=jd&goods_id=100');
+  assert.equal(parsedUserTab.searchParams.get('redirect'), '/detail?item=p1_100');
   assert.equal(buildUserTabUrl({ redirect: '//evil.com' }), '/?tab=user');
 
   // 2. app.js + account.js: login and target platform authorization return cleanly to safe redirect path; invalid redirect ignored
   let replacedTarget = '';
-  const hAppLogin = harness({ url: 'https://shop.test/?tab=user&redirect=%2Fdetail%3Fplatform%3Dpdd%26goods_id%3D99' });
+  const hAppLogin = harness({ url: 'https://shop.test/?tab=user&redirect=%2Fdetail%3Fitem%3Dp1_99' });
   hAppLogin.context.location.replace = url => { replacedTarget = url; };
   hAppLogin.load('app');
   const bootLogin = hAppLogin.mounted[0]();
@@ -3892,18 +3924,18 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
   const retTimer = [...hAppLogin.timers.values()].find(t => t.delay === 350);
   assert.ok(retTimer, 'login schedules return redirect timer');
   retTimer.callback();
-  assert.equal(replacedTarget, '/detail?platform=pdd&goods_id=99');
+  assert.equal(replacedTarget, '/detail?item=p1_99');
 
-  // 3. submit_deal.js: PDD sign-only goods match summary cache and never send goods_sign as goods_id
-  const pddSign = 'E9r2SignOnlyTokenForCacheMatchTest1234567890';
+  // 3. submit_deal.js: PDD encrypted item_code goods match summary cache and send only item_code
+  const pddCode = 'p1_PDD_SIGN_ONLY_ITEM';
   const hSignSub = harness({
-    url: `https://shop.test/submit_deal?platform=pdd&product_id=${pddSign}&goods_sign=${pddSign}`,
+    url: `https://shop.test/submit_deal?item=${pddCode}`,
     saved: { easy_shop_token: 'tok-sign-1', easy_shop_uid: 'u_sign_1' },
   });
   hSignSub.context.sessionStorage.setItem(
-    hSignSub.summaryKey({ platform: 'pdd', product_id: pddSign, goods_sign: pddSign }),
+    hSignSub.summaryKey({ item_code: pddCode }),
     JSON.stringify({
-      platform: 'pdd', product_id: pddSign, goods_id: '', goods_sign: pddSign, name: '纯Sign测试品', price: 9.9,
+      item_code: pddCode, platform: 'pdd', name: '纯Sign测试品', price: 9.9,
     })
   );
   hSignSub.load('submit_deal');
@@ -3921,14 +3953,16 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
   assert.equal(signCtrl.goods.value.name, '纯Sign测试品', 'PDD sign-only goods hits session summary cache');
   const detailReqUrl = hSignSub.requests.find(r => r.url.includes('/api/home/detail')).url;
   const detailParams = new URL(detailReqUrl, 'https://shop.test').searchParams;
-  assert.equal(detailParams.get('goods_sign'), pddSign);
-  assert.equal(detailParams.get('goods_id'), null, 'PDD sign-only request never populates goods_id with goods_sign');
-  await hSignSub.finish(1, { status: 'success', data: { platform: 'pdd', product_id: pddSign, goods_sign: pddSign, name: '纯Sign测试品', price: 9.9 } });
-  await hSignSub.finish(2, { status: 'success', data: { items: [{ tip_id: 't1', platform: 'pdd', product_id: pddSign, goods_sign: pddSign, title: '纯Sign测试品' }] } });
+  assert.equal(detailParams.get('item_code'), pddCode);
+  assert.equal(detailParams.get('goods_sign'), null);
+  assert.equal(detailParams.get('goods_id'), null);
+  await hSignSub.finish(1, { status: 'success', data: { item_code: pddCode, platform: 'pdd', name: '纯Sign测试品', price: 9.9 } });
+  await hSignSub.finish(2, { status: 'success', data: { items: [{ tip_id: 't1', platform: 'pdd', item_code: pddCode, title: '纯Sign测试品' }] } });
   await signInit;
   signCtrl.openSubmittedDetail(signCtrl.submissions.value[0]);
   const openedParams = new URL(hSignSub.context.location.href, 'https://shop.test').searchParams;
-  assert.equal(openedParams.get('goods_sign'), pddSign);
+  assert.equal(openedParams.get('item'), pddCode);
+  assert.equal(openedParams.get('goods_sign'), null);
   assert.equal(openedParams.get('goods_id'), null);
   signCtrl.dispose();
 
@@ -4000,8 +4034,8 @@ test('E2E audit fixes: safe return redirect, detail error layout, PDD sign-only 
 
   for (const htmlName of ['index.html', 'detail.html', 'favorites.html', 'submit_deal.html', 'group_help.html']) {
     const content = fs.readFileSync(path.join(root, 'static', htmlName), 'utf8');
-    assert.ok(content.includes('?v=ux-20261126-6'), `${htmlName} bumped asset version`);
-    assert.ok(!content.includes('?v=ux-20261126-5'), `${htmlName} has no stale asset version`);
+    assert.ok(content.includes('?v=ux-20261127-1'), `${htmlName} bumped asset version`);
+    assert.ok(!content.includes('?v=ux-20261126-6'), `${htmlName} has no stale asset version`);
   }
 });
 

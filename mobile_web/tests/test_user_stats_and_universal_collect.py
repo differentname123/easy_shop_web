@@ -220,13 +220,16 @@ def test_routes_record_view_intent_and_client_actions(monkeypatch):
         "settings",
         replace(config.settings, warmup_enabled=False, detail_prefetch_enabled=False),
     )
+    from public_boundary import encode_item_code
+
     app = create_app()
+    code_555 = encode_item_code("pdd", "555")
     with TestClient(app) as client:
-        assert client.get("/api/home/detail?platform=pdd&goods_id=555").status_code == 200
-        assert client.post("/api/promote/convert", json={"platform": "pdd", "goods_id": "555", "goods_sign": "SIGN_555"}).status_code == 200
-        assert client.post("/api/goods/action", json={"platform": "pdd", "product_id": "555", "action": "share"}).status_code == 200
-        assert client.post("/api/goods/action", json={"platform": "pdd", "product_id": "555", "action": "buyable"}).status_code == 200
-        assert client.post("/api/goods/action", json={"platform": "pdd", "product_id": "555", "action": "bad_action"}).status_code == 422
+        assert client.get(f"/api/home/detail?item_code={code_555}").status_code == 200
+        assert client.post("/api/promote/convert", json={"item_code": code_555}).status_code == 200
+        assert client.post("/api/goods/action", json={"item_code": code_555, "action": "share"}).status_code == 200
+        assert client.post("/api/goods/action", json={"item_code": code_555, "action": "buyable"}).status_code == 200
+        assert client.post("/api/goods/action", json={"item_code": code_555, "action": "bad_action"}).status_code == 422
 
     # lifespan stop() 已自动 flush
     stats = col.docs[0]["user_stats"]

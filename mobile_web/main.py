@@ -35,6 +35,7 @@ from api.order import router as order_router, order_service
 from api.group_help import router as group_help_router, group_help_worker
 from api.favorite import router as favorite_router
 from api.deal_submit import router as deal_submit_router
+from public_boundary import PublicBoundaryMiddleware
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 GROUP_HELP_ENABLED = True  # 多人团互助独立模块总开关，置为 False 即可一键下线
@@ -215,6 +216,7 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if enable_docs else None,
         openapi_url="/openapi.json" if enable_docs else None,
     )
+    application.add_middleware(PublicBoundaryMiddleware)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=list(_ALLOWED_CORS_ORIGINS),

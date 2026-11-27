@@ -201,10 +201,11 @@ def test_upstream_authorization_error_cannot_use_previous_promotion_cache(monkey
 def test_personal_conversion_requires_token_and_rejects_forged_uid(monkeypatch):
     import api.promote as promote_api
     from main import app
+    from public_boundary import encode_item_code
     convert = MagicMock(return_value={"status": "success", "final_link": "https://example.com"})
     monkeypatch.setattr(promote_api, "promote_service", SimpleNamespace(convert_link=convert))
     client = TestClient(app)
-    payload = {"platform": "pdd", "goods_id": "123", "uid": UID}
+    payload = {"item_code": encode_item_code("pdd", "123"), "uid": UID}
     assert client.post("/api/promote/convert", json=payload).status_code == 403
     assert client.post("/api/promote/convert", json=payload, headers={"Authorization": "Bearer invalid"}).status_code == 401
     token = create_access_token(UID)

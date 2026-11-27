@@ -24,6 +24,7 @@ import main as main_module
 from adapters import PlatformUnavailableError
 from auth import create_access_token
 from main import create_app
+from public_boundary import encode_item_code
 from models.deal_constants import (
     CLEAN_STAGE_NEED_USER_AUDIT,
     DEFAULT_NORMAL_RELIABILITY_SCORE,
@@ -1113,9 +1114,10 @@ def test_http_routes_and_submit_page(monkeypatch, tmp_path):
         assert page_resp.status_code == 200
         assert "好价爆料中心" in page_resp.text
 
+        item_code = encode_item_code("jd", "1001001")
         assert client.post(
             "/api/deals/submit",
-            json={"platform": "jd", "product_id": "1001001", "deal_price": 29.9, "tutorial_text": "先领券下单"},
+            json={"item_code": item_code, "deal_price": 29.9, "tutorial_text": "先领券下单"},
         ).status_code == 401
         assert client.get("/api/deals/my_submissions").status_code == 401
 
@@ -1124,8 +1126,7 @@ def test_http_routes_and_submit_page(monkeypatch, tmp_path):
             "/api/deals/submit",
             headers={"Authorization": f"Bearer {token}"},
             json={
-                "platform": "jd",
-                "product_id": "1001001",
+                "item_code": item_code,
                 "deal_price": 29.9,
                 "tutorial_text": "领券直接购买29.9",
                 "images_base64": [_make_png_b64(400, 300)],

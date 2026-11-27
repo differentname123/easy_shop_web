@@ -5,9 +5,10 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Path, Query
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from auth import get_current_uid
+from public_boundary import require_item_code, resolve_internal_product_keys
 from services.deal_submit_service import DealSubmitError, DealSubmitService
 
 router = APIRouter(prefix="/api/deals", tags=["用户爆料"])
@@ -16,10 +17,8 @@ _IMAGE_SEMAPHORE = asyncio.Semaphore(4)
 
 
 class DealSubmitRequest(BaseModel):
-    platform: str = Field(..., min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$")
-    product_id: Optional[str] = Field("", max_length=128)
-    goods_id: Optional[str] = Field("", max_length=128)
-    goods_sign: Optional[str] = Field("", max_length=128)
+    model_config = ConfigDict(extra="forbid")
+    item_code: str = Field(..., min_length=8, max_length=256)
     deal_price: float = Field(..., gt=0, lt=1000000)
     tutorial_text: str = Field(..., min_length=1, max_length=1000)
     coupon_input: Optional[str] = Field("", max_length=600)
@@ -32,15 +31,17 @@ async def submit_user_deal(
     current_uid: str = Depends(get_current_uid),
 ):
     """从商品详情页发起好价补充，支持最多 3 张压缩截图，按原有清洗流程异步处理。"""
+    plat, cid = require_item_code(req.item_code)
+    plat, gid, gsign = resolve_internal_product_keys(plat, cid)
     try:
         async with _IMAGE_SEMAPHORE:
             return await asyncio.to_thread(
                 deal_submit_service.submit_user_deal,
                 uid=current_uid,
-                platform=req.platform,
-                product_id=req.product_id or "",
-                goods_id=req.goods_id or "",
-                goods_sign=req.goods_sign or "",
+                platform=plat,
+                product_id=gid or gsign,
+                goods_id=gid,
+                goods_sign=gsign,
                 deal_price=req.deal_price,
                 tutorial_text=req.tutorial_text,
                 coupon_input=req.coupon_input or "",

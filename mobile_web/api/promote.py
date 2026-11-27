@@ -7,8 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from auth import get_optional_uid
 from api.home import product_stats_buffer
 from api.user import user_service
-from models.product import resolve_item_identity
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from public_boundary import (
+    require_coupon_code,
+    require_item_code,
+    resolve_internal_product_keys,
+)
 from services.promote_service import PromoteService
 from services.product_stats_service import extract_actor_key
 
@@ -17,10 +21,9 @@ promote_service = PromoteService(user_service=user_service)
 
 
 class ConvertRequest(BaseModel):
-    platform: str = Field("pdd", max_length=32, pattern="^[a-z][a-z0-9_]*$")
-    goods_sign: Optional[str] = Field(None, max_length=128)
-    goods_id: Optional[str] = Field(None, max_length=64)
-    product_url: Optional[str] = Field(None, max_length=512)
+    model_config = ConfigDict(extra="forbid")
+    item_code: Optional[str] = Field(None, min_length=8, max_length=256)
+    coupon_code: Optional[str] = Field(None, min_length=8, max_length=256)
     uid: Optional[str] = Field(None, max_length=64)
     title: Optional[str] = Field(None, max_length=200)
     price: Optional[float] = None
@@ -34,23 +37,29 @@ def convert_link(request: Request, req: ConvertRequest, current_uid: Optional[st
     """
     if req.uid and req.uid.strip() != current_uid:
         raise HTTPException(status_code=403, detail="推广归因必须使用本人已验证身份")
-    goods_key = req.goods_sign or req.goods_id or ""
+    has_item = bool(req.item_code and req.item_code.strip())
+    has_coupon = bool(req.coupon_code and req.coupon_code.strip())
+    if has_item == has_coupon:
+        raise HTTPException(status_code=400, detail="请提供唯一有效的商品编号或优惠券编号")
+    if has_coupon:
+        plat, cid, dg = require_coupon_code(req.coupon_code)
+        return promote_service.redeem_deal_coupon(plat, cid, dg)
+
+    plat, cid = require_item_code(req.item_code)
+    plat, gid, gsign = resolve_internal_product_keys(plat, cid)
+    goods_key = gsign or gid
     res = promote_service.convert_link(
-        platform=req.platform,
+        platform=plat,
         goods_id_or_sign=goods_key,
-        goods_id=req.goods_id,
-        goods_sign=req.goods_sign,
-        product_url=req.product_url,
+        goods_id=gid or None,
+        goods_sign=gsign or None,
+        product_url=None,
         uid=current_uid,
         title=req.title,
         price=req.price,
         coupon_amount=req.coupon_amount,
     )
     if isinstance(res, dict) and res.get("status") == "success":
-        plat, gid, gsign = resolve_item_identity(
-            {"platform": req.platform, "goods_id": req.goods_id, "goods_sign": req.goods_sign},
-            default_platform=req.platform,
-        )
         pid = gid or gsign
         if pid:
             product_stats_buffer.record(plat, pid, "intent", extract_actor_key(request, current_uid))

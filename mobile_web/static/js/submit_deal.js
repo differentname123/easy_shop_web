@@ -99,17 +99,9 @@
       }
     };
 
-    const rawAnchor = (() => {
-      const sp = searchParams();
-      return {
-        platform: (sp.get('platform') || '').trim().toLowerCase(),
-        product_id: (sp.get('product_id') || '').trim(),
-        goods_id: (sp.get('goods_id') || '').trim(),
-        goods_sign: (sp.get('goods_sign') || '').trim(),
-      };
-    })();
+    const rawItemCode = (searchParams().get('item') || '').trim();
 
-    const hasAnchorParams = computed(() => Boolean(rawAnchor.platform && (rawAnchor.product_id || rawAnchor.goods_id || rawAnchor.goods_sign)));
+    const hasAnchorParams = computed(() => Boolean(rawItemCode));
 
     const currentReturnPath = () => {
       try {
@@ -126,26 +118,19 @@
         : '/?tab=user';
     };
     const goToAuth = () => { goToLogin(); };
-    const buildDetailUrlFromIdentity = rawObj => {
-      const id = shop.goodsIdentity(rawObj || {});
-      const p = new URLSearchParams();
-      if (id.platform) p.set('platform', id.platform);
-      if (id.goods_id) p.set('goods_id', id.goods_id);
-      if (id.goods_sign) p.set('goods_sign', id.goods_sign);
-      return `/detail?${p.toString()}`;
-    };
     const goBack = () => {
       if (global.history && global.history.length > 1) return global.history.back();
       if (hasAnchorParams.value) {
-        global.location.href = buildDetailUrlFromIdentity(rawAnchor);
+        global.location.href = shop.buildDetailUrl(rawItemCode);
         return;
       }
       global.location.href = '/?tab=user';
     };
 
     const openSubmittedDetail = rec => {
-      if (!rec || !rec.platform || (!rec.product_id && !rec.goods_id && !rec.goods_sign)) return;
-      global.location.href = buildDetailUrlFromIdentity(rec);
+      const code = shop.itemCode(rec);
+      if (!code) return;
+      global.location.href = shop.buildDetailUrl(code);
     };
 
     const triggerImagePicker = () => {
@@ -208,25 +193,21 @@
 
     const loadAnchoredGoods = async token => {
       if (!hasAnchorParams.value) return;
-      const summaryReq = shop.goodsIdentity(rawAnchor);
       try {
-        const cached = JSON.parse(global.sessionStorage?.getItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(summaryReq)}`) || 'null');
-        if (cached && cached.name) goods.value = cached;
+        const cached = JSON.parse(global.sessionStorage?.getItem(`current_goods_summary:${session.scope()}:${rawItemCode}`) || 'null');
+        if (cached && cached.name && shop.matchesGoodsSummary(cached, rawItemCode)) goods.value = cached;
       } catch (_) {}
 
       loadingGoods.value = true;
       goodsError.value = '';
       try {
-        const params = new URLSearchParams();
-        if (summaryReq.platform) params.set('platform', summaryReq.platform);
-        if (summaryReq.goods_id) params.set('goods_id', summaryReq.goods_id);
-        if (summaryReq.goods_sign) params.set('goods_sign', summaryReq.goods_sign);
+        const params = new URLSearchParams({ item_code: rawItemCode });
         const res = await api.get(`/api/home/detail?${params.toString()}`, token ? { token } : undefined);
         if (disposed) return;
         if (res.ok && res.data?.status === 'success' && res.data?.data) {
           goods.value = res.data.data;
         } else if (!goods.value) {
-          goodsError.value = res.data?.error_msg || '未能核实到该商品，请返回详情页重试';
+          goodsError.value = res.data?.detail || res.data?.error_msg || '未能核实到该商品，请返回详情页重试';
         }
       } catch (_) {
         if (!disposed && !goods.value) goodsError.value = '网络异常，请返回商品详情页重试';
@@ -258,10 +239,7 @@
       quotaNotice.value = null;
       try {
         const payload = {
-          platform: goods.value.platform || rawAnchor.platform,
-          product_id: String(goods.value.product_id || rawAnchor.product_id || ''),
-          goods_id: String(goods.value.goods_id || rawAnchor.goods_id || ''),
-          goods_sign: String(goods.value.goods_sign || rawAnchor.goods_sign || ''),
+          item_code: shop.itemCode(goods.value) || rawItemCode,
           deal_price: Number(priceNum.toFixed(2)),
           tutorial_text: cleanTut,
           coupon_input: String(couponInput.value || '').trim(),

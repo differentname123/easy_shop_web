@@ -24,15 +24,8 @@
 
     const openDetail = item => {
       if (!item) return;
-      const prod = item.product || {};
-      const params = new URLSearchParams();
-      params.set('platform', item.platform || prod.platform || 'pdd');
-      const gid = prod.goods_id || (item.platform !== 'pdd' ? item.product_id : (item.product_id !== prod.goods_sign ? item.product_id : ''));
-      const gsign = prod.goods_sign || '';
-      if (gid) params.set('goods_id', gid);
-      if (gsign) params.set('goods_sign', gsign);
-      if (!gid && !gsign && item.product_id) params.set('goods_id', item.product_id);
-      global.location.href = `/detail?${params.toString()}`;
+      const code = shop.itemCode(item) || shop.itemCode(item.product);
+      if (code) global.location.href = shop.buildDetailUrl(code);
     };
 
     const loadPage = async (targetPage = 1, append = false) => {
@@ -73,12 +66,10 @@
       if (!item) return;
       const token = session.token ? session.token() : '';
       if (!token) return goToLogin();
+      const code = shop.itemCode(item) || shop.itemCode(item.product);
+      if (!code) return;
       try {
-        const res = await api.post('/api/favorites/remove', {
-          platform: item.platform,
-          product_id: item.product_id,
-          goods_sign: item.product?.goods_sign || '',
-        }, { token });
+        const res = await api.post('/api/favorites/remove', { item_code: code }, { token });
         if (res.status === 401) {
           session.clear();
           isLoggedIn.value = false;
@@ -86,7 +77,7 @@
           return;
         }
         if (res.ok && res.data?.status === 'success') {
-          items.value = items.value.filter(it => !(it.platform === item.platform && it.product_id === item.product_id));
+          items.value = items.value.filter(it => (shop.itemCode(it) || shop.itemCode(it.product)) !== code);
           total.value = Math.max(0, total.value - 1);
           browser.showToast('已移出收藏');
         } else {

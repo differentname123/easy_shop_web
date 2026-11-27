@@ -420,7 +420,7 @@ class ProductService:
         return doc
 
     @staticmethod
-    def _upgrade_ref_sign(ref: ProductRef, item: Optional[dict] = None) -> ProductRef:
+    def _upgrade_ref_sign(ref: ProductRef, item: Optional[dict] = None, *, prefer_item_sign: bool = False) -> ProductRef:
         if ref.platform not in ("taobao", "jd", "pdd") or not ref.goods_id:
             return ref
         needs_upgrade = (
@@ -428,13 +428,21 @@ class ProductService:
             or ref.goods_sign == ref.goods_id
             or (ref.platform == "jd" and is_jd_image_key(ref.goods_sign))
         )
-        if not needs_upgrade:
+        if not needs_upgrade and not prefer_item_sign:
             return ref
         if isinstance(item, dict):
             doc_sign = str(item.get("goods_sign") or "").strip()
-            if doc_sign and doc_sign != ref.goods_id and not (ref.platform == "jd" and is_jd_image_key(doc_sign)):
-                SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), doc_sign)
+            if (
+                doc_sign
+                and doc_sign != ref.goods_id
+                and not (ref.platform == "jd" and is_jd_image_key(doc_sign))
+                and not (ref.platform == "pdd" and doc_sign.isdigit())
+            ):
+                if doc_sign != ref.goods_sign:
+                    SIGN_BY_ID_CACHE.set((ref.platform, ref.goods_id), doc_sign)
                 return ProductRef(ref.platform, ref.goods_id, doc_sign)
+        if not needs_upgrade:
+            return ref
         cached_sign = SIGN_BY_ID_CACHE.get((ref.platform, ref.goods_id))
         if isinstance(cached_sign, str) and cached_sign.strip():
             return ProductRef(ref.platform, ref.goods_id, cached_sign.strip())
@@ -601,6 +609,11 @@ class ProductService:
         ref = adapter.resolve_product_ref(goods_id_or_sign, goods_id, goods_sign)
         if not ref.key:
             return {"status": "error", "error_msg": "请提供商品 ID 或 Sign", "error_code": "missing_product_identity"}
+        had_explicit_sign = bool(
+            ref.goods_sign
+            and ref.goods_sign != ref.goods_id
+            and not (plat == "jd" and is_jd_image_key(ref.goods_sign))
+        )
         ref = self._upgrade_ref_sign(ref)
         if is_product_off_promotion(plat, ref.goods_id, ref.goods_sign):
             return {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION", "error_msg": "该商品已取消推广或已下架，请挑选其他好物"}
@@ -609,7 +622,7 @@ class ProductService:
         if cached:
             return self._apply_deal_tip(plat, cached[1], ref)
         item = self._read_detail(ref)
-        ref = self._upgrade_ref_sign(ref, item)
+        ref = self._upgrade_ref_sign(ref, item, prefer_item_sign=not had_explicit_sign)
         if isinstance(item, dict) and item.get("superseded_by"):
             superseded_id = str(item.get("superseded_by") or "").strip()
             has_usable_sign = bool(

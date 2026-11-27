@@ -245,11 +245,13 @@ def test_registered_test_platform_uses_existing_core_flow_and_routes(monkeypatch
     from api import home
     monkeypatch.setattr(home.product_service, "repo", MagicMock())
     from main import create_app
+    from public_boundary import encode_item_code
     client = TestClient(create_app())
     try:
         assert client.get("/api/home/channels?platform=fixture").json()["data"][0]["channel_type"] == 42
         result = client.get("/api/home/recommend?platform=fixture&channel_type=42&offset=450").json()
-        assert result["data"][0]["goods_id"] == "x-1"
+        assert result["data"][0]["item_code"] == encode_item_code("fixture", "x-1")
+        assert "goods_id" not in result["data"][0]
         assert client.get("/api/home/channels?platform=unknown").status_code == 400
         assert client.get("/api/home/channels?platform=jd").status_code == 400
     finally:

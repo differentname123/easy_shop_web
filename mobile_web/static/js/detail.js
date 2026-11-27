@@ -37,7 +37,7 @@
         commandModal.value.wechatGuide ? `口令已复制，请打开${platformName.value} App 领券下单` : `推广口令与链接已复制，可前往${platformName.value}使用`,
       );
     };
-    let requested = null;
+    let requestedCode = '';
     let detailGeneration = 0;
     let identityRestore = null;
     let identitySnapshot = null;
@@ -48,7 +48,9 @@
     let conversionGeneration = 0;
     let disposed = false;
     const promotionSessions = new WeakMap();
-    const platformName = computed(() => goods.value?.platform_name || goods.value?.platform || requested?.platform || '平台');
+    const dealAuxPromoCache = new Map();
+    const dealAuxInFlight = new Map();
+    const platformName = computed(() => goods.value?.platform_name || goods.value?.platform || '平台');
     const canUse = info => !disposed && info && promotionSessions.has(info) && session.isCurrent(promotionSessions.get(info));
     const invalidateSession = () => {
       session.clear(); verifiedSession = null; identityRestore = null; uid.value = ''; myInviteCode.value = ''; isLoggedIn.value = false;
@@ -80,10 +82,11 @@
     const detailGalleryList = computed(() => (carouselList.value.length > 1 ? carouselList.value.slice(1) : carouselList.value));
     const hasNoAvailableImages = computed(() => !isDeepLoading.value && !isOffPromotion.value && carouselList.value.length === 0);
     const persistCurrentSummary = item => {
-      if (!item || !requested) return;
+      if (!item || !requestedCode) return;
+      const actualCode = shop.itemCode(item) || requestedCode;
       const summary = {
-        ...shop.goodsIdentity(item),
-        product_id: item.product_id || item.goods_id || item.goods_sign || '',
+        item_code: actualCode,
+        platform: item.platform || '',
         platform_name: item.platform_name || platformName.value,
         name: item.name || '',
         price: item.price ?? 0,
@@ -96,25 +99,20 @@
         sales_tip: item.sales_tip || '0',
         image_url: carouselList.value[0] || '',
         mall_name: item.mall_name || '',
-        product_url: item.product_url || '',
       };
       try {
-        global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`, JSON.stringify(summary));
-        const actualKey = shop.goodsKey(item);
-        if (actualKey !== shop.goodsKey(requested)) {
-          global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${actualKey}`, JSON.stringify(summary));
+        global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${requestedCode}`, JSON.stringify(summary));
+        if (actualCode && actualCode !== requestedCode) {
+          global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${actualCode}`, JSON.stringify(summary));
         }
       } catch (_) {}
     };
     const syncOuterSnapshots = (detailItem, offPromotion = false) => {
-      if (!requested) return;
+      if (!requestedCode) return;
       const scope = session.scope();
-      const reqId = shop.goodsIdentity(requested);
-      const detId = detailItem ? shop.goodsIdentity(detailItem) : reqId;
-      const plat = detId.platform || reqId.platform;
-      const ids = [...new Set([reqId.goods_id, detId.goods_id].filter(Boolean))];
-      const signs = [...new Set([reqId.goods_sign, detId.goods_sign].filter(Boolean))];
-      if (!plat || (!ids.length && !signs.length)) return;
+      const plat = detailItem?.platform || goods.value?.platform || '';
+      const codes = [...new Set([requestedCode, shop.itemCode(detailItem)].filter(Boolean))];
+      if (!codes.length) return;
       const patch = {};
       if (!offPromotion && detailItem) {
         for (const k of ['price', 'original_price', 'coupon_amount', 'saved_price', 'commission_rate', 'commission_amount']) {
@@ -124,22 +122,18 @@
         if (patch.coupon_amount !== undefined && patch.saved_price === undefined) patch.saved_price = patch.coupon_amount;
         if (detailItem.has_coupon !== undefined) patch.has_coupon = Boolean(detailItem.has_coupon);
         else if (patch.coupon_amount !== undefined) patch.has_coupon = patch.coupon_amount > 0;
-        for (const k of ['name', 'sales_tip', 'mall_name', 'product_url']) {
+        for (const k of ['name', 'sales_tip', 'mall_name']) {
           if (typeof detailItem[k] === 'string' && detailItem[k].trim()) patch[k] = detailItem[k].trim();
         }
         const validImg = carouselList.value[0] || normalizeImg(detailItem.image_url);
         if (validImg) patch.image_url = validImg;
       }
-      const matchesItem = item => {
-        if (!item) return false;
-        const cid = shop.goodsIdentity(item);
-        return cid.platform === plat && ((cid.goods_id && ids.includes(cid.goods_id)) || (cid.goods_sign && signs.includes(cid.goods_sign)));
-      };
-      for (const sKey of [
-        `easy_shop_home_return_state:${scope}:${plat}`,
-        `easy_shop_home_search_state:${scope}:${plat}`,
-        `easy_shop_boom_return_state:${scope}:all`,
-      ]) {
+      const matchesItem = item => Boolean(item && codes.includes(shop.itemCode(item)));
+      const storageKeys = [`easy_shop_boom_return_state:${scope}:all`];
+      if (plat) {
+        storageKeys.push(`easy_shop_home_return_state:${scope}:${plat}`, `easy_shop_home_search_state:${scope}:${plat}`);
+      }
+      for (const sKey of storageKeys) {
         try {
           const snap = JSON.parse(global.sessionStorage.getItem(sKey) || 'null');
           if (snap && Array.isArray(snap.list)) {
@@ -152,7 +146,7 @@
         } catch (_) {}
       }
       try {
-        global.sessionStorage.setItem(`easy_shop_bfcache_sync:${scope}`, JSON.stringify({ plat, ids, signs, offPromotion: Boolean(offPromotion), patch }));
+        global.sessionStorage.setItem(`easy_shop_bfcache_sync:${scope}`, JSON.stringify({ codes, offPromotion: Boolean(offPromotion), patch }));
       } catch (_) {}
     };
     const onProductImageError = url => {
@@ -165,9 +159,9 @@
       if (currentImgIndex.value >= carouselList.value.length) {
         currentImgIndex.value = Math.max(0, carouselList.value.length - 1);
       }
-      if (requested) {
+      if (requestedCode) {
         try {
-          const sKey = `current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`;
+          const sKey = `current_goods_summary:${session.scope()}:${requestedCode}`;
           const stored = JSON.parse(global.sessionStorage.getItem(sKey) || 'null');
           if (stored && normalizeImg(stored.image_url) === clean) {
             stored.image_url = carouselList.value[0] || '';
@@ -246,21 +240,59 @@
       const text = dealTip.value?.original_copywriting;
       if (typeof text === 'string' && text.trim()) browser.copyText(text.trim(), '线报话术已复制');
     };
-    const copyDealAuxItem = item => {
-      if (!item) return;
-      const token = typeof item.token === 'string' ? item.token.trim() : '';
-      const url = typeof item.url === 'string' ? item.url.trim() : '';
-      const content = token || url;
-      if (content) browser.copyText(content, token ? '口令已复制，请打开对应 App 使用' : '链接已复制');
+    const redeemDealAuxCoupon = async item => {
+      const couponCode = String(item?.coupon_code || '').trim();
+      if (!couponCode) return null;
+      if (dealAuxPromoCache.has(couponCode)) return dealAuxPromoCache.get(couponCode);
+      if (dealAuxInFlight.has(couponCode)) return dealAuxInFlight.get(couponCode);
+      const pending = (async () => {
+        try {
+          const token = session.token ? session.token() : '';
+          const res = await api.post('/api/promote/convert', { coupon_code: couponCode }, token ? { token } : undefined);
+          if (disposed) return null;
+          if (res.status === 401) { invalidateSession(); return null; }
+          const data = res.data || {};
+          if (res.ok && data.status === 'success' && (data.final_link || data.url || data.promotion_token || data.command_text)) {
+            dealAuxPromoCache.set(couponCode, data);
+            return data;
+          }
+          browser.showToast(data.error_msg || data.detail || '该优惠券暂不可用');
+        } catch (_) {
+          if (!disposed) browser.showToast('获取优惠券失败，请稍后重试');
+        }
+        return null;
+      })().finally(() => {
+        dealAuxInFlight.delete(couponCode);
+      });
+      dealAuxInFlight.set(couponCode, pending);
+      return pending;
     };
-    const openDealAuxItem = item => {
-      if (!item) return;
-      const url = typeof item.url === 'string' ? item.url.trim() : '';
-      const token = typeof item.token === 'string' ? item.token.trim() : '';
+    const copyDealAuxItem = async item => {
+      if (!item?.coupon_code) return;
+      const info = await redeemDealAuxCoupon(item);
+      if (disposed || !info) return;
+      const token = typeof info.promotion_token === 'string' ? info.promotion_token.trim() : '';
+      const url = typeof (info.final_link || info.url) === 'string' ? (info.final_link || info.url).trim() : '';
+      const content = token || info.command_text || url;
+      if (content) {
+        commandModal.value = {
+          visible: true,
+          text: content,
+          wechatGuide: false,
+        };
+        browser.copyText(content, token ? '口令已复制，请打开对应 App 使用' : '链接已复制');
+      }
+    };
+    const openDealAuxItem = async item => {
+      if (!item?.coupon_code) return;
+      const info = await redeemDealAuxCoupon(item);
+      if (disposed || !info) return;
+      const url = typeof (info.final_link || info.url) === 'string' ? (info.final_link || info.url).trim() : '';
+      const token = typeof info.promotion_token === 'string' ? info.promotion_token.trim() : '';
       if (!url && !token) return;
       const pseudoInfo = { final_link: url, promotion_token: token };
       if (!url || (browser.shouldBlockDirectJump && browser.shouldBlockDirectJump(pseudoInfo, url))) {
-        const content = token || url;
+        const content = token || info.command_text || url;
         commandModal.value = {
           visible: true,
           text: content,
@@ -296,18 +328,15 @@
     const PRICE_FEEDBACK_STORAGE_KEY = 'easy_shop_price_feedback_v1';
     const PRICE_FEEDBACK_TTL_MS = 24 * 3600 * 1000;
     const currentProductStatsIdentity = () => {
-      const target = goods.value || requested;
-      if (!target) return { platform: '', product_id: '', goods_sign: '' };
-      const id = shop.goodsIdentity(target);
-      const pid = String(goods.value?.product_id || id.goods_id || id.goods_sign || '').trim();
-      return { platform: id.platform, product_id: pid, goods_sign: id.goods_sign || '' };
+      const code = shop.itemCode(goods.value) || requestedCode;
+      return { item_code: code };
     };
     const sendGoodsAction = action => {
-      const { platform, product_id } = currentProductStatsIdentity();
-      if (!platform || !product_id || !api?.post) return;
+      const { item_code } = currentProductStatsIdentity();
+      if (!item_code || !api?.post) return;
       const token = session.token ? session.token() : '';
       try {
-        Promise.resolve(api.post('/api/goods/action', { platform, product_id, action }, { token, keepalive: true })).catch(() => {});
+        Promise.resolve(api.post('/api/goods/action', { item_code, action }, { token, keepalive: true })).catch(() => {});
       } catch (_) {}
     };
     const readPriceFeedbackStore = () => {
@@ -327,15 +356,15 @@
       }
     };
     const loadPriceFeedback = () => {
-      const { platform, product_id } = currentProductStatsIdentity();
-      if (!platform || !product_id) { priceFeedbackChoice.value = ''; return; }
+      const { item_code } = currentProductStatsIdentity();
+      if (!item_code) { priceFeedbackChoice.value = ''; return; }
       const store = readPriceFeedbackStore();
-      priceFeedbackChoice.value = store[`${platform}:${product_id}`]?.choice || '';
+      priceFeedbackChoice.value = store[item_code]?.choice || '';
     };
     const submitPriceFeedback = action => {
       if (!canOperateDetail.value || (action !== 'buyable' && action !== 'unbuyable')) return;
-      const { platform, product_id } = currentProductStatsIdentity();
-      if (!platform || !product_id) return;
+      const { item_code } = currentProductStatsIdentity();
+      if (!item_code) return;
       if (priceFeedbackChoice.value) {
         browser.showToast('您已反馈过该商品，感谢参与');
         return;
@@ -343,7 +372,7 @@
       priceFeedbackChoice.value = action;
       try {
         const store = readPriceFeedbackStore();
-        store[`${platform}:${product_id}`] = { choice: action, ts: Date.now() };
+        store[item_code] = { choice: action, ts: Date.now() };
         const entries = Object.entries(store).sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0)).slice(0, 100);
         global.localStorage?.setItem(PRICE_FEEDBACK_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
       } catch (_) {}
@@ -360,12 +389,12 @@
         goToRegister();
         return;
       }
-      const { platform, product_id, goods_sign } = currentProductStatsIdentity();
-      if (!platform || (!product_id && !goods_sign)) return;
+      const { item_code } = currentProductStatsIdentity();
+      if (!item_code) return;
       isFavoriteBusy.value = true;
       try {
         if (isFavorited.value) {
-          const res = await api.post('/api/favorites/remove', { platform, product_id, goods_sign }, { token });
+          const res = await api.post('/api/favorites/remove', { item_code }, { token });
           if (res.status === 401) { invalidateSession(); return; }
           if (res.ok && res.data?.status === 'success') {
             isFavorited.value = false;
@@ -376,9 +405,7 @@
         } else {
           const dealPrice = dealTip.value && Number(dealTip.value.deal_price) > 0 ? Number(dealTip.value.deal_price) : null;
           const payload = {
-            platform,
-            product_id,
-            goods_sign,
+            item_code,
             name: goods.value?.name || '',
             image_url: carouselList.value[0] || goods.value?.image_url || '',
             price: dealPrice !== null ? dealPrice : Number(goods.value?.price || 0),
@@ -419,13 +446,9 @@
         return;
       }
       persistCurrentSummary(goods.value);
-      const { platform, product_id, goods_sign } = currentProductStatsIdentity();
-      const params = new URLSearchParams();
-      params.set('platform', platform || goods.value.platform || requested?.platform || 'pdd');
-      if (product_id) params.set('product_id', product_id);
-      if (goods.value?.goods_id) params.set('goods_id', String(goods.value.goods_id));
-      if (goods_sign) params.set('goods_sign', goods_sign);
-      global.location.href = `/submit_deal?${params.toString()}`;
+      const { item_code } = currentProductStatsIdentity();
+      if (!item_code) return;
+      global.location.href = `/submit_deal?${new URLSearchParams({ item: item_code }).toString()}`;
     };
     const goBack = () => {
       if (global.history.length > 1) return global.history.back();
@@ -436,7 +459,7 @@
           return;
         }
       } catch (_) {}
-      const platform = requested?.platform || 'pdd';
+      const platform = goods.value?.platform || 'pdd';
       let keyword = '';
       try { keyword = JSON.parse(global.sessionStorage.getItem(`easy_shop_home_search_keyword:${session.scope()}:${platform}`) || 'null') || ''; } catch (_) {}
       const params = new URLSearchParams({ platform });
@@ -471,14 +494,14 @@
       return identityRestore;
     };
     const loadDeepDetail = async () => {
-      if (disposed || !requested) return;
+      if (disposed || !requestedCode) return;
       const generation = ++detailGeneration;
       isDeepLoading.value = true;
       detailError.value = false;
       detailErrorMsg.value = '';
       isOffPromotion.value = false;
       try {
-        const params = new URLSearchParams(requested);
+        const params = new URLSearchParams({ item_code: requestedCode });
         const token = session.token ? session.token() : '';
         let { ok, status, data } = await api.get(`/api/home/detail?${params}`, token ? { token } : undefined);
         if (generation !== detailGeneration) return;
@@ -504,6 +527,7 @@
             || safePrevMain;
           goods.value = {
             ...(goods.value || {}), ...detail,
+            item_code: shop.itemCode(detail) || requestedCode,
             image_url: nextImageUrl,
             carousel_images: (Array.isArray(detail.carousel_images) && detail.carousel_images.length) ? detail.carousel_images : prevImages,
             deal_tip: detail.deal_tip !== undefined ? detail.deal_tip : (goods.value?.deal_tip || null),
@@ -520,17 +544,18 @@
             detailErrorMsg.value = '商品图片暂未加载成功，请点击重新获取';
           }
         } else {
-          if (data?.error_msg) detailErrorMsg.value = data.error_msg;
+          if (data?.error_msg || data?.detail) detailErrorMsg.value = data.error_msg || data.detail;
           if (data?.error_code === 'PRODUCT_OFF_PROMOTION') {
             isOffPromotion.value = true;
             detailErrorMsg.value = data.error_msg || '该商品已取消推广或已下架，请挑选其他好物';
             goods.value = null;
             syncDocumentTitle();
             syncOuterSnapshots(null, true);
-            try { global.sessionStorage.removeItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`); } catch (_) {}
+            try { global.sessionStorage.removeItem(`current_goods_summary:${session.scope()}:${requestedCode}`); } catch (_) {}
             browser.showToast(detailErrorMsg.value);
-          } else if (data?.error_code === 'missing_product_identity' || data?.error_code === 'INVALID_ARGUMENT') {
+          } else if (data?.error_code === 'missing_product_identity' || data?.error_code === 'INVALID_ARGUMENT' || status === 400 || status === 422) {
             isOffPromotion.value = true;
+            if (!detailErrorMsg.value) detailErrorMsg.value = '商品编号无效，请返回首页挑选好物';
           }
           detailError.value = true;
         }
@@ -548,7 +573,7 @@
       if (disposed || !goods.value) return null;
       await restoreIdentity();
       if (disposed) return null;
-      const product = { ...goods.value };
+      const product = { ...goods.value, item_code: shop.itemCode(goods.value) || requestedCode };
       const snapshot = session.capture();
       // A token removed or changed in another tab must not retain the old UID.
       const accountUid = isLoggedIn.value && verifiedSession && session.isCurrent(verifiedSession) ? uid.value : '';
@@ -578,14 +603,8 @@
             return data;
           }
           if (response.status === 403) { browser.showToast(data.detail || '推广身份不匹配，请重新登录'); return null; }
-          if (data?.error_code === 'PRODUCT_OFF_PROMOTION' || !product.product_url?.trim()) {
-            browser.showToast(data.error_msg || data.detail || '平台未返回有效推广链接，请稍后重试');
-            return null;
-          }
-          browser.showToast('专属优惠暂不可用，已提供商品原链接');
-          const fallback = { final_link: product.product_url, is_fallback: true };
-          promotionSessions.set(fallback, snapshot);
-          return fallback;
+          browser.showToast(data?.error_msg || data?.detail || '平台未返回有效推广链接，请稍后重试');
+          return null;
         } catch (error) {
           global.console.warn('转链异常:', error);
           if (!disposed && generation === conversionGeneration && session.isCurrent(snapshot)) browser.showToast(failureTip);
@@ -613,17 +632,17 @@
     const showAuthorization = (info, action) => {
       if (!canUse(info)) return;
       recheck.stop();
-      const platform = info.auth_platform || shop.goodsIdentity(goods.value).platform;
+      const platform = info.auth_platform || goods.value?.platform || '';
       pendingAuthorizationInfo = info;
       authModal.value = { visible: true, platform,
-        platformName: info.auth_platform_name || (platform === goods.value.platform ? platformName.value : platform),
+        platformName: info.auth_platform_name || (platform === goods.value?.platform ? platformName.value : platform),
         msg: info.auth_msg || info.error_msg || '尚未完成平台渠道授权备案；通用链接不保证计入本人推广佣金。',
         action, pendingInfo: info };
     };
     const executeJumpToBuy = info => {
       if (!canUse(info)) return;
       const content = info.command_text || info.promotion_token || info.final_link;
-      if (browser.shouldBlockDirectJump && browser.shouldBlockDirectJump(info, goods.value?.product_url || '')) {
+      if (browser.shouldBlockDirectJump && browser.shouldBlockDirectJump(info, '')) {
         if (content) {
           commandModal.value = {
             visible: true,
@@ -639,7 +658,7 @@
       if (content) {
         browser.copyText(content, `已复制推广信息，正在前往${platformName.value}领券...`);
       }
-      browser.jumpToLink(info, goods.value?.product_url || '', () => canUse(info));
+      browser.jumpToLink(info, '', () => canUse(info));
     };
     const executeCopyPromoteLink = (info, successTip) => {
       if (!canUse(info)) return;
@@ -711,8 +730,8 @@
       const params = new URLSearchParams(global.location.search);
       const incomingInvite = params.get('invite_code') || '';
       if (incomingInvite && session.savePendingInvite) session.savePendingInvite(incomingInvite);
-      requested = shop.goodsIdentity({ goods_id: params.get('goods_id'), goods_sign: params.get('goods_sign'), platform: params.get('platform') });
-      if (!requested.goods_id && !requested.goods_sign) {
+      requestedCode = String(params.get('item') || '').trim();
+      if (!requestedCode) {
         isDeepLoading.value = false;
         detailError.value = true;
         isOffPromotion.value = true;
@@ -726,15 +745,11 @@
       }
       let hasSummary = false;
       try {
-        const summary = JSON.parse(global.sessionStorage.getItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(requested)}`) || 'null');
-        if (shop.matchesGoodsSummary(summary, requested)) {
+        const summary = JSON.parse(global.sessionStorage.getItem(`current_goods_summary:${session.scope()}:${requestedCode}`) || 'null');
+        if (shop.matchesGoodsSummary(summary, requestedCode)) {
           goods.value = summary;
           hasSummary = true;
           syncDocumentTitle();
-          const cachedIdentity = shop.goodsIdentity(summary);
-          if (requested.platform !== 'pdd' && (!requested.goods_sign || requested.goods_sign === requested.goods_id) && cachedIdentity.goods_sign) {
-            requested = { ...requested, goods_sign: cachedIdentity.goods_sign };
-          }
         }
       } catch (_) {}
       if (!hasSummary) browser.startSmartLoading('正在加载商品详情...', [

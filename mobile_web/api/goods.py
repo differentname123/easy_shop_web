@@ -4,17 +4,18 @@
 """
 from typing import Optional
 from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from auth import get_optional_uid
 from api.home import product_service, product_stats_buffer
+from public_boundary import require_item_code
 from services.product_stats_service import extract_actor_key
 
 router = APIRouter(prefix="/api/goods", tags=["爆单推广库"])
 
 
 class ProductActionRequest(BaseModel):
-    platform: str = Field(..., min_length=1, max_length=32, pattern="^[a-z][a-z0-9_]*$")
-    product_id: str = Field(..., min_length=1, max_length=128)
+    model_config = ConfigDict(extra="forbid")
+    item_code: str = Field(..., min_length=8, max_length=256)
     action: str = Field(..., pattern="^(share|buyable|unbuyable)$")
 
 
@@ -25,9 +26,10 @@ def record_product_action(
     current_uid: Optional[str] = Depends(get_optional_uid),
 ):
     """通用商品动作统计上报（分享、能买到/买不到），仅内存聚合异步刷盘。"""
+    plat, cid = require_item_code(req.item_code)
     product_stats_buffer.record(
-        req.platform,
-        req.product_id,
+        plat,
+        cid,
         req.action,
         extract_actor_key(request, current_uid),
     )

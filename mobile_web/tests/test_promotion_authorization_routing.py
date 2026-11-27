@@ -384,11 +384,14 @@ def test_universal_convert_http_route_and_keyword_or_ambiguous_interceptions(mon
         "/api/promote/universal",
         json={"text": "67￥JBnB61RqEqX￥ https://m.tb.cn/h.xxx 好丽友巧克力派", "platform": "auto"},
     )
+    from public_boundary import encode_item_code
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "success" and body["platform"] == "taobao"
     assert body["promotion_token"] == "￥JBnB61RqEqX￥"
-    assert body["product"]["goods_id"] == "TB_ENC_ID_999"
+    assert body["product"]["item_code"] == encode_item_code("taobao", "TB_ENC_ID_999")
+    assert "goods_id" not in body["product"] and "goods_sign" not in body["product"]
+    assert "goods_id" not in body and "goods_sign" not in body
 
     # 验证错误清洗单一真源对 UPSTREAM_ERROR / RATE_LIMIT / 数字网关码的收口（detail 与 convert 出口）
     from unittest.mock import MagicMock as _MM

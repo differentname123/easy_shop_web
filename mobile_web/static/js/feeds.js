@@ -350,22 +350,20 @@
         payload = JSON.parse(global.sessionStorage.getItem(syncKey) || 'null');
         if (payload) global.sessionStorage.removeItem(syncKey);
       } catch (_) {}
-      if (!payload || !payload.plat) return;
-      const ids = Array.isArray(payload.ids) ? payload.ids : [];
-      const signs = Array.isArray(payload.signs) ? payload.signs : [];
+      const codes = Array.isArray(payload?.codes) ? payload.codes.filter(Boolean) : [];
+      if (!payload || !codes.length) return;
+      const codeSet = new Set(codes);
       const applyList = list => {
         if (!Array.isArray(list) || !list.length) return list;
         let changed = false;
         const next = payload.offPromotion
           ? list.filter(it => {
-              const cid = it ? shop.goodsIdentity(it) : null;
-              const matched = Boolean(cid && cid.platform === payload.plat && ((cid.goods_id && ids.includes(cid.goods_id)) || (cid.goods_sign && signs.includes(cid.goods_sign))));
+              const matched = Boolean(it && codeSet.has(shop.itemCode(it)));
               if (matched) changed = true;
               return !matched;
             })
           : list.map(it => {
-              const cid = it ? shop.goodsIdentity(it) : null;
-              if (!cid || cid.platform !== payload.plat || !((cid.goods_id && ids.includes(cid.goods_id)) || (cid.goods_sign && signs.includes(cid.goods_sign)))) return it;
+              if (!it || !codeSet.has(shop.itemCode(it))) return it;
               changed = true;
               return { ...it, ...(payload.patch || {}) };
             });

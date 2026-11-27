@@ -158,14 +158,15 @@
         return walletRestore;
       };
       const openGoodsDetail = item => {
+        const code = shop.itemCode(item);
+        if (!code) return;
         try {
-          global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${shop.goodsKey(item)}`, JSON.stringify(item));
+          global.sessionStorage.setItem(`current_goods_summary:${session.scope()}:${code}`, JSON.stringify(item));
           global.sessionStorage.setItem(`easy_shop_last_active_tab:${session.scope()}`, currentTab.value);
         } catch (_) {}
         if (currentTab.value === 'boom') feeds.saveBoomState();
         else feeds.saveSearchState();
-        const params = new URLSearchParams(shop.goodsIdentity(item));
-        global.location.href = `/detail?${params}`;
+        global.location.href = shop.buildDetailUrl(code);
       };
       const executeRefresh = async () => {
         try {
