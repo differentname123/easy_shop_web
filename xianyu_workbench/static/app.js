@@ -183,6 +183,37 @@ createApp({
     const aiGenerating = ref(false);
     const savingEditor = ref(false);
     const zoomImageUrl = ref('');
+    const titleDirty = ref(false);
+    const descDirty = ref(false);
+    let editCopyPollTimer = null;
+    let itemsCopyPollTimer = null;
+
+    function markTitleDirty() {
+      titleDirty.value = true;
+    }
+
+    function markDescDirty() {
+      descDirty.value = true;
+    }
+
+    function resetCopyDirty() {
+      titleDirty.value = false;
+      descDirty.value = false;
+    }
+
+    function stopEditCopyPoll() {
+      if (editCopyPollTimer) {
+        clearInterval(editCopyPollTimer);
+        editCopyPollTimer = null;
+      }
+    }
+
+    function stopItemsCopyPoll() {
+      if (itemsCopyPollTimer) {
+        clearTimeout(itemsCopyPollTimer);
+        itemsCopyPollTimer = null;
+      }
+    }
 
     const unusedPoolImages = computed(() => {
       if (!editing.value) return [];
@@ -285,6 +316,8 @@ createApp({
 
     async function doLogout() {
       stopQrPolling();
+      stopEditCopyPoll();
+      stopItemsCopyPoll();
       try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {}
       user.value = null;
       candidates.value = [];
@@ -396,6 +429,42 @@ createApp({
       }
     }
 
+    function startEditCopyPoll(listingId) {
+      stopEditCopyPoll();
+      if (!listingId) return;
+      editCopyPollTimer = setInterval(async () => {
+        if (!editing.value || editing.value.listing_id !== listingId) {
+          stopEditCopyPoll();
+          return;
+        }
+        try {
+          const fresh = await api(`/api/items/${encodeURIComponent(listingId)}`);
+          if (!editing.value || editing.value.listing_id !== listingId) {
+            stopEditCopyPoll();
+            return;
+          }
+          editing.value.copy_status = fresh.copy_status || '';
+          editing.value.copy_error = fresh.copy_error || '';
+          if (fresh.copy_status !== 'generating') {
+            stopEditCopyPoll();
+            let updated = false;
+            if (fresh.title && !titleDirty.value) {
+              editing.value.title = fresh.title;
+              updated = true;
+            }
+            if (fresh.description && (!descDirty.value || !String(editing.value.description || '').trim())) {
+              editing.value.description = fresh.description;
+              updated = true;
+            }
+            if (updated) {
+              showToast('✨ 后台已自动生成文案');
+            }
+            loadItems().catch(() => {});
+          }
+        } catch (_) {}
+      }, 1200);
+    }
+
     async function pickCandidate(c) {
       try {
         const doc = await api('/api/items/draft', {
@@ -410,7 +479,11 @@ createApp({
           (x) => !(x.platform === c.platform && x.product_id === c.product_id)
         );
         if (pickSource.value === 'eval' && evalTotal.value > 0) evalTotal.value -= 1;
+        resetCopyDirty();
         editing.value = JSON.parse(JSON.stringify(doc));
+        if (doc.copy_status === 'generating') {
+          startEditCopyPoll(doc.listing_id);
+        }
         await Promise.all([loadItems(), refreshMeAndChannels()]);
       } catch (e) {
         showToast(e.message);
@@ -419,11 +492,17 @@ createApp({
 
     // 本地待上架 & 在售切换
     async function loadItems() {
+      stopItemsCopyPoll();
       itemsLoading.value = true;
       try {
         const data = await api('/api/items?status=active&page=1&page_size=80');
         localItems.value = data.items || [];
         if (data.item_counts) itemCounts.value = data.item_counts;
+        if (user.value && localItems.value.some((it) => it.copy_status === 'generating')) {
+          itemsCopyPollTimer = setTimeout(() => {
+            if (user.value) loadItems().catch(() => {});
+          }, 2500);
+        }
       } catch (e) {
         showToast(e.message);
       } finally {
@@ -466,13 +545,24 @@ createApp({
     async function openEditor(item) {
       try {
         const detail = await api(`/api/items/${encodeURIComponent(item.listing_id)}`);
+        resetCopyDirty();
         editing.value = JSON.parse(JSON.stringify(detail));
+        if (detail.copy_status === 'generating') {
+          startEditCopyPoll(detail.listing_id);
+        } else {
+          stopEditCopyPoll();
+          // 兼容历史空白草稿：首次打开且尚无文案时自动生成一次并落库
+          if (detail.status === 'draft' && !String(detail.description || '').trim() && !detail.copy_status) {
+            generateEditorCopy();
+          }
+        }
       } catch (e) {
         showToast(e.message);
       }
     }
 
     function closeEditor() {
+      stopEditCopyPoll();
       editing.value = null;
     }
 
@@ -522,18 +612,40 @@ createApp({
 
     async function generateEditorCopy() {
       if (!editing.value) return;
+      const targetId = editing.value.listing_id;
       aiGenerating.value = true;
+      stopEditCopyPoll();
       try {
-        const data = await api(`/api/items/${encodeURIComponent(editing.value.listing_id)}/generate-copy`, {
+        const data = await api(`/api/items/${encodeURIComponent(targetId)}/generate-copy`, {
           method: 'POST',
         });
+        if (!editing.value || editing.value.listing_id !== targetId) return;
         editing.value.title = data.title || editing.value.title;
         editing.value.description = data.description || editing.value.description;
-        showToast('已生成帮拍话术');
+        editing.value.copy_status = data.copy_status || 'ready';
+        editing.value.copy_error = '';
+        resetCopyDirty();
+        loadItems().catch(() => {});
+        showToast('已生成并保存文案');
       } catch (e) {
-        showToast(e.message);
+        if (editing.value && editing.value.listing_id === targetId) {
+          showToast(e.message);
+        }
       } finally {
         aiGenerating.value = false;
+      }
+    }
+
+    async function promoteDraftToReady(it) {
+      try {
+        await api(`/api/items/${encodeURIComponent(it.listing_id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'ready' }),
+        });
+        showToast('已加入选品库');
+        await Promise.all([loadItems(), refreshMeAndChannels()]);
+      } catch (e) {
+        showToast(e.message);
       }
     }
 
@@ -552,7 +664,7 @@ createApp({
           }),
         });
         showToast(targetStatus === 'ready' ? '已加入待上架' : '草稿已保存');
-        editing.value = null;
+        closeEditor();
         await Promise.all([loadItems(), refreshMeAndChannels()]);
       } catch (e) {
         showToast(e.message);
@@ -568,7 +680,7 @@ createApp({
           method: 'PATCH',
           body: JSON.stringify({ status: 'dismissed' }),
         });
-        editing.value = null;
+        closeEditor();
         showToast('已移出清单');
         await Promise.all([loadItems(), refreshMeAndChannels()]);
       } catch (e) {
@@ -872,12 +984,14 @@ createApp({
         // 重新推入状态，使工作台留在原位
         history.pushState({ page: 'workbench' }, '', location.href);
         // 若编辑抽屉打开，则关闭抽屉（而非退出页面）
-        if (editing.value) { editing.value = null; }
+        if (editing.value) { closeEditor(); }
       });
     });
 
     onBeforeUnmount(() => {
       stopQrPolling();
+      stopEditCopyPoll();
+      stopItemsCopyPoll();
       window.removeEventListener('beforeunload', handlePageUnload);
     });
 
@@ -944,11 +1058,14 @@ createApp({
       openMeTab,
       openEditor,
       closeEditor,
+      markTitleDirty,
+      markDescDirty,
       removeEditorImage,
       setCoverImage,
       addPoolImage,
       onPickUploadFiles,
       generateEditorCopy,
+      promoteDraftToReady,
       saveEditor,
       dismissFromEditor,
       copyItemCopy,

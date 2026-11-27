@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import uuid
 
 from fastapi import HTTPException
@@ -31,6 +33,9 @@ PROMPT_PATH = WORKBENCH_DIR / "prompts" / "copywriting.txt"
 _MAX_UPLOAD_DIMENSION = 1600
 _SCREENSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}\.jpg$")
 _UPLOAD_NAME_RE = re.compile(r"^upl_[0-9a-f]{16}\.jpg$")
+_PLATFORM_READABLE = {"jd": "京东", "taobao": "淘宝", "pdd": "拼多多"}
+_COPY_STALE_SECONDS = 150
+LOGGER = logging.getLogger("xianyu_workbench.copy")
 
 
 def _positive_float(val: Any) -> Optional[float]:
@@ -146,6 +151,18 @@ class WorkbenchService:
         self.config = config or load_config()
         self._ai_generator = ai_generator or generate_ai_copy
         self._json_parser = json_parser or parse_ai_json
+        self._copy_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xy_copy")
+        self._copy_lock = threading.Lock()
+        self._copy_inflight: Set[Tuple[str, str]] = set()
+        self._shutting_down = threading.Event()
+
+    def shutdown(self, wait: bool = True) -> None:
+        """停机时停止接收并等待或取消后台文案生成任务，避免悬挂线程访问已关闭库连接。"""
+        self._shutting_down.set()
+        try:
+            self._copy_executor.shutdown(wait=wait, cancel_futures=True)
+        except TypeError:
+            self._copy_executor.shutdown(wait=wait)
 
     # =========================================================================
     # 账号登录与主站收藏 UID 绑定
@@ -478,7 +495,12 @@ class WorkbenchService:
             updated = self.repo.update_listing_by_id(
                 owner,
                 existing["listing_id"],
-                {"status": "dismissed", "updated_at": now},
+                {
+                    "status": "dismissed",
+                    "copy_gen_token": "",
+                    "copy_status": "" if existing.get("copy_status") == "generating" else str(existing.get("copy_status") or ""),
+                    "updated_at": now,
+                },
             )
             return {"listing_id": (updated or existing).get("listing_id"), "status": "dismissed"}
 
@@ -488,7 +510,7 @@ class WorkbenchService:
             owner,
             plat,
             pid,
-            set_fields={"status": "dismissed", "updated_at": now},
+            set_fields={"status": "dismissed", "copy_gen_token": "", "updated_at": now},
             set_on_insert={
                 "listing_id": f"xyl_{uuid.uuid4().hex[:8]}",
                 "owner": owner,
@@ -497,6 +519,8 @@ class WorkbenchService:
                 "source_origin": source_origin or "xianyu_eval",
                 "title": title,
                 "description": "",
+                "copy_status": "",
+                "copy_error": "",
                 "images": [],
                 "price": 0.0,
                 "created_at": now,
@@ -537,6 +561,21 @@ class WorkbenchService:
         raw_pf = doc.get("publish_failure")
         publish_failure = dict(raw_pf) if isinstance(raw_pf, dict) and raw_pf else None
 
+        copy_status = str(doc.get("copy_status") or "").strip()
+        copy_error = str(doc.get("copy_error") or "").strip()
+        lid_clean = str(doc.get("listing_id") or "").strip()
+        owner_clean = str(doc.get("owner") or "").strip()
+        if copy_status == "generating":
+            with self._copy_lock:
+                inflight = (owner_clean, lid_clean) in self._copy_inflight
+            if not inflight:
+                upd_at = doc.get("updated_at")
+                if isinstance(upd_at, datetime):
+                    dt_utc = upd_at.replace(tzinfo=timezone.utc) if upd_at.tzinfo is None else upd_at.astimezone(timezone.utc)
+                    if (datetime.now(timezone.utc) - dt_utc).total_seconds() > _COPY_STALE_SECONDS:
+                        copy_status = "failed"
+                        copy_error = "后台生成已中断，请点击重试"
+
         # 向后兼容读取老文档的 sell_price / rejected
         raw_price = doc.get("price") if doc.get("price") is not None else doc.get("sell_price")
         display_price = _nonneg_float(raw_price, 0.0)
@@ -550,8 +589,8 @@ class WorkbenchService:
                 })
 
         return {
-            "listing_id": str(doc.get("listing_id") or ""),
-            "owner": str(doc.get("owner") or ""),
+            "listing_id": lid_clean,
+            "owner": owner_clean,
             "platform": plat,
             "product_id": pid,
             "main_item_code": main_item_code,
@@ -559,6 +598,8 @@ class WorkbenchService:
             "status": _normalize_status(doc.get("status")),
             "title": str(doc.get("title") or "").strip(),
             "description": str(doc.get("description") or "").strip(),
+            "copy_status": copy_status,
+            "copy_error": copy_error,
             "images": clean_images,
             "price": display_price,
             "xianyu_ref_url": xianyu_ref_url,
@@ -576,6 +617,45 @@ class WorkbenchService:
             "confirmed_at": _iso_utc(doc.get("confirmed_at")) if doc.get("confirmed_at") else "",
         }
 
+    def _claim_copy_slot(self, owner: str, listing_id: str) -> str:
+        """为后台生成申请互斥槽位与令牌；若已在运行或服务停机中则返回空字符串。"""
+        with self._copy_lock:
+            if self._shutting_down.is_set():
+                return ""
+            key = (str(owner).strip(), str(listing_id or "").strip())
+            if not key[0] or not key[1] or key in self._copy_inflight:
+                return ""
+            token = uuid.uuid4().hex[:12]
+            self._copy_inflight.add(key)
+            return token
+
+    def _release_copy_slot(self, owner: str, listing_id: str) -> None:
+        with self._copy_lock:
+            self._copy_inflight.discard((str(owner).strip(), str(listing_id or "").strip()))
+
+    def _submit_background_copy(self, owner: str, listing_id: str, token: str) -> None:
+        """提交已写好令牌的后台文案任务；提交失败时立即释放槽位并回写失败态。"""
+        if not token:
+            return
+        try:
+            self._copy_executor.submit(self._run_background_copy_task, owner, listing_id, token)
+        except Exception as exc:
+            self._release_copy_slot(owner, listing_id)
+            try:
+                self.repo.finish_listing_copy_generation(
+                    owner,
+                    listing_id,
+                    token=token,
+                    set_fields={
+                        "copy_status": "failed",
+                        "copy_error": f"后台任务投递失败: {exc}"[:200],
+                        "copy_gen_token": "",
+                        "updated_at": datetime.now(timezone.utc),
+                    },
+                )
+            except Exception:
+                pass
+
     def create_or_open_draft(
         self,
         owner: str,
@@ -583,6 +663,7 @@ class WorkbenchService:
         platform: str,
         product_id: str,
         source_origin: str = "favorite",
+        auto_generate_copy: bool = True,
     ) -> Dict[str, Any]:
         plat = normalize_platform(platform)
         pid = clean_id(product_id)
@@ -594,12 +675,29 @@ class WorkbenchService:
         ev = self.repo.find_best_evaluation_for_product(plat, pid)
         existing = self.repo.get_listing_by_product(owner, plat, pid)
         if existing is not None:
+            lid = existing["listing_id"]
+            updates: Dict[str, Any] = {}
             if _normalize_status(existing.get("status")) == "dismissed":
-                existing = self.repo.update_listing_by_id(
-                    owner,
-                    existing["listing_id"],
-                    {"status": "draft", "updated_at": now},
-                ) or existing
+                updates["status"] = "draft"
+            token = ""
+            if auto_generate_copy and not str(existing.get("description") or "").strip():
+                token = self._claim_copy_slot(owner, lid)
+                if token:
+                    updates.update({
+                        "copy_status": "generating",
+                        "copy_error": "",
+                        "copy_gen_token": token,
+                    })
+            if updates:
+                updates["updated_at"] = now
+                try:
+                    existing = self.repo.update_listing_by_id(owner, lid, updates) or existing
+                except Exception:
+                    if token:
+                        self._release_copy_slot(owner, lid)
+                    raise
+                if token:
+                    self._submit_background_copy(owner, lid, token)
             return self._hydrate_item(existing, prod, ev)
 
         user = self.repo.get_user(owner) or {}
@@ -641,29 +739,50 @@ class WorkbenchService:
             or str((ev or {}).get("name") or "").strip()
         )
         listing_id = f"xyl_{uuid.uuid4().hex[:8]}"
+        token = self._claim_copy_slot(owner, listing_id) if auto_generate_copy else ""
 
-        created = self.repo.upsert_listing(
-            owner,
-            plat,
-            pid,
-            set_fields={"updated_at": now},
-            set_on_insert={
-                "listing_id": listing_id,
-                "owner": owner,
-                "platform": plat,
-                "product_id": pid,
-                "source_origin": source_origin or ("xianyu_eval" if ev else "favorite"),
-                "status": "draft",
-                "title": raw_title[:30],
-                "description": "",
-                "images": default_images,
-                "price": default_price,
-                "created_at": now,
-                "confirmed_at": None,
-            },
-        )
+        set_fields: Dict[str, Any] = {"updated_at": now}
+        if token:
+            set_fields.update({
+                "copy_status": "generating",
+                "copy_error": "",
+                "copy_gen_token": token,
+            })
+
+        try:
+            created = self.repo.upsert_listing(
+                owner,
+                plat,
+                pid,
+                set_fields=set_fields,
+                set_on_insert={
+                    "listing_id": listing_id,
+                    "owner": owner,
+                    "platform": plat,
+                    "product_id": pid,
+                    "source_origin": source_origin or ("xianyu_eval" if ev else "favorite"),
+                    "status": "draft",
+                    "title": raw_title[:30],
+                    "description": "",
+                    "copy_status": "generating" if token else "",
+                    "copy_error": "",
+                    "copy_gen_token": token,
+                    "images": default_images,
+                    "price": default_price,
+                    "created_at": now,
+                    "confirmed_at": None,
+                },
+            )
+        except Exception:
+            if token:
+                self._release_copy_slot(owner, listing_id)
+            raise
         if not created:
+            if token:
+                self._release_copy_slot(owner, listing_id)
             raise HTTPException(status_code=500, detail="创建商品素材草稿失败")
+        if token:
+            self._submit_background_copy(owner, created["listing_id"], token)
         return self._hydrate_item(created, prod, ev)
 
     def get_item_detail(self, owner: str, listing_id: str) -> Dict[str, Any]:
@@ -714,12 +833,18 @@ class WorkbenchService:
         if not existing:
             raise HTTPException(status_code=404, detail="商品素材不存在或无权编辑")
 
-        set_fields: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc)}
+        now = datetime.now(timezone.utc)
+        set_fields: Dict[str, Any] = {"updated_at": now}
 
         if "title" in updates and updates["title"] is not None:
             set_fields["title"] = str(updates["title"]).strip()[:60]
         if "description" in updates and updates["description"] is not None:
-            set_fields["description"] = str(updates["description"]).strip()[:2000]
+            clean_desc = str(updates["description"]).strip()[:2000]
+            set_fields["description"] = clean_desc
+            if clean_desc:
+                set_fields["copy_status"] = "ready"
+                set_fields["copy_error"] = ""
+                set_fields["copy_gen_token"] = ""
         if "images" in updates and updates["images"] is not None:
             set_fields["images"] = self._sanitize_images(updates["images"])
         if "price" in updates and updates["price"] is not None:
@@ -736,6 +861,10 @@ class WorkbenchService:
                 raise HTTPException(status_code=400, detail=f"不支持的状态: {raw_req_status}")
             target_status = raw_req_status
             set_fields["status"] = target_status
+            if target_status == "dismissed":
+                set_fields["copy_gen_token"] = ""
+                if existing.get("copy_status") == "generating":
+                    set_fields["copy_status"] = ""
 
         merged = {**existing, **set_fields}
         eff_price = _nonneg_float(
@@ -751,7 +880,7 @@ class WorkbenchService:
                 raise HTTPException(status_code=400, detail="加入待上架前请填写大于 0 的标价")
             if not (isinstance(merged.get("images"), list) and len(merged["images"]) >= 1):
                 raise HTTPException(status_code=400, detail="加入待上架前请至少保留 1 张商品图片")
-            set_fields["confirmed_at"] = datetime.now(timezone.utc)
+            set_fields["confirmed_at"] = now
 
         updated = self.repo.update_listing_by_id(owner, listing_id, set_fields)
         if not updated:
@@ -760,37 +889,43 @@ class WorkbenchService:
         ev = self.repo.find_best_evaluation_for_product(updated["platform"], updated["product_id"])
         return self._hydrate_item(updated, prod, ev)
 
-    def generate_copy(self, owner: str, listing_id: str) -> Dict[str, Any]:
-        doc = self.repo.get_listing_by_id(owner, listing_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="商品素材不存在或无权操作")
-        prod = self.repo.get_product_one(doc["platform"], doc["product_id"]) or {}
+    def _build_copy_prompt(self, doc: Dict[str, Any], prod: Dict[str, Any]) -> Tuple[str, str]:
         di = prod.get("deal_info") if isinstance(prod.get("deal_info"), dict) else {}
-
+        plat = normalize_platform(doc.get("platform"))
         raw_price = doc.get("price") if doc.get("price") is not None else doc.get("sell_price")
         display_price = _nonneg_float(raw_price, 0.0)
-        prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
-        context_payload = {
-            "product_name": str(prod.get("name") or doc.get("title") or "").strip(),
-            "source_platform": normalize_platform(doc.get("platform")),
+        fallback_name = str(prod.get("name") or doc.get("title") or "").strip()
+
+        raw_payload: Dict[str, Any] = {
+            "product_name": fallback_name,
+            "platform": _PLATFORM_READABLE.get(plat, plat),
+            "shop_name": str(prod.get("mall_name") or prod.get("shop_name") or "").strip(),
             "brand": str(prod.get("brand") or "").strip(),
             "category": str(prod.get("category") or "").strip(),
             "specs": prod.get("specs") or [],
-            "price": display_price,
+            "price": display_price if display_price > 0 else None,
             "deal_highlight": str(di.get("card_highlight") or "").strip(),
-            "deal_price_logic": str(di.get("price_logic") or "").strip(),
+            "service_guarantees": [
+                str(x).strip() for x in (prod.get("service_guarantees") or []) if str(x).strip()
+            ],
         }
+        context_payload = {k: v for k, v in raw_payload.items() if v}
+        prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
         full_prompt = (
             f"{prompt_template}\n\n"
             f"<product_input>\n{json.dumps(context_payload, ensure_ascii=False, indent=2)}\n</product_input>"
         )
+        return full_prompt, fallback_name
 
+    def _invoke_copy_llm(self, doc: Dict[str, Any], prod: Dict[str, Any]) -> Dict[str, str]:
+        """调用大模型并解析 `{title, description}`，供后台异步与手动重生成共用。"""
+        full_prompt, fallback_name = self._build_copy_prompt(doc, prod)
         res = self._ai_generator(full_prompt)
         raw_content = str((res or {}).get("content") or "").strip()
         status_str = str((res or {}).get("status") or "")
         model_used = str(((res or {}).get("metrics") or {}).get("model_used") or "")
         if ("失败" in status_str and not raw_content) or not raw_content:
-            raise HTTPException(status_code=502, detail=f"AI 文案生成失败: {status_str or '空响应'}")
+            raise ValueError(f"AI 文案生成失败: {status_str or '空响应'}")
 
         title = ""
         description = ""
@@ -806,13 +941,91 @@ class WorkbenchService:
                 description = "\n".join(lines[1:]).strip() or lines[0]
 
         if not title:
-            title = str(doc.get("title") or context_payload["product_name"])[:30]
+            title = str(doc.get("title") or fallback_name)[:30]
         if not description:
             description = raw_content
         return {
             "title": title[:30],
             "description": description[:2000],
             "model_used": model_used,
+        }
+
+    def _run_background_copy_task(self, owner: str, listing_id: str, token: str) -> None:
+        try:
+            if self._shutting_down.is_set():
+                return
+            doc = self.repo.get_listing_by_id(owner, listing_id)
+            if not doc or _normalize_status(doc.get("status")) == "dismissed":
+                return
+            if str(doc.get("copy_gen_token") or "") != token:
+                return
+            prod = self.repo.get_product_one(doc["platform"], doc["product_id"]) or {}
+            generated = self._invoke_copy_llm(doc, prod)
+            saved = self.repo.finish_listing_copy_generation(
+                owner,
+                listing_id,
+                token=token,
+                set_fields={
+                    "title": generated["title"],
+                    "description": generated["description"],
+                    "copy_status": "ready",
+                    "copy_error": "",
+                    "copy_gen_token": "",
+                    "copy_model": generated.get("model_used") or "",
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+            if not saved:
+                LOGGER.info("跳过回写后台文案（可能已被手动修改或移出）: %s/%s", owner, listing_id)
+        except Exception as exc:
+            LOGGER.warning("后台文案生成失败 %s/%s: %s", owner, listing_id, exc)
+            try:
+                self.repo.finish_listing_copy_generation(
+                    owner,
+                    listing_id,
+                    token=token,
+                    set_fields={
+                        "copy_status": "failed",
+                        "copy_error": str(exc)[:200],
+                        "copy_gen_token": "",
+                        "updated_at": datetime.now(timezone.utc),
+                    },
+                )
+            except Exception:
+                pass
+        finally:
+            self._release_copy_slot(owner, listing_id)
+
+    def generate_copy(self, owner: str, listing_id: str) -> Dict[str, Any]:
+        doc = self.repo.get_listing_by_id(owner, listing_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="商品素材不存在或无权操作")
+        prod = self.repo.get_product_one(doc["platform"], doc["product_id"]) or {}
+        try:
+            generated = self._invoke_copy_llm(doc, prod)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        now = datetime.now(timezone.utc)
+        self.repo.update_listing_by_id(
+            owner,
+            listing_id,
+            {
+                "title": generated["title"],
+                "description": generated["description"],
+                "copy_status": "ready",
+                "copy_error": "",
+                "copy_gen_token": "",
+                "copy_model": generated.get("model_used") or "",
+                "updated_at": now,
+            },
+        )
+        return {
+            "title": generated["title"],
+            "description": generated["description"],
+            "model_used": generated.get("model_used") or "",
+            "copy_status": "ready",
+            "copy_error": "",
         }
 
     def list_items(

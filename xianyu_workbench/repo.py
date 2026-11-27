@@ -236,11 +236,13 @@ class WorkbenchRepository:
             "platform": normalize_platform(platform),
             "product_id": clean_id(product_id),
         }
-        self.listings_col.update_one(
-            flt,
-            {"$set": set_fields, "$setOnInsert": set_on_insert},
-            upsert=True,
-        )
+        # MongoDB 严禁同一字段同时出现在 $set 与 $setOnInsert 中（code=40 path conflict）
+        clean_set = dict(set_fields or {})
+        clean_on_insert = {k: v for k, v in (set_on_insert or {}).items() if k not in clean_set}
+        update_doc: Dict[str, Any] = {"$set": clean_set}
+        if clean_on_insert:
+            update_doc["$setOnInsert"] = clean_on_insert
+        self.listings_col.update_one(flt, update_doc, upsert=True)
         return self.get_listing_by_product(flt["owner"], flt["platform"], flt["product_id"])
 
     def update_listing_by_id(
@@ -255,6 +257,27 @@ class WorkbenchRepository:
         if int(getattr(res, "matched_count", 0) or 0) == 0:
             return None
         return self.get_listing_by_id(flt["owner"], flt["listing_id"])
+
+    def finish_listing_copy_generation(
+        self,
+        owner: str,
+        listing_id: str,
+        *,
+        token: str,
+        set_fields: Dict[str, Any],
+    ) -> bool:
+        """按生成令牌原子回写异步文案结果，若已被人工覆盖或移出则安全放弃。"""
+        self.ensure_indexes()
+        clean_tok = str(token or "").strip()
+        if not clean_tok:
+            return False
+        flt = {
+            "owner": str(owner).strip(),
+            "listing_id": str(listing_id or "").strip(),
+            "copy_gen_token": clean_tok,
+        }
+        res = self.listings_col.update_one(flt, {"$set": set_fields})
+        return int(getattr(res, "matched_count", 0) or 0) > 0
 
     def record_listing_publish_failure(
         self,

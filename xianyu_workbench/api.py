@@ -46,6 +46,7 @@ class DraftCreateRequest(BaseModel):
     platform: str = Field(..., min_length=1, max_length=32)
     product_id: str = Field(..., min_length=1, max_length=128)
     source_origin: str = Field("favorite", max_length=32)
+    auto_generate_copy: bool = Field(True)
 
 
 class ItemUpdateRequest(BaseModel):
@@ -119,6 +120,12 @@ def create_app(
         try:
             yield
         finally:
+            svc_obj = state.get("service")
+            if svc_obj is not None:
+                try:
+                    svc_obj.shutdown(wait=True)
+                except Exception:
+                    pass
             try:
                 registry.shutdown()
             except Exception:
@@ -245,6 +252,7 @@ def create_app(
             platform=req.platform,
             product_id=req.product_id,
             source_origin=req.source_origin,
+            auto_generate_copy=req.auto_generate_copy,
         )
         return {"status": "success", "data": data}
 
@@ -410,8 +418,9 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     def workbench_page():
         index_path = STATIC_DIR / "index.html"
+        headers = {"Cache-Control": "no-store, no-cache, must-revalidate"}
         if index_path.is_file():
-            return HTMLResponse(index_path.read_text(encoding="utf-8"))
-        return HTMLResponse("<h3>选品工作台页面未就绪</h3>", status_code=200)
+            return HTMLResponse(index_path.read_text(encoding="utf-8"), headers=headers)
+        return HTMLResponse("<h3>选品工作台页面未就绪</h3>", status_code=200, headers=headers)
 
     return app

@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 
 from fastapi.testclient import TestClient
 from PIL import Image
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, WriteError
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -112,16 +112,18 @@ def _apply_update(target, update_doc):
 
 class _MemoryCollection:
     def __init__(self, unique_keys=()):
+        self._lock = threading.RLock()
         self.docs = []
         self.indexes = []
         self._unique_keys = list(unique_keys)
 
     def create_index(self, keys, **kwargs):
-        self.indexes.append((keys, kwargs))
-        if kwargs.get("unique"):
-            fields = tuple(k for k, _ in keys)
-            if fields not in self._unique_keys:
-                self._unique_keys.append(fields)
+        with self._lock:
+            self.indexes.append((keys, kwargs))
+            if kwargs.get("unique"):
+                fields = tuple(k for k, _ in keys)
+                if fields not in self._unique_keys:
+                    self._unique_keys.append(fields)
 
     def _check_unique(self, candidate, skip_idx=None):
         for fields in self._unique_keys:
@@ -133,41 +135,55 @@ class _MemoryCollection:
                     raise DuplicateKeyError(f"duplicate key on {fields}")
 
     def find_one(self, query=None, projection=None):
-        for doc in self.docs:
-            if _match_query(doc, query or {}):
-                return self._project(doc, projection)
-        return None
+        with self._lock:
+            for doc in self.docs:
+                if _match_query(doc, query or {}):
+                    return self._project(doc, projection)
+            return None
 
     def find(self, query=None, projection=None):
-        matched = [self._project(doc, projection) for doc in self.docs if _match_query(doc, query or {})]
-        return _MemoryCursor(matched)
+        with self._lock:
+            matched = [self._project(doc, projection) for doc in self.docs if _match_query(doc, query or {})]
+            return _MemoryCursor(matched)
 
     def count_documents(self, query=None):
-        return sum(1 for doc in self.docs if _match_query(doc, query or {}))
+        with self._lock:
+            return sum(1 for doc in self.docs if _match_query(doc, query or {}))
 
     def insert_one(self, doc):
-        stored = deepcopy(doc)
-        self._check_unique(stored)
-        stored.setdefault("_id", f"id_{len(self.docs) + 1}")
-        self.docs.append(stored)
-        return SimpleNamespace(inserted_id=stored["_id"])
+        with self._lock:
+            stored = deepcopy(doc)
+            self._check_unique(stored)
+            stored.setdefault("_id", f"id_{len(self.docs) + 1}")
+            self.docs.append(stored)
+            return SimpleNamespace(inserted_id=stored["_id"])
 
     def update_one(self, flt, update_doc, upsert=False):
-        for idx, doc in enumerate(self.docs):
-            if _match_query(doc, flt):
-                _apply_update(doc, update_doc)
-                self._check_unique(doc, skip_idx=idx)
-                return SimpleNamespace(matched_count=1, modified_count=1)
-        if upsert:
-            new_doc = deepcopy(flt)
-            for k, v in (update_doc.get("$setOnInsert") or {}).items():
-                new_doc[k] = deepcopy(v)
-            _apply_update(new_doc, update_doc)
-            self._check_unique(new_doc)
-            new_doc.setdefault("_id", f"id_{len(self.docs) + 1}")
-            self.docs.append(new_doc)
-            return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=new_doc["_id"])
-        return SimpleNamespace(matched_count=0, modified_count=0)
+        with self._lock:
+            set_map = update_doc.get("$set") or {}
+            ins_map = update_doc.get("$setOnInsert") or {}
+            conflict_keys = set(set_map.keys()) & set(ins_map.keys())
+            if conflict_keys:
+                bad = sorted(conflict_keys)[0]
+                raise WriteError(
+                    f"Updating the path '{bad}' would create a conflict at '{bad}'",
+                    code=40,
+                )
+            for idx, doc in enumerate(self.docs):
+                if _match_query(doc, flt):
+                    _apply_update(doc, update_doc)
+                    self._check_unique(doc, skip_idx=idx)
+                    return SimpleNamespace(matched_count=1, modified_count=1)
+            if upsert:
+                new_doc = deepcopy(flt)
+                for k, v in ins_map.items():
+                    new_doc[k] = deepcopy(v)
+                _apply_update(new_doc, update_doc)
+                self._check_unique(new_doc)
+                new_doc.setdefault("_id", f"id_{len(self.docs) + 1}")
+                self.docs.append(new_doc)
+                return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=new_doc["_id"])
+            return SimpleNamespace(matched_count=0, modified_count=0)
 
     @staticmethod
     def _project(doc, projection):
@@ -385,6 +401,20 @@ def _make_jpeg_base64(width=120, height=80, color=(220, 80, 30)) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _default_offline_ai(_prompt: str) -> Dict[str, Any]:
+    return {
+        "status": "✅ 成功",
+        "content": json.dumps(
+            {
+                "title": "默认测试帮拍好价 官旗直发",
+                "description": "品牌官旗直发全新正品，支持代下单直发，拍前私聊确认最新库存与价格。",
+            },
+            ensure_ascii=False,
+        ),
+        "metrics": {"model_used": "offline-stub"},
+    }
+
+
 def _build_env(tmp_path: Path, ai_generator=None, adapters=None):
     db = _MemoryDB()
     cfg = WorkbenchConfig(
@@ -406,7 +436,7 @@ def _build_env(tmp_path: Path, ai_generator=None, adapters=None):
 
     repo = WorkbenchRepository(db)
     repo.ensure_indexes()
-    svc = WorkbenchService(repo, cfg, ai_generator=ai_generator)
+    svc = WorkbenchService(repo, cfg, ai_generator=(ai_generator or _default_offline_ai))
 
     registry = ChannelRegistry()
     if adapters is None:
@@ -618,7 +648,12 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
 
         draft = client.post(
             "/api/items/draft",
-            json={"platform": "jd", "product_id": "jd_box_9", "source_origin": "xianyu_eval"},
+            json={
+                "platform": "jd",
+                "product_id": "jd_box_9",
+                "source_origin": "xianyu_eval",
+                "auto_generate_copy": False,
+            },
         ).json()["data"]
         lid = draft["listing_id"]
         assert draft["status"] == "draft"
@@ -636,7 +671,7 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
         # 文案为空不能直接标为 ready
         assert client.patch(f"/api/items/{lid}", json={"status": "ready"}).status_code == 400
 
-        # 上传本地图片 + 调用帮拍话术生成
+        # 上传本地图片 + 调用帮拍话术生成（直接落库持久化）
         assert client.post("/api/assets/upload", json={"image_base64": "not-an-image"}).status_code == 400
         up_url = client.post("/api/assets/upload", json={"image_base64": _make_jpeg_base64()}).json()["data"]["url"]
         assert client.get(up_url).status_code == 200
@@ -647,6 +682,11 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
         assert "个人闲置" in ai_prompts[0]  # 仅在“不要编造”约束中否定提及，不应出现成本毛利字样
         assert "cost_price" not in ai_prompts[0]
         assert "shipping_fee" not in ai_prompts[0]
+        assert gen["copy_status"] == "ready"
+        reloaded = client.get(f"/api/items/{lid}").json()["data"]
+        assert reloaded["title"] == gen["title"]
+        assert reloaded["description"] == gen["description"]
+        assert reloaded["copy_status"] == "ready"
 
         ready = client.patch(
             f"/api/items/{lid}",
@@ -1567,6 +1607,187 @@ def test_eval_source_type_filter_and_want_cnt_sort(tmp_path):
         # 5. 非法筛选参数拦截 (422)
         assert client.get("/api/candidates/evaluations?source_type=unknown").status_code == 422
         assert client.get("/api/candidates/evaluations?sort_by=invalid").status_code == 422
+
+
+def test_background_copy_auto_generation_persistence_and_concurrency_guards(tmp_path):
+    """验证选品后后台自动生成文案并落库、并发手动覆盖保护、移出丢弃及失败重试闭环。"""
+    call_log = []
+    block_event = threading.Event()
+    entered_event = threading.Event()
+    mode = {"behavior": "instant", "counter": 0}
+
+    def _controlled_ai(prompt: str):
+        mode["counter"] += 1
+        idx = mode["counter"]
+        call_log.append(prompt)
+        beh = mode["behavior"]
+        if beh == "wait_once":
+            entered_event.set()
+            block_event.wait(timeout=3.0)
+        elif beh == "fail":
+            return {"status": "❌ 失败: 上游超时", "content": "", "metrics": {}}
+        return {
+            "status": "✅ 成功",
+            "content": json.dumps(
+                {
+                    "title": f"自动文案#{idx} 官旗直发",
+                    "description": f"这是后台自动生成的第{idx}版高转化文案，下单发订单截图凭证。",
+                },
+                ensure_ascii=False,
+            ),
+            "metrics": {"model_used": "mock-bg"},
+        }
+
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, ai_generator=_controlled_ai)
+    repo.create_user("autopicker", hash_password("123456"))
+    db.cols["products"].docs.extend([
+        {
+            "platform": "jd",
+            "product_id": "jd_auto_1",
+            "name": "维达超韧抽纸整箱24包",
+            "mall_name": "维达京东自营旗舰店",
+            "brand": "维达",
+            "category": "纸品",
+            "service_guarantees": ["7天无理由退货", "闪电发货"],
+            "price": 49.9,
+            "activity_price": 29.9,
+            "image_url": "https://img.jd.com/auto1.jpg",
+        },
+        {
+            "platform": "pdd",
+            "product_id": "pdd_manual_2",
+            "name": "三只松鼠大礼包150包",
+            "price": 39.9,
+            "activity_price": 17.9,
+            "image_url": "https://img.pdd.com/auto2.jpg",
+        },
+        {
+            "platform": "taobao",
+            "product_id": "tb_dismiss_3",
+            "name": "并发移出商品测试",
+            "price": 29.9,
+            "activity_price": 15.9,
+            "image_url": "https://img.tb.com/auto3.jpg",
+        },
+    ])
+
+    def _wait_copy_done(client, lid: str, timeout: float = 3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            d = client.get(f"/api/items/{lid}").json()["data"]
+            if d["copy_status"] != "generating":
+                return d
+            time.sleep(0.02)
+        raise AssertionError("后台文案生成等待超时")
+
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"username": "autopicker", "password": "123456"}).status_code == 200
+
+        # 1. 选品即触发后台生成，返回即带 generating 态，稍后直接从库里加载即可读到完整标题与文案
+        draft1 = client.post(
+            "/api/items/draft",
+            json={"platform": "jd", "product_id": "jd_auto_1", "source_origin": "xianyu_eval"},
+        ).json()["data"]
+        lid1 = draft1["listing_id"]
+        assert draft1["copy_status"] in ("generating", "ready")
+
+        done1 = _wait_copy_done(client, lid1)
+        assert done1["copy_status"] == "ready"
+        assert "自动文案#1" in done1["title"]
+        assert "订单截图凭证" in done1["description"]
+        # 提示词输入应包含富上下文 shop_name 与保障，且不泄漏内部成本字段
+        assert "维达京东自营旗舰店" in call_log[0]
+        assert "7天无理由退货" in call_log[0]
+        assert "cost_price" not in call_log[0]
+
+        # 列表接口下次加载也能直接读到数据库里的文案
+        listed = client.get("/api/items?status=active").json()["data"]["items"]
+        item1 = next(x for x in listed if x["listing_id"] == lid1)
+        assert item1["description"] == done1["description"]
+        assert item1["copy_status"] == "ready"
+
+        # 再次调用 draft 打开已有文案的商品，不应覆盖已有文案
+        prev_cnt = len(call_log)
+        reopened = client.post(
+            "/api/items/draft",
+            json={"platform": "jd", "product_id": "jd_auto_1", "source_origin": "xianyu_eval"},
+        ).json()["data"]
+        assert reopened["description"] == done1["description"]
+        assert len(call_log) == prev_cnt
+
+        # 2. 并发保护：后台生成未完成期间用户手动保存了文案，迟到的 AI 结果不得覆盖用户手写内容
+        mode["behavior"] = "wait_once"
+        block_event.clear()
+        entered_event.clear()
+        draft2 = client.post(
+            "/api/items/draft",
+            json={"platform": "pdd", "product_id": "pdd_manual_2", "source_origin": "favorite"},
+        ).json()["data"]
+        lid2 = draft2["listing_id"]
+        assert entered_event.wait(timeout=2.0)
+
+        manual_desc = "我手写的专用文案，不要被后台覆盖"
+        patched = client.patch(
+            f"/api/items/{lid2}",
+            json={"title": "手写标题", "description": manual_desc, "status": "ready"},
+        ).json()["data"]
+        assert patched["copy_status"] == "ready"
+        assert patched["description"] == manual_desc
+
+        block_event.set()
+        time.sleep(0.08)
+        after2 = client.get(f"/api/items/{lid2}").json()["data"]
+        assert after2["title"] == "手写标题"
+        assert after2["description"] == manual_desc
+
+        # 3. 后台异常：生成失败写入 failed + copy_error，且支持后续重跑成功
+        mode["behavior"] = "fail"
+        draft3 = client.post(
+            "/api/items/draft",
+            json={"platform": "taobao", "product_id": "tb_dismiss_3", "source_origin": "xianyu_eval"},
+        ).json()["data"]
+        lid3 = draft3["listing_id"]
+        failed3 = _wait_copy_done(client, lid3)
+        assert failed3["copy_status"] == "failed"
+        assert "超时" in failed3["copy_error"]
+        assert failed3["description"] == ""
+
+        mode["behavior"] = "instant"
+        retried3 = client.post(f"/api/items/{lid3}/generate-copy").json()["data"]
+        assert retried3["copy_status"] == "ready"
+        assert "自动文案#" in retried3["title"]
+        assert "订单截图凭证" in retried3["description"]
+        assert client.get(f"/api/items/{lid3}").json()["data"]["description"] == retried3["description"]
+
+        # 4. 并发移出丢弃保护：生成中若用户在前端点移出，迟到的 AI 结果不得覆盖/伪造就绪状态
+        mode["behavior"] = "wait_once"
+        block_event.clear()
+        entered_event.clear()
+        db.cols["products"].docs.append({
+            "platform": "jd",
+            "product_id": "jd_dismiss_4",
+            "name": "生成中点不要的商品",
+            "price": 19.9,
+            "activity_price": 9.9,
+            "image_url": "https://img.jd.com/auto4.jpg",
+        })
+        draft4 = client.post(
+            "/api/items/draft",
+            json={"platform": "jd", "product_id": "jd_dismiss_4", "source_origin": "xianyu_eval"},
+        ).json()["data"]
+        lid4 = draft4["listing_id"]
+        assert entered_event.wait(timeout=2.0)
+
+        assert client.post(
+            "/api/candidates/dismiss",
+            json={"platform": "jd", "product_id": "jd_dismiss_4", "source_origin": "xianyu_eval"},
+        ).status_code == 200
+        block_event.set()
+        time.sleep(0.08)
+        after4 = client.get(f"/api/items/{lid4}").json()["data"]
+        assert after4["status"] == "dismissed"
+        assert after4["description"] == ""
+
 
 
 
