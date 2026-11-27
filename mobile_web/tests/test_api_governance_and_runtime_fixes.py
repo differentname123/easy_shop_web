@@ -617,7 +617,13 @@ def test_upstream_health_report_skips_stale_snapshots_from_aggregation():
 
 def test_xianyu_round_pool_search_then_h5_never_self_deadlocks_and_ai_timeout_clean():
     import logging
-    from infrastructure.xianyu import session as pxy
+    from pathlib import Path
+    import sys
+
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from xianyu_workbench.client import session as pxy
     from services.deal_pool_cleaner import DealPoolCleaner
 
     # 1) 真实调用 _acquire_serial_browser_lock（仅桩掉 Playwright），验证同轮先 search_session 再 h5_detail_session 绝不自死锁

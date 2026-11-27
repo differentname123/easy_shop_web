@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-闲鱼高性价比商品探测与比价核心服务（定时任务由 scripts/run_xianyu_deal_discovery_scheduler.py 调度）。
+闲鱼高性价比商品探测与比价核心服务（定时任务由 xianyu_workbench/run_discovery.py 调度）。
 ================================================================================
 核心流程：
   1. 【候选商品选拔（双源各最多 20 个，按类别已比价次数升序轮转，1:1 交替，且仅入选可靠商品）】：
@@ -21,10 +21,20 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
+import sys
 import time
 import unicodedata
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from xianyu_workbench.bridge import ensure_mobile_web_on_path
+
+ensure_mobile_web_on_path()
 
 from pymongo import UpdateOne
 
@@ -35,7 +45,7 @@ from infrastructure.ai_api.model_api import generate_content
 from infrastructure.api_governance import api_caller_context
 from infrastructure.mongo import gen_db_object
 from infrastructure.runtime_io import load_prompt_cached as read_file_to_str
-from infrastructure.xianyu import (
+from xianyu_workbench.client import (
     DEFAULT_GUEST_USER_DATA_DIR,
     DEFAULT_SEARCH_USER_DATA_DIR,
     XianyuRoundBrowserPool,
@@ -53,22 +63,22 @@ from models.deal_constants import (
 )
 from repositories.product_repo import ProductRepository
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORKBENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 
 EVAL_COLLECTION_NAME = "xianyu_deal_evaluations"
 XIANYU_ITEMS_COLLECTION_NAME = "xianyu_items"
 SOURCE_TYPE_OFFICIAL = "official"
 SOURCE_TYPE_DEAL_TIP = "deal_tip"
 
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+LOG_DIR = os.path.join(WORKBENCH_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "xianyu_deal_discovery.log")
-PROMPT_DIR = os.path.join(PROJECT_ROOT, "prompt")
+PROMPT_DIR = os.path.join(WORKBENCH_DIR, "prompts")
 KEYWORD_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼搜索关键字生成.txt")
 COARSE_FILTER_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼同款商品初筛.txt")
 COMPARISON_PROMPT_PATH = os.path.join(PROMPT_DIR, "闲鱼同款比价与性价比计算.txt")
 
 # ==============================================================================
-# 默认运行参数（可在 scripts/run_xianyu_deal_discovery_scheduler.py 顶部统一覆盖）
+# 默认运行参数（可在 xianyu_workbench/run_discovery.py 顶部统一覆盖）
 # ==============================================================================
 ENABLE_LOOP = True
 LOOP_INTERVAL_HOURS = 1.0
@@ -83,6 +93,10 @@ MAX_XIANYU_SEARCH_ITEMS = 20
 MAX_DETAIL_CHECKS_PER_CATEGORY = 2
 MAX_LIVE_H5_DETAILS_PER_ROUND = 18
 XIANYU_DETAIL_CACHE_DAYS = 7
+DEFAULT_SCREENSHOT_DIR = (
+    os.environ.get("XY_SCREENSHOT_DIR")
+    or os.path.join(WORKBENCH_DIR, "data", "eval_screenshots")
+)
 DEBUG_BROWSER = False
 SEARCH_USER_DATA_DIR = DEFAULT_SEARCH_USER_DATA_DIR
 GUEST_USER_DATA_DIR = DEFAULT_GUEST_USER_DATA_DIR
@@ -1284,6 +1298,8 @@ def _load_cached_xianyu_details(
             det_copy = dict(det)
             det_copy["ok"] = True
             det_copy["item_id"] = iid
+            if not det_copy.get("screenshot_file") and doc.get("screenshot_file"):
+                det_copy["screenshot_file"] = str(doc.get("screenshot_file") or "").strip()
             det_copy["_from_db_cache"] = True
             det_copy["_detail_updated_at_str"] = str(
                 doc.get("detail_updated_at_str") or det_utc.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -1316,6 +1332,7 @@ def _save_xianyu_item_details(
             continue
         item_url = str(det.get("item_url") or f"https://www.goofish.com/item?id={iid}").strip()
         price_val = _num(det.get("price"), 0.0)
+        screenshot_file = str(det.get("screenshot_file") or "").strip()
         clean_det = {
             "ok": True,
             "item_id": iid,
@@ -1335,30 +1352,34 @@ def _save_xianyu_item_details(
             "browse_cnt": int(_num(det.get("browse_cnt"), 0.0)),
             "quantity": int(_num(det.get("quantity"), 1.0)),
             "images": list(det.get("images") or []),
+            "screenshot_file": screenshot_file,
             "seller_nick": str(det.get("seller_nick") or ""),
             "seller_city": str(det.get("seller_city") or ""),
             "seller_sold_count": int(_num(det.get("seller_sold_count"), 0.0)),
             "seller_good_rate": str(det.get("seller_good_rate") or ""),
         }
+        set_doc: Dict[str, Any] = {
+            "item_id": iid,
+            "item_url": item_url,
+            "title": clean_det["title"],
+            "price": clean_det["price"],
+            "transport_fee": clean_det["transport_fee"],
+            "is_free_shipping": clean_det["is_free_shipping"],
+            "has_multi_sku": clean_det["has_multi_sku"],
+            "has_detail": True,
+            "detail": clean_det,
+            "detail_updated_at": now_utc,
+            "detail_updated_at_str": now_str,
+            "updated_at": now_utc,
+            "updated_at_str": now_str,
+        }
+        if screenshot_file:
+            set_doc["screenshot_file"] = screenshot_file
         ops.append(
             UpdateOne(
                 {"item_id": iid},
                 {
-                    "$set": {
-                        "item_id": iid,
-                        "item_url": item_url,
-                        "title": clean_det["title"],
-                        "price": clean_det["price"],
-                        "transport_fee": clean_det["transport_fee"],
-                        "is_free_shipping": clean_det["is_free_shipping"],
-                        "has_multi_sku": clean_det["has_multi_sku"],
-                        "has_detail": True,
-                        "detail": clean_det,
-                        "detail_updated_at": now_utc,
-                        "detail_updated_at_str": now_str,
-                        "updated_at": now_utc,
-                        "updated_at_str": now_str,
-                    },
+                    "$set": set_doc,
                     "$setOnInsert": {
                         "created_at": now_utc,
                         "created_at_str": now_str,
@@ -1392,6 +1413,7 @@ def compare_candidate_with_xianyu(
     items_col: Optional[Any] = None,
     detail_cache_days: int = XIANYU_DETAIL_CACHE_DAYS,
     browser_pool: Optional[XianyuRoundBrowserPool] = None,
+    screenshot_dir: Optional[str] = DEFAULT_SCREENSHOT_DIR,
 ) -> Dict[str, Any]:
     """对单个候选商品一次性串行跑完：资格审查与搜词 -> 闲鱼搜索 -> 同款初筛 -> 前2款详情补齐 -> 大模型终审比价。"""
     cand = dict(candidate)
@@ -1604,12 +1626,15 @@ def compare_candidate_with_xianyu(
                 f"📦 [步骤3/无痕H5免登录拉取详情] 分类=【{cat_name}】 | AI初筛同款={len(step2_comp_ids)}款 -> "
                 f"仅保留前 {len(ids_to_fetch)} 款拉取详情..."
             )
-        batch_det_res = get_xianyu_item_details_batch(
-            item_ids=missing_ids,
-            user_data_dir=guest_user_data_dir,
-            debug=debug_browser,
+        det_kwargs: Dict[str, Any] = {
+            "item_ids": missing_ids,
+            "user_data_dir": guest_user_data_dir,
+            "debug": debug_browser,
             **pool_kw,
-        )
+        }
+        if screenshot_dir:
+            det_kwargs["screenshot_dir"] = screenshot_dir
+        batch_det_res = get_xianyu_item_details_batch(**det_kwargs)
         live_details_map = batch_det_res.get("details_by_id") or {}
         detail_live_fetched_count = sum(1 for v in live_details_map.values() if isinstance(v, dict) and v.get("ok"))
         if detail_live_fetched_count > 0:
@@ -1759,6 +1784,7 @@ def compare_candidate_with_xianyu(
         browser_aborted=False,
         debug_browser=debug_browser,
         llm_aborted=not ok,
+        details_by_id=details_by_id,
     )
 
 
@@ -1781,6 +1807,7 @@ def _build_final_record(
     debug_browser: bool = False,
     ineligible: bool = False,
     llm_aborted: bool = False,
+    details_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """直接以第 3 次大模型最终判定的性价比比例与胜负结果构建入库文档（避免受预清洗误差干扰）。"""
     has_comp = bool(llm_data.get("has_comparable_item"))
@@ -1845,6 +1872,18 @@ def _build_final_record(
     is_my_better = final_winner == "my_product"
     raw_xy_card = next((x for x in xianyu_items_for_llm if x.get("item_id") == best_xy_id), {})
     best_det_info = raw_xy_card.get("detail_verified_info") if isinstance(raw_xy_card.get("detail_verified_info"), dict) else {}
+    best_raw_det = (
+        (details_by_id or {}).get(best_xy_id)
+        or ((batch_det_res or {}).get("details_by_id") or {}).get(best_xy_id)
+        or {}
+    )
+    if not isinstance(best_raw_det, dict):
+        best_raw_det = {}
+    best_images = [
+        str(u).strip()
+        for u in (best_raw_det.get("images") or [])
+        if isinstance(u, str) and str(u).strip()
+    ][:5]
 
     best_xianyu_product = {
         "item_id": best_xy_id,
@@ -1859,6 +1898,8 @@ def _build_final_record(
         "desc": best_det_info.get("desc") or "",
         "spec_description": str(llm_data.get("best_xianyu_spec") or ""),
         "want_cnt": raw_xy_card.get("want_cnt"),
+        "screenshot_file": str(best_raw_det.get("screenshot_file") or ""),
+        "images": best_images,
         "unit_quantities": xy_qty_clean,
         "unit_cost_performance": xy_cp_clean,
     }
@@ -2210,6 +2251,49 @@ def _ensure_xianyu_items_indexes(items_col: Any) -> None:
     items_col.create_index([("updated_at", -1)], background=True)
 
 
+def _cleanup_old_screenshots(
+    screenshot_dir: Optional[str],
+    max_age_days: int = 30,
+    max_files: int = 2000,
+) -> int:
+    """有界清理过期的闲鱼 H5 截图，避免运行盘无界膨胀。"""
+    clean_dir = str(screenshot_dir or "").strip()
+    if not clean_dir or not os.path.isdir(clean_dir):
+        return 0
+    removed = 0
+    try:
+        entries = []
+        with os.scandir(clean_dir) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.lower().endswith(".jpg") and not entry.name.startswith("."):
+                    try:
+                        entries.append((entry.path, entry.stat().st_mtime))
+                    except OSError:
+                        continue
+        cutoff = time.time() - max(1, int(max_age_days)) * 86400
+        survivors: List[Tuple[str, float]] = []
+        for path_str, mtime in entries:
+            if mtime < cutoff:
+                try:
+                    os.unlink(path_str)
+                    removed += 1
+                except OSError:
+                    pass
+            else:
+                survivors.append((path_str, mtime))
+        if max_files > 0 and len(survivors) > max_files:
+            survivors.sort(key=lambda item: item[1])
+            for path_str, _ in survivors[: len(survivors) - max_files]:
+                try:
+                    os.unlink(path_str)
+                    removed += 1
+                except OSError:
+                    pass
+    except Exception as exc:
+        logger.warning(f"⚠️ [闲鱼截图目录清理异常] dir={clean_dir} | 异常={exc}")
+    return removed
+
+
 # ==============================================================================
 # 主流程：选出本轮候选商品（1:1交替） -> 逐商品一气呵成跑完全流程
 # ==============================================================================
@@ -2227,6 +2311,7 @@ def run_discovery_cycle(
     debug_browser: bool = DEBUG_BROWSER,
     max_consecutive_browser_fails: int = MAX_CONSECUTIVE_BROWSER_FAILS,
     max_live_h5_details: Optional[int] = None,
+    screenshot_dir: Optional[str] = DEFAULT_SCREENSHOT_DIR,
 ) -> List[Dict[str, Any]]:
     global _LAST_CYCLE_ABORTED_BY_RISK
     _LAST_CYCLE_ABORTED_BY_RISK = False
@@ -2316,6 +2401,7 @@ def run_discovery_cycle(
                     items_col=items_col,
                     detail_cache_days=detail_cache_days,
                     browser_pool=browser_pool,
+                    screenshot_dir=screenshot_dir,
                 )
                 rec["batch_id"] = batch_id
                 rec_src_type = _normalize_source_type(rec.get("source_type"))
@@ -2392,6 +2478,7 @@ def run_discovery_cycle(
         elapsed = time.monotonic() - t0
         if records:
             logger.info(_format_batch_summary_report(batch_id, elapsed, records))
+        _cleanup_old_screenshots(screenshot_dir)
         return records
     finally:
         if callable(getattr(db, "close", None)):

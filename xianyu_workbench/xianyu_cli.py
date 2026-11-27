@@ -2,13 +2,13 @@
 r"""
 闲鱼 (Goofish) 手动浏览器接管与工具命令行入口。
 ================================================================================
-- 底层能力统一位于 `infrastructure.xianyu`（会话/锁、卖家操作、市场搜索与 H5 详情）；
+- 底层能力统一位于 `xianyu_workbench.client`（会话/锁、卖家操作、市场搜索与 H5 详情）；
 - 常用默认配置集中于下方 `XIANYU_CLI_CONFIG`，不带子命令直接运行等同于 `login`；
 - 常用示例：
-    python mobile_web/scripts/publish_to_xianyu.py
-    python mobile_web/scripts/publish_to_xianyu.py --account seller status
-    python mobile_web/scripts/publish_to_xianyu.py search "可口可乐 330ml 24罐" --max-items 5
-    python mobile_web/scripts/publish_to_xianyu.py detail 780427279990
+    python xianyu_workbench/xianyu_cli.py
+    python xianyu_workbench/xianyu_cli.py --account seller status
+    python xianyu_workbench/xianyu_cli.py search "可口可乐 330ml 24罐" --max-items 5
+    python xianyu_workbench/xianyu_cli.py detail 780427279990
 ================================================================================
 """
 from __future__ import annotations
@@ -19,12 +19,16 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
 
-MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
-if str(MOBILE_WEB_DIR) not in sys.path:
-    sys.path.insert(0, str(MOBILE_WEB_DIR))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from xianyu_workbench.bridge import ensure_mobile_web_on_path
+
+ensure_mobile_web_on_path()
 
 from infrastructure.runtime_io import bootstrap_script
-from infrastructure.xianyu import (
+from xianyu_workbench.client import (
     DEFAULT_GUEST_USER_DATA_DIR,
     DEFAULT_SEARCH_USER_DATA_DIR,
     DEFAULT_USER_DATA_DIR,

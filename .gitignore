@@ -43,3 +43,6 @@ keys/
 # Temporary files
 temp*.json
 *.tmp
+
+# Xianyu workbench runtime media
+xianyu_workbench/data/

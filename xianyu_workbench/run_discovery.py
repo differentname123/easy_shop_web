@@ -2,11 +2,11 @@
 r"""
 闲鱼高性价比商品探测与比价定时任务主控脚本。
 ================================================================================
-- 所有核心选品、缓存复用与三段式 LLM 比价逻辑均位于 `services.xianyu_discovery`；
+- 所有核心选品、缓存复用与三段式 LLM 比价逻辑均位于 `xianyu_workbench.discovery`；
 - 所有日常运维参数集中在下方 `XIANYU_SCHEDULER_CONFIG`，修改保存即可生效；
 - 常用示例：
-    python mobile_web/scripts/run_xianyu_deal_discovery_scheduler.py
-    python mobile_web/scripts/run_xianyu_deal_discovery_scheduler.py --once --only-official
+    python xianyu_workbench/run_discovery.py
+    python xianyu_workbench/run_discovery.py --once --only-official
 ================================================================================
 """
 from __future__ import annotations
@@ -17,16 +17,20 @@ import sys
 import threading
 from typing import Any, Dict, List, Optional
 
-MOBILE_WEB_DIR = Path(__file__).resolve().parents[1]
-if str(MOBILE_WEB_DIR) not in sys.path:
-    sys.path.insert(0, str(MOBILE_WEB_DIR))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from xianyu_workbench.bridge import ensure_mobile_web_on_path
+
+ensure_mobile_web_on_path()
 
 from infrastructure.runtime_io import (
     bootstrap_script,
     install_shutdown_signals,
     interruptible_sleep,
 )
-from services import xianyu_discovery as xd
+from xianyu_workbench import discovery as xd
 
 # ==============================================================================
 # 【运维直改配置区】：闲鱼比价探测常用开关集中在此，一目了然、随时调整

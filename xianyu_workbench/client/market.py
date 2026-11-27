@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """闲鱼公开市场比价检索能力：搜索小号登录搜索概览 + 移动端 H5 免登录批量/单条获取商品完整详情。"""
 
+import os
+from pathlib import Path
 import random
 import re
 import time
@@ -523,6 +525,41 @@ def _parse_detail_packet_to_dict(
     }
 
 
+_SCREENSHOT_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+
+
+def _capture_item_screenshot(page: Any, item_id: str, screenshot_dir: Optional[str]) -> str:
+    """在已打开的闲鱼 H5 详情页捕获首屏 JPEG 截图，异常绝不阻断详情抓取。"""
+    clean_dir = str(screenshot_dir or "").strip()
+    clean_id = str(item_id or "").strip()
+    if not clean_dir or not _SCREENSHOT_ITEM_ID_RE.fullmatch(clean_id):
+        return ""
+    if not callable(getattr(page, "screenshot", None)):
+        return ""
+
+    target_dir = Path(clean_dir)
+    filename = f"{clean_id}.jpg"
+    target_path = target_dir / filename
+    tmp_path = target_dir / f".tmp_{clean_id}_{os.getpid()}.jpg"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        wait_fn = getattr(page, "wait_for_timeout", None)
+        if callable(wait_fn):
+            wait_fn(400)
+        page.screenshot(path=str(tmp_path), type="jpeg", quality=75, full_page=False)
+        if tmp_path.is_file() and tmp_path.stat().st_size > 0:
+            os.replace(tmp_path, target_path)
+            return filename
+    except Exception as exc:
+        logger.warning(f"⚠️ [H5商品截图保存失败] item_id={clean_id} | 原因={exc}")
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return ""
+
+
 def get_xianyu_item_details_batch(
     item_ids: List[str],
     user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
@@ -530,6 +567,7 @@ def get_xianyu_item_details_batch(
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
     ephemeral: bool = True,
     browser_pool: Optional[XianyuRoundBrowserPool] = None,
+    screenshot_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     通过闲鱼移动端 H5 公开分享页免登录批量获取多个商品详情（描述、多规格 SKU 价格、库存与运费）：
@@ -630,6 +668,10 @@ def get_xianyu_item_details_batch(
                             detail_url=pc_detail_url,
                             user_data_dir=user_data_dir,
                         )
+                        if screenshot_dir:
+                            shot_file = _capture_item_screenshot(page, item_id, screenshot_dir)
+                            if shot_file:
+                                parsed_detail["screenshot_file"] = shot_file
                         details_by_id[item_id] = parsed_detail
                         logger.info(
                             f"[H5免登录批量详情/{idx + 1}/{len(clean_ids)}] ✅ 会话={tag} | 商品ID={item_id} | "
@@ -710,6 +752,7 @@ def get_xianyu_item_detail(
     user_data_dir: str = DEFAULT_GUEST_USER_DATA_DIR,
     debug: bool = False,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    screenshot_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """移动端 H5 免登录获取单个商品完整详情（内部直接复用 get_xianyu_item_details_batch，零重复逻辑）。"""
     item_id = _extract_item_id(item_id_or_url)
@@ -720,6 +763,7 @@ def get_xianyu_item_detail(
         user_data_dir=user_data_dir,
         debug=debug,
         lock_timeout_sec=lock_timeout_sec,
+        screenshot_dir=screenshot_dir,
     )
     if not batch_res.get("ok"):
         res = dict(batch_res)

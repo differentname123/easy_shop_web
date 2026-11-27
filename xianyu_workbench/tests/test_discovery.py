@@ -7,9 +7,12 @@ import sys
 from unittest.mock import MagicMock, patch
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-_MOBILE_WEB_DIR = os.path.dirname(_TESTS_DIR)
-if _MOBILE_WEB_DIR not in sys.path:
-    sys.path.insert(0, _MOBILE_WEB_DIR)
+_WORKBENCH_DIR = os.path.dirname(_TESTS_DIR)
+_REPO_ROOT = os.path.dirname(_WORKBENCH_DIR)
+_MOBILE_WEB_DIR = os.path.join(_REPO_ROOT, "mobile_web")
+for _p in (_REPO_ROOT, _MOBILE_WEB_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 try:
     import playwright.sync_api  # noqa: F401
@@ -22,9 +25,9 @@ except ModuleNotFoundError:
     sys.modules.setdefault("playwright", _pw_mod)
     sys.modules.setdefault("playwright.sync_api", _pw_sync)
 
-from infrastructure.xianyu import market as xianyu_market
-from infrastructure.xianyu import session as xianyu_session
-from services import xianyu_discovery as sched
+from xianyu_workbench.client import market as xianyu_market
+from xianyu_workbench.client import session as xianyu_session
+from xianyu_workbench import discovery as sched
 
 
 def _make_sample_deal_doc(
@@ -1037,6 +1040,169 @@ def test_select_round_candidates_filters_unreliable_products():
     assert off_proj["deal_info.is_deal_tip"] == 1
     assert off_proj["deal_info.reliability_score"] == 1
     assert off_proj["deal_info.price_is_reliable"] == 1
+
+
+def test_h5_batch_detail_captures_screenshot_non_fatally_and_forwards_to_eval(tmp_path):
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    # 1) 验证 get_xianyu_item_details_batch 在 screenshot_dir 非空时保存 {item_id}.jpg 且截屏失败不阻断详情
+    fake_page = MagicMock()
+    fake_ctx = MagicMock()
+    tracker = {"failed_apis": [], "risk_rets": [], "guest_login_blocked_rets": []}
+
+    def _fake_goto(url, **_kwargs):
+        # 找到绑定的 response 监听器并喂入成功详情数据包
+        iid = url.split("id=")[-1]
+        pkt = {
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "itemDO": {
+                    "title": f"闲鱼商品_{iid}",
+                    "desc": "全新未拆包邮",
+                    "soldPrice": "35.00",
+                    "transportFee": "0.00",
+                    "imageInfos": [{"url": f"https://img.goofish.com/{iid}.jpg"}],
+                },
+                "sellerDO": {"nick": "卖家A"},
+            },
+        }
+        fake_resp = MagicMock()
+        fake_resp.url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.awesome.detail/1.0/"
+        fake_resp.json.return_value = pkt
+        for call in fake_page.on.call_args_list:
+            if call.args[0] == "response":
+                call.args[1](fake_resp)
+
+    fake_page.goto.side_effect = _fake_goto
+
+    shot_calls = []
+
+    def _fake_screenshot(*, path, **_kwargs):
+        shot_calls.append(path)
+        if "880002" in path:
+            raise RuntimeError("mock screenshot error")
+        Path(path).write_bytes(b"\xff\xd8\xff\xe0mock-shot")
+
+    fake_page.screenshot.side_effect = _fake_screenshot
+
+    @contextmanager
+    def _fake_ephemeral_guard(**_kwargs):
+        yield fake_ctx, fake_page, tracker
+
+    with patch.object(xianyu_market, "_ephemeral_h5_session_guard", side_effect=_fake_ephemeral_guard):
+        batch_res = xianyu_market.get_xianyu_item_details_batch(
+            ["880001", "880002"],
+            screenshot_dir=str(tmp_path),
+        )
+
+    assert batch_res["ok"] is True
+    assert batch_res["details_by_id"]["880001"]["ok"] is True
+    assert batch_res["details_by_id"]["880001"]["screenshot_file"] == "880001.jpg"
+    assert (tmp_path / "880001.jpg").is_file()
+    assert batch_res["details_by_id"]["880002"]["ok"] is True
+    assert "screenshot_file" not in batch_res["details_by_id"]["880002"]
+    assert len(shot_calls) == 2
+
+    # 2) 验证 compare_candidate_with_xianyu 将 screenshot_file 与 images 写入 best_xianyu_product 且不污染第 3 步 LLM 输入
+    cand = _make_sample_candidate(1, with_keyword=True, source_type=sched.SOURCE_TYPE_DEAL_TIP)
+    captured_prompts = []
+
+    def _fake_step3_llm(prompt, **_kwargs):
+        captured_prompts.append(prompt)
+        return {
+            "status": "成功",
+            "content": json.dumps(
+                {
+                    "has_comparable_item": True,
+                    "comparable_item_ids": ["880001"],
+                    "best_xianyu_item_id": "880001",
+                    "best_xianyu_price": 35.0,
+                    "best_xianyu_spec": "24包包邮35元",
+                    "matched_unit": "包",
+                    "my_unit_quantity": 24.0,
+                    "my_unit_cost_performance": round(24.0 / 19.9, 6),
+                    "xianyu_unit_quantity": 24.0,
+                    "xianyu_unit_cost_performance": round(24.0 / 35.0, 6),
+                    "cost_performance_ratio": 1.7588,
+                    "llm_winner": "my_product",
+                    "llm_reason": "我方19.9元明显优于闲鱼35元",
+                },
+                ensure_ascii=False,
+            ),
+            "metrics": {"model_used": "unit_test_step3"},
+        }
+
+    fake_search_res = {
+        "ok": True,
+        "is_offline": False,
+        "is_risk_blocked": False,
+        "items": [{"item_id": "880001", "title": "维达抽纸24包", "price": 35.0, "want_cnt": 12, "is_free_shipping": True}],
+    }
+    fake_det_res = {
+        "ok": True,
+        "is_offline": False,
+        "is_risk_blocked": False,
+        "details_by_id": {
+            "880001": {
+                "ok": True,
+                "item_id": "880001",
+                "title": "维达抽纸24包",
+                "desc": "全新包邮",
+                "price": 35.0,
+                "transport_fee": 0.0,
+                "is_free_shipping": True,
+                "has_multi_sku": False,
+                "min_price": 35.0,
+                "max_price": 35.0,
+                "sku_list": [],
+                "want_cnt": 12,
+                "images": ["https://img.goofish.com/880001.jpg"],
+                "screenshot_file": "880001.jpg",
+            }
+        },
+    }
+
+    with patch.object(sched, "search_xianyu_items", return_value=fake_search_res), patch.object(
+        sched, "_filter_comparable_xianyu_items_by_llm", return_value=(["880001"], {}, "ok")
+    ), patch.object(sched, "get_xianyu_item_details_batch", return_value=fake_det_res), patch.object(
+        sched, "generate_content", side_effect=_fake_step3_llm
+    ):
+        rec = sched.compare_candidate_with_xianyu(candidate=cand, screenshot_dir=str(tmp_path))
+
+    assert rec["best_xianyu_product"]["screenshot_file"] == "880001.jpg"
+    assert rec["best_xianyu_product"]["images"] == ["https://img.goofish.com/880001.jpg"]
+    assert len(captured_prompts) == 1
+    assert "screenshot_file" not in captured_prompts[0]
+
+
+def test_workbench_entrypoints_resist_pycharm_pythonpath_shadowing():
+    import subprocess
+
+    repo_root = _REPO_ROOT
+    workbench_dir = _WORKBENCH_DIR
+    mobile_web_dir = _MOBILE_WEB_DIR
+
+    for py_path in (
+        f"{repo_root}{os.pathsep}{mobile_web_dir}",
+        f"{mobile_web_dir}{os.pathsep}{repo_root}",
+    ):
+        env = dict(os.environ, PYTHONPATH=py_path)
+        for script_name in ("run_discovery.py", "xianyu_cli.py", "run.py"):
+            proc = subprocess.run(
+                [sys.executable, os.path.join(workbench_dir, script_name), "--help"],
+                cwd=workbench_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert proc.returncode == 0, (
+                f"{script_name} failed under PYTHONPATH={py_path!r}: "
+                f"stdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+
+
 
 
 
