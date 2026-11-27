@@ -32,6 +32,7 @@ def open_browser_for_manual_use(
     user_data_dir: str = DEFAULT_USER_DATA_DIR,
     home_url: str = GOOFISH_PERSONAL_URL,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    lock_scope: str = "global",
 ) -> None:
     """
     启动独立浏览器目录并移交人工操作（如首次扫码登录、掉线后重登、日常维护），直接关闭浏览器窗口即可自动保存并结束。
@@ -41,6 +42,7 @@ def open_browser_for_manual_use(
         user_data_dir=user_data_dir,
         task_name="open_browser_for_manual_use",
         lock_timeout_sec=lock_timeout_sec,
+        lock_scope=lock_scope,
     ):
         clean_browser_cache(user_data_dir)
         with sync_playwright() as p:

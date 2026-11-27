@@ -191,13 +191,43 @@ class _XianyuQrLoginWorker:
                 continue
         return None
 
-    def _click_keep_login_if_visible(self, login_frame: Any) -> None:
+    def _click_keep_login_if_visible(self, login_frame: Any) -> bool:
+        for selector in (
+            ".qrcode-login button.keep-login-confirm-btn.primary",
+            "button.keep-login-confirm-btn.primary",
+        ):
+            try:
+                loc = login_frame.locator(selector)
+                cnt = loc.count()
+                for i in range(cnt):
+                    btn = loc.nth(i)
+                    if btn.is_visible():
+                        btn.click()
+                        return True
+            except Exception:
+                continue
         try:
-            btn = login_frame.locator("button.keep-login-confirm-btn.primary").first
-            if btn.count() > 0 and btn.is_visible():
-                btn.click()
+            clicked = bool(
+                login_frame.evaluate(
+                    """() => {
+                        const btns = Array.from(document.querySelectorAll('button.keep-login-confirm-btn.primary'));
+                        for (const btn of btns) {
+                            const rect = btn.getBoundingClientRect();
+                            const style = window.getComputedStyle(btn);
+                            if (rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none') {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }"""
+                )
+            )
+            if clicked:
+                return True
         except Exception:
             pass
+        return False
 
     def _read_frame_status_text(self, login_frame: Any) -> str:
         try:
@@ -268,8 +298,10 @@ class _XianyuQrLoginWorker:
                             login_frame = self._find_login_frame(page)
                             unb = str(cookies.get("unb") or auth_tracker.get("user_id") or "").strip()
 
-                            if login_frame is not None:
-                                self._click_keep_login_if_visible(login_frame)
+                            if login_frame is not None and self._click_keep_login_if_visible(login_frame):
+                                self._set_state("scanned", "已扫码，正在确认保持长效登录...")
+                                page.wait_for_timeout(600)
+                                continue
 
                             if (
                                 unb
@@ -277,9 +309,36 @@ class _XianyuQrLoginWorker:
                                 and not auth_tracker.get("expired_rets")
                                 and login_frame is None
                             ):
-                                # 登录后稍等个人昵称接口落稳
-                                if not auth_tracker.get("display_name"):
-                                    page.wait_for_timeout(1200)
+                                # 等待持久化长效续登 Cookie (havana_lgc2_77 / _hvn_lgc_) 与昵称落盘，杜绝只拿到会话 cookie2 关窗即掉线
+                                has_persistent_sso = bool(
+                                    cookies.get("havana_lgc2_77") or cookies.get("_hvn_lgc_")
+                                )
+                                settle_deadline = time.monotonic() + 5.0
+                                while time.monotonic() < settle_deadline and not self._cancel_event.is_set():
+                                    if has_persistent_sso and auth_tracker.get("display_name"):
+                                        break
+                                    page.wait_for_timeout(300)
+                                    lf_now = self._find_login_frame(page)
+                                    if lf_now is not None:
+                                        self._click_keep_login_if_visible(lf_now)
+                                    cookies = self._read_cookies(context)
+                                    has_persistent_sso = bool(
+                                        cookies.get("havana_lgc2_77") or cookies.get("_hvn_lgc_")
+                                    )
+
+                                if not has_persistent_sso:
+                                    logger.warning(
+                                        f"[闲鱼扫码] 未获取到长效持久化 Cookie (havana_lgc2_77/_hvn_lgc_), owner={self.owner}"
+                                    )
+                                    self._set_state(
+                                        "error",
+                                        "未获取到闲鱼长效登录凭证（保持登录未生效），请重新扫码",
+                                        clear_qr=True,
+                                        error_code="NO_PERSISTENT_SESSION",
+                                    )
+                                    return
+
+                                page.wait_for_timeout(1000)
                                 nick = str(auth_tracker.get("display_name") or "").strip()
                                 self._set_state(
                                     "success",
@@ -292,7 +351,9 @@ class _XianyuQrLoginWorker:
 
                             if login_frame is not None:
                                 txt = self._read_frame_status_text(login_frame)
-                                if "请在手机上确认登录" in txt or "扫描成功" in txt:
+                                if "保持登录状态" in txt:
+                                    self._set_state("scanned", "已扫码，正在确认保持长效登录...")
+                                elif "请在手机上确认登录" in txt or "扫描成功" in txt:
                                     self._set_state("scanned", "已扫码，请在手机闲鱼 App 点击确认登录")
                                 elif "二维码已失效" in txt or "已过期" in txt:
                                     self._set_state("expired", "二维码已失效，请点击刷新重扫", clear_qr=True, error_code="QR_EXPIRED")
@@ -307,7 +368,7 @@ class _XianyuQrLoginWorker:
                                             qr_bytes=png,
                                         )
 
-                            page.wait_for_timeout(1000)
+                            page.wait_for_timeout(400)
                     finally:
                         _detach_tracker_from_context(context, auth_tracker, on_page_cb)
                         if context is not None:
@@ -415,6 +476,17 @@ class XianyuChannelAdapter(SellingChannel):
             w.join(timeout=2.0)
         return True
 
+    @staticmethod
+    def _friendly_error_message(error_code: str, default_msg: str) -> str:
+        code = str(error_code or "").strip().upper()
+        if code == "ACCOUNT_OFFLINE":
+            return "账号未登录或已掉线，请点击「扫码绑定」重新登录"
+        if code == "RISK_CONTROL_BLOCKED":
+            return "触发闲鱼安全校验，已自动暂停，请稍后再试"
+        if code == "LOCK_TIMEOUT":
+            return "当前账号正在同步或检测中，请稍后再试"
+        return default_msg
+
     def check_status(self, username: str) -> ChannelAccountStatus:
         profile_dir = self.profile_dir_for(username)
         res = check_login_status(
@@ -424,13 +496,15 @@ class XianyuChannelAdapter(SellingChannel):
             lock_scope="profile",
         )
         online = bool(res.get("ok"))
+        err_code = "" if online else str(res.get("error_code") or "ACCOUNT_OFFLINE")
+        msg = "账号在线" if online else self._friendly_error_message(err_code, "账号未登录或已掉线，请重新扫码绑定")
         return ChannelAccountStatus(
             channel=self.channel_code,
             online=online,
             account_id=str(res.get("unb") or "").strip(),
             nickname=str(res.get("nick") or "").strip(),
-            error_code="" if online else str(res.get("error_code") or "ACCOUNT_OFFLINE"),
-            message="账号在线" if online else str(res.get("message") or "账号未登录或已掉线"),
+            error_code=err_code,
+            message=msg,
             checked_at=_now_iso(),
         )
 
@@ -443,14 +517,16 @@ class XianyuChannelAdapter(SellingChannel):
             lock_scope="profile",
         )
         ok = bool(res.get("ok"))
+        err_code = "" if ok else str(res.get("error_code") or "SYNC_FAILED")
+        msg = "同步完成" if ok else self._friendly_error_message(err_code, "同步在售商品失败，请稍后重试")
         return ChannelSyncResult(
             ok=ok,
             channel=self.channel_code,
             online=ok,
             account_id=str(res.get("unb") or "").strip(),
             nickname=str(res.get("nick") or "").strip(),
-            error_code="" if ok else str(res.get("error_code") or "SYNC_FAILED"),
-            message="同步完成" if ok else str(res.get("message") or "同步在售商品失败"),
+            error_code=err_code,
+            message=msg,
             online_items=list(res.get("online_items") or []),
             abnormal_items=list(res.get("abnormal_items") or []),
             group_counts=dict(res.get("group_counts") or {}),

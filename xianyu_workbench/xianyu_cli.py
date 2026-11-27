@@ -43,12 +43,18 @@ from xianyu_workbench.client import (
 )
 
 # ==============================================================================
-# 【运维直改配置区】：直接运行本脚本无子命令时，默认打开 `default_account` 登录窗
+# 【直接运行配置区】：PyCharm 里直接点绿色运行按钮即可按这里打开浏览器（不用敲命令行）
+# 常用目录路径示例（复制到下方 "user_data_dir" 即可打开对应用户）：
+#   1. 原卖货主号目录 : r"W:\temp\xianyu_myself"
+#   2. 比价搜索小号   : r"W:\temp\xianyu_xiaohao"
+#   3. 工作台 15310625037 托管目录:
+#      r"W:\project\python_project\easy_shop_web\xianyu_workbench\data\channel_profiles\xianyu\15310625037"
 # ==============================================================================
 XIANYU_CLI_CONFIG: Dict[str, Any] = {
-    "default_account": "search",             # 可选: "search"(比价搜索小号) | "seller"(卖货主号) | "guest"(免登录访客)
-    "home_url": GOOFISH_PERSONAL_URL,      # `login` 手动接管打开的初始页面
-    "debug": False,                        # 是否开启有头调试窗口
+    "user_data_dir": r"W:\temp\xianyu_myself",  # 填任意电脑目录即可直接打开；留空 "" 则按下方 default_account 打开
+    "default_account": "search",                # 仅当上方 user_data_dir 为空时生效: "search" | "seller" | "guest"
+    "home_url": GOOFISH_PERSONAL_URL,           # 打开浏览器后自动跳转的链接（可改成任意 URL）
+    "debug": False,                             # 是否开启有头调试窗口
 }
 
 _ACCOUNT_DIRS: Dict[str, str] = {
@@ -61,8 +67,12 @@ _ACCOUNT_DIRS: Dict[str, str] = {
 def _resolve_user_data_dir(account: Optional[str], explicit_dir: str, *, default_account: str) -> str:
     if str(explicit_dir or "").strip():
         return str(explicit_dir).strip()
-    key = account or default_account
-    return _ACCOUNT_DIRS.get(key, DEFAULT_SEARCH_USER_DATA_DIR)
+    if account:
+        return _ACCOUNT_DIRS.get(account, DEFAULT_SEARCH_USER_DATA_DIR)
+    configured_dir = str(XIANYU_CLI_CONFIG.get("user_data_dir") or "").strip()
+    if configured_dir:
+        return configured_dir
+    return _ACCOUNT_DIRS.get(default_account, DEFAULT_SEARCH_USER_DATA_DIR)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -119,12 +129,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cmd = args.command or "login"
     debug = bool(args.debug or XIANYU_CLI_CONFIG["debug"])
+    import os
     fallback_acc = "guest" if cmd == "detail" else str(XIANYU_CLI_CONFIG["default_account"])
     user_dir = _resolve_user_data_dir(args.account, args.user_data_dir, default_account=fallback_acc)
+    is_search_dir = os.path.normcase(os.path.abspath(user_dir)) == os.path.normcase(os.path.abspath(DEFAULT_SEARCH_USER_DATA_DIR))
+    eff_lock_scope = "global" if is_search_dir else "profile"
 
     if cmd == "login":
         home_url = getattr(args, "home_url", str(XIANYU_CLI_CONFIG["home_url"]))
-        open_browser_for_manual_use(user_data_dir=user_dir, home_url=home_url)
+        open_browser_for_manual_use(
+            user_data_dir=user_dir,
+            home_url=home_url,
+            lock_scope=eff_lock_scope,
+        )
         return 0
 
     if cmd == "clean-cache":

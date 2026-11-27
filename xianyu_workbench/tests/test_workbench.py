@@ -811,3 +811,67 @@ def test_profile_lock_scope_isolates_seller_from_global_discovery_lock(tmp_path)
         finally:
             done.set()
             t.join(timeout=3.0)
+
+
+def test_xianyu_qr_worker_clicks_visible_qrcode_keep_login_and_sanitizes_errors(tmp_path):
+    from xianyu_workbench.channels.xianyu import XianyuChannelAdapter, _XianyuQrLoginWorker
+
+    class _FakeBtn:
+        def __init__(self, visible: bool):
+            self._visible = visible
+            self.clicked = False
+
+        def is_visible(self) -> bool:
+            return self._visible
+
+        def click(self) -> None:
+            self.clicked = True
+
+    class _FakeLocator:
+        def __init__(self, btns):
+            self._btns = btns
+
+        def count(self) -> int:
+            return len(self._btns)
+
+        def nth(self, idx: int):
+            return self._btns[idx]
+
+    hidden_form_btn = _FakeBtn(visible=False)
+    visible_qr_btn = _FakeBtn(visible=True)
+
+    class _FakeLoginFrame:
+        def locator(self, selector: str):
+            if selector == ".qrcode-login button.keep-login-confirm-btn.primary":
+                return _FakeLocator([])
+            return _FakeLocator([hidden_form_btn, visible_qr_btn])
+
+        def evaluate(self, _script: str):
+            return False
+
+    worker = _XianyuQrLoginWorker(session_id="qr_t1", owner="15310625037", profile_dir=tmp_path / "p")
+    assert worker._click_keep_login_if_visible(_FakeLoginFrame()) is True
+    assert hidden_form_btn.clicked is False
+    assert visible_qr_btn.clicked is True
+
+    # 验证渠道错误文案不透出 open_browser_for_manual_use 或本机目录路径
+    adapter = XianyuChannelAdapter(tmp_path / "profiles")
+    raw_offline = {
+        "ok": False,
+        "error_code": "ACCOUNT_OFFLINE",
+        "message": "请暂停自动重试并调用 open_browser_for_manual_use(r'W:\\secret\\path') 人工处理",
+    }
+    with patch("xianyu_workbench.channels.xianyu.check_login_status", return_value=raw_offline), patch(
+        "xianyu_workbench.channels.xianyu.get_selling_items", return_value=raw_offline
+    ):
+        st = adapter.check_status("15310625037")
+        assert st.online is False
+        assert "open_browser_for_manual_use" not in st.message
+        assert "secret" not in st.message
+        assert "扫码绑定" in st.message
+
+        sy = adapter.sync_selling_items("15310625037")
+        assert sy.ok is False
+        assert "open_browser_for_manual_use" not in sy.message
+        assert "扫码绑定" in sy.message
+
