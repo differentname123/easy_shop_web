@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import io
 import logging
 from pathlib import Path
+import shutil
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -57,6 +58,41 @@ def _format_qr_png(raw_png: bytes) -> bytes:
         buf = io.BytesIO()
         canvas.save(buf, format="PNG")
         return buf.getvalue()
+
+
+def _rename_with_retry(src: Path, dst: Path, attempts: int = 8, delay_sec: float = 0.25) -> None:
+    """等待 Chrome 子进程在关闭后彻底释放 Windows 目录句柄，再执行原子改名。"""
+    last_err: Optional[OSError] = None
+    for i in range(max(1, attempts)):
+        try:
+            src.rename(dst)
+            return
+        except OSError as exc:
+            last_err = exc
+            if i + 1 < attempts:
+                time.sleep(delay_sec)
+    assert last_err is not None
+    raise last_err
+
+
+def _replace_profile_dir(staging_dir: Path, target_dir: Path) -> None:
+    """用扫码登录成功的全新目录原子替换正式托管目录，失败时自动回滚旧目录。"""
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir: Optional[Path] = None
+    if target_dir.exists():
+        backup_dir = target_dir.with_name(f"{target_dir.name}.bak_{uuid.uuid4().hex[:6]}")
+        _rename_with_retry(target_dir, backup_dir)
+    try:
+        _rename_with_retry(staging_dir, target_dir)
+    except Exception:
+        if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
+            try:
+                _rename_with_retry(backup_dir, target_dir)
+            except Exception:
+                pass
+        raise
+    if backup_dir is not None and backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 class _XianyuQrLoginWorker:
@@ -192,38 +228,11 @@ class _XianyuQrLoginWorker:
         return None
 
     def _click_keep_login_if_visible(self, login_frame: Any) -> bool:
-        for selector in (
-            ".qrcode-login button.keep-login-confirm-btn.primary",
-            "button.keep-login-confirm-btn.primary",
-        ):
-            try:
-                loc = login_frame.locator(selector)
-                cnt = loc.count()
-                for i in range(cnt):
-                    btn = loc.nth(i)
-                    if btn.is_visible():
-                        btn.click()
-                        return True
-            except Exception:
-                continue
+        # 必须点击扫码区内的「保持」按钮；若错过倒计时，闲鱼会在该目录永久记住「不保持」
         try:
-            clicked = bool(
-                login_frame.evaluate(
-                    """() => {
-                        const btns = Array.from(document.querySelectorAll('button.keep-login-confirm-btn.primary'));
-                        for (const btn of btns) {
-                            const rect = btn.getBoundingClientRect();
-                            const style = window.getComputedStyle(btn);
-                            if (rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none') {
-                                btn.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }"""
-                )
-            )
-            if clicked:
+            btn = login_frame.locator(".qrcode-login button.keep-login-confirm-btn.primary").first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click()
                 return True
         except Exception:
             pass
@@ -248,6 +257,10 @@ class _XianyuQrLoginWorker:
             return
 
         profile_str = str(self.profile_dir)
+        # 每次扫码均从全新的临时目录启动，确保必弹「保持登录状态」且不被历史「不保持」污染
+        staging_dir = self.profile_dir.with_name(f"{self.profile_dir.name}.staging_{self.session_id}")
+        pending_success: Optional[Dict[str, str]] = None
+
         try:
             with _acquire_serial_browser_lock(
                 user_data_dir=profile_str,
@@ -257,13 +270,14 @@ class _XianyuQrLoginWorker:
             ):
                 if self._cancel_event.is_set():
                     return
+                staging_dir.mkdir(parents=True, exist_ok=True)
                 with sync_playwright() as p:
                     context = None
                     auth_tracker: Optional[Dict[str, Any]] = None
                     on_page_cb = None
                     try:
                         context = launch_persistent_context(
-                            p, user_data_dir=profile_str, headless=True
+                            p, user_data_dir=str(staging_dir), headless=True
                         )
                         context.set_default_timeout(30_000)
                         context.set_default_navigation_timeout(30_000)
@@ -309,7 +323,6 @@ class _XianyuQrLoginWorker:
                                 and not auth_tracker.get("expired_rets")
                                 and login_frame is None
                             ):
-                                # 等待持久化长效续登 Cookie (havana_lgc2_77 / _hvn_lgc_) 与昵称落盘，杜绝只拿到会话 cookie2 关窗即掉线
                                 has_persistent_sso = bool(
                                     cookies.get("havana_lgc2_77") or cookies.get("_hvn_lgc_")
                                 )
@@ -338,16 +351,12 @@ class _XianyuQrLoginWorker:
                                     )
                                     return
 
-                                page.wait_for_timeout(1000)
-                                nick = str(auth_tracker.get("display_name") or "").strip()
-                                self._set_state(
-                                    "success",
-                                    f"已绑定闲鱼账号：{nick or unb}",
-                                    clear_qr=True,
-                                    account_id=unb,
-                                    nickname=nick,
-                                )
-                                return
+                                page.wait_for_timeout(800)
+                                pending_success = {
+                                    "account_id": unb,
+                                    "nickname": str(auth_tracker.get("display_name") or "").strip(),
+                                }
+                                break
 
                             if login_frame is not None:
                                 txt = self._read_frame_status_text(login_frame)
@@ -376,6 +385,18 @@ class _XianyuQrLoginWorker:
                                 context.close()
                             except Exception:
                                 pass
+
+                if pending_success and not self._cancel_event.is_set():
+                    _replace_profile_dir(staging_dir, self.profile_dir)
+                    unb = pending_success["account_id"]
+                    nick = pending_success["nickname"]
+                    self._set_state(
+                        "success",
+                        f"已绑定闲鱼账号：{nick or unb}",
+                        clear_qr=True,
+                        account_id=unb,
+                        nickname=nick,
+                    )
         except XianyuLockTimeoutError:
             self._set_state(
                 "error",
@@ -387,10 +408,13 @@ class _XianyuQrLoginWorker:
             logger.exception(f"[闲鱼扫码登录异常] owner={self.owner}: {exc}")
             self._set_state(
                 "error",
-                f"启动闲鱼扫码页面失败：{exc}",
+                f"闲鱼扫码绑定失败：{exc}",
                 clear_qr=True,
                 error_code="QR_WORKER_ERROR",
             )
+        finally:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 class XianyuChannelAdapter(SellingChannel):
@@ -413,7 +437,6 @@ class XianyuChannelAdapter(SellingChannel):
         self._sessions: Dict[str, _XianyuQrLoginWorker] = {}
 
     def _prune_inactive_locked(self) -> None:
-        # 保留已结束会话短时间供最后一次轮询读取；仅当总数过多时裁剪最老的已结束会话
         if len(self._sessions) <= 12:
             return
         finished = [sid for sid, w in self._sessions.items() if not w.is_active()]

@@ -813,13 +813,20 @@ def test_profile_lock_scope_isolates_seller_from_global_discovery_lock(tmp_path)
             t.join(timeout=3.0)
 
 
-def test_xianyu_qr_worker_clicks_visible_qrcode_keep_login_and_sanitizes_errors(tmp_path):
-    from xianyu_workbench.channels.xianyu import XianyuChannelAdapter, _XianyuQrLoginWorker
+def test_xianyu_qr_worker_keep_login_atomic_replace_and_sanitized_errors(tmp_path):
+    from xianyu_workbench.channels.xianyu import (
+        XianyuChannelAdapter,
+        _XianyuQrLoginWorker,
+        _replace_profile_dir,
+    )
 
     class _FakeBtn:
         def __init__(self, visible: bool):
             self._visible = visible
             self.clicked = False
+
+        def count(self) -> int:
+            return 1
 
         def is_visible(self) -> bool:
             return self._visible
@@ -831,28 +838,38 @@ def test_xianyu_qr_worker_clicks_visible_qrcode_keep_login_and_sanitizes_errors(
         def __init__(self, btns):
             self._btns = btns
 
+        @property
+        def first(self):
+            return self._btns[0]
+
         def count(self) -> int:
             return len(self._btns)
 
-        def nth(self, idx: int):
-            return self._btns[idx]
-
-    hidden_form_btn = _FakeBtn(visible=False)
-    visible_qr_btn = _FakeBtn(visible=True)
+    qr_btn = _FakeBtn(visible=True)
 
     class _FakeLoginFrame:
         def locator(self, selector: str):
-            if selector == ".qrcode-login button.keep-login-confirm-btn.primary":
-                return _FakeLocator([])
-            return _FakeLocator([hidden_form_btn, visible_qr_btn])
-
-        def evaluate(self, _script: str):
-            return False
+            assert selector == ".qrcode-login button.keep-login-confirm-btn.primary"
+            return _FakeLocator([qr_btn])
 
     worker = _XianyuQrLoginWorker(session_id="qr_t1", owner="15310625037", profile_dir=tmp_path / "p")
     assert worker._click_keep_login_if_visible(_FakeLoginFrame()) is True
-    assert hidden_form_btn.clicked is False
-    assert visible_qr_btn.clicked is True
+    assert qr_btn.clicked is True
+
+    # 验证全新扫码临时目录原子替换已有旧目录（清除历史“不保持”污染且无残留目录）
+    target = tmp_path / "profiles" / "xianyu" / "15310625037"
+    target.mkdir(parents=True)
+    (target / "stale_not_keep.txt").write_text("old", encoding="utf-8")
+
+    staging = target.with_name("15310625037.staging_qr123")
+    staging.mkdir(parents=True)
+    (staging / "fresh_keep.txt").write_text("new", encoding="utf-8")
+
+    _replace_profile_dir(staging, target)
+    assert not staging.exists()
+    assert not (target / "stale_not_keep.txt").exists()
+    assert (target / "fresh_keep.txt").read_text(encoding="utf-8") == "new"
+    assert [p.name for p in target.parent.iterdir()] == ["15310625037"]
 
     # 验证渠道错误文案不透出 open_browser_for_manual_use 或本机目录路径
     adapter = XianyuChannelAdapter(tmp_path / "profiles")

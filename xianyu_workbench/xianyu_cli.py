@@ -42,19 +42,10 @@ from xianyu_workbench.client import (
     search_xianyu_items,
 )
 
-# ==============================================================================
-# 【直接运行配置区】：PyCharm 里直接点绿色运行按钮即可按这里打开浏览器（不用敲命令行）
-# 常用目录路径示例（复制到下方 "user_data_dir" 即可打开对应用户）：
-#   1. 原卖货主号目录 : r"W:\temp\xianyu_myself"
-#   2. 比价搜索小号   : r"W:\temp\xianyu_xiaohao"
-#   3. 工作台 15310625037 托管目录:
-#      r"W:\project\python_project\easy_shop_web\xianyu_workbench\data\channel_profiles\xianyu\15310625037"
-# ==============================================================================
 XIANYU_CLI_CONFIG: Dict[str, Any] = {
-    "user_data_dir": r"W:\temp\xianyu_myself",  # 填任意电脑目录即可直接打开；留空 "" 则按下方 default_account 打开
-    "default_account": "search",                # 仅当上方 user_data_dir 为空时生效: "search" | "seller" | "guest"
-    "home_url": GOOFISH_PERSONAL_URL,           # 打开浏览器后自动跳转的链接（可改成任意 URL）
-    "debug": False,                             # 是否开启有头调试窗口
+    "default_account": "search",             # 可选: "search"(比价搜索小号) | "seller"(卖货主号) | "guest"(免登录访客)
+    "home_url": GOOFISH_PERSONAL_URL,      # `login` 手动接管打开的初始页面
+    "debug": False,                        # 是否开启有头调试窗口
 }
 
 _ACCOUNT_DIRS: Dict[str, str] = {
@@ -67,12 +58,8 @@ _ACCOUNT_DIRS: Dict[str, str] = {
 def _resolve_user_data_dir(account: Optional[str], explicit_dir: str, *, default_account: str) -> str:
     if str(explicit_dir or "").strip():
         return str(explicit_dir).strip()
-    if account:
-        return _ACCOUNT_DIRS.get(account, DEFAULT_SEARCH_USER_DATA_DIR)
-    configured_dir = str(XIANYU_CLI_CONFIG.get("user_data_dir") or "").strip()
-    if configured_dir:
-        return configured_dir
-    return _ACCOUNT_DIRS.get(default_account, DEFAULT_SEARCH_USER_DATA_DIR)
+    key = account or default_account
+    return _ACCOUNT_DIRS.get(key, DEFAULT_SEARCH_USER_DATA_DIR)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -187,4 +174,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    # 不带命令行参数直接运行时，直接按下方地址和网址用浏览器打开对应账号目录：
+    # 常用目录示例：
+    #   工作台 15310625037 账号目录: r"W:\project\python_project\easy_shop_web\xianyu_workbench\data\channel_profiles\xianyu\15310625037"
+    #   卖货主号目录:               r"W:\temp\xianyu_myself"
+    #   比价搜索小号目录:           r"W:\temp\xianyu_xiaohao"
+    if len(sys.argv) <= 1:
+        bootstrap_script("xianyu_cli", "publish_to_xianyu", log_path=None, configure_network=False)
+        open_browser_for_manual_use(
+            user_data_dir=r"W:\temp\xianyu_1",
+            home_url="https://www.goofish.com/personal",
+            lock_scope="profile",
+        )
+        sys.exit(0)
     sys.exit(main())
