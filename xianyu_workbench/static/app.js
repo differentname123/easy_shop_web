@@ -115,6 +115,8 @@ createApp({
     const evalSortBy = ref('want');
     const includeAllWinners = ref(false);
     const favNeedsBinding = ref(false);
+    /** 比价理由展开状态：key = platform:product_id */
+    const expandedReasons = ref(new Set());
 
     // 本地待上架商品
     const localItems = ref([]);
@@ -227,8 +229,9 @@ createApp({
     }
 
     function formatTime(iso) {
+      /** 兼容 SQLite 格式 '2026-11-24 06:12:29'（无T）和 ISO 格式 */
       if (!iso) return '';
-      const d = new Date(iso);
+      const d = new Date(String(iso).replace(' ', 'T'));
       if (Number.isNaN(d.getTime())) return '';
       const pad = (n) => String(n).padStart(2, '0');
       return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -337,6 +340,15 @@ createApp({
     function toggleAllWinners() {
       includeAllWinners.value = !includeAllWinners.value;
       loadCandidates(true);
+    }
+
+    function toggleReason(c) {
+      /** 展开/折叠某个候选商品的比价理由 */
+      const key = `${c.platform}:${c.product_id}`;
+      const s = expandedReasons.value;
+      if (s.has(key)) { s.delete(key); } else { s.add(key); }
+      // 触发响应式更新（Set 本身变化不被 Vue 追踪，需替换引用）
+      expandedReasons.value = new Set(s);
     }
 
     async function loadCandidates(reset = true) {
@@ -854,6 +866,14 @@ createApp({
     onMounted(() => {
       bootstrapSession();
       window.addEventListener('beforeunload', handlePageUnload);
+      // 拦截手机物理返回键/手势，防止退出单页应用
+      history.pushState({ page: 'workbench' }, '', location.href);
+      window.addEventListener('popstate', () => {
+        // 重新推入状态，使工作台留在原位
+        history.pushState({ page: 'workbench' }, '', location.href);
+        // 若编辑抽屉打开，则关闭抽屉（而非退出页面）
+        if (editing.value) { editing.value = null; }
+      });
     });
 
     onBeforeUnmount(() => {
@@ -879,6 +899,7 @@ createApp({
       evalSourceType,
       evalSortBy,
       includeAllWinners,
+      expandedReasons,
       favNeedsBinding,
       localItems,
       itemsLoading,
@@ -912,6 +933,7 @@ createApp({
       setEvalSourceType,
       toggleEvalSortBy,
       toggleAllWinners,
+      toggleReason,
       loadCandidates,
       dismissCandidate,
       pickCandidate,

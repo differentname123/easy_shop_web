@@ -229,8 +229,10 @@
     .eval-reason {
       margin-top: 4px;
       color: var(--text);
+    }
+    .eval-reason.collapsed {
       display: -webkit-box;
-      -webkit-line-clamp: 2;
+      -webkit-line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
     }
@@ -633,7 +635,21 @@
                 <span v-if="c.xianyu_ref.want_cnt"> · {{ c.xianyu_ref.want_cnt }}人想要</span>
                 <span v-if="c.xianyu_ref.screenshot_url" style="color: var(--blue);"> · 点图放大</span>
               </div>
-              <div class="eval-reason">{{ c.llm_reason || c.xianyu_ref.title }}</div>
+              <div
+                class="eval-reason"
+                :class="{ collapsed: !expandedReasons.has(c.platform+':'+c.product_id) }"
+              >{{ c.llm_reason || c.xianyu_ref.title }}</div>
+              <div style="display:flex; align-items:center; justify-content:space-between; margin-top:4px;">
+                <span v-if="c.evaluated_at" style="font-size:11px; color:var(--sub);">
+                  评估于 {{ formatTime(c.evaluated_at) }}
+                </span>
+                <button
+                  v-if="c.llm_reason && c.llm_reason.length > 60"
+                  class="link-btn"
+                  style="font-size:11px; margin-left:auto;"
+                  @click.stop="toggleReason(c)"
+                >{{ expandedReasons.has(c.platform+':'+c.product_id) ? '收起 ↑' : '展开理由 ↓' }}</button>
+              </div>
             </div>
           </div>
 
@@ -1267,6 +1283,6 @@
 </div>
 
 <script src="/static/vue.global.prod.js"></script>
-<script src="/static/app.js?v=6"></script>
+<script src="/static/app.js?v=7"></script>
 </body>
 </html>
