@@ -1,0 +1,467 @@
+# -*- coding: utf-8 -*-
+"""闲鱼销售渠道适配器：服务端托管隔离目录、扫码登录、在线检测与真实在售同步。"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import io
+import logging
+from pathlib import Path
+import threading
+import time
+from typing import Any, Dict, Optional
+import uuid
+
+from PIL import Image
+
+from ..client.seller import check_login_status, get_selling_items
+from ..client.session import (
+    GOOFISH_PERSONAL_URL,
+    XianyuLockTimeoutError,
+    _acquire_serial_browser_lock,
+    _attach_auth_tracker,
+    _detach_tracker_from_context,
+    _extract_risk_reasons,
+    launch_persistent_context,
+    sync_playwright,
+)
+from .base import (
+    ChannelAccountStatus,
+    ChannelCapabilities,
+    ChannelSyncResult,
+    QrLoginSnapshot,
+    SellingChannel,
+)
+
+logger = logging.getLogger("xianyu_workbench.channels.xianyu")
+
+QR_LOGIN_TIMEOUT_SEC = 150.0
+MAX_ACTIVE_QR_SESSIONS = 3
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _format_qr_png(raw_png: bytes) -> bytes:
+    """放大二维码并补齐白色静区，确保手机相册保存后易于闲鱼 App 识别。"""
+    with Image.open(io.BytesIO(raw_png)) as img:
+        rgb = img.convert("RGB")
+        w, h = rgb.size
+        target = 280
+        if max(w, h) < target and min(w, h) > 0:
+            scale = max(1, (target + min(w, h) - 1) // min(w, h))
+            rgb = rgb.resize((w * scale, h * scale), Image.Resampling.NEAREST)
+        pad = 20
+        canvas = Image.new("RGB", (rgb.width + pad * 2, rgb.height + pad * 2), (255, 255, 255))
+        canvas.paste(rgb, (pad, pad))
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        return buf.getvalue()
+
+
+class _XianyuQrLoginWorker:
+    """单线程独占 Playwright 生命周期的闲鱼扫码登录工作器。"""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        owner: str,
+        profile_dir: Path,
+        timeout_sec: float = QR_LOGIN_TIMEOUT_SEC,
+    ) -> None:
+        self.session_id = session_id
+        self.owner = owner
+        self.profile_dir = profile_dir
+        self.timeout_sec = max(30.0, float(timeout_sec or QR_LOGIN_TIMEOUT_SEC))
+        self.deadline = time.monotonic() + self.timeout_sec
+
+        self._lock = threading.Lock()
+        self._cancel_event = threading.Event()
+        self._state = "starting"
+        self._message = "正在打开闲鱼登录页..."
+        self._qr_bytes: Optional[bytes] = None
+        self._account_id = ""
+        self._nickname = ""
+        self._error_code = ""
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"xy-qr-{session_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        with self._lock:
+            if not self._is_terminal_state(self._state):
+                self._state = "cancelled"
+                self._message = "已取消扫码登录"
+                self._qr_bytes = None
+
+    def join(self, timeout: float = 2.0) -> None:
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    @staticmethod
+    def _is_terminal_state(state: str) -> bool:
+        return state in ("success", "expired", "risk_blocked", "error", "cancelled")
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return not self._is_terminal_state(self._state) and self._thread.is_alive()
+
+    def snapshot(self) -> QrLoginSnapshot:
+        with self._lock:
+            rem = max(0, int(round(self.deadline - time.monotonic())))
+            return QrLoginSnapshot(
+                session_id=self.session_id,
+                channel="xianyu",
+                state=self._state,
+                message=self._message,
+                has_qr=bool(self._qr_bytes),
+                account_id=self._account_id,
+                nickname=self._nickname,
+                error_code=self._error_code,
+                expires_in_sec=0 if self._is_terminal_state(self._state) else rem,
+            )
+
+    def qr_bytes(self) -> Optional[bytes]:
+        with self._lock:
+            return self._qr_bytes
+
+    def _set_state(
+        self,
+        state: str,
+        message: str,
+        *,
+        qr_bytes: Optional[bytes] = None,
+        clear_qr: bool = False,
+        account_id: Optional[str] = None,
+        nickname: Optional[str] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            if self._cancel_event.is_set() and state != "cancelled":
+                return
+            self._state = state
+            self._message = message
+            if clear_qr:
+                self._qr_bytes = None
+            elif qr_bytes is not None:
+                self._qr_bytes = qr_bytes
+            if account_id is not None:
+                self._account_id = account_id
+            if nickname is not None:
+                self._nickname = nickname
+            if error_code is not None:
+                self._error_code = error_code
+
+    @staticmethod
+    def _find_login_frame(page: Any) -> Any:
+        for f in getattr(page, "frames", None) or []:
+            url = str(getattr(f, "url", "") or "")
+            if "passport.goofish.com/mini_login" in url or "login.taobao.com" in url:
+                return f
+        return None
+
+    @staticmethod
+    def _read_cookies(context: Any) -> Dict[str, str]:
+        return {
+            c["name"]: c["value"]
+            for c in (context.cookies() or [])
+            if isinstance(c, dict) and c.get("name") and c.get("value")
+        }
+
+    def _capture_qr_png(self, login_frame: Any) -> Optional[bytes]:
+        for selector in ("#qrcode-img", "div.qrcode-img", "#qrcode-img canvas"):
+            try:
+                loc = login_frame.locator(selector).first
+                if loc.count() <= 0:
+                    continue
+                box = loc.bounding_box()
+                if not box or box.get("width", 0) < 60 or box.get("height", 0) < 60:
+                    continue
+                raw = loc.screenshot(type="png")
+                if raw:
+                    return _format_qr_png(raw)
+            except Exception:
+                continue
+        return None
+
+    def _click_keep_login_if_visible(self, login_frame: Any) -> None:
+        try:
+            btn = login_frame.locator("button.keep-login-confirm-btn.primary").first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click()
+        except Exception:
+            pass
+
+    def _read_frame_status_text(self, login_frame: Any) -> str:
+        try:
+            return str(
+                login_frame.evaluate("() => (document.body ? document.body.innerText : '').trim()") or ""
+            )
+        except Exception:
+            return ""
+
+    def _run(self) -> None:
+        if sync_playwright is None:
+            self._set_state(
+                "error",
+                "Playwright 未安装，无法发起扫码登录",
+                clear_qr=True,
+                error_code="PLAYWRIGHT_MISSING",
+            )
+            return
+
+        profile_str = str(self.profile_dir)
+        try:
+            with _acquire_serial_browser_lock(
+                user_data_dir=profile_str,
+                task_name="qr_login",
+                lock_timeout_sec=15.0,
+                lock_scope="profile",
+            ):
+                if self._cancel_event.is_set():
+                    return
+                with sync_playwright() as p:
+                    context = None
+                    auth_tracker: Optional[Dict[str, Any]] = None
+                    on_page_cb = None
+                    try:
+                        context = launch_persistent_context(
+                            p, user_data_dir=profile_str, headless=True
+                        )
+                        context.set_default_timeout(30_000)
+                        context.set_default_navigation_timeout(30_000)
+                        page = context.pages[0] if context.pages else context.new_page()
+                        auth_tracker = _attach_auth_tracker(page)
+                        if hasattr(context, "on") and callable(auth_tracker.get("_on_response_cb")):
+                            def _on_new_page(new_p):
+                                new_p.on("response", auth_tracker["_on_response_cb"])
+                            on_page_cb = _on_new_page
+                            context.on("page", on_page_cb)
+
+                        page.goto(GOOFISH_PERSONAL_URL, wait_until="domcontentloaded")
+                        page.wait_for_timeout(2500)
+
+                        last_qr_capture = 0.0
+                        while not self._cancel_event.is_set():
+                            if time.monotonic() >= self.deadline:
+                                self._set_state("expired", "二维码已超时，请重新生成", clear_qr=True, error_code="TIMEOUT")
+                                return
+
+                            risk = _extract_risk_reasons(page, auth_tracker)
+                            if risk:
+                                self._set_state(
+                                    "risk_blocked",
+                                    f"触发闲鱼安全校验（{risk[0]}），已自动停止，请稍后再试",
+                                    clear_qr=True,
+                                    error_code="RISK_CONTROL_BLOCKED",
+                                )
+                                return
+
+                            cookies = self._read_cookies(context)
+                            login_frame = self._find_login_frame(page)
+                            unb = str(cookies.get("unb") or auth_tracker.get("user_id") or "").strip()
+
+                            if login_frame is not None:
+                                self._click_keep_login_if_visible(login_frame)
+
+                            if (
+                                unb
+                                and cookies.get("cookie2")
+                                and not auth_tracker.get("expired_rets")
+                                and login_frame is None
+                            ):
+                                # 登录后稍等个人昵称接口落稳
+                                if not auth_tracker.get("display_name"):
+                                    page.wait_for_timeout(1200)
+                                nick = str(auth_tracker.get("display_name") or "").strip()
+                                self._set_state(
+                                    "success",
+                                    f"已绑定闲鱼账号：{nick or unb}",
+                                    clear_qr=True,
+                                    account_id=unb,
+                                    nickname=nick,
+                                )
+                                return
+
+                            if login_frame is not None:
+                                txt = self._read_frame_status_text(login_frame)
+                                if "请在手机上确认登录" in txt or "扫描成功" in txt:
+                                    self._set_state("scanned", "已扫码，请在手机闲鱼 App 点击确认登录")
+                                elif "二维码已失效" in txt or "已过期" in txt:
+                                    self._set_state("expired", "二维码已失效，请点击刷新重扫", clear_qr=True, error_code="QR_EXPIRED")
+                                    return
+                                elif time.monotonic() - last_qr_capture >= 2.5 or self.qr_bytes() is None:
+                                    png = self._capture_qr_png(login_frame)
+                                    if png:
+                                        last_qr_capture = time.monotonic()
+                                        self._set_state(
+                                            "waiting_scan",
+                                            "请用手机闲鱼 App 扫一扫，或长按保存二维码后在闲鱼相册扫码",
+                                            qr_bytes=png,
+                                        )
+
+                            page.wait_for_timeout(1000)
+                    finally:
+                        _detach_tracker_from_context(context, auth_tracker, on_page_cb)
+                        if context is not None:
+                            try:
+                                context.close()
+                            except Exception:
+                                pass
+        except XianyuLockTimeoutError:
+            self._set_state(
+                "error",
+                "当前账号正在执行状态检测或同步，请几秒后再发起扫码",
+                clear_qr=True,
+                error_code="LOCK_TIMEOUT",
+            )
+        except Exception as exc:
+            logger.exception(f"[闲鱼扫码登录异常] owner={self.owner}: {exc}")
+            self._set_state(
+                "error",
+                f"启动闲鱼扫码页面失败：{exc}",
+                clear_qr=True,
+                error_code="QR_WORKER_ERROR",
+            )
+
+
+class XianyuChannelAdapter(SellingChannel):
+    """闲鱼渠道实现。"""
+
+    channel_code = "xianyu"
+    channel_name = "闲鱼"
+    capabilities = ChannelCapabilities(
+        qr_login=True,
+        status_check=True,
+        sync_selling=True,
+        auto_publish=False,
+        auto_downshelf=False,
+    )
+
+    def __init__(self, profiles_root: Path, *, login_timeout_sec: float = QR_LOGIN_TIMEOUT_SEC) -> None:
+        super().__init__(profiles_root)
+        self.login_timeout_sec = login_timeout_sec
+        self._sessions_lock = threading.Lock()
+        self._sessions: Dict[str, _XianyuQrLoginWorker] = {}
+
+    def _prune_inactive_locked(self) -> None:
+        # 保留已结束会话短时间供最后一次轮询读取；仅当总数过多时裁剪最老的已结束会话
+        if len(self._sessions) <= 12:
+            return
+        finished = [sid for sid, w in self._sessions.items() if not w.is_active()]
+        for sid in finished[: len(self._sessions) - 12]:
+            self._sessions.pop(sid, None)
+
+    def start_qr_login(self, username: str) -> QrLoginSnapshot:
+        profile_dir = self.profile_dir_for(username)
+        with self._sessions_lock:
+            self._prune_inactive_locked()
+            to_cancel = [w for w in self._sessions.values() if w.owner == username and w.is_active()]
+            active_others = sum(
+                1 for w in self._sessions.values() if w.owner != username and w.is_active()
+            )
+            if active_others >= MAX_ACTIVE_QR_SESSIONS:
+                raise RuntimeError("当前扫码会话过多，请稍后再试")
+
+        for old_worker in to_cancel:
+            old_worker.cancel()
+            old_worker.join(timeout=2.0)
+
+        sid = f"qr_{uuid.uuid4().hex[:12]}"
+        worker = _XianyuQrLoginWorker(
+            session_id=sid,
+            owner=username,
+            profile_dir=profile_dir,
+            timeout_sec=self.login_timeout_sec,
+        )
+        with self._sessions_lock:
+            self._sessions[sid] = worker
+        worker.start()
+        return worker.snapshot()
+
+    def _get_worker(self, username: str, session_id: str) -> Optional[_XianyuQrLoginWorker]:
+        with self._sessions_lock:
+            worker = self._sessions.get(str(session_id or "").strip())
+            if worker is None or worker.owner != username:
+                return None
+            return worker
+
+    def get_qr_login_status(self, username: str, session_id: str) -> Optional[QrLoginSnapshot]:
+        worker = self._get_worker(username, session_id)
+        return worker.snapshot() if worker else None
+
+    def get_qr_image_bytes(self, username: str, session_id: str) -> Optional[bytes]:
+        worker = self._get_worker(username, session_id)
+        return worker.qr_bytes() if worker else None
+
+    def cancel_qr_login(self, username: str, session_id: Optional[str] = None) -> bool:
+        with self._sessions_lock:
+            targets = [
+                w
+                for sid, w in self._sessions.items()
+                if w.owner == username and (not session_id or sid == session_id)
+            ]
+        if not targets:
+            return False
+        for w in targets:
+            w.cancel()
+            w.join(timeout=2.0)
+        return True
+
+    def check_status(self, username: str) -> ChannelAccountStatus:
+        profile_dir = self.profile_dir_for(username)
+        res = check_login_status(
+            user_data_dir=str(profile_dir),
+            lock_timeout_sec=20.0,
+            operation_timeout_sec=45.0,
+            lock_scope="profile",
+        )
+        online = bool(res.get("ok"))
+        return ChannelAccountStatus(
+            channel=self.channel_code,
+            online=online,
+            account_id=str(res.get("unb") or "").strip(),
+            nickname=str(res.get("nick") or "").strip(),
+            error_code="" if online else str(res.get("error_code") or "ACCOUNT_OFFLINE"),
+            message="账号在线" if online else str(res.get("message") or "账号未登录或已掉线"),
+            checked_at=_now_iso(),
+        )
+
+    def sync_selling_items(self, username: str) -> ChannelSyncResult:
+        profile_dir = self.profile_dir_for(username)
+        res = get_selling_items(
+            user_data_dir=str(profile_dir),
+            lock_timeout_sec=25.0,
+            operation_timeout_sec=60.0,
+            lock_scope="profile",
+        )
+        ok = bool(res.get("ok"))
+        return ChannelSyncResult(
+            ok=ok,
+            channel=self.channel_code,
+            online=ok,
+            account_id=str(res.get("unb") or "").strip(),
+            nickname=str(res.get("nick") or "").strip(),
+            error_code="" if ok else str(res.get("error_code") or "SYNC_FAILED"),
+            message="同步完成" if ok else str(res.get("message") or "同步在售商品失败"),
+            online_items=list(res.get("online_items") or []),
+            abnormal_items=list(res.get("abnormal_items") or []),
+            group_counts=dict(res.get("group_counts") or {}),
+            synced_at=_now_iso(),
+        )
+
+    def shutdown(self) -> None:
+        with self._sessions_lock:
+            workers = list(self._sessions.values())
+            self._sessions.clear()
+        for w in workers:
+            w.cancel()
+        for w in workers:
+            w.join(timeout=2.0)

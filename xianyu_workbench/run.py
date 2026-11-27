@@ -7,13 +7,14 @@ r"""
   python xianyu_workbench/run.py create-user admin 123456 --bind-phone 13800138000
   python xianyu_workbench/run.py list-users
   python xianyu_workbench/run.py reset-password admin newpass123
-  python xianyu_workbench/run.py              # 默认启动 Web 工作台 (127.0.0.1:8002)
+  python xianyu_workbench/run.py              # 默认启动 Web 工作台 (0.0.0.0:8002)
 ================================================================================
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import socket
 import sys
 from typing import Any, List, Optional
 
@@ -62,6 +63,45 @@ def cmd_list_users(repo: WorkbenchRepository) -> List[dict]:
     return repo.list_users()
 
 
+def _is_lan_ipv4(ip: str) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31)
+
+
+def _detect_lan_ip() -> str:
+    """探测本机局域网私有 IPv4 地址（避开 Clash 198.18.x 虚拟网卡），供手机同 Wi-Fi 访问。"""
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        candidates = [info[4][0] for info in infos if info and info[4]]
+        for ip in candidates:
+            if _is_lan_ipv4(ip):
+                return ip
+    except OSError:
+        pass
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and not ip.startswith(("127.", "169.254.", "198.18.")):
+            return ip
+    except OSError:
+        pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return ""
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     cfg: WorkbenchConfig = load_config()
     parser = argparse.ArgumentParser(description="闲鱼选品与上架工作台 CLI")
@@ -92,7 +132,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         host = getattr(args, "host", cfg.host)
         port = int(getattr(args, "port", cfg.port))
-        print(f"🚀 闲鱼选品与上架工作台已启动: http://{host}:{port}")
+        if host in ("0.0.0.0", "::"):
+            lan_ip = _detect_lan_ip()
+            print(f"🚀 闲鱼选品与上架工作台已启动:")
+            print(f"   - 本机访问: http://127.0.0.1:{port}")
+            if lan_ip:
+                print(f"   - 局域网/手机同Wi-Fi访问: http://{lan_ip}:{port}")
+        else:
+            print(f"🚀 闲鱼选品与上架工作台已启动: http://{host}:{port}")
         uvicorn.run(create_app(cfg), host=host, port=port)
         return 0
 

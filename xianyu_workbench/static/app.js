@@ -1,585 +1,758 @@
-(function (global) {
-  'use strict';
+const { createApp, ref, computed, onMounted, onBeforeUnmount } = Vue;
 
-  const TOKEN_KEY = 'xy_workbench_token';
+const PLATFORM_NAMES = { pdd: '拼多多', jd: '京东', taobao: '淘宝' };
 
-  function formatMoney(v) {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return '0.00';
-    return n.toFixed(2);
+async function api(url, options = {}) {
+  const opts = {
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options,
+  };
+  const resp = await fetch(url, opts);
+  const text = await resp.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (_) {
+    throw new Error(`服务返回异常 (${resp.status})`);
   }
+  if (!resp.ok) {
+    const msg = (json && (json.detail || json.message)) || `请求失败 (${resp.status})`;
+    const err = new Error(msg);
+    err.status = resp.status;
+    throw err;
+  }
+  return json.data;
+}
 
-  function createWorkbenchController({ ref, computed, onMounted }) {
-    const booting = ref(true);
-    const isLoggedIn = ref(false);
-    const user = ref({ username: '', bound_shop_uid: '' });
-    const statusCounts = ref({ draft: 0, ready: 0, online: 0, offline: 0, rejected: 0, all: 0 });
-    const activeTab = ref('candidates');
-    const candidateSource = ref('evaluations');
-    const toastMsg = ref('');
-    const lightboxUrl = ref('');
+function compressImageToDataUrl(file, maxDim = 1400, quality = 0.85) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (Math.max(width, height) > maxDim) {
+          const ratio = maxDim / Math.max(width, height);
+          width = Math.max(1, Math.round(width * ratio));
+          height = Math.max(1, Math.round(height * ratio));
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => reject(new Error('无法读取该图片'));
+      img.src = reader.result;
+    };
+    reader.onerror = () => reject(new Error('读取文件失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+createApp({
+  setup() {
+    const toast = ref('');
     let toastTimer = null;
-
-    const loginForm = ref({ username: '', password: '' });
-    const loginBusy = ref(false);
-
-    const bindModal = ref({ visible: false, shop_uid: '', shop_phone: '', saving: false });
-
-    const evalFilters = ref({
-      winner: 'my_product',
-      source_type: 'all',
-      min_ratio: 1,
-      sort: 'ratio',
-      include_handled: false,
-      include_off: false,
-    });
-    const evalState = ref({ items: [], total: 0, page: 1, hasMore: false, loading: false });
-
-    const favFilters = ref({ include_handled: false, include_off: false });
-    const favState = ref({ items: [], total: 0, page: 1, hasMore: false, loading: false, needs_binding: false });
-
-    const listingStatusTabs = [
-      { key: 'ready', label: '待上架就绪' },
-      { key: 'draft', label: '编辑草稿' },
-      { key: 'online', label: '闲鱼已上架' },
-      { key: 'offline', label: '已下架' },
-      { key: 'rejected', label: '已淘汰' },
-      { key: 'all', label: '全部有效' },
-    ];
-    const listingFilterStatus = ref('ready');
-    const listingsState = ref({ items: [], total: 0, page: 1, hasMore: false, loading: false });
-
-    const editor = ref({
-      listing: null,
-      form: {
-        title: '',
-        description: '',
-        images: [],
-        sell_price: 0,
-        shipping_fee: 0,
-        max_cost_price: 0,
-      },
-      copyStyle: 'casual',
-      customImageUrl: '',
-      uploading: false,
-      generating: false,
-      saving: false,
-    });
-
-    const showToast = (msg, duration = 2600) => {
-      toastMsg.value = String(msg || '');
+    function showToast(msg) {
+      toast.value = String(msg || '');
       if (toastTimer) clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => { toastMsg.value = ''; }, duration);
-    };
+      toastTimer = setTimeout(() => { toast.value = ''; }, 2400);
+    }
 
-    const getToken = () => {
-      try { return global.localStorage.getItem(TOKEN_KEY) || ''; } catch (_) { return ''; }
-    };
-    const setToken = tok => {
+    async function copyText(text) {
+      const val = String(text || '').trim();
+      if (!val) {
+        showToast('内容为空');
+        return;
+      }
       try {
-        if (tok) global.localStorage.setItem(TOKEN_KEY, tok);
-        else global.localStorage.removeItem(TOKEN_KEY);
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(val);
+          showToast('已复制文案');
+          return;
+        }
       } catch (_) {}
-    };
-
-    const request = async (path, { method = 'GET', body } = {}) => {
-      const headers = {};
-      const tok = getToken();
-      if (tok) headers.Authorization = `Bearer ${tok}`;
-      if (body !== undefined) headers['Content-Type'] = 'application/json';
-      const resp = await global.fetch(path, {
-        method,
-        headers,
-        credentials: 'same-origin',
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
-      let data = {};
-      try { data = await resp.json(); } catch (_) {}
-      if (resp.status === 401) {
-        setToken('');
-        isLoggedIn.value = false;
-      }
-      return { ok: resp.ok, status: resp.status, data };
-    };
-
-    const platformLabel = p => ({ pdd: '拼多多', taobao: '淘宝', jd: '京东' }[p] || p || '未知');
-    const originLabel = o => ({ official: '官方图', deal: '爆料图', upload: '上传图', custom: '外链图' }[o] || '图片');
-    const statusLabel = s => ({
-      draft: '编辑草稿',
-      ready: '已就绪待上架',
-      online: '闲鱼已上架',
-      offline: '已下架',
-      rejected: '已淘汰',
-    }[s] || s);
-
-    const estimatedProfit = computed(() => {
-      const sell = Number(editor.value.form.sell_price || 0);
-      const cost = Number(editor.value.listing?.cost_price || 0);
-      return sell - cost;
-    });
-
-    const unusedOfficialImages = computed(() => {
-      const list = editor.value.listing?.available_official_images || [];
-      const used = new Set((editor.value.form.images || []).map(x => x.url));
-      return list.filter(u => !used.has(u));
-    });
-
-    const unusedDealImages = computed(() => {
-      const list = editor.value.listing?.available_deal_images || [];
-      const used = new Set((editor.value.form.images || []).map(x => x.url));
-      return list.filter(u => !used.has(u));
-    });
-
-    const openLightbox = url => {
-      if (url) lightboxUrl.value = url;
-    };
-
-    const applyListingToEditor = doc => {
-      editor.value.listing = doc;
-      editor.value.form = {
-        title: doc.title || '',
-        description: doc.description || '',
-        images: Array.isArray(doc.images) ? doc.images.map(x => ({ url: x.url, origin: x.origin || 'custom' })) : [],
-        sell_price: Number(doc.sell_price || 0),
-        shipping_fee: Number(doc.shipping_fee || 0),
-        max_cost_price: Number(doc.max_cost_price || 0),
-      };
-      editor.value.customImageUrl = '';
-    };
-
-    const refreshMe = async () => {
-      const res = await request('/api/auth/me');
-      if (res.ok && res.data?.status === 'success') {
-        const d = res.data.data;
-        user.value = { username: d.username, bound_shop_uid: d.bound_shop_uid || '' };
-        if (d.status_counts) statusCounts.value = d.status_counts;
-        isLoggedIn.value = true;
-        return true;
-      }
-      isLoggedIn.value = false;
-      return false;
-    };
-
-    const handleLogin = async () => {
-      if (loginBusy.value) return;
-      loginBusy.value = true;
       try {
-        const res = await request('/api/auth/login', { method: 'POST', body: loginForm.value });
-        if (res.ok && res.data?.status === 'success') {
-          const d = res.data.data;
-          setToken(d.token);
-          user.value = d.user;
-          isLoggedIn.value = true;
-          loginForm.value.password = '';
-          await refreshMe();
-          await loadEvaluations(1);
-          showToast('登录成功');
-        } else {
-          showToast(res.data?.detail || '用户名或密码错误');
-        }
+        const ta = document.createElement('textarea');
+        ta.value = val;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, val.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast(ok ? '已复制文案' : '请长按文案手动复制');
       } catch (_) {
-        showToast('登录请求失败，请检查服务状态');
-      } finally {
-        loginBusy.value = false;
+        showToast('请长按文案手动复制');
       }
-    };
+    }
 
-    const handleLogout = async () => {
-      await request('/api/auth/logout', { method: 'POST' });
-      setToken('');
-      isLoggedIn.value = false;
-      editor.value.listing = null;
-    };
+    // 登录与账号态
+    const user = ref(null);
+    const itemCounts = ref({ draft: 0, ready: 0, active: 0, dismissed: 0 });
+    const loginForm = ref({ username: '', password: '' });
+    const loginError = ref('');
+    const loginLoading = ref(false);
+    const bindPhoneInput = ref('');
 
-    const openBindModal = () => {
-      bindModal.value = {
-        visible: true,
-        shop_uid: user.value.bound_shop_uid || '',
-        shop_phone: '',
-        saving: false,
+    // 导航状态
+    const mainTab = ref('pick');
+    const pickSource = ref('eval');
+    const itemsSubTab = ref('ready');
+
+    // 挑品流
+    const candidates = ref([]);
+    const candidatesPage = ref(1);
+    const candidatesHasMore = ref(false);
+    const candidatesLoading = ref(false);
+    const evalTotal = ref(0);
+    const includeAllWinners = ref(false);
+    const favNeedsBinding = ref(false);
+
+    // 本地待上架商品
+    const localItems = ref([]);
+    const itemsLoading = ref(false);
+
+    // 可插拔渠道与在售同步
+    const channels = ref([]);
+    const activeChannelCode = ref('xianyu');
+    const channelBusy = ref('');
+    const syncLoading = ref(false);
+    const sellingData = ref({
+      online_items: [],
+      abnormal_items: [],
+      online_count: 0,
+      abnormal_count: 0,
+      synced_at: '',
+    });
+
+    const activeChannel = computed(() => {
+      return channels.value.find((c) => c.channel === activeChannelCode.value) || {
+        channel: activeChannelCode.value,
+        name: '闲鱼',
+        bound: false,
+        online: false,
+        nickname: '',
+        account_id: '',
+        online_count: 0,
+        capabilities: {},
       };
-    };
+    });
 
-    const submitBinding = async () => {
-      if (bindModal.value.saving) return;
-      bindModal.value.saving = true;
+    // 全屏编辑抽屉
+    const editing = ref(null);
+    const uploading = ref(false);
+    const aiGenerating = ref(false);
+    const savingEditor = ref(false);
+    const zoomImageUrl = ref('');
+
+    const unusedPoolImages = computed(() => {
+      if (!editing.value) return [];
+      const selected = new Set((editing.value.images || []).map((x) => x.url));
+      const pool = [];
+      for (const u of (editing.value.available_official_images || [])) {
+        if (!selected.has(u)) pool.push({ url: u, origin: 'official' });
+      }
+      for (const u of (editing.value.available_deal_images || [])) {
+        if (!selected.has(u)) pool.push({ url: u, origin: 'deal' });
+      }
+      return pool;
+    });
+
+    // 扫码弹窗状态
+    const qrModal = ref({
+      visible: false,
+      channel: 'xianyu',
+      channelName: '闲鱼',
+      sessionId: '',
+      state: 'starting',
+      message: '',
+      hasQr: false,
+      qrUrl: '',
+      expiresIn: 0,
+    });
+    let qrPollTimer = null;
+
+    // 关联本地商品弹窗
+    const linkModal = ref({ visible: false, sellingItem: null });
+
+    function platformLabel(code) {
+      return PLATFORM_NAMES[String(code || '').toLowerCase()] || String(code || '').toUpperCase();
+    }
+
+    function formatTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    async function refreshMeAndChannels() {
+      const [me, chData] = await Promise.all([
+        api('/api/auth/me'),
+        api('/api/channels'),
+      ]);
+      user.value = { username: me.username, bound_shop_uid: me.bound_shop_uid };
+      itemCounts.value = me.item_counts || itemCounts.value;
+      channels.value = chData.channels || [];
+      if (channels.value.length > 0 && !channels.value.some((c) => c.channel === activeChannelCode.value)) {
+        activeChannelCode.value = channels.value[0].channel;
+      }
+    }
+
+    async function bootstrapSession() {
       try {
-        const res = await request('/api/auth/binding', {
-          method: 'PATCH',
-          body: { shop_uid: bindModal.value.shop_uid, shop_phone: bindModal.value.shop_phone },
-        });
-        if (res.ok && res.data?.status === 'success') {
-          user.value.bound_shop_uid = res.data.data.bound_shop_uid || '';
-          bindModal.value.visible = false;
-          showToast('主站收藏数据源绑定已更新');
-          if (activeTab.value === 'candidates' && candidateSource.value === 'favorites') {
-            await loadFavorites(1);
-          }
-        } else {
-          showToast(res.data?.detail || '绑定失败');
-        }
-      } finally {
-        bindModal.value.saving = false;
+        await refreshMeAndChannels();
+        await Promise.all([loadCandidates(true), loadItems()]);
+      } catch (_) {
+        user.value = null;
       }
-    };
+    }
 
-    const loadEvaluations = async (page = 1, append = false) => {
-      evalState.value.loading = true;
+    async function doLogin() {
+      if (!loginForm.value.username || !loginForm.value.password) {
+        loginError.value = '请输入账号和密码';
+        return;
+      }
+      loginLoading.value = true;
+      loginError.value = '';
       try {
-        const qs = new URLSearchParams({
-          winner: evalFilters.value.winner,
-          source_type: evalFilters.value.source_type,
-          min_ratio: String(evalFilters.value.min_ratio),
-          sort: evalFilters.value.sort,
-          include_handled: String(evalFilters.value.include_handled),
-          include_off: String(evalFilters.value.include_off),
-          page: String(page),
-          page_size: '20',
-        });
-        const res = await request(`/api/candidates/evaluations?${qs}`);
-        if (res.ok && res.data?.status === 'success') {
-          const d = res.data.data;
-          evalState.value.items = append ? [...evalState.value.items, ...d.items] : d.items;
-          evalState.value.total = d.total;
-          evalState.value.page = d.page;
-          evalState.value.hasMore = Boolean(d.has_more);
-        }
-      } finally {
-        evalState.value.loading = false;
-      }
-    };
-
-    const loadFavorites = async (page = 1, append = false) => {
-      favState.value.loading = true;
-      try {
-        const qs = new URLSearchParams({
-          include_handled: String(favFilters.value.include_handled),
-          include_off: String(favFilters.value.include_off),
-          page: String(page),
-          page_size: '20',
-        });
-        const res = await request(`/api/candidates/favorites?${qs}`);
-        if (res.ok && res.data?.status === 'success') {
-          const d = res.data.data;
-          favState.value.items = append ? [...favState.value.items, ...d.items] : d.items;
-          favState.value.total = d.total;
-          favState.value.page = d.page;
-          favState.value.hasMore = Boolean(d.has_more);
-          favState.value.needs_binding = Boolean(d.needs_binding);
-        }
-      } finally {
-        favState.value.loading = false;
-      }
-    };
-
-    const loadListings = async (page = 1, append = false) => {
-      listingsState.value.loading = true;
-      try {
-        const qs = new URLSearchParams({
-          status: listingFilterStatus.value,
-          page: String(page),
-          page_size: '20',
-        });
-        const res = await request(`/api/listings?${qs}`);
-        if (res.ok && res.data?.status === 'success') {
-          const d = res.data.data;
-          listingsState.value.items = append ? [...listingsState.value.items, ...d.items] : d.items;
-          listingsState.value.total = d.total;
-          listingsState.value.page = d.page;
-          listingsState.value.hasMore = Boolean(d.has_more);
-          if (d.status_counts) statusCounts.value = d.status_counts;
-        }
-      } finally {
-        listingsState.value.loading = false;
-      }
-    };
-
-    const switchTab = async tab => {
-      activeTab.value = tab;
-      if (tab === 'candidates') {
-        if (candidateSource.value === 'evaluations') await loadEvaluations(1);
-        else await loadFavorites(1);
-      } else if (tab === 'listings') {
-        await loadListings(1);
-      }
-    };
-
-    const switchCandidateSource = async src => {
-      candidateSource.value = src;
-      if (src === 'evaluations') await loadEvaluations(1);
-      else await loadFavorites(1);
-    };
-
-    const switchListingStatus = async status => {
-      listingFilterStatus.value = status;
-      await loadListings(1);
-    };
-
-    const rejectCandidate = async (item, sourceOrigin) => {
-      const res = await request('/api/candidates/reject', {
-        method: 'POST',
-        body: { platform: item.platform, product_id: item.product_id, source_origin: sourceOrigin },
-      });
-      if (res.ok && res.data?.status === 'success') {
-        if (sourceOrigin === 'xianyu_eval') {
-          evalState.value.items = evalState.value.items.filter(
-            x => !(x.platform === item.platform && x.product_id === item.product_id)
-          );
-        } else {
-          favState.value.items = favState.value.items.filter(
-            x => !(x.platform === item.platform && x.product_id === item.product_id)
-          );
-        }
-        await refreshMe();
-        showToast('已标记淘汰，不再出现在待选池');
-      } else {
-        showToast(res.data?.detail || '淘汰失败');
-      }
-    };
-
-    const openDraftFromCandidate = async (item, sourceOrigin) => {
-      const res = await request('/api/listings/draft', {
-        method: 'POST',
-        body: { platform: item.platform, product_id: item.product_id, source_origin: sourceOrigin },
-      });
-      if (res.ok && res.data?.status === 'success') {
-        applyListingToEditor(res.data.data);
-        activeTab.value = 'editor';
-        await refreshMe();
-      } else {
-        showToast(res.data?.detail || '创建草稿失败');
-      }
-    };
-
-    const openListingInEditor = async listingId => {
-      const res = await request(`/api/listings/${listingId}`);
-      if (res.ok && res.data?.status === 'success') {
-        applyListingToEditor(res.data.data);
-        activeTab.value = 'editor';
-      } else {
-        showToast(res.data?.detail || '打开编辑失败');
-      }
-    };
-
-    const moveImage = (idx, delta) => {
-      const arr = [...editor.value.form.images];
-      const nextIdx = idx + delta;
-      if (nextIdx < 0 || nextIdx >= arr.length) return;
-      const [picked] = arr.splice(idx, 1);
-      arr.splice(nextIdx, 0, picked);
-      editor.value.form.images = arr;
-    };
-
-    const removeImage = idx => {
-      const arr = [...editor.value.form.images];
-      arr.splice(idx, 1);
-      editor.value.form.images = arr;
-    };
-
-    const appendPoolImage = (url, origin) => {
-      if (editor.value.form.images.length >= 9) {
-        return showToast('最多保留 9 张图片');
-      }
-      if (editor.value.form.images.some(x => x.url === url)) return;
-      editor.value.form.images = [...editor.value.form.images, { url, origin }];
-    };
-
-    const addCustomImageUrl = () => {
-      const url = String(editor.value.customImageUrl || '').trim();
-      if (!url) return;
-      if (!/^https?:\/\//i.test(url)) {
-        return showToast('请输入 http:// 或 https:// 开头的图片链接');
-      }
-      appendPoolImage(url, 'custom');
-      editor.value.customImageUrl = '';
-    };
-
-    const handleUploadImage = ev => {
-      const file = ev.target.files && ev.target.files[0];
-      ev.target.value = '';
-      if (!file) return;
-      if (editor.value.form.images.length >= 9) {
-        return showToast('最多保留 9 张图片');
-      }
-      const reader = new global.FileReader();
-      reader.onload = async () => {
-        editor.value.uploading = true;
-        try {
-          const res = await request('/api/assets/upload', {
-            method: 'POST',
-            body: { image_base64: String(reader.result || '') },
-          });
-          if (res.ok && res.data?.status === 'success') {
-            appendPoolImage(res.data.data.url, 'upload');
-            showToast('图片上传成功');
-          } else {
-            showToast(res.data?.detail || '图片上传失败');
-          }
-        } finally {
-          editor.value.uploading = false;
-        }
-      };
-      reader.readAsDataURL(file);
-    };
-
-    const handleGenerateCopy = async () => {
-      if (!editor.value.listing || editor.value.generating) return;
-      editor.value.generating = true;
-      try {
-        // 先将当前定价同步给草稿，让 AI 知晓最新定价
-        await request(`/api/listings/${editor.value.listing.listing_id}`, {
-          method: 'PATCH',
-          body: {
-            sell_price: editor.value.form.sell_price,
-            shipping_fee: editor.value.form.shipping_fee,
-          },
-        });
-        const res = await request(`/api/listings/${editor.value.listing.listing_id}/generate-copy`, {
+        await api('/api/auth/login', {
           method: 'POST',
-          body: { style: editor.value.copyStyle },
+          body: JSON.stringify(loginForm.value),
         });
-        if (res.ok && res.data?.status === 'success') {
-          editor.value.form.title = res.data.data.title || editor.value.form.title;
-          editor.value.form.description = res.data.data.description || '';
-          showToast('AI 话术已生成，请核对后保存或确认就绪');
-        } else {
-          showToast(res.data?.detail || 'AI 生成失败');
-        }
+        await bootstrapSession();
+      } catch (e) {
+        loginError.value = e.message;
       } finally {
-        editor.value.generating = false;
+        loginLoading.value = false;
       }
-    };
+    }
 
-    const saveEditor = async targetStatus => {
-      if (!editor.value.listing || editor.value.saving) return;
-      editor.value.saving = true;
+    async function doLogout() {
+      stopQrPolling();
+      try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {}
+      user.value = null;
+      candidates.value = [];
+      localItems.value = [];
+      editing.value = null;
+    }
+
+    async function updateShopBinding() {
+      if (!bindPhoneInput.value) {
+        showToast('请输入主站手机号');
+        return;
+      }
       try {
-        const res = await request(`/api/listings/${editor.value.listing.listing_id}`, {
+        const res = await api('/api/auth/binding', {
           method: 'PATCH',
-          body: {
-            title: editor.value.form.title,
-            description: editor.value.form.description,
-            images: editor.value.form.images,
-            sell_price: editor.value.form.sell_price,
-            shipping_fee: editor.value.form.shipping_fee,
-            max_cost_price: editor.value.form.max_cost_price,
-            status: targetStatus,
-          },
+          body: JSON.stringify({ shop_phone: bindPhoneInput.value }),
         });
-        if (res.ok && res.data?.status === 'success') {
-          applyListingToEditor(res.data.data);
-          await refreshMe();
-          if (targetStatus === 'ready') {
-            showToast('已确认就绪并进入标准上架库');
-            listingFilterStatus.value = 'ready';
-            await switchTab('listings');
-          } else if (targetStatus === 'rejected') {
-            showToast('已淘汰该商品');
-            editor.value.listing = null;
-            await switchTab('candidates');
-          } else {
-            showToast('草稿已保存');
-          }
+        user.value = { ...user.value, bound_shop_uid: res.bound_shop_uid };
+        bindPhoneInput.value = '';
+        showToast('主站收藏账号绑定成功');
+        if (pickSource.value === 'fav') loadCandidates(true);
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    // 挑品逻辑
+    function switchPickSource(src) {
+      if (pickSource.value === src) return;
+      pickSource.value = src;
+      loadCandidates(true);
+    }
+
+    function toggleAllWinners() {
+      includeAllWinners.value = !includeAllWinners.value;
+      loadCandidates(true);
+    }
+
+    async function loadCandidates(reset = true) {
+      if (candidatesLoading.value) return;
+      candidatesLoading.value = true;
+      const targetPage = reset ? 1 : candidatesPage.value + 1;
+      try {
+        const url = pickSource.value === 'eval'
+          ? `/api/candidates/evaluations?include_all_winners=${includeAllWinners.value}&page=${targetPage}&page_size=15`
+          : `/api/candidates/favorites?page=${targetPage}&page_size=15`;
+        const data = await api(url);
+        if (reset) {
+          candidates.value = data.items || [];
         } else {
-          showToast(res.data?.detail || '保存失败');
+          candidates.value = [...candidates.value, ...(data.items || [])];
         }
+        candidatesPage.value = targetPage;
+        candidatesHasMore.value = !!data.has_more;
+        favNeedsBinding.value = !!data.needs_binding;
+        if (pickSource.value === 'eval') evalTotal.value = data.total || 0;
+      } catch (e) {
+        showToast(e.message);
       } finally {
-        editor.value.saving = false;
+        candidatesLoading.value = false;
       }
-    };
+    }
 
-    const changeListingStatus = async (listingId, nextStatus) => {
-      const res = await request(`/api/listings/${listingId}`, {
-        method: 'PATCH',
-        body: { status: nextStatus },
-      });
-      if (res.ok && res.data?.status === 'success') {
-        showToast('状态已更新');
-        await loadListings(1);
-      } else {
-        showToast(res.data?.detail || '更新失败');
-      }
-    };
-
-    const copyListingText = async item => {
-      const text = `${item.title || ''}\n\n${item.description || ''}`.trim();
-      if (!text) return showToast('暂无可复制的话术');
+    async function dismissCandidate(c) {
       try {
-        await global.navigator.clipboard.writeText(text);
-        showToast('标题和描述已复制');
-      } catch (_) {
-        showToast('复制失败，请手动选中复制');
+        await api('/api/candidates/dismiss', {
+          method: 'POST',
+          body: JSON.stringify({
+            platform: c.platform,
+            product_id: c.product_id,
+            source_origin: c.source_origin,
+          }),
+        });
+        candidates.value = candidates.value.filter(
+          (x) => !(x.platform === c.platform && x.product_id === c.product_id)
+        );
+        if (pickSource.value === 'eval' && evalTotal.value > 0) evalTotal.value -= 1;
+        showToast('已跳过');
+      } catch (e) {
+        showToast(e.message);
       }
-    };
+    }
 
-    onMounted(async () => {
+    async function pickCandidate(c) {
       try {
-        const ok = await refreshMe();
-        if (ok) await loadEvaluations(1);
+        const doc = await api('/api/items/draft', {
+          method: 'POST',
+          body: JSON.stringify({
+            platform: c.platform,
+            product_id: c.product_id,
+            source_origin: c.source_origin,
+          }),
+        });
+        candidates.value = candidates.value.filter(
+          (x) => !(x.platform === c.platform && x.product_id === c.product_id)
+        );
+        if (pickSource.value === 'eval' && evalTotal.value > 0) evalTotal.value -= 1;
+        editing.value = JSON.parse(JSON.stringify(doc));
+        await Promise.all([loadItems(), refreshMeAndChannels()]);
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    // 本地待上架 & 在售切换
+    async function loadItems() {
+      itemsLoading.value = true;
+      try {
+        const data = await api('/api/items?status=active&page=1&page_size=80');
+        localItems.value = data.items || [];
+        if (data.item_counts) itemCounts.value = data.item_counts;
+      } catch (e) {
+        showToast(e.message);
       } finally {
-        booting.value = false;
+        itemsLoading.value = false;
       }
+    }
+
+    async function loadChannelSelling(code = activeChannelCode.value) {
+      try {
+        const data = await api(`/api/channels/${encodeURIComponent(code)}/selling`);
+        sellingData.value = data;
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    function openItemsTab() {
+      mainTab.value = 'items';
+      loadItems();
+      if (itemsSubTab.value === 'selling') loadChannelSelling();
+    }
+
+    function switchItemsSubTab(sub) {
+      itemsSubTab.value = sub;
+      if (sub === 'ready') loadItems();
+      else loadChannelSelling();
+    }
+
+    function selectChannel(code) {
+      activeChannelCode.value = code;
+      loadChannelSelling(code);
+    }
+
+    function openMeTab() {
+      mainTab.value = 'me';
+      refreshMeAndChannels().catch(() => {});
+    }
+
+    // 编辑抽屉逻辑
+    async function openEditor(item) {
+      try {
+        const detail = await api(`/api/items/${encodeURIComponent(item.listing_id)}`);
+        editing.value = JSON.parse(JSON.stringify(detail));
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    function closeEditor() {
+      editing.value = null;
+    }
+
+    function removeEditorImage(idx) {
+      editing.value.images.splice(idx, 1);
+    }
+
+    function setCoverImage(idx) {
+      const imgs = editing.value.images;
+      const [picked] = imgs.splice(idx, 1);
+      imgs.unshift(picked);
+    }
+
+    function addPoolImage(pimg) {
+      if ((editing.value.images || []).length >= 9) {
+        showToast('最多保留 9 张图片');
+        return;
+      }
+      editing.value.images.push({ url: pimg.url, origin: pimg.origin });
+    }
+
+    async function onPickUploadFiles(ev) {
+      const files = Array.from(ev.target.files || []);
+      ev.target.value = '';
+      if (!files.length) return;
+      uploading.value = true;
+      try {
+        for (const f of files) {
+          if ((editing.value.images || []).length >= 9) {
+            showToast('最多保留 9 张图片');
+            break;
+          }
+          const b64 = await compressImageToDataUrl(f);
+          const res = await api('/api/assets/upload', {
+            method: 'POST',
+            body: JSON.stringify({ image_base64: b64 }),
+          });
+          editing.value.images.push({ url: res.url, origin: 'upload' });
+        }
+        showToast('图片上传成功');
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        uploading.value = false;
+      }
+    }
+
+    async function generateEditorCopy() {
+      if (!editing.value) return;
+      aiGenerating.value = true;
+      try {
+        const data = await api(`/api/items/${encodeURIComponent(editing.value.listing_id)}/generate-copy`, {
+          method: 'POST',
+        });
+        editing.value.title = data.title || editing.value.title;
+        editing.value.description = data.description || editing.value.description;
+        showToast('已生成帮拍话术');
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        aiGenerating.value = false;
+      }
+    }
+
+    async function saveEditor(targetStatus) {
+      if (!editing.value) return;
+      savingEditor.value = true;
+      try {
+        await api(`/api/items/${encodeURIComponent(editing.value.listing_id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            title: editing.value.title,
+            description: editing.value.description,
+            images: editing.value.images,
+            price: Number(editing.value.price || 0),
+            status: targetStatus,
+          }),
+        });
+        showToast(targetStatus === 'ready' ? '已加入待上架' : '草稿已保存');
+        editing.value = null;
+        await Promise.all([loadItems(), refreshMeAndChannels()]);
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        savingEditor.value = false;
+      }
+    }
+
+    async function dismissFromEditor() {
+      if (!editing.value) return;
+      try {
+        await api(`/api/items/${encodeURIComponent(editing.value.listing_id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'dismissed' }),
+        });
+        editing.value = null;
+        showToast('已移出清单');
+        await Promise.all([loadItems(), refreshMeAndChannels()]);
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    function copyItemCopy(it) {
+      const txt = `${it.title || ''}\n\n${it.description || ''}`.trim();
+      copyText(txt);
+    }
+
+    // 渠道能力：扫码绑定、状态检测、在售同步与关联
+    function stopQrPolling() {
+      if (qrPollTimer) {
+        clearInterval(qrPollTimer);
+        qrPollTimer = null;
+      }
+    }
+
+    async function closeQrModal(cancelRemote = false) {
+      stopQrPolling();
+      const ch = qrModal.value.channel;
+      const sid = qrModal.value.sessionId;
+      qrModal.value.visible = false;
+      if (cancelRemote && sid) {
+        try {
+          await api(`/api/channels/${encodeURIComponent(ch)}/login/cancel`, {
+            method: 'POST',
+            body: JSON.stringify({ session_id: sid }),
+          });
+        } catch (_) {}
+      }
+    }
+
+    async function startQrLogin(channelCode = activeChannelCode.value) {
+      stopQrPolling();
+      const chObj = channels.value.find((c) => c.channel === channelCode) || { name: '闲鱼' };
+      qrModal.value = {
+        visible: true,
+        channel: channelCode,
+        channelName: chObj.name || channelCode,
+        sessionId: '',
+        state: 'starting',
+        message: '正在打开登录页面...',
+        hasQr: false,
+        qrUrl: '',
+        expiresIn: 0,
+      };
+      try {
+        const snap = await api(`/api/channels/${encodeURIComponent(channelCode)}/login/start`, {
+          method: 'POST',
+        });
+        qrModal.value.sessionId = snap.session_id;
+        applyQrSnapshot(snap);
+        if (snap.state === 'success') {
+          await onQrSuccess();
+          return;
+        }
+        qrPollTimer = setInterval(() => pollQrStatus(), 1500);
+      } catch (e) {
+        qrModal.value.state = 'error';
+        qrModal.value.message = e.message;
+      }
+    }
+
+    function applyQrSnapshot(snap) {
+      qrModal.value.state = snap.state;
+      qrModal.value.message = snap.message || '';
+      qrModal.value.expiresIn = snap.expires_in_sec || 0;
+      if (snap.has_qr) {
+        qrModal.value.hasQr = true;
+        if (!qrModal.value.qrUrl) {
+          qrModal.value.qrUrl = `/api/channels/${encodeURIComponent(qrModal.value.channel)}/login/qr/${encodeURIComponent(snap.session_id)}?t=${Date.now()}`;
+        }
+      }
+    }
+
+    async function onQrSuccess() {
+      stopQrPolling();
+      showToast('账号绑定成功');
+      await refreshMeAndChannels();
+      setTimeout(() => { qrModal.value.visible = false; }, 900);
+      if (itemsSubTab.value === 'selling') {
+        await syncActiveChannel(qrModal.value.channel);
+      }
+    }
+
+    async function pollQrStatus() {
+      if (!qrModal.value.visible || !qrModal.value.sessionId) return;
+      try {
+        const snap = await api(
+          `/api/channels/${encodeURIComponent(qrModal.value.channel)}/login/status/${encodeURIComponent(qrModal.value.sessionId)}`
+        );
+        applyQrSnapshot(snap);
+        if (snap.state === 'success') {
+          await onQrSuccess();
+        } else if (['expired', 'risk_blocked', 'error', 'cancelled'].includes(snap.state)) {
+          stopQrPolling();
+        }
+      } catch (e) {
+        stopQrPolling();
+        qrModal.value.state = 'error';
+        qrModal.value.message = e.message;
+      }
+    }
+
+    async function checkChannelStatus(channelCode) {
+      channelBusy.value = channelCode;
+      try {
+        const res = await api(`/api/channels/${encodeURIComponent(channelCode)}/status`, { method: 'POST' });
+        await refreshMeAndChannels();
+        showToast(res.online ? `在线：${res.nickname || res.account_id}` : (res.message || '账号未在线'));
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        channelBusy.value = '';
+      }
+    }
+
+    async function syncActiveChannel(codeArg) {
+      const code = typeof codeArg === 'string' && codeArg ? codeArg : activeChannelCode.value;
+      if (syncLoading.value) return;
+      syncLoading.value = true;
+      try {
+        const res = await api(`/api/channels/${encodeURIComponent(code)}/sync`, { method: 'POST' });
+        sellingData.value = res;
+        await refreshMeAndChannels();
+        showToast(`同步完成：在售 ${res.online_count} 件`);
+      } catch (e) {
+        showToast(e.message);
+        await refreshMeAndChannels();
+      } finally {
+        syncLoading.value = false;
+      }
+    }
+
+    async function openLinkModal(sellingItem) {
+      if (localItems.value.length === 0) await loadItems();
+      linkModal.value = { visible: true, sellingItem };
+    }
+
+    async function submitLink(listingId) {
+      const ext = linkModal.value.sellingItem;
+      if (!ext) return;
+      try {
+        const res = await api(
+          `/api/channels/${encodeURIComponent(activeChannelCode.value)}/selling/${encodeURIComponent(ext.item_id)}/link`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ listing_id: listingId || '' }),
+          }
+        );
+        sellingData.value = res;
+        linkModal.value.visible = false;
+        showToast(listingId ? '关联成功' : '已取消关联');
+        await refreshMeAndChannels();
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    async function publishToChannel(it) {
+      try {
+        await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/publish`, {
+          method: 'POST',
+          body: JSON.stringify({ listing_id: it.listing_id }),
+        });
+        showToast('上架成功');
+        await syncActiveChannel();
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    function handlePageUnload() {
+      if (qrModal.value.visible && qrModal.value.sessionId) {
+        navigator.sendBeacon?.(
+          `/api/channels/${encodeURIComponent(qrModal.value.channel)}/login/cancel`,
+          new Blob([JSON.stringify({ session_id: qrModal.value.sessionId })], { type: 'application/json' })
+        );
+      }
+    }
+
+    onMounted(() => {
+      bootstrapSession();
+      window.addEventListener('beforeunload', handlePageUnload);
+    });
+
+    onBeforeUnmount(() => {
+      stopQrPolling();
+      window.removeEventListener('beforeunload', handlePageUnload);
     });
 
     return {
-      booting,
-      isLoggedIn,
+      toast,
       user,
-      statusCounts,
-      activeTab,
-      candidateSource,
-      toastMsg,
-      lightboxUrl,
+      itemCounts,
       loginForm,
-      loginBusy,
-      bindModal,
-      evalFilters,
-      evalState,
-      favFilters,
-      favState,
-      listingStatusTabs,
-      listingFilterStatus,
-      listingsState,
-      editor,
-      estimatedProfit,
-      unusedOfficialImages,
-      unusedDealImages,
-      formatMoney,
+      loginError,
+      loginLoading,
+      bindPhoneInput,
+      mainTab,
+      pickSource,
+      itemsSubTab,
+      candidates,
+      candidatesHasMore,
+      candidatesLoading,
+      evalTotal,
+      includeAllWinners,
+      favNeedsBinding,
+      localItems,
+      itemsLoading,
+      channels,
+      activeChannelCode,
+      activeChannel,
+      channelBusy,
+      syncLoading,
+      sellingData,
+      editing,
+      uploading,
+      aiGenerating,
+      savingEditor,
+      zoomImageUrl,
+      unusedPoolImages,
+      qrModal,
+      linkModal,
       platformLabel,
-      originLabel,
-      statusLabel,
-      openLightbox,
-      handleLogin,
-      handleLogout,
-      openBindModal,
-      submitBinding,
-      switchTab,
-      switchCandidateSource,
-      switchListingStatus,
-      loadEvaluations,
-      loadFavorites,
-      loadListings,
-      rejectCandidate,
-      openDraftFromCandidate,
-      openListingInEditor,
-      moveImage,
-      removeImage,
-      appendPoolImage,
-      addCustomImageUrl,
-      handleUploadImage,
-      handleGenerateCopy,
+      formatTime,
+      copyText,
+      doLogin,
+      doLogout,
+      updateShopBinding,
+      switchPickSource,
+      toggleAllWinners,
+      loadCandidates,
+      dismissCandidate,
+      pickCandidate,
+      loadItems,
+      openItemsTab,
+      switchItemsSubTab,
+      selectChannel,
+      openMeTab,
+      openEditor,
+      closeEditor,
+      removeEditorImage,
+      setCoverImage,
+      addPoolImage,
+      onPickUploadFiles,
+      generateEditorCopy,
       saveEditor,
-      changeListingStatus,
-      copyListingText,
+      dismissFromEditor,
+      copyItemCopy,
+      startQrLogin,
+      closeQrModal,
+      checkChannelStatus,
+      syncActiveChannel,
+      openLinkModal,
+      submitLink,
+      publishToChannel,
     };
-  }
-
-  if (global.Vue && global.document && global.document.getElementById('app')) {
-    const { createApp, ref, computed, onMounted } = global.Vue;
-    createApp({
-      setup() {
-        return createWorkbenchController({ ref, computed, onMounted });
-      },
-    }).mount('#app');
-  }
-})(globalThis);
+  },
+}).mount('#app');

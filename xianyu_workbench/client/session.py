@@ -12,6 +12,7 @@ r"""
 
 from contextlib import ExitStack, contextmanager
 import gc
+import hashlib
 import logging
 import os
 import random
@@ -50,6 +51,8 @@ DEFAULT_OPERATION_TIMEOUT_SEC = 60.0
 
 _PROCESS_THREAD_LOCK = threading.Lock()
 _GLOBAL_LOCK_FILE_PATH = os.path.join(tempfile.gettempdir(), "xianyu_browser_serial.lock")
+_PROFILE_LOCKS_GUARD = threading.Lock()
+_PROFILE_THREAD_LOCKS: Dict[str, threading.Lock] = {}
 
 # 判定掉线的关键 MTOP 接口（这些接口一旦返回 SESSION_EXPIRED 等错误码即代表账号掉线）
 _AUTH_CRITICAL_APIS: Tuple[str, ...] = (
@@ -160,15 +163,30 @@ def _build_lock_timeout_result(user_data_dir: str, timeout_sec: float, action: s
     return res
 
 
+def _resolve_lock_target(user_data_dir: str, lock_scope: str) -> Tuple[threading.Lock, str]:
+    """根据 lock_scope 解析线程锁与内核文件锁路径；'profile' 按托管目录隔离故障域。"""
+    if str(lock_scope or "global").strip().lower() != "profile":
+        return _PROCESS_THREAD_LOCK, _GLOBAL_LOCK_FILE_PATH
+    norm = os.path.normcase(os.path.abspath(str(user_data_dir or "")))
+    digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+    with _PROFILE_LOCKS_GUARD:
+        tlock = _PROFILE_THREAD_LOCKS.get(digest)
+        if tlock is None:
+            tlock = threading.Lock()
+            _PROFILE_THREAD_LOCKS[digest] = tlock
+    return tlock, os.path.join(tempfile.gettempdir(), f"xianyu_profile_{digest}.lock")
+
+
 @contextmanager
 def _acquire_serial_browser_lock(
     user_data_dir: str,
     task_name: str = "browser_task",
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    lock_scope: str = "global",
 ) -> Generator[None, None, None]:
     """
     本机「跨线程 + 跨进程」浏览器串行排队锁：
-    1. 先获取当前进程内 `_PROCESS_THREAD_LOCK`（带超时）；
+    1. 先获取对应作用域的线程锁（带超时）；
     2. 再获取操作系统内核级文件字节锁 `msvcrt.locking`（若持锁进程崩溃退出，Windows 内核会自动释放，绝不死锁）；
     3. 超过 `lock_timeout_sec` 仍未获取到锁则抛出 `XianyuLockTimeoutError`。
     """
@@ -177,16 +195,17 @@ def _acquire_serial_browser_lock(
     deadline = start_ts + timeout_sec
     logged_waiting = False
     tag = _dir_tag(user_data_dir)
+    thread_lock, lock_file_path = _resolve_lock_target(user_data_dir, lock_scope)
 
     # 1. 进程内线程锁排队
-    if not _PROCESS_THREAD_LOCK.acquire(timeout=0.05):
+    if not thread_lock.acquire(timeout=0.05):
         logged_waiting = True
         logger.info(
             f"⏳ [并发锁/排队中] 任务={task_name} | 账号目录={tag} | "
             f"原因=当前进程内有其他闲鱼浏览器任务正在运行 | 最长等待={timeout_sec:.0f}s"
         )
         remaining = max(0.05, deadline - time.monotonic())
-        if not _PROCESS_THREAD_LOCK.acquire(timeout=remaining):
+        if not thread_lock.acquire(timeout=remaining):
             waited = time.monotonic() - start_ts
             logger.error(
                 f"❌ [并发锁/等待超时] 任务={task_name} | 账号目录={tag} (<{user_data_dir}>) | "
@@ -197,8 +216,8 @@ def _acquire_serial_browser_lock(
     lock_file = None
     file_locked = False
     try:
-        os.makedirs(os.path.dirname(_GLOBAL_LOCK_FILE_PATH), exist_ok=True)
-        fd = os.open(_GLOBAL_LOCK_FILE_PATH, os.O_CREAT | os.O_RDWR)
+        os.makedirs(os.path.dirname(lock_file_path), exist_ok=True)
+        fd = os.open(lock_file_path, os.O_CREAT | os.O_RDWR)
         lock_file = os.fdopen(fd, "r+b")
         if os.fstat(lock_file.fileno()).st_size == 0:
             lock_file.write(b"0")
@@ -219,7 +238,7 @@ def _acquire_serial_browser_lock(
                     waited = time.monotonic() - start_ts
                     logger.error(
                         f"❌ [并发锁/等待超时] 任务={task_name} | 账号目录={tag} (<{user_data_dir}>) | "
-                        f"已等待={waited:.2f}s (上限 {timeout_sec:.0f}s) | 锁文件={_GLOBAL_LOCK_FILE_PATH} | "
+                        f"已等待={waited:.2f}s (上限 {timeout_sec:.0f}s) | 锁文件={lock_file_path} | "
                         f"判定=获取跨进程文件锁超时，放弃本次执行以防卡死"
                     )
                     raise XianyuLockTimeoutError(user_data_dir, timeout_sec)
@@ -253,7 +272,7 @@ def _acquire_serial_browser_lock(
                 lock_file.close()
             except Exception:
                 pass
-        _PROCESS_THREAD_LOCK.release()
+        thread_lock.release()
 
 
 def clean_browser_cache(user_data_dir: str = DEFAULT_USER_DATA_DIR) -> None:
@@ -597,6 +616,7 @@ def _browser_session_guard(
     mobile_h5: bool = False,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
     operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    lock_scope: str = "global",
 ) -> Generator[Tuple[Any, Any, Dict[str, Any]], None, None]:
     """
     统一浏览器自动化执行上下文：
@@ -612,6 +632,7 @@ def _browser_session_guard(
         user_data_dir=user_data_dir,
         task_name=task_name,
         lock_timeout_sec=lock_timeout_sec,
+        lock_scope=lock_scope,
     ):
         with sync_playwright() as p:
             context = None

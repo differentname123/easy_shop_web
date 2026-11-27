@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""闲鱼选品工作台核心业务编排：双源选品过滤、默认预览装配、AI 话术生成、图片管理与标准库输出。"""
+"""平台无关选品与商品素材核心服务：候选挑品、图片/标价编排、帮拍话术生成与素材管理。"""
 from __future__ import annotations
 
 import base64
@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
 
 from fastapi import HTTPException
@@ -25,10 +25,9 @@ from .repo import WorkbenchRepository, clean_id, normalize_platform
 
 Image.MAX_IMAGE_PIXELS = 25_000_000
 
-ALLOWED_STATUSES = frozenset({"draft", "ready", "online", "offline", "rejected"})
+ALLOWED_STATUSES = frozenset({"draft", "ready", "dismissed"})
 ALLOWED_ORIGINS = frozenset({"official", "deal", "upload", "custom"})
-ALLOWED_COPY_STYLES = frozenset({"casual", "value"})
-PROMPT_PATH = WORKBENCH_DIR / "prompts" / "xianyu_copywriting.txt"
+PROMPT_PATH = WORKBENCH_DIR / "prompts" / "copywriting.txt"
 _MAX_UPLOAD_DIMENSION = 1600
 _SCREENSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}\.jpg$")
 _UPLOAD_NAME_RE = re.compile(r"^upl_[0-9a-f]{16}\.jpg$")
@@ -70,6 +69,15 @@ def _normalize_image_url(raw: Any) -> str:
     if s.startswith(("http://", "https://", "/api/assets/uploads/", "/api/deals/image/", "/api/assets/screenshots/")):
         return s
     return ""
+
+
+def _normalize_status(raw_status: Any) -> str:
+    s = str(raw_status or "draft").strip().lower()
+    if s in ("online", "offline"):
+        return "ready"
+    if s == "rejected":
+        return "dismissed"
+    return s if s in ALLOWED_STATUSES else "draft"
 
 
 def _collect_product_media(
@@ -140,7 +148,7 @@ class WorkbenchService:
         self._json_parser = json_parser or parse_ai_json
 
     # =========================================================================
-    # 账号登录与主站 UID 绑定
+    # 账号登录与主站收藏 UID 绑定
     # =========================================================================
     def authenticate(self, username: str, password: str) -> Dict[str, Any]:
         clean_user = str(username or "").strip()
@@ -163,7 +171,7 @@ class WorkbenchService:
         return {
             "username": user["username"],
             "bound_shop_uid": str(user.get("bound_shop_uid") or "").strip(),
-            "status_counts": self.repo.get_status_counts(user["username"]),
+            "item_counts": self.repo.get_item_counts(user["username"]),
         }
 
     def update_binding(self, username: str, *, shop_uid: str = "", shop_phone: str = "") -> Dict[str, Any]:
@@ -174,10 +182,6 @@ class WorkbenchService:
             if not resolved:
                 raise HTTPException(status_code=404, detail="未找到该手机号对应的主站账号")
             target_uid = resolved
-        elif target_uid and not self.repo.shop_uid_exists(target_uid):
-            # 允许在完全独立库场景下直接填写 UID，但给出明确提示字段
-            pass
-
         if not self.repo.update_bound_shop_uid(username, target_uid):
             raise HTTPException(status_code=404, detail="当前工作台账号不存在")
         return {
@@ -186,7 +190,7 @@ class WorkbenchService:
         }
 
     # =========================================================================
-    # 模块一：双源选品候选池（主站收藏 & 闲鱼比价）
+    # 模块一：极简双源挑品池（比价好货 & 我的收藏）
     # =========================================================================
     def _screenshot_url_if_exists(self, filename: str) -> str:
         clean = str(filename or "").strip()
@@ -201,7 +205,6 @@ class WorkbenchService:
         *,
         page: int = 1,
         page_size: int = 20,
-        include_handled: bool = False,
         include_off: bool = False,
     ) -> Dict[str, Any]:
         user = self.repo.get_user(owner)
@@ -230,10 +233,7 @@ class WorkbenchService:
         for fav in fav_docs:
             plat = normalize_platform(fav.get("platform"))
             pid = clean_id(fav.get("product_id"))
-            if not plat or not pid:
-                continue
-            listing = listing_map.get((plat, pid))
-            if not include_handled and listing is not None:
+            if not plat or not pid or listing_map.get((plat, pid)) is not None:
                 continue
 
             prod = prod_map.get((plat, pid))
@@ -245,37 +245,28 @@ class WorkbenchService:
             collected_price = _positive_float(fav.get("collected_price"))
             official_imgs, deal_imgs = _collect_product_media(prod, fallback_image=str(snap.get("image_url") or ""))
             name = str((prod or {}).get("name") or snap.get("name") or "未命名商品").strip()
-            price_diff = (
-                round(live_price - collected_price, 2)
-                if live_price is not None and collected_price is not None
-                else None
-            )
+            ref_price = live_price if live_price is not None else collected_price
 
             filtered.append({
                 "source_origin": "favorite",
                 "platform": plat,
                 "product_id": pid,
-                "goods_sign": str((prod or {}).get("goods_sign") or snap.get("goods_sign") or "").strip(),
                 "name": name,
                 "image_url": official_imgs[0] if official_imgs else "",
+                "price": ref_price,
                 "collected_price": collected_price,
-                "live_price": live_price,
-                "price_diff": price_diff,
                 "live_status": live_status,
                 "is_deal_tip": is_active_deal,
                 "deal_highlight": str(di.get("card_highlight") or "").strip(),
                 "official_image_count": len(official_imgs),
                 "deal_image_count": len(deal_imgs),
-                "listing_status": listing.get("status") if listing else None,
-                "listing_id": listing.get("listing_id") if listing else None,
                 "created_at": _iso_utc(fav.get("created_at")),
             })
 
         total = len(filtered)
         start = (safe_page - 1) * safe_size
-        page_items = filtered[start : start + safe_size]
         return {
-            "items": page_items,
+            "items": filtered[start : start + safe_size],
             "total": total,
             "page": safe_page,
             "page_size": safe_size,
@@ -288,11 +279,7 @@ class WorkbenchService:
         self,
         owner: str,
         *,
-        winner: str = "my_product",
-        source_type: str = "all",
-        min_ratio: float = 1.0,
-        sort: str = "ratio",
-        include_handled: bool = False,
+        include_all_winners: bool = False,
         include_off: bool = False,
         page: int = 1,
         page_size: int = 20,
@@ -301,23 +288,17 @@ class WorkbenchService:
         safe_size = max(1, min(100, int(page_size or 20)))
 
         query: Dict[str, Any] = {}
-        if winner == "my_product":
-            query["is_my_product_better"] = True
-        else:
+        if include_all_winners:
             query["final_winner"] = {"$in": ["my_product", "tie", "xianyu_product"]}
-        if source_type in ("official", "deal_tip"):
-            query["source_type"] = source_type
-        if min_ratio and float(min_ratio) > 0:
-            query["cost_performance_ratio"] = {"$gte": float(min_ratio)}
+        else:
+            query["is_my_product_better"] = True
 
-        sort_spec = (
-            [("evaluated_at", -1)]
-            if sort == "latest"
-            else [("cost_performance_ratio", -1), ("evaluated_at", -1)]
+        raw_evals = self.repo.list_evaluations(
+            query,
+            [("cost_performance_ratio", -1), ("evaluated_at", -1)],
+            limit=500,
         )
-        raw_evals = self.repo.list_evaluations(query, sort_spec, limit=500)
 
-        # 若同一 (platform, product_id) 同时存在 official 与 deal_tip 记录，只保留排名靠前的那条进入待审流
         dedup_evals: List[Dict[str, Any]] = []
         seen_keys = set()
         for ev in raw_evals:
@@ -342,8 +323,7 @@ class WorkbenchService:
         for ev in dedup_evals:
             plat = normalize_platform(ev.get("platform"))
             pid = clean_id(ev.get("product_id"))
-            listing = listing_map.get((plat, pid))
-            if not include_handled and listing is not None:
+            if listing_map.get((plat, pid)) is not None:
                 continue
 
             prod = prod_map.get((plat, pid))
@@ -356,12 +336,7 @@ class WorkbenchService:
             cr = ev.get("comparison_result") if isinstance(ev.get("comparison_result"), dict) else {}
 
             eval_price = _positive_float(ev.get("activity_price"))
-            price_diff_from_eval = (
-                round(live_price - eval_price, 2)
-                if live_price is not None and eval_price is not None
-                else None
-            )
-
+            ref_price = live_price if live_price is not None else eval_price
             official_imgs, deal_imgs = _collect_product_media(
                 prod,
                 fallback_image=str(cand.get("image_url") or ""),
@@ -395,26 +370,19 @@ class WorkbenchService:
                 "source_origin": "xianyu_eval",
                 "platform": plat,
                 "product_id": pid,
-                "goods_sign": str((prod or {}).get("goods_sign") or cand.get("goods_sign") or "").strip(),
                 "source_type": str(ev.get("source_type") or "official"),
-                "category_name": str(ev.get("category_name") or "").strip(),
                 "name": str((prod or {}).get("name") or ev.get("name") or "未命名商品").strip(),
                 "image_url": official_imgs[0] if official_imgs else "",
-                "eval_price": eval_price,
-                "live_price": live_price,
-                "price_diff_from_eval": price_diff_from_eval,
+                "price": ref_price,
                 "live_status": live_status,
                 "is_deal_tip": is_active_deal,
                 "deal_highlight": str(di.get("card_highlight") or cand.get("deal_highlight_text") or "").strip(),
                 "official_image_count": len(official_imgs),
                 "deal_image_count": len(deal_imgs),
                 "cost_performance_ratio": ev.get("cost_performance_ratio"),
-                "matched_unit": cr.get("matched_unit"),
                 "final_winner": ev.get("final_winner"),
                 "llm_reason": str(cr.get("llm_reason") or "").strip(),
                 "evaluated_at": str(ev.get("evaluated_at") or ""),
-                "listing_status": listing.get("status") if listing else None,
-                "listing_id": listing.get("listing_id") if listing else None,
                 "xianyu_ref": {
                     "item_id": xy_id,
                     "item_url": str(bxy.get("item_url") or (f"https://www.goofish.com/item?id={xy_id}" if xy_id else "")),
@@ -422,7 +390,6 @@ class WorkbenchService:
                     "comparable_price": _positive_float(bxy.get("comparable_price")),
                     "spec_description": str(bxy.get("spec_description") or "").strip(),
                     "want_cnt": bxy.get("want_cnt"),
-                    "is_free_shipping": bxy.get("is_free_shipping"),
                     "screenshot_url": shot_url,
                     "fallback_images": fallback_xy_imgs[:5],
                 },
@@ -430,16 +397,15 @@ class WorkbenchService:
 
         total = len(filtered)
         start = (safe_page - 1) * safe_size
-        page_items = filtered[start : start + safe_size]
         return {
-            "items": page_items,
+            "items": filtered[start : start + safe_size],
             "total": total,
             "page": safe_page,
             "page_size": safe_size,
             "has_more": (start + safe_size) < total,
         }
 
-    def reject_candidate(
+    def dismiss_candidate(
         self,
         owner: str,
         *,
@@ -458,9 +424,9 @@ class WorkbenchService:
             updated = self.repo.update_listing_by_id(
                 owner,
                 existing["listing_id"],
-                {"status": "rejected", "updated_at": now},
+                {"status": "dismissed", "updated_at": now},
             )
-            return updated or existing
+            return {"listing_id": (updated or existing).get("listing_id"), "status": "dismissed"}
 
         prod = self.repo.get_product_one(plat, pid)
         title = str((prod or {}).get("name") or "").strip()[:30]
@@ -468,104 +434,69 @@ class WorkbenchService:
             owner,
             plat,
             pid,
-            set_fields={
-                "status": "rejected",
-                "updated_at": now,
-            },
+            set_fields={"status": "dismissed", "updated_at": now},
             set_on_insert={
                 "listing_id": f"xyl_{uuid.uuid4().hex[:8]}",
                 "owner": owner,
                 "platform": plat,
                 "product_id": pid,
-                "goods_sign": str((prod or {}).get("goods_sign") or "").strip(),
                 "source_origin": source_origin or "xianyu_eval",
                 "title": title,
                 "description": "",
                 "images": [],
-                "sell_price": 0.0,
-                "shipping_fee": 0.0,
-                "cost_price": 0.0,
-                "max_cost_price": 0.0,
-                "eval_ref": None,
-                "external_item_id": "",
-                "offline_reason": "",
+                "price": 0.0,
                 "created_at": now,
                 "confirmed_at": None,
             },
         )
-        return doc or {}
+        return {"listing_id": (doc or {}).get("listing_id"), "status": "dismissed"}
 
     # =========================================================================
-    # 模块二：预览草稿初始化、图片增删、AI 话术生成与标准格式定稿
+    # 模块二：平台无关商品素材编排（图片/标价/帮拍话术）
     # =========================================================================
-    def _build_eval_ref(self, eval_doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not isinstance(eval_doc, dict):
-            return None
-        bxy = eval_doc.get("best_xianyu_product") if isinstance(eval_doc.get("best_xianyu_product"), dict) else {}
-        cr = eval_doc.get("comparison_result") if isinstance(eval_doc.get("comparison_result"), dict) else {}
-        xy_id = str(bxy.get("item_id") or "").strip()
-        return {
-            "xianyu_item_id": xy_id,
-            "xianyu_item_url": str(bxy.get("item_url") or (f"https://www.goofish.com/item?id={xy_id}" if xy_id else "")),
-            "xianyu_title": str(bxy.get("title") or "").strip(),
-            "xianyu_price": _positive_float(bxy.get("comparable_price")),
-            "xianyu_spec": str(bxy.get("spec_description") or "").strip(),
-            "want_cnt": bxy.get("want_cnt"),
-            "cp_ratio": eval_doc.get("cost_performance_ratio"),
-            "matched_unit": cr.get("matched_unit"),
-            "llm_reason": str(cr.get("llm_reason") or "").strip(),
-            "screenshot_file": str(bxy.get("screenshot_file") or "").strip(),
-            "fallback_images": [
-                u for u in (_normalize_image_url(x) for x in (bxy.get("images") or [])) if u
-            ][:5],
-        }
-
-    def _hydrate_listing(
+    def _hydrate_item(
         self,
-        listing: Dict[str, Any],
+        doc: Dict[str, Any],
         product_doc: Optional[Dict[str, Any]],
-        *,
-        xy_item_doc: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        out = dict(listing)
         live_status, live_price, is_active_deal, di = _resolve_live_product_state(product_doc)
         official_imgs, deal_imgs = _collect_product_media(product_doc)
 
-        cost_price = _nonneg_float(out.get("cost_price"), 0.0)
-        max_cost_price = _nonneg_float(out.get("max_cost_price"), 0.0)
-        risk_alert = ""
-        if live_status == "off_promotion":
-            risk_alert = "off_promotion"
-        elif live_price is not None and max_cost_price > 0 and live_price > max_cost_price:
-            risk_alert = "price_exceeded"
+        # 向后兼容读取老文档的 sell_price / rejected
+        raw_price = doc.get("price") if doc.get("price") is not None else doc.get("sell_price")
+        display_price = _nonneg_float(raw_price, 0.0)
+        raw_images = doc.get("images") if isinstance(doc.get("images"), list) else []
+        clean_images: List[Dict[str, str]] = []
+        for entry in raw_images:
+            if isinstance(entry, dict) and entry.get("url"):
+                clean_images.append({
+                    "url": str(entry["url"]),
+                    "origin": str(entry.get("origin") or "custom"),
+                })
 
-        eval_ref = out.get("eval_ref")
-        if isinstance(eval_ref, dict):
-            eval_ref = dict(eval_ref)
-            shot_file = str(eval_ref.get("screenshot_file") or "").strip()
-            if not shot_file and isinstance(xy_item_doc, dict):
-                shot_file = str(xy_item_doc.get("screenshot_file") or "").strip()
-            eval_ref["screenshot_url"] = self._screenshot_url_if_exists(shot_file)
-            if not eval_ref.get("fallback_images") and isinstance(xy_item_doc, dict):
-                det_imgs = (xy_item_doc.get("detail") or {}).get("images") if isinstance(xy_item_doc.get("detail"), dict) else []
-                eval_ref["fallback_images"] = [
-                    u for u in (_normalize_image_url(x) for x in (det_imgs or [])) if u
-                ][:5]
-            out["eval_ref"] = eval_ref
-
-        out["live_status"] = live_status
-        out["live_price"] = live_price
-        out["risk_alert"] = risk_alert
-        out["is_deal_tip"] = is_active_deal
-        out["deal_highlight"] = str(di.get("card_highlight") or "").strip()
-        out["deal_price_logic"] = str(di.get("price_logic") or "").strip()
-        out["product_name"] = str((product_doc or {}).get("name") or out.get("title") or "").strip()
-        out["available_official_images"] = official_imgs
-        out["available_deal_images"] = deal_imgs
-        out["created_at"] = _iso_utc(out.get("created_at"))
-        out["updated_at"] = _iso_utc(out.get("updated_at"))
-        out["confirmed_at"] = _iso_utc(out.get("confirmed_at")) if out.get("confirmed_at") else ""
-        return out
+        return {
+            "listing_id": str(doc.get("listing_id") or ""),
+            "owner": str(doc.get("owner") or ""),
+            "platform": normalize_platform(doc.get("platform")),
+            "product_id": clean_id(doc.get("product_id")),
+            "source_origin": str(doc.get("source_origin") or "favorite"),
+            "status": _normalize_status(doc.get("status")),
+            "title": str(doc.get("title") or "").strip(),
+            "description": str(doc.get("description") or "").strip(),
+            "images": clean_images,
+            "price": display_price,
+            "live_status": live_status,
+            "live_price": live_price,
+            "off_promotion_alert": live_status == "off_promotion",
+            "is_deal_tip": is_active_deal,
+            "deal_highlight": str(di.get("card_highlight") or "").strip(),
+            "product_name": str((product_doc or {}).get("name") or doc.get("title") or "").strip(),
+            "available_official_images": official_imgs,
+            "available_deal_images": deal_imgs,
+            "created_at": _iso_utc(doc.get("created_at")),
+            "updated_at": _iso_utc(doc.get("updated_at")),
+            "confirmed_at": _iso_utc(doc.get("confirmed_at")) if doc.get("confirmed_at") else "",
+        }
 
     def create_or_open_draft(
         self,
@@ -584,15 +515,13 @@ class WorkbenchService:
         prod = self.repo.get_product_one(plat, pid)
         existing = self.repo.get_listing_by_product(owner, plat, pid)
         if existing is not None:
-            if existing.get("status") == "rejected":
+            if _normalize_status(existing.get("status")) == "dismissed":
                 existing = self.repo.update_listing_by_id(
                     owner,
                     existing["listing_id"],
                     {"status": "draft", "updated_at": now},
                 ) or existing
-            xy_id = str(((existing.get("eval_ref") or {}).get("xianyu_item_id")) or "").strip()
-            xy_map = self.repo.batch_get_xianyu_items([xy_id]) if xy_id else {}
-            return self._hydrate_listing(existing, prod, xy_item_doc=xy_map.get(xy_id))
+            return self._hydrate_item(existing, prod)
 
         user = self.repo.get_user(owner) or {}
         bound_uid = str(user.get("bound_shop_uid") or "").strip()
@@ -620,13 +549,12 @@ class WorkbenchService:
                 default_images.append({"url": u, "origin": "deal"})
 
         _live_status, live_price, _is_deal, di = _resolve_live_product_state(prod)
-        cost_price = (
+        default_price = (
             live_price
             or _positive_float((fav or {}).get("collected_price"))
             or _positive_float((ev or {}).get("activity_price"))
             or 0.0
         )
-        max_cost_price = round(cost_price * 1.05, 2) if cost_price > 0 else 0.0
 
         raw_title = (
             str(di.get("clean_title") or "").strip()
@@ -634,7 +562,6 @@ class WorkbenchService:
             or str(snap.get("name") or "").strip()
             or str((ev or {}).get("name") or "").strip()
         )
-        eval_ref = self._build_eval_ref(ev)
         listing_id = f"xyl_{uuid.uuid4().hex[:8]}"
 
         created = self.repo.upsert_listing(
@@ -647,37 +574,26 @@ class WorkbenchService:
                 "owner": owner,
                 "platform": plat,
                 "product_id": pid,
-                "goods_sign": str((prod or {}).get("goods_sign") or snap.get("goods_sign") or cand.get("goods_sign") or "").strip(),
                 "source_origin": source_origin or ("xianyu_eval" if ev else "favorite"),
                 "status": "draft",
                 "title": raw_title[:30],
                 "description": "",
                 "images": default_images,
-                "sell_price": cost_price,
-                "shipping_fee": 0.0,
-                "cost_price": cost_price,
-                "max_cost_price": max_cost_price,
-                "eval_ref": eval_ref,
-                "external_item_id": "",
-                "offline_reason": "",
+                "price": default_price,
                 "created_at": now,
                 "confirmed_at": None,
             },
         )
         if not created:
-            raise HTTPException(status_code=500, detail="创建上架草稿失败")
-        xy_id = str((eval_ref or {}).get("xianyu_item_id") or "").strip()
-        xy_map = self.repo.batch_get_xianyu_items([xy_id]) if xy_id else {}
-        return self._hydrate_listing(created, prod, xy_item_doc=xy_map.get(xy_id))
+            raise HTTPException(status_code=500, detail="创建商品素材草稿失败")
+        return self._hydrate_item(created, prod)
 
-    def get_listing_detail(self, owner: str, listing_id: str) -> Dict[str, Any]:
-        listing = self.repo.get_listing_by_id(owner, listing_id)
-        if not listing:
-            raise HTTPException(status_code=404, detail="上架单不存在或无权查看")
-        prod = self.repo.get_product_one(listing["platform"], listing["product_id"])
-        xy_id = str(((listing.get("eval_ref") or {}).get("xianyu_item_id")) or "").strip()
-        xy_map = self.repo.batch_get_xianyu_items([xy_id]) if xy_id else {}
-        return self._hydrate_listing(listing, prod, xy_item_doc=xy_map.get(xy_id))
+    def get_item_detail(self, owner: str, listing_id: str) -> Dict[str, Any]:
+        doc = self.repo.get_listing_by_id(owner, listing_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="商品素材不存在或无权查看")
+        prod = self.repo.get_product_one(doc["platform"], doc["product_id"])
+        return self._hydrate_item(doc, prod)
 
     def _sanitize_images(self, raw_images: Any) -> List[Dict[str, str]]:
         if not isinstance(raw_images, list):
@@ -706,10 +622,10 @@ class WorkbenchService:
             )
         return cleaned
 
-    def update_listing(self, owner: str, listing_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    def update_item(self, owner: str, listing_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
         existing = self.repo.get_listing_by_id(owner, listing_id)
         if not existing:
-            raise HTTPException(status_code=404, detail="上架单不存在或无权编辑")
+            raise HTTPException(status_code=404, detail="商品素材不存在或无权编辑")
 
         set_fields: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc)}
 
@@ -719,73 +635,62 @@ class WorkbenchService:
             set_fields["description"] = str(updates["description"]).strip()[:2000]
         if "images" in updates and updates["images"] is not None:
             set_fields["images"] = self._sanitize_images(updates["images"])
-        if "sell_price" in updates and updates["sell_price"] is not None:
-            sp = _nonneg_float(updates["sell_price"], -1.0)
-            if sp < 0:
-                raise HTTPException(status_code=400, detail="售价不能为负数")
-            set_fields["sell_price"] = sp
-        if "shipping_fee" in updates and updates["shipping_fee"] is not None:
-            sf = _nonneg_float(updates["shipping_fee"], -1.0)
-            if sf < 0:
-                raise HTTPException(status_code=400, detail="运费不能为负数")
-            set_fields["shipping_fee"] = sf
-        if "max_cost_price" in updates and updates["max_cost_price"] is not None:
-            mc = _nonneg_float(updates["max_cost_price"], -1.0)
-            if mc < 0:
-                raise HTTPException(status_code=400, detail="止损成本上限不能为负数")
-            set_fields["max_cost_price"] = mc
-        if "external_item_id" in updates and updates["external_item_id"] is not None:
-            set_fields["external_item_id"] = str(updates["external_item_id"]).strip()[:64]
-        if "offline_reason" in updates and updates["offline_reason"] is not None:
-            set_fields["offline_reason"] = str(updates["offline_reason"]).strip()[:100]
+        if "price" in updates and updates["price"] is not None:
+            pr = _nonneg_float(updates["price"], -1.0)
+            if pr < 0:
+                raise HTTPException(status_code=400, detail="标价不能为负数")
+            set_fields["price"] = pr
 
-        target_status = str(updates.get("status") or existing.get("status") or "draft").strip().lower()
-        if target_status not in ALLOWED_STATUSES:
-            raise HTTPException(status_code=400, detail=f"不支持的状态: {target_status}")
-        if "status" in updates and updates["status"] is not None:
+        cur_status = _normalize_status(existing.get("status"))
+        target_status = _normalize_status(updates.get("status")) if updates.get("status") else cur_status
+        if updates.get("status") is not None:
+            raw_req_status = str(updates["status"]).strip().lower()
+            if raw_req_status not in ALLOWED_STATUSES:
+                raise HTTPException(status_code=400, detail=f"不支持的状态: {raw_req_status}")
+            target_status = raw_req_status
             set_fields["status"] = target_status
 
         merged = {**existing, **set_fields}
+        eff_price = _nonneg_float(
+            merged.get("price") if merged.get("price") is not None else merged.get("sell_price"),
+            0.0,
+        )
         if target_status == "ready":
             if not str(merged.get("title") or "").strip():
-                raise HTTPException(status_code=400, detail="确认就绪前请先填写闲鱼标题")
+                raise HTTPException(status_code=400, detail="加入待上架前请先填写商品标题")
             if not str(merged.get("description") or "").strip():
-                raise HTTPException(status_code=400, detail="确认就绪前请先生成或填写商品描述")
-            if _nonneg_float(merged.get("sell_price"), 0.0) <= 0:
-                raise HTTPException(status_code=400, detail="确认就绪前售价必须大于 0")
+                raise HTTPException(status_code=400, detail="加入待上架前请先生成或填写商品文案")
+            if eff_price <= 0:
+                raise HTTPException(status_code=400, detail="加入待上架前请填写大于 0 的标价")
             if not (isinstance(merged.get("images"), list) and len(merged["images"]) >= 1):
-                raise HTTPException(status_code=400, detail="确认就绪前请至少保留 1 张商品图片")
+                raise HTTPException(status_code=400, detail="加入待上架前请至少保留 1 张商品图片")
             set_fields["confirmed_at"] = datetime.now(timezone.utc)
 
         updated = self.repo.update_listing_by_id(owner, listing_id, set_fields)
         if not updated:
-            raise HTTPException(status_code=404, detail="上架单不存在")
+            raise HTTPException(status_code=404, detail="商品素材不存在")
         prod = self.repo.get_product_one(updated["platform"], updated["product_id"])
-        xy_id = str(((updated.get("eval_ref") or {}).get("xianyu_item_id")) or "").strip()
-        xy_map = self.repo.batch_get_xianyu_items([xy_id]) if xy_id else {}
-        return self._hydrate_listing(updated, prod, xy_item_doc=xy_map.get(xy_id))
+        return self._hydrate_item(updated, prod)
 
-    def generate_copy(self, owner: str, listing_id: str, *, style: str = "casual") -> Dict[str, Any]:
-        listing = self.repo.get_listing_by_id(owner, listing_id)
-        if not listing:
-            raise HTTPException(status_code=404, detail="上架单不存在或无权操作")
-        eff_style = style if style in ALLOWED_COPY_STYLES else "casual"
-        prod = self.repo.get_product_one(listing["platform"], listing["product_id"]) or {}
+    def generate_copy(self, owner: str, listing_id: str) -> Dict[str, Any]:
+        doc = self.repo.get_listing_by_id(owner, listing_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="商品素材不存在或无权操作")
+        prod = self.repo.get_product_one(doc["platform"], doc["product_id"]) or {}
         di = prod.get("deal_info") if isinstance(prod.get("deal_info"), dict) else {}
-        eval_ref = listing.get("eval_ref") if isinstance(listing.get("eval_ref"), dict) else {}
 
+        raw_price = doc.get("price") if doc.get("price") is not None else doc.get("sell_price")
+        display_price = _nonneg_float(raw_price, 0.0)
         prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
         context_payload = {
-            "style": eff_style,
-            "product_name": str(prod.get("name") or listing.get("title") or "").strip(),
-            "category": str(prod.get("category") or "").strip(),
+            "product_name": str(prod.get("name") or doc.get("title") or "").strip(),
+            "source_platform": normalize_platform(doc.get("platform")),
             "brand": str(prod.get("brand") or "").strip(),
+            "category": str(prod.get("category") or "").strip(),
             "specs": prod.get("specs") or [],
-            "sell_price": _nonneg_float(listing.get("sell_price"), 0.0),
-            "shipping_fee": _nonneg_float(listing.get("shipping_fee"), 0.0),
+            "price": display_price,
             "deal_highlight": str(di.get("card_highlight") or "").strip(),
             "deal_price_logic": str(di.get("price_logic") or "").strip(),
-            "xianyu_ref_spec": str(eval_ref.get("xianyu_spec") or "").strip(),
         }
         full_prompt = (
             f"{prompt_template}\n\n"
@@ -797,7 +702,7 @@ class WorkbenchService:
         status_str = str((res or {}).get("status") or "")
         model_used = str(((res or {}).get("metrics") or {}).get("model_used") or "")
         if ("失败" in status_str and not raw_content) or not raw_content:
-            raise HTTPException(status_code=502, detail=f"AI 话术生成失败: {status_str or '空响应'}")
+            raise HTTPException(status_code=502, detail=f"AI 文案生成失败: {status_str or '空响应'}")
 
         title = ""
         description = ""
@@ -813,58 +718,50 @@ class WorkbenchService:
                 description = "\n".join(lines[1:]).strip() or lines[0]
 
         if not title:
-            title = str(listing.get("title") or context_payload["product_name"])[:30]
+            title = str(doc.get("title") or context_payload["product_name"])[:30]
         if not description:
             description = raw_content
         return {
             "title": title[:30],
             "description": description[:2000],
-            "style": eff_style,
             "model_used": model_used,
         }
 
-    # =========================================================================
-    # 模块三：标准上架库查询 & 资产上传/读取
-    # =========================================================================
-    def list_listings(
+    def list_items(
         self,
         owner: str,
         *,
-        status: str = "ready",
+        status: str = "active",
         page: int = 1,
-        page_size: int = 20,
+        page_size: int = 30,
     ) -> Dict[str, Any]:
-        eff_status = str(status or "ready").strip().lower()
-        if eff_status != "all" and eff_status not in ALLOWED_STATUSES:
-            raise HTTPException(status_code=400, detail=f"不支持的筛选状态: {eff_status}")
-        rows, total = self.repo.list_listings(owner, status=eff_status, page=page, page_size=page_size)
+        eff = str(status or "active").strip().lower()
+        if eff not in ("active", "ready", "draft", "dismissed", "all"):
+            raise HTTPException(status_code=400, detail=f"不支持的筛选状态: {eff}")
+        rows, total = self.repo.list_listings(owner, status=eff, page=page, page_size=page_size)
         keys = [(r.get("platform"), r.get("product_id")) for r in rows]
         prod_map = self.repo.batch_get_products(keys)
-        xy_ids = [
-            str(((r.get("eval_ref") or {}).get("xianyu_item_id")) or "").strip()
-            for r in rows
-        ]
-        xy_map = self.repo.batch_get_xianyu_items(xy_ids)
-
         items = [
-            self._hydrate_listing(
+            self._hydrate_item(
                 r,
                 prod_map.get((normalize_platform(r.get("platform")), clean_id(r.get("product_id")))),
-                xy_item_doc=xy_map.get(str(((r.get("eval_ref") or {}).get("xianyu_item_id")) or "").strip()),
             )
             for r in rows
         ]
         safe_page = max(1, int(page or 1))
-        safe_size = max(1, min(100, int(page_size or 20)))
+        safe_size = max(1, min(100, int(page_size or 30)))
         return {
             "items": items,
             "total": total,
             "page": safe_page,
             "page_size": safe_size,
             "has_more": (safe_page * safe_size) < total,
-            "status_counts": self.repo.get_status_counts(owner),
+            "item_counts": self.repo.get_item_counts(owner),
         }
 
+    # =========================================================================
+    # 图片上传与受保护媒体读取
+    # =========================================================================
     def save_uploaded_image_base64(self, image_base64: str) -> str:
         raw = str(image_base64 or "").strip()
         if not raw:

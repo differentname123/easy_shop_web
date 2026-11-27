@@ -71,6 +71,7 @@ def check_login_status(
     debug: bool = False,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
     operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    lock_scope: str = "global",
 ) -> Dict[str, Any]:
     """
     快速检测指定浏览器目录的闲鱼账号是否在线。
@@ -86,6 +87,7 @@ def check_login_status(
             debug=debug,
             lock_timeout_sec=lock_timeout_sec,
             operation_timeout_sec=operation_timeout_sec,
+            lock_scope=lock_scope,
         ) as (context, page, auth_tracker):
             page.goto(GOOFISH_PERSONAL_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
@@ -136,6 +138,7 @@ def get_selling_items(
     *,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
     operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    lock_scope: str = "global",
 ) -> Dict[str, Any]:
     """
     获取当前账号在闲鱼上的商品在售状态（精准区分 `itemStatus == 0` 真正正常在售 与 `itemStatus != 0` 被平台下架/删除）：
@@ -159,6 +162,7 @@ def get_selling_items(
             debug=debug,
             lock_timeout_sec=lock_timeout_sec,
             operation_timeout_sec=operation_timeout_sec,
+            lock_scope=lock_scope,
         ) as (context, page, auth_tracker):
             group_summary: Dict[str, int] = {}
             selling_packets: List[Dict[str, Any]] = []

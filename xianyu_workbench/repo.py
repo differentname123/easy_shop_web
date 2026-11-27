@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""工作台数据仓储：自有集合 `xy_users`/`xy_listings` 与上游三表只读访问。"""
+"""工作台数据仓储：通用选品库、多渠道账户与同步快照、及上游只读数据源。"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -24,6 +24,9 @@ def clean_id(value: Any) -> str:
 class WorkbenchRepository:
     USERS_COL = "xy_users"
     LISTINGS_COL = "xy_listings"
+    CHANNEL_ACCOUNTS_COL = "xy_channel_accounts"
+    CHANNEL_SELLING_COL = "xy_channel_selling"
+
     FAVORITES_COL = "favorites"
     PRODUCTS_COL = "products"
     EVALS_COL = "xianyu_deal_evaluations"
@@ -41,6 +44,14 @@ class WorkbenchRepository:
     @property
     def listings_col(self):
         return self.db.get_collection(self.LISTINGS_COL)
+
+    @property
+    def channel_accounts_col(self):
+        return self.db.get_collection(self.CHANNEL_ACCOUNTS_COL)
+
+    @property
+    def channel_selling_col(self):
+        return self.db.get_collection(self.CHANNEL_SELLING_COL)
 
     @property
     def favorites_col(self):
@@ -73,6 +84,8 @@ class WorkbenchRepository:
                 unique=True,
             )
             self.listings_col.create_index([("owner", 1), ("status", 1), ("updated_at", -1)])
+            self.channel_accounts_col.create_index([("owner", 1), ("channel", 1)], unique=True)
+            self.channel_selling_col.create_index([("owner", 1), ("channel", 1)], unique=True)
             self._indexes_ready = True
             return True
         except Exception:
@@ -146,7 +159,7 @@ class WorkbenchRepository:
         return self.shop_users_col.find_one({"uid": clean_uid}, {"_id": 1}) is not None
 
     # =========================================================================
-    # 标准上架库 (xy_listings)
+    # 通用商品素材库 (xy_listings，平台无关)
     # =========================================================================
     def get_listing_by_id(self, owner: str, listing_id: str) -> Optional[Dict[str, Any]]:
         self.ensure_indexes()
@@ -249,8 +262,16 @@ class WorkbenchRepository:
     ) -> Tuple[List[Dict[str, Any]], int]:
         self.ensure_indexes()
         query: Dict[str, Any] = {"owner": str(owner or "").strip()}
-        if status and status != "all":
-            query["status"] = str(status).strip()
+        eff = str(status or "active").strip().lower()
+        if eff == "active":
+            query["status"] = {"$in": ["ready", "draft", "online", "offline"]}
+        elif eff == "ready":
+            query["status"] = {"$in": ["ready", "online", "offline"]}
+        elif eff == "dismissed":
+            query["status"] = {"$in": ["dismissed", "rejected"]}
+        elif eff != "all":
+            query["status"] = eff
+
         safe_page = max(1, int(page or 1))
         safe_size = max(1, min(100, int(page_size or 20)))
         total = int(self.listings_col.count_documents(query))
@@ -267,17 +288,151 @@ class WorkbenchRepository:
         )
         return [dict(d) for d in cursor if isinstance(d, dict)], total
 
-    def get_status_counts(self, owner: str) -> Dict[str, int]:
+    def list_all_active_listings(self, owner: str, limit: int = 300) -> List[Dict[str, Any]]:
+        self.ensure_indexes()
+        cursor = (
+            self.listings_col.find(
+                {
+                    "owner": str(owner or "").strip(),
+                    "status": {"$in": ["ready", "draft", "online", "offline"]},
+                },
+                {"_id": 0},
+            )
+            .sort([("updated_at", -1)])
+            .limit(max(1, int(limit)))
+        )
+        return [dict(d) for d in cursor if isinstance(d, dict)]
+
+    def get_item_counts(self, owner: str) -> Dict[str, int]:
         self.ensure_indexes()
         clean_owner = str(owner or "").strip()
-        counts = {"draft": 0, "ready": 0, "online": 0, "offline": 0, "rejected": 0}
+        counts = {"draft": 0, "ready": 0, "dismissed": 0}
         for doc in self.listings_col.find({"owner": clean_owner}, {"_id": 0, "status": 1}):
-            if isinstance(doc, dict):
-                st = str(doc.get("status") or "").strip()
-                if st in counts:
-                    counts[st] += 1
-        counts["all"] = sum(v for k, v in counts.items() if k != "rejected")
+            if not isinstance(doc, dict):
+                continue
+            raw = str(doc.get("status") or "").strip().lower()
+            if raw in ("ready", "online", "offline"):
+                counts["ready"] += 1
+            elif raw in ("dismissed", "rejected"):
+                counts["dismissed"] += 1
+            elif raw == "draft":
+                counts["draft"] += 1
+        counts["active"] = counts["draft"] + counts["ready"]
         return counts
+
+    # =========================================================================
+    # 可插拔渠道账户与同步在售快照 (xy_channel_accounts / xy_channel_selling)
+    # =========================================================================
+    def get_channel_account(self, owner: str, channel: str) -> Optional[Dict[str, Any]]:
+        self.ensure_indexes()
+        doc = self.channel_accounts_col.find_one(
+            {"owner": str(owner).strip(), "channel": str(channel).strip().lower()},
+            {"_id": 0},
+        )
+        return dict(doc) if isinstance(doc, dict) else None
+
+    def list_channel_accounts(self, owner: str) -> List[Dict[str, Any]]:
+        self.ensure_indexes()
+        cursor = self.channel_accounts_col.find({"owner": str(owner).strip()}, {"_id": 0})
+        return [dict(d) for d in cursor if isinstance(d, dict)]
+
+    def upsert_channel_account(
+        self,
+        owner: str,
+        channel: str,
+        set_fields: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self.ensure_indexes()
+        flt = {"owner": str(owner).strip(), "channel": str(channel).strip().lower()}
+        now = datetime.now(timezone.utc)
+        self.channel_accounts_col.update_one(
+            flt,
+            {
+                "$set": set_fields,
+                "$setOnInsert": {
+                    "owner": flt["owner"],
+                    "channel": flt["channel"],
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+        return self.get_channel_account(flt["owner"], flt["channel"]) or {}
+
+    def get_channel_selling(self, owner: str, channel: str) -> Optional[Dict[str, Any]]:
+        self.ensure_indexes()
+        doc = self.channel_selling_col.find_one(
+            {"owner": str(owner).strip(), "channel": str(channel).strip().lower()},
+            {"_id": 0},
+        )
+        return dict(doc) if isinstance(doc, dict) else None
+
+    def upsert_channel_selling(
+        self,
+        owner: str,
+        channel: str,
+        *,
+        online_items: List[Dict[str, Any]],
+        abnormal_items: List[Dict[str, Any]],
+        group_counts: Dict[str, int],
+        synced_at: datetime,
+    ) -> Dict[str, Any]:
+        self.ensure_indexes()
+        flt = {"owner": str(owner).strip(), "channel": str(channel).strip().lower()}
+        self.channel_selling_col.update_one(
+            flt,
+            {
+                "$set": {
+                    "online_items": list(online_items),
+                    "abnormal_items": list(abnormal_items),
+                    "group_counts": dict(group_counts),
+                    "synced_at": synced_at,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$setOnInsert": {
+                    "owner": flt["owner"],
+                    "channel": flt["channel"],
+                    "manual_links": {},
+                },
+            },
+            upsert=True,
+        )
+        return self.get_channel_selling(flt["owner"], flt["channel"]) or {}
+
+    def update_channel_manual_link(
+        self,
+        owner: str,
+        channel: str,
+        external_item_id: str,
+        listing_id: str,
+    ) -> Dict[str, Any]:
+        self.ensure_indexes()
+        flt = {"owner": str(owner).strip(), "channel": str(channel).strip().lower()}
+        existing = self.get_channel_selling(flt["owner"], flt["channel"]) or {}
+        links = dict(existing.get("manual_links") or {})
+        ext_id = str(external_item_id or "").strip()
+        clean_lid = str(listing_id or "").strip()
+        if clean_lid:
+            links[ext_id] = clean_lid
+        else:
+            links.pop(ext_id, None)
+        now = datetime.now(timezone.utc)
+        self.channel_selling_col.update_one(
+            flt,
+            {
+                "$set": {"manual_links": links, "updated_at": now},
+                "$setOnInsert": {
+                    "owner": flt["owner"],
+                    "channel": flt["channel"],
+                    "online_items": [],
+                    "abnormal_items": [],
+                    "group_counts": {},
+                    "synced_at": None,
+                },
+            },
+            upsert=True,
+        )
+        return self.get_channel_selling(flt["owner"], flt["channel"]) or {}
 
     # =========================================================================
     # 上游只读数据源 (favorites / products / xianyu_deal_evaluations / xianyu_items)

@@ -1,637 +1,1016 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>闲鱼选品与上架工作台</title>
-  <script src="/static/vue.global.prod.js"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#FFFFFF" />
+  <title>帮拍选品工作台</title>
   <style>
     :root {
-      --bg: #f4f6f9;
+      --bg: #f5f6f8;
       --card: #ffffff;
-      --text: #1f2937;
-      --sub: #6b7280;
-      --border: #e5e7eb;
-      --primary: #ff6b00;
-      --primary-hover: #e85f00;
-      --primary-soft: #fff4ec;
-      --green: #16a34a;
-      --green-soft: #dcfce7;
-      --red: #dc2626;
-      --red-soft: #fee2e2;
-      --blue: #2563eb;
-      --blue-soft: #eff6ff;
-      --shadow: 0 2px 10px rgba(15, 23, 42, 0.06);
+      --text: #161823;
+      --sub: #646a73;
+      --muted: #8f959e;
+      --border: #eaecf0;
+      --primary: #ff5722;
+      --primary-bg: #fff2ed;
+      --dark: #1f2329;
+      --green: #0a8754;
+      --green-bg: #e8f8f0;
+      --red: #d92d20;
+      --red-bg: #fef3f2;
+      --amber: #b54708;
+      --amber-bg: #fffaeb;
+      --blue: #155eef;
+      --blue-bg: #eff4ff;
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
     }
-    * { box-sizing: border-box; }
-    [v-cloak] { display: none !important; }
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
-    button, input, select, textarea { font-family: inherit; font-size: inherit; }
-
-    /* 登录 */
-    .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
-    .login-card { width: 100%; max-width: 380px; background: var(--card); border-radius: 14px; padding: 28px 24px; box-shadow: var(--shadow); border: 1px solid var(--border); }
-    .login-title { font-size: 20px; font-weight: 700; margin: 0 0 6px; text-align: center; }
-    .login-sub { color: var(--sub); font-size: 13px; text-align: center; margin-bottom: 22px; }
-    .field { margin-bottom: 14px; }
-    .field label { display: block; font-size: 12px; font-weight: 600; color: var(--sub); margin-bottom: 6px; }
-    .input, .textarea, .select { width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: #fff; color: var(--text); outline: none; }
-    .input:focus, .textarea:focus, .select:focus { border-color: var(--primary); }
-    .textarea { resize: vertical; line-height: 1.5; }
-
-    /* 按钮 */
-    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: #fff; color: var(--text); cursor: pointer; font-weight: 600; transition: 0.15s; text-decoration: none; }
-    .btn:hover:not(:disabled) { background: #f9fafb; }
-    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
-    .btn-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
-    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
-    .btn-green { background: var(--green); color: #fff; border-color: var(--green); }
-    .btn-danger { color: var(--red); border-color: #fecaca; background: #fff; }
-    .btn-danger:hover:not(:disabled) { background: var(--red-soft); }
-    .btn-sm { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
-    .btn-block { width: 100%; padding: 10px 16px; }
-
-    /* 顶栏 */
-    .topbar { position: sticky; top: 0; z-index: 40; background: #fff; border-bottom: 1px solid var(--border); padding: 0 20px; }
-    .topbar-inner { max-width: 1280px; margin: 0 auto; height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-    .brand { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-    .brand-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--primary); }
-    .nav-tabs { display: flex; gap: 6px; }
-    .nav-tab { padding: 7px 14px; border-radius: 8px; border: none; background: transparent; color: var(--sub); font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
-    .nav-tab.active { background: var(--primary-soft); color: var(--primary); }
-    .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--border); color: var(--text); }
-    .nav-tab.active .badge { background: var(--primary); color: #fff; }
-    .user-actions { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-    .bind-chip { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: #f9fafb; cursor: pointer; color: var(--sub); }
-    .bind-chip.bound { color: var(--green); border-color: #bbf7d0; background: var(--green-soft); }
-
-    /* 主容器 */
-    .main { max-width: 1280px; margin: 0 auto; padding: 18px 20px 60px; }
-    .toolbar { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-    .pill-group { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-    .pill { padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border); background: #fff; color: var(--sub); cursor: pointer; font-size: 13px; font-weight: 600; }
-    .pill.active { background: var(--text); color: #fff; border-color: var(--text); }
-    .filter-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .filter-row .select { width: auto; padding: 5px 10px; font-size: 12px; }
-    .check-label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--sub); cursor: pointer; }
-
-    /* 候选卡片 */
-    .card-grid { display: flex; flex-direction: column; gap: 14px; }
-    .eval-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; box-shadow: var(--shadow); }
-    .eval-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 12px; flex-wrap: wrap; }
-    .tag { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; }
-    .tag-plat { background: #f3f4f6; color: #374151; }
-    .tag-win { background: var(--green-soft); color: var(--green); }
-    .tag-warn { background: #fef3c7; color: #b45309; }
-    .tag-red { background: var(--red-soft); color: var(--red); }
-    .tag-blue { background: var(--blue-soft); color: var(--blue); }
-    .eval-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .side-box { background: #f9fafb; border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; gap: 12px; min-width: 0; }
-    .thumb { width: 96px; height: 96px; border-radius: 8px; object-fit: cover; background: #e5e7eb; flex-shrink: 0; cursor: zoom-in; border: 1px solid var(--border); }
-    .shot-thumb { width: 110px; height: 148px; border-radius: 8px; object-fit: cover; object-position: top; background: #e5e7eb; flex-shrink: 0; cursor: zoom-in; border: 1px solid var(--border); }
-    .side-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-    .item-title { font-weight: 700; line-height: 1.4; word-break: break-word; }
-    .price-big { font-size: 18px; font-weight: 800; color: var(--primary); }
-    .muted { color: var(--sub); font-size: 12px; }
-    .reason-box { margin-top: 10px; padding: 9px 12px; background: #f8fafc; border-left: 3px solid var(--green); border-radius: 4px; font-size: 12px; color: #334155; line-height: 1.5; }
-    .card-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
-
-    /* 编辑器 */
-    .editor-layout { display: grid; grid-template-columns: 360px 1fr; gap: 18px; align-items: start; }
-    .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; box-shadow: var(--shadow); }
-    .panel-title { font-size: 15px; font-weight: 700; margin: 0 0 12px; display: flex; align-items: center; justify-content: space-between; }
-    .preview-cover { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 10px; background: #f3f4f6; border: 1px solid var(--border); cursor: zoom-in; }
-    .img-manager-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; margin-bottom: 12px; }
-    .img-tile { border: 1px solid var(--border); border-radius: 8px; padding: 6px; background: #fafafa; position: relative; }
-    .img-tile.cover { border-color: var(--primary); background: var(--primary-soft); }
-    .img-tile img { width: 100%; height: 96px; object-fit: cover; border-radius: 6px; display: block; cursor: zoom-in; }
-    .img-origin { position: absolute; top: 10px; left: 10px; font-size: 10px; padding: 1px 5px; border-radius: 4px; background: rgba(15,23,42,0.72); color: #fff; }
-    .img-ops { display: flex; gap: 4px; margin-top: 6px; justify-content: space-between; }
-    .img-ops button { padding: 2px 6px; font-size: 11px; border: 1px solid var(--border); background: #fff; border-radius: 4px; cursor: pointer; }
-    .pool-strip { display: flex; gap: 8px; overflow-x: auto; padding: 6px 0; }
-    .pool-item { width: 74px; flex-shrink: 0; text-align: center; }
-    .pool-item img { width: 74px; height: 74px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; display: block; }
-    .price-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-    .stat-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 10px; font-size: 12px; }
-    .stat-cell { background: #f9fafb; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); }
-
-    /* 标准库 */
-    .listing-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; display: flex; gap: 14px; box-shadow: var(--shadow); }
-    .listing-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-    .alert-banner { padding: 6px 10px; border-radius: 6px; background: var(--red-soft); color: var(--red); font-size: 12px; font-weight: 700; }
-
-    /* 弹窗与灯箱 */
-    .modal-mask { position: fixed; inset: 0; background: rgba(15,23,42,0.55); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px; }
-    .modal-box { width: 100%; max-width: 420px; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 12px 32px rgba(0,0,0,0.2); }
-    .lightbox-img { max-width: 92vw; max-height: 90vh; border-radius: 8px; object-fit: contain; background: #fff; }
-    .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: rgba(17,24,39,0.92); color: #fff; padding: 9px 18px; border-radius: 999px; font-size: 13px; z-index: 200; }
-    .empty { text-align: center; padding: 48px 20px; color: var(--sub); background: var(--card); border-radius: 12px; border: 1px dashed var(--border); }
-
-    @media (max-width: 900px) {
-      .eval-cols, .editor-layout, .price-grid { grid-template-columns: 1fr; }
-      .listing-card { flex-direction: column; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #eceef2;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.45;
     }
+    [v-cloak] { display: none; }
+    .app-shell {
+      max-width: 480px;
+      min-height: 100dvh;
+      margin: 0 auto;
+      background: var(--bg);
+      position: relative;
+      padding-bottom: calc(74px + var(--safe-bottom));
+      box-shadow: 0 0 32px rgba(15, 23, 42, 0.06);
+    }
+    .login-wrap {
+      max-width: 480px;
+      min-height: 100dvh;
+      margin: 0 auto;
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .login-card {
+      width: 100%;
+      background: var(--card);
+      border-radius: 20px;
+      padding: 26px 20px;
+      box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08);
+    }
+    .login-title { font-size: 21px; font-weight: 700; margin: 0 0 6px; }
+    .login-sub { font-size: 13px; color: var(--sub); margin: 0 0 22px; }
+    .field-label { display: block; font-size: 13px; font-weight: 600; color: var(--sub); margin-bottom: 6px; }
+    .input, .textarea {
+      width: 100%;
+      border: 1px solid #d0d5dd;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 15px;
+      color: var(--text);
+      background: #fff;
+      outline: none;
+      font-family: inherit;
+    }
+    .input:focus, .textarea:focus { border-color: var(--primary); }
+    .textarea { resize: vertical; min-height: 140px; line-height: 1.55; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 44px;
+      padding: 0 16px;
+      border-radius: 12px;
+      border: none;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      text-decoration: none;
+      transition: opacity 0.15s;
+    }
+    .btn:active { opacity: 0.78; }
+    .btn:disabled { opacity: 0.48; cursor: not-allowed; }
+    .btn-block { width: 100%; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-dark { background: var(--dark); color: #fff; }
+    .btn-soft { background: #eef0f4; color: var(--text); }
+    .btn-danger-soft { background: var(--red-bg); color: var(--red); }
+    .btn-blue-soft { background: var(--blue-bg); color: var(--blue); }
+    .btn-sm { min-height: 36px; padding: 0 12px; font-size: 13px; border-radius: 10px; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .seg-group {
+      flex: 1;
+      display: flex;
+      background: #eff1f5;
+      border-radius: 12px;
+      padding: 3px;
+      gap: 4px;
+    }
+    .seg-btn {
+      flex: 1;
+      min-height: 36px;
+      border: none;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--sub);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .seg-btn.active {
+      background: #fff;
+      color: var(--text);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+    }
+    .icon-btn {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #fff;
+      font-size: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .page-body { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+    .card {
+      background: var(--card);
+      border-radius: 16px;
+      padding: 14px;
+      border: 1px solid var(--border);
+    }
+    .card-alert { border-color: #fda29b; background: #fffbfa; }
+    .prod-row { display: flex; gap: 12px; align-items: flex-start; }
+    .thumb {
+      width: 92px;
+      height: 92px;
+      border-radius: 12px;
+      object-fit: cover;
+      background: #f0f2f5;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+    }
+    .thumb-sm { width: 72px; height: 72px; }
+    .prod-meta { flex: 1; min-width: 0; }
+    .prod-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      margin-bottom: 6px;
+    }
+    .price-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+    .price-main { font-size: 20px; font-weight: 700; color: var(--primary); }
+    .price-main small { font-size: 13px; margin-right: 1px; }
+    .tags-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .pill-gray { background: #eff1f5; color: var(--sub); }
+    .pill-orange { background: var(--primary-bg); color: var(--primary); }
+    .pill-green { background: var(--green-bg); color: var(--green); }
+    .pill-red { background: var(--red-bg); color: var(--red); }
+    .pill-amber { background: var(--amber-bg); color: var(--amber); }
+    .pill-blue { background: var(--blue-bg); color: var(--blue); }
+
+    .eval-box {
+      margin-top: 12px;
+      padding: 10px;
+      border-radius: 12px;
+      background: #f8f9fb;
+      border: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .eval-shot {
+      width: 64px;
+      height: 82px;
+      border-radius: 8px;
+      object-fit: cover;
+      border: 1px solid #d0d5dd;
+      flex-shrink: 0;
+      background: #fff;
+    }
+    .eval-info { flex: 1; min-width: 0; font-size: 12px; color: var(--sub); }
+    .eval-info b { color: var(--text); }
+    .eval-reason {
+      margin-top: 4px;
+      color: var(--text);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .actions-row { display: flex; gap: 10px; margin-top: 12px; }
+    .actions-row .btn { flex: 1; }
+
+    .sub-filter-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 2px 2px 0;
+      font-size: 13px;
+      color: var(--sub);
+    }
+    .link-btn {
+      background: none;
+      border: none;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 4px 0;
+      cursor: pointer;
+    }
+
+    .status-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: var(--card);
+      border-radius: 14px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+    }
+
+    .bottom-nav {
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      bottom: 0;
+      width: 100%;
+      max-width: 480px;
+      z-index: 30;
+      background: rgba(255, 255, 255, 0.98);
+      backdrop-filter: blur(10px);
+      border-top: 1px solid var(--border);
+      display: flex;
+      padding: 6px 8px calc(6px + var(--safe-bottom));
+    }
+    .nav-item {
+      flex: 1;
+      border: none;
+      background: none;
+      padding: 4px 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .nav-item .nav-ico { font-size: 20px; line-height: 1.2; }
+    .nav-item.active { color: var(--primary); }
+
+    /* 全屏编辑页 */
+    .editor-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      max-width: 480px;
+      margin: 0 auto;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+    }
+    .editor-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .editor-footer {
+      background: #fff;
+      border-top: 1px solid var(--border);
+      padding: 10px 14px calc(10px + var(--safe-bottom));
+      display: flex;
+      gap: 10px;
+    }
+    .filmstrip {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .img-tile {
+      position: relative;
+      width: 96px;
+      height: 96px;
+      border-radius: 12px;
+      overflow: hidden;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+      background: #f2f4f7;
+    }
+    .img-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .img-del {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      border: none;
+      background: rgba(0, 0, 0, 0.65);
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .img-cover-tag {
+      position: absolute;
+      left: 4px;
+      bottom: 4px;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      background: rgba(255, 87, 34, 0.92);
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
+    .img-cover-btn {
+      position: absolute;
+      left: 4px;
+      bottom: 4px;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-size: 10px;
+      font-weight: 600;
+      background: rgba(0, 0, 0, 0.56);
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
+    .upload-tile {
+      width: 96px;
+      height: 96px;
+      border-radius: 12px;
+      border: 1.5px dashed #c0c6d0;
+      background: #fafbfc;
+      color: var(--sub);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+    .pool-strip { display: flex; gap: 8px; overflow-x: auto; padding-top: 8px; }
+    .pool-thumb {
+      position: relative;
+      width: 64px;
+      height: 64px;
+      border-radius: 10px;
+      overflow: hidden;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .pool-thumb img { width: 100%; height: 100%; object-fit: cover; }
+    .pool-add {
+      position: absolute;
+      right: 2px;
+      bottom: 2px;
+      background: var(--primary);
+      color: #fff;
+      border-radius: 999px;
+      width: 18px;
+      height: 18px;
+      font-size: 13px;
+      line-height: 18px;
+      text-align: center;
+      font-weight: 700;
+    }
+    .price-input-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid #d0d5dd;
+      border-radius: 12px;
+      padding: 6px 14px;
+      background: #fff;
+    }
+    .price-input-wrap span { font-size: 20px; font-weight: 700; color: var(--primary); }
+    .price-input-wrap input {
+      border: none;
+      outline: none;
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--text);
+      width: 100%;
+      padding: 4px 0;
+      font-family: inherit;
+    }
+
+    /* 弹层与扫码框 */
+    .modal-mask {
+      position: fixed;
+      inset: 0;
+      z-index: 60;
+      background: rgba(0, 0, 0, 0.55);
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+    }
+    .modal-mask.center { align-items: center; padding: 20px; }
+    .modal-sheet {
+      width: 100%;
+      max-width: 480px;
+      max-height: 82dvh;
+      background: #fff;
+      border-radius: 20px 20px 0 0;
+      padding: 18px 16px calc(18px + var(--safe-bottom));
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow-y: auto;
+    }
+    .modal-card {
+      width: 100%;
+      max-width: 360px;
+      background: #fff;
+      border-radius: 20px;
+      padding: 20px;
+      text-align: center;
+    }
+    .qr-box {
+      width: 240px;
+      height: 240px;
+      margin: 12px auto;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .qr-box img { width: 100%; height: 100%; object-fit: contain; }
+    .zoom-mask {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      background: rgba(0, 0, 0, 0.92);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .zoom-mask img { max-width: 100%; max-height: 92dvh; border-radius: 8px; }
+    .toast {
+      position: fixed;
+      top: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 100;
+      background: rgba(22, 24, 35, 0.9);
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      max-width: 88vw;
+      text-align: center;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 46px 20px;
+      color: var(--sub);
+      background: var(--card);
+      border-radius: 16px;
+      border: 1px solid var(--border);
+    }
+    .empty-state p { margin: 8px 0 14px; font-size: 14px; }
   </style>
 </head>
 <body>
 <div id="app" v-cloak>
-  <!-- ==================== 登录页 ==================== -->
-  <div class="login-wrap" v-if="!isLoggedIn && !booting">
-    <form class="login-card" @submit.prevent="handleLogin">
-      <h1 class="login-title">闲鱼选品与上架工作台</h1>
-      <p class="login-sub">独立内部工作台 · 选品审核 / AI 话术 / 图片编排 / 标准上架库</p>
-      <div class="field">
-        <label>工作台账号</label>
-        <input class="input" v-model="loginForm.username" placeholder="输入账号" autocomplete="username" required />
+  <div v-if="toast" class="toast">{{ toast }}</div>
+
+  <!-- 未登录：极简手机登录页 -->
+  <div v-if="!user" class="login-wrap">
+    <div class="login-card">
+      <h1 class="login-title">帮拍选品工作台</h1>
+      <p class="login-sub">选好价 · 改文案 · 同步在售与源品监控</p>
+      <div style="margin-bottom: 14px;">
+        <label class="field-label">账号 / 手机号</label>
+        <input v-model.trim="loginForm.username" class="input" placeholder="输入工作台账号" @keyup.enter="doLogin" />
       </div>
-      <div class="field">
-        <label>登录密码</label>
-        <input class="input" type="password" v-model="loginForm.password" placeholder="输入密码" autocomplete="current-password" required />
+      <div style="margin-bottom: 18px;">
+        <label class="field-label">密码</label>
+        <input v-model="loginForm.password" type="password" class="input" placeholder="输入登录密码" @keyup.enter="doLogin" />
       </div>
-      <button type="submit" class="btn btn-primary btn-block" :disabled="loginBusy">
-        {{ loginBusy ? '登录中...' : '登录工作台' }}
+      <p v-if="loginError" style="color: var(--red); font-size: 13px; margin: -6px 0 14px;">{{ loginError }}</p>
+      <button class="btn btn-primary btn-block" :disabled="loginLoading" @click="doLogin">
+        {{ loginLoading ? '登录中...' : '登录工作台' }}
       </button>
-    </form>
+    </div>
   </div>
 
-  <!-- ==================== 工作台主界面 ==================== -->
-  <template v-if="isLoggedIn">
-    <header class="topbar">
-      <div class="topbar-inner">
-        <div class="brand">
-          <span class="brand-dot"></span>
-          <span>闲鱼选品工作台</span>
+  <!-- 已登录主界面 -->
+  <div v-else class="app-shell">
+    <!-- TAB 1: 挑品 -->
+    <template v-if="mainTab === 'pick'">
+      <div class="topbar">
+        <div class="seg-group">
+          <button class="seg-btn" :class="{ active: pickSource === 'eval' }" @click="switchPickSource('eval')">比价好货</button>
+          <button class="seg-btn" :class="{ active: pickSource === 'fav' }" @click="switchPickSource('fav')">我的收藏</button>
         </div>
-
-        <nav class="nav-tabs">
-          <button class="nav-tab" :class="{ active: activeTab === 'candidates' }" @click="switchTab('candidates')">
-            <span>1. 选品候选池</span>
-          </button>
-          <button class="nav-tab" :class="{ active: activeTab === 'editor' }" @click="switchTab('editor')">
-            <span>2. 上架预览编辑</span>
-          </button>
-          <button class="nav-tab" :class="{ active: activeTab === 'listings' }" @click="switchTab('listings')">
-            <span>3. 标准上架库</span>
-            <span class="badge" v-if="statusCounts.ready > 0">{{ statusCounts.ready }}</span>
-          </button>
-        </nav>
-
-        <div class="user-actions">
-          <button type="button" class="bind-chip" :class="{ bound: Boolean(user.bound_shop_uid) }" @click="openBindModal">
-            {{ user.bound_shop_uid ? ('主站收藏: ' + user.bound_shop_uid) : '未绑定主站收藏' }}
-          </button>
-          <span class="muted">{{ user.username }}</span>
-          <button type="button" class="btn btn-sm" @click="handleLogout">退出</button>
-        </div>
+        <button class="icon-btn" title="刷新" @click="loadCandidates(true)">↻</button>
       </div>
-    </header>
 
-    <main class="main">
-      <!-- ==================== TAB 1: 选品候选池 ==================== -->
-      <section v-if="activeTab === 'candidates'">
-        <div class="toolbar">
-          <div class="pill-group">
-            <button class="pill" :class="{ active: candidateSource === 'evaluations' }" @click="switchCandidateSource('evaluations')">
-              闲鱼比价推荐
-            </button>
-            <button class="pill" :class="{ active: candidateSource === 'favorites' }" @click="switchCandidateSource('favorites')">
-              我的主站收藏
-            </button>
-          </div>
-
-          <div class="filter-row" v-if="candidateSource === 'evaluations'">
-            <select class="select" v-model="evalFilters.winner" @change="loadEvaluations(1)">
-              <option value="my_product">仅看我方胜出</option>
-              <option value="all">全部可比结果</option>
-            </select>
-            <select class="select" v-model="evalFilters.source_type" @change="loadEvaluations(1)">
-              <option value="all">全部来源</option>
-              <option value="deal_tip">仅线报爆料</option>
-              <option value="official">仅官方商品</option>
-            </select>
-            <select class="select" v-model.number="evalFilters.min_ratio" @change="loadEvaluations(1)">
-              <option :value="1">性价比 ≥ 1.0x</option>
-              <option :value="1.2">性价比 ≥ 1.2x</option>
-              <option :value="1.5">性价比 ≥ 1.5x</option>
-            </select>
-            <select class="select" v-model="evalFilters.sort" @change="loadEvaluations(1)">
-              <option value="ratio">按性价比倍数</option>
-              <option value="latest">按最新比价</option>
-            </select>
-            <label class="check-label">
-              <input type="checkbox" v-model="evalFilters.include_handled" @change="loadEvaluations(1)" />
-              含已处理
-            </label>
-            <label class="check-label">
-              <input type="checkbox" v-model="evalFilters.include_off" @change="loadEvaluations(1)" />
-              含已下架
-            </label>
-          </div>
-
-          <div class="filter-row" v-else>
-            <label class="check-label">
-              <input type="checkbox" v-model="favFilters.include_handled" @change="loadFavorites(1)" />
-              含已处理
-            </label>
-            <label class="check-label">
-              <input type="checkbox" v-model="favFilters.include_off" @change="loadFavorites(1)" />
-              含已下架
-            </label>
-          </div>
+      <div class="page-body">
+        <div v-if="pickSource === 'eval'" class="sub-filter-bar">
+          <span>待审 {{ evalTotal }} 条</span>
+          <button class="link-btn" @click="toggleAllWinners">
+            {{ includeAllWinners ? '当前：含平局/参考款' : '只看我方更优 ›' }}
+          </button>
         </div>
 
-        <!-- 闲鱼比价候选列表 -->
-        <template v-if="candidateSource === 'evaluations'">
-          <div class="empty" v-if="evalState.loading && evalState.items.length === 0">正在加载闲鱼比价推荐...</div>
-          <div class="empty" v-else-if="evalState.items.length === 0">暂无待审核的比价推荐商品</div>
-          <div class="card-grid" v-else>
-            <div class="eval-card" v-for="item in evalState.items" :key="item.platform + ':' + item.product_id">
-              <div class="eval-head">
-                <div class="pill-group">
-                  <span class="tag tag-plat">{{ platformLabel(item.platform) }}</span>
-                  <span class="tag tag-blue">{{ item.source_type === 'deal_tip' ? '线报爆料' : '官方商品' }}</span>
-                  <span class="tag tag-win" v-if="item.cost_performance_ratio">我方划算 {{ item.cost_performance_ratio }}x</span>
-                  <span class="tag tag-warn" v-if="item.price_diff_from_eval > 0">较比价时涨 ¥{{ formatMoney(item.price_diff_from_eval) }}</span>
-                  <span class="tag tag-red" v-if="item.live_status === 'off_promotion'">已下架</span>
-                  <span class="tag tag-plat" v-if="item.listing_status">库内: {{ statusLabel(item.listing_status) }}</span>
-                </div>
-                <span class="muted">{{ item.category_name }} · {{ item.evaluated_at }}</span>
-              </div>
+        <div v-if="candidatesLoading && candidates.length === 0" class="empty-state">加载中...</div>
 
-              <div class="eval-cols">
-                <div class="side-box">
-                  <img v-if="item.image_url" :src="item.image_url" referrerpolicy="no-referrer" class="thumb" @click="openLightbox(item.image_url)" />
-                  <div class="side-info">
-                    <div class="item-title">{{ item.name }}</div>
-                    <div>
-                      <span class="price-big">¥{{ formatMoney(item.live_price ?? item.eval_price ?? 0) }}</span>
-                      <span class="muted" style="margin-left:8px" v-if="item.eval_price">比价时 ¥{{ formatMoney(item.eval_price) }}</span>
-                    </div>
-                    <div class="muted" v-if="item.deal_highlight">{{ item.deal_highlight }}</div>
-                    <div class="muted">可用素材：官方图 {{ item.official_image_count }} 张 · 爆料图 {{ item.deal_image_count }} 张</div>
-                  </div>
-                </div>
-
-                <div class="side-box">
-                  <img
-                    v-if="item.xianyu_ref?.screenshot_url || (item.xianyu_ref?.fallback_images && item.xianyu_ref.fallback_images[0])"
-                    :src="item.xianyu_ref.screenshot_url || item.xianyu_ref.fallback_images[0]"
-                    referrerpolicy="no-referrer"
-                    :class="item.xianyu_ref.screenshot_url ? 'shot-thumb' : 'thumb'"
-                    @click="openLightbox(item.xianyu_ref.screenshot_url || item.xianyu_ref.fallback_images[0])"
-                  />
-                  <div class="side-info">
-                    <div class="pill-group">
-                      <span class="tag tag-plat">{{ item.xianyu_ref?.screenshot_url ? '真实H5截图(点图放大)' : '闲鱼同款参考' }}</span>
-                      <span class="tag tag-warn" v-if="item.xianyu_ref?.want_cnt">{{ item.xianyu_ref.want_cnt }}人想要</span>
-                    </div>
-                    <div class="item-title">{{ item.xianyu_ref?.title || '无标题' }}</div>
-                    <div>
-                      <span class="price-big" style="color:#374151">¥{{ formatMoney(item.xianyu_ref?.comparable_price ?? 0) }}</span>
-                      <span class="muted" style="margin-left:8px">{{ item.xianyu_ref?.spec_description }}</span>
-                    </div>
-                    <a v-if="item.xianyu_ref?.item_url" :href="item.xianyu_ref.item_url" target="_blank" rel="noopener noreferrer" class="muted">打开闲鱼原帖 ↗</a>
-                  </div>
-                </div>
-              </div>
-
-              <div class="reason-box" v-if="item.llm_reason">
-                <b>AI 比价依据：</b>{{ item.llm_reason }}
-              </div>
-
-              <div class="card-actions">
-                <span class="muted">ID: {{ item.platform }}:{{ item.product_id }}</span>
-                <div class="pill-group">
-                  <button class="btn btn-danger btn-sm" @click="rejectCandidate(item, 'xianyu_eval')">淘汰忽略</button>
-                  <button class="btn btn-primary btn-sm" @click="openDraftFromCandidate(item, 'xianyu_eval')">选入上架编辑 →</button>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div style="margin-top:14px;text-align:center" v-if="evalState.hasMore">
-            <button class="btn" :disabled="evalState.loading" @click="loadEvaluations(evalState.page + 1, true)">加载更多</button>
-          </div>
-        </template>
-
-        <!-- 主站收藏候选列表 -->
-        <template v-else>
-          <div class="empty" v-if="favState.needs_binding">
-            <div style="margin-bottom:12px">当前工作台账号尚未绑定主站收藏夹账号</div>
-            <button class="btn btn-primary" @click="openBindModal">立即绑定主站 UID / 手机号</button>
-          </div>
-          <div class="empty" v-else-if="favState.loading && favState.items.length === 0">正在加载主站收藏...</div>
-          <div class="empty" v-else-if="favState.items.length === 0">暂无待处理的主站收藏商品</div>
-          <div class="card-grid" v-else>
-            <div class="listing-card" v-for="item in favState.items" :key="item.platform + ':' + item.product_id">
-              <img v-if="item.image_url" :src="item.image_url" referrerpolicy="no-referrer" class="thumb" @click="openLightbox(item.image_url)" />
-              <div class="listing-body">
-                <div class="pill-group">
-                  <span class="tag tag-plat">{{ platformLabel(item.platform) }}</span>
-                  <span class="tag tag-blue" v-if="item.is_deal_tip">有线报</span>
-                  <span class="tag tag-red" v-if="item.live_status === 'off_promotion'">已下架</span>
-                  <span class="tag tag-win" v-if="item.price_diff !== null && item.price_diff < 0">降 ¥{{ formatMoney(Math.abs(item.price_diff)) }}</span>
-                  <span class="tag tag-warn" v-else-if="item.price_diff !== null && item.price_diff > 0">涨 ¥{{ formatMoney(item.price_diff) }}</span>
-                  <span class="tag tag-plat" v-if="item.listing_status">库内: {{ statusLabel(item.listing_status) }}</span>
-                </div>
-                <div class="item-title">{{ item.name }}</div>
-                <div>
-                  <span class="price-big">¥{{ formatMoney(item.live_price ?? item.collected_price ?? 0) }}</span>
-                  <span class="muted" style="margin-left:8px" v-if="item.collected_price">收藏时 ¥{{ formatMoney(item.collected_price) }}</span>
-                </div>
-                <div class="muted">可用素材：官方图 {{ item.official_image_count }} 张 · 爆料图 {{ item.deal_image_count }} 张</div>
-                <div class="card-actions" style="margin-top:auto">
-                  <span class="muted">收藏于 {{ item.created_at }}</span>
-                  <div class="pill-group">
-                    <button class="btn btn-danger btn-sm" @click="rejectCandidate(item, 'favorite')">淘汰忽略</button>
-                    <button class="btn btn-primary btn-sm" @click="openDraftFromCandidate(item, 'favorite')">选入上架编辑 →</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div style="margin-top:14px;text-align:center" v-if="favState.hasMore">
-            <button class="btn" :disabled="favState.loading" @click="loadFavorites(favState.page + 1, true)">加载更多</button>
-          </div>
-        </template>
-      </section>
-
-      <!-- ==================== TAB 2: 上架预览与编辑 ==================== -->
-      <section v-if="activeTab === 'editor'">
-        <div class="empty" v-if="!editor.listing">
-          <div style="margin-bottom:12px">请先从「选品候选池」或「标准上架库」选择一件商品进入预览编辑</div>
-          <div class="pill-group" style="justify-content:center">
-            <button class="btn btn-primary" @click="switchTab('candidates')">去选品候选池</button>
-            <button class="btn" @click="switchTab('listings')">查看标准上架库</button>
-          </div>
+        <div v-else-if="pickSource === 'fav' && favNeedsBinding" class="empty-state">
+          <p>还没有绑定主站收藏账号</p>
+          <button class="btn btn-primary" @click="mainTab = 'me'">去「我的」绑定手机号</button>
         </div>
 
-        <div class="editor-layout" v-else>
-          <!-- 左侧：实时闲鱼效果预览 + 竞品参考 -->
-          <div style="display:flex;flex-direction:column;gap:14px">
-            <div class="panel">
-              <div class="panel-title">
-                <span>闲鱼上架效果预览</span>
-                <span class="tag tag-plat">{{ statusLabel(editor.listing.status) }}</span>
-              </div>
-              <img
-                v-if="editor.form.images.length > 0"
-                :src="editor.form.images[0].url"
-                referrerpolicy="no-referrer"
-                class="preview-cover"
-                @click="openLightbox(editor.form.images[0].url)"
-              />
-              <div v-else class="empty" style="padding:36px 10px">暂无图片</div>
-
-              <div style="margin-top:12px;display:flex;align-items:baseline;justify-content:space-between">
-                <span class="price-big">¥{{ formatMoney(editor.form.sell_price) }}</span>
-                <span class="muted">{{ Number(editor.form.shipping_fee) > 0 ? ('运费 ¥' + formatMoney(editor.form.shipping_fee)) : '包邮' }}</span>
-              </div>
-              <div class="item-title" style="margin-top:6px">{{ editor.form.title || '(待填写标题)' }}</div>
-              <div class="muted" style="margin-top:6px;white-space:pre-wrap;line-height:1.5;max-height:160px;overflow:auto">{{ editor.form.description || '(待生成或填写描述)' }}</div>
-
-              <div class="stat-row">
-                <div class="stat-cell">
-                  <div class="muted">参考成本</div>
-                  <b>¥{{ formatMoney(editor.listing.cost_price) }}</b>
-                </div>
-                <div class="stat-cell">
-                  <div class="muted">预估毛利</div>
-                  <b :style="{ color: estimatedProfit >= 0 ? 'var(--green)' : 'var(--red)' }">
-                    {{ estimatedProfit >= 0 ? '+' : '' }}¥{{ formatMoney(estimatedProfit) }}
-                  </b>
-                </div>
-                <div class="stat-cell">
-                  <div class="muted">上游实时价</div>
-                  <b>{{ editor.listing.live_price !== null ? ('¥' + formatMoney(editor.listing.live_price)) : '未知/下架' }}</b>
-                </div>
-                <div class="stat-cell">
-                  <div class="muted">图片数量</div>
-                  <b>{{ editor.form.images.length }} / 9 张</b>
-                </div>
-              </div>
-              <div class="alert-banner" style="margin-top:10px" v-if="editor.listing.risk_alert === 'off_promotion'">
-                ⚠️ 源商品当前已下架或取消推广，请勿上架！
-              </div>
-              <div class="alert-banner" style="margin-top:10px" v-else-if="editor.listing.risk_alert === 'price_exceeded'">
-                ⚠️ 当前上游价格已高于止损上限 ¥{{ formatMoney(editor.listing.max_cost_price) }}
-              </div>
-            </div>
-
-            <!-- 竞品参考面板 -->
-            <div class="panel" v-if="editor.listing.eval_ref">
-              <div class="panel-title">
-                <span>闲鱼同款比价参考</span>
-                <span class="tag tag-win" v-if="editor.listing.eval_ref.cp_ratio">划算 {{ editor.listing.eval_ref.cp_ratio }}x</span>
-              </div>
-              <div style="display:flex;gap:10px">
-                <img
-                  v-if="editor.listing.eval_ref.screenshot_url || (editor.listing.eval_ref.fallback_images && editor.listing.eval_ref.fallback_images[0])"
-                  :src="editor.listing.eval_ref.screenshot_url || editor.listing.eval_ref.fallback_images[0]"
-                  referrerpolicy="no-referrer"
-                  class="shot-thumb"
-                  @click="openLightbox(editor.listing.eval_ref.screenshot_url || editor.listing.eval_ref.fallback_images[0])"
-                />
-                <div class="side-info">
-                  <div class="item-title" style="font-size:13px">{{ editor.listing.eval_ref.xianyu_title }}</div>
-                  <div class="muted">闲鱼含邮价：<b>¥{{ formatMoney(editor.listing.eval_ref.xianyu_price || 0) }}</b></div>
-                  <div class="muted" v-if="editor.listing.eval_ref.want_cnt">热度：{{ editor.listing.eval_ref.want_cnt }}人想要</div>
-                  <div class="muted">{{ editor.listing.eval_ref.llm_reason }}</div>
-                  <a v-if="editor.listing.eval_ref.xianyu_item_url" :href="editor.listing.eval_ref.xianyu_item_url" target="_blank" rel="noopener noreferrer" class="muted">查看闲鱼原帖 ↗</a>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- 右侧：图片编排 + 定价 + AI 话术 + 定稿 -->
-          <div class="panel">
-            <div class="panel-title">
-              <span>图片编排（默认最多 3 张官方图 + 爆料图，可自由删增调序）</span>
-            </div>
-
-            <div class="img-manager-grid">
-              <div class="img-tile" :class="{ cover: idx === 0 }" v-for="(img, idx) in editor.form.images" :key="img.url + '_' + idx">
-                <span class="img-origin">{{ idx === 0 ? '封面·' : '' }}{{ originLabel(img.origin) }}</span>
-                <img :src="img.url" referrerpolicy="no-referrer" @click="openLightbox(img.url)" />
-                <div class="img-ops">
-                  <button type="button" title="左移" :disabled="idx === 0" @click="moveImage(idx, -1)">←</button>
-                  <button type="button" title="右移" :disabled="idx === editor.form.images.length - 1" @click="moveImage(idx, 1)">→</button>
-                  <button type="button" title="删除" style="color:var(--red)" @click="removeImage(idx)">✕</button>
-                </div>
-              </div>
-            </div>
-
-            <div class="filter-row" style="margin-bottom:12px">
-              <label class="btn btn-sm" style="cursor:pointer">
-                <span>{{ editor.uploading ? '上传中...' : '+ 上传本地图片' }}</span>
-                <input type="file" accept="image/*" style="display:none" :disabled="editor.uploading" @change="handleUploadImage" />
-              </label>
-              <input class="input" style="max-width:260px;padding:5px 10px;font-size:12px" v-model="editor.customImageUrl" placeholder="或粘贴图片链接 http(s)://..." />
-              <button type="button" class="btn btn-sm" @click="addCustomImageUrl">添加链接</button>
-            </div>
-
-            <!-- 备选素材池 -->
-            <div v-if="unusedOfficialImages.length > 0 || unusedDealImages.length > 0" style="margin-bottom:16px;padding:10px;background:#f9fafb;border-radius:8px;border:1px solid var(--border)">
-              <div class="muted" style="font-weight:600;margin-bottom:6px">未选官方图 / 爆料图素材池（点击可补加）：</div>
-              <div class="pool-strip">
-                <div class="pool-item" v-for="u in unusedOfficialImages" :key="'off_' + u">
-                  <img :src="u" referrerpolicy="no-referrer" @click="openLightbox(u)" />
-                  <button type="button" class="btn btn-sm" style="margin-top:4px;width:100%;padding:2px" @click="appendPoolImage(u, 'official')">+ 官方</button>
-                </div>
-                <div class="pool-item" v-for="u in unusedDealImages" :key="'deal_' + u">
-                  <img :src="u" referrerpolicy="no-referrer" @click="openLightbox(u)" />
-                  <button type="button" class="btn btn-sm" style="margin-top:4px;width:100%;padding:2px" @click="appendPoolImage(u, 'deal')">+ 爆料</button>
-                </div>
-              </div>
-            </div>
-
-            <!-- 价格设置 -->
-            <div class="price-grid" style="margin-bottom:14px">
-              <div class="field" style="margin-bottom:0">
-                <label>闲鱼售价 (¥，默认爆料/活动价)</label>
-                <input class="input" type="number" step="0.01" min="0" v-model.number="editor.form.sell_price" />
-              </div>
-              <div class="field" style="margin-bottom:0">
-                <label>运费 (¥，0 为包邮)</label>
-                <input class="input" type="number" step="0.01" min="0" v-model.number="editor.form.shipping_fee" />
-              </div>
-              <div class="field" style="margin-bottom:0">
-                <label>成本止损上限 (¥)</label>
-                <input class="input" type="number" step="0.01" min="0" v-model.number="editor.form.max_cost_price" />
-              </div>
-            </div>
-
-            <!-- AI 话术生成 -->
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-              <div class="muted" style="font-weight:700">商品标题与闲鱼描述</div>
-              <div class="filter-row">
-                <select class="select" v-model="editor.copyStyle">
-                  <option value="casual">个人闲置 / 多囤出清风</option>
-                  <option value="value">实惠直出 / 性价比风</option>
-                </select>
-                <button type="button" class="btn btn-sm btn-primary" :disabled="editor.generating" @click="handleGenerateCopy">
-                  {{ editor.generating ? 'AI 生成中...' : '✨ AI 生成闲鱼话术' }}
-                </button>
-              </div>
-            </div>
-
-            <div class="field">
-              <label>闲鱼标题（建议 ≤ 30 字，当前 {{ (editor.form.title || '').length }} 字）</label>
-              <input class="input" v-model="editor.form.title" maxlength="60" placeholder="输入或 AI 生成闲鱼标题" />
-            </div>
-            <div class="field">
-              <label>闲鱼正文描述</label>
-              <textarea class="textarea" rows="6" v-model="editor.form.description" placeholder="点击上方「AI 生成闲鱼话术」或直接手写描述"></textarea>
-            </div>
-
-            <div class="card-actions">
-              <button type="button" class="btn btn-danger" :disabled="editor.saving" @click="saveEditor('rejected')">淘汰此品</button>
-              <div class="pill-group">
-                <button type="button" class="btn" :disabled="editor.saving" @click="saveEditor('draft')">保存草稿</button>
-                <button type="button" class="btn btn-green" :disabled="editor.saving" @click="saveEditor('ready')">✓ 确认就绪（入标准上架库）</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ==================== TAB 3: 标准上架库 ==================== -->
-      <section v-if="activeTab === 'listings'">
-        <div class="toolbar">
-          <div class="pill-group">
-            <button
-              class="pill"
-              v-for="tab in listingStatusTabs"
-              :key="tab.key"
-              :class="{ active: listingFilterStatus === tab.key }"
-              @click="switchListingStatus(tab.key)"
-            >
-              {{ tab.label }} ({{ statusCounts[tab.key] ?? 0 }})
-            </button>
-          </div>
-          <button class="btn btn-sm" @click="loadListings(1)">刷新状态</button>
+        <div v-else-if="candidates.length === 0" class="empty-state">
+          <p>暂无待筛选的候选商品</p>
+          <button class="btn btn-soft btn-sm" @click="loadCandidates(true)">刷新列表</button>
         </div>
 
-        <div class="empty" v-if="listingsState.loading && listingsState.items.length === 0">正在加载标准上架库...</div>
-        <div class="empty" v-else-if="listingsState.items.length === 0">当前分类下暂无商品</div>
-        <div class="card-grid" v-else>
-          <div class="listing-card" v-for="item in listingsState.items" :key="item.listing_id">
+        <div v-for="c in candidates" :key="c.platform + ':' + c.product_id" class="card">
+          <div class="prod-row">
             <img
-              v-if="item.images && item.images.length > 0"
-              :src="item.images[0].url"
-              referrerpolicy="no-referrer"
               class="thumb"
-              @click="openLightbox(item.images[0].url)"
+              :src="c.image_url || ''"
+              alt=""
+              @click="c.image_url && (zoomImageUrl = c.image_url)"
             />
-            <div class="listing-body">
-              <div class="alert-banner" v-if="item.risk_alert === 'off_promotion'">⚠️ 上游商品已下架/取消推广，建议立即下架</div>
-              <div class="alert-banner" v-else-if="item.risk_alert === 'price_exceeded'">⚠️ 上游现价 ¥{{ formatMoney(item.live_price) }} 已超过止损上限 ¥{{ formatMoney(item.max_cost_price) }}</div>
-
-              <div class="pill-group">
-                <span class="tag tag-plat">{{ platformLabel(item.platform) }}</span>
-                <span class="tag" :class="item.status === 'ready' || item.status === 'online' ? 'tag-win' : (item.status === 'rejected' ? 'tag-red' : 'tag-plat')">
-                  {{ statusLabel(item.status) }}
-                </span>
-                <span class="muted">配图 {{ (item.images || []).length }} 张</span>
-                <span class="muted" v-if="item.confirmed_at">定稿于 {{ item.confirmed_at }}</span>
+            <div class="prod-meta">
+              <div class="prod-title">{{ c.name }}</div>
+              <div class="price-row">
+                <span class="price-main" v-if="c.price"><small>¥</small>{{ c.price }}</span>
+                <span class="pill pill-gray">{{ platformLabel(c.platform) }}</span>
+                <span v-if="c.is_deal_tip" class="pill pill-orange">线报好价</span>
+                <span v-if="c.cost_performance_ratio" class="pill pill-green">性价比 {{ Number(c.cost_performance_ratio).toFixed(2) }}x</span>
               </div>
+              <div v-if="c.deal_highlight" style="font-size: 12px; color: var(--primary);">{{ c.deal_highlight }}</div>
+            </div>
+          </div>
 
-              <div class="item-title">{{ item.title || item.product_name }}</div>
+          <div v-if="c.xianyu_ref && (c.xianyu_ref.item_id || c.xianyu_ref.screenshot_url || c.llm_reason)" class="eval-box">
+            <img
+              v-if="c.xianyu_ref.screenshot_url || (c.xianyu_ref.fallback_images && c.xianyu_ref.fallback_images[0])"
+              class="eval-shot"
+              :src="c.xianyu_ref.screenshot_url || c.xianyu_ref.fallback_images[0]"
+              alt="闲鱼比价"
+              @click="zoomImageUrl = c.xianyu_ref.screenshot_url || c.xianyu_ref.fallback_images[0]"
+            />
+            <div class="eval-info">
               <div>
-                <span class="price-big">挂售 ¥{{ formatMoney(item.sell_price) }}</span>
-                <span class="muted" style="margin-left:10px">成本 ¥{{ formatMoney(item.cost_price) }}</span>
-                <span class="muted" style="margin-left:10px" v-if="item.live_price !== null">实时 ¥{{ formatMoney(item.live_price) }}</span>
+                闲鱼参考 <b>¥{{ c.xianyu_ref.comparable_price || '-' }}</b>
+                <span v-if="c.xianyu_ref.want_cnt"> · {{ c.xianyu_ref.want_cnt }}人想要</span>
+                <span v-if="c.xianyu_ref.screenshot_url" style="color: var(--blue);"> · 点图放大</span>
               </div>
-              <div class="muted" style="white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden">{{ item.description }}</div>
+              <div class="eval-reason">{{ c.llm_reason || c.xianyu_ref.title }}</div>
+            </div>
+          </div>
 
-              <div class="card-actions" style="margin-top:auto">
-                <span class="muted">{{ item.listing_id }}</span>
-                <div class="pill-group">
-                  <button class="btn btn-sm" @click="copyListingText(item)">复制标题+文案</button>
-                  <button class="btn btn-sm" @click="openListingInEditor(item.listing_id)">编辑预览</button>
-                  <button class="btn btn-sm btn-green" v-if="item.status === 'ready'" @click="changeListingStatus(item.listing_id, 'online')">标为已上架</button>
-                  <button class="btn btn-sm btn-danger" v-if="item.status === 'online' || item.status === 'ready'" @click="changeListingStatus(item.listing_id, 'offline')">标为下架</button>
-                  <button class="btn btn-sm" v-if="item.status === 'offline' || item.status === 'rejected'" @click="changeListingStatus(item.listing_id, 'ready')">恢复待上架</button>
+          <div class="actions-row">
+            <button class="btn btn-soft" @click="dismissCandidate(c)">不要</button>
+            <button class="btn btn-primary" @click="pickCandidate(c)">选这个</button>
+          </div>
+        </div>
+
+        <button v-if="candidatesHasMore" class="btn btn-soft btn-block" :disabled="candidatesLoading" @click="loadCandidates(false)">
+          {{ candidatesLoading ? '加载中...' : '加载更多' }}
+        </button>
+      </div>
+    </template>
+
+    <!-- TAB 2: 商品 (待上架 + 真实渠道在售) -->
+    <template v-else-if="mainTab === 'items'">
+      <div class="topbar">
+        <div class="seg-group">
+          <button class="seg-btn" :class="{ active: itemsSubTab === 'ready' }" @click="switchItemsSubTab('ready')">
+            待上架 ({{ itemCounts.active || 0 }})
+          </button>
+          <button class="seg-btn" :class="{ active: itemsSubTab === 'selling' }" @click="switchItemsSubTab('selling')">
+            {{ activeChannel.name }}在售 ({{ activeChannel.online_count || 0 }})
+          </button>
+        </div>
+        <button
+          class="icon-btn"
+          title="同步/刷新"
+          @click="itemsSubTab === 'ready' ? loadItems() : syncActiveChannel()"
+        >↻</button>
+      </div>
+
+      <div class="page-body">
+        <!-- 子视图 A：待上架 / 草稿素材 -->
+        <template v-if="itemsSubTab === 'ready'">
+          <div v-if="itemsLoading" class="empty-state">加载中...</div>
+          <div v-else-if="localItems.length === 0" class="empty-state">
+            <p>还没有整理好的待上架商品</p>
+            <button class="btn btn-primary" @click="mainTab = 'pick'">去挑品</button>
+          </div>
+
+          <div v-for="it in localItems" :key="it.listing_id" class="card" :class="{ 'card-alert': it.off_promotion_alert }">
+            <div class="prod-row">
+              <img class="thumb thumb-sm" :src="(it.images[0] && it.images[0].url) || ''" alt="" />
+              <div class="prod-meta">
+                <div class="prod-title">{{ it.title || it.product_name || '未填标题' }}</div>
+                <div class="price-row">
+                  <span class="price-main"><small>¥</small>{{ it.price }}</span>
+                  <span class="pill" :class="it.status === 'ready' ? 'pill-green' : 'pill-amber'">
+                    {{ it.status === 'ready' ? '待上架' : '草稿' }}
+                  </span>
+                  <span v-if="it.off_promotion_alert" class="pill pill-red">⚠️ 上游已失效</span>
+                </div>
+                <div style="font-size: 12px; color: var(--muted);">{{ platformLabel(it.platform) }} · {{ it.images.length }}张图</div>
+              </div>
+            </div>
+            <div class="actions-row">
+              <button class="btn btn-soft btn-sm" @click="openEditor(it)">编辑</button>
+              <button class="btn btn-blue-soft btn-sm" @click="copyItemCopy(it)">复制文案</button>
+              <button v-if="activeChannel.capabilities && activeChannel.capabilities.auto_publish" class="btn btn-primary btn-sm" @click="publishToChannel(it)">一键上架</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- 子视图 B：渠道真实在售同步 -->
+        <template v-else>
+          <!-- 多渠道切换（后续接入淘宝等渠道时自动显示） -->
+          <div v-if="channels.length > 1" style="display: flex; gap: 8px; overflow-x: auto;">
+            <button
+              v-for="ch in channels"
+              :key="ch.channel"
+              class="btn btn-sm"
+              :class="ch.channel === activeChannelCode ? 'btn-dark' : 'btn-soft'"
+              @click="selectChannel(ch.channel)"
+            >{{ ch.name }}</button>
+          </div>
+
+          <div class="status-banner">
+            <div style="min-width: 0;">
+              <div style="font-weight: 700; font-size: 14px;">
+                {{ activeChannel.name }}账号：
+                <span :style="{ color: activeChannel.online ? 'var(--green)' : 'var(--red)' }">
+                  {{ activeChannel.online ? ('在线 · ' + (activeChannel.nickname || activeChannel.account_id)) : (activeChannel.bound ? '已掉线' : '未绑定') }}
+                </span>
+              </div>
+              <div style="font-size: 12px; color: var(--muted);">
+                {{ sellingData.synced_at ? ('上次同步：' + formatTime(sellingData.synced_at)) : '点击右上角或下方按钮同步在售商品' }}
+              </div>
+            </div>
+            <button
+              v-if="activeChannel.bound && activeChannel.online"
+              class="btn btn-dark btn-sm"
+              :disabled="syncLoading"
+              @click="syncActiveChannel"
+            >{{ syncLoading ? '同步中...' : '同步在售' }}</button>
+            <button
+              v-else
+              class="btn btn-primary btn-sm"
+              @click="startQrLogin(activeChannelCode)"
+            >扫码绑定</button>
+          </div>
+
+          <div v-if="!activeChannel.bound && sellingData.online_items.length === 0 && sellingData.abnormal_items.length === 0" class="empty-state">
+            <p>绑定{{ activeChannel.name }}账号后，可自动同步真实在售商品，并实时监控上游源品是否下架失效</p>
+            <button class="btn btn-primary" @click="startQrLogin(activeChannelCode)">立即扫码绑定</button>
+          </div>
+
+          <template v-else>
+            <!-- 异常/已被平台下架 -->
+            <div v-for="ab in sellingData.abnormal_items" :key="'ab_' + ab.item_id" class="card card-alert">
+              <div class="prod-row">
+                <img class="thumb thumb-sm" :src="ab.pic_url || ''" alt="" />
+                <div class="prod-meta">
+                  <div class="prod-title">{{ ab.title }}</div>
+                  <div class="price-row">
+                    <span class="price-main"><small>¥</small>{{ ab.price }}</span>
+                    <span class="pill pill-red">{{ ab.status_label || '已被下架' }}</span>
+                    <span v-if="ab.off_promotion_alert" class="pill pill-red">上游源已失效</span>
+                  </div>
+                  <div style="font-size: 12px; color: var(--sub);">ID: {{ ab.item_id }}</div>
                 </div>
               </div>
             </div>
+
+            <!-- 正常在售 -->
+            <div v-for="on in sellingData.online_items" :key="'on_' + on.item_id" class="card" :class="{ 'card-alert': on.off_promotion_alert }">
+              <div class="prod-row">
+                <img class="thumb thumb-sm" :src="on.pic_url || ''" alt="" />
+                <div class="prod-meta">
+                  <div class="prod-title">{{ on.title }}</div>
+                  <div class="price-row">
+                    <span class="price-main"><small>¥</small>{{ on.price }}</span>
+                    <span class="pill pill-green">正常在售</span>
+                    <span v-if="on.off_promotion_alert" class="pill pill-red">⚠️ 上游源已失效</span>
+                    <span v-else-if="on.upstream_status === 'online'" class="pill pill-blue">
+                      上游有货{{ on.upstream_live_price ? (' ¥' + on.upstream_live_price) : '' }}
+                    </span>
+                    <span v-else class="pill pill-gray">未关联源品</span>
+                  </div>
+                  <div style="font-size: 12px; color: var(--muted);">
+                    {{ on.want_info || '暂无热度' }}
+                    <span v-if="on.linked_listing_title"> · 关联：{{ on.linked_listing_title.slice(0, 14) }}</span>
+                  </div>
+                </div>
+              </div>
+              <div class="actions-row">
+                <button class="btn btn-soft btn-sm" @click="openLinkModal(on)">
+                  {{ on.linked_listing_id ? '修改关联' : '关联源品' }}
+                </button>
+                <a v-if="on.item_url" class="btn btn-blue-soft btn-sm" :href="on.item_url" target="_blank" rel="noopener">查看原帖</a>
+              </div>
+            </div>
+
+            <div v-if="sellingData.online_items.length === 0 && sellingData.abnormal_items.length === 0" class="empty-state">
+              <p>当前暂无在售商品</p>
+              <button class="btn btn-soft btn-sm" :disabled="syncLoading" @click="syncActiveChannel">刷新同步</button>
+            </div>
+          </template>
+        </template>
+      </div>
+    </template>
+
+    <!-- TAB 3: 我的 (渠道账号绑定 & 主站收藏绑定) -->
+    <template v-else-if="mainTab === 'me'">
+      <div class="topbar">
+        <div style="font-weight: 700; font-size: 16px;">账号与渠道设置</div>
+      </div>
+
+      <div class="page-body">
+        <div style="font-size: 13px; font-weight: 700; color: var(--sub); padding: 2px 4px;">销售渠道账号（服务端自动托管隔离环境）</div>
+
+        <div v-for="ch in channels" :key="ch.channel" class="card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div>
+              <div style="font-size: 16px; font-weight: 700;">{{ ch.name }}</div>
+              <div style="font-size: 12px; color: var(--sub); margin-top: 2px;">
+                {{ ch.nickname ? ('昵称：' + ch.nickname + ' (' + ch.account_id + ')') : (ch.message || '未绑定账号') }}
+              </div>
+            </div>
+            <span class="pill" :class="ch.online ? 'pill-green' : (ch.bound ? 'pill-red' : 'pill-gray')">
+              {{ ch.online ? '在线' : (ch.bound ? '已掉线' : '未绑定') }}
+            </span>
+          </div>
+
+          <div style="font-size: 12px; color: var(--muted); margin-bottom: 12px;">
+            在售 {{ ch.online_count || 0 }} 件
+            <span v-if="ch.abnormal_count"> · 异常 {{ ch.abnormal_count }} 件</span>
+            <span v-if="ch.off_promotion_alert_count" style="color: var(--red);"> · 上游失效预警 {{ ch.off_promotion_alert_count }} 件</span>
+            <span v-if="ch.last_checked_at"> · 检测于 {{ formatTime(ch.last_checked_at) }}</span>
+          </div>
+
+          <div class="actions-row" style="margin-top: 0;">
+            <button class="btn btn-primary btn-sm" @click="startQrLogin(ch.channel)">
+              {{ ch.online ? '重新扫码' : '扫码绑定' }}
+            </button>
+            <button class="btn btn-soft btn-sm" :disabled="channelBusy === ch.channel" @click="checkChannelStatus(ch.channel)">
+              {{ channelBusy === ch.channel ? '检测中...' : '检测在线' }}
+            </button>
+            <button class="btn btn-dark btn-sm" :disabled="syncLoading" @click="syncActiveChannel(ch.channel)">
+              {{ syncLoading ? '同步中...' : '同步在售' }}
+            </button>
           </div>
         </div>
-        <div style="margin-top:14px;text-align:center" v-if="listingsState.hasMore">
-          <button class="btn" :disabled="listingsState.loading" @click="loadListings(listingsState.page + 1, true)">加载更多</button>
+
+        <div style="font-size: 13px; font-weight: 700; color: var(--sub); padding: 4px 4px 0;">主站收藏同步</div>
+        <div class="card">
+          <div style="font-size: 14px; font-weight: 600; margin-bottom: 6px;">
+            当前绑定主站 UID：<span style="color: var(--primary);">{{ user.bound_shop_uid || '未绑定' }}</span>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 10px;">
+            <input v-model.trim="bindPhoneInput" class="input" placeholder="输入主站手机号换绑" inputmode="tel" />
+            <button class="btn btn-dark" style="flex-shrink: 0;" @click="updateShopBinding">绑定</button>
+          </div>
         </div>
-      </section>
-    </main>
-  </template>
 
-  <!-- ==================== 绑定主站收藏弹窗 ==================== -->
-  <div class="modal-mask" v-if="bindModal.visible" @click.self="bindModal.visible = false">
-    <form class="modal-box" @submit.prevent="submitBinding">
-      <h3 style="margin:0 0 8px">绑定主站收藏夹数据源</h3>
-      <p class="muted" style="margin:0 0 14px">填写你在主站网页登录的 UID 或注册手机号，工作台将只读拉取该账号收藏的商品。</p>
-      <div class="field">
-        <label>主站 UID（与下方手机号二选一）</label>
-        <input class="input" v-model="bindModal.shop_uid" placeholder="例如 u_9b2e61a4" />
+        <div class="card">
+          <div style="font-size: 13px; color: var(--sub); margin-bottom: 10px;">当前工作台账号：{{ user.username }}</div>
+          <button class="btn btn-danger-soft btn-block" @click="doLogout">退出登录</button>
+        </div>
       </div>
-      <div class="field">
-        <label>或输入主站注册手机号自动匹配</label>
-        <input class="input" v-model="bindModal.shop_phone" placeholder="例如 13800138000" />
-      </div>
-      <div class="card-actions">
-        <button type="button" class="btn" @click="bindModal.visible = false">取消</button>
-        <button type="submit" class="btn btn-primary" :disabled="bindModal.saving">{{ bindModal.saving ? '保存中...' : '保存绑定' }}</button>
-      </div>
-    </form>
+    </template>
+
+    <!-- 底部固定三栏导航 -->
+    <nav class="bottom-nav">
+      <button class="nav-item" :class="{ active: mainTab === 'pick' }" @click="mainTab = 'pick'">
+        <span class="nav-ico">🛍️</span>
+        <span>挑品</span>
+      </button>
+      <button class="nav-item" :class="{ active: mainTab === 'items' }" @click="openItemsTab">
+        <span class="nav-ico">📦</span>
+        <span>商品</span>
+      </button>
+      <button class="nav-item" :class="{ active: mainTab === 'me' }" @click="openMeTab">
+        <span class="nav-ico">👤</span>
+        <span>我的</span>
+      </button>
+    </nav>
   </div>
 
-  <!-- ==================== 大图预览灯箱 ==================== -->
-  <div class="modal-mask" v-if="lightboxUrl" @click="lightboxUrl = ''">
-    <img :src="lightboxUrl" referrerpolicy="no-referrer" class="lightbox-img" @click.stop />
+  <!-- 全屏手机端编辑抽屉 -->
+  <div v-if="editing" class="editor-overlay">
+    <div class="topbar">
+      <button class="btn btn-soft btn-sm" @click="closeEditor">← 返回</button>
+      <div style="flex: 1; font-weight: 700; font-size: 16px; text-align: center;">编辑商品素材</div>
+      <button class="btn btn-danger-soft btn-sm" @click="dismissFromEditor">移出</button>
+    </div>
+
+    <div class="editor-scroll">
+      <div v-if="editing.off_promotion_alert" class="card card-alert" style="padding: 10px 14px; color: var(--red); font-size: 13px; font-weight: 600;">
+        ⚠️ 该商品上游活动已结束/失效，暂不建议继续发布
+      </div>
+
+      <!-- 图片编辑 -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <span style="font-weight: 700; font-size: 14px;">商品图片（{{ editing.images.length }}/9）</span>
+          <span style="font-size: 12px; color: var(--muted);">默认保留前3张官方图 + 爆料图</span>
+        </div>
+
+        <div class="filmstrip">
+          <div v-for="(img, idx) in editing.images" :key="img.url" class="img-tile">
+            <img :src="img.url" alt="" @click="zoomImageUrl = img.url" />
+            <button class="img-del" @click="removeEditorImage(idx)">✕</button>
+            <span v-if="idx === 0" class="img-cover-tag">首图</span>
+            <button v-else class="img-cover-btn" @click="setCoverImage(idx)">设首图</button>
+          </div>
+          <label v-if="editing.images.length < 9" class="upload-tile">
+            <span style="font-size: 22px;">＋</span>
+            <span>{{ uploading ? '上传中' : '相册传图' }}</span>
+            <input type="file" accept="image/*" multiple style="display: none;" @change="onPickUploadFiles" />
+          </label>
+        </div>
+
+        <div v-if="unusedPoolImages.length > 0" style="margin-top: 12px;">
+          <div style="font-size: 12px; color: var(--sub);">可补选的原图池（点击加入）：</div>
+          <div class="pool-strip">
+            <div v-for="pimg in unusedPoolImages" :key="pimg.url" class="pool-thumb" @click="addPoolImage(pimg)">
+              <img :src="pimg.url" alt="" />
+              <span class="pool-add">+</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 单一标价 -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px;">
+          <span style="font-weight: 700; font-size: 14px;">展示标价</span>
+          <span v-if="editing.live_price" style="font-size: 12px; color: var(--sub);">当前参考好价 ¥{{ editing.live_price }}</span>
+        </div>
+        <div class="price-input-wrap">
+          <span>¥</span>
+          <input v-model.number="editing.price" type="number" step="0.01" inputmode="decimal" placeholder="0.00" />
+        </div>
+      </div>
+
+      <!-- AI 帮拍文案 + 标题正文 -->
+      <div class="card">
+        <button class="btn btn-dark btn-block" :disabled="aiGenerating" @click="generateEditorCopy" style="margin-bottom: 14px;">
+          {{ aiGenerating ? '正在生成帮拍/好价话术...' : '✨ 生成帮拍 / 好价话术' }}
+        </button>
+
+        <div style="margin-bottom: 12px;">
+          <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+            <label class="field-label" style="margin: 0;">商品标题</label>
+            <span style="font-size: 12px; color: var(--muted);">{{ (editing.title || '').length }}/30</span>
+          </div>
+          <input v-model="editing.title" class="input" maxlength="60" placeholder="填写清晰商品标题" />
+        </div>
+
+        <div>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <label class="field-label" style="margin: 0;">帮拍/代下介绍文案</label>
+            <button class="link-btn" @click="copyText((editing.title ? editing.title + '\n\n' : '') + (editing.description || ''))">复制文案</button>
+          </div>
+          <textarea v-model="editing.description" class="textarea" placeholder="点击上方一键生成帮拍好价话术，也可手动修改"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="editor-footer">
+      <button class="btn btn-soft" style="flex: 0.9;" :disabled="savingEditor" @click="saveEditor('draft')">存草稿</button>
+      <button class="btn btn-primary" style="flex: 2;" :disabled="savingEditor" @click="saveEditor('ready')">
+        {{ savingEditor ? '保存中...' : '保存，加入待上架' }}
+      </button>
+    </div>
   </div>
 
-  <!-- ==================== Toast ==================== -->
-  <div class="toast" v-if="toastMsg">{{ toastMsg }}</div>
+  <!-- 渠道扫码绑定弹窗 -->
+  <div v-if="qrModal.visible" class="modal-mask center">
+    <div class="modal-card">
+      <div style="font-size: 17px; font-weight: 700;">扫码绑定{{ qrModal.channelName }}账号</div>
+      <div style="font-size: 12px; color: var(--sub); margin-top: 4px;">
+        手机上请长按二维码保存，再打开闲鱼「扫一扫 → 相册」识别
+      </div>
+
+      <div class="qr-box">
+        <img v-if="qrModal.hasQr && qrModal.qrUrl" :src="qrModal.qrUrl" alt="登录二维码" />
+        <div v-else style="font-size: 13px; color: var(--sub); padding: 16px;">正在获取二维码...</div>
+      </div>
+
+      <div style="font-size: 13px; font-weight: 600; margin-bottom: 14px;"
+           :style="{ color: qrModal.state === 'risk_blocked' || qrModal.state === 'error' || qrModal.state === 'expired' ? 'var(--red)' : (qrModal.state === 'success' ? 'var(--green)' : 'var(--text)') }">
+        {{ qrModal.message }}
+        <span v-if="qrModal.expiresIn > 0 && (qrModal.state === 'waiting_scan' || qrModal.state === 'scanned')" style="color: var(--muted); font-weight: 400;">
+          （{{ qrModal.expiresIn }}s）
+        </span>
+      </div>
+
+      <div class="actions-row" style="margin-top: 0;">
+        <button class="btn btn-soft btn-sm" @click="closeQrModal(true)">关闭</button>
+        <button class="btn btn-primary btn-sm" @click="startQrLogin(qrModal.channel)">刷新二维码</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 关联本地商品底部抽屉 -->
+  <div v-if="linkModal.visible" class="modal-mask" @click.self="linkModal.visible = false">
+    <div class="modal-sheet">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <span style="font-size: 16px; font-weight: 700;">关联本地选品（用于上游失效预警）</span>
+        <button class="link-btn" @click="linkModal.visible = false">关闭</button>
+      </div>
+      <div style="font-size: 13px; color: var(--sub);">在售商品：{{ linkModal.sellingItem?.title }}</div>
+
+      <button v-if="linkModal.sellingItem?.linked_listing_id" class="btn btn-danger-soft btn-sm btn-block" @click="submitLink('')">
+        取消当前关联
+      </button>
+
+      <div v-if="localItems.length === 0" style="text-align: center; padding: 20px; color: var(--muted);">
+        暂无待上架/草稿商品可关联
+      </div>
+      <div v-for="it in localItems" :key="it.listing_id"
+           style="display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer;"
+           @click="submitLink(it.listing_id)">
+        <img :src="(it.images[0] && it.images[0].url) || ''" style="width: 48px; height: 48px; border-radius: 8px; object-fit: cover; background: #eee;" alt="" />
+        <div style="flex: 1; min-width: 0;">
+          <div style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ it.title || it.product_name }}</div>
+          <div style="font-size: 12px; color: var(--sub);">¥{{ it.price }} · {{ platformLabel(it.platform) }}</div>
+        </div>
+        <span v-if="linkModal.sellingItem?.linked_listing_id === it.listing_id" class="pill pill-green">已选</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全屏图片放大 -->
+  <div v-if="zoomImageUrl" class="zoom-mask" @click="zoomImageUrl = ''">
+    <img :src="zoomImageUrl" alt="大图预览" />
+  </div>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/vue.global.prod.js"></script>
+<script src="/static/app.js?v=2"></script>
 </body>
 </html>

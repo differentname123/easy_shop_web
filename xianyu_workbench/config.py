@@ -27,7 +27,7 @@ def _read_local_json(config_path: Optional[Path] = None) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class WorkbenchConfig:
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8002
     auth_secret: str = DEFAULT_DEV_AUTH_SECRET
     token_ttl_seconds: int = 30 * 86400
@@ -36,6 +36,7 @@ class WorkbenchConfig:
     data_dir: Path = WORKBENCH_DIR / "data"
     screenshot_dir: Path = WORKBENCH_DIR / "data" / "eval_screenshots"
     upload_dir: Path = WORKBENCH_DIR / "data" / "uploads"
+    channel_profiles_dir: Path = WORKBENCH_DIR / "data" / "channel_profiles"
     deal_image_dir: Path = REPO_ROOT / "mobile_web" / "runtime" / "deal_submit_images"
     default_official_image_count: int = 3
     max_images_per_listing: int = 9
@@ -56,6 +57,11 @@ def load_config(config_path: Optional[Path] = None) -> WorkbenchConfig:
         or local.get("upload_dir")
         or (data_dir / "uploads")
     )
+    channel_profiles_dir = Path(
+        os.environ.get("XY_CHANNEL_PROFILES_DIR")
+        or local.get("channel_profiles_dir")
+        or (data_dir / "channel_profiles")
+    )
     deal_image_dir = Path(
         os.environ.get("XY_DEAL_IMAGE_DIR")
         or local.get("deal_image_dir")
@@ -68,7 +74,7 @@ def load_config(config_path: Optional[Path] = None) -> WorkbenchConfig:
         port = 8002
 
     return WorkbenchConfig(
-        host=str(os.environ.get("XY_WORKBENCH_HOST") or local.get("host") or "127.0.0.1").strip(),
+        host=str(os.environ.get("XY_WORKBENCH_HOST") or local.get("host") or "0.0.0.0").strip(),
         port=port,
         auth_secret=str(
             os.environ.get("XY_AUTH_SECRET")
@@ -83,6 +89,7 @@ def load_config(config_path: Optional[Path] = None) -> WorkbenchConfig:
         data_dir=data_dir,
         screenshot_dir=screenshot_dir,
         upload_dir=upload_dir,
+        channel_profiles_dir=channel_profiles_dir,
         deal_image_dir=deal_image_dir,
         default_official_image_count=max(1, int(local.get("default_official_image_count") or 3)),
         max_images_per_listing=max(1, int(local.get("max_images_per_listing") or 9)),

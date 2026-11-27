@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""闲鱼选品工作台独立 FastAPI 应用装配与 HTTP 接口。"""
+"""好价帮拍工作台 FastAPI 应用：平台无关核心接口 + 可插拔销售渠道接口。"""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 
 from .auth import COOKIE_NAME, require_current_username
 from .bridge import open_mongo_connection
+from .channel_service import ChannelService
+from .channels import ChannelRegistry, build_default_channel_registry
 from .config import WORKBENCH_DIR, WorkbenchConfig, load_config
 from .repo import WorkbenchRepository
 from .service import WorkbenchService
@@ -33,7 +35,7 @@ class BindingUpdateRequest(BaseModel):
     shop_phone: str = Field("", max_length=32)
 
 
-class RejectCandidateRequest(BaseModel):
+class DismissCandidateRequest(BaseModel):
     platform: str = Field(..., min_length=1, max_length=32)
     product_id: str = Field(..., min_length=1, max_length=128)
     source_origin: str = Field("xianyu_eval", max_length=32)
@@ -45,20 +47,28 @@ class DraftCreateRequest(BaseModel):
     source_origin: str = Field("favorite", max_length=32)
 
 
-class ListingUpdateRequest(BaseModel):
+class ItemUpdateRequest(BaseModel):
     title: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = Field(None, max_length=4000)
     images: Optional[List[Any]] = None
-    sell_price: Optional[float] = None
-    shipping_fee: Optional[float] = None
-    max_cost_price: Optional[float] = None
+    price: Optional[float] = None
     status: Optional[str] = Field(None, max_length=32)
-    external_item_id: Optional[str] = Field(None, max_length=64)
-    offline_reason: Optional[str] = Field(None, max_length=128)
 
 
-class GenerateCopyRequest(BaseModel):
-    style: str = Field("casual", max_length=32)
+class LinkSellingRequest(BaseModel):
+    listing_id: str = Field("", max_length=64)
+
+
+class PublishRequest(BaseModel):
+    listing_id: str = Field(..., min_length=1, max_length=64)
+
+
+class DownshelfRequest(BaseModel):
+    external_item_id: str = Field(..., min_length=1, max_length=64)
+
+
+class CancelQrRequest(BaseModel):
+    session_id: Optional[str] = Field(None, max_length=64)
 
 
 class UploadImageRequest(BaseModel):
@@ -70,26 +80,43 @@ def create_app(
     *,
     db: Any = None,
     service: Optional[WorkbenchService] = None,
+    channel_registry: Optional[ChannelRegistry] = None,
+    channel_service: Optional[ChannelService] = None,
 ) -> FastAPI:
     cfg = config or load_config()
-    state: Dict[str, Any] = {"service": service, "close_db": None}
+    registry = channel_registry or build_default_channel_registry(cfg)
+    state: Dict[str, Any] = {
+        "service": service,
+        "channel_service": channel_service,
+        "close_db": None,
+    }
 
-    if state["service"] is None and db is not None:
+    if db is not None:
         repo = WorkbenchRepository(db)
         repo.ensure_indexes()
-        state["service"] = WorkbenchService(repo, cfg)
+        if state["service"] is None:
+            state["service"] = WorkbenchService(repo, cfg)
+        if state["channel_service"] is None:
+            state["channel_service"] = ChannelService(repo, registry)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if state["service"] is None:
+        if state["service"] is None or state["channel_service"] is None:
             mongo_db, close_fn = open_mongo_connection(cfg)
             state["close_db"] = close_fn
             repo = WorkbenchRepository(mongo_db)
             repo.ensure_indexes()
-            state["service"] = WorkbenchService(repo, cfg)
+            if state["service"] is None:
+                state["service"] = WorkbenchService(repo, cfg)
+            if state["channel_service"] is None:
+                state["channel_service"] = ChannelService(repo, registry)
         try:
             yield
         finally:
+            try:
+                registry.shutdown()
+            except Exception:
+                pass
             close_fn = state.get("close_db")
             state["close_db"] = None
             if callable(close_fn):
@@ -98,7 +125,7 @@ def create_app(
                 except Exception:
                     pass
 
-    app = FastAPI(title="闲鱼选品与上架工作台", lifespan=lifespan)
+    app = FastAPI(title="帮拍选品工作台", lifespan=lifespan)
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="workbench_static")
 
@@ -108,11 +135,17 @@ def create_app(
             raise HTTPException(status_code=503, detail="工作台服务尚未就绪")
         return svc
 
+    def _ch_svc() -> ChannelService:
+        csvc = state.get("channel_service")
+        if csvc is None:
+            raise HTTPException(status_code=503, detail="渠道服务尚未就绪")
+        return csvc
+
     def _uid(request: Request) -> str:
         return require_current_username(request, cfg.auth_secret)
 
     # =========================================================================
-    # 独立鉴权与主站 UID 绑定
+    # 一、账号登录与主站收藏绑定
     # =========================================================================
     @app.post("/api/auth/login")
     def login(req: LoginRequest, response: Response):
@@ -144,14 +177,13 @@ def create_app(
         return {"status": "success", "data": data}
 
     # =========================================================================
-    # 模块一：候选选品池
+    # 二、挑品候选池（比价好货 & 我的收藏）
     # =========================================================================
     @app.get("/api/candidates/favorites")
     def get_favorite_candidates(
         request: Request,
         page: int = Query(1, ge=1, le=500),
         page_size: int = Query(20, ge=1, le=100),
-        include_handled: bool = Query(False),
         include_off: bool = Query(False),
     ):
         username = _uid(request)
@@ -159,7 +191,6 @@ def create_app(
             username,
             page=page,
             page_size=page_size,
-            include_handled=include_handled,
             include_off=include_off,
         )
         return {"status": "success", "data": data}
@@ -167,11 +198,7 @@ def create_app(
     @app.get("/api/candidates/evaluations")
     def get_evaluation_candidates(
         request: Request,
-        winner: str = Query("my_product", pattern="^(my_product|all)$"),
-        source_type: str = Query("all", pattern="^(all|official|deal_tip)$"),
-        min_ratio: float = Query(1.0, ge=0.0, le=100.0),
-        sort: str = Query("ratio", pattern="^(ratio|latest)$"),
-        include_handled: bool = Query(False),
+        include_all_winners: bool = Query(False),
         include_off: bool = Query(False),
         page: int = Query(1, ge=1, le=500),
         page_size: int = Query(20, ge=1, le=100),
@@ -179,32 +206,28 @@ def create_app(
         username = _uid(request)
         data = _svc().list_evaluation_candidates(
             username,
-            winner=winner,
-            source_type=source_type,
-            min_ratio=min_ratio,
-            sort=sort,
-            include_handled=include_handled,
+            include_all_winners=include_all_winners,
             include_off=include_off,
             page=page,
             page_size=page_size,
         )
         return {"status": "success", "data": data}
 
-    @app.post("/api/candidates/reject")
-    def reject_candidate(req: RejectCandidateRequest, request: Request):
+    @app.post("/api/candidates/dismiss")
+    def dismiss_candidate(req: DismissCandidateRequest, request: Request):
         username = _uid(request)
-        data = _svc().reject_candidate(
+        data = _svc().dismiss_candidate(
             username,
             platform=req.platform,
             product_id=req.product_id,
             source_origin=req.source_origin,
         )
-        return {"status": "success", "data": {"listing_id": data.get("listing_id"), "status": data.get("status")}}
+        return {"status": "success", "data": data}
 
     # =========================================================================
-    # 模块二 & 三：预览编辑、AI 文案与标准上架库
+    # 三、通用商品素材库（平台无关）
     # =========================================================================
-    @app.post("/api/listings/draft")
+    @app.post("/api/items/draft")
     def create_or_open_draft(req: DraftCreateRequest, request: Request):
         username = _uid(request)
         data = _svc().create_or_open_draft(
@@ -215,37 +238,101 @@ def create_app(
         )
         return {"status": "success", "data": data}
 
-    @app.get("/api/listings")
-    def list_listings(
+    @app.get("/api/items")
+    def list_items(
         request: Request,
-        status: str = Query("ready", pattern="^(draft|ready|online|offline|rejected|all)$"),
+        status: str = Query("active", pattern="^(active|ready|draft|dismissed|all)$"),
         page: int = Query(1, ge=1, le=500),
-        page_size: int = Query(20, ge=1, le=100),
+        page_size: int = Query(30, ge=1, le=100),
     ):
         username = _uid(request)
-        data = _svc().list_listings(username, status=status, page=page, page_size=page_size)
+        data = _svc().list_items(username, status=status, page=page, page_size=page_size)
         return {"status": "success", "data": data}
 
-    @app.get("/api/listings/{listing_id}")
-    def get_listing_detail(listing_id: str, request: Request):
+    @app.get("/api/items/{listing_id}")
+    def get_item_detail(listing_id: str, request: Request):
         username = _uid(request)
-        data = _svc().get_listing_detail(username, listing_id)
+        return {"status": "success", "data": _svc().get_item_detail(username, listing_id)}
+
+    @app.patch("/api/items/{listing_id}")
+    def update_item(listing_id: str, req: ItemUpdateRequest, request: Request):
+        username = _uid(request)
+        data = _svc().update_item(username, listing_id, req.model_dump(exclude_unset=True))
         return {"status": "success", "data": data}
 
-    @app.patch("/api/listings/{listing_id}")
-    def update_listing(listing_id: str, req: ListingUpdateRequest, request: Request):
+    @app.post("/api/items/{listing_id}/generate-copy")
+    def generate_copy(listing_id: str, request: Request):
         username = _uid(request)
-        data = _svc().update_listing(username, listing_id, req.model_dump(exclude_unset=True))
-        return {"status": "success", "data": data}
-
-    @app.post("/api/listings/{listing_id}/generate-copy")
-    def generate_copy(listing_id: str, req: GenerateCopyRequest, request: Request):
-        username = _uid(request)
-        data = _svc().generate_copy(username, listing_id, style=req.style)
+        data = _svc().generate_copy(username, listing_id)
         return {"status": "success", "data": data}
 
     # =========================================================================
-    # 图片上传与受保护截图/图片读取
+    # 四、可插拔销售渠道（扫码绑定、状态检测、真实在售同步与对账）
+    # =========================================================================
+    @app.get("/api/channels")
+    def list_channels(request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": {"channels": _ch_svc().list_channels(username)}}
+
+    @app.post("/api/channels/{channel}/login/start")
+    def start_channel_login(channel: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().start_qr_login(username, channel)}
+
+    @app.get("/api/channels/{channel}/login/status/{session_id}")
+    def get_channel_login_status(channel: str, session_id: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().get_qr_login_status(username, channel, session_id)}
+
+    @app.get("/api/channels/{channel}/login/qr/{session_id}")
+    def get_channel_login_qr(channel: str, session_id: str, request: Request):
+        username = _uid(request)
+        png = _ch_svc().get_qr_image_bytes(username, channel, session_id)
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
+
+    @app.post("/api/channels/{channel}/login/cancel")
+    def cancel_channel_login(channel: str, request: Request, req: Optional[CancelQrRequest] = None):
+        username = _uid(request)
+        sid = req.session_id if req else None
+        return {"status": "success", "data": _ch_svc().cancel_qr_login(username, channel, sid)}
+
+    @app.post("/api/channels/{channel}/status")
+    def check_channel_status(channel: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().check_account_status(username, channel)}
+
+    @app.post("/api/channels/{channel}/sync")
+    def sync_channel_selling(channel: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().sync_selling(username, channel)}
+
+    @app.get("/api/channels/{channel}/selling")
+    def get_channel_selling(channel: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().get_selling_snapshot(username, channel)}
+
+    @app.post("/api/channels/{channel}/selling/{external_item_id}/link")
+    def link_selling_item(channel: str, external_item_id: str, req: LinkSellingRequest, request: Request):
+        username = _uid(request)
+        data = _ch_svc().link_selling_item(username, channel, external_item_id, req.listing_id)
+        return {"status": "success", "data": data}
+
+    @app.post("/api/channels/{channel}/publish")
+    def publish_channel_item(channel: str, req: PublishRequest, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().publish_item(username, channel, req.listing_id)}
+
+    @app.post("/api/channels/{channel}/downshelf")
+    def downshelf_channel_item(channel: str, req: DownshelfRequest, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().downshelf_item(username, channel, req.external_item_id)}
+
+    # =========================================================================
+    # 五、图片上传与受保护媒体读取
     # =========================================================================
     @app.post("/api/assets/upload")
     def upload_image(req: UploadImageRequest, request: Request):
@@ -286,6 +373,6 @@ def create_app(
         index_path = STATIC_DIR / "index.html"
         if index_path.is_file():
             return HTMLResponse(index_path.read_text(encoding="utf-8"))
-        return HTMLResponse("<h3>闲鱼工作台前端页面未就绪</h3>", status_code=200)
+        return HTMLResponse("<h3>选品工作台页面未就绪</h3>", status_code=200)
 
     return app
