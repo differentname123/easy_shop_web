@@ -111,6 +111,8 @@ createApp({
     const candidatesHasMore = ref(false);
     const candidatesLoading = ref(false);
     const evalTotal = ref(0);
+    const evalSourceType = ref('all');
+    const evalSortBy = ref('want');
     const includeAllWinners = ref(false);
     const favNeedsBinding = ref(false);
 
@@ -123,9 +125,13 @@ createApp({
     const activeChannelCode = ref('xianyu');
     const channelBusy = ref('');
     const syncLoading = ref(false);
+    const publishingId = ref('');
+    const downshelvingId = ref('');
+    const reconcilePreviewLoading = ref(false);
     const sellingData = ref({
       online_items: [],
       abnormal_items: [],
+      publications: {},
       online_count: 0,
       abnormal_count: 0,
       synced_at: '',
@@ -143,6 +149,31 @@ createApp({
         capabilities: {},
       };
     });
+
+    const onlineByListingId = computed(() => {
+      const map = {};
+      for (const item of (sellingData.value.online_items || [])) {
+        if (item.linked_listing_id) {
+          map[item.linked_listing_id] = item;
+        }
+      }
+      return map;
+    });
+
+    function onlineItemFor(listingId) {
+      return onlineByListingId.value[listingId] || null;
+    }
+
+    const mainSiteCfg = ref({ port: 8001, baseUrl: '' });
+
+    function mainProductUrl(code) {
+      const raw = String(code || '').trim();
+      if (!raw) return '';
+      const base = String(mainSiteCfg.value.baseUrl || '').replace(/\/+$/, '');
+      if (base) return `${base}/detail?item=${encodeURIComponent(raw)}`;
+      const port = mainSiteCfg.value.port || 8001;
+      return `${window.location.protocol}//${window.location.hostname}:${port}/detail?item=${encodeURIComponent(raw)}`;
+    }
 
     // 全屏编辑抽屉
     const editing = ref(null);
@@ -181,6 +212,16 @@ createApp({
     // 关联本地商品弹窗
     const linkModal = ref({ visible: false, sellingItem: null });
 
+    // 同步选品库预览与执行抽屉
+    const reconcileModal = ref({
+      visible: false,
+      applying: false,
+      preview: null,
+      publishIds: [],
+      downshelfIds: [],
+      result: null,
+    });
+
     function platformLabel(code) {
       return PLATFORM_NAMES[String(code || '').toLowerCase()] || String(code || '').toUpperCase();
     }
@@ -200,6 +241,10 @@ createApp({
       ]);
       user.value = { username: me.username, bound_shop_uid: me.bound_shop_uid };
       itemCounts.value = me.item_counts || itemCounts.value;
+      mainSiteCfg.value = {
+        port: Number(me.main_site_port || 8001),
+        baseUrl: String(me.main_site_base_url || ''),
+      };
       channels.value = chData.channels || [];
       if (channels.value.length > 0 && !channels.value.some((c) => c.channel === activeChannelCode.value)) {
         activeChannelCode.value = channels.value[0].channel;
@@ -209,7 +254,7 @@ createApp({
     async function bootstrapSession() {
       try {
         await refreshMeAndChannels();
-        await Promise.all([loadCandidates(true), loadItems()]);
+        await Promise.all([loadCandidates(true), loadItems(), loadChannelSelling()]);
       } catch (_) {
         user.value = null;
       }
@@ -241,6 +286,14 @@ createApp({
       user.value = null;
       candidates.value = [];
       localItems.value = [];
+      sellingData.value = {
+        online_items: [],
+        abnormal_items: [],
+        publications: {},
+        online_count: 0,
+        abnormal_count: 0,
+        synced_at: '',
+      };
       editing.value = null;
     }
 
@@ -270,6 +323,17 @@ createApp({
       loadCandidates(true);
     }
 
+    function setEvalSourceType(st) {
+      if (evalSourceType.value === st) return;
+      evalSourceType.value = st;
+      loadCandidates(true);
+    }
+
+    function toggleEvalSortBy() {
+      evalSortBy.value = evalSortBy.value === 'want' ? 'ratio' : 'want';
+      loadCandidates(true);
+    }
+
     function toggleAllWinners() {
       includeAllWinners.value = !includeAllWinners.value;
       loadCandidates(true);
@@ -281,7 +345,7 @@ createApp({
       const targetPage = reset ? 1 : candidatesPage.value + 1;
       try {
         const url = pickSource.value === 'eval'
-          ? `/api/candidates/evaluations?include_all_winners=${includeAllWinners.value}&page=${targetPage}&page_size=15`
+          ? `/api/candidates/evaluations?source_type=${encodeURIComponent(evalSourceType.value)}&sort_by=${encodeURIComponent(evalSortBy.value)}&include_all_winners=${includeAllWinners.value}&page=${targetPage}&page_size=15`
           : `/api/candidates/favorites?page=${targetPage}&page_size=15`;
         const data = await api(url);
         if (reset) {
@@ -656,15 +720,125 @@ createApp({
     }
 
     async function publishToChannel(it) {
+      if (!activeChannel.value.bound) {
+        showToast(`请先扫码绑定${activeChannel.value.name}账号`);
+        startQrLogin(activeChannelCode.value);
+        return;
+      }
+      if (publishingId.value) return;
+      publishingId.value = it.listing_id;
       try {
-        await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/publish`, {
+        const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/publish`, {
           method: 'POST',
           body: JSON.stringify({ listing_id: it.listing_id }),
         });
-        showToast('上架成功');
-        await syncActiveChannel();
+        if (res.selling) sellingData.value = res.selling;
+        await Promise.all([loadItems(), refreshMeAndChannels()]);
+        showToast('上架成功，可点击「看帖子」查看效果');
       } catch (e) {
         showToast(e.message);
+        await Promise.all([loadItems(), refreshMeAndChannels(), loadChannelSelling()]).catch(() => {});
+        if (e.status === 409 && !activeChannel.value.online) {
+          startQrLogin(activeChannelCode.value);
+        }
+      } finally {
+        publishingId.value = '';
+      }
+    }
+
+    async function clearEditingFailure() {
+      if (!editing.value?.listing_id) return;
+      try {
+        const res = await api(`/api/items/${encodeURIComponent(editing.value.listing_id)}/failure/clear`, {
+          method: 'POST',
+        });
+        editing.value = res;
+        await loadItems();
+        showToast('已清除该商品的失败记录');
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    async function downshelfFromChannel(itemId, title = '') {
+      if (!itemId || downshelvingId.value) return;
+      const label = title ? `「${String(title).slice(0, 18)}」` : `商品 ${itemId}`;
+      if (!window.confirm(`确定要在${activeChannel.value.name}下架 ${label} 吗？`)) {
+        return;
+      }
+      downshelvingId.value = itemId;
+      try {
+        const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/downshelf`, {
+          method: 'POST',
+          body: JSON.stringify({ external_item_id: itemId }),
+        });
+        if (res.selling) sellingData.value = res.selling;
+        await refreshMeAndChannels();
+        showToast('已在渠道下架');
+      } catch (e) {
+        showToast(e.message);
+        await refreshMeAndChannels().catch(() => {});
+        if (e.status === 409 && !activeChannel.value.online) {
+          startQrLogin(activeChannelCode.value);
+        }
+      } finally {
+        downshelvingId.value = '';
+      }
+    }
+
+    async function openReconcilePreview() {
+      if (!activeChannel.value.bound) {
+        showToast(`请先扫码绑定${activeChannel.value.name}账号`);
+        startQrLogin(activeChannelCode.value);
+        return;
+      }
+      if (reconcilePreviewLoading.value) return;
+      reconcilePreviewLoading.value = true;
+      try {
+        const preview = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/reconcile/preview`, {
+          method: 'POST',
+        });
+        if (preview.selling) sellingData.value = preview.selling;
+        await refreshMeAndChannels();
+        reconcileModal.value = {
+          visible: true,
+          applying: false,
+          preview,
+          publishIds: (preview.to_publish || []).map((x) => x.listing_id),
+          downshelfIds: (preview.to_downshelf || []).map((x) => x.item_id),
+          result: null,
+        };
+      } catch (e) {
+        showToast(e.message);
+        await refreshMeAndChannels().catch(() => {});
+        if (e.status === 409 && !activeChannel.value.online) {
+          startQrLogin(activeChannelCode.value);
+        }
+      } finally {
+        reconcilePreviewLoading.value = false;
+      }
+    }
+
+    async function applyReconcile() {
+      if (reconcileModal.value.applying) return;
+      reconcileModal.value.applying = true;
+      try {
+        const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/reconcile/apply`, {
+          method: 'POST',
+          body: JSON.stringify({
+            publish_listing_ids: reconcileModal.value.publishIds,
+            downshelf_item_ids: reconcileModal.value.downshelfIds,
+          }),
+        });
+        reconcileModal.value.result = res;
+        if (res.selling) sellingData.value = res.selling;
+        await Promise.all([loadItems(), refreshMeAndChannels()]);
+        showToast(`同步结束：上架 ${res.published.length} 件 · 下架 ${res.downshelved.length} 件`);
+      } catch (e) {
+        showToast(e.message);
+        await Promise.all([loadItems(), refreshMeAndChannels(), loadChannelSelling()]).catch(() => {});
+      } finally {
+        reconcileModal.value.applying = false;
       }
     }
 
@@ -702,6 +876,8 @@ createApp({
       candidatesHasMore,
       candidatesLoading,
       evalTotal,
+      evalSourceType,
+      evalSortBy,
       includeAllWinners,
       favNeedsBinding,
       localItems,
@@ -711,7 +887,12 @@ createApp({
       activeChannel,
       channelBusy,
       syncLoading,
+      publishingId,
+      downshelvingId,
+      reconcilePreviewLoading,
       sellingData,
+      onlineItemFor,
+      mainProductUrl,
       editing,
       uploading,
       aiGenerating,
@@ -720,6 +901,7 @@ createApp({
       unusedPoolImages,
       qrModal,
       linkModal,
+      reconcileModal,
       platformLabel,
       formatTime,
       copyText,
@@ -727,6 +909,8 @@ createApp({
       doLogout,
       updateShopBinding,
       switchPickSource,
+      setEvalSourceType,
+      toggleEvalSortBy,
       toggleAllWinners,
       loadCandidates,
       dismissCandidate,
@@ -753,6 +937,10 @@ createApp({
       openLinkModal,
       submitLink,
       publishToChannel,
+      clearEditingFailure,
+      downshelfFromChannel,
+      openReconcilePreview,
+      applyReconcile,
     };
   },
 }).mount('#app');

@@ -36,11 +36,14 @@ class WorkbenchConfig:
     data_dir: Path = WORKBENCH_DIR / "data"
     screenshot_dir: Path = WORKBENCH_DIR / "data" / "eval_screenshots"
     upload_dir: Path = WORKBENCH_DIR / "data" / "uploads"
+    publish_fail_dir: Path = WORKBENCH_DIR / "data" / "publish_failures"
     channel_profiles_dir: Path = WORKBENCH_DIR / "data" / "channel_profiles"
     deal_image_dir: Path = REPO_ROOT / "mobile_web" / "runtime" / "deal_submit_images"
     default_official_image_count: int = 3
     max_images_per_listing: int = 9
     max_upload_bytes: int = 5 * 1024 * 1024
+    main_site_port: int = 8001
+    main_site_base_url: str = ""
 
 
 def load_config(config_path: Optional[Path] = None) -> WorkbenchConfig:
@@ -56,6 +59,11 @@ def load_config(config_path: Optional[Path] = None) -> WorkbenchConfig:
         os.environ.get("XY_UPLOAD_DIR")
         or local.get("upload_dir")
         or (data_dir / "uploads")
+    )
+    publish_fail_dir = Path(
+        os.environ.get("XY_PUBLISH_FAIL_DIR")
+        or local.get("publish_fail_dir")
+        or (data_dir / "publish_failures")
     )
     channel_profiles_dir = Path(
         os.environ.get("XY_CHANNEL_PROFILES_DIR")
@@ -73,6 +81,20 @@ def load_config(config_path: Optional[Path] = None) -> WorkbenchConfig:
     except (TypeError, ValueError):
         port = 8002
 
+    main_port_raw = os.environ.get("XY_MAIN_SITE_PORT") or local.get("main_site_port")
+    if main_port_raw is not None:
+        try:
+            main_site_port = int(main_port_raw)
+        except (TypeError, ValueError):
+            main_site_port = 8001
+    else:
+        from .bridge import get_main_site_port
+
+        main_site_port = get_main_site_port(8001)
+    main_site_base_url = str(
+        os.environ.get("XY_MAIN_SITE_URL") or local.get("main_site_base_url") or ""
+    ).strip().rstrip("/")
+
     return WorkbenchConfig(
         host=str(os.environ.get("XY_WORKBENCH_HOST") or local.get("host") or "0.0.0.0").strip(),
         port=port,
@@ -89,9 +111,12 @@ def load_config(config_path: Optional[Path] = None) -> WorkbenchConfig:
         data_dir=data_dir,
         screenshot_dir=screenshot_dir,
         upload_dir=upload_dir,
+        publish_fail_dir=publish_fail_dir,
         channel_profiles_dir=channel_profiles_dir,
         deal_image_dir=deal_image_dir,
         default_official_image_count=max(1, int(local.get("default_official_image_count") or 3)),
         max_images_per_listing=max(1, int(local.get("max_images_per_listing") or 9)),
         max_upload_bytes=max(256 * 1024, int(local.get("max_upload_bytes") or 5 * 1024 * 1024)),
+        main_site_port=main_site_port,
+        main_site_base_url=main_site_base_url,
     )

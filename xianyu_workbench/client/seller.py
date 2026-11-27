@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
-"""闲鱼卖家工作台与 IM 消息只读自动化能力：手动接管登录、在售查询与消息监控。"""
+"""闲鱼卖家工作台与 IM 消息自动化能力：手动接管登录、在售查询、极简发布、下架、删除与消息监控。"""
 
 import json
+import os
+from pathlib import Path
+import random
 import re
+import shutil
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
+import uuid
+
+import requests
 
 from .session import (
     DEFAULT_LOCK_TIMEOUT_SEC,
@@ -13,12 +22,14 @@ from .session import (
     GOOFISH_HOME_URL,
     GOOFISH_IM_URL,
     GOOFISH_PERSONAL_URL,
+    GOOFISH_PUBLISH_URL,
     XianyuLockTimeoutError,
     XianyuOfflineError,
     _acquire_serial_browser_lock,
     _browser_session_guard,
     _build_lock_timeout_result,
     _build_offline_result,
+    _collect_page_error_tips,
     _dir_tag,
     _verify_account_online,
     clean_browser_cache,
@@ -305,6 +316,461 @@ def get_selling_items(
         return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="get_selling_items")
     except XianyuLockTimeoutError as e:
         return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="get_selling_items")
+
+
+# ==============================================================================
+# 三-B、 帮拍文案净水、图片防撞准备、极简上架 (`publish_item`) 与下架 (`downshelf_item`)
+# ==============================================================================
+_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.IGNORECASE)
+_SHORTLINK_RE = re.compile(
+    r"(?:u\.jd\.com|3\.cn|m\.tb\.cn|s\.click\.taobao\.com|yangkeduo\.com|pinduoduo\.com)/[A-Za-z0-9_/?=&.-]+",
+    re.IGNORECASE,
+)
+_TAOKOULING_RE = re.compile(
+    r"[￥¥$€£₴¢][0-9A-Za-z]{8,14}[￥¥$€£₴¢]|[\d]{1,2}\.[\d]+\s*[A-Za-z]{2,4}:/[A-Za-z0-9/]+"
+)
+
+_EXTREME_WORD_REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
+    ("全网最低价", "高性价比"),
+    ("全网最低", "诚意好价"),
+    ("全网底价", "超值好价"),
+    ("史上最低", "超值特惠"),
+    ("历史最低", "超值好价"),
+    ("国家级", "高品质"),
+    ("第一品牌", "口碑品牌"),
+    ("最便宜", "实惠"),
+    ("顶级", "优质"),
+    ("极品", "精品"),
+    ("绝对正品", "正品保障"),
+    ("100%正品", "正品保障"),
+    ("假一赔十", "支持验货"),
+    ("假一罚十", "支持验货"),
+    ("专柜正品", "正品好物"),
+)
+
+_PROHIBITED_KEYWORDS: Tuple[str, ...] = (
+    "加微信",
+    "加v",
+    "加V",
+    "+v",
+    "+V",
+    "微信号",
+    "wx号",
+    "VX号",
+    "绿泡泡",
+    "私聊转账",
+    "站外交易",
+    "先款后货",
+    "刷单",
+    "套现",
+    "高仿",
+    "精仿",
+    "A货",
+)
+
+
+def sanitize_content(title: str, desc: str) -> Tuple[str, str, List[str]]:
+    """剥离推广短链与淘口令，替换极限广告词，拦截站外引流敏感词。"""
+    clean_title = _TAOKOULING_RE.sub("", _SHORTLINK_RE.sub("", _URL_RE.sub("", str(title or ""))))
+    clean_desc = _TAOKOULING_RE.sub("", _SHORTLINK_RE.sub("", _URL_RE.sub("", str(desc or ""))))
+
+    replaced: List[str] = []
+    for bad, good in _EXTREME_WORD_REPLACEMENTS:
+        if bad in clean_title or bad in clean_desc:
+            clean_title = clean_title.replace(bad, good)
+            clean_desc = clean_desc.replace(bad, good)
+            replaced.append(f"{bad}->{good}")
+
+    clean_title = re.sub(r"\s+", " ", clean_title).strip()[:30].rstrip()
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in clean_desc.splitlines()]
+    clean_desc = "\n".join(ln for ln in lines if ln).strip()
+
+    combined = f"{clean_title}\n{clean_desc}"
+    for kw in _PROHIBITED_KEYWORDS:
+        if kw.lower() in combined.lower():
+            raise ValueError(f"文案触发闲鱼违禁/外联拦截词: 【{kw}】")
+
+    if not clean_title:
+        raise ValueError("商品标题不能为空")
+    return clean_title, clean_desc, replaced
+
+
+def _prepare_local_image_files(images: List[str], temp_dir: str) -> List[str]:
+    """将本地图片或 http/https URL 准备为临时文件，并对 JPEG 注入注释微扰防撞图。"""
+    local_files: List[str] = []
+    for idx, src in enumerate(images[:9], start=1):
+        src_str = str(src or "").strip()
+        if not src_str:
+            continue
+        if src_str.lower().startswith(("http://", "https://")):
+            resp = requests.get(src_str, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+            resp.raise_for_status()
+            raw_bytes = resp.content
+            ext = os.path.splitext(urlsplit(src_str).path)[1].lower() or ".jpg"
+        else:
+            p = Path(src_str).expanduser().resolve()
+            if not p.is_file():
+                raise FileNotFoundError(f"本地图片不存在: {src_str}")
+            raw_bytes = p.read_bytes()
+            ext = p.suffix.lower() or ".jpg"
+
+        if raw_bytes.startswith(b"\xff\xd8\xff") and raw_bytes.endswith(b"\xff\xd9"):
+            ext = ".jpg"
+            seed = f"xy_{int(time.time() * 1000000)}_{idx}_{random.randint(100, 999)}".encode("ascii")
+            length = len(seed) + 2
+            raw_bytes = raw_bytes[:-2] + b"\xff\xfe" + length.to_bytes(2, "big") + seed + b"\xff\xd9"
+        elif raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            ext = ".png"
+
+        out_path = os.path.join(temp_dir, f"xianyu_img_{idx}{ext}")
+        with open(out_path, "wb") as f:
+            f.write(raw_bytes)
+        local_files.append(out_path)
+
+    if not local_files:
+        raise ValueError("至少需要提供 1 张有效图片")
+    return local_files
+
+
+_MAX_PUBLISH_FAILURE_SCREENSHOTS = 50
+_PUBLISH_FAIL_NAME_RE = re.compile(r"^pubfail_\d+_[0-9a-f]{8}\.jpg$")
+
+
+def _capture_publish_failure_screenshot(page: Any, failure_screenshot_dir: Optional[str]) -> str:
+    """在上架失败且浏览器页面仍打开时原子保存现场压缩截图，并有界保留最近 N 张。"""
+    if not failure_screenshot_dir or page is None:
+        return ""
+    tmp_path: Optional[Path] = None
+    try:
+        out_dir = Path(failure_screenshot_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fname = f"pubfail_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
+        target_path = out_dir / fname
+        tmp_path = out_dir / f".tmp_{fname}"
+        raw = page.screenshot(type="jpeg", quality=80)
+        if not raw:
+            return ""
+        tmp_path.write_bytes(raw)
+        os.replace(tmp_path, target_path)
+        tmp_path = None
+
+        files = sorted(
+            (p for p in out_dir.iterdir() if p.is_file() and _PUBLISH_FAIL_NAME_RE.fullmatch(p.name)),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in files[_MAX_PUBLISH_FAILURE_SCREENSHOTS:]:
+            stale.unlink(missing_ok=True)
+        return fname
+    except Exception as exc:
+        logger.debug(f"[商品上架/失败截图跳过] {exc}")
+        return ""
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def publish_item(
+    title: str,
+    desc: str,
+    images: List[str],
+    price: float,
+    *,
+    original_price: Optional[float] = None,
+    delivery: str = "包邮",
+    user_data_dir: str = DEFAULT_USER_DATA_DIR,
+    debug: bool = False,
+    lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    lock_scope: str = "global",
+    failure_screenshot_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """极简发布商品到闲鱼（图片 + 文案 + 价格，自动匹配默认分类）并返回 `item_id` 与 `item_url`。"""
+    t0 = time.monotonic()
+    tag = _dir_tag(user_data_dir)
+    if float(price or 0) <= 0:
+        raise ValueError("商品价格必须大于 0")
+    clean_title, clean_desc, replaced = sanitize_content(title, desc or title)
+    full_text = f"{clean_title}\n{clean_desc}" if clean_desc != clean_title else clean_title
+
+    temp_dir = tempfile.mkdtemp(prefix="xianyu_pub_")
+    try:
+        local_files = _prepare_local_image_files(images, temp_dir)
+        logger.info(
+            f"[商品上架/1-准备] 账号目录={tag} | 标题=【{clean_title}】 | 售价=¥{price:.2f} | "
+            f"图片数={len(local_files)}张 | 敏感词替换={replaced or '无'}"
+        )
+
+        with _browser_session_guard(
+            user_data_dir=user_data_dir,
+            task_name="publish_item",
+            debug=debug,
+            lock_timeout_sec=lock_timeout_sec,
+            operation_timeout_sec=operation_timeout_sec,
+            lock_scope=lock_scope,
+        ) as (context, page, auth_tracker):
+            try:
+                publish_resp_data: Dict[str, Any] = {}
+
+                def on_response(resp):
+                    if "mtop.idle.pc.idleitem.publish" in resp.url:
+                        try:
+                            publish_resp_data.update(resp.json())
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+                page.goto(GOOFISH_PUBLISH_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                unb = _verify_account_online(context, page, auth_tracker, user_data_dir, task_name="publish_item")
+                nick = auth_tracker.get("display_name", "")
+
+                file_input = page.locator('input[type="file"]').first
+                file_input.set_input_files(local_files)
+                page.wait_for_timeout(2500 + 800 * len(local_files))
+
+                editor = page.locator('[contenteditable="true"]').first
+                editor.click()
+                editor.fill(full_text)
+                page.wait_for_timeout(2500)
+
+                price_input = page.locator('.ant-form-item:has-text("价格") input[placeholder="0.00"]').first
+                if price_input.count() == 0:
+                    price_input = page.locator('input[placeholder="0.00"]').first
+                price_input.click()
+                price_input.fill(f"{float(price):.2f}")
+                page.wait_for_timeout(500)
+
+                if original_price and original_price > 0:
+                    orig_input = page.locator('.ant-form-item:has-text("原价") input[placeholder="0.00"]').first
+                    if orig_input.count() > 0:
+                        orig_input.click()
+                        orig_input.fill(f"{float(original_price):.2f}")
+                        page.wait_for_timeout(400)
+
+                if delivery and delivery != "包邮":
+                    radio = page.locator(f'label.ant-radio-wrapper:has-text("{delivery}")').first
+                    if radio.count() > 0:
+                        radio.click()
+                        page.wait_for_timeout(400)
+
+                pub_btn = page.locator('button:has-text("发布")').first
+                pub_btn.click()
+
+                for _ in range(30):
+                    if publish_resp_data or "/item?id=" in page.url or auth_tracker.get("expired_rets"):
+                        break
+                    page.wait_for_timeout(500)
+
+                _verify_account_online(context, page, auth_tracker, user_data_dir, task_name="publish_item")
+
+                ret_list = publish_resp_data.get("ret") or []
+                ret_str = " | ".join(str(x) for x in ret_list)
+                resp_data = publish_resp_data.get("data") or {}
+                item_id = str(
+                    resp_data.get("itemId")
+                    or (resp_data.get("itemDO") or {}).get("itemId")
+                    or ""
+                ).strip()
+
+                if not item_id and "id=" in page.url:
+                    m = re.search(r"id=(\d+)", page.url)
+                    if m:
+                        item_id = m.group(1)
+
+                if not item_id:
+                    page_tips = _collect_page_error_tips(page)
+                    shot_file = _capture_publish_failure_screenshot(page, failure_screenshot_dir)
+                    logger.error(
+                        f"❌ [商品上架/失败诊断] 账号={nick or unb} ({tag}) | 标题=【{clean_title}】 | "
+                        f"MTOP响应={publish_resp_data} | 页面提示=【{page_tips or '无'}】 | 截图={shot_file or '无'} | URL={page.url}"
+                    )
+                    return {
+                        "ok": False,
+                        "is_offline": False,
+                        "action": "publish",
+                        "error_code": "PUBLISH_FAILED",
+                        "user_data_dir": user_data_dir,
+                        "screenshot_file": shot_file,
+                        "message": f"发布未成功：{page_tips or ret_str or '未返回商品ID'}",
+                    }
+
+                elapsed = time.monotonic() - t0
+                result = {
+                    "ok": True,
+                    "is_offline": False,
+                    "action": "publish",
+                    "user_data_dir": user_data_dir,
+                    "unb": unb,
+                    "nick": nick,
+                    "item_id": item_id,
+                    "item_url": f"{GOOFISH_HOME_URL}/item?id={item_id}",
+                    "title": clean_title,
+                    "price": f"{float(price):.2f}",
+                    "replaced_words": replaced,
+                    "ret": ret_str or "SUCCESS::调用成功",
+                }
+                logger.info(
+                    f"[商品上架/成功] 🎉 账号={nick or unb} ({tag}) | item_id={item_id} | "
+                    f"售价=¥{float(price):.2f} | 总耗时={elapsed:.2f}s | 链接={result['item_url']}"
+                )
+                return result
+            except XianyuOfflineError as e:
+                shot_file = _capture_publish_failure_screenshot(page, failure_screenshot_dir)
+                res = _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="publish")
+                res["screenshot_file"] = shot_file
+                return res
+            except Exception as exc:
+                shot_file = _capture_publish_failure_screenshot(page, failure_screenshot_dir)
+                page_tips = _collect_page_error_tips(page)
+                logger.error(
+                    f"❌ [商品上架/页面异常] 账号目录={tag} | 标题=【{clean_title}】 | "
+                    f"错误={exc} | 页面提示=【{page_tips or '无'}】 | 截图={shot_file or '无'}"
+                )
+                return {
+                    "ok": False,
+                    "is_offline": False,
+                    "action": "publish",
+                    "error_code": "PUBLISH_ERROR",
+                    "user_data_dir": user_data_dir,
+                    "screenshot_file": shot_file,
+                    "message": f"发布过程异常：{page_tips or exc}",
+                }
+    except XianyuOfflineError as e:
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action="publish")
+    except XianyuLockTimeoutError as e:
+        return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action="publish")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def downshelf_item(
+    item_id: str,
+    *,
+    delete: bool = False,
+    user_data_dir: str = DEFAULT_USER_DATA_DIR,
+    debug: bool = False,
+    lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    lock_scope: str = "global",
+) -> Dict[str, Any]:
+    """对指定 `item_id` 的商品执行下架（或删除）。"""
+    t0 = time.monotonic()
+    tag = _dir_tag(user_data_dir)
+    target_id = str(item_id or "").strip()
+    if not target_id:
+        raise ValueError("item_id 不能为空")
+
+    action_name = "delete" if delete else "downshelf"
+    action_label = "删除" if delete else "下架"
+    target_api = "com.taobao.idle.item.delete" if delete else "mtop.taobao.idle.item.downshelf"
+    item_url = f"{GOOFISH_HOME_URL}/item?id={target_id}"
+    logger.info(f"[商品{action_label}/开始] 账号目录={tag} | item_id={target_id} | URL={item_url}")
+
+    try:
+        with _browser_session_guard(
+            user_data_dir=user_data_dir,
+            task_name=f"{action_name}_item({target_id})",
+            debug=debug,
+            lock_timeout_sec=lock_timeout_sec,
+            operation_timeout_sec=operation_timeout_sec,
+            lock_scope=lock_scope,
+        ) as (context, page, auth_tracker):
+            action_resp: Dict[str, Any] = {}
+
+            def on_response(resp):
+                if target_api in resp.url:
+                    try:
+                        action_resp.update(resp.json())
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+            page.goto(item_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            unb = _verify_account_online(
+                context, page, auth_tracker, user_data_dir, task_name=f"{action_name}_item"
+            )
+            nick = auth_tracker.get("display_name", "")
+
+            btn = page.locator('div[class*="sellerButton"]:not([class*="Group"])').filter(has_text=action_label).first
+            if btn.count() == 0:
+                btn = page.get_by_text(action_label, exact=True).first
+            if btn.count() == 0:
+                page_tips = _collect_page_error_tips(page)
+                return {
+                    "ok": False,
+                    "is_offline": False,
+                    "action": action_name,
+                    "error_code": "BUTTON_NOT_FOUND",
+                    "user_data_dir": user_data_dir,
+                    "item_id": target_id,
+                    "message": f"商品页未找到「{action_label}」按钮（{page_tips or '可能已下架或不属于当前账号'}）",
+                }
+
+            btn.click()
+            page.wait_for_timeout(800)
+
+            confirm_btn = page.locator(".ant-modal-content").get_by_text("确定", exact=True).last
+            confirm_btn.click()
+
+            for _ in range(20):
+                if action_resp or auth_tracker.get("expired_rets"):
+                    break
+                page.wait_for_timeout(400)
+
+            _verify_account_online(
+                context, page, auth_tracker, user_data_dir, task_name=f"{action_name}_item"
+            )
+
+            ret_list = action_resp.get("ret") or []
+            ret_str = " | ".join(str(x) for x in ret_list)
+            ok = "SUCCESS" in ret_str
+            elapsed = time.monotonic() - t0
+            logger.info(
+                f"[商品{action_label}/结束] ok={ok} | item_id={target_id} | MTOP={ret_str} | 耗时={elapsed:.2f}s"
+            )
+
+            return {
+                "ok": ok,
+                "is_offline": False,
+                "action": action_name,
+                "error_code": "" if ok else "DOWNSHELF_FAILED",
+                "user_data_dir": user_data_dir,
+                "unb": unb,
+                "nick": nick,
+                "item_id": target_id,
+                "ret": ret_str,
+                "message": f"{action_label}成功" if ok else f"{action_label}失败：{ret_str or '接口未返回成功'}",
+            }
+    except XianyuOfflineError as e:
+        return _build_offline_result(user_data_dir, e.reason, error_code=e.error_code, action=action_name)
+    except XianyuLockTimeoutError as e:
+        return _build_lock_timeout_result(user_data_dir, e.timeout_sec, action=action_name)
+
+
+def delete_item(
+    item_id: str,
+    *,
+    user_data_dir: str = DEFAULT_USER_DATA_DIR,
+    debug: bool = False,
+    lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
+    operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    lock_scope: str = "global",
+) -> Dict[str, Any]:
+    """彻底删除指定 `item_id` 的商品（复用 `downshelf_item(..., delete=True)`）。"""
+    return downshelf_item(
+        item_id=item_id,
+        delete=True,
+        user_data_dir=user_data_dir,
+        debug=debug,
+        lock_timeout_sec=lock_timeout_sec,
+        operation_timeout_sec=operation_timeout_sec,
+        lock_scope=lock_scope,
+    )
 
 
 # ==============================================================================

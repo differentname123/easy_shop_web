@@ -39,5 +39,12 @@ class ChannelRegistry:
 
 def build_default_channel_registry(config: WorkbenchConfig) -> ChannelRegistry:
     registry = ChannelRegistry()
-    registry.register(XianyuChannelAdapter(config.channel_profiles_dir))
+    registry.register(
+        XianyuChannelAdapter(
+            config.channel_profiles_dir,
+            upload_dir=config.upload_dir,
+            deal_image_dir=config.deal_image_dir,
+            publish_fail_dir=config.publish_fail_dir,
+        )
+    )
     return registry

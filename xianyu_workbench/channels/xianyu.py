@@ -6,15 +6,16 @@ from datetime import datetime, timezone
 import io
 import logging
 from pathlib import Path
+import re
 import shutil
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 
 from PIL import Image
 
-from ..client.seller import check_login_status, get_selling_items
+from ..client.seller import check_login_status, downshelf_item, get_selling_items, publish_item
 from ..client.session import (
     GOOFISH_PERSONAL_URL,
     XianyuLockTimeoutError,
@@ -426,12 +427,27 @@ class XianyuChannelAdapter(SellingChannel):
         qr_login=True,
         status_check=True,
         sync_selling=True,
-        auto_publish=False,
-        auto_downshelf=False,
+        auto_publish=True,
+        auto_downshelf=True,
     )
 
-    def __init__(self, profiles_root: Path, *, login_timeout_sec: float = QR_LOGIN_TIMEOUT_SEC) -> None:
+    _UPLOAD_NAME_RE = re.compile(r"^upl_[0-9a-f]{16}\.jpg$")
+    _DEAL_IMAGE_ID_RE = re.compile(r"^dsi_[0-9a-f]{20}$")
+    _PUBFAIL_NAME_RE = re.compile(r"^pubfail_\d+_[0-9a-f]{8}\.jpg$")
+
+    def __init__(
+        self,
+        profiles_root: Path,
+        *,
+        upload_dir: Optional[Path] = None,
+        deal_image_dir: Optional[Path] = None,
+        publish_fail_dir: Optional[Path] = None,
+        login_timeout_sec: float = QR_LOGIN_TIMEOUT_SEC,
+    ) -> None:
         super().__init__(profiles_root)
+        self.upload_dir = Path(upload_dir) if upload_dir is not None else None
+        self.deal_image_dir = Path(deal_image_dir) if deal_image_dir is not None else None
+        self.publish_fail_dir = Path(publish_fail_dir) if publish_fail_dir is not None else None
         self.login_timeout_sec = login_timeout_sec
         self._sessions_lock = threading.Lock()
         self._sessions: Dict[str, _XianyuQrLoginWorker] = {}
@@ -555,6 +571,157 @@ class XianyuChannelAdapter(SellingChannel):
             group_counts=dict(res.get("group_counts") or {}),
             synced_at=_now_iso(),
         )
+
+    def _resolve_publish_images(self, raw_images: Any) -> List[str]:
+        """将素材库中的图片列表（远程 URL / 工作台本地上传 / 爆料实拍图）安全解析为可上传路径/URL。"""
+        out: List[str] = []
+        for entry in (raw_images or []):
+            url = str(entry.get("url") if isinstance(entry, dict) else entry or "").strip()
+            if not url:
+                continue
+            if url.startswith(("http://", "https://")):
+                out.append(url)
+                continue
+            if url.startswith("/api/assets/uploads/") and self.upload_dir is not None:
+                fname = url.rsplit("/", 1)[-1]
+                if not self._UPLOAD_NAME_RE.fullmatch(fname):
+                    raise ValueError(f"非法上传图片名: {fname}")
+                base = self.upload_dir.resolve()
+                cand = (base / fname).resolve()
+                if cand.parent != base or not cand.is_file():
+                    raise ValueError(f"本地上传图片不存在: {fname}")
+                out.append(str(cand))
+                continue
+            if url.startswith("/api/deals/image/") and self.deal_image_dir is not None:
+                img_id = url.rsplit("/", 1)[-1]
+                if not self._DEAL_IMAGE_ID_RE.fullmatch(img_id):
+                    raise ValueError(f"非法爆料图片ID: {img_id}")
+                base = self.deal_image_dir.resolve()
+                cand = (base / f"{img_id}.jpg").resolve()
+                if cand.parent != base or not cand.is_file():
+                    raise ValueError(f"本地爆料图片不存在: {img_id}")
+                out.append(str(cand))
+                continue
+            raise ValueError(f"不支持的图片路径格式: {url}")
+        if not out:
+            raise ValueError("至少需要 1 张有效商品图片")
+        return out
+
+    def publish_item(self, username: str, item_payload: Dict[str, Any]) -> Dict[str, Any]:
+        profile_dir = self.profile_dir_for(username)
+        raw_price = (
+            item_payload.get("price")
+            if item_payload.get("price") is not None
+            else item_payload.get("sell_price")
+        )
+        try:
+            price = float(raw_price or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            return {
+                "ok": False,
+                "is_offline": False,
+                "error_code": "INVALID_PRICE",
+                "message": "上架前请先设置大于 0 的标价",
+            }
+        try:
+            images = self._resolve_publish_images(item_payload.get("images"))
+            res = publish_item(
+                title=str(item_payload.get("title") or "").strip(),
+                desc=str(item_payload.get("description") or "").strip(),
+                images=images,
+                price=price,
+                user_data_dir=str(profile_dir),
+                lock_timeout_sec=30.0,
+                operation_timeout_sec=90.0,
+                lock_scope="profile",
+                failure_screenshot_dir=str(self.publish_fail_dir) if self.publish_fail_dir is not None else None,
+            )
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "is_offline": False,
+                "error_code": "VALIDATION_ERROR",
+                "message": str(exc),
+            }
+        except Exception as exc:
+            logger.exception(f"[闲鱼上架异常] owner={username}: {exc}")
+            return {
+                "ok": False,
+                "is_offline": False,
+                "error_code": "PUBLISH_ERROR",
+                "message": f"上架失败：{exc}",
+            }
+
+        ok = bool(res.get("ok"))
+        err_code = "" if ok else str(res.get("error_code") or "PUBLISH_FAILED")
+        msg = "上架成功" if ok else self._friendly_error_message(
+            err_code, str(res.get("message") or "上架失败，请稍后重试")
+        )
+        shot_file = str(res.get("screenshot_file") or "").strip()
+        shot_url = (
+            f"/api/assets/publish-failures/{shot_file}"
+            if (not ok and shot_file and self._PUBFAIL_NAME_RE.fullmatch(shot_file))
+            else ""
+        )
+        return {
+            "ok": ok,
+            "is_offline": bool(res.get("is_offline")),
+            "error_code": err_code,
+            "message": msg,
+            "failure_screenshot_url": shot_url,
+            "item_id": str(res.get("item_id") or "").strip(),
+            "item_url": str(res.get("item_url") or "").strip(),
+            "title": str(res.get("title") or "").strip(),
+            "price": str(res.get("price") or f"{price:.2f}"),
+            "account_id": str(res.get("unb") or "").strip(),
+            "nickname": str(res.get("nick") or "").strip(),
+        }
+
+    def downshelf_item(self, username: str, external_item_id: str) -> Dict[str, Any]:
+        profile_dir = self.profile_dir_for(username)
+        try:
+            res = downshelf_item(
+                item_id=external_item_id,
+                delete=False,
+                user_data_dir=str(profile_dir),
+                lock_timeout_sec=25.0,
+                operation_timeout_sec=60.0,
+                lock_scope="profile",
+            )
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "is_offline": False,
+                "error_code": "VALIDATION_ERROR",
+                "message": str(exc),
+                "item_id": external_item_id,
+            }
+        except Exception as exc:
+            logger.exception(f"[闲鱼下架异常] owner={username} item={external_item_id}: {exc}")
+            return {
+                "ok": False,
+                "is_offline": False,
+                "error_code": "DOWNSHELF_ERROR",
+                "message": f"下架失败：{exc}",
+                "item_id": external_item_id,
+            }
+
+        ok = bool(res.get("ok"))
+        err_code = "" if ok else str(res.get("error_code") or "DOWNSHELF_FAILED")
+        msg = "下架成功" if ok else self._friendly_error_message(
+            err_code, str(res.get("message") or "下架失败，请稍后重试")
+        )
+        return {
+            "ok": ok,
+            "is_offline": bool(res.get("is_offline")),
+            "error_code": err_code,
+            "message": msg,
+            "item_id": str(res.get("item_id") or external_item_id).strip(),
+            "account_id": str(res.get("unb") or "").strip(),
+            "nickname": str(res.get("nick") or "").strip(),
+        }
 
     def shutdown(self) -> None:
         with self._sessions_lock:

@@ -22,6 +22,7 @@ from .service import WorkbenchService
 STATIC_DIR = WORKBENCH_DIR / "static"
 _SCREENSHOT_FILE_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}\.jpg$")
 _UPLOAD_FILE_RE = re.compile(r"^upl_[0-9a-f]{16}\.jpg$")
+_PUBFAIL_FILE_RE = re.compile(r"^pubfail_\d+_[0-9a-f]{8}\.jpg$")
 _DEAL_IMAGE_ID_RE = re.compile(r"^dsi_[0-9a-f]{20}$")
 
 
@@ -65,6 +66,11 @@ class PublishRequest(BaseModel):
 
 class DownshelfRequest(BaseModel):
     external_item_id: str = Field(..., min_length=1, max_length=64)
+
+
+class ReconcileApplyRequest(BaseModel):
+    publish_listing_ids: List[str] = Field(default_factory=list)
+    downshelf_item_ids: List[str] = Field(default_factory=list)
 
 
 class CancelQrRequest(BaseModel):
@@ -198,6 +204,8 @@ def create_app(
     @app.get("/api/candidates/evaluations")
     def get_evaluation_candidates(
         request: Request,
+        source_type: str = Query("all", pattern="^(all|deal_tip|official)$"),
+        sort_by: str = Query("want", pattern="^(want|ratio)$"),
         include_all_winners: bool = Query(False),
         include_off: bool = Query(False),
         page: int = Query(1, ge=1, le=500),
@@ -206,6 +214,8 @@ def create_app(
         username = _uid(request)
         data = _svc().list_evaluation_candidates(
             username,
+            source_type=source_type,
+            sort_by=sort_by,
             include_all_winners=include_all_winners,
             include_off=include_off,
             page=page,
@@ -265,6 +275,11 @@ def create_app(
         username = _uid(request)
         data = _svc().generate_copy(username, listing_id)
         return {"status": "success", "data": data}
+
+    @app.post("/api/items/{listing_id}/failure/clear")
+    def clear_item_failure(listing_id: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _svc().clear_item_failure(username, listing_id)}
 
     # =========================================================================
     # 四、可插拔销售渠道（扫码绑定、状态检测、真实在售同步与对账）
@@ -331,6 +346,22 @@ def create_app(
         username = _uid(request)
         return {"status": "success", "data": _ch_svc().downshelf_item(username, channel, req.external_item_id)}
 
+    @app.post("/api/channels/{channel}/reconcile/preview")
+    def preview_channel_reconcile(channel: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _ch_svc().preview_reconcile(username, channel)}
+
+    @app.post("/api/channels/{channel}/reconcile/apply")
+    def apply_channel_reconcile(channel: str, req: ReconcileApplyRequest, request: Request):
+        username = _uid(request)
+        data = _ch_svc().apply_reconcile(
+            username,
+            channel,
+            publish_listing_ids=req.publish_listing_ids,
+            downshelf_item_ids=req.downshelf_item_ids,
+        )
+        return {"status": "success", "data": data}
+
     # =========================================================================
     # 五、图片上传与受保护媒体读取
     # =========================================================================
@@ -354,6 +385,14 @@ def create_app(
         path = WorkbenchService.resolve_safe_file(cfg.upload_dir, filename, _UPLOAD_FILE_RE)
         if path is None:
             raise HTTPException(status_code=404, detail="图片不存在")
+        return FileResponse(path, media_type="image/jpeg")
+
+    @app.get("/api/assets/publish-failures/{filename}")
+    def get_publish_failure_screenshot(filename: str, request: Request):
+        _uid(request)
+        path = WorkbenchService.resolve_safe_file(cfg.publish_fail_dir, filename, _PUBFAIL_FILE_RE)
+        if path is None:
+            raise HTTPException(status_code=404, detail="失败截图不存在")
         return FileResponse(path, media_type="image/jpeg")
 
     @app.get("/api/deals/image/{image_id}")

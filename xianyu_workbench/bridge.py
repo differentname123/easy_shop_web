@@ -69,6 +69,35 @@ def generate_ai_copy(prompt: str, timeout: float = 90.0) -> Dict[str, Any]:
     )
 
 
+def get_main_site_port(default: int = 8001) -> int:
+    """读取主站 Web 服务监听端口（供拼接本站商品详情直达链接）。"""
+    try:
+        _ensure_mobile_web_on_path()
+        from infrastructure.settings import get_settings
+
+        return int(getattr(get_settings(), "web_port", default) or default)
+    except Exception:
+        return int(default)
+
+
+def encode_main_site_item_code(
+    platform: str,
+    product_id: str,
+    goods_sign: str = "",
+) -> str:
+    """复用主站无状态编码器生成 `detail?item=...` 所需的 `p1_...` 商品编码。"""
+    try:
+        _ensure_mobile_web_on_path()
+        from public_boundary import encode_item_code
+
+        target = str(product_id or goods_sign or "").strip()
+        if not platform or not target:
+            return ""
+        return str(encode_item_code(platform, target) or "").strip()
+    except Exception:
+        return ""
+
+
 def parse_ai_json(raw_text: str) -> Any:
     """解析大模型返回的 JSON 文本，优先复用主站容错解析器，失败时走标准库兜底。"""
     text = str(raw_text or "").strip()

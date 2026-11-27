@@ -564,11 +564,23 @@
       </div>
 
       <div class="page-body">
-        <div v-if="pickSource === 'eval'" class="sub-filter-bar">
-          <span>待审 {{ evalTotal }} 条</span>
-          <button class="link-btn" @click="toggleAllWinners">
-            {{ includeAllWinners ? '当前：含平局/参考款' : '只看我方更优 ›' }}
-          </button>
+        <div v-if="pickSource === 'eval'" style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+            <div style="display: flex; gap: 6px;">
+              <button class="btn btn-sm" :class="evalSourceType === 'all' ? 'btn-dark' : 'btn-soft'" @click="setEvalSourceType('all')">全部</button>
+              <button class="btn btn-sm" :class="evalSourceType === 'deal_tip' ? 'btn-dark' : 'btn-soft'" @click="setEvalSourceType('deal_tip')">线报</button>
+              <button class="btn btn-sm" :class="evalSourceType === 'official' ? 'btn-dark' : 'btn-soft'" @click="setEvalSourceType('official')">官方</button>
+            </div>
+            <button class="btn btn-sm" :class="evalSortBy === 'want' ? 'btn-blue-soft' : 'btn-soft'" @click="toggleEvalSortBy">
+              {{ evalSortBy === 'want' ? '🔥 按想要数 ↓' : '⚖️ 按性价比 ↓' }}
+            </button>
+          </div>
+          <div class="sub-filter-bar">
+            <span>共 {{ evalTotal }} 条待审</span>
+            <button class="link-btn" @click="toggleAllWinners">
+              {{ includeAllWinners ? '当前：含平局/参考款' : '只看我方更优 ›' }}
+            </button>
+          </div>
         </div>
 
         <div v-if="candidatesLoading && candidates.length === 0" class="empty-state">加载中...</div>
@@ -596,7 +608,11 @@
               <div class="price-row">
                 <span class="price-main" v-if="c.price"><small>¥</small>{{ c.price }}</span>
                 <span class="pill pill-gray">{{ platformLabel(c.platform) }}</span>
-                <span v-if="c.is_deal_tip" class="pill pill-orange">线报好价</span>
+                <span v-if="c.source_origin === 'xianyu_eval'" class="pill" :class="c.source_type === 'deal_tip' ? 'pill-orange' : 'pill-blue'">
+                  {{ c.source_type === 'deal_tip' ? '线报' : '官方' }}
+                </span>
+                <span v-else-if="c.is_deal_tip" class="pill pill-orange">线报好价</span>
+                <span v-if="c.xianyu_ref && c.xianyu_ref.want_cnt" class="pill pill-red">🔥 {{ c.xianyu_ref.want_cnt }}人想要</span>
                 <span v-if="c.cost_performance_ratio" class="pill pill-green">性价比 {{ Number(c.cost_performance_ratio).toFixed(2) }}x</span>
               </div>
               <div v-if="c.deal_highlight" style="font-size: 12px; color: var(--primary);">{{ c.deal_highlight }}</div>
@@ -621,6 +637,18 @@
             </div>
           </div>
 
+          <div v-if="c.main_item_code || (c.xianyu_ref && c.xianyu_ref.item_url)"
+               style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;">
+            <a v-if="c.main_item_code" class="pill pill-blue" style="text-decoration: none;"
+               :href="mainProductUrl(c.main_item_code)" target="_blank" rel="noopener">
+              🔗 本店商品详情 ↗
+            </a>
+            <a v-if="c.xianyu_ref && c.xianyu_ref.item_url" class="pill pill-orange" style="text-decoration: none;"
+               :href="c.xianyu_ref.item_url" target="_blank" rel="noopener">
+              🐟 闲鱼参考帖 ↗
+            </a>
+          </div>
+
           <div class="actions-row">
             <button class="btn btn-soft" @click="dismissCandidate(c)">不要</button>
             <button class="btn btn-primary" @click="pickCandidate(c)">选这个</button>
@@ -633,15 +661,15 @@
       </div>
     </template>
 
-    <!-- TAB 2: 商品 (待上架 + 真实渠道在售) -->
+    <!-- TAB 2: 商品 (选品库 + 真实渠道在售与一键对齐) -->
     <template v-else-if="mainTab === 'items'">
       <div class="topbar">
         <div class="seg-group">
           <button class="seg-btn" :class="{ active: itemsSubTab === 'ready' }" @click="switchItemsSubTab('ready')">
-            待上架 ({{ itemCounts.active || 0 }})
+            选品库 ({{ itemCounts.active || 0 }})
           </button>
           <button class="seg-btn" :class="{ active: itemsSubTab === 'selling' }" @click="switchItemsSubTab('selling')">
-            {{ activeChannel.name }}在售 ({{ activeChannel.online_count || 0 }})
+            {{ activeChannel.name }}在售 ({{ sellingData.online_count || activeChannel.online_count || 0 }})
           </button>
         </div>
         <button
@@ -652,11 +680,29 @@
       </div>
 
       <div class="page-body">
-        <!-- 子视图 A：待上架 / 草稿素材 -->
+        <!-- 子视图 A：选品库（支持单品手动上下架、直接跳转闲鱼链接、及一键同步选品库） -->
         <template v-if="itemsSubTab === 'ready'">
+          <div class="status-banner">
+            <div style="min-width: 0;">
+              <div style="font-weight: 700; font-size: 14px;">
+                已备选 {{ itemCounts.ready || 0 }} 件
+                <span v-if="itemCounts.draft" style="font-weight: 400; color: var(--sub);"> · 草稿 {{ itemCounts.draft }} 件</span>
+              </div>
+              <div style="font-size: 12px; color: var(--muted);">
+                与{{ activeChannel.name }}保持一致（缺的补上架，多的下架）
+              </div>
+            </div>
+            <button
+              v-if="activeChannel.capabilities && activeChannel.capabilities.auto_publish && activeChannel.capabilities.auto_downshelf"
+              class="btn btn-dark btn-sm"
+              :disabled="reconcilePreviewLoading"
+              @click="openReconcilePreview"
+            >{{ reconcilePreviewLoading ? '比对中...' : '⇄ 同步选品库' }}</button>
+          </div>
+
           <div v-if="itemsLoading" class="empty-state">加载中...</div>
           <div v-else-if="localItems.length === 0" class="empty-state">
-            <p>还没有整理好的待上架商品</p>
+            <p>选品库还没有商品</p>
             <button class="btn btn-primary" @click="mainTab = 'pick'">去挑品</button>
           </div>
 
@@ -668,24 +714,85 @@
                 <div class="price-row">
                   <span class="price-main"><small>¥</small>{{ it.price }}</span>
                   <span class="pill" :class="it.status === 'ready' ? 'pill-green' : 'pill-amber'">
-                    {{ it.status === 'ready' ? '待上架' : '草稿' }}
+                    {{ it.status === 'ready' ? '选品库' : '草稿' }}
                   </span>
+                  <span v-if="onlineItemFor(it.listing_id)" class="pill pill-blue">
+                    🟢 已上架{{ activeChannel.name }}
+                  </span>
+                  <span v-else-if="it.publish_failure" class="pill pill-red">⚠️ 上架失败</span>
                   <span v-if="it.off_promotion_alert" class="pill pill-red">⚠️ 上游已失效</span>
                 </div>
-                <div style="font-size: 12px; color: var(--muted);">{{ platformLabel(it.platform) }} · {{ it.images.length }}张图</div>
+                <div style="font-size: 12px; color: var(--muted);">
+                  {{ platformLabel(it.platform) }} · {{ it.images.length }}张图
+                  <span v-if="onlineItemFor(it.listing_id)?.want_info"> · {{ onlineItemFor(it.listing_id).want_info }}</span>
+                </div>
+                <div v-if="it.main_item_code || it.xianyu_ref_url"
+                     style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
+                  <a v-if="it.main_item_code" class="pill pill-blue" style="text-decoration: none;"
+                     :href="mainProductUrl(it.main_item_code)" target="_blank" rel="noopener">🔗 本店商品 ↗</a>
+                  <a v-if="it.xianyu_ref_url" class="pill pill-orange" style="text-decoration: none;"
+                     :href="it.xianyu_ref_url" target="_blank" rel="noopener">🐟 闲鱼参考 ↗</a>
+                </div>
               </div>
             </div>
-            <div class="actions-row">
+
+            <div v-if="it.publish_failure"
+                 style="display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 8px 10px; border-radius: 10px; background: var(--red-bg); cursor: pointer;"
+                 @click="openEditor(it)">
+              <img
+                v-if="it.publish_failure.screenshot_url"
+                :src="it.publish_failure.screenshot_url"
+                alt="失败现场"
+                @click.stop="zoomImageUrl = it.publish_failure.screenshot_url"
+                style="width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid #fecaca; flex-shrink: 0;"
+              />
+              <div style="flex: 1; min-width: 0; font-size: 12px; color: var(--red);">
+                <div style="font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                  {{ it.publish_failure.message }}
+                </div>
+                <div style="color: var(--sub); margin-top: 2px;">点击卡片查看详情 · 点左图放大截图</div>
+              </div>
+            </div>
+
+            <!-- 已在当前渠道上架：直接展示跳转原帖链接 + 下架 + 编辑 -->
+            <div v-if="onlineItemFor(it.listing_id)" class="actions-row">
+              <a
+                class="btn btn-blue-soft btn-sm"
+                style="flex: 1.4;"
+                :href="onlineItemFor(it.listing_id).item_url"
+                target="_blank"
+                rel="noopener"
+              >🔗 看{{ activeChannel.name }}帖子 ↗</a>
+              <button
+                class="btn btn-danger-soft btn-sm"
+                :disabled="downshelvingId === onlineItemFor(it.listing_id).item_id"
+                @click="downshelfFromChannel(onlineItemFor(it.listing_id).item_id, it.title)"
+              >{{ downshelvingId === onlineItemFor(it.listing_id).item_id ? '下架中...' : '下架' }}</button>
+              <button class="btn btn-soft btn-sm" style="flex: 0.7;" @click="openEditor(it)">编辑</button>
+            </div>
+
+            <!-- 未上架且属于选品库 ready：手动点击上架 + 编辑 + 复制 -->
+            <div v-else-if="it.status === 'ready'" class="actions-row">
+              <button
+                v-if="activeChannel.capabilities && activeChannel.capabilities.auto_publish"
+                class="btn btn-primary btn-sm"
+                style="flex: 1.4;"
+                :disabled="publishingId === it.listing_id || it.off_promotion_alert"
+                @click="publishToChannel(it)"
+              >{{ publishingId === it.listing_id ? '上架中...' : (it.off_promotion_alert ? '上游已失效' : ('🚀 上架' + activeChannel.name)) }}</button>
               <button class="btn btn-soft btn-sm" @click="openEditor(it)">编辑</button>
-              <button class="btn btn-blue-soft btn-sm" @click="copyItemCopy(it)">复制文案</button>
-              <button v-if="activeChannel.capabilities && activeChannel.capabilities.auto_publish" class="btn btn-primary btn-sm" @click="publishToChannel(it)">一键上架</button>
+              <button class="btn btn-blue-soft btn-sm" @click="copyItemCopy(it)">复制</button>
+            </div>
+
+            <!-- 草稿状态 -->
+            <div v-else class="actions-row">
+              <button class="btn btn-dark btn-sm" @click="openEditor(it)">完善文案并加入选品库</button>
             </div>
           </div>
         </template>
 
         <!-- 子视图 B：渠道真实在售同步 -->
         <template v-else>
-          <!-- 多渠道切换（后续接入淘宝等渠道时自动显示） -->
           <div v-if="channels.length > 1" style="display: flex; gap: 8px; overflow-x: auto;">
             <button
               v-for="ch in channels"
@@ -705,24 +812,33 @@
                 </span>
               </div>
               <div style="font-size: 12px; color: var(--muted);">
-                {{ sellingData.synced_at ? ('上次同步：' + formatTime(sellingData.synced_at)) : '点击右上角或下方按钮同步在售商品' }}
+                {{ sellingData.synced_at ? ('上次同步：' + formatTime(sellingData.synced_at)) : '点击同步拉取当前线上真实在售商品' }}
               </div>
             </div>
-            <button
-              v-if="activeChannel.bound && activeChannel.online"
-              class="btn btn-dark btn-sm"
-              :disabled="syncLoading"
-              @click="syncActiveChannel"
-            >{{ syncLoading ? '同步中...' : '同步在售' }}</button>
-            <button
-              v-else
-              class="btn btn-primary btn-sm"
-              @click="startQrLogin(activeChannelCode)"
-            >扫码绑定</button>
+            <div style="display: flex; gap: 6px; flex-shrink: 0;">
+              <template v-if="activeChannel.bound && activeChannel.online">
+                <button
+                  class="btn btn-soft btn-sm"
+                  :disabled="syncLoading"
+                  @click="syncActiveChannel"
+                >{{ syncLoading ? '刷新中' : '刷新' }}</button>
+                <button
+                  v-if="activeChannel.capabilities && activeChannel.capabilities.auto_publish"
+                  class="btn btn-dark btn-sm"
+                  :disabled="reconcilePreviewLoading"
+                  @click="openReconcilePreview"
+                >{{ reconcilePreviewLoading ? '比对中' : '同步选品库' }}</button>
+              </template>
+              <button
+                v-else
+                class="btn btn-primary btn-sm"
+                @click="startQrLogin(activeChannelCode)"
+              >扫码绑定</button>
+            </div>
           </div>
 
           <div v-if="!activeChannel.bound && sellingData.online_items.length === 0 && sellingData.abnormal_items.length === 0" class="empty-state">
-            <p>绑定{{ activeChannel.name }}账号后，可自动同步真实在售商品，并实时监控上游源品是否下架失效</p>
+            <p>绑定{{ activeChannel.name }}账号后，可一键上下架商品、同步选品库、跳转帖子查看效果并监控上游货源</p>
             <button class="btn btn-primary" @click="startQrLogin(activeChannelCode)">立即扫码绑定</button>
           </div>
 
@@ -756,24 +872,31 @@
                     <span v-else-if="on.upstream_status === 'online'" class="pill pill-blue">
                       上游有货{{ on.upstream_live_price ? (' ¥' + on.upstream_live_price) : '' }}
                     </span>
-                    <span v-else class="pill pill-gray">未关联源品</span>
+                    <span v-else class="pill pill-gray">不在选品库</span>
                   </div>
                   <div style="font-size: 12px; color: var(--muted);">
                     {{ on.want_info || '暂无热度' }}
-                    <span v-if="on.linked_listing_title"> · 关联：{{ on.linked_listing_title.slice(0, 14) }}</span>
+                    <span v-if="on.linked_listing_title"> · 选品：{{ on.linked_listing_title.slice(0, 14) }}</span>
                   </div>
                 </div>
               </div>
               <div class="actions-row">
+                <a v-if="on.item_url" class="btn btn-blue-soft btn-sm" style="flex: 1.2;" :href="on.item_url" target="_blank" rel="noopener">🔗 看帖子 ↗</a>
+                <a v-if="on.linked_main_item_code" class="btn btn-soft btn-sm" style="flex: 0.9;" :href="mainProductUrl(on.linked_main_item_code)" target="_blank" rel="noopener">本店商品 ↗</a>
+                <button
+                  v-if="activeChannel.capabilities && activeChannel.capabilities.auto_downshelf"
+                  class="btn btn-danger-soft btn-sm"
+                  :disabled="downshelvingId === on.item_id"
+                  @click="downshelfFromChannel(on.item_id, on.title)"
+                >{{ downshelvingId === on.item_id ? '下架中...' : '下架' }}</button>
                 <button class="btn btn-soft btn-sm" @click="openLinkModal(on)">
-                  {{ on.linked_listing_id ? '修改关联' : '关联源品' }}
+                  {{ on.linked_listing_id ? '改关联' : '关联' }}
                 </button>
-                <a v-if="on.item_url" class="btn btn-blue-soft btn-sm" :href="on.item_url" target="_blank" rel="noopener">查看原帖</a>
               </div>
             </div>
 
             <div v-if="sellingData.online_items.length === 0 && sellingData.abnormal_items.length === 0" class="empty-state">
-              <p>当前暂无在售商品</p>
+              <p>当前{{ activeChannel.name }}暂无在售商品</p>
               <button class="btn btn-soft btn-sm" :disabled="syncLoading" @click="syncActiveChannel">刷新同步</button>
             </div>
           </template>
@@ -871,6 +994,38 @@
         ⚠️ 该商品上游活动已结束/失效，暂不建议继续发布
       </div>
 
+      <div v-if="editing.publish_failure" class="card card-alert">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <span style="font-size: 14px; font-weight: 700; color: var(--red);">⚠️ 上次上架失败详情</span>
+          <span style="font-size: 12px; color: var(--muted);">{{ formatTime(editing.publish_failure.failed_at) }}</span>
+        </div>
+        <div style="font-size: 13px; color: var(--text); word-break: break-word; line-height: 1.5;">
+          {{ editing.publish_failure.message }}
+        </div>
+        <div v-if="editing.publish_failure.screenshot_url" style="margin-top: 10px;">
+          <img
+            :src="editing.publish_failure.screenshot_url"
+            alt="上架失败当时截图"
+            @click="zoomImageUrl = editing.publish_failure.screenshot_url"
+            style="width: 100%; max-height: 220px; object-fit: cover; border-radius: 10px; border: 1px solid #fecaca; cursor: pointer;"
+          />
+          <div style="font-size: 12px; color: var(--blue); margin-top: 4px; text-align: center;"
+               @click="zoomImageUrl = editing.publish_failure.screenshot_url">🔍 点击全屏放大查看现场</div>
+        </div>
+        <div style="margin-top: 10px; display: flex; justify-content: flex-end;">
+          <button class="btn btn-soft btn-sm" @click="clearEditingFailure">清除失败记录</button>
+        </div>
+      </div>
+
+      <div v-if="editing.main_item_code || editing.xianyu_ref_url"
+           class="card" style="padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+        <span style="font-size: 12px; color: var(--sub); font-weight: 600;">原始链接：</span>
+        <a v-if="editing.main_item_code" class="pill pill-blue" style="text-decoration: none;"
+           :href="mainProductUrl(editing.main_item_code)" target="_blank" rel="noopener">🔗 本店商品详情 ↗</a>
+        <a v-if="editing.xianyu_ref_url" class="pill pill-orange" style="text-decoration: none;"
+           :href="editing.xianyu_ref_url" target="_blank" rel="noopener">🐟 闲鱼参考帖 ↗</a>
+      </div>
+
       <!-- 图片编辑 -->
       <div class="card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
@@ -942,7 +1097,7 @@
     <div class="editor-footer">
       <button class="btn btn-soft" style="flex: 0.9;" :disabled="savingEditor" @click="saveEditor('draft')">存草稿</button>
       <button class="btn btn-primary" style="flex: 2;" :disabled="savingEditor" @click="saveEditor('ready')">
-        {{ savingEditor ? '保存中...' : '保存，加入待上架' }}
+        {{ savingEditor ? '保存中...' : '保存，加入选品库' }}
       </button>
     </div>
   </div>
@@ -972,6 +1127,107 @@
         <button class="btn btn-soft btn-sm" @click="closeQrModal(true)">关闭</button>
         <button class="btn btn-primary btn-sm" @click="startQrLogin(qrModal.channel)">刷新二维码</button>
       </div>
+    </div>
+  </div>
+
+  <!-- 同步选品库 Diff 预览与执行确认抽屉 -->
+  <div v-if="reconcileModal.visible" class="modal-mask" @click.self="!reconcileModal.applying && (reconcileModal.visible = false)">
+    <div class="modal-sheet">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <span style="font-size: 16px; font-weight: 700;">同步选品库到{{ activeChannel.name }}</span>
+        <button v-if="!reconcileModal.applying" class="link-btn" @click="reconcileModal.visible = false">关闭</button>
+      </div>
+
+      <!-- 阶段 A：预览与勾选 -->
+      <template v-if="reconcileModal.preview && !reconcileModal.result">
+        <div style="font-size: 13px; color: var(--sub); background: #f8f9fb; padding: 10px 12px; border-radius: 10px;">
+          选品库 {{ reconcileModal.preview.ready_count }} 件 · {{ activeChannel.name }}当前在售 {{ reconcileModal.preview.online_count }} 件 · 已一致 {{ reconcileModal.preview.already_synced.length }} 件
+        </div>
+
+        <div v-if="reconcileModal.preview.to_publish.length === 0 && reconcileModal.preview.to_downshelf.length === 0"
+             style="text-align: center; padding: 26px 12px; color: var(--green); font-weight: 600;">
+          ✅ 选品库与{{ activeChannel.name }}在售已完全一致，无需改动
+        </div>
+
+        <template v-if="reconcileModal.preview.to_publish.length > 0">
+          <div style="font-size: 13px; font-weight: 700; color: var(--green);">
+            ↑ 缺少待上架（{{ reconcileModal.publishIds.length }}/{{ reconcileModal.preview.to_publish.length }}）
+          </div>
+          <label v-for="p in reconcileModal.preview.to_publish" :key="'pub_' + p.listing_id"
+                 style="display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 12px;">
+            <input type="checkbox" :value="p.listing_id" v-model="reconcileModal.publishIds" :disabled="reconcileModal.applying" />
+            <img :src="p.pic_url || ''" style="width: 44px; height: 44px; border-radius: 8px; object-fit: cover; background: #eee;" alt="" />
+            <div style="flex: 1; min-width: 0;">
+              <div style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ p.title }}</div>
+              <div style="font-size: 12px; color: var(--sub);">¥{{ p.price }} · {{ platformLabel(p.platform) }}</div>
+            </div>
+          </label>
+        </template>
+
+        <template v-if="reconcileModal.preview.to_downshelf.length > 0">
+          <div style="font-size: 13px; font-weight: 700; color: var(--red);">
+            ↓ 多余待下架（{{ reconcileModal.downshelfIds.length }}/{{ reconcileModal.preview.to_downshelf.length }}）
+          </div>
+          <label v-for="d in reconcileModal.preview.to_downshelf" :key="'dw_' + d.item_id"
+                 style="display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid #fda29b; background: #fffbfa; border-radius: 12px;">
+            <input type="checkbox" :value="d.item_id" v-model="reconcileModal.downshelfIds" :disabled="reconcileModal.applying" />
+            <img :src="d.pic_url || ''" style="width: 44px; height: 44px; border-radius: 8px; object-fit: cover; background: #eee;" alt="" />
+            <div style="flex: 1; min-width: 0;">
+              <div style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ d.title }}</div>
+              <div style="font-size: 12px; color: var(--red);">¥{{ d.price }} · {{ d.reason }}</div>
+            </div>
+          </label>
+        </template>
+
+        <div v-if="reconcileModal.preview.skipped_off_promotion.length > 0" style="font-size: 12px; color: var(--amber);">
+          ⚠️ 另有 {{ reconcileModal.preview.skipped_off_promotion.length }} 件选品因上游已失效，本次不会新上架
+        </div>
+
+        <div v-if="reconcileModal.applying" style="font-size: 13px; color: var(--blue); text-align: center; padding: 6px 0;">
+          正在自动操控浏览器上下架，请稍候（勿关闭页面）...
+        </div>
+
+        <button
+          v-if="reconcileModal.preview.to_publish.length > 0 || reconcileModal.preview.to_downshelf.length > 0"
+          class="btn btn-primary btn-block"
+          :disabled="reconcileModal.applying || (reconcileModal.publishIds.length === 0 && reconcileModal.downshelfIds.length === 0)"
+          @click="applyReconcile"
+        >
+          {{ reconcileModal.applying ? '同步执行中...' : ('确认同步（上架 ' + reconcileModal.publishIds.length + ' · 下架 ' + reconcileModal.downshelfIds.length + '）') }}
+        </button>
+      </template>
+
+      <!-- 阶段 B：执行结果与直达链接 -->
+      <template v-else-if="reconcileModal.result">
+        <div style="font-size: 14px; font-weight: 600; color: var(--text);">
+          同步完成：新上架 {{ reconcileModal.result.published.length }} 件 · 已下架 {{ reconcileModal.result.downshelved.length }} 件
+          <span v-if="reconcileModal.result.failed.length" style="color: var(--red);"> · 失败 {{ reconcileModal.result.failed.length }} 件</span>
+        </div>
+        <div v-if="reconcileModal.result.aborted_reason" style="font-size: 13px; color: var(--red); background: var(--red-bg); padding: 10px; border-radius: 10px;">
+          {{ reconcileModal.result.aborted_reason }}
+        </div>
+        <div v-for="pub in reconcileModal.result.published" :key="'res_' + pub.item_id"
+             style="display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 12px;">
+          <div style="min-width: 0; flex: 1;">
+            <div style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ pub.title }}</div>
+            <div style="font-size: 12px; color: var(--green);">¥{{ pub.price }} · ID: {{ pub.item_id }}</div>
+          </div>
+          <a class="btn btn-blue-soft btn-sm" :href="pub.item_url" target="_blank" rel="noopener">看帖子 ↗</a>
+        </div>
+        <div v-for="(err, idx) in reconcileModal.result.failed" :key="'err_' + idx"
+             style="display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-radius: 10px; background: var(--red-bg);">
+          <div style="font-size: 12px; color: var(--red); flex: 1; min-width: 0; word-break: break-word;">
+            • {{ err.action === 'downshelf' ? '下架' : '上架' }}失败：{{ err.message }}
+          </div>
+          <button
+            v-if="err.screenshot_url"
+            class="btn btn-blue-soft btn-sm"
+            style="flex-shrink: 0;"
+            @click="zoomImageUrl = err.screenshot_url"
+          >看截图</button>
+        </div>
+        <button class="btn btn-dark btn-block" @click="reconcileModal.visible = false">完成</button>
+      </template>
     </div>
   </div>
 
@@ -1011,6 +1267,6 @@
 </div>
 
 <script src="/static/vue.global.prod.js"></script>
-<script src="/static/app.js?v=2"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>

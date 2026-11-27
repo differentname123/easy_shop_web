@@ -49,7 +49,9 @@ class _MemoryCursor:
 
     def sort(self, spec):
         def _key_fn(doc, field):
-            val = doc.get(field)
+            val = doc
+            for part in str(field).split("."):
+                val = val.get(part) if isinstance(val, dict) else None
             if val is None:
                 return (0, "")
             if isinstance(val, datetime.datetime):
@@ -192,8 +194,7 @@ class _MemoryDB:
         self.cols = {
             "xy_users": _MemoryCollection(),
             "xy_listings": _MemoryCollection(),
-            "xy_channel_accounts": _MemoryCollection(),
-            "xy_channel_selling": _MemoryCollection(),
+            "xy_channels": _MemoryCollection(),
             "favorites": _MemoryCollection(),
             "products": _MemoryCollection(),
             "xianyu_deal_evaluations": _MemoryCollection(),
@@ -217,6 +218,7 @@ class _FakeChannelAdapter(SellingChannel):
         channel_code: str = "xianyu",
         channel_name: str = "闲鱼",
         auto_publish: bool = False,
+        auto_downshelf: bool = False,
     ) -> None:
         super().__init__(profiles_root)
         self.channel_code = channel_code
@@ -226,7 +228,7 @@ class _FakeChannelAdapter(SellingChannel):
             status_check=True,
             sync_selling=True,
             auto_publish=auto_publish,
-            auto_downshelf=False,
+            auto_downshelf=auto_downshelf,
         )
         self.qr_poll_sequence = ["waiting_scan", "waiting_scan", "scanned", "success"]
         self._poll_idx: Dict[str, int] = {}
@@ -237,6 +239,10 @@ class _FakeChannelAdapter(SellingChannel):
         self.abnormal_items = []
         self.shutdown_called = False
         self.cancelled_sessions = []
+        self._pub_seq = 100
+        self.published_calls = []
+        self.downshelved_calls = []
+        self.force_offline_on_write = False
 
     def start_qr_login(self, username: str) -> QrLoginSnapshot:
         self.profile_dir_for(username)
@@ -326,7 +332,47 @@ class _FakeChannelAdapter(SellingChannel):
     def publish_item(self, username: str, item_payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self.capabilities.auto_publish:
             raise NotImplementedError("未开启自动上架")
-        return {"published": True, "external_item_id": "tb_999", "listing_id": item_payload.get("listing_id")}
+        if self.force_offline_on_write or not self.online_state:
+            return {"ok": False, "is_offline": True, "error_code": "ACCOUNT_OFFLINE", "message": "账号掉线"}
+        self._pub_seq += 1
+        item_id = f"{self.channel_code}_pub_{self._pub_seq}"
+        item_url = f"https://www.goofish.com/item?id={item_id}"
+        entry = {
+            "item_id": item_id,
+            "title": str(item_payload.get("title") or ""),
+            "price": f"{float(item_payload.get('price') or 0):.2f}",
+            "want_info": "",
+            "pic_url": "",
+            "item_url": item_url,
+            "is_online": True,
+        }
+        self.online_items.insert(0, entry)
+        self.published_calls.append(item_payload.get("listing_id"))
+        return {
+            "ok": True,
+            "is_offline": False,
+            "item_id": item_id,
+            "item_url": item_url,
+            "title": entry["title"],
+            "price": entry["price"],
+            "account_id": self.account_id,
+            "nickname": self.nickname,
+        }
+
+    def downshelf_item(self, username: str, external_item_id: str) -> Dict[str, Any]:
+        if not self.capabilities.auto_downshelf:
+            raise NotImplementedError("未开启自动下架")
+        if self.force_offline_on_write or not self.online_state:
+            return {"ok": False, "is_offline": True, "error_code": "ACCOUNT_OFFLINE", "message": "账号掉线"}
+        self.online_items = [x for x in self.online_items if str(x.get("item_id")) != str(external_item_id)]
+        self.downshelved_calls.append(external_item_id)
+        return {
+            "ok": True,
+            "is_offline": False,
+            "item_id": str(external_item_id),
+            "account_id": self.account_id,
+            "nickname": self.nickname,
+        }
 
     def shutdown(self) -> None:
         self.shutdown_called = True
@@ -346,6 +392,7 @@ def _build_env(tmp_path: Path, ai_generator=None, adapters=None):
         data_dir=tmp_path / "data",
         screenshot_dir=tmp_path / "data" / "eval_screenshots",
         upload_dir=tmp_path / "data" / "uploads",
+        publish_fail_dir=tmp_path / "data" / "publish_failures",
         channel_profiles_dir=tmp_path / "data" / "channel_profiles",
         deal_image_dir=tmp_path / "deal_images",
         default_official_image_count=3,
@@ -353,6 +400,7 @@ def _build_env(tmp_path: Path, ai_generator=None, adapters=None):
     )
     cfg.screenshot_dir.mkdir(parents=True, exist_ok=True)
     cfg.upload_dir.mkdir(parents=True, exist_ok=True)
+    cfg.publish_fail_dir.mkdir(parents=True, exist_ok=True)
     cfg.channel_profiles_dir.mkdir(parents=True, exist_ok=True)
     cfg.deal_image_dir.mkdir(parents=True, exist_ok=True)
 
@@ -618,7 +666,10 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
 def test_pluggable_channels_qr_login_sync_reconcile_and_shutdown(tmp_path):
     cfg_dir = tmp_path / "data" / "channel_profiles"
     xianyu_adapter = _FakeChannelAdapter(cfg_dir, channel_code="xianyu", channel_name="闲鱼", auto_publish=False)
-    taobao_adapter = _FakeChannelAdapter(cfg_dir, channel_code="taobao", channel_name="淘宝", auto_publish=True)
+    taobao_adapter = _FakeChannelAdapter(
+        cfg_dir, channel_code="taobao", channel_name="淘宝", auto_publish=True, auto_downshelf=True
+    )
+    taobao_adapter.online_state = True
 
     db, cfg, repo, _svc, registry, _ch_svc, app = _build_env(
         tmp_path,
@@ -734,7 +785,7 @@ def test_pluggable_channels_qr_login_sync_reconcile_and_shutdown(tmp_path):
         assert done["state"] == "success"
         assert done["nickname"] == "小王好价帮拍"
 
-        # 成功后账号状态持久化在 xy_channel_accounts
+        # 成功后账号状态持久化在统一的 xy_channels 表
         chs_after = client.get("/api/channels").json()["data"]["channels"]
         assert chs_after[0]["bound"] is True
         assert chs_after[0]["online"] is True
@@ -761,12 +812,13 @@ def test_pluggable_channels_qr_login_sync_reconcile_and_shutdown(tmp_path):
         assert item2["off_promotion_alert"] is True
         assert linked["off_promotion_alert_count"] == 1
 
-        # 5. 能力门控：闲鱼不支持自动上架诚实返回 501；支持该能力的淘宝返回 200
+        # 5. 能力门控：未开启写能力渠道返回 501；开启写能力渠道返回 200 并记录外部链接
         assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_auto_match"}).status_code == 501
         assert client.post("/api/channels/xianyu/downshelf", json={"external_item_id": "xy_item_1"}).status_code == 501
         tb_pub = client.post("/api/channels/taobao/publish", json={"listing_id": "xyl_auto_match"})
         assert tb_pub.status_code == 200
         assert tb_pub.json()["data"]["published"] is True
+        assert tb_pub.json()["data"]["item_url"].startswith("https://www.goofish.com/item?id=")
 
         # 取消接口支持无 body 和带 session_id
         assert client.post("/api/channels/xianyu/login/cancel").status_code == 200
@@ -891,4 +943,630 @@ def test_xianyu_qr_worker_keep_login_atomic_replace_and_sanitized_errors(tmp_pat
         assert sy.ok is False
         assert "open_browser_for_manual_use" not in sy.message
         assert "扫码绑定" in sy.message
+
+
+def test_manual_publish_downshelf_reconcile_and_multiuser_isolation(tmp_path):
+    cfg_dir = tmp_path / "data" / "channel_profiles"
+    xianyu_adapter = _FakeChannelAdapter(
+        cfg_dir, channel_code="xianyu", channel_name="闲鱼", auto_publish=True, auto_downshelf=True
+    )
+    xianyu_adapter.online_state = True
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[xianyu_adapter])
+
+    repo.create_user("user_a", hash_password("123456"))
+    repo.create_user("user_b", hash_password("123456"))
+
+    db.cols["products"].docs.extend([
+        {
+            "platform": "jd",
+            "product_id": "jd_shared_1",
+            "name": "共享爆款纸巾整箱",
+            "price": 39.9,
+            "activity_price": 24.9,
+            "is_off_promotion": False,
+        },
+        {
+            "platform": "pdd",
+            "product_id": "pdd_new_2",
+            "name": "德芙黑巧克力大碗装",
+            "price": 45.0,
+            "activity_price": 29.9,
+            "is_off_promotion": False,
+        },
+        {
+            "platform": "taobao",
+            "product_id": "tb_dead_3",
+            "name": "已失效商品不应上架",
+            "price": 19.9,
+            "is_off_promotion": True,
+        },
+    ])
+
+    # A 和 B 同时挑选同一件商品 (jd, jd_shared_1)，验证多用户完全隔离
+    db.cols["xy_listings"].docs.extend([
+        {
+            "listing_id": "xyl_a1",
+            "owner": "user_a",
+            "platform": "jd",
+            "product_id": "jd_shared_1",
+            "status": "ready",
+            "title": "共享爆款纸巾整箱 帮拍",
+            "description": "官旗直发",
+            "images": [{"url": "https://img.jd.com/1.jpg", "origin": "official"}],
+            "price": 24.9,
+        },
+        {
+            "listing_id": "xyl_a2",
+            "owner": "user_a",
+            "platform": "pdd",
+            "product_id": "pdd_new_2",
+            "status": "ready",
+            "title": "德芙黑巧大碗装 帮拍",
+            "description": "支持帮拍",
+            "images": [{"url": "https://img.pdd.com/2.jpg", "origin": "official"}],
+            "price": 29.9,
+        },
+        {
+            "listing_id": "xyl_a3_dead",
+            "owner": "user_a",
+            "platform": "taobao",
+            "product_id": "tb_dead_3",
+            "status": "ready",
+            "title": "失效商品",
+            "description": "已失效",
+            "images": [{"url": "https://img.tb.com/3.jpg", "origin": "official"}],
+            "price": 19.9,
+        },
+        {
+            "listing_id": "xyl_b1",
+            "owner": "user_b",
+            "platform": "jd",
+            "product_id": "jd_shared_1",
+            "status": "ready",
+            "title": "B用户的纸巾选品",
+            "description": "B专用描述",
+            "images": [{"url": "https://img.jd.com/1.jpg", "origin": "official"}],
+            "price": 25.5,
+        },
+    ])
+
+    # 闲鱼上当前有 1 件多余旧商品
+    xianyu_adapter.online_items = [
+        {
+            "item_id": "xy_extra_99",
+            "title": "早年多余的杂物商品",
+            "price": "12.0",
+            "want_info": "",
+            "pic_url": "https://img.goofish.com/extra.jpg",
+            "item_url": "https://www.goofish.com/item?id=xy_extra_99",
+            "is_online": True,
+        }
+    ]
+
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "user_a", "password": "123456"})
+
+        # 1. 手动上架 xyl_a1：记录 item_id 与可跳转 item_url，禁止重复上架，禁止上架失效商品
+        pub = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_a1"})
+        assert pub.status_code == 200
+        pub_data = pub.json()["data"]
+        assert pub_data["published"] is True
+        a1_ext_id = pub_data["item_id"]
+        assert pub_data["item_url"] == f"https://www.goofish.com/item?id={a1_ext_id}"
+        assert pub_data["selling"]["publications"]["xyl_a1"]["status"] == "online"
+
+        assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_a1"}).status_code == 409
+        assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_a3_dead"}).status_code == 400
+
+        # 2. 同步选品库预览：应包含 to_publish=[xyl_a2]、to_downshelf=[xy_extra_99]、already_synced=[xyl_a1]、skipped=[xyl_a3_dead]
+        prev = client.post("/api/channels/xianyu/reconcile/preview").json()["data"]
+        assert [x["listing_id"] for x in prev["to_publish"]] == ["xyl_a2"]
+        assert [x["item_id"] for x in prev["to_downshelf"]] == ["xy_extra_99"]
+        assert [x["listing_id"] for x in prev["already_synced"]] == ["xyl_a1"]
+        assert [x["listing_id"] for x in prev["skipped_off_promotion"]] == ["xyl_a3_dead"]
+
+        # 3. 执行同步选品库：自动下架 xy_extra_99，自动上架 xyl_a2，且重复传 xyl_a1 幂等跳过
+        applied = client.post(
+            "/api/channels/xianyu/reconcile/apply",
+            json={"publish_listing_ids": ["xyl_a2", "xyl_a1"], "downshelf_item_ids": ["xy_extra_99"]},
+        ).json()["data"]
+        assert len(applied["downshelved"]) == 1 and applied["downshelved"][0]["item_id"] == "xy_extra_99"
+        assert len(applied["published"]) == 1 and applied["published"][0]["listing_id"] == "xyl_a2"
+        assert applied["published"][0]["item_url"].startswith("https://www.goofish.com/item?id=")
+        assert applied["failed"] == []
+
+        # 4. 手动下架刚上架的 xyl_a1，清除在线态
+        dw = client.post("/api/channels/xianyu/downshelf", json={"external_item_id": a1_ext_id})
+        assert dw.status_code == 200
+        dw_selling = dw.json()["data"]["selling"]
+        assert all(x["item_id"] != a1_ext_id for x in dw_selling["online_items"])
+        assert dw_selling["publications"]["xyl_a1"]["status"] == "downshelf"
+
+        # 5. 切到 user_b 登录，验证 B 账号选品与渠道快照完全不受 user_a 影响
+        client.post("/api/auth/login", json={"username": "user_b", "password": "123456"})
+        b_items = client.get("/api/items?status=ready").json()["data"]["items"]
+        assert [x["listing_id"] for x in b_items] == ["xyl_b1"]
+        b_selling = client.get("/api/channels/xianyu/selling").json()["data"]
+        assert b_selling["publications"] == {}
+        assert b_selling["online_items"] == []
+
+
+def test_xianyu_adapter_local_image_resolution_and_profile_lock_scope(tmp_path):
+    from xianyu_workbench.channels.xianyu import XianyuChannelAdapter
+
+    upload_dir = tmp_path / "uploads"
+    deal_dir = tmp_path / "deal_images"
+    upload_dir.mkdir()
+    deal_dir.mkdir()
+
+    upl_file = upload_dir / "upl_0123456789abcdef.jpg"
+    upl_file.write_bytes(b"\xff\xd8\xff\xd9")
+    deal_file = deal_dir / "dsi_0123456789abcdef0123.jpg"
+    deal_file.write_bytes(b"\xff\xd8\xff\xd9")
+
+    adapter = XianyuChannelAdapter(tmp_path / "profiles", upload_dir=upload_dir, deal_image_dir=deal_dir)
+    assert adapter.capabilities.auto_publish is True
+    assert adapter.capabilities.auto_downshelf is True
+
+    resolved = adapter._resolve_publish_images([
+        {"url": "https://img.jd.com/remote.jpg", "origin": "official"},
+        {"url": "/api/assets/uploads/upl_0123456789abcdef.jpg", "origin": "upload"},
+        {"url": "/api/deals/image/dsi_0123456789abcdef0123", "origin": "deal"},
+    ])
+    assert resolved[0] == "https://img.jd.com/remote.jpg"
+    assert Path(resolved[1]) == upl_file.resolve()
+    assert Path(resolved[2]) == deal_file.resolve()
+
+    try:
+        adapter._resolve_publish_images([{"url": "/api/assets/uploads/../../secret.jpg"}])
+        raise AssertionError("非法路径应被拦截")
+    except ValueError:
+        pass
+
+    pub_calls = []
+    dw_calls = []
+    with patch(
+        "xianyu_workbench.channels.xianyu.publish_item",
+        side_effect=lambda **kw: pub_calls.append(kw) or {"ok": True, "item_id": "xy_88", "item_url": "https://www.goofish.com/item?id=xy_88", "title": "t", "price": "9.90"},
+    ), patch(
+        "xianyu_workbench.channels.xianyu.downshelf_item",
+        side_effect=lambda **kw: dw_calls.append(kw) or {"ok": True, "item_id": kw["item_id"]},
+    ):
+        p_res = adapter.publish_item("user_1", {"title": "测试", "description": "描述", "price": 9.9, "images": [{"url": "https://img.jd.com/a.jpg"}]})
+        assert p_res["ok"] is True and pub_calls[0]["lock_scope"] == "profile"
+        d_res = adapter.downshelf_item("user_1", "xy_88")
+        assert d_res["ok"] is True and dw_calls[0]["lock_scope"] == "profile"
+
+
+def test_dismiss_is_user_isolated_and_original_urls_returned(tmp_path):
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[adapter])
+
+    repo.create_user("user_a", hash_password("123456"), bound_shop_uid="uid_shared")
+    repo.create_user("user_b", hash_password("123456"), bound_shop_uid="uid_shared")
+
+    db.cols["products"].docs.extend([
+        {
+            "platform": "jd",
+            "product_id": "jd_hash_1",
+            "name": "京东测试好价",
+            "price": 59.0,
+            "activity_price": 29.0,
+            "product_url": "https://jingfen.jd.com/detail/ABC123.html",
+            "image_url": "https://img14.360buyimg.com/test1.jpg",
+            "deal_info": {
+                "is_deal_tip": True,
+                "deal_price": 29.0,
+                "source_url": "https://guangdiu.com/detail.php?id=9001",
+            },
+        },
+        {
+            "platform": "pdd",
+            "product_id": "729779165834",
+            "goods_sign": "E9L2SrLxSignTest",
+            "name": "拼多多兜底链接测试",
+            "price": 49.0,
+            "activity_price": 35.0,
+            "image_url": "https://img.pddpic.com/test2.jpg",
+        },
+        {
+            "platform": "taobao",
+            "product_id": "26yKM4vTestId",
+            "goods_sign": "eQ2Sign-26yKM4vTestId",
+            "name": "淘宝兜底链接测试",
+            "price": 39.0,
+            "activity_price": 19.0,
+            "image_url": "https://img.alicdn.com/test3.jpg",
+        },
+    ])
+    db.cols["favorites"].docs.extend([
+        {"uid": "uid_shared", "platform": "pdd", "product_id": "729779165834", "collected_price": 35.0, "snapshot": {"name": "拼多多兜底链接测试", "goods_sign": "E9L2SrLxSignTest"}},
+        {"uid": "uid_shared", "platform": "taobao", "product_id": "26yKM4vTestId", "collected_price": 19.0, "snapshot": {"name": "淘宝兜底链接测试"}},
+    ])
+    db.cols["xianyu_deal_evaluations"].docs.extend([
+        {
+            "platform": "jd",
+            "product_id": "jd_hash_1",
+            "is_my_product_better": True,
+            "final_winner": "my_product",
+            "cost_performance_ratio": 1.6,
+            "activity_price": 29.0,
+            "best_xianyu_product": {
+                "item_id": "1072780724261",
+                "title": "闲鱼同款比价帖",
+                "comparable_price": 45.0,
+            },
+        },
+    ])
+
+    with TestClient(app) as client:
+        # 1. A 登录后分别查看比价好货和收藏夹中仅保留的两个链接：本店商品编码(main_item_code) + 闲鱼参考帖(item_url)
+        me = client.post("/api/auth/login", json={"username": "user_a", "password": "123456"}).json()["data"]
+        assert me["user"]["username"] == "user_a"
+        me_info = client.get("/api/auth/me").json()["data"]
+        assert int(me_info["main_site_port"]) > 0
+
+        ev_items = client.get("/api/candidates/evaluations").json()["data"]["items"]
+        assert len(ev_items) == 1
+        assert ev_items[0]["main_item_code"].startswith("p1_")
+        assert "product_url" not in ev_items[0] and "deal_source_url" not in ev_items[0]
+        assert ev_items[0]["xianyu_ref"]["item_url"] == "https://www.goofish.com/item?id=1072780724261"
+
+        fav_items = client.get("/api/candidates/favorites").json()["data"]["items"]
+        by_plat = {x["platform"]: x for x in fav_items}
+        assert by_plat["pdd"]["main_item_code"].startswith("p1_")
+        assert by_plat["taobao"]["main_item_code"].startswith("p1_")
+
+        from public_boundary import decode_item_code
+        assert decode_item_code(ev_items[0]["main_item_code"]) == ("jd", "jd_hash_1")
+        assert decode_item_code(by_plat["pdd"]["main_item_code"]) == ("pdd", "729779165834")
+
+        # 2. A 将京东好价选入草稿并上架；将拼多多商品点「不要」
+        draft = client.post(
+            "/api/items/draft",
+            json={"platform": "jd", "product_id": "jd_hash_1", "source_origin": "xianyu_eval"},
+        ).json()["data"]
+        assert draft["main_item_code"] == ev_items[0]["main_item_code"]
+        assert draft["xianyu_ref_url"] == "https://www.goofish.com/item?id=1072780724261"
+
+        # A 的列表与在售视图同样透出本店商品编码
+        items_res = client.get("/api/items").json()["data"]["items"]
+        assert items_res[0]["main_item_code"] == ev_items[0]["main_item_code"]
+        assert items_res[0]["xianyu_ref_url"] == "https://www.goofish.com/item?id=1072780724261"
+        client.patch(
+            f"/api/items/{draft['listing_id']}",
+            json={"status": "ready", "description": "好价帮拍测试"},
+        )
+        pub = client.post("/api/channels/xianyu/publish", json={"listing_id": draft["listing_id"]}).json()["data"]
+        assert pub["selling"]["online_items"][0]["linked_main_item_code"] == ev_items[0]["main_item_code"]
+
+        assert client.post(
+            "/api/candidates/dismiss",
+            json={"platform": "pdd", "product_id": "729779165834", "source_origin": "favorite"},
+        ).status_code == 200
+        assert client.post(
+            "/api/candidates/dismiss",
+            json={"platform": "jd", "product_id": "jd_hash_1", "source_origin": "xianyu_eval"},
+        ).status_code == 200
+
+        assert client.get("/api/candidates/evaluations").json()["data"]["items"] == []
+        assert [x["platform"] for x in client.get("/api/candidates/favorites").json()["data"]["items"]] == ["taobao"]
+
+        # 3. 切换到 B 登录（同主站收藏池）：B 仍能正常看到 A 点了「不要」的比价好货和收藏商品
+        assert client.post("/api/auth/login", json={"username": "user_b", "password": "123456"}).status_code == 200
+        b_eval = client.get("/api/candidates/evaluations").json()["data"]["items"]
+        assert len(b_eval) == 1 and b_eval[0]["product_id"] == "jd_hash_1"
+        b_fav = client.get("/api/candidates/favorites").json()["data"]["items"]
+        assert sorted(x["platform"] for x in b_fav) == ["pdd", "taobao"]
+
+
+def test_seller_publish_item_captures_bounded_failure_screenshot(tmp_path):
+    from contextlib import contextmanager
+    from xianyu_workbench.client import seller
+    from xianyu_workbench.client.session import XianyuOfflineError
+
+    img_file = tmp_path / "good.jpg"
+    img_file.write_bytes(b"\xff\xd8\xff\xd9")
+    fail_dir = tmp_path / "publish_failures"
+    fail_dir.mkdir()
+
+    # 预填 54 张旧截图，验证有界保留不超过 50 张
+    for idx in range(54):
+        old_p = fail_dir / f"pubfail_{1700000000 + idx:d}_{idx:08x}.jpg"
+        old_p.write_bytes(b"\xff\xd8\xff\xd9")
+
+    class _DummyLocator:
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def set_input_files(self, files):
+            return None
+
+        def click(self):
+            return None
+
+        def fill(self, text):
+            return None
+
+    class _DummyPage:
+        url = "https://www.goofish.com/publish"
+
+        def __init__(self, *, raise_on_fill=False):
+            self.raise_on_fill = raise_on_fill
+            self.screenshot_calls = 0
+
+        def on(self, evt, cb):
+            return None
+
+        def goto(self, url, **kw):
+            return None
+
+        def wait_for_timeout(self, ms):
+            return None
+
+        def locator(self, sel):
+            if self.raise_on_fill and "contenteditable" in sel:
+                class _BoomLoc(_DummyLocator):
+                    def fill(self, text):
+                        raise RuntimeError("富文本编辑器超时")
+                return _BoomLoc()
+            return _DummyLocator()
+
+        def evaluate(self, script):
+            return "标题含不支持词汇"
+
+        def screenshot(self, *, type="jpeg", quality=80):
+            self.screenshot_calls += 1
+            return b"\xff\xd8\xff\xe0MOCKJPEG\xff\xd9"
+
+    def _run_case(mode: str):
+        page = _DummyPage(raise_on_fill=(mode == "boom"))
+
+        @contextmanager
+        def _fake_guard(**kw):
+            yield object(), page, {"display_name": "测试账号", "user_id": "1001"}
+
+        def _fake_verify(*args, **kw):
+            if mode == "offline":
+                raise XianyuOfflineError("dummy", "弹窗登录失效", error_code="ACCOUNT_OFFLINE")
+            return "1001"
+
+        with patch.object(seller, "_browser_session_guard", _fake_guard), patch.object(
+            seller, "_verify_account_online", _fake_verify
+        ):
+            return page, seller.publish_item(
+                "测试商品标题",
+                "测试商品描述文案",
+                [str(img_file)],
+                19.9,
+                user_data_dir=str(tmp_path / "profile"),
+                failure_screenshot_dir=str(fail_dir),
+            )
+
+    page1, res_no_id = _run_case("no_id")
+    assert res_no_id["ok"] is False and res_no_id["error_code"] == "PUBLISH_FAILED"
+    assert page1.screenshot_calls == 1
+    assert res_no_id["screenshot_file"].startswith("pubfail_")
+    assert (fail_dir / res_no_id["screenshot_file"]).is_file()
+
+    page2, res_offline = _run_case("offline")
+    assert res_offline["ok"] is False and res_offline["is_offline"] is True
+    assert page2.screenshot_calls == 1
+    assert (fail_dir / res_offline["screenshot_file"]).is_file()
+
+    page3, res_boom = _run_case("boom")
+    assert res_boom["ok"] is False and res_boom["error_code"] == "PUBLISH_ERROR"
+    assert page3.screenshot_calls == 1
+    assert (fail_dir / res_boom["screenshot_file"]).is_file()
+
+    kept = list(fail_dir.glob("pubfail_*.jpg"))
+    assert len(kept) <= seller._MAX_PUBLISH_FAILURE_SCREENSHOTS
+
+
+def test_publish_failure_screenshot_api_persistence_and_clear(tmp_path):
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    should_fail = {"flag": True}
+    shot_name = "pubfail_1700000123_deadbeef.jpg"
+
+    def _custom_publish(username, item_payload):
+        if should_fail["flag"]:
+            return {
+                "ok": False,
+                "is_offline": False,
+                "error_code": "PUBLISH_FAILED",
+                "message": "闲鱼页面拦截：缺少必填属性",
+                "failure_screenshot_url": f"/api/assets/publish-failures/{shot_name}",
+            }
+        return {
+            "ok": True,
+            "is_offline": False,
+            "item_id": "xy_ok_888",
+            "item_url": "https://www.goofish.com/item?id=xy_ok_888",
+            "title": item_payload["title"],
+            "price": "15.00",
+            "account_id": "4229872747",
+            "nickname": "清和愿ovo",
+        }
+
+    adapter.publish_item = _custom_publish
+    db, cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[adapter])
+    (cfg.publish_fail_dir / shot_name).write_bytes(b"\xff\xd8\xff\xe0FAILSHOT\xff\xd9")
+
+    db.cols["products"].docs.append({
+        "platform": "pdd",
+        "product_id": "p_fail_1",
+        "name": "失败演示商品",
+        "price": 19.9,
+        "activity_price": 19.9,
+        "is_off_promotion": False,
+    })
+    repo.create_user("user_fail", hash_password("123456"))
+    db.cols["xy_listings"].docs.append({
+        "listing_id": "xyl_fail_1",
+        "owner": "user_fail",
+        "platform": "pdd",
+        "product_id": "p_fail_1",
+        "product_name": "失败演示商品",
+        "title": "失败演示商品",
+        "description": "文案完整",
+        "price": 15.0,
+        "images": [{"url": "https://img.pddpic.com/1.jpg", "origin": "official"}],
+        "status": "ready",
+    })
+    repo.upsert_channel_account("user_fail", "xianyu", {
+        "bound": True,
+        "online": True,
+        "account_id": "4229872747",
+        "nickname": "清和愿ovo",
+    })
+
+    with TestClient(app) as client:
+        # 未登录禁止读取失败截图
+        assert client.get(f"/api/assets/publish-failures/{shot_name}").status_code == 401
+        assert client.post("/api/auth/login", json={"username": "user_fail", "password": "123456"}).status_code == 200
+
+        # 非法路径穿越拦截
+        assert client.get("/api/assets/publish-failures/..%2Fsecret.jpg").status_code == 404
+
+        # 1. 单品手动上架失败：自动写入该商品本身的 publish_failure 并开放鉴权读图
+        pub_fail = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"})
+        assert pub_fail.status_code == 400
+        item_detail = client.get("/api/items/xyl_fail_1").json()["data"]
+        fail_info = item_detail["publish_failure"]
+        assert fail_info is not None
+        assert fail_info["channel"] == "xianyu"
+        assert fail_info["screenshot_url"] == f"/api/assets/publish-failures/{shot_name}"
+        assert "缺少必填属性" in fail_info["message"]
+
+        # 选品库列表也能直接看到该商品自身的失败记录
+        listed_item = client.get("/api/items").json()["data"]["items"][0]
+        assert listed_item["publish_failure"]["screenshot_url"] == fail_info["screenshot_url"]
+
+        img_resp = client.get(fail_info["screenshot_url"])
+        assert img_resp.status_code == 200
+        assert img_resp.headers["content-type"].startswith("image/jpeg")
+
+        # 2. 对账批量执行失败也附带 screenshot_url，且同样沉淀到对应商品记录
+        reconcile_fail = client.post(
+            "/api/channels/xianyu/reconcile/apply",
+            json={"publish_listing_ids": ["xyl_fail_1"], "downshelf_item_ids": []},
+        ).json()["data"]
+        assert len(reconcile_fail["failed"]) == 1
+        assert reconcile_fail["failed"][0]["screenshot_url"] == fail_info["screenshot_url"]
+
+        # 3. 显式清除该商品的失败记录
+        cleared = client.post("/api/items/xyl_fail_1/failure/clear").json()["data"]
+        assert cleared["publish_failure"] is None
+
+        # 4. 再次失败后成功重试上架 -> 自动清空该商品自身的 publish_failure
+        assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"}).status_code == 400
+        assert client.get("/api/items/xyl_fail_1").json()["data"]["publish_failure"] is not None
+        should_fail["flag"] = False
+        pub_ok = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"}).json()["data"]
+        assert pub_ok["published"] is True
+        assert client.get("/api/items/xyl_fail_1").json()["data"]["publish_failure"] is None
+
+
+def test_eval_source_type_filter_and_want_cnt_sort(tmp_path):
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path)
+    repo.create_user("picker", hash_password("123456"))
+
+    db.cols["products"].docs.extend([
+        {"platform": "jd", "product_id": "p_deal_hot", "name": "线报高热度款", "price": 50.0, "activity_price": 29.0, "is_off_promotion": False},
+        {"platform": "pdd", "product_id": "p_off_hot", "name": "官方最高想要款", "price": 60.0, "activity_price": 39.0, "is_off_promotion": False},
+        {"platform": "taobao", "product_id": "p_deal_ratio", "name": "线报高性价比款", "price": 80.0, "activity_price": 19.0, "is_off_promotion": False},
+        {"platform": "jd", "product_id": "p_off_none", "name": "官方无热度款", "price": 40.0, "activity_price": 25.0, "is_off_promotion": False},
+    ])
+    db.cols["xianyu_deal_evaluations"].docs.extend([
+        {
+            "platform": "jd",
+            "product_id": "p_deal_hot",
+            "source_type": "deal_tip",
+            "is_my_product_better": True,
+            "final_winner": "my_product",
+            "cost_performance_ratio": 1.2,
+            "activity_price": 29.0,
+            "best_xianyu_product": {"item_id": "xy_1", "want_cnt": 520, "comparable_price": 40.0},
+        },
+        {
+            "platform": "pdd",
+            "product_id": "p_off_hot",
+            "source_type": "official",
+            "is_my_product_better": True,
+            "final_winner": "my_product",
+            "cost_performance_ratio": 1.4,
+            "activity_price": 39.0,
+            "best_xianyu_product": {"item_id": "xy_2", "want_cnt": 1800, "comparable_price": 58.0},
+        },
+        {
+            "platform": "taobao",
+            "product_id": "p_deal_ratio",
+            "source_type": "deal_tip",
+            "is_my_product_better": True,
+            "final_winner": "my_product",
+            "cost_performance_ratio": 3.8,
+            "activity_price": 19.0,
+            "best_xianyu_product": {"item_id": "xy_3", "want_cnt": 45, "comparable_price": 45.0},
+        },
+        {
+            "platform": "jd",
+            "product_id": "p_off_none",
+            "source_type": "official",
+            "is_my_product_better": True,
+            "final_winner": "my_product",
+            "cost_performance_ratio": 2.5,
+            "activity_price": 25.0,
+            "best_xianyu_product": {"item_id": "xy_4", "want_cnt": None, "comparable_price": 42.0},
+        },
+    ])
+
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"username": "picker", "password": "123456"}).status_code == 200
+
+        # 1. 默认排序 = 按闲鱼想要人数降序 (want_cnt=None 排在最后)
+        res_all = client.get("/api/candidates/evaluations").json()["data"]
+        assert res_all["total"] == 4
+        assert [x["product_id"] for x in res_all["items"]] == [
+            "p_off_hot",
+            "p_deal_hot",
+            "p_deal_ratio",
+            "p_off_none",
+        ]
+
+        # 2. 按来源筛选 = 仅看线报 (deal_tip)，仍按想要人数降序
+        res_deal = client.get("/api/candidates/evaluations?source_type=deal_tip").json()["data"]
+        assert res_deal["total"] == 2
+        assert [x["product_id"] for x in res_deal["items"]] == ["p_deal_hot", "p_deal_ratio"]
+        assert all(x["source_type"] == "deal_tip" for x in res_deal["items"])
+
+        # 3. 线报 + 切换按性价比降序 (ratio)
+        res_deal_ratio = client.get("/api/candidates/evaluations?source_type=deal_tip&sort_by=ratio").json()["data"]
+        assert [x["product_id"] for x in res_deal_ratio["items"]] == ["p_deal_ratio", "p_deal_hot"]
+
+        # 4. 按来源筛选 = 仅看官方 (official)
+        res_off = client.get("/api/candidates/evaluations?source_type=official").json()["data"]
+        assert res_off["total"] == 2
+        assert [x["product_id"] for x in res_off["items"]] == ["p_off_hot", "p_off_none"]
+        assert all(x["source_type"] == "official" for x in res_off["items"])
+
+        # 5. 非法筛选参数拦截 (422)
+        assert client.get("/api/candidates/evaluations?source_type=unknown").status_code == 422
+        assert client.get("/api/candidates/evaluations?sort_by=invalid").status_code == 422
+
+
 

@@ -21,11 +21,20 @@ def clean_id(value: Any) -> str:
     return "" if text in ("", "0", "0.0", "None") else text
 
 
+def clean_http_url(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("//"):
+        s = "https:" + s
+    return s if s.startswith(("http://", "https://")) else ""
+
+
 class WorkbenchRepository:
+    # 工作台自有 3 张核心表
     USERS_COL = "xy_users"
     LISTINGS_COL = "xy_listings"
-    CHANNEL_ACCOUNTS_COL = "xy_channel_accounts"
-    CHANNEL_SELLING_COL = "xy_channel_selling"
+    CHANNELS_COL = "xy_channels"
 
     FAVORITES_COL = "favorites"
     PRODUCTS_COL = "products"
@@ -46,12 +55,8 @@ class WorkbenchRepository:
         return self.db.get_collection(self.LISTINGS_COL)
 
     @property
-    def channel_accounts_col(self):
-        return self.db.get_collection(self.CHANNEL_ACCOUNTS_COL)
-
-    @property
-    def channel_selling_col(self):
-        return self.db.get_collection(self.CHANNEL_SELLING_COL)
+    def channels_col(self):
+        return self.db.get_collection(self.CHANNELS_COL)
 
     @property
     def favorites_col(self):
@@ -84,8 +89,7 @@ class WorkbenchRepository:
                 unique=True,
             )
             self.listings_col.create_index([("owner", 1), ("status", 1), ("updated_at", -1)])
-            self.channel_accounts_col.create_index([("owner", 1), ("channel", 1)], unique=True)
-            self.channel_selling_col.create_index([("owner", 1), ("channel", 1)], unique=True)
+            self.channels_col.create_index([("owner", 1), ("channel", 1)], unique=True)
             self._indexes_ready = True
             return True
         except Exception:
@@ -252,6 +256,36 @@ class WorkbenchRepository:
             return None
         return self.get_listing_by_id(flt["owner"], flt["listing_id"])
 
+    def record_listing_publish_failure(
+        self,
+        owner: str,
+        listing_id: str,
+        failure_info: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        return self.update_listing_by_id(
+            owner,
+            listing_id,
+            {
+                "publish_failure": dict(failure_info or {}),
+                "updated_at": now,
+            },
+        )
+
+    def clear_listing_publish_failure(
+        self,
+        owner: str,
+        listing_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        return self.update_listing_by_id(
+            owner,
+            listing_id,
+            {
+                "publish_failure": None,
+                "updated_at": datetime.now(timezone.utc),
+            },
+        )
+
     def list_listings(
         self,
         owner: str,
@@ -321,22 +355,22 @@ class WorkbenchRepository:
         return counts
 
     # =========================================================================
-    # 可插拔渠道账户与同步在售快照 (xy_channel_accounts / xy_channel_selling)
+    # 可插拔销售渠道统一文档 (xy_channels: 账号绑定 + 在售快照 + 发布追踪)
     # =========================================================================
-    def get_channel_account(self, owner: str, channel: str) -> Optional[Dict[str, Any]]:
+    def get_channel_doc(self, owner: str, channel: str) -> Optional[Dict[str, Any]]:
         self.ensure_indexes()
-        doc = self.channel_accounts_col.find_one(
+        doc = self.channels_col.find_one(
             {"owner": str(owner).strip(), "channel": str(channel).strip().lower()},
             {"_id": 0},
         )
         return dict(doc) if isinstance(doc, dict) else None
 
-    def list_channel_accounts(self, owner: str) -> List[Dict[str, Any]]:
+    def list_channel_docs(self, owner: str) -> List[Dict[str, Any]]:
         self.ensure_indexes()
-        cursor = self.channel_accounts_col.find({"owner": str(owner).strip()}, {"_id": 0})
+        cursor = self.channels_col.find({"owner": str(owner).strip()}, {"_id": 0})
         return [dict(d) for d in cursor if isinstance(d, dict)]
 
-    def upsert_channel_account(
+    def _upsert_channel(
         self,
         owner: str,
         channel: str,
@@ -345,27 +379,49 @@ class WorkbenchRepository:
         self.ensure_indexes()
         flt = {"owner": str(owner).strip(), "channel": str(channel).strip().lower()}
         now = datetime.now(timezone.utc)
-        self.channel_accounts_col.update_one(
+        full_set = {**set_fields, "updated_at": set_fields.get("updated_at") or now}
+        defaults = {
+            "owner": flt["owner"],
+            "channel": flt["channel"],
+            "bound": False,
+            "online": False,
+            "account_id": "",
+            "nickname": "",
+            "error_code": "",
+            "message": "",
+            "last_checked_at": None,
+            "online_items": [],
+            "abnormal_items": [],
+            "group_counts": {},
+            "manual_links": {},
+            "publications": {},
+            "synced_at": None,
+            "created_at": now,
+        }
+        set_on_insert = {k: v for k, v in defaults.items() if k not in full_set}
+        self.channels_col.update_one(
             flt,
-            {
-                "$set": set_fields,
-                "$setOnInsert": {
-                    "owner": flt["owner"],
-                    "channel": flt["channel"],
-                    "created_at": now,
-                },
-            },
+            {"$set": full_set, "$setOnInsert": set_on_insert},
             upsert=True,
         )
-        return self.get_channel_account(flt["owner"], flt["channel"]) or {}
+        return self.get_channel_doc(flt["owner"], flt["channel"]) or {}
+
+    def get_channel_account(self, owner: str, channel: str) -> Optional[Dict[str, Any]]:
+        return self.get_channel_doc(owner, channel)
+
+    def list_channel_accounts(self, owner: str) -> List[Dict[str, Any]]:
+        return self.list_channel_docs(owner)
+
+    def upsert_channel_account(
+        self,
+        owner: str,
+        channel: str,
+        set_fields: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return self._upsert_channel(owner, channel, set_fields)
 
     def get_channel_selling(self, owner: str, channel: str) -> Optional[Dict[str, Any]]:
-        self.ensure_indexes()
-        doc = self.channel_selling_col.find_one(
-            {"owner": str(owner).strip(), "channel": str(channel).strip().lower()},
-            {"_id": 0},
-        )
-        return dict(doc) if isinstance(doc, dict) else None
+        return self.get_channel_doc(owner, channel)
 
     def upsert_channel_selling(
         self,
@@ -377,27 +433,34 @@ class WorkbenchRepository:
         group_counts: Dict[str, int],
         synced_at: datetime,
     ) -> Dict[str, Any]:
-        self.ensure_indexes()
-        flt = {"owner": str(owner).strip(), "channel": str(channel).strip().lower()}
-        self.channel_selling_col.update_one(
-            flt,
+        clean_owner = str(owner).strip()
+        clean_ch = str(channel).strip().lower()
+        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
+        online_id_set = {
+            str(x.get("item_id") or "").strip() for x in online_items if isinstance(x, dict)
+        }
+        publications = dict(existing.get("publications") or {})
+        now_iso = synced_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        for lid, pub in list(publications.items()):
+            if isinstance(pub, dict) and pub.get("status") == "online":
+                if str(pub.get("external_item_id") or "").strip() not in online_id_set:
+                    updated_pub = dict(pub)
+                    updated_pub["status"] = "downshelf"
+                    updated_pub["downshelved_at"] = now_iso
+                    publications[lid] = updated_pub
+
+        return self._upsert_channel(
+            clean_owner,
+            clean_ch,
             {
-                "$set": {
-                    "online_items": list(online_items),
-                    "abnormal_items": list(abnormal_items),
-                    "group_counts": dict(group_counts),
-                    "synced_at": synced_at,
-                    "updated_at": datetime.now(timezone.utc),
-                },
-                "$setOnInsert": {
-                    "owner": flt["owner"],
-                    "channel": flt["channel"],
-                    "manual_links": {},
-                },
+                "online_items": list(online_items),
+                "abnormal_items": list(abnormal_items),
+                "group_counts": dict(group_counts),
+                "publications": publications,
+                "synced_at": synced_at,
+                "updated_at": datetime.now(timezone.utc),
             },
-            upsert=True,
         )
-        return self.get_channel_selling(flt["owner"], flt["channel"]) or {}
 
     def update_channel_manual_link(
         self,
@@ -406,9 +469,9 @@ class WorkbenchRepository:
         external_item_id: str,
         listing_id: str,
     ) -> Dict[str, Any]:
-        self.ensure_indexes()
-        flt = {"owner": str(owner).strip(), "channel": str(channel).strip().lower()}
-        existing = self.get_channel_selling(flt["owner"], flt["channel"]) or {}
+        clean_owner = str(owner).strip()
+        clean_ch = str(channel).strip().lower()
+        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
         links = dict(existing.get("manual_links") or {})
         ext_id = str(external_item_id or "").strip()
         clean_lid = str(listing_id or "").strip()
@@ -416,23 +479,113 @@ class WorkbenchRepository:
             links[ext_id] = clean_lid
         else:
             links.pop(ext_id, None)
+        return self._upsert_channel(clean_owner, clean_ch, {"manual_links": links})
+
+    def record_channel_publication(
+        self,
+        owner: str,
+        channel: str,
+        *,
+        listing_id: str,
+        external_item_id: str,
+        item_url: str,
+        title: str,
+        price: Any,
+        pic_url: str = "",
+    ) -> Dict[str, Any]:
+        clean_owner = str(owner).strip()
+        clean_ch = str(channel).strip().lower()
+        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
+        links = dict(existing.get("manual_links") or {})
+        publications = dict(existing.get("publications") or {})
+        online_items = [
+            dict(x)
+            for x in (existing.get("online_items") or [])
+            if isinstance(x, dict) and str(x.get("item_id") or "").strip() != external_item_id
+        ]
+
         now = datetime.now(timezone.utc)
-        self.channel_selling_col.update_one(
-            flt,
+        now_iso = now.isoformat().replace("+00:00", "Z")
+        links[external_item_id] = listing_id
+        publications[listing_id] = {
+            "listing_id": listing_id,
+            "external_item_id": external_item_id,
+            "item_url": item_url,
+            "title": title,
+            "price": str(price),
+            "status": "online",
+            "published_at": now_iso,
+        }
+        online_items.insert(
+            0,
             {
-                "$set": {"manual_links": links, "updated_at": now},
-                "$setOnInsert": {
-                    "owner": flt["owner"],
-                    "channel": flt["channel"],
-                    "online_items": [],
-                    "abnormal_items": [],
-                    "group_counts": {},
-                    "synced_at": None,
-                },
+                "item_id": external_item_id,
+                "title": title,
+                "price": str(price),
+                "post_info": "",
+                "item_status": 0,
+                "is_online": True,
+                "status_label": "在售(正常)",
+                "want_info": "",
+                "pic_url": pic_url,
+                "item_url": item_url,
             },
-            upsert=True,
         )
-        return self.get_channel_selling(flt["owner"], flt["channel"]) or {}
+        return self._upsert_channel(
+            clean_owner,
+            clean_ch,
+            {
+                "manual_links": links,
+                "publications": publications,
+                "online_items": online_items,
+                "updated_at": now,
+            },
+        )
+
+    def mark_channel_downshelf(
+        self,
+        owner: str,
+        channel: str,
+        external_item_id: str,
+    ) -> Dict[str, Any]:
+        clean_owner = str(owner).strip()
+        clean_ch = str(channel).strip().lower()
+        ext_id = str(external_item_id or "").strip()
+        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
+        links = dict(existing.get("manual_links") or {})
+        links.pop(ext_id, None)
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat().replace("+00:00", "Z")
+        publications = dict(existing.get("publications") or {})
+        for lid, pub in list(publications.items()):
+            if isinstance(pub, dict) and str(pub.get("external_item_id") or "").strip() == ext_id:
+                updated_pub = dict(pub)
+                updated_pub["status"] = "downshelf"
+                updated_pub["downshelved_at"] = now_iso
+                publications[lid] = updated_pub
+
+        online_items = [
+            dict(x)
+            for x in (existing.get("online_items") or [])
+            if isinstance(x, dict) and str(x.get("item_id") or "").strip() != ext_id
+        ]
+        abnormal_items = [
+            dict(x)
+            for x in (existing.get("abnormal_items") or [])
+            if isinstance(x, dict) and str(x.get("item_id") or "").strip() != ext_id
+        ]
+        return self._upsert_channel(
+            clean_owner,
+            clean_ch,
+            {
+                "manual_links": links,
+                "publications": publications,
+                "online_items": online_items,
+                "abnormal_items": abnormal_items,
+                "updated_at": now,
+            },
+        )
 
     # =========================================================================
     # 上游只读数据源 (favorites / products / xianyu_deal_evaluations / xianyu_items)
@@ -514,6 +667,45 @@ class WorkbenchRepository:
         )
         docs = [dict(d) for d in cursor if isinstance(d, dict)]
         return docs[0] if docs else None
+
+    def batch_get_best_evaluations(
+        self, keys: Sequence[Tuple[str, str]]
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        by_plat: Dict[str, List[str]] = {}
+        for plat, pid in keys:
+            np = normalize_platform(plat)
+            cp = clean_id(pid)
+            if np and cp:
+                by_plat.setdefault(np, []).append(cp)
+        if not by_plat:
+            return {}
+        or_clauses = [
+            {"platform": plat, "product_id": {"$in": list(dict.fromkeys(pids))}}
+            for plat, pids in by_plat.items()
+        ]
+        query = or_clauses[0] if len(or_clauses) == 1 else {"$or": or_clauses}
+        cursor = (
+            self.evals_col.find(
+                query,
+                {
+                    "_id": 0,
+                    "platform": 1,
+                    "product_id": 1,
+                    "is_my_product_better": 1,
+                    "cost_performance_ratio": 1,
+                    "evaluated_at": 1,
+                    "best_xianyu_product": 1,
+                    "candidate_product": 1,
+                },
+            )
+            .sort([("is_my_product_better", -1), ("cost_performance_ratio", -1), ("evaluated_at", -1)])
+        )
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for doc in cursor:
+            if isinstance(doc, dict):
+                k = (normalize_platform(doc.get("platform")), clean_id(doc.get("product_id")))
+                out.setdefault(k, dict(doc))
+        return out
 
     def batch_get_xianyu_items(self, item_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         clean_ids = list(dict.fromkeys(str(i or "").strip() for i in item_ids if str(i or "").strip()))

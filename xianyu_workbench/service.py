@@ -19,9 +19,9 @@ from fastapi import HTTPException
 from PIL import Image, ImageOps
 
 from .auth import create_token, verify_password
-from .bridge import generate_ai_copy, parse_ai_json
+from .bridge import encode_main_site_item_code, generate_ai_copy, parse_ai_json
 from .config import WORKBENCH_DIR, WorkbenchConfig, load_config
-from .repo import WorkbenchRepository, clean_id, normalize_platform
+from .repo import WorkbenchRepository, clean_http_url, clean_id, normalize_platform
 
 Image.MAX_IMAGE_PIXELS = 25_000_000
 
@@ -172,6 +172,8 @@ class WorkbenchService:
             "username": user["username"],
             "bound_shop_uid": str(user.get("bound_shop_uid") or "").strip(),
             "item_counts": self.repo.get_item_counts(user["username"]),
+            "main_site_port": int(getattr(self.config, "main_site_port", 8001) or 8001),
+            "main_site_base_url": str(getattr(self.config, "main_site_base_url", "") or "").strip(),
         }
 
     def update_binding(self, username: str, *, shop_uid: str = "", shop_phone: str = "") -> Dict[str, Any]:
@@ -246,11 +248,14 @@ class WorkbenchService:
             official_imgs, deal_imgs = _collect_product_media(prod, fallback_image=str(snap.get("image_url") or ""))
             name = str((prod or {}).get("name") or snap.get("name") or "未命名商品").strip()
             ref_price = live_price if live_price is not None else collected_price
+            gsign = str((prod or {}).get("goods_sign") or snap.get("goods_sign") or "").strip()
+            main_item_code = encode_main_site_item_code(plat, pid, gsign)
 
             filtered.append({
                 "source_origin": "favorite",
                 "platform": plat,
                 "product_id": pid,
+                "main_item_code": main_item_code,
                 "name": name,
                 "image_url": official_imgs[0] if official_imgs else "",
                 "price": ref_price,
@@ -279,6 +284,8 @@ class WorkbenchService:
         self,
         owner: str,
         *,
+        source_type: str = "all",
+        sort_by: str = "want",
         include_all_winners: bool = False,
         include_off: bool = False,
         page: int = 1,
@@ -286,17 +293,30 @@ class WorkbenchService:
     ) -> Dict[str, Any]:
         safe_page = max(1, int(page or 1))
         safe_size = max(1, min(100, int(page_size or 20)))
+        clean_source = str(source_type or "all").strip().lower()
+        if clean_source not in ("all", "deal_tip", "official"):
+            clean_source = "all"
+        clean_sort = str(sort_by or "want").strip().lower()
+        if clean_sort not in ("want", "ratio"):
+            clean_sort = "want"
 
         query: Dict[str, Any] = {}
         if include_all_winners:
             query["final_winner"] = {"$in": ["my_product", "tie", "xianyu_product"]}
         else:
             query["is_my_product_better"] = True
+        if clean_source in ("deal_tip", "official"):
+            query["source_type"] = clean_source
 
+        sort_spec = (
+            [("best_xianyu_product.want_cnt", -1), ("cost_performance_ratio", -1), ("evaluated_at", -1)]
+            if clean_sort == "want"
+            else [("cost_performance_ratio", -1), ("evaluated_at", -1)]
+        )
         raw_evals = self.repo.list_evaluations(
             query,
-            [("cost_performance_ratio", -1), ("evaluated_at", -1)],
-            limit=500,
+            sort_spec,
+            limit=2000,
         )
 
         dedup_evals: List[Dict[str, Any]] = []
@@ -366,10 +386,17 @@ class WorkbenchService:
                             fallback_xy_imgs.append(cu)
                         break
 
+            gsign = str((prod or {}).get("goods_sign") or cand.get("goods_sign") or "").strip()
+            main_item_code = encode_main_site_item_code(plat, pid, gsign)
+            xy_item_url = clean_http_url(bxy.get("item_url")) or (
+                f"https://www.goofish.com/item?id={xy_id}" if xy_id else ""
+            )
+
             filtered.append({
                 "source_origin": "xianyu_eval",
                 "platform": plat,
                 "product_id": pid,
+                "main_item_code": main_item_code,
                 "source_type": str(ev.get("source_type") or "official"),
                 "name": str((prod or {}).get("name") or ev.get("name") or "未命名商品").strip(),
                 "image_url": official_imgs[0] if official_imgs else "",
@@ -385,7 +412,7 @@ class WorkbenchService:
                 "evaluated_at": str(ev.get("evaluated_at") or ""),
                 "xianyu_ref": {
                     "item_id": xy_id,
-                    "item_url": str(bxy.get("item_url") or (f"https://www.goofish.com/item?id={xy_id}" if xy_id else "")),
+                    "item_url": xy_item_url,
                     "title": str(bxy.get("title") or "").strip(),
                     "comparable_price": _positive_float(bxy.get("comparable_price")),
                     "spec_description": str(bxy.get("spec_description") or "").strip(),
@@ -395,6 +422,31 @@ class WorkbenchService:
                 },
             })
 
+        def _sort_num(val: Any) -> float:
+            try:
+                return float(val) if val is not None else -1.0
+            except (TypeError, ValueError):
+                return -1.0
+
+        if clean_sort == "want":
+            filtered.sort(
+                key=lambda item: (
+                    _sort_num((item.get("xianyu_ref") or {}).get("want_cnt")),
+                    _sort_num(item.get("cost_performance_ratio")),
+                    str(item.get("evaluated_at") or ""),
+                ),
+                reverse=True,
+            )
+        else:
+            filtered.sort(
+                key=lambda item: (
+                    _sort_num(item.get("cost_performance_ratio")),
+                    _sort_num((item.get("xianyu_ref") or {}).get("want_cnt")),
+                    str(item.get("evaluated_at") or ""),
+                ),
+                reverse=True,
+            )
+
         total = len(filtered)
         start = (safe_page - 1) * safe_size
         return {
@@ -403,6 +455,8 @@ class WorkbenchService:
             "page": safe_page,
             "page_size": safe_size,
             "has_more": (start + safe_size) < total,
+            "source_type": clean_source,
+            "sort_by": clean_sort,
         }
 
     def dismiss_candidate(
@@ -458,9 +512,30 @@ class WorkbenchService:
         self,
         doc: Dict[str, Any],
         product_doc: Optional[Dict[str, Any]],
+        eval_doc: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         live_status, live_price, is_active_deal, di = _resolve_live_product_state(product_doc)
         official_imgs, deal_imgs = _collect_product_media(product_doc)
+        plat = normalize_platform(doc.get("platform"))
+        pid = clean_id(doc.get("product_id"))
+        cand = (
+            (eval_doc or {}).get("candidate_product")
+            if isinstance((eval_doc or {}).get("candidate_product"), dict)
+            else {}
+        )
+        gsign = str((product_doc or {}).get("goods_sign") or cand.get("goods_sign") or "").strip()
+        main_item_code = encode_main_site_item_code(plat, pid, gsign)
+        bxy = (
+            (eval_doc or {}).get("best_xianyu_product")
+            if isinstance((eval_doc or {}).get("best_xianyu_product"), dict)
+            else {}
+        )
+        xy_id = str(bxy.get("item_id") or "").strip()
+        xianyu_ref_url = clean_http_url(bxy.get("item_url")) or (
+            f"https://www.goofish.com/item?id={xy_id}" if xy_id else ""
+        )
+        raw_pf = doc.get("publish_failure")
+        publish_failure = dict(raw_pf) if isinstance(raw_pf, dict) and raw_pf else None
 
         # 向后兼容读取老文档的 sell_price / rejected
         raw_price = doc.get("price") if doc.get("price") is not None else doc.get("sell_price")
@@ -477,14 +552,17 @@ class WorkbenchService:
         return {
             "listing_id": str(doc.get("listing_id") or ""),
             "owner": str(doc.get("owner") or ""),
-            "platform": normalize_platform(doc.get("platform")),
-            "product_id": clean_id(doc.get("product_id")),
+            "platform": plat,
+            "product_id": pid,
+            "main_item_code": main_item_code,
             "source_origin": str(doc.get("source_origin") or "favorite"),
             "status": _normalize_status(doc.get("status")),
             "title": str(doc.get("title") or "").strip(),
             "description": str(doc.get("description") or "").strip(),
             "images": clean_images,
             "price": display_price,
+            "xianyu_ref_url": xianyu_ref_url,
+            "publish_failure": publish_failure,
             "live_status": live_status,
             "live_price": live_price,
             "off_promotion_alert": live_status == "off_promotion",
@@ -513,6 +591,7 @@ class WorkbenchService:
 
         now = datetime.now(timezone.utc)
         prod = self.repo.get_product_one(plat, pid)
+        ev = self.repo.find_best_evaluation_for_product(plat, pid)
         existing = self.repo.get_listing_by_product(owner, plat, pid)
         if existing is not None:
             if _normalize_status(existing.get("status")) == "dismissed":
@@ -521,12 +600,11 @@ class WorkbenchService:
                     existing["listing_id"],
                     {"status": "draft", "updated_at": now},
                 ) or existing
-            return self._hydrate_item(existing, prod)
+            return self._hydrate_item(existing, prod, ev)
 
         user = self.repo.get_user(owner) or {}
         bound_uid = str(user.get("bound_shop_uid") or "").strip()
         fav = self.repo.find_favorite_one(bound_uid, plat, pid) if bound_uid else None
-        ev = self.repo.find_best_evaluation_for_product(plat, pid)
         if prod is None and fav is None and ev is None:
             raise HTTPException(status_code=404, detail="未在商品库、收藏夹或比价记录中找到该商品")
 
@@ -586,14 +664,23 @@ class WorkbenchService:
         )
         if not created:
             raise HTTPException(status_code=500, detail="创建商品素材草稿失败")
-        return self._hydrate_item(created, prod)
+        return self._hydrate_item(created, prod, ev)
 
     def get_item_detail(self, owner: str, listing_id: str) -> Dict[str, Any]:
         doc = self.repo.get_listing_by_id(owner, listing_id)
         if not doc:
             raise HTTPException(status_code=404, detail="商品素材不存在或无权查看")
         prod = self.repo.get_product_one(doc["platform"], doc["product_id"])
-        return self._hydrate_item(doc, prod)
+        ev = self.repo.find_best_evaluation_for_product(doc["platform"], doc["product_id"])
+        return self._hydrate_item(doc, prod, ev)
+
+    def clear_item_failure(self, owner: str, listing_id: str) -> Dict[str, Any]:
+        updated = self.repo.clear_listing_publish_failure(owner, listing_id)
+        if not updated:
+            raise HTTPException(status_code=404, detail="商品素材不存在或无权操作")
+        prod = self.repo.get_product_one(updated["platform"], updated["product_id"])
+        ev = self.repo.find_best_evaluation_for_product(updated["platform"], updated["product_id"])
+        return self._hydrate_item(updated, prod, ev)
 
     def _sanitize_images(self, raw_images: Any) -> List[Dict[str, str]]:
         if not isinstance(raw_images, list):
@@ -670,7 +757,8 @@ class WorkbenchService:
         if not updated:
             raise HTTPException(status_code=404, detail="商品素材不存在")
         prod = self.repo.get_product_one(updated["platform"], updated["product_id"])
-        return self._hydrate_item(updated, prod)
+        ev = self.repo.find_best_evaluation_for_product(updated["platform"], updated["product_id"])
+        return self._hydrate_item(updated, prod, ev)
 
     def generate_copy(self, owner: str, listing_id: str) -> Dict[str, Any]:
         doc = self.repo.get_listing_by_id(owner, listing_id)
@@ -741,10 +829,12 @@ class WorkbenchService:
         rows, total = self.repo.list_listings(owner, status=eff, page=page, page_size=page_size)
         keys = [(r.get("platform"), r.get("product_id")) for r in rows]
         prod_map = self.repo.batch_get_products(keys)
+        eval_map = self.repo.batch_get_best_evaluations(keys)
         items = [
             self._hydrate_item(
                 r,
                 prod_map.get((normalize_platform(r.get("platform")), clean_id(r.get("product_id")))),
+                eval_map.get((normalize_platform(r.get("platform")), clean_id(r.get("product_id")))),
             )
             for r in rows
         ]
