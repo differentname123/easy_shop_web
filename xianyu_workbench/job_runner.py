@@ -347,8 +347,11 @@ class ChannelJobRunner:
             )
         except HTTPException as exc:
             fin = datetime.now(timezone.utc)
-            acct = self.repo.get_channel_account(task.owner, task.channel) or {}
-            err_code = str(acct.get("error_code") or ("ACCOUNT_OFFLINE" if exc.status_code == 409 else "SYNC_FAILED"))
+            if exc.status_code == 409:
+                acct = self.repo.get_channel_account(task.owner, task.channel) or {}
+                err_code = str(acct.get("error_code") or "ACCOUNT_OFFLINE")
+            else:
+                err_code = "SYNC_FAILED"
             self.repo.update_channel_job(
                 task.job_id,
                 {

@@ -509,17 +509,31 @@ class WorkbenchRepository:
         publications = dict(existing.get("publications") or {})
         fallback_pub_dict = False
         for lid, pub in list(publications.items()):
-            if isinstance(pub, dict) and pub.get("status") == "online":
-                if str(pub.get("external_item_id") or "").strip() not in online_id_set:
-                    if self._safe_mongo_key(lid):
-                        set_fields[f"publications.{lid}.status"] = "downshelf"
-                        set_fields[f"publications.{lid}.downshelved_at"] = now_iso
-                    else:
-                        updated_pub = dict(pub)
-                        updated_pub["status"] = "downshelf"
-                        updated_pub["downshelved_at"] = now_iso
-                        publications[lid] = updated_pub
-                        fallback_pub_dict = True
+            if not isinstance(pub, dict):
+                continue
+            ext_id = str(pub.get("external_item_id") or "").strip()
+            in_online = bool(ext_id and ext_id in online_id_set)
+            cur_st = pub.get("status")
+            if cur_st == "online" and not in_online:
+                if self._safe_mongo_key(lid):
+                    set_fields[f"publications.{lid}.status"] = "downshelf"
+                    set_fields[f"publications.{lid}.downshelved_at"] = now_iso
+                else:
+                    updated_pub = dict(pub)
+                    updated_pub["status"] = "downshelf"
+                    updated_pub["downshelved_at"] = now_iso
+                    publications[lid] = updated_pub
+                    fallback_pub_dict = True
+            elif cur_st == "downshelf" and in_online:
+                if self._safe_mongo_key(lid):
+                    set_fields[f"publications.{lid}.status"] = "online"
+                    set_fields[f"publications.{lid}.downshelved_at"] = ""
+                else:
+                    updated_pub = dict(pub)
+                    updated_pub["status"] = "online"
+                    updated_pub["downshelved_at"] = ""
+                    publications[lid] = updated_pub
+                    fallback_pub_dict = True
         if fallback_pub_dict:
             set_fields["publications"] = publications
 

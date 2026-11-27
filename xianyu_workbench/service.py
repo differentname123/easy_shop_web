@@ -23,6 +23,21 @@ from PIL import Image, ImageOps
 from .auth import create_token, verify_password
 from .bridge import encode_main_site_item_code, generate_ai_copy, parse_ai_json
 from .config import WORKBENCH_DIR, WorkbenchConfig, load_config
+from .copy_templates import (
+    DEFAULT_TEMPLATE_ID,
+    DEFAULT_TEMPLATE_IDS,
+    NONE_TEMPLATE_ID,
+    compose_full_description,
+    get_combined_template_content,
+    get_combined_template_name,
+    get_template_content,
+    get_template_name,
+    list_copy_templates,
+    normalize_template_id,
+    normalize_template_ids,
+    resolve_listing_template_ids,
+    strip_platform_names,
+)
 from .repo import WorkbenchRepository, clean_http_url, clean_id, normalize_platform
 
 Image.MAX_IMAGE_PIXELS = 25_000_000
@@ -192,6 +207,9 @@ class WorkbenchService:
             "item_counts": self.repo.get_item_counts(user["username"]),
             "main_site_port": int(getattr(self.config, "main_site_port", 8001) or 8001),
             "main_site_base_url": str(getattr(self.config, "main_site_base_url", "") or "").strip(),
+            "default_template_id": DEFAULT_TEMPLATE_ID,
+            "default_template_ids": list(DEFAULT_TEMPLATE_IDS),
+            "copy_templates": list_copy_templates(),
         }
 
     def update_binding(self, username: str, *, shop_uid: str = "", shop_phone: str = "") -> Dict[str, Any]:
@@ -589,6 +607,15 @@ class WorkbenchService:
                     "origin": str(entry.get("origin") or "custom"),
                 })
 
+        raw_title = str(doc.get("title") or "").strip()
+        raw_desc = str(doc.get("description") or "").strip()
+        template_ids = resolve_listing_template_ids(doc)
+        template_id = template_ids[0] if template_ids else NONE_TEMPLATE_ID
+        template_names = [get_template_name(tid) for tid in template_ids]
+        template_name = get_combined_template_name(template_ids)
+        template_text = get_combined_template_content(template_ids)
+        full_description = compose_full_description(raw_desc, template_ids)
+
         return {
             "listing_id": lid_clean,
             "owner": owner_clean,
@@ -597,8 +624,14 @@ class WorkbenchService:
             "main_item_code": main_item_code,
             "source_origin": str(doc.get("source_origin") or "favorite"),
             "status": _normalize_status(doc.get("status")),
-            "title": str(doc.get("title") or "").strip(),
-            "description": str(doc.get("description") or "").strip(),
+            "title": raw_title,
+            "description": raw_desc,
+            "template_ids": template_ids,
+            "template_names": template_names,
+            "template_id": template_id,
+            "template_name": template_name,
+            "template_text": template_text,
+            "full_description": full_description,
             "copy_status": copy_status,
             "copy_error": copy_error,
             "images": clean_images,
@@ -733,7 +766,7 @@ class WorkbenchService:
             or 0.0
         )
 
-        raw_title = (
+        raw_title = strip_platform_names(
             str(di.get("clean_title") or "").strip()
             or str((prod or {}).get("name") or "").strip()
             or str(snap.get("name") or "").strip()
@@ -765,6 +798,8 @@ class WorkbenchService:
                     "status": "draft",
                     "title": raw_title[:TITLE_MAX_LEN],
                     "description": "",
+                    "template_ids": list(DEFAULT_TEMPLATE_IDS),
+                    "template_id": DEFAULT_TEMPLATE_ID,
                     "copy_status": "generating" if token else "",
                     "copy_error": "",
                     "copy_gen_token": token,
@@ -850,6 +885,20 @@ class WorkbenchService:
                 set_fields["copy_status"] = "ready"
                 set_fields["copy_error"] = ""
                 set_fields["copy_gen_token"] = ""
+        if "template_ids" in updates and updates["template_ids"] is not None:
+            try:
+                norm_ids = normalize_template_ids(updates["template_ids"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            set_fields["template_ids"] = norm_ids
+            set_fields["template_id"] = norm_ids[0] if norm_ids else NONE_TEMPLATE_ID
+        elif "template_id" in updates and updates["template_id"] is not None:
+            try:
+                norm_id = normalize_template_id(updates["template_id"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            set_fields["template_id"] = norm_id
+            set_fields["template_ids"] = [] if norm_id == NONE_TEMPLATE_ID else [norm_id]
         if "images" in updates and updates["images"] is not None:
             set_fields["images"] = self._sanitize_images(updates["images"])
         if "price" in updates and updates["price"] is not None:
@@ -900,23 +949,34 @@ class WorkbenchService:
 
     def _build_copy_prompt(self, doc: Dict[str, Any], prod: Dict[str, Any]) -> Tuple[str, str]:
         di = prod.get("deal_info") if isinstance(prod.get("deal_info"), dict) else {}
-        plat = normalize_platform(doc.get("platform"))
         raw_price = doc.get("price") if doc.get("price") is not None else doc.get("sell_price")
         display_price = _nonneg_float(raw_price, 0.0)
-        fallback_name = str(prod.get("name") or doc.get("title") or "").strip()
+        if display_price <= 0:
+            _, live_p, _, _ = _resolve_live_product_state(prod)
+            if live_p:
+                display_price = live_p
+        fallback_name = strip_platform_names(prod.get("name") or doc.get("title") or "")
+
+        # 对传入大模型的上下文彻底剥离第三方电商平台名，且不传递发货时效/退货保障以免混入非商品话术
+        shop_source = strip_platform_names(prod.get("mall_name") or prod.get("shop_name") or "")
+        clean_specs: List[Dict[str, str]] = []
+        for sp in (prod.get("specs") or []):
+            if not isinstance(sp, dict):
+                continue
+            lbl = strip_platform_names(sp.get("label") or "")
+            val = strip_platform_names(sp.get("value") or "")
+            if not lbl or not val or lbl in ("店铺名称", "平台"):
+                continue
+            clean_specs.append({"label": lbl, "value": val})
 
         raw_payload: Dict[str, Any] = {
             "product_name": fallback_name,
-            "platform": _PLATFORM_READABLE.get(plat, plat),
-            "shop_name": str(prod.get("mall_name") or prod.get("shop_name") or "").strip(),
-            "brand": str(prod.get("brand") or "").strip(),
-            "category": str(prod.get("category") or "").strip(),
-            "specs": prod.get("specs") or [],
+            "shop_source": shop_source,
+            "brand": strip_platform_names(prod.get("brand") or ""),
+            "category": strip_platform_names(prod.get("category") or ""),
+            "specs": clean_specs,
             "price": display_price if display_price > 0 else None,
-            "deal_highlight": str(di.get("card_highlight") or "").strip(),
-            "service_guarantees": [
-                str(x).strip() for x in (prod.get("service_guarantees") or []) if str(x).strip()
-            ],
+            "deal_highlight": strip_platform_names(di.get("card_highlight") or ""),
         }
         context_payload = {k: v for k, v in raw_payload.items() if v}
         prompt_template = PROMPT_PATH.read_text(encoding="utf-8")
@@ -927,7 +987,7 @@ class WorkbenchService:
         return full_prompt, fallback_name
 
     def _invoke_copy_llm(self, doc: Dict[str, Any], prod: Dict[str, Any]) -> Dict[str, str]:
-        """调用大模型并解析 `{title, description}`，供后台异步与手动重生成共用。"""
+        """调用大模型并解析纯商品 `{title, description}`，剥离任何误带出的平台名称。"""
         full_prompt, fallback_name = self._build_copy_prompt(doc, prod)
         res = self._ai_generator(full_prompt)
         raw_content = str((res or {}).get("content") or "").strip()
@@ -949,13 +1009,11 @@ class WorkbenchService:
                 title = lines[0]
                 description = "\n".join(lines[1:]).strip() or lines[0]
 
-        if not title:
-            title = str(doc.get("title") or fallback_name)[:TITLE_MAX_LEN]
-        if not description:
-            description = raw_content
+        clean_title = strip_platform_names(title) or strip_platform_names(doc.get("title") or fallback_name)
+        clean_desc = strip_platform_names(description) or strip_platform_names(raw_content)
         return {
-            "title": title[:TITLE_MAX_LEN],
-            "description": description[:2000],
+            "title": clean_title[:TITLE_MAX_LEN],
+            "description": clean_desc[:2000],
             "model_used": model_used,
         }
 

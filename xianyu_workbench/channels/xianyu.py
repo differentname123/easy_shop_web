@@ -564,11 +564,33 @@ class XianyuChannelAdapter(SellingChannel):
         )
         ok = bool(res.get("ok"))
         err_code = "" if ok else str(res.get("error_code") or "SYNC_FAILED")
-        msg = "同步完成" if ok else self._friendly_error_message(err_code, "同步在售商品失败，请稍后重试")
+        is_offline_err = bool(res.get("is_offline")) or err_code in (
+            "ACCOUNT_OFFLINE",
+            "RISK_CONTROL_BLOCKED",
+        )
+        # 仅当明确掉线/风控才标 online=False；列表拉取异常/锁超时保留账号在线态以防误触发扫码解绑
+        still_online = True if ok else (
+            not is_offline_err
+            and (
+                bool(res.get("unb"))
+                or err_code.startswith("SYNC_")
+                or err_code == "LOCK_TIMEOUT"
+            )
+        )
+        raw_msg = str(res.get("message") or "").strip()
+        msg = (
+            "同步完成"
+            if ok
+            else (
+                raw_msg
+                if err_code.startswith("SYNC_") and raw_msg
+                else self._friendly_error_message(err_code, raw_msg or "同步在售商品失败，请稍后重试")
+            )
+        )
         return ChannelSyncResult(
             ok=ok,
             channel=self.channel_code,
-            online=ok,
+            online=still_online,
             account_id=str(res.get("unb") or "").strip(),
             nickname=str(res.get("nick") or "").strip(),
             error_code=err_code,

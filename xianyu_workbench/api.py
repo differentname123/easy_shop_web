@@ -16,6 +16,7 @@ from .bridge import open_mongo_connection
 from .channel_service import ChannelService
 from .channels import ChannelRegistry, build_default_channel_registry
 from .config import WORKBENCH_DIR, WorkbenchConfig, load_config
+from .copy_templates import DEFAULT_TEMPLATE_ID, DEFAULT_TEMPLATE_IDS, list_copy_templates
 from .job_runner import ChannelJobRunner
 from .repo import WorkbenchRepository
 from .service import WorkbenchService
@@ -53,6 +54,8 @@ class DraftCreateRequest(BaseModel):
 class ItemUpdateRequest(BaseModel):
     title: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = Field(None, max_length=4000)
+    template_id: Optional[str] = Field(None, max_length=32)
+    template_ids: Optional[List[str]] = Field(None, max_length=12)
     images: Optional[List[Any]] = None
     price: Optional[float] = None
     status: Optional[str] = Field(None, max_length=32)
@@ -324,6 +327,18 @@ def create_app(
     def clear_item_failure(listing_id: str, request: Request):
         username = _uid(request)
         return {"status": "success", "data": _svc().clear_item_failure(username, listing_id)}
+
+    @app.get("/api/copy-templates")
+    def get_copy_templates(request: Request):
+        _uid(request)
+        return {
+            "status": "success",
+            "data": {
+                "default_template_id": DEFAULT_TEMPLATE_ID,
+                "default_template_ids": list(DEFAULT_TEMPLATE_IDS),
+                "templates": list_copy_templates(),
+            },
+        }
 
     # =========================================================================
     # 四、可插拔销售渠道（扫码绑定、状态检测、真实在售同步与对账）

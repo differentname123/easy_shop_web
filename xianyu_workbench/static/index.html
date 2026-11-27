@@ -874,14 +874,15 @@
                   </span>
                   <span v-else-if="it.publish_failure" class="pill pill-red">⚠️ 上架失败</span>
                   <span v-if="it.off_promotion_alert" class="pill pill-red">⚠️ 上游已失效</span>
+                  <span v-if="it.template_name && it.template_name !== '不用模板'" class="pill pill-gray">📋 {{ it.template_name }}</span>
                 </div>
                 <div style="font-size: 12px; color: var(--muted);">
                   {{ platformLabel(it.platform) }} · {{ it.images.length }}张图
                   <span v-if="onlineItemFor(it.listing_id)?.want_info"> · {{ onlineItemFor(it.listing_id).want_info }}</span>
                 </div>
-                <div v-if="it.description"
+                <div v-if="it.full_description || it.description"
                      style="font-size: 12px; color: var(--sub); margin-top: 6px; line-height: 1.45; white-space: pre-line; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;">
-                  {{ it.description }}
+                  {{ it.full_description || it.description }}
                 </div>
                 <div v-if="it.main_item_code || it.xianyu_ref_url"
                      style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
@@ -1001,7 +1002,7 @@
                   v-if="activeChannel.capabilities && activeChannel.capabilities.auto_publish"
                   class="btn btn-dark btn-sm"
                   :disabled="reconcilePreviewLoading"
-                  @click="openReconcilePreview(false)"
+                  @click="openReconcilePreview(!sellingData.synced_at)"
                 >{{ reconcilePreviewLoading ? '比对中' : '同步选品库' }}</button>
               </template>
               <button
@@ -1276,7 +1277,7 @@
         </div>
 
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
-          <span style="font-weight: 700; font-size: 14px;">商品标题与直发文案</span>
+          <span style="font-weight: 700; font-size: 14px;">① 商品卖点文案（只写商品，不提平台与规则）</span>
           <button class="btn btn-soft btn-sm" :disabled="aiGenerating" @click="generateEditorCopy">
             {{ aiGenerating ? '生成中...' : '🔄 重新生成' }}
           </button>
@@ -1294,14 +1295,73 @@
 
         <div>
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-            <label class="field-label" style="margin: 0;">商品介绍文案（保留空行，上架自动过滤 Emoji）</label>
-            <button class="link-btn" @click="copyText(editorFormattedPreview)">复制全文</button>
+            <label class="field-label" style="margin: 0;">商品吸引力正文（保留空行，自动过滤平台词与 Emoji）</label>
+            <button class="link-btn" @click="copyText(editorFormattedPreview)">复制完整全文</button>
           </div>
-          <textarea v-model="editing.description" class="textarea" placeholder="后台自动生成后将自动填入并保存，也可手动修改" @input="markDescDirty"></textarea>
+          <textarea v-model="editing.description" class="textarea" placeholder="后台自动生成纯商品卖点后自动填入，也可手动修改" @input="markDescDirty"></textarea>
+        </div>
+
+        <div style="margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px;">
+            <label class="field-label" style="margin: 0;">② 交易与吸引模板（可多选搭配，再点取消）</label>
+            <div style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+              <span style="font-size: 11px; color: var(--muted);">
+                {{ selectedTemplates.length ? ('已按序拼接 ' + selectedTemplates.length + ' 项') : '未选模板' }}
+              </span>
+              <button
+                v-if="selectedTemplates.length"
+                type="button"
+                class="link-btn"
+                style="font-size: 11px; padding: 0;"
+                @click="clearEditorTemplates"
+              >清空</button>
+            </div>
+          </div>
+          <div style="font-size: 11px; font-weight: 600; color: var(--primary); margin-bottom: 5px;">✨ 吸引买家 · 服务与速度承诺</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;">
+            <button
+              v-for="tpl in attractTemplates"
+              :key="tpl.id"
+              type="button"
+              class="btn btn-sm"
+              :title="tpl.summary"
+              :style="templateOrderIndex(tpl.id) >= 0
+                ? 'background: var(--primary-bg); color: var(--primary); border: 1px solid var(--primary);'
+                : 'background: #f4f6f9; color: var(--sub); border: 1px solid var(--border);'"
+              @click="toggleEditorTemplate(tpl.id)"
+            >
+              <span v-if="templateOrderIndex(tpl.id) >= 0"
+                    style="display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 999px; background: var(--primary); color: #fff; font-size: 10px; font-weight: 700; margin-right: 4px;">{{ templateOrderIndex(tpl.id) + 1 }}</span>
+              <span>{{ tpl.name }}</span>
+              <span v-if="tpl.is_default && templateOrderIndex(tpl.id) < 0" style="opacity: 0.72; font-weight: 500; margin-left: 3px;">(默认)</span>
+            </button>
+          </div>
+          <div style="font-size: 11px; font-weight: 600; color: var(--sub); margin-bottom: 5px;">📋 提前说清 · 高情商防纠纷须知</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+            <button
+              v-for="tpl in ruleTemplates"
+              :key="tpl.id"
+              type="button"
+              class="btn btn-sm"
+              :title="tpl.summary"
+              :style="templateOrderIndex(tpl.id) >= 0
+                ? 'background: var(--primary-bg); color: var(--primary); border: 1px solid var(--primary);'
+                : 'background: #f4f6f9; color: var(--sub); border: 1px solid var(--border);'"
+              @click="toggleEditorTemplate(tpl.id)"
+            >
+              <span v-if="templateOrderIndex(tpl.id) >= 0"
+                    style="display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 999px; background: var(--primary); color: #fff; font-size: 10px; font-weight: 700; margin-right: 4px;">{{ templateOrderIndex(tpl.id) + 1 }}</span>
+              <span>{{ tpl.name }}</span>
+            </button>
+          </div>
+          <div v-if="templateContentFor(resolveTemplateIds(editing))"
+               style="margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: #fff9f5; border: 1px solid #ffd6be; font-size: 12px; line-height: 1.5; color: var(--sub); white-space: pre-line;">
+            {{ templateContentFor(resolveTemplateIds(editing)) }}
+          </div>
         </div>
 
         <div v-if="editorFormattedPreview" style="margin-top: 12px;">
-          <div style="font-size: 12px; font-weight: 600; color: var(--sub);">闲鱼发布排版预览：</div>
+          <div style="font-size: 12px; font-weight: 600; color: var(--sub);">完整发布排版预览（所见即所得，含模板）：</div>
           <div class="preview-box">{{ editorFormattedPreview }}</div>
         </div>
       </div>

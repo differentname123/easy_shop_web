@@ -296,6 +296,7 @@ class _FakeChannelAdapter(SellingChannel):
         self.cancelled_sessions = []
         self._pub_seq = 100
         self.published_calls = []
+        self.published_payloads = []
         self.downshelved_calls = []
         self.sync_calls = 0
         self.batch_session_entries = 0
@@ -406,6 +407,7 @@ class _FakeChannelAdapter(SellingChannel):
         }
         self.online_items.insert(0, entry)
         self.published_calls.append(item_payload.get("listing_id"))
+        self.published_payloads.append(dict(item_payload))
         return {
             "ok": True,
             "is_offline": False,
@@ -750,10 +752,14 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
 
         gen = client.post(f"/api/items/{lid}/generate-copy").json()["data"]
         assert len(ai_prompts) == 1
-        assert "现货直接拍" in ai_prompts[0] and "下单马上发" in ai_prompts[0]
-        assert "45~85" in ai_prompts[0]
-        assert "严禁出现“代拍" in ai_prompts[0]
-        assert "严禁编造“个人闲置" in ai_prompts[0]
+        assert "买家买这类商品最在意什么" in ai_prompts[0]
+        assert "最有说服力" in ai_prompts[0]
+        assert "绝对不要写任何交易/物流/售后规则" in ai_prompts[0]
+        assert "绝对不要出现任何第三方电商平台名称" in ai_prompts[0]
+        assert "40~90" in ai_prompts[0]
+        assert "折合单价" in ai_prompts[0]
+        assert "代拍、帮拍" in ai_prompts[0]
+        assert "个人闲置" in ai_prompts[0]
         assert "Emoji" in ai_prompts[0]
         assert "cost_price" not in ai_prompts[0]
         assert "shipping_fee" not in ai_prompts[0]
@@ -761,6 +767,9 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
         reloaded = client.get(f"/api/items/{lid}").json()["data"]
         assert reloaded["title"] == gen["title"]
         assert reloaded["description"] == gen["description"]
+        assert reloaded["template_ids"] == ["direct_fast"]
+        assert reloaded["template_id"] == "direct_fast"
+        assert "24小时全自动下单系统" in reloaded["full_description"]
         assert reloaded["copy_status"] == "ready"
 
         ready = client.patch(
@@ -776,6 +785,8 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
         assert ready["status"] == "ready"
         assert ready["price"] == 41.5
         assert ready["confirmed_at"] != ""
+        assert ready["template_id"] == "direct_fast"
+        assert "24小时全自动下单系统" in ready["full_description"]
 
 
 def test_pluggable_channels_qr_login_sync_reconcile_and_shutdown(tmp_path):
@@ -1711,6 +1722,16 @@ def test_eval_source_type_filter_and_want_cnt_sort(tmp_path):
         assert client.get("/api/candidates/evaluations?sort_by=invalid").status_code == 422
 
 
+def _wait_copy_done(client, lid: str, timeout: float = 3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        d = client.get(f"/api/items/{lid}").json()["data"]
+        if d["copy_status"] != "generating":
+            return d
+        time.sleep(0.02)
+    raise AssertionError("后台文案生成等待超时")
+
+
 def test_background_copy_auto_generation_persistence_and_concurrency_guards(tmp_path):
     """验证选品后后台自动生成文案并落库、并发手动覆盖保护、移出丢弃及失败重试闭环。"""
     call_log = []
@@ -1773,15 +1794,6 @@ def test_background_copy_auto_generation_persistence_and_concurrency_guards(tmp_
         },
     ])
 
-    def _wait_copy_done(client, lid: str, timeout: float = 3.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            d = client.get(f"/api/items/{lid}").json()["data"]
-            if d["copy_status"] != "generating":
-                return d
-            time.sleep(0.02)
-        raise AssertionError("后台文案生成等待超时")
-
     with TestClient(app) as client:
         assert client.post("/api/auth/login", json={"username": "autopicker", "password": "123456"}).status_code == 200
 
@@ -1797,10 +1809,12 @@ def test_background_copy_auto_generation_persistence_and_concurrency_guards(tmp_
         assert done1["copy_status"] == "ready"
         assert "自动文案#1" in done1["title"]
         assert "订单截图凭证" in done1["description"]
-        # 提示词输入应包含富上下文 shop_name 与保障，且不泄漏内部成本字段
-        assert "维达京东自营旗舰店" in call_log[0]
-        assert "7天无理由退货" in call_log[0]
-        assert "cost_price" not in call_log[0]
+        # 提示词输入应只保留剥离平台词后的干净官方来源，不传 platform/service_guarantees 与内部成本字段
+        product_input_str = call_log[0].split("<product_input>", 1)[1]
+        assert "维达官方旗舰店" in product_input_str
+        assert "京东" not in product_input_str
+        assert "7天无理由退货" not in product_input_str
+        assert "cost_price" not in product_input_str
 
         # 列表接口下次加载也能直接读到数据库里的文案
         listed = client.get("/api/items?status=active").json()["data"]["items"]
@@ -2328,6 +2342,375 @@ def test_sanitize_strips_emojis_and_auto_switches_restricted_category(tmp_path):
         s_res = client.post("/api/channels/xianyu/sync")
         _wait_job(client, "xianyu", s_res.json()["data"]["job"]["job_id"])
         assert client.get("/api/items/xyl_snack_1").json()["data"]["publish_failure"] is None
+
+
+def test_copy_templates_scrubber_and_publish_composition(tmp_path):
+    from xianyu_workbench.copy_templates import (
+        DEFAULT_TEMPLATE_ID,
+        compose_full_description,
+        list_copy_templates,
+        strip_platform_names,
+    )
+
+    templates = list_copy_templates()
+    assert [t["id"] for t in templates] == [
+        "direct_fast",
+        "brand_auth",
+        "spec_note",
+        "fresh_batch",
+        "vip_service",
+        "no_refund",
+        "shipping_extra",
+        "order_guide",
+    ]
+    assert len([t for t in templates if t["group"] == "attract"]) == 5
+    assert len([t for t in templates if t["group"] == "rules"]) == 3
+    assert "unbox_proof" not in [t["id"] for t in templates]
+    for tpl in templates:
+        assert 25 <= len(tpl["content"]) <= 80
+        for forbidden in ("拼多多", "淘宝", "天猫", "京东", "代拍", "PDD", "JD", "三五块", "吃进嘴", "贴身", "赔付", "破损", "开箱", "口味"):
+            assert forbidden not in tpl["content"]
+
+    assert strip_platform_names("洽洽京东自营官方旗舰店") == "洽洽官方旗舰店"
+    assert strip_platform_names("拼多多百亿补贴天猫超市直发（JD）") == "官方旗舰店官方直发" or (
+        "拼多多" not in strip_platform_names("拼多多百亿补贴天猫超市直发（JD）")
+        and "天猫" not in strip_platform_names("拼多多百亿补贴天猫超市直发（JD）")
+        and "JD" not in strip_platform_names("拼多多百亿补贴天猫超市直发（JD）")
+    )
+
+    # 验证 AI 生成、模板切换、默认回退以及发布器拼装全链路
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    captured_prompts = []
+
+    def _dirty_ai(prompt: str):
+        captured_prompts.append(prompt)
+        return {
+            "status": "生成成功",
+            "content": json.dumps({
+                "title": "洽洽每日坚果30包（京东自营直发）",
+                "description": "30包整箱全新未拆，日期新鲜好口感。\n\n淘宝拼多多同款贵很多，独立小包每天一袋很方便。",
+            }, ensure_ascii=False),
+            "metrics": {"model_used": "mock-clean"},
+        }
+
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(
+        tmp_path, adapters=[adapter], ai_generator=_dirty_ai
+    )
+    repo.create_user("tpl_user", hash_password("123456"))
+    db.cols["products"].docs.append({
+        "platform": "jd",
+        "product_id": "jd_nuts_1",
+        "name": "洽洽每日坚果30袋京东自营礼盒",
+        "mall_name": "洽洽京东自营旗舰店",
+        "brand": "洽洽",
+        "category": "坚果炒货",
+        "service_guarantees": ["7天无理由退货"],
+        "specs": [{"店铺名称": "洽洽京东自营旗舰店"}, {"净含量": "750g/30袋"}],
+        "price": 79.0,
+        "activity_price": 46.8,
+        "image_url": "https://img.jd.com/nuts1.jpg",
+    })
+
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"username": "tpl_user", "password": "123456"}).status_code == 200
+        me = client.get("/api/auth/me").json()["data"]
+        assert me["default_template_id"] == "direct_fast"
+        assert me["default_template_ids"] == ["direct_fast"]
+        assert len(me["copy_templates"]) == 8
+
+        tpl_res = client.get("/api/copy-templates").json()["data"]
+        assert len(tpl_res["templates"]) == 8
+        assert tpl_res["default_template_id"] == "direct_fast"
+        assert tpl_res["default_template_ids"] == ["direct_fast"]
+
+        draft = client.post(
+            "/api/items/draft",
+            json={"platform": "jd", "product_id": "jd_nuts_1", "source_origin": "favorite"},
+        ).json()["data"]
+        lid = draft["listing_id"]
+        done = _wait_copy_done(client, lid)
+
+        # Prompt 输入块不得携带外部平台名称和 7天无理由保障，title/description 不得残留第三方平台词
+        assert len(captured_prompts) == 1
+        prod_in = captured_prompts[0].split("<product_input>", 1)[1]
+        assert "京东" not in prod_in
+        assert "7天无理由退货" not in prod_in
+        assert "洽洽官方旗舰店" in prod_in
+        assert "京东" not in done["title"]
+        assert "淘宝" not in done["description"] and "拼多多" not in done["description"]
+        assert done["template_ids"] == ["direct_fast"]
+        assert done["template_id"] == "direct_fast"
+        assert "24小时全自动下单系统" in done["full_description"]
+
+        # 校验不支持模板拒绝
+        assert client.patch(f"/api/items/{lid}", json={"template_id": "bad_tpl"}).status_code == 400
+        assert client.patch(f"/api/items/{lid}", json={"template_ids": ["direct_fast", "bad_tpl"]}).status_code == 400
+
+        # 多选按点击先后顺序叠加组合，并按空行 (\n\n) 清晰分段持久化与发布
+        switched = client.patch(
+            f"/api/items/{lid}",
+            json={"template_ids": ["direct_fast", "vip_service", "spec_note", "no_refund"], "status": "ready"},
+        ).json()["data"]
+        assert switched["template_ids"] == ["direct_fast", "vip_service", "spec_note", "no_refund"]
+        assert switched["template_id"] == "direct_fast"
+        assert switched["template_name"] == "全自动秒发 + 其他商品问价 + 规格款式任选 + 特价不议不退"
+        assert "24小时全自动下单系统" in switched["full_description"]
+        assert "其他想买的商品" in switched["full_description"]
+        assert "主图经典款" in switched["full_description"]
+        assert "本身微利走量" in switched["full_description"]
+        assert (
+            switched["full_description"].index("24小时全自动下单系统")
+            < switched["full_description"].index("其他想买的商品")
+            < switched["full_description"].index("主图经典款")
+            < switched["full_description"].index("本身微利走量")
+        )
+        # 校验多选模板正文之间存在空行分隔（不密密麻麻）
+        assert "\n\n平时有其他想买的商品" in switched["full_description"]
+        assert "\n\n有多种款式、型号或规格" in switched["full_description"]
+        assert "\n\n本身微利走量" in switched["full_description"]
+
+        pub = client.post(
+            "/api/channels/xianyu/publish",
+            json={"listing_id": lid},
+        ).json()["data"]
+        job = _wait_job(client, "xianyu", pub["job"]["job_id"])
+        assert job["status"] == "completed"
+        assert len(adapter.published_payloads) == 1
+        sent = adapter.published_payloads[0]
+        assert sent["description"] == compose_full_description(
+            switched["description"],
+            ["direct_fast", "vip_service", "spec_note", "no_refund"],
+        )
+        assert "惊喜好价" in sent["description"]
+        for forbidden in ("京东", "淘宝", "拼多多"):
+            assert forbidden not in sent["title"]
+            assert forbidden not in sent["description"]
+
+        # 测试取消所有选中（[]）时不拼任何模板
+        cleared_res = client.patch(f"/api/items/{lid}", json={"template_ids": []}).json()["data"]
+        assert cleared_res["template_ids"] == []
+        assert cleared_res["template_id"] == "none"
+        assert cleared_res["template_name"] == "不用模板"
+        assert cleared_res["full_description"] == cleared_res["description"]
+
+        # 单独再次点击一个模板可重新启用
+        repicked = client.patch(f"/api/items/{lid}", json={"template_ids": ["order_guide"]}).json()["data"]
+        assert repicked["template_ids"] == ["order_guide"]
+        assert "拍前先私聊问我一声" in repicked["full_description"]
+
+
+def test_sync_fail_closed_preserves_snapshot_and_handles_personal_dom(tmp_path, monkeypatch):
+    """验证新版闲鱼 /personal 页面无「在售」Tab 仍可完整抓数，且抓数失败时严格 Fail-Closed 不误报 0 件。"""
+    from xianyu_workbench.channels.base import ChannelSyncResult
+    from xianyu_workbench.client import seller
+
+    class _FakeResp:
+        def __init__(self, url, body):
+            self.url = url
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    class _EmptyLocator:
+        def count(self):
+            return 0
+
+    class _FakeContext:
+        def cookies(self):
+            return [{"name": "unb", "value": "u_422"}, {"name": "cookie2", "value": "c_ok"}]
+
+    class _FakePage:
+        def __init__(self, scenario: str):
+            self.url = "https://www.goofish.com/personal"
+            self.frames = []
+            self._cbs = []
+            self.scenario = scenario
+            self.scroll_calls = 0
+
+        def on(self, ev, cb):
+            if ev == "response":
+                self._cbs.append(cb)
+
+        def remove_listener(self, ev, cb):
+            if ev == "response" and cb in self._cbs:
+                self._cbs.remove(cb)
+
+        def get_by_text(self, *_args, **_kwargs):
+            return _EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+        def evaluate(self, script):
+            if "scrollTo" in str(script):
+                self.scroll_calls += 1
+                return None
+            if self.scenario == "mismatch_zero":
+                return "清和愿ovo\n宝贝\n6\n信用及评价"
+            return "清和愿ovo\n宝贝\n0" if self.scenario == "genuine_zero" else "清和愿ovo\n宝贝\n2"
+
+        def goto(self, _url, **_kwargs):
+            if self.scenario == "personal_no_tab":
+                pkt = {
+                    "ret": ["SUCCESS::调用成功"],
+                    "data": {
+                        "nextPage": False,
+                        "cardList": [
+                            {"cardData": {"id": "111", "itemStatus": 0, "title": "正常商品A", "priceInfo": {"price": "19.9"}}},
+                            {"cardData": {"id": "222", "itemStatus": 1, "title": "已售出B", "priceInfo": {"price": "0.01"}}},
+                        ],
+                    },
+                }
+                for cb in list(self._cbs):
+                    cb(_FakeResp("https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/", pkt))
+            elif self.scenario == "empty_packets":
+                return None
+            elif self.scenario == "pagination_stall":
+                pkt = {
+                    "ret": ["SUCCESS::调用成功"],
+                    "data": {
+                        "nextPage": True,
+                        "cardList": [
+                            {"cardData": {"id": "111", "itemStatus": 0, "title": "第一页商品", "priceInfo": {"price": "9.9"}}},
+                        ],
+                    },
+                }
+                for cb in list(self._cbs):
+                    cb(_FakeResp("https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/", pkt))
+            elif self.scenario in ("mismatch_zero", "genuine_zero"):
+                pkt = {"ret": ["SUCCESS::调用成功"], "data": {"nextPage": False, "cardList": []}}
+                for cb in list(self._cbs):
+                    cb(_FakeResp("https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/", pkt))
+
+    monkeypatch.setattr(seller, "_verify_account_online", lambda ctx, pg, trk, d, task_name="": "u_422")
+    ctx = _FakeContext()
+
+    # 1. 新版 /personal 无「在售」Tab 时直接抓取初始包，绝不 clear() 清零
+    pg1 = _FakePage("personal_no_tab")
+    r1 = seller._get_selling_items_on_page(ctx, pg1, {"display_name": "清和愿ovo"}, user_data_dir="u1")
+    assert r1["ok"] is True
+    assert r1["online_count"] == 1
+    assert r1["online_items"][0]["item_id"] == "111"
+    assert r1["abnormal_count"] == 1
+
+    # 2. 未抓到任何 mtop.idle.web.xyh.item.list 响应 -> Fail-Closed 报错而非返回 0 件
+    pg2 = _FakePage("empty_packets")
+    r2 = seller._get_selling_items_on_page(ctx, pg2, {"display_name": "清和愿ovo"}, user_data_dir="u1")
+    assert r2["ok"] is False
+    assert r2["is_offline"] is False
+    assert r2["error_code"] == "SYNC_EMPTY_RESPONSE"
+
+    # 3. nextPage=True 分页中断 -> 拒绝残缺列表
+    pg3 = _FakePage("pagination_stall")
+    r3 = seller._get_selling_items_on_page(ctx, pg3, {"display_name": "清和愿ovo"}, user_data_dir="u1")
+    assert r3["ok"] is False
+    assert r3["error_code"] == "SYNC_INCOMPLETE_PAGINATION"
+
+    # 4. 页面写着 宝贝 6 却返回 0 条 -> 矛盾拦截
+    pg4 = _FakePage("mismatch_zero")
+    r4 = seller._get_selling_items_on_page(ctx, pg4, {"display_name": "清和愿ovo"}, user_data_dir="u1")
+    assert r4["ok"] is False
+    assert r4["error_code"] == "SYNC_MISMATCH_ERROR"
+
+    # 5. 真正的新空号（API SUCCESS=[] 且 DOM 宝贝 0）允许成功返回 0
+    pg5 = _FakePage("genuine_zero")
+    r5 = seller._get_selling_items_on_page(ctx, pg5, {"display_name": "清和愿ovo"}, user_data_dir="u1")
+    assert r5["ok"] is True
+    assert r5["online_count"] == 0
+
+    # 6. 验证渠道同步失败时，绝不覆盖现有 online_items、绝不把已发布标成 downshelf、也不会把在线账号误标成掉线
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    sync_mode = {"fail": False}
+
+    def _custom_sync(username: str) -> ChannelSyncResult:
+        if sync_mode["fail"]:
+            return ChannelSyncResult(
+                ok=False,
+                channel="xianyu",
+                online=True,
+                account_id="422",
+                nickname="清和愿ovo",
+                error_code="SYNC_EMPTY_RESPONSE",
+                message="未拉取到闲鱼在售商品列表，已保留原快照",
+            )
+        return ChannelSyncResult(
+            ok=True,
+            channel="xianyu",
+            online=True,
+            account_id="422",
+            nickname="清和愿ovo",
+            online_items=list(adapter.online_items),
+        )
+
+    adapter.sync_selling_items = _custom_sync
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[adapter])
+    repo.create_user("sync_guard_u", hash_password("123456"))
+    db.cols["products"].docs.append({
+        "platform": "pdd",
+        "product_id": "pdd_guard_1",
+        "name": "防误杀商品测试",
+        "price": 29.0,
+        "activity_price": 15.0,
+        "is_off_promotion": False,
+    })
+    db.cols["xy_listings"].docs.append({
+        "listing_id": "xyl_guard_1",
+        "owner": "sync_guard_u",
+        "platform": "pdd",
+        "product_id": "pdd_guard_1",
+        "title": "防误杀商品测试",
+        "description": "规格真实清晰",
+        "price": 15.0,
+        "images": [{"url": "https://img.pddpic.com/g1.jpg", "origin": "official"}],
+        "status": "ready",
+    })
+    adapter.online_items = [{
+        "item_id": "999888777",
+        "title": "防误杀商品测试",
+        "price": "15.00",
+        "want_info": "",
+        "pic_url": "https://img.goofish.com/g1.jpg",
+        "item_url": "https://www.goofish.com/item?id=999888777",
+        "is_online": True,
+    }]
+
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"username": "sync_guard_u", "password": "123456"}).status_code == 200
+        # 先成功同步 1 件商品并完成手动关联
+        j1 = _wait_job(client, "xianyu", client.post("/api/channels/xianyu/sync").json()["data"]["job"]["job_id"])
+        assert j1["status"] == "completed"
+        snap1 = client.get("/api/channels/xianyu/selling").json()["data"]
+        assert snap1["online_count"] == 1
+
+        # 触发一次拉取接口异常（SYNC_EMPTY_RESPONSE）
+        sync_mode["fail"] = True
+        j2 = _wait_job(client, "xianyu", client.post("/api/channels/xianyu/sync").json()["data"]["job"]["job_id"])
+        assert j2["status"] == "failed"
+        assert j2["error_code"] == "SYNC_FAILED"
+
+        # 关键断言：账号仍在线，原有 1 件在售快照完整保留，同步预览不会重复待上架！
+        chs = client.get("/api/channels").json()["data"]["channels"]
+        assert chs[0]["online"] is True
+        snap2 = client.get("/api/channels/xianyu/selling").json()["data"]
+        assert snap2["online_count"] == 1
+        assert snap2["online_items"][0]["item_id"] == "999888777"
+        diff = client.post("/api/channels/xianyu/reconcile/preview", json={"refresh": False}).json()["data"]
+        assert diff["to_publish"] == []
+
+
 
 
 

@@ -275,6 +275,9 @@ createApp({
     });
 
     const mainSiteCfg = ref({ port: 8001, baseUrl: '' });
+    const copyTemplates = ref([]);
+    const defaultTemplateId = ref('direct_fast');
+    const defaultTemplateIds = ref(['direct_fast']);
 
     function mainProductUrl(code) {
       const raw = String(code || '').trim();
@@ -303,14 +306,70 @@ createApp({
       descDirty.value = false;
     }
 
+    function resolveTemplateIds(obj) {
+      if (!obj) return [];
+      if (Array.isArray(obj.template_ids)) {
+        return obj.template_ids.filter((id) => id && id !== 'none');
+      }
+      const single = String(obj.template_id || '').trim().toLowerCase();
+      if (single === 'none') return [];
+      if (single) return [single];
+      return [...(defaultTemplateIds.value || ['direct_fast'])];
+    }
+
+    function templateContentFor(templateIdsOrId) {
+      let ids = [];
+      if (Array.isArray(templateIdsOrId)) {
+        ids = templateIdsOrId.filter((id) => id && id !== 'none');
+      } else {
+        const tid = String(templateIdsOrId || '').trim().toLowerCase();
+        if (tid === 'none') return '';
+        ids = tid ? [tid] : [...(defaultTemplateIds.value || ['direct_fast'])];
+      }
+      const byId = new Map((copyTemplates.value || []).map((t) => [t.id, t]));
+      return ids
+        .map((id) => (byId.get(id) ? String(byId.get(id).content || '').trim() : ''))
+        .filter(Boolean)
+        .join('\n\n');
+    }
+
+    function templateOrderIndex(tid) {
+      if (!editing.value) return -1;
+      return resolveTemplateIds(editing.value).indexOf(tid);
+    }
+
+    const attractTemplates = computed(() =>
+      (copyTemplates.value || []).filter((t) => t.group !== 'rules')
+    );
+
+    const ruleTemplates = computed(() =>
+      (copyTemplates.value || []).filter((t) => t.group === 'rules')
+    );
+
+    const selectedTemplates = computed(() => {
+      if (!editing.value) return [];
+      const byId = new Map((copyTemplates.value || []).map((t) => [t.id, t]));
+      return resolveTemplateIds(editing.value)
+        .map((id) => byId.get(id))
+        .filter(Boolean);
+    });
+
+    const selectedTemplateObj = computed(() => selectedTemplates.value[0] || null);
+
     const editorFormattedPreview = computed(() => {
       if (!editing.value) return '';
       const t = String(editing.value.title || '').trim();
-      const d = String(editing.value.description || '').trim();
-      if (!t && !d) return '';
-      if (!d || d === t) return t;
-      if (!t) return d;
-      return `${t}\n\n${d}`;
+      const body = String(editing.value.description || '').trim();
+      const tplText = templateContentFor(resolveTemplateIds(editing.value));
+      let composedDesc = body;
+      if (tplText) {
+        if (!body) composedDesc = tplText;
+        else if (!body.endsWith(tplText)) composedDesc = `${body}\n\n${tplText}`;
+      }
+      if (!t && !composedDesc) return '';
+      if (!composedDesc || composedDesc === t) return t;
+      if (!t) return composedDesc;
+      return `${t}\n\n${composedDesc}`;
     });
 
     function stopEditCopyPoll() {
@@ -451,6 +510,15 @@ createApp({
         port: Number(me.main_site_port || 8001),
         baseUrl: String(me.main_site_base_url || ''),
       };
+      if (Array.isArray(me.copy_templates)) {
+        copyTemplates.value = me.copy_templates;
+      }
+      if (me.default_template_id) {
+        defaultTemplateId.value = me.default_template_id;
+      }
+      if (Array.isArray(me.default_template_ids)) {
+        defaultTemplateIds.value = me.default_template_ids;
+      }
       channels.value = chData.channels || [];
       if (channels.value.length > 0 && !channels.value.some((c) => c.channel === activeChannelCode.value)) {
         activeChannelCode.value = channels.value[0].channel;
@@ -895,7 +963,10 @@ createApp({
       try {
         const detail = await api(`/api/items/${encodeURIComponent(item.listing_id)}`);
         resetCopyDirty();
-        editing.value = JSON.parse(JSON.stringify(detail));
+        const cloned = JSON.parse(JSON.stringify(detail));
+        cloned.template_ids = resolveTemplateIds(cloned);
+        cloned.template_id = cloned.template_ids[0] || 'none';
+        editing.value = cloned;
         if (detail.copy_status === 'generating') {
           startEditCopyPoll(detail.listing_id);
         } else {
@@ -912,6 +983,22 @@ createApp({
     function closeEditor() {
       stopEditCopyPoll();
       editing.value = null;
+    }
+
+    function toggleEditorTemplate(tid) {
+      if (!editing.value) return;
+      const current = resolveTemplateIds(editing.value);
+      const next = current.includes(tid)
+        ? current.filter((x) => x !== tid)
+        : [...current, tid];
+      editing.value.template_ids = next;
+      editing.value.template_id = next[0] || 'none';
+    }
+
+    function clearEditorTemplates() {
+      if (!editing.value) return;
+      editing.value.template_ids = [];
+      editing.value.template_id = 'none';
     }
 
     function removeEditorImage(idx) { editing.value.images.splice(idx, 1); }
@@ -1005,11 +1092,14 @@ createApp({
       }
       savingEditor.value = true;
       try {
+        const chosenIds = resolveTemplateIds(editing.value);
         await api(`/api/items/${encodeURIComponent(targetId)}`, {
           method: 'PATCH',
           body: JSON.stringify({
             title: String(editing.value.title || '').slice(0, 30),
             description: editing.value.description,
+            template_ids: chosenIds,
+            template_id: chosenIds[0] || 'none',
             images: editing.value.images,
             price: Number(editing.value.price || 0),
             status: targetStatus,
@@ -1091,7 +1181,9 @@ createApp({
     }
 
     function copyItemCopy(it) {
-      const txt = `${it.title || ''}\n\n${it.description || ''}`.trim();
+      const body = String(it.full_description || it.description || '').trim();
+      const t = String(it.title || '').trim();
+      const txt = [t, body].filter(Boolean).join('\n\n');
       copyText(txt);
     }
 
@@ -1472,6 +1564,18 @@ createApp({
       runConfirmAlt,
       mainProductUrl,
       editing,
+      copyTemplates,
+      attractTemplates,
+      ruleTemplates,
+      defaultTemplateId,
+      defaultTemplateIds,
+      resolveTemplateIds,
+      templateContentFor,
+      templateOrderIndex,
+      selectedTemplates,
+      selectedTemplateObj,
+      toggleEditorTemplate,
+      clearEditorTemplates,
       editorFormattedPreview,
       uploading,
       aiGenerating,

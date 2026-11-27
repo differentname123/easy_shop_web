@@ -15,6 +15,7 @@ import uuid
 
 import requests
 
+from ..copy_templates import strip_platform_names
 from .session import (
     DEFAULT_LOCK_TIMEOUT_SEC,
     DEFAULT_OPERATION_TIMEOUT_SEC,
@@ -147,6 +148,38 @@ def _status_code_to_label(status_code: Any) -> Tuple[bool, str]:
 # ==============================================================================
 # 三、 核心函数 1：查询当前在售商品（闭环感知是否在架 / 被平台下架 / 是否掉线）
 # ==============================================================================
+def _find_zaisou_tab(page: Any) -> Any:
+    """精确查找真实可见的「在售」子标签，避免误点商品名中包含「在售」二字的元素。"""
+    try:
+        loc = page.get_by_text(re.compile(r"^在售(?:\s*[（(]?\d+[）)]?)?$"))
+        cnt = loc.count()
+        for idx in range(min(cnt, 6)):
+            cand = loc.nth(idx)
+            try:
+                if cand.is_visible():
+                    return cand
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _extract_personal_baobei_count(page: Any) -> Optional[int]:
+    """从闲鱼个人主页顶部标签读取可见的「宝贝 N」计数，用于 0 条结果时的交叉防误杀校验。"""
+    try:
+        txt = str(page.evaluate("() => (document.body ? document.body.innerText : '')") or "")
+    except Exception:
+        return None
+    m = re.search(r"宝贝\s*[:：\n\r ]*(\d+)", txt)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
 def _get_selling_items_on_page(
     context: Any,
     page: Any,
@@ -155,69 +188,154 @@ def _get_selling_items_on_page(
     user_data_dir: str,
     expected_item_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """在已就绪的浏览器页面上下文中查询当前闲鱼在售与异常商品列表。"""
+    """
+    在已就绪的浏览器页面上下文中查询当前闲鱼在售与异常商品列表（严格 Fail-Closed）。
+    兼容旧版「在售」子标签与新版个人主页「宝贝」直出列表；若列表接口未返回有效响应或分页中断，
+    明确返回 ok=False 报错，绝不把拉取失败误报成 0 件在售！
+    """
     t0 = time.monotonic()
     tag = _dir_tag(user_data_dir)
     group_summary: Dict[str, int] = {}
-    selling_packets: List[Dict[str, Any]] = []
+    all_packets: List[Dict[str, Any]] = []
+    list_api_errors: List[str] = []
 
     def on_response(resp):
-        if "mtop.idle.web.xyh.item.list" in resp.url:
-            try:
-                body = resp.json()
-                data = body.get("data") or {}
-                for g in data.get("itemGroupList") or []:
-                    if isinstance(g, dict) and g.get("groupName"):
-                        group_summary[str(g["groupName"])] = int(g.get("itemNumber") or 0)
-                if data.get("cardList") is not None:
-                    selling_packets.append(data)
-            except Exception:
-                pass
+        if "mtop.idle.web.xyh.item.list" not in resp.url:
+            return
+        try:
+            body = resp.json()
+        except Exception as exc:
+            list_api_errors.append(f"响应解析异常({exc})")
+            return
+        if not isinstance(body, dict):
+            list_api_errors.append("响应体非JSON对象")
+            return
+        ret_str = " | ".join(str(x) for x in (body.get("ret") or []))
+        data = body.get("data") or {}
+        if isinstance(data, dict):
+            for g in data.get("itemGroupList") or []:
+                if isinstance(g, dict) and g.get("groupName"):
+                    group_summary[str(g["groupName"])] = int(g.get("itemNumber") or 0)
+        if "SUCCESS" in ret_str and isinstance(data, dict) and isinstance(data.get("cardList"), list):
+            all_packets.append(data)
+        elif ret_str and "FAIL_SYS_TOKEN_EMPTY" not in ret_str:
+            list_api_errors.append(ret_str)
+        elif not isinstance(data, dict) or not isinstance(data.get("cardList"), list):
+            list_api_errors.append(f"缺少cardList(ret={ret_str or 'empty'})")
 
     page.on("response", on_response)
+    pagination_incomplete = False
+    active_packets: List[Dict[str, Any]] = []
+    dom_baobei_count: Optional[int] = None
     try:
         page.goto(GOOFISH_PERSONAL_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
+        for _ in range(18):
+            if (
+                all_packets
+                or list_api_errors
+                or auth_tracker.get("expired_rets")
+                or auth_tracker.get("risk_rets")
+            ):
+                break
+            page.wait_for_timeout(200)
+        page.wait_for_timeout(500)
+
         unb = _verify_account_online(
             context, page, auth_tracker, user_data_dir, task_name="get_selling_items"
         )
 
-        selling_packets.clear()
-        zaisou_tab = page.get_by_text("在售", exact=False).first
-        if zaisou_tab.count() > 0:
+        zaisou_tab = _find_zaisou_tab(page)
+        if zaisou_tab is not None:
+            # 记录点击「在售」前已到达的数据包；只有点击后确实触发新列表响应时才切换为筛选后包
+            pre_click_len = len(all_packets)
+            pre_click_err = len(list_api_errors)
             zaisou_tab.click()
-            for _ in range(20):
-                if selling_packets or auth_tracker.get("expired_rets"):
+            for _ in range(15):
+                if (
+                    len(all_packets) > pre_click_len
+                    or len(list_api_errors) > pre_click_err
+                    or auth_tracker.get("expired_rets")
+                    or auth_tracker.get("risk_rets")
+                ):
                     break
-                page.wait_for_timeout(300)
-            page.wait_for_timeout(500)
-
-            _verify_account_online(
-                context, page, auth_tracker, user_data_dir, task_name="get_selling_items"
+                page.wait_for_timeout(200)
+            page.wait_for_timeout(300)
+            active_packets = (
+                list(all_packets[pre_click_len:])
+                if len(all_packets) > pre_click_len
+                else list(all_packets)
             )
-
-            while selling_packets and selling_packets[-1].get("nextPage") is True:
-                prev_len = len(selling_packets)
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                for _ in range(15):
-                    if len(selling_packets) > prev_len:
-                        break
-                    page.wait_for_timeout(300)
-                if len(selling_packets) == prev_len:
-                    break
         else:
-            logger.warning(
-                f"⚠️ [在售查询/DOM诊断] 账号目录={tag} | 在个人主页未找到「在售」Tab 元素 | 当前URL={page.url}"
-            )
+            active_packets = list(all_packets)
+
+        # 分页滚动加载：若 nextPage=True 但后续页未拉取成功，标记不完整并中止同步防漏掉在售商品
+        while active_packets and active_packets[-1].get("nextPage") is True:
+            prev_total_len = len(all_packets)
+            prev_err_len = len(list_api_errors)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            for step_i in range(20):
+                if (
+                    len(all_packets) > prev_total_len
+                    or len(list_api_errors) > prev_err_len
+                    or auth_tracker.get("expired_rets")
+                    or auth_tracker.get("risk_rets")
+                ):
+                    break
+                if step_i == 8:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(250)
+            if len(all_packets) > prev_total_len:
+                active_packets.extend(all_packets[prev_total_len:])
+            else:
+                pagination_incomplete = True
+                break
+
+        _verify_account_online(
+            context, page, auth_tracker, user_data_dir, task_name="get_selling_items"
+        )
+        dom_baobei_count = _extract_personal_baobei_count(page)
     finally:
         _detach_listener_safely(page, "response", on_response)
+
+    nick = auth_tracker.get("display_name", "")
+
+    if not active_packets:
+        err_code = "SYNC_API_ERROR" if list_api_errors else "SYNC_EMPTY_RESPONSE"
+        detail_hint = list_api_errors[-1] if list_api_errors else "页面未返回 mtop.idle.web.xyh.item.list 有效数据"
+        msg = (
+            f"未拉取到闲鱼在售商品列表（{detail_hint}），已保留原有在售快照不覆盖，请稍后重试"
+        )
+        logger.warning(f"⚠️ [在售查询/Fail-Closed] 账号={nick or unb} ({tag}) | {msg} | URL={page.url}")
+        return {
+            "ok": False,
+            "is_offline": False,
+            "error_code": err_code,
+            "user_data_dir": user_data_dir,
+            "unb": unb,
+            "nick": nick,
+            "message": msg,
+        }
+
+    if pagination_incomplete:
+        err_detail = f"（{list_api_errors[-1]}）" if list_api_errors else ""
+        msg = f"闲鱼在售商品分页拉取未完成{err_detail}，为防止漏掉商品已中止本次同步"
+        logger.warning(f"⚠️ [在售查询/分页中断] 账号={nick or unb} ({tag}) | {msg}")
+        return {
+            "ok": False,
+            "is_offline": False,
+            "error_code": "SYNC_INCOMPLETE_PAGINATION",
+            "user_data_dir": user_data_dir,
+            "unb": unb,
+            "nick": nick,
+            "message": msg,
+        }
 
     online_items: List[Dict[str, Any]] = []
     abnormal_items: List[Dict[str, Any]] = []
     seen_ids = set()
     online_id_set = set()
 
-    for pkt in selling_packets:
+    for pkt in active_packets:
         for card in pkt.get("cardList") or []:
             cd = (card.get("cardData") or {}) if isinstance(card, dict) else {}
             dp = cd.get("detailParams") or {}
@@ -263,7 +381,21 @@ def _get_selling_items_on_page(
                     f"¥{price_str} | 标题={title_str[:28]}"
                 )
 
-    nick = auth_tracker.get("display_name", "")
+    if len(online_items) + len(abnormal_items) == 0:
+        expected_hint = max(int(group_summary.get("在售") or 0), int(dom_baobei_count or 0))
+        if expected_hint > 0:
+            msg = f"闲鱼页面显示共有 {expected_hint} 件商品但解析结果为 0 条，已中止同步以防误判在售为0件"
+            logger.warning(f"⚠️ [在售查询/数量矛盾] 账号={nick or unb} ({tag}) | {msg}")
+            return {
+                "ok": False,
+                "is_offline": False,
+                "error_code": "SYNC_MISMATCH_ERROR",
+                "user_data_dir": user_data_dir,
+                "unb": unb,
+                "nick": nick,
+                "message": msg,
+            }
+
     result: Dict[str, Any] = {
         "ok": True,
         "is_offline": False,
@@ -411,15 +543,19 @@ _PROHIBITED_KEYWORDS: Tuple[str, ...] = (
 
 
 def sanitize_content(title: str, desc: str) -> Tuple[str, str, List[str]]:
-    """剥离推广短链、淘口令与 Emoji，替换极限广告词，拦截外联违禁词，并保留正文段落空行。"""
+    """剥离推广短链、淘口令、第三方平台词与 Emoji，替换极限广告词，拦截外联违禁词，并保留段落空行。"""
     raw_title = _TAOKOULING_RE.sub("", _SHORTLINK_RE.sub("", _URL_RE.sub("", str(title or ""))))
     raw_desc = _TAOKOULING_RE.sub("", _SHORTLINK_RE.sub("", _URL_RE.sub("", str(desc or ""))))
-    clean_title = strip_emojis(raw_title)
-    clean_desc = strip_emojis(raw_desc)
+    no_emoji_title = strip_emojis(raw_title)
+    no_emoji_desc = strip_emojis(raw_desc)
+    clean_title = strip_platform_names(no_emoji_title) or no_emoji_title
+    clean_desc = strip_platform_names(no_emoji_desc)
 
     replaced: List[str] = []
-    if clean_title != raw_title or clean_desc != raw_desc:
+    if no_emoji_title != raw_title or no_emoji_desc != raw_desc:
         replaced.append("移除Emoji")
+    if clean_title != no_emoji_title or clean_desc != no_emoji_desc:
+        replaced.append("剥离平台词")
 
     for bad, good in _EXTREME_WORD_REPLACEMENTS:
         if bad in clean_title or bad in clean_desc:

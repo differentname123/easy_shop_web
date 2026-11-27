@@ -13,6 +13,13 @@ from fastapi import HTTPException
 from .bridge import encode_main_site_item_code
 from .channels import ChannelRegistry
 from .channels.base import SellingChannel
+from .copy_templates import (
+    DEFAULT_TEMPLATE_ID,
+    compose_full_description,
+    normalize_template_id,
+    resolve_listing_template_ids,
+    strip_platform_names,
+)
 from .repo import WorkbenchRepository, clean_id, normalize_platform
 
 _NORM_TITLE_RE = re.compile(r"[\W_]+", re.UNICODE)
@@ -415,19 +422,28 @@ class ChannelService:
             raise HTTPException(status_code=501, detail=f"{adapter.channel_name} 暂不支持同步在售")
         res = adapter.sync_selling_items(owner)
         if not res.ok:
-            self._persist_account_state(
-                owner,
-                adapter.channel_code,
-                bound=False,
-                online=False,
-                account_id=res.account_id,
-                nickname=res.nickname,
-                error_code=res.error_code,
-                message=res.message,
+            is_auth_or_risk = (
+                res.error_code in ("ACCOUNT_OFFLINE", "RISK_CONTROL_BLOCKED")
+                or not res.online
             )
+            if is_auth_or_risk:
+                self._persist_account_state(
+                    owner,
+                    adapter.channel_code,
+                    bound=False,
+                    online=False,
+                    account_id=res.account_id,
+                    nickname=res.nickname,
+                    error_code=res.error_code,
+                    message=res.message,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=res.message or "渠道账号未登录或已掉线，请重新扫码绑定",
+                )
             raise HTTPException(
-                status_code=409,
-                detail=res.message or "渠道账号未登录或已掉线，请重新扫码绑定",
+                status_code=502,
+                detail=res.message or "拉取闲鱼在售列表失败，已保留原在售快照，请稍后重试",
             )
 
         self._persist_account_state(
@@ -521,10 +537,16 @@ class ChannelService:
             now = datetime.now(timezone.utc)
             self.repo.update_listing_by_id(owner, lid, {"status": "ready", "confirmed_at": now, "updated_at": now})
 
+        eff_tids = resolve_listing_template_ids(lst)
+        raw_desc = str(lst.get("description") or "").strip()
+        full_desc = compose_full_description(raw_desc, eff_tids)
+        clean_pub_title = strip_platform_names(title) or title
+        clean_pub_desc = strip_platform_names(full_desc) or full_desc
+
         payload = {
             "listing_id": lid,
-            "title": title,
-            "description": str(lst.get("description") or "").strip(),
+            "title": clean_pub_title,
+            "description": clean_pub_desc,
             "images": images,
             "price": price,
         }
