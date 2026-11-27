@@ -36,6 +36,7 @@ from xianyu_workbench.channels.base import (
 )
 from xianyu_workbench.client import session as xy_session
 from xianyu_workbench.config import WorkbenchConfig
+from xianyu_workbench.job_runner import ChannelJobRunner
 from xianyu_workbench.repo import WorkbenchRepository
 from xianyu_workbench.run import cmd_create_user, cmd_list_users, cmd_reset_password
 from xianyu_workbench.service import WorkbenchService
@@ -94,6 +95,9 @@ def _match_query(doc, query):
                 if op == "$in":
                     if val not in target:
                         return False
+                elif op == "$nin":
+                    if val in target:
+                        return False
                 elif op == "$gte":
                     if val is None or val < target:
                         return False
@@ -105,9 +109,37 @@ def _match_query(doc, query):
     return True
 
 
+def _set_nested(target, dotted_key, value):
+    parts = str(dotted_key).split(".")
+    cur = target
+    for p in parts[:-1]:
+        if not isinstance(cur.get(p), dict):
+            cur[p] = {}
+        cur = cur[p]
+    cur[parts[-1]] = deepcopy(value)
+
+
+def _unset_nested(target, dotted_key):
+    parts = str(dotted_key).split(".")
+    cur = target
+    for p in parts[:-1]:
+        if not isinstance(cur.get(p), dict):
+            return
+        cur = cur[p]
+    cur.pop(parts[-1], None)
+
+
 def _apply_update(target, update_doc):
     for k, v in (update_doc.get("$set") or {}).items():
-        target[k] = deepcopy(v)
+        if "." in str(k):
+            _set_nested(target, k, v)
+        else:
+            target[k] = deepcopy(v)
+    for k in (update_doc.get("$unset") or {}).keys():
+        if "." in str(k):
+            _unset_nested(target, k)
+        else:
+            target.pop(k, None)
 
 
 class _MemoryCollection:
@@ -149,6 +181,12 @@ class _MemoryCollection:
     def count_documents(self, query=None):
         with self._lock:
             return sum(1 for doc in self.docs if _match_query(doc, query or {}))
+
+    def delete_many(self, query=None):
+        with self._lock:
+            before = len(self.docs)
+            self.docs = [doc for doc in self.docs if not _match_query(doc, query or {})]
+            return SimpleNamespace(deleted_count=before - len(self.docs))
 
     def insert_one(self, doc):
         with self._lock:
@@ -211,6 +249,7 @@ class _MemoryDB:
             "xy_users": _MemoryCollection(),
             "xy_listings": _MemoryCollection(),
             "xy_channels": _MemoryCollection(),
+            "xy_channel_jobs": _MemoryCollection(),
             "favorites": _MemoryCollection(),
             "products": _MemoryCollection(),
             "xianyu_deal_evaluations": _MemoryCollection(),
@@ -258,6 +297,8 @@ class _FakeChannelAdapter(SellingChannel):
         self._pub_seq = 100
         self.published_calls = []
         self.downshelved_calls = []
+        self.sync_calls = 0
+        self.batch_session_entries = 0
         self.force_offline_on_write = False
 
     def start_qr_login(self, username: str) -> QrLoginSnapshot:
@@ -325,6 +366,7 @@ class _FakeChannelAdapter(SellingChannel):
 
     def sync_selling_items(self, username: str) -> ChannelSyncResult:
         self.profile_dir_for(username)
+        self.sync_calls += 1
         if not self.online_state:
             return ChannelSyncResult(
                 ok=False,
@@ -390,6 +432,16 @@ class _FakeChannelAdapter(SellingChannel):
             "nickname": self.nickname,
         }
 
+    def batch_session(self, username: str):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            self.batch_session_entries += 1
+            yield self
+
+        return _cm()
+
     def shutdown(self) -> None:
         self.shutdown_called = True
 
@@ -443,10 +495,30 @@ def _build_env(tmp_path: Path, ai_generator=None, adapters=None):
         adapters = [_FakeChannelAdapter(cfg.channel_profiles_dir)]
     for ad in adapters:
         registry.register(ad)
-    ch_svc = ChannelService(repo, registry)
+    ch_svc = ChannelService(repo, registry, inter_item_delay_range=(0.0, 0.0))
+    job_runner = ChannelJobRunner(repo, ch_svc)
 
-    app = create_app(cfg, db=db, service=svc, channel_registry=registry, channel_service=ch_svc)
+    app = create_app(
+        cfg,
+        db=db,
+        service=svc,
+        channel_registry=registry,
+        channel_service=ch_svc,
+        job_runner=job_runner,
+    )
     return db, cfg, repo, svc, registry, ch_svc, app
+
+
+def _wait_job(client: TestClient, channel: str, job_id: str, timeout: float = 3.0) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/api/channels/{channel}/jobs/{job_id}")
+        assert resp.status_code == 200
+        job = resp.json()["data"]
+        if job["status"] not in ("queued", "running"):
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"后台任务等待超时: {channel}/{job_id}")
 
 
 def test_auth_cli_and_legacy_document_compatibility(tmp_path):
@@ -678,8 +750,11 @@ def test_core_draft_images_proxy_buy_copy_and_upload(tmp_path):
 
         gen = client.post(f"/api/items/{lid}/generate-copy").json()["data"]
         assert len(ai_prompts) == 1
-        assert "帮拍" in ai_prompts[0] and "代下单" in ai_prompts[0]
-        assert "个人闲置" in ai_prompts[0]  # 仅在“不要编造”约束中否定提及，不应出现成本毛利字样
+        assert "现货直接拍" in ai_prompts[0] and "下单马上发" in ai_prompts[0]
+        assert "45~85" in ai_prompts[0]
+        assert "严禁出现“代拍" in ai_prompts[0]
+        assert "严禁编造“个人闲置" in ai_prompts[0]
+        assert "Emoji" in ai_prompts[0]
         assert "cost_price" not in ai_prompts[0]
         assert "shipping_fee" not in ai_prompts[0]
         assert gen["copy_status"] == "ready"
@@ -808,8 +883,12 @@ def test_pluggable_channels_qr_login_sync_reconcile_and_shutdown(tmp_path):
         assert [c["channel"] for c in chs] == ["xianyu", "taobao"]
         assert chs[0]["bound"] is False
 
-        # 未登录同步返回 409
-        assert client.post("/api/channels/xianyu/sync").status_code == 409
+        # 未登录同步提交返回 202，后台任务失败并标记 ACCOUNT_OFFLINE
+        unlogged_sync = client.post("/api/channels/xianyu/sync")
+        assert unlogged_sync.status_code == 202
+        unlogged_job = _wait_job(client, "xianyu", unlogged_sync.json()["data"]["job"]["job_id"])
+        assert unlogged_job["status"] == "failed"
+        assert unlogged_job["error_code"] == "ACCOUNT_OFFLINE"
 
         # 2. 扫码登录全生命周期：start -> qr image -> waiting -> scanned -> success
         start = client.post("/api/channels/xianyu/login/start").json()["data"]
@@ -832,7 +911,11 @@ def test_pluggable_channels_qr_login_sync_reconcile_and_shutdown(tmp_path):
         assert chs_after[0]["nickname"] == "小王好价帮拍"
 
         # 3. 同步闲鱼在售并自动标题对账
-        synced = client.post("/api/channels/xianyu/sync").json()["data"]
+        sync_resp = client.post("/api/channels/xianyu/sync")
+        assert sync_resp.status_code == 202
+        sync_job = _wait_job(client, "xianyu", sync_resp.json()["data"]["job"]["job_id"])
+        assert sync_job["status"] == "completed"
+        synced = client.get("/api/channels/xianyu/selling").json()["data"]
         assert synced["online_count"] == 2
         assert synced["abnormal_count"] == 1
         assert synced["online_items"][0]["link_mode"] == "auto_title"
@@ -852,13 +935,14 @@ def test_pluggable_channels_qr_login_sync_reconcile_and_shutdown(tmp_path):
         assert item2["off_promotion_alert"] is True
         assert linked["off_promotion_alert_count"] == 1
 
-        # 5. 能力门控：未开启写能力渠道返回 501；开启写能力渠道返回 200 并记录外部链接
+        # 5. 能力门控：未开启写能力渠道返回 501；开启写能力渠道返回 202 后台任务并记录外部链接
         assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_auto_match"}).status_code == 501
         assert client.post("/api/channels/xianyu/downshelf", json={"external_item_id": "xy_item_1"}).status_code == 501
         tb_pub = client.post("/api/channels/taobao/publish", json={"listing_id": "xyl_auto_match"})
-        assert tb_pub.status_code == 200
-        assert tb_pub.json()["data"]["published"] is True
-        assert tb_pub.json()["data"]["item_url"].startswith("https://www.goofish.com/item?id=")
+        assert tb_pub.status_code == 202
+        tb_job = _wait_job(client, "taobao", tb_pub.json()["data"]["job"]["job_id"])
+        assert tb_job["status"] == "completed"
+        assert tb_job["published"][0]["item_url"].startswith("https://www.goofish.com/item?id=")
 
         # 取消接口支持无 body 和带 session_id
         assert client.post("/api/channels/xianyu/login/cancel").status_code == 200
@@ -1086,30 +1170,35 @@ def test_manual_publish_downshelf_reconcile_and_multiuser_isolation(tmp_path):
     with TestClient(app) as client:
         client.post("/api/auth/login", json={"username": "user_a", "password": "123456"})
 
-        # 1. 手动上架 xyl_a1：记录 item_id 与可跳转 item_url，禁止重复上架，禁止上架失效商品
+        # 1. 手动上架 xyl_a1：后台任务记录 item_id 与可跳转 item_url，禁止重复上架，禁止上架失效商品
         pub = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_a1"})
-        assert pub.status_code == 200
-        pub_data = pub.json()["data"]
-        assert pub_data["published"] is True
-        a1_ext_id = pub_data["item_id"]
-        assert pub_data["item_url"] == f"https://www.goofish.com/item?id={a1_ext_id}"
-        assert pub_data["selling"]["publications"]["xyl_a1"]["status"] == "online"
+        assert pub.status_code == 202
+        pub_job = _wait_job(client, "xianyu", pub.json()["data"]["job"]["job_id"])
+        assert pub_job["status"] == "completed"
+        a1_ext_id = pub_job["published"][0]["item_id"]
+        assert pub_job["published"][0]["item_url"] == f"https://www.goofish.com/item?id={a1_ext_id}"
+        selling_after_pub = client.get("/api/channels/xianyu/selling").json()["data"]
+        assert selling_after_pub["publications"]["xyl_a1"]["status"] == "online"
 
         assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_a1"}).status_code == 409
         assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_a3_dead"}).status_code == 400
 
-        # 2. 同步选品库预览：应包含 to_publish=[xyl_a2]、to_downshelf=[xy_extra_99]、already_synced=[xyl_a1]、skipped=[xyl_a3_dead]
-        prev = client.post("/api/channels/xianyu/reconcile/preview").json()["data"]
+        # 2. 同步选品库预览：refresh=True 拉取线上 xy_extra_99；区分外部帖子 recommended=False
+        prev = client.post("/api/channels/xianyu/reconcile/preview", json={"refresh": True}).json()["data"]
         assert [x["listing_id"] for x in prev["to_publish"]] == ["xyl_a2"]
         assert [x["item_id"] for x in prev["to_downshelf"]] == ["xy_extra_99"]
+        assert prev["to_downshelf"][0]["downshelf_category"] == "external_unlinked"
+        assert prev["to_downshelf"][0]["recommended"] is False
         assert [x["listing_id"] for x in prev["already_synced"]] == ["xyl_a1"]
         assert [x["listing_id"] for x in prev["skipped_off_promotion"]] == ["xyl_a3_dead"]
 
         # 3. 执行同步选品库：自动下架 xy_extra_99，自动上架 xyl_a2，且重复传 xyl_a1 幂等跳过
-        applied = client.post(
+        applied_resp = client.post(
             "/api/channels/xianyu/reconcile/apply",
             json={"publish_listing_ids": ["xyl_a2", "xyl_a1"], "downshelf_item_ids": ["xy_extra_99"]},
-        ).json()["data"]
+        )
+        assert applied_resp.status_code == 202
+        applied = _wait_job(client, "xianyu", applied_resp.json()["data"]["job"]["job_id"])
         assert len(applied["downshelved"]) == 1 and applied["downshelved"][0]["item_id"] == "xy_extra_99"
         assert len(applied["published"]) == 1 and applied["published"][0]["listing_id"] == "xyl_a2"
         assert applied["published"][0]["item_url"].startswith("https://www.goofish.com/item?id=")
@@ -1117,8 +1206,10 @@ def test_manual_publish_downshelf_reconcile_and_multiuser_isolation(tmp_path):
 
         # 4. 手动下架刚上架的 xyl_a1，清除在线态
         dw = client.post("/api/channels/xianyu/downshelf", json={"external_item_id": a1_ext_id})
-        assert dw.status_code == 200
-        dw_selling = dw.json()["data"]["selling"]
+        assert dw.status_code == 202
+        dw_job = _wait_job(client, "xianyu", dw.json()["data"]["job"]["job_id"])
+        assert dw_job["status"] == "completed"
+        dw_selling = client.get("/api/channels/xianyu/selling").json()["data"]
         assert all(x["item_id"] != a1_ext_id for x in dw_selling["online_items"])
         assert dw_selling["publications"]["xyl_a1"]["status"] == "downshelf"
 
@@ -1283,8 +1374,11 @@ def test_dismiss_is_user_isolated_and_original_urls_returned(tmp_path):
             f"/api/items/{draft['listing_id']}",
             json={"status": "ready", "description": "好价帮拍测试"},
         )
-        pub = client.post("/api/channels/xianyu/publish", json={"listing_id": draft["listing_id"]}).json()["data"]
-        assert pub["selling"]["online_items"][0]["linked_main_item_code"] == ev_items[0]["main_item_code"]
+        pub = client.post("/api/channels/xianyu/publish", json={"listing_id": draft["listing_id"]})
+        assert pub.status_code == 202
+        _wait_job(client, "xianyu", pub.json()["data"]["job"]["job_id"])
+        selling_data = client.get("/api/channels/xianyu/selling").json()["data"]
+        assert selling_data["online_items"][0]["linked_main_item_code"] == ev_items[0]["main_item_code"]
 
         assert client.post(
             "/api/candidates/dismiss",
@@ -1483,9 +1577,11 @@ def test_publish_failure_screenshot_api_persistence_and_clear(tmp_path):
         # 非法路径穿越拦截
         assert client.get("/api/assets/publish-failures/..%2Fsecret.jpg").status_code == 404
 
-        # 1. 单品手动上架失败：自动写入该商品本身的 publish_failure 并开放鉴权读图
+        # 1. 单品手动上架失败：异步执行后写入该商品本身的 publish_failure 并开放鉴权读图
         pub_fail = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"})
-        assert pub_fail.status_code == 400
+        assert pub_fail.status_code == 202
+        pub_fail_job = _wait_job(client, "xianyu", pub_fail.json()["data"]["job"]["job_id"])
+        assert pub_fail_job["status"] == "failed"
         item_detail = client.get("/api/items/xyl_fail_1").json()["data"]
         fail_info = item_detail["publish_failure"]
         assert fail_info is not None
@@ -1502,10 +1598,12 @@ def test_publish_failure_screenshot_api_persistence_and_clear(tmp_path):
         assert img_resp.headers["content-type"].startswith("image/jpeg")
 
         # 2. 对账批量执行失败也附带 screenshot_url，且同样沉淀到对应商品记录
-        reconcile_fail = client.post(
+        reconcile_resp = client.post(
             "/api/channels/xianyu/reconcile/apply",
             json={"publish_listing_ids": ["xyl_fail_1"], "downshelf_item_ids": []},
-        ).json()["data"]
+        )
+        assert reconcile_resp.status_code == 202
+        reconcile_fail = _wait_job(client, "xianyu", reconcile_resp.json()["data"]["job"]["job_id"])
         assert len(reconcile_fail["failed"]) == 1
         assert reconcile_fail["failed"][0]["screenshot_url"] == fail_info["screenshot_url"]
 
@@ -1514,11 +1612,15 @@ def test_publish_failure_screenshot_api_persistence_and_clear(tmp_path):
         assert cleared["publish_failure"] is None
 
         # 4. 再次失败后成功重试上架 -> 自动清空该商品自身的 publish_failure
-        assert client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"}).status_code == 400
+        fail_again = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"})
+        assert fail_again.status_code == 202
+        assert _wait_job(client, "xianyu", fail_again.json()["data"]["job"]["job_id"])["status"] == "failed"
         assert client.get("/api/items/xyl_fail_1").json()["data"]["publish_failure"] is not None
         should_fail["flag"] = False
-        pub_ok = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"}).json()["data"]
-        assert pub_ok["published"] is True
+        pub_ok = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_fail_1"})
+        assert pub_ok.status_code == 202
+        pub_ok_job = _wait_job(client, "xianyu", pub_ok.json()["data"]["job"]["job_id"])
+        assert pub_ok_job["status"] == "completed"
         assert client.get("/api/items/xyl_fail_1").json()["data"]["publish_failure"] is None
 
 
@@ -1787,6 +1889,446 @@ def test_background_copy_auto_generation_persistence_and_concurrency_guards(tmp_
         after4 = client.get(f"/api/items/{lid4}").json()["data"]
         assert after4["status"] == "dismissed"
         assert after4["description"] == ""
+
+
+def test_copywriting_newlines_and_contenteditable_publish():
+    from xianyu_workbench.client import seller
+
+    raw_title = "维达超韧抽纸整箱24包   京东自营直发包邮测试超长截断标题超过三十个字"
+    raw_desc = "第一段：规格 100抽*24包\r\n官旗直发\n\n\n\n第二段：下单提供订单凭证\n\n第三段：拍前私聊确认"
+    clean_title, clean_desc, _ = seller.sanitize_content(raw_title, raw_desc)
+
+    assert len(clean_title) == seller.TITLE_MAX_LEN
+    assert "\n\n" in clean_desc
+    assert "\n\n\n" not in clean_desc
+    assert clean_desc.splitlines() == [
+        "第一段：规格 100抽*24包",
+        "官旗直发",
+        "",
+        "第二段：下单提供订单凭证",
+        "",
+        "第三段：拍前私聊确认",
+    ]
+
+    full_text = seller.format_publish_text(clean_title, clean_desc)
+    assert full_text.startswith(clean_title + "\n\n第一段：")
+
+    events = []
+
+    class _FakeKeyboard:
+        def insert_text(self, s):
+            events.append(("text", s))
+
+        def press(self, key):
+            events.append(("press", key))
+
+    class _FakeEditor:
+        def click(self):
+            events.append(("click", ""))
+
+        def fill(self, val):
+            events.append(("fill", val))
+
+    class _FakePage:
+        keyboard = _FakeKeyboard()
+
+    seller._fill_contenteditable_text(_FakePage(), _FakeEditor(), "标题行\n\n正文段1\n正文段2")
+    assert events == [
+        ("click", ""),
+        ("fill", ""),
+        ("text", "标题行"),
+        ("press", "Enter"),
+        ("press", "Enter"),
+        ("text", "正文段1"),
+        ("press", "Enter"),
+        ("text", "正文段2"),
+    ]
+
+
+def test_delete_listing_and_reconcile_anti_false_downshelf(tmp_path):
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[adapter])
+    repo.create_user("alice", hash_password("123456"))
+
+    db.cols["products"].docs.extend([
+        {"platform": "jd", "product_id": "jd_del_1", "name": "待删除测试商品", "price": 30.0, "activity_price": 20.0, "is_off_promotion": False},
+        {"platform": "pdd", "product_id": "pdd_off_2", "name": "上游失效品", "price": 40.0, "activity_price": 25.0, "is_off_promotion": False},
+        {"platform": "taobao", "product_id": "tb_ok_3", "name": "正常在售品", "price": 50.0, "activity_price": 35.0, "is_off_promotion": False},
+    ])
+    db.cols["xy_listings"].docs.extend([
+        {
+            "listing_id": "xyl_del_1",
+            "owner": "alice",
+            "platform": "jd",
+            "product_id": "jd_del_1",
+            "status": "ready",
+            "title": "待删除测试商品",
+            "description": "文案1",
+            "images": [{"url": "https://img.jd.com/1.jpg", "origin": "official"}],
+            "price": 20.0,
+        },
+        {
+            "listing_id": "xyl_off_2",
+            "owner": "alice",
+            "platform": "pdd",
+            "product_id": "pdd_off_2",
+            "status": "ready",
+            "title": "上游失效品",
+            "description": "文案2",
+            "images": [{"url": "https://img.pdd.com/2.jpg", "origin": "official"}],
+            "price": 25.0,
+        },
+        {
+            "listing_id": "xyl_ok_3",
+            "owner": "alice",
+            "platform": "taobao",
+            "product_id": "tb_ok_3",
+            "status": "ready",
+            "title": "正常在售品",
+            "description": "文案3",
+            "images": [{"url": "https://img.tb.com/3.jpg", "origin": "official"}],
+            "price": 35.0,
+        },
+    ])
+
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "alice", "password": "123456"})
+
+        # 先上架全部 3 件，再通过同步追加 1 件外部个人闲置帖子
+        for lid in ("xyl_del_1", "xyl_off_2", "xyl_ok_3"):
+            r = client.post("/api/channels/xianyu/publish", json={"listing_id": lid})
+            assert r.status_code == 202
+            _wait_job(client, "xianyu", r.json()["data"]["job"]["job_id"])
+
+        adapter.online_items.append({
+            "item_id": "xy_personal_999",
+            "title": "我自己发的闲置耳机",
+            "price": "199.00",
+            "want_info": "3人想要",
+            "pic_url": "https://img.goofish.com/p.jpg",
+            "item_url": "https://www.goofish.com/item?id=xy_personal_999",
+            "is_online": True,
+        })
+        sr = client.post("/api/channels/xianyu/sync")
+        _wait_job(client, "xianyu", sr.json()["data"]["job"]["job_id"])
+
+        # 上游 pdd_off_2 在发布后失效
+        db.cols["products"].docs[1]["is_off_promotion"] = True
+
+        # 从选品库删除 xyl_del_1
+        del_resp = client.delete("/api/items/xyl_del_1")
+        assert del_resp.status_code == 200
+        assert del_resp.json()["data"]["status"] == "dismissed"
+
+        # 在售快照仍保留被删商品溯源：link_mode="removed", linked_listing_status="dismissed"
+        selling = client.get("/api/channels/xianyu/selling").json()["data"]
+        removed_on = next(x for x in selling["online_items"] if x["linked_listing_id"] == "xyl_del_1")
+        assert removed_on["link_mode"] == "removed"
+        assert removed_on["linked_listing_status"] == "dismissed"
+
+        # reconcile/preview 默认 refresh=False 不触发浏览器同步，且精确分类 3 类待下架
+        sync_before = adapter.sync_calls
+        prev = client.post("/api/channels/xianyu/reconcile/preview").json()["data"]
+        assert adapter.sync_calls == sync_before
+
+        by_cat = {x["downshelf_category"]: x for x in prev["to_downshelf"]}
+        assert by_cat["removed_from_library"]["recommended"] is True
+        assert by_cat["removed_from_library"]["reason"] == "已从选品库删除"
+        assert by_cat["off_promotion"]["recommended"] is True
+        assert by_cat["off_promotion"]["reason"] == "上游活动已失效"
+        assert by_cat["external_unlinked"]["item_id"] == "xy_personal_999"
+        assert by_cat["external_unlinked"]["recommended"] is False
+        # 推荐下架项排在前面
+        assert [x["recommended"] for x in prev["to_downshelf"]] == [True, True, False]
+
+
+def test_channel_job_runner_queue_dedup_cancel_batch_session_and_recovery(tmp_path):
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    started_first = threading.Event()
+    release_first = threading.Event()
+    orig_pub = adapter.publish_item
+
+    def _blocking_publish(username, item_payload):
+        if item_payload.get("listing_id") == "xyl_j1":
+            started_first.set()
+            release_first.wait(timeout=3.0)
+        return orig_pub(username, item_payload)
+
+    adapter.publish_item = _blocking_publish
+
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[adapter])
+    repo.create_user("runner_u", hash_password("123456"))
+    for idx in (1, 2, 3):
+        db.cols["products"].docs.append({
+            "platform": "jd",
+            "product_id": f"jd_j{idx}",
+            "name": f"队列商品{idx}",
+            "price": 20.0 + idx,
+            "activity_price": 10.0 + idx,
+            "is_off_promotion": False,
+        })
+        db.cols["xy_listings"].docs.append({
+            "listing_id": f"xyl_j{idx}",
+            "owner": "runner_u",
+            "platform": "jd",
+            "product_id": f"jd_j{idx}",
+            "status": "ready",
+            "title": f"队列商品{idx}",
+            "description": "文案",
+            "images": [{"url": "https://img.jd.com/1.jpg", "origin": "official"}],
+            "price": 10.0 + idx,
+        })
+
+    # 预插入一条孤儿 running 任务，验证 create_app 初始化自愈标为 failed
+    repo.create_channel_job({
+        "job_id": "job_orphan_1",
+        "owner": "runner_u",
+        "channel": "xianyu",
+        "kind": "sync",
+        "label": "遗留任务",
+        "status": "running",
+        "total": 1,
+        "completed": 0,
+        "created_at": datetime.datetime.now(datetime.timezone.utc),
+    })
+    app_restarted = create_app(_cfg, db=db, channel_registry=_reg)
+    orphan_after = repo.get_channel_job("runner_u", "xianyu", "job_orphan_1")
+    assert orphan_after["status"] == "failed"
+    assert orphan_after["error_code"] == "SERVER_RESTARTED"
+    assert app_restarted is not None
+
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "runner_u", "password": "123456"})
+
+        # 1. 提交批量同步（阻塞在第一件 xyl_j1），立即返回 202
+        r = client.post(
+            "/api/channels/xianyu/reconcile/apply",
+            json={"publish_listing_ids": ["xyl_j1", "xyl_j2", "xyl_j3"], "downshelf_item_ids": []},
+        )
+        assert r.status_code == 202
+        jid = r.json()["data"]["job"]["job_id"]
+        assert started_first.wait(timeout=2.0)
+
+        # 并发再发起第二个 reconcile 应被 409 拦截
+        assert client.post(
+            "/api/channels/xianyu/reconcile/apply",
+            json={"publish_listing_ids": ["xyl_j2"], "downshelf_item_ids": []},
+        ).status_code == 409
+
+        # 重复提交同款单品上架应幂等返回已有活跃任务
+        dup_pub = client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_j2"})
+        assert dup_pub.status_code == 202
+        assert dup_pub.json()["data"]["job"]["job_id"] == jid
+
+        # 在执行 xyl_j1 期间请求取消 -> xyl_j1 完成后立即中止剩余 xyl_j2 / xyl_j3
+        cancel_res = client.post(f"/api/channels/xianyu/jobs/{jid}/cancel")
+        assert cancel_res.status_code == 200
+        assert cancel_res.json()["data"]["cancel_requested"] is True
+        release_first.set()
+
+        done = _wait_job(client, "xianyu", jid)
+        assert done["status"] == "cancelled"
+        assert len(done["published"]) == 1
+        assert done["published"][0]["listing_id"] == "xyl_j1"
+        assert adapter.batch_session_entries == 1
+
+        # 剩余 xyl_j2, xyl_j3 通过一次批量同步一起上架，验证只进入 1 次 batch_session
+        r2 = client.post(
+            "/api/channels/xianyu/reconcile/apply",
+            json={"publish_listing_ids": ["xyl_j2", "xyl_j3"], "downshelf_item_ids": []},
+        )
+        done2 = _wait_job(client, "xianyu", r2.json()["data"]["job"]["job_id"])
+        assert done2["status"] == "completed"
+        assert len(done2["published"]) == 2
+        assert adapter.batch_session_entries == 2
+
+
+def test_channel_repo_atomic_updates_and_dynamic_static_version(tmp_path):
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path)
+    repo.create_user("atomic_u", hash_password("123456"))
+
+    # 验证 upsert_channel_selling 不会覆盖已存在的 manual_links
+    repo.update_channel_manual_link("atomic_u", "xianyu", "ext_1", "xyl_1")
+    repo.upsert_channel_selling(
+        "atomic_u",
+        "xianyu",
+        online_items=[{"item_id": "ext_1", "title": "t", "price": "10"}],
+        abnormal_items=[],
+        group_counts={"在售": 1},
+        synced_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    doc = repo.get_channel_doc("atomic_u", "xianyu")
+    assert doc["manual_links"] == {"ext_1": "xyl_1"}
+
+    # 验证 GET / 动态注入 app.js mtime 版本号
+    with TestClient(app) as client:
+        html = client.get("/").text
+        assert "/static/app.js?v=" in html
+        assert "/static/app.js?v=10" not in html
+
+
+def test_sanitize_strips_emojis_and_auto_switches_restricted_category(tmp_path):
+    from contextlib import contextmanager
+    from xianyu_workbench.client import seller
+
+    raw_title = "🔥脆升升薯条20g*15袋 全新现货包邮✨"
+    raw_desc = "第一段：📦全新未拆。\n\n第二段：现货直接拍，下单马上发🚀。"
+    clean_t, clean_d, replaced = seller.sanitize_content(raw_title, raw_desc)
+    assert "🔥" not in clean_t and "✨" not in clean_t
+    assert "📦" not in clean_d and "🚀" not in clean_d
+    assert "移除Emoji" in replaced
+    assert clean_t == "脆升升薯条20g*15袋 全新现货包邮"
+    assert clean_d == "第一段：全新未拆。\n\n第二段：现货直接拍，下单马上发。"
+
+    img_file = tmp_path / "snack.jpg"
+    img_file.write_bytes(b"\xff\xd8\xff\xd9")
+
+    class _AutoSwitchPage:
+        url = "https://www.goofish.com/publish"
+        keyboard = None
+
+        def __init__(self):
+            self._cbs = []
+            self.switched = False
+
+        def on(self, evt, cb):
+            if evt == "response":
+                self._cbs.append(cb)
+
+        def remove_listener(self, evt, cb):
+            if cb in self._cbs:
+                self._cbs.remove(cb)
+
+        def goto(self, url, **kw):
+            return None
+
+        def wait_for_timeout(self, ms):
+            return None
+
+        def evaluate(self, script):
+            if "preview-container" in script:
+                return {"uploading": 0, "uploaded": 1, "error_img": 0, "error_msg": ""}
+            if "tips--" in script:
+                return "" if self.switched else "网页版暂不支持发布此分类，请使用闲鱼APP扫码继续发布 点击展示二维码"
+            return ""
+
+        def locator(self, sel):
+            page_ref = self
+
+            class _Loc:
+                def __init__(self):
+                    self.first = self
+
+                def count(self):
+                    return 1
+
+                def set_input_files(self, files):
+                    return None
+
+                def click(self):
+                    if "其他闲置" in sel:
+                        page_ref.switched = True
+
+                        class _RecResp:
+                            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.kgraph.property.recommend/2.0/"
+
+                            def json(self_inner):
+                                return {"ret": ["SUCCESS::调用成功"], "data": {"cardList": [{"cardType": "20401", "cardData": {"propertyName": "分类", "propertyId": "-10000", "valuesList": [{"catName": "其他闲置", "isClicked": "1"}]}}]}}
+
+                        for cb in list(page_ref._cbs):
+                            cb(_RecResp())
+                    elif "发布" in sel and page_ref.switched:
+                        class _PubResp:
+                            url = "https://h5api.m.goofish.com/h5/mtop.idle.pc.idleitem.publish/1.0/"
+
+                            def json(self_inner):
+                                return {"ret": ["SUCCESS::调用成功"], "data": {"itemId": "110999888"}}
+
+                        for cb in list(page_ref._cbs):
+                            cb(_PubResp())
+
+                def fill(self, val):
+                    return None
+
+            return _Loc()
+
+    page = _AutoSwitchPage()
+
+    @contextmanager
+    def _mock_guard(**kw):
+        yield object(), page, {"display_name": "清和愿ovo", "user_id": "4229872747"}
+
+    with patch.object(seller, "_browser_session_guard", _mock_guard), patch.object(
+        seller, "_verify_account_online", return_value="4229872747"
+    ):
+        res = seller.publish_item(
+            "脆升升薯条15袋",
+            "全新未拆\n\n现货直接拍下单马上发",
+            [str(img_file)],
+            11.0,
+            user_data_dir=str(tmp_path / "p"),
+        )
+    assert page.switched is True
+    assert res["ok"] is True
+    assert res["item_id"] == "110999888"
+
+    # 验证「同步在售」匹配后自动清除遗留 publish_failure
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[adapter])
+    db.cols["products"].docs.append({
+        "platform": "pdd",
+        "product_id": "pdd_snack_1",
+        "name": "脆升升薯条",
+        "price": 19.9,
+        "activity_price": 11.0,
+        "is_off_promotion": False,
+    })
+    repo.create_user("snack_u", hash_password("123456"))
+    db.cols["xy_listings"].docs.append({
+        "listing_id": "xyl_snack_1",
+        "owner": "snack_u",
+        "platform": "pdd",
+        "product_id": "pdd_snack_1",
+        "title": "脆升升薯条15袋",
+        "description": "现货直接拍",
+        "price": 11.0,
+        "images": [{"url": "https://img.pddpic.com/1.jpg", "origin": "official"}],
+        "status": "ready",
+        "publish_failure": {"message": "历史失败", "error_code": "PUBLISH_FAILED"},
+    })
+    adapter.online_items = [{
+        "item_id": "xy_live_1",
+        "title": "脆升升薯条15袋",
+        "price": "11.00",
+        "want_info": "",
+        "pic_url": "https://img.goofish.com/a.jpg",
+        "item_url": "https://www.goofish.com/item?id=xy_live_1",
+        "is_online": True,
+    }]
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"username": "snack_u", "password": "123456"}).status_code == 200
+        s_res = client.post("/api/channels/xianyu/sync")
+        _wait_job(client, "xianyu", s_res.json()["data"]["job"]["job_id"])
+        assert client.get("/api/items/xyl_snack_1").json()["data"]["publish_failure"] is None
+
 
 
 

@@ -2,6 +2,7 @@
 """闲鱼销售渠道适配器：服务端托管隔离目录、扫码登录、在线检测与真实在售同步。"""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import io
 import logging
@@ -10,12 +11,18 @@ import re
 import shutil
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 import uuid
 
 from PIL import Image
 
-from ..client.seller import check_login_status, downshelf_item, get_selling_items, publish_item
+from ..client.seller import (
+    XianyuSellerSession,
+    check_login_status,
+    downshelf_item,
+    get_selling_items,
+    publish_item,
+)
 from ..client.session import (
     GOOFISH_PERSONAL_URL,
     XianyuLockTimeoutError,
@@ -607,7 +614,55 @@ class XianyuChannelAdapter(SellingChannel):
             raise ValueError("至少需要 1 张有效商品图片")
         return out
 
-    def publish_item(self, username: str, item_payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_publish_result(self, raw_res: Dict[str, Any], price: float) -> Dict[str, Any]:
+        ok = bool(raw_res.get("ok"))
+        err_code = "" if ok else str(raw_res.get("error_code") or "PUBLISH_FAILED")
+        msg = "上架成功" if ok else self._friendly_error_message(
+            err_code, str(raw_res.get("message") or "上架失败，请稍后重试")
+        )
+        shot_file = str(raw_res.get("screenshot_file") or "").strip()
+        shot_url = (
+            f"/api/assets/publish-failures/{shot_file}"
+            if (not ok and shot_file and self._PUBFAIL_NAME_RE.fullmatch(shot_file))
+            else ""
+        )
+        return {
+            "ok": ok,
+            "is_offline": bool(raw_res.get("is_offline")),
+            "error_code": err_code,
+            "message": msg,
+            "failure_screenshot_url": shot_url,
+            "item_id": str(raw_res.get("item_id") or "").strip(),
+            "item_url": str(raw_res.get("item_url") or "").strip(),
+            "title": str(raw_res.get("title") or "").strip(),
+            "price": str(raw_res.get("price") or f"{price:.2f}"),
+            "account_id": str(raw_res.get("unb") or "").strip(),
+            "nickname": str(raw_res.get("nick") or "").strip(),
+        }
+
+    def _format_downshelf_result(self, raw_res: Dict[str, Any], external_item_id: str) -> Dict[str, Any]:
+        ok = bool(raw_res.get("ok"))
+        err_code = "" if ok else str(raw_res.get("error_code") or "DOWNSHELF_FAILED")
+        msg = "下架成功" if ok else self._friendly_error_message(
+            err_code, str(raw_res.get("message") or "下架失败，请稍后重试")
+        )
+        return {
+            "ok": ok,
+            "is_offline": bool(raw_res.get("is_offline")),
+            "error_code": err_code,
+            "message": msg,
+            "item_id": str(raw_res.get("item_id") or external_item_id).strip(),
+            "account_id": str(raw_res.get("unb") or "").strip(),
+            "nickname": str(raw_res.get("nick") or "").strip(),
+        }
+
+    def publish_item(
+        self,
+        username: str,
+        item_payload: Dict[str, Any],
+        *,
+        session: Optional[XianyuSellerSession] = None,
+    ) -> Dict[str, Any]:
         profile_dir = self.profile_dir_for(username)
         raw_price = (
             item_payload.get("price")
@@ -627,17 +682,29 @@ class XianyuChannelAdapter(SellingChannel):
             }
         try:
             images = self._resolve_publish_images(item_payload.get("images"))
-            res = publish_item(
-                title=str(item_payload.get("title") or "").strip(),
-                desc=str(item_payload.get("description") or "").strip(),
-                images=images,
-                price=price,
-                user_data_dir=str(profile_dir),
-                lock_timeout_sec=30.0,
-                operation_timeout_sec=90.0,
-                lock_scope="profile",
-                failure_screenshot_dir=str(self.publish_fail_dir) if self.publish_fail_dir is not None else None,
-            )
+            title = str(item_payload.get("title") or "").strip()
+            desc = str(item_payload.get("description") or "").strip()
+            fail_dir = str(self.publish_fail_dir) if self.publish_fail_dir is not None else None
+            if session is not None:
+                res = session.publish_item(
+                    title=title,
+                    desc=desc,
+                    images=images,
+                    price=price,
+                    failure_screenshot_dir=fail_dir,
+                )
+            else:
+                res = publish_item(
+                    title=title,
+                    desc=desc,
+                    images=images,
+                    price=price,
+                    user_data_dir=str(profile_dir),
+                    lock_timeout_sec=30.0,
+                    operation_timeout_sec=90.0,
+                    lock_scope="profile",
+                    failure_screenshot_dir=fail_dir,
+                )
         except ValueError as exc:
             return {
                 "ok": False,
@@ -653,43 +720,28 @@ class XianyuChannelAdapter(SellingChannel):
                 "error_code": "PUBLISH_ERROR",
                 "message": f"上架失败：{exc}",
             }
+        return self._format_publish_result(res, price)
 
-        ok = bool(res.get("ok"))
-        err_code = "" if ok else str(res.get("error_code") or "PUBLISH_FAILED")
-        msg = "上架成功" if ok else self._friendly_error_message(
-            err_code, str(res.get("message") or "上架失败，请稍后重试")
-        )
-        shot_file = str(res.get("screenshot_file") or "").strip()
-        shot_url = (
-            f"/api/assets/publish-failures/{shot_file}"
-            if (not ok and shot_file and self._PUBFAIL_NAME_RE.fullmatch(shot_file))
-            else ""
-        )
-        return {
-            "ok": ok,
-            "is_offline": bool(res.get("is_offline")),
-            "error_code": err_code,
-            "message": msg,
-            "failure_screenshot_url": shot_url,
-            "item_id": str(res.get("item_id") or "").strip(),
-            "item_url": str(res.get("item_url") or "").strip(),
-            "title": str(res.get("title") or "").strip(),
-            "price": str(res.get("price") or f"{price:.2f}"),
-            "account_id": str(res.get("unb") or "").strip(),
-            "nickname": str(res.get("nick") or "").strip(),
-        }
-
-    def downshelf_item(self, username: str, external_item_id: str) -> Dict[str, Any]:
+    def downshelf_item(
+        self,
+        username: str,
+        external_item_id: str,
+        *,
+        session: Optional[XianyuSellerSession] = None,
+    ) -> Dict[str, Any]:
         profile_dir = self.profile_dir_for(username)
         try:
-            res = downshelf_item(
-                item_id=external_item_id,
-                delete=False,
-                user_data_dir=str(profile_dir),
-                lock_timeout_sec=25.0,
-                operation_timeout_sec=60.0,
-                lock_scope="profile",
-            )
+            if session is not None:
+                res = session.downshelf_item(external_item_id, delete=False)
+            else:
+                res = downshelf_item(
+                    item_id=external_item_id,
+                    delete=False,
+                    user_data_dir=str(profile_dir),
+                    lock_timeout_sec=25.0,
+                    operation_timeout_sec=60.0,
+                    lock_scope="profile",
+                )
         except ValueError as exc:
             return {
                 "ok": False,
@@ -707,21 +759,21 @@ class XianyuChannelAdapter(SellingChannel):
                 "message": f"下架失败：{exc}",
                 "item_id": external_item_id,
             }
+        return self._format_downshelf_result(res, external_item_id)
 
-        ok = bool(res.get("ok"))
-        err_code = "" if ok else str(res.get("error_code") or "DOWNSHELF_FAILED")
-        msg = "下架成功" if ok else self._friendly_error_message(
-            err_code, str(res.get("message") or "下架失败，请稍后重试")
-        )
-        return {
-            "ok": ok,
-            "is_offline": bool(res.get("is_offline")),
-            "error_code": err_code,
-            "message": msg,
-            "item_id": str(res.get("item_id") or external_item_id).strip(),
-            "account_id": str(res.get("unb") or "").strip(),
-            "nickname": str(res.get("nick") or "").strip(),
-        }
+    @contextmanager
+    def batch_session(self, username: str) -> Generator[SellingChannel, None, None]:
+        """在批量同步中复用同一个 Chrome 上下文，避免逐件冷启动浏览器。"""
+        profile_dir = self.profile_dir_for(username)
+        fail_dir = str(self.publish_fail_dir) if self.publish_fail_dir is not None else None
+        with XianyuSellerSession(
+            user_data_dir=str(profile_dir),
+            lock_timeout_sec=30.0,
+            operation_timeout_sec=90.0,
+            lock_scope="profile",
+            failure_screenshot_dir=fail_dir,
+        ) as session:
+            yield _XianyuSessionAdapter(self, session)
 
     def shutdown(self) -> None:
         with self._sessions_lock:
@@ -731,3 +783,39 @@ class XianyuChannelAdapter(SellingChannel):
             w.cancel()
         for w in workers:
             w.join(timeout=2.0)
+
+
+class _XianyuSessionAdapter(SellingChannel):
+    """批处理会话内使用的轻量代理适配器：共享同一个 XianyuSellerSession。"""
+
+    def __init__(self, parent: XianyuChannelAdapter, session: XianyuSellerSession) -> None:
+        super().__init__(parent.profiles_root)
+        self._parent = parent
+        self._session = session
+        self.channel_code = parent.channel_code
+        self.channel_name = parent.channel_name
+        self.capabilities = parent.capabilities
+
+    def start_qr_login(self, username: str) -> QrLoginSnapshot:
+        return self._parent.start_qr_login(username)
+
+    def get_qr_login_status(self, username: str, session_id: str) -> Optional[QrLoginSnapshot]:
+        return self._parent.get_qr_login_status(username, session_id)
+
+    def get_qr_image_bytes(self, username: str, session_id: str) -> Optional[bytes]:
+        return self._parent.get_qr_image_bytes(username, session_id)
+
+    def cancel_qr_login(self, username: str, session_id: Optional[str] = None) -> bool:
+        return self._parent.cancel_qr_login(username, session_id)
+
+    def check_status(self, username: str) -> ChannelAccountStatus:
+        return self._parent.check_status(username)
+
+    def sync_selling_items(self, username: str) -> ChannelSyncResult:
+        return self._parent.sync_selling_items(username)
+
+    def publish_item(self, username: str, item_payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._parent.publish_item(username, item_payload, session=self._session)
+
+    def downshelf_item(self, username: str, external_item_id: str) -> Dict[str, Any]:
+        return self._parent.downshelf_item(username, external_item_id, session=self._session)

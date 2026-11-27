@@ -16,6 +16,7 @@ from .bridge import open_mongo_connection
 from .channel_service import ChannelService
 from .channels import ChannelRegistry, build_default_channel_registry
 from .config import WORKBENCH_DIR, WorkbenchConfig, load_config
+from .job_runner import ChannelJobRunner
 from .repo import WorkbenchRepository
 from .service import WorkbenchService
 
@@ -69,6 +70,10 @@ class DownshelfRequest(BaseModel):
     external_item_id: str = Field(..., min_length=1, max_length=64)
 
 
+class ReconcilePreviewRequest(BaseModel):
+    refresh: bool = False
+
+
 class ReconcileApplyRequest(BaseModel):
     publish_listing_ids: List[str] = Field(default_factory=list)
     downshelf_item_ids: List[str] = Field(default_factory=list)
@@ -89,37 +94,56 @@ def create_app(
     service: Optional[WorkbenchService] = None,
     channel_registry: Optional[ChannelRegistry] = None,
     channel_service: Optional[ChannelService] = None,
+    job_runner: Optional[ChannelJobRunner] = None,
 ) -> FastAPI:
     cfg = config or load_config()
     registry = channel_registry or build_default_channel_registry(cfg)
     state: Dict[str, Any] = {
         "service": service,
         "channel_service": channel_service,
+        "job_runner": job_runner,
+        "repo": None,
         "close_db": None,
     }
 
     if db is not None:
         repo = WorkbenchRepository(db)
         repo.ensure_indexes()
+        state["repo"] = repo
         if state["service"] is None:
             state["service"] = WorkbenchService(repo, cfg)
         if state["channel_service"] is None:
             state["channel_service"] = ChannelService(repo, registry)
+        if state["job_runner"] is None:
+            state["job_runner"] = ChannelJobRunner(repo, state["channel_service"])
+        state["job_runner"].recover_stale_jobs()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if state["service"] is None or state["channel_service"] is None:
-            mongo_db, close_fn = open_mongo_connection(cfg)
-            state["close_db"] = close_fn
-            repo = WorkbenchRepository(mongo_db)
-            repo.ensure_indexes()
+        if state["service"] is None or state["channel_service"] is None or state["job_runner"] is None:
+            repo = state.get("repo")
+            if repo is None:
+                mongo_db, close_fn = open_mongo_connection(cfg)
+                state["close_db"] = close_fn
+                repo = WorkbenchRepository(mongo_db)
+                repo.ensure_indexes()
+                state["repo"] = repo
             if state["service"] is None:
                 state["service"] = WorkbenchService(repo, cfg)
             if state["channel_service"] is None:
                 state["channel_service"] = ChannelService(repo, registry)
+            if state["job_runner"] is None:
+                state["job_runner"] = ChannelJobRunner(repo, state["channel_service"])
+            state["job_runner"].recover_stale_jobs()
         try:
             yield
         finally:
+            jr = state.get("job_runner")
+            if jr is not None:
+                try:
+                    jr.shutdown(wait=True)
+                except Exception:
+                    pass
             svc_obj = state.get("service")
             if svc_obj is not None:
                 try:
@@ -153,6 +177,12 @@ def create_app(
         if csvc is None:
             raise HTTPException(status_code=503, detail="渠道服务尚未就绪")
         return csvc
+
+    def _job_runner() -> ChannelJobRunner:
+        jr = state.get("job_runner")
+        if jr is None:
+            raise HTTPException(status_code=503, detail="后台任务服务尚未就绪")
+        return jr
 
     def _uid(request: Request) -> str:
         return require_current_username(request, cfg.auth_secret)
@@ -278,6 +308,12 @@ def create_app(
         data = _svc().update_item(username, listing_id, req.model_dump(exclude_unset=True))
         return {"status": "success", "data": data}
 
+    @app.delete("/api/items/{listing_id}")
+    def dismiss_item(listing_id: str, request: Request):
+        username = _uid(request)
+        data = _svc().dismiss_item(username, listing_id)
+        return {"status": "success", "data": data}
+
     @app.post("/api/items/{listing_id}/generate-copy")
     def generate_copy(listing_id: str, request: Request):
         username = _uid(request)
@@ -328,10 +364,11 @@ def create_app(
         username = _uid(request)
         return {"status": "success", "data": _ch_svc().check_account_status(username, channel)}
 
-    @app.post("/api/channels/{channel}/sync")
+    @app.post("/api/channels/{channel}/sync", status_code=202)
     def sync_channel_selling(channel: str, request: Request):
         username = _uid(request)
-        return {"status": "success", "data": _ch_svc().sync_selling(username, channel)}
+        job = _job_runner().submit_sync(username, channel)
+        return {"status": "success", "data": {"job": job}}
 
     @app.get("/api/channels/{channel}/selling")
     def get_channel_selling(channel: str, request: Request):
@@ -344,31 +381,53 @@ def create_app(
         data = _ch_svc().link_selling_item(username, channel, external_item_id, req.listing_id)
         return {"status": "success", "data": data}
 
-    @app.post("/api/channels/{channel}/publish")
+    @app.post("/api/channels/{channel}/publish", status_code=202)
     def publish_channel_item(channel: str, req: PublishRequest, request: Request):
         username = _uid(request)
-        return {"status": "success", "data": _ch_svc().publish_item(username, channel, req.listing_id)}
+        job = _job_runner().submit_publish(username, channel, req.listing_id)
+        return {"status": "success", "data": {"job": job}}
 
-    @app.post("/api/channels/{channel}/downshelf")
+    @app.post("/api/channels/{channel}/downshelf", status_code=202)
     def downshelf_channel_item(channel: str, req: DownshelfRequest, request: Request):
         username = _uid(request)
-        return {"status": "success", "data": _ch_svc().downshelf_item(username, channel, req.external_item_id)}
+        job = _job_runner().submit_downshelf(username, channel, req.external_item_id)
+        return {"status": "success", "data": {"job": job}}
 
     @app.post("/api/channels/{channel}/reconcile/preview")
-    def preview_channel_reconcile(channel: str, request: Request):
+    def preview_channel_reconcile(
+        channel: str,
+        request: Request,
+        req: Optional[ReconcilePreviewRequest] = None,
+    ):
         username = _uid(request)
-        return {"status": "success", "data": _ch_svc().preview_reconcile(username, channel)}
+        refresh = bool(req.refresh) if req is not None else False
+        return {"status": "success", "data": _ch_svc().preview_reconcile(username, channel, refresh=refresh)}
 
-    @app.post("/api/channels/{channel}/reconcile/apply")
+    @app.post("/api/channels/{channel}/reconcile/apply", status_code=202)
     def apply_channel_reconcile(channel: str, req: ReconcileApplyRequest, request: Request):
         username = _uid(request)
-        data = _ch_svc().apply_reconcile(
+        job = _job_runner().submit_reconcile(
             username,
             channel,
             publish_listing_ids=req.publish_listing_ids,
             downshelf_item_ids=req.downshelf_item_ids,
         )
-        return {"status": "success", "data": data}
+        return {"status": "success", "data": {"job": job}}
+
+    @app.get("/api/channels/{channel}/jobs")
+    def list_channel_jobs(channel: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _job_runner().list_jobs(username, channel)}
+
+    @app.get("/api/channels/{channel}/jobs/{job_id}")
+    def get_channel_job(channel: str, job_id: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _job_runner().get_job(username, channel, job_id)}
+
+    @app.post("/api/channels/{channel}/jobs/{job_id}/cancel")
+    def cancel_channel_job(channel: str, job_id: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _job_runner().cancel_job(username, channel, job_id)}
 
     # =========================================================================
     # 五、图片上传与受保护媒体读取
@@ -418,9 +477,14 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     def workbench_page():
         index_path = STATIC_DIR / "index.html"
+        app_js_path = STATIC_DIR / "app.js"
         headers = {"Cache-Control": "no-store, no-cache, must-revalidate"}
         if index_path.is_file():
-            return HTMLResponse(index_path.read_text(encoding="utf-8"), headers=headers)
+            html = index_path.read_text(encoding="utf-8")
+            if app_js_path.is_file():
+                ver = str(int(app_js_path.stat().st_mtime_ns))
+                html = re.sub(r'/static/app\.js(?:\?v=[^"\']*)?', f"/static/app.js?v={ver}", html)
+            return HTMLResponse(html, headers=headers)
         return HTMLResponse("<h3>选品工作台页面未就绪</h3>", status_code=200, headers=headers)
 
     return app

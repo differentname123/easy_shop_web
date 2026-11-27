@@ -537,23 +537,40 @@ def _verify_account_online(
 
 
 def _collect_page_error_tips(page) -> str:
-    """收集页面上可见的 Ant Design 表单报错或 Toast 提示文本，用于失败时输出诊断日志。"""
+    """收集页面上当前可见的报错、类目提示或 Toast 文本（按优先级排序，过滤隐藏弹窗）。"""
     try:
         tips = page.evaluate(
             """() => {
             const selectors = [
+                '[class*="violation-tip"]',
+                '.ant-form-item-explain-error',
                 '.ant-message-notice-content',
                 '.ant-notification-notice',
-                '.ant-form-item-explain-error',
-                '.ant-modal-body',
+                'div[class*="tips--"]',
+                '.ant-modal-wrap .ant-modal-body',
                 '[class*="error"]',
                 '[class*="warn"]'
             ];
+            const isVisible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (!style || style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') <= 0) {
+                    return false;
+                }
+                const wrap = el.closest('.ant-modal-wrap, .ant-drawer');
+                if (wrap) {
+                    const ws = window.getComputedStyle(wrap);
+                    if (!ws || ws.display === 'none' || ws.visibility === 'hidden') return false;
+                }
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
             const out = [];
             for (const sel of selectors) {
                 for (const el of document.querySelectorAll(sel)) {
+                    if (!isVisible(el)) continue;
                     const txt = (el.innerText || '').trim().replace(/\\s+/g, ' ');
-                    if (txt && txt.length <= 120 && !out.includes(txt)) {
+                    if (txt && txt.length <= 160 && !out.includes(txt)) {
                         out.push(txt);
                     }
                 }

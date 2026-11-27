@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 _SAFE_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 
@@ -125,6 +126,11 @@ class SellingChannel(ABC):
 
     def downshelf_item(self, username: str, external_item_id: str) -> Dict[str, Any]:
         raise NotImplementedError(f"渠道「{self.channel_name or self.channel_code}」暂未开启自动下架")
+
+    @contextmanager
+    def batch_session(self, username: str) -> Generator["SellingChannel", None, None]:
+        """可选的批处理浏览器会话复用上下文，默认退化为逐次调用 self。"""
+        yield self
 
     def shutdown(self) -> None:
         return None

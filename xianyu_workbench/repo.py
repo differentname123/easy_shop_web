@@ -31,10 +31,11 @@ def clean_http_url(raw: Any) -> str:
 
 
 class WorkbenchRepository:
-    # 工作台自有 3 张核心表
+    # 工作台自有 4 张核心表
     USERS_COL = "xy_users"
     LISTINGS_COL = "xy_listings"
     CHANNELS_COL = "xy_channels"
+    JOBS_COL = "xy_channel_jobs"
 
     FAVORITES_COL = "favorites"
     PRODUCTS_COL = "products"
@@ -57,6 +58,10 @@ class WorkbenchRepository:
     @property
     def channels_col(self):
         return self.db.get_collection(self.CHANNELS_COL)
+
+    @property
+    def jobs_col(self):
+        return self.db.get_collection(self.JOBS_COL)
 
     @property
     def favorites_col(self):
@@ -90,6 +95,8 @@ class WorkbenchRepository:
             )
             self.listings_col.create_index([("owner", 1), ("status", 1), ("updated_at", -1)])
             self.channels_col.create_index([("owner", 1), ("channel", 1)], unique=True)
+            self.jobs_col.create_index([("job_id", 1)], unique=True)
+            self.jobs_col.create_index([("owner", 1), ("channel", 1), ("created_at", -1)])
             self._indexes_ready = True
             return True
         except Exception:
@@ -172,6 +179,26 @@ class WorkbenchRepository:
             {"_id": 0},
         )
         return dict(doc) if isinstance(doc, dict) else None
+
+    def batch_get_listings_by_ids(
+        self,
+        owner: str,
+        listing_ids: Sequence[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """按 listing_id 批量读取选品文档（不限状态，包含 dismissed，用于下架溯源）。"""
+        self.ensure_indexes()
+        clean_owner = str(owner or "").strip()
+        clean_ids = list(dict.fromkeys(str(x or "").strip() for x in listing_ids if str(x or "").strip()))
+        if not clean_owner or not clean_ids:
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for doc in self.listings_col.find(
+            {"owner": clean_owner, "listing_id": {"$in": clean_ids}},
+            {"_id": 0},
+        ):
+            if isinstance(doc, dict) and doc.get("listing_id"):
+                out[str(doc["listing_id"]).strip()] = dict(doc)
+        return out
 
     def get_listing_by_product(
         self,
@@ -446,6 +473,14 @@ class WorkbenchRepository:
     def get_channel_selling(self, owner: str, channel: str) -> Optional[Dict[str, Any]]:
         return self.get_channel_doc(owner, channel)
 
+    @staticmethod
+    def _safe_mongo_key(key: str) -> bool:
+        s = str(key or "").strip()
+        return bool(s and "." not in s and not s.startswith("$"))
+
+    def _ensure_channel_doc(self, owner: str, channel: str) -> Dict[str, Any]:
+        return self._upsert_channel(owner, channel, {})
+
     def upsert_channel_selling(
         self,
         owner: str,
@@ -458,32 +493,41 @@ class WorkbenchRepository:
     ) -> Dict[str, Any]:
         clean_owner = str(owner).strip()
         clean_ch = str(channel).strip().lower()
-        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
+        existing = self._ensure_channel_doc(clean_owner, clean_ch)
         online_id_set = {
             str(x.get("item_id") or "").strip() for x in online_items if isinstance(x, dict)
         }
-        publications = dict(existing.get("publications") or {})
+        now = datetime.now(timezone.utc)
         now_iso = synced_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        set_fields: Dict[str, Any] = {
+            "online_items": list(online_items),
+            "abnormal_items": list(abnormal_items),
+            "group_counts": dict(group_counts),
+            "synced_at": synced_at,
+            "updated_at": now,
+        }
+        publications = dict(existing.get("publications") or {})
+        fallback_pub_dict = False
         for lid, pub in list(publications.items()):
             if isinstance(pub, dict) and pub.get("status") == "online":
                 if str(pub.get("external_item_id") or "").strip() not in online_id_set:
-                    updated_pub = dict(pub)
-                    updated_pub["status"] = "downshelf"
-                    updated_pub["downshelved_at"] = now_iso
-                    publications[lid] = updated_pub
+                    if self._safe_mongo_key(lid):
+                        set_fields[f"publications.{lid}.status"] = "downshelf"
+                        set_fields[f"publications.{lid}.downshelved_at"] = now_iso
+                    else:
+                        updated_pub = dict(pub)
+                        updated_pub["status"] = "downshelf"
+                        updated_pub["downshelved_at"] = now_iso
+                        publications[lid] = updated_pub
+                        fallback_pub_dict = True
+        if fallback_pub_dict:
+            set_fields["publications"] = publications
 
-        return self._upsert_channel(
-            clean_owner,
-            clean_ch,
-            {
-                "online_items": list(online_items),
-                "abnormal_items": list(abnormal_items),
-                "group_counts": dict(group_counts),
-                "publications": publications,
-                "synced_at": synced_at,
-                "updated_at": datetime.now(timezone.utc),
-            },
+        self.channels_col.update_one(
+            {"owner": clean_owner, "channel": clean_ch},
+            {"$set": set_fields},
         )
+        return self.get_channel_doc(clean_owner, clean_ch) or {}
 
     def update_channel_manual_link(
         self,
@@ -494,15 +538,26 @@ class WorkbenchRepository:
     ) -> Dict[str, Any]:
         clean_owner = str(owner).strip()
         clean_ch = str(channel).strip().lower()
-        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
-        links = dict(existing.get("manual_links") or {})
         ext_id = str(external_item_id or "").strip()
         clean_lid = str(listing_id or "").strip()
+        existing = self._ensure_channel_doc(clean_owner, clean_ch)
+        now = datetime.now(timezone.utc)
+        flt = {"owner": clean_owner, "channel": clean_ch}
+        if self._safe_mongo_key(ext_id):
+            update_doc: Dict[str, Any] = {"$set": {"updated_at": now}}
+            if clean_lid:
+                update_doc["$set"][f"manual_links.{ext_id}"] = clean_lid
+            else:
+                update_doc["$unset"] = {f"manual_links.{ext_id}": ""}
+            self.channels_col.update_one(flt, update_doc)
+            return self.get_channel_doc(clean_owner, clean_ch) or {}
+
+        links = dict(existing.get("manual_links") or {})
         if clean_lid:
             links[ext_id] = clean_lid
         else:
             links.pop(ext_id, None)
-        return self._upsert_channel(clean_owner, clean_ch, {"manual_links": links})
+        return self._upsert_channel(clean_owner, clean_ch, {"manual_links": links, "updated_at": now})
 
     def record_channel_publication(
         self,
@@ -518,9 +573,7 @@ class WorkbenchRepository:
     ) -> Dict[str, Any]:
         clean_owner = str(owner).strip()
         clean_ch = str(channel).strip().lower()
-        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
-        links = dict(existing.get("manual_links") or {})
-        publications = dict(existing.get("publications") or {})
+        existing = self._ensure_channel_doc(clean_owner, clean_ch)
         online_items = [
             dict(x)
             for x in (existing.get("online_items") or [])
@@ -529,8 +582,7 @@ class WorkbenchRepository:
 
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat().replace("+00:00", "Z")
-        links[external_item_id] = listing_id
-        publications[listing_id] = {
+        pub_entry = {
             "listing_id": listing_id,
             "external_item_id": external_item_id,
             "item_url": item_url,
@@ -554,16 +606,29 @@ class WorkbenchRepository:
                 "item_url": item_url,
             },
         )
-        return self._upsert_channel(
-            clean_owner,
-            clean_ch,
-            {
-                "manual_links": links,
-                "publications": publications,
-                "online_items": online_items,
-                "updated_at": now,
-            },
+        set_fields: Dict[str, Any] = {
+            "online_items": online_items,
+            "updated_at": now,
+        }
+        if self._safe_mongo_key(external_item_id):
+            set_fields[f"manual_links.{external_item_id}"] = listing_id
+        else:
+            links = dict(existing.get("manual_links") or {})
+            links[external_item_id] = listing_id
+            set_fields["manual_links"] = links
+
+        if self._safe_mongo_key(listing_id):
+            set_fields[f"publications.{listing_id}"] = pub_entry
+        else:
+            publications = dict(existing.get("publications") or {})
+            publications[listing_id] = pub_entry
+            set_fields["publications"] = publications
+
+        self.channels_col.update_one(
+            {"owner": clean_owner, "channel": clean_ch},
+            {"$set": set_fields},
         )
+        return self.get_channel_doc(clean_owner, clean_ch) or {}
 
     def mark_channel_downshelf(
         self,
@@ -574,20 +639,10 @@ class WorkbenchRepository:
         clean_owner = str(owner).strip()
         clean_ch = str(channel).strip().lower()
         ext_id = str(external_item_id or "").strip()
-        existing = self.get_channel_doc(clean_owner, clean_ch) or {}
-        links = dict(existing.get("manual_links") or {})
-        links.pop(ext_id, None)
+        existing = self._ensure_channel_doc(clean_owner, clean_ch)
 
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat().replace("+00:00", "Z")
-        publications = dict(existing.get("publications") or {})
-        for lid, pub in list(publications.items()):
-            if isinstance(pub, dict) and str(pub.get("external_item_id") or "").strip() == ext_id:
-                updated_pub = dict(pub)
-                updated_pub["status"] = "downshelf"
-                updated_pub["downshelved_at"] = now_iso
-                publications[lid] = updated_pub
-
         online_items = [
             dict(x)
             for x in (existing.get("online_items") or [])
@@ -598,17 +653,143 @@ class WorkbenchRepository:
             for x in (existing.get("abnormal_items") or [])
             if isinstance(x, dict) and str(x.get("item_id") or "").strip() != ext_id
         ]
-        return self._upsert_channel(
-            clean_owner,
-            clean_ch,
+
+        set_fields: Dict[str, Any] = {
+            "online_items": online_items,
+            "abnormal_items": abnormal_items,
+            "updated_at": now,
+        }
+        unset_fields: Dict[str, str] = {}
+
+        if self._safe_mongo_key(ext_id):
+            unset_fields[f"manual_links.{ext_id}"] = ""
+        else:
+            links = dict(existing.get("manual_links") or {})
+            links.pop(ext_id, None)
+            set_fields["manual_links"] = links
+
+        publications = dict(existing.get("publications") or {})
+        fallback_pub_dict = False
+        for lid, pub in list(publications.items()):
+            if isinstance(pub, dict) and str(pub.get("external_item_id") or "").strip() == ext_id:
+                if self._safe_mongo_key(lid):
+                    set_fields[f"publications.{lid}.status"] = "downshelf"
+                    set_fields[f"publications.{lid}.downshelved_at"] = now_iso
+                else:
+                    updated_pub = dict(pub)
+                    updated_pub["status"] = "downshelf"
+                    updated_pub["downshelved_at"] = now_iso
+                    publications[lid] = updated_pub
+                    fallback_pub_dict = True
+        if fallback_pub_dict:
+            set_fields["publications"] = publications
+
+        update_doc: Dict[str, Any] = {"$set": set_fields}
+        if unset_fields:
+            update_doc["$unset"] = unset_fields
+        self.channels_col.update_one({"owner": clean_owner, "channel": clean_ch}, update_doc)
+        return self.get_channel_doc(clean_owner, clean_ch) or {}
+
+    # =========================================================================
+    # 渠道后台异步任务仓储 (xy_channel_jobs)
+    # =========================================================================
+    def create_channel_job(self, job_doc: Dict[str, Any]) -> Dict[str, Any]:
+        self.ensure_indexes()
+        stored = dict(job_doc)
+        self.jobs_col.insert_one(stored)
+        stored.pop("_id", None)
+        return stored
+
+    def get_channel_job(self, owner: str, channel: str, job_id: str) -> Optional[Dict[str, Any]]:
+        self.ensure_indexes()
+        doc = self.jobs_col.find_one(
             {
-                "manual_links": links,
-                "publications": publications,
-                "online_items": online_items,
-                "abnormal_items": abnormal_items,
-                "updated_at": now,
+                "owner": str(owner or "").strip(),
+                "channel": str(channel or "").strip().lower(),
+                "job_id": str(job_id or "").strip(),
             },
+            {"_id": 0},
         )
+        return dict(doc) if isinstance(doc, dict) else None
+
+    def update_channel_job(self, job_id: str, set_fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        self.ensure_indexes()
+        clean_id_val = str(job_id or "").strip()
+        if not clean_id_val:
+            return None
+        res = self.jobs_col.update_one({"job_id": clean_id_val}, {"$set": dict(set_fields or {})})
+        if int(getattr(res, "matched_count", 0) or 0) == 0:
+            return None
+        doc = self.jobs_col.find_one({"job_id": clean_id_val}, {"_id": 0})
+        return dict(doc) if isinstance(doc, dict) else None
+
+    def list_channel_jobs(self, owner: str, channel: str, limit: int = 15) -> List[Dict[str, Any]]:
+        self.ensure_indexes()
+        cursor = (
+            self.jobs_col.find(
+                {
+                    "owner": str(owner or "").strip(),
+                    "channel": str(channel or "").strip().lower(),
+                },
+                {"_id": 0},
+            )
+            .sort([("created_at", -1)])
+            .limit(max(1, int(limit)))
+        )
+        return [dict(d) for d in cursor if isinstance(d, dict)]
+
+    def prune_channel_jobs(self, owner: str, channel: str, keep: int = 20) -> int:
+        self.ensure_indexes()
+        clean_owner = str(owner or "").strip()
+        clean_ch = str(channel or "").strip().lower()
+        cursor = (
+            self.jobs_col.find(
+                {
+                    "owner": clean_owner,
+                    "channel": clean_ch,
+                    "status": {"$in": ["completed", "partial", "failed", "cancelled"]},
+                },
+                {"_id": 0, "job_id": 1},
+            )
+            .sort([("created_at", -1)])
+        )
+        stale_ids = [
+            str(d.get("job_id") or "")
+            for idx, d in enumerate(cursor)
+            if idx >= max(1, int(keep)) and isinstance(d, dict) and d.get("job_id")
+        ]
+        if not stale_ids:
+            return 0
+        res = self.jobs_col.delete_many({"owner": clean_owner, "channel": clean_ch, "job_id": {"$in": stale_ids}})
+        return int(getattr(res, "deleted_count", 0) or 0)
+
+    def mark_stale_channel_jobs_failed(self, active_job_ids: Sequence[str] = ()) -> int:
+        self.ensure_indexes()
+        now = datetime.now(timezone.utc)
+        flt: Dict[str, Any] = {"status": {"$in": ["queued", "running"]}}
+        keep_ids = [str(x or "").strip() for x in active_job_ids if str(x or "").strip()]
+        if keep_ids:
+            flt["job_id"] = {"$nin": keep_ids}
+        updated = 0
+        for doc in list(self.jobs_col.find(flt, {"_id": 0, "job_id": 1})):
+            jid = str((doc or {}).get("job_id") or "").strip()
+            if not jid:
+                continue
+            res = self.jobs_col.update_one(
+                {"job_id": jid, "status": {"$in": ["queued", "running"]}},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "error_code": "SERVER_RESTARTED",
+                        "error": "服务已重启，后台任务中断",
+                        "aborted_reason": "服务已重启，后台任务中断",
+                        "finished_at": now,
+                        "updated_at": now,
+                    }
+                },
+            )
+            updated += int(getattr(res, "matched_count", 0) or 0)
+        return updated
 
     # =========================================================================
     # 上游只读数据源 (favorites / products / xianyu_deal_evaluations / xianyu_items)

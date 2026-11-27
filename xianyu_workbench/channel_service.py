@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import random
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import HTTPException
 
@@ -64,9 +66,17 @@ def _live_price_of(product_doc: Optional[Dict[str, Any]]) -> Tuple[str, Optional
 class ChannelService:
     """隔离具体销售平台的账户绑定、状态检测、在售同步、手动上下架与选品库对齐。"""
 
-    def __init__(self, repo: WorkbenchRepository, registry: ChannelRegistry) -> None:
+    def __init__(
+        self,
+        repo: WorkbenchRepository,
+        registry: ChannelRegistry,
+        *,
+        inter_item_delay_range: Tuple[float, float] = (2.0, 4.5),
+    ) -> None:
         self.repo = repo
         self.registry = registry
+        lo, hi = inter_item_delay_range
+        self._inter_item_delay_range = (max(0.0, float(lo)), max(0.0, float(hi)))
 
     def _adapter(self, channel_code: str) -> SellingChannel:
         try:
@@ -136,17 +146,37 @@ class ChannelService:
                 by_norm_title.setdefault(nt, lst)
                 listing_norms.append((nt, lst))
 
-        matched_pairs: Dict[str, Tuple[Dict[str, Any], str]] = {}
+        matched_pairs: Dict[str, Tuple[Optional[Dict[str, Any]], str, str]] = {}
+        missing_explicit_lids: List[str] = []
+        for entry in online_raw + abnormal_raw:
+            ext_id = str(entry.get("item_id") or "").strip()
+            explicit_lid = str(manual_links.get(ext_id) or pub_ext_to_lid.get(ext_id) or "").strip()
+            if explicit_lid and explicit_lid not in by_id:
+                missing_explicit_lids.append(explicit_lid)
+        hist_by_id = (
+            self.repo.batch_get_listings_by_ids(owner, missing_explicit_lids)
+            if missing_explicit_lids
+            else {}
+        )
+
         keys: List[Tuple[str, str]] = []
         for entry in online_raw + abnormal_raw:
             ext_id = str(entry.get("item_id") or "").strip()
             linked_lst: Optional[Dict[str, Any]] = None
             link_mode = "unlinked"
+            resolved_lid = ""
 
             explicit_lid = str(manual_links.get(ext_id) or pub_ext_to_lid.get(ext_id) or "").strip()
-            if explicit_lid and explicit_lid in by_id:
-                linked_lst = by_id[explicit_lid]
-                link_mode = "manual"
+            if explicit_lid:
+                if explicit_lid in by_id:
+                    linked_lst = by_id[explicit_lid]
+                    link_mode = "manual"
+                    resolved_lid = explicit_lid
+                else:
+                    # 曾由工作台发布或关联，现已移出选品库（dismissed）或记录已清理，仍保留溯源以便同步精准下架
+                    linked_lst = hist_by_id.get(explicit_lid)
+                    link_mode = "removed"
+                    resolved_lid = explicit_lid
             else:
                 ext_norm = _norm_title(entry.get("title"))
                 if ext_norm:
@@ -159,9 +189,12 @@ class ChannelService:
                                 linked_lst = lst
                                 link_mode = "auto_title"
                                 break
-            if linked_lst is not None:
-                matched_pairs[ext_id] = (linked_lst, link_mode)
-                keys.append((linked_lst.get("platform"), linked_lst.get("product_id")))
+                    if linked_lst is not None:
+                        resolved_lid = str(linked_lst.get("listing_id") or "").strip()
+            if resolved_lid:
+                matched_pairs[ext_id] = (linked_lst, link_mode, resolved_lid)
+                if linked_lst is not None:
+                    keys.append((linked_lst.get("platform"), linked_lst.get("product_id")))
 
         prod_map = self.repo.batch_get_products(keys) if keys else {}
         off_promotion_count = 0
@@ -185,19 +218,35 @@ class ChannelService:
                 })
                 return item
 
-            lst, mode = pair
+            lst, mode, lid = pair
+            pub_rec = publications.get(lid) if isinstance(publications.get(lid), dict) else {}
+            if lst is None:
+                item.update({
+                    "link_mode": mode,
+                    "linked_listing_id": lid,
+                    "linked_listing_title": str(pub_rec.get("title") or ""),
+                    "linked_listing_status": "dismissed",
+                    "linked_platform": "",
+                    "linked_product_id": "",
+                    "linked_main_item_code": "",
+                    "upstream_status": "removed",
+                    "upstream_live_price": None,
+                    "off_promotion_alert": False,
+                })
+                return item
+
             plat = normalize_platform(lst.get("platform"))
             pid = clean_id(lst.get("product_id"))
             prod = prod_map.get((plat, pid))
             up_status, up_price = _live_price_of(prod)
             is_off = up_status == "off_promotion"
-            if is_off and item.get("is_online") is not False:
+            if is_off and item.get("is_online") is not False and mode != "removed":
                 off_promotion_count += 1
             gsign = str((prod or {}).get("goods_sign") or "").strip()
             item.update({
                 "link_mode": mode,
-                "linked_listing_id": str(lst.get("listing_id") or ""),
-                "linked_listing_title": str(lst.get("title") or ""),
+                "linked_listing_id": lid,
+                "linked_listing_title": str(lst.get("title") or pub_rec.get("title") or ""),
                 "linked_listing_status": _normalize_listing_status(lst.get("status")),
                 "linked_platform": plat,
                 "linked_product_id": pid,
@@ -400,7 +449,19 @@ class ChannelService:
             group_counts=res.group_counts,
             synced_at=now,
         )
-        return self._build_selling_payload(owner, adapter, saved)
+        payload = self._build_selling_payload(owner, adapter, saved)
+        online_lids = [
+            str(x.get("linked_listing_id") or "").strip()
+            for x in (payload.get("online_items") or [])
+            if isinstance(x, dict) and x.get("linked_listing_id") and x.get("link_mode") != "removed"
+        ]
+        if online_lids:
+            hist = self.repo.batch_get_listings_by_ids(owner, online_lids)
+            for lid in online_lids:
+                lst = hist.get(lid)
+                if isinstance(lst, dict) and lst.get("publish_failure"):
+                    self.repo.clear_listing_publish_failure(owner, lid)
+        return payload
 
     def get_selling_snapshot(self, owner: str, channel_code: str) -> Dict[str, Any]:
         adapter = self._adapter(channel_code)
@@ -470,25 +531,26 @@ class ChannelService:
         res = adapter.publish_item(owner, payload)
         if not res.get("ok"):
             shot_url = str(res.get("failure_screenshot_url") or "").strip()
+            err_code = str(res.get("error_code") or "PUBLISH_FAILED")
             self.repo.record_listing_publish_failure(
                 owner,
                 lid,
                 {
                     "channel": adapter.channel_code,
                     "channel_name": adapter.channel_name,
-                    "error_code": str(res.get("error_code") or "PUBLISH_FAILED"),
+                    "error_code": err_code,
                     "message": str(res.get("message") or "上架失败"),
                     "screenshot_url": shot_url,
                     "failed_at": _iso_utc(datetime.now(timezone.utc)),
                 },
             )
-            if res.get("is_offline") or res.get("error_code") in ("ACCOUNT_OFFLINE", "RISK_CONTROL_BLOCKED"):
+            if res.get("is_offline") or err_code in ("ACCOUNT_OFFLINE", "RISK_CONTROL_BLOCKED"):
                 self._persist_account_state(
                     owner,
                     adapter.channel_code,
                     bound=False,
                     online=False,
-                    error_code=str(res.get("error_code") or "ACCOUNT_OFFLINE"),
+                    error_code=err_code,
                     message=str(res.get("message") or "账号掉线，请重新扫码绑定"),
                 )
             return {**res, "failure_screenshot_url": shot_url}
@@ -633,9 +695,87 @@ class ChannelService:
         }
 
     # =========================================================================
-    # 声明式「同步选品库」对齐（缺少上架、多余下架）
+    # 同步前置校验（供后台队列入队前即刻拦截非法请求）
     # =========================================================================
-    def preview_reconcile(self, owner: str, channel_code: str) -> Dict[str, Any]:
+    def validate_sync_request(self, owner: str, channel_code: str) -> SellingChannel:
+        adapter = self._adapter(channel_code)
+        if not adapter.capabilities.sync_selling:
+            raise HTTPException(status_code=501, detail=f"{adapter.channel_name} 暂不支持同步在售")
+        return adapter
+
+    def validate_publish_request(self, owner: str, channel_code: str, listing_id: str) -> Dict[str, Any]:
+        adapter = self._adapter(channel_code)
+        if not adapter.capabilities.auto_publish:
+            raise HTTPException(
+                status_code=501,
+                detail=f"{adapter.channel_name} 暂未开启自动上架",
+            )
+        lst = self.repo.get_listing_by_id(owner, listing_id)
+        if not lst:
+            raise HTTPException(status_code=404, detail="选品库中未找到该商品")
+        selling = self.get_selling_snapshot(owner, adapter.channel_code)
+        for on in selling.get("online_items") or []:
+            if str(on.get("linked_listing_id") or "") == str(lst.get("listing_id") or ""):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"该商品已在{adapter.channel_name}上架（ID: {on.get('item_id')}），可直接点击查看",
+                )
+        title = str(lst.get("title") or "").strip()
+        price = _listing_price(lst)
+        images = lst.get("images") if isinstance(lst.get("images"), list) else []
+        if not title:
+            raise HTTPException(status_code=400, detail="商品标题不能为空")
+        if price <= 0:
+            raise HTTPException(status_code=400, detail="标价必须大于 0")
+        if not images:
+            raise HTTPException(status_code=400, detail="至少需要保留 1 张商品图片")
+        prod = self.repo.get_product_one(lst.get("platform"), lst.get("product_id"))
+        up_status, _ = _live_price_of(prod)
+        if up_status == "off_promotion":
+            raise HTTPException(status_code=400, detail="该商品上游活动已失效，暂不可上架")
+        return lst
+
+    def validate_downshelf_request(self, owner: str, channel_code: str, external_item_id: str) -> str:
+        adapter = self._adapter(channel_code)
+        if not adapter.capabilities.auto_downshelf:
+            raise HTTPException(
+                status_code=501,
+                detail=f"{adapter.channel_name} 暂未开启自动下架",
+            )
+        ext_id = str(external_item_id or "").strip()
+        if not ext_id:
+            raise HTTPException(status_code=400, detail="商品 ID 不能为空")
+        return ext_id
+
+    def validate_reconcile_request(
+        self,
+        owner: str,
+        channel_code: str,
+        publish_listing_ids: Sequence[str],
+        downshelf_item_ids: Sequence[str],
+    ) -> Tuple[List[str], List[str]]:
+        adapter = self._adapter(channel_code)
+        if not (adapter.capabilities.auto_publish and adapter.capabilities.auto_downshelf):
+            raise HTTPException(
+                status_code=501,
+                detail=f"{adapter.channel_name} 暂不支持选品库自动同步对齐",
+            )
+        pub_ids = list(dict.fromkeys(str(x or "").strip() for x in publish_listing_ids if str(x or "").strip()))
+        dw_ids = list(dict.fromkeys(str(x or "").strip() for x in downshelf_item_ids if str(x or "").strip()))
+        if not pub_ids and not dw_ids:
+            raise HTTPException(status_code=400, detail="请至少选择 1 件待上架或待下架商品")
+        return pub_ids, dw_ids
+
+    # =========================================================================
+    # 声明式「同步选品库」对齐（缺少上架、多余下架；默认读取快照秒开，防误杀外部帖子）
+    # =========================================================================
+    def preview_reconcile(
+        self,
+        owner: str,
+        channel_code: str,
+        *,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
         adapter = self._adapter(channel_code)
         if not (adapter.capabilities.auto_publish and adapter.capabilities.auto_downshelf):
             raise HTTPException(
@@ -643,7 +783,11 @@ class ChannelService:
                 detail=f"{adapter.channel_name} 暂不支持选品库自动同步对齐",
             )
 
-        selling = self.sync_selling(owner, adapter.channel_code)
+        selling = (
+            self.sync_selling(owner, adapter.channel_code)
+            if refresh
+            else self.get_selling_snapshot(owner, adapter.channel_code)
+        )
         all_active = self.repo.list_all_active_listings(owner)
         ready_listings = [
             d for d in all_active if _normalize_listing_status(d.get("status")) == "ready"
@@ -659,6 +803,7 @@ class ChannelService:
 
         for on in selling.get("online_items") or []:
             lid = str(on.get("linked_listing_id") or "").strip()
+            lid_status = str(on.get("linked_listing_status") or "").strip()
             ext_id = str(on.get("item_id") or "").strip()
             if lid and lid in ready_map:
                 lst = ready_map[lid]
@@ -672,6 +817,8 @@ class ChannelService:
                         "pic_url": str(on.get("pic_url") or ""),
                         "item_url": str(on.get("item_url") or ""),
                         "linked_listing_id": lid,
+                        "downshelf_category": "off_promotion",
+                        "recommended": True,
                         "reason": "上游活动已失效",
                     })
                 else:
@@ -683,7 +830,7 @@ class ChannelService:
                         "price": str(on.get("price") or ""),
                         "item_url": str(on.get("item_url") or ""),
                     })
-            else:
+            elif lid:
                 to_downshelf.append({
                     "item_id": ext_id,
                     "title": str(on.get("title") or ""),
@@ -691,8 +838,24 @@ class ChannelService:
                     "pic_url": str(on.get("pic_url") or ""),
                     "item_url": str(on.get("item_url") or ""),
                     "linked_listing_id": lid,
-                    "reason": "已移出选品库" if lid else "不在当前选品库",
+                    "downshelf_category": "removed_from_library",
+                    "recommended": True,
+                    "reason": "已退回草稿" if lid_status == "draft" else "已从选品库删除",
                 })
+            else:
+                to_downshelf.append({
+                    "item_id": ext_id,
+                    "title": str(on.get("title") or ""),
+                    "price": str(on.get("price") or ""),
+                    "pic_url": str(on.get("pic_url") or ""),
+                    "item_url": str(on.get("item_url") or ""),
+                    "linked_listing_id": "",
+                    "downshelf_category": "external_unlinked",
+                    "recommended": False,
+                    "reason": "非选品库商品（外部发布）",
+                })
+
+        to_downshelf.sort(key=lambda x: 0 if x.get("recommended") else 1)
 
         to_publish: List[Dict[str, Any]] = []
         skipped_off_promotion: List[Dict[str, Any]] = []
@@ -719,14 +882,28 @@ class ChannelService:
         return {
             "channel": adapter.channel_code,
             "channel_name": adapter.channel_name,
+            "synced_at": str(selling.get("synced_at") or ""),
             "ready_count": len(ready_listings),
             "online_count": len(selling.get("online_items") or []),
             "to_publish": to_publish,
             "to_downshelf": to_downshelf,
+            "recommended_downshelf_count": sum(1 for x in to_downshelf if x.get("recommended")),
             "already_synced": already_synced,
             "skipped_off_promotion": skipped_off_promotion,
             "selling": selling,
         }
+
+    def _sleep_interruptible(self, should_cancel: Optional[Callable[[], bool]]) -> bool:
+        lo, hi = self._inter_item_delay_range
+        if hi <= 0:
+            return bool(should_cancel and should_cancel())
+        delay = random.uniform(lo, max(lo, hi))
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if should_cancel and should_cancel():
+                return True
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        return bool(should_cancel and should_cancel())
 
     def apply_reconcile(
         self,
@@ -735,6 +912,8 @@ class ChannelService:
         *,
         publish_listing_ids: Sequence[str] = (),
         downshelf_item_ids: Sequence[str] = (),
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         adapter = self._adapter(channel_code)
         if not (adapter.capabilities.auto_publish and adapter.capabilities.auto_downshelf):
@@ -743,70 +922,126 @@ class ChannelService:
                 detail=f"{adapter.channel_name} 暂不支持选品库自动同步对齐",
             )
 
+        dw_ids = list(dict.fromkeys(str(x or "").strip() for x in downshelf_item_ids if str(x or "").strip()))
+        pub_ids = list(dict.fromkeys(str(x or "").strip() for x in publish_listing_ids if str(x or "").strip()))
+        total = len(dw_ids) + len(pub_ids)
+        completed = 0
+
         downshelved: List[Dict[str, Any]] = []
         published: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
         aborted_reason = ""
+        cancelled = False
 
-        # 1. 先下架多余商品，避免占坑
-        for raw_ext_id in dict.fromkeys(str(x or "").strip() for x in downshelf_item_ids if str(x or "").strip()):
-            res = self._execute_downshelf_one(owner, adapter, raw_ext_id)
-            if res.get("ok"):
-                downshelved.append({"item_id": raw_ext_id})
-            else:
-                failed.append({
-                    "action": "downshelf",
-                    "item_id": raw_ext_id,
-                    "message": str(res.get("message") or "下架失败"),
+        def _emit(current_label: str = "") -> None:
+            if callable(on_progress):
+                on_progress({
+                    "total": total,
+                    "completed": completed,
+                    "current_label": current_label,
+                    "published": list(published),
+                    "downshelved": list(downshelved),
+                    "failed": list(failed),
+                    "aborted_reason": aborted_reason,
                 })
-                if res.get("is_offline") or res.get("error_code") in ("ACCOUNT_OFFLINE", "RISK_CONTROL_BLOCKED"):
-                    aborted_reason = str(res.get("message") or "账号掉线或触发安全校验，已中止同步")
+
+        with adapter.batch_session(owner) as session_adapter:
+            # 1. 先下架多余商品，避免占坑
+            for idx, raw_ext_id in enumerate(dw_ids):
+                if should_cancel and should_cancel():
+                    cancelled = True
+                    aborted_reason = "已按请求停止后续同步"
                     break
-
-        # 2. 再补上架缺少的选品
-        if not aborted_reason:
-            current_online_lids = {
-                str(x.get("linked_listing_id") or "").strip()
-                for x in (self.get_selling_snapshot(owner, adapter.channel_code).get("online_items") or [])
-                if x.get("linked_listing_id")
-            }
-            for raw_lid in dict.fromkeys(str(x or "").strip() for x in publish_listing_ids if str(x or "").strip()):
-                if raw_lid in current_online_lids:
-                    continue
-                lst = self.repo.get_listing_by_id(owner, raw_lid)
-                if not lst:
-                    failed.append({"action": "publish", "listing_id": raw_lid, "message": "选品不存在"})
-                    continue
-                try:
-                    res = self._execute_publish_one(owner, adapter, lst)
-                except ValueError as exc:
-                    failed.append({"action": "publish", "listing_id": raw_lid, "message": str(exc)})
-                    continue
-
+                _emit(f"正在下架 {raw_ext_id}")
+                res = self._execute_downshelf_one(owner, session_adapter, raw_ext_id)
+                completed += 1
                 if res.get("ok"):
-                    current_online_lids.add(res["listing_id"])
-                    published.append({
-                        "listing_id": res["listing_id"],
-                        "item_id": res["item_id"],
-                        "item_url": res["item_url"],
-                        "title": res["title"],
-                        "price": res["price"],
-                    })
+                    downshelved.append({"item_id": raw_ext_id})
                 else:
                     failed.append({
-                        "action": "publish",
-                        "listing_id": raw_lid,
-                        "message": str(res.get("message") or "上架失败"),
-                        "screenshot_url": str(res.get("failure_screenshot_url") or ""),
+                        "action": "downshelf",
+                        "item_id": raw_ext_id,
+                        "message": str(res.get("message") or "下架失败"),
                     })
                     if res.get("is_offline") or res.get("error_code") in ("ACCOUNT_OFFLINE", "RISK_CONTROL_BLOCKED"):
                         aborted_reason = str(res.get("message") or "账号掉线或触发安全校验，已中止同步")
+                        _emit("")
                         break
+                _emit("")
+                has_more = (idx + 1 < len(dw_ids)) or bool(pub_ids)
+                if has_more and self._sleep_interruptible(should_cancel):
+                    cancelled = True
+                    aborted_reason = "已按请求停止后续同步"
+                    break
+
+            # 2. 再补上架缺少的选品
+            if not aborted_reason and not cancelled and pub_ids:
+                current_online_lids = {
+                    str(x.get("linked_listing_id") or "").strip()
+                    for x in (self.get_selling_snapshot(owner, adapter.channel_code).get("online_items") or [])
+                    if x.get("linked_listing_id")
+                }
+                for idx, raw_lid in enumerate(pub_ids):
+                    if should_cancel and should_cancel():
+                        cancelled = True
+                        aborted_reason = "已按请求停止后续同步"
+                        break
+                    if raw_lid in current_online_lids:
+                        completed += 1
+                        _emit("")
+                        continue
+                    lst = self.repo.get_listing_by_id(owner, raw_lid)
+                    if not lst:
+                        completed += 1
+                        failed.append({"action": "publish", "listing_id": raw_lid, "message": "选品不存在"})
+                        _emit("")
+                        continue
+
+                    item_title = str(lst.get("title") or raw_lid).strip()[:20]
+                    _emit(f"正在上架：{item_title}")
+                    did_browser_op = True
+                    try:
+                        res = self._execute_publish_one(owner, session_adapter, lst)
+                    except ValueError as exc:
+                        completed += 1
+                        failed.append({"action": "publish", "listing_id": raw_lid, "message": str(exc)})
+                        _emit("")
+                        continue
+
+                    completed += 1
+                    if res.get("ok"):
+                        current_online_lids.add(res["listing_id"])
+                        published.append({
+                            "listing_id": res["listing_id"],
+                            "item_id": res["item_id"],
+                            "item_url": res["item_url"],
+                            "title": res["title"],
+                            "price": res["price"],
+                        })
+                    else:
+                        failed.append({
+                            "action": "publish",
+                            "listing_id": raw_lid,
+                            "error_code": str(res.get("error_code") or "PUBLISH_FAILED"),
+                            "message": str(res.get("message") or "上架失败"),
+                            "screenshot_url": str(res.get("failure_screenshot_url") or ""),
+                        })
+                        if res.get("is_offline") or res.get("error_code") in ("ACCOUNT_OFFLINE", "RISK_CONTROL_BLOCKED"):
+                            aborted_reason = str(res.get("message") or "账号掉线或触发安全校验，已中止同步")
+                            _emit("")
+                            break
+                    _emit("")
+                    if did_browser_op and idx + 1 < len(pub_ids):
+                        if self._sleep_interruptible(should_cancel):
+                            cancelled = True
+                            aborted_reason = "已按请求停止后续同步"
+                            break
 
         return {
             "downshelved": downshelved,
             "published": published,
             "failed": failed,
             "aborted_reason": aborted_reason,
+            "cancelled": cancelled,
             "selling": self.get_selling_snapshot(owner, adapter.channel_code),
         }

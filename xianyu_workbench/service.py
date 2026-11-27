@@ -35,6 +35,7 @@ _SCREENSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}\.jpg$")
 _UPLOAD_NAME_RE = re.compile(r"^upl_[0-9a-f]{16}\.jpg$")
 _PLATFORM_READABLE = {"jd": "京东", "taobao": "淘宝", "pdd": "拼多多"}
 _COPY_STALE_SECONDS = 150
+TITLE_MAX_LEN = 30
 LOGGER = logging.getLogger("xianyu_workbench.copy")
 
 
@@ -505,7 +506,7 @@ class WorkbenchService:
             return {"listing_id": (updated or existing).get("listing_id"), "status": "dismissed"}
 
         prod = self.repo.get_product_one(plat, pid)
-        title = str((prod or {}).get("name") or "").strip()[:30]
+        title = str((prod or {}).get("name") or "").strip()[:TITLE_MAX_LEN]
         doc = self.repo.upsert_listing(
             owner,
             plat,
@@ -762,7 +763,7 @@ class WorkbenchService:
                     "product_id": pid,
                     "source_origin": source_origin or ("xianyu_eval" if ev else "favorite"),
                     "status": "draft",
-                    "title": raw_title[:30],
+                    "title": raw_title[:TITLE_MAX_LEN],
                     "description": "",
                     "copy_status": "generating" if token else "",
                     "copy_error": "",
@@ -801,6 +802,10 @@ class WorkbenchService:
         ev = self.repo.find_best_evaluation_for_product(updated["platform"], updated["product_id"])
         return self._hydrate_item(updated, prod, ev)
 
+    def dismiss_item(self, owner: str, listing_id: str) -> Dict[str, Any]:
+        """从选品库移出（软删除为 dismissed），保留历史文档以便渠道同步识别并下架在售帖子。"""
+        return self.update_item(owner, listing_id, {"status": "dismissed"})
+
     def _sanitize_images(self, raw_images: Any) -> List[Dict[str, str]]:
         if not isinstance(raw_images, list):
             raise HTTPException(status_code=400, detail="images 必须是数组")
@@ -837,7 +842,7 @@ class WorkbenchService:
         set_fields: Dict[str, Any] = {"updated_at": now}
 
         if "title" in updates and updates["title"] is not None:
-            set_fields["title"] = str(updates["title"]).strip()[:60]
+            set_fields["title"] = str(updates["title"]).strip()[:TITLE_MAX_LEN]
         if "description" in updates and updates["description"] is not None:
             clean_desc = str(updates["description"]).strip()[:2000]
             set_fields["description"] = clean_desc
@@ -888,6 +893,10 @@ class WorkbenchService:
         prod = self.repo.get_product_one(updated["platform"], updated["product_id"])
         ev = self.repo.find_best_evaluation_for_product(updated["platform"], updated["product_id"])
         return self._hydrate_item(updated, prod, ev)
+
+    def dismiss_item(self, owner: str, listing_id: str) -> Dict[str, Any]:
+        """从选品库移出（软删除为 dismissed），保留历史文档以便渠道同步识别并下架在售帖子。"""
+        return self.update_item(owner, listing_id, {"status": "dismissed"})
 
     def _build_copy_prompt(self, doc: Dict[str, Any], prod: Dict[str, Any]) -> Tuple[str, str]:
         di = prod.get("deal_info") if isinstance(prod.get("deal_info"), dict) else {}
@@ -941,11 +950,11 @@ class WorkbenchService:
                 description = "\n".join(lines[1:]).strip() or lines[0]
 
         if not title:
-            title = str(doc.get("title") or fallback_name)[:30]
+            title = str(doc.get("title") or fallback_name)[:TITLE_MAX_LEN]
         if not description:
             description = raw_content
         return {
-            "title": title[:30],
+            "title": title[:TITLE_MAX_LEN],
             "description": description[:2000],
             "model_used": model_used,
         }

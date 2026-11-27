@@ -1,6 +1,7 @@
 const { createApp, ref, computed, onMounted, onBeforeUnmount } = Vue;
 
 const PLATFORM_NAMES = { pdd: '拼多多', jd: '京东', taobao: '淘宝' };
+const ACTIVE_JOB_STATUSES = new Set(['queued', 'running']);
 
 async function api(url, options = {}) {
   const opts = {
@@ -54,12 +55,26 @@ function compressImageToDataUrl(file, maxDim = 1400, quality = 0.85) {
 
 createApp({
   setup() {
-    const toast = ref('');
+    const toast = ref({ message: '', actionLabel: '', onAction: null });
     let toastTimer = null;
-    function showToast(msg) {
-      toast.value = String(msg || '');
+
+    function showToast(msg, options = {}) {
+      toast.value = {
+        message: String(msg || ''),
+        actionLabel: options.actionLabel || '',
+        onAction: typeof options.onAction === 'function' ? options.onAction : null,
+      };
       if (toastTimer) clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => { toast.value = ''; }, 2400);
+      toastTimer = setTimeout(() => {
+        toast.value = { message: '', actionLabel: '', onAction: null };
+      }, options.durationMs || (options.actionLabel ? 3800 : 2400));
+    }
+
+    function triggerToastAction() {
+      const fn = toast.value.onAction;
+      toast.value = { message: '', actionLabel: '', onAction: null };
+      if (toastTimer) clearTimeout(toastTimer);
+      if (typeof fn === 'function') fn();
     }
 
     async function copyText(text) {
@@ -115,20 +130,20 @@ createApp({
     const evalSortBy = ref('want');
     const includeAllWinners = ref(false);
     const favNeedsBinding = ref(false);
-    /** 比价理由展开状态：key = platform:product_id */
     const expandedReasons = ref(new Set());
 
-    // 本地待上架商品
+    // 本地待上架商品（支持筛选与分页）
     const localItems = ref([]);
+    const itemFilter = ref('all'); // all | ready | draft | online
+    const itemsPage = ref(1);
+    const itemsHasMore = ref(false);
     const itemsLoading = ref(false);
+    const itemsLoadingMore = ref(false);
 
     // 可插拔渠道与在售同步
     const channels = ref([]);
     const activeChannelCode = ref('xianyu');
     const channelBusy = ref('');
-    const syncLoading = ref(false);
-    const publishingId = ref('');
-    const downshelvingId = ref('');
     const reconcilePreviewLoading = ref(false);
     const sellingData = ref({
       online_items: [],
@@ -136,7 +151,29 @@ createApp({
       publications: {},
       online_count: 0,
       abnormal_count: 0,
+      off_promotion_alert_count: 0,
       synced_at: '',
+    });
+
+    // 后台任务队列状态
+    const channelJobs = ref({ active_jobs: [], recent_jobs: [], latest_job: null });
+    const dismissedJobId = ref('');
+    const jobDetailModal = ref({ visible: false, job: null });
+    let jobsPollTimer = null;
+    let prevActiveJobIds = new Set();
+
+    // 页内通用确认弹窗
+    const confirmModal = ref({
+      visible: false,
+      title: '',
+      message: '',
+      confirmText: '确定',
+      confirmClass: 'btn-primary',
+      altText: '',
+      altClass: 'btn-danger-soft',
+      onConfirm: null,
+      onAlt: null,
+      loading: false,
     });
 
     const activeChannel = computed(() => {
@@ -166,6 +203,77 @@ createApp({
       return onlineByListingId.value[listingId] || null;
     }
 
+    const filteredLocalItems = computed(() => {
+      const list = localItems.value || [];
+      if (itemFilter.value === 'ready') {
+        return list.filter((it) => it.status === 'ready' && !onlineItemFor(it.listing_id));
+      }
+      if (itemFilter.value === 'draft') {
+        return list.filter((it) => it.status !== 'ready');
+      }
+      if (itemFilter.value === 'online') {
+        return list.filter((it) => !!onlineItemFor(it.listing_id));
+      }
+      return list;
+    });
+
+    const offPromoOnlineItems = computed(() => {
+      return (sellingData.value.online_items || []).filter(
+        (x) => x.off_promotion_alert && x.link_mode !== 'removed'
+      );
+    });
+
+    const isChannelSyncing = computed(() => {
+      return (channelJobs.value.active_jobs || []).some((j) => j.kind === 'sync');
+    });
+
+    const activePublishListingIds = computed(() => {
+      const set = new Set();
+      for (const j of (channelJobs.value.active_jobs || [])) {
+        if (j.kind === 'publish' || j.kind === 'reconcile') {
+          for (const lid of (j.target_listing_ids || [])) set.add(lid);
+        }
+      }
+      return set;
+    });
+
+    const activeDownshelfItemIds = computed(() => {
+      const set = new Set();
+      for (const j of (channelJobs.value.active_jobs || [])) {
+        if (j.kind === 'downshelf' || j.kind === 'reconcile') {
+          for (const iid of (j.target_item_ids || [])) set.add(iid);
+        }
+      }
+      return set;
+    });
+
+    function isListingPublishing(listingId) {
+      return activePublishListingIds.value.has(listingId);
+    }
+
+    function isItemDownshelving(itemId) {
+      return activeDownshelfItemIds.value.has(itemId);
+    }
+
+    function isJobActive(job) {
+      return !!(job && ACTIVE_JOB_STATUSES.has(job.status));
+    }
+
+    const bannerJob = computed(() => {
+      const active = channelJobs.value.active_jobs || [];
+      if (active.length > 0) return active[0];
+      const latest = channelJobs.value.latest_job;
+      if (!latest || latest.job_id === dismissedJobId.value) return null;
+      const ts = latest.finished_at || latest.updated_at;
+      if (ts) {
+        const dt = new Date(ts);
+        if (!Number.isNaN(dt.getTime()) && (Date.now() - dt.getTime()) > 15 * 60 * 1000) {
+          return null;
+        }
+      }
+      return latest;
+    });
+
     const mainSiteCfg = ref({ port: 8001, baseUrl: '' });
 
     function mainProductUrl(code) {
@@ -188,18 +296,22 @@ createApp({
     let editCopyPollTimer = null;
     let itemsCopyPollTimer = null;
 
-    function markTitleDirty() {
-      titleDirty.value = true;
-    }
-
-    function markDescDirty() {
-      descDirty.value = true;
-    }
-
+    function markTitleDirty() { titleDirty.value = true; }
+    function markDescDirty() { descDirty.value = true; }
     function resetCopyDirty() {
       titleDirty.value = false;
       descDirty.value = false;
     }
+
+    const editorFormattedPreview = computed(() => {
+      if (!editing.value) return '';
+      const t = String(editing.value.title || '').trim();
+      const d = String(editing.value.description || '').trim();
+      if (!t && !d) return '';
+      if (!d || d === t) return t;
+      if (!t) return d;
+      return `${t}\n\n${d}`;
+    });
 
     function stopEditCopyPoll() {
       if (editCopyPollTimer) {
@@ -212,6 +324,13 @@ createApp({
       if (itemsCopyPollTimer) {
         clearTimeout(itemsCopyPollTimer);
         itemsCopyPollTimer = null;
+      }
+    }
+
+    function stopJobsPoll() {
+      if (jobsPollTimer) {
+        clearTimeout(jobsPollTimer);
+        jobsPollTimer = null;
       }
     }
 
@@ -245,14 +364,24 @@ createApp({
     // 关联本地商品弹窗
     const linkModal = ref({ visible: false, sellingItem: null });
 
-    // 同步选品库预览与执行抽屉
+    // 同步选品库预览抽屉
     const reconcileModal = ref({
       visible: false,
-      applying: false,
+      submitting: false,
+      showExternal: false,
       preview: null,
       publishIds: [],
       downshelfIds: [],
-      result: null,
+    });
+
+    const recommendedDownshelfList = computed(() => {
+      return ((reconcileModal.value.preview && reconcileModal.value.preview.to_downshelf) || [])
+        .filter((d) => !!d.recommended);
+    });
+
+    const externalDownshelfList = computed(() => {
+      return ((reconcileModal.value.preview && reconcileModal.value.preview.to_downshelf) || [])
+        .filter((d) => !d.recommended);
     });
 
     function platformLabel(code) {
@@ -260,12 +389,55 @@ createApp({
     }
 
     function formatTime(iso) {
-      /** 兼容 SQLite 格式 '2026-11-24 06:12:29'（无T）和 ISO 格式 */
       if (!iso) return '';
       const d = new Date(String(iso).replace(' ', 'T'));
       if (Number.isNaN(d.getTime())) return '';
       const pad = (n) => String(n).padStart(2, '0');
       return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function jobBannerClass(job) {
+      if (!job) return '';
+      if (isJobActive(job)) return '';
+      if (job.status === 'completed') return 'done';
+      if (job.status === 'partial' || job.status === 'cancelled') return 'warn';
+      return 'fail';
+    }
+
+    function jobStatusLabel(st) {
+      const map = {
+        queued: '排队中',
+        running: '执行中',
+        completed: '已完成',
+        partial: '部分完成',
+        failed: '失败',
+        cancelled: '已停止',
+      };
+      return map[st] || st;
+    }
+
+    function jobSummaryText(job) {
+      if (!job) return '';
+      if (job.kind === 'sync') {
+        return job.status === 'completed' ? ' · 已更新' : ` · ${job.error || '失败'}`;
+      }
+      if (job.kind === 'publish') {
+        if (job.status === 'completed') return ' · 上架成功';
+        return ` · ${job.error || '上架失败'}`;
+      }
+      if (job.kind === 'downshelf') {
+        if (job.status === 'completed') return ' · 已下架';
+        return ` · ${job.error || '下架失败'}`;
+      }
+      const pubCnt = (job.published || []).length;
+      const dwCnt = (job.downshelved || []).length;
+      const failCnt = (job.failed || []).length;
+      const parts = [];
+      if (pubCnt) parts.push(`上架${pubCnt}`);
+      if (dwCnt) parts.push(`下架${dwCnt}`);
+      if (failCnt) parts.push(`失败${failCnt}`);
+      if (job.status === 'cancelled') parts.push('已停止');
+      return parts.length ? ` · ${parts.join(' ')}` : '';
     }
 
     async function refreshMeAndChannels() {
@@ -288,7 +460,12 @@ createApp({
     async function bootstrapSession() {
       try {
         await refreshMeAndChannels();
-        await Promise.all([loadCandidates(true), loadItems(), loadChannelSelling()]);
+        await Promise.all([
+          loadCandidates(true),
+          loadItems({ reset: true }),
+          loadChannelSelling(),
+          loadChannelJobs(),
+        ]);
       } catch (_) {
         user.value = null;
       }
@@ -318,16 +495,20 @@ createApp({
       stopQrPolling();
       stopEditCopyPoll();
       stopItemsCopyPoll();
+      stopJobsPoll();
       try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {}
       user.value = null;
       candidates.value = [];
       localItems.value = [];
+      channelJobs.value = { active_jobs: [], recent_jobs: [], latest_job: null };
+      prevActiveJobIds = new Set();
       sellingData.value = {
         online_items: [],
         abnormal_items: [],
         publications: {},
         online_count: 0,
         abnormal_count: 0,
+        off_promotion_alert_count: 0,
         synced_at: '',
       };
       editing.value = null;
@@ -376,11 +557,9 @@ createApp({
     }
 
     function toggleReason(c) {
-      /** 展开/折叠某个候选商品的比价理由 */
       const key = `${c.platform}:${c.product_id}`;
       const s = expandedReasons.value;
       if (s.has(key)) { s.delete(key); } else { s.add(key); }
-      // 触发响应式更新（Set 本身变化不被 Vue 追踪，需替换引用）
       expandedReasons.value = new Set(s);
     }
 
@@ -459,7 +638,7 @@ createApp({
             if (updated) {
               showToast('✨ 后台已自动生成文案');
             }
-            loadItems().catch(() => {});
+            loadItems({ silent: true }).catch(() => {});
           }
         } catch (_) {}
       }, 1200);
@@ -479,34 +658,68 @@ createApp({
           (x) => !(x.platform === c.platform && x.product_id === c.product_id)
         );
         if (pickSource.value === 'eval' && evalTotal.value > 0) evalTotal.value -= 1;
-        resetCopyDirty();
-        editing.value = JSON.parse(JSON.stringify(doc));
-        if (doc.copy_status === 'generating') {
-          startEditCopyPoll(doc.listing_id);
-        }
-        await Promise.all([loadItems(), refreshMeAndChannels()]);
+        showToast(
+          doc.copy_status === 'generating' ? '已加入草稿，后台生成文案中' : '已加入选品草稿',
+          { actionLabel: '去编辑', onAction: () => openEditor(doc) }
+        );
+        Promise.all([loadItems({ silent: true }), refreshMeAndChannels()]).catch(() => {});
       } catch (e) {
         showToast(e.message);
       }
     }
 
     // 本地待上架 & 在售切换
-    async function loadItems() {
+    function apiStatusForFilter() {
+      if (itemFilter.value === 'draft') return 'draft';
+      if (itemFilter.value === 'ready' || itemFilter.value === 'online') return 'ready';
+      return 'active';
+    }
+
+    function setItemFilter(f) {
+      if (itemFilter.value === f) return;
+      itemFilter.value = f;
+      loadItems({ reset: true });
+    }
+
+    async function loadItems({ reset = true, silent = false } = {}) {
       stopItemsCopyPoll();
-      itemsLoading.value = true;
+      const apiStatus = apiStatusForFilter();
+      const targetPage = reset ? 1 : itemsPage.value + 1;
+      const pageSize = silent ? Math.min(100, Math.max(40, localItems.value.length || 40)) : 40;
+      if (!silent) {
+        if (reset) itemsLoading.value = true;
+        else itemsLoadingMore.value = true;
+      }
       try {
-        const data = await api('/api/items?status=active&page=1&page_size=80');
-        localItems.value = data.items || [];
+        const data = await api(
+          `/api/items?status=${encodeURIComponent(apiStatus)}&page=${silent ? 1 : targetPage}&page_size=${pageSize}`
+        );
+        if (reset || silent) {
+          localItems.value = data.items || [];
+          if (!silent) itemsPage.value = 1;
+        } else {
+          const existingIds = new Set(localItems.value.map((x) => x.listing_id));
+          const merged = [...localItems.value];
+          for (const row of (data.items || [])) {
+            if (!existingIds.has(row.listing_id)) merged.push(row);
+          }
+          localItems.value = merged;
+          itemsPage.value = targetPage;
+        }
+        itemsHasMore.value = !!data.has_more;
         if (data.item_counts) itemCounts.value = data.item_counts;
         if (user.value && localItems.value.some((it) => it.copy_status === 'generating')) {
           itemsCopyPollTimer = setTimeout(() => {
-            if (user.value) loadItems().catch(() => {});
+            if (user.value) loadItems({ silent: true }).catch(() => {});
           }, 2500);
         }
       } catch (e) {
-        showToast(e.message);
+        if (!silent) showToast(e.message);
       } finally {
-        itemsLoading.value = false;
+        if (!silent) {
+          itemsLoading.value = false;
+          itemsLoadingMore.value = false;
+        }
       }
     }
 
@@ -521,24 +734,160 @@ createApp({
 
     function openItemsTab() {
       mainTab.value = 'items';
-      loadItems();
+      loadItems({ silent: localItems.value.length > 0 });
       if (itemsSubTab.value === 'selling') loadChannelSelling();
     }
 
     function switchItemsSubTab(sub) {
       itemsSubTab.value = sub;
-      if (sub === 'ready') loadItems();
+      if (sub === 'ready') loadItems({ silent: localItems.value.length > 0 });
       else loadChannelSelling();
     }
 
     function selectChannel(code) {
       activeChannelCode.value = code;
       loadChannelSelling(code);
+      loadChannelJobs(code);
     }
 
     function openMeTab() {
       mainTab.value = 'me';
       refreshMeAndChannels().catch(() => {});
+    }
+
+    // 后台任务轮询与管理
+    function scheduleJobsPoll() {
+      stopJobsPoll();
+      if (!user.value) return;
+      if ((channelJobs.value.active_jobs || []).length > 0) {
+        jobsPollTimer = setTimeout(() => {
+          if (user.value) loadChannelJobs().catch(() => {});
+        }, 1800);
+      }
+    }
+
+    function syncDetailModalJob(data) {
+      if (!jobDetailModal.value.visible || !jobDetailModal.value.job) return;
+      const jid = jobDetailModal.value.job.job_id;
+      const all = [...(data.active_jobs || []), ...(data.recent_jobs || [])];
+      const match = all.find((x) => x.job_id === jid);
+      if (match) jobDetailModal.value.job = match;
+    }
+
+    async function loadChannelJobs(code = activeChannelCode.value) {
+      try {
+        const data = await api(`/api/channels/${encodeURIComponent(code)}/jobs`);
+        channelJobs.value = data;
+        syncDetailModalJob(data);
+
+        const activeNow = new Set((data.active_jobs || []).map((j) => j.job_id));
+        const finishedIds = [...prevActiveJobIds].filter((id) => !activeNow.has(id));
+        prevActiveJobIds = activeNow;
+
+        if (finishedIds.length > 0) {
+          await Promise.all([
+            loadItems({ silent: true }),
+            loadChannelSelling(code),
+            refreshMeAndChannels(),
+          ]).catch(() => {});
+
+          const recent = data.recent_jobs || [];
+          const doneJob = recent.find((j) => j.job_id === finishedIds[0]) || data.latest_job;
+          if (doneJob) {
+            if (doneJob.error_code === 'ACCOUNT_OFFLINE' && !activeChannel.value.online) {
+              showToast(doneJob.error || '渠道账号已掉线，请重新扫码绑定');
+              startQrLogin(code);
+            } else {
+              showToast(`${doneJob.label}${jobSummaryText(doneJob)}`);
+            }
+          }
+        }
+        scheduleJobsPoll();
+      } catch (_) {}
+    }
+
+    function trackSubmittedJob(job) {
+      if (!job || !job.job_id) return;
+      dismissedJobId.value = '';
+      const active = [...(channelJobs.value.active_jobs || []).filter((x) => x.job_id !== job.job_id)];
+      if (isJobActive(job)) {
+        active.unshift(job);
+        prevActiveJobIds.add(job.job_id);
+      }
+      channelJobs.value = {
+        ...channelJobs.value,
+        active_jobs: active,
+        latest_job: job,
+      };
+      scheduleJobsPoll();
+    }
+
+    function openJobDetail(job) {
+      jobDetailModal.value = { visible: true, job };
+    }
+
+    function dismissJobBanner(jobId) {
+      dismissedJobId.value = jobId || '';
+    }
+
+    async function cancelChannelJob(jobId) {
+      if (!jobId) return;
+      try {
+        const updated = await api(
+          `/api/channels/${encodeURIComponent(activeChannelCode.value)}/jobs/${encodeURIComponent(jobId)}/cancel`,
+          { method: 'POST' }
+        );
+        if (jobDetailModal.value.job && jobDetailModal.value.job.job_id === jobId) {
+          jobDetailModal.value.job = updated;
+        }
+        showToast(updated.status === 'cancelled' ? '已取消任务' : '已请求停止，当前步骤完成后中止');
+        await loadChannelJobs();
+      } catch (e) {
+        showToast(e.message);
+      }
+    }
+
+    // 页内确认弹窗控制
+    function openConfirmModal(opts) {
+      confirmModal.value = {
+        visible: true,
+        title: opts.title || '确认操作',
+        message: opts.message || '',
+        confirmText: opts.confirmText || '确定',
+        confirmClass: opts.confirmClass || 'btn-primary',
+        altText: opts.altText || '',
+        altClass: opts.altClass || 'btn-danger-soft',
+        onConfirm: opts.onConfirm || null,
+        onAlt: opts.onAlt || null,
+        loading: false,
+      };
+    }
+
+    function closeConfirmModal() {
+      if (confirmModal.value.loading) return;
+      confirmModal.value.visible = false;
+    }
+
+    async function runConfirmPrimary() {
+      const fn = confirmModal.value.onConfirm;
+      confirmModal.value.loading = true;
+      try {
+        if (typeof fn === 'function') await fn();
+        confirmModal.value.visible = false;
+      } finally {
+        confirmModal.value.loading = false;
+      }
+    }
+
+    async function runConfirmAlt() {
+      const fn = confirmModal.value.onAlt;
+      confirmModal.value.loading = true;
+      try {
+        if (typeof fn === 'function') await fn();
+        confirmModal.value.visible = false;
+      } finally {
+        confirmModal.value.loading = false;
+      }
     }
 
     // 编辑抽屉逻辑
@@ -551,7 +900,6 @@ createApp({
           startEditCopyPoll(detail.listing_id);
         } else {
           stopEditCopyPoll();
-          // 兼容历史空白草稿：首次打开且尚无文案时自动生成一次并落库
           if (detail.status === 'draft' && !String(detail.description || '').trim() && !detail.copy_status) {
             generateEditorCopy();
           }
@@ -566,9 +914,7 @@ createApp({
       editing.value = null;
     }
 
-    function removeEditorImage(idx) {
-      editing.value.images.splice(idx, 1);
-    }
+    function removeEditorImage(idx) { editing.value.images.splice(idx, 1); }
 
     function setCoverImage(idx) {
       const imgs = editing.value.images;
@@ -625,7 +971,7 @@ createApp({
         editing.value.copy_status = data.copy_status || 'ready';
         editing.value.copy_error = '';
         resetCopyDirty();
-        loadItems().catch(() => {});
+        loadItems({ silent: true }).catch(() => {});
         showToast('已生成并保存文案');
       } catch (e) {
         if (editing.value && editing.value.listing_id === targetId) {
@@ -643,29 +989,44 @@ createApp({
           body: JSON.stringify({ status: 'ready' }),
         });
         showToast('已加入选品库');
-        await Promise.all([loadItems(), refreshMeAndChannels()]);
+        await Promise.all([loadItems({ silent: true }), refreshMeAndChannels()]);
       } catch (e) {
         showToast(e.message);
       }
     }
 
-    async function saveEditor(targetStatus) {
+    async function saveEditor(targetStatus, publishAfter = false) {
       if (!editing.value) return;
+      const targetId = editing.value.listing_id;
+      if (publishAfter && !activeChannel.value.bound) {
+        showToast(`请先扫码绑定${activeChannel.value.name}账号`);
+        startQrLogin(activeChannelCode.value);
+        return;
+      }
       savingEditor.value = true;
       try {
-        await api(`/api/items/${encodeURIComponent(editing.value.listing_id)}`, {
+        await api(`/api/items/${encodeURIComponent(targetId)}`, {
           method: 'PATCH',
           body: JSON.stringify({
-            title: editing.value.title,
+            title: String(editing.value.title || '').slice(0, 30),
             description: editing.value.description,
             images: editing.value.images,
             price: Number(editing.value.price || 0),
             status: targetStatus,
           }),
         });
-        showToast(targetStatus === 'ready' ? '已加入待上架' : '草稿已保存');
+        if (publishAfter) {
+          const pubRes = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/publish`, {
+            method: 'POST',
+            body: JSON.stringify({ listing_id: targetId }),
+          });
+          trackSubmittedJob(pubRes.job);
+          showToast('已保存并提交后台上架');
+        } else {
+          showToast(targetStatus === 'ready' ? '已保存至选品库' : '草稿已保存');
+        }
         closeEditor();
-        await Promise.all([loadItems(), refreshMeAndChannels()]);
+        await Promise.all([loadItems({ silent: true }), refreshMeAndChannels()]);
       } catch (e) {
         showToast(e.message);
       } finally {
@@ -673,18 +1034,59 @@ createApp({
       }
     }
 
-    async function dismissFromEditor() {
-      if (!editing.value) return;
-      try {
-        await api(`/api/items/${encodeURIComponent(editing.value.listing_id)}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ status: 'dismissed' }),
-        });
+    async function executeDismissListing(it, alsoDownshelf = false) {
+      if (!it || !it.listing_id) return;
+      const online = onlineItemFor(it.listing_id);
+      await api(`/api/items/${encodeURIComponent(it.listing_id)}`, { method: 'DELETE' });
+      if (editing.value && editing.value.listing_id === it.listing_id) {
         closeEditor();
-        showToast('已移出清单');
-        await Promise.all([loadItems(), refreshMeAndChannels()]);
-      } catch (e) {
-        showToast(e.message);
+      }
+      if (alsoDownshelf && online && online.item_id) {
+        try {
+          const dwRes = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/downshelf`, {
+            method: 'POST',
+            body: JSON.stringify({ external_item_id: online.item_id }),
+          });
+          trackSubmittedJob(dwRes.job);
+          showToast('已移出选品库，并提交后台下架');
+        } catch (e) {
+          showToast(`已移出选品库，但下架提交失败：${e.message}`);
+        }
+      } else if (online) {
+        showToast('已移出选品库，同步时将自动标记下架');
+      } else {
+        showToast('已从选品库移出');
+      }
+      await Promise.all([
+        loadItems({ silent: true }),
+        loadChannelSelling(),
+        refreshMeAndChannels(),
+      ]).catch(() => {});
+    }
+
+    function requestDismissItem(it) {
+      if (!it || !it.listing_id) return;
+      const online = onlineItemFor(it.listing_id);
+      const label = (it.title || it.product_name || '该商品').slice(0, 18);
+      if (online) {
+        openConfirmModal({
+          title: '移出选品库',
+          message: `「${label}」当前已在${activeChannel.value.name}在售。请选择仅移出选品库（下次同步时再下架），或立即在后台下架原帖：`,
+          confirmText: '仅移出选品库',
+          confirmClass: 'btn-soft',
+          altText: '移出并立即后台下架',
+          altClass: 'btn-danger-soft',
+          onConfirm: () => executeDismissListing(it, false),
+          onAlt: () => executeDismissListing(it, true),
+        });
+      } else {
+        openConfirmModal({
+          title: '移出选品库',
+          message: `确定将「${label}」从选品库移出吗？移出后不会再出现在挑品推荐中。`,
+          confirmText: '确认移出',
+          confirmClass: 'btn-danger-soft',
+          onConfirm: () => executeDismissListing(it, false),
+        });
       }
     }
 
@@ -693,7 +1095,7 @@ createApp({
       copyText(txt);
     }
 
-    // 渠道能力：扫码绑定、状态检测、在售同步与关联
+    // 渠道能力：扫码绑定、状态检测、后台同步/上下架与关联
     function stopQrPolling() {
       if (qrPollTimer) {
         clearInterval(qrPollTimer);
@@ -803,23 +1205,17 @@ createApp({
 
     async function syncActiveChannel(codeArg) {
       const code = typeof codeArg === 'string' && codeArg ? codeArg : activeChannelCode.value;
-      if (syncLoading.value) return;
-      syncLoading.value = true;
       try {
         const res = await api(`/api/channels/${encodeURIComponent(code)}/sync`, { method: 'POST' });
-        sellingData.value = res;
-        await refreshMeAndChannels();
-        showToast(`同步完成：在售 ${res.online_count} 件`);
+        trackSubmittedJob(res.job);
+        showToast('已开始后台刷新在售列表');
       } catch (e) {
         showToast(e.message);
-        await refreshMeAndChannels();
-      } finally {
-        syncLoading.value = false;
       }
     }
 
     async function openLinkModal(sellingItem) {
-      if (localItems.value.length === 0) await loadItems();
+      if (localItems.value.length === 0) await loadItems({ reset: true });
       linkModal.value = { visible: true, sellingItem };
     }
 
@@ -849,24 +1245,18 @@ createApp({
         startQrLogin(activeChannelCode.value);
         return;
       }
-      if (publishingId.value) return;
-      publishingId.value = it.listing_id;
       try {
         const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/publish`, {
           method: 'POST',
           body: JSON.stringify({ listing_id: it.listing_id }),
         });
-        if (res.selling) sellingData.value = res.selling;
-        await Promise.all([loadItems(), refreshMeAndChannels()]);
-        showToast('上架成功，可点击「看帖子」查看效果');
+        trackSubmittedJob(res.job);
+        showToast('已加入后台上架队列');
       } catch (e) {
         showToast(e.message);
-        await Promise.all([loadItems(), refreshMeAndChannels(), loadChannelSelling()]).catch(() => {});
         if (e.status === 409 && !activeChannel.value.online) {
           startQrLogin(activeChannelCode.value);
         }
-      } finally {
-        publishingId.value = '';
       }
     }
 
@@ -877,40 +1267,66 @@ createApp({
           method: 'POST',
         });
         editing.value = res;
-        await loadItems();
+        await loadItems({ silent: true });
         showToast('已清除该商品的失败记录');
       } catch (e) {
         showToast(e.message);
       }
     }
 
-    async function downshelfFromChannel(itemId, title = '') {
-      if (!itemId || downshelvingId.value) return;
+    function confirmDownshelf(itemId, title = '') {
+      if (!itemId) return;
       const label = title ? `「${String(title).slice(0, 18)}」` : `商品 ${itemId}`;
-      if (!window.confirm(`确定要在${activeChannel.value.name}下架 ${label} 吗？`)) {
-        return;
-      }
-      downshelvingId.value = itemId;
-      try {
-        const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/downshelf`, {
-          method: 'POST',
-          body: JSON.stringify({ external_item_id: itemId }),
-        });
-        if (res.selling) sellingData.value = res.selling;
-        await refreshMeAndChannels();
-        showToast('已在渠道下架');
-      } catch (e) {
-        showToast(e.message);
-        await refreshMeAndChannels().catch(() => {});
-        if (e.status === 409 && !activeChannel.value.online) {
-          startQrLogin(activeChannelCode.value);
-        }
-      } finally {
-        downshelvingId.value = '';
-      }
+      openConfirmModal({
+        title: `下架${activeChannel.value.name}商品`,
+        message: `确定要在${activeChannel.value.name}后台下架 ${label} 吗？`,
+        confirmText: '确认下架',
+        confirmClass: 'btn-danger-soft',
+        onConfirm: async () => {
+          try {
+            const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/downshelf`, {
+              method: 'POST',
+              body: JSON.stringify({ external_item_id: itemId }),
+            });
+            trackSubmittedJob(res.job);
+            showToast('已提交后台下架');
+          } catch (e) {
+            showToast(e.message);
+            if (e.status === 409 && !activeChannel.value.online) {
+              startQrLogin(activeChannelCode.value);
+            }
+          }
+        },
+      });
     }
 
-    async function openReconcilePreview() {
+    function confirmDownshelfOffPromo() {
+      const items = offPromoOnlineItems.value;
+      if (items.length === 0) return;
+      openConfirmModal({
+        title: '一键下架失效品',
+        message: `确认将 ${items.length} 件上游活动已失效的在售商品提交后台批量下架吗？`,
+        confirmText: '确认批量下架',
+        confirmClass: 'btn-danger-soft',
+        onConfirm: async () => {
+          try {
+            const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/reconcile/apply`, {
+              method: 'POST',
+              body: JSON.stringify({
+                publish_listing_ids: [],
+                downshelf_item_ids: items.map((x) => x.item_id),
+              }),
+            });
+            trackSubmittedJob(res.job);
+            showToast(`已提交后台下架 ${items.length} 件失效商品`);
+          } catch (e) {
+            showToast(e.message);
+          }
+        },
+      });
+    }
+
+    async function openReconcilePreview(refresh = false) {
       if (!activeChannel.value.bound) {
         showToast(`请先扫码绑定${activeChannel.value.name}账号`);
         startQrLogin(activeChannelCode.value);
@@ -921,16 +1337,18 @@ createApp({
       try {
         const preview = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/reconcile/preview`, {
           method: 'POST',
+          body: JSON.stringify({ refresh: !!refresh }),
         });
         if (preview.selling) sellingData.value = preview.selling;
-        await refreshMeAndChannels();
+        if (refresh) await refreshMeAndChannels();
         reconcileModal.value = {
           visible: true,
-          applying: false,
+          submitting: false,
+          showExternal: false,
           preview,
           publishIds: (preview.to_publish || []).map((x) => x.listing_id),
-          downshelfIds: (preview.to_downshelf || []).map((x) => x.item_id),
-          result: null,
+          // 仅默认勾选工作台建议下架的（已删选品/上游失效），外部未关联商品默认不勾选防误杀
+          downshelfIds: (preview.to_downshelf || []).filter((x) => !!x.recommended).map((x) => x.item_id),
         };
       } catch (e) {
         showToast(e.message);
@@ -944,8 +1362,8 @@ createApp({
     }
 
     async function applyReconcile() {
-      if (reconcileModal.value.applying) return;
-      reconcileModal.value.applying = true;
+      if (reconcileModal.value.submitting) return;
+      reconcileModal.value.submitting = true;
       try {
         const res = await api(`/api/channels/${encodeURIComponent(activeChannelCode.value)}/reconcile/apply`, {
           method: 'POST',
@@ -954,15 +1372,13 @@ createApp({
             downshelf_item_ids: reconcileModal.value.downshelfIds,
           }),
         });
-        reconcileModal.value.result = res;
-        if (res.selling) sellingData.value = res.selling;
-        await Promise.all([loadItems(), refreshMeAndChannels()]);
-        showToast(`同步结束：上架 ${res.published.length} 件 · 下架 ${res.downshelved.length} 件`);
+        reconcileModal.value.visible = false;
+        trackSubmittedJob(res.job);
+        showToast('已提交后台同步，可继续操作其他页面');
       } catch (e) {
         showToast(e.message);
-        await Promise.all([loadItems(), refreshMeAndChannels(), loadChannelSelling()]).catch(() => {});
       } finally {
-        reconcileModal.value.applying = false;
+        reconcileModal.value.submitting = false;
       }
     }
 
@@ -975,28 +1391,36 @@ createApp({
       }
     }
 
+    function handlePopState() {
+      history.pushState({ page: 'workbench' }, '', location.href);
+      if (zoomImageUrl.value) { zoomImageUrl.value = ''; return; }
+      if (confirmModal.value.visible) { closeConfirmModal(); return; }
+      if (jobDetailModal.value.visible) { jobDetailModal.value.visible = false; return; }
+      if (reconcileModal.value.visible) { reconcileModal.value.visible = false; return; }
+      if (linkModal.value.visible) { linkModal.value.visible = false; return; }
+      if (qrModal.value.visible) { closeQrModal(true); return; }
+      if (editing.value) { closeEditor(); }
+    }
+
     onMounted(() => {
       bootstrapSession();
       window.addEventListener('beforeunload', handlePageUnload);
-      // 拦截手机物理返回键/手势，防止退出单页应用
       history.pushState({ page: 'workbench' }, '', location.href);
-      window.addEventListener('popstate', () => {
-        // 重新推入状态，使工作台留在原位
-        history.pushState({ page: 'workbench' }, '', location.href);
-        // 若编辑抽屉打开，则关闭抽屉（而非退出页面）
-        if (editing.value) { closeEditor(); }
-      });
+      window.addEventListener('popstate', handlePopState);
     });
 
     onBeforeUnmount(() => {
       stopQrPolling();
       stopEditCopyPoll();
       stopItemsCopyPoll();
+      stopJobsPoll();
       window.removeEventListener('beforeunload', handlePageUnload);
+      window.removeEventListener('popstate', handlePopState);
     });
 
     return {
       toast,
+      triggerToastAction,
       user,
       itemCounts,
       loginForm,
@@ -1016,19 +1440,39 @@ createApp({
       expandedReasons,
       favNeedsBinding,
       localItems,
+      filteredLocalItems,
+      itemFilter,
+      setItemFilter,
+      itemsHasMore,
       itemsLoading,
+      itemsLoadingMore,
       channels,
       activeChannelCode,
       activeChannel,
       channelBusy,
-      syncLoading,
-      publishingId,
-      downshelvingId,
+      isChannelSyncing,
       reconcilePreviewLoading,
       sellingData,
+      offPromoOnlineItems,
       onlineItemFor,
+      isListingPublishing,
+      isItemDownshelving,
+      bannerJob,
+      isJobActive,
+      jobBannerClass,
+      jobStatusLabel,
+      jobSummaryText,
+      jobDetailModal,
+      openJobDetail,
+      dismissJobBanner,
+      cancelChannelJob,
+      confirmModal,
+      closeConfirmModal,
+      runConfirmPrimary,
+      runConfirmAlt,
       mainProductUrl,
       editing,
+      editorFormattedPreview,
       uploading,
       aiGenerating,
       savingEditor,
@@ -1037,6 +1481,8 @@ createApp({
       qrModal,
       linkModal,
       reconcileModal,
+      recommendedDownshelfList,
+      externalDownshelfList,
       platformLabel,
       formatTime,
       copyText,
@@ -1067,7 +1513,7 @@ createApp({
       generateEditorCopy,
       promoteDraftToReady,
       saveEditor,
-      dismissFromEditor,
+      requestDismissItem,
       copyItemCopy,
       startQrLogin,
       closeQrModal,
@@ -1077,7 +1523,8 @@ createApp({
       submitLink,
       publishToChannel,
       clearEditingFailure,
-      downshelfFromChannel,
+      confirmDownshelf,
+      confirmDownshelfOffPromo,
       openReconcilePreview,
       applyReconcile,
     };
