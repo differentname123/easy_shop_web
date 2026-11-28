@@ -95,13 +95,8 @@ _IMAGE_COMPRESS_MIN_BYTES = 8192
 _IMAGE_JPEG_QUALITY = 85
 
 HIGH_MODEL_LIST = [
-    {"model_name": "gemini-aistudio-3.1-pro-preview", "无附件权重": 40, "有附件权重": 40, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-web-3.1-pro-thinking-max", "无附件权重": 35, "有附件权重": 35, "备注": "来源gemini_web"},
-    {"model_name": "gemini-aistudio-4-hydrogen", "无附件权重": 25, "有附件权重": 25, "备注": "来源aistudio_web"},
-    # {"model_name": "gpt-6-astra-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 订阅账号"},
-    {"model_name": "gpt-6.1-sol-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 订阅账号 (暂无可用号先置0，补号后恢复)"},
-    # {"model_name": "antigravity-argon-high", "无附件权重": 0, "有附件权重": 0, "备注": "来源antigravity 本地客户端"},
-    # {"model_name": "claude-antigravity-opus-4-6-thinking", "无附件权重": 0, "有附件权重": 0, "备注": "来源antigravity"},
+
+    {"model_name": "gpt-6.1-sol-max", "无附件权重": 1, "有附件权重": 1, "备注": "来源codex 订阅账号 (暂无可用号先置0，补号后恢复)"},
 ]
 MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-web-3.8-flash-thinking-max", "无附件权重": 24, "有附件权重": 24, "备注": "来源gemini_web"},
@@ -119,7 +114,7 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-api-key-3.8-flash", "无附件权重": 0, "有附件权重": 0, "备注": "来源api key aistudio"},
     {"model_name": "gpt-5.6-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源chatgpt_web"},
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "无附件权重": 0, "有附件权重": 0, "备注": "来源gemini_web"},
-    {"model_name": "gpt-6-codex-luna-max", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 付费 (暂无可用号先置0，补号后恢复)"},
+    {"model_name": "gpt-6-codex-luna-max", "无附件权重": 10, "有附件权重": 10, "备注": "来源codex 付费 (暂无可用号先置0，补号后恢复)"},
     # --------------------------------------------------------------------------
     # ⚠️ [2026-11-25 已停用 Antigravity 本地模型] 取消注释恢复权重前必读！
     # 实证记录：just4mike@usa.com（38h / 4并发高峰6h死）与 lourdesvega5@yahoo.com
@@ -146,7 +141,7 @@ LOW_MODEL_LIST = [
     {"model_name": "gemini-aistudio-api-key-2.5-flash-lite", "无附件权重": 2, "有附件权重": 2, "备注": "来源api key aistudio"},
     {"model_name": "gemini-aistudio-api-key-2.5-flash", "无附件权重": 1, "有附件权重": 1, "备注": "来源api key aistudio"},
     {"model_name": "gemini-aistudio-gemma-4-31b-it-high", "无附件权重": 1, "有附件权重": 4, "备注": "来源aistudio_web"},
-    {"model_name": "gpt-6-codex-luna", "无附件权重": 0, "有附件权重": 0, "备注": "来源codex 免费 (暂无可用号先置0，补号后恢复)"},
+    {"model_name": "gpt-6-codex-luna", "无附件权重": 10, "有附件权重": 10, "备注": "来源codex 免费 (暂无可用号先置0，补号后恢复)"},
     # ⚠️ 同 MEDIUM_MODEL_LIST：2026-11-25 已停用。重启前必先阅读 antigravity_client.py 顶部复盘并完成 P0 改造。
     # {"model_name": "antigravity-3.8-flash-medium", "无附件权重": 0, "有附件权重": 0, "备注": "来源antigravity 本地客户端"},
 ]
