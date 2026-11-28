@@ -542,6 +542,40 @@ _PROHIBITED_KEYWORDS: Tuple[str, ...] = (
 )
 
 
+_REPLY_EXTRA_FORBIDDEN_KEYWORDS: Tuple[str, ...] = (
+    "微信",
+    "扣扣",
+    "二维码",
+    "手机号",
+    "淘宝",
+    "天猫",
+    "拼多多",
+    "京东",
+    "<think>",
+    "</think>",
+)
+_REPLY_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?:vx|wx|qq|pdd|jd)(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def validate_reply_text(text: Any) -> Tuple[bool, str]:
+    """发前合规门禁：拦截空消息、站外导流/竞品词、外链、淘口令与模型思考标记。"""
+    clean = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not clean:
+        return False, "回复内容不能为空"
+    if len(clean) > 500:
+        return False, "单条回复不能超过 500 字"
+    if _URL_RE.search(clean) or _SHORTLINK_RE.search(clean) or _TAOKOULING_RE.search(clean):
+        return False, "回复中禁止包含外部链接、短链或淘口令"
+    lowered = clean.lower()
+    for kw in _PROHIBITED_KEYWORDS + _REPLY_EXTRA_FORBIDDEN_KEYWORDS:
+        if kw.lower() in lowered:
+            return False, f"回复触发闲鱼合规拦截词：【{kw}】"
+    tok_m = _REPLY_TOKEN_RE.search(clean)
+    if tok_m:
+        return False, f"回复触发闲鱼合规拦截词：【{tok_m.group(0)}】"
+    return True, clean
+
+
 def sanitize_content(title: str, desc: str) -> Tuple[str, str, List[str]]:
     """剥离推广短链、淘口令、第三方平台词与 Emoji，替换极限广告词，拦截外联违禁词，并保留段落空行。"""
     raw_title = _TAOKOULING_RE.sub("", _SHORTLINK_RE.sub("", _URL_RE.sub("", str(title or ""))))
@@ -874,6 +908,46 @@ def _fill_contenteditable_text(page: Any, editor: Any, text: str) -> None:
         editor.fill(text)
 
 
+def _disable_coin_deduction_if_present(page: Any) -> Dict[str, Any]:
+    """检查并关闭发布页可能默认勾选的「闲鱼币抵扣/优推」开关（防成交强扣货款折币）。"""
+    script = """(doClick) => {
+        const nodes = Array.from(document.querySelectorAll('.ant-form-item, label, .ant-checkbox-wrapper, div[class*="switch"], div[class*="coin"]'));
+        for (const el of nodes) {
+            const txt = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+            if (!txt || txt.length > 120 || !/(闲鱼币|优推|抵扣)/.test(txt)) continue;
+            const sw = el.querySelector('.ant-switch, input[type="checkbox"], [role="switch"]');
+            if (!sw) continue;
+            const style = window.getComputedStyle(sw);
+            if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
+            const aria = sw.getAttribute('aria-checked');
+            const isChecked = aria === 'true' || Boolean(sw.checked) || sw.classList.contains('ant-switch-checked');
+            if (isChecked) {
+                if (doClick) sw.click();
+                return { found: true, checked: true, label: txt.slice(0, 40) };
+            }
+            return { found: true, checked: false, label: txt.slice(0, 40) };
+        }
+        return { found: false, checked: false, label: '' };
+    }"""
+    try:
+        info = page.evaluate(script, False)
+    except Exception:
+        return {"found": False, "unchecked": False, "failed": False}
+    if not isinstance(info, dict):
+        return {"found": False, "unchecked": False, "failed": False}
+    if not (info.get("found") and info.get("checked")):
+        return {"found": bool(info.get("found")), "unchecked": False, "failed": False}
+    try:
+        page.evaluate(script, True)
+        page.wait_for_timeout(250)
+        recheck = page.evaluate(script, False)
+        if isinstance(recheck, dict) and recheck.get("checked"):
+            return {"found": True, "unchecked": False, "failed": True, "label": info.get("label", "")}
+        return {"found": True, "unchecked": True, "failed": False, "label": info.get("label", "")}
+    except Exception:
+        return {"found": True, "unchecked": False, "failed": True, "label": info.get("label", "")}
+
+
 def _publish_item_on_page(
     context: Any,
     page: Any,
@@ -1007,6 +1081,21 @@ def _publish_item_on_page(
                     "screenshot_file": shot_file,
                     "message": f"分类「{cat_label}」网页端受限，自动切换「其他闲置」未成功，请稍后重试",
                 }
+
+        coin_guard = _disable_coin_deduction_if_present(page)
+        if coin_guard.get("failed"):
+            shot_file = _capture_publish_failure_screenshot(page, failure_screenshot_dir)
+            return {
+                "ok": False,
+                "is_offline": False,
+                "action": "publish",
+                "error_code": "COIN_DEDUCTION_UNCHECK_FAILED",
+                "user_data_dir": user_data_dir,
+                "unb": unb,
+                "nick": nick,
+                "screenshot_file": shot_file,
+                "message": "检测到「闲鱼币抵扣/优推」处于开启状态且自动关闭未生效，为防强扣货款已中止发布",
+            }
 
         pub_btn = page.locator('button:has-text("发布")').first
         pub_btn.click()
@@ -1648,6 +1737,7 @@ def get_messages(
     debug: bool = False,
     lock_timeout_sec: float = DEFAULT_LOCK_TIMEOUT_SEC,
     operation_timeout_sec: float = DEFAULT_OPERATION_TIMEOUT_SEC,
+    lock_scope: str = "profile",
 ) -> Dict[str, Any]:
     """
     纯消息监控函数（不附带任何自动回复动作，职责单一）：
@@ -1679,6 +1769,7 @@ def get_messages(
             debug=debug,
             lock_timeout_sec=lock_timeout_sec,
             operation_timeout_sec=operation_timeout_sec,
+            lock_scope=lock_scope,
         ) as (context, page, auth_tracker):
             latest_headinfo: Dict[str, Any] = {}
 

@@ -19,6 +19,7 @@ class ChannelCapabilities:
     sync_selling: bool = False
     auto_publish: bool = False
     auto_downshelf: bool = False
+    im_messaging: bool = False
 
     def to_dict(self) -> Dict[str, bool]:
         return asdict(self)

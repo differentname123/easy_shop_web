@@ -11,7 +11,7 @@ import re
 import shutil
 import threading
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 import uuid
 
 from PIL import Image
@@ -113,11 +113,13 @@ class _XianyuQrLoginWorker:
         owner: str,
         profile_dir: Path,
         timeout_sec: float = QR_LOGIN_TIMEOUT_SEC,
+        on_before_replace: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.session_id = session_id
         self.owner = owner
         self.profile_dir = profile_dir
         self.timeout_sec = max(30.0, float(timeout_sec or QR_LOGIN_TIMEOUT_SEC))
+        self._on_before_replace = on_before_replace
         self.deadline = time.monotonic() + self.timeout_sec
 
         self._lock = threading.Lock()
@@ -395,6 +397,11 @@ class _XianyuQrLoginWorker:
                                 pass
 
                 if pending_success and not self._cancel_event.is_set():
+                    if callable(self._on_before_replace):
+                        try:
+                            self._on_before_replace(self.owner)
+                        except Exception:
+                            pass
                     _replace_profile_dir(staging_dir, self.profile_dir)
                     unb = pending_success["account_id"]
                     nick = pending_success["nickname"]
@@ -436,6 +443,7 @@ class XianyuChannelAdapter(SellingChannel):
         sync_selling=True,
         auto_publish=True,
         auto_downshelf=True,
+        im_messaging=True,
     )
 
     _UPLOAD_NAME_RE = re.compile(r"^upl_[0-9a-f]{16}\.jpg$")
@@ -458,6 +466,17 @@ class XianyuChannelAdapter(SellingChannel):
         self.login_timeout_sec = login_timeout_sec
         self._sessions_lock = threading.Lock()
         self._sessions: Dict[str, _XianyuQrLoginWorker] = {}
+        self._before_profile_replace_cb: Optional[Callable[[str], None]] = None
+        self._live_status_probe_cb: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
+
+    def set_im_hooks(
+        self,
+        *,
+        on_before_profile_replace: Optional[Callable[[str], None]] = None,
+        live_status_probe: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+    ) -> None:
+        self._before_profile_replace_cb = on_before_profile_replace
+        self._live_status_probe_cb = live_status_probe
 
     def _prune_inactive_locked(self) -> None:
         if len(self._sessions) <= 12:
@@ -487,6 +506,7 @@ class XianyuChannelAdapter(SellingChannel):
             owner=username,
             profile_dir=profile_dir,
             timeout_sec=self.login_timeout_sec,
+            on_before_replace=self._before_profile_replace_cb,
         )
         with self._sessions_lock:
             self._sessions[sid] = worker
@@ -534,6 +554,21 @@ class XianyuChannelAdapter(SellingChannel):
         return default_msg
 
     def check_status(self, username: str) -> ChannelAccountStatus:
+        if callable(self._live_status_probe_cb):
+            try:
+                live = self._live_status_probe_cb(username)
+                if isinstance(live, dict) and live.get("im_state") == "online" and live.get("user_id"):
+                    return ChannelAccountStatus(
+                        channel=self.channel_code,
+                        online=True,
+                        account_id=str(live.get("user_id") or "").strip(),
+                        nickname=str(live.get("nickname") or "").strip(),
+                        error_code="",
+                        message="账号在线（实时消息心跳在线）",
+                        checked_at=_now_iso(),
+                    )
+            except Exception:
+                pass
         profile_dir = self.profile_dir_for(username)
         res = check_login_status(
             user_data_dir=str(profile_dir),

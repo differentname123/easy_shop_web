@@ -199,6 +199,8 @@ class ChannelService:
         for raw_entry in raw_items:
             ext_id = str(raw_entry.get("external_item_id") or raw_entry.get("item_id") or "").strip()
             status = str(raw_entry.get("status") or ("online" if raw_entry.get("is_online") else "abnormal")).strip().lower()
+            raw_convs = [c for c in (raw_entry.get("conversations") or []) if isinstance(c, dict)]
+            latest_conv = raw_convs[0] if raw_convs else None
             item: Dict[str, Any] = {
                 "item_id": ext_id,
                 "external_item_id": ext_id,
@@ -217,6 +219,17 @@ class ChannelService:
                 "published_at": _iso_utc(raw_entry.get("published_at")),
                 "downshelved_at": _iso_utc(raw_entry.get("downshelved_at")),
                 "last_synced_at": _iso_utc(raw_entry.get("last_synced_at")),
+                "conversation_count": int(
+                    raw_entry.get("conversation_count")
+                    if raw_entry.get("conversation_count") is not None
+                    else len(raw_convs)
+                ),
+                "unread_message_count": int(raw_entry.get("unread_message_count") or 0),
+                "last_message_at": _iso_utc(
+                    raw_entry.get("last_message_at") or (latest_conv or {}).get("last_message_at")
+                ),
+                "last_message_preview": str((latest_conv or {}).get("last_message_preview") or ""),
+                "has_message_gap": any(bool(c.get("has_gap")) for c in raw_convs),
             }
             pair = matched_pairs.get(ext_id)
             if not pair:
@@ -324,6 +337,7 @@ class ChannelService:
             for item in online_items
             if item.get("off_promotion_alert") and item.get("link_mode") != "removed"
         )
+        total_unread_messages = sum(int(item.get("unread_message_count") or 0) for item in decorated)
         return {
             "online_items": online_items,
             "abnormal_items": abnormal_items,
@@ -333,6 +347,7 @@ class ChannelService:
             "abnormal_count": len(abnormal_items),
             "downshelf_count": len(downshelf_items),
             "off_promotion_alert_count": off_promotion_count,
+            "total_unread_messages": total_unread_messages,
             "group_counts": dict((account_doc or {}).get("group_counts") or {}),
             "synced_at": _iso_utc((account_doc or {}).get("synced_at")),
         }
@@ -358,6 +373,10 @@ class ChannelService:
             "account_id": str(doc.get("account_id") or ""),
             "nickname": str(doc.get("nickname") or ""),
             "last_checked_at": _iso_utc(doc.get("last_checked_at")),
+            "im_state": str(doc.get("im_state") or "stopped"),
+            "im_message": str(doc.get("im_message") or ""),
+            "im_error_code": str(doc.get("im_error_code") or ""),
+            "im_last_sync_at": _iso_utc(doc.get("im_last_sync_at")),
             **enriched,
         }
 
@@ -380,10 +399,15 @@ class ChannelService:
                 "error_code": str(doc.get("error_code") or ""),
                 "message": str(doc.get("message") or ("未绑定账号" if not doc.get("bound") else "")),
                 "last_checked_at": _iso_utc(doc.get("last_checked_at")),
+                "im_state": str(doc.get("im_state") or "stopped"),
+                "im_message": str(doc.get("im_message") or ""),
+                "im_error_code": str(doc.get("im_error_code") or ""),
+                "im_last_sync_at": _iso_utc(doc.get("im_last_sync_at")),
                 "online_count": enriched["online_count"],
                 "abnormal_count": enriched["abnormal_count"],
                 "downshelf_count": enriched["downshelf_count"],
                 "off_promotion_alert_count": enriched["off_promotion_alert_count"],
+                "total_unread_messages": enriched["total_unread_messages"],
                 "synced_at": enriched["synced_at"],
             })
         return out

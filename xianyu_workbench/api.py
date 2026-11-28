@@ -17,6 +17,7 @@ from .channel_service import ChannelService
 from .channels import ChannelRegistry, build_default_channel_registry
 from .config import WORKBENCH_DIR, WorkbenchConfig, load_config
 from .copy_templates import DEFAULT_TEMPLATE_ID, DEFAULT_TEMPLATE_IDS, list_copy_templates
+from .im_service import ChannelIMService
 from .job_runner import ChannelJobRunner
 from .repo import WorkbenchRepository
 from .service import WorkbenchService
@@ -86,6 +87,14 @@ class CancelQrRequest(BaseModel):
     session_id: Optional[str] = Field(None, max_length=64)
 
 
+class ImReconnectRequest(BaseModel):
+    force_refresh: bool = False
+
+
+class ReplyRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=600)
+
+
 class UploadImageRequest(BaseModel):
     image_base64: str = Field(..., min_length=8)
 
@@ -98,6 +107,7 @@ def create_app(
     channel_registry: Optional[ChannelRegistry] = None,
     channel_service: Optional[ChannelService] = None,
     job_runner: Optional[ChannelJobRunner] = None,
+    im_service: Optional[ChannelIMService] = None,
 ) -> FastAPI:
     cfg = config or load_config()
     registry = channel_registry or build_default_channel_registry(cfg)
@@ -105,6 +115,7 @@ def create_app(
         "service": service,
         "channel_service": channel_service,
         "job_runner": job_runner,
+        "im_service": im_service,
         "repo": None,
         "close_db": None,
     }
@@ -119,11 +130,18 @@ def create_app(
             state["channel_service"] = ChannelService(repo, registry)
         if state["job_runner"] is None:
             state["job_runner"] = ChannelJobRunner(repo, state["channel_service"])
+        if state["im_service"] is None:
+            state["im_service"] = ChannelIMService(repo, registry)
         state["job_runner"].recover_stale_jobs()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if state["service"] is None or state["channel_service"] is None or state["job_runner"] is None:
+        if (
+            state["service"] is None
+            or state["channel_service"] is None
+            or state["job_runner"] is None
+            or state["im_service"] is None
+        ):
             repo = state.get("repo")
             if repo is None:
                 mongo_db, close_fn = open_mongo_connection(cfg)
@@ -137,10 +155,24 @@ def create_app(
                 state["channel_service"] = ChannelService(repo, registry)
             if state["job_runner"] is None:
                 state["job_runner"] = ChannelJobRunner(repo, state["channel_service"])
+            if state["im_service"] is None:
+                state["im_service"] = ChannelIMService(repo, registry)
             state["job_runner"].recover_stale_jobs()
+        im_obj = state.get("im_service")
+        if im_obj is not None:
+            try:
+                im_obj.start_all_bound_accounts()
+            except Exception:
+                pass
         try:
             yield
         finally:
+            im_obj_end = state.get("im_service")
+            if im_obj_end is not None:
+                try:
+                    im_obj_end.shutdown()
+                except Exception:
+                    pass
             jr = state.get("job_runner")
             if jr is not None:
                 try:
@@ -186,6 +218,12 @@ def create_app(
         if jr is None:
             raise HTTPException(status_code=503, detail="后台任务服务尚未就绪")
         return jr
+
+    def _im_svc() -> ChannelIMService:
+        ims = state.get("im_service")
+        if ims is None:
+            raise HTTPException(status_code=503, detail="实时消息服务尚未就绪")
+        return ims
 
     def _uid(request: Request) -> str:
         return require_current_username(request, cfg.auth_secret)
@@ -351,12 +389,24 @@ def create_app(
     @app.post("/api/channels/{channel}/login/start")
     def start_channel_login(channel: str, request: Request):
         username = _uid(request)
-        return {"status": "success", "data": _ch_svc().start_qr_login(username, channel)}
+        snap = _ch_svc().start_qr_login(username, channel)
+        if snap.get("state") == "success":
+            try:
+                _im_svc().ensure_account_monitoring(username, channel, force_refresh=True)
+            except Exception:
+                pass
+        return {"status": "success", "data": snap}
 
     @app.get("/api/channels/{channel}/login/status/{session_id}")
     def get_channel_login_status(channel: str, session_id: str, request: Request):
         username = _uid(request)
-        return {"status": "success", "data": _ch_svc().get_qr_login_status(username, channel, session_id)}
+        snap = _ch_svc().get_qr_login_status(username, channel, session_id)
+        if snap.get("state") == "success":
+            try:
+                _im_svc().ensure_account_monitoring(username, channel, force_refresh=True)
+            except Exception:
+                pass
+        return {"status": "success", "data": snap}
 
     @app.get("/api/channels/{channel}/login/qr/{session_id}")
     def get_channel_login_qr(channel: str, session_id: str, request: Request):
@@ -412,6 +462,39 @@ def create_app(
     def get_channel_item_detail(channel: str, external_item_id: str, request: Request):
         username = _uid(request)
         data = _ch_svc().get_channel_item_detail(username, channel, external_item_id)
+        return {"status": "success", "data": data}
+
+    @app.get("/api/channels/{channel}/im/status")
+    def get_channel_im_status(channel: str, request: Request):
+        username = _uid(request)
+        return {"status": "success", "data": _im_svc().get_im_status(username, channel)}
+
+    @app.post("/api/channels/{channel}/im/reconnect")
+    def reconnect_channel_im(
+        channel: str,
+        request: Request,
+        req: Optional[ImReconnectRequest] = None,
+    ):
+        username = _uid(request)
+        force = bool(req.force_refresh) if req is not None else False
+        return {"status": "success", "data": _im_svc().reconnect_account(username, channel, force_refresh=force)}
+
+    @app.get("/api/channels/{channel}/items/{external_item_id}/conversations")
+    def get_channel_item_conversations(channel: str, external_item_id: str, request: Request):
+        username = _uid(request)
+        data = _im_svc().get_item_conversations(username, channel, external_item_id)
+        return {"status": "success", "data": data}
+
+    @app.post("/api/channels/{channel}/items/{external_item_id}/conversations/{cid}/reply")
+    def reply_channel_item_conversation(
+        channel: str,
+        external_item_id: str,
+        cid: str,
+        req: ReplyRequest,
+        request: Request,
+    ):
+        username = _uid(request)
+        data = _im_svc().send_item_reply(username, channel, external_item_id, cid, req.text)
         return {"status": "success", "data": data}
 
     @app.post("/api/channels/{channel}/selling/{external_item_id}/link")

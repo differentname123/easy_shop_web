@@ -16,6 +16,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import shutil
 import tempfile
 import threading
@@ -23,14 +24,19 @@ import time
 
 if os.name == "nt":
     import msvcrt
+    import winreg
 else:
     import fcntl
+    winreg = None  # type: ignore[assignment]
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 try:
-    from playwright.sync_api import sync_playwright
+    from patchright.sync_api import sync_playwright  # type: ignore[import-not-found]
 except ImportError:
-    sync_playwright = None
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        sync_playwright = None
 
 logger = logging.getLogger("publish_to_xianyu")
 
@@ -53,6 +59,9 @@ _PROCESS_THREAD_LOCK = threading.Lock()
 _GLOBAL_LOCK_FILE_PATH = os.path.join(tempfile.gettempdir(), "xianyu_browser_serial.lock")
 _PROFILE_LOCKS_GUARD = threading.Lock()
 _PROFILE_THREAD_LOCKS: Dict[str, threading.Lock] = {}
+_MAX_HEADLESS_BROWSERS = max(1, min(4, int(os.environ.get("XY_MAX_HEADLESS_BROWSERS", "2") or 2)))
+_HEADLESS_POOL_SEMAPHORE = threading.BoundedSemaphore(_MAX_HEADLESS_BROWSERS)
+_RESOLVED_CHROME_UA: Optional[str] = None
 
 # 判定掉线的关键 MTOP 接口（这些接口一旦返回 SESSION_EXPIRED 等错误码即代表账号掉线）
 _AUTH_CRITICAL_APIS: Tuple[str, ...] = (
@@ -321,6 +330,39 @@ DEFAULT_HEADLESS_VIEWPORT = {"width": 1440, "height": 900}
 DEFAULT_MOBILE_H5_VIEWPORT = {"width": 390, "height": 844}
 
 
+def _resolve_desktop_user_agent() -> str:
+    """探测本机真实 Chrome 主版本号，避免写死过期版本号或泄露 HeadlessChrome 标识。"""
+    global _RESOLVED_CHROME_UA
+    if _RESOLVED_CHROME_UA:
+        return _RESOLVED_CHROME_UA
+    major = ""
+    if os.name == "nt" and winreg is not None:
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for subkey in (
+                r"Software\Google\Chrome\BLBeacon",
+                r"SOFTWARE\Wow6432Node\Google\Chrome\BLBeacon",
+            ):
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        ver, _ = winreg.QueryValueEx(key, "version")
+                        m = re.match(r"(\d+)\.", str(ver or ""))
+                        if m:
+                            major = m.group(1)
+                            break
+                except OSError:
+                    continue
+            if major:
+                break
+    _RESOLVED_CHROME_UA = (
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Safari/537.36"
+        if major
+        else DEFAULT_DESKTOP_USER_AGENT
+    )
+    return _RESOLVED_CHROME_UA
+
+
 def launch_persistent_context(
     p,
     user_data_dir: str = DEFAULT_USER_DATA_DIR,
@@ -332,8 +374,14 @@ def launch_persistent_context(
     """启动挂载独立浏览器目录的持久化 Chrome 上下文（支持桌面端 PC 模式与移动端 H5 免登录分享页模式）。"""
     os.makedirs(user_data_dir, exist_ok=True)
     default_args = list(args or ["--disable-blink-features=AutomationControlled"])
-    if headless and "--headless=new" not in default_args:
-        default_args.append("--headless=new")
+    if headless:
+        for flag in (
+            "--headless=new",
+            "--disable-dev-shm-usage",
+            "--js-flags=--max-old-space-size=512",
+        ):
+            if flag not in default_args:
+                default_args.append(flag)
 
     kwargs: Dict[str, Any] = {
         "channel": "chrome",
@@ -348,7 +396,7 @@ def launch_persistent_context(
         kwargs["has_touch"] = True
     elif headless:
         kwargs["viewport"] = dict(DEFAULT_HEADLESS_VIEWPORT)
-        kwargs["user_agent"] = DEFAULT_DESKTOP_USER_AGENT
+        kwargs["user_agent"] = _resolve_desktop_user_agent()
     else:
         default_args.extend(["--start-maximized", "--window-position=0,0"])
         kwargs["no_viewport"] = True
@@ -651,35 +699,45 @@ def _browser_session_guard(
         lock_timeout_sec=lock_timeout_sec,
         lock_scope=lock_scope,
     ):
-        with sync_playwright() as p:
-            context = None
-            auth_tracker: Optional[Dict[str, Any]] = None
-            on_page_cb = None
-            try:
-                context = launch_persistent_context(
-                    p,
-                    user_data_dir=user_data_dir,
-                    headless=use_headless,
-                    mobile_h5=mobile_h5,
-                )
-                context.set_default_timeout(op_timeout_ms)
-                context.set_default_navigation_timeout(op_timeout_ms)
-                page = context.pages[0] if context.pages else context.new_page()
-                auth_tracker = _attach_auth_tracker(page)
-                if hasattr(context, "on") and callable(auth_tracker.get("_on_response_cb")):
-                    def _on_new_page(new_p):
-                        new_p.on("response", auth_tracker["_on_response_cb"])
-                    on_page_cb = _on_new_page
-                    context.on("page", on_page_cb)
-                yield context, page, auth_tracker
-            finally:
-                _detach_tracker_from_context(context, auth_tracker, on_page_cb)
-                if context:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
-        gc.collect()
+        sem_acquired = False
+        if use_headless and str(lock_scope or "global").strip().lower() == "profile":
+            sem_timeout = max(1.0, float(lock_timeout_sec or DEFAULT_LOCK_TIMEOUT_SEC))
+            sem_acquired = _HEADLESS_POOL_SEMAPHORE.acquire(timeout=sem_timeout)
+            if not sem_acquired:
+                raise XianyuLockTimeoutError(user_data_dir, lock_timeout_sec)
+        try:
+            with sync_playwright() as p:
+                context = None
+                auth_tracker: Optional[Dict[str, Any]] = None
+                on_page_cb = None
+                try:
+                    context = launch_persistent_context(
+                        p,
+                        user_data_dir=user_data_dir,
+                        headless=use_headless,
+                        mobile_h5=mobile_h5,
+                    )
+                    context.set_default_timeout(op_timeout_ms)
+                    context.set_default_navigation_timeout(op_timeout_ms)
+                    page = context.pages[0] if context.pages else context.new_page()
+                    auth_tracker = _attach_auth_tracker(page)
+                    if hasattr(context, "on") and callable(auth_tracker.get("_on_response_cb")):
+                        def _on_new_page(new_p):
+                            new_p.on("response", auth_tracker["_on_response_cb"])
+                        on_page_cb = _on_new_page
+                        context.on("page", on_page_cb)
+                    yield context, page, auth_tracker
+                finally:
+                    _detach_tracker_from_context(context, auth_tracker, on_page_cb)
+                    if context:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+            gc.collect()
+        finally:
+            if sem_acquired:
+                _HEADLESS_POOL_SEMAPHORE.release()
 
 
 @contextmanager

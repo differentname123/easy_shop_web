@@ -1,4 +1,4 @@
-const { createApp, ref, computed, onMounted, onBeforeUnmount } = Vue;
+const { createApp, ref, computed, nextTick, onMounted, onBeforeUnmount } = Vue;
 
 const PLATFORM_NAMES = { pdd: '拼多多', jd: '京东', taobao: '淘宝' };
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running']);
@@ -164,6 +164,29 @@ createApp({
     const jobDetailModal = ref({ visible: false, job: null });
     let jobsPollTimer = null;
     let prevActiveJobIds = new Set();
+
+    // 商品买家对话抽屉与消息监控状态
+    const chatMessagesRef = ref(null);
+    const imReconnecting = ref(false);
+    const chatDrawer = ref({
+      visible: false,
+      channel: 'xianyu',
+      item: null,
+      conversations: [],
+      activeCid: '',
+      imState: '',
+      imMessage: '',
+      loading: false,
+      sending: false,
+      replyText: '',
+    });
+    const activeChatConv = computed(() => {
+      const convs = chatDrawer.value.conversations || [];
+      if (!convs.length) return null;
+      return convs.find((c) => c.cid === chatDrawer.value.activeCid) || convs[0];
+    });
+    let chatPollTimer = null;
+    let sellingImPollTimer = null;
 
     // 页内通用确认弹窗
     const confirmModal = ref({
@@ -567,6 +590,9 @@ createApp({
       stopEditCopyPoll();
       stopItemsCopyPoll();
       stopJobsPoll();
+      stopChatPoll();
+      stopSellingImPoll();
+      chatDrawer.value.visible = false;
       try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {}
       user.value = null;
       candidates.value = [];
@@ -796,12 +822,190 @@ createApp({
       }
     }
 
-    async function loadChannelSelling(code = activeChannelCode.value) {
+    async function loadChannelSelling(code = activeChannelCode.value, { silent = false } = {}) {
       try {
         const data = await api(`/api/channels/${encodeURIComponent(code)}/selling`);
         sellingData.value = data;
       } catch (e) {
+        if (!silent) showToast(e.message);
+      } finally {
+        scheduleSellingImPoll();
+      }
+    }
+
+    function imStateLabel(state) {
+      if (state === 'online') return '消息实时监控中';
+      if (state === 'recovering') return '消息自动恢复中';
+      if (state === 'attention') return '部分消息待核对';
+      if (state === 'paused_risk') return '风控熔断已暂停';
+      if (state === 'offline') return '消息通道已断开';
+      return '消息监控未开启';
+    }
+
+    function imStateColor(state) {
+      if (state === 'online') return 'var(--green)';
+      if (state === 'recovering' || state === 'attention') return 'var(--amber)';
+      if (state === 'paused_risk' || state === 'offline') return 'var(--red)';
+      return 'var(--muted)';
+    }
+
+    function stopSellingImPoll() {
+      if (sellingImPollTimer) {
+        clearTimeout(sellingImPollTimer);
+        sellingImPollTimer = null;
+      }
+    }
+
+    function scheduleSellingImPoll() {
+      stopSellingImPoll();
+      if (!user.value || document.hidden) return;
+      if (mainTab.value !== 'items' || itemsSubTab.value !== 'selling') return;
+      const ch = activeChannel.value;
+      if (!ch || !ch.bound || !ch.capabilities || !ch.capabilities.im_messaging) return;
+      sellingImPollTimer = setTimeout(() => {
+        if (!user.value || document.hidden || mainTab.value !== 'items' || itemsSubTab.value !== 'selling') return;
+        loadChannelSelling(activeChannelCode.value, { silent: true }).catch(() => {});
+      }, 5000);
+    }
+
+    function stopChatPoll() {
+      if (chatPollTimer) {
+        clearTimeout(chatPollTimer);
+        chatPollTimer = null;
+      }
+    }
+
+    function scheduleChatPoll() {
+      stopChatPoll();
+      if (!user.value || !chatDrawer.value.visible || document.hidden) return;
+      chatPollTimer = setTimeout(() => {
+        if (!user.value || !chatDrawer.value.visible || document.hidden) return;
+        refreshItemChat({ silent: true }).catch(() => {});
+      }, 3000);
+    }
+
+    function scrollChatToBottom() {
+      nextTick(() => {
+        const el = chatMessagesRef.value;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    }
+
+    function selectDefaultChatCid(convs, currentCid) {
+      if (!convs || !convs.length) return '';
+      if (currentCid && convs.some((c) => c.cid === currentCid)) return currentCid;
+      const unreadFirst = convs.find((c) => (c.unread_count || 0) > 0);
+      return (unreadFirst || convs[0]).cid;
+    }
+
+    async function refreshItemChat({ silent = false } = {}) {
+      const item = chatDrawer.value.item;
+      const chCode = chatDrawer.value.channel || activeChannelCode.value;
+      if (!item || !item.item_id) return;
+      if (!silent) chatDrawer.value.loading = true;
+      try {
+        const prevCount = ((activeChatConv.value && activeChatConv.value.messages) || []).length;
+        const data = await api(
+          `/api/channels/${encodeURIComponent(chCode)}/items/${encodeURIComponent(item.item_id)}/conversations`
+        );
+        const convs = data.conversations || [];
+        chatDrawer.value.conversations = convs;
+        chatDrawer.value.activeCid = selectDefaultChatCid(convs, chatDrawer.value.activeCid);
+        chatDrawer.value.imState = data.im_state || '';
+        chatDrawer.value.imMessage = data.im_message || '';
+        const nextConv = convs.find((c) => c.cid === chatDrawer.value.activeCid) || convs[0];
+        const nextCount = ((nextConv && nextConv.messages) || []).length;
+        if (!silent || nextCount > prevCount) scrollChatToBottom();
+      } catch (e) {
+        if (!silent) showToast(e.message);
+      } finally {
+        chatDrawer.value.loading = false;
+        scheduleChatPoll();
+      }
+    }
+
+    function openItemChat(item) {
+      if (!item || !item.item_id) return;
+      chatDrawer.value = {
+        visible: true,
+        channel: activeChannelCode.value,
+        item,
+        conversations: [],
+        activeCid: '',
+        imState: sellingData.value.im_state || (activeChannel.value && activeChannel.value.im_state) || '',
+        imMessage: sellingData.value.im_message || (activeChannel.value && activeChannel.value.im_message) || '',
+        loading: true,
+        sending: false,
+        replyText: '',
+      };
+      refreshItemChat({ silent: false });
+    }
+
+    function selectChatBuyer(cid) {
+      chatDrawer.value.activeCid = cid;
+      scrollChatToBottom();
+    }
+
+    function closeItemChat() {
+      stopChatPoll();
+      chatDrawer.value.visible = false;
+    }
+
+    async function sendChatReply() {
+      const conv = activeChatConv.value;
+      const item = chatDrawer.value.item;
+      const text = (chatDrawer.value.replyText || '').trim();
+      if (!conv || !item || !text || chatDrawer.value.sending) return;
+      chatDrawer.value.sending = true;
+      const chCode = chatDrawer.value.channel || activeChannelCode.value;
+      try {
+        const res = await api(
+          `/api/channels/${encodeURIComponent(chCode)}/items/${encodeURIComponent(item.item_id)}/conversations/${encodeURIComponent(conv.cid)}/reply`,
+          { method: 'POST', body: JSON.stringify({ text }) }
+        );
+        if (Array.isArray(res.conversations)) {
+          chatDrawer.value.conversations = res.conversations;
+          chatDrawer.value.activeCid = selectDefaultChatCid(res.conversations, conv.cid);
+        }
+        if (res.delivery_status === 'sent' || res.delivery_status === 'uncertain') {
+          chatDrawer.value.replyText = '';
+        }
+        if (res.delivery_status === 'uncertain') {
+          showToast(res.message || '发送回执超时，状态存疑，请稍后刷新核对');
+        } else if (!res.ok) {
+          showToast(res.message || '消息发送失败');
+        }
+        scrollChatToBottom();
+        loadChannelSelling(chCode, { silent: true }).catch(() => {});
+      } catch (e) {
+        showToast(e.message || '发送失败');
+        refreshItemChat({ silent: true }).catch(() => {});
+      } finally {
+        chatDrawer.value.sending = false;
+      }
+    }
+
+    async function reconnectChannelIm(code = activeChannelCode.value, forceRefresh = false) {
+      if (imReconnecting.value) return;
+      imReconnecting.value = true;
+      try {
+        const data = await api(`/api/channels/${encodeURIComponent(code)}/im/reconnect`, {
+          method: 'POST',
+          body: JSON.stringify({ force_refresh: !!forceRefresh }),
+        });
+        if (chatDrawer.value.visible && chatDrawer.value.channel === code) {
+          chatDrawer.value.imState = data.im_state || '';
+          chatDrawer.value.imMessage = data.im_message || '';
+        }
+        await Promise.all([
+          loadChannels().catch(() => {}),
+          loadChannelSelling(code, { silent: true }).catch(() => {}),
+        ]);
+        showToast(data.im_state === 'online' ? '消息通道已重连' : (data.im_message || '已触发重连'));
+      } catch (e) {
         showToast(e.message);
+      } finally {
+        imReconnecting.value = false;
       }
     }
 
@@ -809,12 +1013,17 @@ createApp({
       mainTab.value = 'items';
       loadItems({ silent: localItems.value.length > 0 });
       if (itemsSubTab.value === 'selling') loadChannelSelling();
+      else stopSellingImPoll();
     }
 
     function switchItemsSubTab(sub) {
       itemsSubTab.value = sub;
-      if (sub === 'ready') loadItems({ silent: localItems.value.length > 0 });
-      else loadChannelSelling();
+      if (sub === 'ready') {
+        stopSellingImPoll();
+        loadItems({ silent: localItems.value.length > 0 });
+      } else {
+        loadChannelSelling();
+      }
     }
 
     function selectChannel(code) {
@@ -824,6 +1033,7 @@ createApp({
     }
 
     function openMeTab() {
+      stopSellingImPoll();
       mainTab.value = 'me';
       refreshMeAndChannels().catch(() => {});
     }
@@ -1488,9 +1698,22 @@ createApp({
       }
     }
 
+    function handleVisibilityChange() {
+      if (document.hidden) {
+        stopChatPoll();
+        stopSellingImPoll();
+        return;
+      }
+      if (chatDrawer.value.visible) refreshItemChat({ silent: true }).catch(() => {});
+      if (mainTab.value === 'items' && itemsSubTab.value === 'selling') {
+        loadChannelSelling(activeChannelCode.value, { silent: true }).catch(() => {});
+      }
+    }
+
     function handlePopState() {
       history.pushState({ page: 'workbench' }, '', location.href);
       if (zoomImageUrl.value) { zoomImageUrl.value = ''; return; }
+      if (chatDrawer.value.visible) { closeItemChat(); return; }
       if (confirmModal.value.visible) { closeConfirmModal(); return; }
       if (jobDetailModal.value.visible) { jobDetailModal.value.visible = false; return; }
       if (reconcileModal.value.visible) { reconcileModal.value.visible = false; return; }
@@ -1502,8 +1725,9 @@ createApp({
     onMounted(() => {
       bootstrapSession();
       window.addEventListener('beforeunload', handlePageUnload);
-      history.pushState({ page: 'workbench' }, '', location.href);
       window.addEventListener('popstate', handlePopState);
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+      history.pushState({ page: 'workbench' }, '', location.href);
     });
 
     onBeforeUnmount(() => {
@@ -1511,8 +1735,11 @@ createApp({
       stopEditCopyPoll();
       stopItemsCopyPoll();
       stopJobsPoll();
+      stopChatPoll();
+      stopSellingImPoll();
       window.removeEventListener('beforeunload', handlePageUnload);
       window.removeEventListener('popstate', handlePopState);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     });
 
     return {
@@ -1637,6 +1864,18 @@ createApp({
       confirmDownshelfOffPromo,
       openReconcilePreview,
       applyReconcile,
+      chatMessagesRef,
+      imReconnecting,
+      chatDrawer,
+      activeChatConv,
+      imStateLabel,
+      imStateColor,
+      openItemChat,
+      refreshItemChat,
+      selectChatBuyer,
+      closeItemChat,
+      sendChatReply,
+      reconnectChannelIm,
     };
   },
 }).mount('#app');

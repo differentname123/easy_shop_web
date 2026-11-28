@@ -2939,6 +2939,660 @@ def test_channel_items_granularity_downshelf_republish_and_legacy_migration(tmp_
     assert leg_items["leg_dw_1"]["downshelved_at"] is not None
 
 
+# ==============================================================================
+# 实时消息长连接、合规门禁、防闲鱼币抵扣与工作台对话回复测试
+# ==============================================================================
+import asyncio
+from xianyu_workbench.client.im_ws import (
+    XianyuIMHub,
+    build_text_send_payload,
+    parse_conversations_payload,
+)
+from xianyu_workbench.client.seller import _disable_coin_deduction_if_present, validate_reply_text
+from xianyu_workbench.im_service import ChannelIMService
+
+
+def test_reply_compliance_and_coin_deduction_guard():
+    ok, clean = validate_reply_text("  亲，全新未拆封，今天就能发出\r\n可放心拍  ")
+    assert ok is True
+    assert clean == "亲，全新未拆封，今天就能发出\n可放心拍"
+
+    for bad_text in (
+        "",
+        "   ",
+        "加我微信详细聊",
+        "可以走vx交易",
+        "加wx私发给你",
+        "我给你发个https://example.com/item",
+        "领券戳 u.jd.com/abcdef",
+        "拼多多那边更便宜",
+        "<think>思考过程不能发出去</think>你好",
+        "a" * 501,
+    ):
+        is_ok, reason = validate_reply_text(bad_text)
+        assert is_ok is False, f"应拦截违规回复: {bad_text!r}"
+        assert reason
+
+    # 闲鱼币抵扣开关：勾选状态可被关闭
+    class _FakePage:
+        def __init__(self, stay_checked: bool = False):
+            self.checked = True
+            self.stay_checked = stay_checked
+
+        def evaluate(self, _script, do_click=False):
+            if do_click and not self.stay_checked:
+                self.checked = False
+            return {"found": True, "checked": self.checked, "label": "闲鱼币抵扣"}
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    res_ok = _disable_coin_deduction_if_present(_FakePage(stay_checked=False))
+    assert res_ok["found"] is True and res_ok["unchecked"] is True and res_ok["failed"] is False
+
+    # 若未能成功取消勾选，必须 Fail-Closed 报错阻断发布
+    res_fail = _disable_coin_deduction_if_present(_FakePage(stay_checked=True))
+    assert res_fail["found"] is True and res_fail["failed"] is True
+
+    # 对返回字符串的简陋 Mock 页面安全跳过
+    class _StringEvalPage:
+        def evaluate(self, _script, _do_click=False):
+            return "ignored"
+
+    res_str = _disable_coin_deduction_if_present(_StringEvalPage())
+    assert res_str == {"found": False, "unchecked": False, "failed": False}
+
+
+def test_repo_conversations_dedup_and_survival_across_selling_sync(tmp_path):
+    _db, _cfg, repo, _svc, _reg, _ch_svc, _app = _build_env(tmp_path)
+    repo.upsert_channel_selling(
+        "u_im",
+        "xianyu",
+        online_items=[{
+            "item_id": "item_im_1",
+            "title": "蓝牙降噪耳机",
+            "price": "199.00",
+            "item_url": "https://www.goofish.com/item?id=item_im_1",
+        }],
+        abnormal_items=[],
+        group_counts={"online": 1, "abnormal": 0, "downshelf": 0},
+        synced_at=datetime.datetime(2026, 11, 28, 10, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    base_ts = 1764300000000
+    many_msgs = [
+        {
+            "message_id": f"m_{i}",
+            "client_uuid": f"c_{i}",
+            "sender": "peer" if i % 2 == 0 else "me",
+            "msg_type": "text",
+            "text": f"买家咨询第{i}条",
+            "created_at_ms": base_ts + i * 1000,
+        }
+        for i in range(95)
+    ]
+    # 故意带一条重复 message_id 验证去重
+    many_msgs.append({
+        "message_id": "m_94",
+        "client_uuid": "c_94",
+        "sender": "peer",
+        "msg_type": "text",
+        "text": "买家咨询第94条",
+        "created_at_ms": base_ts + 94 * 1000,
+    })
+
+    repo.upsert_channel_item_conversations(
+        "u_im",
+        "xianyu",
+        "item_im_1",
+        conversations=[{
+            "cid": "cid_buyer_1@goofish",
+            "peer_user_id": "buyer_1001",
+            "peer_nick": "测试买家",
+            "unread_count": 2,
+            "has_gap": False,
+            "last_message_at": datetime.datetime.fromtimestamp((base_ts + 94000) / 1000.0, tz=datetime.timezone.utc),
+            "messages": many_msgs,
+        }],
+    )
+    doc = repo.get_channel_item("u_im", "xianyu", "item_im_1")
+    assert doc["conversation_count"] == 1
+    assert doc["unread_message_count"] == 2
+    assert len(doc["conversations"][0]["messages"]) == 80  # 上限 80 条有序保留最新
+    assert doc["conversations"][0]["messages"][-1]["message_id"] == "m_94"
+
+    # 发送前先写 sending -> 收到回执升级为 sent，不应重复一条
+    pending = {
+        "message_id": "-tmp_uuid_1",
+        "client_uuid": "-tmp_uuid_1",
+        "sender": "me",
+        "msg_type": "text",
+        "text": "包邮马上发货",
+        "created_at_ms": base_ts + 120000,
+        "delivery_status": "sending",
+    }
+    repo.append_channel_item_message("u_im", "xianyu", "item_im_1", "cid_buyer_1@goofish", pending)
+    repo.update_channel_item_message_status(
+        "u_im",
+        "xianyu",
+        "item_im_1",
+        "cid_buyer_1@goofish",
+        "-tmp_uuid_1",
+        delivery_status="sent",
+        message_id="srv_real_888",
+        created_at_ms=base_ts + 120050,
+    )
+    doc_after_send = repo.get_channel_item("u_im", "xianyu", "item_im_1")
+    matched = [m for m in doc_after_send["conversations"][0]["messages"] if m.get("client_uuid") == "-tmp_uuid_1"]
+    assert len(matched) == 1
+    assert matched[0]["delivery_status"] == "sent" and matched[0]["message_id"] == "srv_real_888"
+
+    # 在售同步 & 下架重上绝不能抹掉已沉淀的买家对话
+    repo.upsert_channel_selling(
+        "u_im",
+        "xianyu",
+        online_items=[{
+            "item_id": "item_im_1",
+            "title": "蓝牙降噪耳机-改价后",
+            "price": "188.00",
+        }],
+        abnormal_items=[],
+        group_counts={"online": 1, "abnormal": 0, "downshelf": 0},
+        synced_at=datetime.datetime(2026, 11, 28, 10, 5, tzinfo=datetime.timezone.utc),
+    )
+    repo.mark_channel_downshelf("u_im", "xianyu", "item_im_1")
+    doc_after_down = repo.get_channel_item("u_im", "xianyu", "item_im_1")
+    assert doc_after_down["status"] == "downshelf"
+    assert doc_after_down["conversation_count"] == 1
+    assert doc_after_down["unread_message_count"] == 0
+    assert doc_after_down["conversations"][0]["messages"][-1]["message_id"] == "srv_real_888"
+
+
+def _make_b64_text_content(text: str) -> Dict[str, Any]:
+    inner = json.dumps({"contentType": 1, "text": {"text": text}}, ensure_ascii=False)
+    return {
+        "contentType": 101,
+        "custom": {"type": 1, "data": base64.b64encode(inner.encode("utf-8")).decode("ascii")},
+    }
+
+
+class _FakeLwpWebSocket:
+    """模拟闲鱼 DingTalk LWP WebSocket 服务端行为（支持推包顺序检查与超时模式）。"""
+
+    def __init__(self, *, my_uid: str = "my_uid_1", send_mode: str = "ok", event_log=None) -> None:
+        self.my_uid = my_uid
+        self.send_mode = send_mode  # ok | timeout_missing | timeout_server_has
+        self.event_log = event_log
+        self.incoming: Optional[asyncio.Queue] = None
+        self.sent_packets = []
+        self.events = []
+        self.closed = False
+        self.unread_count = 1
+        self.modify_time_ms = 1764310001000
+        self.peer_msgs = [
+            {
+                "message": {
+                    "messageId": "msg_peer_1",
+                    "senderId": "buyer_9001@goofish",
+                    "createAt": 1764310001000,
+                    "content": _make_b64_text_content("在吗，能少点吗？"),
+                    "extension": {"reminderTitle": "爽快买家", "reminderContent": "在吗，能少点吗？"},
+                }
+            }
+        ]
+
+    def _ensure_q(self) -> None:
+        if self.incoming is None:
+            self.incoming = asyncio.Queue()
+
+    async def recv(self) -> str:
+        self._ensure_q()
+        item = await self.incoming.get()
+        if item is None:
+            raise ConnectionError("ws closed")
+        return json.dumps(item, ensure_ascii=False)
+
+    async def send(self, raw: str) -> None:
+        self._ensure_q()
+        pkt = json.loads(raw)
+        self.sent_packets.append(pkt)
+        lwp = pkt.get("lwp")
+        headers = pkt.get("headers") or {}
+        mid = headers.get("mid")
+
+        if "code" in pkt and mid:
+            self.events.append(("ws_ack", mid))
+            if self.event_log is not None:
+                self.event_log.append(("ws_ack", mid))
+            return
+        if lwp == "/r/SyncStatus/ackDiff":
+            self.events.append(("ws_ack_diff", pkt.get("body")))
+            if mid:
+                await self.incoming.put({"code": 200, "headers": {"mid": mid}, "body": {}})
+            return
+
+        if lwp == "/reg":
+            await self.incoming.put({
+                "code": 200,
+                "headers": {"mid": mid, "sid": "sid_test_1"},
+                "body": {},
+            })
+        elif lwp == "/!":
+            await self.incoming.put({"code": 200, "headers": {"mid": mid}, "body": {}})
+        elif lwp == "/r/SyncStatus/getState":
+            await self.incoming.put({"code": 200, "headers": {"mid": mid}, "body": {"pts": 100}})
+        elif lwp == "/r/Conversation/listNewestPagination":
+            latest_msg = self.peer_msgs[-1]
+            await self.incoming.put({
+                "code": 200,
+                "headers": {"mid": mid},
+                "body": {
+                    "userConvs": [
+                        {
+                            "singleChatUserConversation": {
+                                "visible": 1,
+                                "redPoint": self.unread_count,
+                                "modifyTime": self.modify_time_ms,
+                                "lastMessage": latest_msg,
+                                "singleChatConversation": {
+                                    "cid": "cid_9001@goofish",
+                                    "bizType": "1",
+                                    "pairFirst": f"{self.my_uid}@goofish",
+                                    "pairSecond": "buyer_9001@goofish",
+                                    "extension": {
+                                        "itemId": "ext_item_100",
+                                        "itemSellerId": self.my_uid,
+                                        "itemTitle": "全新无线键鼠",
+                                        "itemMainPic": "https://img.example.com/kb.jpg",
+                                    },
+                                },
+                            }
+                        },
+                        # 卖家咨询别人的商品（应过滤）
+                        {
+                            "singleChatUserConversation": {
+                                "visible": 1,
+                                "redPoint": 3,
+                                "modifyTime": 1764310002000,
+                                "singleChatConversation": {
+                                    "cid": "cid_other_seller@goofish",
+                                    "bizType": "1",
+                                    "pairFirst": f"{self.my_uid}@goofish",
+                                    "pairSecond": "other_seller@goofish",
+                                    "extension": {
+                                        "itemId": "ext_other_999",
+                                        "itemSellerId": "other_seller",
+                                    },
+                                },
+                            }
+                        },
+                        # AI 助手通知（bizType=57，应过滤）
+                        {
+                            "singleChatUserConversation": {
+                                "visible": 1,
+                                "redPoint": 1,
+                                "singleChatConversation": {
+                                    "cid": "cid_ai_57@goofish",
+                                    "bizType": "57",
+                                    "extension": {"itemId": "ext_item_100", "itemSellerId": self.my_uid},
+                                },
+                            }
+                        },
+                    ]
+                },
+            })
+        elif lwp == "/r/MessageManager/listUserMessages":
+            msgs = list(self.peer_msgs)
+            if self.send_mode == "timeout_server_has":
+                # 模拟消息其实已送达服务端只是回执丢了
+                msgs.append({
+                    "message": {
+                        "messageId": "srv_recovered_77",
+                        "senderId": f"{self.my_uid}@goofish",
+                        "createAt": int(time.time() * 1000),
+                        "content": _make_b64_text_content("可以包邮出"),
+                        "extension": {"senderUserId": self.my_uid},
+                    }
+                })
+            await self.incoming.put({
+                "code": 200,
+                "headers": {"mid": mid},
+                "body": {"userMessageModels": msgs},
+            })
+        elif lwp == "/r/MessageSend/sendByReceiverScope":
+            if self.send_mode == "ok":
+                body_msg = (pkt.get("body") or [{}])[0]
+                await self.incoming.put({
+                    "code": 200,
+                    "headers": {"mid": mid},
+                    "body": {
+                        "messageId": "srv_msg_555",
+                        "uuid": body_msg.get("uuid"),
+                        "createAt": 1764310005000,
+                    },
+                })
+            else:
+                # 故意不回包触发发送超时分支
+                pass
+
+    async def push_sync(self, max_pts: int = 202) -> None:
+        self._ensure_q()
+        self.unread_count += 1
+        self.modify_time_ms += 8000
+        self.peer_msgs.append({
+            "message": {
+                "messageId": f"msg_peer_push_{max_pts}",
+                "senderId": "buyer_9001@goofish",
+                "createAt": self.modify_time_ms,
+                "content": _make_b64_text_content("请问什么时候能发？"),
+                "extension": {"reminderTitle": "爽快买家", "reminderContent": "请问什么时候能发？"},
+            }
+        })
+        await self.incoming.put({
+            "lwp": "/s/sync",
+            "headers": {"mid": "srv_push_9"},
+            "body": {"syncPushPackage": {"data": [{"objectType": 4}], "maxPts": max_pts}},
+        })
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.incoming is not None:
+            await self.incoming.put(None)
+
+
+def test_im_ws_hub_sync_persist_before_ack_send_and_breakers():
+    # 先校验发消息载荷严格遵循闲鱼网页版红点与双接收人协议
+    cuuid, msg_obj, scope_obj = build_text_send_payload(
+        cid="cid_9001@goofish",
+        peer_user_id="buyer_9001",
+        my_user_id="my_uid_1",
+        text="明天可发",
+    )
+    assert msg_obj["uuid"] == cuuid
+    assert msg_obj["redPointPolicy"] == 0
+    assert msg_obj["msgReadStatusSetting"] == 1
+    assert scope_obj["actualReceivers"] == ["buyer_9001@goofish", "my_uid_1@goofish"]
+    decoded = json.loads(base64.b64decode(msg_obj["content"]["custom"]["data"]).decode("utf-8"))
+    assert decoded == {"contentType": 1, "text": {"text": "明天可发"}}
+
+    ws_holder: Dict[str, _FakeLwpWebSocket] = {}
+    events_log = []
+
+    def fake_mint(profile_dir: str) -> Dict[str, Any]:
+        if "risk_user" in profile_dir:
+            return {"ok": False, "error_code": "RISK_CONTROL_BLOCKED", "message": "触发滑块验证"}
+        return {
+            "ok": True,
+            "user_id": "my_uid_1",
+            "nickname": "掌柜测试",
+            "access_token": "tok_ok_1",
+            "device_id": "dev_1",
+            "app_key": "444e9908a51d1cb236a27862abc769c9",
+            "expired_ms": 86400000,
+            "ding_ua": "TestDingUA",
+        }
+
+    async def fake_connect(_headers: Dict[str, str]):
+        ws = _FakeLwpWebSocket(my_uid="my_uid_1", send_mode="ok", event_log=events_log)
+        ws_holder["ws"] = ws
+        return ws
+
+    states: Dict[str, Dict[str, Any]] = {}
+    synced_convs = []
+
+    def on_convs(_key: str, convs):
+        events_log.append(("persisted", len(convs)))
+        synced_convs.extend(convs)
+
+    def on_state(key: str, info: Dict[str, Any]):
+        states[key] = dict(info)
+
+    hub = XianyuIMHub(
+        mint_fn=fake_mint,
+        ws_connect_fn=fake_connect,
+        send_delay_range=(0.0, 0.0),
+        max_sends_per_minute=2,
+    )
+    try:
+        hub.ensure_started(
+            "xianyu::u_ok",
+            profile_dir="/tmp/ok_user",
+            owner="u_ok",
+            channel="xianyu",
+            on_conversations=on_convs,
+            on_state_change=on_state,
+        )
+        hub.ensure_started(
+            "xianyu::u_risk",
+            profile_dir="/tmp/risk_user",
+            owner="u_risk",
+            channel="xianyu",
+            on_conversations=lambda *_a: None,
+            on_state_change=on_state,
+        )
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if (
+                states.get("xianyu::u_ok", {}).get("im_state") == "online"
+                and states.get("xianyu::u_risk", {}).get("im_state") == "paused_risk"
+                and synced_convs
+            ):
+                break
+            time.sleep(0.02)
+
+        # 风控仅熔断 u_risk，绝不连坐 u_ok
+        assert states["xianyu::u_ok"]["im_state"] == "online"
+        assert states["xianyu::u_risk"]["im_state"] == "paused_risk"
+        assert len(synced_convs) == 1
+        assert synced_convs[0]["cid"] == "cid_9001@goofish"
+        assert synced_convs[0]["messages"][0]["text"] == "在吗，能少点吗？"
+
+        # 测试 Persist-Before-Ack：服务端推送 /s/sync 后，必须先落盘回调再发 WS ACK
+        ws = ws_holder["ws"]
+        ws.events.clear()
+        events_log.clear()
+        fut_push = asyncio.run_coroutine_threadsafe(ws.push_sync(max_pts=333), hub._loop)
+        fut_push.result(timeout=2.0)
+        ack_deadline = time.monotonic() + 2.0
+        while time.monotonic() < ack_deadline:
+            if any(ev[0] == "ws_ack" for ev in ws.events):
+                break
+            time.sleep(0.01)
+        kinds = [ev[0] for ev in events_log]
+        assert "persisted" in kinds and "ws_ack" in kinds
+        assert kinds.index("persisted") < kinds.index("ws_ack")
+
+        # 正常发送拿到真实服务端回执 + 触发每分钟防刷限流
+        send1 = hub.send_message("xianyu::u_ok", cid="cid_9001@goofish", peer_user_id="buyer_9001", text="可以包邮")
+        assert send1["ok"] is True and send1["delivery_status"] == "sent"
+        assert send1["message_id"] == "srv_msg_555"
+
+        send2 = hub.send_message("xianyu::u_ok", cid="cid_9001@goofish", peer_user_id="buyer_9001", text="今天发")
+        assert send2["ok"] is True
+
+        send_limited = hub.send_message("xianyu::u_ok", cid="cid_9001@goofish", peer_user_id="buyer_9001", text="第3条限流")
+        assert send_limited["ok"] is False and send_limited["error_code"] == "RATE_LIMITED"
+
+        # 回执超时分支：先模拟超时，若查不到线上记录 -> 严禁撒谎，明确标为 uncertain
+        ws.send_mode = "timeout_missing"
+        rt_ok = hub._accounts["xianyu::u_ok"]
+        rt_ok.send_timestamps.clear()
+
+        async def _fast_timeout_rpc(rt, pkt, timeout=10.0):
+            if pkt.get("lwp") == "/r/MessageSend/sendByReceiverScope":
+                raise asyncio.TimeoutError("simulated send timeout")
+            return await orig_send_rpc(rt, pkt, timeout=timeout)
+
+        orig_send_rpc = hub._send_rpc
+        with patch.object(hub, "_send_rpc", side_effect=_fast_timeout_rpc):
+            unc_res = hub.send_message("xianyu::u_ok", cid="cid_9001@goofish", peer_user_id="buyer_9001", text="状态存疑测试")
+            assert unc_res["ok"] is False
+            assert unc_res["delivery_status"] == "uncertain"
+            assert unc_res["error_code"] == "SEND_ACK_TIMEOUT"
+
+            # 若回执超时但服务端 listUserMessages 已查到该条记录 -> 自动校准为 sent
+            ws.send_mode = "timeout_server_has"
+            rt_ok.send_timestamps.clear()
+            rec_res = hub.send_message("xianyu::u_ok", cid="cid_9001@goofish", peer_user_id="buyer_9001", text="可以包邮出")
+            assert rec_res["ok"] is True and rec_res["delivery_status"] == "sent"
+            assert rec_res["message_id"] == "srv_recovered_77"
+    finally:
+        hub.shutdown()
+
+
+def test_im_api_endpoints_reply_flow_and_isolation(tmp_path):
+    db = _MemoryDB()
+    cfg = WorkbenchConfig(
+        auth_secret="test_secret_im_123",
+        data_dir=tmp_path / "data",
+        screenshot_dir=tmp_path / "data" / "eval_screenshots",
+        upload_dir=tmp_path / "data" / "uploads",
+        publish_fail_dir=tmp_path / "data" / "publish_failures",
+        channel_profiles_dir=tmp_path / "data" / "channel_profiles",
+        deal_image_dir=tmp_path / "deal_images",
+    )
+    for d in (cfg.screenshot_dir, cfg.upload_dir, cfg.publish_fail_dir, cfg.channel_profiles_dir, cfg.deal_image_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    repo = WorkbenchRepository(db)
+    repo.ensure_indexes()
+    svc = WorkbenchService(repo, cfg, ai_generator=_default_offline_ai)
+    registry = ChannelRegistry()
+    adapter = _FakeChannelAdapter(cfg.channel_profiles_dir, auto_publish=True, auto_downshelf=True)
+    adapter.capabilities = ChannelCapabilities(
+        qr_login=True,
+        status_check=True,
+        sync_selling=True,
+        auto_publish=True,
+        auto_downshelf=True,
+        im_messaging=True,
+    )
+    adapter.online_state = True
+    registry.register(adapter)
+
+    ws_ref: Dict[str, _FakeLwpWebSocket] = {}
+
+    def _mint_ok(_dir: str) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "user_id": "my_uid_1",
+            "nickname": "工作台掌柜",
+            "access_token": "tok_api_1",
+            "device_id": "dev_api",
+            "app_key": "444e9908a51d1cb236a27862abc769c9",
+            "expired_ms": 86400000,
+            "ding_ua": "TestDingUA",
+        }
+
+    async def _connect_ok(_headers):
+        ws = _FakeLwpWebSocket(my_uid="my_uid_1", send_mode="ok")
+        ws_ref["ws"] = ws
+        return ws
+
+    hub = XianyuIMHub(mint_fn=_mint_ok, ws_connect_fn=_connect_ok, send_delay_range=(0.0, 0.0))
+    ch_svc = ChannelService(repo, registry, inter_item_delay_range=(0.0, 0.0))
+    im_svc = ChannelIMService(repo, registry, hub=hub, auto_start=True)
+    job_runner = ChannelJobRunner(repo, ch_svc)
+
+    app = create_app(
+        cfg,
+        db=db,
+        service=svc,
+        channel_registry=registry,
+        channel_service=ch_svc,
+        job_runner=job_runner,
+        im_service=im_svc,
+    )
+
+    db.cols["users"].docs.extend([
+        {"uid": "u_seller_a", "phone": "15310625037"},
+        {"uid": "u_seller_b", "phone": "15310625038"},
+    ])
+    cmd_create_user(repo, username="seller_a", password="password123", bind_phone="15310625037")
+    cmd_create_user(repo, username="seller_b", password="password456", bind_phone="15310625038")
+    repo.upsert_channel_account("seller_a", "xianyu", {"bound": True, "online": True, "account_id": "my_uid_1", "nickname": "工作台掌柜"})
+    repo.upsert_channel_selling(
+        "seller_a",
+        "xianyu",
+        online_items=[{
+            "item_id": "ext_item_100",
+            "title": "全新无线键鼠",
+            "price": "99.00",
+            "item_url": "https://www.goofish.com/item?id=ext_item_100",
+        }],
+        abnormal_items=[],
+        group_counts={"online": 1, "abnormal": 0, "downshelf": 0},
+        synced_at=datetime.datetime(2026, 11, 28, 12, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    with TestClient(app) as client_a, TestClient(app) as client_b:
+        assert client_a.post("/api/auth/login", json={"username": "seller_a", "password": "password123"}).status_code == 200
+        assert client_b.post("/api/auth/login", json={"username": "seller_b", "password": "password456"}).status_code == 200
+
+        # 等待启动后 WS 完成首次同步
+        dl = time.monotonic() + 3.0
+        while time.monotonic() < dl:
+            st = client_a.get("/api/channels/xianyu/im/status").json()["data"]
+            it = repo.get_channel_item("seller_a", "xianyu", "ext_item_100") or {}
+            if st["im_state"] == "online" and it.get("conversation_count", 0) > 0:
+                break
+            time.sleep(0.02)
+
+        st_resp = client_a.get("/api/channels/xianyu/im/status")
+        assert st_resp.status_code == 200
+        st_data = st_resp.json()["data"]
+        assert st_data["im_state"] == "online" and st_data["total_unread_messages"] == 1
+
+        # B 用户严禁跨账号访问 A 商品对话
+        assert client_b.get("/api/channels/xianyu/items/ext_item_100/conversations").status_code == 404
+
+        conv_resp = client_a.get("/api/channels/xianyu/items/ext_item_100/conversations")
+        assert conv_resp.status_code == 200
+        conv_data = conv_resp.json()["data"]
+        assert conv_data["conversation_count"] == 1
+        assert conv_data["conversations"][0]["cid"] == "cid_9001@goofish"
+        assert conv_data["conversations"][0]["messages"][0]["text"] == "在吗，能少点吗？"
+
+        # 站外引流违规拦截 -> HTTP 400
+        bad_reply = client_a.post(
+            "/api/channels/xianyu/items/ext_item_100/conversations/cid_9001@goofish/reply",
+            json={"text": "加我vx发定位给你"},
+        )
+        assert bad_reply.status_code == 400
+
+        # 正常手动回复 -> 真实送达 + 持久化 + 在售列表摘要更新
+        ok_reply = client_a.post(
+            "/api/channels/xianyu/items/ext_item_100/conversations/cid_9001@goofish/reply",
+            json={"text": "亲，诚心要可以包邮，今天下午发出"},
+        )
+        assert ok_reply.status_code == 200
+        ok_data = ok_reply.json()["data"]
+        assert ok_data["ok"] is True and ok_data["delivery_status"] == "sent"
+        assert ok_data["conversation"]["messages"][-1]["text"] == "亲，诚心要可以包邮，今天下午发出"
+        assert ok_data["conversation"]["messages"][-1]["message_id"] == "srv_msg_555"
+
+        selling_resp = client_a.get("/api/channels/xianyu/selling").json()["data"]
+        assert selling_resp["im_state"] == "online"
+        assert selling_resp["total_unread_messages"] == 0
+        assert selling_resp["online_items"][0]["conversation_count"] == 1
+        assert "包邮" in selling_resp["online_items"][0]["last_message_preview"]
+
+        # 熔断状态下拒绝盲目发消息 (HTTP 409)
+        rt = hub._accounts["xianyu::seller_a"]
+        hub._emit_state(rt, "paused_risk", "触发滑块风控暂停", error_code="RISK_CONTROL_BLOCKED")
+        blocked_reply = client_a.post(
+            "/api/channels/xianyu/items/ext_item_100/conversations/cid_9001@goofish/reply",
+            json={"text": "恢复测试"},
+        )
+        assert blocked_reply.status_code == 409
+
+        # 手动重连接口可重新拉起监控
+        reconn = client_a.post("/api/channels/xianyu/im/reconnect", json={"force_refresh": False})
+        assert reconn.status_code == 200
+
+
+
 
 
 

@@ -2,8 +2,10 @@
 """工作台数据仓储：通用选品库、多渠道账户与同步快照、及上游只读数据源。"""
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import re
+import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pymongo.errors import DuplicateKeyError
@@ -68,6 +70,7 @@ class WorkbenchRepository:
     def __init__(self, db: Any) -> None:
         self.db = db
         self._indexes_ready = False
+        self._conv_lock = threading.RLock()
 
     @property
     def users_col(self):
@@ -621,6 +624,10 @@ class WorkbenchRepository:
             "error_code": "",
             "message": "",
             "last_checked_at": None,
+            "im_state": "stopped",
+            "im_message": "",
+            "im_error_code": "",
+            "im_last_sync_at": None,
             "group_counts": {},
             "synced_at": None,
             "created_at": now,
@@ -681,6 +688,10 @@ class WorkbenchRepository:
             "downshelved_at": None,
             "last_synced_at": None,
             "sync_order": 0,
+            "conversations": [],
+            "conversation_count": 0,
+            "unread_message_count": 0,
+            "last_message_at": None,
             "created_at": now,
         }
         if set_on_insert:
@@ -975,6 +986,302 @@ class WorkbenchRepository:
                 "updated_at": now,
             },
         )
+
+    def list_all_bound_channel_accounts(self, channel: str) -> List[Dict[str, Any]]:
+        self.ensure_indexes()
+        clean_ch = str(channel or "").strip().lower()
+        cursor = self.channels_col.find(
+            {"channel": clean_ch, "bound": True, "online": True},
+            {"_id": 0},
+        )
+        return [dict(d) for d in cursor if isinstance(d, dict)]
+
+    def update_channel_im_state(
+        self,
+        owner: str,
+        channel: str,
+        *,
+        im_state: str,
+        im_message: str = "",
+        im_error_code: str = "",
+        im_last_sync_at: Any = None,
+        account_id: str = "",
+        nickname: str = "",
+    ) -> Dict[str, Any]:
+        clean_owner = str(owner or "").strip()
+        clean_ch = str(channel or "").strip().lower()
+        now = datetime.now(timezone.utc)
+        set_fields: Dict[str, Any] = {
+            "im_state": str(im_state or "stopped").strip(),
+            "im_message": str(im_message or "").strip(),
+            "im_error_code": str(im_error_code or "").strip(),
+            "updated_at": now,
+        }
+        sync_dt = _parse_utc_dt(im_last_sync_at)
+        if sync_dt is not None:
+            set_fields["im_last_sync_at"] = sync_dt
+        if account_id:
+            set_fields["account_id"] = str(account_id).strip()
+        if nickname:
+            set_fields["nickname"] = str(nickname).strip()
+        if im_state in ("offline", "paused_risk"):
+            set_fields["online"] = False
+            set_fields["error_code"] = str(im_error_code or (
+                "RISK_CONTROL_BLOCKED" if im_state == "paused_risk" else "ACCOUNT_OFFLINE"
+            ))
+            if im_message:
+                set_fields["message"] = str(im_message).strip()
+            set_fields["last_checked_at"] = now
+        elif im_state == "online":
+            set_fields["bound"] = True
+            set_fields["online"] = True
+            set_fields["error_code"] = ""
+            set_fields["last_checked_at"] = now
+        return self.upsert_channel_account(clean_owner, clean_ch, set_fields)
+
+    @staticmethod
+    def _merge_conv_messages(
+        existing_msgs: Sequence[Dict[str, Any]],
+        incoming_msgs: Sequence[Dict[str, Any]],
+        cap: int = 80,
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        by_msg_id: Dict[str, int] = {}
+        by_client_uuid: Dict[str, int] = {}
+
+        def _norm_msg(raw: Dict[str, Any]) -> Dict[str, Any]:
+            m = deepcopy(raw)
+            dt = _parse_utc_dt(m.get("created_at")) or datetime.now(timezone.utc)
+            m["created_at"] = dt
+            m["created_at_ms"] = int(m.get("created_at_ms") or int(dt.timestamp() * 1000))
+            m["message_id"] = str(m.get("message_id") or "").strip()
+            m["client_uuid"] = str(m.get("client_uuid") or "").strip()
+            m["sender"] = "me" if m.get("sender") == "me" else "peer"
+            m["msg_type"] = str(m.get("msg_type") or "text")
+            m["text"] = str(m.get("text") or "")
+            m["image_url"] = str(m.get("image_url") or "")
+            m["delivery_status"] = str(m.get("delivery_status") or "sent")
+            m["error"] = str(m.get("error") or "")
+            return m
+
+        for raw in list(existing_msgs or []) + list(incoming_msgs or []):
+            if not isinstance(raw, dict):
+                continue
+            item = _norm_msg(raw)
+            mid = item["message_id"]
+            cuuid = item["client_uuid"]
+            hit_idx: Optional[int] = None
+            if mid and mid in by_msg_id:
+                hit_idx = by_msg_id[mid]
+            elif cuuid and cuuid in by_client_uuid:
+                hit_idx = by_client_uuid[cuuid]
+
+            if hit_idx is not None:
+                prev = merged[hit_idx]
+                if prev.get("delivery_status") == "sending" or item.get("delivery_status") == "sent":
+                    merged[hit_idx] = {**prev, **item}
+            else:
+                idx = len(merged)
+                merged.append(item)
+                if mid:
+                    by_msg_id[mid] = idx
+                if cuuid:
+                    by_client_uuid[cuuid] = idx
+
+        merged.sort(key=lambda x: (int(x.get("created_at_ms") or 0), str(x.get("message_id") or x.get("client_uuid") or "")))
+        return merged[-max(1, int(cap)):]
+
+    def _recompute_conv_summary(self, conversations: List[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+        convs_sorted = sorted(
+            conversations,
+            key=lambda c: (
+                (_parse_utc_dt(c.get("last_message_at")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp()
+            ),
+            reverse=True,
+        )[:50]
+        unread_total = sum(int(c.get("unread_count") or 0) for c in convs_sorted)
+        last_dt: Optional[datetime] = None
+        for c in convs_sorted:
+            dt = _parse_utc_dt(c.get("last_message_at"))
+            if dt is not None and (last_dt is None or dt > last_dt):
+                last_dt = dt
+        return {
+            "conversations": convs_sorted,
+            "conversation_count": len(convs_sorted),
+            "unread_message_count": unread_total,
+            "last_message_at": last_dt,
+            "updated_at": now,
+        }
+
+    def upsert_channel_item_conversations(
+        self,
+        owner: str,
+        channel: str,
+        external_item_id: str,
+        *,
+        conversations: Sequence[Dict[str, Any]],
+        item_meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        clean_owner = str(owner or "").strip()
+        clean_ch = str(channel or "").strip().lower()
+        ext_id = str(external_item_id or "").strip()
+        if not clean_owner or not clean_ch or not ext_id:
+            return None
+
+        with self._conv_lock:
+            existing_doc = self.get_channel_item(clean_owner, clean_ch, ext_id)
+            if existing_doc is None:
+                meta = item_meta or {}
+                on_insert = {
+                    "status": "online",
+                    "is_online": True,
+                    "status_label": "在售(正常)",
+                    "title": str(meta.get("title") or ""),
+                    "pic_url": str(meta.get("pic_url") or ""),
+                    "item_url": str(meta.get("item_url") or f"https://www.goofish.com/item?id={ext_id}"),
+                }
+                existing_doc = self._upsert_channel_item(
+                    clean_owner,
+                    clean_ch,
+                    ext_id,
+                    set_fields={},
+                    set_on_insert=on_insert,
+                ) or {}
+
+            now = datetime.now(timezone.utc)
+            by_cid: Dict[str, Dict[str, Any]] = {}
+            for c in existing_doc.get("conversations") or []:
+                if isinstance(c, dict) and c.get("cid"):
+                    by_cid[str(c["cid"])] = deepcopy(c)
+
+            for inc in conversations or []:
+                if not isinstance(inc, dict) or not inc.get("cid"):
+                    continue
+                cid = str(inc["cid"]).strip()
+                prev = by_cid.get(cid) or {}
+                merged_msgs = self._merge_conv_messages(
+                    prev.get("messages") or [],
+                    inc.get("messages") or [],
+                )
+                inc_dt = _parse_utc_dt(inc.get("last_message_at"))
+                msg_dt = _parse_utc_dt(merged_msgs[-1].get("created_at")) if merged_msgs else None
+                prev_dt = _parse_utc_dt(prev.get("last_message_at"))
+                cand_dts = [d for d in (inc_dt, msg_dt, prev_dt) if d is not None]
+                eff_dt = max(cand_dts) if cand_dts else now
+                preview = (
+                    str(merged_msgs[-1].get("text") or "")
+                    if merged_msgs
+                    else str(inc.get("last_message_preview") or prev.get("last_message_preview") or "")
+                )
+                by_cid[cid] = {
+                    "cid": cid,
+                    "peer_user_id": str(inc.get("peer_user_id") or prev.get("peer_user_id") or "").strip(),
+                    "peer_nick": str(inc.get("peer_nick") or prev.get("peer_nick") or "").strip(),
+                    "unread_count": int(inc.get("unread_count", prev.get("unread_count", 0)) or 0),
+                    "has_gap": bool(inc.get("has_gap", False)),
+                    "last_message_preview": preview[:120],
+                    "last_message_at": eff_dt,
+                    "messages": merged_msgs,
+                    "updated_at": now,
+                }
+
+            summary_fields = self._recompute_conv_summary(list(by_cid.values()), now)
+            return self._upsert_channel_item(
+                clean_owner,
+                clean_ch,
+                ext_id,
+                set_fields=summary_fields,
+            )
+
+    def append_channel_item_message(
+        self,
+        owner: str,
+        channel: str,
+        external_item_id: str,
+        cid: str,
+        message_doc: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        clean_owner = str(owner or "").strip()
+        clean_ch = str(channel or "").strip().lower()
+        ext_id = str(external_item_id or "").strip()
+        clean_cid = str(cid or "").strip()
+        with self._conv_lock:
+            existing_doc = self.get_channel_item(clean_owner, clean_ch, ext_id)
+            if not existing_doc:
+                return None
+            convs = [deepcopy(c) for c in (existing_doc.get("conversations") or []) if isinstance(c, dict)]
+            target = next((c for c in convs if str(c.get("cid") or "") == clean_cid), None)
+            if target is None:
+                return None
+            now = datetime.now(timezone.utc)
+            target["messages"] = self._merge_conv_messages(target.get("messages") or [], [message_doc])
+            if message_doc.get("delivery_status") in ("sending", "sent"):
+                target["last_message_preview"] = str(message_doc.get("text") or "")[:120]
+                target["last_message_at"] = _parse_utc_dt(message_doc.get("created_at")) or now
+            target["updated_at"] = now
+            summary_fields = self._recompute_conv_summary(convs, now)
+            return self._upsert_channel_item(
+                clean_owner,
+                clean_ch,
+                ext_id,
+                set_fields=summary_fields,
+            )
+
+    def update_channel_item_message_status(
+        self,
+        owner: str,
+        channel: str,
+        external_item_id: str,
+        cid: str,
+        client_uuid: str,
+        *,
+        delivery_status: str,
+        message_id: str = "",
+        created_at: Any = None,
+        created_at_ms: int = 0,
+        error: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        clean_owner = str(owner or "").strip()
+        clean_ch = str(channel or "").strip().lower()
+        ext_id = str(external_item_id or "").strip()
+        clean_cid = str(cid or "").strip()
+        clean_uuid = str(client_uuid or "").strip()
+        with self._conv_lock:
+            existing_doc = self.get_channel_item(clean_owner, clean_ch, ext_id)
+            if not existing_doc:
+                return None
+            convs = [deepcopy(c) for c in (existing_doc.get("conversations") or []) if isinstance(c, dict)]
+            target = next((c for c in convs if str(c.get("cid") or "") == clean_cid), None)
+            if target is None:
+                return None
+            now = datetime.now(timezone.utc)
+            msgs = list(target.get("messages") or [])
+            for m in reversed(msgs):
+                if isinstance(m, dict) and str(m.get("client_uuid") or "") == clean_uuid:
+                    m["delivery_status"] = str(delivery_status)
+                    m["error"] = str(error or "")
+                    if message_id:
+                        m["message_id"] = str(message_id)
+                    dt = _parse_utc_dt(created_at)
+                    if dt is not None:
+                        m["created_at"] = dt
+                    if created_at_ms:
+                        m["created_at_ms"] = int(created_at_ms)
+                    break
+            target["messages"] = msgs
+            if delivery_status == "sent":
+                target["unread_count"] = 0
+                if msgs:
+                    target["last_message_preview"] = str(msgs[-1].get("text") or "")[:120]
+                    target["last_message_at"] = _parse_utc_dt(msgs[-1].get("created_at")) or now
+            target["updated_at"] = now
+            summary_fields = self._recompute_conv_summary(convs, now)
+            return self._upsert_channel_item(
+                clean_owner,
+                clean_ch,
+                ext_id,
+                set_fields=summary_fields,
+            )
 
     # =========================================================================
     # 渠道后台异步任务仓储 (xy_channel_jobs)
