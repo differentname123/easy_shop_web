@@ -145,12 +145,15 @@ createApp({
     const activeChannelCode = ref('xianyu');
     const channelBusy = ref('');
     const reconcilePreviewLoading = ref(false);
+    const sellingFilter = ref('online'); // online | downshelf | abnormal
     const sellingData = ref({
       online_items: [],
       abnormal_items: [],
+      downshelf_items: [],
       publications: {},
       online_count: 0,
       abnormal_count: 0,
+      downshelf_count: 0,
       off_promotion_alert_count: 0,
       synced_at: '',
     });
@@ -573,9 +576,11 @@ createApp({
       sellingData.value = {
         online_items: [],
         abnormal_items: [],
+        downshelf_items: [],
         publications: {},
         online_count: 0,
         abnormal_count: 0,
+        downshelf_count: 0,
         off_promotion_alert_count: 0,
         synced_at: '',
       };
@@ -1544,6 +1549,7 @@ createApp({
       channelBusy,
       isChannelSyncing,
       reconcilePreviewLoading,
+      sellingFilter,
       sellingData,
       offPromoOnlineItems,
       onlineItemFor,

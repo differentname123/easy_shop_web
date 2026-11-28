@@ -123,23 +123,11 @@ class ChannelService:
             },
         )
 
-    def _enrich_selling_items(
+    def _decorate_channel_items(
         self,
         owner: str,
-        selling_doc: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        online_raw = list((selling_doc or {}).get("online_items") or [])
-        abnormal_raw = list((selling_doc or {}).get("abnormal_items") or [])
-        manual_links = dict((selling_doc or {}).get("manual_links") or {})
-        publications = dict((selling_doc or {}).get("publications") or {})
-
-        pub_ext_to_lid: Dict[str, str] = {}
-        for lid, pub in publications.items():
-            if isinstance(pub, dict):
-                ext = str(pub.get("external_item_id") or "").strip()
-                if ext:
-                    pub_ext_to_lid.setdefault(ext, str(lid))
-
+        raw_items: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         listings = self.repo.list_all_active_listings(owner)
         by_id: Dict[str, Dict[str, Any]] = {}
         by_norm_title: Dict[str, Dict[str, Any]] = {}
@@ -153,11 +141,9 @@ class ChannelService:
                 by_norm_title.setdefault(nt, lst)
                 listing_norms.append((nt, lst))
 
-        matched_pairs: Dict[str, Tuple[Optional[Dict[str, Any]], str, str]] = {}
         missing_explicit_lids: List[str] = []
-        for entry in online_raw + abnormal_raw:
-            ext_id = str(entry.get("item_id") or "").strip()
-            explicit_lid = str(manual_links.get(ext_id) or pub_ext_to_lid.get(ext_id) or "").strip()
+        for entry in raw_items:
+            explicit_lid = str(entry.get("listing_id") or "").strip()
             if explicit_lid and explicit_lid not in by_id:
                 missing_explicit_lids.append(explicit_lid)
         hist_by_id = (
@@ -166,14 +152,17 @@ class ChannelService:
             else {}
         )
 
+        matched_pairs: Dict[str, Tuple[Optional[Dict[str, Any]], str, str]] = {}
         keys: List[Tuple[str, str]] = []
-        for entry in online_raw + abnormal_raw:
-            ext_id = str(entry.get("item_id") or "").strip()
+        for entry in raw_items:
+            ext_id = str(entry.get("external_item_id") or entry.get("item_id") or "").strip()
+            if not ext_id:
+                continue
             linked_lst: Optional[Dict[str, Any]] = None
             link_mode = "unlinked"
             resolved_lid = ""
 
-            explicit_lid = str(manual_links.get(ext_id) or pub_ext_to_lid.get(ext_id) or "").strip()
+            explicit_lid = str(entry.get("listing_id") or "").strip()
             if explicit_lid:
                 if explicit_lid in by_id:
                     linked_lst = by_id[explicit_lid]
@@ -198,18 +187,37 @@ class ChannelService:
                                 break
                     if linked_lst is not None:
                         resolved_lid = str(linked_lst.get("listing_id") or "").strip()
+
             if resolved_lid:
                 matched_pairs[ext_id] = (linked_lst, link_mode, resolved_lid)
                 if linked_lst is not None:
                     keys.append((linked_lst.get("platform"), linked_lst.get("product_id")))
 
         prod_map = self.repo.batch_get_products(keys) if keys else {}
-        off_promotion_count = 0
 
-        def _decorate(raw_entry: Dict[str, Any]) -> Dict[str, Any]:
-            nonlocal off_promotion_count
-            item = dict(raw_entry)
-            ext_id = str(item.get("item_id") or "").strip()
+        decorated: List[Dict[str, Any]] = []
+        for raw_entry in raw_items:
+            ext_id = str(raw_entry.get("external_item_id") or raw_entry.get("item_id") or "").strip()
+            status = str(raw_entry.get("status") or ("online" if raw_entry.get("is_online") else "abnormal")).strip().lower()
+            item: Dict[str, Any] = {
+                "item_id": ext_id,
+                "external_item_id": ext_id,
+                "status": status,
+                "is_online": bool(raw_entry.get("is_online", status == "online")),
+                "item_status": raw_entry.get("item_status"),
+                "status_label": str(raw_entry.get("status_label") or ""),
+                "title": str(raw_entry.get("title") or ""),
+                "price": str(raw_entry.get("price") or ""),
+                "post_info": str(raw_entry.get("post_info") or ""),
+                "category_id": raw_entry.get("category_id"),
+                "want_info": str(raw_entry.get("want_info") or ""),
+                "pic_url": str(raw_entry.get("pic_url") or ""),
+                "item_url": str(raw_entry.get("item_url") or ""),
+                "link_source": str(raw_entry.get("link_source") or ""),
+                "published_at": _iso_utc(raw_entry.get("published_at")),
+                "downshelved_at": _iso_utc(raw_entry.get("downshelved_at")),
+                "last_synced_at": _iso_utc(raw_entry.get("last_synced_at")),
+            }
             pair = matched_pairs.get(ext_id)
             if not pair:
                 item.update({
@@ -219,19 +227,20 @@ class ChannelService:
                     "linked_listing_status": "",
                     "linked_platform": "",
                     "linked_product_id": "",
+                    "linked_main_item_code": "",
                     "upstream_status": "unlinked",
                     "upstream_live_price": None,
                     "off_promotion_alert": False,
                 })
-                return item
+                decorated.append(item)
+                continue
 
             lst, mode, lid = pair
-            pub_rec = publications.get(lid) if isinstance(publications.get(lid), dict) else {}
             if lst is None:
                 item.update({
                     "link_mode": mode,
                     "linked_listing_id": lid,
-                    "linked_listing_title": str(pub_rec.get("title") or ""),
+                    "linked_listing_title": str(raw_entry.get("title") or ""),
                     "linked_listing_status": "dismissed",
                     "linked_platform": "",
                     "linked_product_id": "",
@@ -240,20 +249,19 @@ class ChannelService:
                     "upstream_live_price": None,
                     "off_promotion_alert": False,
                 })
-                return item
+                decorated.append(item)
+                continue
 
             plat = normalize_platform(lst.get("platform"))
             pid = clean_id(lst.get("product_id"))
             prod = prod_map.get((plat, pid))
             up_status, up_price = _live_price_of(prod)
             is_off = up_status == "off_promotion"
-            if is_off and item.get("is_online") is not False and mode != "removed":
-                off_promotion_count += 1
             gsign = str((prod or {}).get("goods_sign") or "").strip()
             item.update({
                 "link_mode": mode,
                 "linked_listing_id": lid,
-                "linked_listing_title": str(lst.get("title") or pub_rec.get("title") or ""),
+                "linked_listing_title": str(lst.get("title") or raw_entry.get("title") or ""),
                 "linked_listing_status": _normalize_listing_status(lst.get("status")),
                 "linked_platform": plat,
                 "linked_product_id": pid,
@@ -262,29 +270,85 @@ class ChannelService:
                 "upstream_live_price": up_price,
                 "off_promotion_alert": is_off,
             })
-            return item
+            decorated.append(item)
+        return decorated
 
-        online_items = [_decorate(x) for x in online_raw]
-        abnormal_items = [_decorate(x) for x in abnormal_raw]
+    @staticmethod
+    def _derive_publications(decorated_items: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """从独立渠道商品实体中派生按 listing_id 索引的发布状态摘要（在售优先，其次最新记录）。"""
+        pubs: Dict[str, Dict[str, Any]] = {}
+        for item in decorated_items:
+            lid = str(item.get("linked_listing_id") or "").strip()
+            if not lid:
+                continue
+            if item.get("link_source") != "published" and not item.get("published_at"):
+                continue
+            cur_status = "online" if item.get("status") == "online" else "downshelf"
+            candidate = {
+                "listing_id": lid,
+                "external_item_id": item["external_item_id"],
+                "item_url": item.get("item_url") or "",
+                "title": item.get("title") or "",
+                "price": str(item.get("price") or ""),
+                "status": cur_status,
+                "published_at": item.get("published_at") or "",
+                "downshelved_at": item.get("downshelved_at") or "",
+            }
+            existing = pubs.get(lid)
+            if existing is None:
+                pubs[lid] = candidate
+                continue
+            if existing.get("status") != "online" and cur_status == "online":
+                pubs[lid] = candidate
+            elif existing.get("status") == cur_status and candidate["published_at"] >= existing.get("published_at", ""):
+                pubs[lid] = candidate
+        return pubs
+
+    def _enrich_selling_items(
+        self,
+        owner: str,
+        channel_code: str,
+        account_doc: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        raw_items = self.repo.list_channel_items(owner, channel_code)
+        decorated = self._decorate_channel_items(owner, raw_items)
+        online_items = [x for x in decorated if x["status"] == "online"]
+        abnormal_items = [x for x in decorated if x["status"] == "abnormal"]
+        downshelf_items = sorted(
+            (x for x in decorated if x["status"] == "downshelf"),
+            key=lambda x: x.get("downshelved_at") or x.get("last_synced_at") or "",
+            reverse=True,
+        )
+        off_promotion_count = sum(
+            1
+            for item in online_items
+            if item.get("off_promotion_alert") and item.get("link_mode") != "removed"
+        )
         return {
             "online_items": online_items,
             "abnormal_items": abnormal_items,
-            "publications": publications,
+            "downshelf_items": downshelf_items,
+            "publications": self._derive_publications(decorated),
             "online_count": len(online_items),
             "abnormal_count": len(abnormal_items),
+            "downshelf_count": len(downshelf_items),
             "off_promotion_alert_count": off_promotion_count,
-            "group_counts": dict((selling_doc or {}).get("group_counts") or {}),
-            "synced_at": _iso_utc((selling_doc or {}).get("synced_at")),
+            "group_counts": dict((account_doc or {}).get("group_counts") or {}),
+            "synced_at": _iso_utc((account_doc or {}).get("synced_at")),
         }
 
     def _build_selling_payload(
         self,
         owner: str,
         adapter: SellingChannel,
-        selling_doc: Optional[Dict[str, Any]],
+        account_doc: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        doc = selling_doc if isinstance(selling_doc, dict) else (self.repo.get_channel_doc(owner, adapter.channel_code) or {})
-        enriched = self._enrich_selling_items(owner, doc)
+        doc = (
+            account_doc
+            if isinstance(account_doc, dict)
+            else (self.repo.get_channel_account(owner, adapter.channel_code) or {})
+        )
+        enriched = self._enrich_selling_items(owner, adapter.channel_code, doc)
         return {
             "channel": adapter.channel_code,
             "name": adapter.channel_name,
@@ -299,12 +363,12 @@ class ChannelService:
 
     def list_channels(self, owner: str) -> List[Dict[str, Any]]:
         ch_map = {
-            str(d.get("channel") or ""): d for d in self.repo.list_channel_docs(owner)
+            str(d.get("channel") or ""): d for d in self.repo.list_channel_accounts(owner)
         }
         out: List[Dict[str, Any]] = []
         for adapter in self.registry.list_all():
             doc = ch_map.get(adapter.channel_code) or {}
-            enriched = self._enrich_selling_items(owner, doc) if doc else None
+            enriched = self._enrich_selling_items(owner, adapter.channel_code, doc)
             out.append({
                 "channel": adapter.channel_code,
                 "name": adapter.channel_name,
@@ -316,10 +380,11 @@ class ChannelService:
                 "error_code": str(doc.get("error_code") or ""),
                 "message": str(doc.get("message") or ("未绑定账号" if not doc.get("bound") else "")),
                 "last_checked_at": _iso_utc(doc.get("last_checked_at")),
-                "online_count": enriched["online_count"] if enriched else 0,
-                "abnormal_count": enriched["abnormal_count"] if enriched else 0,
-                "off_promotion_alert_count": enriched["off_promotion_alert_count"] if enriched else 0,
-                "synced_at": enriched["synced_at"] if enriched else "",
+                "online_count": enriched["online_count"],
+                "abnormal_count": enriched["abnormal_count"],
+                "downshelf_count": enriched["downshelf_count"],
+                "off_promotion_alert_count": enriched["off_promotion_alert_count"],
+                "synced_at": enriched["synced_at"],
             })
         return out
 
@@ -481,8 +546,60 @@ class ChannelService:
 
     def get_selling_snapshot(self, owner: str, channel_code: str) -> Dict[str, Any]:
         adapter = self._adapter(channel_code)
-        selling_doc = self.repo.get_channel_selling(owner, adapter.channel_code)
-        return self._build_selling_payload(owner, adapter, selling_doc)
+        account_doc = self.repo.get_channel_account(owner, adapter.channel_code)
+        return self._build_selling_payload(owner, adapter, account_doc)
+
+    def list_channel_items(
+        self,
+        owner: str,
+        channel_code: str,
+        *,
+        status: str = "all",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> Dict[str, Any]:
+        adapter = self._adapter(channel_code)
+        eff = str(status or "all").strip().lower()
+        if eff not in ("all", "online", "downshelf", "abnormal"):
+            raise HTTPException(status_code=400, detail=f"不支持的渠道商品状态: {eff}")
+        rows, total = self.repo.list_channel_items_paged(
+            owner,
+            adapter.channel_code,
+            status=eff,
+            page=page,
+            page_size=page_size,
+        )
+        items = self._decorate_channel_items(owner, rows)
+        counts = self.repo.get_channel_item_counts(owner, adapter.channel_code)
+        account_doc = self.repo.get_channel_account(owner, adapter.channel_code) or {}
+        safe_page = max(1, int(page or 1))
+        safe_size = max(1, min(100, int(page_size or 50)))
+        return {
+            "channel": adapter.channel_code,
+            "name": adapter.channel_name,
+            "items": items,
+            "total": total,
+            "page": safe_page,
+            "page_size": safe_size,
+            "has_more": (safe_page * safe_size) < total,
+            "counts": counts,
+            "synced_at": _iso_utc(account_doc.get("synced_at")),
+        }
+
+    def get_channel_item_detail(
+        self,
+        owner: str,
+        channel_code: str,
+        external_item_id: str,
+    ) -> Dict[str, Any]:
+        adapter = self._adapter(channel_code)
+        ext_id = str(external_item_id or "").strip()
+        if not ext_id:
+            raise HTTPException(status_code=400, detail="无效的渠道商品 ID")
+        doc = self.repo.get_channel_item(owner, adapter.channel_code, ext_id)
+        if not doc or doc.get("status") == "pending":
+            raise HTTPException(status_code=404, detail="渠道商品不存在")
+        return self._decorate_channel_items(owner, [doc])[0]
 
     def link_selling_item(
         self,
@@ -495,13 +612,16 @@ class ChannelService:
         ext_id = str(external_item_id or "").strip()
         if not ext_id:
             raise HTTPException(status_code=400, detail="无效的渠道商品 ID")
+        existing_item = self.repo.get_channel_item(owner, adapter.channel_code, ext_id)
+        if not existing_item:
+            raise HTTPException(status_code=404, detail="渠道商品不存在，请先刷新在售列表")
         clean_lid = str(listing_id or "").strip()
         if clean_lid:
             lst = self.repo.get_listing_by_id(owner, clean_lid)
             if not lst:
                 raise HTTPException(status_code=404, detail="待关联的本地商品不存在")
-        updated = self.repo.update_channel_manual_link(owner, adapter.channel_code, ext_id, clean_lid)
-        return self._build_selling_payload(owner, adapter, updated)
+        self.repo.update_channel_manual_link(owner, adapter.channel_code, ext_id, clean_lid)
+        return self._build_selling_payload(owner, adapter)
 
     # =========================================================================
     # 单品手动上架、手动下架与发布追踪

@@ -223,6 +223,18 @@ class _MemoryCollection:
                 return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=new_doc["_id"])
             return SimpleNamespace(matched_count=0, modified_count=0)
 
+    def update_many(self, flt, update_doc):
+        with self._lock:
+            matched = 0
+            modified = 0
+            for idx, doc in enumerate(self.docs):
+                if _match_query(doc, flt):
+                    matched += 1
+                    _apply_update(doc, update_doc)
+                    self._check_unique(doc, skip_idx=idx)
+                    modified += 1
+            return SimpleNamespace(matched_count=matched, modified_count=modified)
+
     @staticmethod
     def _project(doc, projection):
         out = deepcopy(doc)
@@ -249,6 +261,7 @@ class _MemoryDB:
             "xy_users": _MemoryCollection(),
             "xy_listings": _MemoryCollection(),
             "xy_channels": _MemoryCollection(),
+            "xy_channel_items": _MemoryCollection(),
             "xy_channel_jobs": _MemoryCollection(),
             "favorites": _MemoryCollection(),
             "products": _MemoryCollection(),
@@ -2173,7 +2186,7 @@ def test_channel_repo_atomic_updates_and_dynamic_static_version(tmp_path):
     db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path)
     repo.create_user("atomic_u", hash_password("123456"))
 
-    # 验证 upsert_channel_selling 不会覆盖已存在的 manual_links
+    # 验证 upsert_channel_selling 不会覆盖独立渠道商品表上已存在的关联与扩展字段
     repo.update_channel_manual_link("atomic_u", "xianyu", "ext_1", "xyl_1")
     repo.upsert_channel_selling(
         "atomic_u",
@@ -2183,8 +2196,15 @@ def test_channel_repo_atomic_updates_and_dynamic_static_version(tmp_path):
         group_counts={"在售": 1},
         synced_at=datetime.datetime.now(datetime.timezone.utc),
     )
-    doc = repo.get_channel_doc("atomic_u", "xianyu")
-    assert doc["manual_links"] == {"ext_1": "xyl_1"}
+    acct = repo.get_channel_account("atomic_u", "xianyu")
+    assert acct is not None
+    for blob_key in ("online_items", "abnormal_items", "manual_links", "publications"):
+        assert blob_key not in acct
+    ch_item = repo.get_channel_item("atomic_u", "xianyu", "ext_1")
+    assert ch_item is not None
+    assert ch_item["listing_id"] == "xyl_1"
+    assert ch_item["link_source"] == "manual"
+    assert ch_item["status"] == "online"
 
     # 验证 GET / 动态注入 app.js mtime 版本号
     with TestClient(app) as client:
@@ -2709,6 +2729,214 @@ def test_sync_fail_closed_preserves_snapshot_and_handles_personal_dom(tmp_path, 
         assert snap2["online_items"][0]["item_id"] == "999888777"
         diff = client.post("/api/channels/xianyu/reconcile/preview", json={"refresh": False}).json()["data"]
         assert diff["to_publish"] == []
+
+
+def test_channel_items_granularity_downshelf_republish_and_legacy_migration(tmp_path):
+    """验证 xy_channel_items 一品一记录、下架/同步消失保留记录与字段、重发共存、及旧版 xy_channels 平滑迁移。"""
+    adapter = _FakeChannelAdapter(
+        tmp_path / "data" / "channel_profiles",
+        channel_code="xianyu",
+        auto_publish=True,
+        auto_downshelf=True,
+    )
+    adapter.online_state = True
+    db, _cfg, repo, _svc, _reg, _ch_svc, app = _build_env(tmp_path, adapters=[adapter])
+    repo.create_user("gran_u", hash_password("123456"))
+
+    db.cols["products"].docs.append({
+        "platform": "jd",
+        "product_id": "jd_gran_1",
+        "name": "维达抽纸整箱24包",
+        "price": 39.9,
+        "activity_price": 25.9,
+        "is_off_promotion": False,
+    })
+    db.cols["xy_listings"].docs.append({
+        "listing_id": "xyl_gran_1",
+        "owner": "gran_u",
+        "platform": "jd",
+        "product_id": "jd_gran_1",
+        "status": "ready",
+        "title": "维达抽纸整箱24包 官旗直发",
+        "description": "全新未拆封整箱",
+        "images": [{"url": "https://img.jd.com/v1.jpg", "origin": "official"}],
+        "price": 25.9,
+    })
+    # 预先带入 1 件外部自发闲置商品
+    adapter.online_items = [{
+        "item_id": "xy_ext_manual_1",
+        "title": "我自己发的耳机闲置",
+        "price": "99.00",
+        "want_info": "4人想要",
+        "pic_url": "https://img.goofish.com/ear.jpg",
+        "item_url": "https://www.goofish.com/item?id=xy_ext_manual_1",
+        "is_online": True,
+    }]
+
+    with TestClient(app) as client:
+        assert client.post("/api/auth/login", json={"username": "gran_u", "password": "123456"}).status_code == 200
+
+        # 1. 同步外部商品 + 上架选品商品，验证 xy_channel_items 一品一文档且 xy_channels 不存商品大数组
+        s1 = _wait_job(client, "xianyu", client.post("/api/channels/xianyu/sync").json()["data"]["job"]["job_id"])
+        assert s1["status"] == "completed"
+        p1 = _wait_job(
+            client,
+            "xianyu",
+            client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_gran_1"}).json()["data"]["job"]["job_id"],
+        )
+        assert p1["status"] == "completed"
+        first_pub_id = p1["published"][0]["item_id"]
+
+        acct_doc = db.cols["xy_channels"].find_one({"owner": "gran_u", "channel": "xianyu"}, {"_id": 0})
+        for blob_key in ("online_items", "abnormal_items", "manual_links", "publications"):
+            assert blob_key not in acct_doc
+        assert db.cols["xy_channel_items"].count_documents({"owner": "gran_u", "channel": "xianyu"}) == 2
+
+        # 模拟未来单品扩展挂载字段（如话术/对话），验证下架与同步绝对不会清除或覆写
+        db.cols["xy_channel_items"].update_one(
+            {"owner": "gran_u", "channel": "xianyu", "external_item_id": first_pub_id},
+            {"$set": {"custom_reply_note": "老链接专属备注"}},
+        )
+        db.cols["xy_channel_items"].update_one(
+            {"owner": "gran_u", "channel": "xianyu", "external_item_id": "xy_ext_manual_1"},
+            {"$set": {"custom_reply_note": "外部商品专属备注"}},
+        )
+
+        # 2. 主动下架 first_pub_id：记录保留、状态变 downshelf、关联与扩展字段完整留存，且可通过 API 读取
+        dw1 = _wait_job(
+            client,
+            "xianyu",
+            client.post("/api/channels/xianyu/downshelf", json={"external_item_id": first_pub_id}).json()["data"]["job"]["job_id"],
+        )
+        assert dw1["status"] == "completed"
+        item_after_dw = db.cols["xy_channel_items"].find_one(
+            {"owner": "gran_u", "channel": "xianyu", "external_item_id": first_pub_id},
+            {"_id": 0},
+        )
+        assert item_after_dw["status"] == "downshelf"
+        assert item_after_dw["is_online"] is False
+        assert item_after_dw["listing_id"] == "xyl_gran_1"
+        assert item_after_dw["downshelved_at"] is not None
+        assert item_after_dw["custom_reply_note"] == "老链接专属备注"
+
+        dw_list = client.get("/api/channels/xianyu/items?status=downshelf").json()["data"]
+        assert dw_list["total"] == 1
+        assert dw_list["items"][0]["external_item_id"] == first_pub_id
+        assert dw_list["items"][0]["linked_listing_id"] == "xyl_gran_1"
+        assert dw_list["counts"] == {"online": 1, "abnormal": 0, "downshelf": 1, "total": 2}
+
+        detail_res = client.get(f"/api/channels/xianyu/items/{first_pub_id}").json()["data"]
+        assert detail_res["status"] == "downshelf"
+        assert detail_res["downshelved_at"] != ""
+
+        # 3. 同一选品重发生成全新 second_pub_id：新旧两代闲鱼商品各自独立保留一行
+        p2 = _wait_job(
+            client,
+            "xianyu",
+            client.post("/api/channels/xianyu/publish", json={"listing_id": "xyl_gran_1"}).json()["data"]["job"]["job_id"],
+        )
+        assert p2["status"] == "completed"
+        second_pub_id = p2["published"][0]["item_id"]
+        assert second_pub_id != first_pub_id
+        assert db.cols["xy_channel_items"].count_documents({"owner": "gran_u", "channel": "xianyu"}) == 3
+
+        selling = client.get("/api/channels/xianyu/selling").json()["data"]
+        assert selling["publications"]["xyl_gran_1"]["external_item_id"] == second_pub_id
+        assert selling["publications"]["xyl_gran_1"]["status"] == "online"
+        assert [x["external_item_id"] for x in selling["downshelf_items"]] == [first_pub_id]
+
+        # 4. 外部自发商品在闲鱼 App 端下架消失后同步 -> 转标 downshelf 不删记录；重新上架后同步 -> 恢复 online 且保留扩展字段
+        adapter.online_items = [x for x in adapter.online_items if x["item_id"] != "xy_ext_manual_1"]
+        _wait_job(client, "xianyu", client.post("/api/channels/xianyu/sync").json()["data"]["job"]["job_id"])
+        ext_dw = repo.get_channel_item("gran_u", "xianyu", "xy_ext_manual_1")
+        assert ext_dw["status"] == "downshelf"
+        assert ext_dw["custom_reply_note"] == "外部商品专属备注"
+
+        adapter.online_items.append({
+            "item_id": "xy_ext_manual_1",
+            "title": "我自己发的耳机闲置",
+            "price": "88.00",
+            "want_info": "6人想要",
+            "pic_url": "https://img.goofish.com/ear.jpg",
+            "item_url": "https://www.goofish.com/item?id=xy_ext_manual_1",
+            "is_online": True,
+        })
+        _wait_job(client, "xianyu", client.post("/api/channels/xianyu/sync").json()["data"]["job"]["job_id"])
+        ext_back = repo.get_channel_item("gran_u", "xianyu", "xy_ext_manual_1")
+        assert ext_back["status"] == "online"
+        assert ext_back["price"] == "88.00"
+        assert ext_back["downshelved_at"] is None
+        assert ext_back["custom_reply_note"] == "外部商品专属备注"
+
+        # 5. 验证链接不存在商品返回 404
+        assert client.post(
+            "/api/channels/xianyu/selling/non_existent_999/link",
+            json={"listing_id": "xyl_gran_1"},
+        ).status_code == 404
+        assert client.get("/api/channels/xianyu/items/non_existent_999").status_code == 404
+
+    # 6. 验证遗留旧版 xy_channels 大文档无损迁移并剥离旧数组字段
+    repo.create_user("legacy_u", hash_password("123456"))
+    db.cols["xy_channels"].insert_one({
+        "owner": "legacy_u",
+        "channel": "xianyu",
+        "bound": True,
+        "online": True,
+        "account_id": "422001",
+        "nickname": "遗留账号",
+        "synced_at": datetime.datetime(2026, 11, 27, 20, 0, 0, tzinfo=datetime.timezone.utc),
+        "online_items": [
+            {
+                "item_id": "leg_on_1",
+                "title": "遗留在线商品",
+                "price": "19.90",
+                "item_status": 0,
+                "is_online": True,
+                "status_label": "在售(正常)",
+                "item_url": "https://www.goofish.com/item?id=leg_on_1",
+            }
+        ],
+        "abnormal_items": [
+            {
+                "item_id": "leg_abn_1",
+                "title": "遗留异常商品",
+                "price": "0.01",
+                "item_status": 1,
+                "is_online": False,
+                "status_label": "非在售(status=1)",
+            }
+        ],
+        "manual_links": {"leg_on_1": "xyl_leg_1"},
+        "publications": {
+            "xyl_leg_1": {
+                "listing_id": "xyl_leg_1",
+                "external_item_id": "leg_on_1",
+                "published_at": "2026-11-27T19:00:00Z",
+                "status": "online",
+            },
+            "xyl_leg_old": {
+                "listing_id": "xyl_leg_old",
+                "external_item_id": "leg_dw_1",
+                "title": "遗留已下架商品",
+                "price": "9.90",
+                "item_url": "https://www.goofish.com/item?id=leg_dw_1",
+                "published_at": "2026-11-27T18:00:00Z",
+                "downshelved_at": "2026-11-27T18:30:00Z",
+                "status": "downshelf",
+            },
+        },
+    })
+    migrated_cnt = repo.migrate_legacy_channel_docs()
+    assert migrated_cnt == 1
+    cleaned_legacy = repo.get_channel_account("legacy_u", "xianyu")
+    for blob_key in ("online_items", "abnormal_items", "manual_links", "publications"):
+        assert blob_key not in cleaned_legacy
+    leg_items = {x["external_item_id"]: x for x in repo.list_channel_items("legacy_u", "xianyu")}
+    assert set(leg_items.keys()) == {"leg_on_1", "leg_abn_1", "leg_dw_1"}
+    assert leg_items["leg_on_1"]["status"] == "online" and leg_items["leg_on_1"]["listing_id"] == "xyl_leg_1"
+    assert leg_items["leg_abn_1"]["status"] == "abnormal" and leg_items["leg_abn_1"]["listing_id"] == ""
+    assert leg_items["leg_dw_1"]["status"] == "downshelf" and leg_items["leg_dw_1"]["listing_id"] == "xyl_leg_old"
+    assert leg_items["leg_dw_1"]["downshelved_at"] is not None
 
 
 

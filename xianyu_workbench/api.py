@@ -390,6 +390,30 @@ def create_app(
         username = _uid(request)
         return {"status": "success", "data": _ch_svc().get_selling_snapshot(username, channel)}
 
+    @app.get("/api/channels/{channel}/items")
+    def list_channel_items(
+        channel: str,
+        request: Request,
+        status: str = Query("all", pattern="^(all|online|downshelf|abnormal)$"),
+        page: int = Query(1, ge=1, le=500),
+        page_size: int = Query(50, ge=1, le=100),
+    ):
+        username = _uid(request)
+        data = _ch_svc().list_channel_items(
+            username,
+            channel,
+            status=status,
+            page=page,
+            page_size=page_size,
+        )
+        return {"status": "success", "data": data}
+
+    @app.get("/api/channels/{channel}/items/{external_item_id}")
+    def get_channel_item_detail(channel: str, external_item_id: str, request: Request):
+        username = _uid(request)
+        data = _ch_svc().get_channel_item_detail(username, channel, external_item_id)
+        return {"status": "success", "data": data}
+
     @app.post("/api/channels/{channel}/selling/{external_item_id}/link")
     def link_selling_item(channel: str, external_item_id: str, req: LinkSellingRequest, request: Request):
         username = _uid(request)

@@ -1026,69 +1026,144 @@
             </button>
           </div>
 
-          <div v-if="!activeChannel.bound && sellingData.online_items.length === 0 && sellingData.abnormal_items.length === 0" class="empty-state">
+          <div v-if="!activeChannel.bound && sellingData.online_items.length === 0 && sellingData.abnormal_items.length === 0 && (sellingData.downshelf_items || []).length === 0" class="empty-state">
             <p>绑定{{ activeChannel.name }}账号后，可后台上下架商品、同步选品库、跳转帖子查看效果并监控上游货源</p>
             <button class="btn btn-primary" @click="startQrLogin(activeChannelCode)">立即扫码绑定</button>
           </div>
 
           <template v-else>
+            <div class="filter-chips">
+              <button class="btn btn-xs" :class="sellingFilter === 'online' ? 'btn-dark' : 'btn-soft'" @click="sellingFilter = 'online'">
+                在售 ({{ sellingData.online_count || sellingData.online_items.length || 0 }})
+              </button>
+              <button class="btn btn-xs" :class="sellingFilter === 'downshelf' ? 'btn-dark' : 'btn-soft'" @click="sellingFilter = 'downshelf'">
+                已下架 ({{ sellingData.downshelf_count || (sellingData.downshelf_items || []).length || 0 }})
+              </button>
+              <button
+                v-if="(sellingData.abnormal_count || sellingData.abnormal_items.length || 0) > 0"
+                class="btn btn-xs"
+                :class="sellingFilter === 'abnormal' ? 'btn-dark' : 'btn-soft'"
+                @click="sellingFilter = 'abnormal'"
+              >
+                异常 ({{ sellingData.abnormal_count || sellingData.abnormal_items.length || 0 }})
+              </button>
+            </div>
+
+            <div
+              v-if="sellingFilter === 'online' && sellingData.abnormal_items.length > 0"
+              class="status-banner card-alert"
+              style="cursor: pointer;"
+              @click="sellingFilter = 'abnormal'"
+            >
+              <div style="font-size: 13px; color: var(--red); font-weight: 600;">
+                ⚠️ 检测到 {{ sellingData.abnormal_items.length }} 件异常/被平台下架商品
+              </div>
+              <span class="link-btn" style="font-size: 12px;">去查看 ›</span>
+            </div>
+
             <!-- 异常/已被平台下架 -->
-            <div v-for="ab in sellingData.abnormal_items" :key="'ab_' + ab.item_id" class="card card-alert">
-              <div class="prod-row">
-                <img class="thumb thumb-sm" :src="ab.pic_url || ''" alt="" />
-                <div class="prod-meta">
-                  <div class="prod-title">{{ ab.title }}</div>
-                  <div class="price-row">
-                    <span class="price-main"><small>¥</small>{{ ab.price }}</span>
-                    <span class="pill pill-red">{{ ab.status_label || '已被下架' }}</span>
-                    <span v-if="ab.off_promotion_alert" class="pill pill-red">上游源已失效</span>
+            <template v-if="sellingFilter === 'abnormal'">
+              <div v-for="ab in sellingData.abnormal_items" :key="'ab_' + ab.item_id" class="card card-alert">
+                <div class="prod-row">
+                  <img class="thumb thumb-sm" :src="ab.pic_url || ''" alt="" />
+                  <div class="prod-meta">
+                    <div class="prod-title">{{ ab.title }}</div>
+                    <div class="price-row">
+                      <span class="price-main"><small>¥</small>{{ ab.price }}</span>
+                      <span class="pill pill-red">{{ ab.status_label || '已被下架' }}</span>
+                      <span v-if="ab.off_promotion_alert" class="pill pill-red">上游源已失效</span>
+                    </div>
+                    <div style="font-size: 12px; color: var(--sub);">ID: {{ ab.item_id }}</div>
                   </div>
-                  <div style="font-size: 12px; color: var(--sub);">ID: {{ ab.item_id }}</div>
+                </div>
+                <div class="actions-row">
+                  <a v-if="ab.item_url" class="btn btn-blue-soft btn-sm" style="flex: 1.2;" :href="ab.item_url" target="_blank" rel="noopener">🔗 看帖子 ↗</a>
+                  <button class="btn btn-soft btn-sm" @click="openLinkModal(ab)">
+                    {{ ab.linked_listing_id ? '改关联' : '关联' }}
+                  </button>
                 </div>
               </div>
-            </div>
+              <div v-if="sellingData.abnormal_items.length === 0" class="empty-state">
+                <p>暂无异常状态商品</p>
+              </div>
+            </template>
+
+            <!-- 已下架保留历史记录 -->
+            <template v-else-if="sellingFilter === 'downshelf'">
+              <div v-for="dw in (sellingData.downshelf_items || [])" :key="'dw_' + dw.item_id" class="card">
+                <div class="prod-row">
+                  <img class="thumb thumb-sm" :src="dw.pic_url || ''" alt="" />
+                  <div class="prod-meta">
+                    <div class="prod-title">{{ dw.title || ('商品 ' + dw.item_id) }}</div>
+                    <div class="price-row">
+                      <span v-if="dw.price" class="price-main"><small>¥</small>{{ dw.price }}</span>
+                      <span class="pill pill-gray">已下架</span>
+                      <span v-if="dw.link_mode === 'removed'" class="pill pill-amber">已从选品库移出</span>
+                      <span v-else-if="dw.off_promotion_alert" class="pill pill-red">上游源已失效</span>
+                    </div>
+                    <div style="font-size: 12px; color: var(--muted);">
+                      ID: {{ dw.item_id }}
+                      <span v-if="dw.downshelved_at"> · 下架于 {{ formatTime(dw.downshelved_at) }}</span>
+                      <span v-if="dw.linked_listing_title"> · 选品：{{ dw.linked_listing_title.slice(0, 14) }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="actions-row">
+                  <a v-if="dw.item_url" class="btn btn-blue-soft btn-sm" style="flex: 1.2;" :href="dw.item_url" target="_blank" rel="noopener">🔗 看原帖 ↗</a>
+                  <a v-if="dw.linked_main_item_code" class="btn btn-soft btn-sm" style="flex: 0.9;" :href="mainProductUrl(dw.linked_main_item_code)" target="_blank" rel="noopener">本店商品 ↗</a>
+                  <button class="btn btn-soft btn-sm" @click="openLinkModal(dw)">
+                    {{ dw.linked_listing_id ? '改关联' : '关联' }}
+                  </button>
+                </div>
+              </div>
+              <div v-if="(sellingData.downshelf_items || []).length === 0" class="empty-state">
+                <p>暂无已下架商品记录</p>
+              </div>
+            </template>
 
             <!-- 正常在售 -->
-            <div v-for="on in sellingData.online_items" :key="'on_' + on.item_id" class="card" :class="{ 'card-alert': on.off_promotion_alert || on.link_mode === 'removed' }">
-              <div class="prod-row">
-                <img class="thumb thumb-sm" :src="on.pic_url || ''" alt="" />
-                <div class="prod-meta">
-                  <div class="prod-title">{{ on.title }}</div>
-                  <div class="price-row">
-                    <span class="price-main"><small>¥</small>{{ on.price }}</span>
-                    <span class="pill pill-green">正常在售</span>
-                    <span v-if="on.link_mode === 'removed'" class="pill pill-amber">已从选品库移出（待同步下架）</span>
-                    <span v-else-if="on.off_promotion_alert" class="pill pill-red">⚠️ 上游源已失效</span>
-                    <span v-else-if="on.upstream_status === 'online'" class="pill pill-blue">
-                      上游有货{{ on.upstream_live_price ? (' ¥' + on.upstream_live_price) : '' }}
-                    </span>
-                    <span v-else class="pill pill-gray">非选品库商品</span>
-                  </div>
-                  <div style="font-size: 12px; color: var(--muted);">
-                    {{ on.want_info || '暂无热度' }}
-                    <span v-if="on.linked_listing_title"> · 选品：{{ on.linked_listing_title.slice(0, 14) }}</span>
+            <template v-else>
+              <div v-for="on in sellingData.online_items" :key="'on_' + on.item_id" class="card" :class="{ 'card-alert': on.off_promotion_alert || on.link_mode === 'removed' }">
+                <div class="prod-row">
+                  <img class="thumb thumb-sm" :src="on.pic_url || ''" alt="" />
+                  <div class="prod-meta">
+                    <div class="prod-title">{{ on.title }}</div>
+                    <div class="price-row">
+                      <span class="price-main"><small>¥</small>{{ on.price }}</span>
+                      <span class="pill pill-green">正常在售</span>
+                      <span v-if="on.link_mode === 'removed'" class="pill pill-amber">已从选品库移出（待同步下架）</span>
+                      <span v-else-if="on.off_promotion_alert" class="pill pill-red">⚠️ 上游源已失效</span>
+                      <span v-else-if="on.upstream_status === 'online'" class="pill pill-blue">
+                        上游有货{{ on.upstream_live_price ? (' ¥' + on.upstream_live_price) : '' }}
+                      </span>
+                      <span v-else class="pill pill-gray">非选品库商品</span>
+                    </div>
+                    <div style="font-size: 12px; color: var(--muted);">
+                      {{ on.want_info || '暂无热度' }}
+                      <span v-if="on.linked_listing_title"> · 选品：{{ on.linked_listing_title.slice(0, 14) }}</span>
+                    </div>
                   </div>
                 </div>
+                <div class="actions-row">
+                  <a v-if="on.item_url" class="btn btn-blue-soft btn-sm" style="flex: 1.2;" :href="on.item_url" target="_blank" rel="noopener">🔗 看帖子 ↗</a>
+                  <a v-if="on.linked_main_item_code" class="btn btn-soft btn-sm" style="flex: 0.9;" :href="mainProductUrl(on.linked_main_item_code)" target="_blank" rel="noopener">本店商品 ↗</a>
+                  <button
+                    v-if="activeChannel.capabilities && activeChannel.capabilities.auto_downshelf"
+                    class="btn btn-danger-soft btn-sm"
+                    :disabled="isItemDownshelving(on.item_id)"
+                    @click="confirmDownshelf(on.item_id, on.title)"
+                  >{{ isItemDownshelving(on.item_id) ? '下架中...' : '下架' }}</button>
+                  <button class="btn btn-soft btn-sm" @click="openLinkModal(on)">
+                    {{ on.linked_listing_id ? '改关联' : '关联' }}
+                  </button>
+                </div>
               </div>
-              <div class="actions-row">
-                <a v-if="on.item_url" class="btn btn-blue-soft btn-sm" style="flex: 1.2;" :href="on.item_url" target="_blank" rel="noopener">🔗 看帖子 ↗</a>
-                <a v-if="on.linked_main_item_code" class="btn btn-soft btn-sm" style="flex: 0.9;" :href="mainProductUrl(on.linked_main_item_code)" target="_blank" rel="noopener">本店商品 ↗</a>
-                <button
-                  v-if="activeChannel.capabilities && activeChannel.capabilities.auto_downshelf"
-                  class="btn btn-danger-soft btn-sm"
-                  :disabled="isItemDownshelving(on.item_id)"
-                  @click="confirmDownshelf(on.item_id, on.title)"
-                >{{ isItemDownshelving(on.item_id) ? '下架中...' : '下架' }}</button>
-                <button class="btn btn-soft btn-sm" @click="openLinkModal(on)">
-                  {{ on.linked_listing_id ? '改关联' : '关联' }}
-                </button>
-              </div>
-            </div>
 
-            <div v-if="sellingData.online_items.length === 0 && sellingData.abnormal_items.length === 0" class="empty-state">
-              <p>当前{{ activeChannel.name }}暂无在售商品</p>
-              <button class="btn btn-soft btn-sm" :disabled="isChannelSyncing" @click="syncActiveChannel()">刷新同步</button>
-            </div>
+              <div v-if="sellingData.online_items.length === 0" class="empty-state">
+                <p>当前{{ activeChannel.name }}暂无在售商品</p>
+                <button class="btn btn-soft btn-sm" :disabled="isChannelSyncing" @click="syncActiveChannel()">刷新同步</button>
+              </div>
+            </template>
           </template>
         </template>
       </div>
