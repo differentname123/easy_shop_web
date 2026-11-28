@@ -3592,6 +3592,290 @@ def test_im_api_endpoints_reply_flow_and_isolation(tmp_path):
         assert reconn.status_code == 200
 
 
+def test_im_system_message_classification_and_nick_sanitization(tmp_path):
+    from xianyu_workbench.client.im_ws import (
+        normalize_lwp_message,
+        parse_messages_payload,
+        sanitize_peer_nick,
+    )
+    from xianyu_workbench.im_service import _serialize_conversation
+
+    sys_raw_1 = {
+        "message": {
+            "messageId": "m_sys_1",
+            "senderId": "3365477897@goofish",
+            "createAt": 1764320001000,
+            "content": _make_b64_text_content("快给ta一个评价吧～"),
+            "extension": {"senderUserId": "3365477897", "reminderTitle": "快给ta一个评价吧～"},
+        }
+    }
+    sys_raw_2 = {
+        "message": {
+            "messageId": "m_sys_2",
+            "senderId": "4229872747@goofish",
+            "createAt": 1764320002000,
+            "content": _make_b64_text_content("[我已发货，请查看发货凭证]"),
+            "extension": {"senderUserId": "4229872747"},
+        }
+    }
+    real_peer_raw = {
+        "message": {
+            "messageId": "m_peer_real",
+            "senderId": "3365477897@goofish",
+            "createAt": 1764320003000,
+            "content": _make_b64_text_content("你好，今天能发吗"),
+            "extension": {"senderUserId": "3365477897", "reminderTitle": "爱逛街的猫"},
+        }
+    }
+    assert normalize_lwp_message(sys_raw_1, "4229872747")["sender"] == "system"
+    assert normalize_lwp_message(sys_raw_2, "4229872747")["sender"] == "system"
+    msgs, extracted_nick = parse_messages_payload(
+        {"userMessageModels": [sys_raw_1, sys_raw_2, real_peer_raw]},
+        "4229872747",
+    )
+    assert [m["sender"] for m in msgs] == ["system", "system", "peer"]
+    assert extracted_nick == "爱逛街的猫"
+    assert sanitize_peer_nick("我完成了评价", "3365477897") == "买家7897"
+
+    # 历史库里已写入的污名会在合并或序列化时自动清洗
+    _db, _cfg, repo, _svc, _reg, _ch_svc, _app = _build_env(tmp_path)
+    repo.upsert_channel_item_conversations(
+        "u_nick",
+        "xianyu",
+        "item_nick_1",
+        conversations=[{
+            "cid": "cid_nick@goofish",
+            "peer_user_id": "3365477897",
+            "peer_nick": "快给ta一个评价吧～",
+            "unread_count": 0,
+            "messages": [msgs[0]],
+        }],
+    )
+    doc = repo.get_channel_item("u_nick", "xianyu", "item_nick_1")
+    assert doc["conversations"][0]["peer_nick"] == "买家7897"
+    ser = _serialize_conversation({"cid": "c1", "peer_user_id": "3365477897", "peer_nick": "我完成了评价", "messages": []})
+    assert ser["peer_nick"] == "买家7897"
+
+
+def test_im_image_payload_upload_retry_and_manual_send_latency():
+    from xianyu_workbench.client.im_ws import build_image_send_payload
+
+    cuuid, msg_obj, scope_obj = build_image_send_payload(
+        cid="cid_9001@goofish",
+        peer_user_id="buyer_9001",
+        my_user_id="my_uid_1",
+        image_url="https://img.alicdn.com/xy_chat_test.jpg",
+        width=640,
+        height=480,
+    )
+    assert msg_obj["uuid"] == cuuid and msg_obj["redPointPolicy"] == 0
+    inner = json.loads(base64.b64decode(msg_obj["content"]["custom"]["data"]).decode("utf-8"))
+    assert inner == {
+        "contentType": 2,
+        "image": {"pics": [{"height": 480, "type": 0, "url": "https://img.alicdn.com/xy_chat_test.jpg", "width": 640}]},
+    }
+    assert scope_obj["actualReceivers"] == ["buyer_9001@goofish", "my_uid_1@goofish"]
+
+    mint_calls = {"count": 0}
+    upload_calls = {"count": 0}
+
+    def fake_mint(_dir: str) -> Dict[str, Any]:
+        mint_calls["count"] += 1
+        return {
+            "ok": True,
+            "user_id": "my_uid_1",
+            "nickname": "掌柜测试",
+            "access_token": "tok_img_1",
+            "device_id": "dev_img",
+            "app_key": "444e9908a51d1cb236a27862abc769c9",
+            "expired_ms": 86400000,
+            "ding_ua": "TestDingUA",
+            "cookies": {"cookie2": f"ck_{mint_calls['count']}"},
+        }
+
+    def fake_upload(_img_bytes: bytes, *, cookies=None, **_kw) -> Dict[str, Any]:
+        upload_calls["count"] += 1
+        if upload_calls["count"] == 1:
+            return {"ok": False, "auth_expired": True, "error_code": "UPLOAD_AUTH_EXPIRED", "message": "expired"}
+        assert cookies and cookies.get("cookie2") == "ck_2"
+        return {"ok": True, "url": "https://img.alicdn.com/xy_chat_test.jpg", "width": 120, "height": 90}
+
+    async def fake_connect(_headers):
+        return _FakeLwpWebSocket(my_uid="my_uid_1", send_mode="ok")
+
+    hub = XianyuIMHub(
+        mint_fn=fake_mint,
+        ws_connect_fn=fake_connect,
+        upload_image_fn=fake_upload,
+        min_send_interval_sec=0.05,
+    )
+    try:
+        hub.ensure_started(
+            "xianyu::u_img",
+            profile_dir="/tmp/img_user",
+            owner="u_img",
+            channel="xianyu",
+            on_conversations=lambda *_a: None,
+            on_state_change=lambda *_a: None,
+        )
+        dl = time.monotonic() + 3.0
+        while time.monotonic() < dl:
+            if hub.get_status("xianyu::u_img")["im_state"] == "online":
+                break
+            time.sleep(0.01)
+
+        # 人工默认配置下发文字零人工睡等，瞬间完成
+        t0 = time.monotonic()
+        res_txt = hub.send_message("xianyu::u_img", cid="cid_9001@goofish", peer_user_id="buyer_9001", text="你好马上发")
+        assert res_txt["ok"] is True and (time.monotonic() - t0) < 0.6
+
+        # 图片上传 Cookie 过期时自动静默换证一次后重传成功
+        res_img = hub.send_image_message(
+            "xianyu::u_img",
+            cid="cid_9001@goofish",
+            peer_user_id="buyer_9001",
+            image_bytes=b"fake_jpeg_bytes",
+        )
+        assert res_img["ok"] is True
+        assert res_img["delivery_status"] == "sent"
+        assert res_img["image_url"] == "https://img.alicdn.com/xy_chat_test.jpg"
+        assert mint_calls["count"] == 2 and upload_calls["count"] == 2
+    finally:
+        hub.shutdown()
+
+
+def test_im_image_reply_endpoint_live_probe_and_isolation(tmp_path):
+    db = _MemoryDB()
+    cfg = WorkbenchConfig(
+        auth_secret="test_secret_img_123",
+        data_dir=tmp_path / "data",
+        screenshot_dir=tmp_path / "data" / "eval_screenshots",
+        upload_dir=tmp_path / "data" / "uploads",
+        publish_fail_dir=tmp_path / "data" / "publish_failures",
+        channel_profiles_dir=tmp_path / "data" / "channel_profiles",
+        deal_image_dir=tmp_path / "deal_images",
+    )
+    for d in (cfg.screenshot_dir, cfg.upload_dir, cfg.publish_fail_dir, cfg.channel_profiles_dir, cfg.deal_image_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    repo = WorkbenchRepository(db)
+    repo.ensure_indexes()
+    svc = WorkbenchService(repo, cfg, ai_generator=_default_offline_ai)
+    registry = ChannelRegistry()
+    adapter = _FakeChannelAdapter(cfg.channel_profiles_dir, auto_publish=True, auto_downshelf=True)
+    adapter.capabilities = ChannelCapabilities(
+        qr_login=True,
+        status_check=True,
+        sync_selling=True,
+        auto_publish=True,
+        auto_downshelf=True,
+        im_messaging=True,
+    )
+    adapter.online_state = True
+    # 模拟 _live_status_probe_cb（测试实时刷新时间同步）
+    live_probe_ts = "2026-11-28T13:15:00Z"
+    adapter._live_status_probe_cb = lambda _owner: {
+        "im_state": "online",
+        "im_message": "实时消息监控中",
+        "im_error_code": "",
+        "im_last_sync_at": live_probe_ts,
+    }
+    registry.register(adapter)
+
+    async def _async_ws(_hdrs):
+        return _FakeLwpWebSocket(my_uid="my_uid_1", send_mode="ok")
+
+    hub = XianyuIMHub(
+        mint_fn=lambda _dir: {
+            "ok": True,
+            "user_id": "my_uid_1",
+            "nickname": "掌柜图",
+            "access_token": "tok_img_api",
+            "device_id": "dev_api",
+            "app_key": "444e9908a51d1cb236a27862abc769c9",
+            "expired_ms": 86400000,
+            "ding_ua": "TestDingUA",
+            "cookies": {"cookie2": "ck_api"},
+        },
+        ws_connect_fn=_async_ws,
+        upload_image_fn=lambda *_a, **_kw: {"ok": True, "url": "https://img.alicdn.com/xy_chat_api.jpg", "width": 64, "height": 64},
+        min_send_interval_sec=0.0,
+    )
+    ch_svc = ChannelService(repo, registry, inter_item_delay_range=(0.0, 0.0))
+    im_svc = ChannelIMService(repo, registry, hub=hub, auto_start=True)
+    job_runner = ChannelJobRunner(repo, ch_svc)
+    app = create_app(
+        cfg,
+        db=db,
+        service=svc,
+        channel_registry=registry,
+        channel_service=ch_svc,
+        job_runner=job_runner,
+        im_service=im_svc,
+    )
+
+    db.cols["users"].docs.extend([
+        {"uid": "u_img_a", "phone": "15310625037"},
+        {"uid": "u_img_b", "phone": "15310625038"},
+    ])
+    cmd_create_user(repo, username="img_a", password="password123", bind_phone="15310625037")
+    cmd_create_user(repo, username="img_b", password="password456", bind_phone="15310625038")
+    repo.upsert_channel_account("img_a", "xianyu", {"bound": True, "online": True, "account_id": "my_uid_1", "nickname": "掌柜图"})
+    repo.upsert_channel_selling(
+        "img_a",
+        "xianyu",
+        online_items=[{"item_id": "ext_item_100", "title": "测试发图商品", "price": "50.00"}],
+        abnormal_items=[],
+        group_counts={"online": 1, "abnormal": 0, "downshelf": 0},
+        synced_at=datetime.datetime(2026, 11, 28, 12, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), color=(255, 200, 0)).save(buf, format="PNG")
+    b64_img = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+    with TestClient(app) as client_a, TestClient(app) as client_b:
+        assert client_a.post("/api/auth/login", json={"username": "img_a", "password": "password123"}).status_code == 200
+        assert client_b.post("/api/auth/login", json={"username": "img_b", "password": "password456"}).status_code == 200
+
+        dl = time.monotonic() + 3.0
+        while time.monotonic() < dl:
+            it = repo.get_channel_item("img_a", "xianyu", "ext_item_100") or {}
+            if it.get("conversation_count", 0) > 0 and hub.get_status("xianyu::img_a")["im_state"] == "online":
+                break
+            time.sleep(0.02)
+
+        # 非法图片 -> HTTP 400
+        bad_img = client_a.post(
+            "/api/channels/xianyu/items/ext_item_100/conversations/cid_9001@goofish/reply-image",
+            json={"image_base64": "not-an-image!!"},
+        )
+        assert bad_img.status_code == 400
+
+        # 跨账号禁止操作 -> HTTP 404
+        iso_img = client_b.post(
+            "/api/channels/xianyu/items/ext_item_100/conversations/cid_9001@goofish/reply-image",
+            json={"image_base64": b64_img},
+        )
+        assert iso_img.status_code == 404
+
+        # 合法图片 -> HTTP 200，写入 CDN 图片地址与已送达状态
+        ok_img = client_a.post(
+            "/api/channels/xianyu/items/ext_item_100/conversations/cid_9001@goofish/reply-image",
+            json={"image_base64": b64_img},
+        )
+        assert ok_img.status_code == 200
+        res_data = ok_img.json()["data"]
+        assert res_data["ok"] is True and res_data["delivery_status"] == "sent"
+        last_m = res_data["conversation"]["messages"][-1]
+        assert last_m["msg_type"] == "image" and last_m["image_url"] == "https://img.alicdn.com/xy_chat_api.jpg"
+
+        # 验证 selling & channels 接口直接叠加实时探针 im_last_sync_at
+        selling = client_a.get("/api/channels/xianyu/selling").json()["data"]
+        assert selling["im_last_sync_at"] == live_probe_ts
+
+
+
 
 
 

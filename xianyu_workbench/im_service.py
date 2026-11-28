@@ -2,16 +2,19 @@
 """渠道实时消息与回复服务：衔接轻量长连接中枢与数据库商品对话记录，职责内聚。"""
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
+import io
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
 
 from fastapi import HTTPException
+from PIL import Image
 
 from .channels import ChannelRegistry
-from .client.im_ws import XianyuIMHub
+from .client.im_ws import XianyuIMHub, sanitize_peer_nick
 from .client.seller import validate_reply_text
 from .repo import WorkbenchRepository
 
@@ -35,10 +38,12 @@ def _parse_account_key(key: str) -> Tuple[str, str]:
 
 
 def _serialize_message(m: Dict[str, Any]) -> Dict[str, Any]:
+    raw_sender = m.get("sender")
+    sender = raw_sender if raw_sender in ("me", "peer", "system") else "peer"
     return {
         "message_id": str(m.get("message_id") or ""),
         "client_uuid": str(m.get("client_uuid") or ""),
-        "sender": "me" if m.get("sender") == "me" else "peer",
+        "sender": sender,
         "msg_type": str(m.get("msg_type") or "text"),
         "text": str(m.get("text") or ""),
         "image_url": str(m.get("image_url") or ""),
@@ -50,16 +55,47 @@ def _serialize_message(m: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _serialize_conversation(c: Dict[str, Any]) -> Dict[str, Any]:
+    peer_uid = str(c.get("peer_user_id") or "")
     return {
         "cid": str(c.get("cid") or ""),
-        "peer_user_id": str(c.get("peer_user_id") or ""),
-        "peer_nick": str(c.get("peer_nick") or ""),
+        "peer_user_id": peer_uid,
+        "peer_nick": sanitize_peer_nick(c.get("peer_nick"), peer_uid),
         "unread_count": int(c.get("unread_count") or 0),
         "has_gap": bool(c.get("has_gap", False)),
         "last_message_preview": str(c.get("last_message_preview") or ""),
         "last_message_at": _iso_utc(c.get("last_message_at")),
         "messages": [_serialize_message(m) for m in (c.get("messages") or []) if isinstance(m, dict)],
     }
+
+
+_MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def _decode_chat_image_base64(image_base64: str) -> Tuple[bytes, str, str]:
+    raw = str(image_base64 or "").strip()
+    if "," in raw and raw[:40].lower().startswith("data:image/"):
+        raw = raw.split(",", 1)[1].strip()
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="图片编码格式无效") from exc
+    if not decoded or len(decoded) > _MAX_CHAT_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="图片不能为空且大小不能超过 5MB")
+    try:
+        with Image.open(io.BytesIO(decoded)) as im:
+            fmt = (im.format or "JPEG").upper()
+            out = io.BytesIO()
+            if fmt == "PNG":
+                im.save(out, format="PNG", optimize=True)
+                return out.getvalue(), "chat.png", "image/png"
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(out, format="JPEG", quality=88, optimize=True)
+            return out.getvalue(), "chat.jpg", "image/jpeg"
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="无法识别的图片文件，请重新选择") from exc
 
 
 class ChannelIMService:
@@ -253,28 +289,26 @@ class ChannelIMService:
             "conversations": convs,
         }
 
-    def send_item_reply(
+    def _prepare_reply_context(
         self,
         owner: str,
         channel_code: str,
         external_item_id: str,
         cid: str,
-        text: str,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Any, str, str, str, str]:
         adapter = self._adapter(channel_code)
         ext_id = str(external_item_id or "").strip()
         clean_cid = str(cid or "").strip()
         if not ext_id or not clean_cid:
             raise HTTPException(status_code=400, detail="缺少商品或会话标识")
 
-        ok_txt, clean_or_err = validate_reply_text(text)
-        if not ok_txt:
-            raise HTTPException(status_code=400, detail=clean_or_err)
-
         doc = self.repo.get_channel_item(owner, adapter.channel_code, ext_id)
         if not doc or doc.get("status") == "pending":
             raise HTTPException(status_code=404, detail="未找到该渠道商品")
-        conv = next((c for c in (doc.get("conversations") or []) if isinstance(c, dict) and str(c.get("cid") or "") == clean_cid), None)
+        conv = next(
+            (c for c in (doc.get("conversations") or []) if isinstance(c, dict) and str(c.get("cid") or "") == clean_cid),
+            None,
+        )
         if conv is None:
             raise HTTPException(status_code=404, detail="未找到该商品下对应的买家会话")
 
@@ -302,14 +336,27 @@ class ChannelIMService:
             if live.get("im_state") != "online":
                 raise HTTPException(status_code=409, detail=live.get("im_message") or "实时消息通道正在连接中，请稍候重试")
 
+        return adapter, ext_id, clean_cid, peer_uid, key
+
+    def _execute_reply(
+        self,
+        owner: str,
+        adapter: Any,
+        ext_id: str,
+        clean_cid: str,
+        *,
+        msg_type: str,
+        preview_text: str,
+        send_fn: Callable[[], Dict[str, Any]],
+    ) -> Dict[str, Any]:
         client_uuid = f"-{int(time.time() * 1000)}{uuid.uuid4().hex[:6]}"
         now = datetime.now(timezone.utc)
         pending_msg = {
             "message_id": client_uuid,
             "client_uuid": client_uuid,
             "sender": "me",
-            "msg_type": "text",
-            "text": clean_or_err,
+            "msg_type": msg_type,
+            "text": preview_text,
             "image_url": "",
             "created_at_ms": int(now.timestamp() * 1000),
             "created_at": now,
@@ -318,12 +365,7 @@ class ChannelIMService:
         }
         self.repo.append_channel_item_message(owner, adapter.channel_code, ext_id, clean_cid, pending_msg)
 
-        send_res = self.hub.send_message(
-            key,
-            cid=clean_cid,
-            peer_user_id=peer_uid,
-            text=clean_or_err,
-        )
+        send_res = send_fn()
         delivery_status = str(send_res.get("delivery_status") or ("sent" if send_res.get("ok") else "failed"))
         updated_doc = self.repo.update_channel_item_message_status(
             owner,
@@ -333,6 +375,7 @@ class ChannelIMService:
             client_uuid,
             delivery_status=delivery_status,
             message_id=str(send_res.get("message_id") or ""),
+            image_url=str(send_res.get("image_url") or ""),
             created_at=send_res.get("created_at"),
             created_at_ms=int(send_res.get("created_at_ms") or 0),
             error="" if send_res.get("ok") else str(send_res.get("message") or "发送失败"),
@@ -351,6 +394,64 @@ class ChannelIMService:
             "conversation": target_conv,
             "conversations": updated_convs,
         }
+
+    def send_item_reply(
+        self,
+        owner: str,
+        channel_code: str,
+        external_item_id: str,
+        cid: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        ok_txt, clean_or_err = validate_reply_text(text)
+        if not ok_txt:
+            raise HTTPException(status_code=400, detail=clean_or_err)
+        adapter, ext_id, clean_cid, peer_uid, key = self._prepare_reply_context(
+            owner, channel_code, external_item_id, cid
+        )
+        return self._execute_reply(
+            owner,
+            adapter,
+            ext_id,
+            clean_cid,
+            msg_type="text",
+            preview_text=clean_or_err,
+            send_fn=lambda: self.hub.send_message(
+                key,
+                cid=clean_cid,
+                peer_user_id=peer_uid,
+                text=clean_or_err,
+            ),
+        )
+
+    def send_item_image_reply(
+        self,
+        owner: str,
+        channel_code: str,
+        external_item_id: str,
+        cid: str,
+        image_base64: str,
+    ) -> Dict[str, Any]:
+        image_bytes, filename, mime_type = _decode_chat_image_base64(image_base64)
+        adapter, ext_id, clean_cid, peer_uid, key = self._prepare_reply_context(
+            owner, channel_code, external_item_id, cid
+        )
+        return self._execute_reply(
+            owner,
+            adapter,
+            ext_id,
+            clean_cid,
+            msg_type="image",
+            preview_text="[图片]",
+            send_fn=lambda: self.hub.send_image_message(
+                key,
+                cid=clean_cid,
+                peer_user_id=peer_uid,
+                image_bytes=image_bytes,
+                filename=filename,
+                mime_type=mime_type,
+            ),
+        )
 
     def shutdown(self) -> None:
         self.hub.shutdown()

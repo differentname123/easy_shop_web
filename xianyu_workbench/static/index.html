@@ -716,6 +716,11 @@
     }
     .chat-msg-row.peer { align-self: flex-start; align-items: flex-start; }
     .chat-msg-row.me { align-self: flex-end; align-items: flex-end; }
+    .chat-msg-row.system {
+      align-self: center;
+      align-items: center;
+      max-width: 92%;
+    }
     .chat-bubble {
       padding: 9px 12px;
       border-radius: 14px;
@@ -736,6 +741,13 @@
       font-weight: 500;
       border-top-right-radius: 4px;
     }
+    .chat-msg-row.system .chat-bubble {
+      background: #e2e8f0;
+      color: #475569;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+    }
     .chat-meta {
       margin-top: 3px;
       font-size: 11px;
@@ -744,6 +756,29 @@
       align-items: center;
       gap: 6px;
     }
+    .chat-retry-btn {
+      border: none;
+      background: transparent;
+      color: var(--blue);
+      font-size: 11px;
+      padding: 0 2px;
+      cursor: pointer;
+      text-decoration: underline;
+    }
+    .chat-icon-btn {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #f8fafc;
+      font-size: 18px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .chat-icon-btn:active { background: #e2e8f0; }
     .chat-composer {
       background: var(--card);
       border-top: 1px solid var(--border);
@@ -2008,10 +2043,10 @@
           ⚠️ 曾检测到断线空窗，建议点右上角「刷新」或重新连接核对最新消息。
         </div>
         <div
-          v-for="msg in (activeChatConv.messages || [])"
+          v-for="msg in activeChatMessages"
           :key="msg.client_uuid || msg.message_id"
           class="chat-msg-row"
-          :class="msg.sender === 'me' ? 'me' : 'peer'"
+          :class="msg.sender === 'me' ? 'me' : (msg.sender === 'system' ? 'system' : 'peer')"
         >
           <div class="chat-bubble">
             <img
@@ -2021,16 +2056,23 @@
               style="max-width: 180px; border-radius: 8px; display: block; margin-bottom: 4px; cursor: zoom-in;"
               @click="zoomImageUrl = msg.image_url"
             />
-            <span v-if="msg.text">{{ msg.text }}</span>
+            <span v-if="msg.text && !(msg.image_url && msg.text === '[图片]')">{{ msg.text }}</span>
             <span v-else-if="!msg.image_url">[{{ msg.msg_type || '消息' }}]</span>
           </div>
-          <div class="chat-meta">
+          <div v-if="msg.sender !== 'system'" class="chat-meta">
             <span>{{ msg.sender === 'me' ? '我' : (activeChatConv.peer_nick || '买家') }}</span>
             <span v-if="msg.created_at">{{ formatTime(msg.created_at) }}</span>
             <span v-if="msg.sender === 'me' && msg.delivery_status === 'sending'" style="color: var(--sub);">发送中...</span>
             <span v-else-if="msg.sender === 'me' && msg.delivery_status === 'sent'" style="color: var(--green);">已送达</span>
             <span v-else-if="msg.sender === 'me' && msg.delivery_status === 'uncertain'" style="color: var(--amber);">状态存疑</span>
-            <span v-else-if="msg.sender === 'me' && msg.delivery_status === 'failed'" style="color: var(--red);">发送失败{{ msg.error ? ('：' + msg.error) : '' }}</span>
+            <template v-else-if="msg.sender === 'me' && msg.delivery_status === 'failed'">
+              <span style="color: var(--red);">发送失败{{ msg.error ? ('：' + msg.error) : '' }}</span>
+              <button
+                v-if="msg.text && msg.msg_type !== 'image'"
+                class="chat-retry-btn"
+                @click="restoreFailedDraft(msg)"
+              >填入重编</button>
+            </template>
           </div>
         </div>
       </template>
@@ -2038,23 +2080,36 @@
 
     <div v-if="activeChatConv" class="chat-composer">
       <div class="chat-composer-row">
+        <input
+          ref="chatImageInputRef"
+          type="file"
+          accept="image/*"
+          style="display: none;"
+          @change="onPickChatImage"
+        />
+        <button
+          class="chat-icon-btn"
+          title="发送图片附件"
+          @click="triggerPickChatImage"
+        >🖼️</button>
         <textarea
-          v-model="chatDrawer.replyText"
+          v-model="currentChatDraft"
           class="chat-input"
           rows="2"
-          placeholder="输入回复给买家的话术（Enter 发送，Shift+Enter 换行）"
-          :disabled="chatDrawer.sending"
+          placeholder="输入回复话术（Enter 发送，Shift+Enter 换行，支持粘贴截图）"
           @keydown.enter.exact.prevent="sendChatReply"
+          @paste="onChatPaste"
         ></textarea>
         <button
           class="btn btn-primary"
           style="min-width: 72px; height: 42px;"
-          :disabled="chatDrawer.sending || !chatDrawer.replyText.trim()"
+          :disabled="!currentChatDraft.trim()"
           @click="sendChatReply"
-        >{{ chatDrawer.sending ? '发送中' : '发送' }}</button>
+        >发送</button>
       </div>
-      <div style="font-size: 11px; color: var(--muted); margin-top: 5px;">
-        支持真实发送给闲鱼买家；已开启违禁词/站外引流保护，查看消息不会清除闲鱼官方红点。
+      <div style="font-size: 11px; color: var(--muted); margin-top: 5px; display: flex; justify-content: space-between; gap: 8px;">
+        <span>发文字或图片直接同步闲鱼买家（不消官方红点）；请勿发站外二维码或导流文字。</span>
+        <span v-if="activeConvSendingCount > 0" style="color: var(--blue); flex-shrink: 0;">后台发送中({{ activeConvSendingCount }})...</span>
       </div>
     </div>
   </div>

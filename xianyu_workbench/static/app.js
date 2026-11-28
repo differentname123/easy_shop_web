@@ -167,6 +167,7 @@ createApp({
 
     // 商品买家对话抽屉与消息监控状态
     const chatMessagesRef = ref(null);
+    const chatImageInputRef = ref(null);
     const imReconnecting = ref(false);
     const chatDrawer = ref({
       visible: false,
@@ -177,13 +178,42 @@ createApp({
       imState: '',
       imMessage: '',
       loading: false,
-      sending: false,
-      replyText: '',
+      draftsByCid: {},
+      pendingByCid: {},
+      sendingCountByCid: {},
     });
     const activeChatConv = computed(() => {
       const convs = chatDrawer.value.conversations || [];
       if (!convs.length) return null;
       return convs.find((c) => c.cid === chatDrawer.value.activeCid) || convs[0];
+    });
+    const currentChatDraft = computed({
+      get() {
+        const cid = activeChatConv.value ? activeChatConv.value.cid : '';
+        return cid ? (chatDrawer.value.draftsByCid[cid] || '') : '';
+      },
+      set(val) {
+        const cid = activeChatConv.value ? activeChatConv.value.cid : '';
+        if (!cid) return;
+        chatDrawer.value.draftsByCid = {
+          ...chatDrawer.value.draftsByCid,
+          [cid]: val,
+        };
+      },
+    });
+    const activeConvSendingCount = computed(() => {
+      const cid = activeChatConv.value ? activeChatConv.value.cid : '';
+      return cid ? (chatDrawer.value.sendingCountByCid[cid] || 0) : 0;
+    });
+    const activeChatMessages = computed(() => {
+      const conv = activeChatConv.value;
+      if (!conv) return [];
+      const srv = Array.isArray(conv.messages) ? conv.messages : [];
+      const pending = chatDrawer.value.pendingByCid[conv.cid] || [];
+      if (!pending.length) return srv;
+      const seenKeys = new Set(srv.map((m) => m.client_uuid || m.message_id).filter(Boolean));
+      const extra = pending.filter((p) => !seenKeys.has(p.client_uuid));
+      return [...srv, ...extra];
     });
     let chatPollTimer = null;
     let sellingImPollTimer = null;
@@ -924,6 +954,40 @@ createApp({
       }
     }
 
+    function _addPendingBubble(cid, bubble) {
+      const prev = chatDrawer.value.pendingByCid[cid] || [];
+      chatDrawer.value.pendingByCid = {
+        ...chatDrawer.value.pendingByCid,
+        [cid]: [...prev, bubble],
+      };
+    }
+
+    function _updatePendingBubble(cid, localUuid, patch) {
+      const prev = chatDrawer.value.pendingByCid[cid] || [];
+      if (!prev.length) return;
+      chatDrawer.value.pendingByCid = {
+        ...chatDrawer.value.pendingByCid,
+        [cid]: prev.map((m) => (m.client_uuid === localUuid ? { ...m, ...patch } : m)),
+      };
+    }
+
+    function _removePendingBubble(cid, localUuid) {
+      const prev = chatDrawer.value.pendingByCid[cid] || [];
+      if (!prev.length) return;
+      chatDrawer.value.pendingByCid = {
+        ...chatDrawer.value.pendingByCid,
+        [cid]: prev.filter((m) => m.client_uuid !== localUuid),
+      };
+    }
+
+    function _bumpSendingCount(cid, delta) {
+      const cur = chatDrawer.value.sendingCountByCid[cid] || 0;
+      chatDrawer.value.sendingCountByCid = {
+        ...chatDrawer.value.sendingCountByCid,
+        [cid]: Math.max(0, cur + delta),
+      };
+    }
+
     function openItemChat(item) {
       if (!item || !item.item_id) return;
       chatDrawer.value = {
@@ -935,8 +999,9 @@ createApp({
         imState: sellingData.value.im_state || (activeChannel.value && activeChannel.value.im_state) || '',
         imMessage: sellingData.value.im_message || (activeChannel.value && activeChannel.value.im_message) || '',
         loading: true,
-        sending: false,
-        replyText: '',
+        draftsByCid: {},
+        pendingByCid: {},
+        sendingCountByCid: {},
       };
       refreshItemChat({ silent: false });
     }
@@ -951,37 +1016,157 @@ createApp({
       chatDrawer.value.visible = false;
     }
 
+    function restoreFailedDraft(msg) {
+      const conv = activeChatConv.value;
+      if (!conv || !msg || !msg.text) return;
+      const cid = conv.cid;
+      chatDrawer.value.draftsByCid = {
+        ...chatDrawer.value.draftsByCid,
+        [cid]: msg.text,
+      };
+      _removePendingBubble(cid, msg.client_uuid);
+    }
+
     async function sendChatReply() {
       const conv = activeChatConv.value;
       const item = chatDrawer.value.item;
-      const text = (chatDrawer.value.replyText || '').trim();
-      if (!conv || !item || !text || chatDrawer.value.sending) return;
-      chatDrawer.value.sending = true;
+      if (!conv || !item) return;
+      const targetCid = conv.cid;
+      const targetItemId = item.item_id;
       const chCode = chatDrawer.value.channel || activeChannelCode.value;
+      const text = (chatDrawer.value.draftsByCid[targetCid] || '').trim();
+      if (!text) return;
+
+      // 立即清空当前买家草稿并上屏乐观「发送中」气泡，不卡输入框、不阻断切换买家
+      chatDrawer.value.draftsByCid = {
+        ...chatDrawer.value.draftsByCid,
+        [targetCid]: '',
+      };
+      const localUuid = `local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      _addPendingBubble(targetCid, {
+        message_id: localUuid,
+        client_uuid: localUuid,
+        sender: 'me',
+        msg_type: 'text',
+        text,
+        image_url: '',
+        created_at: new Date().toISOString(),
+        delivery_status: 'sending',
+        error: '',
+      });
+      if (chatDrawer.value.activeCid === targetCid) scrollChatToBottom();
+      _bumpSendingCount(targetCid, 1);
+
       try {
         const res = await api(
-          `/api/channels/${encodeURIComponent(chCode)}/items/${encodeURIComponent(item.item_id)}/conversations/${encodeURIComponent(conv.cid)}/reply`,
+          `/api/channels/${encodeURIComponent(chCode)}/items/${encodeURIComponent(targetItemId)}/conversations/${encodeURIComponent(targetCid)}/reply`,
           { method: 'POST', body: JSON.stringify({ text }) }
         );
-        if (Array.isArray(res.conversations)) {
+        const sameItem = chatDrawer.value.item && chatDrawer.value.item.item_id === targetItemId;
+        if (sameItem && Array.isArray(res.conversations)) {
+          _removePendingBubble(targetCid, localUuid);
           chatDrawer.value.conversations = res.conversations;
-          chatDrawer.value.activeCid = selectDefaultChatCid(res.conversations, conv.cid);
-        }
-        if (res.delivery_status === 'sent' || res.delivery_status === 'uncertain') {
-          chatDrawer.value.replyText = '';
+          // 保持用户当前正在看的目标买家，不强行跳转回原会话
+          chatDrawer.value.activeCid = selectDefaultChatCid(res.conversations, chatDrawer.value.activeCid);
         }
         if (res.delivery_status === 'uncertain') {
           showToast(res.message || '发送回执超时，状态存疑，请稍后刷新核对');
         } else if (!res.ok) {
           showToast(res.message || '消息发送失败');
         }
-        scrollChatToBottom();
+        if (sameItem && chatDrawer.value.activeCid === targetCid) scrollChatToBottom();
         loadChannelSelling(chCode, { silent: true }).catch(() => {});
       } catch (e) {
-        showToast(e.message || '发送失败');
-        refreshItemChat({ silent: true }).catch(() => {});
+        const errMsg = e.message || '发送失败';
+        _updatePendingBubble(targetCid, localUuid, {
+          delivery_status: 'failed',
+          error: errMsg,
+        });
+        showToast(errMsg);
       } finally {
-        chatDrawer.value.sending = false;
+        _bumpSendingCount(targetCid, -1);
+      }
+    }
+
+    function triggerPickChatImage() {
+      if (chatImageInputRef.value) chatImageInputRef.value.click();
+    }
+
+    async function sendChatImageFile(file) {
+      const conv = activeChatConv.value;
+      const item = chatDrawer.value.item;
+      if (!conv || !item || !file) return;
+      const targetCid = conv.cid;
+      const targetItemId = item.item_id;
+      const chCode = chatDrawer.value.channel || activeChannelCode.value;
+
+      let dataUrl = '';
+      try {
+        dataUrl = await compressImageToDataUrl(file, 1400, 0.85);
+      } catch (e) {
+        showToast((e && e.message) || '图片读取失败');
+        return;
+      }
+
+      const localUuid = `local_img_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      _addPendingBubble(targetCid, {
+        message_id: localUuid,
+        client_uuid: localUuid,
+        sender: 'me',
+        msg_type: 'image',
+        text: '[图片]',
+        image_url: dataUrl,
+        created_at: new Date().toISOString(),
+        delivery_status: 'sending',
+        error: '',
+      });
+      if (chatDrawer.value.activeCid === targetCid) scrollChatToBottom();
+      _bumpSendingCount(targetCid, 1);
+
+      try {
+        const res = await api(
+          `/api/channels/${encodeURIComponent(chCode)}/items/${encodeURIComponent(targetItemId)}/conversations/${encodeURIComponent(targetCid)}/reply-image`,
+          { method: 'POST', body: JSON.stringify({ image_base64: dataUrl }) }
+        );
+        const sameItem = chatDrawer.value.item && chatDrawer.value.item.item_id === targetItemId;
+        if (sameItem && Array.isArray(res.conversations)) {
+          _removePendingBubble(targetCid, localUuid);
+          chatDrawer.value.conversations = res.conversations;
+          chatDrawer.value.activeCid = selectDefaultChatCid(res.conversations, chatDrawer.value.activeCid);
+        }
+        if (res.delivery_status === 'uncertain') {
+          showToast(res.message || '图片回执超时，状态存疑，请稍后刷新核对');
+        } else if (!res.ok) {
+          showToast(res.message || '图片发送失败');
+        }
+        if (sameItem && chatDrawer.value.activeCid === targetCid) scrollChatToBottom();
+        loadChannelSelling(chCode, { silent: true }).catch(() => {});
+      } catch (e) {
+        const errMsg = e.message || '图片发送失败';
+        _updatePendingBubble(targetCid, localUuid, {
+          delivery_status: 'failed',
+          error: errMsg,
+        });
+        showToast(errMsg);
+      } finally {
+        _bumpSendingCount(targetCid, -1);
+      }
+    }
+
+    function onPickChatImage(ev) {
+      const files = ev && ev.target && ev.target.files ? Array.from(ev.target.files) : [];
+      if (ev && ev.target) ev.target.value = '';
+      if (files.length > 0) sendChatImageFile(files[0]);
+    }
+
+    function onChatPaste(ev) {
+      const items = ev && ev.clipboardData && ev.clipboardData.items ? Array.from(ev.clipboardData.items) : [];
+      const imgItem = items.find((it) => it.kind === 'file' && String(it.type || '').startsWith('image/'));
+      if (!imgItem) return;
+      const file = imgItem.getAsFile();
+      if (file) {
+        ev.preventDefault();
+        sendChatImageFile(file);
       }
     }
 
@@ -1865,16 +2050,24 @@ createApp({
       openReconcilePreview,
       applyReconcile,
       chatMessagesRef,
+      chatImageInputRef,
       imReconnecting,
       chatDrawer,
       activeChatConv,
+      currentChatDraft,
+      activeConvSendingCount,
+      activeChatMessages,
       imStateLabel,
       imStateColor,
       openItemChat,
       refreshItemChat,
       selectChatBuyer,
       closeItemChat,
+      restoreFailedDraft,
       sendChatReply,
+      triggerPickChatImage,
+      onPickChatImage,
+      onChatPaste,
       reconnectChannelIm,
     };
   },

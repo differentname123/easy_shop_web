@@ -1056,7 +1056,8 @@ class WorkbenchRepository:
             m["created_at_ms"] = int(m.get("created_at_ms") or int(dt.timestamp() * 1000))
             m["message_id"] = str(m.get("message_id") or "").strip()
             m["client_uuid"] = str(m.get("client_uuid") or "").strip()
-            m["sender"] = "me" if m.get("sender") == "me" else "peer"
+            raw_sender = m.get("sender")
+            m["sender"] = raw_sender if raw_sender in ("me", "peer", "system") else "peer"
             m["msg_type"] = str(m.get("msg_type") or "text")
             m["text"] = str(m.get("text") or "")
             m["image_url"] = str(m.get("image_url") or "")
@@ -1173,10 +1174,22 @@ class WorkbenchRepository:
                     if merged_msgs
                     else str(inc.get("last_message_preview") or prev.get("last_message_preview") or "")
                 )
+                from .client.im_ws import is_valid_peer_nick, sanitize_peer_nick
+
+                peer_uid = str(inc.get("peer_user_id") or prev.get("peer_user_id") or "").strip()
+                inc_nick = str(inc.get("peer_nick") or "").strip()
+                prev_nick = str(prev.get("peer_nick") or "").strip()
+                if is_valid_peer_nick(inc_nick) and not inc_nick.startswith("买家"):
+                    eff_nick = inc_nick
+                elif is_valid_peer_nick(prev_nick) and not prev_nick.startswith("买家"):
+                    eff_nick = prev_nick
+                else:
+                    eff_nick = sanitize_peer_nick(inc_nick or prev_nick, peer_uid)
+
                 by_cid[cid] = {
                     "cid": cid,
-                    "peer_user_id": str(inc.get("peer_user_id") or prev.get("peer_user_id") or "").strip(),
-                    "peer_nick": str(inc.get("peer_nick") or prev.get("peer_nick") or "").strip(),
+                    "peer_user_id": peer_uid,
+                    "peer_nick": eff_nick,
                     "unread_count": int(inc.get("unread_count", prev.get("unread_count", 0)) or 0),
                     "has_gap": bool(inc.get("has_gap", False)),
                     "last_message_preview": preview[:120],
@@ -1237,6 +1250,7 @@ class WorkbenchRepository:
         *,
         delivery_status: str,
         message_id: str = "",
+        image_url: str = "",
         created_at: Any = None,
         created_at_ms: int = 0,
         error: str = "",
@@ -1262,6 +1276,8 @@ class WorkbenchRepository:
                     m["error"] = str(error or "")
                     if message_id:
                         m["message_id"] = str(message_id)
+                    if image_url:
+                        m["image_url"] = str(image_url)
                     dt = _parse_utc_dt(created_at)
                     if dt is not None:
                         m["created_at"] = dt

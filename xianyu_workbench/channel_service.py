@@ -352,6 +352,31 @@ class ChannelService:
             "synced_at": _iso_utc((account_doc or {}).get("synced_at")),
         }
 
+    @staticmethod
+    def _live_im_fields(owner: str, adapter: SellingChannel, doc: Dict[str, Any]) -> Dict[str, str]:
+        im_state = str(doc.get("im_state") or "stopped")
+        im_message = str(doc.get("im_message") or "")
+        im_error_code = str(doc.get("im_error_code") or "")
+        im_last_sync_at = _iso_utc(doc.get("im_last_sync_at"))
+        probe = getattr(adapter, "_live_status_probe_cb", None)
+        if doc.get("bound") and callable(probe):
+            try:
+                live = probe(owner)
+                if isinstance(live, dict) and live.get("im_state") and live.get("im_state") != "stopped":
+                    im_state = str(live["im_state"])
+                    im_message = str(live.get("im_message") or im_message)
+                    im_error_code = str(live.get("im_error_code") or "")
+                    if live.get("im_last_sync_at"):
+                        im_last_sync_at = _iso_utc(live["im_last_sync_at"])
+            except Exception:
+                pass
+        return {
+            "im_state": im_state,
+            "im_message": im_message,
+            "im_error_code": im_error_code,
+            "im_last_sync_at": im_last_sync_at,
+        }
+
     def _build_selling_payload(
         self,
         owner: str,
@@ -373,10 +398,7 @@ class ChannelService:
             "account_id": str(doc.get("account_id") or ""),
             "nickname": str(doc.get("nickname") or ""),
             "last_checked_at": _iso_utc(doc.get("last_checked_at")),
-            "im_state": str(doc.get("im_state") or "stopped"),
-            "im_message": str(doc.get("im_message") or ""),
-            "im_error_code": str(doc.get("im_error_code") or ""),
-            "im_last_sync_at": _iso_utc(doc.get("im_last_sync_at")),
+            **self._live_im_fields(owner, adapter, doc),
             **enriched,
         }
 
@@ -399,10 +421,7 @@ class ChannelService:
                 "error_code": str(doc.get("error_code") or ""),
                 "message": str(doc.get("message") or ("未绑定账号" if not doc.get("bound") else "")),
                 "last_checked_at": _iso_utc(doc.get("last_checked_at")),
-                "im_state": str(doc.get("im_state") or "stopped"),
-                "im_message": str(doc.get("im_message") or ""),
-                "im_error_code": str(doc.get("im_error_code") or ""),
-                "im_last_sync_at": _iso_utc(doc.get("im_last_sync_at")),
+                **self._live_im_fields(owner, adapter, doc),
                 "online_count": enriched["online_count"],
                 "abnormal_count": enriched["abnormal_count"],
                 "downshelf_count": enriched["downshelf_count"],

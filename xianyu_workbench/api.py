@@ -497,6 +497,18 @@ def create_app(
         data = _im_svc().send_item_reply(username, channel, external_item_id, cid, req.text)
         return {"status": "success", "data": data}
 
+    @app.post("/api/channels/{channel}/items/{external_item_id}/conversations/{cid}/reply-image")
+    def reply_channel_item_image(
+        channel: str,
+        external_item_id: str,
+        cid: str,
+        req: UploadImageRequest,
+        request: Request,
+    ):
+        username = _uid(request)
+        data = _im_svc().send_item_image_reply(username, channel, external_item_id, cid, req.image_base64)
+        return {"status": "success", "data": data}
+
     @app.post("/api/channels/{channel}/selling/{external_item_id}/link")
     def link_selling_item(channel: str, external_item_id: str, req: LinkSellingRequest, request: Request):
         username = _uid(request)

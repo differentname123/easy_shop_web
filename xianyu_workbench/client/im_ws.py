@@ -16,6 +16,7 @@ import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import inspect
+import io
 import json
 import logging
 import os
@@ -25,6 +26,13 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import urllib.parse
+
+import requests
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None  # type: ignore[assignment]
 
 try:
     import websockets
@@ -45,12 +53,65 @@ from .session import (
 logger = logging.getLogger("xianyu_workbench.im_ws")
 
 GOOFISH_WS_URL = "wss://wss-goofish.dingtalk.com/"
+GOOFISH_IM_IMAGE_UPLOAD_URL = (
+    "https://stream-upload.goofish.com/api/upload.api"
+    "?floderId=0&appkey=xy_chat&_input_charset=utf-8"
+)
 DEFAULT_IM_APP_KEY = "444e9908a51d1cb236a27862abc769c9"
 DEFAULT_MAX_UINT64_CURSOR = 9007199254740991
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _CHROME_MAJOR_RE = re.compile(r"Chrome/(\d+)")
 _GENERIC_REMINDER_TITLES = frozenset({"交易消息", "你有一条新消息", "系统消息", "通知消息"})
+_SYSTEM_TIP_PHRASES: Tuple[str, ...] = (
+    "蚂蚁森林",
+    "你已发货",
+    "我已拍下",
+    "我已付款",
+    "我已发货",
+    "我完成了评价",
+    "买家已确认收货",
+    "记得及时确认收货",
+    "快给ta一个评价",
+    "快给TA一个评价",
+    "30分钟内回复",
+    "开启不在线回复",
+    "当你不在线时",
+    "交易成功",
+    "快递已完成取件",
+    "请支付快递费",
+    "已退款",
+    "申请退款",
+)
+
+
+def is_valid_peer_nick(title: Any, *, msg_text: str = "", msg_type: str = "text") -> bool:
+    """判断 reminderTitle 是否像真实买家昵称，过滤闲鱼订单/评价等系统通知文案。"""
+    clean = str(title or "").strip()
+    if not clean or msg_type == "system":
+        return False
+    if clean in _GENERIC_REMINDER_TITLES:
+        return False
+    if any(phrase in clean for phrase in _SYSTEM_TIP_PHRASES):
+        return False
+    if clean.startswith("[") and clean.endswith("]"):
+        return False
+    if msg_text and clean == str(msg_text).strip() and any(
+        k in clean for k in ("评价", "发货", "收货", "付款", "拍下", "快递", "退款")
+    ):
+        return False
+    return True
+
+
+def sanitize_peer_nick(nick: Any, peer_user_id: str) -> str:
+    """清洗买家昵称；若检测到曾被系统提示污染，则回退为稳定占位名。"""
+    clean = str(nick or "").strip()
+    if clean and is_valid_peer_nick(clean):
+        return clean
+    uid = str(peer_user_id or "").strip()
+    if not uid:
+        return "闲鱼买家"
+    return f"买家{uid[-4:]}" if len(uid) >= 4 else f"买家{uid}"
 
 
 def _now_utc() -> datetime:
@@ -169,6 +230,14 @@ def normalize_lwp_message(model_or_wrap: Dict[str, Any], my_user_id: str) -> Opt
     if not text and not image_url:
         return None
 
+    if (
+        msg_type == "system"
+        or sender_uid in ("", "0", "system")
+        or any(phrase in text for phrase in _SYSTEM_TIP_PHRASES)
+        or (text.startswith("[") and text.endswith("]") and text != "[图片]")
+    ):
+        sender = "system"
+
     created_dt = (
         datetime.fromtimestamp(created_at_ms / 1000.0, tz=timezone.utc)
         if created_at_ms > 0
@@ -232,11 +301,15 @@ def parse_conversations_payload(body_or_list: Any, my_user_id: str) -> List[Dict
 
         peer_nick = ""
         if last_msg_norm and last_msg_norm.get("sender") == "peer":
-            rt = str(last_msg_norm.get("reminder_title") or "").strip()
-            if rt and rt not in _GENERIC_REMINDER_TITLES:
-                peer_nick = rt
+            rt_title = str(last_msg_norm.get("reminder_title") or "").strip()
+            if is_valid_peer_nick(
+                rt_title,
+                msg_text=str(last_msg_norm.get("text") or ""),
+                msg_type=str(last_msg_norm.get("msg_type") or "text"),
+            ):
+                peer_nick = rt_title
         if not peer_nick:
-            peer_nick = f"买家{peer_uid[-4:]}" if len(peer_uid) >= 4 else f"买家{peer_uid}"
+            peer_nick = sanitize_peer_nick("", peer_uid)
 
         out.append({
             "cid": cid,
@@ -266,28 +339,30 @@ def parse_messages_payload(body: Any, my_user_id: str) -> Tuple[List[Dict[str, A
         if norm is None:
             continue
         if not peer_nick and norm.get("sender") == "peer":
-            rt = str(norm.get("reminder_title") or "").strip()
-            if rt and rt not in _GENERIC_REMINDER_TITLES:
-                peer_nick = rt
+            rt_title = str(norm.get("reminder_title") or "").strip()
+            if is_valid_peer_nick(
+                rt_title,
+                msg_text=str(norm.get("text") or ""),
+                msg_type=str(norm.get("msg_type") or "text"),
+            ):
+                peer_nick = rt_title
         norm.pop("reminder_title", None)
         msgs.append(norm)
     msgs.sort(key=lambda m: (int(m.get("created_at_ms") or 0), str(m.get("message_id") or "")))
     return msgs, peer_nick
 
 
-def build_text_send_payload(
+def _build_lwp_send_envelope(
     *,
     cid: str,
     peer_user_id: str,
     my_user_id: str,
-    text: str,
+    inner_content: Dict[str, Any],
     client_uuid: str = "",
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """构造实时校验过的 /r/MessageSend/sendByReceiverScope 参数元组。"""
     uid_val = client_uuid or f"-{int(time.time() * 1000)}{random.randint(10000, 99999)}"
-    inner = {"contentType": 1, "text": {"text": text}}
     b64_data = base64.b64encode(
-        json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        json.dumps(inner_content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
     msg_obj: Dict[str, Any] = {
         "uuid": uid_val,
@@ -310,6 +385,142 @@ def build_text_send_payload(
         ]
     }
     return uid_val, msg_obj, scope_obj
+
+
+def build_text_send_payload(
+    *,
+    cid: str,
+    peer_user_id: str,
+    my_user_id: str,
+    text: str,
+    client_uuid: str = "",
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """构造实时校验过的 /r/MessageSend/sendByReceiverScope 文本消息参数元组。"""
+    return _build_lwp_send_envelope(
+        cid=cid,
+        peer_user_id=peer_user_id,
+        my_user_id=my_user_id,
+        inner_content={"contentType": 1, "text": {"text": text}},
+        client_uuid=client_uuid,
+    )
+
+
+def build_image_send_payload(
+    *,
+    cid: str,
+    peer_user_id: str,
+    my_user_id: str,
+    image_url: str,
+    width: int = 0,
+    height: int = 0,
+    client_uuid: str = "",
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """构造闲鱼网页端 IM 图片消息 /r/MessageSend/sendByReceiverScope 参数元组。"""
+    return _build_lwp_send_envelope(
+        cid=cid,
+        peer_user_id=peer_user_id,
+        my_user_id=my_user_id,
+        inner_content={
+            "contentType": 2,
+            "image": {
+                "pics": [
+                    {
+                        "height": int(height or 0),
+                        "type": 0,
+                        "url": str(image_url).strip(),
+                        "width": int(width or 0),
+                    }
+                ]
+            },
+        },
+        client_uuid=client_uuid,
+    )
+
+
+def _image_dimensions(image_bytes: bytes) -> Tuple[int, int]:
+    if Image is None:
+        return 0, 0
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            w, h = img.size
+            return int(w), int(h)
+    except Exception:
+        return 0, 0
+
+
+def upload_im_image(
+    image_bytes: bytes,
+    *,
+    filename: str = "chat.jpg",
+    mime_type: str = "image/jpeg",
+    cookies: Optional[Dict[str, str]] = None,
+    desktop_ua: str = "",
+) -> Dict[str, Any]:
+    """直传聊天图片至闲鱼官方流媒体图床（零浏览器额外启动），返回 CDN URL 与宽高。"""
+    if not image_bytes:
+        return {"ok": False, "error_code": "EMPTY_IMAGE", "message": "图片内容不能为空"}
+    if not cookies:
+        return {"ok": False, "auth_expired": True, "error_code": "NO_UPLOAD_COOKIE", "message": "上传凭证尚未就绪"}
+
+    ua = desktop_ua or _resolve_desktop_user_agent()
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.goofish.com",
+        "Referer": "https://www.goofish.com/im",
+        "User-Agent": ua,
+    }
+    try:
+        resp = requests.post(
+            GOOFISH_IM_IMAGE_UPLOAD_URL,
+            files={"file": (filename, image_bytes, mime_type)},
+            cookies=cookies,
+            headers=headers,
+            timeout=20,
+        )
+    except Exception as exc:
+        return {"ok": False, "error_code": "UPLOAD_NETWORK_ERROR", "message": f"上传图片网络异常: {exc}"}
+
+    if resp.status_code in (401, 403):
+        return {"ok": False, "auth_expired": True, "error_code": "UPLOAD_AUTH_EXPIRED", "message": "上传登录凭证已过期"}
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        auth_hint = resp.status_code >= 300 or "login" in str(resp.url or "").lower()
+        return {
+            "ok": False,
+            "auth_expired": auth_hint,
+            "error_code": "UPLOAD_INVALID_RESPONSE",
+            "message": f"图片上传返回异常（HTTP {resp.status_code}）",
+        }
+
+    obj = body.get("object") if isinstance(body.get("object"), dict) else {}
+    img_url = str(obj.get("url") or "").strip()
+    if not img_url:
+        msg = str(body.get("message") or body.get("errorMsg") or "").strip()
+        lowered = msg.lower()
+        auth_exp = any(k in lowered for k in ("login", "session", "auth", "token", "登录", "过期"))
+        return {
+            "ok": False,
+            "auth_expired": auth_exp,
+            "error_code": "UPLOAD_FAILED",
+            "message": msg or "闲鱼图床未返回图片地址",
+        }
+
+    width, height = 0, 0
+    pix = str(obj.get("pix") or "").strip()
+    if "x" in pix.lower():
+        parts = pix.lower().split("x", 1)
+        try:
+            width, height = int(parts[0]), int(parts[1])
+        except ValueError:
+            width, height = 0, 0
+    if width <= 0 or height <= 0:
+        width, height = _image_dimensions(image_bytes)
+
+    return {"ok": True, "url": img_url, "width": width, "height": height}
 
 
 def mint_im_credentials(
@@ -367,6 +578,14 @@ def mint_im_credentials(
                 context, page, auth_tracker, user_data_dir, task_name="im_mint_token"
             )
             nick = str(auth_tracker.get("display_name") or "").strip()
+            cookie_map: Dict[str, str] = {}
+            try:
+                raw_cookies = context.cookies(["https://www.goofish.com", "https://stream-upload.goofish.com"])
+                for ck in raw_cookies or []:
+                    if isinstance(ck, dict) and ck.get("name"):
+                        cookie_map[str(ck["name"])] = str(ck.get("value") or "")
+            except Exception:
+                cookie_map = {}
             if not minted.get("access_token"):
                 return {
                     "ok": False,
@@ -385,6 +604,7 @@ def mint_im_credentials(
                 "expired_ms": int(minted.get("expired_ms") or 86400000),
                 "desktop_ua": desktop_ua,
                 "ding_ua": _build_ding_ua(desktop_ua),
+                "cookies": cookie_map,
             }
     except XianyuOfflineError as exc:
         return {
@@ -445,6 +665,7 @@ class _AccountRuntime:
     pending_rpcs: Dict[str, asyncio.Future] = field(default_factory=dict)
     conv_fingerprints: Dict[str, str] = field(default_factory=dict)
     send_timestamps: List[float] = field(default_factory=list)
+    last_send_mono: float = 0.0
 
 
 class XianyuIMHub:
@@ -455,16 +676,19 @@ class XianyuIMHub:
         *,
         mint_fn: Callable[[str], Dict[str, Any]] = mint_im_credentials,
         ws_connect_fn: Callable[[Dict[str, str]], Any] = _connect_goofish_ws,
+        upload_image_fn: Callable[..., Dict[str, Any]] = upload_im_image,
         heartbeat_interval_sec: float = 20.0,
         heartbeat_timeout_sec: float = 10.0,
         delta_sync_interval_sec: float = 120.0,
         token_refresh_interval_sec: float = 14 * 3600.0,
         max_recovering_sec: float = 180.0,
-        send_delay_range: Tuple[float, float] = (1.5, 3.5),
+        send_delay_range: Tuple[float, float] = (0.0, 0.0),
+        min_send_interval_sec: float = 0.8,
         max_sends_per_minute: int = 15,
     ) -> None:
         self._mint_fn = mint_fn
         self._ws_connect_fn = ws_connect_fn
+        self._upload_image_fn = upload_image_fn
         self._heartbeat_interval_sec = max(1.0, float(heartbeat_interval_sec))
         self._heartbeat_timeout_sec = max(1.0, float(heartbeat_timeout_sec))
         self._delta_sync_interval_sec = max(5.0, float(delta_sync_interval_sec))
@@ -472,6 +696,7 @@ class XianyuIMHub:
         self._max_recovering_sec = max(5.0, float(max_recovering_sec))
         lo, hi = send_delay_range
         self._send_delay_range = (max(0.0, float(lo)), max(0.0, float(hi)))
+        self._min_send_interval_sec = max(0.0, float(min_send_interval_sec))
         self._max_sends_per_minute = max(1, int(max_sends_per_minute))
 
         self._guard = threading.Lock()
@@ -565,6 +790,7 @@ class XianyuIMHub:
         cid: str,
         peer_user_id: str,
         text: str,
+        delay_range: Optional[Tuple[float, float]] = None,
         timeout_sec: float = 25.0,
     ) -> Dict[str, Any]:
         ok_txt, clean_or_err = validate_reply_text(text)
@@ -586,7 +812,56 @@ class XianyuIMHub:
                 "message": "该账号实时消息监控未运行，请先检测在线或重连",
             }
         fut = asyncio.run_coroutine_threadsafe(
-            self._async_send_message(rt, cid=cid, peer_user_id=peer_user_id, text=clean_or_err),
+            self._async_send_message(
+                rt,
+                cid=cid,
+                peer_user_id=peer_user_id,
+                text=clean_or_err,
+                delay_range=delay_range,
+            ),
+            loop,
+        )
+        return fut.result(timeout=timeout_sec)
+
+    def send_image_message(
+        self,
+        account_key: str,
+        *,
+        cid: str,
+        peer_user_id: str,
+        image_bytes: bytes,
+        filename: str = "chat.jpg",
+        mime_type: str = "image/jpeg",
+        delay_range: Optional[Tuple[float, float]] = None,
+        timeout_sec: float = 35.0,
+    ) -> Dict[str, Any]:
+        if not image_bytes:
+            return {
+                "ok": False,
+                "delivery_status": "failed",
+                "error_code": "EMPTY_IMAGE",
+                "message": "图片内容不能为空",
+            }
+        with self._guard:
+            loop = self._loop
+            rt = self._accounts.get(account_key)
+        if loop is None or rt is None or loop.is_closed():
+            return {
+                "ok": False,
+                "delivery_status": "failed",
+                "error_code": "IM_NOT_RUNNING",
+                "message": "该账号实时消息监控未运行，请先检测在线或重连",
+            }
+        fut = asyncio.run_coroutine_threadsafe(
+            self._async_send_image_message(
+                rt,
+                cid=cid,
+                peer_user_id=peer_user_id,
+                image_bytes=image_bytes,
+                filename=filename,
+                mime_type=mime_type,
+                delay_range=delay_range,
+            ),
             loop,
         )
         return fut.result(timeout=timeout_sec)
@@ -755,6 +1030,7 @@ class XianyuIMHub:
                 "app_key": str(res.get("app_key") or DEFAULT_IM_APP_KEY).strip(),
                 "desktop_ua": str(res.get("desktop_ua") or _resolve_desktop_user_agent()),
                 "ding_ua": str(res.get("ding_ua") or _build_ding_ua(_resolve_desktop_user_agent())),
+                "cookies": dict(res.get("cookies") or {}),
             }
             rt.user_id = rt.credentials["user_id"] or rt.user_id
             rt.nickname = rt.credentials["nickname"] or rt.nickname
@@ -1040,6 +1316,99 @@ class XianyuIMHub:
         cid: str,
         peer_user_id: str,
         text: str,
+        delay_range: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        return await self._async_send_lwp_payload(
+            rt,
+            cid=cid,
+            payload_builder=lambda: build_text_send_payload(
+                cid=cid,
+                peer_user_id=peer_user_id,
+                my_user_id=rt.user_id,
+                text=text,
+            ),
+            verify_text=text,
+            delay_range=delay_range,
+        )
+
+    async def _async_send_image_message(
+        self,
+        rt: _AccountRuntime,
+        *,
+        cid: str,
+        peer_user_id: str,
+        image_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        delay_range: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        if rt.ws is None or rt.state in ("offline", "paused_risk"):
+            return {
+                "ok": False,
+                "delivery_status": "failed",
+                "error_code": rt.error_code or "IM_NOT_ONLINE",
+                "message": rt.message or "实时消息通道未在线",
+            }
+        creds = rt.credentials or {}
+        cookies = dict(creds.get("cookies") or {})
+        desktop_ua = str(creds.get("desktop_ua") or "")
+
+        up_res = await asyncio.to_thread(
+            self._upload_image_fn,
+            image_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            cookies=cookies,
+            desktop_ua=desktop_ua,
+        )
+        if not up_res.get("ok") and up_res.get("auth_expired"):
+            refreshed = await self._ensure_credentials(rt, force=True)
+            if refreshed.get("ok"):
+                up_res = await asyncio.to_thread(
+                    self._upload_image_fn,
+                    image_bytes,
+                    filename=filename,
+                    mime_type=mime_type,
+                    cookies=dict(refreshed.get("cookies") or {}),
+                    desktop_ua=str(refreshed.get("desktop_ua") or ""),
+                )
+        if not up_res.get("ok"):
+            return {
+                "ok": False,
+                "delivery_status": "failed",
+                "error_code": str(up_res.get("error_code") or "UPLOAD_FAILED"),
+                "message": str(up_res.get("message") or "聊天图片上传失败"),
+            }
+
+        img_url = str(up_res.get("url") or "").strip()
+        w = int(up_res.get("width") or 0)
+        h = int(up_res.get("height") or 0)
+        res = await self._async_send_lwp_payload(
+            rt,
+            cid=cid,
+            payload_builder=lambda: build_image_send_payload(
+                cid=cid,
+                peer_user_id=peer_user_id,
+                my_user_id=rt.user_id,
+                image_url=img_url,
+                width=w,
+                height=h,
+            ),
+            verify_image_url=img_url,
+            delay_range=delay_range,
+        )
+        res["image_url"] = img_url
+        return res
+
+    async def _async_send_lwp_payload(
+        self,
+        rt: _AccountRuntime,
+        *,
+        cid: str,
+        payload_builder: Callable[[], Tuple[str, Dict[str, Any], Dict[str, Any]]],
+        verify_text: str = "",
+        verify_image_url: str = "",
+        delay_range: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Any]:
         assert rt.send_lock is not None
         async with rt.send_lock:
@@ -1060,9 +1429,13 @@ class XianyuIMHub:
                     "message": rt.message or "实时消息通道未在线",
                 }
 
-            lo, hi = self._send_delay_range
+            lo, hi = self._send_delay_range if delay_range is None else delay_range
             if hi > 0:
-                await asyncio.sleep(random.uniform(lo, max(lo, hi)))
+                await asyncio.sleep(random.uniform(max(0.0, lo), max(lo, hi)))
+            elif rt.last_send_mono > 0 and self._min_send_interval_sec > 0:
+                elapsed = time.monotonic() - rt.last_send_mono
+                if elapsed < self._min_send_interval_sec:
+                    await asyncio.sleep(self._min_send_interval_sec - elapsed)
 
             if rt.ws is None:
                 return {
@@ -1072,13 +1445,10 @@ class XianyuIMHub:
                     "message": "等待发送期间长连接已断开",
                 }
 
-            client_uuid, msg_obj, scope_obj = build_text_send_payload(
-                cid=cid,
-                peer_user_id=peer_user_id,
-                my_user_id=rt.user_id,
-                text=text,
-            )
-            rt.send_timestamps.append(time.monotonic())
+            client_uuid, msg_obj, scope_obj = payload_builder()
+            sent_mono = time.monotonic()
+            rt.send_timestamps.append(sent_mono)
+            rt.last_send_mono = sent_mono
             try:
                 ack = await self._send_rpc(
                     rt,
@@ -1090,7 +1460,13 @@ class XianyuIMHub:
                 )
             except Exception:
                 # 严禁盲猜：回执超时先查线上最近历史消息确认是否已发上
-                confirmed = await self._verify_sent_on_server(rt, cid=cid, client_uuid=client_uuid, text=text)
+                confirmed = await self._verify_sent_on_server(
+                    rt,
+                    cid=cid,
+                    client_uuid=client_uuid,
+                    text=verify_text,
+                    image_url=verify_image_url,
+                )
                 if confirmed:
                     return confirmed
                 return {
@@ -1127,7 +1503,8 @@ class XianyuIMHub:
         *,
         cid: str,
         client_uuid: str,
-        text: str,
+        text: str = "",
+        image_url: str = "",
     ) -> Optional[Dict[str, Any]]:
         if rt.ws is None:
             return None
@@ -1147,8 +1524,11 @@ class XianyuIMHub:
             for m in reversed(msgs):
                 if m.get("sender") != "me":
                     continue
-                if m.get("client_uuid") == client_uuid or (
-                    m.get("text") == text and abs(now_ms - int(m.get("created_at_ms") or 0)) <= 45000
+                recent = abs(now_ms - int(m.get("created_at_ms") or 0)) <= 45000
+                if (
+                    m.get("client_uuid") == client_uuid
+                    or (text and m.get("text") == text and recent)
+                    or (image_url and m.get("image_url") == image_url and recent)
                 ):
                     return {
                         "ok": True,
@@ -1174,7 +1554,7 @@ class XianyuIMHub:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("[IM长连接异常断开] key=%s: %s", rt.account_key, exc)
+                logger.warning("[IM长连接异常断开] key=%s: %s: %s", rt.account_key, type(exc).__name__, exc)
                 outcome = "reconnect"
 
             if rt.stop_requested:
