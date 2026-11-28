@@ -141,17 +141,29 @@ def _parse_optional_float(val: Any) -> Optional[float]:
 
 
 def _parse_optional_price(val: Any) -> Optional[float]:
-    """解析可选价格字段（兼容 '¥55.5' 或数字），缺失或非正/非法文本返回 None。"""
+    """解析可选正数价格字段（兼容 '¥55.5' 或数字），缺失、0 或负数一律返回 None，避免假 0 污染原价统计。"""
     if val is None or isinstance(val, bool):
         return None
     if isinstance(val, (int, float)):
         f = float(val)
-        return round(f, 2) if math.isfinite(f) else None
+        return round(f, 2) if (math.isfinite(f) and f > 0) else None
     s = str(val).strip()
     if not s:
         return None
     m = re.search(r"(\d+(?:\.\d+)?)", s)
-    return round(float(m.group(1)), 2) if m else None
+    if not m:
+        return None
+    f = round(float(m.group(1)), 2)
+    return f if (math.isfinite(f) and f > 0) else None
+
+
+_FAKE_ZERO_SHOP_LABELS = frozenset({"0条评价", "好评率0%"})
+
+
+def _text_has_free_shipping(text: str) -> bool:
+    """正向识别包邮文本，防止 '不包邮' / '偏远地区不包邮' 被子串误判为包邮。"""
+    s = str(text or "").strip()
+    return bool(s and "包邮" in s and "不包邮" not in s)
 
 
 def _parse_optional_bool(val: Any) -> Optional[bool]:
@@ -320,7 +332,7 @@ def _parse_search_result_item(
     price_drop_amount: Optional[float] = None
     want_cnt = _parse_optional_int(ex.get("wantCnt") or dp.get("wantCnt"))
     official_tag_codes = str(cp_args.get("tag") or "").strip()
-    is_free_shipping = ("包邮" in title) or ("freeship" in official_tag_codes.lower())
+    is_free_shipping = "freeship" in official_tag_codes.lower()
     has_nfr_badge = False
     credit_tags: List[str] = []
 
@@ -353,9 +365,9 @@ def _parse_search_result_item(
                     continue
                 if "想要" in content and want_cnt is None:
                     want_cnt = _parse_optional_int(content)
-                elif content == "freeShippingIcon" or "包邮" in content:
+                elif content == "freeShippingIcon" or _text_has_free_shipping(content):
                     is_free_shipping = True
-                elif not content.startswith("¥") and content not in credit_tags:
+                elif not content.startswith("¥") and content not in _FAKE_ZERO_SHOP_LABELS and content not in credit_tags:
                     credit_tags.append(content)
 
     shop_label = ex.get("userFishShopLabel") or {}
@@ -363,7 +375,7 @@ def _parse_search_result_item(
         for t in shop_label.get("tagList") or []:
             if isinstance(t, dict):
                 c = str((t.get("data") or {}).get("content") or "").strip()
-                if c and c not in credit_tags:
+                if c and c not in _FAKE_ZERO_SHOP_LABELS and c not in credit_tags:
                     credit_tags.append(c)
 
     pic_url = str(ex.get("picUrl") or "").strip()
@@ -435,7 +447,8 @@ def _parse_sku_entry(sku: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     price_cent = sku.get("priceInCent")
     if price_cent is None:
         price_cent = sku.get("price")
-    sku_price = round(float(price_cent) / 100.0, 2) if price_cent is not None else 0.0
+    price_cent_val = _parse_optional_float(price_cent)
+    sku_price = round(price_cent_val / 100.0, 2) if price_cent_val is not None else None
 
     specs: Dict[str, str] = {}
     spec_parts: List[str] = []
@@ -479,7 +492,7 @@ def _parse_sku_entry(sku: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     qty_raw = sku.get("quantity")
     if qty_raw is None and isinstance(features, dict):
         qty_raw = features.get("idleOriginalQuantity")
-    quantity = _parse_int_num(qty_raw, default=0)
+    quantity = _parse_optional_int(qty_raw)
 
     return {
         "sku_id": str(sku.get("inventoryId") or sku.get("skuId") or "").strip(),
@@ -488,7 +501,6 @@ def _parse_sku_entry(sku: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "price": sku_price,
         "quantity": quantity,
         "original_quantity": _parse_optional_int(features.get("idleOriginalQuantity")) if isinstance(features, dict) else None,
-        "sku_order_num": _parse_optional_int(features.get("sku_order_num")) if isinstance(features, dict) else None,
     }
 
 
@@ -689,8 +701,7 @@ def normalize_item_detail(det: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     item_url = str(det.get("item_url") or f"{GOOFISH_HOME_URL}/item?id={item_id}").strip()
     price = _parse_float_price(det.get("price"), default=0.0)
     sku_list = [dict(s) for s in (det.get("sku_list") or []) if isinstance(s, dict)]
-    sku_prices = [_parse_float_price(s.get("price"), default=0.0) for s in sku_list]
-    sku_prices = [p for p in sku_prices if p > 0]
+    sku_prices = [p for p in (_parse_optional_price(s.get("price")) for s in sku_list) if p is not None]
     min_fallback = min(sku_prices) if sku_prices else price
     max_fallback = max(sku_prices) if sku_prices else price
 
@@ -802,11 +813,14 @@ def _parse_detail_packet_to_dict(
         if isinstance(t, dict)
     ]
     has_baoyou_tag = any(
-        "包邮" in str(t.get("text") or "") or (t.get("trackParams") or {}).get("tagType") == "baoyou"
+        _text_has_free_shipping(str(t.get("text") or "")) or (t.get("trackParams") or {}).get("tagType") == "baoyou"
         for t in all_tag_dicts
     )
     coin_discount = any((t.get("trackParams") or {}).get("tagType") == "coin_pay" for t in all_tag_dicts)
-    is_free_shipping = bool((transport_fee is None or transport_fee == 0.0) and (has_baoyou_tag or "包邮" in desc or "包邮" in title))
+    is_free_shipping = bool(
+        (transport_fee is None or transport_fee == 0.0)
+        and (has_baoyou_tag or _text_has_free_shipping(desc) or _text_has_free_shipping(title))
+    )
 
     raw_skus = item_do.get("skuList") or item_do.get("idleItemSkuList") or []
     sku_list: List[Dict[str, Any]] = []
@@ -816,7 +830,7 @@ def _parse_detail_packet_to_dict(
             if parsed_sku is not None:
                 sku_list.append(parsed_sku)
 
-    sku_prices = [s["price"] for s in sku_list if s["price"] > 0]
+    sku_prices = [s["price"] for s in sku_list if s.get("price") is not None and s["price"] > 0]
     min_price = _parse_float_price(item_do.get("minPrice"), default=(min(sku_prices) if sku_prices else price))
     max_price = _parse_float_price(item_do.get("maxPrice"), default=(max(sku_prices) if sku_prices else price))
 

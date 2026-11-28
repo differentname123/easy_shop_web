@@ -439,7 +439,9 @@ def _parse_deal_time_utc(val: Any, default_tz: datetime.timezone = _CN_TZ) -> Op
 
 
 def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.datetime) -> Optional[Dict[str, Any]]:
-    """校验线报商品时效性、可靠性与清洗状态，组装统一候选视图文档。"""
+    """校验线报商品有效态、时效性、可靠性与清洗状态，组装统一候选视图文档。"""
+    if doc.get("is_off_promotion") is True or doc.get("superseded_by"):
+        return None
     di = doc.get("deal_info")
     if not isinstance(di, dict) or not di.get("is_deal_tip"):
         return None
@@ -492,10 +494,72 @@ def _build_deal_tip_virtual_doc(doc: Dict[str, Any], cutoff_utc: datetime.dateti
     }
 
 
-def _verify_live_activity_price(platform: str, product_id: str, goods_sign: str, fallback_price: float) -> Optional[float]:
-    """调用官方 Adapter 验证正式商品实时价格（下架淘汰返回 None，网络波动沿用入库价）。"""
+_INVALID_ITEM_ERROR_MARKERS = (
+    "OFF_PROMOTION",
+    "NOT_FOUND",
+    "OFF_SHELF",
+    "INVALID_ITEM",
+    "INVALID_GOODS",
+    "DELETED",
+)
+INVALID_CANDIDATE_SKIP_TTL_SEC = 6 * 3600
+INVALID_CANDIDATE_SKIP_MAX_ENTRIES = 2000
+_INVALID_CANDIDATE_SKIP_UNTIL: Dict[Tuple[str, str], float] = {}
+
+
+def _is_item_invalid_error_code(error_code: Any) -> bool:
+    code = str(error_code or "").strip().upper()
+    if not code:
+        return False
+    return code == "PRODUCT_OFF_PROMOTION" or any(marker in code for marker in _INVALID_ITEM_ERROR_MARKERS)
+
+
+def _mark_invalid_candidate_skip(
+    platform: str,
+    product_id: str,
+    ttl_sec: float = INVALID_CANDIDATE_SKIP_TTL_SEC,
+) -> None:
+    """仅在当前进程内存记录已确认下架/涨价失效候选，严禁写回正式 products 集合。"""
+    plat = normalize_platform(platform)
+    pid = str(product_id or "").strip()
+    if not pid:
+        return
+    now_mono = time.monotonic()
+    expired = [k for k, exp in _INVALID_CANDIDATE_SKIP_UNTIL.items() if exp <= now_mono]
+    for k in expired:
+        _INVALID_CANDIDATE_SKIP_UNTIL.pop(k, None)
+    if len(_INVALID_CANDIDATE_SKIP_UNTIL) >= INVALID_CANDIDATE_SKIP_MAX_ENTRIES:
+        oldest_key = min(_INVALID_CANDIDATE_SKIP_UNTIL, key=_INVALID_CANDIDATE_SKIP_UNTIL.__getitem__)
+        _INVALID_CANDIDATE_SKIP_UNTIL.pop(oldest_key, None)
+    _INVALID_CANDIDATE_SKIP_UNTIL[(plat, pid)] = now_mono + max(60.0, float(ttl_sec))
+
+
+def _is_invalid_candidate_skipped(platform: str, product_id: str) -> bool:
+    """检查候选是否在进程内存冷却期（下架/涨价失效缓存），过期自动清理。"""
+    plat = normalize_platform(platform)
+    pid = str(product_id or "").strip()
+    if not pid:
+        return False
+    key = (plat, pid)
+    exp = _INVALID_CANDIDATE_SKIP_UNTIL.get(key)
+    if exp is None:
+        return False
+    if exp <= time.monotonic():
+        _INVALID_CANDIDATE_SKIP_UNTIL.pop(key, None)
+        return False
+    return True
+
+
+def _verify_live_activity_price(
+    platform: str,
+    product_id: str,
+    goods_sign: str,
+    fallback_price: float,
+) -> Optional[float]:
+    """调用官方 Adapter 验证商品实时价格（下架/明确失效淘汰返回 None 并记入内存跳过表，瞬态网络波动沿用入库价）。"""
+    plat = normalize_platform(platform)
     try:
-        adapter = get_adapter(platform)
+        adapter = get_adapter(plat)
         with api_caller_context("background"):
             res = adapter.get_goods_detail(
                 goods_id_or_sign=goods_sign or product_id,
@@ -503,15 +567,21 @@ def _verify_live_activity_price(platform: str, product_id: str, goods_sign: str,
                 goods_sign=goods_sign or None,
             )
         if isinstance(res, dict):
-            if str(res.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION":
-                logger.warning(f"🚫 [官方验价淘汰] [{platform.upper()}:{product_id}] 商品已下架或取消推广，跳过该候选")
+            err_code = str(res.get("error_code") or "").strip().upper()
+            if err_code == "PRODUCT_OFF_PROMOTION":
+                logger.warning(f"🚫 [官方验价淘汰] [{plat.upper()}:{product_id}] 商品已下架或取消推广，跳过该候选")
+                _mark_invalid_candidate_skip(plat, product_id)
+                return None
+            if res.get("status") != "success" and _is_item_invalid_error_code(err_code):
+                logger.warning(f"🚫 [官方验价失效] [{plat.upper()}:{product_id}] error_code={err_code}，跳过该候选")
+                _mark_invalid_candidate_skip(plat, product_id)
                 return None
             if res.get("status") == "success" and isinstance(res.get("data"), dict):
                 live_p = _num(res["data"].get("activity_price") or res["data"].get("price"), 0.0)
                 if live_p > 0:
                     return round(live_p, 2)
     except Exception as exc:
-        logger.warning(f"⚠️ [官方验价异常] [{platform.upper()}:{product_id}] 沿用入库价=¥{fallback_price} | 异常={exc}")
+        logger.warning(f"⚠️ [官方验价异常] [{plat.upper()}:{product_id}] 沿用入库价=¥{fallback_price} | 异常={exc}")
     return round(fallback_price, 2) if fallback_price > 0 else None
 
 
@@ -636,8 +706,15 @@ def _batch_verify_live_activity_prices(
             for pid, _gs, ref_key, fb_p, _ref in chunk:
                 res = batch_map.get(ref_key) or batch_map.get(pid)
                 if isinstance(res, dict):
-                    if str(res.get("error_code") or "").upper() == "PRODUCT_OFF_PROMOTION":
+                    err_code = str(res.get("error_code") or "").strip().upper()
+                    if err_code == "PRODUCT_OFF_PROMOTION":
                         logger.warning(f"🚫 [官方验价淘汰] [{plat.upper()}:{pid}] 商品已下架或取消推广，跳过该候选")
+                        _mark_invalid_candidate_skip(plat, pid)
+                        results[(plat, pid)] = None
+                        continue
+                    if res.get("status") != "success" and _is_item_invalid_error_code(err_code):
+                        logger.warning(f"🚫 [官方验价失效] [{plat.upper()}:{pid}] error_code={err_code}，跳过该候选")
+                        _mark_invalid_candidate_skip(plat, pid)
                         results[(plat, pid)] = None
                         continue
                     if res.get("status") == "success" and isinstance(res.get("data"), dict):
@@ -656,34 +733,49 @@ def _pick_verified_candidate_from_category(
     prefetched_prices: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
     ranked_override: Optional[Tuple[str, List[Dict[str, Any]]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """从单个类别选出 1 个通过官方价格校验（正式源）或时效校验（线报源）的待比价候选商品。"""
+    """从单个类别选出 1 个通过官方在售与价格核验（正式源与线报底价均核验）的待比价候选商品。"""
     src_type = _normalize_source_type(source_type)
     top_unit, ranked = ranked_override if ranked_override is not None else _rank_category_candidates(raw_items)
     if not ranked:
         return None
 
     chosen: Optional[Dict[str, Any]] = None
-    max_try = 1 if src_type == SOURCE_TYPE_DEAL_TIP else min(len(ranked), OFFICIAL_PRICE_VERIFY_ATTEMPTS_PER_CAT)
+    max_try = min(len(ranked), OFFICIAL_PRICE_VERIFY_ATTEMPTS_PER_CAT)
     for cand in ranked[:max_try]:
         doc = cand["doc"]
+        plat = normalize_platform(doc.get("platform") or "pdd")
+        pid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
+        gsign = str(doc.get("goods_sign") or "").strip()
+        ref_fb_price = (
+            _num(doc.get("official_reference_price") or cand["db_activity_price"], 0.0)
+            if src_type == SOURCE_TYPE_DEAL_TIP
+            else cand["db_activity_price"]
+        )
+        if prefetched_prices is not None and (plat, pid) in prefetched_prices:
+            live_price = prefetched_prices[(plat, pid)]
+        else:
+            live_price = _verify_live_activity_price(plat, pid, gsign, ref_fb_price)
+        if live_price is None or live_price <= 0:
+            _mark_invalid_candidate_skip(plat, pid)
+            continue
+
         if src_type == SOURCE_TYPE_DEAL_TIP:
+            off_ref = _num(doc.get("official_reference_price"), 0.0)
+            if off_ref > 0 and live_price > off_ref * 1.30:
+                logger.warning(
+                    f"🚫 [线报底价失效] [{plat.upper()}:{pid}] 官方实时价¥{live_price} 较底价¥{off_ref} 涨幅超30%，线报已过期，跳过该商品"
+                )
+                _mark_invalid_candidate_skip(plat, pid)
+                continue
             cand["verified_activity_price"] = cand["db_activity_price"]
             chosen = cand
             break
 
-        plat = normalize_platform(doc.get("platform") or "pdd")
-        pid = str(doc.get("product_id") or doc.get("goods_id") or "").strip()
-        gsign = str(doc.get("goods_sign") or "").strip()
-        if prefetched_prices is not None and (plat, pid) in prefetched_prices:
-            live_price = prefetched_prices[(plat, pid)]
-        else:
-            live_price = _verify_live_activity_price(plat, pid, gsign, cand["db_activity_price"])
-        if live_price is None or live_price <= 0:
-            continue
         if live_price > cand["db_activity_price"] * 1.30:
             logger.warning(
                 f"🚫 [官方验价优惠失效] [{plat.upper()}:{pid}] 实时价¥{live_price} 较入库价¥{cand['db_activity_price']} 涨幅超30%，优惠已失效，跳过该商品"
             )
+            _mark_invalid_candidate_skip(plat, pid)
             continue
         cand["verified_activity_price"] = live_price
         cand["unit_cost_performance"] = _compute_unit_cp(cand["unit_quantities"], live_price)
@@ -759,6 +851,8 @@ def select_round_candidates_for_source(
         query = {
             "$and": [
                 {"deal_info.is_deal_tip": True},
+                {"is_off_promotion": {"$ne": True}},
+                {"superseded_by": {"$exists": False}},
                 reliable_product_mongo_filter(),
                 {"deal_info.format_status": "success"},
                 {"deal_info.need_reformat": {"$ne": True}},
@@ -769,6 +863,8 @@ def select_round_candidates_for_source(
         projection = {
             **repo._SUMMARY_PROJECTION,
             "channel_type": 1,
+            "is_off_promotion": 1,
+            "superseded_by": 1,
             "deal_info.is_deal_tip": 1,
             "deal_info.reliability_score": 1,
             "deal_info.price_is_reliable": 1,
@@ -795,6 +891,7 @@ def select_round_candidates_for_source(
                 reliable_product_mongo_filter(),
                 {
                     "format_status": "success",
+                    "need_reformat": {"$ne": True},
                     "$or": [{"updated_at": {"$gte": cutoff_dt}}, {"updated_at": {"$gte": cutoff_str}}],
                 },
             ]
@@ -855,7 +952,7 @@ def select_round_candidates_for_source(
         if not pid:
             continue
         plat = normalize_platform(doc.get("platform") or "pdd")
-        if (plat, pid) in evaluated_keys:
+        if (plat, pid) in evaluated_keys or _is_invalid_candidate_skipped(plat, pid):
             skipped_evaluated_cnt += 1
             continue
         act_price = _num(doc.get("activity_price") or doc.get("price"), 0.0)
@@ -876,7 +973,7 @@ def select_round_candidates_for_source(
 
     preranked_by_cat: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
     prefetched_prices: Optional[Dict[Tuple[str, str], Optional[float]]] = None
-    if src_type == SOURCE_TYPE_OFFICIAL and sorted_cats:
+    if sorted_cats:
         batch_scan_limit = min(len(sorted_cats), max_categories * 2) if max_categories > 0 else len(sorted_cats)
         verify_items: List[Tuple[str, str, str, float]] = []
         for cat_name, raw_items in sorted_cats[:batch_scan_limit]:
@@ -888,7 +985,12 @@ def select_round_candidates_for_source(
                 pid0 = str(doc0.get("product_id") or doc0.get("goods_id") or "").strip()
                 gsign0 = str(doc0.get("goods_sign") or "").strip()
                 if pid0:
-                    verify_items.append((plat0, pid0, gsign0, ranked[0]["db_activity_price"]))
+                    fb_p0 = (
+                        _num(doc0.get("official_reference_price") or ranked[0]["db_activity_price"], 0.0)
+                        if src_type == SOURCE_TYPE_DEAL_TIP
+                        else ranked[0]["db_activity_price"]
+                    )
+                    verify_items.append((plat0, pid0, gsign0, fb_p0))
         if verify_items:
             prefetched_prices = _batch_verify_live_activity_prices(verify_items)
 

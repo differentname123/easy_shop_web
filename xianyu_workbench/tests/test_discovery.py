@@ -302,12 +302,12 @@ def test_category_eval_count_rotation_official_price_filter_and_1to1_interleave(
     fake_cursor.sort.return_value = raw_official_docs
     fake_repo.col.find.return_value = fake_cursor
 
-    def _fake_verify_live_price(platform, product_id, goods_sign, fallback_price):
+    def _fake_verify_live_price(platform, product_id, goods_sign, fallback_price, **_kwargs):
         if product_id == "shampoo_spiked":
             return 59.9  # 较入库价 19.9 暴涨 >30%，即使该类别仅 1 款商品也必须因优惠失效淘汰
         return fallback_price
 
-    def _fake_batch_verify(items):
+    def _fake_batch_verify(items, **_kwargs):
         return {
             (sched.normalize_platform(plat), str(pid)): _fake_verify_live_price(plat, pid, gsign, fb_p)
             for plat, pid, gsign, fb_p in items
@@ -323,9 +323,11 @@ def test_category_eval_count_rotation_official_price_filter_and_1to1_interleave(
             source_type=sched.SOURCE_TYPE_OFFICIAL,
         )
 
-    # 预期顺序：0次比价的「纯牛奶」(过滤掉 already_done 选出 milk_new) -> 1次比价的「抽纸」 -> 3次比价的「洗衣液」；「洗发水」因涨价淘汰
+    # 预期顺序：0次比价的「纯牛奶」(过滤掉 already_done 选出 milk_new) -> 1次比价的「抽纸」 -> 3次比价的「洗衣液」；「洗发水」因涨价淘汰且不写正式库
     assert [c["category_name"] for c in off_cands] == ["纯牛奶", "抽纸", "洗衣液"]
     assert off_cands[0]["product_id"] == "milk_new"
+    assert fake_repo.col.update_one.call_count == 0
+    assert fake_repo.delete_product.call_count == 0
     assert fake_eval_col.aggregate.call_count == 1
     assert fake_eval_col.find.call_count == 1
     eval_find_filter = fake_eval_col.find.call_args.args[0]
@@ -1030,7 +1032,13 @@ def test_select_round_candidates_filters_unreliable_products():
     fake_deal_cursor.sort.return_value = deal_docs
     fake_repo.col.find.return_value = fake_deal_cursor
 
-    with patch.object(sched, "ProductRepository", return_value=fake_repo):
+    with patch.object(sched, "ProductRepository", return_value=fake_repo), patch.object(
+        sched,
+        "_batch_verify_live_activity_prices",
+        side_effect=lambda items, **_kw: {(sched.normalize_platform(p), str(pid)): fb for p, pid, _gs, fb in items},
+    ), patch.object(
+        sched, "_verify_live_activity_price", side_effect=lambda _p, _pid, _gs, fb, **_kw: fb
+    ):
         deal_cands = sched.select_round_candidates_for_source(
             db=fake_db,
             hours_window=48,
@@ -1041,6 +1049,8 @@ def test_select_round_candidates_filters_unreliable_products():
     assert [c["product_id"] for c in deal_cands] == ["deal_src_ok", "deal_price_ok"]
     deal_query, deal_proj = fake_repo.col.find.call_args.args
     assert expected_reliable_filter in deal_query["$and"]
+    assert {"is_off_promotion": {"$ne": True}} in deal_query["$and"]
+    assert deal_proj["is_off_promotion"] == 1
     assert deal_proj["deal_info.is_deal_tip"] == 1
     assert deal_proj["deal_info.reliability_score"] == 1
     assert deal_proj["deal_info.price_is_reliable"] == 1
@@ -1070,9 +1080,11 @@ def test_select_round_candidates_filters_unreliable_products():
     fake_repo.col.find.return_value = fake_off_cursor
 
     with patch.object(sched, "ProductRepository", return_value=fake_repo), patch.object(
-        sched, "_batch_verify_live_activity_prices", side_effect=lambda items: {(sched.normalize_platform(p), str(pid)): fb for p, pid, _gs, fb in items}
+        sched,
+        "_batch_verify_live_activity_prices",
+        side_effect=lambda items, **_kw: {(sched.normalize_platform(p), str(pid)): fb for p, pid, _gs, fb in items},
     ), patch.object(
-        sched, "_verify_live_activity_price", side_effect=lambda _p, _pid, _gs, fb: fb
+        sched, "_verify_live_activity_price", side_effect=lambda _p, _pid, _gs, fb, **_kw: fb
     ):
         off_cands = sched.select_round_candidates_for_source(
             db=fake_db,
@@ -1289,6 +1301,13 @@ def test_market_parsers_schema_v2_and_strict_nulls():
                             "picHeight": "1920",
                             "isVideo": "true",
                         },
+                        "userFishShopLabel": {
+                            "tagList": [
+                                {"data": {"content": "0条评价"}},
+                                {"data": {"content": "好评率0%"}},
+                                {"data": {"content": "631条评价"}},
+                            ]
+                        },
                         "fishTags": {
                             "r3": {
                                 "tagList": [
@@ -1322,6 +1341,27 @@ def test_market_parsers_schema_v2_and_strict_nulls():
     assert "¥50" not in card["seller_tags"]
     assert "累计降价1.99元" not in card["seller_tags"]
     assert "nfrIcon" not in card["seller_tags"]
+    assert "0条评价" not in card["seller_tags"]
+    assert "好评率0%" not in card["seller_tags"]
+    assert "631条评价" in card["seller_tags"]
+
+    # 验证 '偏远地区不包邮' 且无 freeship 标记时不被误判为包邮
+    raw_non_free = {
+        "data": {
+            "item": {
+                "main": {
+                    "clickParam": {"args": {"tag": "credit-6"}},
+                    "exContent": {
+                        "itemId": "1104149344999",
+                        "detailParams": {"itemId": "1104149344999", "title": "偏远地区不包邮 纸巾", "soldPrice": "5"},
+                    },
+                }
+            }
+        }
+    }
+    non_free_card = xy_market._parse_search_result_item(raw_non_free)
+    assert non_free_card is not None
+    assert non_free_card["is_free_shipping"] is False
     assert card["want_cnt"] == 34
     assert card["pic_width"] == 887
     assert card["pic_height"] == 1920
@@ -1344,6 +1384,7 @@ def test_market_parsers_schema_v2_and_strict_nulls():
                 "title": "闪迪内存卡",
                 "desc": "公司采购整多了",
                 "soldPrice": "18",
+                "originalPrice": "0.00",
                 "transportFee": "0.00",
                 "priceRelativeTags": [{"text": "包邮", "trackParams": {"tagType": "baoyou"}}],
                 "priceTextTags": [{"trackParams": {"tagType": "coin_pay"}}],
@@ -1374,7 +1415,13 @@ def test_market_parsers_schema_v2_and_strict_nulls():
                         "quantity": 22,
                         "propertyList": [{"propertyText": "容量", "actualValueText": "16G"}],
                         "features": {"idleOriginalQuantity": "25", "sku_order_num": "0"},
-                    }
+                    },
+                    {
+                        "inventoryId": 1138604,
+                        "priceInCent": 2300,
+                        "propertyList": [{"propertyText": "容量", "actualValueText": "32G"}],
+                        "features": {},
+                    },
                 ],
             },
             "sellerDO": {
@@ -1406,6 +1453,7 @@ def test_market_parsers_schema_v2_and_strict_nulls():
         user_data_dir="guest",
     )
     assert det["collect_cnt"] == 33
+    assert det["original_price"] is None  # 详情 originalPrice="0.00" 不得伪造为 0.0
     assert det["coin_discount"] is True
     assert "favor_cnt" not in det
     assert "sold_cnt" not in det
@@ -1422,7 +1470,8 @@ def test_market_parsers_schema_v2_and_strict_nulls():
     assert det["item_labels"] == ["闪存卡", "Sandisk/闪迪"]
     assert det["service_tags"] == ["包邮", "48小时发货"]
     assert det["sku_list"][0]["original_quantity"] == 25
-    assert det["sku_list"][0]["sku_order_num"] == 0
+    assert "sku_order_num" not in det["sku_list"][0]
+    assert det["sku_list"][1]["quantity"] is None  # 缺失 SKU 库存严格保持 None
     assert det["seller"]["seller_id"] == "3670364797"
     assert isinstance(det["seller"]["register_at"], datetime.datetime)
     assert det["seller"]["register_at"].tzinfo == datetime.timezone.utc
@@ -1570,6 +1619,120 @@ def test_save_xianyu_items_schema_v2_detail_protection_and_smart_snapshots():
     assert cached["777001"]["screenshot_file"] == "item_777001.jpg"
     assert cached["777001"]["_from_db_cache"] is True
     assert isinstance(cached["777001"]["_detail_updated_at"], datetime.datetime)
+
+
+def test_expired_and_off_promotion_candidates_skipped_in_memory_without_touching_products(monkeypatch):
+    """验证下架/失效错误码淘汰且绝不修改正式 products 库，同享线报在售/底价涨价校验，并在进程内存冷却期自动跳过。"""
+    sched._INVALID_CANDIDATE_SKIP_UNTIL.clear()
+    fake_repo = MagicMock()
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    recent_pub = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+    batch_calls = []
+
+    class _FakeAdapter:
+        def batch_get_goods_details(self, refs):
+            batch_calls.append([r.goods_id for r in refs])
+            out = {}
+            for r in refs:
+                if r.goods_id == "off_promo_id":
+                    out[r.key] = {"status": "error", "error_code": "PRODUCT_OFF_PROMOTION"}
+                elif r.goods_id == "not_found_id":
+                    out[r.key] = {"status": "error", "error_code": "PRODUCT_NOT_FOUND"}
+                elif r.goods_id == "deal_base_surged":
+                    out[r.key] = {"status": "success", "data": {"activity_price": 88.0}}
+                elif r.goods_id == "deal_valid_coupon":
+                    out[r.key] = {"status": "success", "data": {"activity_price": 52.0}}
+            return out
+
+        def get_goods_detail(self, *, goods_id_or_sign="", goods_id="", goods_sign=None):
+            pid = goods_id or goods_id_or_sign
+            return self.batch_get_goods_details([sched.ProductRef("pdd", pid, goods_sign)]).get(
+                sched.ProductRef("pdd", pid, goods_sign).key,
+                {"status": "error", "error_code": "NOT_FOUND"},
+            )
+
+    monkeypatch.setattr(sched, "get_adapter", lambda _plat: _FakeAdapter())
+
+    res = sched._batch_verify_live_activity_prices(
+        [
+            ("jd", "off_promo_id", "s1", 20.0),
+            ("jd", "not_found_id", "s2", 20.0),
+            ("jd", "deal_base_surged", "s3", 50.0),
+            ("jd", "deal_valid_coupon", "s4", 50.0),
+        ]
+    )
+    assert res[("jd", "off_promo_id")] is None
+    assert res[("jd", "not_found_id")] is None
+    assert res[("jd", "deal_base_surged")] == 88.0
+    assert res[("jd", "deal_valid_coupon")] == 52.0
+    assert sched._is_invalid_candidate_skipped("jd", "off_promo_id") is True
+    assert sched._is_invalid_candidate_skipped("jd", "not_found_id") is True
+
+    # 线报虚拟文档构造拒绝已软下架记录
+    v_off = sched._build_deal_tip_virtual_doc(
+        {
+            **_make_sample_deal_doc(product_id="soft_off", publish_time=recent_pub, reliability_score=25),
+            "is_off_promotion": True,
+        },
+        cutoff_utc=now_utc - datetime.timedelta(hours=48),
+    )
+    assert v_off is None
+
+    # 同类别按顺序回退：#1 底价暴涨(>30%)淘汰且不写 DB -> 选中 #2 合法叠券线报(保留 12.9 元 deal_price)
+    d_surged = _make_sample_deal_doc(product_id="deal_base_surged", category_name="面霜", publish_time=recent_pub, reliability_score=25)
+    d_surged["activity_price"] = 50.0
+    d_surged["deal_info"]["deal_price"] = 10.0
+    d_surged["deal_info"]["format_deal_price"] = 10.0
+    d_surged["deal_info"]["format_info"]["price"] = 10.0
+
+    d_ok = _make_sample_deal_doc(product_id="deal_valid_coupon", category_name="面霜", publish_time=recent_pub, reliability_score=25)
+    d_ok["activity_price"] = 50.0
+    d_ok["deal_info"]["deal_price"] = 12.9
+    d_ok["deal_info"]["format_deal_price"] = 12.9
+    d_ok["deal_info"]["format_info"]["price"] = 12.9
+
+    fake_eval_col = MagicMock()
+    fake_eval_col.aggregate.return_value = []
+    fake_eval_col.find.return_value = []
+    fake_db = MagicMock()
+    fake_db.get_collection.return_value = fake_eval_col
+
+    fake_repo._SUMMARY_PROJECTION = {"name": 1}
+    fake_cursor = MagicMock()
+    fake_cursor.sort.return_value = [d_surged, d_ok]
+    fake_repo.col.find.return_value = fake_cursor
+
+    batch_calls.clear()
+    with patch.object(sched, "ProductRepository", return_value=fake_repo):
+        cands = sched.select_round_candidates_for_source(
+            db=fake_db,
+            hours_window=48,
+            max_categories=20,
+            source_type=sched.SOURCE_TYPE_DEAL_TIP,
+        )
+
+    assert len(cands) == 1
+    assert cands[0]["product_id"] == "deal_valid_coupon"
+    assert cands[0]["activity_price"] == 12.9
+    # 严禁任何修改正式 products 商品库的动作
+    assert fake_repo.delete_product.call_count == 0
+    assert fake_repo.col.update_one.call_count == 0
+    assert fake_repo.col.update_many.call_count == 0
+    assert sched._is_invalid_candidate_skipped("pdd", "deal_base_surged") is True
+
+    # 下一轮同进程再次选拔时，deal_base_surged 已被内存跳过，不会重复查接口
+    batch_calls.clear()
+    with patch.object(sched, "ProductRepository", return_value=fake_repo):
+        cands_next = sched.select_round_candidates_for_source(
+            db=fake_db,
+            hours_window=48,
+            max_categories=20,
+            source_type=sched.SOURCE_TYPE_DEAL_TIP,
+        )
+    assert len(cands_next) == 1
+    assert cands_next[0]["product_id"] == "deal_valid_coupon"
+    assert batch_calls == [["deal_valid_coupon"]]
+    sched._INVALID_CANDIDATE_SKIP_UNTIL.clear()
 
 
 
