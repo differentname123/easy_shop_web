@@ -52,6 +52,11 @@ from xianyu_workbench.client import (
     get_xianyu_item_details_batch,
     search_xianyu_items,
 )
+from xianyu_workbench.client.market import (
+    XIANYU_ITEM_SCHEMA_VERSION,
+    normalize_item_detail,
+    normalize_search_card,
+)
 from models.cost_performance import (
     UNIT_TO_CATEGORY,
     UNIT_TO_MULTIPLIER,
@@ -1188,71 +1193,167 @@ def _validate_llm_comparison_response(
 
 
 # ==============================================================================
-# 闲鱼商品表（xianyu_items）搜索概览保存与 7 天详情缓存复用
+# 闲鱼商品表（xianyu_items）Schema v2 标准入库、详情优先保护与 7 天详情缓存复用
 # ==============================================================================
+SNAPSHOT_MAX_ITEMS = 30
+SNAPSHOT_MIN_INTERVAL_SEC = 3600
+
+
+def _should_append_snapshot(
+    prev_snap: Optional[Dict[str, Any]],
+    new_snap: Dict[str, Any],
+    min_interval_sec: int = SNAPSHOT_MIN_INTERVAL_SEC,
+) -> bool:
+    """判断本次观测是否需要追加快照：首条、搜索升级详情、间隔>=1h 或关键数值变化才追加。"""
+    if not isinstance(prev_snap, dict):
+        return True
+    prev_src = prev_snap.get("source")
+    new_src = new_snap.get("source")
+    if prev_src == "search" and new_src == "detail":
+        return True
+
+    prev_at = _parse_deal_time_utc(prev_snap.get("at"), default_tz=datetime.timezone.utc)
+    new_at = new_snap.get("at")
+    if prev_at is None or not isinstance(new_at, datetime.datetime):
+        return True
+    if (new_at - prev_at).total_seconds() >= float(min_interval_sec):
+        return True
+
+    tracked_keys = ("price", "want_cnt")
+    if new_src == "detail":
+        tracked_keys = ("price", "want_cnt", "browse_cnt", "collect_cnt", "quantity")
+    return any(prev_snap.get(k) != new_snap.get(k) for k in tracked_keys)
+
+
 def _save_xianyu_search_items(
     items_col: Optional[Any],
     raw_items: List[Dict[str, Any]],
+    search_keyword: str = "",
 ) -> int:
-    """将搜索返回的闲鱼商品概览按唯一标识 item_id 入库（绝不覆盖该商品已有的详情字段）。"""
+    """将搜索返回的闲鱼商品概览按唯一标识 item_id 入库（Schema v2：详情优先保护 + 智能去重有界快照）。"""
     if items_col is None or not raw_items:
         return 0
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
-    now_str = now_utc.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    fallback_kw = str(search_keyword or "").strip()
 
-    dedup_by_id: Dict[str, Dict[str, Any]] = {}
+    dedup_cards: Dict[str, Dict[str, Any]] = {}
     for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-        iid = str(item.get("item_id") or "").strip()
-        if iid and iid not in dedup_by_id:
-            dedup_by_id[iid] = item
+        clean_card = normalize_search_card(item, search_keyword=fallback_kw)
+        if clean_card is not None and clean_card["item_id"] not in dedup_cards:
+            dedup_cards[clean_card["item_id"]] = clean_card
 
-    if not dedup_by_id:
+    if not dedup_cards:
         return 0
 
-    ops: List[UpdateOne] = []
-    for iid, card in dedup_by_id.items():
-        item_url = str(card.get("item_url") or f"https://www.goofish.com/item?id={iid}").strip()
-        clean_card = {
-            "item_id": iid,
-            "item_url": item_url,
-            "title": str(card.get("title") or ""),
-            "price": _num(card.get("price"), 0.0),
-            "raw_price_text": str(card.get("raw_price_text") or ""),
-            "original_price": _num(card.get("original_price"), 0.0),
-            "want_cnt": int(_num(card.get("want_cnt"), 0.0)),
-            "is_free_shipping": bool(card.get("is_free_shipping")),
-            "area": str(card.get("area") or ""),
-            "seller_nick": str(card.get("seller_nick") or ""),
-            "seller_tags": list(card.get("seller_tags") or []),
-            "image_url": str(card.get("image_url") or ""),
-        }
-        ops.append(
-            UpdateOne(
-                {"item_id": iid},
-                {
-                    "$set": {
-                        "item_id": iid,
-                        "item_url": item_url,
-                        "search_card": clean_card,
-                        "search_updated_at": now_utc,
-                        "search_updated_at_str": now_str,
-                        "updated_at": now_utc,
-                        "updated_at_str": now_str,
-                    },
-                    "$setOnInsert": {
-                        "created_at": now_utc,
-                        "created_at_str": now_str,
-                        "has_detail": False,
-                        "title": clean_card["title"],
-                        "price": clean_card["price"],
-                    },
-                },
-                upsert=True,
-            )
+    existing_map: Dict[str, Dict[str, Any]] = {}
+    try:
+        cursor = items_col.find(
+            {"item_id": {"$in": list(dedup_cards.keys())}},
+            {"_id": 0, "item_id": 1, "has_detail": 1, "publish_at_source": 1, "snapshots": {"$slice": -1}},
         )
+        for doc in cursor or []:
+            if isinstance(doc, dict) and doc.get("item_id"):
+                existing_map[str(doc["item_id"]).strip()] = doc
+    except Exception as exc:
+        logger.warning(f"⚠️ [闲鱼商品表/预查询已有状态异常] count={len(dedup_cards)} | 异常={exc}")
+
+    ops: List[UpdateOne] = []
+    for iid, clean_card in dedup_cards.items():
+        existing = existing_map.get(iid)
+        snaps = (existing or {}).get("snapshots") or []
+        prev_snap = snaps[-1] if isinstance(snaps, list) and snaps else None
+        snap = {
+            "at": now_utc,
+            "source": "search",
+            "price": clean_card["price"],
+            "want_cnt": clean_card["want_cnt"],
+            "rank": clean_card["search_rank"],
+            "keyword": clean_card["search_keyword"],
+        }
+
+        if existing is None:
+            set_doc: Dict[str, Any] = {
+                "schema_version": XIANYU_ITEM_SCHEMA_VERSION,
+                "item_id": iid,
+                "item_url": clean_card["item_url"],
+                "title": clean_card["title"],
+                "price": clean_card["price"],
+                "original_price": clean_card["original_price"],
+                "is_free_shipping": clean_card["is_free_shipping"],
+                "has_video": clean_card["is_video"],
+                "is_ad": clean_card["is_ad"],
+                "is_fish_shop": clean_card["is_fish_shop"],
+                "coin_discount": clean_card["coin_discount"],
+                "search_card": clean_card,
+                "metrics": {
+                    "want_cnt": clean_card["want_cnt"],
+                    "browse_cnt": None,
+                    "collect_cnt": None,
+                    "quantity": None,
+                    "want_rate": None,
+                },
+                "search_updated_at": now_utc,
+                "updated_at": now_utc,
+            }
+            if clean_card["publish_at"] is not None:
+                set_doc["publish_at"] = clean_card["publish_at"]
+                set_doc["publish_at_source"] = "search"
+            update_doc: Dict[str, Any] = {
+                "$set": set_doc,
+                "$setOnInsert": {
+                    "first_seen_at": now_utc,
+                    "has_detail": False,
+                    "transport_fee": None,
+                    "has_multi_sku": None,
+                    "seller_id": None,
+                    "detail_updated_at": None,
+                },
+            }
+        elif not existing.get("has_detail"):
+            set_doc = {
+                "schema_version": XIANYU_ITEM_SCHEMA_VERSION,
+                "item_id": iid,
+                "item_url": clean_card["item_url"],
+                "title": clean_card["title"],
+                "price": clean_card["price"],
+                "original_price": clean_card["original_price"],
+                "is_free_shipping": clean_card["is_free_shipping"],
+                "has_video": clean_card["is_video"],
+                "is_ad": clean_card["is_ad"],
+                "is_fish_shop": clean_card["is_fish_shop"],
+                "coin_discount": clean_card["coin_discount"],
+                "search_card": clean_card,
+                "metrics.want_cnt": clean_card["want_cnt"],
+                "search_updated_at": now_utc,
+                "updated_at": now_utc,
+            }
+            if existing.get("publish_at_source") != "detail" and clean_card["publish_at"] is not None:
+                set_doc["publish_at"] = clean_card["publish_at"]
+                set_doc["publish_at_source"] = "search"
+            update_doc = {"$set": set_doc}
+        else:
+            # 详情优先保护：已采集完整详情的商品仅刷新搜索卡位与推广标记，绝不覆盖详情态主字段与 metrics
+            set_doc = {
+                "schema_version": XIANYU_ITEM_SCHEMA_VERSION,
+                "search_card": clean_card,
+                "is_ad": clean_card["is_ad"],
+                "is_fish_shop": clean_card["is_fish_shop"],
+                "coin_discount": clean_card["coin_discount"],
+                "search_updated_at": now_utc,
+                "updated_at": now_utc,
+            }
+            if existing.get("publish_at_source") != "detail" and clean_card["publish_at"] is not None:
+                set_doc["publish_at"] = clean_card["publish_at"]
+                set_doc["publish_at_source"] = "search"
+            update_doc = {"$set": set_doc}
+
+        if _should_append_snapshot(prev_snap, snap):
+            update_doc["$push"] = {
+                "snapshots": {"$each": [snap], "$slice": -SNAPSHOT_MAX_ITEMS},
+            }
+
+        ops.append(UpdateOne({"item_id": iid}, update_doc, upsert=(existing is None)))
 
     try:
         items_col.bulk_write(ops, ordered=False)
@@ -1288,8 +1389,6 @@ def _load_cached_xianyu_details(
             if not iid:
                 continue
             det_utc = _parse_deal_time_utc(doc.get("detail_updated_at"), default_tz=datetime.timezone.utc)
-            if det_utc is None:
-                det_utc = _parse_deal_time_utc(doc.get("detail_updated_at_str"), default_tz=_CN_TZ)
             if det_utc is None or det_utc < cutoff_utc:
                 continue
             det = doc.get("detail")
@@ -1298,12 +1397,8 @@ def _load_cached_xianyu_details(
             det_copy = dict(det)
             det_copy["ok"] = True
             det_copy["item_id"] = iid
-            if not det_copy.get("screenshot_file") and doc.get("screenshot_file"):
-                det_copy["screenshot_file"] = str(doc.get("screenshot_file") or "").strip()
             det_copy["_from_db_cache"] = True
-            det_copy["_detail_updated_at_str"] = str(
-                doc.get("detail_updated_at_str") or det_utc.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
-            )
+            det_copy["_detail_updated_at"] = det_utc
             cached_by_id[iid] = det_copy
     except Exception as exc:
         logger.warning(f"⚠️ [闲鱼商品表/读取7天缓存详情异常] IDs={clean_ids} | 异常={exc}")
@@ -1316,78 +1411,109 @@ def _save_xianyu_item_details(
     items_col: Optional[Any],
     details_by_id: Dict[str, Dict[str, Any]],
 ) -> int:
-    """将成功拉取的闲鱼商品详情写入 xianyu_items 表，标记 detail_updated_at 供 7 天内复用。"""
+    """将成功拉取的闲鱼商品详情写入 xianyu_items 表（Schema v2，权威覆盖详情域并智能追加有界快照）。"""
     if items_col is None or not details_by_id:
         return 0
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    now_str = now_utc.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    ops: List[UpdateOne] = []
-
+    valid_details: Dict[str, Dict[str, Any]] = {}
     for raw_id, det in details_by_id.items():
         if not isinstance(det, dict) or not det.get("ok"):
             continue
-        iid = str(det.get("item_id") or raw_id or "").strip()
-        if not iid:
-            continue
-        item_url = str(det.get("item_url") or f"https://www.goofish.com/item?id={iid}").strip()
-        price_val = _num(det.get("price"), 0.0)
-        screenshot_file = str(det.get("screenshot_file") or "").strip()
-        clean_det = {
-            "ok": True,
-            "item_id": iid,
-            "item_url": item_url,
-            "title": str(det.get("title") or ""),
-            "desc": str(det.get("desc") or ""),
-            "price": price_val,
-            "original_price": _num(det.get("original_price"), 0.0),
-            "transport_fee": None if det.get("transport_fee") is None else _num(det.get("transport_fee"), 0.0),
-            "is_free_shipping": bool(det.get("is_free_shipping")),
-            "min_price": _num(det.get("min_price"), price_val),
-            "max_price": _num(det.get("max_price"), price_val),
-            "has_multi_sku": bool(det.get("has_multi_sku")),
-            "sku_list": list(det.get("sku_list") or []),
-            "cpv_labels": list(det.get("cpv_labels") or []),
-            "want_cnt": None if det.get("want_cnt") is None else int(_num(det.get("want_cnt"), 0.0)),
-            "browse_cnt": int(_num(det.get("browse_cnt"), 0.0)),
-            "quantity": int(_num(det.get("quantity"), 1.0)),
-            "images": list(det.get("images") or []),
-            "screenshot_file": screenshot_file,
-            "seller_nick": str(det.get("seller_nick") or ""),
-            "seller_city": str(det.get("seller_city") or ""),
-            "seller_sold_count": int(_num(det.get("seller_sold_count"), 0.0)),
-            "seller_good_rate": str(det.get("seller_good_rate") or ""),
-        }
+        payload = dict(det)
+        if not payload.get("item_id"):
+            payload["item_id"] = str(raw_id or "").strip()
+        clean_det = normalize_item_detail(payload)
+        if clean_det is not None:
+            valid_details[clean_det["item_id"]] = clean_det
+
+    if not valid_details:
+        return 0
+
+    existing_map: Dict[str, Dict[str, Any]] = {}
+    try:
+        cursor = items_col.find(
+            {"item_id": {"$in": list(valid_details.keys())}},
+            {"_id": 0, "item_id": 1, "snapshots": {"$slice": -1}},
+        )
+        for doc in cursor or []:
+            if isinstance(doc, dict) and doc.get("item_id"):
+                existing_map[str(doc["item_id"]).strip()] = doc
+    except Exception as exc:
+        logger.warning(f"⚠️ [闲鱼商品表/预查询快照异常] count={len(valid_details)} | 异常={exc}")
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    ops: List[UpdateOne] = []
+
+    for iid, clean_det in valid_details.items():
+        want_cnt = clean_det["want_cnt"]
+        browse_cnt = clean_det["browse_cnt"]
+        want_rate = (
+            round(want_cnt / browse_cnt, 4)
+            if (want_cnt is not None and browse_cnt is not None and browse_cnt > 0)
+            else None
+        )
+        seller_id = clean_det["seller"]["seller_id"] or None
+
         set_doc: Dict[str, Any] = {
+            "schema_version": XIANYU_ITEM_SCHEMA_VERSION,
             "item_id": iid,
-            "item_url": item_url,
+            "item_url": clean_det["item_url"],
             "title": clean_det["title"],
             "price": clean_det["price"],
+            "original_price": clean_det["original_price"],
             "transport_fee": clean_det["transport_fee"],
             "is_free_shipping": clean_det["is_free_shipping"],
             "has_multi_sku": clean_det["has_multi_sku"],
+            "has_video": clean_det["has_video"],
             "has_detail": True,
+            "metrics": {
+                "want_cnt": want_cnt,
+                "browse_cnt": browse_cnt,
+                "collect_cnt": clean_det["collect_cnt"],
+                "quantity": clean_det["quantity"],
+                "want_rate": want_rate,
+            },
+            "seller_id": seller_id,
             "detail": clean_det,
             "detail_updated_at": now_utc,
-            "detail_updated_at_str": now_str,
             "updated_at": now_utc,
-            "updated_at_str": now_str,
         }
-        if screenshot_file:
-            set_doc["screenshot_file"] = screenshot_file
-        ops.append(
-            UpdateOne(
-                {"item_id": iid},
-                {
-                    "$set": set_doc,
-                    "$setOnInsert": {
-                        "created_at": now_utc,
-                        "created_at_str": now_str,
-                    },
-                },
-                upsert=True,
-            )
-        )
+        if clean_det["publish_at"] is not None:
+            set_doc["publish_at"] = clean_det["publish_at"]
+            set_doc["publish_at_source"] = "detail"
+        shot_file = str(clean_det.get("screenshot_file") or "").strip()
+        if shot_file:
+            set_doc["screenshot_file"] = shot_file
+
+        existing = existing_map.get(iid)
+        snaps = (existing or {}).get("snapshots") or []
+        prev_snap = snaps[-1] if isinstance(snaps, list) and snaps else None
+        snap = {
+            "at": now_utc,
+            "source": "detail",
+            "price": clean_det["price"],
+            "want_cnt": want_cnt,
+            "browse_cnt": browse_cnt,
+            "collect_cnt": clean_det["collect_cnt"],
+            "quantity": clean_det["quantity"],
+        }
+
+        update_doc: Dict[str, Any] = {
+            "$set": set_doc,
+            "$setOnInsert": {
+                "first_seen_at": now_utc,
+                "search_updated_at": None,
+                "is_ad": None,
+                "is_fish_shop": None,
+                "coin_discount": None,
+            },
+        }
+        if _should_append_snapshot(prev_snap, snap):
+            update_doc["$push"] = {
+                "snapshots": {"$each": [snap], "$slice": -SNAPSHOT_MAX_ITEMS},
+            }
+
+        ops.append(UpdateOne({"item_id": iid}, update_doc, upsert=True))
 
     if not ops:
         return 0
@@ -1491,7 +1617,7 @@ def compare_candidate_with_xianyu(
                 f"错误码={res.get('error_code')} | 目录={res.get('user_data_dir')} | 原因={res.get('message')}"
             )
         elif res.get("items"):
-            _save_xianyu_search_items(items_col, res.get("items") or [])
+            _save_xianyu_search_items(items_col, res.get("items") or [], search_keyword=target_kw)
         return res
 
     def _build_search_aborted_record(failed_kw: str, failed_res: Dict[str, Any]) -> Dict[str, Any]:
@@ -1696,7 +1822,9 @@ def compare_candidate_with_xianyu(
                 "cpv_labels": det.get("cpv_labels") or [],
             },
         })
-        src_badge = f"库缓存:{det.get('_detail_updated_at_str')}" if det.get("_from_db_cache") else "H5新拉"
+        cached_at = det.get("_detail_updated_at")
+        cached_at_str = cached_at.astimezone(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S") if isinstance(cached_at, datetime.datetime) else ""
+        src_badge = f"库缓存:{cached_at_str}" if det.get("_from_db_cache") else "H5新拉"
         logger.info(
             f"   ├─ ✅ ({idx}/{len(ids_to_fetch)}) 详情就绪 [XY:{iid}][{src_badge}] | "
             f"详情价=¥{det.get('price')} (区间:¥{det.get('min_price')}~¥{det.get('max_price')}) | "
@@ -2248,6 +2376,8 @@ def _ensure_xianyu_items_indexes(items_col: Any) -> None:
         return
     items_col.create_index([("item_id", 1)], unique=True, background=True)
     items_col.create_index([("has_detail", 1), ("detail_updated_at", -1)], background=True)
+    items_col.create_index([("publish_at", -1)], background=True)
+    items_col.create_index([("seller_id", 1)], background=True)
     items_col.create_index([("updated_at", -1)], background=True)
 
 

@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """闲鱼公开市场比价检索能力：搜索小号登录搜索概览 + 移动端 H5 免登录批量/单条获取商品完整详情。"""
 
+import math
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import random
 import re
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
+
+XIANYU_ITEM_SCHEMA_VERSION = 2
 
 from .session import (
     DEFAULT_GUEST_USER_DATA_DIR,
@@ -98,19 +102,201 @@ def _parse_int_num(val: Any, default: int = 0) -> int:
     return int(m.group(1)) if m else default
 
 
-def _parse_search_result_item(item_wrap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+_CN_TZ = timezone(timedelta(hours=8))
+
+
+def _parse_optional_int(val: Any) -> Optional[int]:
+    """仅当存在有效整数时返回 int；缺失、布尔或空值一律返回 None，避免用 0 污染统计。"""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    m = re.fullmatch(r"(-?\d+)(?:\.\d+)?", s)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r"(-?\d+)", s)
+    return int(m2.group(1)) if m2 else None
+
+
+def _parse_optional_float(val: Any) -> Optional[float]:
+    """仅当存在有效有限数字时返回 float；缺失或空值返回 None。"""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return f if math.isfinite(f) else None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        f = float(s)
+        return f if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_optional_price(val: Any) -> Optional[float]:
+    """解析可选价格字段（兼容 '¥55.5' 或数字），缺失或非正/非法文本返回 None。"""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return round(f, 2) if math.isfinite(f) else None
+    s = str(val).strip()
+    if not s:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    return round(float(m.group(1)), 2) if m else None
+
+
+def _parse_optional_bool(val: Any) -> Optional[bool]:
+    """解析可选布尔字段，仅当明确为 bool 或布尔字符串时返回 bool，否则返回 None。"""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "1", "yes"):
+            return True
+        if s in ("false", "0", "no"):
+            return False
+    return None
+
+
+def _parse_bool_flag(val: Any) -> bool:
+    """安全解析布尔开关（兼容 bool / 'true' / '1' / 1）。"""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    s = str(val or "").strip().lower()
+    return s in ("true", "1", "yes")
+
+
+def _parse_utc_datetime(val: Any) -> Optional[datetime]:
+    """将 datetime、13 位毫秒/10 位秒级时间戳或北京时间字符串统一转为 UTC-aware datetime。"""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, datetime):
+        return val.astimezone(timezone.utc) if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, (int, float)):
+        ts = float(val)
+        if not math.isfinite(ts) or ts <= 0:
+            return None
+        if ts >= 1e12:
+            ts /= 1000.0
+        if ts < 1_000_000_000:
+            return None
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return _parse_utc_datetime(float(s))
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=_CN_TZ).astimezone(timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_CN_TZ).astimezone(timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_reply_ratio(seller_do: Dict[str, Any]) -> Optional[float]:
+    """优先提取浮点 24h 回复率，否则回退解析百分比字符串（如 '85%' -> 0.85）。"""
+    ratio = _parse_optional_float(seller_do.get("replyIn24hRatioDouble"))
+    if ratio is not None:
+        return round(ratio, 4)
+    raw_pct = str(seller_do.get("replyRatio24h") or "").strip()
+    if raw_pct:
+        m = re.search(r"(\d+(?:\.\d+)?)", raw_pct)
+        if m:
+            return round(float(m.group(1)) / 100.0, 4)
+    return None
+
+
+def normalize_search_card(
+    card: Dict[str, Any],
+    *,
+    search_keyword: str = "",
+) -> Optional[Dict[str, Any]]:
+    """SSOT：将任意闲鱼搜索卡片字典规范化为 Schema v2 标准结构。"""
+    if not isinstance(card, dict):
+        return None
+    item_id = str(card.get("item_id") or "").strip()
+    if not item_id:
+        return None
+
+    item_url = str(card.get("item_url") or f"{GOOFISH_HOME_URL}/item?id={item_id}").strip()
+    pic_url = str(card.get("image_url") or "").strip()
+    if pic_url.startswith("//"):
+        pic_url = "https:" + pic_url
+
+    return {
+        "item_id": item_id,
+        "item_url": item_url,
+        "title": str(card.get("title") or "").strip(),
+        "price": _parse_float_price(card.get("price"), default=0.0),
+        "raw_price_text": str(card.get("raw_price_text") or "").strip(),
+        "original_price": _parse_optional_price(card.get("original_price")),
+        "price_drop_amount": _parse_optional_price(card.get("price_drop_amount")),
+        "want_cnt": _parse_optional_int(card.get("want_cnt")),
+        "is_free_shipping": bool(card.get("is_free_shipping")),
+        "has_nfr_badge": bool(card.get("has_nfr_badge")),
+        "area": str(card.get("area") or "").strip(),
+        "seller_id_enc": str(card.get("seller_id_enc") or "").strip(),
+        "seller_nick": str(card.get("seller_nick") or "").strip(),
+        "seller_tags": [str(x).strip() for x in (card.get("seller_tags") or []) if str(x).strip()],
+        "image_url": pic_url,
+        "publish_at": _parse_utc_datetime(card.get("publish_at")),
+        "pic_width": _parse_optional_int(card.get("pic_width")),
+        "pic_height": _parse_optional_int(card.get("pic_height")),
+        "is_video": bool(card.get("is_video")),
+        "is_ad": bool(card.get("is_ad")),
+        "is_fish_shop": bool(card.get("is_fish_shop")),
+        "coin_discount": bool(card.get("coin_discount")),
+        "cat_id": str(card.get("cat_id") or "").strip(),
+        "channel_cat_id": str(card.get("channel_cat_id") or "").strip(),
+        "tb_cat_id": str(card.get("tb_cat_id") or "").strip(),
+        "official_tag_codes": str(card.get("official_tag_codes") or "").strip(),
+        "official_tag_names": str(card.get("official_tag_names") or "").strip(),
+        "search_keyword": str(card.get("search_keyword") or search_keyword or "").strip(),
+        "search_rank": _parse_optional_int(card.get("search_rank")),
+    }
+
+
+def _parse_search_result_item(
+    item_wrap: Dict[str, Any],
+    *,
+    keyword: str = "",
+    rank: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     """解析 `mtop.taobao.idlemtopsearch.pc.search` 单条商品卡片数据。"""
     if not isinstance(item_wrap, dict):
         return None
-    ex = (
-        ((item_wrap.get("data") or {}).get("item") or {})
-        .get("main", {})
-        .get("exContent")
-    )
+    main = ((item_wrap.get("data") or {}).get("item") or {}).get("main") or {}
+    if not isinstance(main, dict):
+        return None
+    ex = main.get("exContent")
     if not isinstance(ex, dict):
         return None
 
     dp = ex.get("detailParams") or {}
+    cp_args = ((main.get("clickParam") or {}).get("args")) or {}
+    if not isinstance(cp_args, dict):
+        cp_args = {}
     item_id = str(ex.get("itemId") or dp.get("itemId") or "").strip()
     if not item_id:
         return None
@@ -130,9 +316,12 @@ def _parse_search_result_item(item_wrap: Dict[str, Any]) -> Optional[Dict[str, A
         price = _parse_float_price(joined)
         raw_price_text = joined.strip()
 
-    original_price = _parse_float_price(ex.get("oriPrice"), default=0.0)
-    want_cnt = _parse_int_num(ex.get("wantCnt") or dp.get("wantCnt"), default=0)
-    is_free_shipping = "包邮" in title
+    original_price = _parse_optional_price(ex.get("oriPrice"))
+    price_drop_amount: Optional[float] = None
+    want_cnt = _parse_optional_int(ex.get("wantCnt") or dp.get("wantCnt"))
+    official_tag_codes = str(cp_args.get("tag") or "").strip()
+    is_free_shipping = ("包邮" in title) or ("freeship" in official_tag_codes.lower())
+    has_nfr_badge = False
     credit_tags: List[str] = []
 
     fish_tags = ex.get("fishTags") or {}
@@ -143,11 +332,27 @@ def _parse_search_result_item(item_wrap: Dict[str, Any]) -> Optional[Dict[str, A
             for t in region_val.get("tagList") or []:
                 if not isinstance(t, dict):
                     continue
-                content = str((t.get("data") or {}).get("content") or "").strip()
+                tag_data = t.get("data") or {}
+                if not isinstance(tag_data, dict):
+                    continue
+                content = str(tag_data.get("content") or "").strip()
                 if not content:
                     continue
-                if "想要" in content and want_cnt == 0:
-                    want_cnt = _parse_int_num(content, default=0)
+                label_id = str(tag_data.get("labelId") or "").strip()
+                is_strike = _parse_bool_flag(tag_data.get("isStrikeThrough"))
+                if (is_strike or label_id == "41") and content.startswith("¥"):
+                    if original_price is None:
+                        original_price = _parse_optional_price(content)
+                    continue
+                if label_id == "749" or "降价" in content:
+                    if price_drop_amount is None:
+                        price_drop_amount = _parse_optional_price(content)
+                    continue
+                if content == "nfrIcon" or label_id == "664":
+                    has_nfr_badge = True
+                    continue
+                if "想要" in content and want_cnt is None:
+                    want_cnt = _parse_optional_int(content)
                 elif content == "freeShippingIcon" or "包邮" in content:
                     is_free_shipping = True
                 elif not content.startswith("¥") and content not in credit_tags:
@@ -165,20 +370,61 @@ def _parse_search_result_item(item_wrap: Dict[str, Any]) -> Optional[Dict[str, A
     if pic_url.startswith("//"):
         pic_url = "https:" + pic_url
 
-    return {
-        "item_id": item_id,
-        "item_url": f"{GOOFISH_HOME_URL}/item?id={item_id}",
-        "title": title,
-        "price": price,
-        "raw_price_text": raw_price_text,
-        "original_price": original_price,
-        "want_cnt": want_cnt,
-        "is_free_shipping": is_free_shipping,
-        "area": str(ex.get("area") or "").strip(),
-        "seller_nick": str(ex.get("userNickName") or dp.get("userNick") or "").strip(),
-        "seller_tags": credit_tags,
-        "image_url": pic_url,
-    }
+    publish_at = _parse_utc_datetime(cp_args.get("publishTime") or main.get("publishTime"))
+    pic_width = _parse_optional_int(dp.get("picWidth"))
+    if pic_width is None:
+        pic_width = _parse_optional_int(ex.get("picWidth"))
+    pic_height = _parse_optional_int(dp.get("picHeight"))
+    if pic_height is None:
+        pic_height = _parse_optional_int(ex.get("picHeight"))
+
+    jump_args = ((ex.get("jump2XianYuHao") or {}).get("clickParam") or {}).get("args") or {}
+    if not isinstance(jump_args, dict):
+        jump_args = {}
+    seller_id_enc = str(cp_args.get("seller_id") or jump_args.get("user_id") or "").strip()
+
+    resolved_rank: Optional[int] = rank if isinstance(rank, int) and rank > 0 else None
+    if resolved_rank is None:
+        pos_val = _parse_optional_int(cp_args.get("position"))
+        if pos_val is None:
+            pos_val = _parse_optional_int(cp_args.get("index"))
+        if pos_val is not None and pos_val >= 0:
+            resolved_rank = pos_val + 1
+
+    return normalize_search_card(
+        {
+            "item_id": item_id,
+            "item_url": f"{GOOFISH_HOME_URL}/item?id={item_id}",
+            "title": title,
+            "price": price,
+            "raw_price_text": raw_price_text,
+            "original_price": original_price,
+            "price_drop_amount": price_drop_amount,
+            "want_cnt": want_cnt,
+            "is_free_shipping": is_free_shipping,
+            "has_nfr_badge": has_nfr_badge,
+            "area": str(ex.get("area") or "").strip(),
+            "seller_id_enc": seller_id_enc,
+            "seller_nick": str(ex.get("userNickName") or dp.get("userNick") or "").strip(),
+            "seller_tags": credit_tags,
+            "image_url": pic_url,
+            "publish_at": publish_at,
+            "pic_width": pic_width,
+            "pic_height": pic_height,
+            "is_video": _parse_bool_flag(dp.get("isVideo")) or bool(ex.get("showVideoIcon")),
+            "is_ad": _parse_bool_flag(ex.get("isAliMaMaAD")),
+            "is_fish_shop": _parse_bool_flag(ex.get("userIsUseFishShopCard")) or _parse_bool_flag(cp_args.get("userIsUseFishShopCard")),
+            "coin_discount": _parse_bool_flag(cp_args.get("CoinPay_Morediscount")),
+            "cat_id": str(cp_args.get("catId") or "").strip(),
+            "channel_cat_id": str(cp_args.get("cCatId") or "").strip(),
+            "tb_cat_id": str(cp_args.get("tbCatId") or "").strip(),
+            "official_tag_codes": official_tag_codes,
+            "official_tag_names": str(cp_args.get("tagname") or "").strip(),
+            "search_keyword": str(keyword or cp_args.get("keyword") or "").strip(),
+            "search_rank": resolved_rank,
+        },
+        search_keyword=keyword,
+    )
 
 
 def _parse_sku_entry(sku: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -241,6 +487,8 @@ def _parse_sku_entry(sku: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "specs": specs,
         "price": sku_price,
         "quantity": quantity,
+        "original_quantity": _parse_optional_int(features.get("idleOriginalQuantity")) if isinstance(features, dict) else None,
+        "sku_order_num": _parse_optional_int(features.get("sku_order_num")) if isinstance(features, dict) else None,
     }
 
 
@@ -374,8 +622,8 @@ def search_xianyu_items(
 
                 raw_list = (success_packet.get("data") or {}).get("resultList") or []
                 parsed_items: List[Dict[str, Any]] = []
-                for wrap in raw_list:
-                    item_obj = _parse_search_result_item(wrap)
+                for idx, wrap in enumerate(raw_list):
+                    item_obj = _parse_search_result_item(wrap, keyword=kw_clean, rank=idx + 1)
                     if item_obj is not None:
                         parsed_items.append(item_obj)
                         if len(parsed_items) >= limit:
@@ -430,6 +678,97 @@ def search_xianyu_items(
         }
 
 
+def normalize_item_detail(det: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """SSOT：将任意闲鱼商品详情字典规范化为 Schema v2 标准结构（含嵌套 seller 与 UTC 时间）。"""
+    if not isinstance(det, dict):
+        return None
+    item_id = str(det.get("item_id") or "").strip()
+    if not item_id:
+        return None
+
+    item_url = str(det.get("item_url") or f"{GOOFISH_HOME_URL}/item?id={item_id}").strip()
+    price = _parse_float_price(det.get("price"), default=0.0)
+    sku_list = [dict(s) for s in (det.get("sku_list") or []) if isinstance(s, dict)]
+    sku_prices = [_parse_float_price(s.get("price"), default=0.0) for s in sku_list]
+    sku_prices = [p for p in sku_prices if p > 0]
+    min_fallback = min(sku_prices) if sku_prices else price
+    max_fallback = max(sku_prices) if sku_prices else price
+
+    images: List[str] = []
+    for raw_u in det.get("images") or []:
+        u = str(raw_u or "").strip()
+        if u.startswith("//"):
+            u = "https:" + u
+        if u and u not in images:
+            images.append(u)
+
+    image_meta = [dict(m) for m in (det.get("image_meta") or []) if isinstance(m, dict)]
+    seller_src = det.get("seller") if isinstance(det.get("seller"), dict) else {}
+    seller = {
+        "seller_id": str(seller_src.get("seller_id") or "").strip(),
+        "nick": str(seller_src.get("nick") or "").strip(),
+        "city": str(seller_src.get("city") or "").strip(),
+        "register_at": _parse_utc_datetime(seller_src.get("register_at")),
+        "seller_level": _parse_optional_int(seller_src.get("seller_level")),
+        "sold_count": _parse_optional_int(seller_src.get("sold_count")),
+        "good_rate": str(seller_src.get("good_rate") or "").strip(),
+        "item_count": _parse_optional_int(seller_src.get("item_count")),
+        "reg_days": _parse_optional_int(seller_src.get("reg_days")),
+        "last_visit": str(seller_src.get("last_visit") or "").strip(),
+        "reply_ratio_24h": _parse_optional_float(seller_src.get("reply_ratio_24h")),
+        "reply_interval": str(seller_src.get("reply_interval") or "").strip(),
+        "avg_reply_30d_min": _parse_optional_int(seller_src.get("avg_reply_30d_min")),
+        "business_type": _parse_optional_int(seller_src.get("business_type")),
+        "is_yxp_pro": _parse_optional_bool(seller_src.get("is_yxp_pro")),
+        "zhima_auth": _parse_optional_bool(seller_src.get("zhima_auth")),
+        "zhima_level": str(seller_src.get("zhima_level") or "").strip(),
+        "good_remark_cnt": _parse_optional_int(seller_src.get("good_remark_cnt")),
+        "bad_remark_cnt": _parse_optional_int(seller_src.get("bad_remark_cnt")),
+        "default_remark_cnt": _parse_optional_int(seller_src.get("default_remark_cnt")),
+    }
+
+    result = {
+        "ok": True,
+        "item_id": item_id,
+        "item_url": item_url,
+        "title": str(det.get("title") or "").strip(),
+        "desc": str(det.get("desc") or "").strip(),
+        "price": price,
+        "original_price": _parse_optional_price(det.get("original_price")),
+        "transport_fee": _parse_optional_float(det.get("transport_fee")),
+        "is_free_shipping": bool(det.get("is_free_shipping")),
+        "min_price": _parse_float_price(det.get("min_price"), default=min_fallback),
+        "max_price": _parse_float_price(det.get("max_price"), default=max_fallback),
+        "has_multi_sku": bool(sku_list) if sku_list else bool(det.get("has_multi_sku")),
+        "sku_list": sku_list,
+        "cpv_labels": [dict(lbl) for lbl in (det.get("cpv_labels") or []) if isinstance(lbl, dict)],
+        "want_cnt": _parse_optional_int(det.get("want_cnt")),
+        "browse_cnt": _parse_optional_int(det.get("browse_cnt")),
+        "quantity": _parse_optional_int(det.get("quantity")),
+        "collect_cnt": _parse_optional_int(det.get("collect_cnt")),
+        "coin_discount": bool(det.get("coin_discount")),
+        "publish_at": _parse_utc_datetime(det.get("publish_at")),
+        "item_status": _parse_optional_int(det.get("item_status")),
+        "item_status_str": str(det.get("item_status_str") or "").strip(),
+        "bargained": bool(det.get("bargained")),
+        "title_is_user_input": _parse_optional_bool(det.get("title_is_user_input")),
+        "category_id": str(det.get("category_id") or "").strip(),
+        "item_cat": dict(det.get("item_cat") or {}) if isinstance(det.get("item_cat"), dict) else {},
+        "item_labels": [str(x).strip() for x in (det.get("item_labels") or []) if str(x).strip()],
+        "service_tags": [str(x).strip() for x in (det.get("service_tags") or []) if str(x).strip()],
+        "images": images,
+        "image_meta": image_meta,
+        "first_pic_width": _parse_optional_int(det.get("first_pic_width")),
+        "first_pic_height": _parse_optional_int(det.get("first_pic_height")),
+        "has_video": bool(det.get("has_video")),
+        "seller": seller,
+    }
+    shot_file = str(det.get("screenshot_file") or "").strip()
+    if shot_file:
+        result["screenshot_file"] = shot_file
+    return result
+
+
 def _parse_detail_packet_to_dict(
     success_packet: Dict[str, Any],
     item_id: str,
@@ -447,15 +786,27 @@ def _parse_detail_packet_to_dict(
         title = desc.splitlines()[0].strip()
 
     price = _parse_float_price(item_do.get("soldPrice"), default=0.0)
-    original_price = _parse_float_price(item_do.get("originalPrice"), default=0.0)
-    transport_fee = _parse_float_price(item_do.get("transportFee"), default=0.0)
+    original_price = _parse_optional_price(item_do.get("originalPrice"))
+    transport_fee = _parse_optional_float(item_do.get("transportFee"))
 
     rel_tags = item_do.get("priceRelativeTags") or []
+    common_tags = item_do.get("commonTags") or []
+    price_text_tags = item_do.get("priceTextTags") or []
+    all_tag_dicts = [
+        t
+        for t in (
+            *(price_text_tags if isinstance(price_text_tags, list) else []),
+            *(common_tags if isinstance(common_tags, list) else []),
+            *(rel_tags if isinstance(rel_tags, list) else []),
+        )
+        if isinstance(t, dict)
+    ]
     has_baoyou_tag = any(
-        isinstance(t, dict) and ("包邮" in str(t.get("text") or "") or (t.get("trackParams") or {}).get("tagType") == "baoyou")
-        for t in rel_tags
+        "包邮" in str(t.get("text") or "") or (t.get("trackParams") or {}).get("tagType") == "baoyou"
+        for t in all_tag_dicts
     )
-    is_free_shipping = bool(transport_fee == 0.0 and (has_baoyou_tag or "包邮" in desc or "包邮" in title))
+    coin_discount = any((t.get("trackParams") or {}).get("tagType") == "coin_pay" for t in all_tag_dicts)
+    is_free_shipping = bool((transport_fee is None or transport_fee == 0.0) and (has_baoyou_tag or "包邮" in desc or "包邮" in title))
 
     raw_skus = item_do.get("skuList") or item_do.get("idleItemSkuList") or []
     sku_list: List[Dict[str, Any]] = []
@@ -478,6 +829,7 @@ def _parse_detail_packet_to_dict(
                 cpv_labels.append({"name": p_name, "value": v_name})
 
     images: List[str] = []
+    image_meta: List[Dict[str, Any]] = []
     for img in item_do.get("imageInfos") or []:
         if isinstance(img, dict):
             u = str(img.get("url") or "").strip()
@@ -485,15 +837,110 @@ def _parse_detail_packet_to_dict(
                 u = "https:" + u
             if u and u not in images:
                 images.append(u)
+            image_meta.append({
+                "width": _parse_optional_int(img.get("widthSize")),
+                "height": _parse_optional_int(img.get("heightSize")),
+                "major": bool(img.get("major")),
+                "type": _parse_optional_int(img.get("type")),
+            })
 
-    want_cnt = _parse_int_num(item_do.get("wantCnt"), default=0)
-    browse_cnt = _parse_int_num(item_do.get("browseCnt"), default=0)
-    quantity = _parse_int_num(item_do.get("quantity"), default=1)
+    major_img_meta = next((m for m in image_meta if m.get("major")), image_meta[0] if image_meta else {})
+    first_pic_width = major_img_meta.get("width") if isinstance(major_img_meta, dict) else None
+    first_pic_height = major_img_meta.get("height") if isinstance(major_img_meta, dict) else None
+    has_video = bool(item_do.get("videoInfo") or item_do.get("video")) or any(
+        (m.get("type") or 0) != 0 for m in image_meta
+    )
 
-    seller_nick = str(seller_do.get("nick") or "").strip()
-    seller_city = str(seller_do.get("city") or seller_do.get("publishCity") or "").strip()
-    seller_sold_count = _parse_int_num(seller_do.get("hasSoldNumInteger"), default=0)
-    seller_good_rate = str(seller_do.get("newGoodRatioRate") or "").strip()
+    publish_at = _parse_utc_datetime(item_do.get("gmtCreate"))
+    if publish_at is None:
+        publish_at = _parse_utc_datetime(item_do.get("GMT_CREATE_DATE_KEY"))
+
+    raw_cat = item_do.get("itemCatDTO")
+    item_cat: Dict[str, Any] = {}
+    if isinstance(raw_cat, dict):
+        for k in ("catId", "tbCatId", "channelCatId", "rootChannelCatId", "level2ChannelCatId", "level3ChannelCatId", "leafId"):
+            if raw_cat.get(k) is not None and raw_cat.get(k) != "":
+                item_cat[k] = raw_cat.get(k)
+
+    item_labels: List[str] = []
+    for ext in item_do.get("itemLabelExtList") or []:
+        if isinstance(ext, dict):
+            txt = str(ext.get("valueText") or ext.get("text") or "").strip()
+            if txt and txt not in item_labels:
+                item_labels.append(txt)
+
+    service_tags: List[str] = []
+    for tag_list in (rel_tags, common_tags):
+        if isinstance(tag_list, list):
+            for t in tag_list:
+                if isinstance(t, dict):
+                    txt = str(t.get("text") or "").strip()
+                    if txt and txt not in service_tags:
+                        service_tags.append(txt)
+
+    remark_do = seller_do.get("remarkDO") if isinstance(seller_do.get("remarkDO"), dict) else {}
+    zhima_info = seller_do.get("zhimaLevelInfo") if isinstance(seller_do.get("zhimaLevelInfo"), dict) else {}
+    credit_tag = seller_do.get("idleFishCreditTag") if isinstance(seller_do.get("idleFishCreditTag"), dict) else {}
+    credit_tp = credit_tag.get("trackParams") if isinstance(credit_tag.get("trackParams"), dict) else {}
+
+    clean_det = normalize_item_detail(
+        {
+            "item_id": item_id,
+            "item_url": detail_url,
+            "title": title,
+            "desc": desc,
+            "price": price,
+            "original_price": original_price,
+            "transport_fee": transport_fee,
+            "is_free_shipping": is_free_shipping,
+            "min_price": min_price,
+            "max_price": max_price,
+            "has_multi_sku": len(sku_list) > 0,
+            "sku_list": sku_list,
+            "cpv_labels": cpv_labels,
+            "want_cnt": _parse_optional_int(item_do.get("wantCnt")),
+            "browse_cnt": _parse_optional_int(item_do.get("browseCnt")),
+            "quantity": _parse_optional_int(item_do.get("quantity")),
+            "collect_cnt": _parse_optional_int(item_do.get("collectCnt")),
+            "coin_discount": coin_discount,
+            "publish_at": publish_at,
+            "item_status": _parse_optional_int(item_do.get("itemStatus")),
+            "item_status_str": str(item_do.get("itemStatusStr") or "").strip(),
+            "bargained": bool(item_do.get("bargained")),
+            "title_is_user_input": _parse_optional_bool(item_do.get("titleIsUserInput")),
+            "category_id": str(item_do.get("categoryId") or "").strip(),
+            "item_cat": item_cat,
+            "item_labels": item_labels,
+            "service_tags": service_tags,
+            "images": images,
+            "image_meta": image_meta,
+            "first_pic_width": first_pic_width,
+            "first_pic_height": first_pic_height,
+            "has_video": has_video,
+            "seller": {
+                "seller_id": str(seller_do.get("sellerId") or "").strip(),
+                "nick": str(seller_do.get("nick") or "").strip(),
+                "city": str(seller_do.get("city") or seller_do.get("publishCity") or "").strip(),
+                "register_at": _parse_utc_datetime(seller_do.get("registerTime")),
+                "seller_level": _parse_optional_int(credit_tp.get("sellerLevel")),
+                "sold_count": _parse_optional_int(seller_do.get("hasSoldNumInteger")),
+                "good_rate": str(seller_do.get("newGoodRatioRate") or "").strip(),
+                "item_count": _parse_optional_int(seller_do.get("itemCount")),
+                "reg_days": _parse_optional_int(seller_do.get("userRegDay")),
+                "last_visit": str(seller_do.get("lastVisitTime") or "").strip(),
+                "reply_ratio_24h": _parse_reply_ratio(seller_do),
+                "reply_interval": str(seller_do.get("replyInterval") or "").strip(),
+                "avg_reply_30d_min": _parse_optional_int(seller_do.get("avgReply30dLong")),
+                "business_type": _parse_optional_int(seller_do.get("businessType")),
+                "is_yxp_pro": _parse_optional_bool(seller_do.get("yxpPro")),
+                "zhima_auth": _parse_optional_bool(seller_do.get("zhimaAuth")),
+                "zhima_level": str(zhima_info.get("levelName") or "").strip(),
+                "good_remark_cnt": _parse_optional_int(remark_do.get("sellerGoodRemarkCnt")),
+                "bad_remark_cnt": _parse_optional_int(remark_do.get("sellerBadRemarkCnt")),
+                "default_remark_cnt": _parse_optional_int(remark_do.get("sellerDefaultRemarkCnt")),
+            },
+        }
+    ) or {}
 
     return {
         "ok": True,
@@ -501,27 +948,7 @@ def _parse_detail_packet_to_dict(
         "is_risk_blocked": False,
         "action": "get_xianyu_item_detail",
         "user_data_dir": user_data_dir,
-        "item_id": item_id,
-        "item_url": detail_url,
-        "title": title,
-        "desc": desc,
-        "price": price,
-        "original_price": original_price,
-        "transport_fee": transport_fee,
-        "is_free_shipping": is_free_shipping,
-        "min_price": min_price,
-        "max_price": max_price,
-        "has_multi_sku": len(sku_list) > 0,
-        "sku_list": sku_list,
-        "cpv_labels": cpv_labels,
-        "want_cnt": want_cnt,
-        "browse_cnt": browse_cnt,
-        "quantity": quantity,
-        "images": images,
-        "seller_nick": seller_nick,
-        "seller_city": seller_city,
-        "seller_sold_count": seller_sold_count,
-        "seller_good_rate": seller_good_rate,
+        **clean_det,
     }
 
 

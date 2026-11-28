@@ -157,17 +157,58 @@ class _InMemoryXianyuItemsCol:
     def create_index(self, keys, **kwargs):
         self.indexes.append((keys, kwargs))
 
+    @staticmethod
+    def _apply_set_dict(target, set_map):
+        for k, v in set_map.items():
+            if "." in k:
+                cur = target
+                parts = k.split(".")
+                for part in parts[:-1]:
+                    nxt = cur.get(part)
+                    if not isinstance(nxt, dict):
+                        nxt = {}
+                        cur[part] = nxt
+                    cur = nxt
+                cur[parts[-1]] = v
+            else:
+                target[k] = v
+
+    @staticmethod
+    def _assert_no_path_conflict(set_keys, insert_keys) -> None:
+        for sk in set_keys:
+            for ik in insert_keys:
+                if sk == ik or sk.startswith(ik + ".") or ik.startswith(sk + "."):
+                    raise ValueError(
+                        f"MongoDB code=40 path conflict between $set ({sk}) and $setOnInsert ({ik})"
+                    )
+
     def bulk_write(self, ops, ordered=False):
         for op in ops:
+            set_map = dict(op._doc.get("$set") or {})
+            insert_map = dict(op._doc.get("$setOnInsert") or {})
+            if set_map and insert_map:
+                self._assert_no_path_conflict(set_map.keys(), insert_map.keys())
             iid = str(op._filter["item_id"])
             is_insert = iid not in self.docs
-            target = self.docs.setdefault(iid, {})
-            if is_insert and "$setOnInsert" in op._doc:
-                target.update(dict(op._doc["$setOnInsert"]))
-            if "$set" in op._doc:
-                target.update(dict(op._doc["$set"]))
+            if not is_insert or op._upsert:
+                target = self.docs.setdefault(iid, {})
+                if is_insert and insert_map:
+                    self._apply_set_dict(target, insert_map)
+                if set_map:
+                    self._apply_set_dict(target, set_map)
+                if "$push" in op._doc:
+                    for field, push_spec in op._doc["$push"].items():
+                        arr = list(target.get(field) or [])
+                        if isinstance(push_spec, dict) and "$each" in push_spec:
+                            arr.extend(push_spec["$each"])
+                            sl = push_spec.get("$slice")
+                            if isinstance(sl, int) and sl < 0:
+                                arr = arr[sl:]
+                        else:
+                            arr.append(push_spec)
+                        target[field] = arr
 
-    def find(self, query):
+    def find(self, query, projection=None):
         id_filter = set((query.get("item_id") or {}).get("$in") or [])
         req_has_detail = query.get("has_detail")
         matched = []
@@ -176,7 +217,14 @@ class _InMemoryXianyuItemsCol:
                 continue
             if req_has_detail is not None and bool(doc.get("has_detail")) != bool(req_has_detail):
                 continue
-            matched.append(dict(doc))
+            row = dict(doc)
+            if isinstance(projection, dict) and projection:
+                snap_spec = projection.get("snapshots")
+                if isinstance(snap_spec, dict) and isinstance(snap_spec.get("$slice"), int) and "snapshots" in row:
+                    sl = snap_spec["$slice"]
+                    snaps = list(row.get("snapshots") or [])
+                    row["snapshots"] = snaps[sl:] if sl < 0 else snaps[:sl]
+            matched.append(row)
         return matched
 
 
@@ -360,7 +408,6 @@ def test_top2_detail_cap_and_7day_xianyu_items_cache_reuse():
                 "item_id": "9001",
                 "has_detail": True,
                 "detail_updated_at": two_days_ago,
-                "detail_updated_at_str": "2026-11-11 10:00:00",
                 "detail": {
                     "ok": True,
                     "item_id": "9001",
@@ -1201,6 +1248,329 @@ def test_workbench_entrypoints_resist_pycharm_pythonpath_shadowing():
                 f"{script_name} failed under PYTHONPATH={py_path!r}: "
                 f"stdout={proc.stdout}\nstderr={proc.stderr}"
             )
+
+
+def test_market_parsers_schema_v2_and_strict_nulls():
+    from xianyu_workbench.client import market as xy_market
+
+    # 1. 搜索卡片 Schema v2 解析（UTC datetime publish_at、seller_id_enc、类目、标签与排名，无冗余 *_str）
+    raw_search_wrap = {
+        "data": {
+            "item": {
+                "main": {
+                    "clickParam": {
+                        "args": {
+                            "publishTime": "1795622954000",
+                            "CoinPay_Morediscount": "true",
+                            "userIsUseFishShopCard": "false",
+                            "seller_id": "enc_seller_001",
+                            "catId": "50025446",
+                            "cCatId": "126858348",
+                            "tbCatId": "50012478",
+                            "tag": "freeship/credit-6",
+                            "tagname": "包邮/极好",
+                            "keyword": "维达抽纸",
+                            "position": "0",
+                        }
+                    },
+                    "exContent": {
+                        "itemId": "1104149344866",
+                        "area": "四川",
+                        "picUrl": "//img.alicdn.com/test.jpg",
+                        "isAliMaMaAD": False,
+                        "showVideoIcon": False,
+                        "userIsUseFishShopCard": True,
+                        "userNickName": "测试卖家",
+                        "detailParams": {
+                            "itemId": "1104149344866",
+                            "title": "维达抽纸24包",
+                            "soldPrice": "24",
+                            "picWidth": "887",
+                            "picHeight": "1920",
+                            "isVideo": "true",
+                        },
+                        "fishTags": {
+                            "r3": {
+                                "tagList": [
+                                    {"data": {"labelId": "41", "isStrikeThrough": "true", "content": "¥50"}},
+                                    {"data": {"labelId": "749", "content": "累计降价1.99元"}},
+                                    {"data": {"content": "34人想要"}},
+                                ]
+                            },
+                            "r5": {
+                                "tagList": [
+                                    {"data": {"labelId": "664", "content": "nfrIcon"}},
+                                ]
+                            },
+                        },
+                    },
+                }
+            }
+        }
+    }
+    card = xy_market._parse_search_result_item(raw_search_wrap, keyword="维达抽纸", rank=3)
+    assert card is not None
+    assert isinstance(card["publish_at"], datetime.datetime)
+    assert card["publish_at"].tzinfo == datetime.timezone.utc
+    assert int(card["publish_at"].timestamp()) == 1795622954
+    assert "publish_ts" not in card
+    assert "publish_time_str" not in card
+    assert card["is_free_shipping"] is True  # 由 official_tag_codes 中的 freeship 识别
+    assert card["original_price"] == 50.0
+    assert card["price_drop_amount"] == 1.99
+    assert card["has_nfr_badge"] is True
+    assert "¥50" not in card["seller_tags"]
+    assert "累计降价1.99元" not in card["seller_tags"]
+    assert "nfrIcon" not in card["seller_tags"]
+    assert card["want_cnt"] == 34
+    assert card["pic_width"] == 887
+    assert card["pic_height"] == 1920
+    assert card["is_video"] is True
+    assert card["is_ad"] is False
+    assert card["is_fish_shop"] is True
+    assert card["coin_discount"] is True
+    assert card["seller_id_enc"] == "enc_seller_001"
+    assert card["cat_id"] == "50025446"
+    assert card["channel_cat_id"] == "126858348"
+    assert card["tb_cat_id"] == "50012478"
+    assert card["search_keyword"] == "维达抽纸"
+    assert card["search_rank"] == 3
+
+    # 2. 详情包 Schema v2 解析（UTC datetime publish_at、嵌套 seller、严格 None 边界）
+    raw_detail_pkt = {
+        "data": {
+            "itemDO": {
+                "itemId": 1101996601108,
+                "title": "闪迪内存卡",
+                "desc": "公司采购整多了",
+                "soldPrice": "18",
+                "transportFee": "0.00",
+                "priceRelativeTags": [{"text": "包邮", "trackParams": {"tagType": "baoyou"}}],
+                "priceTextTags": [{"trackParams": {"tagType": "coin_pay"}}],
+                "commonTags": [{"text": "包邮"}, {"text": "48小时发货"}],
+                "wantCnt": 107,
+                "browseCnt": 1247,
+                "collectCnt": 33,
+                "favorCnt": 0,
+                "soldCnt": 0,
+                "quantity": 98,
+                "gmtCreate": 1795250507000,
+                "GMT_CREATE_DATE_KEY": "2026-11-21 16:41:47",
+                "itemStatus": 0,
+                "itemStatusStr": "在线",
+                "bargained": False,
+                "titleIsUserInput": False,
+                "categoryId": 50025387,
+                "itemCatDTO": {"catId": 50025387, "tbCatId": 50012166, "channelCatId": 126854217},
+                "itemLabelExtList": [{"valueText": "闪存卡"}, {"valueText": "Sandisk/闪迪"}],
+                "imageInfos": [
+                    {"url": "//img.alicdn.com/1.jpg", "major": True, "widthSize": 1080, "heightSize": 1440, "type": 0},
+                    {"url": "//img.alicdn.com/2.jpg", "major": False, "widthSize": 1000, "heightSize": 1000, "type": 0},
+                ],
+                "skuList": [
+                    {
+                        "inventoryId": 1138603,
+                        "priceInCent": 1800,
+                        "quantity": 22,
+                        "propertyList": [{"propertyText": "容量", "actualValueText": "16G"}],
+                        "features": {"idleOriginalQuantity": "25", "sku_order_num": "0"},
+                    }
+                ],
+            },
+            "sellerDO": {
+                "sellerId": 3670364797,
+                "nick": "C***e",
+                "city": "深圳",
+                "registerTime": 1617431685000,
+                "idleFishCreditTag": {"trackParams": {"sellerLevel": "1"}},
+                "hasSoldNumInteger": 1050,
+                "newGoodRatioRate": "75%",
+                "itemCount": 30,
+                "userRegDay": 2064,
+                "lastVisitTime": "7小时前来过",
+                "replyIn24hRatioDouble": 0.8585,
+                "replyInterval": "2小时",
+                # avgReply30dLong 故意缺省，验证返回 None 而非 0
+                "businessType": 2,
+                "yxpPro": False,
+                "zhimaAuth": True,
+                "zhimaLevelInfo": {"levelName": "信用极好"},
+                "remarkDO": {"sellerGoodRemarkCnt": 42, "sellerBadRemarkCnt": 14, "sellerDefaultRemarkCnt": 0},
+            },
+        }
+    }
+    det = xy_market._parse_detail_packet_to_dict(
+        raw_detail_pkt,
+        item_id="1101996601108",
+        detail_url="https://www.goofish.com/item?id=1101996601108",
+        user_data_dir="guest",
+    )
+    assert det["collect_cnt"] == 33
+    assert det["coin_discount"] is True
+    assert "favor_cnt" not in det
+    assert "sold_cnt" not in det
+    assert isinstance(det["publish_at"], datetime.datetime)
+    assert det["publish_at"].tzinfo == datetime.timezone.utc
+    assert int(det["publish_at"].timestamp()) == 1795250507
+    assert "gmt_create_ts" not in det
+    assert "gmt_create_str" not in det
+    assert det["item_status"] == 0
+    assert det["item_status_str"] == "在线"
+    assert det["first_pic_width"] == 1080
+    assert det["first_pic_height"] == 1440
+    assert det["has_video"] is False
+    assert det["item_labels"] == ["闪存卡", "Sandisk/闪迪"]
+    assert det["service_tags"] == ["包邮", "48小时发货"]
+    assert det["sku_list"][0]["original_quantity"] == 25
+    assert det["sku_list"][0]["sku_order_num"] == 0
+    assert det["seller"]["seller_id"] == "3670364797"
+    assert isinstance(det["seller"]["register_at"], datetime.datetime)
+    assert det["seller"]["register_at"].tzinfo == datetime.timezone.utc
+    assert int(det["seller"]["register_at"].timestamp()) == 1617431685
+    assert det["seller"]["seller_level"] == 1
+    assert det["seller"]["item_count"] == 30
+    assert det["seller"]["reg_days"] == 2064
+    assert det["seller"]["reply_ratio_24h"] == 0.8585
+    assert det["seller"]["avg_reply_30d_min"] is None
+    assert det["seller"]["zhima_level"] == "信用极好"
+    assert det["seller"]["good_remark_cnt"] == 42
+    assert det["seller"]["bad_remark_cnt"] == 14
+
+
+def test_save_xianyu_items_schema_v2_detail_protection_and_smart_snapshots():
+    fake_col = _InMemoryXianyuItemsCol()
+
+    # 1. 连续写入 35 次搜索（价格与想要数递增），验证严格 30 条快照截断、UTC 时间与零 *_str 冗余
+    pub_search_dt = datetime.datetime(2026, 11, 25, 10, 0, 0, tzinfo=datetime.timezone.utc)
+    for i in range(35):
+        sched._save_xianyu_search_items(
+            fake_col,
+            [
+                {
+                    "item_id": "777001",
+                    "title": "搜索态标题",
+                    "price": 20.0 + i * 0.1,
+                    "want_cnt": 5 + i,
+                    "publish_at": pub_search_dt,
+                    "pic_width": 900,
+                    "pic_height": 1200,
+                    "is_video": False,
+                    "is_ad": False,
+                    "is_fish_shop": True,
+                    "coin_discount": False,
+                    "seller_id_enc": "enc_s777",
+                    "search_rank": i + 1,
+                }
+            ],
+            search_keyword="测试关键字",
+        )
+
+    doc_after_search = fake_col.docs["777001"]
+    assert doc_after_search["schema_version"] == 2
+    assert doc_after_search["has_detail"] is False
+    assert doc_after_search["publish_at"] == pub_search_dt
+    assert doc_after_search["publish_at_source"] == "search"
+    assert len(doc_after_search["snapshots"]) == 30
+
+    # 2. 完全相同价格与想要数 1 分钟内再次搜索，应被智能去重不重复追加快照
+    sched._save_xianyu_search_items(
+        fake_col,
+        [
+            {
+                "item_id": "777001",
+                "title": "搜索态标题",
+                "price": 20.0 + 34 * 0.1,
+                "want_cnt": 5 + 34,
+                "publish_at": pub_search_dt,
+            }
+        ],
+        search_keyword="测试关键字",
+    )
+    assert len(fake_col.docs["777001"]["snapshots"]) == 30
+    assert fake_col.docs["777001"]["snapshots"][-1]["source"] == "search"
+
+    # 3. 写入权威 H5 详情（search -> detail 升级应追加快照，且 publish_at_source 切为 "detail"）
+    pub_detail_dt = datetime.datetime(2026, 11, 24, 8, 30, 0, tzinfo=datetime.timezone.utc)
+    sched._save_xianyu_item_details(
+        fake_col,
+        {
+            "777001": {
+                "ok": True,
+                "item_id": "777001",
+                "title": "权威详情标题",
+                "desc": "详细描述",
+                "price": 22.0,
+                "transport_fee": 0.0,
+                "is_free_shipping": True,
+                "want_cnt": 40,
+                "browse_cnt": 400,
+                "quantity": 10,
+                "collect_cnt": 12,
+                "publish_at": pub_detail_dt,
+                "has_video": True,
+                "screenshot_file": "item_777001.jpg",
+                "seller": {
+                    "seller_id": "998877",
+                    "avg_reply_30d_min": None,
+                    "reply_ratio_24h": 0.95,
+                },
+            }
+        },
+    )
+
+    doc = fake_col.docs["777001"]
+    assert doc["has_detail"] is True
+    assert doc["title"] == "权威详情标题"
+    assert doc["price"] == 22.0
+    assert doc["publish_at"] == pub_detail_dt
+    assert doc["publish_at_source"] == "detail"
+    assert doc["metrics"]["want_cnt"] == 40
+    assert doc["metrics"]["browse_cnt"] == 400
+    assert doc["metrics"]["collect_cnt"] == 12
+    assert doc["metrics"]["want_rate"] == 0.1
+    assert "favor_cnt" not in doc["metrics"]
+    assert "sold_cnt" not in doc["metrics"]
+    assert doc["seller_id"] == "998877"
+    assert doc["screenshot_file"] == "item_777001.jpg"
+    assert doc["detail"]["seller"]["avg_reply_30d_min"] is None
+    assert doc["detail"]["seller"]["reply_ratio_24h"] == 0.95
+    assert len(doc["snapshots"]) == 30
+    assert doc["snapshots"][-1]["source"] == "detail"
+    assert doc["snapshots"][-1]["browse_cnt"] == 400
+    for forbidden in ("publish_time_str", "gmt_create_ts", "gmt_create_str", "detail_updated_at_str", "updated_at_str", "created_at_str"):
+        assert forbidden not in doc
+
+    # 4. 详情优先保护：再次搜索写入脏标题/不同价格/旧时间，绝不覆盖详情态主字段、metrics 与 detail
+    sched._save_xianyu_search_items(
+        fake_col,
+        [
+            {
+                "item_id": "777001",
+                "title": "搜索覆盖尝试标题",
+                "price": 999.0,
+                "want_cnt": 1,
+                "publish_at": pub_search_dt,
+                "is_ad": True,
+                "search_rank": 2,
+            }
+        ],
+        search_keyword="新关键字",
+    )
+    doc_protected = fake_col.docs["777001"]
+    assert doc_protected["title"] == "权威详情标题"
+    assert doc_protected["price"] == 22.0
+    assert doc_protected["publish_at"] == pub_detail_dt
+    assert doc_protected["publish_at_source"] == "detail"
+    assert doc_protected["metrics"]["want_cnt"] == 40
+    assert doc_protected["is_ad"] is True  # 允许刷新广告曝光/搜索卡位
+    assert doc_protected["search_card"]["search_keyword"] == "新关键字"
+
+    # 5. 验证 7 天缓存读取直接使用原生 detail_updated_at 并正确返回 screenshot_file
+    cached = sched._load_cached_xianyu_details(fake_col, ["777001"], cache_days=7)
+    assert cached["777001"]["screenshot_file"] == "item_777001.jpg"
+    assert cached["777001"]["_from_db_cache"] is True
+    assert isinstance(cached["777001"]["_detail_updated_at"], datetime.datetime)
+
 
 
 
